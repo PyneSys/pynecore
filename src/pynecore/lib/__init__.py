@@ -1136,31 +1136,17 @@ def _parse_session_string_cached(session: str, timezone: str) -> tuple['SessionI
     )
 
 
-@_lru_cache(maxsize=256)
-def _is_bar_in_session(bar_time_ms: int, session_infos: 'tuple[SessionInfo, ...]',
-                       timeframe: str) -> bool:
+def _is_bar_in_session(bar_time_ms: int, session_infos: 'tuple[SessionInfo, ...]') -> bool:
     """
-    Check if a bar time falls within any of the specified session ranges.
-
-    The answer depends on nothing but the arguments, and a script asks it many
-    times per bar -- once per ``time()``/``time_close()`` call, each rebuilding the
-    same localized datetimes -- so the recent answers are memoized. The session
-    ranges arrive as the frozen tuple :func:`_parse_session_string` hands out, so
-    the key is cheap to hash and stable for the whole run.
+    Check if a bar's opening time falls within any of the specified session ranges.
 
     :param bar_time_ms: Bar time in milliseconds (UNIX timestamp)
     :param session_infos: Session ranges of one session specification -- every range
                           shares the same day set and timezone, and the bar is in
                           session as soon as one of them contains it
-    :param timeframe: Timeframe string for calculating bar duration
     :return: True if bar is within session, False otherwise
     """
-    try:
-        tf_seconds = timeframe_module.in_seconds(timeframe)
-    except (ValueError, AssertionError):
-        # If timeframe is invalid, assume 1-minute bars
-        tf_seconds = 60
-    return _session_occurrence(bar_time_ms, session_infos, tf_seconds) is not None
+    return _session_occurrence(bar_time_ms, session_infos) is not None
 
 
 @_lru_cache(maxsize=512)
@@ -1255,18 +1241,24 @@ def _session_occurrences_opening_on(day: date,
 
 
 @_lru_cache(maxsize=256)
-def _session_occurrence(bar_time_ms: int, session_infos: 'tuple[SessionInfo, ...]',
-                        chart_tf_seconds: int) -> tuple[int, int] | None:
+def _session_occurrence(bar_time_ms: int,
+                        session_infos: 'tuple[SessionInfo, ...]') -> tuple[int, int] | None:
     """
     Bounds of the single session occurrence a chart bar falls into.
 
-    The bar belongs to the occurrence it overlaps, the same contract
-    :func:`_is_bar_in_session` answers yes/no to; the latest overlapping one
-    wins when ranges touch.
+    MEASURED LAW (BINANCE:BTCUSDT at 30 minutes, 4 hours and daily): the bar
+    belongs to an occurrence only when its OPENING time lies in ``[open, close)``
+    -- a bar merely overlapping the run is NOT in session. On the 30-minute
+    chart "0945-1015" ran on the 10:00 bar alone (never the straddling 09:30
+    one), "0915-0945" on 09:30 alone (never 09:00), "1545-1615" on 16:00 alone,
+    and "1550-1555" -- a run entirely inside one bar -- on no bar at all. The
+    same holds where the bar is longer than the run: at 4 hours "0930-1600" ran
+    on the 12:00 bar only and "0100-0300" on none, and the daily bar (opening
+    00:00) was in "2200-0200" but in neither "0930-1600" nor "1200-1300".
+    The latest containing occurrence wins when ranges overlap.
 
     :param bar_time_ms: Chart bar open in milliseconds
     :param session_infos: Session ranges of one session specification
-    :param chart_tf_seconds: Chart bar length in seconds
     :return: ``(open_ms, close_ms)`` of the occurrence, or ``None`` when the bar
              is outside every range
     """
@@ -1276,15 +1268,14 @@ def _session_occurrence(bar_time_ms: int, session_infos: 'tuple[SessionInfo, ...
         return None
     tz = _parse_timezone(session_infos[0].timezone)
     bar_dt = datetime.fromtimestamp(bar_time_ms / 1000, tz)
-    bar_end_ms = bar_time_ms + chart_tf_seconds * 1000
 
     best: tuple[int, int] | None = None
     # An overnight range that opened yesterday still covers this bar, so both
-    # dates have to be offered to the overlap test.
+    # dates have to be offered to the containment test.
     for day_offset in (-1, 0):
         day = (bar_dt + timedelta(days=day_offset)).date()
         for start_ms, end_ms in _session_occurrences_opening_on(day, session_infos):
-            if bar_time_ms < end_ms and bar_end_ms > start_ms:
+            if start_ms <= bar_time_ms < end_ms:
                 if best is None or start_ms > best[0]:
                     best = (start_ms, end_ms)
     return best
@@ -1475,12 +1466,7 @@ def _session_bar_bounds(chart_time_ms: int, session_infos: 'tuple[SessionInfo, .
     if modifier not in ('', 'S', 'D') or (modifier == 'D' and multiplier != 1):
         return bar_start_ms, bar_close_ms
 
-    chart_period = str(syminfo.period)
-    try:
-        chart_tf_seconds = timeframe_module.in_seconds(chart_period)
-    except (ValueError, AssertionError):
-        chart_tf_seconds = 60
-    occurrence = _session_occurrence(chart_time_ms, session_infos, chart_tf_seconds)
+    occurrence = _session_occurrence(chart_time_ms, session_infos)
     if occurrence is None and steps <= 0:
         return None
 
@@ -1506,8 +1492,7 @@ def _session_bar_bounds(chart_time_ms: int, session_infos: 'tuple[SessionInfo, .
     step_ms = (multiplier if modifier == 'S' else multiplier * 60) * 1000
     in_session = occurrence is not None
     if occurrence is not None:
-        # A bar straddling the open belongs to the session's first bucket.
-        index = max(0, (chart_time_ms - occurrence[0]) // step_ms) - steps
+        index = (chart_time_ms - occurrence[0]) // step_ms - steps
     else:
         # MEASURED (both "0930-1600" with seven buckets and "0900-1130" with
         # three, requested "60", offsets 1..8): out of session the walk starts

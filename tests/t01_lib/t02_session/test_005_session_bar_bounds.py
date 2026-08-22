@@ -13,7 +13,6 @@ from pynecore.lib import (_parse_session_string, _is_bar_in_session, _session_oc
                           _session_period_anchor, _session_bar_bounds, syminfo)
 
 NY = "America/New_York"
-HALF_HOUR = 1800
 
 
 def _ms(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> int:
@@ -24,11 +23,11 @@ def __test_day_session_reports_its_own_bounds__():
     """A day session's occurrence opens and closes at the session, not at midnight"""
     infos = _parse_session_string("0300-1200:1234567", NY)
     # 2025-01-06 is a Monday; 03:00 New York is 08:00 UTC in winter.
-    bounds = _session_occurrence(_ms(2025, 1, 6, 10), infos, HALF_HOUR)
+    bounds = _session_occurrence(_ms(2025, 1, 6, 10), infos)
     assert bounds == (_ms(2025, 1, 6, 8), _ms(2025, 1, 6, 17))
     # The bar before the open and the bar at the close are both outside.
-    assert _session_occurrence(_ms(2025, 1, 6, 7, 30), infos, HALF_HOUR) is None
-    assert _session_occurrence(_ms(2025, 1, 6, 17), infos, HALF_HOUR) is None
+    assert _session_occurrence(_ms(2025, 1, 6, 7, 30), infos) is None
+    assert _session_occurrence(_ms(2025, 1, 6, 17), infos) is None
 
 
 def __test_overnight_occurrence_is_anchored_on_its_opening_day__():
@@ -36,8 +35,8 @@ def __test_overnight_occurrence_is_anchored_on_its_opening_day__():
     infos = _parse_session_string("1700-0200:1234567", NY)
     # 17:00 New York on 2025-01-06 is 22:00 UTC, the run closes 02:00 the next day.
     expected = (_ms(2025, 1, 6, 22), _ms(2025, 1, 7, 7))
-    assert _session_occurrence(_ms(2025, 1, 6, 23), infos, HALF_HOUR) == expected
-    assert _session_occurrence(_ms(2025, 1, 7, 3), infos, HALF_HOUR) == expected
+    assert _session_occurrence(_ms(2025, 1, 6, 23), infos) == expected
+    assert _session_occurrence(_ms(2025, 1, 7, 3), infos) == expected
 
 
 def __test_dst_crossing_session_keeps_its_wall_clock_endpoints__():
@@ -51,18 +50,18 @@ def __test_dst_crossing_session_keeps_its_wall_clock_endpoints__():
     evening = _parse_session_string("1900-0400:1234567", NY)
     night = _parse_session_string("0100-0500:1234567", NY)
     # Spring forward: the closing clock time is reached an hour of real time early.
-    assert _session_occurrence(_ms(2025, 3, 9, 3), evening, HALF_HOUR) == \
+    assert _session_occurrence(_ms(2025, 3, 9, 3), evening) == \
            (_ms(2025, 3, 9, 0), _ms(2025, 3, 9, 8))
-    assert _session_occurrence(_ms(2025, 3, 9, 7), night, HALF_HOUR) == \
+    assert _session_occurrence(_ms(2025, 3, 9, 7), night) == \
            (_ms(2025, 3, 9, 6), _ms(2025, 3, 9, 9))
     # Fall back: the repeated hour stretches the run instead.
-    assert _session_occurrence(_ms(2025, 11, 2, 3), evening, HALF_HOUR) == \
+    assert _session_occurrence(_ms(2025, 11, 2, 3), evening) == \
            (_ms(2025, 11, 1, 23), _ms(2025, 11, 2, 9))
-    assert _session_occurrence(_ms(2025, 11, 2, 7), night, HALF_HOUR) == \
+    assert _session_occurrence(_ms(2025, 11, 2, 7), night) == \
            (_ms(2025, 11, 2, 5), _ms(2025, 11, 2, 10))
     # The bar starting at the close is already out of session.
-    assert _is_bar_in_session(_ms(2025, 11, 2, 8, 30), evening, "30") is True
-    assert _is_bar_in_session(_ms(2025, 11, 2, 9), evening, "30") is False
+    assert _is_bar_in_session(_ms(2025, 11, 2, 8, 30), evening) is True
+    assert _is_bar_in_session(_ms(2025, 11, 2, 9), evening) is False
 
 
 def __test_session_closing_on_the_changing_hour_ends_on_its_last_minute__():
@@ -76,13 +75,13 @@ def __test_session_closing_on_the_changing_hour_ends_on_its_last_minute__():
     """
     infos = _parse_session_string("1700-0200:1234567", NY)
     # Spring forward: 17:00 EST is 22:00 UTC, and 02:00 does not exist.
-    assert _session_occurrence(_ms(2025, 3, 9, 0), infos, HALF_HOUR) == \
+    assert _session_occurrence(_ms(2025, 3, 9, 0), infos) == \
            (_ms(2025, 3, 8, 22), _ms(2025, 3, 9, 7))
     # Fall back: 17:00 EDT is 21:00 UTC, and 02:00 is reached an hour early.
-    assert _session_occurrence(_ms(2025, 11, 2, 0), infos, HALF_HOUR) == \
+    assert _session_occurrence(_ms(2025, 11, 2, 0), infos) == \
            (_ms(2025, 11, 1, 21), _ms(2025, 11, 2, 6))
-    assert _is_bar_in_session(_ms(2025, 11, 2, 5, 30), infos, "30") is True
-    assert _is_bar_in_session(_ms(2025, 11, 2, 6), infos, "30") is False
+    assert _is_bar_in_session(_ms(2025, 11, 2, 5, 30), infos) is True
+    assert _is_bar_in_session(_ms(2025, 11, 2, 6), infos) is False
 
 
 def __test_period_anchor_is_the_first_session_open_of_the_period__():
@@ -111,11 +110,11 @@ def __test_day_mask_names_the_closing_weekday__():
     infos = _parse_session_string("1700-0200:23456", "UTC")
     # 2025-01-05 is a Sunday, 2025-01-10 a Friday.
     sunday_night = (_ms(2025, 1, 5, 17), _ms(2025, 1, 6, 2))
-    assert _session_occurrence(_ms(2025, 1, 5, 18), infos, 3600) == sunday_night
-    assert _session_occurrence(_ms(2025, 1, 6, 1), infos, 3600) == sunday_night
+    assert _session_occurrence(_ms(2025, 1, 5, 18), infos) == sunday_night
+    assert _session_occurrence(_ms(2025, 1, 6, 1), infos) == sunday_night
     # The Friday evening opens a Saturday-closing run, which the mask drops.
-    assert _session_occurrence(_ms(2025, 1, 10, 18), infos, 3600) is None
-    assert _session_occurrence(_ms(2025, 1, 11, 1), infos, 3600) is None
+    assert _session_occurrence(_ms(2025, 1, 10, 18), infos) is None
+    assert _session_occurrence(_ms(2025, 1, 11, 1), infos) is None
 
 
 def __test_day_mask_of_a_full_day_wrap_stays_on_the_opening_day__():
@@ -125,15 +124,15 @@ def __test_day_mask_of_a_full_day_wrap_stays_on_the_opening_day__():
     "1700-1700:23456" ran Sunday 17:00 -> Monday 17:00 up to Thursday -> Friday.
     """
     all_day = _parse_session_string("0000-0000:23456", "UTC")
-    assert _is_bar_in_session(_ms(2025, 1, 6, 12), all_day, "60") is True   # Monday
-    assert _is_bar_in_session(_ms(2025, 1, 10, 12), all_day, "60") is True  # Friday
-    assert _is_bar_in_session(_ms(2025, 1, 11, 12), all_day, "60") is False  # Saturday
-    assert _is_bar_in_session(_ms(2025, 1, 5, 12), all_day, "60") is False  # Sunday
+    assert _is_bar_in_session(_ms(2025, 1, 6, 12), all_day) is True   # Monday
+    assert _is_bar_in_session(_ms(2025, 1, 10, 12), all_day) is True  # Friday
+    assert _is_bar_in_session(_ms(2025, 1, 11, 12), all_day) is False  # Saturday
+    assert _is_bar_in_session(_ms(2025, 1, 5, 12), all_day) is False  # Sunday
 
     wrap = _parse_session_string("1700-1700:23456", "UTC")
-    assert _is_bar_in_session(_ms(2025, 1, 5, 18), wrap, "60") is True    # Sunday evening
-    assert _is_bar_in_session(_ms(2025, 1, 10, 12), wrap, "60") is True   # Friday noon
-    assert _is_bar_in_session(_ms(2025, 1, 10, 18), wrap, "60") is False  # Friday evening
+    assert _is_bar_in_session(_ms(2025, 1, 5, 18), wrap) is True    # Sunday evening
+    assert _is_bar_in_session(_ms(2025, 1, 10, 12), wrap) is True   # Friday noon
+    assert _is_bar_in_session(_ms(2025, 1, 10, 18), wrap) is False  # Friday evening
 
 
 def __test_period_anchor_of_an_overnight_session_opens_the_evening_before__():

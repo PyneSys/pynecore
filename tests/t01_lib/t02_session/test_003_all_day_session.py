@@ -21,19 +21,19 @@ def __test_all_day_session_includes_every_hour__():
     # 2021-01-04 is a Monday.
     session_info = _parse_session_string("0000-0000:1234567", "UTC")
     for hour in (0, 3, 12, 18, 23):
-        assert _is_bar_in_session(_ms(2021, 1, 4, hour), session_info, "60") is True, hour
+        assert _is_bar_in_session(_ms(2021, 1, 4, hour), session_info) is True, hour
 
 
 def __test_all_day_session_still_honours_day_filter__():
     """The all-day span does not override the day-of-week gate"""
     # Days "23456" = Monday..Friday (TV numbering, 1=Sun).
     session_info = _parse_session_string("0000-0000:23456", "UTC")
-    assert _is_bar_in_session(_ms(2021, 1, 3, 12), session_info, "60") is False  # Sunday
-    assert _is_bar_in_session(_ms(2021, 1, 4, 12), session_info, "60") is True   # Monday
+    assert _is_bar_in_session(_ms(2021, 1, 3, 12), session_info) is False  # Sunday
+    assert _is_bar_in_session(_ms(2021, 1, 4, 12), session_info) is True   # Monday
 
 
 def __test_bounded_session_unaffected__():
     """A normal HHMM-HHMM session keeps excluding out-of-range bars"""
     session_info = _parse_session_string("0930-1600:1234567", "UTC")
-    assert _is_bar_in_session(_ms(2021, 1, 4, 12), session_info, "60") is True
-    assert _is_bar_in_session(_ms(2021, 1, 4, 20), session_info, "60") is False
+    assert _is_bar_in_session(_ms(2021, 1, 4, 12), session_info) is True
+    assert _is_bar_in_session(_ms(2021, 1, 4, 20), session_info) is False

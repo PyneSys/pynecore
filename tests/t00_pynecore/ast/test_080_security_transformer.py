@@ -893,3 +893,69 @@ def main():
     signal_call = signal_if.body[0].value
     assert signal_call.func.id == '__sec_signal__'
     assert len(signal_call.args) == 3
+
+
+def __test_symbol_call_with_local_arg_deferred__(log):
+    """``ticker.heikinashi(<local>)`` must not reach the module-level ctx.
+
+    The callee is a safe ``lib.*`` chain, but the argument is a function
+    parameter (an ``input.symbol()`` in Pine), so the whole call has to be
+    deferred to ``__sec_signal__`` — inlining it would NameError at import.
+    """
+    source = """
+def main(sym):
+    val = lib.request.security(lib.ticker.heikinashi(sym), "1D", lib.close)
+"""
+    tree = _transform_tree(source)
+
+    ctx_assign = _find_contexts(tree)
+    ctx_dict = ctx_assign.value.values[0]
+    ctx_keys = [k.value for k in ctx_dict.keys]
+    sym_val = ctx_dict.values[ctx_keys.index('symbol')]
+    assert isinstance(sym_val, ast.Constant) and sym_val.value is None
+
+    # Signal is emitted inline and carries the actual call expression
+    func = _find_func(tree)
+    signal_if = func.body[0]
+    assert isinstance(signal_if, ast.If)
+    signal_call = signal_if.body[0].value
+    assert signal_call.func.id == '__sec_signal__'
+    assert isinstance(signal_call.args[1], ast.Call)
+
+
+def __test_symbol_call_with_lib_arg_stays_module_level__(log):
+    """``ticker.heikinashi(lib.syminfo.tickerid)`` stays in the module ctx."""
+    source = """
+def main():
+    val = lib.request.security(
+        lib.ticker.heikinashi(lib.syminfo.tickerid), "1D", lib.close
+    )
+"""
+    tree = _transform_tree(source)
+
+    ctx_assign = _find_contexts(tree)
+    ctx_dict = ctx_assign.value.values[0]
+    ctx_keys = [k.value for k in ctx_dict.keys]
+    sym_val = ctx_dict.values[ctx_keys.index('symbol')]
+    assert isinstance(sym_val, ast.Call)
+
+
+def __test_tuple_expression_pins_arity_without_unpack_target__(log):
+    """A tuple EXPRESSION sets the read default even with no unpack target.
+
+    ``return lib.request.security(..., (a, b, c), ...)`` is not the RHS of an
+    assignment, so the unpack-target rule sees nothing — but the expression
+    itself is authoritative. Without it the inactive-context read returns a
+    scalar ``na`` and the caller's unpack raises ``na is not iterable``.
+    """
+    source = """
+def main():
+    def f():
+        return lib.request.security(lib.syminfo.tickerid, "D",
+                                    (lib.volume, lib.high, lib.low))
+    a, b, c = f()
+"""
+    result = _transform(source)
+    assert '__sec_read__' in result
+    read_line = next(ln for ln in result.splitlines() if '__sec_read__' in ln)
+    assert read_line.count('lib.na') == 3, read_line

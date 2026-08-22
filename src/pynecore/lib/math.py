@@ -287,7 +287,25 @@ def pow(base: TFI | NA[TFI], exponent: TFI | NA[TFI]) -> PyneFloat:
     if base != base or exponent != exponent:
         return na_float
 
-    return cast(float, base) ** cast(float, exponent)
+    b = cast(float, base)
+    # MEASURED (BINANCE:BTCUSDT@30, 8000 bars, base in [0.3, 1.3]): TradingView
+    # answers these four exponents with the shortcut result exactly -- every bar
+    # of ``pow(x, 2) - x * x``, ``pow(x, 0.5) - sqrt(x)``, ``pow(x, 1) - x`` and
+    # ``pow(x, 0) - 1`` was zero. The platform ``pow()`` is not: it disagrees
+    # with ``x * x`` on 8 of those bars and with ``sqrt(x)`` on 5, which a
+    # recursive script carries into its output (Signal Moving Average [LuxAlgo]).
+    # Only these hold -- ``pow(x, -1)`` is NOT ``1 / x`` on TradingView (3 bars),
+    # and ``pow(x, 3)`` is not ``x * x * x`` on 2149 of them.
+    if exponent == 2:
+        return b * b
+    if exponent == 1:
+        return b
+    if exponent == 0:
+        return 1.0
+    if exponent == 0.5 and b >= 0.0:
+        return math.sqrt(b)
+
+    return b ** cast(float, exponent)
 
 
 # noinspection PyShadowingBuiltins

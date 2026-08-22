@@ -187,7 +187,13 @@ class SecurityTransformer(ast.NodeTransformer):
         if isinstance(node, ast.Name):
             return node.id == 'lib'
         if isinstance(node, ast.Call):
-            return SecurityTransformer._is_module_level_expr(node.func)
+            # A call is only safe if its callee AND every argument are —
+            # ``ticker.heikinashi(inputSymbol)`` has a lib.* callee but a local
+            # argument, so it must not be emitted at module level.
+            return (SecurityTransformer._is_module_level_expr(node.func)
+                    and all(SecurityTransformer._is_module_level_expr(a) for a in node.args)
+                    and all(SecurityTransformer._is_module_level_expr(kw.value)
+                            for kw in node.keywords))
         return False
 
     @staticmethod
@@ -483,7 +489,8 @@ class SecurityTransformer(ast.NodeTransformer):
                 for call_node in call_nodes_here:
                     arity = self._detect_tuple_arity(stmt, call_node)
                     if arity is not None:
-                        call_node._tuple_len = arity  # type: ignore[attr-defined]
+                        if not hasattr(call_node, '_tuple_len'):
+                            call_node._tuple_len = arity  # type: ignore[attr-defined]
                         # LTF call with an opaque tuple expression (a function
                         # call, not a literal): the expression's own arity is
                         # unknowable here, but Pine enforces LHS-arity ==
@@ -567,6 +574,13 @@ class SecurityTransformer(ast.NodeTransformer):
                 symbol, timeframe, expression, gaps, lookahead, ignore_invalid, currency = (
                     self._extract_args(call)
                 )
+                # A tuple/list expression pins the arity at the call itself,
+                # which the unpack target below cannot see when the call is
+                # not the direct RHS of an assignment (a nested function's
+                # ``return``, say) — the security child would then read a
+                # scalar ``na`` and crash the unpack at the call site.
+                if isinstance(expression, (ast.Tuple, ast.List)):
+                    call._tuple_len = len(expression.elts)  # type: ignore[attr-defined]
 
             if expression is not None:
                 bad = self._find_forbidden_strategy_state(expression)

@@ -186,6 +186,7 @@ class Order:
         "profit_ticks", "loss_ticks", "trail_points_ticks",  # Store tick values for later calculation
         "is_market_order",  # Flag to check if this is a market order
         "cancelled",  # Flag to mark order as cancelled by OCA
+        "gap_committed",  # Exit leg locked into the current bar-open gap batch
         "deferred_qty",  # Default-sized entry: quantity re-resolves at the actual fill price
         "budget_money",  # Money budget of a default-sized entry frozen at (last) placement
         "filled_qty",  # Live: quantity of this entry order already reflected in open_trades
@@ -267,6 +268,15 @@ class Order:
                                 and self.trail_points_ticks is None)
 
         self.cancelled = False
+        # True while this exit leg sits in the bar-open gap batch. MEASURED on
+        # TradingView (BINANCE:BTCUSDT 30m, 6/6 events): when a stop entry that
+        # reverses the position and a strategy.exit stop BOTH gap through the
+        # same open, both fill there -- the exit is not cancelled by the reversal
+        # that filled a moment earlier. It sells its own quantity a second time
+        # and opens a fresh position under its own exit id. Only the gap batch
+        # behaves this way: an exit level first reached inside the bar (18/18
+        # events) and one outlived by a MARKET reversal (6/6) are cancelled unfilled.
+        self.gap_committed = False
         self.deferred_qty = False
         self.budget_money: float | None = None
         # Live-only fill accounting: how much of this retained entry order has
@@ -403,15 +413,20 @@ class _EntryBinding:
     entry's ORIGINAL quantity, not off what is left of it.
     """
 
-    __slots__ = ('seq', 'entry_id', 'init_size', 'bound', 'sign', 'entry_price')
+    __slots__ = ('seq', 'entry_id', 'init_size', 'bound', 'sign', 'entry_price', 'exit_opened')
 
-    def __init__(self, seq: int, entry_id: str | None, size: PyneFloat, entry_price: PyneFloat):
+    def __init__(self, seq: int, entry_id: str | None, size: PyneFloat, entry_price: PyneFloat,
+                 exit_opened: bool = False):
         self.seq: int = seq
         self.entry_id: str | None = entry_id
         self.init_size: float = abs(size)
         self.bound: float = abs(size)
         self.sign: float = 0.0 if size == 0.0 else 1.0 if size > 0.0 else -1.0
         self.entry_price: PyneFloat = entry_price
+        # Opened by a gap-committed exit leg rather than by an entry order, which
+        # moves it to the FRONT of the leg order a later strategy.exit issues
+        # (see _filled_targets).
+        self.exit_opened: bool = exit_opened
 
     def __repr__(self):
         return (f"_EntryBinding(seq={self.seq}; entry_id={self.entry_id}; "
@@ -1039,6 +1054,13 @@ class SimPosition(PositionBase):
             self._remove_order(order)
 
     def _cancel_all_orders(self) -> None:
+        # Market orders live in their own dict too, so clearing the books alone
+        # would leave a same-bar market entry to fill at the next bar's open.
+        for book in (self.entry_orders, self.exit_orders):
+            for order in book.values():
+                order.cancelled = True
+                if order.is_market_order:
+                    self.market_orders.pop(_market_order_key(order), None)
         self.entry_orders.clear()
         self.exit_orders.clear()
         self.orderbook.clear()
@@ -1082,7 +1104,7 @@ class SimPosition(PositionBase):
                     order.size = new_size * order.sign
 
     def _bind_entry(self, entry_id: str | None, size: PyneFloat,
-                    entry_price: PyneFloat) -> None:
+                    entry_price: PyneFloat, exit_opened: bool = False) -> None:
         """Open a binding for a just-filled entry and hand it any waiting exit legs.
 
         A leg issued while the entry order was still pending carries no
@@ -1092,7 +1114,7 @@ class SimPosition(PositionBase):
         leg beside the pending-bound one, and the pair would over-close.
         """
         self._entry_seq += 1
-        binding = _EntryBinding(self._entry_seq, entry_id, size, entry_price)
+        binding = _EntryBinding(self._entry_seq, entry_id, size, entry_price, exit_opened)
         self._entry_book.append(binding)
         if entry_id is None:
             return
@@ -1134,6 +1156,8 @@ class SimPosition(PositionBase):
         except ValueError:
             return
         for exit_order in list(self.exit_orders.values()):
+            if exit_order.gap_committed:
+                continue
             if (exit_order.entry_seq == binding.seq
                     or (exit_order.entry_seq is None
                         and exit_order.order_id == binding.entry_id
@@ -1489,7 +1513,7 @@ class SimPosition(PositionBase):
                     self.min_equity = min(self.min_equity, self.equity)
 
         # New trade
-        elif order.order_type != _order_type_close:
+        elif order.order_type != _order_type_close or order.gap_committed:
             # Calculate commission
             if commission_value:
                 if commission_type == _commission.cash_per_order:
@@ -1520,8 +1544,11 @@ class SimPosition(PositionBase):
                 # Entry equity
                 self.entry_equity = entry_equity
 
-            # For close_all overshoot, use exit_id as entry_id
-            entry_id = order.order_id if order.order_id is not None else order.exit_id
+            # A close_all overshoot and a gap-committed exit leg that outlived
+            # the position it was bound to both open under their own exit id.
+            entry_id = (order.exit_id
+                        if order.order_type == _order_type_close or order.order_id is None
+                        else order.order_id)
 
             trade = Trade(
                 size=order.size,
@@ -1532,7 +1559,7 @@ class SimPosition(PositionBase):
             )
 
             self.open_trades.append(trade)
-            self._bind_entry(entry_id, order.size, price)
+            self._bind_entry(entry_id, order.size, price, order.gap_committed)
             self.size = _size_add(self.size, trade.size)
             self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
 
@@ -1560,6 +1587,10 @@ class SimPosition(PositionBase):
             exit_orders_to_remove = list(self.exit_orders.values())
             for exit_order in exit_orders_to_remove:
                 if exit_order.order_id in self.entry_orders:
+                    continue
+                # A leg already committed to this bar-open gap batch survives the
+                # flat moment between a reversal's two legs (see gap_committed).
+                if exit_order.gap_committed:
                     continue
                 self._remove_order(exit_order)
 
@@ -3141,6 +3172,11 @@ class SimPosition(PositionBase):
         # The leg that the gap triggered decides how the fill is priced below, so
         # it is carried over to the market loop instead of being re-derived there.
         gap_triggers: dict[_MarketOrderKey, Literal['stop', 'limit']] = {}
+        gap_batch: list[Order] = []
+        # Everything already in the dict was queued on an EARLIER bar; the scan
+        # below appends this bar's gap batch behind it (see the arming point in
+        # the market loop).
+        queued_before_bar = len(self.market_orders)
         # An empty book yields nothing, so the generator is skipped rather than
         # created and immediately exhausted — every bar of an open position with
         # no resting order passes here.
@@ -3164,12 +3200,21 @@ class SimPosition(PositionBase):
                         self._remove_order(order)
                         continue
 
-                # Convert to market order
-                order.is_market_order = True
-                # Add to market orders dict
-                market_key = _market_order_key(order)
-                self.market_orders[market_key] = order
-                gap_triggers[market_key] = gap_trigger
+                gap_triggers[_market_order_key(order)] = gap_trigger
+                gap_batch.append(order)
+
+        # The batch fills entries first, exits after -- MEASURED on TradingView
+        # (BINANCE:BTCUSDT 30m, 12/12 events): a stop entry that reverses the
+        # position closes the old one whatever the two levels are, above the exit
+        # stop or below it, and whichever of the two the script placed first. The
+        # sort is stable, so the order book's own price walk still orders each
+        # group internally.
+        gap_batch.sort(key=lambda o: o.order_type == _order_type_close)
+        for order in gap_batch:
+            # Convert to market order
+            order.is_market_order = True
+            # Add to market orders dict
+            self.market_orders[_market_order_key(order)] = order
 
         # Reversal context for the pre-fill margin reject below. A genuine fresh entry
         # that cannot be margined at its fill price is rejected outright (TV-verified).
@@ -3197,7 +3242,17 @@ class SimPosition(PositionBase):
 
         # Process Market orders. The snapshot exists because fills mutate the dict;
         # an empty one has nothing to mutate, so it is not copied at all.
-        for order in (list(self.market_orders.values()) if self.market_orders else ()):
+        for index, order in enumerate(list(self.market_orders.values())
+                                      if self.market_orders else ()):
+            if index == queued_before_bar:
+                # The gap batch starts here, so it is armed only now: a MARKET
+                # order queued on an earlier bar still cancels an exit leg
+                # outright (MEASURED, 6/6 events -- a market reversal leaves the
+                # gapped exit unfilled), while a fill from inside the batch no
+                # longer does (see Order.gap_committed).
+                for leg in gap_batch:
+                    if leg.exit_id is not None:
+                        leg.gap_committed = True
             if order.cancelled:
                 continue
             if order.order_type == _order_type_entry:
@@ -3313,6 +3368,11 @@ class SimPosition(PositionBase):
             elif (order.order_type == _order_type_entry
                   and order.limit is None and order.stop is None):
                 same_bar_entry_sign = order.sign
+
+        # The batch is over: a leg that outlived it (its fill was a no-op) is
+        # cancellable again from here on.
+        for order in (self.exit_orders.values() if self.exit_orders else ()):
+            order.gap_committed = False
 
         # Convert tick-based exit prices for entries that just filled this bar
         self._resolve_filled_entry_exits()
@@ -4391,10 +4451,18 @@ def _price_round(price: PyneFloat, direction: int | float) -> PyneFloat:
         return na_float
     pricescale = syminfo.pricescale
     minmove = syminfo.minmove
-    tick_count = round(price * pricescale / minmove, 7)
+    tick_count = price * pricescale / minmove
+    # A level within 1e-4 of a tick counts as ON that tick. MEASURED on
+    # TradingView (BINANCE:BTCUSDT 30m, 66 short-stop and 55 long-stop events,
+    # plus BINANCE:ADAUSDT at mintick 1e-4): a short's stop 9.63e-5 ticks above
+    # the grid fills AT the grid point while 1.005e-4 above fills one tick
+    # higher, and a long's stop 9e-5 ticks below fills at the grid point while
+    # 1.5e-4 below fills one tick lower. The width is in TICKS -- not in price
+    # units and not in ULPs: the same 1e-4 separates the two outcomes whether
+    # the tick count is 5e3 or 8.7e6.
     if direction < 0:
-        return int(tick_count) * minmove / pricescale
-    return math.ceil(tick_count) * minmove / pricescale
+        return math.floor(tick_count + 1e-4) * minmove / pricescale
+    return math.ceil(tick_count - 1e-4) * minmove / pricescale
 
 
 # noinspection PyShadowingBuiltins,PyProtectedMember
@@ -5544,9 +5612,17 @@ def exit(id: str, from_entry: str = "",
         :param entry_id: The ``from_entry`` to bind to, or None for all entries
         """
         if isinstance(position, SimPosition):
-            return [(b.seq, b.entry_id or "", b.sign, b.init_size)
-                    for b in position._entry_book
+            book = [b for b in position._entry_book
                     if entry_id is None or b.entry_id == entry_id]
+            # A position a gap-committed exit leg opened (see Order.gap_committed)
+            # takes its leg BEFORE the entries that were already open. MEASURED on
+            # TradingView (BINANCE:BTCUSDT 30m): closing long 1 / short 5 + exit-leg
+            # 1 with one from_entry-less strategy.exit reports the closed rows as
+            # 1, 4, 1 -- the exit-opened leg's single unit is taken off the OLDEST
+            # trade first, splitting it -- while the same exit over two plain
+            # pyramid adds (1 and 2) reports a clean 1, 2.
+            book.sort(key=lambda b: not b.exit_opened)
+            return [(b.seq, b.entry_id or "", b.sign, b.init_size) for b in book]
         grouped: dict[str, list[float]] = {}
         for open_trade in position.open_trades:
             trade_id = open_trade.entry_id or ""
