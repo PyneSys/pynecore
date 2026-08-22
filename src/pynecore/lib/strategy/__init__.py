@@ -95,8 +95,8 @@ _trail_pending = 2
 # instead of colliding on a shared key. Both elements are None for the orders
 # that use neither, which keeps their dedup-by-id semantics intact.
 _ExitOrderKey: _TypeAlias = (tuple[str | None, str | None]
-                            | tuple[str | None, str | None, int]
-                            | tuple[str | None, str | None, int | None, int])
+                             | tuple[str | None, str | None, int]
+                             | tuple[str | None, str | None, int | None, int])
 _MarketOrderKey: _TypeAlias = (tuple[_OrderType, str | None, str | None]
                                | tuple[_OrderType, str | None, str | None, int])
 
@@ -310,7 +310,8 @@ class Trade:
     """
 
     __slots__ = (
-        "size", "init_size", "sign", "entry_id", "entry_bar_index", "entry_time", "entry_price", "entry_comment", "entry_equity",
+        "size", "init_size", "sign", "entry_id", "entry_bar_index", "entry_time", "entry_price", "entry_comment",
+        "entry_equity",
         "exit_id", "exit_bar_index", "exit_time", "exit_price", "exit_comment", "exit_equity",
         "commission", "max_drawdown", "max_drawdown_percent", "max_runup", "max_runup_percent",
         "profit", "profit_percent", "cum_profit", "cum_profit_percent",
@@ -819,7 +820,7 @@ class SimPosition(PositionBase):
 
     __slots__ = (
         'h', 'l', 'c', 'o',
-        'netprofit', 'openprofit', 'grossprofit', 'grossloss',
+        'openprofit', 'grossprofit', 'grossloss',
         'entry_orders', 'exit_orders', 'market_orders', 'orderbook',
         'open_trades', 'closed_trades', 'new_closed_trades',
         'closed_trades_count', 'wintrades', 'eventrades', 'losstrades',
@@ -847,7 +848,6 @@ class SimPosition(PositionBase):
         self.o: float = 0.0
 
         # Profit/loss tracking
-        self.netprofit: PyneFloat = 0.0
         self.openprofit: PyneFloat = 0.0
         self.grossprofit: PyneFloat = 0.0
         self.grossloss: PyneFloat = 0.0
@@ -946,6 +946,19 @@ class SimPosition(PositionBase):
         # during the body; drained by settle_immediate_closes() right after the body
         # so position series stay constant for the rest of the bar (TV semantics).
         self._deferred_immediate_closes: list[Order] = []
+
+    @property
+    def netprofit(self) -> PyneFloat:
+        """Realized net profit, derived from the gross P&L totals."""
+        # TV keeps NO running netprofit accumulator: it derives netprofit from
+        # the gross totals, with an open position's entry commissions still
+        # pending in ``open_commission`` (the public ``grossloss()`` getter adds
+        # them back, so netprofit = grossprofit - grossloss on the published
+        # numbers). Measured on BINANCE:SHIBUSDT 1h (npacc probe, 1119 closed
+        # trades): the derived form reproduces every plotted netprofit bit-exact
+        # (23144/23144), while a running ``+= profit`` accumulator drifts by ULPs
+        # after the 6th close and matches only 1211/23144.
+        return self.grossprofit - self.grossloss - self.open_commission
 
     def _recalc_avg_price(self):
         """
@@ -1298,12 +1311,6 @@ class SimPosition(PositionBase):
                     # Commission summ
                     self.open_commission -= closed_trade.commission
 
-                    # Realize profit or loss. This lands in netprofit BEFORE the exit
-                    # commission: on the Acrypto - Weighted Strategy 2025-01-02 17:00
-                    # reversal the two orders differ by one ULP and only gross-first
-                    # reproduces TradingView's -7.635611411154892.
-                    self.netprofit += pnl
-
                     # cash_per_order is a flat fee per order: defer realization
                     # until the order is removed so it can be split across all
                     # closed trades it actually filled (see delete block below).
@@ -1320,8 +1327,6 @@ class SimPosition(PositionBase):
                                                           commission_value, False)
 
                         closed_trade.commission += commission
-                        # Realize commission
-                        self.netprofit -= commission
                         closed_trade.profit -= closed_trade.commission
 
                     # Profit percent — both profit and entry_value are in USD
@@ -1333,7 +1338,7 @@ class SimPosition(PositionBase):
                         closed_trade.profit_percent = 0.0
 
                     # Modify sizes
-                    self.size = _size_units(self.size + size)
+                    self.size = _size_add(self.size, size)
                     # Handle too small sizes because of floating point inaccuracy and rounding
                     position_flat = _size_round(self.size) == 0.0
                     if position_flat:
@@ -1344,7 +1349,7 @@ class SimPosition(PositionBase):
                     # the position: a snapped position with a dirty trade
                     # residue would leave ±1e-18 dust open after the final close
                     # and export a ghost 0-qty trade.
-                    trade.size = _size_units(trade.size + size)
+                    trade.size = _size_add(trade.size, size)
                     if position_flat:
                         # `size` already absorbed the position residual above, so the
                         # trade that flattened the position is fully closed. Snap off
@@ -1353,7 +1358,10 @@ class SimPosition(PositionBase):
                         # avg_price to NA and poison equity (and every subsequent
                         # percent-of-equity sizing) on later bars.
                         trade.size = 0.0
-                    order.size -= size
+                    # The unfilled remainder feeds the next FIFO leg's closed-trade
+                    # size, so it must stay on the long lot ledger like the
+                    # position itself (see ``_size_add``).
+                    order.size = _size_add(order.size, -size)
 
                     # Gross P/L and counters. Every commission mode classifies
                     # win/loss on the after-fee profit: cash_per_order fees are
@@ -1424,8 +1432,6 @@ class SimPosition(PositionBase):
                     # the part proportional to the quantity it closed.
                     leg_commission = _book_flat_commission(comm_booking, closed_trade_size,
                                                            commission_value)
-                    # Realize commission
-                    self.netprofit -= leg_commission
                     for trade in new_closed_trades:
                         commission = (leg_commission * abs(trade.size)) / closed_trade_size
                         trade.commission += commission
@@ -1473,7 +1479,7 @@ class SimPosition(PositionBase):
                 )
                 self.open_trades.append(overshoot_trade)
                 self._bind_entry(entry_id, overshoot_trade.size, price)
-                self.size = _size_units(self.size + overshoot_trade.size)
+                self.size = _size_add(self.size, overshoot_trade.size)
                 self.sign = 1.0 if self.size > 0.0 else -1.0 if self.size < 0.0 else 0.0
                 self._recalc_avg_price()
                 self.openprofit = self.size * (self.c - self.avg_price) * pv
@@ -1502,8 +1508,9 @@ class SimPosition(PositionBase):
 
             before_equity = self.equity
 
-            # Realize commission
-            self.netprofit -= commission
+            # Realize commission: the entry fee sits in open_commission until the
+            # trade closes, and the derived netprofit subtracts it from there.
+            self.open_commission += commission
 
             entry_equity = self.equity
             if not self.open_trades:
@@ -1526,7 +1533,7 @@ class SimPosition(PositionBase):
 
             self.open_trades.append(trade)
             self._bind_entry(entry_id, order.size, price)
-            self.size = _size_units(self.size + trade.size)
+            self.size = _size_add(self.size, trade.size)
             self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
 
             # Average entry price (see _recalc_avg_price). Measured on
@@ -1536,8 +1543,6 @@ class SimPosition(PositionBase):
             self._recalc_avg_price()
             # Unrealized P&L
             self.openprofit = self.size * (self.c - self.avg_price) * pv
-            # Commission summ
-            self.open_commission += commission
 
             # Remove order
             self._remove_order(order)
@@ -2741,11 +2746,11 @@ class SimPosition(PositionBase):
             money = None
         else:
             money = order.budget_money if order.budget_money is not None else budget[0]
-            qty = money / budget[1]
+            qty = (_sig10_money(money) if money < 1e7 else money) / budget[1]
         if not (0.0 < qty < math.inf):  # unsizable_qty
             order.size = 0.0
             return
-        size = _size_round((qty + order.flip_extra) * order.sign)
+        size = _size_floor((qty + order.flip_extra) * order.sign)
         if size != 0.0:
             # The big-money sizing judgment applies to the money-sized part of
             # the order only; the reversal flip component is the old position,
@@ -3306,7 +3311,7 @@ class SimPosition(PositionBase):
             # A filled market entry establishes the same-bar direction that a
             # later opposite entry must both-legs-margin against (guard above).
             elif (order.order_type == _order_type_entry
-                    and order.limit is None and order.stop is None):
+                  and order.limit is None and order.stop is None):
                 same_bar_entry_sign = order.sign
 
         # Convert tick-based exit prices for entries that just filled this bar
@@ -4046,6 +4051,7 @@ def _round_cash(amount: float) -> float:
     return float(_CASH_CTX.create_decimal(repr(amount)))
 
 
+# noinspection PyProtectedMember
 def _book_commission(booking: list, qty: float, price: float,
                      commission_value: float, is_percent: bool) -> float:
     """
@@ -4195,8 +4201,8 @@ def _size_units(qty: PyneFloat) -> PyneFloat:
     # TV carries every quantity as an integer count of 1e-8 units and hands out
     # ``units * 1e-8``. Measured on BINANCE:BTCUSDT 30m (pyramiding 2, full TP
     # cascade): all 19581 in-position bars report position_size and every
-    # opentrades.size as an exact ``round(q * 1e8) * 1e-8`` double -- including
-    # the ones that differ from the shortest decimal (104 lots of 1e-5 is
+    # opentrades.size as an exact unit multiple -- including the ones that
+    # differ from the shortest decimal (104 lots of 1e-5 is
     # 0.0010400000000000001, not the 0.00104 that 104 / 1e5 yields). The run's
     # 91 distinct lot counts pin the materialization to this grid alone: no
     # ``n / 10**k`` or ``n * 10**-k`` pairing reproduces the whole table, and
@@ -4206,16 +4212,81 @@ def _size_units(qty: PyneFloat) -> PyneFloat:
     # on every one of their 141940 in-position quantities, 13-15% of which the
     # lot grid gets wrong (TV says 5294.900000000001, not 5294.9). On a
     # whole-contract symbol every quantity is an integer, which is always an
-    # exact unit multiple, so this is a no-op there. Quantities are left alone
-    # beyond the exact-integer range and on a symbol whose lot step is finer
-    # than the grid.
+    # exact unit multiple, so this is a no-op there.
+    #
+    # The trip to units is a DIVISION by 1e-8, not a multiplication by 1e8: the
+    # two differ because ``fl(1e-8)`` is not the reciprocal of ``fl(1e8)``.
+    # Below 2**53 units both forms agree, but on BINANCE:SHIBUSDT 1h (lot step
+    # 1e-3, explicit quantities from 4.5e7 to 2.3e10, so 4.5e15..2.3e18 units)
+    # only the division reproduces TV: it is exact on all 1158 fresh legs and
+    # all 70366 reported quantities, while ``* 1e8`` drifts by +-1 ULP on 12% of
+    # them. Above 2**53 the round() is a no-op -- the double already is an
+    # integer -- so the grid keeps working all the way to the long range TV's
+    # own unit counter is bounded by; past that the quantity is left alone.
     rfactor = syminfo._size_round_factor  # noqa
     if rfactor > 1e8:
         return qty
-    scaled = qty * 1e8
-    if not (abs(scaled) < 2 ** 53):  # NaN or beyond exact integer range
+    units = qty / 1e-8
+    if not (abs(units) < 9.223372036854776e18):  # NaN or beyond TV's long range
         return qty
-    return round(scaled) * 1e-8
+    return round(units) * 1e-8
+
+
+def _size_add(qty_a: PyneFloat, qty_b: PyneFloat) -> PyneFloat:
+    """
+    Combine two on-grid quantities the way TradingView's long lot ledger does.
+
+    :param qty_a: First quantity in contracts (an exact lot multiple)
+    :param qty_b: Second quantity in contracts (an exact lot multiple)
+    :return: The sum as an exact multiple of the lot step
+    """
+    # TV books every position change as a LONG count of lots and materializes
+    # ``lots * mincontract``. Measured on BINANCE:SHIBUSDT 1h (explicit
+    # quantities up to 2.3e10 contracts, so far beyond 2**53 units): the
+    # partial-close remainders, the second-generation remainders and every
+    # position_size reproduce 7899/7899 ONLY from the exact lot difference --
+    # the double subtraction of the materialized sizes drifts +-1 ULP on ~40%
+    # of them, and summing the materialized per-trade doubles gets
+    # position_size wrong on ~45% (TV materializes the TOTAL lot count
+    # instead). Below 2**53 units the double sum snapped by ``_size_units``
+    # lands on the same grid point, so this is inert there. Both inputs are
+    # exact lot multiples (every fill goes through ``_size_round`` /
+    # ``_explicit_qty_round``), which makes the lot counts recoverable from
+    # the doubles as long as they fit the 2**53 integer range; past that the
+    # recovery itself would lose lots, so fall back to the snapped double sum.
+    rfactor = syminfo._size_round_factor  # noqa
+    if rfactor > 1e8:
+        return qty_a + qty_b
+    lots_a = qty_a * rfactor
+    lots_b = qty_b * rfactor
+    if not (abs(lots_a) < 9007199254740992.0 and abs(lots_b) < 9007199254740992.0):
+        return _size_units(qty_a + qty_b)  # NaN or beyond exact lot recovery
+    return _size_units((round(lots_a) + round(lots_b)) * (1.0 / rfactor))
+
+
+def _size_floor(qty: PyneFloat) -> PyneFloat:
+    """
+    Plain lot floor for a money-derived (default-sized) quantity.
+
+    :param qty: The quantity in contracts, fresh from the budget division
+    :return: The quantity floored to the lot grid
+    """
+    # A default-sized entry floors the budget division with NO near-integer
+    # snap: TV divides the sig10-quantized budget by the unit cost in double
+    # and truncates whatever comes out, so a quotient one ULP below a whole
+    # lot count loses that lot (BINANCE:SHIBUSDT bar 14041: 10328.61155 /
+    # 1.285e-05 / 0.001 = 803782999999.9999, TV sizes 803782999999 lots).
+    # ``_size_round``'s snap exists for internally derived sizes that are
+    # already lot-exact and only dirtied by the scaling multiply; the budget
+    # quotient is not one of those.
+    if not (qty == qty):  # is_na_arg
+        return na_float
+    rfactor = syminfo._size_round_factor  # noqa
+    lots = int(abs(qty) * rfactor)
+    if lots == 0:
+        return 0.0
+    sign = 1 if qty > 0 else -1
+    return _size_units(sign * lots * (1.0 / rfactor))
 
 
 def _explicit_qty_round(qty: PyneFloat) -> PyneFloat:
@@ -4248,7 +4319,7 @@ def _explicit_qty_round(qty: PyneFloat) -> PyneFloat:
     grid = cached_grid[1]
     lots = int((Decimal(repr(abs(qty))) / grid).to_integral_value(rounding=ROUND_FLOOR))
     sign = 1 if qty > 0 else -1
-    return _size_units(sign * lots / rfactor)
+    return _size_units(sign * lots * mincontract)
 
 
 def _size_round(qty: PyneFloat) -> PyneFloat:
@@ -4277,11 +4348,20 @@ def _size_round(qty: PyneFloat) -> PyneFloat:
     # ordinary fills.
     scaled = abs(qty) * rfactor
     nearest = round(scaled)
-    lots = nearest if abs(scaled - nearest) <= scaled * 1e-12 + 1e-9 else int(scaled)
+    # The snap width is a few ULPs of the scaled value: the float dirt it
+    # guards against is 1-2 ULPs, while a fixed relative width (the old
+    # 1e-12) grows to a third of a LOT at SHIB-scale counts (3.2e11 lots)
+    # and swallows the real 0.77-lot fraction of a qty_percent close that
+    # TradingView floors (BINANCE:SHIBUSDT probe, bar 9: TV closes
+    # ...248.554 lots from 867052023.121 * 0.37, the wide snap closed .555).
+    lots = nearest if abs(scaled - nearest) <= 8.0 * math.ulp(scaled) + 1e-9 else int(scaled)
     if lots == 0:
         return 0.0
     sign = 1 if qty > 0 else -1
-    return _size_units(sign * lots / rfactor)
+    # The lot count is scaled UP by the lot step, not divided by the factor: the
+    # two land on different unit-grid points once the quantity passes 2**53 units
+    # (BINANCE:SHIBUSDT, lot step 1e-3). See ``_size_units``.
+    return _size_units(sign * lots * (1.0 / rfactor))
 
 
 # noinspection PyShadowingNames
@@ -4698,7 +4778,36 @@ def _default_entry_qty(price: float) -> float:
     if budget is None:
         return lib._script.default_qty_value
     money, unit_cost = budget
+    if money < 1e7:
+        money = _sig10_money(money)
     return money / unit_cost
+
+
+def _sig10_money(money: float) -> float:
+    """Quantize a sizing money budget to 10 significant decimal digits.
+
+    :param money: The money budget in account currency
+    :return: The budget rounded half-up to 10 significant decimals
+    """
+    # TV rounds the money side of default sizing to 10 significant decimal
+    # digits (half-up) before dividing by the unit cost. Measured on
+    # BINANCE:SHIBUSDT 1h flat-cycle probes at five percent levels (9, 22.5,
+    # 45, 67.5, 90) whose 1e-3 lots on ~1e9 contracts resolve ~1e-8 of the
+    # budget: 5777/5785 sizing events reproduce exactly (the rest are 1-lot
+    # razor ties at exact lot boundaries), while the raw budget scores under
+    # 30/5785. The grid follows the budget's decimal exponent (1e-6 near 9e3,
+    # 1e-5 near 3e4..9e4, 1e-4 above 1e5), which also explains every snap-up
+    # band measured earlier on BINANCE:BTCUSDT — the 0.05/0.005 tick edges at
+    # money 1e6/1.2e5 and the 0.5/5/50 tick grids of the >=1e7 gate are all
+    # exactly half of this grid expressed in ticks, including the previously
+    # unmapped ON point at cost 1.25e8 ticks. Applied below 1e7 money only:
+    # the >=1e7 MASTER-X gate encodes the same quantization empirically in
+    # its truncation + grid predicates, and its 378/378 probe census was fit
+    # on the raw budget.
+    if not (money > 0.0):
+        return money
+    dec = Decimal(repr(money))
+    return float(dec.quantize(Decimal(1).scaleb(dec.adjusted() - 9), rounding=ROUND_HALF_UP))
 
 
 # Distance threshold (in ticks) of the big-money gate's down-step in the
@@ -4850,26 +4959,15 @@ def _judge_money_entry(size: float, price: float, market: bool = False,
     runs at the floor size directly. See :func:`_gate_entry_lots` for the
     gate itself and the measurement provenance.
 
-    Below 1e7 money TV still snaps a MARKET entry up to the next lot when
-    the raw money tick count reaches the grid floor-cell of that lot's
-    cost (edge = cost ticks mod grid; unlike the >=1e7 gate the money side
-    is NOT truncated to whole ticks). The grid is scale-dependent and only
-    measured in bands; the snap applies only inside a verified band and
-    only for market entries (the placement-close sizing path); everywhere
-    else the plain floor stands. Measured by one-shot equity-injection
-    sweeps on BINANCE:BTCUSDT 30m:
-    - grid 0.05 at cost [1e8, 1.16e8] ticks (2026-07-08): edges two-sided
-      at cost 1.0200e8 and 1.1575e8 (5-level cluster), further ON points at
-      1.005e8/1.08e8, OFF at 9.9e7 and from 1.20e8 up (with an unmapped
-      interleaved ON at 1.25e8 — the OFF points are consistent with a
-      different, unmapped grid rather than an inactive mechanism).
-    - grid 0.005 at cost ~1.245e7 ticks (2026-07-10, the Fabio Pro Scalper
-      2025-11-05 10:30 razor cancel): edge pinned exactly at money ticks
-      12451249.295 = ceil_.005(cost) - 0.005 by 7-probe bisection (fill at
-      .294/.2949, cancel at .29501/.2955/.29711); grids 0.05/0.01/0.002
-      are each refuted by one of those points. Band held at [1.2e7, 1.3e7]
-      until more levels are mapped.
-    A snapped size then faces the ordinary
+    Below 1e7 money the quantization lives at the sizing source instead:
+    ``_default_entry_qty`` floors from ``_sig10_money(money)``, whose
+    10-significant-digit decimal grid reproduces every snap edge measured
+    here by one-shot equity-injection sweeps on BINANCE:BTCUSDT 30m (the
+    0.05-tick edges of the 2026-07-08 cost cluster at [1e8, 1.16e8] ticks
+    including the 1.25e8 ON point the band model could not map, and the
+    0.005-tick Fabio Pro Scalper bisection edge at money ticks
+    12451249.295 on 2026-07-10) as half of that decimal grid in ticks.
+    A quantized size then faces the ordinary
     creation-time margin check at the placement close: at 100%
     percent_of_equity sizing the snapped cost always exceeds equity, so the
     entry cancels at placement even when the fill open would fit (measured:
@@ -4913,27 +5011,30 @@ def _judge_money_entry(size: float, price: float, market: bool = False,
         # while the 2026-07-14 12:30 bar (C=63960.00, even ticks) fills even
         # at 0.8e-10 headroom. Slope selector below C<1e5 beyond these two
         # bars is unmeasured; even-tick bars are treated as s=0.
-        if lots > 1 and round(price / mintick) % 2 == 1:
+        # Both measured bars sit near 7e6 ticks; BINANCE:SHIBUSDT refutes the
+        # drop far below that (odd closes of 967..1038 ticks fill the full
+        # floored size even at 5e-12 relative headroom), so the mechanism is
+        # scoped to the measured magnitude until more bars are mapped.
+        if lots > 1 and round(price / mintick) % 2 == 1 and price / mintick >= 1e6:
             floor_cost = lots / rfactor * unit_cost
-            if money < floor_cost * (1.0 + 2.0 ** -33):
+            # The drop was measured in the regime where the floored size's
+            # cost sits at or below the raw budget; a size floored from the
+            # sig10-rounded-UP budget has floor_cost above the raw money and
+            # is NOT dropped.
+            if floor_cost <= money < floor_cost * (1.0 + 2.0 ** -33):
                 lots -= 1
                 sign = 1.0 if size > 0 else -1.0
                 size = sign * lots / rfactor
-        next_cost = (lots + 1) / rfactor * unit_cost / mintick
-        if 1e8 <= next_cost <= 1.16e8:
-            snap_grid = 0.05
-        elif 1.2e7 <= next_cost <= 1.3e7:
-            snap_grid = 0.005
-        else:
-            return size
-        _, m1 = _ceil_to_grid(next_cost, snap_grid)
-        # m1 - grid unconditionally, like the >=1e7 snap: a cost landing
-        # exactly on the grid keeps the full 0.05 window (the 2025-01-02
-        # 19:30 flat100 cancel pinned this — cost double == grid double,
-        # TV still snapped).
-        if money / mintick >= m1 - snap_grid:
-            sign = 1.0 if size > 0 else -1.0
-            return sign * (lots + 1) / rfactor
+        # The sub-1e7 snap-up to the next lot is the half-grid image of the
+        # 10-significant-digit money quantization and now happens at the
+        # source: ``_default_entry_qty`` sizes from ``_sig10_money(money)``,
+        # so a budget within half a decimal grid unit below the next lot's
+        # cost already floors to the larger size (and one just above a lot
+        # boundary correctly rounds DOWN, which the one-way snap never
+        # could). The 0.05/0.005 tick edges measured on BINANCE:BTCUSDT
+        # (2026-07-08/10: the 1.0200e8/1.1575e8 cost cluster, the Fabio Pro
+        # Scalper 12451249.295 bisection, the flat100 and Gaussian Channel
+        # razor cancels) are exactly that half grid in ticks.
         return size
     money_ticks = money / mintick
     next_cost = (lots + 1) / rfactor * unit_cost / mintick
@@ -5054,7 +5155,7 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # requested qty in broker mode so the sync engine dispatches it and the
     # plugin's quantity preflight reports the skip.
     if isinstance(position, SimPosition):
-        size = _size_round(size) if deferred_default \
+        size = _size_floor(size) if deferred_default \
             else direction_sign * _explicit_qty_round(float(qty))
         if size == 0.0:
             return
@@ -5409,12 +5510,12 @@ def exit(id: str, from_entry: str = "",
                 existing.trail_price is not None or existing.trail_points_ticks is not None):
             had_trail = True
             trail_unchanged = (
-                existing.trail_offset == order.trail_offset
-                and ((order.trail_points_ticks is not None
-                      and existing.trail_points_ticks == order.trail_points_ticks)
-                     or (order.trail_points_ticks is None
-                         and existing.trail_points_ticks is None
-                         and existing.trail_price == order.trail_price)))
+                    existing.trail_offset == order.trail_offset
+                    and ((order.trail_points_ticks is not None
+                          and existing.trail_points_ticks == order.trail_points_ticks)
+                         or (order.trail_points_ticks is None
+                             and existing.trail_points_ticks is None
+                             and existing.trail_price == order.trail_price)))
             if trail_unchanged and existing.trail_triggered:
                 order.trail_triggered = True
                 order.trail_stop = existing.trail_stop
@@ -5645,7 +5746,7 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # qty and let the plugin's preflight report a below-minimum skip instead of
     # silently dropping a live signal here.
     if isinstance(position, SimPosition):
-        size = _size_round(size) if deferred_default \
+        size = _size_floor(size) if deferred_default \
             else direction_sign * _explicit_qty_round(float(qty))
         if size == 0.0:
             return
