@@ -1124,7 +1124,7 @@ def __test_declined_close_arms_the_marker_and_the_retry_waits_a_bar__():
 
 
 def __test_stale_redispatch_waits_for_the_next_bar__():
-    """Same-bar sync passes never re-drive the close, however many run."""
+    """Same-bar sync passes inside the time cap never re-drive the close."""
     from pynecore.core.broker.sync_engine import _REVERSAL_CLOSE_STALE_SYNCS
 
     b = MockBroker()
@@ -1141,6 +1141,108 @@ def __test_stale_redispatch_waits_for_the_next_bar__():
     assert "S" in engine._pending_reversal_opens
 
     engine.sync(BAR_TS + 120_000)
+    assert len(b.close_calls) == 2
+
+
+def __test_stale_redispatch_time_cap_re_drives_within_the_same_bar__():
+    """On a slow chart the wall-clock cap re-drives a stuck reversal close.
+
+    The bar boundary is the retry beat, which is right on an intraday
+    chart — but an hourly/daily bar would park a stuck close for hours.
+    Once the marker is older than ``_CLOSE_DECLINE_RETRY_S``, a same-bar
+    sync past the stale-sync bound re-runs the protocol anyway.
+    """
+    from pynecore.core.broker.sync_engine import (
+        _CLOSE_DECLINE_RETRY_S, _REVERSAL_CLOSE_STALE_SYNCS,
+    )
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    for _ in range(_REVERSAL_CLOSE_STALE_SYNCS + 2):
+        engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
+
+    marker = engine._pending_reversal_opens["S"]
+    marker.armed_monotonic -= _CLOSE_DECLINE_RETRY_S + 1.0
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 2
+    assert _dispatched_close(b.close_calls[1]).synthetic_kind == 'reversal_close'
+
+
+def __test_declined_script_close_waits_for_the_next_bar__():
+    """A plugin-declined script close is retried once per bar, not per sync.
+
+    ``strategy.close_all()`` reaches :meth:`_dispatch_new` directly (no
+    reversal marker involved), so the reversal-path decline gate never
+    covered it: the declined intent stayed out of ``_active_intents`` and
+    every event-driven sync pass rebuilt and re-dispatched it into the
+    same decline — 3745 dispatches over two bars (Capital.com trend lane,
+    cycle 60). ``_close_skip_bar_gate`` now arms on the decline and holds
+    the key until the next bar anchor.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    assert pos.size == 1.0
+
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -1.0, order_type=_order_type_close, exit_id="Close position order",
+    )
+    b.raise_on_next_close = OrderSkippedByPlugin(
+        "nothing to close", intent_key="", reason="nothing_to_close",
+    )
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
+
+    # A same-bar sync storm inside the time cap never re-dispatches the
+    # declined close.
+    for _ in range(10):
+        engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
+
+    # The next bar retries against the settled book.
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.close_calls) == 2
+
+
+def __test_declined_script_close_time_cap_retries_within_the_same_bar__():
+    """On a slow chart the wall-clock cap retries a declined script close.
+
+    "Next bar" is the retry beat on an intraday chart, but an hourly/daily
+    bar would park a still-needed close for hours; once the decline is
+    older than ``_CLOSE_DECLINE_RETRY_S`` the same-bar retry goes out.
+    """
+    from pynecore.core.broker.sync_engine import _CLOSE_DECLINE_RETRY_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -1.0, order_type=_order_type_close, exit_id="Close position order",
+    )
+    b.raise_on_next_close = OrderSkippedByPlugin(
+        "nothing to close", intent_key="", reason="nothing_to_close",
+    )
+    engine.sync(BAR_TS + 60_000)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
+
+    bar_anchor, armed = engine._close_skip_bar_gate[""]
+    engine._close_skip_bar_gate[""] = (
+        bar_anchor, armed - _CLOSE_DECLINE_RETRY_S - 1.0,
+    )
+    engine.sync(BAR_TS + 60_000)
     assert len(b.close_calls) == 2
 
 

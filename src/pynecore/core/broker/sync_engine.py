@@ -545,6 +545,10 @@ class _PendingReversalOpen:
     close_qty: float
     consumed_entry_ids: frozenset[str]
     armed_bar_ts_ms: int
+    #: ``time.monotonic()`` at arming — the wall-clock leg of the stale
+    #: re-dispatch gate (:data:`_CLOSE_DECLINE_RETRY_S`), so a slow chart's
+    #: bar boundary cannot park a stuck close for hours.
+    armed_monotonic: float
     blocked_syncs: int = 0
     #: Set when a same-bar ``skip_flip`` re-placement supersedes the parked
     #: open: TV modifies the standing order with the raw quantity and does
@@ -569,6 +573,17 @@ class _PendingReversalOpen:
 #: protocol re-runs with a fresh close dispatch (see
 #: :class:`_PendingReversalOpen`).
 _REVERSAL_CLOSE_STALE_SYNCS = 3
+
+#: Wall-clock cap on the close-retry bar gates. The bar boundary is the
+#: retry beat for a deferred/declined close, which is right on an intraday
+#: chart — but on a slow chart (hourly/daily bars) "next bar" could park a
+#: still-needed close for hours. After this many seconds inside the SAME
+#: bar the retry is allowed anyway; on fast charts the bar boundary always
+#: arrives first, so behaviour there is unchanged. Both the reversal-close
+#: marker and the script-close decline gate honour it. 60 s also matches
+#: the slowest venue confirmation path seen live (Capital.com activity
+#: stream), so an earlier retry would mostly re-hit the same decline.
+_CLOSE_DECLINE_RETRY_S = 60.0
 
 
 @dataclasses.dataclass(slots=True)
@@ -1080,6 +1095,16 @@ class OrderSyncEngine:
         # live in :meth:`_dispatch_new` and accumulated on every matching CLOSE-leg
         # FILL in :meth:`_route_event`.
         self._active_close_filled_qty: dict[str, float] = {}
+        #: Per-``intent_key`` ``(bar anchor, time.monotonic())`` of the last
+        #: plugin-declined close dispatch. Event-driven syncs re-run the diff
+        #: many times inside one bar; without this gate a close the plugin
+        #: keeps declining (e.g. ``close_already_in_flight`` while its own
+        #: DELETEs settle, or ``nothing_to_close`` on an already-flat side)
+        #: is re-dispatched on every sync — thousands of no-op round trips
+        #: per bar (measured 2026-08-23, capitalcom cycle 60). One attempt
+        #: per bar per key, capped by :data:`_CLOSE_DECLINE_RETRY_S` so a
+        #: slow chart's bar cannot park a still-needed close for hours.
+        self._close_skip_bar_gate: dict[str, tuple[int, float]] = {}
         # The Pine-side close ``Order`` instance each dispatched ``CloseIntent``
         # was built from, keyed by ``CloseIntent.intent_key``. Captured in
         # :meth:`_dispatch_new` and consumed by
@@ -12593,6 +12618,20 @@ class OrderSyncEngine:
                         # marker the moment the script changes or cancels it.
                         skipped_entry_ids_this_sync.add(intent.pine_id)
                         continue
+                    close_gate = (
+                        self._close_skip_bar_gate.get(key)
+                        if isinstance(intent, CloseIntent) else None
+                    )
+                    if (close_gate is not None
+                            and close_gate[0] == self._current_bar_ts_ms
+                            and (time.monotonic() - close_gate[1]
+                                 < _CLOSE_DECLINE_RETRY_S)):
+                        # The plugin already declined this close on this bar
+                        # (see ``_close_skip_bar_gate``); event-driven syncs
+                        # would otherwise re-dispatch it on every venue event.
+                        # The next bar — or the wall-clock cap on a slow
+                        # chart — retries against the settled book.
+                        continue
                     try:
                         self._dispatch_new(intent)
                     except OrderSkippedByPlugin as e:
@@ -12607,6 +12646,10 @@ class OrderSyncEngine:
                         if isinstance(intent, EntryIntent):
                             skipped_entry_ids_this_sync.add(intent.pine_id)
                             self._record_entry_reject(key, intent, e)
+                        elif isinstance(intent, CloseIntent):
+                            self._close_skip_bar_gate[key] = (
+                                self._current_bar_ts_ms, time.monotonic(),
+                            )
                         continue
                     if isinstance(intent, EntryIntent):
                         self._rejected_entry_intents.pop(key, None)
@@ -14201,9 +14244,13 @@ class OrderSyncEngine:
             # plugin decline would re-drive the close at that same rate
             # (measured live: a five-hour ~10/s dispatch loop). A bar
             # boundary is the venue-paced beat — the fresh re-dispatch
-            # additionally waits for the NEXT bar after arming.
+            # additionally waits for the NEXT bar after arming, capped by
+            # :data:`_CLOSE_DECLINE_RETRY_S` so a slow chart's bar cannot
+            # park a stuck close for hours.
             if (marker.blocked_syncs <= _REVERSAL_CLOSE_STALE_SYNCS
-                    or marker.armed_bar_ts_ms == self._current_bar_ts_ms):
+                    or (marker.armed_bar_ts_ms == self._current_bar_ts_ms
+                        and (time.monotonic() - marker.armed_monotonic
+                             < _CLOSE_DECLINE_RETRY_S))):
                 raise self._reversal_close_pending_skip(
                     intent,
                     f"Reversal entry {format_intent_key(key)} deferred: the "
@@ -14261,6 +14308,7 @@ class OrderSyncEngine:
                 close_qty=close_qty,
                 consumed_entry_ids=consumed_ids,
                 armed_bar_ts_ms=self._current_bar_ts_ms,
+                armed_monotonic=time.monotonic(),
             )
             raise self._reversal_close_pending_skip(
                 intent,
@@ -14290,6 +14338,7 @@ class OrderSyncEngine:
             close_qty=close_qty,
             consumed_entry_ids=consumed_ids,
             armed_bar_ts_ms=self._current_bar_ts_ms,
+            armed_monotonic=time.monotonic(),
         )
         raise self._reversal_close_pending_skip(
             intent,
