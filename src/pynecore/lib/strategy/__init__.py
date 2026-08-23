@@ -973,7 +973,12 @@ class SimPosition(PositionBase):
         # trades): the derived form reproduces every plotted netprofit bit-exact
         # (23144/23144), while a running ``+= profit`` accumulator drifts by ULPs
         # after the 6th close and matches only 1211/23144.
-        return self.grossprofit - self.grossloss - self.open_commission
+        # The subtraction is over the PUBLISHED grossloss -- one subtraction, not
+        # two: measured on the wild "Built-in Kelly ratio" (currency=USD on
+        # BINANCE:BTCUSDT 30m), ``netprofit == grossprofit - grossloss`` holds
+        # bit-exact on all 28782 plotted bars, while peeling the two terms off
+        # one at a time misses 10461 of them by an ULP.
+        return self.grossprofit - (self.grossloss + self.open_commission)
 
     def _recalc_avg_price(self):
         """
@@ -1350,8 +1355,22 @@ class SimPosition(PositionBase):
                             commission = _book_commission(comm_booking, abs(size), price,
                                                           commission_value, False)
 
-                        closed_trade.commission += commission
+                        # TV takes the two commission legs off the gross P&L ONE
+                        # AT A TIME; folding them into a single sum first lands a
+                        # few ULP away once the two legs convert at different
+                        # account rates. Measured on the wild "Built-in Kelly
+                        # ratio" (currency=USD on BINANCE:BTCUSDT 30m, trade #1
+                        # entered 2025-01-01 and closed 2025-01-03, so the legs
+                        # carry different daily USDT/USD rates): TV's plotted
+                        # grossprofit is 240.37221009390822, which is exactly
+                        # ``gross - entry_comm - exit_comm``, while
+                        # ``gross - (entry_comm + exit_comm)`` gives
+                        # ...825. Trades whose legs share one rate agree either
+                        # way, which is why this only surfaces on a converted
+                        # account.
                         closed_trade.profit -= closed_trade.commission
+                        closed_trade.commission += commission
+                        closed_trade.profit -= commission
 
                     # Profit percent — both profit and entry_value are in USD
                     entry_value = abs(closed_trade.size) * closed_trade.entry_price * pv
@@ -1405,7 +1424,7 @@ class SimPosition(PositionBase):
                     self._recalc_avg_price()
                     if self.size:
                         # Unrealized P&L
-                        self.openprofit = self.size * (self.c - self.avg_price) * pv
+                        self.openprofit = self.size * (_tick_snap(self.c) - self.avg_price) * pv
                     else:
                         # If position has just closed
                         self.openprofit = 0.0
@@ -1506,7 +1525,7 @@ class SimPosition(PositionBase):
                 self.size = _size_add(self.size, overshoot_trade.size)
                 self.sign = 1.0 if self.size > 0.0 else -1.0 if self.size < 0.0 else 0.0
                 self._recalc_avg_price()
-                self.openprofit = self.size * (self.c - self.avg_price) * pv
+                self.openprofit = self.size * (_tick_snap(self.c) - self.avg_price) * pv
                 if not new_closed_trades:
                     self.entry_equity = self.equity
                     self.max_equity = max(self.max_equity, self.equity)
@@ -1569,7 +1588,7 @@ class SimPosition(PositionBase):
             # the same -- only reproduces the 13440 single-leg bars.
             self._recalc_avg_price()
             # Unrealized P&L
-            self.openprofit = self.size * (self.c - self.avg_price) * pv
+            self.openprofit = self.size * (_tick_snap(self.c) - self.avg_price) * pv
 
             # Remove order
             self._remove_order(order)
@@ -1698,7 +1717,7 @@ class SimPosition(PositionBase):
             # When risk management suppresses the opening leg the order executes
             # as a plain close, so the closing quantity is the whole order and it
             # carries the entire flat fee.
-            order_qty = abs(self.size) + (abs(new_size) if direction_allowed else 0.0)
+            order_qty = _size_add(abs(self.size), abs(new_size) if direction_allowed else 0.0)
             order.comm_booking = [Decimal(0), 0.0, [], order_qty]
 
             # Create a copy for closing existing position
@@ -3032,7 +3051,7 @@ class SimPosition(PositionBase):
                   else self._path_price(self._coof_cursor) if self._coof_cursor >= 0
                   else self._last_fill_price)
         if self.size != 0.0:
-            self.openprofit = self.size * (self.c - self.avg_price) * _account_point_value()
+            self.openprofit = self.size * (_tick_snap(self.c) - self.avg_price) * _account_point_value()
 
     def process_orders(self):
         """ Process orders """
@@ -3642,8 +3661,16 @@ class SimPosition(PositionBase):
             pv = (syminfo.pointvalue if _conv_identity_script is lib._script
                   else _account_point_value())
 
-            # Unrealized P&L
-            self.openprofit = self.size * (self.c - self.avg_price) * pv
+            # Unrealized P&L. The mark rides the FILL tick grid (``_tick_snap``),
+            # not the OHLC quantization ``self.c`` carries: measured on the wild
+            # "Built-in Kelly ratio" (currency=USD on BINANCE:BTCUSDT 30m), the
+            # snapped close reproduces all 10892 in-position bars of
+            # ``strategy.openprofit`` bit-exact, while ``self.c`` itself misses
+            # 1378 of them. The two forms are algebraically equal and differ by
+            # one ULP of the price (94208.43 against 94208.43000000001), which
+            # the position size scales into a ~1.5e-12 offset that never washes
+            # out -- ``strategy.equity`` is built on it.
+            self.openprofit = self.size * (_tick_snap(self.c) - self.avg_price) * pv
 
             # Calculate open drawdowns and runups
             for trade in self.open_trades:
@@ -4141,9 +4168,20 @@ def _book_commission(booking: list, qty: float, price: float,
     # reversals via the per-trade commission fields). The pool books the
     # DIFFERENCE between that running target and what was booked already, so a
     # single-leg order rounds exactly on its own.
+    # The order's own quantity is the split base whenever it is known ahead of
+    # the fills (booking[3], stamped for a reversal). Splitting over the running
+    # leg sum instead prices the first leg as if it were the whole order and
+    # dumps the difference on the last one: measured on the wild "Built-in Kelly
+    # ratio" (currency=USD on BINANCE:BTCUSDT 30m), the 2025-01-05 22:00
+    # reversal books its closing leg round10(rate * 0.00723) = 0.7121963641
+    # where TV's share of the full 0.02038 order is 0.7121963643, and the 2e-10
+    # lands on the opening leg -- which is trade #6's entry fee, so TV's plotted
+    # grossprofit runs 2.0003e-10 ahead from that trade on. The order total and
+    # the sum of the shares are the same either way, so only the per-leg
+    # attribution -- what each closed trade reports as its own fee -- moves.
     booking[0] += Decimal(repr(qty))
     booking[2].append(qty)
-    qty_total = float(booking[0])
+    qty_total = booking[3] or float(booking[0])
     if is_percent:
         # The account-currency conversion happens on the PRICE, as a plain
         # double multiply, and the cash rounding lands on the double of the
@@ -4199,6 +4237,35 @@ def _book_flat_commission(booking: list, qty: float, commission_value: float) ->
     return _apply_booking(booking, _round_cash(commission_value), qty_total)
 
 
+def _split_lots(leg_qtys: list, qty_total: float) -> tuple[list, Decimal]:
+    """
+    Express an order's leg quantities and its total as exact lot counts.
+
+    :param leg_qtys: The booked leg quantities in contracts
+    :param qty_total: The order's total quantity in contracts
+    :return: ``(leg lot counts, total lot count)``, or the shortest reprs when
+             the counts are not recoverable
+    """
+    # The split ratio is a ratio of LOT COUNTS, not of the materialized doubles:
+    # TV carries every quantity as an integer count of 1e-8 units (see
+    # ``_size_units``), so a reversal that closes and opens the same size splits
+    # its fee exactly in half however the doubles landed. Measured on the wild
+    # "Built-in Kelly ratio" (currency=USD on BINANCE:BTCUSDT 30m): its
+    # 2025-02-16 07:30 reversal is 14000 units against 14000, whose exact half
+    # 0.013529148375 rounds UP to 0.01352914838 per leg -- while the contract
+    # doubles give 0.00014000000000000001 / 0.00028000000000000003, a quotient a
+    # hair under one half that rounds the tie down and leaves grossprofit 1e-11
+    # short for the rest of the run.
+    rfactor = syminfo._size_round_factor  # noqa
+    if rfactor <= 1e8:
+        units = [q / 1e-8 for q in leg_qtys]
+        total_units = qty_total / 1e-8
+        if (all(abs(u) < 9.223372036854776e18 for u in units)
+                and abs(total_units) < 9.223372036854776e18):
+            return [Decimal(round(u)) for u in units], Decimal(round(total_units))
+    return [Decimal(repr(q)) for q in leg_qtys], Decimal(repr(qty_total))
+
+
 def _apply_booking(booking: list, total: float, qty_total: float) -> float:
     """
     Split an order's rounded commission over its legs and return what is still unbooked.
@@ -4211,16 +4278,16 @@ def _apply_booking(booking: list, total: float, qty_total: float) -> float:
     if len(booking[2]) == 1 and booking[2][0] == qty_total:
         target = total
     else:
-        # The split is decimal division rounded straight to the cash grid:
-        # total*q/qty_total computed on the shortest reprs resolves the exact
-        # split-half ties upward, where the double quotient falls a hair short
-        # and misrounds them down (Acrypto - Weighted Strategy 2026-06-30, a
-        # perfect half-half reversal; no probe order distinguishes the two).
+        # The split is decimal division rounded straight to the cash grid, over
+        # the legs' exact lot counts (see _split_lots): a double quotient falls a
+        # hair short of a split-half tie and misrounds it down (Acrypto -
+        # Weighted Strategy 2026-06-30, a perfect half-half reversal; no probe
+        # order distinguishes the two).
         total_dec = Decimal(repr(total))
-        qty_dec = Decimal(repr(qty_total))
+        legs_dec, qty_dec = _split_lots(booking[2], qty_total)
         target = 0.0
-        for leg_qty in booking[2]:
-            share = _SPLIT_CTX.multiply(total_dec, Decimal(repr(leg_qty)))
+        for leg_dec in legs_dec:
+            share = _SPLIT_CTX.multiply(total_dec, leg_dec)
             target += float(_CASH_CTX.divide(share, qty_dec))
     amount = target - booking[1]
     booking[1] = target
@@ -5214,6 +5281,16 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
 
     size = qty * direction_sign
 
+    # Re-placing an entry under an id that already has an unfilled order from this
+    # same bar MODIFIES that order, and the modification carries the raw qty only:
+    # the reversal flip the replaced order was built with is not computed again.
+    # Measured on TradingView (BINANCE:BTCUSDT 30m): with a 10-contract long open,
+    # one strategy.entry(short, 4) reverses to 4 short, while the SAME call issued
+    # twice on one bar sells only 4 and leaves 6 long.
+    existing_entry = position.entry_orders.get(id)
+    skip_flip = (existing_entry is not None and not existing_entry.cancelled
+                 and existing_entry.bar_index == int(lib.bar_index))
+
     # The Pine-side lot floor is a backtest-only quantization: TV silently
     # snaps a sub-lot size to zero and drops the order. In broker mode the
     # exchange owns the quantity grid — the plugin quantizes onto the venue
@@ -5225,7 +5302,16 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     if isinstance(position, SimPosition):
         size = _size_floor(size) if deferred_default \
             else direction_sign * _explicit_qty_round(float(qty))
-        if size == 0.0:
+        # A quantity that snaps to zero lots still REVERSES: TV closes the
+        # opposite position and opens nothing. Measured on BINANCE:BTCUSDT 30m
+        # (mincontract 1e-5): a 9e-6 short against a 0.001 long books the closed
+        # trade and leaves the position flat, while the same 1.9e-5 short from
+        # flat opens exactly one lot. The zero size nets to a pure close through
+        # the reversal flip below for a price-based order, and through the
+        # zero-size closing leg the market path already builds; an order with
+        # nothing to close is dropped outright.
+        if size == 0.0 and (skip_flip or position.size == 0.0
+                            or position.sign == direction_sign):
             return
 
     # Market entries keep their placement-close sizing (price-based orders
@@ -5308,16 +5394,6 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
                         return
             elif margin_needed > equity:
                 return
-
-    # Re-placing an entry under an id that already has an unfilled order from this
-    # same bar MODIFIES that order, and the modification carries the raw qty only:
-    # the reversal flip the replaced order was built with is not computed again.
-    # Measured on TradingView (BINANCE:BTCUSDT 30m): with a 10-contract long open,
-    # one strategy.entry(short, 4) reverses to 4 short, while the SAME call issued
-    # twice on one bar sells only 4 and leaves 6 long.
-    existing_entry = position.entry_orders.get(id)
-    skip_flip = (existing_entry is not None and not existing_entry.cancelled
-                 and existing_entry.bar_index == int(lib.bar_index))
 
     # If it is not a market order, we should check pyramiding and flip conditions here
     # Market orders are checked at the order processing time
