@@ -84,6 +84,9 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     seen: Persistent[int] = 0
     window: Persistent[int] = 0
     capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
+    calls: Persistent[int] = 0
+    prev_len: Persistent[int] = 0
+    chg_at: Persistent[int] = -1 << 60
 
     # Representation-agnostic na test: an na source is either an NA object or a
     # native nan (OHLCV gaps can already deliver a bare nan). Both must be
@@ -98,6 +101,18 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
         length = int(length)
 
     assert length > 0, "Invalid length, length must be greater than 0!"
+
+    # A length change on the bar right after another one marks a RUNNING series
+    # length (a ``barssince`` ramp or sawtooth). The dense/isolated distinction
+    # picks the length-change handling below, so record it before any early
+    # return can skip the bar.
+    calls += 1
+    changed = prev_len != 0 and length != prev_len
+    dense = changed and calls - chg_at <= 1
+    if changed:
+        chg_at = calls
+    if length != prev_len:
+        prev_len = length
 
     n = seen
     if not source_na:
@@ -163,6 +178,40 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
         ring = cap
         slot = at
 
+    if dense and n > length:
+        # RUNNING length (changed on consecutive bars): TradingView's arithmetic
+        # for repeated changes is still open — its own machine carries a
+        # persistent sub-ulp drift (MEASURED, probe sumlen8: a length-1 window
+        # reports the raw value plus leftover debris, probe sumlen9: window
+        # membership stays exact, so ALL deviation is compensation arithmetic).
+        # The walk below is bit-exact for isolated events but its drift against
+        # TV accumulates without bound when the length moves every bar (the
+        # corpus sawtooth went from 1.5k to 14.5k max ulp on it), while a
+        # re-baseline bounds the divergence at one window's summation error.
+        # Between the two approximations the re-baseline measures better in
+        # this regime (probe columns saw20/50/200), the walk in every other,
+        # so the dense path re-baselines: newest-first raw linear sum, cleared
+        # compensation, raw stored entries — the same shape a fire produces.
+        rebuilt = builtins.float(src[0])
+        for i in builtins.range(1, new_w):
+            rebuilt = builtins.float(src[i]) + rebuilt
+        base = at if not source_na else at - 1
+        if base < 0:
+            base += cap
+        for j in builtins.range(new_w):
+            e = base - j
+            if e < 0:
+                e += cap
+            ent[e] = builtins.float(src[j])
+        summ = rebuilt
+        compensation = 0.0
+        seen = n
+        window = new_w
+        if not source_na:
+            at += 1
+            slot = 0 if at == cap else at
+        return rebuilt if new_w >= length else na_float
+
     c = compensation
     s = summ
 
@@ -180,10 +229,11 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     # step. Offsets ``prev_w + shift``..``new_w - 1`` are ADMITTED oldest first
     # with their raw values, each an addition-only step whose realized residue
     # becomes that offset's stored entry.
-    # Still OPEN: a change spanning many entries at once (probe sumlen6's
-    # 100->1, sumlen3's 610->100) stays 1-7 ulp off every order tried, so a
-    # sawtooth length (``ta.sma(src, ta.barssince(...))``) keeps the right
-    # window and ~14 digits, not the last bit.
+    # Every ISOLATED change measured this way is bit-exact over the full
+    # following tail (probes sumlen3/6/7: 8->1, 100->1, 300->150->50, 610->100,
+    # 5->3, 6->5 and the grow events). Still OPEN: the arithmetic of a RUNNING
+    # length (probe sumlen8's per-bar saws) — the dense branch above bounds
+    # that case instead of walking it.
     if source_na:
         shift = 0
         base = at - 1
@@ -197,13 +247,14 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
 
     d0 = 0.0
     if prev_w + shift > new_w:
-        # Oldest first, the newest leaving entry left for the fused step below
+        # Oldest first with the RAW source values (MEASURED, probes sumlen3/6:
+        # the isolated 8->1, 100->1, 300->150, 610->100 and 5->3 events are all
+        # bit-exact only this way), the newest leaving entry — the realized one,
+        # exactly the steady-state eviction — left for the fused step below.
         k = prev_w - 1 + shift
         while k > new_w:
-            e = base - k
-            if e < 0:
-                e += cap
-            y1 = -ent[e] - c
+            v = builtins.float(src[k - 1 + shift])
+            y1 = -v - c
             t = s + y1
             e1 = (t - s) - y1
             y2 = -e1
