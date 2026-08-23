@@ -710,8 +710,12 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     # measurement have to hold together: with the bar-aged index over a ``length + 1``
     # ring, ``ta.lowest(low, 40)`` inside the else branch of the wild-corpus script
     # "Leledc levels (IS)" reproduces TradingView on all 28302 bars it runs on, while
-    # call-aging misses 257 of them.
-    gap = bar_index - last_bar - 1
+    # call-aging misses 257 of them. The same law binds the opposite case — a window
+    # read from inside a ``for`` loop, called many times on ONE bar (probe
+    # ``hiloop_probe``, BINANCE:BTCUSDT 30m): the age advances once per bar no matter
+    # how many calls land on it, and each call merely rewrites the newest ring slot.
+    # Aging per call instead misses 5991 of 143815 returned values there.
+    gap = bar_index - last_bar
     if last_bar >= 0 and gap > 0:
         last_max_index += gap
     last_bar = bar_index
@@ -734,7 +738,6 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
             # For pivot detection (_check_eq=True): don't update index for equal values
 
     max_index = last_max_index
-    last_max_index += 1
 
     if bar_index < length - 1:
         return na_float if not _tuple else (na_float, na_float)  # type: ignore[return-value]
@@ -975,9 +978,10 @@ def lowest(source: Series[float], length: int,
     last_bar: Persistent[int] = -1
 
     # The kept extreme ages in BARS, not in calls: a bar that skips the call still
-    # moves the window on, so the rescan that lets a stale slot in has to fire on the
-    # same bar TradingView fires it (see ``highest``).
-    gap = bar_index - last_bar - 1
+    # moves the window on, and a bar that calls it many times moves it only once, so
+    # the rescan that lets a stale slot in fires on the same bar TradingView fires it
+    # (see ``highest``).
+    gap = bar_index - last_bar
     if last_bar >= 0 and gap > 0:
         last_min_index += gap
     last_bar = bar_index
@@ -1000,7 +1004,6 @@ def lowest(source: Series[float], length: int,
             # For pivot detection (_check_eq=True): don't update index for equal values
 
     min_index = last_min_index
-    last_min_index += 1
 
     if bar_index < length - 1:
         return na_float if not _tuple else (na_float, NA(int))  # type: ignore[return-value]
@@ -2097,6 +2100,20 @@ def rsi(source: float, length: int) -> PyneFloat:
     rma_u = rma(builtins.max(source - prev_src, 0.0), length)
     rma_d = rma(builtins.max(prev_src - source, 0.0), length)
     prev_src = source
+
+    # MEASURED (probe ``rsiconst_probe``, BINANCE:BTCUSDT 30m, 28519 bars): the
+    # documented ``100 - 100/(1 + rma_u/rma_d)`` is only what the reference
+    # snippet computes — the native machine first ZEROES each side under the
+    # language's 1e-10 absolute tolerance, and a zeroed side SATURATES the
+    # result instead of dividing. A weekly ``fixnan`` source held constant for
+    # days decays ``rma_d`` to ~1e-11 while ``rma_u`` stays at ~10, where the
+    # quotient form returns 99.99999999915303 and TradingView returns exactly
+    # 100. The down side is tested FIRST, so a doubly zeroed pair (both sides
+    # dormant) is 100, not 0 and not na — measured on 322 such bars.
+    if rma_d <= 1e-10:
+        return 100.0
+    if rma_u <= 1e-10:
+        return 0.0
 
     return 100 - 100 / (1 + rma_u / rma_d)
 
