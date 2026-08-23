@@ -9615,6 +9615,72 @@ def __test_reduce_only_exit_cancel_without_bot_close_still_quarantines__():
     assert engine._quarantined
 
 
+def _mk_two_leg_bracket_without_close(b: MockBroker):
+    """Entry L filled, bracket TP\\0L mapped to TWO legs, no close in flight.
+
+    Returns ``(engine, pos, tp_id, sl_id)``. Mirrors the live-lab
+    ``bybit_inverse_pyramid`` sequence at the instant the SL leg fires: no
+    bot close is in flight — the position leaves through the bracket itself.
+    """
+    engine, pos, tp_id = _mk_bracket_with_inflight_close(b)
+    engine._active_intents.pop("L", None)
+    sl_id = "TP-sl-xchg"
+    engine._order_mapping["TP\0L"].append(sl_id)
+    return engine, pos, tp_id, sl_id
+
+
+def _sl_leg_fill_event(order_id: str) -> OrderEvent:
+    """The venue ``filled`` push for the bracket's conditional SL leg."""
+    return replace(
+        _fill_event("sell", 1.0, 45_000.0, pine_id="TP",
+                    leg=LegType.STOP_LOSS, xchg_id=order_id,
+                    fill_id="sl-fill-1"),
+        from_entry="L",
+    )
+
+
+def __test_oca_cancel_ahead_of_queued_sibling_fill_is_expected__():
+    """A venue OCA cancel delivered AHEAD of its sibling leg's fill in the
+    same drain batch must not quarantine.
+
+    When the bracket's SL stop fills, Bybit auto-cancels the reduce-only TP
+    limit — but the ``order``-topic cancel push can arrive before the
+    ``execution``-topic fill push (measured: bybit-inverse cycle 11, L2-X and
+    L3-X). Both sit in the same drain batch: the classifier must look ahead,
+    recognise the queued sibling fill, trim only the dead TP leg and let the
+    fill settle the position through the normal path.
+    """
+    b = MockBroker()
+    engine, pos, tp_id, sl_id = _mk_two_leg_bracket_without_close(b)
+
+    engine.on_order_event(_reduce_only_cancel_event(tp_id))
+    engine.on_order_event(_sl_leg_fill_event(sl_id))
+    engine._drain_events()
+
+    assert not engine._quarantined
+    # The SL fill settled the position; the bracket intent is retired.
+    assert pos.size == 0.0
+    assert "TP\0L" not in engine.active_intents
+    assert "TP\0L" not in engine.order_mapping
+
+
+def __test_oca_cancel_without_queued_sibling_fill_still_quarantines__():
+    """The lookahead only suppresses the quarantine when the sibling's fill
+    is actually queued — a lone cancel drained by itself stays external.
+
+    An operator cancelling one reduce-only leg produces no sibling fill, so
+    the same drain-batch machinery must still route the cancel through the
+    ``on_unexpected_cancel`` quarantine path.
+    """
+    b = MockBroker()
+    engine, pos, tp_id, sl_id = _mk_two_leg_bracket_without_close(b)
+
+    engine.on_order_event(_reduce_only_cancel_event(tp_id))
+    engine._drain_events()
+
+    assert engine._quarantined
+
+
 def _mk_multi_bracket_with_cross_entry_close(b: MockBroker):
     """Two entries L1/L2, each its own whole-row bracket; close(L1) in flight.
 

@@ -1204,6 +1204,18 @@ class OrderSyncEngine:
         # ``from_entry`` each get their own slot.
         self._deferred_exits: dict[str, ExitIntent] = {}
         self._event_queue: queue.Queue[OrderEvent | _NativeCancelAllExpected] = queue.Queue()
+        # Snapshot of the drain batch currently being routed by
+        # :meth:`_drain_events`, plus the index of the NEXT event to route.
+        # Lets the ``cancelled`` classifier look AHEAD at the not-yet-routed
+        # remainder of the same batch: Bybit's private stream delivers the
+        # OCA auto-cancel of a bracket's reduce-only TP leg (``order`` topic)
+        # and the sibling SL leg's fill (``execution`` topic) as separate
+        # frames in venue order, and the cancel can arrive FIRST — without
+        # the lookahead the engine declares a bot-owned order externally
+        # cancelled and quarantines (measured: bybit-inverse cycle 11, both
+        # L2-X and L3-X, cancel and sibling fill stamped the same second).
+        self._drain_batch: list[OrderEvent | _NativeCancelAllExpected] = []
+        self._drain_batch_pos: int = 0
         # §2.6.7 broker-native fail-safe recovery feed. The plugin's reconcile
         # pass runs on the broker event-loop thread and enqueues observed
         # bracket triples here; they are applied to the manager on the MAIN
@@ -4883,20 +4895,40 @@ class OrderSyncEngine:
     def _drain_events(self) -> None:
         drained_any = False
         while True:
-            try:
-                event = self._event_queue.get_nowait()
-            except queue.Empty:
+            # Snapshot everything currently queued into one batch before
+            # routing any of it. Routing per-batch (instead of one
+            # ``get_nowait`` per event) gives the ``cancelled`` classifier
+            # lookahead over the not-yet-routed remainder via
+            # ``_drain_batch`` / ``_drain_batch_pos`` (see
+            # :meth:`_is_oca_sibling_fill_queued`). Events enqueued while a
+            # batch routes are picked up by the next outer-loop snapshot,
+            # preserving the old fully-drained postcondition.
+            batch: list[OrderEvent | _NativeCancelAllExpected] = []
+            while True:
+                try:
+                    batch.append(self._event_queue.get_nowait())
+                except queue.Empty:
+                    break
+            if not batch:
                 break
-            if isinstance(event, _NativeCancelAllExpected):
-                # Native bulk-cancel marker (see :class:`_NativeCancelAllExpected`).
-                # FIFO-ordered ahead of the ``CANCELLED`` pushes the bulk cancel
-                # generates, so snapshotting the mapping here — on the main
-                # thread — arms the expected-cancel set before those events route.
-                self._register_native_cancel_all_expected(event.symbol)
-                drained_any = True
-                continue
-            self._route_event(event)
-            drained_any = True
+            self._drain_batch = batch
+            try:
+                for pos, event in enumerate(batch):
+                    self._drain_batch_pos = pos + 1
+                    if isinstance(event, _NativeCancelAllExpected):
+                        # Native bulk-cancel marker (see
+                        # :class:`_NativeCancelAllExpected`). FIFO-ordered ahead
+                        # of the ``CANCELLED`` pushes the bulk cancel generates,
+                        # so snapshotting the mapping here — on the main thread —
+                        # arms the expected-cancel set before those events route.
+                        self._register_native_cancel_all_expected(event.symbol)
+                        drained_any = True
+                        continue
+                    self._route_event(event)
+                    drained_any = True
+            finally:
+                self._drain_batch = []
+                self._drain_batch_pos = 0
         # Fill-time short-gate reconcile: a fill drained just now may have
         # shrunk ``_position.size`` below the aggregate working sell qty the
         # dispatch-time gate admitted. Re-drive any parked forced cancel
@@ -6020,6 +6052,32 @@ class OrderSyncEngine:
                 # the conditional SL stop rests live until swept).
                 self._handle_expected_bracket_close_cancel(event, key)
                 return
+            if (key is not None
+                    and self._is_oca_sibling_fill_queued(event, key)):
+                # The venue OCA-cancelled this reduce-only bracket leg because
+                # its SIBLING leg (same intent) filled — and delivered the
+                # cancel push ahead of the fill push. The fill is already
+                # queued in the current drain batch: trim only the dead leg
+                # and let the sibling's fill settle the position through the
+                # normal fill path (which then sweeps / retires the bracket).
+                # NOT an external cancel — no quarantine.
+                _blog_info(
+                    "reduce-only bracket leg %s OCA-cancelled by venue ahead "
+                    "of its sibling leg's fill (queued in the same batch) — "
+                    "expected, trimming the dead leg",
+                    format_intent_key(key),
+                )
+                self._trim_cancelled_bracket_leg(event, key)
+                if self._store_ctx is not None:
+                    self._store_ctx.log_event(
+                        'oca_sibling_cancel',
+                        client_order_id=(
+                            event.order.client_order_id
+                            if event.order is not None else None
+                        ),
+                        intent_key=key,
+                    )
+                return
             if key is not None:
                 _blog_error(
                     "unexpected cancel for intent %s (%s)",
@@ -6372,6 +6430,47 @@ class OrderSyncEngine:
         if self._bot_close_in_flight_for(intent.from_entry):
             return True
         return self._bot_close_in_flight_for_symbol(intent.symbol)
+
+    def _is_oca_sibling_fill_queued(
+            self, event: OrderEvent, key: str,
+    ) -> bool:
+        """True when a cancelled bracket leg's sibling fill is already queued.
+
+        A whole-row ``strategy.exit`` bracket maps ONE :class:`ExitIntent` to
+        two venue legs (TP limit + conditional SL stop). When one leg fills,
+        the venue auto-cancels its reduce-only OCA sibling — but the private
+        stream delivers the cancel (``order`` topic) and the fill
+        (``execution`` topic) as separate frames in venue order, and the
+        cancel can arrive FIRST. Processed in isolation that cancel looks
+        like an external cancel of a bot-owned order and quarantines the
+        engine. Both events sit in the same :meth:`_drain_events` batch, so
+        look AHEAD at the not-yet-routed remainder: a ``filled`` / ``partial``
+        for a DIFFERENT order id mapped under the SAME intent proves the
+        cancel is the venue's own OCA fallout of that fill.
+
+        An operator cancel of a lone reduce-only leg has no queued sibling
+        fill and still routes through the ``on_unexpected_cancel`` path.
+        """
+        intent = self._active_intents.get(key)
+        if not isinstance(intent, ExitIntent):
+            return False
+        order = event.order
+        if order is None or not order.reduce_only:
+            return False
+        mapped = self._order_mapping.get(key)
+        if not mapped:
+            return False
+        for pending in self._drain_batch[self._drain_batch_pos:]:
+            if isinstance(pending, _NativeCancelAllExpected):
+                continue
+            if pending.event_type not in ('filled', 'partial'):
+                continue
+            pending_order = pending.order
+            if pending_order is None or pending_order.id == order.id:
+                continue
+            if pending_order.id in mapped:
+                return True
+        return False
 
     def _cancel_and_retire_exit_leg(self, key: str, intent: ExitIntent) -> None:
         """Cancel any still-live venue legs of an exit intent, then retire it.
