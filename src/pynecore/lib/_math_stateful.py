@@ -45,6 +45,13 @@ def random(min: TFI | NA[TFI] = 0, max: TFI | NA[TFI] = 1, seed: PyneInt = NA(in
     return res
 
 
+# The PRNG advances once per CALL by nature: rolling it back to bar-start
+# state on the same-bar re-executions of a shared loop call site would hand
+# every iteration the same draw. The layout flag shields it from the
+# ``__loop_state__`` rollback (see ``_collect_builtins``).
+getattr(random, '__pyne_layout__')['per_call'] = True
+
+
 # The IDE findings here are artifacts of the ``@pyne`` transform, not real defects:
 # ``Persistent`` assignments look dead because their value is read on the NEXT bar,
 # ``src`` looks possibly-unbound because it is a series whose storage outlives the

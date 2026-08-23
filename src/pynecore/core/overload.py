@@ -36,7 +36,7 @@ from inspect import signature
 from collections import defaultdict
 from types import FunctionType, UnionType
 
-from .instance_state import _bind_target, _make_state, register_shared_cache, __dyn_default__
+from .instance_state import _bind_target, _make_state, register_shared_cache, __dyn_default__  # noqa: internal API
 from ..types.base import StrLiteral
 from ..types.matrix import Matrix
 from ..types.na import NA
@@ -151,7 +151,7 @@ def _check_type(value: Any, expected_type: Type, strict: bool = False) -> bool:
     # parameterized generics. Match on the container type, then discriminate on a
     # sample element -- overloads can differ only in their element types
     # (map<string, string> vs map<string, float>)
-    _origin = get_origin(expected_type)
+    _origin: Any = get_origin(expected_type)
     # The element types of a parameterized expectation, kept for the na branch
     # below: matching an na argument needs them AFTER expected_type has been
     # stripped to its origin here
@@ -442,6 +442,14 @@ def _anchored(impls: list[Implementation], qualname: str,
                 entry = _cache[impl] = (func, None, _bind_target(func))
         return entry[2](*args, **kwargs)
 
+    # The bound cache is otherwise opaque to state walkers; the loop-site
+    # same-bar rollback (``instance_state._collect_bound_builtins``) reads the
+    # per-implementation state vectors through this reference. The registry
+    # list rides along so a module can reach its implementations' layouts
+    # after the dispatcher has replaced the def name (the ``per_call`` marks
+    # in ``lib.ta`` need exactly that).
+    dispatch.__pyne_cache__ = _cache
+    dispatch.__pyne_impls__ = impls
     return dispatch
 
 

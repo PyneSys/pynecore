@@ -82,7 +82,9 @@ def main(c, o):
 
 
 def __test_inline_series_loop_site__():
-    """ A loop site keeps one buffer per iteration """
+    """ A loop site shares ONE buffer: every iteration rewrites the newest
+    slot, and ``[1]`` reads the previous bar's LAST write (TradingView's
+    measured series-parameter law) """
     ns, dump = _transform('''
 from pynecore.core.series import inline_series
 
@@ -95,10 +97,10 @@ def main(v):
     state = _make_state(ns['__pyne_slot_layout__']['main'])
     with _bars() as next_bar:
         first = ns['main'](state, 0.0)
-        assert all(isinstance(x, NA) for x in first)
+        assert all(isinstance(x, NA) for x in first)  # committed write: 1.0
         next_bar()
-        assert ns['main'](state, 10.0) == [0.0, 1.0]  # each iteration sees its own [1]
-    assert '__bind_any_loop·__(__chl·0__, __i·__, inline_series)' in dump
+        assert ns['main'](state, 10.0) == [1.0, 1.0]  # both read bar 0's last write
+    assert '__bind_loop·__(__state__, 0, inline_series)' in dump
 
 
 def __test_inline_series_direct_call_shared__():

@@ -34,10 +34,11 @@ as ``func.__pyne_layout__``. An entry is a plain dict with these keys:
     Slot indexes of ``varip`` variables (excluded from var rollback).
 ``children``
     ``(slot, call_id, in_loop)`` triples describing the isolated call sites
-    of the scope. Straight-line sites start as ``None`` and are filled by
-    :func:`__resolve_slot__` on first call; loop sites hold a list of child
-    states indexed by the per-invocation call counter and grown by
-    :func:`__grow__`.
+    of the scope. Every site starts as ``None``; straight-line sites are
+    filled with a child state by :func:`__resolve_slot__` on first call, loop
+    sites with the ``[payload, last_bar, snapshot]`` cell of
+    :func:`__loop_state__` / :func:`__bind_loop__` (one SHARED instance per
+    site, plus the same-bar rollback baseline of its builtin machines).
 ``names``
     Optional tuple of per-slot debug names (same order as ``init``); used
     only by :func:`explain_state` and the dump display-rewrite.
@@ -53,23 +54,26 @@ Call shapes emitted by the transformer:
     ema((__st·__ if (__st·__ := __state__[5]) is not None
          else __resolve_slot·__(__state__, 5, ema)), close, 12)
 
-- fast path, loop site (with the per-invocation counter ``__cnt·0__``)::
+- fast path, loop site: ONE shared instance for every iteration — TradingView
+  keeps one per-call-site state no matter how many times a loop body executes
+  it on a bar (measured: a ``var`` counter in a called function keeps counting
+  across iterations, 1,2,3 on one bar then 4,5,6 on the next). The whole guard
+  folds into a helper that also runs the same-bar builtin rollback (see
+  :func:`__loop_state__`); the slot holds a ``[state, last_bar, snapshot]``
+  cell private to the helper::
 
-    ema((__chl·0__[__i·__] if (__i·__ := (__cnt·0__ := __cnt·0__ + 1) - 1) < len(__chl·0__)
-         else __grow·__(__chl·0__, ema)), x, 12)
+    ema(__loop_state·__(__state__, 5, ema), x, 12)
 
 - uniform path (callee unknown at transform time), anchored at slot 7::
 
     (__b·__[1] if (__b·__ := __state__[7]) is not None and __b·__[0] is f
      else __bind_any·__(__state__, 7, f))(x)
 
-- uniform path in a loop (anchor slot holds a list of ``(callee, bound)``
-  pairs indexed by the per-invocation counter, so every iteration keeps its
-  own instance, like the legacy counter-keyed cache did)::
+- uniform path in a loop: the same shared-instance + same-bar-rollback
+  semantics as the fast loop site, with the anchor's identity check folded
+  into the helper (the cell payload is the ``(callee, bound)`` pair)::
 
-    (__b·__[1] if (__i·__ := (__cnt·0__ := __cnt·0__ + 1) - 1) < len(__chl·0__)
-     and (__b·__ := __chl·0__[__i·__])[0] is f
-     else __bind_any_loop·__(__chl·0__, __i·__, f))(x)
+    __bind_loop·__(__state__, 7, f)(x)
 
 - uniform path whose CALLEE EXPRESSION runs code (a call hides in it, e.g.
   ``bump().upper()``): the callee is bound once in a leading tautological
@@ -83,11 +87,11 @@ Call shapes emitted by the transformer:
   writes ``__b·__`` and the loop counter, and a short circuit would skip them.
 
 - comprehension ITERABLE positions, where Python rejects every assignment
-  expression: the guard folds into a single helper call instead, and the
-  loop-shaped variants advance a one-element counter cell::
+  expression: the straight-line guards fold into a single helper call instead
+  (the loop-shaped forms are already helper-only, so they need no variant)::
 
     [x for x in __bind_slot·__(__state__, 7, f)()]
-    [y for a in items for y in bump(__next_state·__(__chl·0__, __cnt·0__, bump), a)]
+    [y for a in items for y in bump(__loop_state·__(__state__, 3, bump), a)]
 
 Semantics note: when the callee at a uniform site genuinely changes (``g = a
 if c else b; g(x)``), the identity check misses and the site is rebound with
@@ -107,11 +111,11 @@ from functools import partial
 from .pine_export import Exported
 from .series import SeriesImpl
 from ..types.base import Drawing
-from ..types.na import na_float
+from ..types.na import NA, na_float
 
 __all__ = [
-    '__resolve_slot__', '__grow__', '__bind_any__', '__bind_any_loop__',
-    '__slot_state__', '__next_state__', '__bind_slot__', '__bind_next__',
+    '__resolve_slot__', '__bind_any__', '__slot_state__', '__bind_slot__',
+    '__loop_state__', '__bind_loop__',
     '__attach_layout__', '__dyn_default__',
     'create_root', 'get_root', 'discard_root', 'reset', 'register_shared_cache',
     'RootVarSnapshot', 'RootSeriesSnapshot', 'RootChildSnapshot', 'explain_state',
@@ -167,9 +171,6 @@ def _make_state(layout: dict[str, Any]) -> list:
     compacted = layout.get('compacted', False)
     for slot, max_bars_back, elem in layout['series']:
         state[slot] = SeriesImpl(max_bars_back, na_float if elem == 'float' else None, compacted)
-    for slot, _call_id, in_loop in layout['children']:
-        if in_loop:
-            state[slot] = []
     # Trailing layout reference: slot addressing uses literal non-negative
     # indexes only, so the extra element is invisible to emitted code. It lets
     # a walker that meets a bare child state vector (fast-path slots hold the
@@ -193,16 +194,188 @@ def __resolve_slot__(parent: list, slot: int, func: Any) -> list:
     return state
 
 
-def __grow__(children: list, func: Any) -> list:
-    """Cold path of a loop-shaped fast-path call site: append a fresh child
-    state for a new loop iteration.
+def _current_bar() -> int:
+    """The runner-maintained global ``bar_index`` (same lazy lib access as
+    :class:`SeriesImpl`, and the import is shared with it on purpose)."""
+    lib = SeriesImpl._lib  # noqa: cooperating core internals
+    if not lib:
+        from .. import lib  # noqa: circular at module import time only
+        SeriesImpl._lib = lib
+    return lib.bar_index
 
-    :param children: The child list living in the parent's slot.
-    :param func: The state-carrying callee (carries ``__pyne_layout__``).
-    :return: The new child state vector.
+
+def _var_slots_of(layout: dict[str, Any]) -> tuple[int, ...]:
+    """Memoized :func:`_var_slots` — the rollback reads it once per machine
+    per bar, and the slot set of a layout never changes."""
+    slots = layout.get('·var_slots')
+    if slots is None:
+        slots = layout['·var_slots'] = _var_slots(layout)
+    return slots
+
+
+def _collect_builtins(state: list, layout: dict[str, Any], out: list) -> None:
+    """Collect the builtin-machine vectors of a callee subtree (flattened),
+    for the same-bar rollback of a shared loop site.
+
+    TradingView's builtin machines are bar-keyed: when a loop body executes
+    the same call site several times on one bar, every execution re-derives
+    from the bar-start state plus its own (newest-slot-rewritten) input, while
+    user-level ``var``s keep accumulating per call (both measured; see
+    :func:`__loop_state__`). The split runs along the module kind: the
+    ``compacted`` layout flag marks exactly the ``@pyne lib`` builtins, so
+    every compacted vector in the subtree is a rollback target (collected
+    flat, each with its own slots), while user vectors are only walked
+    through for builtin descendants. A builtin whose machine advances per
+    CALL even on TradingView (the percentile machines, the PRNG) opts out
+    with a ``per_call`` layout flag: it is skipped, subtree included.
+    User series are never rollback targets — the same-bar rewrite of their
+    newest slot (:meth:`SeriesImpl.add`) is already the measured semantics.
     """
-    state = _make_state(func.__pyne_layout__)
-    children.append(state)
+    if layout.get('per_call'):
+        return
+    if layout.get('compacted'):
+        out.append((state, layout))
+    for slot, _call_id, in_loop in layout['children']:
+        val = state[slot]
+        if val is None:
+            continue
+        if in_loop:
+            val = val[0]
+        if type(val) is list:
+            _collect_builtins(val, val[-1], out)
+        elif type(val) is tuple and len(val) == 2:
+            _collect_bound_builtins(val[1], out)
+
+
+def _collect_bound_builtins(bound: Any, out: list) -> None:
+    """Collect the builtin-machine vectors behind an anchored binding: a
+    state-carrying partial exposes its vector directly, an overload
+    dispatcher its per-implementation vectors through ``__pyne_cache__``.
+    Anything else is opaque — left alone, never dropped (dropping would
+    reset its state on every iteration)."""
+    if type(bound) is partial and bound.args:
+        layout: dict[str, Any] | None = getattr(bound.func, '__pyne_layout__', None)
+        if layout is not None:
+            _collect_builtins(bound.args[0], layout, out)
+        return
+    cache: dict[Any, Any] | None = getattr(bound, '__pyne_cache__', None)
+    if cache is not None:
+        for entry in cache.values():
+            vec = entry[1]
+            if vec is not None:
+                _collect_builtins(vec, vec[-1], out)
+
+
+def _snap_value(value: Any) -> Any:
+    """Snapshot one persistent slot value for the same-bar rollback. Builtin
+    machine persistents hold scalars or FLAT scalar containers by
+    construction, so a shallow container copy is a faithful baseline (and the
+    restore may share its elements); anything else falls back to
+    :func:`_copy_value`."""
+    t = type(value)
+    if t is list:
+        return value.copy()
+    if value is None or t in (int, float, bool, str) or isinstance(value, NA):
+        return value
+    return _copy_value(value)
+
+
+def _snap_collected(vecs: list) -> list:
+    """Bar-start snapshot of collected builtin-machine vectors: per machine,
+    its persistent values and the full-buffer series baselines (taken once
+    per bar — the per-iteration restore is the cheap side)."""
+    return [(vec,
+             tuple((i, _snap_value(vec[i])) for i in _var_slots_of(layout_)),
+             tuple((slot, vec[slot]._snapshot())  # noqa: cooperating core internals
+                   for slot, _max_bars_back, _elem in layout_['series']))
+            for vec, layout_ in vecs]
+
+
+def _snap_builtins(state: list, layout: dict[str, Any]) -> list:
+    """Bar-start snapshot of every builtin machine under a loop-site callee."""
+    vecs: list = []
+    _collect_builtins(state, layout, vecs)
+    return _snap_collected(vecs)
+
+
+def _restore_collected(current: list, snaps: list) -> None:
+    """Roll collected builtin machines back to their bar-start snapshot.
+
+    The caller re-collects instead of replaying the snapshot list: a machine
+    that came alive MID-BAR (created inside an earlier iteration of the same
+    bar, so it is missing from the bar-start snapshot) has "not existing yet"
+    as its bar-start state — it is re-initialized in place rather than left
+    carrying the earlier iteration's advance. The restore itself is
+    O(changed): scalars by value, lists by an in-place slice copy (their
+    elements are scalars, see :func:`_snap_value`), series through the
+    incremental :meth:`SeriesImpl._restore_bar`.
+    """
+    saved = {id(vec): (var_vals, series_vals) for vec, var_vals, series_vals in snaps}
+    for vec, layout_ in current:
+        entry = saved.get(id(vec))
+        if entry is None:
+            vec[:] = _make_state(layout_)
+            continue
+        var_vals, series_vals = entry
+        for i, value in var_vals:
+            if type(value) is list:
+                cur = vec[i]
+                if type(cur) is list:
+                    cur[:] = value
+                else:
+                    vec[i] = value.copy()
+            elif value is None or type(value) in (int, float, bool, str) \
+                    or isinstance(value, NA):
+                vec[i] = value
+            else:
+                vec[i] = _copy_value(value)
+        for slot, snap in series_vals:
+            vec[slot]._restore_bar(snap)  # noqa: cooperating core internals
+
+
+def _restore_builtins(state: list, layout: dict[str, Any], snaps: list) -> None:
+    """Roll the builtin machines under a loop-site callee back to bar start."""
+    current: list = []
+    _collect_builtins(state, layout, current)
+    _restore_collected(current, snaps)
+
+
+def __loop_state__(parent: list, slot: int, func: Any) -> list:
+    """Whole loop-shaped fast-path call site: ONE instance shared by every
+    iteration, with the same-bar builtin rollback.
+
+    TradingView keeps one state per call site no matter how many times a loop
+    body executes it on a bar (measured three ways: a ``var`` counter in a
+    called function counts 1,2,3 on one bar and 4,5,6 on the next; a series
+    parameter keeps only the LAST write of each bar; and ``ta.sma`` inside a
+    loop reproduces 86292/86292 values on the shared-window model against 33%
+    on per-iteration instances). User state therefore accumulates across the
+    iterations of a bar, while the builtin machines in the callee's subtree
+    are rolled back to their bar-start state before every same-bar
+    re-execution — they re-derive from the rewritten newest slot instead of
+    advancing again (see :func:`_collect_builtins` for the boundary).
+
+    The slot holds a ``[state, last_bar, snapshot]`` cell: the first call of a
+    bar refreshes the snapshot, every further call on that bar restores it.
+
+    :param parent: The caller's state vector.
+    :param slot: Child slot index assigned at transform time.
+    :param func: The state-carrying callee (carries ``__pyne_layout__``).
+    :return: The shared child state vector.
+    """
+    cell = parent[slot]
+    bar = _current_bar()
+    if cell is None:
+        layout = func.__pyne_layout__
+        state = _make_state(layout)
+        parent[slot] = [state, bar, _snap_builtins(state, layout)]
+        return state
+    state = cell[0]
+    if cell[1] != bar:
+        cell[1] = bar
+        cell[2] = _snap_builtins(state, state[-1])
+    else:
+        _restore_builtins(state, state[-1], cell[2])
     return state
 
 
@@ -220,23 +393,6 @@ def __slot_state__(parent: list, slot: int, func: Any) -> list:
     """
     state = parent[slot]
     return state if state is not None else __resolve_slot__(parent, slot, func)
-
-
-def __next_state__(children: list, counter: list, func: Any) -> list:
-    """Whole loop-shaped fast-path call site, counter advance included.
-
-    The per-invocation counter lives in a one-element list here instead of a
-    plain local, because the walrus that would advance a local is illegal in
-    the comprehension-iterable position this form serves.
-
-    :param children: The child list living in the parent's slot.
-    :param counter: One-element counter cell, reset in the function prologue.
-    :param func: The state-carrying callee (carries ``__pyne_layout__``).
-    :return: This iteration's child state vector.
-    """
-    index = counter[0]
-    counter[0] = index + 1
-    return children[index] if index < len(children) else __grow__(children, func)
 
 
 def __attach_layout__(layout: dict[str, Any]) -> Callable[[Callable], Callable]:
@@ -339,27 +495,54 @@ def __bind_any__(parent: list, slot: int, func: Any) -> Callable:
     return bound
 
 
-def __bind_any_loop__(children: list, index: int, func: Any) -> Callable:
-    """Bind a callee at a loop-shaped anchored call site: the anchor slot
-    holds a list of ``(callee, bound)`` pairs indexed by the per-invocation
-    counter, so each iteration keeps its own instance. Rebinds in place on
-    an identity miss, reusing the iteration's prior state vector when the same
-    logical callee was redefined for a new bar (see :func:`_carry_state`).
+def _snap_bound_builtins(bound: Any) -> list:
+    """Bar-start builtin snapshot for a uniform loop site's bound target
+    (empty when the binding is opaque and carries no walkable state)."""
+    vecs: list = []
+    _collect_bound_builtins(bound, vecs)
+    return _snap_collected(vecs)
 
-    :param children: The pair list living in the parent's anchor slot.
-    :param index: Current iteration index (counter is sequential, so the
-        grow case is always ``index == len(children)``).
+
+def _restore_bound_builtins(bound: Any, snaps: list) -> None:
+    """Roll the builtin machines behind a uniform loop site's bound target
+    back to bar start."""
+    vecs: list = []
+    _collect_bound_builtins(bound, vecs)
+    _restore_collected(vecs, snaps)
+
+
+def __bind_loop__(parent: list, slot: int, func: Any) -> Callable:
+    """Whole loop-shaped anchored call site (uniform path): identity check,
+    bind and the shared-instance same-bar rollback of :func:`__loop_state__`
+    in one helper. The slot cell payload is the ``(callee, bound)`` pair; an
+    identity miss rebinds the shared entry in place (prior state carried
+    across a per-bar redefinition of the same logical callee exactly like the
+    straight-line anchor, see :func:`_carry_state`).
+
+    :param parent: The caller's state vector.
+    :param slot: Anchor slot index assigned at transform time.
     :param func: The callee as it appears at the call site.
     :return: The bound callable to invoke.
     """
-    prev = children[index] if index < len(children) else None
-    bound = _bind_target(func, prev)
-    entry = (func, bound)
-    if index < len(children):
-        children[index] = entry
+    cell = parent[slot]
+    bar = _current_bar()
+    if cell is None:
+        bound = _bind_target(func, None)
+        parent[slot] = [(func, bound), bar, _snap_bound_builtins(bound)]
+        return bound
+    pair = cell[0]
+    if pair[0] is not func:
+        bound = _bind_target(func, pair)
+        cell[0] = (func, bound)
+        cell[1] = bar
+        cell[2] = _snap_bound_builtins(bound)
+        return bound
+    if cell[1] != bar:
+        cell[1] = bar
+        cell[2] = _snap_bound_builtins(pair[1])
     else:
-        children.append(entry)
-    return bound
+        _restore_bound_builtins(pair[1], cell[2])
+    return pair[1]
 
 
 def __bind_slot__(parent: list, slot: int, func: Any) -> Callable:
@@ -379,23 +562,6 @@ def __bind_slot__(parent: list, slot: int, func: Any) -> Callable:
     if pair is not None and pair[0] is func:
         return pair[1]
     return __bind_any__(parent, slot, func)
-
-
-def __bind_next__(children: list, counter: list, func: Any) -> Callable:
-    """Whole loop-shaped anchored call site, counter advance included.
-
-    :param children: The pair list living in the parent's anchor slot.
-    :param counter: One-element counter cell, reset in the function prologue.
-    :param func: The callee as it appears at the call site.
-    :return: The bound callable to invoke.
-    """
-    index = counter[0]
-    counter[0] = index + 1
-    if index < len(children):
-        pair = children[index]
-        if pair[0] is func:
-            return pair[1]
-    return __bind_any_loop__(children, index, func)
 
 
 def create_root(key: str, layout: dict[str, Any]) -> list:
@@ -440,8 +606,8 @@ def reset() -> None:
     never touched main's own state.
     """
     for state, layout in _root_vectors.values():
-        for slot, _call_id, in_loop in layout['children']:
-            state[slot] = [] if in_loop else None
+        for slot, _call_id, _in_loop in layout['children']:
+            state[slot] = None
     for cache in _shared_caches:
         cache.clear()
 
@@ -585,18 +751,26 @@ def _snap_vector(state: list, layout: dict[str, Any]) -> tuple:
     like TradingView's realtime rollback keeps them.
     """
     var_vals = tuple((i, _copy_value(state[i])) for i in _var_slots(layout))
-    series_vals = tuple((slot, state[slot]._snapshot())
+    series_vals = tuple((slot, state[slot]._snapshot())  # noqa: cooperating core internals
                         for slot, _max_bars_back, _elem in layout['series'])
     return var_vals, series_vals, _snap_children(state, layout)
 
 
 def _snap_children(state: list, layout: dict[str, Any]) -> tuple:
-    """Snapshot only the child slots of a state vector."""
+    """Snapshot only the child slots of a state vector. A loop-site cell
+    carries its bar-tracking fields along with the payload snapshot: a
+    discarded re-execution must find the same bar-start rollback baseline the
+    original pass saw, or its first re-call of the bar would re-snapshot a
+    half-advanced machine (the snapshot structures are never mutated, so they
+    restore by reference)."""
     child_vals = []
     for slot, _call_id, in_loop in layout['children']:
         val = state[slot]
         if in_loop:
-            child_vals.append((slot, True, tuple(_snap_child(e) for e in val)))
+            if val is None:
+                child_vals.append((slot, True, ('none',), 0, None))
+            else:
+                child_vals.append((slot, True, _snap_child(val[0]), val[1], val[2]))
         else:
             child_vals.append((slot, False, _snap_child(val)))
     return tuple(child_vals)
@@ -617,18 +791,18 @@ def _snap_child(entry: Any) -> tuple:
     if entry is None:
         return ('none',)
     if type(entry) is list:
-        return ('vec', entry, _snap_vector(entry, entry[-1]))
+        return 'vec', entry, _snap_vector(entry, entry[-1])
     if type(entry) is tuple and len(entry) == 2:
         bound = entry[1]
         if type(bound) is partial and bound.args:
-            layout = getattr(bound.func, '__pyne_layout__', None)
+            layout: dict[str, Any] | None = getattr(bound.func, '__pyne_layout__', None)
             if layout is not None:
-                return ('pair', entry, bound.args[0], _snap_vector(bound.args[0], layout))
+                return 'pair', entry, bound.args[0], _snap_vector(bound.args[0], layout)
         # A closure-held series must be ROLLED BACK, never dropped: re-binding
         # gives an empty buffer, and ``expr[n]`` then reads na forever.
         series = getattr(bound, '__pyne_series__', None)
         if series is not None:
-            return ('series', entry, series, series._snapshot())
+            return 'series', entry, series, series._snapshot()  # noqa: cooperating core internals
     return ('drop',)
 
 
@@ -638,56 +812,38 @@ def _restore_vector(state: list, snap: tuple) -> None:
     for i, value in var_vals:
         state[i] = _copy_value(value)
     for slot, series_snap in series_vals:
-        state[slot]._restore(series_snap)
+        state[slot]._restore(series_snap)  # noqa: cooperating core internals
     _restore_children(state, child_vals)
 
 
 def _restore_children(state: list, child_vals: tuple) -> None:
     """Restore the child slots of a state vector from :func:`_snap_children`."""
-    for slot, in_loop, child_snap in child_vals:
-        if in_loop:
-            lst = state[slot]
-            # An element that cannot be restored in place ends the reusable
-            # prefix: the per-invocation counter binds strictly sequentially,
-            # so truncating there re-creates it and everything after fresh.
-            keep = 0
-            for saved in child_snap:
-                if not _restore_child(lst, keep, saved):
-                    break
-                keep += 1
-            del lst[keep:]
+    for entry in child_vals:
+        slot, in_loop, child_snap = entry[0], entry[1], entry[2]
+        payload = _restore_payload(child_snap)
+        if not in_loop:
+            state[slot] = payload
+        elif payload is None:
+            state[slot] = None
         else:
-            kind = child_snap[0]
-            if kind == 'none' or kind == 'drop':
-                state[slot] = None
-            elif kind == 'vec':
-                state[slot] = child_snap[1]
-                _restore_vector(child_snap[1], child_snap[2])
-            elif kind == 'series':
-                state[slot] = child_snap[1]
-                child_snap[2]._restore(child_snap[3])
-            else:  # pair
-                state[slot] = child_snap[1]
-                _restore_vector(child_snap[2], child_snap[3])
+            state[slot] = [payload, entry[3], entry[4]]
 
 
-def _restore_child(lst: list, index: int, saved: tuple) -> bool:
-    """Restore one loop-list element in place; ``False`` if it must be dropped
-    (the caller truncates the list from there)."""
-    kind = saved[0]
+def _restore_payload(child_snap: tuple) -> Any:
+    """Restore one :func:`_snap_child` payload in place and return the value
+    the slot (or loop cell) should hold — ``None`` when the entry was empty or
+    opaque (a dropped binding re-binds fresh, exactly like :func:`reset`)."""
+    kind = child_snap[0]
     if kind == 'vec':
-        lst[index] = saved[1]
-        _restore_vector(saved[1], saved[2])
-        return True
+        _restore_vector(child_snap[1], child_snap[2])
+        return child_snap[1]
     if kind == 'pair':
-        lst[index] = saved[1]
-        _restore_vector(saved[2], saved[3])
-        return True
+        _restore_vector(child_snap[2], child_snap[3])
+        return child_snap[1]
     if kind == 'series':
-        lst[index] = saved[1]
-        saved[2]._restore(saved[3])
-        return True
-    return False
+        child_snap[2]._restore(child_snap[3])  # noqa: cooperating core internals
+        return child_snap[1]
+    return None
 
 
 class RootChildSnapshot:

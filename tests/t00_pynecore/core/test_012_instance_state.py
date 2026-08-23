@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from pynecore.core.instance_state import (
-    __resolve_slot__, __grow__, __bind_any__, __bind_any_loop__,
+    __resolve_slot__, __bind_any__, __loop_state__, __bind_loop__,
     __attach_layout__,
     create_root, get_root, discard_root, reset, register_shared_cache,
     RootVarSnapshot, explain_state, _make_state,
@@ -23,7 +23,7 @@ LAYOUT_LEAF = {
 }
 
 # slot 0: var, slot 1: series, slot 2: straight-line child,
-# slot 3: loop child list, slot 4: varip
+# slot 3: loop-site cell, slot 4: varip
 LAYOUT_PARENT = {
     'init': (0, None, None, None, False),
     'series': ((1, 10, None),),
@@ -31,6 +31,22 @@ LAYOUT_PARENT = {
     'children': ((2, 'main·acc·0', False), (3, 'main·acc·1', True)),
     'names': ('count', 'src', 'acc·0', 'acc·1', 'flag'),
 }
+
+# A builtin machine's layout: the ``compacted`` flag (the ``@pyne lib``
+# marker) is what makes it a same-bar rollback target at loop sites
+LAYOUT_BUILTIN = {
+    'init': (0.0,),
+    'series': (),
+    'varip': (),
+    'children': (),
+    'compacted': True,
+}
+
+
+def _set_bar(index: int) -> None:
+    """Drive the runner-maintained global bar index the loop helpers read."""
+    from pynecore import lib
+    lib.bar_index = index
 
 # Two plain var slots: a drawing held directly and one held in a container
 LAYOUT_DRAWINGS = {
@@ -51,14 +67,13 @@ def _make_stateful(layout=LAYOUT_LEAF):
 
 
 def __test_make_state__():
-    """ _make_state: shared immutables, fresh series and loop lists """
+    """ _make_state: shared immutables, fresh series, empty child slots """
     s1 = _make_state(LAYOUT_PARENT)
     s2 = _make_state(LAYOUT_PARENT)
-    assert s1[:-1] == [0, s1[1], None, [], False]
+    assert s1[:-1] == [0, s1[1], None, None, False]
     assert s1[-1] is LAYOUT_PARENT  # trailing layout reference (see _make_state)
     assert isinstance(s1[1], SeriesImpl)
     assert s1[1] is not s2[1]
-    assert s1[3] is not s2[3]
 
 
 def __test_resolve_slot__():
@@ -75,16 +90,65 @@ def __test_resolve_slot__():
     assert child[0] == 3.0
 
 
-def __test_grow__():
-    """ __grow__: appends one fresh child per loop iteration """
+def __test_loop_state_shared_instance__():
+    """ __loop_state__: ONE instance shared by every iteration; user state
+    accumulates across the same-bar calls and across bars """
     acc = _make_stateful()
     parent = _make_state(LAYOUT_PARENT)
-    first = __grow__(parent[3], acc)
-    second = __grow__(parent[3], acc)
-    assert parent[3] == [first, second]
-    assert first is not second
-    acc(first, 1.0)
-    assert second[0] == 0.0
+    _set_bar(0)
+    first = __loop_state__(parent, 3, acc)
+    second = __loop_state__(parent, 3, acc)
+    assert first is second
+    assert parent[3][0] is first
+    assert acc(first, 1.0) == 1.0
+    assert acc(__loop_state__(parent, 3, acc), 1.0) == 2.0
+    _set_bar(1)
+    assert acc(__loop_state__(parent, 3, acc), 1.0) == 3.0
+
+
+def __test_loop_state_builtin_rollback__():
+    """ __loop_state__: a builtin machine (compacted layout) re-derives every
+    same-bar call from bar-start state; a new bar commits the last result;
+    a ``per_call`` machine keeps advancing across iterations """
+    machine = _make_stateful(LAYOUT_BUILTIN)
+    parent = _make_state(LAYOUT_PARENT)
+    _set_bar(0)
+    assert machine(__loop_state__(parent, 3, machine), 1.0) == 1.0
+    # Same bar: rolled back to the 0.0 bar-start state, not 1.0 + 2.0
+    assert machine(__loop_state__(parent, 3, machine), 2.0) == 2.0
+    _set_bar(1)
+    # New bar: the bar's LAST result (2.0) is the committed state
+    assert machine(__loop_state__(parent, 3, machine), 1.0) == 3.0
+
+    percall = _make_stateful({**LAYOUT_BUILTIN, 'per_call': True})
+    parent2 = _make_state(LAYOUT_PARENT)
+    _set_bar(0)
+    assert percall(__loop_state__(parent2, 3, percall), 1.0) == 1.0
+    assert percall(__loop_state__(parent2, 3, percall), 1.0) == 2.0
+
+
+def __test_loop_state_midbar_builtin_reinit__():
+    """ __loop_state__: a builtin child created MID-BAR (inside an earlier
+    iteration, missing from the bar-start snapshot) is re-initialized on the
+    same-bar rollback — its bar-start state is "not existing yet" """
+    machine = _make_stateful(LAYOUT_BUILTIN)
+
+    def wrapper(__state__, x):
+        __state__[0] += 1  # user var: accumulates across iterations
+        child = __state__[2]
+        if child is None:
+            child = __resolve_slot__(__state__, 2, machine)
+        return __state__[0], machine(child, x)
+    wrapper.__pyne_layout__ = LAYOUT_PARENT
+
+    parent = _make_state(LAYOUT_PARENT)
+    _set_bar(0)
+    assert wrapper(__loop_state__(parent, 3, wrapper), 1.0) == (1, 1.0)
+    # Same bar: the var went on, the machine was re-initialized (1.0, not 2.0)
+    assert wrapper(__loop_state__(parent, 3, wrapper), 1.0) == (2, 1.0)
+    _set_bar(1)
+    # New bar: the machine's committed state is the bar's last result
+    assert wrapper(__loop_state__(parent, 3, wrapper), 1.0) == (3, 2.0)
 
 
 def __test_bind_any_stateful__():
@@ -161,27 +225,28 @@ def __test_bind_any_dispatcher_hook__():
     assert bound(2) == 20
 
 
-def __test_bind_any_loop__():
-    """ __bind_any_loop__: per-iteration instances; an in-place rebind keeps the
-    iteration's state when the same logical callee was redefined (same layout),
-    and resets only on a genuinely different callee (distinct layout) """
+def __test_bind_loop__():
+    """ __bind_loop__: ONE shared instance across iterations; an in-place
+    rebind keeps the state when the same logical callee was redefined (same
+    layout), and resets only on a genuinely different callee (distinct
+    layout) """
     acc = _make_stateful()
-    children: list = []
-    first = __bind_any_loop__(children, 0, acc)
-    second = __bind_any_loop__(children, 1, acc)
-    assert [entry[0] for entry in children] == [acc, acc]
+    parent = _make_state(LAYOUT_PARENT)
+    _set_bar(0)
+    first = __bind_loop__(parent, 3, acc)
+    assert __bind_loop__(parent, 3, acc) is first
+    assert parent[3][0] == (acc, first)
     assert first(1.0) == 1.0
-    assert first(2.0) == 3.0
-    assert second(5.0) == 5.0  # own instance, untouched by first
+    assert first(2.0) == 3.0  # user state accumulates across iterations
     # Same logical callee redefined for a new bar (new object, same layout):
-    # identity miss at index 0, but its per-iteration state is kept.
+    # the identity check misses, but the shared state vector is kept.
+    _set_bar(1)
     redefined = _make_stateful()
-    rebound = __bind_any_loop__(children, 0, redefined)
-    assert children[0] == (redefined, rebound)
-    assert rebound(1.0) == 4.0  # continues index 0's state (3.0 + 1.0)
-    assert second(1.0) == 6.0   # the sibling entry keeps its own state
+    rebound = __bind_loop__(parent, 3, redefined)
+    assert parent[3][0] == (redefined, rebound)
+    assert rebound(1.0) == 4.0  # continues the cell's state (3.0 + 1.0)
     # A genuinely different callee (distinct layout) resets to fresh state.
-    other = __bind_any_loop__(children, 0, _make_stateful(layout=dict(LAYOUT_LEAF)))
+    other = __bind_loop__(parent, 3, _make_stateful(layout=dict(LAYOUT_LEAF)))
     assert other(1.0) == 1.0
 
 
@@ -191,12 +256,13 @@ def __test_reset__():
     root = create_root('test·reset', LAYOUT_PARENT)
     try:
         __resolve_slot__(root, 2, acc)
-        __grow__(root[3], acc)
+        _set_bar(0)
+        __loop_state__(root, 3, acc)
         root[0] = 42
         series = root[1]
         reset()
         assert root[2] is None
-        assert root[3] == []
+        assert root[3] is None
         assert root[0] == 42
         assert root[1] is series
         assert get_root('test·reset') is root

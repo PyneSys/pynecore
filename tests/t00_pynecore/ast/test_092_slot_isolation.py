@@ -67,7 +67,9 @@ def main():
 
 
 def __test_fast_path_loop__():
-    """ A loop site keeps one instance per iteration via the child list """
+    """ A loop site shares ONE instance across every iteration (TradingView's
+    measured law: a var counter in a called function counts straight through
+    the iterations of a bar and across bars) """
     ns, dump = _transform(COUNTER_FUNC + '''
 def main():
     total = 0
@@ -78,29 +80,10 @@ def main():
     layouts = ns['__pyne_slot_layout__']
     assert layouts['main']['children'] == ((0, 'main·t1·0', True),)
     state = _make_state(layouts['main'])
-    assert ns['main'](state) == 3   # three fresh instances
-    assert ns['main'](state) == 6   # the same three instances again
-    assert len(state[0]) == 3
-    assert '__cnt·0__ = 0' in dump
-    assert '__chl·0__ = __state__[0]' in dump
-    assert '__grow·__(__chl·0__, t1)' in dump
-
-
-def __test_fast_path_loop_len_shadow__():
-    """ A script variable named ``len`` must not break the loop counter guard """
-    ns, dump = _transform(COUNTER_FUNC + '''
-def main():
-    len = 7  # shadows the builtin, like a common Pine input name
-    total = 0
-    for _ in range(3):
-        total += t1()
-    return total + len
-''')
-    state = _make_state(ns['__pyne_slot_layout__']['main'])
-    assert ns['main'](state) == 10   # three fresh instances (1+1+1) + len(7)
-    assert ns['main'](state) == 13   # same three instances (2+2+2 -> 6) + 7
-    assert 'len(__chl·0__)' not in dump   # never a shadowable builtin call
-    assert '__chl·0__.__len__()' in dump
+    assert ns['main'](state) == 6    # 1 + 2 + 3: one shared instance
+    assert ns['main'](state) == 15   # 4 + 5 + 6: the same instance counts on
+    assert type(state[0]) is list and type(state[0][0]) is list  # [state, bar, snap] cell
+    assert '__loop_state·__(__state__, 0, t1)' in dump
 
 
 def __test_direct_path_stateless__():
@@ -186,7 +169,7 @@ def main():
 
 
 def __test_uniform_loop__():
-    """ An anchored site in a loop keeps one instance per iteration """
+    """ An anchored site in a loop shares ONE instance across iterations """
     ns, dump = _transform(COUNTER_FUNC + '''
 def t2():
     p: Persistent[int] = 100
@@ -201,33 +184,10 @@ def main(flag):
     return total
 ''')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
-    assert ns['main'](state, True) == 2     # 1 + 1, two fresh instances
-    assert ns['main'](state, True) == 4     # 2 + 2, both persisted
-    assert ns['main'](state, False) == 202  # both iterations rebound to t2
-    assert '__bind_any_loop·__(__chl·0__, __i·__, f)' in dump
-
-
-def __test_uniform_loop_len_shadow__():
-    """ The anchored loop guard is shadow-proof against a ``len`` variable too """
-    ns, dump = _transform(COUNTER_FUNC + '''
-def t2():
-    p: Persistent[int] = 100
-    p += 1
-    return p
-
-def main(flag):
-    len = 5  # shadows the builtin
-    f = t1 if flag else t2
-    total = 0
-    for _ in range(2):
-        total += f()
-    return total + len
-''')
-    state = _make_state(ns['__pyne_slot_layout__']['main'])
-    assert ns['main'](state, True) == 7      # 1 + 1 + len(5)
-    assert ns['main'](state, True) == 9      # 2 + 2 + 5
-    assert 'len(__chl·0__)' not in dump
-    assert '__chl·0__.__len__()' in dump
+    assert ns['main'](state, True) == 3     # 1 + 2: one shared instance
+    assert ns['main'](state, True) == 7     # 3 + 4, persisted
+    assert ns['main'](state, False) == 203  # rebound to t2: 101 + 102
+    assert '__bind_loop·__(__state__, 0, f)' in dump
 
 
 def __test_nested_def_fast_path__():
@@ -411,8 +371,9 @@ def main():
     assert dump.count('__resolve_slot·__(__state·main__, 0, bump)') == 1
 
 
-def __test_nested_callee_in_loop_keeps_per_iteration_state__():
-    """ Each loop iteration keeps its own instance for a nested callee site """
+def __test_nested_callee_in_loop_shares_state__():
+    """ Loop iterations share the nested callee's instance, and a per-bar
+    redefinition of the nested def carries it across bars """
     ns, _ = _transform('''
 from pynecore import Persistent
 
@@ -427,9 +388,9 @@ def main():
     return out
 ''')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
-    assert ns['main'](state) == 'X|X|'
-    assert ns['main'](state) == 'XX|XX|'  # not 'XX|X|' (counter double-advance)
-    assert ns['main'](state) == 'XXX|XXX|'
+    assert ns['main'](state) == 'X|XX|'
+    assert ns['main'](state) == 'XXX|XXXX|'
+    assert ns['main'](state) == 'XXXXX|XXXXXX|'
 
 
 def __test_impure_callee_evaluated_once_per_bar__():
@@ -448,9 +409,11 @@ def main(log):
         assert len(log) == expected  # two evaluations per bar would double this
 
 
-def __test_impure_none_callee_in_loop_keeps_state__():
-    """ A callee that is None must not skip the loop counter: the binding
-    conjunct is unfalsifiable, so a surviving iteration keeps its instance """
+def __test_impure_none_callee_in_loop__():
+    """ A None callee raises cleanly at the shared anchor, and an alternating
+    callee follows the documented uniform-site semantics: the identity miss
+    rebinds, so only the state reachable through the PREVIOUS binding's layout
+    survives (the last iteration's fresh instance is what carries over) """
     ns, _ = _transform('''
 import types
 from pynecore import Persistent
@@ -474,8 +437,8 @@ def main():
 ''')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
     assert ns['main'](state) == ['a', 'TE', 'a']
-    assert ns['main'](state) == ['aa', 'TE', 'aa']  # not [..., 'a'] (index desync)
-    assert ns['main'](state) == ['aaa', 'TE', 'aaa']
+    assert ns['main'](state) == ['aa', 'TE', 'a']  # i=0 carries i=2's instance on
+    assert ns['main'](state) == ['aa', 'TE', 'a']
 
 
 def __test_stable_impure_callee_binds_the_right_target__():
@@ -657,8 +620,9 @@ def main():
     assert ns['CALLS'] == ['make_box'] * 2  # callee expression evaluated once per bar
 
 
-def __test_comprehension_iterable_in_loop_keeps_per_iteration_state__():
-    """ A loop-shaped iterable site advances a counter CELL, not a walrus """
+def __test_comprehension_iterable_in_loop_shares_state__():
+    """ A loop-shaped iterable site uses the shared helper form (walrus-free
+    by construction, so it is legal in the iterable position) """
     ns, dump = _transform(COUNTER_FUNC + '''
 def main():
     out = []
@@ -668,15 +632,14 @@ def main():
 ''')
     layouts = ns['__pyne_slot_layout__']
     assert layouts['main']['children'][0] == (0, 'main·t1·0', True)
-    assert '__cnt·0__ = [0]' in dump
-    assert '__next_state·__(__chl·0__, __cnt·0__, t1)' in dump
+    assert '__loop_state·__(__state__, 0, t1)' in dump
     state = _make_state(layouts['main'])
-    assert ns['main'](state) == [[0]] * 3
-    assert ns['main'](state) == [[0, 1]] * 3  # each iteration keeps its own instance
+    assert ns['main'](state) == [[0], [0, 1], [0, 1, 2]]      # 1, 2, 3 shared
+    assert ns['main'](state) == [list(range(n)) for n in (4, 5, 6)]
 
 
 def __test_nested_comprehension_iterable_is_a_loop_site__():
-    """ A LATER generator's iterable runs per element -> own instance each """
+    """ A LATER generator's iterable runs per element -> shared loop site """
     ns, dump = _transform('''
 from pynecore import Persistent
 
@@ -690,19 +653,19 @@ def main(items):
 ''')
     layouts = ns['__pyne_slot_layout__']
     assert layouts['main']['children'][0] == (0, 'main·bump·0', True)
-    assert '__cnt·0__ = [0]' in dump
+    assert '__loop_state·__(__state__, 0, bump)' in dump
     assert ':=' not in dump
     state = _make_state(layouts['main'])
-    assert ns['main'](state, [10, 20]) == [0, 0]
-    assert ns['main'](state, [10, 20]) == [0, 1, 0, 1]
+    assert ns['main'](state, [10, 20]) == [0, 0, 1]           # p = 1 then 2
+    assert ns['main'](state, [10, 20]) == [0, 1, 2, 0, 1, 2, 3]
 
 
-def __test_comprehension_element_still_uses_the_walrus_form__():
-    """ Only the ITERABLE is walrus-free; element and condition stay inline """
+def __test_comprehension_element_sites_are_loop_sites__():
+    """ Element and condition sites run per element — the shared loop helper
+    serves them (the iterable's straight-line site keeps its own helper) """
     _, dump = _transform('''
 def main(g, h):
     return [h(x) for x in g() if h(x)]
 ''')
     assert '__bind_slot·__(__state__, 0, g)' in dump
-    assert '__bind_any_loop·__' in dump  # element/condition sites keep the fast guard
-    assert ':=' in dump
+    assert '__bind_loop·__' in dump  # element/condition sites share one anchor

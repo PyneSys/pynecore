@@ -155,21 +155,26 @@ def alma(series: Series[float], length: int, offset: float = 0.85, sigma: float 
 
     # Use persistent weights to avoid recalculation
     weights: Persistent[list[float]] = []
-    norm: Persistent[float] = 0.0
 
-    # Calculate weights only once
+    # Calculate weights only once. TradingView PREMULTIPLIES: each Gaussian weight
+    # is divided by the norm up front, and the dot product accumulates oldest
+    # sample first with NO final division (probe ``alma_probe``, BINANCE:BTCUSDT
+    # 30m, 28774 bars: this form is bit-exact on all four measured parameter sets
+    # — lengths 3/9/21/5, floored offset included — while the sum-then-divide form
+    # and every summation-order variant of it miss thousands of bars by 1-3 ULP).
     if not weights:
         m = offset * (length - 1) if not floor else math.floor(offset * (length - 1))
         s = length / sigma
-        weights = [math.exp(-1 * ((i - m) * (i - m)) / (2 * s * s)) for i in builtins.range(length)]
-        weights.reverse()  # This is faster then using backward range or index subtraction
-        norm = sum(weights)
+        weights = [math.exp(-1 * ((i - m) * (i - m)) / (2 * (s * s))) for i in builtins.range(length)]
+        norm = 0.0
+        for w in weights:
+            norm += w
+        weights = [w / norm for w in weights]
 
-    # Vectorized calculation using dot product
     summ = 0.0
     for i, w in enumerate(weights):
-        summ += w * series[i]
-    return summ / norm
+        summ += series[length - i - 1] * w
+    return summ
 
 
 def atr(length: int) -> PyneFloat:
@@ -704,6 +709,7 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     last_max: Persistent[float] = na_float
     last_max_index: Persistent[int] = 0
     last_bar: Persistent[int] = -1
+    avail: Persistent[int] = 0
 
     # The kept extreme ages in BARS, not in calls. A conditionally called window only
     # takes a stale slot into account when its rescan fires, so both halves of the
@@ -715,10 +721,34 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     # ``hiloop_probe``, BINANCE:BTCUSDT 30m): the age advances once per bar no matter
     # how many calls land on it, and each call merely rewrites the newest ring slot.
     # Aging per call instead misses 5991 of 143815 returned values there.
+    # ``avail`` moves with the same bar clock: it counts how many older slots the
+    # window may trust — everything before the last na reset is out of bounds.
     gap = bar_index - last_bar
     if last_bar >= 0 and gap > 0:
         last_max_index += gap
+        avail += gap
+        if avail > length:
+            avail = length
     last_bar = bar_index
+
+    # A na input RESETS the machine: the window and the kept extreme are forgotten,
+    # and the next non-na call starts a fresh window (probes ``hina_probe`` and
+    # ``hina2_probe``, BINANCE:BTCUSDT 30m, 28775 bars: the reset model matches
+    # TradingView on every bar for loop AND straight-line sites, while skipping na
+    # or keeping the window diverges from the first na on). The value form returns
+    # na on the na bar; the bars form returns 0 (measured, subject to the same
+    # warmup gate as any other bar).
+    if not (source == source):
+        last_max = na_float
+        last_max_index = 0
+        avail = 0
+        if bar_index < length - 1:
+            return na_float if not _tuple else (na_float, na_float)  # type: ignore[return-value]
+        if _bars:
+            return 0
+        if _tuple:
+            return na_float, 0  # type: ignore[return-value]
+        return na_float
 
     if last_max < source or not (last_max == last_max) or (_check_eq and last_max == source):
         last_max = source
@@ -727,7 +757,7 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     if last_max_index >= length:
         last_max = source
         last_max_index = 0
-        for i in builtins.range(1, length):
+        for i in builtins.range(1, length if avail >= length else avail + 1):
             s = source[i]
             if s > last_max:
                 last_max = s
@@ -752,6 +782,19 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
 @overload
 def highest(length: int) -> PyneFloat:
     return highest(high, length)
+
+
+# The kept extreme advances once per CALL on TradingView — a loop iteration
+# that writes a lower value into the newest slot still reads the higher
+# extreme an earlier iteration of the same bar established, while the index
+# ages once per bar (probe ``hiloop_probe``, BINANCE:BTCUSDT 30m: this
+# machine with no same-bar rollback reproduces all 143815 loop-read values
+# bit-exactly; a bar-start rollback misses 43746 of them). The flag shields
+# it from the shared loop site's rollback; the layouts are reached through
+# the dispatcher's registered implementations, because the dispatcher itself
+# carries no layout.
+for _impl in getattr(highest, '__pyne_impls__'):
+    getattr(_impl.func, '__pyne_layout__')['per_call'] = True
 
 
 # noinspection PyUnusedLocal
@@ -976,15 +1019,34 @@ def lowest(source: Series[float], length: int,
     last_min: Persistent[float] = na_float
     last_min_index: Persistent[int] = 0
     last_bar: Persistent[int] = -1
+    avail: Persistent[int] = 0
 
     # The kept extreme ages in BARS, not in calls: a bar that skips the call still
     # moves the window on, and a bar that calls it many times moves it only once, so
     # the rescan that lets a stale slot in fires on the same bar TradingView fires it
-    # (see ``highest``).
+    # (see ``highest``). ``avail`` bounds the rescan to the slots since the last na
+    # reset, on the same bar clock.
     gap = bar_index - last_bar
     if last_bar >= 0 and gap > 0:
         last_min_index += gap
+        avail += gap
+        if avail > length:
+            avail = length
     last_bar = bar_index
+
+    # A na input resets the machine — window forgotten, next non-na call starts
+    # fresh (see ``highest`` for the measured law).
+    if not (source == source):
+        last_min = na_float
+        last_min_index = 0
+        avail = 0
+        if bar_index < length - 1:
+            return na_float if not _tuple else (na_float, NA(int))  # type: ignore[return-value]
+        if _bars:
+            return 0
+        if _tuple:
+            return na_float, 0  # type: ignore[return-value]
+        return na_float
 
     if last_min > source or not (last_min == last_min) or (_check_eq and last_min == source):
         last_min = source
@@ -993,7 +1055,7 @@ def lowest(source: Series[float], length: int,
     if last_min_index >= length:
         last_min = source
         last_min_index = 0
-        for i in builtins.range(1, length):
+        for i in builtins.range(1, length if avail >= length else avail + 1):
             s = source[i]
             if s < last_min:
                 last_min = s
@@ -1018,6 +1080,11 @@ def lowest(source: Series[float], length: int,
 @overload
 def lowest(length: int) -> PyneFloat:
     return lowest(low, length)
+
+
+# Per-call machine like ``highest`` (same measured law, opposite extreme).
+for _impl in getattr(lowest, '__pyne_impls__'):
+    getattr(_impl.func, '__pyne_layout__')['per_call'] = True
 
 
 # noinspection PyUnusedLocal
@@ -1444,13 +1511,17 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
 
 
 # TradingView advances this machine once per EXECUTION of its call site — loop
-# iterations share it (measured: a [5,9] / [5,na,9] length loop reproduces
-# every exported value bit-exactly on the shared machine, while per-iteration
-# instances miss 83% of the bars) — so the isolation transformer must not give
-# loop iterations their own instances. Not a family-wide builtin law:
-# ``ta.ema``/``ta.sma`` measured the opposite way (see ``_FAST_SHARED`` in the
-# function_isolation transformer).
+# iterations share it AND each one steps it further (measured: a [5,9] /
+# [5,na,9] length loop reproduces every exported value bit-exactly on the
+# shared per-call machine, while per-iteration instances miss 83% of the
+# bars). Not the family-wide builtin law: ``ta.ema``/``ta.sma`` share their
+# call-site state too but re-derive every same-bar execution from bar-start
+# state (see ``_FAST_SHARED`` in the function_isolation transformer). The
+# attribute marker skips the loop form's same-bar rollback at a direct loop
+# call site; the layout flag shields the machine from a rollback of an
+# enclosing callee's subtree (``_collect_builtins``).
 percentile_linear_interpolation.__pyne_shared_call_site__ = True
+getattr(percentile_linear_interpolation, '__pyne_layout__')['per_call'] = True
 
 
 # noinspection PyUnusedLocal,PyProtectedMember
@@ -1553,10 +1624,11 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     return array._select_nearest_rank(sorted_buf, length, percentage)
 
 
-# Shared per-call-site machine on TradingView, loop iterations included — see
-# the docstring's measured law and ``percentile_linear_interpolation``'s
-# matching marker.
+# Shared per-call-site machine on TradingView, advancing once per EXECUTION —
+# see the docstring's measured law and ``percentile_linear_interpolation``'s
+# matching markers.
 percentile_nearest_rank.__pyne_shared_call_site__ = True
+getattr(percentile_nearest_rank, '__pyne_layout__')['per_call'] = True
 
 
 def percentrank(source: Series[float], length: int) -> PyneFloat:

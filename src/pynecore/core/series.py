@@ -309,6 +309,46 @@ class SeriesImpl(Generic[T]):
          self._max_bars_back, self._max_bars_back_set, self._capacity) = snapshot
         self._buffer = buffer.copy()
 
+    def _restore_bar(self, snapshot: tuple[list[T | NA[T]], int, int, int, int, int, int]) -> None:
+        """Same-bar rollback to a :meth:`_snapshot` baseline, O(changed slots).
+
+        The loop-site rollback (``instance_state.__loop_state__``) restores a
+        builtin machine's windows once per loop ITERATION, so the full-copy
+        :meth:`_restore` would dominate the whole run. Between the bar-start
+        snapshot and a same-bar restore the buffer can only have changed in a
+        few recognizable ways: nothing structural (at most the newest slot was
+        SET-rewritten), appended tail elements (filling-mode adds, gap fills),
+        or the single ring overwrite of an at-capacity add. Each is undone in
+        place; any shape this cannot prove (a capacity restructure, a
+        stale-gap advance that wrapped into an overwrite) falls back to the
+        full restore — the snapshot carries the whole buffer precisely so the
+        fallback is always available.
+
+        :param snapshot: A value returned by :meth:`_snapshot`.
+        """
+        buffer, size, write_pos, last_bar, mbb, mbb_set, cap = snapshot
+        if self._capacity == cap and self._max_bars_back == mbb \
+                and self._max_bars_back_set == mbb_set:
+            own = self._buffer
+            if self._size == size and self._write_pos == write_pos \
+                    and self._last_bar_index == last_bar and len(own) == len(buffer):
+                if size:  # only the newest slot could have been rewritten
+                    pos = write_pos - 1
+                    own[pos] = buffer[pos]
+                return
+            if size < cap and self._size == len(own) and size < self._size <= cap \
+                    and self._write_pos == self._size:
+                del own[size:]  # appended tail (adds and gap fills)
+                self._size, self._write_pos, self._last_bar_index = size, write_pos, last_bar
+                return
+            if size == cap and self._size == cap \
+                    and self._write_pos == write_pos % cap + 1:
+                pos = write_pos % cap  # the single at-capacity ring overwrite
+                own[pos] = buffer[pos]
+                self._write_pos, self._last_bar_index = write_pos, last_bar
+                return
+        self._restore(snapshot)
+
     @overload
     def __getitem__(self, key: int) -> T | NA[T]:
         ...

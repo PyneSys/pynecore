@@ -10,27 +10,31 @@ of three routes (see ``work/benchmark`` plan, section 3.4):
       f((__st·__ if (__st·__ := __state__[5]) is not None
          else __resolve_slot·__(__state__, 5, f)), x, 12)
 
-  Loop-shaped sites hold a child list indexed by a per-invocation counter
-  (hoisted to the function prologue together with the list)::
+  Loop-shaped sites keep ONE instance shared by every iteration —
+  TradingView's per-call-site state does not multiply with loop iterations
+  (measured; see :func:`~pynecore.core.instance_state.__loop_state__`, which
+  also runs the same-bar rollback of the callee's builtin machines)::
 
-      f((__chl·0__[__i·__] if (__i·__ := (__cnt·0__ := __cnt·0__ + 1) - 1)
-         < len(__chl·0__) else __grow·__(__chl·0__, f)), x)
+      f(__loop_state·__(__state__, 5, f), x)
 
 - **direct** (provably stateless callee): plain call, zero overhead.
 
 - **uniform** (anything not provable): the caller anchors a
   ``(callee, bound)`` pair in its own slot; the hot path is one identity
-  check, ``__bind_any·__`` / ``__bind_any_loop·__`` (re)binds on a miss::
+  check, ``__bind_any·__`` (re)binds on a miss. Loop-shaped sites fold the
+  whole guard into ``__bind_loop·__`` (shared instance + same-bar rollback,
+  like the fast loop form)::
 
       (__b·__[1] if (__b·__ := __state__[7]) is not None and __b·__[0] is f
        else __bind_any·__(__state__, 7, f))(x)
+      __bind_loop·__(__state__, 7, f)(x)
 
-Every shape above is an assignment expression, which Python forbids anywhere
-inside a comprehension's ITERABLE expression (a lambda or a nested
-comprehension in there does not lift the ban). Sites under an iterable
-therefore fold the whole guard into one helper call — ``__slot_state·__`` /
-``__next_state·__`` / ``__bind_slot·__`` / ``__bind_next·__`` — and their loop
-counter lives in a one-element cell instead of a plain local::
+The straight-line shapes above are assignment expressions, which Python
+forbids anywhere inside a comprehension's ITERABLE expression (a lambda or a
+nested comprehension in there does not lift the ban). Straight-line sites
+under an iterable therefore fold the whole guard into one helper call —
+``__slot_state·__`` / ``__bind_slot·__`` (the loop forms are helper-only
+already and need no variant)::
 
       [x for x in __bind_slot·__(__state__, 7, f)()]
 
@@ -57,8 +61,10 @@ callee there raises a transform error), decorator and default-argument
 expressions, class bodies, ``__test_*__`` functions (the test framework
 calls them with fixtures, they must not grow a hidden parameter), and calls
 whose callee is not a plain name/attribute. Calls inside lambdas are
-anchored on the straight-line uniform route (a loop counter would bind
-lambda-local and break).
+anchored on the straight-line uniform route: a lambda body runs at its
+consumer's cadence (a sort comparator, a filter predicate), which is not
+loop-iteration semantics, so the loop form's same-bar rollback must not
+apply there.
 """
 from typing import cast, Any
 import ast
@@ -80,13 +86,11 @@ __all__ = ['FunctionIsolationTransformer', 'NON_TRANSFORMABLE_FUNCTIONS', 'HELPE
 # An alias stays a plain global lookup, so the emission costs nothing extra.
 HELPER_ALIASES = {
     '__resolve_slot__': '__resolve_slot·__',
-    '__grow__': '__grow·__',
     '__bind_any__': '__bind_any·__',
-    '__bind_any_loop__': '__bind_any_loop·__',
     '__slot_state__': '__slot_state·__',
-    '__next_state__': '__next_state·__',
     '__bind_slot__': '__bind_slot·__',
-    '__bind_next__': '__bind_next·__',
+    '__loop_state__': '__loop_state·__',
+    '__bind_loop__': '__bind_loop·__',
 }
 
 # Functions that should not be transformed because they:
@@ -198,14 +202,17 @@ _SKIP = 'skip'
 _DIRECT = 'direct'
 _FAST = 'fast'
 # Cross-module state-carrying callee marked ``__pyne_shared_call_site__``:
-# emitted on the fast route, but a loop-shaped site keeps ONE instance instead
-# of a child per iteration. TradingView is not uniform here — the percentile
-# machines advance one shared per-call-site state on every execution, loop
-# iterations included, while ``ta.ema``/``ta.sma`` in the same position
-# re-derive each call from bar-keyed series state (measured with
-# window-content and per-iteration probes; see
-# ``ta.percentile_nearest_rank``). Only the measured-shared builtins carry the
-# marker; everything else keeps the child-per-iteration route.
+# emitted on the fast route with the STRAIGHT-LINE shape even inside a loop.
+# Every loop site shares one instance across iterations now, so the marker no
+# longer decides sharing — it decides the same-bar treatment: a marked machine
+# advances once per EXECUTION on TradingView (the percentile machines,
+# measured with a [5,9] / [5,na,9] length-loop probe), so it must skip the
+# bar-keyed rollback ``__loop_state__`` applies to everything else
+# (``ta.ema``/``ta.sma`` re-derive each call from bar-start state, measured
+# with window-content and per-iteration probes). The straight-line emission is
+# exactly that: shared slot, no rollback; the ``per_call`` layout flag
+# (see ``_collect_builtins``) shields the same machines when they sit deeper
+# in a rolled-back callee subtree.
 _FAST_SHARED = 'fast-shared'
 _UNIFORM = 'uniform'
 
@@ -343,9 +350,6 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         self._lambda_depth = 0
         self._comp_iter_depth = 0
         self._ordinals: dict[str, int] = {}
-        # per-function pending loop hoists: (counter name, list name, slot,
-        # counter is a one-element cell)
-        self._loop_hoists: list[list[tuple[str, str, int, bool]]] = []
         self._used_helpers: set[str] = set()
         self._resolve_cache: dict[str, Any] = {}
 
@@ -542,40 +546,6 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         return ast.Subscript(value=ast.Name(id=param, ctx=ast.Load()),
                              slice=ast.Constant(value=slot), ctx=ast.Load())
 
-    @staticmethod
-    def _counter_walrus(counter: str) -> ast.NamedExpr:
-        """``(__i·__ := (<counter> := <counter> + 1) - 1)``"""
-        increment = ast.NamedExpr(
-            target=ast.Name(id=counter, ctx=ast.Store()),
-            value=ast.BinOp(left=ast.Name(id=counter, ctx=ast.Load()),
-                            op=ast.Add(), right=ast.Constant(value=1)))
-        return ast.NamedExpr(
-            target=ast.Name(id='__i·__', ctx=ast.Store()),
-            value=ast.BinOp(left=increment, op=ast.Sub(), right=ast.Constant(value=1)))
-
-    @staticmethod
-    def _list_len(children: str) -> ast.Call:
-        """``<children>.__len__()`` — the loop-site counter guard's list length.
-
-        A bare ``len(...)`` is unsafe here: a script variable named ``len``
-        (one of the most common Pine input names) shadows the builtin in the
-        function scope, so the emitted ``len`` would resolve to that value
-        (e.g. an ``int``) and the guard would raise ``'int' object is not
-        callable``. ``<children>`` is always our own hoisted list, so calling
-        its ``__len__`` slot directly sidesteps name resolution entirely.
-        """
-        return ast.Call(
-            func=ast.Attribute(value=ast.Name(id=children, ctx=ast.Load()),
-                               attr='__len__', ctx=ast.Load()),
-            args=[], keywords=[])
-
-    def _add_loop_hoist(self, slot: int, cell: bool = False) -> tuple[str, str]:
-        """Register a loop site's counter + hoisted list for the prologue."""
-        k = len(self._loop_hoists[-1])
-        counter, children = f'__cnt·{k}__', f'__chl·{k}__'
-        self._loop_hoists[-1].append((counter, children, slot, cell))
-        return counter, children
-
     def _helper(self, name: str) -> str:
         """Register a runtime helper for the import and return its alias."""
         self._used_helpers.add(name)
@@ -595,19 +565,18 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         param = self._state_param()
         callee_copy = self._copy_callee(node.func)
         state_expr: ast.expr
-        if self._comp_iter_depth:
-            if not in_loop:
-                state_expr = self._helper_call(
-                    '__slot_state__', [ast.Name(id=param, ctx=ast.Load()),
-                                       ast.Constant(value=slot), callee_copy])
-            else:
-                counter, children = self._add_loop_hoist(slot, cell=True)
-                state_expr = self._helper_call(
-                    '__next_state__', [ast.Name(id=children, ctx=ast.Load()),
-                                       ast.Name(id=counter, ctx=ast.Load()), callee_copy])
-            node.args.insert(0, state_expr)
-            return node
-        if not in_loop:
+        if in_loop:
+            # Shared instance + same-bar builtin rollback, folded into one
+            # helper call — walrus-free, so it is legal in comprehension
+            # iterables too
+            state_expr = self._helper_call(
+                '__loop_state__', [ast.Name(id=param, ctx=ast.Load()),
+                                   ast.Constant(value=slot), callee_copy])
+        elif self._comp_iter_depth:
+            state_expr = self._helper_call(
+                '__slot_state__', [ast.Name(id=param, ctx=ast.Load()),
+                                   ast.Constant(value=slot), callee_copy])
+        else:
             state_expr = ast.IfExp(
                 test=ast.Compare(
                     left=ast.NamedExpr(target=ast.Name(id='__st·__', ctx=ast.Store()),
@@ -619,37 +588,20 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
                                 args=[ast.Name(id=param, ctx=ast.Load()),
                                       ast.Constant(value=slot), callee_copy],
                                 keywords=[]))
-        else:
-            grow = self._helper('__grow__')
-            counter, children = self._add_loop_hoist(slot)
-            state_expr = ast.IfExp(
-                test=ast.Compare(
-                    left=self._counter_walrus(counter), ops=[ast.Lt()],
-                    comparators=[self._list_len(children)]),
-                body=ast.Subscript(value=ast.Name(id=children, ctx=ast.Load()),
-                                   slice=ast.Name(id='__i·__', ctx=ast.Load()), ctx=ast.Load()),
-                orelse=ast.Call(func=ast.Name(id=grow, ctx=ast.Load()),
-                                args=[ast.Name(id=children, ctx=ast.Load()), callee_copy],
-                                keywords=[]))
         node.args.insert(0, state_expr)
         return node
 
     def _emit_uniform(self, node: ast.Call, slot: int, in_loop: bool) -> ast.Call:
         """Wrap the call in the anchored bind form."""
         param = self._state_param()
-        if self._comp_iter_depth:
+        if in_loop or self._comp_iter_depth:
             # Helper form: the callee expression is evaluated exactly once, as
             # the helper's argument, so a callee that runs code needs no
             # temporary and the identity check needs no walrus
-            if not in_loop:
-                bound: ast.expr = self._helper_call(
-                    '__bind_slot__', [ast.Name(id=param, ctx=ast.Load()),
-                                      ast.Constant(value=slot), node.func])
-            else:
-                counter, children = self._add_loop_hoist(slot, cell=True)
-                bound = self._helper_call(
-                    '__bind_next__', [ast.Name(id=children, ctx=ast.Load()),
-                                      ast.Name(id=counter, ctx=ast.Load()), node.func])
+            bound: ast.expr = self._helper_call(
+                '__bind_loop__' if in_loop else '__bind_slot__',
+                [ast.Name(id=param, ctx=ast.Load()),
+                 ast.Constant(value=slot), node.func])
             return ast.Call(func=bound, args=node.args, keywords=node.keywords)
         callee: ast.expr
         callee_copy: ast.expr
@@ -659,10 +611,8 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
             # copies below would execute it twice -- side effects included, and
             # with the nested call's own state site duplicated. Bind it to a
             # temporary first and reference the name in both places.
-            # The conjunct is a tautology ON PURPOSE: it must never short-circuit.
-            # A falsifiable form (``is not None``) would skip the loop counter
-            # walrus in the next conjunct whenever the callee is falsy, and the
-            # rebind would then write at the previous iteration's child index.
+            # The conjunct is a tautology ON PURPOSE: it must never short-circuit
+            # past the ``__b·__`` walrus in the next conjunct.
             bind = ast.Compare(
                 left=ast.NamedExpr(target=ast.Name(id='__c·__', ctx=ast.Store()),
                                    value=node.func),
@@ -673,49 +623,25 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         else:
             callee, callee_copy = node.func, self._copy_callee(node.func)
         pair = ast.Name(id='__b·__', ctx=ast.Load())
-        if not in_loop:
-            bind_any = self._helper('__bind_any__')
-            test: ast.BoolOp = ast.BoolOp(op=ast.And(), values=[
-                ast.Compare(
-                    left=ast.NamedExpr(target=ast.Name(id='__b·__', ctx=ast.Store()),
-                                       value=self._slot_ref(param, slot)),
-                    ops=[ast.IsNot()], comparators=[ast.Constant(value=None)]),
-                ast.Compare(
-                    left=ast.Subscript(value=pair, slice=ast.Constant(value=0), ctx=ast.Load()),
-                    ops=[ast.Is()], comparators=[callee]),
-            ])
-            rebind: ast.expr = ast.Call(
-                func=ast.Name(id=bind_any, ctx=ast.Load()),
-                args=[ast.Name(id=param, ctx=ast.Load()), ast.Constant(value=slot), callee_copy],
-                keywords=[])
-        else:
-            bind_any_loop = self._helper('__bind_any_loop__')
-            counter, children = self._add_loop_hoist(slot)
-            test = ast.BoolOp(op=ast.And(), values=[
-                ast.Compare(
-                    left=self._counter_walrus(counter), ops=[ast.Lt()],
-                    comparators=[self._list_len(children)]),
-                ast.Compare(
-                    left=ast.Subscript(
-                        value=ast.NamedExpr(
-                            target=ast.Name(id='__b·__', ctx=ast.Store()),
-                            value=ast.Subscript(value=ast.Name(id=children, ctx=ast.Load()),
-                                                slice=ast.Name(id='__i·__', ctx=ast.Load()),
-                                                ctx=ast.Load())),
-                        slice=ast.Constant(value=0), ctx=ast.Load()),
-                    ops=[ast.Is()], comparators=[callee]),
-            ])
-            rebind = ast.Call(
-                func=ast.Name(id=bind_any_loop, ctx=ast.Load()),
-                args=[ast.Name(id=children, ctx=ast.Load()),
-                      ast.Name(id='__i·__', ctx=ast.Load()), callee_copy],
-                keywords=[])
+        bind_any = self._helper('__bind_any__')
+        test: ast.BoolOp = ast.BoolOp(op=ast.And(), values=[
+            ast.Compare(
+                left=ast.NamedExpr(target=ast.Name(id='__b·__', ctx=ast.Store()),
+                                   value=self._slot_ref(param, slot)),
+                ops=[ast.IsNot()], comparators=[ast.Constant(value=None)]),
+            ast.Compare(
+                left=ast.Subscript(value=pair, slice=ast.Constant(value=0), ctx=ast.Load()),
+                ops=[ast.Is()], comparators=[callee]),
+        ])
+        rebind: ast.expr = ast.Call(
+            func=ast.Name(id=bind_any, ctx=ast.Load()),
+            args=[ast.Name(id=param, ctx=ast.Load()), ast.Constant(value=slot), callee_copy],
+            keywords=[])
         if bind is not None:
             # FIRST operand: the callee (and any call site nested in it) must be
-            # fully evaluated before the anchor read below binds ``__b·__`` and
-            # before the loop counter advances -- an inner site writes those same
-            # names, and reading them first would invoke the inner anchor's
-            # callable instead of this one
+            # fully evaluated before the anchor read below binds ``__b·__`` --
+            # an inner site writes that same name, and reading it first would
+            # invoke the inner anchor's callable instead of this one
             test.values.insert(0, bind)
         bound = ast.IfExp(
             test=test,
@@ -766,30 +692,10 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         scope_for_function(self.layout, scope, node)
         old_loop, self._loop_depth = self._loop_depth, 0
         old_lambda, self._lambda_depth = self._lambda_depth, 0
-        self._loop_hoists.append([])
 
         # Only the body is isolation territory (decorators and argument
         # defaults are evaluated outside the instance, legacy parity)
         node.body = [cast(ast.stmt, self.visit(stmt)) for stmt in node.body]
-
-        hoists = self._loop_hoists.pop()
-        if hoists:
-            param = self.layout.state_param(scope)
-            prologue: list[ast.stmt] = []
-            for counter, children, slot, cell in hoists:
-                prologue.append(ast.Assign(
-                    targets=[ast.Name(id=counter, ctx=ast.Store())],
-                    value=ast.List(elts=[ast.Constant(value=0)], ctx=ast.Load()) if cell
-                    else ast.Constant(value=0)))
-                prologue.append(ast.Assign(
-                    targets=[ast.Name(id=children, ctx=ast.Store())],
-                    value=self._slot_ref(param, slot)))
-            insert_pos = 0
-            first = node.body[0] if node.body else None
-            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
-                    and isinstance(first.value.value, str)):
-                insert_pos = 1
-            node.body[insert_pos:insert_pos] = prologue
 
         self._loop_depth, self._lambda_depth = old_loop, old_lambda
         self._scope_stack.pop()
@@ -882,13 +788,15 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
 
         scope = '·'.join(self._scope_stack)
         if self._lambda_depth:
-            # Loop counters would bind lambda-local; the straight-line
-            # anchor is the only emission that stays correct inside a lambda
+            # A lambda body runs at its consumer's cadence, not as a loop
+            # iteration — the straight-line anchor keeps the shared state
+            # without the loop form's same-bar rollback
             route, in_loop = _UNIFORM, False
         elif route == _FAST_SHARED:
-            # A marked builtin's state is per call site on TradingView, loop
-            # iterations included (see ``_FAST_SHARED``): one shared instance,
-            # never a child list.
+            # A marked machine advances per EXECUTION on TradingView, so it
+            # must skip the loop form's same-bar rollback: the straight-line
+            # shape already shares its slot across iterations (see
+            # ``_FAST_SHARED``)
             route, in_loop = _FAST, False
         else:
             in_loop = self._loop_depth > 0
