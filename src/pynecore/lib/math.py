@@ -178,7 +178,7 @@ def log(number: TFI | NA[TFI]) -> PyneFloat:
     """
     if not (number == number):  # is_na_arg
         return na_float
-    return math.log(number)
+    return pine_math.log(number)
 
 
 def log10(number: TFI | NA[TFI]) -> PyneFloat:

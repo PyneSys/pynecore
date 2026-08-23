@@ -1,6 +1,8 @@
 from typing import cast
 import ast
 
+from .lib_series import BUILTIN_PRICE_SERIES
+
 
 class InputTransformer(ast.NodeTransformer):
     """
@@ -83,6 +85,11 @@ class InputTransformer(ast.NodeTransformer):
                                 break
 
                     # Only proceed if it's a source call or input call with a defval
+                    # ``input.source()`` always returns the source NAME, so its defval
+                    # is resolved whatever shape it has. The generic ``input()`` only
+                    # returns a name when the defval is a builtin price series; for any
+                    # other module-level constant (a color, number or string) it returns
+                    # the value itself, which must never be looked up on ``lib``.
                     if (is_source_call or is_input_call) and defval_node:
                         source_name = None
 
@@ -92,12 +99,14 @@ class InputTransformer(ast.NodeTransformer):
                         elif isinstance(defval_node, ast.Attribute):
                             # Handle attribute reference (e.g., lib.close or close)
                             attr = defval_node
-                            if isinstance(attr.value, ast.Name) and attr.value.id == 'lib':
+                            if (isinstance(attr.value, ast.Name) and attr.value.id == 'lib'
+                                    and (is_source_call or attr.attr in BUILTIN_PRICE_SERIES)):
                                 # For lib.xxx pattern, store the attribute name
                                 source_name = attr.attr
                         elif isinstance(defval_node, ast.Name):
                             # Handle direct name reference (e.g., close)
-                            source_name = defval_node.id
+                            if is_source_call or defval_node.id in BUILTIN_PRICE_SERIES:
+                                source_name = defval_node.id
 
                         if source_name:
                             if self.current_function not in self.function_source_vars:

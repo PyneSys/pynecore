@@ -278,13 +278,21 @@ def __test_math_sum_bit_exact__():
             next_bar()
 
 
-def __test_math_sum_length_one_shortcut__():
-    """ length == 1 returns the source untouched, without buffering """
+def __test_math_sum_length_one_na_bar_echoes_the_window__():
+    """ length == 1 gives back the source, and an na bar echoes the last non-na
+
+    MEASURED (probe sumlen4, BINANCE:BTCUSDT 30m, 28746 bars): a length-1 sum
+    equals the source on every non-na bar, and on an na bar it reports the last
+    NON-NA value rather than na — an na bar is not stored and does not advance
+    the window, exactly like every other length.
+    """
     state = _make_state(lib.math.sum.__pyne_layout__)
-    assert lib.math.sum(state, 3.3, 1) == 3.3
-    na_result = lib.math.sum(state, NA(float), 1)
-    assert na_result != na_result  # the untouched na source is the native nan
-    assert state[2] == 0  # the count slot stayed untouched
+    with _bars() as next_bar:
+        assert lib.math.sum(state, 3.3, 1) == 3.3
+        next_bar()
+        assert lib.math.sum(state, NA(float), 1) == 3.3
+        next_bar()
+        assert lib.math.sum(state, 4.5, 1) == 4.5
 
 
 def __test_math_sum_growing_length_keeps_history__():
@@ -301,6 +309,128 @@ def __test_math_sum_growing_length_keeps_history__():
     assert results[2] != results[2] or isinstance(results[2], NA)  # only 3 of 5
     assert results[3] != results[3] or isinstance(results[3], NA)  # only 4 of 5
     assert results[4] == 15.0  # 1 + 2 + 3 + 4 + 5, no spurious na gap
+
+
+def __test_math_sum_grown_length_matches_the_constant_machine__():
+    """ A length grown one bar at a time IS the constant-length machine
+
+    MEASURED LAW (probe sumlen2, BINANCE:BTCUSDT 30m): ``math.sum(volume,
+    min(bar_index + 1, 610))`` equals ``math.sum(volume, 610)`` bit-for-bit on
+    every one of the 28746 exported bars, and so does the shorter 5-length pair.
+    TradingView does not re-baseline when the length moves — while the window is
+    still filling there is nothing to evict, so the two runs are the same
+    machine — hence the clamped-length idiom (``ta.sma(volume, math.min(
+    bar_index + 1, len))``, Heatmap Volume [xdecow]) must not restart the
+    accumulator.
+    """
+    length = 9
+    # Mixed magnitudes so the compensated accumulator carries a live residue:
+    # a re-baselined linear sum drifts off the running machine within a window.
+    values = [1e7 + i * 0.1 + (i % 13) * 1e-9 if i % 3 else 3.25e-5 * (i % 7 + 1)
+              for i in range(60)]
+    grown = _make_state(lib.math.sum.__pyne_layout__)
+    fixed = _make_state(lib.math.sum.__pyne_layout__)
+    with _bars() as next_bar:
+        for i, v in enumerate(values):
+            g = lib.math.sum(grown, v, min(i + 1, length))
+            f = lib.math.sum(fixed, v, length)
+            if i + 1 >= length:
+                assert repr(g) == repr(f), f'bar {i}: {g!r} != {f!r}'
+            next_bar()
+
+
+def __test_math_sum_length_change_walks_one_entry_at_a_time__():
+    """ A moved length enters and leaves the window ONE entry per machine step
+
+    MEASURED LAW (probes sumlen6/sumlen7, BINANCE:BTCUSDT 30m): a 5->6, 6->7,
+    4->10 or 6->5 length step reproduces TradingView bit-for-bit only when every
+    admitted/evicted entry runs its own compensated round -- folding the whole
+    change into a single fused ``d0`` lands 1-3 ulp away. The two models are
+    compared here directly, so the test fails if the implementation folds.
+    """
+    length_before, length_after = 4, 8
+    # Magnitudes chosen so the compensated residue is live when the length moves
+    values = [1e8 + i * 0.5 if i % 2 else 7.5e-7 * (i % 5 + 1) for i in range(24)]
+    change_at = 16
+
+    def lengths(i):
+        return length_before if i < change_at else length_after
+
+    def model(sequential):
+        summ = 0.0
+        comp = 0.0
+        ent = []            # realized entries, index 0 = newest
+        win = 0
+        got = []
+        for i, v in enumerate(values):
+            length = lengths(i)
+            new_w = length if i + 1 >= length else i + 1
+            d0 = 0.0
+            admitted = []
+            if win + 1 > new_w:
+                for k in range(win, new_w, -1):
+                    if sequential:
+                        y1 = -ent[k - 1] - comp
+                        t = summ + y1
+                        y2 = -((t - summ) - y1)
+                        summ = t + y2
+                        comp = (summ - t) - y2
+                    else:
+                        d0 += ent[k - 1]
+                d0 = d0 + ent[new_w - 1] if not sequential else ent[new_w - 1]
+            elif new_w > win + 1:
+                for k in range(new_w - 1, win, -1):
+                    a = values[i - k]
+                    if sequential:
+                        y1 = -comp
+                        t = summ + y1
+                        y2 = a - ((t - summ) - y1)
+                        summ = t + y2
+                        comp = (summ - t) - y2
+                        admitted.append((k, y2))
+                    else:
+                        d0 -= a
+                        admitted.append((k, a))
+            fires = False
+            if comp != 0.0 and v != 0.0:
+                b = comp if comp > 0.0 else -comp
+                r = v + b
+                if r != 0.0 and r - r == 0.0:
+                    fires = b - (r - v) > 0.0
+            if fires:
+                # Re-baseline: newest-first linear sum of the raw window
+                summ = v
+                for k in range(1, new_w):
+                    summ = values[i - k] + summ
+                comp = 0.0
+                ent = [v] + ent
+            else:
+                y1 = -d0 - comp
+                t = summ + y1
+                y2 = v - ((t - summ) - y1)
+                ns = t + y2
+                comp = (ns - t) - y2
+                summ = ns
+                ent = [y2] + ent
+            for k, e in admitted:
+                if k < len(ent):
+                    ent[k] = e
+            win = new_w
+            got.append(summ if new_w >= length else None)
+        return got
+
+    walked = model(True)
+    folded = model(False)
+    state = _make_state(lib.math.sum.__pyne_layout__)
+    with _bars() as next_bar:
+        for i, v in enumerate(values):
+            got = lib.math.sum(state, v, lengths(i))
+            if walked[i] is not None:
+                assert repr(got) == repr(walked[i]), f'bar {i}: {got!r} != {walked[i]!r}'
+            next_bar()
+
+    # The two models must actually disagree, or the assertion above proves nothing
+    assert any(a is not None and repr(a) != repr(b) for a, b in zip(walked, folded))
 
 
 def __test_math_sum_length_change_on_na_bar_keeps_window__():

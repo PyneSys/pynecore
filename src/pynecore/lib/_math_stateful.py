@@ -77,11 +77,12 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     # block probes m562 (5599 independent blocks, lengths 3/4/5/8, every branch
     # decision forced), and on real 22k-bar rsi/stoch/sma chains (probes m561/m562).
     summ: Persistent[float] = 0.0
-    count: Persistent[int] = 0
     compensation: Persistent[float] = 0.0
-    prev_length: Persistent[int] = 0
-    entries: Persistent[list | None] = None
-    head: Persistent[int] = 0
+    entries: Persistent[list[float]] = []
+    ring: Persistent[int] = 0
+    slot: Persistent[int] = 0
+    seen: Persistent[int] = 0
+    window: Persistent[int] = 0
     capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
 
     # Representation-agnostic na test: an na source is either an NA object or a
@@ -96,14 +97,18 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     if builtins.type(length) is not int:
         length = int(length)
 
+    assert length > 0, "Invalid length, length must be greater than 0!"
+
+    n = seen
     if not source_na:
         # Record every non-na bar's value into the sliding buffer BEFORE any
-        # early return (shortcut / warmup), so the positional reads below see
-        # a complete history with no holes. NA values are intentionally not
-        # stored: the buffer stays na-compacted, so ``src[k]`` is the k-th
-        # most recent non-na value — exactly the "last N non-na" window Pine's
-        # sum/sma use.
+        # positional read, so ``src[k]`` sees a complete history with no holes.
+        # NA values are intentionally not stored: the buffer stays na-compacted,
+        # so ``src[k]`` is the k-th most recent non-na value — exactly the "last
+        # N non-na" window Pine's sum/sma use. An na bar leaves the buffer where
+        # it is, so ``src[k]`` keeps addressing the same stored values.
         src: Series[float] = source
+        n += 1
         # The re-baseline reads the raw window via ``src[length - 1]``. Grow the
         # na-compacted buffer so that index stays addressable for lengths beyond
         # the per-series default ``max_bars_back``; otherwise the rebuild reads
@@ -116,78 +121,118 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
             capacity = length
             max_bars_back(src, capacity)
 
-    if length == 1:  # Shortcut
-        # The sliding accumulator is left untouched here; record length == 1 so a
-        # following bar with a different length recomputes instead of trusting the
-        # now-stale state.
-        prev_length = 1
-        return source
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    prev_w = window
+    new_w = length if n >= length else n
+    if source_na and prev_w == new_w:
+        # Nothing entered or left: an na bar that does not move the window is a
+        # no-op and reports the standing sum (MEASURED, probe sumlen4: a length-1
+        # sum on an na bar echoes the last NON-NA value instead of returning na).
+        return summ if new_w >= length else na_float
 
-    # The rolling machine below is only valid while ``length`` stays constant.
-    # Pine allows a series ``length`` (e.g. ``ta.sma(src, barssince(...))``);
-    # when it changes bar-to-bar the accumulator no longer describes the
-    # requested trailing window, so re-baseline from the raw buffer (the same
-    # newest-first linear sum a fire produces) and re-seed the realized queue
-    # with the raw window so a subsequently stable length resumes the O(1) path.
-    # Reading the slot once and only writing it on an actual change keeps the
-    # steady-state path (a constant length) down to a single load.
-    prev = prev_length
-    if prev != length:
-        prev_length = length
-    if prev != 0 and prev != length:
-        # ``src`` is na-compacted, so ``src[0 .. length - 1]`` is the requested
-        # trailing window whether or not the current bar is na: on an na bar the
-        # buffer simply was not advanced, so ``src[0]`` still is the newest
-        # non-na value — the very window the stable-length na branch preserves.
-        newest = src[0]
-        if not (newest == newest):  # No non-na history at all yet
-            summ = 0.0
-            count = 0
-            compensation = 0.0
-            entries = None
-            return na_float
-        rebuilt = builtins.float(newest)
-        found = 1
-        for i in builtins.range(1, length):
-            v = src[i]
-            if not (v == v):
-                # The buffer is na-compacted, so the first na marks the end
-                # of available history — every deeper index is na too.
-                break
-            found += 1
-            rebuilt = builtins.float(v) + rebuilt
-        # A short history is kept as a warmup prefix instead of being dropped:
-        # the following bars then only need ``length - found`` more values, so a
-        # grown length no longer blanks the output for a whole fresh window.
-        # Oldest first, so ``head`` addresses the next entry to be evicted.
-        entries = [0.0] * length
-        for i in builtins.range(found):
-            entries[i] = builtins.float(src[found - 1 - i])
-        head = found
-        if head == length:
-            head = 0
-        summ = rebuilt
-        compensation = 0.0
-        count = found
-        return rebuilt if found == length else na_float
-
-    # Bind the per-bar state into locals: each ``Persistent`` read/write is a
-    # slot index under the transform, and the steady-state step touches the
-    # buffer, the head, the accumulator and the compensation several times.
+    # The realized-entry ring is addressed by position RELATIVE to the newest
+    # entry, its capacity the largest length seen so far. Pine's machine does not
+    # restart when the length moves (MEASURED, probe sumlen2: a length grown
+    # 1..610 reproduces a constant 610 bit-for-bit on all 28746 bars), so the
+    # history already stored has to keep its identity — a ring re-based on the
+    # new length would lose it. Only LEAVING entries are read from the ring and
+    # those sit inside the previous window, so the largest length is enough.
     ent = entries
-    if ent is None:
-        ent = [0.0] * length
+    cap = ring
+    at = slot
+    if length > cap:
+        grown = [0.0] * length
+        j = 0
+        if cap:
+            kept = cap if prev_w > cap else prev_w
+            i = at - kept
+            if i < 0:
+                i += cap
+            j = length - kept
+            for _ in builtins.range(kept):
+                grown[j] = ent[i]
+                i += 1
+                if i == cap:
+                    i = 0
+                j += 1
+                if j == length:
+                    j = 0
+        ent = grown
+        cap = length
+        at = j
         entries = ent
+        ring = cap
+        slot = at
 
-    n = count
-    if source_na:
-        return na_float if n < length else summ
-
-    value = builtins.float(source)
     c = compensation
     s = summ
-    h = head
+
+    # The window is the last ``length`` non-na values, so a moved length both
+    # DROPS and ADMITS entries around it, and TradingView walks that change as a
+    # SEQUENCE of ordinary machine steps rather than one fused one (MEASURED,
+    # probes sumlen6/sumlen7: a 5->6, 6->7, 4->10 or 6->5 step is bit-exact this
+    # way and 1-3 ulp off when the whole change is folded into a single ``d0``).
+    # ``shift`` is 1 on a stored bar (every older offset moves up by one) and 0
+    # on an na bar, so relative to this bar's offset 0 the previous window
+    # covered ``shift``..``prev_w - 1 + shift``. Offsets ``new_w``..
+    # ``prev_w - 1 + shift`` LEAVE oldest first, each an eviction-only step, and
+    # the newest of them is the one fused with this bar's own value — in the
+    # steady state it is the only one, which is exactly the proven single-evict
+    # step. Offsets ``prev_w + shift``..``new_w - 1`` are ADMITTED oldest first
+    # with their raw values, each an addition-only step whose realized residue
+    # becomes that offset's stored entry.
+    # Still OPEN: a change spanning many entries at once (probe sumlen6's
+    # 100->1, sumlen3's 610->100) stays 1-7 ulp off every order tried, so a
+    # sawtooth length (``ta.sma(src, ta.barssince(...))``) keeps the right
+    # window and ~14 digits, not the last bit.
+    if source_na:
+        shift = 0
+        base = at - 1
+        if base < 0:
+            base += cap
+        value = 0.0
+    else:
+        shift = 1
+        base = at
+        value = builtins.float(source)
+
+    d0 = 0.0
+    if prev_w + shift > new_w:
+        # Oldest first, the newest leaving entry left for the fused step below
+        k = prev_w - 1 + shift
+        while k > new_w:
+            e = base - k
+            if e < 0:
+                e += cap
+            y1 = -ent[e] - c
+            t = s + y1
+            e1 = (t - s) - y1
+            y2 = -e1
+            s = t + y2
+            c = (s - t) - y2
+            k -= 1
+        e = base - new_w
+        if e < 0:
+            e += cap
+        d0 = ent[e]
+    elif new_w > prev_w + shift:
+        # Oldest first: the deepest offset enters before the ones above it
+        k = new_w - 1
+        while k >= prev_w + shift:
+            admitted = builtins.float(src[k])
+            y1 = -c
+            t = s + y1
+            e1 = (t - s) - y1
+            y2 = admitted - e1
+            s = t + y2
+            c = (s - t) - y2
+            # The ring mirrors the window, so an admitted entry takes its slot
+            # too: without it a later eviction of that offset would read a slot
+            # the ring never filled (or one a capacity growth dropped).
+            e = base - k
+            if e < 0:
+                e += cap
+            ent[e] = y2
+            k -= 1
 
     # ``core.rolling_sum.sum_fires`` inlined: a call here would cost more than
     # the whole compensated step it guards, and the transform wraps every call
@@ -204,52 +249,31 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
         if r != 0.0 and r - r == 0.0:  # rejects nan and +-inf without a call
             fires = b - (r - value) > 0.0
 
-    if n < length:  # Warmup: accumulate with d0 = 0, fires sum the prefix
-        n += 1
-        count = n
-        if fires:
-            rebuilt = value
-            for i in builtins.range(1, n):
-                rebuilt = builtins.float(src[i]) + rebuilt
-            s = rebuilt
-            compensation = 0.0
-            ent[h] = value
-        else:
-            y1 = -c
-            t = s + y1
-            e1 = (t - s) - y1
-            y2 = value - e1
-            new_sum = t + y2
-            compensation = (new_sum - t) - y2
-            s = new_sum
-            ent[h] = y2
-        summ = s
-        h += 1
-        head = 0 if h == length else h
-        return s if n == length else na_float
-
-    # ``h`` is both the oldest entry and the slot the new one takes
-    old_value = ent[h]
     if fires:
         # Re-baseline: newest-first linear sum of the raw window, raw store
         rebuilt = value
-        for i in builtins.range(1, length):
+        for i in builtins.range(1, new_w):
             rebuilt = builtins.float(src[i]) + rebuilt
         s = rebuilt
         compensation = 0.0
-        ent[h] = value
+        if not source_na:
+            ent[at] = value
     else:
         # Fused two-round evict-and-add, realized store
-        y1 = -old_value - c
+        y1 = -d0 - c
         t = s + y1
         e1 = (t - s) - y1
         y2 = value - e1
         new_sum = t + y2
         compensation = (new_sum - t) - y2
         s = new_sum
-        ent[h] = y2
+        if not source_na:
+            ent[at] = y2
     summ = s
-    h += 1
-    head = 0 if h == length else h
+    seen = n
+    window = new_w
+    if not source_na:
+        at += 1
+        slot = 0 if at == cap else at
 
-    return s
+    return s if new_w >= length else na_float
