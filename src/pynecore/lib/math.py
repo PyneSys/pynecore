@@ -344,6 +344,12 @@ def round(number: TFI | NA[TFI], precision: PyneInt = NA(int)) -> PyneFloat:
     # Known limit: at precision 8 on single-digit values the tolerance no longer
     # separates the ties (26697 of 28397) -- that regime is unmodelled.
     p = precision if isinstance(precision, int) else 0
+    # The slack belongs to the decimal scaling, so precision 0 -- where nothing is
+    # scaled -- compares exactly. MEASURED: every value below the tie rounds down
+    # there however close it sits (452523.49999999994 -> 452523 at 5.8e-11,
+    # 2.4999999999999996 -> 2 at 4.4e-16), while an exact tie still goes away from
+    # zero (2.5 -> 3, -2.5 -> -3). Both `math.round(x)` and `math.round(x, 0)`.
+    tie_scale, tie_half = (2, 1) if p == 0 else (_ROUND_TIE_SCALE, _ROUND_TIE_HALF)
     if p > 308 or p < -308:
         # 10.0 ** p overflows; no attainable rounding changes a finite double here
         return cast(float, number)
@@ -354,7 +360,7 @@ def round(number: TFI | NA[TFI], precision: PyneInt = NA(int)) -> PyneFloat:
     else:
         denominator *= 10 ** -p
     units, remainder = divmod(numerator, denominator)
-    if remainder * _ROUND_TIE_SCALE >= _ROUND_TIE_HALF * denominator:
+    if remainder * tie_scale >= tie_half * denominator:
         units += 1
     if not isinstance(precision, int):
         return -units if negative else units
