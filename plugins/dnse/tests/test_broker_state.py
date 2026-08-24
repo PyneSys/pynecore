@@ -674,3 +674,60 @@ def __test_pending_oco_drain_gives_up_with_manual_intervention__(
     with pytest.raises(BrokerManualInterventionError):
         collect(b.watch_orders(), 1, timeout=1.0)
     assert not b._pending_oco, "escalation must retire the pending entry"
+
+
+def __test_cancel_with_outcome_covers_adopted_children__(
+        fake_client, collect, monkeypatch):
+    """#47 (RED until fixed): after an adoption the envelope maps to
+    [parent shell, child], and ``execute_cancel_with_outcome`` cancelled
+    ``ids[0]`` ONLY — the consumed shell "cancels" trivially (already
+    terminal -> treated-gone), so the engine hears CANCEL_CONFIRMED while the
+    child keeps working the NORMAL book. ``execute_cancel`` (plural) already
+    loops every id; this pins the same contract on the outcome variant."""
+    from pynecore.core.broker.models import ExitIntent, DispatchEnvelope
+    monkeypatch.setattr(broker.time, "sleep", lambda _d: None)
+    state = {"detail_calls": 0, "child_cancelled": False}
+
+    def detail(*_a, order_category=None, **_k):
+        if order_category == "OCO":
+            state["detail_calls"] += 1
+            if state["detail_calls"] <= 8:
+                return (200, {"id": "OCO1", "orderStatus": "New"})
+            return (200, {"id": "OCO1", "orderStatus": "Activated",
+                          "externalOrderId": 9001})
+        if state["child_cancelled"]:
+            return (200, {"id": "9001", "orderStatus": "Canceled"})
+        return (200, {"id": "9001", "orderStatus": "New"})
+
+    cancel_calls = []
+
+    def cancel(_acct, order_id, _mkt, _tok, order_category=None):
+        cancel_calls.append((str(order_id), order_category))
+        if order_category == "OCO":
+            return (400, {"code": "CO-ORD-013"})   # consumed shell: treated-gone
+        state["child_cancelled"] = True
+        return (200, {"id": str(order_id), "orderStatus": "Canceled"})
+
+    child_row = _order_row("9001", "New", fill=0.0, qty=3.0)
+    b = _broker(fake_client,
+        get_security_definition=(200, [{"ceilingPrice": "2060", "floorPrice": "1800",
+                                        "securityGroupId": "FU"}]),
+        get_loan_packages=(200, {"loanPackages": [{"id": 42}]}),
+        post_order=(201, {"id": "OCO1", "symbol": "C1", "side": "NS",
+                          "quantity": 3, "orderStatus": "New"}),
+        get_order_detail=detail,
+        cancel_order=cancel,
+        get_orders=_books((200, {"orders": [child_row]}), (200, {"orders": []})))
+    envelope = DispatchEnvelope(
+        intent=ExitIntent(pine_id="TP", from_entry="L", symbol="C1", side="sell",
+                          qty=3, tp_price=1950.0, sl_price=1900.0),
+        run_tag="abcd", bar_ts_ms=1_700_000_000_000)
+    asyncio.run(b.execute_exit(envelope))
+    collect(b.watch_orders(), 1, timeout=1.0)      # drives the drain -> adoption
+    assert b._ids_for(envelope) == ["OCO1", "9001"], \
+        "reachability: adoption must leave [shell, child] on the envelope"
+
+    asyncio.run(b.execute_cancel_with_outcome(envelope))
+
+    assert "9001" in [order_id for order_id, _cat in cancel_calls], \
+        "the adopted child was never cancelled — CANCEL_CONFIRMED on the dead shell only (#47)"

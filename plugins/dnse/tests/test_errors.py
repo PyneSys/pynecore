@@ -121,13 +121,14 @@ def _book(category):
 @pytest.mark.parametrize("name, behavior, attrs, want", [
     ("recorded-STOP", _book, {"_order_category": {"X": "STOP"}}, (True, ["STOP"])),
     ("fallback-ENTRY", _book, {"_identity": {"X": (None, None, LegType.ENTRY)}},
-     (True, ["NORMAL", "STOP"])),
+     (True, ["NORMAL", "STOP"])),   # STOP cancels -> loop stops before OCO
     ("terminal", lambda c: (400, {"code": "CO-ORD-013"}),
      {"_order_category": {"X": "STOP"}}, (True, ["STOP"])),
     ("session-refused", lambda c: (400, {"code": "CANNOT_CANCEL_THE_ORDER_IN_THE_ATO_SESSION"}),
      {"_order_category": {"X": "STOP"}}, (False, ["STOP"])),
     ("gone-everywhere", lambda c: (404, {"code": "RESOURCE_NOT_FOUND"}),
-     {"_identity": {"X": (None, None, LegType.ENTRY)}}, (True, ["NORMAL", "STOP"])),
+     {"_identity": {"X": (None, None, LegType.ENTRY)}},
+     (True, ["NORMAL", "STOP", "OCO"])),   # #45: unknown ids probe the OCO book too
 ])
 def __test_cancel_one__(name, behavior, attrs, want):
     fake = _FakeClient(behavior)
@@ -138,6 +139,29 @@ def __test_cancel_one__(name, behavior, attrs, want):
     # in test_broker_lifecycle.py, so here the venue simply agrees.
     stub._cancel_took_effect = lambda *_args: True
     assert (stub._cancel_one("X"), fake.calls) == want
+
+
+def __test_cancel_one_unknown_id_probes_every_book__():
+    """#45 (RED until fixed): an id with NO category record and NO identity —
+    every venue.py cancel of a conditional, and the engine after a restart
+    before re-hydration — must probe EVERY book, as ``_cancel_one``'s own
+    docstring promises. The ``_order_category_for`` catch-all instead answered
+    "NORMAL", so the probe loop saw only the NORMAL book's 404 and returned
+    True ("gone from every book") while the conditional kept working — measured
+    live 2026-08-24 on the T04 orphan: three cancel_one=True in a row, order
+    still on the STOP book."""
+    fake = _FakeClient(
+        lambda category: (404, {"code": "RESOURCE_NOT_FOUND"})
+        if category == "NORMAL"
+        else (400, {"code": "INVALID_TRADING_TOKEN", "message": "Invalid trading token"}))
+    stub = _stub(client=fake)
+
+    ok = stub._cancel_one("da5unknownconditional")
+
+    assert "STOP" in fake.calls, \
+        "the STOP book was never probed — the #45 false-True path"
+    assert ok is False, \
+        "a rejected STOP cancel must NOT read as cancelled"
 
 
 # === session-phase cancel codes ===============================================

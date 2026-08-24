@@ -425,24 +425,55 @@ def __test_execute_cancel_multiple_ids_attempts_both_and_ands_results__(fake_cli
     assert cancelled_ids == ["ID1", "ID2"], "both legs of the bracket must be attempted"
 
 
-def __test_execute_cancel_with_outcome_uses_only_first_id__(fake_client, tmp_path):
+def __test_execute_cancel_with_outcome_attempts_every_id__(fake_client, tmp_path):
+    """#47: the outcome variant must walk every mapped id, exactly like
+    ``execute_cancel`` above — after an adoption ids is [consumed shell,
+    working child], and the old ids[0]-only behaviour "confirmed" on the shell
+    while the child kept working. (The previous version of this test PINNED
+    that bug — a characterization test from the coverage commit, no rationale;
+    the engine's cancel-retry loop calls this per-intent and ``_cancel_one`` is
+    idempotent, so attempting every id is safe.)"""
     def _cancel(account, order_id, market, token, order_category=None):
-        assert order_id == "ID1", \
-            f"execute_cancel_with_outcome must not touch id {order_id!r} — only the first id"
         return (200, {"orderStatus": "Canceled"})
 
     # The venue must AGREE the order is gone: a 2xx cancel is only an ACK, so the
     # plugin re-reads the order before reporting success (see _cancel_took_effect).
     b = _broker(fake_client, tmp_path, cancel_order=_cancel,
-                get_order_detail=(200, {"id": "ID1", "symbol": "VN30F1M", "side": "NB",
-                                        "quantity": 1, "orderStatus": "Canceled"}))
+                get_order_detail=lambda _a, order_id, *_r, **_k: (
+                    200, {"id": order_id, "symbol": "VN30F1M", "side": "NB",
+                          "quantity": 1, "orderStatus": "Canceled"}))
     b._order_ids["K"] = ["ID1", "ID2"]
     b._order_category["ID1"] = "STOP"
+    b._order_category["ID2"] = "NORMAL"
 
     outcome = asyncio.run(b.execute_cancel_with_outcome(_cancel_envelope("K")))
 
     assert outcome is CancelDispositionOutcome.CANCEL_CONFIRMED
-    assert b._client.count("cancel_order") == 1, "only the first id's cancel should be attempted"
+    cancelled_ids = [c[1][1] for c in b._client.calls if c[0] == "cancel_order"]
+    assert cancelled_ids == ["ID1", "ID2"], "every mapped id must be attempted (#47)"
+
+
+def __test_execute_cancel_with_outcome_unresolved_id_is_unknown_not_confirmed__(
+        fake_client, tmp_path):
+    """#47 companion: if ANY mapped id fails to cancel, the outcome must be
+    UNKNOWN — the worst individual result — never CANCEL_CONFIRMED, or the
+    engine drops the retained envelope while an order still works the book."""
+    def _cancel(account, order_id, market, token, order_category=None):
+        if order_id == "ID1":
+            return (200, {"orderStatus": "Canceled"})
+        return (400, {"code": "CANNOT_CANCEL_THE_ORDER_IN_THE_ATO_SESSION"})
+
+    b = _broker(fake_client, tmp_path, cancel_order=_cancel,
+                get_order_detail=(200, {"id": "ID1", "symbol": "VN30F1M", "side": "NB",
+                                        "quantity": 1, "orderStatus": "Canceled"}))
+    b._order_ids["K"] = ["ID1", "ID2"]
+    b._order_category["ID1"] = "STOP"
+    b._order_category["ID2"] = "NORMAL"
+
+    outcome = asyncio.run(b.execute_cancel_with_outcome(_cancel_envelope("K")))
+
+    assert outcome is CancelDispositionOutcome.UNKNOWN, \
+        "a session-refused leg must leave the disposition UNKNOWN for the retry loop"
 
 
 # === account_id ===============================================================

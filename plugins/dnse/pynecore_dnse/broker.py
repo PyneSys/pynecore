@@ -83,6 +83,12 @@ _TF_SECONDS = {"1": 60, "3": 180, "5": 300, "15": 900, "30": 1800,
 #: drained by ``watch_orders`` instead.
 _CATEGORIES = ("NORMAL", "STOP")
 
+#: Books a CANCEL may need to probe for an id with no category record (#45) —
+#: unlike the scan set above this must include OCO: an unrecorded umbrella id
+#: answers 404 on both scanned books, and "not found everywhere probed" is
+#: treated as already-gone.
+_CANCEL_PROBE_BOOKS = ("NORMAL", "STOP", "OCO")
+
 #: LegType.name -> idempotency KIND, for the disposition-unknown client_order_id.
 _LEG_KIND = {
     "ENTRY": KIND_ENTRY, "TAKE_PROFIT": KIND_EXIT_TP,
@@ -761,19 +767,18 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         return list(self._order_ids.get(key, [])) if key else []
 
     def _order_category_for(self, order_id: str):
-        """The book a placed order lives in, recorded at place time (authoritative)."""
-        recorded = self._order_category.get(order_id)
-        if recorded:
-            return recorded
-        # Fallback for ids with no record (e.g. a restart before re-hydration):
-        # infer from the leg, and leave ENTRY unknown so cancel probes every book.
-        _, _, leg_type = self._identity_for(order_id)
-        name = getattr(leg_type, "name", "")
-        if name == "STOP_LOSS":
-            return "STOP"
-        if name == "ENTRY":
-            return None
-        return "NORMAL"
+        """The book a placed order lives in, recorded at place time (authoritative).
+
+        No record -> None, so a cancel probes EVERY book. There is no safe
+        leg-based guess (#45): the old "NORMAL" catch-all made `_cancel_one`
+        probe one wrong book whose 404 then read as gone-from-every-book —
+        three false cancel_one=True on a live conditional, measured 2026-08-24.
+        Even STOP_LOSS cannot narrow to "STOP": an OCO umbrella carries an SL
+        leg too. (Identity and category records share a lifecycle — both
+        written at place, both in-memory #36 — so a leg-known/category-unknown
+        id does not occur in practice anyway.)
+        """
+        return self._order_category.get(order_id) or None
 
     @override
     async def execute_cancel(self, envelope) -> bool:
@@ -873,7 +878,7 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         there. Any other failure (session-refused, transient, reject) is logged.
         """
         hinted = self._order_category_for(order_id)
-        categories = [hinted] if hinted else list(_CATEGORIES)
+        categories = [hinted] if hinted else list(_CANCEL_PROBE_BOOKS)
         all_not_found = True
         for category in categories:
             status, body = self._write(lambda tok: self.client.cancel_order(
@@ -912,8 +917,14 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         ids = self._ids_for(envelope)
         if not ids:
             return CancelDispositionOutcome.UNKNOWN
-        return (CancelDispositionOutcome.CANCEL_CONFIRMED
-                if self._cancel_one(str(ids[0]))
+        # Every id the envelope maps to, exactly like execute_cancel: after an
+        # adoption ids is [consumed parent shell, working child], and cancelling
+        # only ids[0] "confirms" on the shell (already terminal -> treated-gone)
+        # while the child keeps working the book (#47).
+        ok = True
+        for order_id in ids:
+            ok = self._cancel_one(str(order_id)) and ok
+        return (CancelDispositionOutcome.CANCEL_CONFIRMED if ok
                 else CancelDispositionOutcome.UNKNOWN)
 
     @override
