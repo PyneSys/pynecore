@@ -215,21 +215,37 @@ qty = strategy.default_entry_qty(close)
 |------|------|-------------|
 | position_size | float | Current position size (> 0 = long, < 0 = short, 0 = flat). |
 | position_avg_price | float | Average entry price of current position. Returns `NaN` if flat. |
+| position_entry_name | string | Entry id of the position's first open trade. Empty string if flat. |
 | opentrades | int | Count of currently open (filled, not yet closed) trades. Pending orders are not counted. |
 | openprofit | float | Current unrealized P&L for all open positions in currency units. |
+| openprofit_percent | float | Unrealized P&L as % of the initial capital. |
 | closedtrades | int | Total count of closed trades for the entire trading range. |
 | wintrades | int | Count of winning trades. |
 | losstrades | int | Count of losing trades. |
 | eventrades | int | Count of breakeven trades. |
 | netprofit | float | Total realized P&L for all closed trades in currency units. |
+| netprofit_percent | float | Realized P&L as % of the initial capital. |
 | grossprofit | float | Total P&L from winning trades in currency units. |
+| grossprofit_percent | float | Gross profit as % of the initial capital. |
 | grossloss | float | Total P&L from losing trades in currency units. |
+| grossloss_percent | float | Gross loss as % of the initial capital. Open commission counts toward it, so a position that is still open already shows a loss percent. |
+| avg_trade | float | Average P&L of the closed trades in currency units. |
+| avg_trade_percent | float | Mean of the closed trades' own profit percentages. Each trade's percent divides by that trade's entry cost — position value plus the fee paid to open it — so this is not `netprofit_percent / closedtrades`. |
+| avg_winning_trade | float | Average P&L of the winning trades in currency units. |
+| avg_winning_trade_percent | float | Mean of the winning trades' own profit percentages. |
+| avg_losing_trade | float | Average loss per losing trade, as a POSITIVE amount — the same sign as `grossloss`, and it counts the open commission the same way. |
+| avg_losing_trade_percent | float | Mean of the losing trades' own profit percentages. Negative, unlike the currency average above. |
 | equity | float | Current equity = initial_capital + netprofit + openprofit. |
 | max_drawdown | float | Maximum equity drawdown from peak in currency units. |
-| max_drawdown_percent | float | Maximum drawdown as % of initial capital. |
-| max_runup | float | Maximum equity run-up from entry in currency units. |
-| max_runup_percent | float | Maximum run-up as % of initial capital. |
+| max_drawdown_percent | float | Maximum drawdown as % of the equity peak it fell from. Tracked on its own, so it can be set on a different bar than `max_drawdown`. |
+| max_runup | float | Maximum equity run-up from trough in currency units. |
+| max_runup_percent | float | Maximum run-up as % of the equity top it rose to. Tracked on its own, like `max_drawdown_percent`. |
+| max_contracts_held_all | float | Largest position size held, either direction. |
+| max_contracts_held_long | float | Largest long position size held. |
+| max_contracts_held_short | float | Largest short position size held, as a positive number. |
+| margin_liquidation_price | float | Price at which the margin call liquidates the position. `NaN` when no margin is set or the position is flat. |
 | initial_capital | float | Initial capital set in strategy properties. |
+| account_currency | string | Account currency of the strategy. |
 
 ## Constants
 
@@ -242,10 +258,6 @@ qty = strategy.default_entry_qty(close)
 | percent_of_equity | QtyType | Quantity type for strategy properties. Percentage of equity per entry. |
 
 ## Compatibility
-
-**Not yet implemented:**
-- `strategy.max_contracts_held_*` — Maximum contract tracking variables
-- Percentage variables: `strategy.grossprofit_percent`, `strategy.grossloss_percent`, `strategy.avg_trade_percent`, `strategy.avg_winning_trade_percent`, `strategy.avg_losing_trade_percent`
 
 **Order sizing:**
 - Only a positive, finite `qty` is placed. A quantity that cannot be sized — `na` or infinite — is

@@ -49,5 +49,11 @@ class ClosedTradesModule(int):
 
     def size(self, trade_num: int) -> PyneFloat: ...
 
+    #
+    # Module properties
+    #
+
+    first_index: int
+
 
 closedtrades: ClosedTradesModule

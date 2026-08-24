@@ -302,4 +302,4 @@ rupct: float = strategy.closedtrades.max_runup_percent(0)  # 3.18
 
 ## Compatibility
 
-- `strategy.closedtrades.first_index` — Not available in PyneCore. Access closed trades by iterating from trade number 0 onwards until a function returns NA.
+- `strategy.closedtrades.first_index` — Always `0`. TradingView trims its trade list only past a limit no strategy can reach: the 9000-order cap stops the run first.

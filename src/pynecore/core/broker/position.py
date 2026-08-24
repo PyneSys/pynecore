@@ -19,7 +19,8 @@ from pynecore.types.na import na_float
 
 if TYPE_CHECKING:
     from pynecore.lib.strategy import direction
-    from pynecore.lib.strategy import Order
+    # noinspection PyProtectedMember
+    from pynecore.lib.strategy import Order, _ExitOrderKey
     from pynecore.types.strategy import QtyType
     from pynecore.core.broker.models import OrderEvent
 
@@ -49,7 +50,10 @@ class BrokerPosition(PositionBase):
         'open_commission',
         'eventrades', 'wintrades', 'losstrades',
         'closed_trades_count',
-        'max_drawdown', 'max_runup', 'max_equity',
+        'max_drawdown', 'max_drawdown_percent', 'max_runup', 'max_runup_percent',
+        'max_equity', 'min_equity',
+        'max_contracts_held_long', 'max_contracts_held_short',
+        'sum_profit_ratio', 'sum_win_profit_ratio', 'sum_loss_profit_ratio',
         'open_trades', 'closed_trades', 'new_closed_trades',
         'entry_orders', 'exit_orders',
         # Per-evaluation set of close keys already seen this script run, so a
@@ -88,11 +92,20 @@ class BrokerPosition(PositionBase):
         self.losstrades: int = 0
         self.closed_trades_count: int = 0
         self.max_drawdown: float = 0.0
+        self.max_drawdown_percent: float = 0.0
         self.max_runup: float = 0.0
+        self.max_runup_percent: float = 0.0
+        self.max_contracts_held_long: float = 0.0
+        self.max_contracts_held_short: float = 0.0
+        self.sum_profit_ratio: float = 0.0
+        self.sum_win_profit_ratio: float = 0.0
+        self.sum_loss_profit_ratio: float = 0.0
         # Mark-to-market peak equity, used by ``_peak_equity`` for the
         # ``max_drawdown(percent_of_equity)`` threshold. Updated on every
         # :meth:`update_unrealized_pnl` and :meth:`record_fill` call.
         self.max_equity: float = -float("inf")
+        # Mark-to-market trough, the run-up's low-water mark.
+        self.min_equity: float = float("inf")
 
         self.open_trades: list[Trade] = []
         self.closed_trades: deque[Trade] = deque(maxlen=9000)
@@ -103,12 +116,12 @@ class BrokerPosition(PositionBase):
         # :class:`~pynecore.lib.strategy.SimPosition.exit_orders`. Single-field
         # keys collide on partial-TP fan-out (multiple exits for one entry)
         # and on ``from_entry=na`` fan-out (one exit_id, many per-entry rows).
-        self.exit_orders: dict[tuple[str | None, str | None], 'Order'] = {}
+        self.exit_orders: dict['_ExitOrderKey', 'Order'] = {}
 
         # Close keys (``(exit_id, order_id)``) already issued in the current
         # script evaluation; reset by :meth:`begin_evaluation`. See
         # :meth:`_add_order` for the same-eval netting it drives.
-        self._closes_this_eval: set[tuple[str | None, str | None]] = set()
+        self._closes_this_eval: set['_ExitOrderKey'] = set()
 
         # === Risk management state ===
         # Configuration (filled by the ``strategy.risk.*`` setters via
@@ -488,6 +501,10 @@ class BrokerPosition(PositionBase):
                 self.avg_price = (self.avg_price * old_abs + fill_price * fill_qty) / new_abs
             self.size = new_size
             self.sign = 1.0 if new_size > 0.0 else (-1.0 if new_size < 0.0 else 0.0)
+            if self.size > self.max_contracts_held_long:
+                self.max_contracts_held_long = self.size
+            elif -self.size > self.max_contracts_held_short:
+                self.max_contracts_held_short = -self.size
 
             trade = Trade(
                 size=signed_delta,
@@ -597,6 +614,10 @@ class BrokerPosition(PositionBase):
                 new_size = self.sign * remaining if self.sign != 0.0 else signed_delta
                 self.size = new_size
                 self.sign = 1.0 if new_size > 0.0 else (-1.0 if new_size < 0.0 else 0.0)
+                if self.size > self.max_contracts_held_long:
+                    self.max_contracts_held_long = self.size
+                elif -self.size > self.max_contracts_held_short:
+                    self.max_contracts_held_short = -self.size
                 self.avg_price = fill_price
                 flipped = Trade(
                     size=new_size,
@@ -684,12 +705,28 @@ class BrokerPosition(PositionBase):
         eq = float(self.equity)
         if eq > self.max_equity:
             self.max_equity = eq
-        # Drawdown is measured from the running peak — same metric the sim
-        # ``max_drawdown`` field tracks, just sourced from mark-to-market.
+        if eq < self.min_equity:
+            self.min_equity = eq
+        # Drawdown is measured from the running peak, run-up from the running
+        # trough — the same metrics the sim fields track, just sourced from
+        # mark-to-market: a live account has no bar path to walk. Each percent
+        # divides by its excursion's HIGHER endpoint, like the sim's.
         if self.max_equity > -float("inf"):
             dd = self.max_equity - eq
             if dd > self.max_drawdown:
                 self.max_drawdown = dd
+            if self.max_equity > 0.0:
+                dd_percent = dd / self.max_equity * 100.0
+                if dd_percent > self.max_drawdown_percent:
+                    self.max_drawdown_percent = dd_percent
+        if self.min_equity < float("inf"):
+            ru = eq - self.min_equity
+            if ru > self.max_runup:
+                self.max_runup = ru
+            if eq > 0.0:
+                ru_percent = ru / eq * 100.0
+                if ru_percent > self.max_runup_percent:
+                    self.max_runup_percent = ru_percent
 
     def _peak_equity(self) -> float:
         """Reference equity for ``max_drawdown(percent_of_equity)``.
@@ -816,9 +853,25 @@ class BrokerPosition(PositionBase):
         trade.exit_time = int(event.timestamp * 1000.0)
         trade.exit_price = fill_price
         trade.exit_comment = ''
+        entry_commission = trade.commission
         trade.commission += fee_share
         trade.profit = (fill_price - trade.entry_price) * trade.size - trade.commission
         trade.exit_equity = self.equity + trade.profit
+        # Total entry cost, position value plus the fee paid to open — the
+        # denominator TradingView divides by (see SimPosition's fill loop).
+        entry_cost = abs(trade.size) * trade.entry_price + entry_commission
+        profit_ratio = (trade.profit / entry_cost) if entry_cost else 0.0
+        trade.profit_percent = profit_ratio * 100.0
+        # The win/loss counters are booked by the three callers, but the percent
+        # sums behind ``strategy.avg_*_trade_percent`` are booked here: this is
+        # the single funnel every closing path goes through, so no caller can
+        # forget one. The predicate is the callers' own — classify on the
+        # after-fee profit.
+        self.sum_profit_ratio += profit_ratio
+        if trade.profit > 0.0:
+            self.sum_win_profit_ratio += profit_ratio
+        elif trade.profit < 0.0:
+            self.sum_loss_profit_ratio += profit_ratio
         if trade in self.open_trades:
             self.open_trades.remove(trade)
         self.closed_trades.append(trade)

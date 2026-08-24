@@ -345,3 +345,21 @@ def closedtrades() -> int:
         return 0
     position = lib._script.position
     return len(position.closed_trades)
+
+
+# noinspection PyProtectedMember
+@module_property
+def first_index() -> int:
+    """
+    The trade number of the oldest trade still listed in the List of Trades.
+
+    :return: The index of the oldest retained closed trade
+    """
+    # TradingView drops the oldest closed trades once their number passes the
+    # trade-list limit, and this is the surviving head's index. That limit is
+    # unreachable in practice -- a run long enough to hit it dies on the 9000
+    # order cap (RE10110/RE10138) first -- and the value stayed 0 on all 28837
+    # bars of a 2880-trade probe, including before the first trade closed. The
+    # accessors index ``closed_trades`` directly, so PyneCore's head is always
+    # trade 0 and the answer is the constant TradingView also reports.
+    return 0

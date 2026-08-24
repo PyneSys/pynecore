@@ -209,14 +209,17 @@ def calculate_strategy_statistics(
     stats.gross_loss = float(position.grossloss) if not isinstance(position.grossloss, NA) else 0.0
     stats.max_equity_drawdown = float(position.max_drawdown) if not isinstance(position.max_drawdown, NA) else 0.0
     stats.max_equity_runup = float(position.max_runup) if not isinstance(position.max_runup, NA) else 0.0
+    # Each equity excursion's percent is measured against its own higher endpoint —
+    # the peak the drop fell from, the top the rise reached — and tracked apart from
+    # the currency maximum, so it is read off the position, not divided out here.
+    stats.max_equity_drawdown_percent = float(position.max_drawdown_percent)
+    stats.max_equity_runup_percent = float(position.max_runup_percent)
 
     # Calculate percentages
     if initial_capital > 0:
         stats.net_profit_percent = (stats.net_profit / initial_capital) * 100
         stats.gross_profit_percent = (stats.gross_profit / initial_capital) * 100
         stats.gross_loss_percent = (stats.gross_loss / initial_capital) * 100
-        stats.max_equity_drawdown_percent = (stats.max_equity_drawdown / initial_capital) * 100
-        stats.max_equity_runup_percent = (stats.max_equity_runup / initial_capital) * 100
 
     # Buy & Hold calculation
     if first_price and last_price and first_price > 0:
@@ -249,7 +252,11 @@ def calculate_strategy_statistics(
 
         # Average calculations
         stats.avg_trade = stats.net_profit / len(closed_trades)
-        stats.avg_trade_percent = stats.net_profit_percent / len(closed_trades)
+        # The percent averages are the mean of the per-trade profit RATIOS, not the
+        # average profit taken against the initial capital. Each ratio's denominator
+        # is that trade's own entry cost including the entry commission, and the
+        # position keeps the running sums (see SimPosition's fill loop).
+        stats.avg_trade_percent = float(position.sum_profit_ratio) / len(closed_trades) * 100
 
         # Separate winning and losing trades
         winning_trades = [t for t in closed_trades if float(t.profit) > 0]
@@ -259,7 +266,8 @@ def calculate_strategy_statistics(
         if winning_trades:
             total_win_profit = sum(float(t.profit) for t in winning_trades)
             stats.avg_winning_trade = total_win_profit / len(winning_trades)
-            stats.avg_winning_trade_percent = stats.avg_winning_trade / initial_capital * 100
+            stats.avg_winning_trade_percent = \
+                float(position.sum_win_profit_ratio) / len(winning_trades) * 100
 
             # Largest winning trade
             max_win = max(winning_trades, key=lambda t: float(t.profit))
@@ -275,7 +283,8 @@ def calculate_strategy_statistics(
         if losing_trades:
             total_loss_profit = sum(float(t.profit) for t in losing_trades)
             stats.avg_losing_trade = total_loss_profit / len(losing_trades)
-            stats.avg_losing_trade_percent = stats.avg_losing_trade / initial_capital * 100
+            stats.avg_losing_trade_percent = \
+                float(position.sum_loss_profit_ratio) / len(losing_trades) * 100
 
             # Largest losing trade
             max_loss = min(losing_trades, key=lambda t: float(t.profit))

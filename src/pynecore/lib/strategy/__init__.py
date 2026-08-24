@@ -619,7 +619,21 @@ class PositionBase(ABC):
     losstrades: int
     closed_trades_count: int
     max_drawdown: float
+    max_drawdown_percent: float
     max_runup: float
+    max_runup_percent: float
+    # Running peaks of the POSITION size per direction — what
+    # ``strategy.max_contracts_held_*`` reports (see there).
+    max_contracts_held_long: float
+    max_contracts_held_short: float
+    # Running sums of the closed trades' own profit RATIOS (profit divided by
+    # total entry cost, without the percent scaling), in close order. The
+    # ``strategy.avg_*_trade_percent`` means scale by 100 only after dividing —
+    # that is where TradingView applies it, and summing pre-scaled percents
+    # lands an ULP away (measured, see ``avg_trade_percent``).
+    sum_profit_ratio: PyneFloat
+    sum_win_profit_ratio: PyneFloat
+    sum_loss_profit_ratio: PyneFloat
     open_trades: list['Trade']
     closed_trades: 'deque[Trade]'
     new_closed_trades: list['Trade']
@@ -840,8 +854,11 @@ class SimPosition(PositionBase):
         'open_trades', 'closed_trades', 'new_closed_trades',
         'closed_trades_count', 'wintrades', 'eventrades', 'losstrades',
         'size', 'sign', 'avg_price', 'cum_profit',
-        'entry_equity', 'max_equity', 'min_equity', 'max_realized_equity',
-        'drawdown_summ', 'runup_summ', 'max_drawdown', 'max_runup',
+        'min_equity', 'max_realized_equity',
+        'drawdown_summ', 'runup_summ', 'max_drawdown', 'max_drawdown_percent',
+        'max_runup', 'max_runup_percent',
+        'max_contracts_held_long', 'max_contracts_held_short',
+        'sum_profit_ratio', 'sum_win_profit_ratio', 'sum_loss_profit_ratio',
         'open_commission',
         'risk_allowed_direction', 'risk_max_cons_loss_days', 'risk_max_cons_loss_days_alert',
         'risk_max_drawdown_value', 'risk_max_drawdown_type', 'risk_max_drawdown_alert',
@@ -899,14 +916,19 @@ class SimPosition(PositionBase):
         self.sign: float = 0.0
         self.avg_price: PyneFloat = na_float
         self.cum_profit: PyneFloat = 0.0
-        self.entry_equity: PyneFloat = 0.0
-        self.max_equity: PyneFloat = -float("inf")
         self.min_equity: PyneFloat = float("inf")
         self.max_realized_equity: PyneFloat = -float("inf")
         self.drawdown_summ: float = 0.0
         self.runup_summ: float = 0.0
         self.max_drawdown: float = 0.0
+        self.max_drawdown_percent: float = 0.0
         self.max_runup: float = 0.0
+        self.max_runup_percent: float = 0.0
+        self.max_contracts_held_long: float = 0.0
+        self.max_contracts_held_short: float = 0.0
+        self.sum_profit_ratio: PyneFloat = 0.0
+        self.sum_win_profit_ratio: PyneFloat = 0.0
+        self.sum_loss_profit_ratio: PyneFloat = 0.0
         self.open_commission: float = 0.0
 
         # Risk management settings
@@ -1203,15 +1225,13 @@ class SimPosition(PositionBase):
                 continue
             qty = self._reduce_binding(candidate, qty)
 
-    def _fill_order(self, order: Order, price: PyneFloat, h: PyneFloat, l: PyneFloat,
+    def _fill_order(self, order: Order, price: PyneFloat,
                     counts_as_filled_order: bool = True):
         """
         Fill an order (actually)
 
         :param order: The order to fill
         :param price: The price to fill at
-        :param h: The high price
-        :param l: The low price
         :param counts_as_filled_order: Whether this fill increments the
                                        ``max_intraday_filled_orders`` counter.
                                        ``False`` for the open half of a
@@ -1304,17 +1324,6 @@ class SimPosition(PositionBase):
                         closed_trade.max_drawdown *= (1 - size_ratio)
                         closed_trade.max_runup *= (1 - size_ratio)
 
-                    # P/L from high/low to calculate drawdown and runup
-                    hprofit = (-size * (h - closed_trade.entry_price) * pv - closed_trade.commission)
-                    lprofit = (-size * (l - closed_trade.entry_price) * pv - closed_trade.commission)
-
-                    # Drawdown and runup
-                    drawdown = -min(hprofit, lprofit, 0.0)
-                    runup = max(hprofit, lprofit, 0.0)
-                    # Drawdown summ runup summ
-                    self.drawdown_summ += drawdown
-                    self.runup_summ += runup
-
                     closed_trade.size = -size
                     closed_trade.exit_id = order.exit_id if order.exit_id is not None else order.order_id
                     closed_trade.exit_bar_index = int(lib.bar_index)
@@ -1343,6 +1352,10 @@ class SimPosition(PositionBase):
                     # cash_per_order is a flat fee per order: defer realization
                     # until the order is removed so it can be split across all
                     # closed trades it actually filled (see delete block below).
+                    # The entry leg's own fee, before the exit leg is added on
+                    # top — the profit percent divides by it (see below).
+                    entry_commission = closed_trade.commission
+
                     if commission_type == _commission.cash_per_order:
                         closed_trade_size += abs(size)
                     else:
@@ -1372,13 +1385,25 @@ class SimPosition(PositionBase):
                         closed_trade.commission += commission
                         closed_trade.profit -= commission
 
-                    # Profit percent — both profit and entry_value are in USD
-                    entry_value = abs(closed_trade.size) * closed_trade.entry_price * pv
+                    # Profit percent — both profit and the entry cost are in USD.
+                    # TradingView divides by the trade's TOTAL ENTRY COST: the
+                    # position value PLUS the fee paid to open it, not the bare
+                    # position value. Measured on BINANCE:BTCUSDT 30m against
+                    # closedtrades.profit_percent in all three commission modes,
+                    # bit-exact in each: percent 0.05% (1 BTC entered at
+                    # 93761.90000000001 reports 0.03838998826686757, which is
+                    # 36.01317999999651 / (93761.90000000001 + 46.88095)),
+                    # cash_per_contract 7.5 (denominator +7.5) and
+                    # cash_per_order 25 (denominator +25, the whole flat entry
+                    # fee). Dividing by the bare value overstates every percent
+                    # by the fee ratio — 5e-4 relative at 0.05% commission.
+                    entry_cost = abs(closed_trade.size) * closed_trade.entry_price * pv + entry_commission
                     try:
                         # Use closed_trade.profit which includes commission, not pnl which doesn't
-                        closed_trade.profit_percent = (closed_trade.profit / entry_value) * 100.0
+                        profit_ratio = closed_trade.profit / entry_cost
                     except ZeroDivisionError:
-                        closed_trade.profit_percent = 0.0
+                        profit_ratio = 0.0
+                    closed_trade.profit_percent = profit_ratio * 100.0
 
                     # Modify sizes
                     self.size = _size_add(self.size, size)
@@ -1411,14 +1436,17 @@ class SimPosition(PositionBase):
                     # only apportioned in the delete block below, so its trades
                     # are classified there once their final profit is known.
                     if commission_type != _commission.cash_per_order:
+                        self.sum_profit_ratio += profit_ratio
                         if closed_trade.profit == 0.0:
                             self.eventrades += 1
                         elif closed_trade.profit > 0.0:
                             self.wintrades += 1
                             self.grossprofit += closed_trade.profit
+                            self.sum_win_profit_ratio += profit_ratio
                         else:
                             self.losstrades += 1
                             self.grossloss -= closed_trade.profit
+                            self.sum_loss_profit_ratio += profit_ratio
 
                     # Average entry price
                     self._recalc_avg_price()
@@ -1435,12 +1463,6 @@ class SimPosition(PositionBase):
                     # Remove from open trades if it is fully filled
                     if trade.size == 0.0:
                         continue
-
-                    if pnl > 0.0:
-                        # Modify summs and entry equity with commission
-                        self.runup_summ -= closed_trade.commission
-                        self.drawdown_summ += closed_trade.commission / 2
-                        self.entry_equity += closed_trade.commission / 2
 
                 new_open_trades.append(trade)
 
@@ -1477,6 +1499,7 @@ class SimPosition(PositionBase):
                                                            commission_value)
                     for trade in new_closed_trades:
                         commission = (leg_commission * abs(trade.size)) / closed_trade_size
+                        entry_commission = trade.commission
                         trade.commission += commission
                         # The percent/cash_per_contract path subtracts the trade's
                         # total commission (entry leg carried on the open trade +
@@ -1485,22 +1508,29 @@ class SimPosition(PositionBase):
                         # same, otherwise the trade list reports raw P&L while
                         # netprofit already includes the fees.
                         trade.profit -= trade.commission
-                        entry_value = abs(trade.size) * trade.entry_price * pv
+                        # Same total-entry-cost denominator as the fill-loop path
+                        # above; for a flat per-order fee the entry leg carries
+                        # the whole 25 of a 25-per-order setting.
+                        entry_cost = abs(trade.size) * trade.entry_price * pv + entry_commission
                         try:
-                            trade.profit_percent = (trade.profit / entry_value) * 100.0
+                            profit_ratio = trade.profit / entry_cost
                         except ZeroDivisionError:
-                            trade.profit_percent = 0.0
+                            profit_ratio = 0.0
+                        trade.profit_percent = profit_ratio * 100.0
                         # Deferred Gross P/L and counters (skipped in the fill
                         # loop above): classify on the after-fee profit, exactly
                         # like the percent/cash_per_contract path does.
+                        self.sum_profit_ratio += profit_ratio
                         if trade.profit == 0.0:
                             self.eventrades += 1
                         elif trade.profit > 0.0:
                             self.wintrades += 1
                             self.grossprofit += trade.profit
+                            self.sum_win_profit_ratio += profit_ratio
                         else:
                             self.losstrades += 1
                             self.grossloss -= trade.profit
+                            self.sum_loss_profit_ratio += profit_ratio
 
             self.new_closed_trades.extend(new_closed_trades)
 
@@ -1524,12 +1554,17 @@ class SimPosition(PositionBase):
                 self._bind_entry(entry_id, overshoot_trade.size, price)
                 self.size = _size_add(self.size, overshoot_trade.size)
                 self.sign = 1.0 if self.size > 0.0 else -1.0 if self.size < 0.0 else 0.0
+                if self.size > self.max_contracts_held_long:
+                    self.max_contracts_held_long = self.size
+                elif -self.size > self.max_contracts_held_short:
+                    self.max_contracts_held_short = -self.size
                 self._recalc_avg_price()
                 self.openprofit = self.size * (_tick_snap(self.c) - self.avg_price) * pv
-                if not new_closed_trades:
-                    self.entry_equity = self.equity
-                    self.max_equity = max(self.max_equity, self.equity)
-                    self.min_equity = min(self.min_equity, self.equity)
+                # The flip's opening leg re-anchors the run-up at the realized
+                # equity: the position was flat the instant before it filled.
+                entry_mark = float(lib._script.initial_capital) + self.netprofit
+                if entry_mark < self.min_equity:
+                    self.min_equity = entry_mark
 
         # New trade
         elif order.order_type != _order_type_close or order.gap_committed:
@@ -1555,13 +1590,19 @@ class SimPosition(PositionBase):
             # trade closes, and the derived netprofit subtracts it from there.
             self.open_commission += commission
 
-            entry_equity = self.equity
-            if not self.open_trades:
-                # Set max and min equity
-                self.max_equity = max(self.max_equity, entry_equity)
-                self.min_equity = min(self.min_equity, entry_equity)
-                # Entry equity
-                self.entry_equity = entry_equity
+            # Low-water mark behind ``strategy.max_runup``: the equity AT the
+            # fill -- the position already held, marked at the fill price, with
+            # this entry's fee already taken. Measured on BINANCE:BTCUSDT 30m: a
+            # second long leg added at 94802.99 on top of one leg from 94711.84
+            # anchors the run-up at 994705.330255, the 91.15 the first leg was
+            # ahead by, and not at the realized equity below it.
+            entry_mark = float(lib._script.initial_capital) + self.netprofit
+            if self.size:
+                open_mark = self.size * (price - self.avg_price) * pv
+                if open_mark > 0.0:
+                    entry_mark += open_mark
+            if entry_mark < self.min_equity:
+                self.min_equity = entry_mark
 
             # A close_all overshoot and a gap-committed exit leg that outlived
             # the position it was bound to both open under their own exit id.
@@ -1581,6 +1622,15 @@ class SimPosition(PositionBase):
             self._bind_entry(entry_id, order.size, price, order.gap_committed)
             self.size = _size_add(self.size, trade.size)
             self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
+            # ``max_contracts_held_*`` peaks on the POSITION, not on a single
+            # trade: measured on BINANCE:BTCUSDT 30m with pyramiding 3, two long
+            # legs of 1 and 2 report 3 (not 2) and two short legs of 4 and 3
+            # report 7 (not 4), on all 28837 bars. Only a fill can raise it, so
+            # the reduce path never needs to look.
+            if self.size > self.max_contracts_held_long:
+                self.max_contracts_held_long = self.size
+            elif -self.size > self.max_contracts_held_short:
+                self.max_contracts_held_short = -self.size
 
             # Average entry price (see _recalc_avg_price). Measured on
             # BINANCE:BTCUSDT 30m (pyramiding 3, 22720 in-position bars): an
@@ -1630,14 +1680,12 @@ class SimPosition(PositionBase):
                 # Use the saved original filled_size from the beginning of this method
                 self._reduce_oca_group(order.oca_name, filled_size)
 
-    def fill_order(self, order: Order, price: float, h: float, l: float) -> bool:
+    def fill_order(self, order: Order, price: float) -> bool:
         """
         Fill an order
 
         :param order: The order to fill
         :param price: The price to fill at
-        :param h: The high price
-        :param l: The low price
         :return: True if the side of the position has changed
         """
         close_only = False
@@ -1702,7 +1750,7 @@ class SimPosition(PositionBase):
                     or self._partial_close_bar == int(lib.bar_index)):
                 # Limit the exit order size to just close the position
                 order.size = -self.size
-                self._fill_order(order, price, h, l)
+                self._fill_order(order, price)
                 return False
 
             # Check if new direction is allowed by risk management
@@ -1729,7 +1777,7 @@ class SimPosition(PositionBase):
             # The exit_id will be the order_id of the original order
             order1.exit_id = order.order_id
             # Fill the closing order first
-            self._fill_order(order1, price, h, l)
+            self._fill_order(order1, price)
 
             if not direction_allowed:
                 # Direction not allowed - convert entry to exit only
@@ -1745,7 +1793,7 @@ class SimPosition(PositionBase):
             # Fill the entry order. The close half above already counted this
             # reversal toward the intraday filled-orders cap, so the open half
             # must not count it a second time.
-            self._fill_order(order, price, h, l, counts_as_filled_order=False)
+            self._fill_order(order, price, counts_as_filled_order=False)
             order.comm_booking = None
             # A reversal that hits the cap is flattened too — same as the
             # non-flip path. Without this the cap-close never fires for a
@@ -1756,7 +1804,7 @@ class SimPosition(PositionBase):
 
         # If position direction is not about to change, we can fill the order directly
         else:
-            self._fill_order(order, price, h, l)
+            self._fill_order(order, price)
 
             # After filling, close the position if this fill hit the intraday cap
             # (TradingView flattens for the rest of the day; the counter blocks
@@ -1802,7 +1850,7 @@ class SimPosition(PositionBase):
         drawdown = peak - float(self.equity)
         return drawdown >= threshold > 0.0
 
-    def _trigger_risk_halt(self, reason: str, price: float, h: float, l: float) -> None:
+    def _trigger_risk_halt(self, reason: str, price: float) -> None:
         """Cancel pending orders, close any open position at ``price``, halt trading.
 
         ``reason`` is embedded in the synthetic close order's comment so the
@@ -1821,7 +1869,7 @@ class SimPosition(PositionBase):
                 order_type=_order_type_close,
                 comment=f"Close Position ({reason})",
             )
-            self._fill_order(close_order, price, h, l)
+            self._fill_order(close_order, price)
         self.risk_halt_trading = True
 
     def _close_position_at_intraday_cap(self, order: Order, price: float) -> None:
@@ -1864,7 +1912,7 @@ class SimPosition(PositionBase):
                 order_type=_order_type_close,
                 comment="Close Position (Max number of filled orders in one day)",
             )
-            self._fill_order(close_order, cap_close_price, self.h, self.l, counts_as_filled_order=False)
+            self._fill_order(close_order, cap_close_price, counts_as_filled_order=False)
 
     def _enforce_post_bar_risk(self) -> None:
         """Run the post-bar ``strategy.risk.*`` checks that depend on bar-end P&L.
@@ -1887,13 +1935,13 @@ class SimPosition(PositionBase):
         # keeps riding, and force-closes the instant a reducing order fills while
         # past the threshold — see ``_is_max_drawdown_breached``.
         if self.new_closed_trades and self._is_max_drawdown_breached():
-            self._trigger_risk_halt("Max drawdown reached", price, h, l)
+            self._trigger_risk_halt("Max drawdown reached", price)
             return
         if self._is_max_intraday_loss_breached():
-            self._trigger_risk_halt("Max intraday loss reached", price, h, l)
+            self._trigger_risk_halt("Max intraday loss reached", price)
             return
         if self._is_max_cons_loss_days_breached():
-            self._trigger_risk_halt("Max consecutive loss days reached", price, h, l)
+            self._trigger_risk_halt("Max consecutive loss days reached", price)
 
     def _check_already_filled(self, order: Order) -> Literal['stop', 'limit'] | None:
         """
@@ -2114,7 +2162,7 @@ class SimPosition(PositionBase):
             if slippage > 0:
                 p += syminfo.mintick * slippage
             order.filled_by_type = 'loss'
-            self.fill_order(order, p, p, self.l)
+            self.fill_order(order, p)
             return True
         return False
 
@@ -2127,7 +2175,7 @@ class SimPosition(PositionBase):
             if order.size < 0 and order.limit <= self.h:
                 p = max(order.limit, self.o)
                 order.filled_by_type = 'profit'
-                self.fill_order(order, p, p, self.l)
+                self.fill_order(order, p)
                 return True
         return False
 
@@ -2144,7 +2192,7 @@ class SimPosition(PositionBase):
         # Short limit (sell back) triggers when price rises to the limit level
         if order.limit is not None and order.size < 0 and order.limit <= self.c:
             order.filled_by_type = 'profit'
-            self.fill_order(order, order.limit, order.limit, self.l)
+            self.fill_order(order, order.limit)
             return True
         # Buy stop triggers when price rises to the stop level
         if order.stop is not None and order.size > 0 and order.stop <= self.c:
@@ -2153,7 +2201,7 @@ class SimPosition(PositionBase):
             if slippage > 0:
                 p += syminfo.mintick * slippage
             order.filled_by_type = 'loss'
-            self.fill_order(order, p, p, self.l)
+            self.fill_order(order, p)
             return True
         return False
 
@@ -2241,7 +2289,7 @@ class SimPosition(PositionBase):
                     if slippage > 0:
                         p -= syminfo.mintick * slippage
                     order.filled_by_type = 'trailing'
-                    self.fill_order(order, p, self.h, p)
+                    self.fill_order(order, p)
                     return _trail_filled
                 # The first tick advances the water mark; with trail_offset == 0
                 # the stop lands on that tick itself and fills there.
@@ -2253,7 +2301,7 @@ class SimPosition(PositionBase):
                         if slippage > 0:
                             p -= syminfo.mintick * slippage
                         order.filled_by_type = 'trailing'
-                        self.fill_order(order, p, self.h, p)
+                        self.fill_order(order, p)
                         return _trail_filled
             elif not close_leg and not armed and start_tick >= order.trail_price:
                 # The walk starts beyond the activation level: the trail arms on
@@ -2265,7 +2313,7 @@ class SimPosition(PositionBase):
                     if slippage > 0:
                         p -= syminfo.mintick * slippage
                     order.filled_by_type = 'trailing'
-                    self.fill_order(order, p, self.h, p)
+                    self.fill_order(order, p)
                     return _trail_filled
 
             # Walk the assumed intrabar path: rising segments arm the trail and
@@ -2314,7 +2362,7 @@ class SimPosition(PositionBase):
                             if slippage > 0:
                                 p -= syminfo.mintick * slippage
                             order.filled_by_type = 'trailing'
-                            self.fill_order(order, p, self.h, p)
+                            self.fill_order(order, p)
                             return _trail_filled
                     if armed:
                         new_stop = round_to_mintick(nxt - offset_price)
@@ -2343,7 +2391,7 @@ class SimPosition(PositionBase):
                         if slippage > 0:
                             p -= syminfo.mintick * slippage
                         order.filled_by_type = 'trailing'
-                        self.fill_order(order, p, self.h, p)
+                        self.fill_order(order, p)
                         return _trail_filled
                 prev = nxt
 
@@ -2367,7 +2415,7 @@ class SimPosition(PositionBase):
                     if slippage > 0:
                         p += syminfo.mintick * slippage
                     order.filled_by_type = 'trailing'
-                    self.fill_order(order, p, p, self.l)
+                    self.fill_order(order, p)
                     return _trail_filled
                 # The first tick advances the water mark; with trail_offset == 0
                 # the stop lands on that tick itself and fills there.
@@ -2379,7 +2427,7 @@ class SimPosition(PositionBase):
                         if slippage > 0:
                             p += syminfo.mintick * slippage
                         order.filled_by_type = 'trailing'
-                        self.fill_order(order, p, p, self.l)
+                        self.fill_order(order, p)
                         return _trail_filled
             elif not close_leg and not armed and start_tick <= order.trail_price:
                 # The walk starts beyond the activation level: the trail arms on
@@ -2391,7 +2439,7 @@ class SimPosition(PositionBase):
                     if slippage > 0:
                         p += syminfo.mintick * slippage
                     order.filled_by_type = 'trailing'
-                    self.fill_order(order, p, p, self.l)
+                    self.fill_order(order, p)
                     return _trail_filled
 
             # Walk the assumed intrabar path: falling segments arm the trail and
@@ -2434,7 +2482,7 @@ class SimPosition(PositionBase):
                             if slippage > 0:
                                 p += syminfo.mintick * slippage
                             order.filled_by_type = 'trailing'
-                            self.fill_order(order, p, p, self.l)
+                            self.fill_order(order, p)
                             return _trail_filled
                     if armed:
                         new_stop = round_to_mintick(nxt + offset_price)
@@ -2463,7 +2511,7 @@ class SimPosition(PositionBase):
                         if slippage > 0:
                             p += syminfo.mintick * slippage
                         order.filled_by_type = 'trailing'
-                        self.fill_order(order, p, p, self.l)
+                        self.fill_order(order, p)
                         return _trail_filled
                 prev = nxt
 
@@ -2728,7 +2776,7 @@ class SimPosition(PositionBase):
         margin_call_order.is_market_order = False
         margin_call_order.bar_index = int(lib.bar_index)
 
-        self._fill_order(margin_call_order, fill_price, fill_price, fill_price)
+        self._fill_order(margin_call_order, fill_price)
         return False
 
     def process_deferred_margin_call(self):
@@ -2767,7 +2815,6 @@ class SimPosition(PositionBase):
                                                           closed_trade.cum_profit / initial_capital) * 100.0
             except ZeroDivisionError:
                 closed_trade.cum_profit_percent = 0.0
-            self.entry_equity += closed_trade.profit
 
     def _resolve_deferred_qty(self, order: Order, fill_price: float) -> None:
         """Finalize a default-sized entry's quantity at its actual fill price.
@@ -2959,7 +3006,7 @@ class SimPosition(PositionBase):
             if slippage > 0:
                 p -= syminfo.mintick * slippage
             order.filled_by_type = 'loss'
-            self.fill_order(order, p, self.h, p)
+            self.fill_order(order, p)
             return True
         return False
 
@@ -2972,7 +3019,7 @@ class SimPosition(PositionBase):
             if order.size > 0 and order.limit >= self.l:
                 p = min(self.o, order.limit)
                 order.filled_by_type = 'profit'
-                self.fill_order(order, p, self.h, p)
+                self.fill_order(order, p)
                 return True
         return False
 
@@ -2989,7 +3036,7 @@ class SimPosition(PositionBase):
         # Long limit (buy back) triggers when price falls to the limit level
         if order.limit is not None and order.size > 0 and order.limit >= self.c:
             order.filled_by_type = 'profit'
-            self.fill_order(order, order.limit, self.h, order.limit)
+            self.fill_order(order, order.limit)
             return True
         # Sell stop triggers when price falls to the stop level
         if order.stop is not None and order.size < 0 and order.stop >= self.c:
@@ -2998,7 +3045,7 @@ class SimPosition(PositionBase):
             if slippage > 0:
                 p -= syminfo.mintick * slippage
             order.filled_by_type = 'loss'
-            self.fill_order(order, p, self.h, p)
+            self.fill_order(order, p)
             return True
         return False
 
@@ -3156,7 +3203,7 @@ class SimPosition(PositionBase):
         # entries cannot fill at this bar's open.
         if self._is_max_cons_loss_days_breached() and not self.risk_halt_trading:
             self._trigger_risk_halt(
-                "Max consecutive loss days reached", self.o, self.h, self.l,
+                "Max consecutive loss days reached", self.o,
             )
             return True
         return False
@@ -3373,10 +3420,10 @@ class SimPosition(PositionBase):
 
             # open → high → low → close
             if ohlc:
-                self.fill_order(order, fill_price, self.o, self.l)
+                self.fill_order(order, fill_price)
             # open → low → high → close
             else:
-                self.fill_order(order, fill_price, self.l, self.o)
+                self.fill_order(order, fill_price)
 
             # A same-bar close that reduced the bar-start position arms the reversal-leg
             # bypass for a subsequent opposite over-margin entry on this bar.
@@ -3446,16 +3493,16 @@ class SimPosition(PositionBase):
                         fill_price += syminfo.mintick * script.slippage * new_sign
                     adapted.filled_by_type = 'loss'
                     if ohlc:
-                        self.fill_order(adapted, fill_price, fill_price, self.l)
+                        self.fill_order(adapted, fill_price)
                     else:
-                        self.fill_order(adapted, fill_price, self.l, fill_price)
+                        self.fill_order(adapted, fill_price)
                     filled = True
                 elif limit_gap:
                     adapted.filled_by_type = 'profit'
                     if ohlc:
-                        self.fill_order(adapted, self.o, self.o, self.l)
+                        self.fill_order(adapted, self.o)
                     else:
-                        self.fill_order(adapted, self.o, self.l, self.o)
+                        self.fill_order(adapted, self.o)
                     filled = True
                 else:
                     self._add_order(adapted)
@@ -3481,9 +3528,9 @@ class SimPosition(PositionBase):
                 if limit_gap:
                     order.filled_by_type = 'profit'
                     if ohlc:
-                        self.fill_order(order, self.o, self.o, self.l)
+                        self.fill_order(order, self.o)
                     else:
-                        self.fill_order(order, self.o, self.l, self.o)
+                        self.fill_order(order, self.o)
                     continue
             # Check stop gap-through
             if order.stop is not None:
@@ -3495,9 +3542,9 @@ class SimPosition(PositionBase):
                         fill_price += syminfo.mintick * script.slippage * order.sign
                     order.filled_by_type = 'loss'
                     if ohlc:
-                        self.fill_order(order, fill_price, fill_price, self.l)
+                        self.fill_order(order, fill_price)
                     else:
-                        self.fill_order(order, fill_price, self.l, fill_price)
+                        self.fill_order(order, fill_price)
                     continue
 
         # Margin call check at OPEN — sized exactly like the intrabar (H/L)
@@ -3677,46 +3724,88 @@ class SimPosition(PositionBase):
                 # Profit of trade
                 trade.profit = trade.size * (self.c - trade.entry_price) * pv - 2 * trade.commission
 
-                # P/L from high/low to calculate drawdown and runup
-                hprofit = trade.size * (self.h - self.avg_price) * pv - trade.commission
-                lprofit = trade.size * (self.l - self.avg_price) * pv - trade.commission
-                # Drawdown
+                # P/L from high/low to calculate drawdown and runup. The
+                # POSITION-level summation below measures every open leg against
+                # the position average — that is what reproduces
+                # ``strategy.max_drawdown``.
+                hprofit = trade.size * (self.h - self.avg_price) * pv
+                lprofit = trade.size * (self.l - self.avg_price) * pv
                 drawdown = -min(hprofit, lprofit, 0.0)
-                trade.max_drawdown = max(drawdown, trade.max_drawdown)
-                # Runup
                 runup = max(hprofit, lprofit, 0.0)
-                trade.max_runup = max(runup, trade.max_runup)
 
-                # Calculate percentage values for drawdown and runup — both in USD
-                trade_value = abs(trade.size) * trade.entry_price * pv
-                if trade_value > 0:
-                    # Calculate drawdown percentage
-                    trade.max_drawdown_percent = max(
-                        (drawdown / trade_value) * 100.0 if drawdown > 0 else 0.0,
-                        trade.max_drawdown_percent
-                    )
+                # The PER-TRADE excursion is a different quantity: measured from
+                # the trade's OWN entry price, with the entry fee counted into
+                # it. Measured on BINANCE:BTCUSDT 30m (pyramiding 3, 0.05%
+                # commission): trade 0 (long 1 at 93761.90000000001, worst low
+                # 93500.0, best high 94509.42) reports max_drawdown 308.78095 =
+                # (93761.9 - 93500.0) + 46.88095 and max_runup 700.63905 =
+                # (94509.42 - 93761.9) - 46.88095; trade 1 (long 2 at
+                # 94098.90000000001) reports 1291.8989 = 2*(94098.9 - 93500.0) +
+                # 94.0989 and a max_runup of 0 (it never traded above its own
+                # entry). Against the position average both go wrong the moment
+                # a second leg shifts it.
+                t_hprofit = trade.size * (self.h - trade.entry_price) * pv - trade.commission
+                t_lprofit = trade.size * (self.l - trade.entry_price) * pv - trade.commission
+                t_drawdown = -min(t_hprofit, t_lprofit, 0.0)
+                if t_drawdown > trade.max_drawdown:
+                    trade.max_drawdown = t_drawdown
+                t_runup = max(t_hprofit, t_lprofit, 0.0)
+                if t_runup > trade.max_runup:
+                    trade.max_runup = t_runup
 
-                    # Calculate runup percentage
-                    trade.max_runup_percent = max(
-                        (runup / trade_value) * 100.0 if runup > 0 else 0.0,
-                        trade.max_runup_percent
-                    )
+                # The percentages divide by the trade's TOTAL ENTRY COST --
+                # position value plus the fee paid to open it -- exactly like
+                # ``profit_percent`` (see the fill loop). ``trade.commission``
+                # still holds the entry leg alone while the trade is open.
+                entry_cost = abs(trade.size) * trade.entry_price * pv + trade.commission
+                if entry_cost > 0:
+                    trade.max_drawdown_percent = trade.max_drawdown / entry_cost * 100.0
+                    trade.max_runup_percent = trade.max_runup / entry_cost * 100.0
 
                 # Drawdown summ runup summ
                 self.drawdown_summ += drawdown
                 self.runup_summ += runup
 
-        # Calculate max drawdown and runup
-        if self.drawdown_summ or self.runup_summ:
-            self.max_drawdown = max(self.max_drawdown, self.max_equity - self.entry_equity + self.drawdown_summ)
-            self.max_runup = max(self.max_runup, self.entry_equity - self.min_equity + self.runup_summ)
-
-        # Realized-equity high-water mark for the ``max_drawdown`` risk rule.
-        # netprofit holds closed P&L only, so this is the closed-equity peak TV
-        # measures the drawdown threshold against — open paper profit never lifts it.
-        realized_equity = float(lib._script.initial_capital) + self.netprofit
+        # Max drawdown and runup. Both excursions run between a REALIZED equity
+        # endpoint and a mark-to-market one: the drop is measured from the
+        # realized high-water mark down to the worst mark of the path, the rise
+        # from the run-up anchor (see the entry-fill branch) up to the best
+        # mark. Open paper profit never lifts the high-water mark -- measured on
+        # BINANCE:BTCUSDT 30m (pyramiding 3, 0.05% commission), a bar whose
+        # intrabar mark peaked at 1000700.63905 still reports the next drawdown
+        # against 1000000.0. The summs carry the GROSS mark, commission-free:
+        # every fee is already inside netprofit through open_commission, so
+        # charging it per leg would book it twice.
+        initial = float(lib._script.initial_capital)
+        realized_equity = initial + self.netprofit
+        # The high-water mark takes this bar's own realized equity first: the
+        # closes that moved it happened DURING the bar, so the rest of the path
+        # is measured against the level they left behind.
         if realized_equity > self.max_realized_equity:
             self.max_realized_equity = realized_equity
+
+        peak = self._max_drawdown_reference()
+        equity_drawdown = peak - realized_equity + self.drawdown_summ
+        if equity_drawdown > self.max_drawdown:
+            self.max_drawdown = equity_drawdown
+        trough = float(self.min_equity)
+        equity_runup = realized_equity + self.runup_summ - trough
+        if equity_runup > self.max_runup:
+            self.max_runup = equity_runup
+        # The percentages are NOT the currency maxima over the initial capital:
+        # each excursion is expressed against its HIGHER endpoint -- the peak it
+        # fell from, the top it rose to -- so a percent maximum can be set on a
+        # different bar than the currency one (measured: a 634150.6465686325
+        # drawdown reports 60.7912228982302%, not 63.415%).
+        if peak > 0.0:
+            drawdown_percent = equity_drawdown / peak * 100.0
+            if drawdown_percent > self.max_drawdown_percent:
+                self.max_drawdown_percent = drawdown_percent
+        top = trough + equity_runup
+        if top > 0.0:
+            runup_percent = equity_runup / top * 100.0
+            if runup_percent > self.max_runup_percent:
+                self.max_runup_percent = runup_percent
 
     def _finalize_new_closed_trades(self) -> None:
         """Apply cumulative stats to every trade closed on this bar.
@@ -3744,9 +3833,6 @@ class SimPosition(PositionBase):
             except ZeroDivisionError:
                 closed_trade.cum_profit_percent = 0.0
 
-            # Modify entry equity, for max drawdown and runup
-            self.entry_equity += closed_trade.profit
-
     def process_orders_at_close(self):
         """
         Optional post-script pass that fills current-bar-submitted orders at the bar's
@@ -3772,12 +3858,11 @@ class SimPosition(PositionBase):
         triggering order so `_fill_order` can attach the right exit comment.
 
         Bookkeeping note: `_finalize_bar_pnl()` already ran in `process_orders()` for the
-        same bar. Re-running it here would double-count `cum_profit` / `entry_equity` for
-        already-settled `new_closed_trades` and dupe the `drawdown_summ` / `runup_summ`
-        contribution of open trades. Instead, we only settle cumulative stats for trades
-        that close DURING this pass (`_settle_close_pass_trades`). For positions opened
-        right at the close, the bar has no remaining H/L range — their per-trade
-        `profit` / `max_drawdown_percent` are intentionally left for the next bar's
+        same bar. Re-running it here would double-count `cum_profit` for already-settled
+        `new_closed_trades`. Instead, we only settle cumulative stats for trades that
+        close DURING this pass (`_settle_close_pass_trades`). For positions opened right
+        at the close, the bar has no remaining H/L range — their per-trade `profit` /
+        `max_drawdown_percent` are intentionally left for the next bar's
         `_finalize_bar_pnl()` to compute, when there will actually be a range to attribute.
         """
         script = lib._script
@@ -3835,19 +3920,7 @@ class SimPosition(PositionBase):
         for order in list(self.exit_orders.values()):
             _add_trigger(order)
 
-        # Bar is closed; no further H/L range can occur after the fill. Use close for both
-        # so any close-pass exit attributes 0 extra drawdown/runup to itself this bar.
-        h_after = close
-        l_after = close
-
         closed_before = len(self.new_closed_trades)
-        # Snapshot drawdown / runup accumulators: `_finalize_bar_pnl()` in
-        # `process_orders()` already booked the open-trade contribution for the full
-        # bar H/L. `_fill_order` would add the close-pass exit PnL to the same summs,
-        # double-counting the bar for any position that was already open at bar start.
-        # We restore the snapshot after the fill loop, before the close-pass settle.
-        drawdown_summ_before = self.drawdown_summ
-        runup_summ_before = self.runup_summ
 
         def _apply_fill(order: Order, trigger: str) -> None:
             """Run the per-candidate fill, mirroring `_process_at_bar_open`."""
@@ -3882,7 +3955,7 @@ class SimPosition(PositionBase):
                     self._remove_order(order)
                     return
 
-            self.fill_order(order, fill_price, h_after, l_after)
+            self.fill_order(order, fill_price)
 
         # Phase 1: fill the initial candidates (market entries, previously-open
         # tick exits, current-bar limit/stop orders already executable at close).
@@ -3920,14 +3993,6 @@ class SimPosition(PositionBase):
                 seen.add(oid)
                 _apply_fill(order, trigger2)
 
-        # Discard the close-pass `_fill_order` contributions to drawdown_summ / runup_summ:
-        # the same bar's H/L range is already booked for these trades by the earlier
-        # `_finalize_bar_pnl()` call. The drop-on-the-floor edge case is a brand-new
-        # trade that opens AND closes within the same close pass — extremely unlikely
-        # and its H/L would be 0 anyway since the bar has no remaining range.
-        self.drawdown_summ = drawdown_summ_before
-        self.runup_summ = runup_summ_before
-
         # Incrementally settle only the trades that closed during the close pass;
         # everything settled by `process_orders()` earlier in this bar stays untouched.
         if len(self.new_closed_trades) > closed_before:
@@ -3937,16 +4002,13 @@ class SimPosition(PositionBase):
         """
         Apply cumulative bookkeeping for trades that closed during `process_orders_at_close`.
 
-        Mirrors the per-closed-trade cum_profit / entry_equity update tail of
-        `_finalize_bar_pnl()`, but only for new_closed_trades appended after the close
-        pass started — the earlier entries were already settled when `process_orders()`
-        ran for this same bar. Position-level max_drawdown / max_runup is intentionally
-        NOT re-rolled here: the bar's H/L drawdown_summ / runup_summ contribution was
-        already booked by `_finalize_bar_pnl()` against the open trades (which include
-        the trades that close here, since they were opened on this same bar), and the
-        close-pass `_fill_order` additions to those summs were discarded above. Re-
-        applying the snapshot would inflate `max_drawdown` whenever `entry_equity` had
-        already advanced (e.g. a losing regular-pass close shrank `entry_equity`).
+        Mirrors the per-closed-trade cum_profit update tail of `_finalize_bar_pnl()`,
+        but only for new_closed_trades appended after the close pass started — the
+        earlier entries were already settled when `process_orders()` ran for this same
+        bar. Position-level max_drawdown / max_runup is intentionally NOT re-rolled
+        here: the bar's H/L drawdown_summ / runup_summ contribution was already booked
+        by `_finalize_bar_pnl()` against the open trades, which include the trades that
+        close here since they were opened on this same bar.
         """
         initial_capital = lib._script.initial_capital
         for closed_trade in self.new_closed_trades[closed_before:]:
@@ -3958,9 +4020,6 @@ class SimPosition(PositionBase):
                 closed_trade.cum_profit_percent = (closed_trade.cum_profit / initial_capital) * 100.0
             except ZeroDivisionError:
                 closed_trade.cum_profit_percent = 0.0
-            # Entry equity must roll AFTER the max_drawdown/runup snapshot above —
-            # same ordering as `_finalize_bar_pnl()`.
-            self.entry_equity += closed_trade.profit
 
     def settle_immediate_closes(self):
         """
@@ -4000,7 +4059,7 @@ class SimPosition(PositionBase):
                 # (worse = higher).
                 price += -syminfo.mintick * slippage if self.sign > 0 \
                     else syminfo.mintick * slippage
-            self.fill_order(order, price, self.h, self.l)
+            self.fill_order(order, price)
             for closed_trade in self.new_closed_trades[closed_before:]:
                 closed_trade.exit_price = self.c
             self._settle_close_pass_trades(closed_before)
@@ -5988,12 +6047,29 @@ def account_currency() -> PyneStr:
 # noinspection PyProtectedMember
 @module_property
 def avg_losing_trade() -> PyneFloat:
+    # Divides the PUBLISHED gross loss -- open commission included, like the
+    # ``grossloss`` getter -- and reports it POSITIVE, even though
+    # ``avg_losing_trade_percent`` is negative. Measured on BINANCE:BTCUSDT 30m:
+    # with one losing trade of 602.310640000007 booked and a short leg open at
+    # 186.8205 commission, TradingView reports 789.13114; the raw field alone
+    # answers 602.31064 and drifts on 14410 of 28840 bars.
     if lib._script is None:
         return 0.0
     position = lib._script.position
     if position.losstrades == 0:
         return na_float
-    return position.grossloss / position.losstrades
+    return (position.grossloss + position.open_commission) / position.losstrades
+
+
+# noinspection PyProtectedMember
+@module_property
+def avg_losing_trade_percent() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
+    position = lib._script.position
+    if position.losstrades == 0:
+        return na_float
+    return position.sum_loss_profit_ratio / position.losstrades * 100.0
 
 
 # noinspection PyProtectedMember
@@ -6009,6 +6085,25 @@ def avg_trade() -> PyneFloat:
 
 # noinspection PyProtectedMember
 @module_property
+def avg_trade_percent() -> PyneFloat:
+    # NOT ``netprofit_percent / closedtrades``: TradingView averages the closed
+    # trades' OWN percentages, each measured against that trade's entry cost.
+    # Measured on BINANCE:BTCUSDT 30m (initial capital 1e6, ~1 BTC legs, so the
+    # two forms differ by an order of magnitude): after 4 trades TV reports
+    # -0.41167387332462313 where the capital-relative form gives -0.13109, and
+    # ``avg_trade_percent * closedtrades`` equals
+    # ``avg_winning_trade_percent * wintrades + avg_losing_trade_percent *
+    # losstrades`` on all 28837 bars.
+    if lib._script is None:
+        return 0.0
+    position = lib._script.position
+    if position.closed_trades_count == 0:
+        return na_float
+    return position.sum_profit_ratio / position.closed_trades_count * 100.0
+
+
+# noinspection PyProtectedMember
+@module_property
 def avg_winning_trade() -> PyneFloat:
     if lib._script is None:
         return 0.0
@@ -6016,6 +6111,17 @@ def avg_winning_trade() -> PyneFloat:
     if position.wintrades == 0:
         return na_float
     return position.grossprofit / position.wintrades
+
+
+# noinspection PyProtectedMember
+@module_property
+def avg_winning_trade_percent() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
+    position = lib._script.position
+    if position.wintrades == 0:
+        return na_float
+    return position.sum_win_profit_ratio / position.wintrades * 100.0
 
 
 # noinspection PyProtectedMember
@@ -6052,10 +6158,37 @@ def grossloss() -> PyneFloat:
 
 # noinspection PyProtectedMember
 @module_property
+def grossloss_percent() -> PyneFloat:
+    # Percent of the INITIAL CAPITAL, over the same grossloss the plain
+    # property reports -- open commission included, so a position that is
+    # still open already shows a loss percent (measured: one open 1 BTC leg at
+    # 0.05% commission reports 0.004688095 against a 1e6 capital).
+    if lib._script is None:
+        return 0.0
+    initial = lib._script.initial_capital
+    if initial == 0.0:
+        return 0.0
+    position = lib._script.position
+    return (position.grossloss + position.open_commission) / initial * 100.0
+
+
+# noinspection PyProtectedMember
+@module_property
 def grossprofit() -> PyneFloat:
     if lib._script is None:
         return 0.0
     return lib._script.position.grossprofit
+
+
+# noinspection PyProtectedMember
+@module_property
+def grossprofit_percent() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
+    initial = lib._script.initial_capital
+    if initial == 0.0:
+        return 0.0
+    return lib._script.position.grossprofit / initial * 100.0
 
 
 # noinspection PyProtectedMember
@@ -6126,6 +6259,33 @@ def margin_liquidation_price() -> PyneFloat:
 
 # noinspection PyProtectedMember
 @module_property
+def max_contracts_held_all() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
+    position = lib._script.position
+    long_peak = position.max_contracts_held_long
+    short_peak = position.max_contracts_held_short
+    return long_peak if long_peak > short_peak else short_peak
+
+
+# noinspection PyProtectedMember
+@module_property
+def max_contracts_held_long() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
+    return lib._script.position.max_contracts_held_long
+
+
+# noinspection PyProtectedMember
+@module_property
+def max_contracts_held_short() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
+    return lib._script.position.max_contracts_held_short
+
+
+# noinspection PyProtectedMember
+@module_property
 def max_drawdown() -> PyneFloat:
     if lib._script is None:
         return 0.0
@@ -6137,10 +6297,7 @@ def max_drawdown() -> PyneFloat:
 def max_drawdown_percent() -> PyneFloat:
     if lib._script is None:
         return 0.0
-    initial = lib._script.initial_capital
-    if initial == 0.0:
-        return 0.0
-    return lib._script.position.max_drawdown / initial * 100.0
+    return lib._script.position.max_drawdown_percent
 
 
 # noinspection PyProtectedMember
@@ -6149,6 +6306,14 @@ def max_runup() -> PyneFloat:
     if lib._script is None:
         return 0.0
     return lib._script.position.max_runup
+
+
+# noinspection PyProtectedMember
+@module_property
+def max_runup_percent() -> PyneFloat:
+    if lib._script is None:
+        return 0.0
+    return lib._script.position.max_runup_percent
 
 
 # noinspection PyProtectedMember

@@ -2250,10 +2250,19 @@
     "avg_losing_trade": {
       "type": "property"
     },
+    "avg_losing_trade_percent": {
+      "type": "property"
+    },
     "avg_trade": {
       "type": "property"
     },
+    "avg_trade_percent": {
+      "type": "property"
+    },
     "avg_winning_trade": {
+      "type": "property"
+    },
+    "avg_winning_trade_percent": {
       "type": "property"
     },
     "bisect_left": {
@@ -2316,7 +2325,13 @@
     "grossloss": {
       "type": "property"
     },
+    "grossloss_percent": {
+      "type": "property"
+    },
     "grossprofit": {
+      "type": "property"
+    },
+    "grossprofit_percent": {
       "type": "property"
     },
     "initial_capital": {
@@ -2340,6 +2355,15 @@
     "math": {
       "type": "variable"
     },
+    "max_contracts_held_all": {
+      "type": "property"
+    },
+    "max_contracts_held_long": {
+      "type": "property"
+    },
+    "max_contracts_held_short": {
+      "type": "property"
+    },
     "max_drawdown": {
       "type": "property"
     },
@@ -2347,6 +2371,9 @@
       "type": "property"
     },
     "max_runup": {
+      "type": "property"
+    },
+    "max_runup_percent": {
       "type": "property"
     },
     "na_float": {
@@ -2449,6 +2476,9 @@
     },
     "exit_time": {
       "type": "variable"
+    },
+    "first_index": {
+      "type": "property"
     },
     "lib": {
       "type": "variable"
