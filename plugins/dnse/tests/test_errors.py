@@ -77,6 +77,7 @@ def _stub(**attrs):
     s._token = lambda: "t"
     s._order_category = {}
     s._identity = {}
+    s._pending_oco = set()
     for key, val in attrs.items():
         setattr(s, key, val)
     return s

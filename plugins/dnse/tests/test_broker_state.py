@@ -526,8 +526,9 @@ def __test_resolver_does_not_sleep_after_its_last_attempt__(fake_client, monkeyp
     b = _broker(fake_client,
                 get_order_detail=(200, {"id": "COND1", "orderStatus": "Activated"}))
 
-    assert b._resolve_stop_child("COND1") is None
-    assert slept == [], "one attempt must not sleep at all"
+    assert b._resolve_child_detail("COND1", "STOP") == {
+        "id": "COND1", "orderStatus": "Activated"}
+    assert slept == [], "a single-read resolver must not sleep at all"
 
 
 def __test_resolver_aborts_on_rate_limit_instead_of_retrying__(fake_client):
@@ -535,7 +536,7 @@ def __test_resolver_aborts_on_rate_limit_instead_of_retrying__(fake_client):
     'not published yet'. Retrying it is how a stall becomes an outage."""
     b = _broker(fake_client, get_order_detail=(429, {"error": "Rate Limit Exceeded"}))
 
-    assert b._resolve_stop_child("COND1", attempts=3, delay=0.0) is None
+    assert b._resolve_child_detail("COND1", "STOP") is None
     assert b._client.count("get_order_detail") == 1, "429 must stop the resolver"
 
 
@@ -567,3 +568,109 @@ def __test_activated_adoption_retries_when_external_id_is_late__(fake_client, co
 
     assert events, "no fill event ever surfaced — adoption was never retried (#42-A)"
     assert events[0].order.id == "555" and events[0].pine_id == "pineS"
+
+
+def __test_unresolved_oco_umbrella_child_fill_still_surfaces__(
+        fake_client, collect, monkeypatch):
+    """#43 (RED until fixed): when _resolve_oco_lo cannot find the umbrella's
+    working LO at PLACE time (stale replica), the umbrella stays tracked as
+    category OCO — a book _CATEGORIES never scans — and the child's fill on the
+    NORMAL book belongs to an id nobody registered. The fill must STILL surface
+    under the exit's Pine identity; today it is silently dropped and the strategy
+    goes position-blind on the EXIT path (same class as #39)."""
+    from pynecore.core.broker.models import ExitIntent, DispatchEnvelope
+    monkeypatch.setattr(broker.time, "sleep", lambda _d: None)  # _resolve_oco_lo polls
+
+    detail_calls = {"n": 0}
+    def detail(*_a, order_category=None, **_k):
+        detail_calls["n"] += 1
+        if order_category == "OCO":
+            # stale replica: externalOrderId not published inside the place-time window
+            if detail_calls["n"] <= 8:
+                return (200, {"id": "OCO1", "orderStatus": "New"})
+            return (200, {"id": "OCO1", "orderStatus": "Activated",
+                          "externalOrderId": 9001})
+        return (200, {"id": "9001", "orderStatus": "Filled", "fillQuantity": 3})
+
+    child_row = _order_row("9001", "Filled", fill=3.0, qty=3.0, avg_price=1930.0)
+    b = _broker(
+        fake_client,
+        get_security_definition=(200, [{"ceilingPrice": "2060", "floorPrice": "1800",
+                                        "securityGroupId": "FU"}]),
+        get_loan_packages=(200, {"loanPackages": [{"id": 42}]}),
+        post_order=(201, {"id": "OCO1", "symbol": "C1", "side": "NS",
+                          "quantity": 3, "orderStatus": "New"}),
+        get_order_detail=detail,
+        get_orders=_books((200, {"orders": [child_row]}),
+                          (200, {"orders": []})),
+    )
+    envelope = DispatchEnvelope(
+        intent=ExitIntent(pine_id="TP", from_entry="L", symbol="C1", side="sell",
+                          qty=3, tp_price=1950.0, sl_price=1900.0),
+        run_tag="abcd", bar_ts_ms=1_700_000_000_000)
+    orders = asyncio.run(b.execute_exit(envelope))
+    assert b._order_category.get(str(orders[0].id)) == "OCO", \
+        "precondition: resolution failed at place time, umbrella tracked as OCO"
+
+    events = collect(b.watch_orders(), 1, timeout=1.0)
+
+    assert events, "the child fill NEVER surfaced — exit-path position blindness (#43)"
+    assert events[0].pine_id == "TP" and events[0].event_type == "filled"
+    assert events[0].fill_qty == 3.0
+
+
+def __test_dead_umbrella_without_child_releases_as_cancelled__(
+        fake_client, collect, monkeypatch):
+    """#43 guard: an unresolved umbrella that dies childless (DAY expiry,
+    operator cancel) must release the exit intent as a ``cancelled`` event and
+    retire from the drain — never grind to the 2-minute escalation."""
+    from pynecore.core.broker.models import ExitIntent, DispatchEnvelope
+    monkeypatch.setattr(broker.time, "sleep", lambda _d: None)
+    b = _broker(fake_client,
+        get_security_definition=(200, [{"ceilingPrice": "2060", "floorPrice": "1800",
+                                        "securityGroupId": "FU"}]),
+        get_loan_packages=(200, {"loanPackages": [{"id": 42}]}),
+        post_order=(201, {"id": "OCO1", "symbol": "C1", "side": "NS",
+                          "quantity": 3, "orderStatus": "New"}),
+        get_order_detail=(200, {"id": "OCO1", "orderStatus": "Canceled"}),
+        get_orders=_books((200, {"orders": []}), (200, {"orders": []})))
+    envelope = DispatchEnvelope(
+        intent=ExitIntent(pine_id="TP", from_entry="L", symbol="C1", side="sell",
+                          qty=3, tp_price=1950.0, sl_price=1900.0),
+        run_tag="abcd", bar_ts_ms=1_700_000_000_000)
+    orders = asyncio.run(b.execute_exit(envelope))
+    assert str(orders[0].id) in b._pending_oco, "give-up at place time must queue the umbrella"
+
+    events = collect(b.watch_orders(), 1, timeout=1.0)
+
+    assert events and events[0].event_type == "cancelled"
+    assert events[0].pine_id == "TP"
+    assert str(events[0].order.id) == "OCO1"
+    assert not b._pending_oco, "a dead umbrella must retire from the drain"
+
+
+def __test_pending_oco_drain_gives_up_with_manual_intervention__(
+        fake_client, collect, monkeypatch):
+    """#43 guard: an umbrella that NEVER resolves and never dies means an
+    untrackable exit and possibly an unmanaged position — the engine must HALT
+    (same escalation contract as the #42-A stop adoption)."""
+    from pynecore.core.broker.models import ExitIntent, DispatchEnvelope
+    monkeypatch.setattr(broker.time, "sleep", lambda _d: None)
+    b = _broker(fake_client,
+        get_security_definition=(200, [{"ceilingPrice": "2060", "floorPrice": "1800",
+                                        "securityGroupId": "FU"}]),
+        get_loan_packages=(200, {"loanPackages": [{"id": 42}]}),
+        post_order=(201, {"id": "OCO1", "symbol": "C1", "side": "NS",
+                          "quantity": 3, "orderStatus": "New"}),
+        get_order_detail=(200, {"id": "OCO1", "orderStatus": "New"}),
+        get_orders=_books((200, {"orders": []}), (200, {"orders": []})))
+    envelope = DispatchEnvelope(
+        intent=ExitIntent(pine_id="TP", from_entry="L", symbol="C1", side="sell",
+                          qty=3, tp_price=1950.0, sl_price=1900.0),
+        run_tag="abcd", bar_ts_ms=1_700_000_000_000)
+    asyncio.run(b.execute_exit(envelope))
+    b._adopt_give_up_polls = 3          # instead of the shipped 240
+
+    with pytest.raises(BrokerManualInterventionError):
+        collect(b.watch_orders(), 1, timeout=1.0)
+    assert not b._pending_oco, "escalation must retire the pending entry"

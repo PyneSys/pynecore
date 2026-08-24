@@ -148,7 +148,25 @@ def __test_resolve_oco_lo_never_appears_returns_none__(fake_client, tmp_path, mo
 
     assert result is None, "externalOrderId never appearing must give up and return None, not raise"
     assert b._client.count("get_order_detail") == 6, "must exhaust exactly the 6-attempt budget"
-    assert len(sleeps) == 6, "every exhausted attempt sleeps once before the next poll"
+    assert len(sleeps) == 5, ("sleeps BETWEEN attempts only — a trailing sleep after the "
+                              "last poll blocked the synchronous place path for nothing "
+                              "(#43 panel, bundled fix)")
+
+
+def __test_resolve_oco_lo_aborts_on_rate_limit__(fake_client, tmp_path, monkeypatch):
+    """A 429 body is a dict WITHOUT externalOrderId — indistinguishable from
+    'not activated yet'. Polling a rate-limited endpoint 6x turns a throttle
+    into an outage; give up and let the watch-loop drain retry instead (#43)."""
+    sleeps = []
+    monkeypatch.setattr(broker.time, "sleep", lambda seconds: sleeps.append(seconds))
+    b = _broker(fake_client, tmp_path,
+                get_order_detail=(429, {"error": "Rate Limit Exceeded"}))
+
+    result = b._resolve_oco_lo("OCO-9", attempts=6, delay=0.15)
+
+    assert result is None
+    assert b._client.count("get_order_detail") == 1, "429 must stop the poll immediately"
+    assert sleeps == [], "an aborted poll must not sleep"
 
 
 def __test_resolve_oco_lo_nondict_lo_detail_falls_back_to_bare_order__(fake_client, tmp_path,

@@ -77,6 +77,10 @@ _TF_SECONDS = {"1": 60, "3": 180, "5": 300, "15": 900, "30": 1800,
 #: working order is the spawned NORMAL LO (tracked via its externalOrderId), and a
 #: STOP is its own working order — so we scan NORMAL + STOP and skip the OCO
 #: umbrella book (whose records would double-count the LO / linger as zombies).
+#: Do NOT "fix" #43 by adding "OCO" here (S3 on that card — rejected: it would
+#: double-count get_open_orders and cost +50% Get-Orders budget forever): an
+#: umbrella whose LO is unknown at place time goes into ``_pending_oco`` and is
+#: drained by ``watch_orders`` instead.
 _CATEGORIES = ("NORMAL", "STOP")
 
 #: LegType.name -> idempotency KIND, for the disposition-unknown client_order_id.
@@ -161,6 +165,11 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         #: parent order id -> adoption attempts so far. ADVISORY only: losing it
         #: (restart) costs a faster retry, never correctness.
         self._adopt_attempts: dict[str, int] = {}
+        #: OCO umbrella ids whose working LO was unresolved at PLACE time (#43);
+        #: they live on a book ``_CATEGORIES`` never scans, so ``watch_orders``
+        #: drains this set every cycle. In-memory like the rest (#36): lost on a
+        #: restart, so recovery must re-derive from the venue books.
+        self._pending_oco: set[str] = set()
         self._last_bar_ts: int = 0
         self._loan_id: int | None = None
 
@@ -522,6 +531,16 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
             if working is not None:
                 order = working
                 tracked_category = "NORMAL"  # the live order lives on the NORMAL book
+            else:
+                # Stale replica: the LO is not visible yet. Track the umbrella
+                # (cancel/amend must target the OCO book) and queue it for the
+                # watch_orders drain — merely tracking it as "OCO" would park it
+                # on a book no scan ever reads and its child's fill would stay
+                # invisible (#43).
+                self._pending_oco.add(str(order.id))
+                log.broker_warning(
+                    "OCO %s placed but its working LO is unresolved — queued for "
+                    "poll-loop adoption (#43)", order.id)
         key = getattr(envelope.intent, "intent_key", None)
         if key:
             self._order_ids.setdefault(key, []).append(order.id)
@@ -537,52 +556,54 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         self._order_category[order.id] = tracked_category
         return [order]
 
-    def _resolve_stop_child(self, stop_id: str, attempts: int = 1, delay: float = 0.0
-                            ) -> "str | None":
-        """The NORMAL-book child id of an Activated STOP conditional (or None).
+    def _resolve_child_detail(self, parent_id: str, category: str) -> "dict | None":
+        """One 429-aware DETAIL read of a conditional parent (or None).
 
         Only the DETAIL carries ``externalOrderId`` (the list view omits it).
+        The single resolver core behind BOTH watch-loop feeders — the
+        Activated-STOP adoption (#42-A) and the pending-OCO drain (#43) — so
+        the two paths cannot drift (panel guard on #43).
 
-        ONE attempt by default — unlike :meth:`_resolve_oco_lo`, which polls 6x
+        ONE read per call — unlike :meth:`_resolve_oco_lo`, which polls 6x
         because it runs at PLACE time inside a synchronous call with no outer
         retry. This runs inside the ``watch_orders`` poll loop, which already
-        retries every cycle (see ``_adopt_stop_child``); a second retry nested
-        here would only burn a worker thread and the Detail budget.
+        retries every cycle (see ``_adopt_child``); a nested retry would only
+        burn a worker thread and the Detail budget.
         """
-        for i in range(attempts):
-            status, body = self.client.get_order_detail(
-                self.account_id, stop_id, self.market_type, order_category="STOP")
-            if status == 429:
-                # A 429 body is a dict WITHOUT externalOrderId, i.e. it looks
-                # exactly like "child not published yet". Retrying a rate-limited
-                # endpoint is how a stall becomes an outage — stop, let the poll
-                # loop come back later.
-                return None
-            external = body.get("externalOrderId") if isinstance(body, dict) else None
-            if external:
-                return str(external)
-            if delay and i + 1 < attempts:
-                time.sleep(delay)   # never after the LAST attempt
-        return None
+        status, body = self.client.get_order_detail(
+            self.account_id, parent_id, self.market_type, order_category=category)
+        if status == 429:
+            # A 429 body is a dict WITHOUT externalOrderId, i.e. it looks
+            # exactly like "child not published yet". Retrying a rate-limited
+            # endpoint is how a stall becomes an outage — stop, let the poll
+            # loop come back later.
+            return None
+        return body if isinstance(body, dict) else None
 
-    async def _adopt_stop_child(self, parent_id: str, pine_id, from_entry,
-                                leg_type) -> bool:
-        """Adopt the NORMAL-book child of an Activated conditional.
+    async def _adopt_child(self, parent_id: str, pine_id, from_entry,
+                           leg_type, category: str = "STOP"
+                           ) -> "tuple[str, dict | None]":
+        """Adopt the NORMAL-book child of a conditional parent (STOP or OCO).
 
-        :return: ``True`` once the child id is known (adopted now, or already
-            adopted); ``False`` while it is not — and on ``False`` the caller MUST
-            leave the parent row out of ``_last_seen``, because the shell's status
-            and fill never change again: a row marked seen here would be deduped
-            forever and the child's fill would stay invisible (#42-A, the latent
-            form of #39).
+        :return: ``("adopted", detail)`` once the child id is known (adopted now,
+            or already adopted); ``("dead", detail)`` when the parent is terminal
+            WITHOUT ever naming a child — nothing will ever come, the caller
+            retires it; ``("pending", detail)`` otherwise — and on ``pending``
+            the caller MUST leave the parent row out of ``_last_seen``, because a
+            shell's status and fill never change again: a row marked seen here
+            would be deduped forever and the child's fill would stay invisible
+            (#42-A, the latent form of #39).
         """
         attempts = self._adopt_attempts.get(parent_id, 0) + 1
         self._adopt_attempts[parent_id] = attempts
         # Degrade the cadence past the fast window instead of hammering forever.
         if attempts > self._adopt_fast_polls and attempts % self._adopt_slow_every:
-            return False
-        child = await asyncio.to_thread(self._resolve_stop_child, parent_id)
-        if child:
+            return ("pending", None)
+        detail = await asyncio.to_thread(
+            self._resolve_child_detail, parent_id, category)
+        external = detail.get("externalOrderId") if detail else None
+        if external:
+            child = str(external)
             if child not in self._identity:
                 self._identity[child] = (pine_id, from_entry, leg_type)
                 self._order_category[child] = "NORMAL"
@@ -593,20 +614,31 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                     "conditional ACTIVATED -> tracking child | parent=%s child=%s "
                     "pine=%s polls=%d", parent_id, child, pine_id, attempts)
             self._adopt_attempts.pop(parent_id, None)
-            return True   # resolved (adopted now or already adopted)
+            return ("adopted", detail)   # adopted now or already adopted
+        if detail is not None:
+            try:
+                terminal = self._to_exchange_order(detail).status in _TERMINAL_STATUSES
+            except Exception:                                        # noqa: BLE001
+                terminal = False         # unparseable row: keep retrying
+            if terminal:
+                # Terminal WITHOUT a child: the parent died before spawning its
+                # working order (DAY expiry, operator cancel, reject). Retire it
+                # instead of grinding to the 2-minute escalation (#43 guard).
+                self._adopt_attempts.pop(parent_id, None)
+                return ("dead", detail)
         if attempts == 1 or attempts == self._adopt_fast_polls:
             log.broker_warning(
-                "conditional ACTIVATED but no externalOrderId after %d poll(s) | "
+                "conditional [%s] has no externalOrderId after %d poll(s) | "
                 "parent=%s pine=%s — the child fill is NOT trackable yet; retrying",
-                attempts, parent_id, pine_id)
+                category, attempts, parent_id, pine_id)
         if attempts >= self._adopt_give_up_polls:
             self._adopt_attempts.pop(parent_id, None)
             raise BrokerManualInterventionError(
-                f"DNSE conditional {parent_id} (pine={pine_id}) reported Activated "
-                f"but never published its child order id after {attempts} polls: "
-                f"its fill CANNOT be tracked and the account may hold an unmanaged "
-                f"position — check the venue and flatten manually")
-        return False
+                f"DNSE conditional {parent_id} (pine={pine_id}) never published "
+                f"its child order id after {attempts} polls: its fill CANNOT be "
+                f"tracked and the account may hold an unmanaged position — check "
+                f"the venue and flatten manually")
+        return ("pending", detail)
 
     def _resolve_oco_lo(self, oco_id: str, attempts: int = 6, delay: float = 0.15
                         ) -> "ExchangeOrder | None":
@@ -617,9 +649,14 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         ``metadata.conditionOrderId`` points back. Poll briefly for activation,
         then fetch the LO. (Synchronous; the brief poll blocks the caller.)
         """
-        for _ in range(attempts):
+        for i in range(attempts):
             status, body = self.client.get_order_detail(
                 self.account_id, oco_id, self.market_type, order_category="OCO")
+            if status == 429:
+                # A 429 body is a dict WITHOUT externalOrderId — keep polling and
+                # a stall becomes an outage. Give up: the place-time caller queues
+                # the umbrella for the watch-loop drain instead (#43).
+                return None
             external = body.get("externalOrderId") if isinstance(body, dict) else None
             if external:
                 lo_id = str(external)
@@ -628,7 +665,8 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                 if isinstance(detail, dict):
                     return self._to_exchange_order(detail)
                 return self._to_exchange_order({"id": lo_id})
-            time.sleep(delay)
+            if i + 1 < attempts:
+                time.sleep(delay)   # never after the LAST attempt
         return None
 
     # --- BrokerPlugin abstracts: execution ---
@@ -845,6 +883,7 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                 # A 2xx from DNSE's conditional cancel is an ACKNOWLEDGEMENT, not a
                 # completion — so it is NOT sufficient to report the order gone.
                 if self._cancel_took_effect(order_id, category):
+                    self._pending_oco.discard(order_id)  # a dead umbrella needs no adoption
                     return True
                 log.broker_warning("%s", (
                     f"cancel[{category}] http={status} ACKED but the order is still "
@@ -855,6 +894,7 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
             if code in errors.TERMINAL_CODES:  # found, already done -> cancel is moot
                 log.broker_info("%s", f"cancel[{category}] code={code} http={status} -> "
                                       f"treated-gone (already terminal) | order={order_id}")
+                self._pending_oco.discard(order_id)
                 return True
             if code in errors.NOT_FOUND_CODES:  # not in THIS book -> probe the next
                 continue
@@ -862,6 +902,8 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
             if classified is not None:
                 self._emit(classified, action=f"cancel[{category}]", ident=order_id)
             all_not_found = False
+        if all_not_found:
+            self._pending_oco.discard(order_id)
         return all_not_found
 
     @override
@@ -922,11 +964,57 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                                  category, status, errors.code_of(body))
 
     @override
+    async def _drain_pending_oco(self):
+        """Retry child-resolution for OCO umbrellas unresolved at PLACE time.
+
+        Such an umbrella lives on a book ``_CATEGORIES`` never scans, so nothing
+        row-driven ever retries it (#43) — this runs every ``watch_orders``
+        cycle instead, on the same poll-counted cadence as the Activated-STOP
+        adoption. Yields a terminal :class:`OrderEvent` for an umbrella that
+        died childless, so the engine's exit intent is released rather than
+        staying blind forever.
+        """
+        from pynecore.core.broker.models import OrderEvent
+        for parent_id in list(self._pending_oco):
+            pine_id, from_entry, leg_type = self._identity_for(parent_id)
+            try:
+                adoption, detail = await self._adopt_child(
+                    parent_id, pine_id, from_entry, leg_type, category="OCO")
+            except BrokerManualInterventionError:
+                self._pending_oco.discard(parent_id)
+                raise                # designed escalation: the engine halts
+            except Exception as exc:                              # noqa: BLE001
+                # One odd reply must never kill fill detection for every other
+                # order — mirror the per-row guard in ``watch_orders``.
+                log.broker_warning(
+                    "pending-OCO drain raised for parent=%s: %s: %s — retrying",
+                    parent_id, type(exc).__name__, exc)
+                continue
+            if adoption == "adopted":
+                self._pending_oco.discard(parent_id)
+            elif adoption == "dead":
+                self._pending_oco.discard(parent_id)
+                order = self._to_exchange_order(detail)
+                event_type = ("cancelled" if order.status is OrderStatus.CANCELLED
+                              else "rejected" if order.status is OrderStatus.REJECTED
+                              else "filled" if order.status is OrderStatus.FILLED
+                              else "cancelled")   # EXPIRED releases as cancelled
+                yield OrderEvent(
+                    order=order, event_type=event_type, fill_price=None,
+                    fill_qty=None, timestamp=int(time.time()),
+                    pine_id=pine_id, from_entry=from_entry, leg_type=leg_type)
+
     async def watch_orders(self):
         """Detect fills/cancels by polling the order books (REST, off-loop)."""
         from pynecore.core.broker.models import OrderEvent
         while True:
             await asyncio.sleep(self._poll_interval)
+            if self._pending_oco:
+                # Umbrellas queued at place time live on the unscanned OCO book —
+                # drain BEFORE the row scan so an adopted child's fill can surface
+                # in this same cycle (#43).
+                async for pending_event in self._drain_pending_oco():
+                    yield pending_event
             try:
                 rows = await asyncio.to_thread(lambda: list(self._iter_orders()))
             except Exception:
@@ -956,7 +1044,7 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                     # will arrive under the CHILD's id — adopt it into the
                     # parent's identity so the scan's normal path reports it.
                     try:
-                        resolved = await self._adopt_stop_child(
+                        adoption, _ = await self._adopt_child(
                             order_id, pine_id, from_entry, leg_type)
                     except BrokerManualInterventionError:
                         raise            # designed escalation: the engine halts
@@ -966,8 +1054,12 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                         log.broker_warning(
                             "child adoption raised for parent=%s: %s: %s — retrying",
                             order_id, type(exc).__name__, exc)
-                        resolved = False
-                    if not resolved:
+                        adoption = "pending"
+                    # "dead" is treated as pending here: an Activated shell stays
+                    # Activated forever (#41), and if a stale row read Activated
+                    # while the detail is already terminal, the row itself will
+                    # report the real status on a later poll via the normal path.
+                    if adoption != "adopted":
                         # Deliberately NOT marked seen: the shell never changes
                         # again, so this is the only thing that makes the next
                         # poll retry (#42-A).
