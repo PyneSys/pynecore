@@ -2289,6 +2289,9 @@
     "datetime": {
       "type": "variable"
     },
+    "default_entry_qty": {
+      "type": "variable"
+    },
     "defaultdict": {
       "type": "variable"
     },

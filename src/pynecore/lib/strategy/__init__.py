@@ -36,7 +36,7 @@ __all__ = [
 
     'Trade', 'Order', 'PositionBase', 'SimPosition',
     "cancel", "cancel_all", "close", "close_all", "convert_to_account", "convert_to_symbol",
-    "entry", "exit", "order",
+    "default_entry_qty", "entry", "exit", "order",
 
     "closedtrades", "opentrades",
 ]
@@ -4913,9 +4913,38 @@ def _default_entry_qty(price: float) -> float:
     if budget is None:
         return lib._script.default_qty_value
     money, unit_cost = budget
+    if unit_cost == 0.0:
+        # A price that snaps to zero leaves no unit cost to divide the budget by.
+        # An unsizable order is dropped by the callers' finite-qty gate.
+        return na_float
     if money < 1e7:
         money = _sig10_money(money)
     return money / unit_cost
+
+
+def default_entry_qty(fill_price: PyneFloat) -> PyneFloat:
+    """
+    Calculates the default quantity, in units, of an entry order from ``strategy.entry`` or
+    ``strategy.order`` if it were to fill at the given price.
+
+    :param fill_price: The fill price to evaluate
+    :return: The default order quantity in contracts, 0 when it cannot be sized
+    """
+    # Measured on TradingView (BINANCE:BTCUSDT 30m, mintick 0.01, lot step 1e-5).
+    # The price argument is SNAPPED to the tick grid before sizing: 100.007 and
+    # 100.01 both return 23.0707 while 100.003 and 100.0 both return 23.07301,
+    # and 0.005 sizes off 0.01 where 0.004 snaps to zero. The quantity is then
+    # FLOORED on the lot grid, never rounded -- 7777.77 / 93825.86 =
+    # 0.08289580 returns 0.08289, and a fixed default_qty_value of 3.1234567
+    # returns 3.12345. ``strategy.fixed`` ignores the price entirely (na, zero
+    # and a negative price all return the same floored value), while a
+    # money-based size with nothing to divide by (na price, or a price snapping
+    # to zero) returns 0. An open position is not considered: the value is the
+    # order's own quantity, not the reversal amount.
+    qty = _default_entry_qty(_tick_snap(fill_price))
+    if not (-math.inf < qty < math.inf):  # is_na_arg or infinite
+        return 0.0
+    return _size_floor(qty)
 
 
 def _sig10_money(money: float) -> float:

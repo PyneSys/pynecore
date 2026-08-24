@@ -189,6 +189,26 @@ strategy.cancel_all()
 `disable_alert` is accepted for Pine compatibility. PyneCore currently records alert messages on
 orders but does not dispatch order-fill alerts, so the parameter has no additional runtime effect.
 
+### strategy.default_entry_qty()
+
+Quantity a default-sized `strategy.entry()` / `strategy.order()` would buy at a given fill price,
+derived from `default_qty_type` and `default_qty_value`.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| fill_price | float | Fill price to evaluate |
+
+Returns: `float`
+
+The price is snapped onto the tick grid before the size is computed, and the size is then floored
+onto the lot grid. With `strategy.fixed` sizing the price is ignored entirely; with money-based
+sizing a price of `na` — or one that snaps to zero — gives `0`. An open position is not considered,
+so a reversing order reports its own quantity, not the amount needed to flip the position.
+
+```python
+qty = strategy.default_entry_qty(close)
+```
+
 ## Variables
 
 | Name | Type | Description |
@@ -224,14 +244,8 @@ orders but does not dispatch order-fill alerts, so the parameter has no addition
 ## Compatibility
 
 **Not yet implemented:**
-- `strategy.account_currency` — Account currency from properties
-- `strategy.convert_to_account()` — Currency conversion to account currency
-- `strategy.convert_to_symbol()` — Currency conversion to symbol currency
-- `strategy.default_entry_qty()` — Calculate default order quantity
-- `strategy.margin_liquidation_price` — Margin call liquidation price
 - `strategy.max_contracts_held_*` — Maximum contract tracking variables
-- All percentage variables: `strategy.netprofit_percent`, `strategy.grossprofit_percent`, `strategy.grossloss_percent`, `strategy.openprofit_percent`, `strategy.avg_trade_percent`, `strategy.avg_winning_trade_percent`, `strategy.avg_losing_trade_percent`
-- `strategy.position_entry_name` — Entry order name for current position
+- Percentage variables: `strategy.grossprofit_percent`, `strategy.grossloss_percent`, `strategy.avg_trade_percent`, `strategy.avg_winning_trade_percent`, `strategy.avg_losing_trade_percent`
 
 **Order sizing:**
 - Only a positive, finite `qty` is placed. A quantity that cannot be sized — `na` or infinite — is

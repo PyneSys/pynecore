@@ -1840,11 +1840,17 @@ def pivothigh(source: float, leftbars: int, rightbars: int) -> PyneFloat:
     # An int-typed Pine value can still carry a fraction (``int / int``); the
     # truncation happens where an integer is required — see ``_check_type``. The
     # strength checks run on the truncated values, since those are the ones the
-    # pivot window is built from: a 0.5 strength is an invalid 0, not a legal side.
+    # pivot window is built from.
+    #
+    # A zero strength is legal on that side: TradingView rejects only a NEGATIVE
+    # strength (RE10001, "must be >= 0"), and measured on BINANCE:BTCUSDT 30m
+    # ``ta.pivothigh(high, 0, 0)`` reports every bar's own high, ``(high, 5, 0)``
+    # confirms a pivot on the bar that makes it, and ``(high, 0, 5)`` reports the
+    # bar five back once nothing beat it.
     leftbars = int(leftbars)
     rightbars = int(rightbars)
-    assert leftbars > 0, "Invalid leftbars, leftbars must be greater than 0!"
-    assert rightbars > 0, "Invalid rightbars, rightbars must be greater than 0!"
+    assert leftbars >= 0, "Invalid leftbars, leftbars must not be negative!"
+    assert rightbars >= 0, "Invalid rightbars, rightbars must not be negative!"
 
     if not (source == source):  # is_na_arg
         return na_float
@@ -1889,11 +1895,16 @@ def pivotlow(source: float, leftbars: int, rightbars: int) -> PyneFloat:
     # An int-typed Pine value can still carry a fraction (``int / int``); the
     # truncation happens where an integer is required — see ``_check_type``. The
     # strength checks run on the truncated values, since those are the ones the
-    # pivot window is built from: a 0.5 strength is an invalid 0, not a legal side.
+    # pivot window is built from.
+    #
+    # A zero strength is legal on that side: TradingView rejects only a NEGATIVE
+    # strength (RE10001, "must be >= 0"), and measured on BINANCE:BTCUSDT 30m
+    # ``ta.pivotlow(low, 5, 0)`` confirms a pivot on the bar that makes the low
+    # and ``(low, 0, 5)`` reports the bar five back once nothing undercut it.
     leftbars = int(leftbars)
     rightbars = int(rightbars)
-    assert leftbars > 0, "Invalid leftbars, leftbars must be greater than 0!"
-    assert rightbars > 0, "Invalid rightbars, rightbars must be greater than 0!"
+    assert leftbars >= 0, "Invalid leftbars, leftbars must not be negative!"
+    assert rightbars >= 0, "Invalid rightbars, rightbars must not be negative!"
 
     if not (source == source):  # is_na_arg
         return na_float
