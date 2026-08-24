@@ -782,10 +782,11 @@ def _snap_child(entry: Any) -> tuple:
     A bare list is a fast-path child state vector (its layout rides in the
     trailing element, see :func:`_make_state`); an anchored ``(callee, bound)``
     pair whose bound is a state-carrying partial exposes its vector as
-    ``bound.args[0]``; a bound closure whose entire state is one series
-    publishes it as ``__pyne_series__`` (``inline_series``). Anything else (an
-    overload dispatcher's or method binder's opaque closure) cannot be walked —
-    it is DROPPED on restore, which re-binds it fresh, exactly what
+    ``bound.args[0]``; an anchored overload dispatcher exposes its
+    per-implementation vectors through ``__pyne_cache__``; a bound closure whose
+    entire state is one series publishes it as ``__pyne_series__``
+    (``inline_series``). Anything else (a method binder's opaque closure) cannot
+    be walked — it is DROPPED on restore, which re-binds it fresh, exactly what
     :func:`reset` did for every child.
     """
     if entry is None:
@@ -798,6 +799,19 @@ def _snap_child(entry: Any) -> tuple:
             layout: dict[str, Any] | None = getattr(bound.func, '__pyne_layout__', None)
             if layout is not None:
                 return 'pair', entry, bound.args[0], _snap_vector(bound.args[0], layout)
+        # An overload dispatcher's machines must be ROLLED BACK, never dropped.
+        # Dropping re-binds the anchor with an EMPTY state vector, so every
+        # multi-signature builtin (``ta.highest``/``ta.lowest`` and the other
+        # dispatched machines) restarts its window from scratch after each
+        # discarded re-execution -- with ``calc_on_order_fills`` that is every
+        # fill bar, which is exactly what the wild-corpus Ichimoku strategy
+        # measured as a diverging donchian channel.
+        cache: dict[Any, Any] | None = getattr(bound, '__pyne_cache__', None)
+        if cache is not None:
+            return ('dispatch', entry, cache, tuple(cache),
+                    tuple((vector, _snap_vector(vector, vector[-1]))
+                          for vector in (impl_entry[1] for impl_entry in cache.values())
+                          if vector is not None))
         # A closure-held series must be ROLLED BACK, never dropped: re-binding
         # gives an empty buffer, and ``expr[n]`` then reads na forever.
         series = getattr(bound, '__pyne_series__', None)
@@ -842,6 +856,16 @@ def _restore_payload(child_snap: tuple) -> Any:
         return child_snap[1]
     if kind == 'series':
         child_snap[2]._restore(child_snap[3])  # noqa: cooperating core internals
+        return child_snap[1]
+    if kind == 'dispatch':
+        cache, keys, vectors = child_snap[2], child_snap[3], child_snap[4]
+        for vector, vector_snap in vectors:
+            _restore_vector(vector, vector_snap)
+        # A signature the discarded pass reached first has no bar-start baseline
+        # to return to; dropping it re-binds fresh on the next call, which is
+        # what an unwalkable binding did for every entry before.
+        for key in [key for key in cache if key not in keys]:
+            del cache[key]
         return child_snap[1]
     return None
 

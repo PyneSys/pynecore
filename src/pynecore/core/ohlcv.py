@@ -513,16 +513,37 @@ def _read_layout(file: BinaryIO, file_size: int, magic: bytes | None = None) -> 
     )
 
 
+#: How far an OHLC bound may fall on the wrong side of open/close before the bar counts
+#: as malformed. A synthetic feed computes every leg with its own arithmetic -- a
+#: TradingView spread symbol (``ECONOMICS:EUM2*FX:EURUSD``) multiplies open and high by
+#: the rate separately, so at 1e13 magnitudes the two roundings can leave ``high`` one
+#: ULP under ``open``. That is rounding noise in the source, not a broken bar, and the
+#: stored value must stay the one the venue computes on.
+_OHLC_RELATION_ULPS = 4
+
+
+def _ohlc_slack(*values: float) -> float:
+    """Rounding slack allowed on an OHLC relation, scaled to the magnitudes compared.
+
+    :param values: The values whose relation is being checked.
+    :return: The absolute tolerance, in units of the largest magnitude's ULP.
+    """
+    scale = max(abs(value) for value in values)
+    return math.ulp(scale) * _OHLC_RELATION_ULPS
+
+
 def _validate_candle(candle: OHLCV) -> None:
     values = (candle.open, candle.high, candle.low, candle.close, candle.volume)
     if any(math.isinf(value) for value in values):
         raise ValueError("OHLCV values cannot contain positive or negative infinity")
 
     if not (math.isnan(candle.open) or math.isnan(candle.close) or math.isnan(candle.high)):
-        if candle.high < max(candle.open, candle.close):
+        bound = max(candle.open, candle.close)
+        if candle.high < bound - _ohlc_slack(candle.high, bound):
             raise ValueError("Invalid OHLC relation: high is below open or close")
     if not (math.isnan(candle.open) or math.isnan(candle.close) or math.isnan(candle.low)):
-        if candle.low > min(candle.open, candle.close):
+        bound = min(candle.open, candle.close)
+        if candle.low > bound + _ohlc_slack(candle.low, bound):
             raise ValueError("Invalid OHLC relation: low is above open or close")
 
 
