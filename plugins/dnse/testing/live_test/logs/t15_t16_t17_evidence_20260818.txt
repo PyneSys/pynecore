@@ -60,3 +60,11 @@ Note: first launch's orders (528386/528396) were operator-cancelled at ~14:21 (C
   538926 (rider, never touched)               -> Expired, fill=0
   528386 / 528396 (1st launch, operator-cancelled in CONT-PM) -> Canceled, fill=0
 => Live-L1-T14-AtcCancelRefusal: PASS (refusal-through-ATC + expiry-at-close both confirmed).
+
+=== Contract-roll validation + full L0 — PASS 2026-08-24 11:41-11:44 (lunch) ===
+alias VN30F1M -> 41I1G9000 (September contract; pre-expiry was 41I1G8000)
+GTD clamp -> 2026-08-31 (+7d default; NOT stuck at the expired contract 08-20)
+daily reference close on new contract: 1934.2
+FULL L0 sweep in lunch: PASS exit 0 — market/stop/stop-limit place+rest+cancel on
+the NEW contract; operator position (+9) and 6 working orders present, untouched.
+First post-roll measurement: the roll is transparent to the plugin.
