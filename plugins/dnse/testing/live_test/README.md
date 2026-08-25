@@ -41,6 +41,54 @@ venue's position netting. Until the operator flattens or provides a sub-account
 (`account_no` in `workdir/config/plugins/dnse_broker.toml`), FILL-tier cases are
 **parked**, not skipped.
 
+## Master test plan v3 (2026-08-25) — dual-system execution
+
+### Execution systems: every engine-driven case runs on BOTH feeds
+The plugin now has two market-data systems (`feed_mode = "ohlc" | "tick"`, #37).
+Policy (operator decision 2026-08-25): **every engine-driven live case runs as a
+dual-mode pair** — one leg per feed — once the tick-delivery gate case (below)
+has passed once. Rationale: all staged scripts are `calc_on_every_tick=false`,
+so their behaviour must be equivalent in both modes; the two legs form a
+**differential oracle** — any divergence between the legs' venue records is
+automatically a finding, sharper than grading either leg alone.
+
+- **Exempt**: L0 and every direct probe (T14/T15/T17/T18/T33) — they hit the
+  client directly and consume no bars; there is nothing feed-dependent to dualize.
+- **Expected divergence carve-out**: the session close. OHLC mode never delivers
+  the final candle (withheld +903 s, Live-L4-T03); tick mode synth-closes it
+  LOUDLY. Close-spanning dual runs grade this difference as EXPECTED.
+- **Grading**: registry status becomes two-dimensional (`✅ ohlc <date> / ✅ tick
+  <date>`); legs run sequentially in one window, ohlc first as control, config
+  flipped between legs by the (planned) `run_dual.sh` wrapper.
+- **Budget**: the tick leg adds ~1,800 req/h on `/trades/latest`'s own 10k/h
+  bucket at the 2 s default — fine at n=1; the 2-strategies/key ceiling (#40)
+  does not bite for tests.
+
+### Scheduling constraint — the #51 venue window (CRITICAL)
+Conditional-book writes are venue-refused (misleading `INVALID_TRADING_TOKEN`)
+after the operator's first EntradeX app trade of the day (#46/#51, unified
+timeline on #51; rules in the repo CLAUDE.md). **Schedule L0 and every
+conditional-involving live case pre-open (~08:20) or in an operator-idle
+window.** Do not re-mint on that signature; do not retry into the window.
+
+### Planned cases (v3 queue)
+| Planned case | What it measures | Gate/priority |
+|---|---|---|
+| **Live-L1-T33-CrossProcessCancel** (direct probe) | process A places a far conditional and STAYS ALIVE; process B (`venue.py cancel`, no records) cancels it — exercises #45's probe-all-books fallback live AND measures the #51 window boundary (pre-open: must succeed; post-app-trade: measures the refusal) | first pre-open slot |
+| **Live-L4-T04-TickDelivery** | tick mode delivers forming updates + closes with who-closed-each-bar grading (official within `tick_close_timeout` vs loud SYNTH fallback), 429 transitions logged; THE GATE for the dual-mode policy | first pre-open slot after T33 |
+| **Live-L4-T05-SynthParity** | recorder over a live window: synth bar captured at each rollover BEFORE official replacement → distributions of close-delta, H/L undershoot, V undershoot (the latest-only endpoint makes exact parity impossible BY CONSTRUCTION — this measures the error bound a calc_on_every_tick author must know) | after T04 |
+| **L1 passive row: DriftDetector (#48)** | self-grades on every run the operator holds a position through; first live PASS 08-25 (2 correct warnings, 0 spam, T32 log) | passive, every session |
+| **L0 tooling update** | classify the #51 signature as "blocked by venue window — reschedule pre-open" instead of generic FAIL (still exits non-zero) | with T33 |
+| **Registry backfill: T19–T30** | the param-matrix states measured 08-17/18 have no registry rows — add them from params_a/b evidence | housekeeping |
+
+### Cases deliberately WITHOUT live coverage (decided, not forgotten)
+- **#43** (pending-OCO drain) and **#47** (cancel-with-outcome multi-id): their
+  triggers are venue races (stale OCO replica at place time; ambiguous cancel
+  disposition) that cannot be forced from outside — fake-venue red-first tests
+  are primary evidence. The F-ladder protocol gains: if the `#43` "queued for
+  poll-loop adoption" line ever appears in a live run, grade that run's venue
+  record against the drain design as a bonus measurement.
+
 ## Canonical test registry — the ONLY names to use
 
 Every live test case has one ID: **`Live-L<level>-<case>`**. Logs, plans, cards and
