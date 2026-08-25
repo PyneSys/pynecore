@@ -1,0 +1,88 @@
+[BROKER] WS connect starting (warmup blocks until subscribed)
+[BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[BROKER] startup adoption limited to run-owned exposure (exchange=9.0, owned=0.0, internal=0.0) — the remaining venue net belongs to another run on this
+[BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[BROKER] warmup phase started — replaying historical bars
+[BROKER] warmup phase complete — 500 bar(s) processed
+[BROKER] live trading active
+[PRM] === PARAM MATRIX — window open. T19-T26/T30 continuous, T16 hold/restart, T14 ATC, T32 ATO. 1 contract unless flagged, >=4.5% away. startState=13 
+[PRM] bar=500 close=1946.7 candle=GREEN phase=POST-ATO state=13 step=0 pending=no pos=0
+[PRM] T32 PLACE phase=POST-ATO (FIRST-EVER ATO measurement) T32a limit=1849.4 + T32b cond stop=2044 — record per-type accept/refuse                     
+[BROKER] dispatching ENTRY BUY id='T32a' qty=1.0 type=limit limit=1849.3
+[BROKER] dispatched ENTRY BUY id='T32a' qty=1.0 type=limit limit=1849.3 -> 
+[BROKER] dispatching ENTRY BUY id='T32b' qty=1.0 type=stop stop=2044.1
+[BROKER] dispatched ENTRY BUY id='T32b' qty=1.0 type=stop stop=2044.1 -> 
+[BROKER] event CREATED id=5006 side=buy qty=1.0 filled=0.0 pine='T32a' leg=entry
+[BROKER] event CREATED id=da6fenj6v3om56m1uovg side=buy qty=1.0 filled=0.0 pine='T32b' leg=entry
+[PRM] bar=501 close=1949.1 candle=GREEN phase=POST-ATO state=13 step=0 pending=yes pos=0
+[PRM] T32 WAITING for continuous phase=POST-ATO
+[BROKER] position drift: venue 9.0 vs internal 0.0 (delta +9) persisted 2 reconciles — external interference, another strategy on this account, or a    
+[PRM] bar=502 close=1947.7 candle=RED phase=POST-ATO state=13 step=0 pending=yes pos=0
+[PRM] T32 WAITING for continuous phase=POST-ATO
+[PRM] bar=503 close=1948 candle=GREEN phase=POST-ATO state=13 step=0 pending=yes pos=0
+[PRM] T32 WAITING for continuous phase=POST-ATO
+[PRM] bar=504 close=1948.8 candle=GREEN phase=POST-ATO state=13 step=0 pending=yes pos=0
+[PRM] T32 WAITING for continuous phase=POST-ATO
+[PRM] bar=505 close=1948 candle=RED phase=POST-ATO state=13 step=0 pending=yes pos=0
+[PRM] T32 WAITING for continuous phase=POST-ATO
+[PRM] bar=506 close=1949.7 candle=GREEN phase=POST-ATO state=13 step=0 pending=yes pos=0
+[PRM] T32 WAITING for continuous phase=POST-ATO
+[PRM] bar=507 close=1949.9 candle=GREEN phase=POST-ATO state=13 step=0 pending=yes pos=0
+[PRM] T32 WAITING for continuous phase=POST-ATO
+[PRM] bar=508 close=1948 candle=RED phase=POST-ATO state=13 step=0 pending=yes pos=0
+[PRM] T32 WAITING for continuous phase=POST-ATO
+[PRM] bar=509 close=1948.1 candle=GREEN phase=POST-ATO state=13 step=0 pending=yes pos=0
+[PRM] T32 WAITING for continuous phase=POST-ATO
+[PRM] bar=510 close=1948.5 candle=GREEN phase=POST-ATO state=13 step=0 pending=yes pos=0
+[PRM] T32 WAITING for continuous phase=POST-ATO
+[PRM] bar=511 close=1948.5 candle=GREEN phase=POST-ATO state=13 step=0 pending=yes pos=0
+[PRM] T32 WAITING for continuous phase=POST-ATO
+[PRM] bar=512 close=1948.8 candle=GREEN phase=POST-ATO state=13 step=0 pending=yes pos=0
+[PRM] T32 WAITING for continuous phase=POST-ATO
+[PRM] bar=513 close=1948.2 candle=RED phase=POST-ATO state=13 step=0 pending=yes pos=0
+[PRM] T32 WAITING for continuous phase=POST-ATO
+[PRM] bar=514 close=1948 candle=RED phase=POST-ATO state=13 step=0 pending=yes pos=0
+[PRM] T32 WAITING for continuous phase=POST-ATO
+[PRM] bar=515 close=1949 candle=GREEN phase=CONT-AM state=13 step=0 pending=yes pos=0
+[PRM] T32 CANCEL_ALL phase=CONT-AM — sweeping whatever the ATO accepted
+[BROKER] cancelling CANCEL id='T32a'
+[BROKER] cancelling CANCEL id='T32b'
+[BROKER] event CANCELLED id=5006 side=buy qty=1.0 filled=0.0 pine='T32a' leg=entry
+[BROKER] event CANCELLED id=da6fenj6v3om56m1uovg side=buy qty=1.0 filled=0.0 pine='T32b' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=5006 side=buy qty=1.0 filled=0.0 pine='T32a' leg=entry)
+[BROKER] strategy cancel confirmed (CANCELLED id=da6fenj6v3om56m1uovg side=buy qty=1.0 filled=0.0 pine='T32b' leg=entry)
+[PRM] bar=516 close=1948.8 candle=RED phase=CONT-AM state=13 step=1 pending=yes pos=0
+[PRM] T32 DONE
+[PRM] STAGE DONE phase=CONT-AM — state 13->14
+[PRM] === PARAM MATRIX DONE. Verify at the venue that NOTHING of ours is still working, then stop the run. ===
+[PRM] bar=517 close=1947.7 candle=RED phase=CONT-AM state=14 step=0 pending=no pos=0
+[PRM] bar=518 close=1947 candle=RED phase=CONT-AM state=14 step=0 pending=no pos=0
+[PRM] bar=519 close=1947.3 candle=GREEN phase=CONT-AM state=14 step=0 pending=no pos=0
+[PRM] bar=520 close=1948.7 candle=GREEN phase=CONT-AM state=14 step=0 pending=no pos=0
+[PRM] bar=521 close=1951.4 candle=GREEN phase=CONT-AM state=14 step=0 pending=no pos=0
+[PRM] bar=522 close=1951.7 candle=GREEN phase=CONT-AM state=14 step=0 pending=no pos=0
+[PRM] bar=523 close=1952 candle=GREEN phase=CONT-AM state=14 step=0 pending=no pos=0
+[PRM] bar=524 close=1950.8 candle=RED phase=CONT-AM state=14 step=0 pending=no pos=0
+[PRM] bar=525 close=1952.2 candle=GREEN phase=CONT-AM state=14 step=0 pending=no pos=0
+[PRM] bar=526 close=1952.6 candle=GREEN phase=CONT-AM state=14 step=0 pending=no pos=0
+[PRM] bar=527 close=1954.1 candle=GREEN phase=CONT-AM state=14 step=0 pending=no pos=0
+[BROKER] position drift: venue 7.0 vs internal 0.0 (delta +7) persisted 28 reconciles — external interference, another strategy on this account, or a   
+[BROKER] run stopped (completed) position=7 equity=152,724,015.00 VND
+
+=== VENUE GRADING (venue.py order, 2026-08-25 09:2x ICT) ===
+5006 [NORMAL]: status=Canceled price=1849.3 qty=1 filled=0                    (T32a)
+da6fenj6v3om56m1uovg [STOP]: status=Canceled stop=2044.1 qty=1                (T32b)
+
+VERDICT: Live-L1-T32-AtoProbe PASS — FIRST-EVER ATO measurement.
+Both a NORMAL limit and a conditional stop, placed at the earliest POST-ATO
+bar (09:00:00, first bar after the auction), were ACCEPTED by the venue —
+neither was refused with a CAN_NOT_PLACE_..._ON_ATO_SESSION-style code.
+Swept cleanly by cancel_all() once phase reached CONT-AM (09:15:00); both
+confirmed Canceled at the venue. No cross-contamination with the operator's
+resting orders throughout (verified via venue.py status before/after).
+
+NOTE (near-miss, corrected before any live impact): the first launch attempt
+used the WRONG script (live_staged_place_cancel.py, which has no T32 case —
+startState=13 there is out of range and matched no branch). Caught before
+any order was placed (verified via venue.py status), killed cleanly, and
+relaunched against the correct live_staged_params.py.
