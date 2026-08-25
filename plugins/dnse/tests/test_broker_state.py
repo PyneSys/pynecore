@@ -69,8 +69,30 @@ def __test_get_position_single_row_long__(fake_client):
     ]}))
     position = asyncio.run(b.get_position("VN30F1M"))
     assert position is not None, "a single NB row must produce a position, not None"
-    assert position.side == "buy" and position.size == 5.0
+    assert position.side == "long" and position.size == 5.0  # engine contract vocabulary (#49, models.py:322)
     assert position.entry_price == 100.0, "entry_price must equal costPrice for one row"
+
+
+def __test_get_position_side_speaks_the_engine_contract_vocabulary__(fake_client):
+    """#49 (RED until fixed): ``models.ExchangePosition`` documents ``side`` as
+    "long" | "short" | "flat" (models.py:322) and the engine's startup size
+    adoption recognizes ONLY "long"/"short" (sync_engine.py:4413 and twins) —
+    DNSE returned "buy"/"sell", so adoption logged "unrecognised side label
+    'buy'" and silently skipped on EVERY start (measured live, smoke824 warmup
+    2026-08-24). Right outcome that day (operator-owned position), wrong reason
+    always."""
+    long_rows = {"positions": [
+        {"symbol": "VN30F1M", "side": "NB", "openQuantity": 9, "costPrice": 1932.5}]}
+    short_rows = {"positions": [
+        {"symbol": "VN30F1M", "side": "NS", "openQuantity": 2, "costPrice": 1940.0}]}
+
+    b = _broker(fake_client, get_positions=(200, long_rows))
+    assert asyncio.run(b.get_position("VN30F1M")).side == "long", \
+        "net long must read 'long' — the engine ignores 'buy'"
+
+    b = _broker(fake_client, get_positions=(200, short_rows))
+    assert asyncio.run(b.get_position("VN30F1M")).side == "short", \
+        "net short must read 'short' — the engine ignores 'sell'"
 
 
 @pytest.mark.parametrize("rows, want_size, want_entry", [
@@ -96,7 +118,7 @@ def __test_get_position_ns_nets_negative__(fake_client):
         {"symbol": "VN30F1M", "side": "NS", "openQuantity": 4, "costPrice": 50.0},
     ]}))
     position = asyncio.run(b.get_position("VN30F1M"))
-    assert position.side == "sell", "NS must net negative -> side sell"
+    assert position.side == "short", "NS must net negative -> side short (#49: engine contract vocabulary)"
     assert position.size == 4.0 and position.entry_price == 50.0
 
 
@@ -105,7 +127,7 @@ def __test_get_position_long_alias_treated_as_positive__(fake_client):
         {"symbol": "VN30F1M", "side": "LONG", "openQuantity": 2, "averagePrice": 10.0},
     ]}))
     position = asyncio.run(b.get_position("VN30F1M"))
-    assert position.side == "buy", "the LONG alias must be treated the same as NB"
+    assert position.side == "long", "the LONG alias must be treated the same as NB (#49 vocabulary)"
     assert position.entry_price == 10.0, "averagePrice must be used when costPrice is absent"
 
 

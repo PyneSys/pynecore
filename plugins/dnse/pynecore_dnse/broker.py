@@ -1138,8 +1138,11 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         if net == 0:
             return None
         volume = abs(net)
+        # "long"/"short" is the ExchangePosition contract (models.py:322) and the
+        # ONLY vocabulary the engine decodes — "buy"/"sell" silently disabled
+        # startup size adoption and could halt a defensive-close settle (#49).
         return ExchangePosition(
-            symbol=symbol, side="buy" if net > 0 else "sell", size=volume,
+            symbol=symbol, side="long" if net > 0 else "short", size=volume,
             entry_price=(cost / volume) if volume else 0.0,
             unrealized_pnl=0.0, liquidation_price=None,
             leverage=1.0, margin_mode="cross")
