@@ -40,7 +40,6 @@ __all__ = ['SeriesTransformer']
 #: left to the runtime no-op in :mod:`pynecore.lib`.
 _BUFFER_SETTERS = {
     'max_bars_back': 'max_bars_back',
-    '_stale_on_gap': 'stale_on_gap',
 }
 
 

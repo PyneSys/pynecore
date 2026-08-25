@@ -28,7 +28,7 @@ from ..core.pine_compare import (EPSILON as _EPSILON, lower_bound as _tol_lower_
 # is a runner internal, like ``_time`` or ``_script``.
 # noinspection PyProtectedMember
 from pynecore.lib import (open, high, low, close, volume, hl2, hlc3, bar_index, array, session,
-                          max_bars_back, math as lib_math, _last_close, _stale_on_gap)
+                          max_bars_back, math as lib_math, _last_close)
 
 TFIB = TypeVar('TFIB', float, int, bool)
 TFI = TypeVar('TFI', float, int)
@@ -695,16 +695,27 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     # An int-typed Pine value can still carry a fraction (``int / int``); the
     # truncation happens where an integer is required — see ``_check_type``.
     length = int(length)
-    _stale_on_gap(source, True)
     capacity: Persistent[int] = 0
-    # TradingView sizes this window to the deepest read it has needed so far, and a
-    # bar that skips the call reads the slot from one capacity back (see
-    # ``_stale_on_gap``), so the capacity is part of the RESULT here, not just of the
-    # storage: it decides how old that stale value is. The growth is monotonic, like
-    # TradingView's own on-demand resize.
-    if length > capacity:
-        capacity = length
-        max_bars_back(source, capacity)
+    window: Persistent[list[float]] = []
+    # MEASURED LAW — every CALL SITE owns a window buffer of ``length + 1`` slots
+    # addressed by the CHART BAR (``bar_index % capacity``) and written only on the
+    # bars the call actually runs. A bar that skips the call leaves its slot holding
+    # what was written a whole capacity earlier, and the extreme is then taken over
+    # that stale value; a bar that calls it many times rewrites one slot. Probed on
+    # the wild-corpus script "Twin Range Filter Algo", whose ``ta.lowest(low, 10)``
+    # sits behind a position-state ``if``: over 28827 bars (BINANCE:BTCUSDT 30m)
+    # this addressing reproduces every value TradingView returns, while reading the
+    # source's own bar history misses 872 of them. The buffer only grows, like
+    # TradingView's own on-demand resize, and a growth remaps each slot onto the bar
+    # it was written on so a stale value keeps its age.
+    if length >= capacity:
+        new_capacity = length + 1
+        new_window: list[float] = [na_float] * new_capacity
+        for j in builtins.range(capacity):
+            b = bar_index - ((bar_index - j) % capacity)
+            new_window[b % new_capacity] = window[j]
+        window = new_window
+        capacity = new_capacity
 
     last_max: Persistent[float] = na_float
     last_max_index: Persistent[int] = 0
@@ -730,6 +741,7 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
         if avail > length:
             avail = length
     last_bar = bar_index
+    window[bar_index % capacity] = source
 
     # A na input RESETS the machine: the window and the kept extreme are forgotten,
     # and the next non-na call starts a fresh window (probes ``hina_probe`` and
@@ -758,7 +770,7 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
         last_max = source
         last_max_index = 0
         for i in builtins.range(1, length if avail >= length else avail + 1):
-            s = source[i]
+            s = window[(bar_index - i) % capacity]
             if s > last_max:
                 last_max = s
                 last_max_index = i
@@ -1008,13 +1020,19 @@ def lowest(source: Series[float], length: int,
     # An int-typed Pine value can still carry a fraction (``int / int``); the
     # truncation happens where an integer is required — see ``_check_type``.
     length = int(length)
-    _stale_on_gap(source, True)
     capacity: Persistent[int] = 0
-    # See ``highest``: the window capacity decides how old the stale value a skipped
-    # bar leaves behind is, so it must be the length TradingView sizes it to.
-    if length > capacity:
-        capacity = length
-        max_bars_back(source, capacity)
+    window: Persistent[list[float]] = []
+    # See ``highest`` for the measured window law: a per-call-site buffer of
+    # ``length + 1`` slots addressed by the chart bar, written only when the call
+    # runs, so a skipped bar serves the value from one capacity back.
+    if length >= capacity:
+        new_capacity = length + 1
+        new_window: list[float] = [na_float] * new_capacity
+        for j in builtins.range(capacity):
+            b = bar_index - ((bar_index - j) % capacity)
+            new_window[b % new_capacity] = window[j]
+        window = new_window
+        capacity = new_capacity
 
     last_min: Persistent[float] = na_float
     last_min_index: Persistent[int] = 0
@@ -1033,6 +1051,7 @@ def lowest(source: Series[float], length: int,
         if avail > length:
             avail = length
     last_bar = bar_index
+    window[bar_index % capacity] = source
 
     # A na input resets the machine — window forgotten, next non-na call starts
     # fresh (see ``highest`` for the measured law).
@@ -1056,7 +1075,7 @@ def lowest(source: Series[float], length: int,
         last_min = source
         last_min_index = 0
         for i in builtins.range(1, length if avail >= length else avail + 1):
-            s = source[i]
+            s = window[(bar_index - i) % capacity]
             if s < last_min:
                 last_min = s
                 last_min_index = i

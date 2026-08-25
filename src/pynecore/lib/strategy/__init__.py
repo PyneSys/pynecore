@@ -189,6 +189,7 @@ class Order:
         "gap_committed",  # Exit leg locked into the current bar-open gap batch
         "deferred_qty",  # Default-sized entry: quantity re-resolves at the actual fill price
         "budget_money",  # Money budget of a default-sized entry frozen at (last) placement
+        "budget_pv",  # Account point value (quote->account rate) frozen with it
         "filled_qty",  # Live: quantity of this entry order already reflected in open_trades
         "flip_extra",  # Reversal flip magnitude frozen at creation (added back on deferred re-size)
         "skip_flip",  # Entry re-placed on the same bar: it keeps its raw qty, no flip augmentation
@@ -279,6 +280,7 @@ class Order:
         self.gap_committed = False
         self.deferred_qty = False
         self.budget_money: float | None = None
+        self.budget_pv: float | None = None
         # Live-only fill accounting: how much of this retained entry order has
         # already been recorded as an open trade. The simulator removes a
         # market entry order on fill, so it stays 0.0 there; the live broker
@@ -2525,29 +2527,33 @@ class SimPosition(PositionBase):
         return _trail_deferred
 
     def _seed_trail_at_issue(self, order: Order, *, fold_extreme: bool = True) -> None:
-        """Fold the issue bar into a trailing exit's high/low-water mark.
+        """Seed a freshly (re-)issued trailing exit's high/low-water mark.
 
         ``process_orders`` runs before the script body, so an exit issued in the
         script on bar N -- e.g. one gated on ``strategy.position_size``, which is
         only known once the entry has filled -- is first evaluated on bar N+1.
-        The entry-fill bar's own extreme would then never seed the trail, leaving
-        PyneCore's water mark one bar behind TradingView's, which keeps the
-        trailing stop alive from the bar the position is already open. Advance the
-        water mark here at issue time (activation + ratchet only -- the fill still
-        happens in the next ``process_orders``).
+        The water mark still has to exist by then: TradingView arms such a leg on
+        its issue bar and carries the armed stop into the next bar's walk.
+
+        MEASURED (BINANCE:BTCUSDT 30m, 222 trades of a probe entering every 97th
+        bar and issuing ``strategy.exit(trail_points=50, trail_offset=10)`` from
+        inside ``if strategy.position_size > 0``): the mark anchors to the issue
+        bar's CLOSE tick, NOT to its extreme. Folding the entry-fill bar's H/L in
+        puts the stop above the next bar's open, which then gaps through and fills
+        at that open -- 106 of the 222 exits land on the wrong price that way,
+        zero with the close anchor. The same anchor was already verified for a
+        changed-params re-issue (per-bar ``atr*mult`` trail): a long re-issue
+        filled at ``next open - offset`` (open above close, mark advanced) and a
+        short re-issue at ``close + offset`` (open above close, mark kept).
 
         Exits placed on the entry SIGNAL bar (entry still pending, so no bound
         trade is open yet) are skipped: ``process_orders`` seeds those on their
-        fill bar exactly as before, so the single-issue path is unchanged.
+        fill bar from the fill price onward (``_activate_trails_on_fill``).
 
-        With ``fold_extreme=False`` (a changed-params re-issue) the water mark
-        anchors to the issue bar's CLOSE tick instead of its extreme: the
-        replaced leg sees only the current price, so it arms there when the
-        activation is already met, and the next bar's open advances the stop
-        only when favorable. TV-verified both ways on BINANCE:BTCUSDT 30m
-        (per-bar ``atr*mult`` trail): a long re-issue filled at
-        ``next open - offset`` (open above close, mark advanced) and a short
-        re-issue filled at ``close + offset`` (open above close, mark kept).
+        ``fold_extreme`` is True only for an IDENTICAL re-issue, whose carried
+        mark ``process_orders`` has already ratcheted through this bar's extreme
+        -- re-folding it there is a no-op that keeps the carried leg's state
+        explicit.
 
         :param order: The freshly (re-)issued trailing exit order.
         :param fold_extreme: If True, ratchet the issue bar's H/L extreme into
@@ -2822,9 +2828,11 @@ class SimPosition(PositionBase):
         TradingView resolves percent_of_equity / cash default sizing of
         price-based (limit/stop) orders when the order EXECUTES, dividing the
         order's money budget by the per-unit cost at the real fill price. The
-        budget itself is FROZEN at the close of the bar where the order was
-        (last) placed or modified — an order resting for many bars keeps the
-        placement-close equity, it is not re-marked at fill (measured on the
+        budget itself — the money AND the quote-to-account rate that turns the
+        fill price into an account-currency unit cost — is FROZEN at the close of
+        the bar where the order was (last) placed or modified: an order resting
+        for many bars keeps the placement-close equity, it is not re-marked at
+        fill (measured on the
         Trendoscope corpus fork: a buy stop placed 12 bars before its fill
         sized off the placement bar's equity, reproduced one-shot by probe;
         an order re-placed every bar degenerates to prev-close equity, which
@@ -2834,10 +2842,17 @@ class SimPosition(PositionBase):
         they keep the placement-close size computed in ``entry``
         (TV-probe-verified). The reversal flip component stays frozen from
         creation (TV computes the flip quantity at order creation time).
+
+        MEASURED on the wild-corpus strategy "Breakout Trend Follower"
+        (BINANCE:BTCUSDT 30m, a USD account on a USDT-quoted symbol, so the daily
+        COINBASE:USDTUSD rate steps at every 00:00 bar): 12 of 580 entries sized
+        one lot off while the FILL bar's rate converted the unit cost, ten of them
+        on a 00:00 bar. Converting with the PLACEMENT bar's rate instead makes all
+        580 exact — the rate rides with the frozen money, not with the fill.
         """
         order.deferred_qty = False
         old_abs = abs(order.size)
-        budget = _default_entry_budget(float(fill_price))
+        budget = _default_entry_budget(float(fill_price), order.budget_pv)
         if budget is None:
             qty = lib._script.default_qty_value
             money = None
@@ -4912,7 +4927,7 @@ def convert_to_symbol(value: PyneFloat) -> PyneFloat:
 
 
 # noinspection PyProtectedMember
-def _default_entry_budget(price: float) -> tuple[float, float] | None:
+def _default_entry_budget(price: float, pv: float | None = None) -> tuple[float, float] | None:
     """Money amount and per-unit cost of a default-sized entry at ``price``.
 
     Returns ``(money, unit_cost)`` so that the raw quantity is
@@ -4924,13 +4939,18 @@ def _default_entry_budget(price: float) -> tuple[float, float] | None:
     ``strategy.cash`` sizes 584/584 at ``(cash / rate) / price`` and
     ``percent_of_equity`` 581/584 at ``floor_mc((equity / rate) / price)``, which is the
     same thing as dividing an account-currency budget by an account-currency unit cost.
+
+    ``pv`` overrides the current bar's account point value with the one frozen at
+    a resting order's placement: the quote->account rate is part of the frozen
+    budget, not of the fill (see :meth:`SimPosition._resolve_deferred_qty`).
     """
     script = lib._script
     default_qty_type = script.default_qty_type
     if default_qty_type == fixed:
         return None
 
-    pv = _account_point_value()
+    if pv is None:
+        pv = _account_point_value()
 
     if default_qty_type == percent_of_equity:
         target_investment = script.position.equity * script.default_qty_value * 0.01
@@ -5517,6 +5537,7 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
         budget = _default_entry_budget(float(exec_price))
         if budget is not None:
             order.budget_money = budget[0]
+            order.budget_pv = _account_point_value()
     # Store in entry_orders dict
     position._add_order(order)
 
@@ -5756,11 +5777,12 @@ def exit(id: str, from_entry: str = "",
         order.bound_size = bound
         order.entry_seq = entry_seq
         position._add_order(order)
-        # A brand-new trailing leg (first issue, or trailing added to a live
-        # bracket) and an identical re-issue fold the issue bar's extreme into
-        # the water mark; a changed-params re-issue re-arms anchored to the
-        # issue bar's close only (see above).
-        position._seed_trail_at_issue(order, fold_extreme=not had_trail or trail_unchanged)
+        # Only an identical re-issue folds the issue bar's extreme into the water
+        # mark -- and there it is a no-op, since the carried leg was already
+        # walked through this bar. A brand-new leg (first issue, or trailing added
+        # to a live bracket) and a changed-params re-issue both anchor to the
+        # issue bar's CLOSE tick (see ``_seed_trail_at_issue``).
+        position._seed_trail_at_issue(order, fold_extreme=had_trail and trail_unchanged)
 
     # noinspection PyProtectedMember
     def _filled_targets(entry_id: str | None) -> list[tuple[int | None, str, float, float]]:
@@ -6011,6 +6033,7 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
         budget = _default_entry_budget(float(exec_price))
         if budget is not None:
             order.budget_money = budget[0]
+            order.budget_pv = _account_point_value()
     position._add_order(order)
 
 

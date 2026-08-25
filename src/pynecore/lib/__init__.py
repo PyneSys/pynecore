@@ -188,21 +188,6 @@ def max_bars_back(var: Any, num: int) -> None:
     """
 
 
-# noinspection PyUnusedLocal
-def _stale_on_gap(var: Any, enabled: bool) -> None:
-    """
-    Make a series history behave like the window buffer of a native TradingView builtin.
-
-    Such a buffer steps one slot per bar even on the bars that do not call the
-    builtin, and those bars write nothing: the slot keeps the value from a whole
-    capacity earlier, which the window then reads back. Only for the ``@pyne lib``
-    machines whose TradingView counterpart was measured to do this.
-
-    :param var: Series variable identifier whose buffer keeps stale slots.
-    :param enabled: True to keep stale slots instead of compacting the gap away.
-    """
-
-
 ### Date / Time ###
 
 # noinspection PyShadowingNames
