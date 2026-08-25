@@ -138,6 +138,26 @@ exit path already tracks its child via `externalOrderId`, the stop-entry path do
 not). When reading order state: `Activated` on the conditional book means *look up
 the child on the normal book* — never treat it as terminal-without-fill.
 
+## INVALID_TRADING_TOKEN on conditional writes is usually NOT a token problem (CRITICAL)
+
+Measured 2026-08-24/25 (cards #46, #51): DNSE rejects VALID, in-TTL trading
+tokens on **conditional-book writes** (place AND cancel) with
+`400 INVALID_TRADING_TOKEN` — a 30-second-old token got the same rejection.
+Both measured windows began right after the operator traded in the EntradeX
+app; before that boundary the same token worked (T32 placed+cancelled a
+conditional fine at 09:00). The token-mint flow itself (request → email OTP →
+token, 8h TTL) has never been the failing part.
+
+Rules:
+- Do NOT re-mint on this error — re-minting was measured NOT to help (both days).
+- `token_status.py` liveness stays GOOD through the breakage (its bogus-id
+  probe dies at order lookup, before the deep check) — it is NOT a proxy for
+  conditional-write ability.
+- Schedule L0 and any conditional-book live work BEFORE the operator's first
+  app trade of the day (pre-open ~08:20), or after they log out / go idle.
+- During a broken window: cancels go through the operator's app; DAY orders
+  expire at 14:45; do not keep retrying.
+
 ## DNSE venue toolkit — use it instead of hand-writing probes (CRITICAL)
 
 `plugins/dnse/tools/venue.py` answers the questions every live session needs.
