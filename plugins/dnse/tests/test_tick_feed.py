@@ -46,8 +46,9 @@ def _broker(fake_client, *, feed_mode="tick", **responses):
     return instance
 
 
-def _print(price, qty, total):
-    return {"matchPrice": price, "matchQtty": qty, "totalVolumeTraded": total}
+def _print(price, qty, total, board="G1"):
+    return {"matchPrice": price, "matchQtty": qty, "totalVolumeTraded": total,
+            "boardId": board}
 
 
 def __test_default_mode_never_touches_the_tick_endpoint__(fake_client, monkeypatch):
@@ -140,6 +141,26 @@ def __test_withheld_official_close_falls_back_to_synth_loudly__(
     assert closed.close == 1900.0, "synth values close the bar when the venue withholds"
     assert any("SYNTH" in r.message for r in caplog.records), \
         "a synth-closed bar must be LOUD (L4 grades who-closed)"
+
+
+def __test_put_through_board_excluded_from_synthesis__(fake_client, monkeypatch):
+    """Measured live 2026-08-25 (probe_trades_latest.py): /trades/latest
+    interleaves G1 (continuous) and T1 (put-through/block) rows with
+    INDEPENDENT totalVolumeTraded counters. A T1 row must not feed the bar
+    (off-market price) and must not perturb the G1 cursor."""
+    clock = _Clock(SLOT_A + 10)
+    monkeypatch.setattr(broker.time, "time", clock)
+    polls = iter([
+        (200, [_print(1900.0, 2, 100, board="G1"), _print(5000.0, 1, 30, board="T1")]),
+        (200, [_print(1902.0, 1, 101, board="G1"), _print(1, 1, 31, board="T1")]),
+    ])
+    b = _broker(fake_client, get_latest_trade=lambda *a, **k: next(polls))
+
+    u1 = asyncio.run(b.watch_ohlcv("VN30F1M", "5"))
+    assert u1.high == 1900.0 and u1.close == 1900.0, "T1's 5000.0 must not reach H/C"
+
+    u2 = asyncio.run(b.watch_ohlcv("VN30F1M", "5"))
+    assert u2.high == 1902.0 and u2.close == 1902.0, "T1's low-cursor row must not be read as a G1 replay"
 
 
 def __test_throttle_transition_logged_once__(fake_client, monkeypatch, caplog):

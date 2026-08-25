@@ -180,8 +180,13 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
             getattr(_cfg, "tick_poll_interval", None) or 2.0)
         self._tick_close_timeout: float = float(
             getattr(_cfg, "tick_close_timeout", None) or 20.0)
-        #: Session-cumulative totalVolumeTraded of the newest accepted print —
-        #: the monotone dedup cursor across overlapping /trades/latest polls.
+        #: Session-cumulative totalVolumeTraded of the newest accepted print,
+        #: PER BOARD — measured live 2026-08-25 (probe_trades_latest.py): the
+        #: endpoint returns G1 (continuous) AND T1 (put-through/block) rows
+        #: interleaved, each with its OWN independent, non-comparable counter (a
+        #: single global cursor silently dropped valid G1 prints as replays
+        #: whenever a lower-cursor T1 row interleaved). Only G1 feeds synthesis.
+        self._tick_board = "G1"
         self._tick_cursor: float = 0.0
         self._tick_slot: int = 0          # bar-start ts (s) of the forming bar
         self._tick_bar: dict | None = None
@@ -404,11 +409,13 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         """One ``/trades/latest`` poll: merge new prints into the forming bar.
 
         Dedup cursor: ``totalVolumeTraded`` is session-cumulative and monotone
-        — only prints strictly above the cursor are new (overlapping polls
-        replay old prints; an equality check would drop a same-volume edge
-        case, strictly-greater cannot double-count). Board filtering
-        (put-through prints polluting H/L) is parameterized but EMPTY until
-        the live probe measures real boardId values (#37 adjudication).
+        PER BOARD (measured live 2026-08-25: G1/T1 counters are independent and
+        NOT comparable to each other — a global cursor silently dropped valid
+        prints as replays). Only ``self._tick_board`` rows are compared/kept;
+        strictly-greater-than-cursor (not >=) so a same-volume edge case cannot
+        be mistaken for a replay, and cannot double-count either.
+        Board filtering: T1 (put-through/block trades) is EXCLUDED — its prices
+        are off-market negotiated trades that would contaminate H/L.
         """
         status, body = self.client.get_latest_trade(self.resolve_contract())
         if status == 429:
@@ -427,7 +434,8 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                 else (body.get("trades") or body.get("data") or [])
                 if isinstance(body, dict) else [])
         changed = False
-        for raw in sorted(rows, key=lambda r: float(r.get("totalVolumeTraded") or 0)):
+        board_rows = [r for r in rows if str(r.get("boardId")) == self._tick_board]
+        for raw in sorted(board_rows, key=lambda r: float(r.get("totalVolumeTraded") or 0)):
             total = float(raw.get("totalVolumeTraded") or 0)
             if total <= self._tick_cursor:
                 continue                      # replayed print from an earlier poll
