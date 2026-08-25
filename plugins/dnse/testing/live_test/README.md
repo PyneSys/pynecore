@@ -79,7 +79,7 @@ window.** Do not re-mint on that signature; do not retry into the window.
 | **Live-L4-T05-SynthParity** | recorder over a live window: synth bar captured at each rollover BEFORE official replacement → distributions of close-delta, H/L undershoot, V undershoot (the latest-only endpoint makes exact parity impossible BY CONSTRUCTION — this measures the error bound a calc_on_every_tick author must know) | after T04 |
 | **L1 passive row: DriftDetector (#48)** | self-grades on every run the operator holds a position through; first live PASS 08-25 (2 correct warnings, 0 spam, T32 log) | passive, every session |
 | **L0 tooling update** | classify the #51 signature as "blocked by venue window — reschedule pre-open" instead of generic FAIL (still exits non-zero) | with T33 |
-| **Registry backfill: T19–T30** | the param-matrix states measured 08-17/18 have no registry rows — add them from params_a/b evidence | housekeeping |
+| **Registry backfill: T19–T31** | the param-matrix states (T19-T30, measured 08-17/18, params_a/b evidence) AND T31 (live_t31_direction_gate.* exists with no registry row at all — found 08-25) have no rows; add them, and sweep all side-annotations for rot (the stale '#39 blocked' F-rows showed annotations decay even when statuses hold) | housekeeping |
 
 ### Cases deliberately WITHOUT live coverage (decided, not forgotten)
 - **#43** (pending-OCO drain) and **#47** (cancel-with-outcome multi-id): their
