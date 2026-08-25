@@ -5910,6 +5910,23 @@ class OrderSyncEngine:
                 self._cleanup_closed_position(event)
             for closed_entry_id in fifo_closed:
                 self._cleanup_position_tracking(closed_entry_id)
+            # A flat book must not keep exit tracking under ANY parent id.
+            # The per-entry cleanup above keys on the ids the FIFO walk (and
+            # the dust flatten) actually consumed — but a startup-adopted
+            # position can hold its exposure under the synthetic
+            # ``ADOPTED_STARTUP_ENTRY_ID`` parent while the adopted protective
+            # legs of the SAME exposure stay keyed on the prior run's REAL
+            # entry id. The flat close then retires only the synthetic parent:
+            # the adopted venue leg keeps resting against inventory the
+            # account no longer holds, and its sticky Pine-side reservation
+            # poisons every later exit sizing under that id (measured live:
+            # bybit-spot cycle 87 — the prior trend cycle's 0.00999 TP leg
+            # survived the dust flatten, filled 30 minutes later into the
+            # flat book, and the spot ledger quarantined on negative
+            # inventory while the surviving reservation shrank each new
+            # partial exit to the 5e-06 dust and starved the entry).
+            if closing_leg and self._position.size == 0:
+                self._retire_orphan_exits_on_flat_book()
             # Defensive-close FILL: when a defensive-close marker is in
             # flight, the FILL event arrives carrying the synthetic
             # CloseIntent's pine_id rather than the parent entry id, so
@@ -8178,6 +8195,54 @@ class OrderSyncEngine:
         if not closed_entry_id:
             return
         self._cleanup_position_tracking(closed_entry_id)
+
+    def _retire_orphan_exits_on_flat_book(self) -> None:
+        """Retire exit tracking whose parent id owns nothing on a flat book.
+
+        Complements the per-entry close-fill cleanup: that path keys on the
+        entry ids the FIFO walk / dust flatten consumed, so an exit whose
+        ``from_entry`` differs from the consumed parent survives it. The one
+        producer of that shape is startup adoption — the net exposure seeded
+        under the synthetic :data:`ADOPTED_STARTUP_ENTRY_ID` (or a clamped
+        aggregate) while the adopted protective legs keep the prior run's
+        real ``from_entry``. Once the book is flat, an exit under a parent
+        with no open trade protects nothing; every venue leg it still owns
+        can only oversell (spot: negative-inventory quarantine).
+
+        Parents that are OPENING rather than gone are skipped — a declared
+        pending entry order, an active :class:`EntryIntent`, a parked
+        reversal open, or engine-trigger partial legs still waiting on their
+        parent entry all legitimately hold exit state for exposure that is
+        about to exist.
+        """
+        parents: set[str] = set()
+        for active in self._active_intents.values():
+            if isinstance(active, ExitIntent) and active.from_entry:
+                parents.add(active.from_entry)
+        for ex_key in self._position.exit_orders:
+            if ex_key[1]:
+                parents.add(ex_key[1])
+        for pid in parents:
+            if any(trade.entry_id == pid
+                   for trade in self._position.open_trades):
+                continue
+            if pid in self._position.entry_orders:
+                continue
+            if isinstance(self._active_intents.get(pid), EntryIntent):
+                continue
+            if pid in self._pending_reversal_opens:
+                continue
+            if any(leg.from_entry == pid
+                   and leg.leg_state in (LEG_STATE_PENDING_ENTRY,
+                                         LEG_STATE_CANCEL_TENTATIVE)
+                   for leg in self._partial_bracket_engine.iter_legs()):
+                continue
+            _blog_warning(
+                "flat book left exit tracking under parent %r with no open "
+                "trade — retiring the orphan exits (adopted-leg shape)",
+                pid,
+            )
+            self._cleanup_position_tracking(pid)
 
     def _resolve_parent_opening_ref(self, from_entry: str) -> str | None:
         """Resolve the dispatch ref the parent position actually OPENED under.

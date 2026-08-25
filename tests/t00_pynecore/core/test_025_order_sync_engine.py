@@ -4989,6 +4989,114 @@ def __test_close_fill_books_subdust_residual_flat_and_retires_the_bracket__():
     )
 
 
+def __test_flat_close_retires_adopted_bracket_keyed_on_a_foreign_parent_id__():
+    """A flat book must retire adopted exit legs keyed on the prior run's id.
+
+    Startup adoption can seed the net exposure under the synthetic
+    ``__adopted_startup__`` parent while the adopted protective leg of the
+    SAME exposure keeps the prior run's real ``from_entry``. The close-fill
+    cleanup keys on the FIFO-consumed ids only, so the adopted leg used to
+    survive the flatten: its venue TP stayed resting against inventory the
+    account no longer held and later filled into the flat book (negative
+    spot ledger -> quarantine), while its sticky Pine-side reservation
+    shrank every later exit under that id to the dust remainder and starved
+    the re-entry (measured live: bybit-spot cycle 87).
+    """
+    from decimal import Decimal
+
+    from pynecore.types.strategy import ADOPTED_STARTUP_ENTRY_ID
+
+    b = MockBroker()
+    b.spot_inventory_port = SimpleNamespace(
+        position_dust_threshold=Decimal("0.00001"),
+    )
+    engine, pos = _mk_engine(b, mintick=0.01)
+
+    # Startup-adopted state: net under the synthetic parent, the restored
+    # bracket under the REAL prior-run parent 'L'.
+    pos.size = 0.009995
+    pos.sign = 1.0
+    pos.avg_price = 2500.0
+    pos.reconstruct_parent_trade(
+        entry_id=ADOPTED_STARTUP_ENTRY_ID, size=0.009995, entry_price=2500.0,
+    )
+    pos.reconstruct_exit_order(
+        pine_id="L-X", from_entry="L", side="sell", qty=0.00999,
+        tp_price=2514.46, sl_price=None, trail_price=None, trail_offset=None,
+    )
+    engine.sync(BAR_TS)
+    assert any(
+        isinstance(intent, ExitIntent) and intent.from_entry == "L"
+        for intent in engine.active_intents.values()
+    )
+
+    # Flat signal: the grid-floored close fill leaves sub-step dust and the
+    # dust flatten books the position flat under the synthetic parent only.
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 0.00999, 2494.87, pine_id="",
+                    leg=LegType.CLOSE, xchg_id="xchg-close"))
+
+    assert pos.size == 0.0
+    assert pos.open_trades == []
+    # The adopted leg must be retired with the book: no active exit intent,
+    # no sticky Pine-side reservation, and its venue order cancelled.
+    assert not any(
+        isinstance(intent, ExitIntent) and intent.from_entry == "L"
+        for intent in engine.active_intents.values()
+    )
+    assert not any(ex_key[1] == "L" for ex_key in pos.exit_orders)
+    assert any(
+        getattr(env.intent, 'from_entry', None) == "L"
+        for env in b.cancel_calls
+    )
+
+
+def __test_flat_close_spares_the_bracket_of_a_still_pending_entry__():
+    """The orphan-exit sweep must not touch a parent that is OPENING.
+
+    A reversal / fresh signal can declare a new entry and its bracket in the
+    same evaluation that flattens the book: the new parent has no open trade
+    yet, but its exit state is owed to the fill that is about to land, not
+    orphaned. The sweep keys on gone-parents only.
+    """
+    from decimal import Decimal
+
+    from pynecore.types.strategy import ADOPTED_STARTUP_ENTRY_ID
+
+    b = MockBroker()
+    b.spot_inventory_port = SimpleNamespace(
+        position_dust_threshold=Decimal("0.00001"),
+    )
+    engine, pos = _mk_engine(b, mintick=0.01)
+    pos.size = 0.009995
+    pos.sign = 1.0
+    pos.avg_price = 2500.0
+    pos.reconstruct_parent_trade(
+        entry_id=ADOPTED_STARTUP_ENTRY_ID, size=0.009995, entry_price=2500.0,
+    )
+    # The script declares a fresh entry and its bracket while the close is
+    # in flight — a declared pending entry owns its exit state.
+    pos.entry_orders["N"] = _entry_order("N", 0.01, limit=2400.0)
+    pos.exit_orders[("N-X", "N")] = _exit_order(
+        "N", 0.01, "N-X", stop=2380.0)
+    engine.sync(BAR_TS)
+
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 0.00999, 2494.87, pine_id="",
+                    leg=LegType.CLOSE, xchg_id="xchg-close"))
+
+    assert pos.size == 0.0
+    assert ("N-X", "N") in pos.exit_orders
+    assert any(
+        isinstance(intent, ExitIntent) and intent.from_entry == "N"
+        for intent in engine.active_intents.values()
+    )
+    assert not any(
+        getattr(env.intent, 'from_entry', None) == "N"
+        for env in b.cancel_calls
+    )
+
+
 def __test_close_fill_keeps_a_tradable_remainder_and_its_bracket__():
     """A partial close leaving a tradable remainder must not be dust-flattened.
 
