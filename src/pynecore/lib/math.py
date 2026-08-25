@@ -375,14 +375,40 @@ def round_to_mintick(number: PyneFloat | PyneInt) -> PyneFloat: ...
 
 def round_to_mintick(number: PyneFloat | PyneInt) -> PyneFloat:
     """
-    Returns value rounded to symbol's mintick with ties rounding up.
+    Returns value rounded to symbol's mintick, ties going away from zero.
     """
     if not (number == number):  # is_na_arg
         return na_float
-    # `mintick = minmove / pricescale` (Pine syminfo). Reconstruct via int math so
-    # `minmove=1` paths stay bit-identical to the old formula, while `minmove != 1`
-    # symbols (e.g. QM1!: mintick=0.025, pricescale=1000, minmove=25) round correctly.
-    return int(number / syminfo.mintick + 0.5) * syminfo.minmove / syminfo.pricescale
+    # `mintick = minmove / pricescale` (Pine syminfo), so the position on the tick
+    # grid is `number * pricescale / minmove` -- reconstructed from the int pair, not
+    # divided by the double mintick, which `minmove != 1` symbols (QM1!: mintick=0.025,
+    # pricescale=1000, minmove=25) need anyway and which the tie rule below requires.
+    # TV decides a tie on the EXACT value of that product with the same 1e-10 tolerance
+    # `round()` carries. MEASURED on BINANCE:BTCUSDT 30m: 19999.585, whose product falls
+    # 8.7e-11 short of the tie, rounds UP, while 16384.245 at 1.0e-10 short rounds DOWN
+    # -- yet both products are the very same exactly representable `.5` as a double, so
+    # no double-precision model can separate them. Negatives are symmetric (-1.075 ->
+    # -1.08, -94130.045 -> -94130.04).
+    minmove = syminfo.minmove
+    pricescale = syminfo.pricescale
+    negative = number < 0.0
+    magnitude = -number if negative else number
+    scaled = magnitude * pricescale / minmove
+    units = builtins.int(scaled)
+    offset = scaled - units - 0.5
+    # Only a near-tie is worth the exact product; elsewhere the double decides. The
+    # window covers the double's own error (8 ulp) at any magnitude.
+    slack = 1e-6 + scaled * 1.8e-15
+    if -slack < offset < slack:
+        numerator, denominator = float(magnitude).as_integer_ratio()
+        numerator *= pricescale
+        denominator *= minmove
+        units, remainder = divmod(numerator, denominator)
+        if remainder * _ROUND_TIE_SCALE >= _ROUND_TIE_HALF * denominator:
+            units += 1
+    elif offset > 0.0:
+        units += 1
+    return (-units if negative else units) * minmove / pricescale
 
 
 def sign(number: TFI | NA[TFI]) -> PyneFloat:

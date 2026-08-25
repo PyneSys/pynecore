@@ -125,12 +125,17 @@ class PineTruthinessTransformer(ast.NodeTransformer):
         # would widen each one by another EPSILON and move the threshold to 2e-10
         below.pine_exact = True  # type: ignore[attr-defined]
         above.pine_exact = True  # type: ignore[attr-defined]
+        # The non-float arm is truth-tested too, not handed back raw: Pine's
+        # ``and``/``or`` yield a bool while Python's yield an operand, so an int
+        # or an ``NA`` operand would otherwise leak out as the whole
+        # expression's value (a marker plot exports na where TradingView
+        # exports 0). Two ``not``s are the cheapest bool cast there is.
         return ast.IfExp(
             test=ast.Compare(
                 left=ast.Attribute(value=guarded, attr='__class__', ctx=ast.Load()),
                 ops=[ast.Is()], comparators=[ast.Name(id='float', ctx=ast.Load())]),
             body=ast.BoolOp(op=ast.Or(), values=[below, above]),
-            orelse=ref())
+            orelse=ast.UnaryOp(op=ast.Not(), operand=ast.UnaryOp(op=ast.Not(), operand=ref())))
 
     def visit_If(self, node: ast.If) -> ast.If:
         self.generic_visit(node)

@@ -94,6 +94,14 @@ def __test_and_or_yield_bools__():
     assert _eval("x and y", x=1.0, y=2.0) is True
     assert _eval("x or y", x=0.0, y=2.0) is True
     assert _eval("x or y", x=0.0, y=1e-15) is False
+    # A non-float operand is bool-cast too: Pine's `1 and true` is true, not 1,
+    # and its `true and na` is false, not na (measured on BINANCE:BTCUSDT 30m,
+    # where the marker plots of an int/na condition export 0.0 and 1.0 only)
+    assert _eval("x and y", x=1, y=2) is True
+    assert _eval("x or y", x=0, y=3) is True
+    assert _eval("x and y", x=True, y=NA(int)) is False
+    assert _eval("x or y", x=NA(int), y=False) is False
+    assert _eval("x and y", x=True, y=float('nan')) is False
 
 
 def __test_operand_is_evaluated_once__():
@@ -112,7 +120,7 @@ def __test_already_bool_expressions_are_left_alone__():
     """ Comparisons and friends are not wrapped: the conversion would be cost only """
     assert _rewrite("1 if a > b else 0") == "1 if a > b else 0"
     assert _rewrite("1 if a and b > c else 0") == \
-        "1 if (-1e-10 > a or 1e-10 < a if a.__class__ is float else a) and b > c else 0"
+        "1 if (-1e-10 > a or 1e-10 < a if a.__class__ is float else not not a) and b > c else 0"
     assert _rewrite("1 if not (a > b) else 0") == "1 if not a > b else 0"
     assert _rewrite("1 if True else 0") == "1 if True else 0"
 
