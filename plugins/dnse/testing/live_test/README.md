@@ -41,6 +41,50 @@ venue's position netting. Until the operator flattens or provides a sub-account
 (`account_no` in `workdir/config/plugins/dnse_broker.toml`), FILL-tier cases are
 **parked**, not skipped.
 
+## Offline suites — map and red-first anchors (verified 2026-08-25)
+
+Counts as of 2026-08-25 (they grow; re-run for current numbers):
+**plugin suite 366** (`pytest plugins/dnse/tests/ -q`) and **core engine suite
+1,664** (`pytest tests/ -q --ignore=tests/t00_pynecore/ast/test_045_…`).
+
+| Plugin file | n | Focus |
+|---|---|---|
+| test_provider.py | 68 | OHLCV provider, symbol/timeframe mapping |
+| test_broker_state.py | 52 | position/fills/watch loop + most red-first anchors |
+| test_broker_orders.py | 51 | order construction, payloads, bands |
+| test_errors.py | 43 | venue-code classification, cancel book-probe table |
+| test_broker_lifecycle.py | 42 | place/cancel lifecycle, OCO resolver, `_with_outcome` |
+| test_client.py / test_errors_helpers.py | 31+30 | transport seam / classification helpers |
+| test_refresh_token.py / test_token_status.py | 11+7 | token tooling |
+| test_stop_fill_price.py | 10 | stop→LO pricing (slippage floor) |
+| test_tick_feed.py | 7 | #37 tick synthesis + guards |
+| test_divergence_matrix.py | 6 | #48 executable baseline (engine+plugin) |
+| test_fixes_end_to_end.py | 4 | fake-venue e2e |
+| test_sdk.py / test_contract.py | 2+2 | vendored SDK / plugin authoring contract |
+
+**Red-first anchor map** (each proven FAILING before its fix; the permanent
+tripwire for that card — never weaken):
+- **#42** `__test_activated_adoption_retries_when_external_id_is_late__`,
+  `__test_adoption_gives_up_with_manual_intervention__` (broker_state)
+- **#43** `__test_unresolved_oco_umbrella_child_fill_still_surfaces__` + the
+  dead-umbrella / drain-give-up guards (broker_state)
+- **#45** `__test_cancel_one_unknown_id_probes_every_book__` (test_errors)
+- **#47** `__test_cancel_with_outcome_covers_adopted_children__` (broker_state)
+- **#49** `__test_get_position_side_speaks_the_engine_contract_vocabulary__` (broker_state)
+- **#39** has REGRESSION PINS only (written after the 08-19 fix; docstrings say
+  "#39 regression") — its live proof is F11.
+
+### How to read the registry (evidence classes — audit rule, 2026-08-25)
+A registry STATUS is trustworthy when it carries a date and an evidence trail
+(evidence file in `logs/`, or the measurement inline in the row from venue
+records). SIDE-ANNOTATIONS (block reasons, cross-references) rot silently as
+cards close — the F03–F08 rows carried a "#39 blocked" reason for 6 days after
+#39 was fixed. Rules: annotations must cite the card they depend on; closing a
+card includes sweeping the registry for annotations that cite it; a
+double-check of these tables re-runs the suites and re-reads the evidence
+files for recent rows, but historical measurements are vouched for by their
+trail, not re-measurable.
+
 ## Master test plan v3 (2026-08-25) — dual-system execution
 
 ### Execution systems: every engine-driven case runs on BOTH feeds
