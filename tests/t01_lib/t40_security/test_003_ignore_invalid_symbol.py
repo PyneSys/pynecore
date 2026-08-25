@@ -28,3 +28,25 @@ def __test_ignore_invalid_symbol__(csv_reader, runner, log):
                 f"bar {i}: expected na but got {sec_val}"
 
     log.info("ignore_invalid_symbol test passed — na returned for missing symbol")
+
+
+def __test_ignore_invalid_symbol_warns__(csv_reader, runner, caplog, log):
+    """The silent na downgrade is announced, naming the resolved context"""
+    import logging
+
+    with csv_reader('advance_decline_ratio.csv', subdir="data") as cr:
+        r = runner(
+            cr,
+            syminfo_override=dict(timezone="US/Eastern"),
+        )
+        with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+            for _ in r.run_iter():
+                pass
+
+    warnings = [rec.getMessage() for rec in caplog.records
+                if rec.levelno == logging.WARNING]
+    assert any("Ignored security context" in msg
+               and "NONEXISTENT:SYMBOL" in msg for msg in warnings), \
+        f"missing ignored-context warning, got: {warnings}"
+
+    log.info("ignored security context is reported as a warning")

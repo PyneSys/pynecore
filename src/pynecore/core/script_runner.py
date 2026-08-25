@@ -11,7 +11,8 @@ from datetime import datetime, UTC
 
 from pynecore import lib
 from pynecore.lib import timeframe as timeframe_lib
-from pynecore.lib.log import broker_debug, broker_info, broker_warning, ohlcv_info, sim_info
+from pynecore.lib.log import (broker_debug, broker_info, broker_warning, ohlcv_info, sim_info,
+                              logger)
 from pynecore.core.broker.exceptions import ExchangeConnectionError
 from pynecore.types.ohlcv import OHLCV
 from pynecore.types.na import na_float
@@ -3532,6 +3533,15 @@ class ScriptRunner:
 
             # No data found — check if ignore_invalid_symbol is set
             if ctx.get('ignore_invalid_symbol'):
+                # The context silently becomes an all-``na`` series, so the run
+                # completes and every value derived from it is wrong without a
+                # single error. Name the resolved context so the omission is
+                # visible (and discoverable by tooling that provisions data).
+                logger.warning(
+                    f"Ignored security context (symbol={symbol!r}, "
+                    f"timeframe={timeframe!r}): no OHLCV data found and "
+                    f"ignore_invalid_symbol=true, the context reads na"
+                )
                 result[sec_id] = None
                 continue
 
