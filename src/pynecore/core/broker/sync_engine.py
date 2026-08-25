@@ -1447,6 +1447,11 @@ class OrderSyncEngine:
         # gating the wait on ``_active_intents`` alone cleared the fresh
         # position instantly and left the venue leg unowned.
         self._last_position_fill_monotonic = 0.0
+        #: #48 periodic drift detector (advisory, in-memory — a restart merely
+        #: re-detects): consecutive reconciles that saw a non-zero signed delta
+        #: between venue and book, and the last delta already warned about.
+        self._position_drift_streak: int = 0
+        self._position_drift_warned_delta: float | None = None
 
         # Entry ids whose tracking the external-flatten clear above retired.
         # Their close-leg fill may still arrive late (a reconnect backfill
@@ -4683,9 +4688,50 @@ class OrderSyncEngine:
                 self._external_flatten_cleared_entry_ids.add(entry_id)
                 self._cleanup_position_tracking(entry_id)
         else:
-            # Venue and book agree (or the book is already flat): any earlier
-            # flat observation is obsolete.
+            # Venue and book agree on FLAT-ness — but a partial divergence used
+            # to land here silently too (#48): only shrink-to-zero has a branch
+            # above, so belief 4 vs venue 3 survived forever with no signal.
+            # Detect it, warn-only (adoption mid-run stays refused — a fill can
+            # race the /positions read, comment above): SIGNED comparison (a
+            # magnitude check reads a long<->short flip as agreement), a
+            # persistence streak over ANY non-zero delta (a same-delta check
+            # false-warns on pipelined fills and never fires on a progressive
+            # unwind — #48 panel), deferred while recent fills or pending
+            # cancel dispositions can still legitimately move the book.
             self._flat_observed_with_intents_since = 0.0
+            drift_side = (exch_pos.side or "").lower() if exch_pos is not None else "flat"
+            if exch_pos is None or new_size == 0.0 or drift_side == "flat":
+                venue_signed = 0.0
+            elif drift_side == "long":
+                venue_signed = float(new_size)
+            elif drift_side == "short":
+                venue_signed = -float(new_size)
+            else:
+                venue_signed = None      # unrecognised label: nothing signed to compare
+            if venue_signed is not None:
+                drift_delta = venue_signed - self._position.size
+                _blog_debug("position parity: venue=%s internal=%s",
+                            venue_signed, self._position.size)
+                if drift_delta == 0.0:
+                    self._position_drift_streak = 0
+                    self._position_drift_warned_delta = None
+                else:
+                    drift_now = time.monotonic()
+                    drift_recent_fill = (
+                        drift_now - self._last_position_fill_monotonic
+                        < EXTERNAL_FLATTEN_CONFIRM_GRACE_S)
+                    if not drift_recent_fill and not self._cancel_disposition_pending:
+                        self._position_drift_streak += 1
+                        if (self._position_drift_streak >= 2
+                                and self._position_drift_warned_delta != drift_delta):
+                            _blog_warning(
+                                "position drift: venue %s vs internal %s "
+                                "(delta %+g) persisted %d reconciles — external "
+                                "interference, another strategy on this account, "
+                                "or a missed fill (#48)",
+                                venue_signed, self._position.size, drift_delta,
+                                self._position_drift_streak)
+                            self._position_drift_warned_delta = drift_delta
 
     def _adopt_size_with_replayed_close(
             self,
