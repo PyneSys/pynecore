@@ -125,6 +125,23 @@ class DNSEBrokerConfig(DNSEConfig):
     #: instance at 3 s over a ~6 h session = 7,200 (7%); ten instances = 72%.
     #: Keep >= 1 s always, and >= 3 s when several instances share one key.
     bar_poll_interval: float = 3.0
+    #: Market-data feed mode (#37). "ohlc" (default) = today's closed-bar
+    #: delivery, byte-identical path. "tick" = poll ``/trades/latest`` and
+    #: synthesize the developing bar (is_closed=False) between closes; the
+    #: venue's official closed bar stays authoritative at rollover when it
+    #: arrives within ``tick_close_timeout``.
+    feed_mode: str = "ohlc"
+    #: Tick-mode poll period (seconds). /trades/latest has its OWN 10,000/h
+    #: bucket (guide-ratelimits.md): 2 s = 1,800/h = 18% per strategy — the
+    #: fleet ceiling is TWO tick-mode strategies per key (#40). 1 s is
+    #: config-reachable but breaches with 3 strategies.
+    tick_poll_interval: float = 2.0
+    #: Seconds to wait for the official closed bar at rollover before closing
+    #: the SYNTHESIZED bar loudly instead: the session-final candle is
+    #: withheld ~+903 s at the close (Live-L4-T03) and the emit-ordering
+    #: guard (#37 panel) forbids forming N+1 before closed N — an unbounded
+    #: wait would stall the feed through every session close.
+    tick_close_timeout: float = 20.0
 
 
 class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
@@ -153,6 +170,23 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
             getattr(_cfg, "order_poll_interval", None) or 0.5)
         self._bar_poll_interval: float = float(
             getattr(_cfg, "bar_poll_interval", None) or 3.0)
+        # --- #37 dual-mode feed (S1' — dispatch inside watch_ohlcv) ---
+        self._feed_mode: str = str(getattr(_cfg, "feed_mode", None) or "ohlc")
+        if self._feed_mode not in ("ohlc", "tick"):
+            raise ValueError(
+                f"feed_mode must be 'ohlc' or 'tick', got {self._feed_mode!r} "
+                f"(fail-fast: a typo silently falling back would hide tick mode)")
+        self._tick_poll_interval: float = float(
+            getattr(_cfg, "tick_poll_interval", None) or 2.0)
+        self._tick_close_timeout: float = float(
+            getattr(_cfg, "tick_close_timeout", None) or 20.0)
+        #: Session-cumulative totalVolumeTraded of the newest accepted print —
+        #: the monotone dedup cursor across overlapping /trades/latest polls.
+        self._tick_cursor: float = 0.0
+        self._tick_slot: int = 0          # bar-start ts (s) of the forming bar
+        self._tick_bar: dict | None = None
+        self._tick_close_deadline: float | None = None
+        self._tick_throttled: bool = False
         #: Cancel-confirmation poll (see ``_cancel_took_effect``); tunable for tests.
         self._cancel_verify_attempts: int = 6
         self._cancel_verify_delay: float = 0.7
@@ -270,6 +304,14 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
 
     @override
     async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
+        """The engine's one bar-feed entry point (live_runner hard-calls it):
+        dispatch by ``feed_mode`` — the parity-proven closed-bar path stays
+        byte-identical and isolated from the tick body (#37 S1')."""
+        if self._feed_mode == "tick":
+            return await self._watch_ohlcv_tick(symbol, timeframe)
+        return await self._watch_ohlcv_closed(symbol, timeframe)
+
+    async def _watch_ohlcv_closed(self, symbol: str, timeframe: str) -> OHLCV:
         """Yield the next CLOSED bar by polling REST ``/price/ohlc``."""
         resolution = self.to_exchange_timeframe(timeframe)
         period = _TF_SECONDS.get(timeframe, 300)
@@ -294,6 +336,123 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                             low=float(body["l"][idx]), close=float(body["c"][idx]),
                             volume=float(body["v"][idx]), is_closed=True)
             await asyncio.sleep(self._bar_poll_interval)
+
+    async def _watch_ohlcv_tick(self, symbol: str, timeframe: str) -> OHLCV:
+        """Tick mode (#37): poll ``/trades/latest``, synthesize the developing
+        bar, emit ``is_closed=False`` on change; at rollover the venue's
+        official closed bar is authoritative — fetched for up to
+        ``tick_close_timeout`` seconds, after which the SYNTHESIZED bar is
+        closed loudly (who-closed=SYNTH; the L4 red line grades this).
+
+        Emit-ordering guard (#37 panel): no forming update for slot N+1 is
+        emitted before slot N's close — a forming bar overtaking its close
+        double-increments bar_index engine-side and moves time backwards.
+        """
+        period = _TF_SECONDS.get(timeframe, 300)
+        while True:
+            now = time.time()
+            slot = int(now - (now % period))
+            if self._tick_bar is not None and self._tick_slot < slot:
+                # rollover: close slot N before any forming N+1
+                if self._tick_close_deadline is None:
+                    self._tick_close_deadline = now + self._tick_close_timeout
+                official = await asyncio.to_thread(
+                    self._tick_fetch_official_close, period)
+                if official is not None:
+                    return official
+                if time.time() >= self._tick_close_deadline:
+                    bar, ts = self._tick_bar, self._tick_slot
+                    self._tick_bar, self._tick_close_deadline = None, None
+                    self._last_bar_ts = ts
+                    log.broker_warning(
+                        "tick mode: official close for bar %d withheld past "
+                        "%.0fs — closing the SYNTHESIZED bar (who-closed=SYNTH; "
+                        "expected at session close, Live-L4-T03)",
+                        ts, self._tick_close_timeout)
+                    return OHLCV(timestamp=ts * 1000, open=bar["o"], high=bar["h"],
+                                 low=bar["l"], close=bar["c"], volume=bar["v"],
+                                 is_closed=True)
+                await asyncio.sleep(self._tick_poll_interval)
+                continue
+            update = await asyncio.to_thread(self._tick_poll_once, slot)
+            if update is not None:
+                return update
+            await asyncio.sleep(self._tick_poll_interval)
+
+    def _tick_fetch_official_close(self, period: int) -> "OHLCV | None":
+        """One attempt to read slot ``self._tick_slot``'s OFFICIAL closed bar."""
+        ts = self._tick_slot
+        status, body = self.client.get_ohlc(
+            self.market_type,
+            {"symbol": self.symbol,
+             "resolution": self.to_exchange_timeframe(str(period // 60 or 1)),
+             "from": ts - period, "to": ts + 2 * period})
+        if status != 200 or not isinstance(body, dict) or not body.get("t"):
+            return None
+        for idx, row_ts in enumerate(body["t"]):
+            if int(row_ts) == ts:
+                self._tick_bar, self._tick_close_deadline = None, None
+                self._last_bar_ts = ts
+                return OHLCV(
+                    timestamp=ts * 1000,
+                    open=float(body["o"][idx]), high=float(body["h"][idx]),
+                    low=float(body["l"][idx]), close=float(body["c"][idx]),
+                    volume=float(body["v"][idx]), is_closed=True)
+        return None
+
+    def _tick_poll_once(self, slot: int) -> "OHLCV | None":
+        """One ``/trades/latest`` poll: merge new prints into the forming bar.
+
+        Dedup cursor: ``totalVolumeTraded`` is session-cumulative and monotone
+        — only prints strictly above the cursor are new (overlapping polls
+        replay old prints; an equality check would drop a same-volume edge
+        case, strictly-greater cannot double-count). Board filtering
+        (put-through prints polluting H/L) is parameterized but EMPTY until
+        the live probe measures real boardId values (#37 adjudication).
+        """
+        status, body = self.client.get_latest_trade(self.resolve_contract())
+        if status == 429:
+            if not self._tick_throttled:
+                self._tick_throttled = True
+                log.broker_warning(
+                    "tick mode: /trades/latest throttled (429) — degraded to "
+                    "poll-and-hope cadence; forming updates may stall (#37)")
+            return None
+        if status != 200:
+            return None
+        if self._tick_throttled:
+            self._tick_throttled = False
+            log.broker_info("tick mode: /trades/latest throttle cleared")
+        rows = (body if isinstance(body, list)
+                else (body.get("trades") or body.get("data") or [])
+                if isinstance(body, dict) else [])
+        changed = False
+        for raw in sorted(rows, key=lambda r: float(r.get("totalVolumeTraded") or 0)):
+            total = float(raw.get("totalVolumeTraded") or 0)
+            if total <= self._tick_cursor:
+                continue                      # replayed print from an earlier poll
+            price = float(raw.get("matchPrice") or 0)
+            qty = float(raw.get("matchQtty") or 0)
+            self._tick_cursor = total
+            if price <= 0:
+                continue
+            if self._tick_bar is None or self._tick_slot != slot:
+                self._tick_slot = slot
+                self._tick_bar = {"o": price, "h": price, "l": price,
+                                  "c": price, "v": 0.0}
+                self._tick_close_deadline = None
+            bar = self._tick_bar
+            bar["h"] = max(bar["h"], price)
+            bar["l"] = min(bar["l"], price)
+            bar["c"] = price
+            bar["v"] += qty
+            changed = True
+        if not changed or self._tick_bar is None:
+            return None
+        bar = self._tick_bar
+        return OHLCV(timestamp=self._tick_slot * 1000, open=bar["o"],
+                     high=bar["h"], low=bar["l"], close=bar["c"],
+                     volume=bar["v"], is_closed=False)
 
     # --- order construction ---
 
