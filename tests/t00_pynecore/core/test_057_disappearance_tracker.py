@@ -688,6 +688,63 @@ def __test_partial_fill_then_cancel_preserves_slice_atomically__(
         assert row.closed_ts_ms is not None
 
 
+def __test_cancelled_fully_filled_retires_benignly_without_policy__(
+        tmp_path: Path,
+) -> None:
+    """A CANCELLED verdict for a FULLY FILLED row is a post-fill echo,
+    not an external cancel: benign terminal close, no cancelled event,
+    no policy. Measured on Capital.com (cycle 70): an in-flight entry
+    was netted into an opposite deal's close and the venue reported the
+    consumed order CANCELLED 28 minutes after its complete fill —
+    the ``stop`` policy quarantined a healthy run over the echo."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", qty=0.01, filled=0.01,
+                  extras={MISSING_PENDING_EXTRA: T0})
+        tracker = _make_tracker(ctx, policy='stop')
+        events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
+        assert events == []
+        assert tracker.pending_halt is None
+        row = ctx.get_order("c1")
+        assert row is not None
+        assert row.state == 'closed'
+        assert row.closed_ts_ms is not None
+        assert _read_events(ctx, 'unexpected_cancel') == []
+        retired = _read_events(ctx, 'reconcile_cancel_after_full_fill_retired')
+        assert [coid for coid, _ in retired] == ["c1"]
+
+
+def __test_cancelled_with_completing_slice_books_fill_and_skips_policy__(
+        tmp_path: Path,
+) -> None:
+    """A CANCELLED verdict whose discovered slice COMPLETES the row books
+    the fill (emitted for the engine to settle) and then retires benignly
+    — the same fully-filled predicate gates both the terminal shape and
+    the policy skip, so a completing recovery can never quarantine."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", qty=1.0, filled=0.4,
+                  extras={MISSING_PENDING_EXTRA: T0})
+        tracker = _make_tracker(
+            ctx, policy='stop',
+            confirm=_confirm_const(MissingConfirmation(
+                MissingResolution.CANCELLED,
+                cumulative_filled_qty=1.0, fill_price=1.1,
+                execution_ids=('E9',),
+            )),
+        )
+        events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
+        assert [ev.event_type for ev in events] == ['filled']
+        assert events[0].fill_qty == pytest.approx(0.6)
+        assert tracker.pending_halt is None
+        row = ctx.get_order("c1")
+        assert row is not None
+        assert row.filled_qty == pytest.approx(1.0)
+        assert row.state == 'closed'
+        assert row.closed_ts_ms is not None
+        assert _read_events(ctx, 'unexpected_cancel') == []
+
+
 def __test_stale_confirmation_dropped_when_row_returns_mid_confirm__(
         tmp_path: Path,
 ) -> None:

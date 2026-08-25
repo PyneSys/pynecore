@@ -6096,6 +6096,35 @@ class OrderSyncEngine:
                     )
                 return
             if key is not None:
+                if (event.order.qty > 0.0
+                        and event.order.filled_qty >= event.order.qty - 1e-9):
+                    # A CANCELLED for a FULLY FILLED order is a post-fill
+                    # bookkeeping echo, never an external cancel — there
+                    # was nothing working left to cancel. Venues emit it
+                    # late after the whole quantity executed (measured:
+                    # Capital.com netted an in-flight entry into an
+                    # opposite deal's close and pushed CANCELLED for the
+                    # consumed order 28 minutes after its fill). The
+                    # exposure side is fully owned by the already-booked
+                    # fill events; running the unexpected-cancel teardown
+                    # here would abort legs / drop the envelope of a
+                    # healthy intent and fire the safety policy over an
+                    # echo. Leave tracking to the normal fill/close paths.
+                    _blog_info(
+                        "cancelled push for fully filled intent %s ignored "
+                        "as a benign post-fill echo (%s)",
+                        format_intent_key(key), event,
+                    )
+                    if self._store_ctx is not None:
+                        self._store_ctx.log_event(
+                            'cancel_after_full_fill_ignored',
+                            client_order_id=(
+                                event.order.client_order_id
+                                if event.order is not None else None
+                            ),
+                            intent_key=key,
+                        )
+                    return
                 _blog_error(
                     "unexpected cancel for intent %s (%s)",
                     format_intent_key(key), event,

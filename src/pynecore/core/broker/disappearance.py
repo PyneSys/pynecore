@@ -117,6 +117,11 @@ UNEXPECTED_CANCEL_POLICIES = (
 _QTY_EPS = 1e-9
 
 
+def _is_fully_filled(row: 'OrderRow') -> bool:
+    """``True`` when the row's cumulative fill consumed its full quantity."""
+    return row.qty > 0.0 and row.filled_qty >= row.qty - _QTY_EPS
+
+
 def resolve_unexpected_cancel_policy(
         policy: str,
         *,
@@ -144,10 +149,18 @@ def resolve_unexpected_cancel_policy(
     ``stop_and_cancel`` sibling sweep — it is async and shaped differently
     per path.
 
+    :param policy: The configured ``on_unexpected_cancel`` policy name
+        (one of :data:`UNEXPECTED_CANCEL_POLICIES`).
+    :param reason: Human-readable description of the confirmed cancel,
+        carried into the halt / quarantine request.
+    :param context: Structured payload passed to the quarantine sink.
     :param request_quarantine: Quarantine latch sink; ``None`` (an unwired
         sink under a quarantining policy) triggers the fail-closed halt.
     :param log_event: Audit sink (``RunContext.log_event``); ``None`` skips
         audit persistence (a store-less engine on the push path).
+    :param client_order_id: The affected row's COID, stamped on audit events.
+    :param exchange_order_id: The affected row's venue ref, stamped on
+        audit events.
     """
     def _log(kind: str) -> None:
         if log_event is not None:
@@ -450,7 +463,12 @@ class DisappearanceTracker:
                         "register_executions hook failed for %r",
                         row.client_order_id,
                     )
-            if applied and confirmation.resolution is MissingResolution.CANCELLED:
+            if (applied
+                    and confirmation.resolution is MissingResolution.CANCELLED
+                    and not _is_fully_filled(hook_row)):
+                # A fully filled row was retired as a benign post-fill
+                # close by ``_apply_confirmation`` (same predicate) — the
+                # unexpected-cancel policy must not fire for it.
                 await self._apply_policy(hook_row)
             for event in events:
                 yield event
@@ -694,6 +712,38 @@ class DisappearanceTracker:
                 # a replayed copy of the evidence cannot re-book after the
                 # retire.
                 register_ids = confirmation.execution_ids
+                if _is_fully_filled(updated):
+                    # A fully filled row's ref vanishing is NOT an external
+                    # cancel: the full quantity already executed and was
+                    # booked, so there was nothing working left to cancel.
+                    # Venues can still surface a late CANCELLED for such an
+                    # order — e.g. Capital.com netting an in-flight entry
+                    # into an opposite deal's close and reporting the
+                    # consumed order CANCELLED minutes later. Applying the
+                    # ``on_unexpected_cancel`` policy here would quarantine
+                    # a healthy run over a bookkeeping echo. Retire the row
+                    # as a benign post-fill close instead: no cancelled
+                    # event, and :meth:`observe` skips ``_apply_policy`` on
+                    # the same predicate.
+                    DispatchJournal(self._store).apply_reconcile_outcome(
+                        updated.client_order_id,
+                        ReconcileOutcome(
+                            kind='terminal_close',
+                            reason='missing_pending_grace_expired',
+                            new_state='closed',
+                            audit_event='reconcile_cancel_after_full_fill_retired',
+                            close_row=True,
+                            audit_payload={'missing_since': since,
+                                           'grace': self._grace_s,
+                                           'filled_qty': updated.filled_qty,
+                                           'qty': updated.qty},
+                            exchange_order_id=updated.exchange_order_id,
+                        ),
+                    )
+                    if fill_event is not None:
+                        events.append(fill_event)
+                    self._forget_deferred(updated.client_order_id)
+                    return events, True, register_ids, updated
                 DispatchJournal(self._store).apply_reconcile_outcome(
                     updated.client_order_id,
                     ReconcileOutcome(

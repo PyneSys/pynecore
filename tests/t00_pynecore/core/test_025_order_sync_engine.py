@@ -11423,6 +11423,26 @@ def __test_push_external_cancel_stop_quarantines_and_blocks_replace__():
     assert len(b.entry_calls) == 1
 
 
+def __test_push_cancel_for_fully_filled_order_is_benign_echo__():
+    """A CANCELLED push whose order is FULLY FILLED is a post-fill
+    bookkeeping echo, not an external cancel: there was nothing working
+    left to cancel (measured on Capital.com cycle 70 — the venue reported
+    a netted-away entry CANCELLED 28 minutes after its complete fill).
+    No quarantine, no teardown — the fill/close paths own the intent."""
+    b = MockBroker()  # on_unexpected_cancel == "stop"
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    deal_id = engine.order_mapping["L"][0]
+
+    engine._route_event(_cancelled_event(deal_id, filled_qty=1.0))
+
+    assert engine.quarantined is False
+    assert engine.halted is False
+    assert "L" in engine.order_mapping
+    assert "L" in engine.active_intents
+
+
 def __test_native_cancel_all_expected_no_quarantine__():
     """A plugin native bulk cancel (``execute_cancel_all``) arms the engine's
     expected-cancel set via ``enqueue_native_cancel_all_expected`` BEFORE the
