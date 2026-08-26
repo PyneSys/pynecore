@@ -105,8 +105,9 @@ automatically a finding, sharper than grading either leg alone.
   <date>`); legs run sequentially in one window, ohlc first as control, config
   flipped between legs by the (planned) `run_dual.sh` wrapper.
 - **Budget**: the tick leg adds ~1,800 req/h on `/trades/latest`'s own 10k/h
-  bucket at the 2 s default — fine at n=1; the 2-strategies/key ceiling (#40)
-  does not bite for tests.
+  bucket at the 2 s default — fine at n=1. Fleet ceiling on one key: FIVE
+  tick strategies at 2 s (six breach), TWO at the 1 s floor (#40) — corrected
+  2026-08-26, the ceiling-of-two had been the 1 s panel figure.
 
 ### Scheduling constraint — the #51 venue window (CRITICAL)
 Conditional-book writes are venue-refused (misleading `INVALID_TRADING_TOKEN`)
@@ -120,6 +121,7 @@ window.** Do not re-mint on that signature; do not retry into the window.
 |---|---|---|
 | **Live-L1-T33-CrossProcessCancel** (direct probe) | process A places a far conditional and STAYS ALIVE; process B (`venue.py cancel`, no records) cancels it — exercises #45's probe-all-books fallback live AND measures the #51 window boundary (pre-open: must succeed; post-app-trade: measures the refusal) | first pre-open slot |
 | **Live-L4-T04-TickDelivery** | tick mode delivers forming updates + closes with who-closed-each-bar grading (official within `tick_close_timeout` vs loud SYNTH fallback), 429 transitions logged; THE GATE for the dual-mode policy | first pre-open slot after T33 |
+| **Live-L1-T27-TickDedup** (live_t27_tick_dedup.pine, script pre-exists) | print-dedup behaviour under the REAL tick feed — runnable only now that #37's tick mode exists | after L4-T04, same window |
 | **Live-L4-T05-SynthParity** | recorder over a live window: synth bar captured at each rollover BEFORE official replacement → distributions of close-delta, H/L undershoot, V undershoot (the latest-only endpoint makes exact parity impossible BY CONSTRUCTION — this measures the error bound a calc_on_every_tick author must know) | after T04 |
 | **L1 passive row: DriftDetector (#48)** | self-grades on every run the operator holds a position through; first live PASS 08-25 (2 correct warnings, 0 spam, T32 log) | passive, every session |
 | **L0 tooling update** | classify the #51 signature as "blocked by venue window — reschedule pre-open" instead of generic FAIL (still exits non-zero) | with T33 |

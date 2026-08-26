@@ -133,8 +133,10 @@ class DNSEBrokerConfig(DNSEConfig):
     feed_mode: str = "ohlc"
     #: Tick-mode poll period (seconds). /trades/latest has its OWN 10,000/h
     #: bucket (guide-ratelimits.md): 2 s = 1,800/h = 18% per strategy — the
-    #: fleet ceiling is TWO tick-mode strategies per key (#40). 1 s is
-    #: config-reachable but breaches with 3 strategies.
+    #: fleet ceiling is FIVE tick-mode strategies per key at this default
+    #: (six breach the hour). At the 1 s floor it drops to TWO (#40's panel
+    #: figure — three breach). Corrected 2026-08-26: the TWO had been carried
+    #: over from the 1 s analysis when the default moved to 2 s.
     tick_poll_interval: float = 2.0
     #: Seconds to wait for the official closed bar at rollover before closing
     #: the SYNTHESIZED bar loudly instead: the session-final candle is
