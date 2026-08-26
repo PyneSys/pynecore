@@ -1610,6 +1610,12 @@ class OrderSyncEngine:
         # Intent keys whose blocked dispatch was already logged, so a
         # re-emitted signal or a retried modify logs once, not every sync.
         self._quarantine_blocked_logged: set[str] = set()
+        # Intent keys whose adopted partial-qty classification restore was
+        # already logged. The restore itself must run every sync (the
+        # adopted book never grows the per-parent open_trades seed, so the
+        # rebuilt intents arrive unflagged each time), but logging it per
+        # sync floods the cycle log for hours on an event-driven lane.
+        self._partial_restore_logged: set[str] = set()
 
         # Cross-restart recovery anchors. The state store persists envelope
         # identity and parked-verification entries; replay rebuilds these
@@ -11522,14 +11528,17 @@ class OrderSyncEngine:
                     intent = dataclasses.replace(
                         intent, is_partial_qty_bracket=True,
                     )
-                    _blog_info(
-                        "restored partial-qty classification for adopted "
-                        "engine-trigger bracket %r (qty=%s): open_trades lacks "
-                        "the per-parent seed after a pyramided restart — "
-                        "adopting the live legs instead of converting to a "
-                        "whole-row exit",
-                        format_intent_key(intent.intent_key), intent.qty,
-                    )
+                    if intent.intent_key not in self._partial_restore_logged:
+                        self._partial_restore_logged.add(intent.intent_key)
+                        _blog_info(
+                            "restored partial-qty classification for adopted "
+                            "engine-trigger bracket %r (qty=%s): open_trades "
+                            "lacks the per-parent seed after a pyramided "
+                            "restart — adopting the live legs instead of "
+                            "converting to a whole-row exit (logged once; the "
+                            "restore itself repeats every sync)",
+                            format_intent_key(intent.intent_key), intent.qty,
+                        )
             corrected.append(intent)
         return corrected
 
@@ -12450,10 +12459,38 @@ class OrderSyncEngine:
                             expected_parent_ref,
                             intent.from_entry,
                         )
+                        # The restart-replay registered a §2.6.7 fail-safe
+                        # state (DEGRADING via ``pending_confirmation``) for
+                        # EACH replayed leg's ``parent_entry_dispatch_ref``
+                        # — including the prior run's parent the legs are
+                        # stale under. Cancelling the legs evicts the only
+                        # handle :meth:`_retire_native_failsafe_for_entry`
+                        # walks to reach that ref, and the opening-ref
+                        # rebuild only resolves THIS run's coid, so without
+                        # an explicit retire the stale parent's state
+                        # degrades and blocks new entries on the symbol for
+                        # the rest of the process (measured: ctrader cycle
+                        # 62 — parent '099c-…' stayed DEGRADED after its
+                        # legs were cancelled here, and every entry from
+                        # bar 394 on was dropped on a flat book). Retire
+                        # the stale refs now; the expected (current)
+                        # parent's state is owned by the normal lifecycle.
+                        stale_refs = {
+                            leg.parent_entry_dispatch_ref
+                            for leg in legs_for_intent
+                            if leg.parent_entry_dispatch_ref
+                            and leg.parent_entry_dispatch_ref
+                            != expected_parent_ref
+                        }
                         self._partial_bracket_engine.cancel_legs_for_intent(
                             intent.intent_key,
                             reason='stale_parent_after_restart',
                         )
+                        for stale_ref in stale_refs:
+                            self._native_failsafe_manager.on_deal_id_disappeared(
+                                stale_ref,
+                                now_ms=float(self._current_bar_ts_ms),
+                            )
                         self._order_mapping.pop(key, None)
                         self._drop_envelope(key)
                         if expected_parent_ref is None:

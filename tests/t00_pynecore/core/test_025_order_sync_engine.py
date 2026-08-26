@@ -11007,6 +11007,59 @@ def __test_restart_multi_parent_partial_brackets_adopted_not_converted__(tmp_pat
             assert engine._partial_bracket_engine.has_active_legs_for_intent(key)  # type: ignore[attr-defined]
 
 
+def __test_stale_replayed_legs_retire_their_foreign_failsafe_state__(tmp_path):
+    """Cancelling stale replayed legs retires their foreign parent's §2.6.7 state.
+
+    The restart replay registers a DEGRADING fail-safe state for EACH
+    replayed leg's ``parent_entry_dispatch_ref`` — including a PRIOR
+    run's parent when the script re-used the ``from_entry`` (measured:
+    ctrader cycle 62, parent '099c-…'). The stale-parent branch cancels
+    those legs, which evicts the only handle the retire walk uses to
+    reach the foreign ref; without the explicit retire the state later
+    hits DEGRADED (stale-window / confirmation-timeout) and
+    ``block_new_entry`` drops every entry on the symbol for the rest of
+    the process — on a flat book, with nothing left to protect.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+    from pynecore.core.broker.store_helpers import (
+        LEG_KIND_TP_PARTIAL, LEG_KIND_SL_PARTIAL,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        # The legs carry a PRIOR run's parent coid; this run's own anchor
+        # for "L" resolves to a different coid -> stale-parent branch.
+        foreign_ref = build_client_order_id(
+            run_tag="dead", pine_id="L", bar_ts_ms=BAR_TS - 60_000,
+            kind=KIND_ENTRY, retry_seq=0,
+        )
+        ctx.record_envelope("L", BAR_TS, 0)
+        _persist_partial_leg(ctx, leg_kind=LEG_KIND_TP_PARTIAL, trigger_level=120.0,
+                             parent_entry_dispatch_ref=foreign_ref,
+                             oca_group="__partial_exit_X_L__", oca_type="cancel")
+        _persist_partial_leg(ctx, leg_kind=LEG_KIND_SL_PARTIAL, trigger_level=90.0,
+                             parent_entry_dispatch_ref=foreign_ref,
+                             oca_group="__partial_exit_X_L__", oca_type="cancel")
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=_software_partial_broker(), position=pos,  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        pos.size = 1.0
+        pos.reconstruct_parent_trade(entry_id="L", size=1.0, entry_price=100.0)
+        engine.sync(BAR_TS)
+        # The replay registered the foreign parent's state; the stale-leg
+        # cancel must retire it so it can never degrade into a permanent
+        # symbol-level entry gate.
+        mgr = engine._native_failsafe_manager  # type: ignore[attr-defined]
+        state = mgr.get_state(foreign_ref)
+        assert state is not None
+        assert state.health is FailsafeHealth.RETIRED
+        assert not mgr.block_new_entry(
+            symbol=SYMBOL, pine_id="L2", bar_ts_ms=BAR_TS,
+        )
+
+
 def __test_orphan_clear_timeout_drained_drops_envelope__(tmp_path):
     """An orphan clear that times out then re-clears via drain retires the stale envelope."""
     # The orphan sweep's DIRECT clear hits an ambiguous timeout: it leaves the
