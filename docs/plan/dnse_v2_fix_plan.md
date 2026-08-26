@@ -25,21 +25,64 @@ alternative designs, double-confirmed. NO item survived unchanged:
 
 ### Resequenced execution order (post-review)
 
-**IMMEDIATE, independent of phases (money-path):** item 7's verdict-object +
-ALREADY_FILLED fix; item 8's status-level read classification + narrowed
-except + _iter_orders fail-closed completeness; item 6's get_position envelope
-guard; retire `_write`'s #51-blind token retry (and unpin its tests).
+**IMMEDIATE, independent of phases (money-path):** #55 — item 7's
+verdict-object + ALREADY_FILLED fix (fix class confirmed blind by round 2);
+the page-completeness family — #57 get_position envelope guard, #61 page-0
+order-book reads, #62 the L0 gate itself green-lighting on a truncated read
+(HIGH — raise on PROVEN truncation only, never infer flat); #54 — item 8's
+status-level read classification + narrowed except + _iter_orders
+`rows | None` fail-closed contract; #58 — retire `_write`'s #51-blind token
+retry (and unpin its tests).
 
-**Phase 0:** `_DNSEBase(DNSEProvider, BrokerPlugin[...])` + anti-shadow test.
-**Phase A:** transport error split → persist-first at `_place` → item 5's
-derive-on-restart cursor + executions-endpoint slices → D0 broker_lab thin
-profile as the red-first spec → sibling-retirement contract clause →
-`ADOPTED_STARTUP_EXTRA_KEY` discipline.
-**Phase B:** item 2's two-class recovery ladder → item 4's tri-state ownership
-surfaces + residual alarm → item 3's staged tracker (B0 observe-only first).
+**Phase 0:** `_DNSEBase(DNSEProvider, BrokerPlugin[...])` + anti-shadow test,
+split 0a-now / 0b-before-C (round 2); fix the validator false-pass alongside.
+**Phase A:** transport error split → persist-first at `_place` (round-2
+corrections adopted: urllib3 not httpx; a client timeout KILLS the run) →
+item 5's journal-persisted cursor with derive-on-restart as the recovery
+fallback (`executions/{orderId}` `eventNo`, both rounds) → D0 broker_lab thin
+profile as the red-first spec (pytest-hosted per round 2) →
+sibling-retirement contract clause → `ADOPTED_STARTUP_EXTRA_KEY` discipline.
+**Phase B:** item 2's two-class recovery ladder + #60 `--run-label` adoption
+hole → item 4 as a clamped-snapshot chokepoint over the four raw-net engine
+consumers (tri-state ownership retained; write-side precondition + retirement
+writer split into its own item) → item 3 REPLACED: terminal-state transitions
+are the primary external-cancel channel; the tracker is demoted to a narrow
+residue detector whose `confirm_missing` concludes only from paginated
+`/orders/history`; first step is the `_iter_orders` `rows | None` rewrite.
 **Phase C:** module split. **Phase D:** full broker_lab toggle/control suite.
 **Parallel:** WS market-data track (S3 scope); `metadata.ip` ownership
 experiment; TradingClient hardening list before any WS production use.
+
+## Round-2 blind re-review (A/B) merged (2026-08-26, operator-approved)
+
+A second, blinded review round ran against the pre-review plan version
+(card [#59](https://github.com/rubycell/pynecore/issues/59); full comparison
+in `dnse_v2_fix_plan_AB_comparison.md`). No verdict flipped. The resequenced
+order above IS the merged truth; material corrections it absorbs:
+
+- **Item 6 fix shape corrected**: raise on PROVEN truncation only — an
+  inferred raise on an incomplete envelope would halt healthy runs.
+- **Item 7**: the plan's capitalcom citation was the wrong artifact
+  (`submit_cancel` is bool and always True); port
+  `execute_cancel_with_outcome` + `_classify_cancel_via_activity`. Never emit
+  CANCEL_CONFIRMED from inference — only a read-back terminal with
+  `filled_qty == 0` confirms; everything else is UNKNOWN (engine retries).
+- **Item 4 rescoped deeper** (~80% FP): the surviving fix is a
+  clamped-snapshot chokepoint over the four raw-net engine consumers the
+  clamp never reaches; halt/settle proofs keep the RAW venue net. The
+  post-restart hole runs the OPPOSITE direction (our fills unbooked).
+- **New defect cards**: #60 `--run-label` adoption hole, #61 page-0-only
+  order-book reads, #62 L0-gate false-green on truncation (HIGH),
+  #63 `fake_venue.get_instruments` shape mismatch.
+
+**Fork resolutions** (leader defaults, operator-approved 2026-08-26):
+
+| Fork | Resolution | Why |
+|---|---|---|
+| Item 1 journal mechanism | r1's persist-first at `_place`, adopting r2's corrections (urllib3 reality; timeout kills the run) | the chokepoint is where intent meets transport and Phase A is built around it |
+| Item 3 surviving tracker role | r2's demotion (terminal transitions primary; residue detector; history-only CANCELLED) | only path that passed all bad-fix probes unconditionally; ref-set repair stays hostage to `_iter_orders` disciplines |
+| Item 5 cursor source | synthesis: persist with the item-1 journal, derive-on-restart as fallback | persistence is ~free once the journal exists; derivation covers journal loss |
+| Item 4 write-side asymmetry | split into its own item (r2) | it is the only protection for operator-partial-close; keeping it implicit is how it stayed unbuilt |
 
 ## Executive summary — skip / change / new (updated 2026-08-26 after operator review)
 
