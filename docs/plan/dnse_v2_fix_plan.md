@@ -297,3 +297,33 @@ The three top-5 lists agree almost perfectly. Merged, by live-risk reduction:
 Cheap immediate wins independent of the phases: #54 (read-error classification),
 the side-mapping chokepoint (three-domain NB/NS↔buy/sell↔long/short — the #49
 habitat), the api_version pin isolated into a verification-dated table.
+
+## Corrections after operator review (2026-08-26)
+
+1. **The WS-skip rationale was WRONG — venue fact refuted by re-measurement.**
+   The "trading-WS measured silent" fact was a methodology error: the WS
+   requires an HMAC auth handshake within 30 s and refuses subscribes before
+   it; the old probe never authenticated. Re-probed correctly
+   (probe_ws_market_data.py): auth_success, 4 channels active, ~2,400
+   frames/45 s — 136 trade prints/30 s on 41I1G9000 (every print, vs REST
+   latest-only sampling a fraction), order-book depth, forming-bar `ohlc.{res}`
+   channels, and HPG STOCK frames on the same socket. The vendored SDK even
+   ships the full WS client + AuthManager (never used by the plugin).
+   Consequence: the reference plugins' streaming patterns (router-task
+   fan-out, inbound-idle watchdog, replay-then-backfill, hold-back ordering)
+   move from "recorded for later" to CURRENT work under #50; the WS is the
+   strictly superior tick source (#37's S2 premise partially refuted —
+   recorded on the card) and the fleet path (#40: one socket, 100
+   subscriptions, no REST bucket). The TRADING WS (order events) must be
+   re-probed with the same corrected methodology before its old "silent"
+   verdict is trusted.
+2. **The spot-inventory skip was WRONG — the account holds STOCKS** (HPG et
+   al.), not just derivatives. bybit's `inventory.py` (spot inventory port)
+   becomes the template when stock trading lands in the plugin; moved from
+   SKIP to DEFERRED-RELEVANT, and the stock side should ride #50's WS work
+   (stock frames already flow on the same socket).
+3. **Hedge-mode future-prep** (netting hard-code stays right): put
+   `venue_mode` in ONE seam (the broker_lab profile attribute + a capability),
+   write Phase B's netting logic behind that switch rather than inline
+   assumptions, and document the hedged upgrade path — so a future venue mode
+   is a seam flip plus new tests, not an excavation.
