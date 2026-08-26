@@ -14514,6 +14514,14 @@ class OrderSyncEngine:
                 marker.close_pine_id, marker.blocked_syncs - 1,
             )
             self._pending_reversal_opens.pop(key, None)
+            # "Fresh close dispatch" must be genuinely fresh: the stale
+            # cycle's pinned envelope would replay the same (possibly
+            # spent) COID and the venue's idempotency cache would hand back
+            # the old order instead of closing anything. The close is
+            # reduce-only, so if the previous close IS still live a
+            # duplicate at worst no-ops.
+            self._drop_envelope(marker.close_pine_id)
+            self._order_mapping.pop(marker.close_pine_id, None)
         self._retire_reversal_closing_surfaces(intent)
         if self._position.size == 0.0:
             # Fill events routed during the sweep's broker round-trips
@@ -14614,6 +14622,18 @@ class OrderSyncEngine:
             return
         for key, marker in list(self._pending_reversal_opens.items()):
             self._pending_reversal_opens.pop(key, None)
+            # The close cycle ends with the marker: retire its envelope and
+            # mapping so the NEXT reversal under the same synthetic close
+            # pine id mints a fresh client order id. The envelope pin makes
+            # same-cycle retries idempotent — carried across protocol runs
+            # it replays the SPENT COID, and an idempotency-caching venue
+            # answers with the already-filled order instead of placing a
+            # new close (measured live: bybit-inverse cycle 22 — the second
+            # S reversal's close "dispatched" to the first S reversal's
+            # filled order for 5.5 hours, the book never settled flat, and
+            # the cycle ended in a K3 MISMATCH with doubled exposure).
+            self._drop_envelope(marker.close_pine_id)
+            self._order_mapping.pop(marker.close_pine_id, None)
             if marker.superseded:
                 # A same-bar skip_flip re-placement demoted the reversal to
                 # a plain reduction; the close settling flat is the end of

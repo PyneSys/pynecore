@@ -868,6 +868,88 @@ def __test_parked_reversal_entry_opens_when_the_close_settles_flat__():
     assert pos.size == -1.0
 
 
+def __test_second_reversal_close_mints_a_fresh_coid__():
+    """A completed reversal must not pin its close COID for the next one.
+
+    The close envelope is pinned so same-cycle retries stay idempotent,
+    but a later reversal under the SAME synthetic close pine id is a new
+    protocol run: replaying the spent COID makes an idempotency-caching
+    venue answer with the already-filled order instead of placing a new
+    close (measured live: bybit-inverse cycle 22 — the second S reversal's
+    close "dispatched" to the first S reversal's filled order for 5.5
+    hours, the book never settled flat, and the cycle ended in a K3
+    MISMATCH with doubled exposure).
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+
+    # First S reversal: close dispatched, fills flat, raw S entry opens.
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(_dispatched_close(b.close_calls[0]),
+                             1.0, 49_995.0))
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 49_990.0, pine_id="S", xchg_id="xchg-s",
+                    fill_id="s-1"))
+    assert pos.size == -1.0
+
+    # Reverse back to long the same way.
+    pos.entry_orders.pop("S", None)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.close_calls) == 2
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(_dispatched_close(b.close_calls[1]),
+                             1.0, 50_010.0, xchg_id="xchg-rc2", fill_id="rc-2"))
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_015.0, pine_id="L", xchg_id="xchg-l2",
+                    fill_id="l-2"))
+    assert pos.size == 1.0
+
+    # Second S reversal: the close leg MUST carry a fresh anchor — the
+    # first cycle's COID is spent at the venue.
+    pos.entry_orders.pop("L", None)
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 180_000)
+    assert len(b.close_calls) == 3
+    first, second = b.close_calls[0], b.close_calls[2]
+    assert _dispatched_close(second).pine_id == _dispatched_close(first).pine_id
+    assert second.bar_ts_ms != first.bar_ts_ms
+    assert second.bar_ts_ms == BAR_TS + 180_000
+
+
+def __test_stale_reversal_close_rerun_mints_a_fresh_coid__():
+    """The stale re-run's "fresh close dispatch" must not replay the old COID.
+
+    When the close has not settled for the stale window, the protocol
+    re-runs with a promised fresh dispatch — but the surviving envelope
+    pin would rebuild the SAME client order id, so an idempotency-caching
+    venue keeps answering with the stuck order and the re-run loops
+    forever without ever placing a new close.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
+    assert "S" in engine._pending_reversal_opens
+    # The close never settles: force the marker past the stale window and
+    # onto an older bar so the next re-emission takes the re-run branch.
+    engine._pending_reversal_opens["S"].blocked_syncs = 10
+
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.close_calls) == 2
+    first, rerun = b.close_calls
+    assert _dispatched_close(rerun).pine_id == _dispatched_close(first).pine_id
+    assert rerun.bar_ts_ms != first.bar_ts_ms
+    assert rerun.bar_ts_ms == BAR_TS + 120_000
+
+
 def __test_racing_protective_fill_flattens_and_opens_the_parked_entry__():
     """A venue-side protective leg racing the close leaves NO surplus.
 
