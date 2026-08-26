@@ -2909,6 +2909,14 @@ class SimPosition(PositionBase):
         market (required = equity * price / limit > equity) while a resting sell
         limit above the market survives (required < equity) -- exactly the
         asymmetry TradingView's exported trade lists show.
+
+        The requirement is the ORDER's own margin, not that of the position it
+        would leave behind. The two coincide from flat, which is where the
+        asymmetry above was measured, but they part company under pyramiding:
+        Rocket Grid Algorithm rests ten stacked stop entries whose tenth alone
+        fits the account while the resulting eleven-fold position does not, and
+        TradingView fills that tenth on every one of its 16 grids (then margin
+        calls) instead of cancelling it.
         """
         if not self.entry_orders:
             return
@@ -2922,8 +2930,7 @@ class SimPosition(PositionBase):
             margin_percent = script.margin_short if order.sign < 0 else script.margin_long
             if margin_percent <= 0:
                 continue
-            resulting_qty = abs(self.size + order.size)
-            margin_needed = resulting_qty * self.c * pv * (margin_percent / 100.0)
+            margin_needed = abs(order.size) * self.c * pv * (margin_percent / 100.0)
             if margin_needed > self.equity:
                 self._remove_order(order)
 
@@ -3691,6 +3698,16 @@ class SimPosition(PositionBase):
 
                 if self.sign < 0:
                     self._check_margin_call(self.h, for_short=True, can_defer=False)
+                elif self.sign > 0:
+                    # The favorable extreme is checked a SECOND time, now with
+                    # what the leg filled: an entry that fills on the way up
+                    # raises the long's margin requirement above what the
+                    # pre-leg checkpoint could see. Measured against TV on
+                    # Rocket Grid Algorithm 2025-11-11 01:00, where two pyramid
+                    # stop entries fill on the rising leg and TV then liquidates
+                    # 0.51464 of the grown 0.79946-contract position at H-slip
+                    # (107499.95) -- more than the whole pre-leg position.
+                    self._check_margin_call(self.h, for_short=False, can_defer=False)
 
             # Trailing fills on the closing leg — chronologically after both
             # margin-call checkpoints, so a partial liquidation at the extreme
