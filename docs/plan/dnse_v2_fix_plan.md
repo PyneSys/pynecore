@@ -4,6 +4,53 @@ Status: COMPLETE v1 (2026-08-26) — phase plan verified against measured
 findings; all three reference deep-dives folded in; consolidated ranking at
 the end. Execution tracked on card #53 (full pipeline on pickup).
 
+## Executive summary — skip / change / new (updated 2026-08-26 after operator review)
+
+### Skipped / deferred
+
+| What | Disposition | Why | From |
+|---|---|---|---|
+| ~~WS/streaming modules~~ | **UN-SKIPPED → current work (#50)** | "WS silent" REFUTED — auth-handshake methodology error; alive with every print, order book, forming bars, stock frames | bybit, capitalcom, ctrader |
+| ~~Trading-WS (order events)~~ | **UN-SKIPPED → control plane PROVEN** | documented in our own mirror + implemented in the vendored `TradingClient` (never used) + the plugin never opened a socket; all 3 channels subscribe `active`; delivery pends ONE account event during a capture (empty ≠ conclusive) | our probe + SDK |
+| ~~Spot inventory~~ | **DEFERRED-RELEVANT** | the account holds stocks; bybit's inventory port is the template; stock frames already flow on #50's socket | bybit |
+| Hedge-mode machinery | skip machinery, **keep the seam** | netting hard-coded behind ONE `venue_mode` seam + documented upgrade path | ctrader |
+| Unconditional `CANCELLED` in `confirm_missing` | skip (anti-pattern) | we CAN re-verify — return `INCONCLUSIVE`, esp. in the #51 window | capitalcom |
+| Retire-and-replace orphans for conditionals | skip (inverted) | #51 — re-adopt what recovery cannot cancel | all 3, inverted |
+| broker_lab **now** | Phase D (last) | verifies mechanisms, adds no safety itself | all 3 |
+
+### Changed — existing DNSE code rebuilt
+
+| What changes | Into what / why | From |
+|---|---|---|
+| `broker.py` monolith (1,327 lines) | module split; **Phase 0 = `_base.py` type-only extraction first** | all 3 |
+| In-memory `_identity`/`_order_ids`/`_order_category` | persist-first journal rows; two books = two refs on one row | capitalcom + ctrader |
+| In-memory `_last_seen` | durable content-addressed fingerprint + cursor (restarts re-emit fills today) | capitalcom + bybit F4 |
+| `_cancel_took_effect` | per-target cancel dispatch table, named `reason_path`, `cancel_pending` on #51 refusals | capitalcom |
+| `watch_orders` bare `except: continue` | read-error classification (**#54**, can land now) | bybit |
+| **0.5 s order polling** (100k/h budget) | **order-event PUSH via TradingClient** once delivery proves — real-time fills, budget dissolves; REST poll demoted to fallback | our probe + all 3 |
+| Tick feed source | S1' REST polling → documented fallback; WS per-print stream = target feed (#50) | our probe |
+| Startup adoption (clamps to zero) | journal-backed owned size + re-adoption sweep | capitalcom, bybit |
+| Side mapping / `api_version` pin / `errors.py` taxonomy | single chokepoint / verification-dated table / which-recovery dimension | bybit, bybit, ctrader |
+| Misleading "WS connected" engine banner | honest per-plugin connect reporting (small fix, on #50) | our discovery |
+
+### New — capabilities DNSE has zero of today
+
+| What's new | Why it matters | From |
+|---|---|---|
+| Persist-first journal wiring (6-point ordering) | a lost conditional-POST reply is currently unrecoverable; 90% core-provided | capitalcom + ctrader |
+| `recovery.py` (verdict ladder, never-mutate-on-doubt, `record_complete` on retire, #51-inverted re-adoption) | fixes T16/#36 on a shared netting account | capitalcom + bybit + ctrader |
+| `DisappearanceTracker` wiring (two-book refs, `INCONCLUSIVE` on #51, `is_exempt` #41) | notices operator in-app cancels of our orders | all 3 |
+| **Run-ownership isolation** | never adopt the operator's position as ours, never book their closes as our exits | **ctrader-unique** |
+| Netting accounting (sibling retirement, freshness gate, FIFO-pinned alias) | one-row closes and last-write-wins silently corrupt position state | bybit + ctrader |
+| **WS market-data + trading-event feeds via vendored `TradingClient`** | every print + order book + forming bars + real-time order events, one socket, no REST buckets | #50 probes + all 3 |
+| Bracket per-parent aggregated resolution / `external_activity_ignored` audit | race fix / operator trades become observable non-events | capitalcom / bybit+ctrader |
+| broker_lab suite (post-write faults, control scenarios, #51/#42-A/#41 toggles) | proves journal/recovery offline; `client.py` is an 85-line override seam | all 3 |
+
+Sequencing: **Phase 0** → **A** → **B** → **C** → **D**, with #50 as a parallel
+track (WS feeds) and four independent quick items: #54, the side-mapping
+chokepoint, the version-pin table, and the 30-second order-event delivery
+proof (one operator app action while a capture is open).
+
 ## Why (measured, not theoretical)
 
 Every missing module corresponds to a live failure mode we have already
