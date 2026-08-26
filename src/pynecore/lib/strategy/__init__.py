@@ -869,7 +869,7 @@ class SimPosition(PositionBase):
         'risk_max_position_size',
         'risk_cons_loss_days', 'risk_last_trading_day', 'risk_last_day_equity',
         'risk_intraday_filled_orders', 'risk_intraday_start_equity', 'risk_halt_trading',
-        '_deferred_margin_call', '_fill_counter', '_last_fill_price', '_partial_close_bar',
+        '_deferred_margin_call', '_mc_stage2', '_fill_counter', '_last_fill_price', '_partial_close_bar',
         '_entry_book', '_entry_seq', '_deferred_immediate_closes', '_coof_cursor', '_market_fill_price',
         '_walk_node', '_path_node'
     )
@@ -957,6 +957,12 @@ class SimPosition(PositionBase):
 
         # Deferred margin call (mc_size==1 and AF@C<0: fire after script runs)
         self._deferred_margin_call: tuple[float, bool] | None = None
+        # Second margin-call stage — armed by a fired liquidation, consumed at the
+        # bar's next margin checkpoint (see _margin_call_stage2). Holds
+        # (bar_index, deficit, stage-1 check price, for_short, ((qty, entry_price), ...))
+        # with the legs snapshotted FIFO BEFORE the stage-1 fill.
+        self._mc_stage2: tuple[int, float, float, bool,
+                               tuple[tuple[float, float], ...]] | None = None
         self._fill_counter: int = 0
         # Price of the most recent fill — the broker emulator's "current price"
         # for a calc_on_order_fills body run (see _mark_to_last_fill).
@@ -2653,6 +2659,18 @@ class SimPosition(PositionBase):
         if margin_percent <= 0:
             return False
 
+        # A liquidation earlier this bar armed the second margin-call stage: the
+        # bar's next checkpoint runs TV's stale-credit walk instead of the real
+        # account state (which the stage-1 proceeds usually push back above
+        # water). If the walk fires, this checkpoint is done; if it credits the
+        # whole deficit (k == 0), fall through to the normal check.
+        st2 = self._mc_stage2
+        if st2 is not None:
+            self._mc_stage2 = None
+            if st2[0] == int(lib.bar_index) and st2[3] == for_short:
+                if self._margin_call_stage2(st2, check_price, for_short):
+                    return False
+
         quantity = abs(self.size)
         # Convert price * quantity to account-currency for margin/equity comparisons.
         # Identity latch of ``_account_point_value`` inlined: this runs up to four
@@ -2782,8 +2800,118 @@ class SimPosition(PositionBase):
         margin_call_order.is_market_order = False
         margin_call_order.bar_index = int(lib.bar_index)
 
+        # Arm the second stage for the bar's next checkpoint. TV does not credit
+        # the liquidation proceeds there: it walks the pre-liquidation trades
+        # FIFO, crediting each trade's entry cost immediately but its realized
+        # gain (net of the exit commission) one trade LATE, and stops before the
+        # credit would cover the deficit — see _margin_call_stage2. The snapshot
+        # must be taken before the fill mutates the trade list.
+        deficit = (margin_ticks - equity_ticks) * mintick if big_margin else -available_funds
+        self._mc_stage2 = (int(lib.bar_index), deficit, check_price, for_short,
+                           tuple((abs(t.size), t.entry_price) for t in self.open_trades))
+
         self._fill_order(margin_call_order, fill_price)
         return False
+
+    def _margin_call_stage2(self, st2: tuple[int, float, float, bool,
+                                             tuple[tuple[float, float], ...]],
+                            check_price: float, for_short: bool) -> bool:
+        """
+        Execute the second stage of an intrabar margin call at the bar's next
+        checkpoint, reproducing TV's stale settlement of the first stage.
+
+        MEASURED on BINANCE:BTCUSDT 30m (Rocket Grid Algorithm wild corpus run +
+        rg_sc550/rg_nc/rg_eq input-sweep probes + mc4/mc5 synthetic probes,
+        848/848 margin-call bars exact): after a liquidation at checkpoint price
+        C1 with deficit D, TV's available funds at the NEXT checkpoint do not
+        reflect the liquidation proceeds. Instead TV walks the pre-liquidation
+        trades FIFO, crediting trade j's entry cost at step j but its realized
+        gain — net of the exit commission only — at step j+1, and stops with the
+        last step k whose running credit still fits inside D:
+
+            k  = max j: cum_cost_j + net_gain_{j-1}(C1) <= D
+            D2 = D - cum_cost_k - net_gain_{k-1}
+
+        The remaining shortfall D2 is covered 4x like the first stage, but sized
+        at the FIRST stage's checkpoint price C1 (not this checkpoint's price),
+        capped by the remaining position, and filled here with slippage. With
+        k == 0 (the first trade's cost alone exceeds D — the common single-trade
+        case) no second stage fires: 754/754 single-stage probe bars confirm the
+        deficit is then fully credited. No third stage was ever observed.
+
+        :param st2: The armed (bar_index, deficit, C1, for_short, legs) state
+        :param check_price: This checkpoint's price (the stage-2 fill price base)
+        :param for_short: True when liquidating a short position
+        :return: True if the second stage fired (the checkpoint is consumed)
+        """
+        _, deficit, c1, _, legs = st2
+        if not self.open_trades:
+            return False
+        script = lib._script
+        margin_percent = script.margin_short if for_short else script.margin_long
+        margin_ratio = margin_percent / 100.0
+        pv = (syminfo.pointvalue if _conv_identity_script is lib._script
+              else _account_point_value())
+        comm_type = script.commission_type
+        comm_val = script.commission_value
+
+        cum = 0.0
+        gain_prev = 0.0
+        gain_cur = 0.0
+        k = 0
+        d2 = deficit
+        for qty, entry_price in legs:
+            cost = qty * entry_price * pv
+            if deficit - (cum + cost) - gain_cur < 0.0:
+                break
+            cum += cost
+            gain_prev = gain_cur
+            gain = qty * (entry_price - c1 if for_short else c1 - entry_price) * pv
+            if comm_val:
+                if comm_type == _commission.percent:
+                    gain -= qty * c1 * pv * comm_val / 100.0
+                elif comm_type == _commission.cash_per_contract:
+                    gain -= qty * comm_val
+                else:
+                    gain -= comm_val
+            gain_cur += gain
+            k += 1
+            d2 = deficit - cum - gain_prev
+        if k == 0 or d2 <= 0.0:
+            return False
+
+        loss = d2 / margin_ratio
+        rfactor = syminfo._size_round_factor  # noqa
+        raw_cover_lots = loss / (c1 * pv) * rfactor
+        # Same truncation-with-float-snap as the first stage.
+        nearest_cover = round(raw_cover_lots)
+        if abs(raw_cover_lots - nearest_cover) <= raw_cover_lots * 2.0 ** -26 + 1e-9:
+            cover_lots = int(nearest_cover)
+        else:
+            cover_lots = int(raw_cover_lots)
+        if cover_lots <= 0:
+            return False
+        margin_call_size = min(cover_lots * 4 / rfactor, abs(self.size))
+
+        fill_price = check_price
+        if script.slippage > 0:
+            slippage_amount = syminfo.mintick * script.slippage
+            if for_short:
+                fill_price = check_price + slippage_amount
+            else:
+                fill_price = check_price - slippage_amount
+
+        margin_call_order = Order(
+            None,
+            -self.sign * margin_call_size,
+            order_type=_order_type_close,
+            comment='Margin call'
+        )
+        margin_call_order.is_market_order = False
+        margin_call_order.bar_index = int(lib.bar_index)
+
+        self._fill_order(margin_call_order, fill_price)
+        return True
 
     def process_deferred_margin_call(self):
         """
@@ -3635,6 +3763,15 @@ class SimPosition(PositionBase):
 
             mc_deferred = self.sign < 0 and self._check_margin_call(self.h, for_short=True)
             if not mc_deferred:
+                if self.sign > 0:
+                    # The favorable extreme is checked AFTER this leg's fills
+                    # too: pyramid stop entries filling on the way up can push
+                    # the long past its margin at H — the mirror of the
+                    # down-walk's post-leg check below. Measured against TV on
+                    # Rocket Grid Algorithm 2026-08-25 02:30 (an up-walk bar):
+                    # TV liquidates at H-slip right after the rising leg's
+                    # fills, then runs the second stage at the low.
+                    self._check_margin_call(self.h, for_short=False, can_defer=False)
                 # The checkpoint at the position's FAVORABLE extreme runs
                 # before this leg's fills. Under the float trigger it is a
                 # no-op (available funds only improve toward the favorable
