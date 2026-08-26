@@ -138,6 +138,32 @@ exit path already tracks its child via `externalOrderId`, the stop-entry path do
 not). When reading order state: `Activated` on the conditional book means *look up
 the child on the normal book* — never treat it as terminal-without-fill.
 
+## DNSE WebSocket testing rules — how the "silent WS" false verdict happened (CRITICAL)
+
+Two venue facts were wrongly recorded as "WS is silent" for ~2 weeks because
+probes were built from the DOCS alone. Rules (measured 2026-08-26):
+
+- **The WS requires an explicit auth message within 30 s** (HMAC-SHA256 over
+  `"{api_key}:{timestamp}:{nonce}"`); subscribes are REFUSED before auth.
+  A probe that skips or fails this handshake sees "silent channels".
+- **The connection path exists ONLY in the SDK, not the docs**:
+  `wss://ws-openapi.dnse.com.vn/v1/stream?encoding=json|msgpack`
+  (`_vendor/dnse/websocket/client.py`). Docs give only the base URL — a
+  docs-faithful probe 404s.
+- **Use the vendored `TradingClient`** (`_vendor/dnse/websocket/` — full
+  client + AuthManager, subscribe helpers for every channel). Operator
+  mandate: never hand-roll a WS client for production paths.
+- **Event-driven channels (order./position.) prove delivery only when an
+  account event occurs during the capture** — zero frames with zero account
+  activity is the EXPECTED result, not silence (empty ≠ conclusive).
+  Market-data channels (tick/quotes/ohlc) prove themselves in seconds during
+  trading hours (measured: ~136 prints + ~650 quote frames per 30 s).
+- **The engine's "WS connected and subscribed" banner is generic live-runner
+  text** — for the REST-only DNSE plugin it prints WITHOUT any socket existing
+  (`connect()` is a no-op). Never take it as WS evidence.
+- Working probe: `plugins/dnse/testing/live_test/probe_ws_market_data.py`
+  (`--trading` for order/position channels). Findings live on card #50.
+
 ## INVALID_TRADING_TOKEN on conditional writes is usually NOT a token problem (CRITICAL)
 
 Measured 2026-08-24/25 (cards #46, #51): DNSE rejects VALID, in-TTL trading
