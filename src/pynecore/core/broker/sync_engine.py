@@ -8249,6 +8249,19 @@ class OrderSyncEngine:
         reversal open, or engine-trigger partial legs still waiting on their
         parent entry all legitimately hold exit state for exposure that is
         about to exist.
+
+        Parents are collected from the in-memory tracking AND from the
+        durable journal's live exit-leg rows: cross-script adoption leaves
+        the prior run's protective legs ONLY in the journal — the new
+        script never declares those pine ids, so no intent or Pine
+        order-book slot ever exists for them and an in-memory-only walk
+        retires nothing (measured live: bybit-spot cycle 90 — the prior
+        pyramid cycle's three TP legs were startup-adopted as journal rows,
+        the flat bot closed the adopted exposure, and the untracked venue
+        TPs filled 11 minutes later into the flat book: negative spot
+        ledger -> quarantine). The per-parent cleanup already recovers its
+        cancel targets from these same durable rows, so journal-only
+        parents cancel cleanly.
         """
         parents: set[str] = set()
         for active in self._active_intents.values():
@@ -8257,6 +8270,12 @@ class OrderSyncEngine:
         for ex_key in self._position.exit_orders:
             if ex_key[1]:
                 parents.add(ex_key[1])
+        if self._store_ctx is not None:
+            for row in self._store_ctx.iter_live_orders():
+                if (row.from_entry is not None
+                        and (row.tp_level is not None
+                             or row.sl_level is not None)):
+                    parents.add(row.from_entry)
         for pid in parents:
             if any(trade.entry_id == pid
                    for trade in self._position.open_trades):

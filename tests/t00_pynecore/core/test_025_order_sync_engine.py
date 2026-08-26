@@ -5097,6 +5097,139 @@ def __test_flat_close_spares_the_bracket_of_a_still_pending_entry__():
     )
 
 
+def __test_flat_close_retires_journal_only_adopted_legs__(tmp_path):
+    """A flat book must retire adopted exit legs that exist ONLY in the journal.
+
+    Cross-script rotation adopts the prior run's protective legs as durable
+    journal rows, but the new script never declares those pine ids, so no
+    in-memory intent or Pine order-book slot ever exists for them. The
+    orphan-exit sweep used to walk only the in-memory tracking and retired
+    nothing: the venue legs stayed armed after the flat close and later
+    filled into empty inventory (measured live: bybit-spot cycle 90 — the
+    prior pyramid cycle's three TP legs filled 11 minutes after the flat
+    bot closed the adopted exposure, quarantining the spot ledger on
+    negative inventory).
+    """
+    from decimal import Decimal
+
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+    from pynecore.types.strategy import ADOPTED_STARTUP_ENTRY_ID
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025", symbol=SYMBOL, timeframe="60",
+                account_id="testbroker-demo", label=None,
+            ),
+            script_source="src", script_path="t025.py",
+        )
+        b = MockBroker()
+        b.spot_inventory_port = SimpleNamespace(
+            position_dust_threshold=Decimal("0.00001"),
+        )
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=0.01, store_ctx=ctx,
+        )
+        pos.size = 0.009995
+        pos.sign = 1.0
+        pos.avg_price = 2500.0
+        pos.reconstruct_parent_trade(
+            entry_id=ADOPTED_STARTUP_ENTRY_ID, size=0.009995,
+            entry_price=2500.0,
+        )
+        # The prior run's bracket: startup-adopted journal rows under a
+        # pine id ('L1') this script never declares.
+        ctx.upsert_order(
+            "test-l1x-t0", symbol=SYMBOL, side="sell", qty=0.00999,
+            state="confirmed", intent_key="L1-X\0L1",
+            exchange_order_id="X-TP-1", from_entry="L1", tp_level=2514.46,
+            extras={"kind": "exit_leg", "leg": "tp", "exit_id": "L1-X"},
+        )
+        ctx.upsert_order(
+            "test-l1x-s0", symbol=SYMBOL, side="sell", qty=0.00999,
+            state="confirmed", intent_key="L1-X\0L1",
+            exchange_order_id="X-SL-1", from_entry="L1", sl_level=2431.03,
+            extras={"kind": "exit_leg", "leg": "sl", "exit_id": "L1-X"},
+        )
+        engine.sync(BAR_TS)
+
+        engine._route_event(  # type: ignore[attr-defined]
+            _fill_event('sell', 0.00999, 2494.87, pine_id="",
+                        leg=LegType.CLOSE, xchg_id="xchg-close"))
+
+        assert pos.size == 0.0
+        assert any(
+            getattr(env.intent, 'from_entry', None) == "L1"
+            for env in b.cancel_calls
+        )
+
+
+def __test_flat_close_spares_journal_legs_of_an_opening_parent__(tmp_path):
+    """Journal-collected parents obey the same opening-parent guards.
+
+    A journal exit-leg row whose parent has a declared pending entry in
+    THIS run (a same-script restart replaying its own still-working entry
+    and bracket) holds exit state for exposure that is about to exist —
+    the flat-close sweep must not cancel its venue legs.
+    """
+    from decimal import Decimal
+
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+    from pynecore.types.strategy import ADOPTED_STARTUP_ENTRY_ID
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025", symbol=SYMBOL, timeframe="60",
+                account_id="testbroker-demo", label=None,
+            ),
+            script_source="src", script_path="t025.py",
+        )
+        b = MockBroker()
+        b.spot_inventory_port = SimpleNamespace(
+            position_dust_threshold=Decimal("0.00001"),
+        )
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=0.01, store_ctx=ctx,
+        )
+        pos.size = 0.009995
+        pos.sign = 1.0
+        pos.avg_price = 2500.0
+        pos.reconstruct_parent_trade(
+            entry_id=ADOPTED_STARTUP_ENTRY_ID, size=0.009995,
+            entry_price=2500.0,
+        )
+        ctx.upsert_order(
+            "test-nx-s0", symbol=SYMBOL, side="sell", qty=0.01,
+            state="confirmed", intent_key="N-X\0N",
+            exchange_order_id="X-SL-N", from_entry="N", sl_level=2380.0,
+            extras={"kind": "exit_leg", "leg": "sl", "exit_id": "N-X"},
+        )
+        pos.entry_orders["N"] = _entry_order("N", 0.01, limit=2400.0)
+        pos.exit_orders[("N-X", "N")] = _exit_order(
+            "N", 0.01, "N-X", stop=2380.0)
+        engine.sync(BAR_TS)
+
+        engine._route_event(  # type: ignore[attr-defined]
+            _fill_event('sell', 0.00999, 2494.87, pine_id="",
+                        leg=LegType.CLOSE, xchg_id="xchg-close"))
+
+        assert pos.size == 0.0
+        assert ("N-X", "N") in pos.exit_orders
+        assert not any(
+            getattr(env.intent, 'from_entry', None) == "N"
+            for env in b.cancel_calls
+        )
+
+
 def __test_close_fill_keeps_a_tradable_remainder_and_its_bracket__():
     """A partial close leaving a tradable remainder must not be dust-flattened.
 
