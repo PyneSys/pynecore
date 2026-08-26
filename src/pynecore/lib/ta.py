@@ -2235,11 +2235,21 @@ def sar(start: float = 0.02, inc: float = 0.02, max: float = 0.2) -> PyneFloat:
     # takes no source, so a sub-tolerance series cannot be fed into it -- but they were
     # bounded instead: over 49k bars of BTCUSDT 30m and EURUSD 1m the smallest non-zero
     # |sar - low| / |sar - high| margin was 2.7e-8, with zero margins in the (0, 1e-10)
-    # band (probe m555). Exact ties do occur (72 bars) and decide the same way under
-    # either rule.
-    assert 0 < start <= max, "Start must be positive and not greater than max!"
-    assert inc > 0, "Increment must be positive!"
-    assert max <= 0.5, "Maximum cannot exceed 0.5!"
+    # band (probe m555).
+    #
+    # MEASURED (probes ``sar_probe``/``sar_probe2``, BINANCE:BTCUSDT 30m, 28915 bars):
+    # TradingView validates NONE of the three arguments -- it runs the recurrence with
+    # whatever it is given. ``start`` above ``max`` is a distinct series from both
+    # ``max = start`` and ``start = max`` (so neither side is clamped to the other),
+    # ``max`` of 0.9 / 0.7 / 0.5 stay distinct once ``inc`` is large enough to reach
+    # them (so there is no 0.5 ceiling), and a zero, negative or zero-increment
+    # acceleration factor computes rather than errors. An acceleration factor large
+    # enough to place the projected stop exactly ON the bar's extreme also settles the
+    # tie: the reversal test is STRICT on both sides, so a bar whose high equals the
+    # short stop (or whose low equals the long stop) does NOT reverse -- the level is
+    # merely carried forward by the two-bar clip. ``ta.sar(0.25, 0.25, 0.13)`` puts 11
+    # such bars in the window and every one of them decides TradingView's way only
+    # under the strict rule.
 
     if bar_index == 0:
         return na_float
@@ -2276,7 +2286,7 @@ def sar(start: float = 0.02, inc: float = 0.02, max: float = 0.2) -> PyneFloat:
     # Trend-dependent logic
     if pos_long:
         # Long trend
-        if low <= next_sar:  # Reverse to short
+        if low < next_sar:  # Reverse to short
             pos_long = False
             af = start
             next_sar = ep  # Start from previous EP (Wilder method)
@@ -2300,7 +2310,7 @@ def sar(start: float = 0.02, inc: float = 0.02, max: float = 0.2) -> PyneFloat:
                 af = builtins.min(af + inc, max)
     else:
         # Short trend
-        if high >= next_sar:  # Reverse to long
+        if high > next_sar:  # Reverse to long
             pos_long = True
             af = start
             next_sar = ep  # Start from previous EP (Wilder method)
