@@ -184,6 +184,7 @@ class Order:
         "trail_price", "trail_offset",
         "trail_triggered", "trail_stop",
         "profit_ticks", "loss_ticks", "trail_points_ticks",  # Store tick values for later calculation
+        "ticks_resolved",  # Tick offsets already turned into levels off the entry fill price
         "is_market_order",  # Flag to check if this is a market order
         "cancelled",  # Flag to mark order as cancelled by OCA
         "gap_committed",  # Exit leg locked into the current bar-open gap batch
@@ -260,6 +261,7 @@ class Order:
         self.profit_ticks = profit_ticks
         self.loss_ticks = loss_ticks
         self.trail_points_ticks = trail_points_ticks
+        self.ticks_resolved = False
 
         # Check if this is a market order (no limit, stop, trail, or tick-based prices)
         self.is_market_order = (self.limit is None and self.stop is None
@@ -2024,30 +2026,69 @@ class SimPosition(PositionBase):
         without a level the order sits in no price bucket at all, and no leg of
         the intrabar walk can ever yield it.
 
+        A tick offset and its absolute counterpart (``profit``/``limit``,
+        ``loss``/``stop``, ``trail_points``/``trail_price``) are BOTH live and
+        the one the price path reaches first wins. MEASURED (probes ``ep6_C``
+        to ``ep6_M``, BINANCE:BTCUSDT 30m, 28915 bars): with the absolute level
+        farther out the trades are bit-identical to the same script written
+        without it at all, and with the absolute level nearer the exits move
+        onto it -- 30/140 for ``limit``, 36/141 for ``stop``, the rest fired
+        from the tick offset because the absolute argument evaluated to ``na``
+        on the bar whose order was live when the entry filled. Both levels of a
+        pair sit on the same side of the entry, so "reached first" is simply the
+        lower of the two on the way up and the higher on the way down.
+
+        Pine made this change in v6; a v4/v5 source means the ABSOLUTE level
+        alone, and PyneComp writes that meaning out (``converter/semantics.py``)
+        rather than the runtime carrying two rules.
+
         :param order: The exit order carrying the tick offsets
         :param entry_price: Fill price of the entry the exit is bound to
-        :return: True when a level was created — False for an already-resolved exit
+        :return: True when a level was created or moved — False once resolved
         """
+        if order.ticks_resolved:
+            return False
+        order.ticks_resolved = True
         direction = 1.0 if order.size < 0 else -1.0  # Exit order size is negative of position
         changed = False
+        # A tick offset that undercuts an absolute level leaves the old, farther
+        # level indexed: ``add_order`` only ever adds, so the book is rebuilt.
+        moved = False
 
-        if order.profit_ticks is not None and order.limit is None:
-            order.limit = _price_round(
+        if order.profit_ticks is not None:
+            level = _price_round(
                 entry_price + direction * syminfo.mintick * order.profit_ticks, direction)
-            changed = True
+            if order.limit is None:
+                order.limit = level
+                changed = True
+            elif (level < order.limit) if direction > 0 else (level > order.limit):
+                order.limit = level
+                changed = moved = True
 
-        if order.loss_ticks is not None and order.stop is None:
-            order.stop = _price_round(
+        if order.loss_ticks is not None:
+            level = _price_round(
                 entry_price - direction * syminfo.mintick * order.loss_ticks, -direction)
-            changed = True
+            if order.stop is None:
+                order.stop = level
+                changed = True
+            elif (level > order.stop) if direction > 0 else (level < order.stop):
+                order.stop = level
+                changed = moved = True
 
-        if order.trail_points_ticks is not None and order.trail_price is None:
-            order.trail_price = _price_round(
+        if order.trail_points_ticks is not None:
+            level = _price_round(
                 entry_price + direction * syminfo.mintick * order.trail_points_ticks, direction)
-            changed = True
+            if order.trail_price is None:
+                order.trail_price = level
+                changed = True
+            elif (level < order.trail_price) if direction > 0 else (level > order.trail_price):
+                order.trail_price = level
+                changed = moved = True
 
         # Update orderbook only when prices were actually calculated
         if changed:
+            if moved:
+                self.orderbook.remove_order(order)
             self.orderbook.add_order(order)
         return changed
 
@@ -2576,10 +2617,15 @@ class SimPosition(PositionBase):
             return  # entry still pending -- seeded later on the fill bar
 
         direction = 1.0 if order.size < 0 else -1.0
+        # Same activation level ``_resolve_tick_exit`` settles, computed without
+        # its side effects: whichever of the pair the path reaches first.
         trail_price = order.trail_price
-        if trail_price is None and order.trail_points_ticks is not None:
-            trail_price = _price_round(
+        if order.trail_points_ticks is not None:
+            level = _price_round(
                 entry_price + direction * syminfo.mintick * order.trail_points_ticks, direction)
+            if trail_price is None or ((level < trail_price) if direction > 0
+                                       else (level > trail_price)):
+                trail_price = level
         if trail_price is None:
             return
 
