@@ -1,8 +1,45 @@
 # DNSE v2 Fix Plan — architecture parity with the reference plugins
 
-Status: COMPLETE v1 (2026-08-26) — phase plan verified against measured
+Status: REVIEWED v2 (2026-08-26 — 11-agent adversarial round; see the verdicts section) — phase plan verified against measured
 findings; all three reference deep-dives folded in; consolidated ranking at
 the end. Execution tracked on card #53 (full pipeline on pickup).
+
+## Per-item adversarial review — verdicts (2026-08-26, 11 Opus agents, full reviews on #53)
+
+Every item was challenged for false positives with red-first probes, given 3
+alternative designs, double-confirmed. NO item survived unchanged:
+
+| # | Item | Verdict | Key correction |
+|---|---|---|---|
+| 0 | _base.py | CONFIRMED on a refuted premise | no type checker sees the plugin; value = the written contract. Base must include DNSEProvider in the MRO (verbatim reference shape BREAKS DNSE). Guard: anti-shadow MRO test (red-proven both ways) |
+| 1 | journal wiring | CONFIRMED, worse than stated | a lost reply isn't even parked today (SDK re-raises; status==0 sentinel is DEAD code). Full run_entry BLOCKED (exit intents lack order_type; no run_exit) → persist-first at the `_place` chokepoint. Transport error split lands FIRST or the journal branches are unreachable. `_write`'s token retry = second POST behind one row |
+| 2 | recovery + #51 inversion | PARTIAL FALSE POSITIVE | reference orphan passes never cancel live orders — the "cannot cancel" scenario never arises there. Two-class ladder: journalled ids = core re-points automatically (just don't retire); ACK-window crashes = HALT + operator list. Guard: adoption journal-sourced NEVER book-sourced. DISCOVERY: `metadata.ip` = server-written ownership signal (unmeasured — experiment) |
+| 3 | DisappearanceTracker | PROCEED, shape was WRONG | union-visibility + immortal #41 shells = the planned ref set silently no-ops on exposure rows → lifecycle refs (parent XOR child). Motivation was a false positive (in-app cancels ARE detected today — 22 events in the corpus). #51-INCONCLUSIVE guards a non-hazard. Staged B0→B2; grace 30 s flat |
+| 4 | run-ownership | PARTIAL FALSE POSITIVE (40/20/40) | identity-refusal already structural; adoption filter duplicates the engine clamp; survives as a precondition of item 2 + tri-state ownership (FOREIGN fails closed / INCONCLUSIVE fails open). An owned-set protects the bot from the operator, NOT vice versa — residual-decrease alarm added; FILL tier NOT unlocked |
+| 5 | durable dedup | Justification refuted; RECLASSED | restarts are SILENT today (identity dies too); the duplicate emerges the moment Phase A restores identity → HARD PREREQUISITE OF A. Derive-on-restart + the SDK's executions/{orderId} endpoint (eventNo — in the SDK all along). Guard: cross-instance event reader (capitalcom's own rebuild is instance-scoped = broken) |
+| 6 | netting accounting | SHRINK — 2/3 dissolved | sibling retirement → Phase A contract clause (engine FIFO already does it); FIFO alias → no reader exists. Survivor: the get_position envelope-completeness guard (NEW hazard: truncated page ≡ flat → external-flatten wipe → double exposure) |
+| 7 | cancel dispatch | ADOPT, RESCOPED | cancel_pending doesn't exist as a retryable state anywhere — dropped. NEW HIGH DEFECT: ALREADY_FILLED never returned → cancel-raced-by-fill reads CANCEL_CONFIRMED → engine fires a SECOND MARKET (double-open, red-proven). Blocking verify measured 8.4 s of the 10 s grace on the shared loop. Fix not blocked on Phase A |
+| 8 | read-errors (#54) | PARTIAL FP — wrong mechanism | the bare except never sees HTTP failures (18,936 silent polls under a permanent 401, measured): non-200s flow through _iter_orders' else as zero rows. Classify at status level + per-book health; narrow the except FIRST (it would swallow the new halt) |
+| 9 | broker_lab | PROCEED, resequenced | ~60% of deliverables hollow; the exclusive value = composition-across-restart + post-write faults. D0 thin profile lands WITH Phase A (T16 reproduces RED under the runner today = A's spec). Guard: pytest wiring from commit 1. DEFECT FOUND: 5 tests PIN the anti-#51 token retry |
+| 10 | WS track (#50) | Both justifications refuted | fill-latency is dead (engine drains at bar close); honest win = print fidelity (11% sampled today) + forming bars. TradingClient NOT production-grade (15 defects; silent-death branch on the 8 h close code; zero lines ever run live). S3: WS market-data only; order events stay REST behind shadow grading |
+
+### Resequenced execution order (post-review)
+
+**IMMEDIATE, independent of phases (money-path):** item 7's verdict-object +
+ALREADY_FILLED fix; item 8's status-level read classification + narrowed
+except + _iter_orders fail-closed completeness; item 6's get_position envelope
+guard; retire `_write`'s #51-blind token retry (and unpin its tests).
+
+**Phase 0:** `_DNSEBase(DNSEProvider, BrokerPlugin[...])` + anti-shadow test.
+**Phase A:** transport error split → persist-first at `_place` → item 5's
+derive-on-restart cursor + executions-endpoint slices → D0 broker_lab thin
+profile as the red-first spec → sibling-retirement contract clause →
+`ADOPTED_STARTUP_EXTRA_KEY` discipline.
+**Phase B:** item 2's two-class recovery ladder → item 4's tri-state ownership
+surfaces + residual alarm → item 3's staged tracker (B0 observe-only first).
+**Phase C:** module split. **Phase D:** full broker_lab toggle/control suite.
+**Parallel:** WS market-data track (S3 scope); `metadata.ip` ownership
+experiment; TradingClient hardening list before any WS production use.
 
 ## Executive summary — skip / change / new (updated 2026-08-26 after operator review)
 
