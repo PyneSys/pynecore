@@ -48,6 +48,9 @@ def _mask(value: str) -> str:
 async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=int, default=45)
+    ap.add_argument("--trading", action="store_true",
+                    help="subscribe the TRADING channels (order/position events) "
+                         "instead of market data — passive, read-only")
     args = ap.parse_args()
 
     cfg = ensure_config(DNSEBrokerConfig,
@@ -74,7 +77,12 @@ async def main() -> int:
             print(f"AUTH FAILED: {auth.get('message')}")
             return 2
 
-        await ws.send(json.dumps({"action": "subscribe", "channels": CHANNELS}))
+        channels = CHANNELS if not args.trading else [
+            {"name": "order.derivative.json", "symbols": []},
+            {"name": "order.stock.json", "symbols": []},
+            {"name": "position.derivative.json", "symbols": []},
+        ]
+        await ws.send(json.dumps({"action": "subscribe", "channels": channels}))
         deadline = time.monotonic() + args.seconds
         while time.monotonic() < deadline:
             try:
@@ -94,7 +102,12 @@ async def main() -> int:
                 continue
             key = (str(frame.get("T") or "") + ":" + str(frame.get("symbol") or frame.get("s") or "?")) if frame.get("T") else (frame.get("channel") or action or "<data>")
             counts[str(key)] += 1
-            samples.setdefault(str(key), json.dumps(frame)[:240])
+            text = json.dumps(frame)
+            for field in ("accountNo", "custodyCode", "investorId"):
+                value = frame.get(field)
+                if value:
+                    text = text.replace(str(value), "<masked>")
+            samples.setdefault(str(key), text[:240])
 
     print(f"\n=== capture ({args.seconds}s) ===")
     for key, n in counts.most_common():

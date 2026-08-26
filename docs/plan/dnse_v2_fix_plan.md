@@ -314,9 +314,21 @@ habitat), the api_version pin isolated into a verification-dated table.
    move from "recorded for later" to CURRENT work under #50; the WS is the
    strictly superior tick source (#37's S2 premise partially refuted —
    recorded on the card) and the fleet path (#40: one socket, 100
-   subscriptions, no REST bucket). The TRADING WS (order events) must be
-   re-probed with the same corrected methodology before its old "silent"
-   verdict is trusted.
+   subscriptions, no REST bucket).
+   **Trading-WS follow-through (same day):** order/position event channels are
+   documented in our own mirror (trading_connect guide), implemented in the
+   vendored SDK (`TradingClient.subscribe_order_event/positions/account` —
+   never used), and the plugin NEVER OPENED A SOCKET (connect() is a REST
+   no-op; the engine's "WS connected and subscribed" banner is generic text —
+   misleading-log fix candidate). Probe: auth_success, all three trading
+   channels subscribed ACTIVE; delivery proof pends ONE account event during a
+   capture window (zero frames with zero account activity is EXPECTED — empty
+   is not conclusive). If delivery proves out, order-event PUSH replaces the
+   0.5 s order-poll entirely (fill latency AND the 100k/h Get-Orders budget,
+   #40) — the architecture plan's events.py story becomes WS-first with REST
+   polling as fallback. MANDATE (operator): build on the vendored
+   TradingClient, never a hand-rolled WS client; note the /v1/stream path
+   exists ONLY in the SDK — the docs alone cannot connect.
 2. **The spot-inventory skip was WRONG — the account holds STOCKS** (HPG et
    al.), not just derivatives. bybit's `inventory.py` (spot inventory port)
    becomes the template when stock trading lands in the plugin; moved from
