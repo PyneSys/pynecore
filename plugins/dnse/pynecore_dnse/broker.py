@@ -32,13 +32,14 @@ from pynecore.core.plugin import override
 from pynecore.core.plugin.broker import BrokerPlugin
 from pynecore.core.broker.models import (
     CancelDispositionOutcome, CapabilityLevel, ExchangeCapabilities,
-    ExchangeOrder, ExchangePosition, OrderStatus, OrderType,
+    ExchangeOrder, ExchangePosition, OrderEvent, OrderStatus, OrderType,
 )
 
 from .cancel_disposition import (
     aggregate as _aggregate_dispositions,
     classify_readback as _classify_readback,
 )
+from .feed_health import FeedHealth
 from .page_completeness import (
     BOOK_READ_DEADLINE_S, POSITIONS_PAGE_SIZE,
     book_page_count, is_exposure_row, positions_complete,
@@ -77,6 +78,10 @@ _TERMINAL_STATUSES = frozenset({
     OrderStatus.FILLED, OrderStatus.CANCELLED,
     OrderStatus.REJECTED, OrderStatus.EXPIRED,
 })
+
+#: Read-side dispositions that mean the CREDENTIAL is refused (#54): the only
+#: failure kinds that can satisfy the feed-health all-books halt condition.
+_AUTH_DISPOSITIONS = (errors.Disposition.AUTH, errors.Disposition.AUTH_TOKEN)
 
 #: TradingView timeframe -> seconds (bar-period math for the closed-bar poll).
 _TF_SECONDS = {"1": 60, "3": 180, "5": 300, "15": 900, "30": 1800,
@@ -211,6 +216,18 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         #: Wall-clock deadline for one off-loop positions/book read (#62);
         #: module default sits under the engine's ~30 s execute budget.
         self._book_read_deadline_s: float = BOOK_READ_DEADLINE_S
+        #: #54 feed-health thresholds, in watch CYCLES (0.5 s cadence): first
+        #: warning ~10 s into a persistent failure, re-warn ~60 s, and the
+        #: all-books-AUTH halt only after ~60 s (a latched halt is
+        #: irreversible — an auth blip must warn, never halt). Tunable for
+        #: tests like ``_cancel_verify_attempts``.
+        self._feed_warn_after: int = 20
+        self._feed_rewarn_every: int = 120
+        self._feed_halt_after: int = 120
+        #: Single-flight wait per cycle on the in-flight poll read; a hung
+        #: socket (60 s timeout) counts as stuck cycles, never a stack of
+        #: abandoned worker threads on the SHARED default executor.
+        self._watch_read_deadline_s: float = 10.0
         #: Child-adoption retry shape for an Activated conditional whose
         #: ``externalOrderId`` is not published yet (#42-A). Counted in POLLS, not
         #: seconds, so the schedule is deterministic in tests and cannot hot-spin
@@ -1209,13 +1226,18 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
 
     # --- BrokerPlugin abstracts: state ---
 
-    def _read_book_rows_sync(self, category: str) -> "list[dict] | None":
-        """Every page of ONE book, or None when completeness is unprovable.
+    def _read_book_rows_sync(self, category: str
+                             ) -> "tuple[list[dict] | None, object | None]":
+        """``(rows, None)`` for a complete book; ``(None, classified)`` on a
+        failed read; ``(None, None)`` when pagination is unprovable.
 
         Drains ``totalPages`` (documented in the orders envelope; ignored
-        until #61 — a book past 100 rows silently truncated). None on any
-        failed page, and on an over-cap/unparseable ``totalPages`` (G5'):
-        a partial drain must never be returned as the book.
+        until #61 — a book past 100 rows silently truncated). None-rows on
+        any failed page, and on an over-cap/unparseable ``totalPages`` (G5'):
+        a partial drain must never be returned as the book. The failure
+        classification is RETURNED, never self-recorded (#54 panel): this
+        helper serves both the watch loop and ``get_open_orders``, and only
+        the watch loop feeds the feed-health ladder.
         """
         rows: list[dict] = []
         pages = 1
@@ -1229,17 +1251,17 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                 # inspectable without flooding the operator's log.
                 log.broker_debug("read:orders[%s] p%s -> transient | http=%s code=%s",
                                  category, page_index, status, errors.code_of(body))
-                return None
+                return None, errors.classify(status, body, is_write=False)
             rows.extend(body.get("orders") or [])
             if page_index == 0:
                 page_plan = book_page_count(body.get("totalPages"))
                 if page_plan is None:
                     log.broker_debug("read:orders[%s] totalPages=%s -> unprovable",
                                      category, body.get("totalPages"))
-                    return None
+                    return None, None
                 pages = page_plan
             page_index += 1
-        return rows
+        return rows, None
 
     def _iter_orders(self):
         """Yield raw order rows across NORMAL + conditional books (best-effort).
@@ -1249,7 +1271,7 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         tolerant semantics stay here; the strict ANY-book-unreadable raise
         lives in :meth:`get_open_orders`, the decision read (#62 G3')."""
         for category in _CATEGORIES:
-            rows = self._read_book_rows_sync(category)
+            rows, _classified = self._read_book_rows_sync(category)
             if rows is None:
                 continue
             yield from rows
@@ -1296,81 +1318,184 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
                     pine_id=pine_id, from_entry=from_entry, leg_type=leg_type)
 
     async def watch_orders(self):
-        """Detect fills/cancels by polling the order books (REST, off-loop)."""
-        from pynecore.core.broker.models import OrderEvent
+        """Detect fills/cancels by polling the order books (REST, off-loop).
+
+        #54 feed-health: a persistently failing poll must not leave the feed
+        PERMANENTLY SILENT (measured: 18,936 DEBUG-only polls under a dead
+        credential). Per-book consecutive-failure counters drive
+        feed-attributed warnings (throttled by the ladder), and an ALL-books
+        AUTH streak raises the DESIGNED halt — the engine latches
+        ``BrokerManualInterventionError`` via ``_record_halt``; any other
+        raise would kill the stream task with one log line and no restart.
+        The poll is SINGLE-FLIGHT with a wait deadline: a hung socket read
+        counts as stuck cycles and is re-awaited, never abandoned per cycle
+        (the shared default executor must not fill with dead workers).
+        """
+        health = FeedHealth(
+            warn_after=self._feed_warn_after,
+            rewarn_every=self._feed_rewarn_every,
+            halt_after=self._feed_halt_after,
+            books=tuple(_CATEGORIES))
+        poll_inflight = None
         while True:
             await asyncio.sleep(self._poll_interval)
             if self._pending_oco:
-                # Umbrellas queued at place time live on the unscanned OCO book —
-                # drain BEFORE the row scan so an adopted child's fill can surface
-                # in this same cycle (#43).
-                async for pending_event in self._drain_pending_oco():
-                    yield pending_event
+                try:
+                    # Umbrellas queued at place time live on the unscanned OCO
+                    # book — drain BEFORE the row scan so an adopted child's
+                    # fill can surface in this same cycle (#43).
+                    async for pending_event in self._drain_pending_oco():
+                        yield pending_event
+                    health.record_success("drain")
+                except BrokerManualInterventionError:
+                    raise            # designed escalation: the engine halts
+                except Exception as exc:                          # noqa: BLE001
+                    # G7: one drain failure must not kill the stream via the
+                    # engine's terminate-on-raise supervisor; persistent
+                    # failure escalates through the ladder instead.
+                    health.record_failure("drain", type(exc).__name__)
+            if poll_inflight is None:
+                poll_inflight = asyncio.ensure_future(
+                    asyncio.to_thread(self._poll_books_sync))
             try:
-                rows = await asyncio.to_thread(lambda: list(self._iter_orders()))
-            except Exception:
+                rows, book_outcomes = await asyncio.wait_for(
+                    asyncio.shield(poll_inflight), self._watch_read_deadline_s)
+                poll_inflight = None
+            except (asyncio.TimeoutError, TimeoutError):
+                # Single-flight: the SAME read is re-awaited next cycle — a
+                # hung socket costs stuck observations, never a growing stack
+                # of abandoned worker threads.
+                for book in _CATEGORIES:
+                    health.record_failure(book, "stuck-read")
+                self._emit_feed_warnings(health)
                 continue
+            except Exception as exc:                              # noqa: BLE001
+                poll_inflight = None
+                health.record_failure("poll", type(exc).__name__)
+                self._emit_feed_warnings(health)
+                continue
+            health.record_success("poll")
+            for book, outcome in book_outcomes.items():
+                if outcome is None:
+                    health.record_success(book)
+                else:
+                    failure_kind, failure_is_auth = outcome
+                    health.record_failure(book, failure_kind,
+                                          is_auth=failure_is_auth)
+            self._emit_feed_warnings(health)
+            halt_message = health.halt_due()
+            if halt_message is not None:
+                raise BrokerManualInterventionError(halt_message)
+            scan_crash_kind = None
             for raw in rows:
-                order_id = str(raw.get("id"))
-                order = self._to_exchange_order(raw)
-                cumulative = float(raw.get("fillQuantity") or 0)
-                # Dedup on the RAW venue status, not the mapped OrderStatus: the
-                # map collapses New and Activated to OPEN, which made a stop's
-                # trigger transition invisible — the exact moment the child
-                # normal-book order must be adopted (#39, measured live 08-18).
-                raw_status = str(raw.get("orderStatus") or "")
-                previous, prev_status = self._last_seen.get(order_id, (0.0, None))
-                if cumulative == previous and raw_status == prev_status:
+                try:
+                    event = await self._scan_row(raw)
+                except BrokerManualInterventionError:
+                    raise            # designed escalation: the engine halts
+                except Exception as exc:                          # noqa: BLE001
+                    # G7: a poisoned row must not kill fill detection for
+                    # every other order. NOT marked seen -> retried next poll.
+                    scan_crash_kind = type(exc).__name__
                     continue
-                pine_id, from_entry, leg_type = self._identity_for(order_id)
-                if pine_id is None:
-                    # NOT marked seen: identity can arrive later (a stop's child
-                    # is adopted only at the parent's Activated transition — #39),
-                    # and a row marked seen pre-adoption would dedup its fill away.
-                    continue  # not ours (yet)
-                if (raw_status.upper() == "ACTIVATED"
-                        and self._order_category.get(order_id) == "STOP"):
-                    # Two-book mechanic (CLAUDE.md): Activated = the conditional
-                    # CLOSED and a NEW order now works the NORMAL book. The fill
-                    # will arrive under the CHILD's id — adopt it into the
-                    # parent's identity so the scan's normal path reports it.
-                    try:
-                        adoption, _ = await self._adopt_child(
-                            order_id, pine_id, from_entry, leg_type)
-                    except BrokerManualInterventionError:
-                        raise            # designed escalation: the engine halts
-                    except Exception as exc:                      # noqa: BLE001
-                        # One odd reply must never kill fill detection for every
-                        # other order (this loop has no other per-row guard).
-                        log.broker_warning(
-                            "child adoption raised for parent=%s: %s: %s — retrying",
-                            order_id, type(exc).__name__, exc)
-                        adoption = "pending"
-                    # "dead" is treated as pending here: an Activated shell stays
-                    # Activated forever (#41), and if a stale row read Activated
-                    # while the detail is already terminal, the row itself will
-                    # report the real status on a later poll via the normal path.
-                    if adoption != "adopted":
-                        # Deliberately NOT marked seen: the shell never changes
-                        # again, so this is the only thing that makes the next
-                        # poll retry (#42-A).
-                        continue
-                    self._last_seen[order_id] = (cumulative, raw_status)
-                    continue  # events come from the child row, not the shell
-                # Any other status retires a pending adoption for this parent.
-                self._adopt_attempts.pop(order_id, None)
-                self._last_seen[order_id] = (cumulative, raw_status)
-                delta = max(cumulative - previous, 0.0)
-                event_type = ("filled" if order.status is OrderStatus.FILLED
-                              else "partial" if order.status is OrderStatus.PARTIALLY_FILLED
-                              else "cancelled" if order.status is OrderStatus.CANCELLED
-                              else "rejected" if order.status is OrderStatus.REJECTED
-                              else "created")
-                yield OrderEvent(
-                    order=order, event_type=event_type,
-                    fill_price=float(raw.get("averagePrice") or 0) or None,
-                    fill_qty=delta or None, timestamp=int(time.time()),
-                    pine_id=pine_id, from_entry=from_entry, leg_type=leg_type)
+                if event is not None:
+                    yield event
+            if scan_crash_kind is None:
+                health.record_success("scan")
+            else:
+                health.record_failure("scan", scan_crash_kind)
+            self._emit_feed_warnings(health)
+
+    @staticmethod
+    def _emit_feed_warnings(health: FeedHealth) -> None:
+        for message in health.warnings_due():
+            log.broker_warning("%s", message)
+
+    def _poll_books_sync(self) -> "tuple[list[dict], dict[str, tuple | None]]":
+        """One watch cycle's raw rows + per-book outcome (None = healthy;
+        otherwise ``(kind, is_auth)`` for the feed-health ladder)."""
+        rows: list[dict] = []
+        outcomes: dict = {}
+        for category in _CATEGORIES:
+            book_rows, classified = self._read_book_rows_sync(category)
+            if book_rows is None:
+                if classified is not None:
+                    outcomes[category] = (
+                        f"{classified.code} http={classified.http_status}",
+                        classified.disposition in _AUTH_DISPOSITIONS)
+                else:
+                    outcomes[category] = ("unprovable-pagination", False)
+            else:
+                rows.extend(book_rows)
+                outcomes[category] = None
+        return rows, outcomes
+
+    async def _scan_row(self, raw: dict) -> "OrderEvent | None":
+        """Process ONE polled row; return its OrderEvent or None.
+
+        Extracted from the watch loop so each row runs under the G7 guard
+        (#54) — the control flow is the loop body's, with ``continue``
+        translated to ``return None``.
+        """
+        order_id = str(raw.get("id"))
+        order = self._to_exchange_order(raw)
+        cumulative = float(raw.get("fillQuantity") or 0)
+        # Dedup on the RAW venue status, not the mapped OrderStatus: the
+        # map collapses New and Activated to OPEN, which made a stop's
+        # trigger transition invisible — the exact moment the child
+        # normal-book order must be adopted (#39, measured live 08-18).
+        raw_status = str(raw.get("orderStatus") or "")
+        previous, prev_status = self._last_seen.get(order_id, (0.0, None))
+        if cumulative == previous and raw_status == prev_status:
+            return None
+        pine_id, from_entry, leg_type = self._identity_for(order_id)
+        if pine_id is None:
+            # NOT marked seen: identity can arrive later (a stop's child
+            # is adopted only at the parent's Activated transition — #39),
+            # and a row marked seen pre-adoption would dedup its fill away.
+            return None  # not ours (yet)
+        if (raw_status.upper() == "ACTIVATED"
+                and self._order_category.get(order_id) == "STOP"):
+            # Two-book mechanic (CLAUDE.md): Activated = the conditional
+            # CLOSED and a NEW order now works the NORMAL book. The fill
+            # will arrive under the CHILD's id — adopt it into the
+            # parent's identity so the scan's normal path reports it.
+            try:
+                adoption, _ = await self._adopt_child(
+                    order_id, pine_id, from_entry, leg_type)
+            except BrokerManualInterventionError:
+                raise            # designed escalation: the engine halts
+            except Exception as exc:                      # noqa: BLE001
+                # One odd reply must never kill fill detection for every
+                # other order (this loop has no other per-row guard).
+                log.broker_warning(
+                    "child adoption raised for parent=%s: %s: %s — retrying",
+                    order_id, type(exc).__name__, exc)
+                adoption = "pending"
+            # "dead" is treated as pending here: an Activated shell stays
+            # Activated forever (#41), and if a stale row read Activated
+            # while the detail is already terminal, the row itself will
+            # report the real status on a later poll via the normal path.
+            if adoption != "adopted":
+                # Deliberately NOT marked seen: the shell never changes
+                # again, so this is the only thing that makes the next
+                # poll retry (#42-A).
+                return None
+            self._last_seen[order_id] = (cumulative, raw_status)
+            return None  # events come from the child row, not the shell
+        # Any other status retires a pending adoption for this parent.
+        self._adopt_attempts.pop(order_id, None)
+        self._last_seen[order_id] = (cumulative, raw_status)
+        delta = max(cumulative - previous, 0.0)
+        event_type = ("filled" if order.status is OrderStatus.FILLED
+                      else "partial" if order.status is OrderStatus.PARTIALLY_FILLED
+                      else "cancelled" if order.status is OrderStatus.CANCELLED
+                      else "rejected" if order.status is OrderStatus.REJECTED
+                      else "created")
+        return OrderEvent(
+            order=order, event_type=event_type,
+            fill_price=float(raw.get("averagePrice") or 0) or None,
+            fill_qty=delta or None, timestamp=int(time.time()),
+            pine_id=pine_id, from_entry=from_entry, leg_type=leg_type)
 
     @override
     async def get_open_orders(self, symbol: str | None = None) -> list[ExchangeOrder]:
@@ -1379,7 +1504,7 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         orders: list[ExchangeOrder] = []
         for category in _CATEGORIES:
             try:
-                rows = await asyncio.wait_for(
+                rows, _classified = await asyncio.wait_for(
                     asyncio.to_thread(self._read_book_rows_sync, category),
                     timeout=self._book_read_deadline_s)
             except (asyncio.TimeoutError, TimeoutError):
