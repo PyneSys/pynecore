@@ -39,6 +39,10 @@ from .cancel_disposition import (
     aggregate as _aggregate_dispositions,
     classify_readback as _classify_readback,
 )
+from .page_completeness import (
+    BOOK_READ_DEADLINE_S, POSITIONS_PAGE_SIZE,
+    book_page_count, is_exposure_row, positions_complete,
+)
 from pynecore.types.ohlcv import OHLCV
 from pynecore.lib import log
 from pynecore.core.broker.exceptions import (
@@ -204,6 +208,9 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         #: resolves on the watch/poll cadence instead of blocking the loop.
         self._cancel_verify_attempts: int = 4
         self._cancel_verify_delay: float = 0.7
+        #: Wall-clock deadline for one off-loop positions/book read (#62);
+        #: module default sits under the engine's ~30 s execute budget.
+        self._book_read_deadline_s: float = BOOK_READ_DEADLINE_S
         #: Child-adoption retry shape for an Activated conditional whose
         #: ``externalOrderId`` is not published yet (#42-A). Counted in POLLS, not
         #: seconds, so the schedule is deterministic in tests and cannot hot-spin
@@ -1202,19 +1209,50 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
 
     # --- BrokerPlugin abstracts: state ---
 
-    def _iter_orders(self):
-        """Yield raw order rows across NORMAL + conditional books (best-effort)."""
-        for category in _CATEGORIES:
+    def _read_book_rows_sync(self, category: str) -> "list[dict] | None":
+        """Every page of ONE book, or None when completeness is unprovable.
+
+        Drains ``totalPages`` (documented in the orders envelope; ignored
+        until #61 — a book past 100 rows silently truncated). None on any
+        failed page, and on an over-cap/unparseable ``totalPages`` (G5'):
+        a partial drain must never be returned as the book.
+        """
+        rows: list[dict] = []
+        pages = 1
+        page_index = 0
+        while page_index < pages:
             status, body = self.client.get_orders(
                 self.account_id, self.market_type, order_category=category,
-                page_index=0, page_size=100)
-            if status == 200 and isinstance(body, dict):
-                yield from body.get("orders") or []
-            else:
-                # High-frequency poll -> DEBUG so a transient blip stays inspectable
-                # without flooding the operator's log.
-                log.broker_debug("read:orders[%s] -> transient | http=%s code=%s",
-                                 category, status, errors.code_of(body))
+                page_index=page_index, page_size=100)
+            if status != 200 or not isinstance(body, dict):
+                # High-frequency poll -> DEBUG so a transient blip stays
+                # inspectable without flooding the operator's log.
+                log.broker_debug("read:orders[%s] p%s -> transient | http=%s code=%s",
+                                 category, page_index, status, errors.code_of(body))
+                return None
+            rows.extend(body.get("orders") or [])
+            if page_index == 0:
+                page_plan = book_page_count(body.get("totalPages"))
+                if page_plan is None:
+                    log.broker_debug("read:orders[%s] totalPages=%s -> unprovable",
+                                     category, body.get("totalPages"))
+                    return None
+                pages = page_plan
+            page_index += 1
+        return rows
+
+    def _iter_orders(self):
+        """Yield raw order rows across NORMAL + conditional books (best-effort).
+
+        A book whose completeness is unprovable yields NOTHING this cycle —
+        the 0.5 s watch loop self-heals next poll (change-detector), so the
+        tolerant semantics stay here; the strict ANY-book-unreadable raise
+        lives in :meth:`get_open_orders`, the decision read (#62 G3')."""
+        for category in _CATEGORIES:
+            rows = self._read_book_rows_sync(category)
+            if rows is None:
+                continue
+            yield from rows
 
     @override
     async def _drain_pending_oco(self):
@@ -1339,38 +1377,57 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         """Union of the NORMAL + conditional books; a failed fetch never looks empty."""
         wanted = self.resolve_contract(symbol) if symbol else None
         orders: list[ExchangeOrder] = []
-        any_ok = False
         for category in _CATEGORIES:
-            status, body = self.client.get_orders(
-                self.account_id, self.market_type, order_category=category,
-                page_index=0, page_size=100)
-            if status != 200 or not isinstance(body, dict):
-                continue
-            any_ok = True
-            for raw in body.get("orders") or []:
+            try:
+                rows = await asyncio.wait_for(
+                    asyncio.to_thread(self._read_book_rows_sync, category),
+                    timeout=self._book_read_deadline_s)
+            except (asyncio.TimeoutError, TimeoutError):
+                rows = None
+            if rows is None:
+                # #62 G3': ONE unreadable/unprovable book poisons the whole
+                # answer — the old any_ok union returned a PARTIAL book set
+                # as complete (false-clean `flat`, restart COID collision).
+                log.broker_warning("%s", (
+                    f"read:orders[{category}] unreadable/unprovable -> "
+                    f"refusing a partial book union"))
+                raise ExchangeConnectionError(f"DNSE {category} book unreadable")
+            for raw in rows:
                 if wanted and raw.get("symbol") != wanted:
                     continue
                 order = self._to_exchange_order(raw)
                 if order.status not in _TERMINAL_STATUSES:
                     orders.append(order)
-        if not any_ok:
-            log.broker_warning("%s", "read:orders -> reconnect | both order books unavailable")
-            raise ExchangeConnectionError("DNSE order books unavailable")
         return orders
 
     @override
     async def get_position(self, symbol: str) -> ExchangePosition | None:
         """Net position for ``symbol`` from ``/positions`` (netting venue)."""
-        status, body = self.client.get_positions(self.account_id, self.market_type)
+        try:
+            status, body = await asyncio.wait_for(
+                asyncio.to_thread(self.client.get_positions, self.account_id,
+                                  self.market_type, POSITIONS_PAGE_SIZE),
+                timeout=self._book_read_deadline_s)
+        except (asyncio.TimeoutError, TimeoutError):
+            raise ExchangeConnectionError("DNSE positions read timed out")
         if status != 200 or not isinstance(body, dict):
             classified = errors.classify(status, body, is_write=False)
             if classified is not None:
                 self._emit(classified, action="read:positions", ident=symbol)
             raise ExchangeConnectionError(f"DNSE positions unavailable: {status}")
+        raw_rows = body.get("positions") or body.get("data") or []
+        # #57/#62 G1/G2b: judged on the RAW row count, before the CLOSED
+        # filter — a truncated page must NEVER look FLAT (None arms the
+        # engine's external-flatten wipe). Absent ``total`` (STOCK) never
+        # infers truncation.
+        if not positions_complete(len(raw_rows), body.get("total")):
+            raise ExchangeConnectionError(
+                f"DNSE positions page truncated: {len(raw_rows)} rows delivered "
+                f"but total={body.get('total')} — refusing to conclude")
         wanted = self.resolve_contract(symbol)
         net, cost = 0.0, 0.0
-        for row in body.get("positions") or body.get("data") or []:
-            if row.get("symbol") != wanted:
+        for row in raw_rows:
+            if row.get("symbol") != wanted or not is_exposure_row(row):
                 continue
             size = float(row.get("openQuantity") or row.get("quantity") or 0)
             signed = size if str(row.get("side", "")).upper() in ("NB", "LONG") else -size

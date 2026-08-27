@@ -54,6 +54,18 @@ class DNSEClient:
             cert_reqs="CERT_REQUIRED", ca_certs=certifi.where(),
         )
 
+    def get_positions(self, account_no, market_type, page_size=None):
+        """Explicit override of the SDK's ``get_positions``: the vendored SDK
+        sends no page params, but the venue accepts ``pageSize`` and answers
+        with a ``total`` the parser needs to PROVE completeness (#57/#62).
+        Defined on the wrapper so ``__getattr__`` no longer proxies it; the
+        vendored SDK itself stays untouched (vendor rule)."""
+        query = {"marketType": market_type}
+        if page_size is not None:
+            query["pageSize"] = page_size
+        return self._parse(self._sdk._request(
+            "GET", f"/accounts/{account_no}/positions", query=query))
+
     @staticmethod
     def _parse(result):
         """Turn the SDK's ``(status, raw)`` into ``(status, parsed)``."""

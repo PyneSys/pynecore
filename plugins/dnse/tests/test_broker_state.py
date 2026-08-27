@@ -232,14 +232,18 @@ def __test_get_open_orders_excludes_terminal_statuses__(fake_client):
     assert len(orders) == 1
 
 
-def __test_get_open_orders_one_book_fails_still_returns_good_book__(fake_client):
+def __test_get_open_orders_one_book_fails_raises_never_partial_union__(fake_client):
+    """#62 DECLARED CHANGE (was: any_ok returned the healthy book alone): to
+    every consumer a partial union is indistinguishable from a complete book —
+    ``venue.py flat`` exits 0 with a resting STOP invisible, and the restart
+    scan can mint a colliding COID. ONE unreadable book now poisons the whole
+    answer; the engine's ExchangeConnectionError path retries (the tolerant
+    per-cycle semantics live in ``_iter_orders``, the watch loop)."""
     normal = (200, {"orders": [_order_row("N1", "New")]})
     stop = (500, {"code": "REMOTE_SERVER_ERROR"})
     b = _broker(fake_client, get_orders=_books(normal, stop))
-    orders = asyncio.run(b.get_open_orders())  # must NOT raise
-    assert [order.id for order in orders] == ["N1"], \
-        "a failed STOP book must not blank out a healthy NORMAL book (any_ok)"
-    assert len(orders) == 1
+    with pytest.raises(ExchangeConnectionError):
+        asyncio.run(b.get_open_orders())
 
 
 def __test_get_open_orders_both_books_fail_raises_never_returns_empty__(fake_client):
@@ -250,7 +254,7 @@ def __test_get_open_orders_both_books_fail_raises_never_returns_empty__(fake_cli
                                                (503, {"code": "SERVICE_UNAVAILABLE"})))
     with pytest.raises(ExchangeConnectionError) as exc_info:
         asyncio.run(b.get_open_orders())
-    assert "unavailable" in str(exc_info.value).lower(), \
+    assert "unreadable" in str(exc_info.value).lower(), \
         "both order books failing must raise ExchangeConnectionError, never []"
 
 
