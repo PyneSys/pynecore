@@ -659,12 +659,13 @@ def security_process_main(
     from .syminfo import mintick_decimals
     _sec_mintick = getattr(syminfo, 'mintick', 0.0) or 0.0
     round_decimals = mintick_decimals(_sec_mintick) if _sec_mintick > 0 else None
-    # This context's own feed decides whether its volume needs the float32 storage
+    # This context's own feed decides whether its bars need the float32 storage
     # clean-up — a child can run on a different file, and format, than the chart.
     # Without a reader this is the live provider path: warmup and streamed bars
-    # carry the provider's own value and never touched storage, so the clean-up
+    # carry the provider's own values and never touched storage, so the clean-up
     # there could only truncate what the feed served.
     lossless_volume = reader.lossless_volume if reader is not None else True
+    lossless_prices = reader.lossless_prices if reader is not None else True
 
     # A security child is a read-only replica of the user's script, not a place
     # to persist config. ``script.indicator``/``strategy`` re-saves the script's
@@ -946,7 +947,8 @@ def security_process_main(
 
         def _run_ltf_intrabar(intrabar, bar_index, confirmed, is_new, islast):
             _set_lib_properties(intrabar, bar_index, tz, lib, round_decimals,
-                                lossless_volume=lossless_volume)
+                                lossless_volume=lossless_volume,
+                                lossless_prices=lossless_prices)
             lib.last_bar_index = bar_index
             barstate.isfirst = (bar_index == 0)
             barstate.islast = islast
@@ -1124,6 +1126,7 @@ def security_process_main(
 
                 _set_lib_properties(_ha_apply(ohlcv), current_bar, tz, lib, round_decimals,
                                     lossless_volume=lossless_volume,
+                                    lossless_prices=lossless_prices,
                                     derived_prices=_derived_prices)
                 lib.last_bar_index = current_bar
 
@@ -1194,6 +1197,7 @@ def security_process_main(
 
                 _set_lib_properties(_ha_apply(ohlcv), current_bar, tz, lib, round_decimals,
                                     lossless_volume=lossless_volume,
+                                    lossless_prices=lossless_prices,
                                     derived_prices=_derived_prices)
                 lib.last_bar_index = current_bar
                 barstate.isfirst = (current_bar == 0)
@@ -1274,6 +1278,7 @@ def security_process_main(
                 total_bars = _current_total()
                 _set_lib_properties(_ha_apply(ohlcv_file_bar), current_bar, tz, lib, round_decimals,
                                     lossless_volume=lossless_volume,
+                                    lossless_prices=lossless_prices,
                                     derived_prices=_derived_prices)
                 lib.last_bar_index = total_bars - 1
                 if reader is not None:

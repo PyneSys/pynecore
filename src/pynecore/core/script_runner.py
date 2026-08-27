@@ -264,10 +264,16 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
                         round_decimals: int | None, last_bar_index: int | None = None,
                         last_bar_time: int | None = None,
                         lossless_volume: bool = False,
+                        lossless_prices: bool = False,
                         derived_prices: bool = False):
     """
     Set lib properties from OHLCV
 
+    :param lossless_prices: The feed reads its OHLC back exactly (see
+        :attr:`OHLCVReader.lossless_prices`). There is no float32 storage artifact
+        to clean, and a legitimately off-grid price -- split-adjusted history, for
+        one -- only loses precision to the 6-significant-digit heuristic, so
+        ``_round_price`` is skipped.
     :param derived_prices: The bar's prices are computed from already cleaned
         feed values (a synthetic Heikin Ashi candle), not read from float32
         storage. Such a price carries no storage artifact and does not sit on
@@ -300,7 +306,7 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
     props['bar_index'] = bar_index
     props['last_bar_index'] = bar_index if last_bar_index is None else last_bar_index
 
-    if derived_prices:
+    if derived_prices or lossless_prices:
         props['open'] = o = ohlcv.open
         props['high'] = h = ohlcv.high
         props['low'] = lo = ohlcv.low
@@ -694,14 +700,15 @@ class ScriptRunner:
                  'bar_index', 'tz', 'plot_writer', 'strat_writer', 'trades_writer', 'last_bar_index',
                  'last_bar_time',
                  'viz_writer', 'viz_journal', '_viz_shadow', 'viz_events',
-                 'equity_curve', 'first_price', 'last_price',
+                 'equity_curve', 'first_price', 'last_price', '_trade_num',
                  '_script_path', '_security_data', '_magnifier_iter', '_magnifier_source_tf',
                  '_chart_provider_name', '_chart_provider_instance', '_chart_data_path',
                  '_time_from', '_sec_syminfos', '_signal_rate_sources_fn',
                  '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
                  '_engine_event_stream_future',
                  '_broker_store_ctx', '_log_ohlcv', '_price_decimals',
-                 '_round_decimals', '_lossless_volume', '_config_dir', '_symbol_map',
+                 '_round_decimals', '_lossless_volume', '_lossless_prices',
+                 '_config_dir', '_symbol_map',
                  'broker_balance', '_sim_logged_open_ids')
 
     # noinspection PyProtectedMember
@@ -724,6 +731,7 @@ class ScriptRunner:
                  time_from: datetime | None = None,
                  chart_data_path: Path | None = None,
                  lossless_volume: bool = False,
+                 lossless_prices: bool = False,
                  config_dir: Path | None = None):
         """
         Initialize the script runner
@@ -780,6 +788,11 @@ class ScriptRunner:
                                 chart feed's :attr:`OHLCVReader.lossless_volume`;
                                 leave false when the source is unknown, which keeps
                                 the clean-up on (see :func:`restore_f32_volume`)
+        :param lossless_prices: Whether ``ohlcv_iter`` yields the feed's own OHLC,
+                                needing no float32 storage clean-up. Read from the
+                                chart feed's :attr:`OHLCVReader.lossless_prices`;
+                                leave false when the source is unknown, which keeps
+                                the clean-up on (see :func:`_round_price`)
         :raises ImportError: If the script does not have a 'main' function
         :raises ImportError: If the 'main' function is not decorated with @script.[indicator|strategy|library]
         :raises OSError: If the plot file could not be opened
@@ -1029,6 +1042,7 @@ class ScriptRunner:
         # back to the magnitude-relative significant-digit heuristic.
         self._round_decimals = mintick_decimals(_mintick) if _mintick > 0 else None
         self._lossless_volume = lossless_volume
+        self._lossless_prices = lossless_prices
 
         self.tz = lib._parse_timezone(syminfo.timezone)
 
@@ -1036,6 +1050,7 @@ class ScriptRunner:
         self.equity_curve: list[float] = []
         self.first_price: float | None = None
         self.last_price: float | None = None
+        self._trade_num = 0
 
         self.plot_writer = CSVWriter(plot_path) if plot_path else None
         # Visual data (plot styles + drawings) NDJSON writer. Journaling can also
@@ -1369,8 +1384,11 @@ class ScriptRunner:
         # access to ``plot_meta`` / ``drawings()`` keeps working.
         viz.reset_state()
 
-        # Trade counter
-        trade_num = 0
+        # Trade counter. Lives on the runner, not in this frame: the bar-magnifier
+        # path runs its chart bars in ``_run_iter_magnified`` while the open-trade
+        # export below stays here, and two frame-local counters would number the
+        # open trades from 1 again, colliding with the closed ones.
+        self._trade_num = 0
 
         # Broker mode watermark: how many entries of the append-only
         # ``BrokerPosition.new_closed_trades`` have already been flushed to the
@@ -2019,7 +2037,7 @@ class ScriptRunner:
 
             # noinspection PyProtectedMember
             def _write_bar_output(bar_candle):
-                nonlocal trade_num, broker_trades_closed_written
+                nonlocal broker_trades_closed_written
                 if self.plot_writer and lib._plot_data:
                     ef = {} if bar_candle.extra_fields is None else dict(bar_candle.extra_fields)
                     ef.update(lib._plot_data)
@@ -2045,9 +2063,9 @@ class ScriptRunner:
                     else:
                         new_trades = position.new_closed_trades
                     for t in new_trades:
-                        trade_num += 1
+                        self._trade_num += 1
                         self.trades_writer.write(
-                            trade_num, t.entry_bar_index,
+                            self._trade_num, t.entry_bar_index,
                             "Entry long" if t.size > 0 else "Entry short",
                             t.entry_comment if t.entry_comment else t.entry_id,
                             string.format_time(t.entry_time),  # type: ignore
@@ -2058,7 +2076,7 @@ class ScriptRunner:
                             f"{t.max_drawdown_percent:.2f}",
                         )
                         self.trades_writer.write(
-                            trade_num, t.exit_bar_index,
+                            self._trade_num, t.exit_bar_index,
                             "Exit long" if t.size > 0 else "Exit short",
                             t.exit_comment if t.exit_comment else t.exit_id,
                             string.format_time(t.exit_time),  # type: ignore
@@ -2279,6 +2297,7 @@ class ScriptRunner:
                 _set_lib_properties(
                     candle, self.bar_index, self.tz, lib, self._round_decimals,
                     self.last_bar_index, self.last_bar_time, self._lossless_volume,
+                    self._lossless_prices,
                 )
 
                 # Store first price for buy & hold calculation
@@ -2507,7 +2526,8 @@ class ScriptRunner:
                     barstate.isnew = is_new_bar
 
                     _set_lib_properties(candle, self.bar_index, self.tz, lib, self._round_decimals,
-                                        lossless_volume=self._lossless_volume)
+                                        lossless_volume=self._lossless_volume,
+                                        lossless_prices=self._lossless_prices)
 
                     if self.first_price is None:
                         self.first_price = lib.close  # type: ignore
@@ -2776,9 +2796,9 @@ class ScriptRunner:
                     pending_closed = position.new_closed_trades[broker_trades_closed_written:]
                     broker_trades_closed_written = len(position.new_closed_trades)
                     for t in pending_closed:
-                        trade_num += 1
+                        self._trade_num += 1
                         self.trades_writer.write(
-                            trade_num, t.entry_bar_index,
+                            self._trade_num, t.entry_bar_index,
                             "Entry long" if t.size > 0 else "Entry short",
                             t.entry_comment if t.entry_comment else t.entry_id,
                             string.format_time(t.entry_time),  # type: ignore
@@ -2789,7 +2809,7 @@ class ScriptRunner:
                             f"{t.max_drawdown_percent:.2f}",
                         )
                         self.trades_writer.write(
-                            trade_num, t.exit_bar_index,
+                            self._trade_num, t.exit_bar_index,
                             "Exit long" if t.size > 0 else "Exit short",
                             t.exit_comment if t.exit_comment else t.exit_id,
                             string.format_time(t.exit_time),  # type: ignore
@@ -2803,10 +2823,10 @@ class ScriptRunner:
                 # Export remaining open trades before closing
                 if self.trades_writer and position.open_trades:
                     for trade in position.open_trades:
-                        trade_num += 1  # Continue numbering from closed trades
+                        self._trade_num += 1  # Continue numbering from closed trades
                         # Export the entry part
                         self.trades_writer.write(
-                            trade_num,
+                            self._trade_num,
                             trade.entry_bar_index,
                             "Entry long" if trade.size > 0 else "Entry short",
                             trade.entry_id,
@@ -2841,7 +2861,7 @@ class ScriptRunner:
                             pnl_percent = (pnl / entry_value) * 100 if entry_value != 0 else 0
 
                             self.trades_writer.write(
-                                trade_num,
+                                self._trade_num,
                                 self.bar_index,  # Last bar index processed
                                 "Exit long" if trade.size > 0 else "Exit short",
                                 "Open",  # TradingView uses "Open" signal for automatic closes
@@ -2955,8 +2975,6 @@ class ScriptRunner:
                                  sym_type=self.syminfo.type,
                                  source_tf=self._magnifier_source_tf)
 
-        trade_num = 0
-
         for window in magnifier:
             # Pre-increment: bar_index becomes the index of the current
             # aggregated chart bar.
@@ -2966,7 +2984,8 @@ class ScriptRunner:
 
             # Set lib OHLCV to the aggregated chart-bar values (what the script sees)
             _set_lib_properties(window.aggregated, self.bar_index, self.tz, lib, self._round_decimals,
-                                lossless_volume=self._lossless_volume)
+                                lossless_volume=self._lossless_volume,
+                                lossless_prices=self._lossless_prices)
 
             # Store first price for buy & hold calculation
             if self.first_price is None:
@@ -2995,13 +3014,16 @@ class ScriptRunner:
                 hi, lo, vol = float('-inf'), float('inf'), 0.0
                 for idx in range(len(window.sub_bars) - 1):
                     sub_bar = window.sub_bars[idx]
-                    sub_high = _round_price(sub_bar.high, self._round_decimals)
-                    sub_low = _round_price(sub_bar.low, self._round_decimals)
+                    sub_high = (sub_bar.high if self._lossless_prices
+                                else _round_price(sub_bar.high, self._round_decimals))
+                    sub_low = (sub_bar.low if self._lossless_prices
+                               else _round_price(sub_bar.low, self._round_decimals))
                     hi = max(hi, sub_high)
                     lo = min(lo, sub_low)
                     vol += (sub_bar.volume if self._lossless_volume
                             else restore_f32_volume(sub_bar.volume))
-                    sub_close = _round_price(sub_bar.close, self._round_decimals)
+                    sub_close = (sub_bar.close if self._lossless_prices
+                                 else _round_price(sub_bar.close, self._round_decimals))
                     if var_snapshot.has_vars:
                         var_snapshot.restore()
                     _drop_discarded_run(drawing_snapshot)
@@ -3132,9 +3154,9 @@ class ScriptRunner:
             # Save trade data
             if is_strat and self.trades_writer and position:
                 for trade in position.new_closed_trades:
-                    trade_num += 1
+                    self._trade_num += 1
                     self.trades_writer.write(
-                        trade_num,
+                        self._trade_num,
                         trade.entry_bar_index,
                         "Entry long" if trade.size > 0 else "Entry short",
                         trade.entry_comment if trade.entry_comment else trade.entry_id,
@@ -3151,7 +3173,7 @@ class ScriptRunner:
                         f"{trade.max_drawdown_percent:.2f}",
                     )
                     self.trades_writer.write(
-                        trade_num,
+                        self._trade_num,
                         trade.exit_bar_index,
                         "Exit long" if trade.size > 0 else "Exit short",
                         trade.exit_comment if trade.exit_comment else trade.exit_id,

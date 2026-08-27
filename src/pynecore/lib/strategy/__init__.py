@@ -1226,8 +1226,14 @@ class SimPosition(PositionBase):
         """Entries counted against ``pyramiding`` — the binding book, not the FIFO one."""
         return len(self._entry_book)
 
-    def _drop_binding(self, binding: '_EntryBinding') -> None:
-        """Retire a spent binding and cancel the exit legs that were bound to it."""
+    def _drop_binding(self, binding: '_EntryBinding', carry_pending: bool = False) -> None:
+        """Retire a spent binding and cancel the exit legs that were bound to it.
+
+        :param carry_pending: The binding was spent by a closer that is not one of
+            its own exit legs, so a leg whose id still has a LONG order waiting to
+            fill survives (see the block below). A leg settling its own binding
+            fired, and dies with it however the id is re-entered.
+        """
         try:
             self._entry_book.remove(binding)
         except ValueError:
@@ -1235,18 +1241,46 @@ class SimPosition(PositionBase):
         for exit_order in list(self.exit_orders.values()):
             if exit_order.gap_committed:
                 continue
-            if (exit_order.entry_seq == binding.seq
+            bound_here = exit_order.entry_seq == binding.seq
+            if not (bound_here
                     or (exit_order.entry_seq is None
                         and exit_order.order_id == binding.entry_id
                         and not self._has_bound(binding.entry_id))):
-                self._remove_order(exit_order)
+                continue
+            # A leg whose ``from_entry`` id has a LONG order still waiting to fill
+            # carries over to that order's fill instead of dying with the binding
+            # ``close_all`` just spent, and is walked on the entry bar itself. It is
+            # re-keyed off the retired binding so ``_bind_entry`` hands it to the new
+            # fill, and ``_exit_awaits_entry`` keeps it inert until then.
+            #
+            # The long-only restriction is TradingView's, not a simplification.
+            # Measured on `Gap Filling Strategy` (NASDAQ:AAPL 30m, 906 trades), where
+            # a session bar flattens with ``close_all`` and re-enters the same id in
+            # the same body: prev long -> new long carried 15/15, prev short -> new
+            # short carried 0/19. Reproduced on synthetic BINANCE:BTCUSDT 30m probes
+            # for both limit legs (long 338/338, short 0/359) and stop legs (long
+            # 192/192, short 0/725). A leg belonging to an id that was NOT open
+            # before is a fresh leg, not a carried one, and fills on either side.
+            # The asymmetry has the shape of a TradingView bookkeeping BUG -- a
+            # ``position_size > 0`` guard where ``!= 0`` was meant -- but a bug in
+            # the reference engine is still the reference: what TradingView prints
+            # is what a backtest has to reproduce.
+            pending = self.entry_orders.get(exit_order.order_id) if carry_pending else None
+            if pending is not None and pending.sign > 0.0:
+                if bound_here:
+                    self.exit_orders.pop(_exit_order_key(exit_order), None)
+                    exit_order.entry_seq = None
+                    self.exit_orders[_exit_order_key(exit_order)] = exit_order
+                continue
+            self._remove_order(exit_order)
 
-    def _reduce_binding(self, binding: '_EntryBinding', qty: float) -> float:
+    def _reduce_binding(self, binding: '_EntryBinding', qty: float,
+                        carry_pending: bool = False) -> float:
         """Take up to ``qty`` off one binding; return what it could not absorb."""
         take = min(binding.bound, qty)
         binding.bound -= take
         if _size_round(binding.bound) <= 0.0:
-            self._drop_binding(binding)
+            self._drop_binding(binding, carry_pending)
         return qty - take
 
     def _settle_entry_book(self, order: Order, qty: float) -> None:
@@ -1273,7 +1307,7 @@ class SimPosition(PositionBase):
                 break
             if bound_id is not None and candidate.entry_id != bound_id:
                 continue
-            qty = self._reduce_binding(candidate, qty)
+            qty = self._reduce_binding(candidate, qty, carry_pending=True)
 
     def _fill_order(self, order: Order, price: PyneFloat,
                     counts_as_filled_order: bool = True):

@@ -2177,6 +2177,31 @@ class _V2OHLCVReader:
         return self._pricescale or None
 
     @property
+    def lossless_prices(self) -> bool:
+        """Return whether the OHLC columns read back the feed values exactly.
+
+        An absolute f64 price column is exact by construction. An f32 delta column is
+        exact only through the grid-snapping read path: the writer promotes every
+        off-grid price to absolute f64 (see :func:`_failing_delta_roles`), so a delta
+        that survives can only encode a true grid multiple, and snapping restores it.
+        Both need the declared grid, and the snap only runs on the standard layout.
+
+        Records written before ``set_tick_info`` stamped the grid were never
+        grid-checked; they read back within f32 noise rather than exactly, which the
+        6-significant-digit clean-up would not repair either.
+
+        :return: Whether the OHLC prices need no storage clean-up.
+        """
+        for column in self._columns:
+            if column.role != _ROLE_OPEN and column.role not in _DELTA_CANDIDATE_ROLES:
+                continue
+            if column.dtype == 6 and column.base == _ABSOLUTE_BASE:
+                continue
+            if not (self._standard_ohlcv and self._pricescale):
+                return False
+        return True
+
+    @property
     def lossless_volume(self) -> bool:
         """Return whether the volume column stores the feed value exactly.
 
@@ -2735,6 +2760,20 @@ class OHLCVReader:
         """
         reader = self._reader
         return reader.pricescale if isinstance(reader, _V2OHLCVReader) else None
+
+    @property
+    def lossless_prices(self) -> bool:
+        """Return whether the OHLC columns read back the feed values exactly.
+
+        A v2 file with a declared tick grid either stores a price as an absolute f64 or
+        as an f32 delta the writer verified to be a grid multiple, and the reader snaps
+        the latter back onto the grid. Legacy v1 files pack every price into f32, where
+        the value read back carries sub-tick error a consumer has to clean up.
+
+        :return: Whether the OHLC prices need no storage clean-up.
+        """
+        reader = self._reader
+        return reader.lossless_prices if isinstance(reader, _V2OHLCVReader) else False
 
     @property
     def lossless_volume(self) -> bool:
