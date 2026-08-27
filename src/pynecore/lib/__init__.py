@@ -1966,13 +1966,33 @@ def time(timeframe: str | None = None, session: str | int | None = None,
         return NA(int)
 
 
+# Pinned ``timenow`` for a bounded historical replay, Unix milliseconds; ``0``
+# means "read the clock". A backtest that reads the real clock is NOT
+# reproducible: a script gating its entries on ``time >= timenow - N days``
+# measures a different bar set on every run, so its result silently changes
+# from one day to the next and can never be matched against a stored reference
+# again (measured on two wild-corpus strategies that scored an exact match on
+# their reference's capture day and diverged the day after, with no code change
+# in between). ``pyne run`` therefore pins the value to the last bar of the
+# data it replays -- the instant that run's world ends -- while live runs leave
+# it at ``0``. The environment variable carries the pin into the ``request.security``
+# subprocesses, which import this module fresh under the ``spawn`` start method
+# and read the variable in ``security_process``.
+_timenow_ms: int = 0
+
+
 @module_property
 def timenow():
     """
     Current time in UNIX format. It is the number of milliseconds that have elapsed since 00:00:00 UTC, 1 January 1970.
 
+    On a bounded historical replay this is the timestamp of the data's last bar,
+    which keeps a backtest reproducible; a live run reads the system clock.
+
     :return: Current time in milliseconds
     """
+    if _timenow_ms:
+        return _timenow_ms
     # Get current UTC time and convert to milliseconds since Unix epoch
     return int(datetime.now(UTC).timestamp() * 1000)
 

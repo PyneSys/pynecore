@@ -445,6 +445,14 @@ def security_process_main(
     # Re-register import hooks (spawn mode starts a fresh Python process)
     from . import import_hook  # noqa
 
+    # Adopt the chart run's ``timenow`` pin: a spawned child imports
+    # ``pynecore.lib`` fresh, and a context reading the clock while the chart
+    # body reads the anchored instant would put the two out of step.
+    _pinned_timenow = os.environ.get('PYNE_TIMENOW_MS')
+    if _pinned_timenow:
+        from pynecore import lib as _lib
+        _lib._timenow_ms = int(_pinned_timenow)
+
     # Open shared memory blocks
     sync_block = SyncBlock(all_sec_ids, create=False, name=sync_block_name)
     result_block = ResultBlock(sec_id, create=False, version=0)

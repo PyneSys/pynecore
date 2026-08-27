@@ -961,6 +961,31 @@ def _download_provider_data_resilient(
             delay = min(delay * 2.0, _PROVIDER_RETRY_MAX_DELAY)
 
 
+def _pin_timenow(last_bar_time: int | None) -> None:
+    """Pin ``timenow`` to the final bar of a bounded historical replay.
+
+    A backtest that reads the real clock is not reproducible: a script gating
+    its entries on ``time >= timenow - N days`` measures a different bar set on
+    every run, so its result changes from one day to the next and can never be
+    matched against a stored reference again. Anchoring the clock to the last
+    bar of the replayed window makes the run deterministic — the instant that
+    run's world ends. Live runs never call this and keep the system clock.
+
+    Both channels are needed: the environment variable reaches the
+    ``request.security`` subprocesses, which import ``pynecore.lib`` fresh under
+    the ``spawn`` start method, while the attribute covers this process, which
+    imported it long before the data window was known.
+
+    :param last_bar_time: UNIX time (ms) of the window's last bar; ``None``
+        (an empty window) leaves the clock alone.
+    """
+    if last_bar_time is None:
+        return
+    from pynecore import lib as _lib
+    os.environ['PYNE_TIMENOW_MS'] = str(last_bar_time)
+    _lib._timenow_ms = last_bar_time
+
+
 def _print_data_requirements(requirements: DataRequirements, script_name: str) -> None:
     """Print a plain, human-readable summary of a script's data dependencies.
 
@@ -1643,6 +1668,8 @@ def run(
                 from pynecore import lib as _lib
                 _lib._is_live = True
                 _lib._strategy_suppressed = True
+            else:
+                _pin_timenow(last_bar_time)
 
             # Show loading spinner while importing
             with Progress(
