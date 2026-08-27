@@ -72,7 +72,6 @@ class BrokerPosition(PositionBase):
         # Runtime counters / day-rollover tracking:
         'risk_cons_loss_days', 'risk_last_trading_day', 'risk_last_day_equity',
         'risk_intraday_filled_orders', 'risk_intraday_start_equity',
-        'risk_halt_trading',
         '_current_price',
     )
 
@@ -145,6 +144,7 @@ class BrokerPosition(PositionBase):
         self.risk_intraday_filled_orders: int = 0
         self.risk_intraday_start_equity: float = 0.0
         self.risk_halt_trading: bool = False
+        self.risk_halt_day: int = -1
 
         self._current_price: float = 0.0
         # Inherited from PositionBase; unused on the live path (close stacking is
@@ -755,12 +755,15 @@ class BrokerPosition(PositionBase):
         simulator-specific work — the broker version only does
         risk-related rollover.
         """
-        if self.risk_halt_trading:
-            return
         try:
             # Statically a value (module_property), at runtime still the function
             current_trading_day = int(lib.time_tradingday())
         except (AttributeError, TypeError, ValueError):
+            return
+        # A ``max_intraday_loss`` halt expires with its day — release it before
+        # the permanent-halt gate below, or the run would never trade again.
+        self._release_intraday_halt(current_trading_day)
+        if self.risk_halt_trading:
             return
         if current_trading_day == self.risk_last_trading_day:
             return
@@ -792,12 +795,12 @@ class BrokerPosition(PositionBase):
             self._trigger_risk_halt("Max drawdown reached")
             return
         if self._is_max_intraday_loss_breached():
-            self._trigger_risk_halt("Max intraday loss reached")
+            self._trigger_risk_halt("Max intraday loss reached", until_day_end=True)
             return
         if self._is_max_cons_loss_days_breached():
             self._trigger_risk_halt("Max consecutive loss days reached")
 
-    def _trigger_risk_halt(self, reason: str) -> None:
+    def _trigger_risk_halt(self, reason: str, *, until_day_end: bool = False) -> None:
         """Cancel pending orders, queue a market close, set the halt flag.
 
         Differs from :meth:`SimPosition._trigger_risk_halt` in two ways: no
@@ -806,6 +809,11 @@ class BrokerPosition(PositionBase):
         decides the fill price). The next :meth:`OrderSyncEngine.sync`
         observes the cleared books plus the queued close and dispatches
         accordingly.
+
+        :param reason: Rule name embedded in the queued close's comment.
+        :param until_day_end: Stamp the halt with the current trading day so
+            :meth:`_release_intraday_halt` lifts it at the next rollover —
+            ``max_intraday_loss`` blocks the rest of the day, not the run.
         """
         # noinspection PyProtectedMember
         from pynecore.lib.strategy import Order, _order_type_close
@@ -820,6 +828,7 @@ class BrokerPosition(PositionBase):
             )
             self._add_order(close_order)
         self.risk_halt_trading = True
+        self.risk_halt_day = self.risk_last_trading_day if until_day_end else -1
 
     def record_liquidation(self, event: 'OrderEvent') -> None:
         """Record an exchange-initiated liquidation — close all open trades."""

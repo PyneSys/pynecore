@@ -29,6 +29,16 @@ _registered_libraries: list[tuple[str, Callable]] = []
 # TypeVar for enum type preservation
 TEnum = TypeVar('TEnum', bound=StrEnum)
 
+# MEASURED on TradingView: ``commission_type`` accepts the undocumented value ``"cash"``
+# (reachable by passing ``strategy.cash``, which is a QtyType constant of the same string).
+# TradingView's argument validator rejects every other out-of-list value at compile time --
+# a literal ``"cash"`` included -- but a built-in constant identifier bypasses it, and the
+# broker emulator then charges ``commission_value`` as a FLAT FEE PER ORDER (probe:
+# size 7, value 30 -> trade commission 60).
+_COMMISSION_TYPE_ALIASES: dict[str, Any] = {
+    _strategy.cash: _strategy.commission.cash_per_order,
+}
+
 
 @dataclass(kw_only=True, slots=True)
 class InputData:
@@ -462,7 +472,7 @@ class Script:
         script.initial_capital = initial_capital
         script.currency = currency
         script.slippage = slippage
-        script.commission_type = commission_type
+        script.commission_type = _COMMISSION_TYPE_ALIASES.get(commission_type, commission_type)
         script.commission_value = commission_value
         script.process_orders_on_close = process_orders_on_close
         script.close_entries_rule = close_entries_rule

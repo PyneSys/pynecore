@@ -601,7 +601,10 @@ class PositionBase(ABC):
     etc. — reads the attributes declared here, so concrete subclasses MUST
     initialize all of them in ``__init__``.
     """
-    __slots__ = ('_close_seq_counter',)
+    # ``_release_intraday_halt`` writes the halt pair from here, so the base owns
+    # those two slots; everything else below is declared for documentation and
+    # type-checking only and slotted by the concrete subclasses.
+    __slots__ = ('_close_seq_counter', 'risk_halt_trading', 'risk_halt_day')
 
     # Attribute surface (declared for documentation and type-checking only —
     # concrete subclasses declare these in ``__slots__`` and initialize them).
@@ -644,6 +647,7 @@ class PositionBase(ABC):
     entry_orders: dict[str | None, 'Order']
     exit_orders: dict['_ExitOrderKey', 'Order']
     risk_halt_trading: bool
+    risk_halt_day: int
     # Monotonic counter feeding _next_close_seq(); initialized by each subclass.
     _close_seq_counter: int
 
@@ -726,19 +730,54 @@ class PositionBase(ABC):
             threshold = float(self.risk_max_drawdown_value)
         return self.max_drawdown >= threshold > 0.0
 
-    def _is_max_intraday_loss_breached(self) -> bool:
+    def _is_max_intraday_loss_breached(self, equity: float | None = None) -> bool:
+        """``max_intraday_loss`` breach test against the day's opening equity.
+
+        :param equity: Mark-to-market equity to test; defaults to the current
+            bar-close equity. The intra-bar walk passes the equity at a path
+            price so the rule can fire — and close — at the same node
+            TradingView does.
+        """
         if self.risk_max_intraday_loss_value is None:
+            return False
+        anchor = self.risk_intraday_start_equity
+        # MEASURED on TradingView: the rule is enforced only while the day's
+        # OPENING equity is positive. A strategy whose equity has gone negative
+        # keeps every position open through arbitrarily large intraday losses
+        # and the rule re-arms on the first day that opens back above zero —
+        # measured over 109 trades of a wild strategy plus a 226-trade probe
+        # (BINANCE:BTCUSDT), where the split is exact: every trade entered on a
+        # positive-anchor day closes on the rule, every trade entered on a
+        # negative-anchor day survives until a later day opens positive.
+        if anchor <= 0.0:
             return False
         # Per TV docs: percent_of_equity for max_intraday_loss is measured
         # against the start-of-day equity (the same anchor used for the loss
         # delta), so the threshold scales with the day's opening capital
         # rather than the initial-bar capital.
         if self.risk_max_intraday_loss_type == percent_of_equity:
-            threshold = self.risk_intraday_start_equity * self.risk_max_intraday_loss_value * 0.01
+            threshold = anchor * self.risk_max_intraday_loss_value * 0.01
         else:
             threshold = float(self.risk_max_intraday_loss_value)
-        intraday_loss = self.risk_intraday_start_equity - float(self.equity)
-        return intraday_loss >= threshold > 0.0
+        if equity is None:
+            equity = float(self.equity)
+        return anchor - equity >= threshold > 0.0
+
+    def _release_intraday_halt(self, current_trading_day: int) -> None:
+        """Lift a ``max_intraday_loss`` halt once its trading day is over.
+
+        ``max_intraday_loss`` prohibits trading only for the REST OF THE DAY
+        (TV docs; measured — a wild strategy fires the rule on 98 separate
+        days of one run), unlike ``max_drawdown`` / ``max_cons_loss_days``,
+        which stop the strategy for good. Those leave :attr:`risk_halt_day`
+        at ``-1`` and are never released here.
+
+        :param current_trading_day: The trading day the caller just rolled into.
+        """
+        if self.risk_halt_day < 0 or current_trading_day == self.risk_halt_day:
+            return
+        self.risk_halt_day = -1
+        self.risk_halt_trading = False
 
     def _is_max_cons_loss_days_breached(self) -> bool:
         if self.risk_max_cons_loss_days is None:
@@ -870,7 +909,7 @@ class SimPosition(PositionBase):
         'risk_max_intraday_loss_value', 'risk_max_intraday_loss_type', 'risk_max_intraday_loss_alert',
         'risk_max_position_size',
         'risk_cons_loss_days', 'risk_last_trading_day', 'risk_last_day_equity',
-        'risk_intraday_filled_orders', 'risk_intraday_start_equity', 'risk_halt_trading',
+        'risk_intraday_filled_orders', 'risk_intraday_start_equity',
         '_deferred_margin_call', '_mc_stage2', '_fill_counter', '_last_fill_price', '_partial_close_bar',
         '_entry_book', '_entry_seq', '_deferred_immediate_closes', '_coof_cursor', '_market_fill_price',
         '_walk_node', '_path_node'
@@ -956,6 +995,7 @@ class SimPosition(PositionBase):
         self.risk_intraday_filled_orders: int = 0
         self.risk_intraday_start_equity: float = 0.0
         self.risk_halt_trading: bool = False
+        self.risk_halt_day: int = -1
 
         # Deferred margin call (mc_size==1 and AF@C<0: fire after script runs)
         self._deferred_margin_call: tuple[float, bool] | None = None
@@ -1860,14 +1900,21 @@ class SimPosition(PositionBase):
         drawdown = peak - float(self.equity)
         return drawdown >= threshold > 0.0
 
-    def _trigger_risk_halt(self, reason: str, price: float) -> None:
+    def _trigger_risk_halt(self, reason: str, price: float, *,
+                           until_day_end: bool = False) -> None:
         """Cancel pending orders, close any open position at ``price``, halt trading.
 
         ``reason`` is embedded in the synthetic close order's comment so the
         backtest log identifies which ``strategy.risk.*`` rule fired. Once
         :attr:`risk_halt_trading` is set, ``strategy.entry`` / ``strategy.order``
         early-return, ``process_orders`` short-circuits, and the strategy stays
-        flat until the script completes.
+        flat.
+
+        :param reason: Rule name embedded in the synthetic close's comment.
+        :param price: Fill price of the synthetic close.
+        :param until_day_end: Stamp the halt with the current trading day so
+            :meth:`_release_intraday_halt` lifts it at the next rollover —
+            ``max_intraday_loss`` blocks the rest of the day, not the run.
         """
         self.entry_orders.clear()
         self.exit_orders.clear()
@@ -1881,6 +1928,7 @@ class SimPosition(PositionBase):
             )
             self._fill_order(close_order, price)
         self.risk_halt_trading = True
+        self.risk_halt_day = self.risk_last_trading_day if until_day_end else -1
 
     def _close_position_at_intraday_cap(self, order: Order, price: float) -> None:
         """Flatten the position when ``max_intraday_filled_orders`` is reached.
@@ -1948,7 +1996,7 @@ class SimPosition(PositionBase):
             self._trigger_risk_halt("Max drawdown reached", price)
             return
         if self._is_max_intraday_loss_breached():
-            self._trigger_risk_halt("Max intraday loss reached", price)
+            self._trigger_risk_halt("Max intraday loss reached", price, until_day_end=True)
             return
         if self._is_max_cons_loss_days_breached():
             self._trigger_risk_halt("Max consecutive loss days reached", price)
@@ -2664,6 +2712,50 @@ class SimPosition(PositionBase):
             if order.trail_stop is None or new_stop < order.trail_stop:
                 order.trail_stop = new_stop
 
+    def _check_intraday_loss(self, check_price: float) -> bool:
+        """Enforce ``max_intraday_loss`` at one price node of the bar walk.
+
+        MEASURED on TradingView: the rule is an INTRA-BAR check, not a bar-end
+        one. The emulator closes the position at the price node where the
+        equity first drops ``value`` below the day's opening equity — for an
+        open position that node is the bar's UNFAVORABLE extreme (the low for a
+        long, the high for a short), so the exit prints there, slippage
+        included, exactly like a margin call. Probed on BINANCE:BTCUSDT: 191 of
+        226 probe trades and 98 of 109 wild-strategy trades close on their own
+        entry bar at that extreme, and a position carried across a day boundary
+        closes on the FIRST bar of the next day once the re-anchored equity
+        breaks — even while the trade itself is deep in profit.
+
+        :param check_price: Path price to mark the open position to.
+        :return: True when the rule fired and flattened the position.
+        """
+        if (self.risk_max_intraday_loss_value is None or self.risk_halt_trading
+                or not self.open_trades):
+            return False
+        # Account-currency value of a 1.0-point move on 1 contract — same
+        # identity latch the margin-call checkpoint uses.
+        pv = (syminfo.pointvalue if _conv_identity_script is lib._script
+              else _account_point_value())
+        quantity = abs(self.size)
+        open_profit = (check_price - self.avg_price) * quantity * pv
+        if self.sign < 0:
+            open_profit = -open_profit
+        equity = lib._script.initial_capital + self.netprofit + open_profit
+        if not self._is_max_intraday_loss_breached(equity):
+            return False
+        # The breach is judged at the raw path price, but the forced close is a
+        # market order and prints slipped AGAINST the position, like a margin
+        # call: measured on the wild strategy above, all 98 rule closes land on
+        # the extreme -/+ ``slippage`` ticks (long low - slip, short high + slip).
+        fill_price = check_price
+        script = lib._script
+        if script.slippage > 0:
+            slippage_amount = syminfo.mintick * script.slippage
+            fill_price = (check_price + slippage_amount if self.sign < 0
+                          else check_price - slippage_amount)
+        self._trigger_risk_halt("Max intraday loss reached", fill_price, until_day_end=True)
+        return True
+
     def _check_margin_call(self, check_price: float, *, for_short: bool,
                            at_open: bool = False,
                            can_defer: bool = True,
@@ -3354,7 +3446,7 @@ class SimPosition(PositionBase):
                                    if self._coof_cursor >= 0 else self.o)
 
         self._process_at_bar_open(ohlc)
-        self._process_limit_stop_orders(ohlc)
+        self._process_limit_stop_orders(ohlc, self._coof_cursor)
         self._cancel_unaffordable_entries()
         self._finalize_bar_pnl()
         if (self.risk_max_drawdown_value is not None
@@ -3377,6 +3469,7 @@ class SimPosition(PositionBase):
         """
         # Statically a value (module_property), at runtime still the function
         current_trading_day = int(lib.time_tradingday())
+        self._release_intraday_halt(current_trading_day)
         if current_trading_day == self.risk_last_trading_day:
             return False
         current_equity = float(self.equity)
@@ -3759,8 +3852,24 @@ class SimPosition(PositionBase):
         elif self.sign > 0:
             self._check_margin_call(self.o, for_short=False, at_open=True)
 
-    def _process_limit_stop_orders(self, ohlc: bool):
-        """Phase 2: Process limit/stop/trailing orders with margin checks at H/L."""
+    def _process_limit_stop_orders(self, ohlc: bool, walked: int = -1):
+        """Phase 2: Process limit/stop/trailing orders with margin checks at H/L.
+
+        :param ohlc: True when the emulator walks open -> high -> low -> close.
+        :param walked: Path node the emulator already stands at, for a
+            ``calc_on_order_fills`` re-execution. The legs BEHIND it are history:
+            an order the re-run body placed cannot fill on a price the bar
+            reached before the fill that triggered the re-run. Measured on
+            `Donchian Breakout Strategy` (BINANCE:BTCUSDT 30m, 2025-01-24 14:30,
+            an open -> low -> high -> close bar): the stop entry fills on the
+            rising leg, the re-run re-issues its ``strategy.exit`` stop at the
+            completed bar's lower Donchian band, and TradingView KEEPS the
+            position because the low is already past. Only the cursor's OWN leg
+            is walked again — the emulator is still inside it. ``-1`` (the
+            default, and what the bar-magnifier walk passes, since real sub-bars
+            carry that bookkeeping in ``process_orders_magnified``'s ``start``)
+            walks the whole path.
+        """
         # The order-book walks are gated on ``price_levels`` at each walk site
         # (re-checked, not hoisted — margin fills and trailing stops mutate the
         # book between walks); an empty book makes every walk yield nothing, so
@@ -3803,12 +3912,16 @@ class SimPosition(PositionBase):
         if ohlc:
             # open -> high
             self._walk_node = 1
-            if self.orderbook.price_levels:
+            if self.orderbook.price_levels and walked <= 1:
                 self._walk_leg(self.o, self.h, rising=True, ohlc=ohlc,
                                trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg)
 
             mc_deferred = self.sign < 0 and self._check_margin_call(self.h, for_short=True)
             if not mc_deferred:
+                # A short's unfavorable extreme is the high the rising leg just
+                # reached — the node ``max_intraday_loss`` closes at.
+                if self.sign < 0 and self._check_intraday_loss(self.h):
+                    return
                 if self.sign > 0:
                     # The favorable extreme is checked AFTER this leg's fills
                     # too: pyramid stop entries filling on the way up can push
@@ -3830,12 +3943,15 @@ class SimPosition(PositionBase):
                     self._check_margin_call(self.l, for_short=True, can_defer=False)
 
                 # open -> low (descending: the level nearest the open fills first)
-                if self.orderbook.price_levels:
+                if self.orderbook.price_levels and walked <= 2:
                     self._walk_leg(self.o, self.l, rising=False, ohlc=ohlc,
                                    trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg)
 
                 if self.sign > 0:
                     self._check_margin_call(self.l, for_short=False, can_defer=False)
+                    # A long's unfavorable extreme, reached by the descending leg.
+                    if self._check_intraday_loss(self.l):
+                        return
 
             # Trailing fills on the closing leg — chronologically after both
             # margin-call checkpoints, so a partial liquidation at the extreme
@@ -3861,12 +3977,16 @@ class SimPosition(PositionBase):
         else:
             # open -> low (descending: the level nearest the open fills first)
             self._walk_node = 1
-            if self.orderbook.price_levels:
+            if self.orderbook.price_levels and walked <= 1:
                 self._walk_leg(self.o, self.l, rising=False, ohlc=ohlc,
                                trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg)
 
             mc_deferred = self.sign > 0 and self._check_margin_call(self.l, for_short=False)
             if not mc_deferred:
+                # A long's unfavorable extreme is the low the descending leg just
+                # reached — the node ``max_intraday_loss`` closes at.
+                if self.sign > 0 and self._check_intraday_loss(self.l):
+                    return
                 # Favorable-extreme checkpoint before this leg's fills — see
                 # the mirrored comment in the OHLC branch (TV-verified on the
                 # Hybrid 2025-10-02 16:00 long margin call at the high).
@@ -3875,7 +3995,7 @@ class SimPosition(PositionBase):
                     self._check_margin_call(self.h, for_short=False, can_defer=False)
 
                 # open -> high
-                if self.orderbook.price_levels:
+                if self.orderbook.price_levels and walked <= 2:
                     self._walk_leg(self.o, self.h, rising=True, ohlc=ohlc,
                                    trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg)
 
@@ -3891,6 +4011,9 @@ class SimPosition(PositionBase):
                     # 0.51464 of the grown 0.79946-contract position at H-slip
                     # (107499.95) -- more than the whole pre-leg position.
                     self._check_margin_call(self.h, for_short=False, can_defer=False)
+                # A short's unfavorable extreme, reached by the rising leg.
+                if self.sign < 0 and self._check_intraday_loss(self.h):
+                    return
 
             # Trailing fills on the closing leg — chronologically after both
             # margin-call checkpoints, so a partial liquidation at the extreme
