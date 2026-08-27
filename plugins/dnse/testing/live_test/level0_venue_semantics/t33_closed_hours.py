@@ -37,6 +37,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+
+from pynecore.core.broker.models import CancelDispositionOutcome
+
+#: #55 adapter: the bool ``_cancel_one`` is gone. OK = positively cancelled or
+#: terminal-without-fill; ALREADY_FILLED is NOT ok — a fill during a no-fill
+#: probe demands operator attention, never a green "cancelled".
+_CANCEL_OK = (CancelDispositionOutcome.CANCEL_CONFIRMED,
+              CancelDispositionOutcome.TOO_LATE_TO_CANCEL)
+
+
+async def _cancel_ok(broker, oid) -> bool:
+    return (await broker._cancel_one_disposition(str(oid))) in _CANCEL_OK
+
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -84,7 +97,7 @@ async def probe(broker: DNSEBroker, result: Result, name: str, *,
                f"ACCEPTED while closed (contradicts 2026-08-13 measurement) ids={ids}")
     await asyncio.sleep(1.0)
     on_book = all([await book_has(broker, oid) for oid in ids])
-    cancelled = all(broker._cancel_one(oid) for oid in ids)
+    cancelled = all([await _cancel_ok(broker, oid) for oid in ids])
     result.add(f"{name}: cancel-while-closed", cancelled,
                ("cancel accepted — closed-hours cancel WORKS (new measurement)"
                 if cancelled else
@@ -138,7 +151,7 @@ async def run(args: argparse.Namespace) -> int:
             print(f"\n[cleanup] cancelling {len(PLACED)} leftover order(s): {PLACED}")
             for oid in list(PLACED):
                 try:
-                    if broker._cancel_one(oid):
+                    if await _cancel_ok(broker, oid):
                         print(f"  cancelled {oid}")
                         PLACED.remove(oid)
                     else:

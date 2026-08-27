@@ -17,7 +17,7 @@ WHEN IT CAN RUN (measured 2026-08-13, partly the hard way):
 Answers the question the Pine-driven tests cannot answer outside a session: **does
 DNSE actually accept and REST each order type we send, and can we cancel it again?**
 No candles required, no strategy, no engine — it drives the real v2 broker code path
-(``DNSEBroker._place`` / ``_cancel_one`` / ``get_open_orders``) directly.
+(``DNSEBroker._place`` / ``_cancel_one_disposition`` / ``get_open_orders``) directly.
 
 Three parts, each self-verifying:
 
@@ -45,6 +45,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+
+from pynecore.core.broker.models import CancelDispositionOutcome
+
+#: #55 adapter: the bool ``_cancel_one`` is gone. OK = positively cancelled or
+#: terminal-without-fill; ALREADY_FILLED is NOT ok — a fill during a no-fill
+#: probe demands operator attention, never a green "cancelled".
+_CANCEL_OK = (CancelDispositionOutcome.CANCEL_CONFIRMED,
+              CancelDispositionOutcome.TOO_LATE_TO_CANCEL)
+
+
+async def _cancel_ok(broker, oid) -> bool:
+    return (await broker._cancel_one_disposition(str(oid))) in _CANCEL_OK
+
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -208,7 +221,7 @@ async def part1_market(broker: DNSEBroker, result: Result, *,
             continue
         result.add(name, True, f"queued at band edge {price}, filled=0, ids={ids}")
 
-        cancelled = all(broker._cancel_one(oid) for oid in ids)
+        cancelled = all([await _cancel_ok(broker, oid) for oid in ids])
         result.add(f"{name}: cancel", cancelled,
                    "cancelled — nothing left to fill at the open" if cancelled
                    else "CANCEL FAILED — WOULD FILL AT THE OPEN, cancel it manually!")
@@ -270,7 +283,7 @@ async def part_resting(broker: DNSEBroker, result: Result, ref: float, *,
                    "found on order book" if present else "NOT on the order book")
 
         # --- cancel
-        cancelled = all(broker._cancel_one(oid) for oid in ids)
+        cancelled = all([await _cancel_ok(broker, oid) for oid in ids])
         result.add(f"{name}: cancel", cancelled,
                    "cancel accepted" if cancelled else "cancel FAILED")
 
@@ -316,7 +329,7 @@ async def run(args: argparse.Namespace) -> int:
             print(f"\n[cleanup] cancelling {len(PLACED)} leftover order(s): {PLACED}")
             for oid in list(PLACED):
                 try:
-                    if broker._cancel_one(oid):
+                    if await _cancel_ok(broker, oid):
                         print(f"  cancelled {oid}")
                         PLACED.remove(oid)
                     else:

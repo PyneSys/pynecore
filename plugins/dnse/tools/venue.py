@@ -31,6 +31,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+
+from pynecore.core.broker.models import CancelDispositionOutcome
+
+#: #55: bool ``_cancel_one`` is gone; OK = positively cancelled or
+#: terminal-without-fill. ALREADY_FILLED is NOT ok (a fill is not a cancel).
+_CANCEL_OK = (CancelDispositionOutcome.CANCEL_CONFIRMED,
+              CancelDispositionOutcome.TOO_LATE_TO_CANCEL)
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -223,7 +230,7 @@ def cmd_cancel(args) -> int:
     worst = EXIT_OK
     for oid in args.ids:
         try:
-            ok = b._cancel_one(oid)
+            ok = asyncio.run(b._cancel_one_disposition(oid)) in _CANCEL_OK
         except Exception as exc:                                      # noqa: BLE001
             print(f"{oid}: cancel RAISED {type(exc).__name__}: {exc}")
             worst = max(worst, EXIT_UNKNOWN)

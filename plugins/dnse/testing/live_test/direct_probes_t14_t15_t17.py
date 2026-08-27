@@ -97,7 +97,7 @@ def cleanup(b: DNSEBroker, ids: list[tuple[str, str]], case: str) -> bool:
     """Best-effort cancel of every (id, category) we placed; True if book is clean."""
     for oid, _cat in ids:
         try:
-            b._cancel_one(oid)
+            asyncio.run(b._cancel_one_disposition(oid))   # #55: disposition core
         except Exception as exc:                                     # noqa: BLE001
             stamp(case, f"cleanup cancel {oid} raised {type(exc).__name__}: {exc}")
     time.sleep(3)
