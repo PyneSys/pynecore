@@ -2,7 +2,7 @@
 measured DNSE behaviour (``testing/fake_venue.py``).
 
 These are not mocks of the plugin's own methods: a real :class:`DNSEBroker` runs the real
-path — ``_place`` -> ``_cancel_one`` -> ``_cancel_took_effect`` -> ``_cancel_dependent_exits``
+path — ``_place`` -> ``_cancel_one_disposition`` -> ``_readback_disposition``
 -> ``get_open_orders`` — against a fake that answers exactly as DNSE did on 2026-08-13
 (cancel 200 is an ACK; the venue never cascades). That closes the gap left by the live
 session ending: the scenarios can be reconstructed at any hour.
@@ -23,7 +23,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "testing"))
 from fake_venue import FakeDNSEVenue                       # noqa: E402
 
 from pynecore_dnse import broker                            # noqa: E402
-from pynecore.core.broker.models import LegType, CancelIntent, DispatchEnvelope  # noqa: E402
+from pynecore.core.broker.models import (  # noqa: E402
+    CancelDispositionOutcome, CancelIntent, DispatchEnvelope, LegType,
+)
 
 
 def _broker(venue) -> broker.DNSEBroker:
@@ -65,9 +67,13 @@ def __test_20_bug_reproduced_when_the_fix_is_disabled__():
     oid = str(b._place(env, "buy", 1.0, price=2020.4, category="STOP",
                        stop_price=2020.2, leg_type=LegType.STOP_LOSS)[0].id)
 
-    b._cancel_took_effect = lambda *_a: True   # <- the old behaviour: trust the 2xx
+    async def _trust_the_ack(*_args):          # <- the old behaviour: trust the 2xx
+        return CancelDispositionOutcome.CANCEL_CONFIRMED
+    b._readback_disposition = _trust_the_ack
 
-    assert b._cancel_one(oid) is True, "old contract reports success on the ACK"
+    assert asyncio.run(b._cancel_one_disposition(oid)) \
+        is CancelDispositionOutcome.CANCEL_CONFIRMED, \
+        "old contract reports success on the ACK"
     assert venue.orders[oid]["orderStatus"] == "New", \
         "...while the order is still WORKING at the venue — this is bug #20"
 
@@ -80,7 +86,8 @@ def __test_20_fixed_confirms_only_once_the_venue_agrees__():
                        stop_price=2020.2, leg_type=LegType.STOP_LOSS)[0].id)
     b._cancel_verify_attempts = 6
 
-    assert b._cancel_one(oid) is True
+    assert asyncio.run(b._cancel_one_disposition(oid)) \
+        is CancelDispositionOutcome.CANCEL_CONFIRMED
     assert venue.orders[oid]["orderStatus"] == "Canceled", \
         "the fix must not report success until the venue itself says terminal"
     assert sum(1 for c in venue.calls if c[0] == "get_order_detail") >= 3, \
@@ -96,8 +103,9 @@ def __test_20_reports_failure_when_the_venue_never_applies_the_cancel__():
                        stop_price=2020.2, leg_type=LegType.STOP_LOSS)[0].id)
     b._cancel_verify_attempts = 3
 
-    assert b._cancel_one(oid) is False, \
-        "an unconfirmed cancel must be reported as NOT done, never as success"
+    assert asyncio.run(b._cancel_one_disposition(oid)) \
+        is CancelDispositionOutcome.UNKNOWN, \
+        "an unconfirmed cancel must stay UNKNOWN so the engine retries — never success"
     assert venue.orders[oid]["orderStatus"] == "New"
 
 

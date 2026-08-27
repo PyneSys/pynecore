@@ -31,8 +31,13 @@ from pathlib import Path
 from pynecore.core.plugin import override
 from pynecore.core.plugin.broker import BrokerPlugin
 from pynecore.core.broker.models import (
-    CapabilityLevel, ExchangeCapabilities, ExchangeOrder, ExchangePosition,
-    OrderStatus, OrderType,
+    CancelDispositionOutcome, CapabilityLevel, ExchangeCapabilities,
+    ExchangeOrder, ExchangePosition, OrderStatus, OrderType,
+)
+
+from .cancel_disposition import (
+    aggregate as _aggregate_dispositions,
+    classify_readback as _classify_readback,
 )
 from pynecore.types.ohlcv import OHLCV
 from pynecore.lib import log
@@ -194,8 +199,10 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         self._tick_bar: dict | None = None
         self._tick_close_deadline: float | None = None
         self._tick_throttled: bool = False
-        #: Cancel-confirmation poll (see ``_cancel_took_effect``); tunable for tests.
-        self._cancel_verify_attempts: int = 6
+        #: Cancel-disposition read-back poll (see ``_readback_disposition``);
+        #: 4 reads / 3 sleeps = a <=3 s budget (#55 panel) — a leftover UNKNOWN
+        #: resolves on the watch/poll cadence instead of blocking the loop.
+        self._cancel_verify_attempts: int = 4
         self._cancel_verify_delay: float = 0.7
         #: Child-adoption retry shape for an Activated conditional whose
         #: ``externalOrderId`` is not published yet (#42-A). Counted in POLLS, not
@@ -203,7 +210,7 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         #: on a wall clock. At the 0.5 s default cadence: retry every poll for
         #: 10 s (the measured stale-replica lag is ~10 s), then once per 10 s so a
         #: permanently unresolvable shell cannot drain the Get-Order-Detail budget
-        #: (10,000/h — shared with ``_cancel_took_effect``, so starving it would
+        #: (10,000/h — shared with ``_readback_disposition``, so starving it would
         #: turn a fill-visibility bug into a cancel-verification bug), and give up
         #: at ~2 min by escalating for manual intervention.
         self._adopt_fast_polls: int = 20
@@ -951,13 +958,25 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
 
     @override
     async def execute_cancel(self, envelope) -> bool:
+        """Bool contract over the same disposition core as
+        :meth:`execute_cancel_with_outcome` (#55).
+
+        DECLARED CHANGE (#55 panel): True now means every id resolved to a
+        POSITIVE cancelled-with-no-fill class (``CANCEL_CONFIRMED`` /
+        ``TOO_LATE_TO_CANCEL``). Absence-from-every-book and fill-raced
+        cancels previously returned True — the same lie the outcome variant
+        told the engine. Core collapses both bools to UNKNOWN on the outcome
+        path anyway (core/plugin/broker.py), and False means "retry" — the
+        safe direction.
+        """
         ids = self._ids_for(envelope)
         if not ids:
             return False
-        ok = True
-        for order_id in ids:
-            ok = self._cancel_one(str(order_id)) and ok
-        return ok
+        outcomes = [await self._cancel_one_disposition(str(order_id))
+                    for order_id in ids]
+        return all(outcome in (CancelDispositionOutcome.CANCEL_CONFIRMED,
+                               CancelDispositionOutcome.TOO_LATE_TO_CANCEL)
+                   for outcome in outcomes)
 
     def _cancel_dependent_exits(self, entry_order_id: str) -> None:
         """RETIRED — do not call. Kept only as documentation of a measured dead end.
@@ -989,112 +1008,166 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         tracked orders whose ``from_entry`` is that entry's ``pine_id``. Best-effort and
         idempotent: an already-terminal leg simply reports gone.
         """
-        pine_id, _from_entry, leg_type = self._identity_for(entry_order_id)
-        if pine_id is None or getattr(leg_type, "name", "") != "ENTRY":
-            return                       # only an ENTRY has dependants
-        for other_id, (_pid, other_from, other_leg) in list(self._identity.items()):
-            if other_id == entry_order_id or other_from != pine_id:
-                continue
-            if getattr(other_leg, "name", "") == "ENTRY":
-                continue                 # never cascade into another entry
-            log.broker_info("%s", (
-                f"cascading cancel to exit leg {other_id} (from_entry={pine_id}) — DNSE "
-                f"does not remove it with the entry, and a stranded exit can OPEN a "
-                f"position on a flat account"))
-            try:
-                self._cancel_one(other_id)
-            except Exception as exc:                                # noqa: BLE001
-                log.broker_warning("%s", (
-                    f"cascade cancel failed for {other_id}: {type(exc).__name__}: {exc} "
-                    f"— CHECK THE VENUE, an exit leg may still be working"))
+        raise NotImplementedError(
+            "RETIRED 2026-08-14 — see docstring. The executable cascade was "
+            "removed with #55: its _cancel_one dependency was replaced by the "
+            "disposition core, and this path must never run anyway.")
 
-    def _cancel_took_effect(self, order_id: str, category: str) -> bool:
-        """Re-read ``order_id`` until it reports a terminal status.
+    async def _readback_disposition(self, order_id: str, category: str
+                                    ) -> CancelDispositionOutcome:
+        """Poll the order detail for a POSITIVE terminal classification.
 
-        DNSE answers a conditional cancel with **200 and the order object**, which is
-        only an acknowledgement that the request was accepted — the order can still be
-        ``New`` afterwards. Measured 2026-08-13 on a resting STOP: three consecutive
-        ``cancel -> 200 OK`` calls left ``orderStatus=New`` for >12s before the venue
-        finally flipped it to ``Canceled``. Trusting the 2xx therefore reports orders
-        gone while they are still live at the exchange — the plugin says "cancelled",
-        the book says otherwise, and nothing retries.
+        DNSE answers a conditional cancel with **200 and the order object** —
+        an acknowledgement only; a resting STOP stayed ``New`` for >12 s after
+        three ACKed cancels (measured 2026-08-13). So the venue itself must
+        answer, and the answer must say WHY the order is done: ``Canceled``/
+        ``Expired`` with zero fill confirms, any fill is ``ALREADY_FILLED``
+        (G6), and a still-working read-back stays ``UNKNOWN`` (G5) so the
+        engine retries on its own cadence — never ``STILL_OPEN``, which the
+        engine treats as a confirmed cancel (models.py naming trap).
 
-        Polls the order detail and returns True only once the venue itself agrees the
-        order is terminal. A read failure is not treated as terminal.
+        Client calls run in a worker thread (G9: the thread touches ONLY the
+        client — every broker-map mutation stays on the loop side) and pacing
+        is ``await asyncio.sleep``, so the loop stays live for the very
+        ``watch_orders`` fill feed that resolves the race (#55 panel). A
+        detail 404 falls through to the history book: absence is not a
+        disposition.
         """
-        for _ in range(self._cancel_verify_attempts):
-            status, body = self.client.get_order_detail(
-                self.account_id, order_id, self.market_type, order_category=category)
+        for attempt in range(self._cancel_verify_attempts):
+            status, body = await asyncio.to_thread(
+                self.client.get_order_detail, self.account_id, order_id,
+                self.market_type, order_category=category)
             if status == 200 and isinstance(body, dict):
                 try:
-                    if self._to_exchange_order(body).status in _TERMINAL_STATUSES:
-                        return True
+                    order = self._to_exchange_order(body)
                 except Exception:                                   # noqa: BLE001
-                    pass                    # unparseable row: fall through and retry
+                    order = None            # unparseable row: fall through, retry
+                if order is not None:
+                    outcome = _classify_readback(order.status, order.filled_qty)
+                    if outcome is not CancelDispositionOutcome.UNKNOWN:
+                        return outcome
             elif errors.code_of(body) in errors.NOT_FOUND_CODES:
-                return True                 # gone from the book entirely
-            time.sleep(self._cancel_verify_delay)
-        return False
+                return await self._history_disposition(order_id)
+            if attempt + 1 < self._cancel_verify_attempts:
+                await asyncio.sleep(self._cancel_verify_delay)
+        return CancelDispositionOutcome.UNKNOWN
 
-    def _cancel_one(self, order_id: str) -> bool:
-        """Cancel by the recorded book; if unknown, probe each.
+    async def _history_disposition(self, order_id: str
+                                   ) -> CancelDispositionOutcome:
+        """Absence is not a disposition — only a POSITIVE ``/orders/history``
+        row may classify an id no book answers for (one call covers BOTH
+        books; rows are date-prefixed ``20260818_538916`` under ``data``,
+        measured 2026-08-19). No row -> ``UNKNOWN``: same-day row timeliness
+        is an UNPROVEN venue premise (#55), and this failure shape degrades to
+        a retry, never to a wrong terminal verdict."""
+        today = datetime.now(timezone(timedelta(hours=7))).date()
+        status, body = await asyncio.to_thread(
+            self.client.get_order_history, self.account_id, self.market_type,
+            from_date=str(today - timedelta(days=1)), to_date=str(today),
+            page_size=200)
+        if status == 200 and isinstance(body, dict):
+            for row in body.get("data") or []:
+                if str(row.get("id", "")).split("_")[-1] != str(order_id):
+                    continue
+                try:
+                    order = self._to_exchange_order(row)
+                except Exception:                                   # noqa: BLE001
+                    return CancelDispositionOutcome.UNKNOWN
+                return _classify_readback(order.status, order.filled_qty)
+        return CancelDispositionOutcome.UNKNOWN
 
-        A ``RESOURCE_NOT_FOUND`` from the WRONG book must NOT count as success — that
-        silently orphaned STOP entries (a STOP id is absent from the NORMAL book, so
-        the NORMAL-first attempt 404'd and short-circuited before ever trying STOP).
-        Only conclude "already gone" if a cancel succeeded, the order is already
-        terminal (``ORDER_IS_DONE`` / ``CO-ORD-013``), or EVERY book agrees it is not
-        there. Any other failure (session-refused, transient, reject) is logged.
+    async def _terminal_reject_disposition(self, order_id: str, category: str
+                                           ) -> CancelDispositionOutcome:
+        """The venue refused the cancel because the order is DONE — read WHY
+        before classifying (the old ``TERMINAL_CODES -> treated-gone`` short
+        circuit is the #55 double-open). On a conditional book the order may
+        be an Activated shell whose economics moved to the NORMAL-book child
+        (#41): classification follows the CHILD via ``externalOrderId`` (G2);
+        a shell that names no child yet stays ``UNKNOWN``."""
+        if category in ("STOP", "OCO"):
+            detail = await asyncio.to_thread(
+                self._resolve_child_detail, order_id, category)
+            child_id = (detail or {}).get("externalOrderId")
+            if child_id:
+                return await self._readback_disposition(str(child_id), "NORMAL")
+            if detail:
+                try:
+                    order = self._to_exchange_order(detail)
+                except Exception:                                   # noqa: BLE001
+                    return CancelDispositionOutcome.UNKNOWN
+                return _classify_readback(order.status, order.filled_qty)
+            return CancelDispositionOutcome.UNKNOWN
+        return await self._readback_disposition(order_id, category)
+
+    async def _cancel_one_disposition(self, order_id: str
+                                      ) -> CancelDispositionOutcome:
+        """Cancel by the recorded book (probe each if unknown, #45) and return
+        a POSITIVE-observation disposition.
+
+        Replaces the bool ``_cancel_one``, whose three True paths could not
+        tell "cancelled, no fill" from "filled before the cancel landed"
+        (#55): a FILLED read-back "took effect", ``TERMINAL_CODES`` was
+        "treated-gone" unread, and absence from every book counted as
+        success. A write refusal (#51 session binding, transient, reject) is
+        a FAILED WRITE, not a disposition (G3) -> ``UNKNOWN`` so the engine
+        retries; absence from every book asks the history — never concluded
+        from silence.
         """
         hinted = self._order_category_for(order_id)
         categories = [hinted] if hinted else list(_CANCEL_PROBE_BOOKS)
-        all_not_found = True
+        write_refused = False
         for category in categories:
-            status, body = self._write(lambda tok: self.client.cancel_order(
-                self.account_id, order_id, self.market_type, tok,
-                order_category=category))
+            status, body = await asyncio.to_thread(
+                self._write,
+                lambda tok, category=category: self.client.cancel_order(
+                    self.account_id, order_id, self.market_type, tok,
+                    order_category=category))
             if status in (200, 204):
-                # A 2xx from DNSE's conditional cancel is an ACKNOWLEDGEMENT, not a
-                # completion — so it is NOT sufficient to report the order gone.
-                if self._cancel_took_effect(order_id, category):
-                    self._pending_oco.discard(order_id)  # a dead umbrella needs no adoption
-                    return True
-                log.broker_warning("%s", (
-                    f"cancel[{category}] http={status} ACKED but the order is still "
-                    f"working after re-reading the book -> reporting NOT cancelled so "
-                    f"the engine retries | order={order_id}"))
-                return False
+                # A 2xx from DNSE's cancel is an ACKNOWLEDGEMENT, not a
+                # completion — the venue read-back decides the disposition.
+                outcome = await self._readback_disposition(order_id, category)
+                if outcome is CancelDispositionOutcome.UNKNOWN:
+                    log.broker_warning("%s", (
+                        f"cancel[{category}] http={status} ACKED but no terminal "
+                        f"read-back within the budget -> UNKNOWN so the engine "
+                        f"retries | order={order_id}"))
+                else:
+                    self._pending_oco.discard(order_id)
+                return outcome
             code = errors.code_of(body)
-            if code in errors.TERMINAL_CODES:  # found, already done -> cancel is moot
-                log.broker_info("%s", f"cancel[{category}] code={code} http={status} -> "
-                                      f"treated-gone (already terminal) | order={order_id}")
-                self._pending_oco.discard(order_id)
-                return True
+            if code in errors.TERMINAL_CODES:
+                log.broker_info("%s", (
+                    f"cancel[{category}] code={code} http={status} -> order is "
+                    f"done; reading WHY before classifying | order={order_id}"))
+                outcome = await self._terminal_reject_disposition(order_id, category)
+                if outcome is not CancelDispositionOutcome.UNKNOWN:
+                    self._pending_oco.discard(order_id)
+                return outcome
             if code in errors.NOT_FOUND_CODES:  # not in THIS book -> probe the next
                 continue
             classified = errors.classify(status, body, is_write=True)
             if classified is not None:
                 self._emit(classified, action=f"cancel[{category}]", ident=order_id)
-            all_not_found = False
-        if all_not_found:
+            write_refused = True                # G3: refusal is not a disposition
+        if write_refused:
+            return CancelDispositionOutcome.UNKNOWN
+        outcome = await self._history_disposition(order_id)
+        if outcome is not CancelDispositionOutcome.UNKNOWN:
             self._pending_oco.discard(order_id)
-        return all_not_found
+        return outcome
 
     @override
     async def execute_cancel_with_outcome(self, envelope):
-        from pynecore.core.broker.models import CancelDispositionOutcome
         ids = self._ids_for(envelope)
         if not ids:
             return CancelDispositionOutcome.UNKNOWN
-        # Every id the envelope maps to, exactly like execute_cancel: after an
-        # adoption ids is [consumed parent shell, working child], and cancelling
-        # only ids[0] "confirms" on the shell (already terminal -> treated-gone)
-        # while the child keeps working the book (#47).
-        ok = True
-        for order_id in ids:
-            ok = self._cancel_one(str(order_id)) and ok
-        return (CancelDispositionOutcome.CANCEL_CONFIRMED if ok
-                else CancelDispositionOutcome.UNKNOWN)
+        # Every id the envelope maps to (#47): after an adoption ids is
+        # [consumed parent shell, working child]. Aggregation is conservative
+        # (cancel_disposition.aggregate): any ALREADY_FILLED wins, then any
+        # UNKNOWN keeps the engine retrying, then confirmed-class.
+        return _aggregate_dispositions(
+            [await self._cancel_one_disposition(str(order_id))
+             for order_id in ids])
 
     @override
     async def modify_entry(self, old, new) -> list[ExchangeOrder]:

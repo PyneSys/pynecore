@@ -617,8 +617,9 @@ def __test_cancel_2xx_is_not_trusted_until_the_venue_agrees__(fake_client, tmp_p
     b._order_category["ID1"] = "STOP"
     b._cancel_verify_attempts, b._cancel_verify_delay = 2, 0.0
 
-    assert b._cancel_one("ID1") is False, \
-        "a 2xx ACK with the order still working must report NOT cancelled, so the engine retries"
+    assert asyncio.run(b._cancel_one_disposition("ID1")) \
+        is CancelDispositionOutcome.UNKNOWN, \
+        "a 2xx ACK with the order still working must stay UNKNOWN (G5), so the engine retries"
     assert b._client.count("get_order_detail") == 2, "the readback must actually poll"
 
 
@@ -637,19 +638,28 @@ def __test_cancel_confirmed_once_the_readback_turns_terminal__(fake_client, tmp_
     b._order_category["ID1"] = "STOP"
     b._cancel_verify_attempts, b._cancel_verify_delay = 4, 0.0
 
-    assert b._cancel_one("ID1") is True, "must confirm once the venue reports terminal"
+    assert asyncio.run(b._cancel_one_disposition("ID1")) \
+        is CancelDispositionOutcome.CANCEL_CONFIRMED, \
+        "must confirm once the venue reports terminal"
     assert seen["n"] == 2, "should stop polling as soon as the venue agrees"
 
 
-def __test_cancel_confirmed_when_the_order_vanishes_from_the_book__(fake_client, tmp_path):
-    """A readback 404 means it is gone — that counts as cancelled, not as unknown."""
+def __test_vanished_readback_consults_history_never_confirms_from_absence__(fake_client, tmp_path):
+    """#55 DECLARED CHANGE (was: readback 404 == cancelled): a 404 says only
+    "not on this book" — fill vs cancel is unknowable from absence, so the
+    plugin asks ``/orders/history`` for a POSITIVE row; none here (the fake
+    answers empty) -> UNKNOWN, and the engine retries."""
     b = _broker(fake_client, tmp_path,
                 cancel_order=(200, {"orderStatus": "New"}),
                 get_order_detail=(404, {"code": "RESOURCE_NOT_FOUND"}))
     b._order_category["ID1"] = "STOP"
     b._cancel_verify_attempts, b._cancel_verify_delay = 3, 0.0
 
-    assert b._cancel_one("ID1") is True
+    outcome = asyncio.run(b._cancel_one_disposition("ID1"))
+
+    assert outcome is CancelDispositionOutcome.UNKNOWN
+    assert b._client.count("get_order_history") == 1, \
+        "absence must be answered by a history read, not concluded from silence"
 
 
 # === cascade REVERTED: an entry cancel must touch ONLY its own ids ============

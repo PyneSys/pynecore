@@ -4,6 +4,8 @@ Table-driven against canned ``(status, body)`` replies — the same fake-client 
 that proved the cancel fix — covering every action class in
 ``docs/plan/dnse-error-handling.md`` plus the codes observed live.
 """
+import asyncio
+
 import pytest
 
 import pynecore.lib as lib
@@ -11,7 +13,7 @@ lib.bar_index = 0  # let the [BROKER] log formatter render during _emit()
 
 from pynecore_dnse import errors, broker
 from pynecore_dnse.errors import Disposition as D
-from pynecore.core.broker.models import LegType
+from pynecore.core.broker.models import CancelDispositionOutcome, LegType
 from pynecore.core.broker.exceptions import (
     AuthenticationError, ExchangeOrderRejectedError, ExchangeRateLimitError,
     InsufficientMarginError, OrderDispositionUnknownError,
@@ -68,7 +70,7 @@ def _stub(**attrs):
     """A minimal object carrying the real DNSEBroker error/cancel methods."""
     class S:
         pass
-    for name in ("_emit", "_raise_write_error", "_cancel_one",
+    for name in ("_emit", "_raise_write_error", "_cancel_one_disposition",
                  "_order_category_for", "_identity_for", "_write"):
         setattr(S, name, getattr(broker.DNSEBroker, name))
     s = S()
@@ -118,27 +120,42 @@ def _book(category):
         else (404, {"code": "RESOURCE_NOT_FOUND"})
 
 
+_CONFIRMED = CancelDispositionOutcome.CANCEL_CONFIRMED
+_UNKNOWN = CancelDispositionOutcome.UNKNOWN
+
+
 @pytest.mark.parametrize("name, behavior, attrs, want", [
-    ("recorded-STOP", _book, {"_order_category": {"X": "STOP"}}, (True, ["STOP"])),
+    ("recorded-STOP", _book, {"_order_category": {"X": "STOP"}}, (_CONFIRMED, ["STOP"])),
     ("fallback-ENTRY", _book, {"_identity": {"X": (None, None, LegType.ENTRY)}},
-     (True, ["NORMAL", "STOP"])),   # STOP cancels -> loop stops before OCO
+     (_CONFIRMED, ["NORMAL", "STOP"])),   # STOP cancels -> loop stops before OCO
     ("terminal", lambda c: (400, {"code": "CO-ORD-013"}),
-     {"_order_category": {"X": "STOP"}}, (True, ["STOP"])),
+     {"_order_category": {"X": "STOP"}}, (_CONFIRMED, ["STOP"])),
     ("session-refused", lambda c: (400, {"code": "CANNOT_CANCEL_THE_ORDER_IN_THE_ATO_SESSION"}),
-     {"_order_category": {"X": "STOP"}}, (False, ["STOP"])),
+     {"_order_category": {"X": "STOP"}}, (_UNKNOWN, ["STOP"])),
     ("gone-everywhere", lambda c: (404, {"code": "RESOURCE_NOT_FOUND"}),
      {"_identity": {"X": (None, None, LegType.ENTRY)}},
-     (True, ["NORMAL", "STOP", "OCO"])),   # #45: unknown ids probe the OCO book too
+     (_UNKNOWN, ["NORMAL", "STOP", "OCO"])),   # #45: unknown ids probe the OCO book too
 ])
 def __test_cancel_one__(name, behavior, attrs, want):
     fake = _FakeClient(behavior)
     stub = _stub(client=fake, **attrs)
-    # These cases pin WHICH BOOK is probed and how each error code is classified. The
-    # separate question — whether a 2xx cancel actually took effect at the venue — is
-    # covered by __test_cancel_2xx_is_not_trusted_until_the_venue_agrees__ and friends
-    # in test_broker_lifecycle.py, so here the venue simply agrees.
-    stub._cancel_took_effect = lambda *_args: True
-    assert (stub._cancel_one("X"), fake.calls) == want
+    # These cases pin WHICH BOOK is probed and how each error code is classified.
+    # The separate question — what the venue read-back actually says — is pinned
+    # in test_broker_lifecycle.py and test_cancel_disposition.py, so the
+    # observation stages simply report success (or, for history, no row) here.
+    # #55 declared change: "session-refused" is a FAILED WRITE (G3) and
+    # "gone-everywhere" is absence — both now UNKNOWN (the engine retries),
+    # never a confirmed cancel.
+    async def _confirmed(*_args):
+        return _CONFIRMED
+
+    async def _no_history_row(*_args):
+        return _UNKNOWN
+
+    stub._readback_disposition = _confirmed
+    stub._terminal_reject_disposition = _confirmed
+    stub._history_disposition = _no_history_row
+    assert (asyncio.run(stub._cancel_one_disposition("X")), fake.calls) == want
 
 
 def __test_cancel_one_unknown_id_probes_every_book__():
@@ -156,12 +173,16 @@ def __test_cancel_one_unknown_id_probes_every_book__():
         else (400, {"code": "INVALID_TRADING_TOKEN", "message": "Invalid trading token"}))
     stub = _stub(client=fake)
 
-    ok = stub._cancel_one("da5unknownconditional")
+    async def _no_history_row(*_args):
+        return CancelDispositionOutcome.UNKNOWN
+
+    stub._history_disposition = _no_history_row
+    ok = asyncio.run(stub._cancel_one_disposition("da5unknownconditional"))
 
     assert "STOP" in fake.calls, \
         "the STOP book was never probed — the #45 false-True path"
-    assert ok is False, \
-        "a rejected STOP cancel must NOT read as cancelled"
+    assert ok is CancelDispositionOutcome.UNKNOWN, \
+        "a rejected STOP cancel must NOT read as cancelled (G3: a failed write is not a disposition)"
 
 
 # === session-phase cancel codes ===============================================
