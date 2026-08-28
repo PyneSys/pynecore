@@ -87,6 +87,65 @@ __all__ = [
 ]
 
 
+def _seq_sum(values: list[float] | list[int]) -> float | int:
+    """
+    Add the elements front to back, one at a time.
+
+    MEASURED (BINANCE:BTCUSDT@30, 29k bars, arrays built with ``unshift`` so index
+    0 is the newest element): TradingView adds from index 0 upwards with plain
+    double arithmetic. Python's ``sum()`` cannot stand in for it -- since 3.12 it
+    runs Neumaier compensated summation over floats, which lands a different last
+    bit on most bars and is what made ``array.avg``/``array.sum`` drift.
+
+    :param values: Numeric elements, na already removed
+    :return: The running total, an int only when every element was one
+    """
+    total: float | int = 0
+    for v in values:
+        total += v
+    return total
+
+
+def _moments(values: list[float]) -> tuple[float, float]:
+    """
+    Sum of the elements and sum of their squares, both front to back.
+
+    :param values: Numeric elements as floats, na already removed
+    :return: ``(sum, sum of squares)``
+    """
+    p = 0.0
+    q = 0.0
+    for v in values:
+        p += v
+    for v in values:
+        q += v * v
+    return p, q
+
+
+def _population_stats(values: list[float]) -> tuple[float, float]:
+    """
+    Population mean and variance in TradingView's own arithmetic.
+
+    :param values: Numeric elements as floats, na already removed
+    :return: ``(mean, variance)``; the variance is clamped at zero
+    """
+    length = len(values)
+    p, q = _moments(values)
+    mean = p / length
+    return mean, builtins.max(0.0, q / length - mean * mean)
+
+
+def _numeric(values: list[Number]) -> list[float]:
+    """
+    The array's numeric elements as floats.
+
+    :param values: Input array
+    :return: Every element that is not na, converted to float
+    """
+    # non-na: neither NA nor nan equals itself
+    return [float(v) for v in values if v == v]
+
+
 # noinspection PyShadowingBuiltins
 def _na_element(id: list[Any] | SequenceView[Any]) -> Any:
     """
@@ -129,7 +188,7 @@ def avg(id: list[Number]) -> float:
     a = [i for i in id if i == i]  # non-na: neither NA nor nan equals itself
     if not a:
         return na_float
-    return builtins.sum(a) / len(a)
+    return _seq_sum(a) / len(a)
 
 
 # noinspection PyShadowingBuiltins
@@ -247,28 +306,29 @@ def covariance(id1: list[Number], id2: list[Number], biased: bool = True) -> flo
     :return: Covariance between the elements in the two arrays, or na if the arrays are empty
     """
     assert len(id1) == len(id2), "Input arrays must have the same length!"
-    pairs = [(v1, v2) for v1, v2 in zip(id1, id2)
+    pairs = [(float(v1), float(v2)) for v1, v2 in zip(id1, id2)
              if v1 == v1 and v2 == v2]
     if not pairs:
         return na_float
-    # Online (Welford) co-moment — matches TradingView bit-for-bit for both
-    # the biased and unbiased result, where the classic two-pass
-    # ``sum((x-mx)*(y-my)) / divisor`` lands a couple of ulps off on the
-    # unbiased path (TV-verified in test_003_array_functions_float).
-    length = 0
+    # MEASURED (BINANCE:BTCUSDT@30, 29k bars, every bar bit-identical): unlike
+    # ``variance``, the covariance is the classic TWO-PASS form -- both means
+    # first, then the co-moment summed front to back -- over the divisor. A pair
+    # is dropped whenever EITHER side is na, and the divisor counts the pairs
+    # that survived. One surviving pair is 0.0 biased and na unbiased.
+    length = len(pairs)
+    if not biased and length < 2:
+        return na_float
     mean1 = 0.0
     mean2 = 0.0
+    for v1, v2 in pairs:
+        mean1 += v1
+        mean2 += v2
+    mean1 /= length
+    mean2 /= length
     comoment = 0.0
     for v1, v2 in pairs:
-        length += 1
-        d1 = v1 - mean1
-        mean1 += d1 / length
-        mean2 += (v2 - mean2) / length
-        comoment += d1 * (v2 - mean2)
-    divisor = (length - 1) if not biased else length
-    if divisor == 0:
-        return 0.0
-    return comoment / divisor
+        comoment += (v1 - mean1) * (v2 - mean2)
+    return comoment / (length if biased else length - 1)
 
 
 # noinspection PyShadowingBuiltins
@@ -1237,13 +1297,15 @@ def standardize(id: list[float | int]) -> list[float | int]:
     # exactly like the same values typed as float -- there is no -1/0/1
     # thresholding -- and [1, 2, 3, na] gives the z-scores of [1, 2, 3] with na in
     # the fourth slot, so the divisor is 3 and not 4.
-    values = [i for i in id if i == i]  # non-na: neither NA nor nan equals itself
+    values = _numeric(id)
     if not values:
         return [na_float] * len(id)
 
-    # statistics.mean, like ``stdev`` above, so the two agree to the last bit
-    mean = statistics.mean(values)
-    stdev = math.sqrt(statistics.mean([(v - mean) ** 2 for v in values]))
+    # The population mean and standard deviation ``variance``/``stdev`` measure,
+    # so the three agree to the last bit (TV-verified over 29k bars on both ends
+    # of a growing array).
+    mean, var = _population_stats(values)
+    stdev = math.sqrt(var)
     if stdev == 0:
         return [1.0 if v == v else na_float for v in id]
     return [(v - mean) / stdev if v == v else na_float for v in id]
@@ -1259,15 +1321,12 @@ def stdev(id: list[Number], biased: bool = True) -> float:
                    unbiased standard deviation.
     :return: Standard deviation of the elements in the array, or na if the array is empty
     """
-    a = [i for i in id if i == i]  # non-na: neither NA nor nan equals itself
-    if not a:
+    # The square root of ``variance`` with the same divisor -- TV-verified on the
+    # same 29k-bar probe for both the biased and the unbiased path.
+    var = variance(id, biased)
+    if not (var == var):
         return na_float
-    if len(a) < 2:
-        return 0.0
-    if not biased:
-        return statistics.stdev(a)
-    mean = statistics.mean(a)
-    return math.sqrt(statistics.mean([(v - mean) ** 2 for v in a]))
+    return math.sqrt(var)
 
 
 # noinspection PyShadowingBuiltins
@@ -1281,7 +1340,7 @@ def sum(id: list[float | int]) -> float | int:
     a = [i for i in id if i == i]  # non-na: neither NA nor nan equals itself
     if not a:
         return na_float
-    return builtins.sum(a)
+    return _seq_sum(a)
 
 
 # noinspection PyShadowingBuiltins
@@ -1304,17 +1363,23 @@ def variance(id: list[Number], biased: bool = True) -> float:
     :param biased: If True, calculates the biased variance. If False, calculates the unbiased variance.
     :return: Variance of the elements in the array, or na if the array is empty
     """
-    a = [i for i in id if i == i]  # non-na: neither NA nor nan equals itself
+    # MEASURED (BINANCE:BTCUSDT@30, 29k bars, growing arrays of both closes and
+    # bar indices, every bar bit-identical): with p and q the front-to-back sums
+    # of the elements and of their squares and m = p / length, TradingView
+    # computes
+    #   biased:   max(0, q / length - m * m)
+    #   unbiased: max(0, q / (length - 1) - (p / (length - 1)) * m)
+    # The unbiased division is distributed over p, not over the product, exactly
+    # as written. A single numeric element is 0.0 biased and na unbiased.
+    a = _numeric(id)
     if not a:
         return na_float
-    if len(a) < 2:
-        return 0.0
-    if not biased:
-        return statistics.variance(a)
-
     length = len(a)
-    mean = statistics.mean(a)
-    summ = 0.0
-    for v in a:
-        summ += (v - mean) ** 2
-    return summ / length
+    if length < 2:
+        return 0.0 if biased else na_float
+
+    p, q = _moments(a)
+    mean = p / length
+    if biased:
+        return builtins.max(0.0, q / length - mean * mean)
+    return builtins.max(0.0, q / (length - 1) - (p / (length - 1)) * mean)

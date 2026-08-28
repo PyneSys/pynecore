@@ -3,4 +3,4 @@
 # init, and those must already load through the transforming loader.
 from .core import import_hook
 from .types import Series, Persistent, PersistentSeries
-from .core.pine_range import pine_range
+from .core.pine_range import pine_range, pine_loop

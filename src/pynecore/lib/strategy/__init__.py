@@ -3158,7 +3158,7 @@ class SimPosition(PositionBase):
             money = None
         else:
             money = order.budget_money if order.budget_money is not None else budget[0]
-            qty = (_sig10_money(money) if money < 1e7 else money) / budget[1]
+            qty = _sig10_money(money) / budget[1]
         if not (0.0 < qty < math.inf):  # unsizable_qty
             order.size = 0.0
             return
@@ -5353,9 +5353,7 @@ def _default_entry_qty(price: float) -> float:
         # A price that snaps to zero leaves no unit cost to divide the budget by.
         # An unsizable order is dropped by the callers' finite-qty gate.
         return na_float
-    if money < 1e7:
-        money = _sig10_money(money)
-    return money / unit_cost
+    return _sig10_money(money) / unit_cost
 
 
 def default_entry_qty(fill_price: PyneFloat) -> PyneFloat:
@@ -5400,14 +5398,29 @@ def _sig10_money(money: float) -> float:
     # band measured earlier on BINANCE:BTCUSDT — the 0.05/0.005 tick edges at
     # money 1e6/1.2e5 and the 0.5/5/50 tick grids of the >=1e7 gate are all
     # exactly half of this grid expressed in ticks, including the previously
-    # unmapped ON point at cost 1.25e8 ticks. Applied below 1e7 money only:
-    # the >=1e7 MASTER-X gate encodes the same quantization empirically in
-    # its truncation + grid predicates, and its 378/378 probe census was fit
-    # on the raw budget.
+    # unmapped ON point at cost 1.25e8 ticks. Applied at every magnitude: the
+    # >=1e7 MASTER-X gate reads the same quantized budget, which is what puts
+    # the four 5e7-budget sizing events of `Fractal Breakout Strategy [KL]`
+    # on TradingView's side (see :func:`_judge_money_entry`).
     if not (money > 0.0):
         return money
     dec = Decimal(repr(money))
     return float(dec.quantize(Decimal(1).scaleb(dec.adjusted() - 9), rounding=ROUND_HALF_UP))
+
+
+def _money_ticks(money: float, mintick: float) -> float:
+    """Express a quantized sizing budget on the tick grid.
+
+    :param money: The money budget in account currency
+    :param mintick: The instrument's tick size
+    :return: The quantized budget in ticks
+    """
+    # The division stays in decimal because the budget is already on
+    # ``_sig10_money``'s decimal grid and a mintick that is not binary-exact
+    # drags the quotient off it: 150435449.7 / 0.01 comes out as
+    # 15043544969.999998, a whole tick below the value it stands for, and the
+    # gate reads the count through ``math.floor``.
+    return float(Decimal(repr(_sig10_money(money))) / Decimal(repr(mintick)))
 
 
 # Distance threshold (in ticks) of the big-money gate's down-step in the
@@ -5559,27 +5572,36 @@ def _judge_money_entry(size: float, price: float, market: bool = False,
     runs at the floor size directly. See :func:`_gate_entry_lots` for the
     gate itself and the measurement provenance.
 
-    Below 1e7 money the quantization lives at the sizing source instead:
+    The budget itself is quantized at the sizing source for every magnitude:
     ``_default_entry_qty`` floors from ``_sig10_money(money)``, whose
     10-significant-digit decimal grid reproduces every snap edge measured
-    here by one-shot equity-injection sweeps on BINANCE:BTCUSDT 30m (the
+    below 1e7 by one-shot equity-injection sweeps on BINANCE:BTCUSDT 30m (the
     0.05-tick edges of the 2026-07-08 cost cluster at [1e8, 1.16e8] ticks
     including the 1.25e8 ON point the band model could not map, and the
     0.005-tick Fabio Pro Scalper bisection edge at money ticks
-    12451249.295 on 2026-07-10) as half of that decimal grid in ticks.
+    12451249.295 on 2026-07-10) as half of that decimal grid in ticks, and it
+    carries the four big-money sizing events of the wild corpus script
+    `Fractal Breakout Strategy [KL]` (5% of a 1e9 account, so 5e7 of budget)
+    that the raw quotient misses -- three one-lot snaps on 2025-03-11 05:30,
+    2026-01-31 08:00 and 2026-03-29 10:00, plus the 2026-08-25 18:30 entry
+    whose raw budget lands 0.05 tick under its own cost ceiling and which
+    TradingView fills at the full 632.93356 contracts.
+
     A quantized size then faces the ordinary
     creation-time margin check at the placement close: at 100%
     percent_of_equity sizing the snapped cost always exceeds equity, so the
     entry cancels at placement even when the fill open would fit (measured:
     the Gaussian Channel razor cancel and the 2025-01-02 19:30 flat100 probe
     cancel, where the open HAD gapped down far enough) — which is how the
-    Gaussian Channel corpus divergence resolves.
+    Gaussian Channel corpus divergence resolves. Above 1e7 that check is the
+    big-money gate itself, and a reversal it rejects keeps its closing leg
+    (see :func:`_suppress_opening_leg`).
 
     :param size: Signed floor-sized quantity in contracts
     :param price: The sizing/gate price (placement close for market entries,
         fill price for price-based orders resolving at execution)
     :param market: True when judging a market entry at placement (enables
-        the sub-1e7 snap-up; price-based fills keep the plain floor)
+        the sub-1e7 last-lot drop; price-based fills keep the plain floor)
     :param money: Placement-frozen money budget of a deferred fill; None
         derives the budget from the current equity (market entries)
     :return: The granted signed quantity, or 0.0 when the entry is rejected
@@ -5636,7 +5658,7 @@ def _judge_money_entry(size: float, price: float, market: bool = False,
         # Scalper 12451249.295 bisection, the flat100 and Gaussian Channel
         # razor cancels) are exactly that half grid in ticks.
         return size
-    money_ticks = money / mintick
+    money_ticks = _money_ticks(money, mintick)
     next_cost = (lots + 1) / rfactor * unit_cost / mintick
     next_grid = 50.0 if next_cost >= 1e11 else 5.0 if next_cost >= 1e10 else 0.5
     _, next_m0 = _ceil_to_grid(next_cost, next_grid)
@@ -5790,19 +5812,8 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     if market_sizing_price is not None:
         size = _judge_money_entry(float(size), market_sizing_price, market=True)
         if size == 0.0:
-            if position.size == 0.0 or position.sign == direction_sign:
-                return
-            # A nofill judgment does not cancel a reversal outright: TV keeps
-            # the order alive as its closing leg, so the opposite position
-            # still closes at the next open while the opening leg stays
-            # suppressed (Hybrid 2026-05-14 15:00: the short closes at the
-            # bar open, the long only fills a bar later from the re-issued,
-            # re-judged entry). The zero size nets to a pure close through
-            # the reversal flip at order processing.
-            order = Order(id, 0.0, order_type=_order_type_entry, oca_name=oca_name,
-                          oca_type=oca_type, comment=comment, alert_message=alert_message)
-            order.sign = direction_sign
-            position._add_order(order)
+            _suppress_opening_leg(position, id, direction_sign, oca_name, oca_type,
+                                  comment, alert_message)
             return
 
     # Creation-time margin check for entry orders (TradingView backtest behavior).
@@ -5856,6 +5867,11 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
                     granted = _gate_entry_lots(equity / mintick, lots, rfactor,
                                                unit_margin, mintick, check_price)
                     if granted != lots:
+                        # The gate refuses to OPEN, which for a reversal is not
+                        # the same as cancelling: the closing leg lives on.
+                        _suppress_opening_leg(position, id, direction_sign,
+                                              oca_name, oca_type, comment,
+                                              alert_message)
                         return
             elif margin_needed > equity:
                 return
@@ -5897,6 +5913,37 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
             order.budget_pv = _account_point_value()
     # Store in entry_orders dict
     position._add_order(order)
+
+
+# noinspection PyShadowingBuiltins,PyProtectedMember
+def _suppress_opening_leg(position: PositionBase, id: str, direction_sign: float,
+                          oca_name: str | None, oca_type: _oca.Oca | None,
+                          comment: str | None, alert_message: str | None) -> None:
+    """Keep an entry TradingView refuses to open alive as a reversal's closing leg.
+
+    :param position: The simulated position the order belongs to
+    :param id: The entry's id
+    :param direction_sign: +1 for a long entry, -1 for a short one
+    :param oca_name: OCA group name of the original order
+    :param oca_type: OCA type of the original order
+    :param comment: Comment of the original order
+    :param alert_message: Alert message of the original order
+    """
+    # A refusal to open is not a cancellation when the entry also reverses: TV
+    # closes the opposite position at the next open and suppresses the opening
+    # leg only. Measured on the wild corpus script
+    # `Hybrid: RSI + Breakout + Dashboard` (BINANCE:BTCUSDT 30m, 100%
+    # percent_of_equity) at 2026-05-14 15:00, where the short closes at the bar
+    # open and the long first fills a bar later, from the re-issued and
+    # re-judged entry. The zero size nets to a pure close through the reversal
+    # flip at order processing.
+    if position.size == 0.0 or position.sign == direction_sign:
+        return
+    closing_leg = Order(id, 0.0, order_type=_order_type_entry, oca_name=oca_name,
+                        oca_type=oca_type, comment=comment,
+                        alert_message=alert_message)
+    closing_leg.sign = direction_sign
+    position._add_order(closing_leg)
 
 
 # noinspection PyShadowingBuiltins,PyProtectedMember,PyShadowingNames,PyUnusedLocal

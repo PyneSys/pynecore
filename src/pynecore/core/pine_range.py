@@ -84,3 +84,69 @@ def _pine_range_float(from_num: PyneFloat, to_num: PyneFloat, step_num: PyneFloa
             # Safety check to prevent infinite loops due to floating point precision
             if step_val < 0 and current < to_num - abs(step_val):
                 break
+
+
+class PineLoop:
+    """
+    Counter of a Pine ``for`` loop whose ``to`` bound is not loop-invariant.
+
+    MEASURED on TradingView (BINANCE:BTCUSDT@30): the ``to`` expression is
+    re-evaluated before EVERY iteration, while ``from`` and ``by`` are evaluated
+    once, when the loop is entered. A body that shrinks the collection the bound
+    is read from therefore ends the loop early instead of running off the end,
+    and a body that grows it keeps iterating.
+
+    The bound cannot travel as a value, so the compiler emits the loop as a
+    ``while`` whose condition re-evaluates the Pine expression at the call site::
+
+        loop__1 = pine_loop(0)
+        while loop__1.step(array.size(levels) - 1):
+            i = loop__1.value
+            ...
+    """
+
+    __slots__ = ('value', '_by', '_step', '_ascending', '_started')
+
+    def __init__(self, from_num: PyneInt | PyneFloat, step_num: PyneInt | PyneFloat | None = None):
+        self.value = from_num
+        # The ``by`` expression as written, absent when the loop has none; the
+        # signed step it resolves to needs the direction, known only on entry.
+        self._by = step_num
+        self._step: PyneInt | PyneFloat = 1
+        self._ascending = True
+        self._started = False
+
+    def step(self, to_num: PyneInt | PyneFloat) -> bool:
+        """
+        Advance the counter and report whether the body must run again.
+
+        :param to_num: The loop's ``to`` bound, freshly evaluated by the caller
+        :return: True while the counter is still within the bound
+        :raises ValueError: If the step is zero
+        """
+        if self._started:
+            self.value += self._step
+        else:
+            self._started = True
+            # Direction is fixed when the loop is entered: it is what gives the
+            # default step its sign, and Pine never flips it mid-loop.
+            self._ascending = self.value <= to_num
+            if self._by is None:
+                self._step = 1 if self._ascending else -1
+            elif self._by == 0:
+                raise ValueError("Step cannot be zero in pine_loop")
+            else:
+                self._step = -self._by if (self._by < 0) == self._ascending else self._by
+        return self.value <= to_num if self._ascending else self.value >= to_num
+
+
+def pine_loop(from_num: PyneInt | PyneFloat,
+              step_num: PyneInt | PyneFloat | None = None) -> PineLoop:
+    """
+    Start a Pine ``for`` loop with a bound that has to be re-read each iteration.
+
+    :param from_num: Start value (inclusive), evaluated once
+    :param step_num: Step value (optional), evaluated once
+    :return: The loop counter the ``while`` condition drives
+    """
+    return PineLoop(from_num, step_num)

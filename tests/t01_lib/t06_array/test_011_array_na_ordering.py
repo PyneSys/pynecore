@@ -88,9 +88,10 @@ def __test_standardize_skips_na_elements__():
     """ na is left out of the statistics and stays na in the result """
     # Measured on TradingView: standardize([1, 2, 3, na]) gives the z-scores of
     # [1, 2, 3] with NaN in the fourth slot, so the population divisor is 3 and
-    # not 4. Feeding the raw array to statistics.mean() used to raise instead.
+    # not 4. The values are TradingView's own to the last bit -- they come out of
+    # the same plain-accumulation mean and variance ``array.variance`` measures.
     result = array.standardize([1.0, 2.0, 3.0, nan])
-    assert result[:3] == [-1.224744871391589, 0.0, 1.224744871391589]
+    assert result[:3] == [-1.2247448713915887, 0.0, 1.2247448713915887]
     assert _is_na(result[3])
 
 
