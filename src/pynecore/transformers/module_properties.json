@@ -2042,6 +2042,9 @@
   "lib.runtime": {
     "error": {
       "type": "variable"
+    },
+    "lib": {
+      "type": "variable"
     }
   },
   "lib.scale": {

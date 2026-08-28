@@ -156,6 +156,11 @@ extra_fields: dict[str, Any] = {}
 # Lib semaphore - to prevent lib`s main function to do things it must not (plot, strategy things, etc.)
 _lib_semaphore = False
 
+# Security-child flag — True in a ``request.security`` worker process. The child
+# re-runs the WHOLE script at the context's timeframe, while TradingView only ever
+# evaluates the REQUESTED EXPRESSION there, so chart-level guards must not fire.
+_in_security = False
+
 # Live trading mode flag — set by run.py when --live is specified
 _is_live = False
 

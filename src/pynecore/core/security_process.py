@@ -721,6 +721,7 @@ def security_process_main(
 
     # Set lib semaphore to suppress plot/strategy/alert side effects
     lib._lib_semaphore = True
+    lib._in_security = True
 
     # noinspection PyProtectedMember
     def _run_script_main():
@@ -1332,3 +1333,4 @@ def security_process_main(
         result_block.close()
         sync_block.close()
         lib._lib_semaphore = False
+        lib._in_security = False

@@ -6039,6 +6039,7 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     order = Order(id, size, order_type=_order_type_entry, limit=limit, stop=stop, oca_name=oca_name,
                   oca_type=oca_type, comment=comment, alert_message=alert_message)
     order.skip_flip = skip_flip
+    order.flip_extra = flip_extra
     # Only price-based orders re-size at execution; a market entry keeps its
     # placement-time (signal close) quantity — TV rejects it at the next open
     # when that quantity can no longer be margined, rather than re-sizing.
@@ -6046,7 +6047,6 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # the per-unit cost (see _resolve_deferred_qty).
     if deferred_default and (limit is not None or stop is not None):
         order.deferred_qty = True
-        order.flip_extra = flip_extra
         budget = _default_entry_budget(float(exec_price))
         if budget is not None:
             order.budget_money = budget[0]
@@ -6407,7 +6407,16 @@ def exit(id: str, from_entry: str = "",
             flip_pending = (pending.limit is None and pending.stop is None
                             and not pending.skip_flip)
             if not flip_pending and position.size != 0.0 and position.sign != pending.sign:
-                unfilled -= abs(position.size)
+                # A price-based entry FROZE its augmentation at placement time
+                # (``_size_flippable_by_entry``), so only that much of the order
+                # closes the opposite position — reading the live position instead
+                # subtracts a close the order never carries. It reads zero whenever
+                # the script flattens with its own ``strategy.close`` before placing
+                # the entry, and the whole sticky bracket then bound nothing and
+                # never armed. A market order that skipped its flip keeps carrying
+                # the live position.
+                priced = pending.limit is not None or pending.stop is not None
+                unfilled -= pending.flip_extra if priced else abs(position.size)
             if unfilled > 0.0:
                 total += unfilled
         return sign, total
