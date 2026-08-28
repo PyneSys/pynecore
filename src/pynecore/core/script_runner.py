@@ -1952,21 +1952,22 @@ class ScriptRunner:
                 self._signal_rate_sources_fn = signal_rate_sources_fn
 
             # Initialize calc_on_order_fills snapshot (for COOF or live mode).
-            # Pine TV semantics: `calc_on_order_fills` is silently disabled when
-            # `process_orders_on_close=True` (TV reverts to a single script calculation
-            # per bar in that combo), so the snapshot stays unused in that case.
             var_snapshot: instance_state.RootVarSnapshot | None = None
             is_live = lib._is_live
             # Indicators always run on every tick; strategies only if calc_on_every_tick
             run_on_every_tick = not is_strat or self.script.calc_on_every_tick
-            coof_active = (is_strat and self.script.calc_on_order_fills
-                           and not self.script.process_orders_on_close)
+            # MEASURED — `process_orders_on_close=True` does NOT disable COOF: on the
+            # bar where a resting exit fills, the body runs at the fill's node AND
+            # again at the close, so a market entry placed on that bar fills TWICE,
+            # once at the node price and once at the close (BINANCE:BTCUSDT 30m,
+            # 41 vs 40 trades against the same script with COOF off).
+            coof_active = is_strat and self.script.calc_on_order_fills
             # `calc_on_every_history_tick` runs the body at every node of the
             # emulator's assumed path of a HISTORICAL bar instead of once at its
             # close. It subsumes `calc_on_order_fills`: every fill already has a
             # pass standing on it, and TV adds no further execution when both are
-            # set. `process_orders_on_close` does NOT disable it (both measured
-            # 2026-08-18 on BINANCE:BTCUSDT 60m) — unlike COOF.
+            # set. `process_orders_on_close` does NOT disable it (measured
+            # 2026-08-18 on BINANCE:BTCUSDT 60m), nor COOF.
             ceht_active = is_strat and self.script.calc_on_every_history_tick
             # Companion to the var snapshot: a discarded re-execution advances
             # the function instances' internal state too (``ta.tr``'s previous
@@ -2345,8 +2346,8 @@ class ScriptRunner:
 
                 # Pine `process_orders_on_close=true` — extra fill attempt at the bar
                 # close for current-bar orders, before the next bar's open arrives.
-                # No COOF re-run here: Pine disables `calc_on_order_fills` when this
-                # flag is set (var_snapshot is None whenever both are true).
+                # This is the definitive execution's own pass: a COOF re-run earlier in
+                # the bar already filled at its node, and the body re-placed the order.
                 # Simulator-only; in broker mode the exchange owns fill timing.
                 if (is_strat and position and not broker_mode
                         and not lib._strategy_suppressed
@@ -3119,9 +3120,8 @@ class ScriptRunner:
                 position.settle_immediate_closes()
 
             # Pine `process_orders_on_close=true` — extra fill attempt at the bar
-            # close for current-bar orders. No COOF re-run: Pine disables
-            # `calc_on_order_fills` when this flag is set (var_snapshot is None
-            # whenever both are true).
+            # close for current-bar orders, after any COOF re-run has already filled
+            # at its own node earlier in the bar.
             if position and self.script.process_orders_on_close:
                 position.process_orders_at_close()
 

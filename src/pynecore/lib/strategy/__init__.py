@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, Literal, overload
 from typing import TypeAlias as _TypeAlias  # underscore-aliased: kept out of the module-property registry
 
 import logging as _logging  # underscore-aliased: kept out of the module-property registry
+import sys as _sys  # underscore-aliased: kept out of the module-property registry
 import math
 import struct
 from abc import ABC, abstractmethod
@@ -91,9 +92,9 @@ _trail_pending = 2
 # ``entry_seq`` of the single filled entry it is bound to, so two pyramid adds
 # sharing a ``from_entry`` id get one leg each. A close placed by
 # ``strategy.close()`` / ``strategy.close_all()`` in BACKTEST carries a unique
-# ``book_seq`` stamp so that multiple same-bar partial closes on one entry STACK
-# instead of colliding on a shared key. Both elements are None for the orders
-# that use neither, which keeps their dedup-by-id semantics intact.
+# call-site stamp in ``book_seq`` so that same-bar partial closes on one entry
+# STACK per statement instead of colliding on a shared key. Both elements are None
+# for the orders that use neither, which keeps their dedup-by-id semantics intact.
 _ExitOrderKey: _TypeAlias = (tuple[str | None, str | None]
                              | tuple[str | None, str | None, int]
                              | tuple[str | None, str | None, int | None, int])
@@ -128,6 +129,35 @@ def _na_to_none(value):  # type: ignore[misc]
     return value
 
 
+# Call sites of ``strategy.close()`` / ``strategy.close_all()``, numbered in
+# first-seen order. The code object is part of the key, so the dict keeps it
+# alive and an id can never be recycled onto a different statement.
+_close_call_sites: dict[tuple[object, int], int] = {}
+
+
+def _close_call_site(frame) -> int:
+    """Identify the ``strategy.close()``/``close_all()`` STATEMENT that is running.
+
+    MEASURED — TradingView gives every close statement its own order-book slot:
+    two statements placed on one bar both fill, whether they sit side by side,
+    live in one function body, or in two different functions. But ONE statement
+    executed twice on a bar (the same helper called from two sites, or a loop)
+    only MODIFIES its pending order — the last call wins, exactly like a repeated
+    ``strategy.entry`` under one id. The statement is the call instruction inside
+    the frame that reached us, so the code object plus its offset is the identity;
+    the caller's own call site is deliberately NOT part of it.
+
+    :param frame: The calling frame, i.e. ``sys._getframe(1)`` at the call site.
+    :return: A small stable integer for this statement, for ``Order.book_seq``.
+    """
+    key = (frame.f_code, frame.f_lasti)
+    seq = _close_call_sites.get(key)
+    if seq is None:
+        seq = len(_close_call_sites) + 1
+        _close_call_sites[key] = seq
+    return seq
+
+
 def _exit_key(exit_id: str | None, order_id: str | None,
               entry_seq: int | None = None, book_seq: int | None = None) -> '_ExitOrderKey':
     """Build an exit/close order-book key. THE single construction rule.
@@ -141,9 +171,9 @@ def _exit_key(exit_id: str | None, order_id: str | None,
     its own. It stays None for a leg still waiting on a pending entry order, for
     every id-bound close, and on the live broker path, which has no binding book.
 
-    ``book_seq`` (see :meth:`PositionBase._next_close_seq`) stamps a backtest
-    partial close so several same-bar closes on one entry get distinct keys and
-    STACK instead of the later call evicting the earlier one.
+    ``book_seq`` (see :func:`_close_call_site`) is the call site of a backtest
+    partial close, so same-bar closes from different statements get distinct keys
+    and STACK while a repeat of one statement evicts its own earlier order.
     """
     if book_seq is not None:
         return exit_id, order_id, entry_seq, book_seq
@@ -202,7 +232,7 @@ class Order:
         "rest_leg",  # Exit leg with no explicit qty/qty_percent: closes the WHOLE bound entry
         "consumed",  # True once an exit leg fired its slice while its entry is still open
         "entry_seq",  # The single filled entry this sticky exit leg is bound to (_EntryBinding)
-        "book_seq",  # Monotonic stamp for same-bar strategy.close()/close_all() partial closes
+        "book_seq",  # Call site of the strategy.close()/close_all() statement that placed this
                      # (backtest only); None for non-stacking sticky-exit / risk / live orders
         "comm_booking",  # Commission pool shared by the two legs of a reversal (see _fill_order)
     )
@@ -302,7 +332,7 @@ class Order:
         # _EntryBinding); None while the leg still waits on a pending entry order
         # and for every id-bound close.
         self.entry_seq: int | None = None
-        # Stamped only by strategy.close()/close_all() in backtest (see _next_close_seq);
+        # Stamped only by strategy.close()/close_all() in backtest (see _close_call_site);
         # left None everywhere else so the order-book key keeps its bare shape.
         self.book_seq: int | None = None
         # ``[Decimal qty_total, booked, leg_qtys, order_qty]`` commission pool, set only
@@ -604,7 +634,7 @@ class PositionBase(ABC):
     # ``_release_intraday_halt`` writes the halt pair from here, so the base owns
     # those two slots; everything else below is declared for documentation and
     # type-checking only and slotted by the concrete subclasses.
-    __slots__ = ('_close_seq_counter', 'risk_halt_trading', 'risk_halt_day')
+    __slots__ = ('risk_halt_trading', 'risk_halt_day')
 
     # Attribute surface (declared for documentation and type-checking only —
     # concrete subclasses declare these in ``__slots__`` and initialize them).
@@ -648,21 +678,6 @@ class PositionBase(ABC):
     exit_orders: dict['_ExitOrderKey', 'Order']
     risk_halt_trading: bool
     risk_halt_day: int
-    # Monotonic counter feeding _next_close_seq(); initialized by each subclass.
-    _close_seq_counter: int
-
-    def _next_close_seq(self) -> int:
-        """Return a fresh monotonic stamp for a same-bar partial close.
-
-        ``strategy.close()`` / ``strategy.close_all()`` use this so that several
-        partial closes issued on one bar against the same entry id get DISTINCT
-        order-book keys and therefore STACK (all fill) instead of the later call
-        silently evicting the earlier one. Backtest only — the live broker path
-        leaves ``Order.book_seq`` None (handled in a separate change).
-        """
-        self._close_seq_counter += 1
-        return self._close_seq_counter
-
     def _pyramid_count(self) -> int:
         """Number of entries counted against the ``pyramiding`` limit.
 
@@ -861,6 +876,14 @@ class PositionBase(ABC):
         """
         return None
 
+    def _size_flippable_by_entry(self) -> float:
+        """Signed position size a new price-based entry would flip.
+
+        The base implementation is the position itself; :class:`SimPosition`
+        nets the market closes already placed on this bar (see its override).
+        """
+        return self.size
+
     @abstractmethod
     def _add_order(self, order: 'Order') -> None:
         """Register an order with this position."""
@@ -1024,7 +1047,6 @@ class SimPosition(PositionBase):
         self._walk_node: int = 0
         self._path_node: int = 0
         # Monotonic stamp source for same-bar stacking of partial closes.
-        self._close_seq_counter: int = 0
         # bar_index of the most recent filled partial strategy.close() (a stamped
         # close with an entry id); lets a same-bar close_all clamp to flat instead
         # of overshooting when the partial already shed part of the position.
@@ -1073,6 +1095,32 @@ class SimPosition(PositionBase):
             summ += trade.entry_price * abs(trade.size)
         self.avg_price = summ / size
 
+    def _size_flippable_by_entry(self) -> float:
+        """Signed position size a new price-based entry would flip.
+
+        A price-based ``strategy.entry`` freezes its reversal augmentation when
+        the script places it, and keeps that quantity however the position moves
+        before the fill (MEASURED: an order created against a 0.04 long still
+        opened 0.03 short after a 50% close, and 0.03 short after the position
+        was flattened entirely). But the freeze reads the position as the market
+        closes ALREADY PLACED on this bar leave it: with
+        ``strategy.close(qty_percent=100)`` called before the entry the flip is
+        zero (0.01 short), with the same close called after it the flip is the
+        full position (0.05 short) — the two probes differ only in script order.
+        """
+        size = self.size
+        if size == 0.0 or not self.market_orders:
+            return size
+        pending = 0.0
+        for order in self.market_orders.values():
+            if order.order_type is _order_type_close and not order.cancelled:
+                pending += order.size
+        if pending == 0.0:
+            return size
+        remaining = size + pending
+        # A close only ever shrinks the position; an over-close lands flat.
+        return remaining if remaining * size > 0.0 else 0.0
+
     def _add_order(self, order: Order):
         """ Add an order to the strategy """
         # Set the bar_index when the order is placed
@@ -1084,7 +1132,18 @@ class SimPosition(PositionBase):
         # the first and only one of them would fill on the gap bar. A stacked
         # partial close additionally keys on book_seq (see _market_order_key).
         if order.is_market_order:
-            self.market_orders[_market_order_key(order)] = order
+            market_key = _market_order_key(order)
+            previous = self.market_orders.get(market_key)
+            if previous is not None and previous.bar_index != order.bar_index:
+                # The key is reused (same close call site, same entry id) but the
+                # order sitting on it is a leftover from an earlier bar — often a
+                # zero-size tombstone re-filled as a no-op. Plain assignment would
+                # hand the fresh order that stale INSERTION SLOT, and the market
+                # book fills in insertion order, so this bar's close would jump
+                # ahead of orders the script placed before it. Drop the key first
+                # to queue the new order where it was actually placed.
+                del self.market_orders[market_key]
+            self.market_orders[market_key] = order
 
         # Check if an order with this ID already exists and remove it first
         if order.order_type == _order_type_close:
@@ -5065,11 +5124,12 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
                   comment=None if isinstance(comment, NA) else comment,
                   alert_message=None if isinstance(alert_message, NA) else alert_message)
 
-    # Stamp a unique book_seq so several same-bar partial closes on this entry
-    # stack instead of colliding on a shared exit-order key. Backtest only —
-    # the live broker close-dispatch path is handled separately and stays None.
+    # Stamp the call site so several same-bar partial closes on this entry stack
+    # when they come from DIFFERENT statements and collapse when they come from
+    # the same one (see _close_call_site). Backtest only — the live broker
+    # close-dispatch path is handled separately and stays None.
     if isinstance(position, SimPosition):
-        order.book_seq = position._next_close_seq()
+        order.book_seq = _close_call_site(_sys._getframe(1))
 
     # Add order to position (this will handle orderbook and exit_orders)
     position._add_order(order)
@@ -5105,10 +5165,10 @@ def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immedi
     order = Order(None, -position.size, exit_id=exit_id, order_type=_order_type_close,
                   comment=comment, alert_message=alert_message)
 
-    # Stamp book_seq so a close_all stacked behind a same-bar partial close fills
-    # too (backtest only; live close-dispatch handled separately, stays None).
+    # Stamp the call site so a close_all stacked behind a same-bar partial close
+    # fills too (backtest only; live close-dispatch handled separately, stays None).
     if isinstance(position, SimPosition):
-        order.book_seq = position._next_close_seq()
+        order.book_seq = _close_call_site(_sys._getframe(1))
 
     # Add order to position (this will handle orderbook and exit_orders)
     position._add_order(order)
@@ -5893,8 +5953,11 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
             # we need to add the position size to the order size to flip it.
             # This means the order will first close the existing position,
             # then open a new one in the opposite direction.
-            size -= position.size  # Subtract because position.size has opposite sign
-            flip_extra = abs(position.size)
+            # The position it reads is the one the market closes already placed
+            # on this bar leave behind (see _size_flippable_by_entry).
+            flippable = position._size_flippable_by_entry()
+            size -= flippable  # Subtract because the position has the opposite sign
+            flip_extra = abs(flippable)
 
     order = Order(id, size, order_type=_order_type_entry, limit=limit, stop=stop, oca_name=oca_name,
                   oca_type=oca_type, comment=comment, alert_message=alert_message)
