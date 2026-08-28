@@ -49,8 +49,10 @@ code, it writes the new token.
    ```
 
 If a morning cron fails (no OTP arrived, Gmail hiccup), fall back to the manual leg above
-— the plugin also re-reads the token file on an `INVALID_TRADING_TOKEN` reject, so a
-mid-session manual refresh is picked up without a restart.
+— the plugin reads the token file fresh on EVERY write, so a mid-session manual refresh
+is picked up without a restart. (#58: the old auto-retry on `INVALID_TRADING_TOKEN` is
+retired — the measured #51/#46 windows showed a retry never reclaims a refusal; the
+refusal now surfaces once, with the do-not-re-mint guidance in the message.)
 
 ## Security
 

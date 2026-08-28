@@ -314,14 +314,17 @@ def __test_place_oco_falls_back_to_umbrella_when_lo_never_appears__(fake_client,
     assert b._client.count("get_order_detail") == 6, "must poll the fixed attempt budget, then give up"
 
 
-# --- _write token-retry ------------------------------------------------------
+# --- _write token policy (#58: one refusal = one write) ----------------------
+# These two REPLACE the retired retry pins ("must retry EXACTLY once"): the
+# retry was a second IDENTICAL write (_token() reads fresh state every call)
+# and the measured #51/#46 windows showed it never reclaims a refusal.
 
-def __test_write_retries_once_on_invalid_token__(fake_client, tmp_path):
-    seen_tokens = []
-
+def __test_write_never_retries_even_when_a_retry_would_succeed__(fake_client, tmp_path):
+    """The venue here WOULD accept a second attempt — the plugin must still
+    not make one: during a measured #51 window every retry is a doomed write
+    into the lockout, and the error code cannot be told apart."""
     def post_order(*args, **kwargs):
-        seen_tokens.append(args[3])
-        if len(seen_tokens) == 1:
+        if b._client.count("post_order") == 1:
             return (400, {"code": "INVALID_TRADING_TOKEN"})
         return (201, {"id": "1", "symbol": "VN30F1M", "side": "NB", "quantity": 1,
                       "orderStatus": "New"})
@@ -329,19 +332,23 @@ def __test_write_retries_once_on_invalid_token__(fake_client, tmp_path):
     b = _broker(fake_client, tmp_path, post_order=post_order)
     envelope = _envelope(EntryIntent(pine_id="L", symbol="VN30F1M", side="buy", qty=1,
                                      order_type=OrderType.LIMIT, limit=1500.0))
-    orders = asyncio.run(b.execute_entry(envelope))
-    assert b._client.count("post_order") == 2, "must retry EXACTLY once on token failure"
-    assert orders[0].id == "1"
+    with pytest.raises(AuthenticationError):
+        asyncio.run(b.execute_entry(envelope))
+    assert b._client.count("post_order") == 1, "one refusal = one venue write, never a retry"
 
 
-def __test_write_propagates_when_still_invalid_after_retry__(fake_client, tmp_path):
+def __test_write_propagates_on_first_refusal_with_guidance__(fake_client, tmp_path):
     b = _broker(fake_client, tmp_path,
                post_order=(400, {"code": "INVALID_TRADING_TOKEN"}))
     envelope = _envelope(EntryIntent(pine_id="L", symbol="VN30F1M", side="buy", qty=1,
                                      order_type=OrderType.LIMIT, limit=1500.0))
-    with pytest.raises(AuthenticationError):
+    with pytest.raises(AuthenticationError) as exc_info:
         asyncio.run(b.execute_entry(envelope))
-    assert b._client.count("post_order") == 2, "must NOT loop forever retrying the same failure"
+    assert b._client.count("post_order") == 1, "must surface the FIRST refusal, never loop"
+    # A refused place terminates the run (uncaught) — the message must read
+    # complete post-mortem: the do-not-re-mint rule and the operator action.
+    assert "re-mint" in str(exc_info.value), \
+        "the surfaced message must carry the measured #51 guidance"
 
 
 # --- _to_exchange_order ------------------------------------------------------

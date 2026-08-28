@@ -92,7 +92,7 @@ def _stub(**attrs):
     (429, {"code": "OA-429"}, ExchangeRateLimitError),
     (0, {}, OrderDispositionUnknownError),
     (403, {"code": "FORBIDDEN"}, AuthenticationError),
-    (400, {"code": "INVALID_TRADING_TOKEN"}, AuthenticationError),  # persists post-reread
+    (400, {"code": "INVALID_TRADING_TOKEN"}, AuthenticationError),  # surfaced on FIRST refusal (#58: no retry)
     (400, {"code": "CANNOT_PLACE_ORDER_IN_THE_CLOSED_SESSION"}, ExchangeOrderRejectedError),
 ])
 def __test_raise_write_error__(status, body, exc):

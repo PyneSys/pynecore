@@ -25,7 +25,7 @@ class Disposition(Enum):
     DISPOSITION_UNKNOWN = "park+verify"     # transient WRITE -> OrderDispositionUnknownError
     CONNECTION = "reconnect"                # transient READ / cancel-retry -> ExchangeConnectionError
     AUTH = "auth-fail"                      # -> AuthenticationError (terminal)
-    AUTH_TOKEN = "token-reread"             # INVALID_TRADING_TOKEN -> re-read state file + retry once
+    AUTH_TOKEN = "token-refused"            # INVALID_TRADING_TOKEN -> surface, never retry (#58/#51)
     NOT_FOUND = "not-found"                 # order not in this book -> cancel probes the next / gone
     TERMINAL = "treated-gone"               # order already done -> a cancel of it is success
 
@@ -161,7 +161,17 @@ def classify(status, body, *, is_write: bool) -> "Classified | None":
                           msg or "no response from DNSE")
     # Classify on the code first, then fall back to HTTP status.
     if code == "INVALID_TRADING_TOKEN":
-        return Classified(Disposition.AUTH_TOKEN, code, status, msg)
+        # #58: no auto-retry — _token() reads fresh state every call, so a
+        # retry is a second identical write, and the measured #51/#46 windows
+        # showed retrying/re-minting never reclaims a refusal. A refused PLACE
+        # terminates the run (uncaught AuthenticationError), so this message
+        # must read complete post-mortem.
+        guidance = ("do NOT re-mint or auto-retry (measured #51/#46: never "
+                    "reclaims); schedule conditional writes pre-open before "
+                    "the operator's first app trade; during a window, cancels "
+                    "go through the operator's app")
+        return Classified(Disposition.AUTH_TOKEN, code, status,
+                          f"{msg or 'invalid trading token'} | {guidance}")
     if code in _AUTH or status in (401, 403):
         return Classified(Disposition.AUTH, code or f"HTTP-{status}", status, msg)
     if code in _RATE_LIMIT or status == 429:

@@ -48,9 +48,11 @@ Token` are only 100/hr, 1,000/day** (the token cron must not spin on OTP).
 
 ### C — Auth / token
 `HTTP 401/403`, `OA-401`, `OA-403`, `FORBIDDEN`, `INVALID_TRADING_TOKEN`, `INVALID_OTP`.
-- `INVALID_TRADING_TOKEN` (expired mid-run): **re-read `dnse_trading_token.json` once**
-  (the cron may have refreshed it) and retry the call; still invalid → `AuthenticationError`.
-  The plugin **never mints** — that's the cron's job.
+- `INVALID_TRADING_TOKEN`: **surface immediately → `AuthenticationError`, never retry**
+  (#58, supersedes the original re-read-and-retry design: the token file is read fresh
+  on EVERY write anyway, and the measured #51/#46 windows showed a retry/re-mint never
+  reclaims a refusal — the message carries the do-not-re-mint + schedule-pre-open
+  guidance). The plugin **never mints** — that's the cron's job.
 - `OA-401` / `OA-403` / `FORBIDDEN` (bad API key / permission): `AuthenticationError`
   immediately — a retry won't fix it.
 

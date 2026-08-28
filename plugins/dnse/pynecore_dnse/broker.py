@@ -640,14 +640,17 @@ class DNSEBroker(DNSEProvider, BrokerPlugin[DNSEBrokerConfig]):
         fn("%s", classified.log_message(action, ident))
 
     def _write(self, call):
-        """``call(token) -> (status, body)``; retry ONCE on INVALID_TRADING_TOKEN with
-        a freshly re-read token (the cron may have refreshed the state file)."""
-        status, body = call(self._token())
-        if errors.code_of(body) == "INVALID_TRADING_TOKEN":
-            log.broker_warning("%s", "write code=INVALID_TRADING_TOKEN -> "
-                                     "token-reread (retry once)")
-            status, body = call(self._token())
-        return status, body
+        """``call(token) -> (status, body)`` — ONE venue write, never a retry.
+
+        The retired "token-reread (retry once)" on INVALID_TRADING_TOKEN was
+        a second IDENTICAL write: ``_token()`` reads the state file fresh on
+        EVERY call, so the first attempt already carried the freshest token,
+        and the measured #51/#46 windows showed retrying (and re-minting)
+        never reclaims a refusal — it only doubled writes into the lockout
+        (#58). The refusal surfaces through the classify path, whose message
+        carries the operator action.
+        """
+        return call(self._token())
 
     @staticmethod
     def _ident_str(envelope, leg_type) -> str:
