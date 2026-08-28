@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, time, timezone
-from typing import Callable
+from typing import Callable, TypeVar
 
 from pynecore.core.plugin import override
 from pynecore.core.plugin.provider import ProviderPlugin
@@ -65,7 +65,13 @@ class DNSEConfig(LiveProviderConfig):
     api_version: str = "2026-07-23"
 
 
-class DNSEProvider(ProviderPlugin[DNSEConfig]):
+#: Phase 0a (#66): the provider is generic in its config (bound, no PEP-696
+#: default — the plugin's floor is Python 3.11) so DNSEBroker can bind
+#: DNSEBrokerConfig without the two bases disagreeing on the config type.
+DNSEConfigT = TypeVar("DNSEConfigT", bound="DNSEConfig")
+
+
+class DNSEProvider(ProviderPlugin[DNSEConfigT]):
     """DNSE market-data provider (Vietnam stocks, derivatives and indices)."""
 
     plugin_name = "DNSE"

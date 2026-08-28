@@ -10,6 +10,7 @@ Startup-time validation for broker mode.
 Pure functions — the ``pyne run --broker`` startup path calls them and, on a
 non-empty error list, refuses to start trading.
 """
+import inspect
 import math
 from dataclasses import fields
 
@@ -246,6 +247,17 @@ def validate_plugin_contract(
         )
 
     if 'watch_orders' not in bad_fields:
+        if caps.watch_orders.is_supported and overridden('watch_orders') \
+                and not inspect.isasyncgenfunction(
+                    inspect.unwrap(getattr(cls, 'watch_orders'))):
+            # A same-named attribute is not a stream: a ``...`` stub passes the
+            # identity check but hands the engine None to ``async for`` over.
+            # Every conforming implementation is an async generator function.
+            errors.append(
+                f"{name} declares watch_orders={caps.watch_orders.name} but "
+                f"the override is not an async generator function — a stub "
+                f"cannot produce the declared order stream."
+            )
         if caps.watch_orders.is_supported and not overridden('watch_orders'):
             errors.append(
                 f"{name} declares watch_orders={caps.watch_orders.name} but "
