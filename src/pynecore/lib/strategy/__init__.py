@@ -884,6 +884,14 @@ class PositionBase(ABC):
         """
         return self.size
 
+    def _pyramid_sign_for_entry(self) -> float:
+        """Direction the pyramiding gate sees when a new entry is placed.
+
+        The base implementation is the position's own sign; :class:`SimPosition`
+        applies the market orders already placed on this bar (see its override).
+        """
+        return self.sign
+
     @abstractmethod
     def _add_order(self, order: 'Order') -> None:
         """Register an order with this position."""
@@ -1120,6 +1128,33 @@ class SimPosition(PositionBase):
         remaining = size + pending
         # A close only ever shrinks the position; an over-close lands flat.
         return remaining if remaining * size > 0.0 else 0.0
+
+    def _pyramid_sign_for_entry(self) -> float:
+        """Direction the pyramiding gate sees when a new entry is placed.
+
+        The gate reads the position as the market orders ALREADY PLACED on this
+        bar leave it, walked in placement order: a close hands its slot over (a
+        ``close_all`` ahead of a same-id re-entry is what lets that entry through
+        under ``pyramiding=1``), and a pending reversal entry makes the next
+        opposite-direction entry a reversal of its own instead of a pyramid add
+        (MEASURED on the "Pivot Extension Strategy" reference, whose long and
+        short entries are placed on the same bar, in that order).
+        """
+        if not self.market_orders:
+            return self.sign
+        size = self.size
+        for order in self.market_orders.values():
+            if order.cancelled:
+                continue
+            if order.order_type is _order_type_close:
+                remaining = size + order.size
+                # A close only ever shrinks the position; an over-close lands flat.
+                size = remaining if remaining * size > 0.0 else 0.0
+            elif order.order_type is _order_type_entry:
+                # A reversal entry carries only its OPENING size until processing
+                # adds the flip, so its own sign is where the position ends up.
+                size = size + order.size if size * order.size >= 0.0 else order.size
+        return 0.0 if size == 0.0 else 1.0 if size > 0.0 else -1.0
 
     def _add_order(self, order: Order):
         """ Add an order to the strategy """
@@ -2143,8 +2178,16 @@ class SimPosition(PositionBase):
 
         A leg carrying an ``entry_seq`` prices off THAT entry, so two pyramid adds
         sharing a ``from_entry`` id resolve their tick offsets from their own fill
-        instead of both from the oldest one. A leg still waiting on a pending entry
-        order falls back to the first open trade under the id.
+        instead of both from the oldest one. A leg issued against a still-PENDING
+        entry order has no price yet: it must wait for THAT order to fill, even when
+        an older trade shares the id — pricing it off the older entry freezes the
+        level a bar early (``ticks_resolved`` is one-shot) and the bracket then sits
+        at the wrong distance for the whole life of the new entry. MEASURED on the
+        wild `How to use Leverage and Margin in PineScript` reference
+        (BINANCE:BTCUSDT 30m, 2025-01-27 08:00): TV fills `tp_long` at
+        `fill + 100 ticks` of the entry that just opened, on the very bar it opened.
+        Only a leg with neither a binding nor a pending entry order falls back to
+        the first open trade under the id.
 
         :param entry_id: The ``from_entry`` an exit leg is bound to
         :param entry_seq: The bound entry, when the leg already has one
@@ -2153,6 +2196,8 @@ class SimPosition(PositionBase):
         binding = self._binding(entry_seq)
         if binding is not None:
             return binding.entry_price
+        if entry_seq is None and entry_id is not None and entry_id in self.entry_orders:
+            return None
         for trade in self.open_trades:
             if trade.entry_id == entry_id:
                 return trade.entry_price
@@ -3087,7 +3132,6 @@ class SimPosition(PositionBase):
         comm_val = script.commission_value
 
         cum = 0.0
-        gain_prev = 0.0
         gain_cur = 0.0
         k = 0
         d2 = deficit
@@ -3597,6 +3641,23 @@ class SimPosition(PositionBase):
 
         # Get script reference for slippage
         script = lib._script
+
+        # Drop an exit leg left behind by an entry order that never opened. A leg
+        # issued against a PENDING entry carries no ``entry_seq``; once that order
+        # is gone -- cancelled, or margin-rejected -- it has nothing to close, and
+        # TradingView does not let it reach the position an OLDER entry of the same
+        # id still holds. MEASURED on the wild `How to use Leverage and Margin in
+        # PineScript` reference (BINANCE:BTCUSDT 30m, 2025-04-02 08:30): TV closes
+        # the single open trade in ONE fill while the orphan leg split it in two.
+        # A ``from_entry``-less leg is exempt -- TV deliberately re-aims that one at
+        # whatever position opens next (see the adoption pass after the open fills).
+        if self.exit_orders:
+            for order in list(self.exit_orders.values()):
+                if (order.is_market_order or order.from_entry_na
+                        or order.entry_seq is not None
+                        or order.order_id in self.entry_orders):
+                    continue
+                self._remove_order(order)
 
         # Skip market exit order processing if there's no open position (TradingView behavior)
         if not self.open_trades and self.exit_orders:
@@ -4465,10 +4526,11 @@ class SimPosition(PositionBase):
         until after the script.
 
         The fill is a market order at the bar close, so the synthetic slippage
-        applies against the position — but TradingView's trade list still shows
-        the RAW close as the exit price while the cash effect is slipped
-        (measured 2026-08-13, Triple CCI corpus: every immediate-close P&L is
-        qty * slippage * mintick below the exported-price arithmetic).
+        applies against the position and the SLIPPED price is what the trade
+        carries — TradingView's trade list exports it too, and its P&L is exactly
+        that price's arithmetic (measured on the Triple CCI and Bollinger Bands
+        Enhanced references, BINANCE:BTCUSDT 240, slippage 5: every immediate
+        close exports ``close - 5 * mintick`` for a long).
         """
         orders = self._deferred_immediate_closes
         if not orders:
@@ -4491,8 +4553,6 @@ class SimPosition(PositionBase):
                 price += -syminfo.mintick * slippage if self.sign > 0 \
                     else syminfo.mintick * slippage
             self.fill_order(order, price)
-            for closed_trade in self.new_closed_trades[closed_before:]:
-                closed_trade.exit_price = self.c
             self._settle_close_pass_trades(closed_before)
 
     def _discard_deferred_immediate_closes(self):
@@ -5936,18 +5996,35 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
             elif margin_needed > equity:
                 return
 
-    # If it is not a market order, we should check pyramiding and flip conditions here
-    # Market orders are checked at the order processing time
+    # The pyramiding limit is judged when the command RUNS, against the position
+    # the body sees — a rejected entry is gone for good, it does not wait for the
+    # next open to be reconsidered. MEASURED on BINANCE:BTCUSDT 240 (pyramiding=1,
+    # probe "PYR probe 1/2"): a second entry placed while the position is open
+    # never fills, whether that position is flattened by a same-body
+    # ``strategy.close(immediately=true)`` or by an ordinary close order filling at
+    # the very open the entry would have used, and regardless of the entry id.
+    # Market orders are re-checked at processing time as well, for the entries
+    # queued together in one body that only fill one after another.
+    # What the gate reads is the position as the market orders already placed on
+    # this bar leave it (see _pyramid_sign_for_entry), not the raw position.
+    # A call that MODIFIES this bar's unfilled order under the same id (see
+    # skip_flip) adds no entry, so the limit has nothing to judge -- rejecting it
+    # would leave the order it was meant to rewrite standing. MEASURED on the wild
+    # `Strategy for UT Bot Alerts indicator` reference (BINANCE:BTCUSDT 30m), whose
+    # two near-identical blocks issue the same entry twice per signal bar: TV takes
+    # the second call's flip-free quantity, reversing a 28.20314 long into a
+    # 2.10875 short rather than the 30.31189 the first call's flip would open.
+    # The flip quantity stays price-order-only: a market order gets it at
+    # processing time.
     flip_extra = 0.0
-    if limit is not None or stop is not None:
-        # Check if the order has the same direction
-        if position.sign == direction_sign:
-            # Check pyramiding limit for entry orders adding to existing position
-            if lib._script.pyramiding <= position._pyramid_count():
-                # Pyramiding limit reached - don't add the order
-                return
+    if not skip_flip and position._pyramid_sign_for_entry() == direction_sign:
+        # Check pyramiding limit for entry orders adding to existing position
+        if lib._script.pyramiding <= position._pyramid_count():
+            # Pyramiding limit reached - don't add the order
+            return
 
-        elif position.size != 0.0 and not skip_flip:
+    elif limit is not None or stop is not None:
+        if position.size != 0.0 and not skip_flip:
             # TradingView calculates the flip quantity at order creation time,
             # not at execution time. If we have an opposite direction position,
             # we need to add the position size to the order size to flip it.
