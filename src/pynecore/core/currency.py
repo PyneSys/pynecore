@@ -3,8 +3,6 @@ Currency rate provider for request.currency_rate().
 
 Sources of exchange-rate data, in priority order:
 
-* the chart symbol itself — when the chart is a currency pair (e.g. EURUSD
-  chart), ``lib.close`` is the up-to-the-second rate.
 * a security context already attached to the run — backtest or live —
   whose ``(basecurrency, currency)`` syminfo matches the requested pair.
   The provider reads the security's latest ``close`` from its
@@ -12,6 +10,16 @@ Sources of exchange-rate data, in priority order:
 * legacy file path: a sibling ``.toml`` describing a static
   ``.ohlcv`` file. Only relevant when older callers still pass plain
   paths; live runs never carry these.
+* the chart symbol itself, as a last resort — when the chart is a currency
+  pair (e.g. EURUSD chart), ``lib.close`` is an up-to-the-second stand-in.
+
+MEASURED — the chart's own close is NOT what TradingView answers with, even
+when the chart IS the requested pair: on BINANCE:BTCUSDT (base BTC, quote USDT)
+``request.currency_rate("USDT", "BTC")`` is POLONIEX:USDTBTC's daily close of
+day D-1 on 3298/3298 bars, and on FX:EURUSD ``request.currency_rate("USD",
+"EUR")`` holds a value the chart never prints. TradingView keeps a separate
+rate feed per pair, so a dedicated source always outranks the chart, which
+stays only as the answer for a run that carries no rate feed at all.
 """
 from __future__ import annotations
 
@@ -46,8 +54,8 @@ class CurrencyRateProvider:
       with callers that have not been migrated yet.
 
     The chart's own OHLCV is also recognized — when the chart symbol is
-    itself a currency pair (e.g. EURUSD), the provider returns
-    ``lib.close`` directly instead of consulting any security context.
+    itself a currency pair (e.g. EURUSD) and nothing else serves the pair,
+    the provider returns ``lib.close``.
     """
 
     __slots__ = (
@@ -104,7 +112,7 @@ class CurrencyRateProvider:
         """
         Index every available rate source by ``(basecurrency, currency)``.
 
-        Priority: chart pair > running security context > static file.
+        Priority: running security context > static file > chart pair.
         On collisions within a priority class the first entry wins; this
         keeps the mapping deterministic across runs.
         """
@@ -158,6 +166,13 @@ class CurrencyRateProvider:
         if from_cur == to_cur:
             return 1.0
 
+        if (from_cur, to_cur) in self._pair_map:
+            return self._lookup(self._pair_map[(from_cur, to_cur)], timestamp)
+
+        if (to_cur, from_cur) in self._pair_map:
+            rate = self._lookup(self._pair_map[(to_cur, from_cur)], timestamp)
+            return 1.0 / rate if rate and not isnan(rate) and rate != 0.0 else float('nan')
+
         global _lib
         if self._chart_pair == (from_cur, to_cur):
             if (lib := _lib) is None:
@@ -170,13 +185,6 @@ class CurrencyRateProvider:
                 _lib = lib
             close = float(lib.close)
             return 1.0 / close if close and not isnan(close) and close != 0.0 else float('nan')
-
-        if (from_cur, to_cur) in self._pair_map:
-            return self._lookup(self._pair_map[(from_cur, to_cur)], timestamp)
-
-        if (to_cur, from_cur) in self._pair_map:
-            rate = self._lookup(self._pair_map[(to_cur, from_cur)], timestamp)
-            return 1.0 / rate if rate and not isnan(rate) and rate != 0.0 else float('nan')
 
         return float('nan')
 

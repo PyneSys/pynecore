@@ -246,6 +246,45 @@ def __test_chart_as_rate_source__(log):
         lib.close = original_close
 
 
+def __test_dedicated_pair_outranks_chart__(log):
+    """A pair with its own feed wins over the chart, in both directions
+
+    Measured on TradingView: on BINANCE:BTCUSDT (base BTC, quote USDT)
+    ``request.currency_rate("USDT", "BTC")`` answers POLONIEX:USDTBTC's daily
+    close, not the chart's own price — the chart is only the last resort.
+    """
+    from pynecore.core.syminfo import SymInfo
+
+    chart_syminfo = SymInfo(
+        prefix="BINANCE", description="BTC/USDT", ticker="BTCUSDT",
+        currency="USDT", basecurrency="BTC", period="30", type="crypto",
+        mintick=0.01, pricescale=100, pointvalue=1.0,
+        mincontract=0.00001,
+        opening_hours=[], session_starts=[], session_ends=[],
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        path = _create_test_ohlcv(
+            tmpdir, "USDTBTC", [(1000000, 1.266e-05), (1086400, 1.274e-05)],
+            currency="BTC", basecurrency="USDT",
+        )
+        provider = CurrencyRateProvider({"rate_USDTBTC": path},
+                                        chart_syminfo=chart_syminfo)
+
+        from pynecore import lib
+        original_close = lib.close
+        try:
+            lib.close = 78539.14
+            rate = provider.get_rate("USDT", "BTC", 1086400)
+            assert rate == 1.266e-05, f"Expected the feed's rate, got {rate}"
+            inverse = provider.get_rate("BTC", "USDT", 1086400)
+            assert abs(inverse - 1.0 / 1.266e-05) < 1e-6, \
+                f"Expected the feed's inverse, got {inverse}"
+        finally:
+            lib.close = original_close
+
+
 def __test_reset_clears_provider__(log):
     """_reset_request_state clears the currency provider"""
     from pynecore.lib import request
