@@ -40,6 +40,7 @@ from .cancel_disposition import (
     classify_readback as _classify_readback,
 )
 from .feed_health import FeedHealth
+from .transport_errors import guard as _guard_transport
 from .page_completeness import (
     BOOK_READ_DEADLINE_S, POSITIONS_PAGE_SIZE,
     book_page_count, is_exposure_row, positions_complete,
@@ -312,10 +313,11 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         period = _TF_SECONDS.get(timeframe, 300)
         while True:
             now = int(time.time())
-            status, body = await asyncio.to_thread(
-                self.client.get_ohlc, self.market_type,
-                {"symbol": self.symbol, "resolution": resolution,
-                 "from": now - period * 5, "to": now})
+            status, body = await asyncio.to_thread(lambda: _guard_transport(
+                lambda: self.client.get_ohlc(
+                    self.market_type,
+                    {"symbol": self.symbol, "resolution": resolution,
+                     "from": now - period * 5, "to": now})))
             if status == 200 and isinstance(body, dict) and body.get("t"):
                 times = body["t"]
                 idx = len(times) - 1
@@ -377,11 +379,11 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
     def _tick_fetch_official_close(self, period: int) -> "OHLCV | None":
         """One attempt to read slot ``self._tick_slot``'s OFFICIAL closed bar."""
         ts = self._tick_slot
-        status, body = self.client.get_ohlc(
+        status, body = _guard_transport(lambda: self.client.get_ohlc(
             self.market_type,
             {"symbol": self.symbol,
              "resolution": self.to_exchange_timeframe(str(period // 60 or 1)),
-             "from": ts - period, "to": ts + 2 * period})
+             "from": ts - period, "to": ts + 2 * period}))
         if status != 200 or not isinstance(body, dict) or not body.get("t"):
             return None
         for idx, row_ts in enumerate(body["t"]):
@@ -502,9 +504,10 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         """
         try:
             now = int(time.time())
-            status, body = self.client.get_ohlc(self.market_type, {
-                "symbol": self.symbol, "resolution": "1",
-                "from": now - 600, "to": now})
+            status, body = _guard_transport(lambda: self.client.get_ohlc(
+                self.market_type, {
+                    "symbol": self.symbol, "resolution": "1",
+                    "from": now - 600, "to": now}))
             if status != 200 or not isinstance(body, dict) or not body.get("c"):
                 return False
             last = float(body["c"][-1])
@@ -605,9 +608,11 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         and the measured #51/#46 windows showed retrying (and re-minting)
         never reclaims a refusal — it only doubled writes into the lockout
         (#58). The refusal surfaces through the classify path, whose message
-        carries the operator action.
+        carries the operator action. #67: a raw transport exception here
+        becomes the ``(0, NO_RESPONSE)`` sentinel so the classify path parks
+        the write (OrderDispositionUnknownError) instead of killing the run.
         """
-        return call(self._token())
+        return _guard_transport(lambda: call(self._token()))
 
     @staticmethod
     def _ident_str(envelope, leg_type) -> str:
@@ -1018,8 +1023,9 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         """
         for attempt in range(self._cancel_verify_attempts):
             status, body = await asyncio.to_thread(
-                self.client.get_order_detail, self.account_id, order_id,
-                self.market_type, order_category=category)
+                lambda: _guard_transport(lambda: self.client.get_order_detail(
+                    self.account_id, order_id, self.market_type,
+                    order_category=category)))
             if status == 200 and isinstance(body, dict):
                 try:
                     order = self._to_exchange_order(body)
@@ -1044,10 +1050,11 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         is an UNPROVEN venue premise (#55), and this failure shape degrades to
         a retry, never to a wrong terminal verdict."""
         today = datetime.now(timezone(timedelta(hours=7))).date()
-        status, body = await asyncio.to_thread(
-            self.client.get_order_history, self.account_id, self.market_type,
-            from_date=str(today - timedelta(days=1)), to_date=str(today),
-            page_size=200)
+        status, body = await asyncio.to_thread(lambda: _guard_transport(
+            lambda: self.client.get_order_history(
+                self.account_id, self.market_type,
+                from_date=str(today - timedelta(days=1)), to_date=str(today),
+                page_size=200)))
         if status == 200 and isinstance(body, dict):
             for row in body.get("data") or []:
                 if str(row.get("id", "")).split("_")[-1] != str(order_id):
@@ -1202,9 +1209,9 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         pages = 1
         page_index = 0
         while page_index < pages:
-            status, body = self.client.get_orders(
+            status, body = _guard_transport(lambda: self.client.get_orders(
                 self.account_id, self.market_type, order_category=category,
-                page_index=page_index, page_size=100)
+                page_index=page_index, page_size=100))
             if status != 200 or not isinstance(body, dict):
                 # High-frequency poll -> DEBUG so a transient blip stays
                 # inspectable without flooding the operator's log.
@@ -1488,8 +1495,9 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         """Net position for ``symbol`` from ``/positions`` (netting venue)."""
         try:
             status, body = await asyncio.wait_for(
-                asyncio.to_thread(self.client.get_positions, self.account_id,
-                                  self.market_type, POSITIONS_PAGE_SIZE),
+                asyncio.to_thread(lambda: _guard_transport(
+                    lambda: self.client.get_positions(
+                        self.account_id, self.market_type, POSITIONS_PAGE_SIZE))),
                 timeout=self._book_read_deadline_s)
         except (asyncio.TimeoutError, TimeoutError):
             raise ExchangeConnectionError("DNSE positions read timed out")
