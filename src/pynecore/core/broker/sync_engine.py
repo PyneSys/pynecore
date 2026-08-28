@@ -14834,6 +14834,30 @@ class OrderSyncEngine:
             # the book settled flat during the pre-clear sweep — this entry
             # then dispatches raw right here into the flat book.
             self._begin_close_then_open_reversal(intent)
+        if (_coid_spent_retry == 0
+                and isinstance(intent, EntryIntent)
+                and intent.intent_key in self._pending_reversal_opens):
+            # This entry is going out through the plain path (the book is
+            # flat, so the stop-and-reverse transform above did not fire) —
+            # the parked open it duplicates is fulfilled by THIS dispatch,
+            # so its marker must retire with it. The leak this closes: a
+            # declined reversal close re-arms the marker, an external
+            # flatten then clears the book, and Pine's re-emitted entry
+            # dispatches raw here while the marker stays armed — the next
+            # flat settle replays the spent marker as a duplicate raw
+            # entry that nets the fresh position back to zero (measured
+            # live: bybit-inverse cycle 29 — the stale S1 marker fired
+            # alongside the L1 open, both entries filled and cancelled
+            # out, and the phantom L1 row drove a 110017 reject loop into
+            # a manual-intervention halt and a K3 MISMATCH).
+            stale = self._pending_reversal_opens.pop(intent.intent_key)
+            self._drop_envelope(stale.close_pine_id)
+            self._order_mapping.pop(stale.close_pine_id, None)
+            _blog_info(
+                "reversal marker for %s retired by the plain re-dispatch "
+                "of its own entry (close leg %r)",
+                format_intent_key(intent.intent_key), stale.close_pine_id,
+            )
         # Short gate: judged before the envelope is built (nothing to clean
         # up on a halt).
         if isinstance(intent, EntryIntent):

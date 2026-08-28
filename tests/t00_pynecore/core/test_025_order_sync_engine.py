@@ -950,6 +950,60 @@ def __test_stale_reversal_close_rerun_mints_a_fresh_coid__():
     assert rerun.bar_ts_ms == BAR_TS + 120_000
 
 
+def __test_plain_redispatch_retires_the_stale_reversal_marker__():
+    """A plain re-dispatch of the parked entry consumes its own marker.
+
+    When an external flatten clears the book while a reversal marker is
+    armed, Pine's re-emitted entry goes out through the plain path (the
+    flat book disables the stop-and-reverse transform). The marker must
+    retire with that dispatch: left armed, the next flat settle replays
+    it as a duplicate raw entry that nets the fresh position back to
+    zero (measured live: bybit-inverse cycle 29 — the stale S1 marker
+    fired alongside the L1 open, both fills cancelled out, and the
+    phantom L1 row drove a 110017 reject loop into a manual-intervention
+    halt and a K3 MISMATCH).
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+
+    # S reversal: the close leg goes out and the raw S entry is parked.
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
+    assert "S" in engine._pending_reversal_opens
+
+    # External flatten clears the book before the close leg's own fill
+    # lands (mirror of the engine's external-clear: position wiped, the
+    # marker untouched).
+    pos.size = 0.0
+    pos.sign = 0.0
+    pos.open_trades.clear()
+
+    # Pine re-emits S against the flat book: it dispatches PLAIN — and
+    # the stale marker must retire with it.
+    engine.sync(BAR_TS + 120_000)
+    assert [c.intent.pine_id for c in b.entry_calls] == ["L", "S"]
+    assert engine._pending_reversal_opens == {}
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 49_990.0, pine_id="S", xchg_id="xchg-s",
+                    fill_id="s-1"))
+    assert pos.size == -1.0
+
+    # Reverse back to long: when the close settles flat, ONLY the fresh
+    # L marker may open — a surviving stale S marker would fire here too
+    # and the duplicate entries would net the new position to zero.
+    pos.entry_orders.pop("S", None)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS + 180_000)
+    assert len(b.close_calls) == 2
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(_dispatched_close(b.close_calls[1]),
+                             1.0, 50_010.0, xchg_id="xchg-rc2",
+                             fill_id="rc-2"))
+    assert [c.intent.pine_id for c in b.entry_calls] == ["L", "S", "L"]
+
+
 def __test_racing_protective_fill_flattens_and_opens_the_parked_entry__():
     """A venue-side protective leg racing the close leaves NO surplus.
 
