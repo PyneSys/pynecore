@@ -376,7 +376,8 @@ class SecurityState:
     ltf_skip: bool = False
 
 
-def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
+def _get_confirmed_time(state: SecurityState, chart_time: int,
+                        next_chart_time: int = 0) -> int:
     """
     Determine which security period the subprocess should advance to.
 
@@ -411,6 +412,8 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
 
     :param state: Security context state
     :param chart_time: Current chart bar time in milliseconds
+    :param next_chart_time: Open time (ms) of the chart bar after this one, 0
+                            when none is known (last historical bar, live)
     :return: Target time in milliseconds
     """
     if state.same_timeframe:
@@ -513,6 +516,29 @@ def _get_confirmed_time(state: SecurityState, chart_time: int) -> int:
     else:
         period = resampler.get_bar_time(close_time, state.tz)
         grid_target = resampler.get_bar_time(period - 1, state.tz)
+
+    # An EARLY EXCHANGE CLOSE (a US half-day session: Black Friday, Christmas
+    # Eve) ends the period before the schedule in ``opening_hours`` says it
+    # does, and TradingView -- which owns the real holiday calendar -- confirms
+    # the HTF bar on that day's LAST chart bar all the same. The chart's own bar
+    # grid realizes that calendar: when the NEXT chart bar already belongs to a
+    # later period, this bar IS the period's last one, so the period it sits in
+    # has closed here. On a full session the close instant already floors
+    # forward into the next period and this is a no-op. MEASURED on AMEX:SPY@5
+    # requesting ``"1D"``: 2025-11-28 and 2025-12-24 were the only two bars in
+    # 20207 where the daily value lagged TradingView by one trading day.
+    # Backtest only, exactly like ``bar_opens``: live has no next bar
+    # (``next_chart_time == 0``) and keeps the schedule, so no value is emitted
+    # that a real-time run could not have produced.
+    if next_chart_time:
+        if state.session_starts is not None:
+            next_period = resampler.get_bar_time(
+                next_chart_time, state.session_tz, state.session_starts,
+                state.session_opening_hours)
+        else:
+            next_period = resampler.get_bar_time(next_chart_time, state.tz)
+        if next_period > period:
+            grid_target = period
 
     if state.bar_opens is None:
         return grid_target
@@ -994,7 +1020,7 @@ def create_chart_protocol(
             # so the live transition starts with the correct in-progress HTF bar.
 
         # Closed-only flow (historical / lookahead_off / lookahead_last_closed)
-        target_time = _get_confirmed_time(state, chart_time)
+        target_time = _get_confirmed_time(state, chart_time, lib._next_time)
 
         if target_time > state.last_confirmed:
             state.last_confirmed = target_time

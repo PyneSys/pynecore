@@ -402,6 +402,7 @@ def _reset_lib_vars():
     lib._last_close_bar = None
 
     lib._time = 0
+    lib._next_time = 0
     lib._datetime = datetime.fromtimestamp(0, UTC)
 
     lib.extra_fields = {}
@@ -2300,6 +2301,11 @@ class ScriptRunner:
                     self.last_bar_index, self.last_bar_time, self._lossless_volume,
                     self._lossless_prices,
                 )
+                # The peek the last-bar detection above already holds: HTF
+                # security confirmation reads it to recognize a session that
+                # ended EARLY (see ``core/security.py::_get_confirmed_time``).
+                lib._next_time = (0 if next_item is LIVE_TRANSITION
+                                  else next_item.timestamp)
 
                 # Store first price for buy & hold calculation
                 if self.first_price is None:
@@ -2529,6 +2535,9 @@ class ScriptRunner:
                     _set_lib_properties(candle, self.bar_index, self.tz, lib, self._round_decimals,
                                         lossless_volume=self._lossless_volume,
                                         lossless_prices=self._lossless_prices)
+                    # Live: no next bar exists, so HTF confirmation keeps the
+                    # session schedule instead of the chart-grid peek.
+                    lib._next_time = 0
 
                     if self.first_price is None:
                         self.first_price = lib.close  # type: ignore
@@ -2987,6 +2996,7 @@ class ScriptRunner:
             _set_lib_properties(window.aggregated, self.bar_index, self.tz, lib, self._round_decimals,
                                 lossless_volume=self._lossless_volume,
                                 lossless_prices=self._lossless_prices)
+            lib._next_time = window.next_time
 
             # Store first price for buy & hold calculation
             if self.first_price is None:

@@ -1062,6 +1062,25 @@ def security_process_main(
             file_last_bar_time_ms = _tail_bar.timestamp
             break
 
+    def _set_series_end(bar_idx: int, is_history: bool) -> None:
+        """Point ``last_bar_index``/``last_bar_time`` at the end of this series.
+
+        A HISTORICAL developing (or closed-override) period sits in the middle of a
+        file-backed run, so the series' end is the file's final bar, not the period
+        being replayed — the same anchor the historical loop below uses. Walking them
+        back to the current period makes ``barstate``/``chart.right_visible_bar_time``
+        fire on every bar instead of once. At the live edge the current bar IS the
+        last one, and a streamer-fed context has no file end to anchor to.
+
+        :param bar_idx: Index of the bar being run
+        :param is_history: True while the period replayed is historical
+        """
+        if is_history and reader is not None:
+            lib.last_bar_index = _current_total() - 1
+            lib.last_bar_time = file_last_bar_time_ms
+        else:
+            lib.last_bar_index = bar_idx
+
     try:
         current_bar = 0
 
@@ -1129,7 +1148,7 @@ def security_process_main(
                                     lossless_volume=lossless_volume,
                                     lossless_prices=lossless_prices,
                                     derived_prices=_derived_prices)
-                lib.last_bar_index = current_bar
+                _set_series_end(current_bar, dev_is_history)
 
                 barstate.isfirst = (current_bar == 0)
                 # Only the developing period at the live edge is the chart's last bar.
@@ -1200,7 +1219,7 @@ def security_process_main(
                                     lossless_volume=lossless_volume,
                                     lossless_prices=lossless_prices,
                                     derived_prices=_derived_prices)
-                lib.last_bar_index = current_bar
+                _set_series_end(current_bar, dev_is_history)
                 barstate.isfirst = (current_bar == 0)
                 barstate.islast = False
                 barstate.isconfirmed = True

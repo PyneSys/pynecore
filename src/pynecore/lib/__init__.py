@@ -128,6 +128,12 @@ _last_close_bar: int | None = None
 
 # Store time as integer as in Pine Scripts timestamp format
 _time: int = 0
+# Open time (ms) of the chart bar AFTER the current one, 0 when none is known
+# (the last historical bar, and every live bar). The historical loop already
+# reads one bar ahead for ``barstate.islast``; HTF security confirmation uses
+# the same peek to see an exchange's EARLY CLOSE, which no session schedule
+# carries (see ``core/security.py::_get_confirmed_time``).
+_next_time: int = 0
 last_bar_time: int = 0
 
 # Datetime object in the exchange timezone

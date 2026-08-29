@@ -30,6 +30,10 @@ class MagnifiedWindow:
     sub_bars: list[OHLCV]
     aggregated: OHLCV
     is_last_window: bool
+    # Open time (ms) of the NEXT chart-timeframe window, 0 for the last one.
+    # The peek-ahead below already holds it; HTF security confirmation reads it
+    # to recognize a session that ended early (see ``lib._next_time``).
+    next_time: int = 0
 
 
 class BarMagnifier:
@@ -142,6 +146,7 @@ class BarMagnifier:
 
                 # Peek-ahead: yield the previous window (now we know it's not the last)
                 if next_window is not None:
+                    next_window.next_time = new_window.aggregated.timestamp
                     yield next_window
                 next_window = new_window
                 window = []
@@ -161,6 +166,7 @@ class BarMagnifier:
             )
 
             if next_window is not None:
+                next_window.next_time = last_window.aggregated.timestamp
                 yield next_window
             yield last_window
         elif next_window is not None:
