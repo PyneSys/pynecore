@@ -1204,6 +1204,15 @@ class OrderSyncEngine:
         # ``from_entry`` each get their own slot.
         self._deferred_exits: dict[str, ExitIntent] = {}
         self._event_queue: queue.Queue[OrderEvent | _NativeCancelAllExpected] = queue.Queue()
+        # The live :meth:`run_event_stream` task, recorded on the broker
+        # event loop so :meth:`stop_event_stream` can cancel AND await it.
+        # A fire-and-forget cancel is not enough at teardown: the main
+        # thread would go on to close the broker store / HTTP client while
+        # a reconcile pass inside ``watch_orders`` is still mid-flight on
+        # the broker loop (measured: bybit-spot cycle 108 — EBADF on an
+        # in-flight REST read + a disappearance pass touching the closed
+        # store).
+        self._event_stream_task: asyncio.Task[None] | None = None
         # Snapshot of the drain batch currently being routed by
         # :meth:`_drain_events`, plus the index of the NEXT event to route.
         # Lets the ``cancelled`` classifier look AHEAD at the not-yet-routed
@@ -2073,6 +2082,7 @@ class OrderSyncEngine:
         loop, captures the moment the broker actually observed the
         transition.
         """
+        self._event_stream_task = asyncio.current_task()
         try:
             stream = self._broker.watch_orders()
         except NotImplementedError:
@@ -2099,6 +2109,27 @@ class OrderSyncEngine:
         except Exception:  # pragma: no cover — defensive
             _log.exception("watch_orders stream terminated with an error")
             raise
+
+    async def stop_event_stream(self) -> None:
+        """Cancel the :meth:`run_event_stream` task and wait for it to unwind.
+
+        Runs on the broker event loop at teardown. Awaiting the cancelled
+        task (instead of cancel-and-forget) guarantees that no reconcile
+        pass inside ``watch_orders`` is still executing when the caller
+        goes on to close the broker store and the plugin's HTTP transport.
+        The task's outcome is deliberately swallowed — a stream that died
+        with an error already logged it, and teardown must proceed.
+        """
+        task = self._event_stream_task
+        self._event_stream_task = None
+        if task is not None and asyncio.current_task() is not task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - teardown must proceed
+                _log.debug("event stream terminated with %r during stop", exc)
 
     @property
     def halted(self) -> bool:

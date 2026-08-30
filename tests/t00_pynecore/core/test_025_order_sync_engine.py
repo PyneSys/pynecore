@@ -4704,6 +4704,61 @@ def __test_run_event_stream_handles_async_gen_not_implemented__():
     asyncio.run(engine.run_event_stream())
 
 
+def __test_stop_event_stream_waits_for_the_stream_to_fully_unwind__():
+    """``stop_event_stream`` returns only after ``watch_orders`` unwound.
+
+    The runner's teardown closes the broker store and the plugin's HTTP
+    client right after stopping the stream — if the stop returned while a
+    reconcile pass inside ``watch_orders`` was still executing on the
+    broker loop, that pass would hit a closed store / closed socket
+    (measured: bybit-spot cycle 108). The generator here blocks in a
+    worker thread like a REST read under ``asyncio.to_thread`` and does
+    non-instant cleanup in its ``finally``; the join must cover both.
+    """
+    b = MockBroker()
+    in_pass = threading.Event()
+    release = threading.Event()
+    unwound = threading.Event()
+
+    def _blocking_stream():
+        async def _gen():
+            try:
+                in_pass.set()
+                await asyncio.to_thread(release.wait, 5.0)
+                yield  # pragma: no cover — cancelled before the first yield
+            finally:
+                # Cleanup that suspends across loop iterations: a stop that
+                # cancels without awaiting the task resolves its own future
+                # first, and the join returns before this completes.
+                await asyncio.sleep(0.05)
+                unwound.set()
+
+        return _gen()
+
+    b.watch_orders = _blocking_stream  # type: ignore[method-assign]
+    engine, _pos = _mk_engine(b)
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        asyncio.run_coroutine_threadsafe(engine.run_event_stream(), loop)
+        assert in_pass.wait(5.0)
+        # The stop owns both the cancel and the join — a prior cancel
+        # request on the concurrent future (the runner also issues one)
+        # would schedule the unwinding ahead of the stop on the loop and
+        # mask a stop that forgot to await the task.
+        join = asyncio.run_coroutine_threadsafe(engine.stop_event_stream(), loop)
+        join.result(timeout=5.0)
+        assert unwound.is_set()
+        assert engine._event_stream_task is None
+    finally:
+        release.set()
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5.0)
+        loop.close()
+
+
 # === Reconciliation ===
 
 

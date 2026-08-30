@@ -1,6 +1,7 @@
 from typing import Iterable, Iterator, Callable, TYPE_CHECKING, Any, cast
 from types import ModuleType
 import asyncio
+import concurrent.futures
 import sys
 import tomllib
 from dataclasses import dataclass, field as dataclasses_field
@@ -2941,10 +2942,27 @@ class ScriptRunner:
 
             # Cancel the broker event-stream task scheduled in __init__.
             # Done before loop teardown so the watch_orders generator gets
-            # a chance to clean up its HTTP session.
+            # a chance to clean up its HTTP session. The concurrent future's
+            # cancel() only *requests* task cancellation on the broker loop;
+            # the engine's stop_event_stream() then awaits the task's actual
+            # unwinding — without that join the caller would close the
+            # broker store / HTTP client while a reconcile pass inside
+            # watch_orders is still mid-flight on the broker loop.
             if self._engine_event_stream_future is not None:
                 self._engine_event_stream_future.cancel()
                 self._engine_event_stream_future = None
+                loop = self._broker_event_loop
+                if (self._order_sync_engine is not None and loop is not None
+                        and loop.is_running()):
+                    engine = cast('OrderSyncEngine', self._order_sync_engine)
+                    join = asyncio.run_coroutine_threadsafe(
+                        engine.stop_event_stream(), loop)
+                    try:
+                        join.result(timeout=10.0)
+                    except (concurrent.futures.TimeoutError,
+                            concurrent.futures.CancelledError,
+                            RuntimeError):
+                        pass
 
             # Finalize the viz writer: a full drawings snapshot, then the end
             # record. Drawing registries are still populated here (they are only
