@@ -721,6 +721,7 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     last_max_index: Persistent[int] = 0
     last_bar: Persistent[int] = -1
     avail: Persistent[int] = 0
+    prev_length: Persistent[int] = 0
 
     # The kept extreme ages in BARS, not in calls. A conditionally called window only
     # takes a stale slot into account when its rescan fires, so both halves of the
@@ -738,8 +739,12 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     if last_bar >= 0 and gap > 0:
         last_max_index += gap
         avail += gap
-        if avail > length:
-            avail = length
+        # Bounded by the RING, not by the current length: slots the ring still holds
+        # stay trustworthy across a dip in a varying length, so the rescan below can
+        # reach the whole window the very bar the length grows back. With a fixed
+        # length ``capacity - 1`` IS ``length``, so nothing else moves.
+        if avail > capacity - 1:
+            avail = capacity - 1
     last_bar = bar_index
     window[bar_index % capacity] = source
 
@@ -766,7 +771,17 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
         last_max = source
         last_max_index = 0
 
-    if last_max_index >= length:
+    # MEASURED LAW — a GROWING length re-reads the whole window. The kept extreme
+    # only expires on age, so a value evicted while the length was short would stay
+    # forgotten once the length reaches back over it again; TradingView returns it.
+    # Probed on the wild script "Ichimoku Kinko hyo" (BINANCE:BTCUSDT 30m), whose
+    # adaptive Senkou length dips to 50 and climbs back: rescanning on every growth
+    # reproduces all 29075 bars of both its ``ta.highest`` and ``ta.lowest``, 24 and
+    # 154 of which the age-only rescan missed. A SHRINKING length needs nothing --
+    # an extreme still inside the smaller window is the extreme of that subset too.
+    grown = length > prev_length
+    prev_length = length
+    if last_max_index >= length or grown:
         last_max = source
         last_max_index = 0
         for i in builtins.range(1, length if avail >= length else avail + 1):
@@ -1038,6 +1053,7 @@ def lowest(source: Series[float], length: int,
     last_min_index: Persistent[int] = 0
     last_bar: Persistent[int] = -1
     avail: Persistent[int] = 0
+    prev_length: Persistent[int] = 0
 
     # The kept extreme ages in BARS, not in calls: a bar that skips the call still
     # moves the window on, and a bar that calls it many times moves it only once, so
@@ -1048,8 +1064,10 @@ def lowest(source: Series[float], length: int,
     if last_bar >= 0 and gap > 0:
         last_min_index += gap
         avail += gap
-        if avail > length:
-            avail = length
+        # See ``highest``: the ring's own reach bounds this, so a length that grows
+        # back after a dip answers over the whole window immediately.
+        if avail > capacity - 1:
+            avail = capacity - 1
     last_bar = bar_index
     window[bar_index % capacity] = source
 
@@ -1071,7 +1089,11 @@ def lowest(source: Series[float], length: int,
         last_min = source
         last_min_index = 0
 
-    if last_min_index >= length:
+    # See ``highest``: a growing length re-reads the whole window, a shrinking one
+    # keeps its extreme.
+    grown = length > prev_length
+    prev_length = length
+    if last_min_index >= length or grown:
         last_min = source
         last_min_index = 0
         for i in builtins.range(1, length if avail >= length else avail + 1):

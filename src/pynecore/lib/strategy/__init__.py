@@ -235,6 +235,8 @@ class Order:
         "book_seq",  # Call site of the strategy.close()/close_all() statement that placed this
                      # (backtest only); None for non-stacking sticky-exit / risk / live orders
         "comm_booking",  # Commission pool shared by the two legs of a reversal (see _fill_order)
+        "reversal_leg",  # Closing leg an entry order was split into when it flipped the position
+        "placed_fill_seq",  # Fills processed before this order was booked (see _fill_order)
     )
 
     def __init__(
@@ -270,6 +272,9 @@ class Order:
         self.order_type = order_type
 
         self.exit_id = exit_id
+
+        self.reversal_leg = False
+        self.placed_fill_seq = -1
 
         self.oca_name = oca_name
         self.oca_type = oca_type if oca_type is not None else _oca.none
@@ -355,7 +360,7 @@ class Trade:
 
     __slots__ = (
         "size", "init_size", "sign", "entry_id", "entry_bar_index", "entry_time", "entry_price", "entry_comment",
-        "entry_equity",
+        "entry_equity", "entry_fill_node", "entry_fill_seq",
         "exit_id", "exit_bar_index", "exit_time", "exit_price", "exit_comment", "exit_equity",
         "commission", "max_drawdown", "max_drawdown_percent", "max_runup", "max_runup_percent",
         "profit", "profit_percent", "cum_profit", "cum_profit_percent",
@@ -366,7 +371,8 @@ class Trade:
     def __init__(self, *, size: PyneFloat, entry_id: str | None, entry_bar_index: int, entry_time: int,
                  entry_price: PyneFloat,
                  commission: PyneFloat, entry_comment: PyneStr | None = None,
-                 entry_equity: PyneFloat = 0.0):
+                 entry_equity: PyneFloat = 0.0, entry_fill_node: int = -1,
+                 entry_fill_seq: int = -1):
         self.size: PyneFloat = size
         # Original entry quantity, frozen — partial exits shrink ``size`` but
         # qty_percent / no-qty "rest" exit legs reserve off this value.
@@ -379,6 +385,11 @@ class Trade:
         self.entry_price: PyneFloat = entry_price
         self.entry_equity: PyneFloat = entry_equity
         self.entry_comment: PyneStr | None = entry_comment
+        # Which point of the intrabar walk this trade's entry filled at. Two fills
+        # sharing a bar AND a node happened at the same moment, which is what the
+        # same-instant reversal booking below keys on.
+        self.entry_fill_node: int = entry_fill_node
+        self.entry_fill_seq: int = entry_fill_seq
 
         self.exit_id: str | None = ""
         self.exit_bar_index: int = -1
@@ -1160,6 +1171,11 @@ class SimPosition(PositionBase):
         """ Add an order to the strategy """
         # Set the bar_index when the order is placed
         order.bar_index = int(lib.bar_index)
+        # How many fills the run had processed when this order reached the book.
+        # It separates an order that waited in the book ALONGSIDE another from one
+        # a fill itself produced (a calc_on_order_fills re-execution) -- see the
+        # same-instant reversal booking in ``_fill_order``.
+        order.placed_fill_seq = self._fill_counter
 
         # Add market order to market orders dict. Key on exit_id too: two
         # brackets sharing the same from_entry (order_id) would otherwise
@@ -1524,6 +1540,40 @@ class SimPosition(PositionBase):
                     elif order.comment:
                         closed_trade.exit_comment = order.comment
 
+                    # MEASURED (BINANCE:BTCUSDT 30m, five probe shapes) — when two
+                    # opposite ENTRY orders WAITED IN THE BOOK TOGETHER and then fill
+                    # at the SAME moment, the lots they annihilate are booked LONG
+                    # side first, whichever order came first: the long order is the
+                    # record's entry and the short one its exit. `strategy.entry`
+                    # placed short-then-long, long-then-short, three orders in one bar
+                    # and unequal sizes all report the long leg as the entry, and
+                    # `strategy.order` behaves the same.
+                    # Two things break the tie back into chronological order:
+                    # * a different fill MOMENT — a reversal whose legs land on
+                    #   different bars or different points of the bar walk keeps its
+                    #   order even when both legs price identically (a buy-limit
+                    #   sitting exactly on the short's entry price stays a short round
+                    #   trip);
+                    # * a reversal order the FILL ITSELF produced — under
+                    #   `calc_on_order_fills` the re-execution that a short's fill
+                    #   runs can place the opposing entry, and TradingView then books
+                    #   a SHORT round trip (probe "coof reversal labeling probe": the
+                    #   coof-issued leg reports size -1, the same-bar pair +1). Only
+                    #   an order already in the book when the trade opened ties.
+                    # Prices are equal here by construction, so only the labels and
+                    # the direction move — the P&L is invariant.
+                    if (order.reversal_leg and trade.size < 0.0
+                            and trade.entry_bar_index == closed_trade.exit_bar_index
+                            and trade.entry_fill_node == self._walk_node
+                            and order.placed_fill_seq < trade.entry_fill_seq
+                            and trade.entry_price == price):
+                        closed_trade.entry_id, closed_trade.exit_id = \
+                            closed_trade.exit_id, closed_trade.entry_id
+                        closed_trade.entry_comment, closed_trade.exit_comment = \
+                            closed_trade.exit_comment, closed_trade.entry_comment or ''
+                        closed_trade.size = -closed_trade.size
+                        closed_trade.sign = -closed_trade.sign
+
                     # Commission summ
                     self.open_commission -= closed_trade.commission
 
@@ -1726,7 +1776,8 @@ class SimPosition(PositionBase):
                     entry_id=entry_id, entry_bar_index=int(lib.bar_index),
                     entry_time=lib._time, entry_price=price,
                     commission=0.0, entry_comment=order.comment,
-                    entry_equity=self.equity
+                    entry_equity=self.equity, entry_fill_node=self._walk_node,
+                    entry_fill_seq=self._fill_counter
                 )
                 self.open_trades.append(overshoot_trade)
                 self._bind_entry(entry_id, overshoot_trade.size, price)
@@ -1793,7 +1844,8 @@ class SimPosition(PositionBase):
                 entry_id=entry_id, entry_bar_index=int(lib.bar_index),
                 entry_time=lib._time, entry_price=price,
                 commission=commission, entry_comment=order.comment,
-                entry_equity=before_equity
+                entry_equity=before_equity, entry_fill_node=self._walk_node,
+                entry_fill_seq=self._fill_counter
             )
 
             self.open_trades.append(trade)
@@ -1949,6 +2001,7 @@ class SimPosition(PositionBase):
             # Create a copy for closing existing position
             order1 = copy(order)
             order1.order_type = _order_type_close
+            order1.reversal_leg = True
             order1.size = -self.size
             # Set order_id to None so it will close any open trades
             order1.order_id = None
