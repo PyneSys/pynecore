@@ -717,13 +717,13 @@ def replace(source: str, target: str, replacement: str, occurrence=0) -> PyneStr
         # An empty target is an insertion point rather than a match: the replacement lands
         # at the nth character position, clamped to the end of the source. Measured:
         # replace("abc", "", "-", 2) == "ab-c" and replace("abc", "", "-", 4) == "abc-".
-        index = min(occurrence, len(source))
+        index = min(int(occurrence), len(source))
     else:
         # Occurrences are enumerated by an overlapping left-to-right scan, so "aa" occurs
         # at index 0 AND 1 in "aaa" — a split-based walk would only see the first one.
         # Measured: replace("aaa", "aa", "-", 1) == "a-".
         index = -1
-        for _ in range(occurrence + 1):
+        for _ in range(int(occurrence) + 1):
             index = source.find(target, index + 1)
             if index < 0:
                 return source
@@ -780,8 +780,14 @@ def substring(source: str, begin_pos: int, end_pos: int | None = None) -> str:
     :param end_pos: The ending position
     :return: The substring of the source string starting at the specified position and ending at the specified position
     """
+    # Pine's int is a static type only: an int-TYPED expression can carry a
+    # fractional value (``14 / 8``), so the positions are truncated where they
+    # are CONSUMED -- ahead of the range checks and of the empty-slice test,
+    # both of which must see the same integer the slice below uses.
+    begin_pos = int(begin_pos)
     assert begin_pos >= 0, "Positions must be >= 0!"
     if end_pos is not None:
+        end_pos = int(end_pos)
         assert end_pos >= begin_pos, "End position must be >= begin position!"
     if begin_pos == end_pos:
         return ""

@@ -812,7 +812,10 @@ def new_int(size: int | NA = 0, initial_value: int = NA(int)) -> list[int]:
     :return: New array of the specified size
     """
     size = _na_size(size)
-    assert isinstance(initial_value, (int, NA)), "Initial value must be int!"
+    # No type assert on the value: an int-TYPED Pine expression may carry a
+    # fractional value (``14 / 8``), and TradingView stores it unchanged --
+    # ``array.get(array.new_int(1, 7 / 4), 0)`` is 1.75, not 1. Truncation
+    # belongs to the consuming slots, never to storage.
     return [initial_value] * size
 
 

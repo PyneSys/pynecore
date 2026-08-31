@@ -325,14 +325,19 @@ def round(number: TFI | NA[TFI], precision: PyneInt = NA(int)) -> PyneFloat:
     :param precision: The number of decimal places to round to.
     :return: The rounded number.
     """
+    # The two overloads are told apart by the PRESENCE of a precision, never by
+    # its Python type: an int-TYPED Pine expression can arrive as a float
+    # (``math.round(x, 4 / 2)``), and an ``isinstance(precision, int)`` test
+    # silently took that for "no precision given" and dropped the rounding.
+    has_precision = precision == precision  # is_na_arg (inverted)
     if not (number == number):  # is_na_arg
         # No precision means the int contract (first overload), so an int-typed na
-        return na_float if isinstance(precision, int) else NA(int)
+        return na_float if has_precision else NA(int)
     if not math.isfinite(number):
         # Pine has no non-finite values (1/0 is na); the precision overload keeps
         # builtins.round() behavior (returns the float unchanged), but the
         # one-argument overload must honor its int contract, so it yields an int na
-        return cast(float, number) if isinstance(precision, int) else NA(int)
+        return cast(float, number) if has_precision else NA(int)
     # TV rounds the EXACT binary value of the double scaled by 10**precision, with
     # ties going away from zero and a 1e-10 absolute tolerance on that scaled value
     # -- the same slack its relational operators carry. Measured on BINANCE:BTCUSDT
@@ -343,7 +348,10 @@ def round(number: TFI | NA[TFI], precision: PyneInt = NA(int)) -> PyneFloat:
     # exactly representable .5, so no double-precision model can tell them apart.
     # Known limit: at precision 8 on single-digit values the tolerance no longer
     # separates the ties (26697 of 28397) -- that regime is unmodelled.
-    p = precision if isinstance(precision, int) else 0
+    # A fractional precision is truncated at this consuming slot. The exact TV
+    # formula for one is an OPEN reverse-engineering question -- ``int()`` is
+    # provisional here, only the integral case is measured.
+    p = int(precision) if has_precision else 0
     # The slack belongs to the decimal scaling, so precision 0 -- where nothing is
     # scaled -- compares exactly. MEASURED: every value below the tie rounds down
     # there however close it sits (452523.49999999994 -> 452523 at 5.8e-11,
@@ -362,7 +370,7 @@ def round(number: TFI | NA[TFI], precision: PyneInt = NA(int)) -> PyneFloat:
     units, remainder = divmod(numerator, denominator)
     if remainder * tie_scale >= tie_half * denominator:
         units += 1
-    if not isinstance(precision, int):
+    if not has_precision:
         return -units if negative else units
     value = units / 10.0 ** p if p >= 0 else units * 10.0 ** -p
     return -value if negative else value

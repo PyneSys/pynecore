@@ -9,6 +9,24 @@ from ...core.module_property import module_property
 # Functions
 #
 
+
+def _trade_index(trade_num: int) -> int:
+    """
+    Normalize a trade number into a list index.
+
+    Pine's ``int`` is a static type only, so an int-TYPED expression may arrive
+    carrying a fractional value; this consuming slot truncates it. An ``na``
+    trade number becomes -1, which every accessor already answers with ``na``
+    instead of reaching the subscript with a non-integer.
+
+    :param trade_num: Trade number of the trade, possibly fractional or ``na``
+    :return: Integer index, or -1 when there is none
+    """
+    if not (trade_num == trade_num):  # is_na_arg
+        return -1
+    return int(trade_num)
+
+
 # noinspection PyProtectedMember
 def commission(trade_num: int) -> PyneFloat:
     """
@@ -17,6 +35,7 @@ def commission(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the open trade. The number of the first trade is zero
     :return: The sum of entry and exit fees paid in the open trade, expressed in strategy.account_currency
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
     try:
@@ -35,6 +54,7 @@ def entry_bar_index(trade_num: int) -> PyneInt:
     :param trade_num: The trade number of the open trade. The number of the first trade is zero
     :return: The bar_index of the open trade's entry
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return NA(int)
     try:
@@ -53,6 +73,7 @@ def entry_comment(trade_num: int) -> PyneStr:
     :param trade_num: The trade number of the open trade. The number of the first trade is zero
     :return: The comment message of the open trade's entry
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return NA(str)
     try:
@@ -72,6 +93,7 @@ def entry_id(trade_num: int) -> PyneStr:
     :param trade_num: The trade number of the open trade. The number of the first trade is zero
     :return: The id of the open trade's entry
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return NA(str)
     try:
@@ -91,6 +113,7 @@ def entry_price(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the open trade. The number of the first trade is zero
     :return: The price of the open trade's entry
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
     try:
@@ -109,6 +132,7 @@ def entry_time(trade_num: int) -> PyneInt:
     :param trade_num: The trade number of the open trade. The number of the first trade is zero
     :return: The time of the open trade's entry (UNIX)
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return NA(int)
     try:
@@ -127,6 +151,7 @@ def max_drawdown(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the open trade. The number of the first trade is zero
     :return: The maximum drawdown of the open trade
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
     try:
@@ -145,6 +170,7 @@ def max_drawdown_percent(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the open trade. The number of the first trade is zero
     :return: The maximum drawdown percentage of the open trade
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
     try:
@@ -163,6 +189,7 @@ def max_runup(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the open trade. The number of the first trade is zero
     :return: The maximum runup of the open trade
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
     try:
@@ -181,6 +208,7 @@ def max_runup_percent(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the open trade. The number of the first trade is zero
     :return: The maximum runup percentage of the open trade
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
     try:
@@ -198,6 +226,7 @@ def profit(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the open trade. The number of the first trade is zero
     :return: The profit of the open trade expressed in strategy.account_currency
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
     try:
@@ -215,6 +244,7 @@ def profit_percent(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the open trade. The number of the first trade is zero
     :return: The profit percentage of the open trade
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
     try:
@@ -233,6 +263,7 @@ def size(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the open trade. The number of the first trade is zero
     :return: The size and direction (<0 short >0 long) of the open trade
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return 0.0
     try:
