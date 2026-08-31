@@ -8,6 +8,7 @@ from collections.abc import Callable
 # forms below test ``> 1e-10`` / ``< -1e-10`` and the non-strict ones
 # ``<= 1e-10`` / ``>= -1e-10``.
 from pynecore.core.pine_compare import EPSILON
+from .pine_type_rules import BOOL, stamp_lowering
 
 # op -> (bound, comparison of the bound against the difference). ``a < b``
 # becomes ``-EPSILON > a - b`` rather than ``b - a > EPSILON``: the difference
@@ -243,4 +244,9 @@ class FloatToleranceTransformer(ast.NodeTransformer):
                                               pair[1], binders[i + 1][1]))
         # A chain evaluates the later operands only if the earlier comparisons
         # hold, which is what Python's own chain semantics do
-        return clauses[0] if len(clauses) == 1 else ast.BoolOp(op=ast.And(), values=clauses)
+        rewritten = (clauses[0] if len(clauses) == 1
+                     else ast.BoolOp(op=ast.And(), values=clauses))
+        # Whatever shape the rewrite took, it stands where a comparison stood,
+        # so it is a bool; the guards, differences and temporaries it emitted
+        # around the preserved operands are typed from those operands
+        return stamp_lowering(rewritten, BOOL)

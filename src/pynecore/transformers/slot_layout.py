@@ -35,6 +35,8 @@ The runtime side of the contract (layout dict format, ``_make_state``,
 import ast
 from dataclasses import dataclass, field
 
+from .pine_type_rules import OBJECT, stamp_lowering
+
 __all__ = ['ModuleLayout', 'ScopeLayout', 'apply_layout', 'scope_for_function',
            'collect_scope_segments']
 
@@ -296,14 +298,19 @@ def _scope_entry_ast(scope: ScopeLayout, compacted: bool = False) -> ast.Dict:
 
 
 def _layout_assign_ast(layout: ModuleLayout) -> ast.Assign:
-    """Build the module-level ``__pyne_slot_layout__`` assignment."""
+    """Build the module-level ``__pyne_slot_layout__`` assignment.
+
+    The literal swallows the declarations' init expressions, which carry Pine
+    types; the table around them is machinery, so the whole literal is typed
+    as one object and the inits keep the stamps they came with.
+    """
     carrying = [scope for scope in layout.scopes.values() if scope.slots]
     return ast.Assign(
         targets=[ast.Name(id='__pyne_slot_layout__', ctx=ast.Store())],
-        value=ast.Dict(
+        value=stamp_lowering(ast.Dict(
             keys=[ast.Constant(value=scope.scope) for scope in carrying],
             values=[_scope_entry_ast(scope, layout.compacted_series) for scope in carrying],
-        ),
+        ), OBJECT),
     )
 
 

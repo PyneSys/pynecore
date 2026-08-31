@@ -1,6 +1,8 @@
 from typing import cast
 import ast
 
+from .pine_type_rules import get_ty, stamp_lowering
+
 
 class SafeConvertTransformer(ast.NodeTransformer):
     """
@@ -34,8 +36,10 @@ class SafeConvertTransformer(ast.NodeTransformer):
             # Mark that we need the safe_convert import
             self.has_convert_functions = True
 
-            # Transform to safe_convert.safe_float/safe_int call
-            return ast.Call(
+            # Transform to safe_convert.safe_float/safe_int call, keeping the
+            # cast's Pine type: the na-safe form converts what the builtin
+            # converts
+            return stamp_lowering(ast.Call(
                 func=ast.Attribute(
                     value=ast.Name(id='safe_convert', ctx=ast.Load()),
                     attr=f'safe_{node.func.id}',
@@ -43,7 +47,7 @@ class SafeConvertTransformer(ast.NodeTransformer):
                 ),
                 args=node.args,
                 keywords=node.keywords
-            )
+            ), get_ty(node))
 
         return node
 

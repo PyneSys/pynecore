@@ -74,6 +74,7 @@ import types
 
 from ..core.pine_export import Exported
 from ..utils.stdlib_checker import is_stdlib
+from .pine_type_rules import get_ty, stamp_lowering
 # noinspection PyProtectedMember
 from .slot_layout import DEFAULT_STATE_PARAM, ModuleLayout, scope_for_function
 
@@ -336,6 +337,22 @@ class _RouteCollector(ast.NodeVisitor):
         if self._stack and isinstance(node.func, (ast.Name, ast.Attribute)):
             route = self.transformer.route_for_callee(node.func, self._stack)
             self.scope_routes['·'.join(self._stack)].append(route)
+
+
+def _stamped_call(bound: ast.expr, node: ast.Call) -> ast.Call:
+    """
+    Re-emit a call site through a bound callee, keeping its Pine type.
+
+    The uniform route builds a NEW ``Call`` around the original arguments, so
+    the result type would be lost on the very node the overload pin lands on;
+    the dispatcher expression it calls through is machinery and types itself.
+
+    :param bound: The expression yielding the callable
+    :param node: The original call
+    :return: The rewritten call, stamped
+    """
+    return stamp_lowering(
+        ast.Call(func=bound, args=node.args, keywords=node.keywords), get_ty(node))
 
 
 class FunctionIsolationTransformer(ast.NodeTransformer):
@@ -602,7 +619,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
                 '__bind_loop__' if in_loop else '__bind_slot__',
                 [ast.Name(id=param, ctx=ast.Load()),
                  ast.Constant(value=slot), node.func])
-            return ast.Call(func=bound, args=node.args, keywords=node.keywords)
+            return _stamped_call(bound, node)
         callee: ast.expr
         callee_copy: ast.expr
         bind: ast.expr | None = None
@@ -648,7 +665,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
             body=ast.Subscript(value=ast.Name(id='__b·__', ctx=ast.Load()),
                                slice=ast.Constant(value=1), ctx=ast.Load()),
             orelse=rebind)
-        return ast.Call(func=bound, args=node.args, keywords=node.keywords)
+        return _stamped_call(bound, node)
 
     # --- visitors ------------------------------------------------------------
 

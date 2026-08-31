@@ -289,6 +289,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             from pynecore.transformers.persistent_series import PersistentSeriesTransformer
             from pynecore.transformers.lib_series import LibrarySeriesTransformer
             from pynecore.transformers.closure_arguments_transformer import ClosureArgumentsTransformer
+            from pynecore.transformers.pine_type_transformer import PineTypeTransformer
             from pynecore.transformers.function_isolation import FunctionIsolationTransformer
             from pynecore.transformers.module_property import ModulePropertyTransformer
             from pynecore.transformers.ta_variable_hoist import TaVariableHoistTransformer
@@ -351,6 +352,13 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             # anchored like any hand-written statement
             transformed = TaVariableHoistTransformer().visit(transformed)
             transformed = ClosureArgumentsTransformer().visit(transformed)
+            # Pine's static types, stamped on the nodes. The last point where
+            # the tree still looks like Pine: the annotations are intact (the
+            # series pass rewrites and consumes them), the `/` is still a
+            # BinOp (safe division wraps it into a call), and the
+            # security-bearing functions are already instantiated per call
+            # site. Analysis only -- it stamps, it does not rewrite.
+            transformed = PineTypeTransformer(pyne_mode).visit(transformed)
             transformed = UnusedSeriesDetectorTransformer().optimize(transformed)
             transformed = SeriesTransformer(slot_layout).visit(transformed)
             transformed = PersistentTransformer(slot_layout).visit(transformed)
