@@ -3721,6 +3721,99 @@ def __test_netted_over_close_clamps_to_flat__():
     assert b.close_calls[0].intent.qty == 10.0  # clamped to the 10-unit long, not 14
 
 
+def __test_spot_full_close_pre_clears_resting_exits_before_the_close_dispatch__():
+    """A spot flatten cancels the venue-resident brackets BEFORE the close.
+
+    Spot has no reduce-only: a resting SL leg that triggers after the
+    close fill sells inventory the account no longer holds (measured
+    live: bybit-spot cycle 109 — negative-inventory quarantine). The
+    pre-clear must dispatch every consumed leg's cancel ahead of the
+    close on the wire, retire the legs from tracking, and must not
+    re-arm them in the same sync.
+    """
+    from decimal import Decimal
+
+    b = MockBroker()
+    b.spot_inventory_port = SimpleNamespace(
+        position_dust_threshold=Decimal("0.00001"),
+    )
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L1"] = _entry_order("L1", 1.0)
+    pos.entry_orders["L2"] = _entry_order("L2", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L1", xchg_id="x1", fill_id="f1"))
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_010.0, pine_id="L2", xchg_id="x2", fill_id="f2"))
+    assert pos.size == 2.0
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", -1.0, "L1-X", stop=49_000.0)
+    pos.exit_orders[("L2-X", "L2")] = _exit_order("L2", -1.0, "L2-X", stop=49_000.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.exit_calls) == 2
+
+    # Record the wire order across the cancel and close calls.
+    wire_sequence: list[str] = []
+    orig_cancel = b.execute_cancel
+    orig_close = b.execute_close
+
+    async def _seq_cancel(envelope):
+        wire_sequence.append(f"cancel:{envelope.intent.pine_id}")
+        return await orig_cancel(envelope)
+
+    async def _seq_close(envelope):
+        wire_sequence.append("close")
+        return await orig_close(envelope)
+
+    b.execute_cancel = _seq_cancel  # type: ignore[method-assign]
+    b.execute_close = _seq_close  # type: ignore[method-assign]
+
+    # Flat signal: Pine still emits the persistent exits alongside the
+    # close_all (the incident shape — the exits only die with the trades).
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -2.0, order_type=_order_type_close, exit_id="Close position order",
+    )
+    engine.sync(BAR_TS + 120_000)
+
+    assert wire_sequence == ["cancel:L1-X", "cancel:L2-X", "close"]
+    assert ("L1-X", "L1") not in {
+        (i.pine_id, i.from_entry)
+        for i in engine.active_intents.values() if isinstance(i, ExitIntent)
+    }
+    assert len(b.exit_calls) == 2  # no same-sync re-arm of the swept legs
+
+
+def __test_spot_partial_close_keeps_the_resting_exits_armed__():
+    """A partial spot close must NOT sweep the brackets — the trade lives on."""
+    from decimal import Decimal
+
+    b = MockBroker()
+    b.spot_inventory_port = SimpleNamespace(
+        position_dust_threshold=Decimal("0.00001"),
+    )
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L1"] = _entry_order("L1", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L1", xchg_id="x1", fill_id="f1"))
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", -1.0, "L1-X", stop=49_000.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.exit_calls) == 1
+
+    # Keyed partial close: half the entry stays open.
+    pos.exit_orders[("Close entry(s) order L1", None)] = Order(
+        "L1", -0.5, order_type=_order_type_close,
+        exit_id="Close entry(s) order L1",
+    )
+    engine.sync(BAR_TS + 120_000)
+
+    assert len(b.close_calls) == 1
+    assert len(b.cancel_calls) == 0
+    assert any(
+        isinstance(i, ExitIntent) and i.from_entry == "L1"
+        for i in engine.active_intents.values()
+    )
+
+
 def __test_close_plus_close_all_clamps_total__():
     """close(id) is honoured first; close_all flattens only the residual exposure."""
     b = MockBroker()
@@ -10094,6 +10187,37 @@ def __test_oca_cancel_ahead_of_queued_sibling_fill_is_expected__():
     assert pos.size == 0.0
     assert "TP\0L" not in engine.active_intents
     assert "TP\0L" not in engine.order_mapping
+
+
+def __test_oca_cancel_behind_a_routed_partial_sibling_fill_is_expected__():
+    """A venue OCA cancel routed AFTER its sibling leg's fill in the same
+    batch must not quarantine, even when the fill leaves the parent alive.
+
+    The fill-first ordering only reaches the cancelled classifier when the
+    fill did NOT fully consume the parent — venue contract rounding on an
+    inverse market can fill the SL leg slightly short of the entry, so the
+    intent (and its mapping) stay live when the TP's CANCELLED echo routes
+    right behind it (measured: bybit-inverse cycle 41, S2-X at bar 376 —
+    the venue amended the TP to residual dust and cancelled it; the engine
+    quarantined a healthy OCA teardown).
+    """
+    b = MockBroker()
+    engine, pos, tp_id, sl_id = _mk_two_leg_bracket_without_close(b)
+
+    # SL fill short of the 1.0 entry: residual exposure keeps the intent live.
+    engine.on_order_event(replace(
+        _fill_event("sell", 0.994, 45_000.0, pine_id="TP",
+                    leg=LegType.STOP_LOSS, xchg_id=sl_id,
+                    fill_id="sl-fill-1"),
+        from_entry="L",
+    ))
+    engine.on_order_event(_reduce_only_cancel_event(tp_id))
+    engine._drain_events()
+
+    assert not engine._quarantined
+    # Only the dead TP leg is trimmed; the intent survives for the residual.
+    assert tp_id not in engine.order_mapping.get("TP\0L", [])
+    assert pos.size != 0.0
 
 
 def __test_oca_cancel_without_queued_sibling_fill_still_quarantines__():

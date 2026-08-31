@@ -1213,6 +1213,11 @@ class OrderSyncEngine:
         # in-flight REST read + a disappearance pass touching the closed
         # store).
         self._event_stream_task: asyncio.Task[None] | None = None
+        # Per-sync marker of the entry ids whose resting exit legs the spot
+        # full-close pre-clear swept (:meth:`_pre_clear_spot_exits_for_full_close`).
+        # Suppresses a same-sync re-dispatch of those legs; reset at the top
+        # of every :meth:`_diff_and_dispatch`.
+        self._spot_close_cleared_entry_ids: set[str] = set()
         # Snapshot of the drain batch currently being routed by
         # :meth:`_drain_events`, plus the index of the NEXT event to route.
         # Lets the ``cancelled`` classifier look AHEAD at the not-yet-routed
@@ -6109,15 +6114,15 @@ class OrderSyncEngine:
             if (key is not None
                     and self._is_oca_sibling_fill_queued(event, key)):
                 # The venue OCA-cancelled this reduce-only bracket leg because
-                # its SIBLING leg (same intent) filled — and delivered the
-                # cancel push ahead of the fill push. The fill is already
-                # queued in the current drain batch: trim only the dead leg
-                # and let the sibling's fill settle the position through the
-                # normal fill path (which then sweeps / retires the bracket).
-                # NOT an external cancel — no quarantine.
+                # its SIBLING leg (same intent) filled — the cancel and fill
+                # pushes land in the same drain batch in either order. Trim
+                # only the dead leg and let the sibling's fill settle the
+                # position through the normal fill path (which then sweeps /
+                # retires the bracket). NOT an external cancel — no
+                # quarantine.
                 _blog_info(
-                    "reduce-only bracket leg %s OCA-cancelled by venue ahead "
-                    "of its sibling leg's fill (queued in the same batch) — "
+                    "reduce-only bracket leg %s OCA-cancelled by venue "
+                    "alongside its sibling leg's fill (same drain batch) — "
                     "expected, trimming the dead leg",
                     format_intent_key(key),
                 )
@@ -6524,15 +6529,22 @@ class OrderSyncEngine:
         the venue auto-cancels its reduce-only OCA sibling — but the private
         stream delivers the cancel (``order`` topic) and the fill
         (``execution`` topic) as separate frames in venue order, and the
-        cancel can arrive FIRST. Processed in isolation that cancel looks
-        like an external cancel of a bot-owned order and quarantines the
-        engine. Both events sit in the same :meth:`_drain_events` batch, so
-        look AHEAD at the not-yet-routed remainder: a ``filled`` / ``partial``
-        for a DIFFERENT order id mapped under the SAME intent proves the
-        cancel is the venue's own OCA fallout of that fill.
+        two can land in EITHER order. Processed in isolation that cancel
+        looks like an external cancel of a bot-owned order and quarantines
+        the engine. Both events sit in the same :meth:`_drain_events`
+        batch, so scan the WHOLE batch — the already-routed prefix AND the
+        not-yet-routed remainder: a ``filled`` / ``partial`` for a
+        DIFFERENT order id mapped under the SAME intent proves the cancel
+        is the venue's own OCA fallout of that fill. The routed-prefix
+        side matters when the fill arrives FIRST but does not fully
+        consume the parent (measured: bybit-inverse cycle 41 — the S2 SL
+        fill's venue contract rounding left residual exposure, so the
+        intent stayed live when the TP's amend-to-dust + CANCELLED echo
+        followed in the same batch).
 
-        An operator cancel of a lone reduce-only leg has no queued sibling
-        fill and still routes through the ``on_unexpected_cancel`` path.
+        An operator cancel of a lone reduce-only leg has no sibling fill
+        in the batch and still routes through the ``on_unexpected_cancel``
+        path.
         """
         intent = self._active_intents.get(key)
         if not isinstance(intent, ExitIntent):
@@ -6543,15 +6555,17 @@ class OrderSyncEngine:
         mapped = self._order_mapping.get(key)
         if not mapped:
             return False
-        for pending in self._drain_batch[self._drain_batch_pos:]:
-            if isinstance(pending, _NativeCancelAllExpected):
+        for batch_event in self._drain_batch:
+            if batch_event is event:
                 continue
-            if pending.event_type not in ('filled', 'partial'):
+            if isinstance(batch_event, _NativeCancelAllExpected):
                 continue
-            pending_order = pending.order
-            if pending_order is None or pending_order.id == order.id:
+            if batch_event.event_type not in ('filled', 'partial'):
                 continue
-            if pending_order.id in mapped:
+            batch_order = batch_event.order
+            if batch_order is None or batch_order.id == order.id:
+                continue
+            if batch_order.id in mapped:
                 return True
         return False
 
@@ -11797,6 +11811,7 @@ class OrderSyncEngine:
             the engine could not re-read.
         """
         intents = self._restore_adopted_partial_bracket_classification(intents)
+        self._spot_close_cleared_entry_ids.clear()
         new_map: dict[str, Intent] = {i.intent_key: i for i in intents}
 
         # Bind any live broker entry orders the restart scan discovered to the
@@ -14695,6 +14710,75 @@ class OrderSyncEngine:
             self._rejected_entry_intents.pop(key, None)
             self._active_intents[key] = entry
 
+    def _pre_clear_spot_exits_for_full_close(self, intent: 'CloseIntent') -> None:
+        """Cancel the resting exit legs a spot full-close is about to strand.
+
+        Spot has no reduce-only: a venue-resident SL/TP leg that triggers
+        after the close fill sells inventory the account no longer holds
+        (measured live: bybit-spot cycle 109 — the flat-signal bulk close
+        filled and the L2 SL triggered in the same second, before the
+        reactive post-fill cancels landed; the spot ledger quarantined on
+        negative inventory). Mirror of the reversal pre-clear sweep
+        (:meth:`_retire_reversal_closing_surfaces`): cancel the legs
+        BEFORE the close dispatch so a leg that fires mid-cancel surfaces
+        as a fill the engine ingests while inventory still backs it.
+        Failures are logged and NEVER block the close — a stranded leg is
+        the status quo this sweep improves on, not a new risk. Derivative
+        venues are untouched (their raced legs are reduce-only rejects,
+        and keeping protection until the close fills is the safer order).
+
+        Runs only for a script close (``synthetic_kind is None``) that
+        consumes its target's whole remaining exposure — a partial close
+        keeps the position alive, so its protection must stay armed.
+        """
+        if getattr(self._broker, 'spot_inventory_port', None) is None:
+            return
+        if intent.synthetic_kind is not None:
+            return
+        open_trades = self._position.open_trades
+        if intent.pine_id:
+            consumed_ids = {intent.pine_id}
+            remaining = sum(
+                abs(trade.size) for trade in open_trades
+                if trade.entry_id == intent.pine_id
+            )
+        else:
+            consumed_ids = {
+                trade.entry_id for trade in open_trades
+                if trade.entry_id is not None
+            }
+            remaining = abs(self._position.size)
+        if not consumed_ids or intent.qty < remaining * (1.0 - 1e-9):
+            return
+        # Same-sync re-arm guard: should the diff loop reach a swept leg's
+        # (re-emitted) ExitIntent AFTER this close in the same sync, the
+        # marker suppresses the fresh dispatch (see the ExitIntent gate in
+        # :meth:`_dispatch_new`). Reset at the top of every diff, so a close
+        # that fails re-arms protection on the next sync.
+        self._spot_close_cleared_entry_ids.update(consumed_ids)
+        for key, old in list(self._active_intents.items()):
+            if not isinstance(old, ExitIntent):
+                continue
+            if old.symbol != intent.symbol or old.from_entry not in consumed_ids:
+                continue
+            _blog_info(
+                "spot full-close pre-clear: cancelling resting exit %s "
+                "before the close dispatch", format_intent_key(key),
+            )
+            # noinspection PyBroadException
+            try:
+                self._dispatch_cancel(old)
+            except Exception:
+                _log.exception(
+                    "spot full-close pre-clear: cancel of exit leg %s "
+                    "failed; the close still dispatches and the post-fill "
+                    "retire sweep re-drives", format_intent_key(key),
+                )
+            self._order_mapping.pop(key, None)
+            self._active_intents.pop(key, None)
+            self._drop_envelope(key)
+            self._remove_pine_order_for_intent(old)
+
     def _dispatch_new(self, intent: Intent, *, _coid_spent_retry: int = 0) -> None:
         # ``_coid_spent_retry`` counts the internal re-dispatches of the
         # :class:`ClientOrderIdSpentError` recovery below (never passed by
@@ -14725,6 +14809,22 @@ class OrderSyncEngine:
                             'from_entry': intent.from_entry,
                         },
                     )
+            # Same-sync guard of the spot full-close pre-clear: a swept
+            # leg's re-emitted intent must not re-arm behind the close it
+            # was cleared for. The marker resets on the next diff, so a
+            # close that failed re-arms protection then.
+            if intent.from_entry in self._spot_close_cleared_entry_ids:
+                raise OrderSkippedByPlugin(
+                    f"Exit {format_intent_key(intent.intent_key)} "
+                    f"skipped: its resting legs were pre-cleared for a "
+                    f"same-sync spot full close; re-evaluating next sync.",
+                    intent_key=intent.intent_key,
+                    reason='spot_full_close_pre_clear',
+                    context={
+                        'symbol': intent.symbol,
+                        'from_entry': intent.from_entry,
+                    },
+                )
         # Quarantine gate: new entries are exactly the "new or
         # exposure-increasing dispatch" the quarantine invariant blocks.
         # Runs BEFORE the envelope is built, so there is nothing to clean
@@ -15209,6 +15309,7 @@ class OrderSyncEngine:
                         orders = self._run_async_write(self._broker.execute_exit(envelope))
                         self._order_mapping[intent.intent_key] = [o.id for o in orders]
             elif isinstance(intent, CloseIntent):
+                self._pre_clear_spot_exits_for_full_close(intent)
                 if port is not None:
                     # Hedging-mode emulation: fan the close out FIFO across the
                     # position-side legs (persist-first close-leg ledger). The
