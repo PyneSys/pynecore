@@ -198,17 +198,18 @@ _WRITE_CLASSIFICATION_GRACE_MULT = 3.0
 #: that no longer exists.
 EXTERNAL_FLATTEN_CONFIRM_GRACE_S = 120.0
 
-#: Seconds a broker read may stay unresolved past its bridge timeout before the
-#: engine stops dispatching. A read that outran ``execute_timeout`` is retained
-#: (see :meth:`OrderSyncEngine._submit_read`) and every later read parks behind
-#: it, which silently disables reconciliation — while ``sync`` would otherwise
-#: keep dispatching, because the periodic reconcile runs *after*
-#: ``_diff_and_dispatch`` and swallows its connection error. Trading on a
-#: position view that can no longer be refreshed is exactly the ambiguity
-#: :class:`BrokerManualInterventionError` exists for, so past this grace the
-#: engine fails closed instead of ordering blind. The ``BrokerPlugin`` contract
-#: does not oblige a read implementation to enforce its own finite timeout, so
-#: Core cannot assume the request eventually expires on its own.
+#: Seconds the broker view may stay unconfirmed before a read outage is
+#: escalated. While the view cannot be refreshed the engine already refuses to
+#: open new exposure (see :meth:`OrderSyncEngine._guard_stuck_reads`), so an
+#: outage never trades blind — but a read that outran ``execute_timeout`` is
+#: retained (see :meth:`OrderSyncEngine._submit_read`) and every later read
+#: parks behind it, and the ``BrokerPlugin`` contract does not oblige a read
+#: implementation to enforce its own finite timeout, so Core cannot assume the
+#: wedge ever clears on its own. Past this grace the engine abandons a retained
+#: read that is itself older than the grace, so the re-read can actually go
+#: out, and logs the outage at ERROR level once per grace window. The run
+#: keeps going: a venue outage is recoverable, and stopping the bot would only
+#: strand the user with the position it was managing.
 READ_STUCK_GRACE_S = 60.0
 """Default stale-grace window (seconds) for cancel-tentative resolution.
 
@@ -967,15 +968,23 @@ class OrderSyncEngine:
         #: the next read instead of stacking a second one on the same
         #: connection. Released on the first cycle that finds it resolved.
         self._inflight_read: futures.Future[Any] | None = None
+        #: Monotonic timestamp at which :attr:`_inflight_read` was submitted.
+        #: :meth:`_guard_stuck_reads` abandons a retained read older than
+        #: :data:`READ_STUCK_GRACE_S` so a fresh read can go out behind it.
+        self._inflight_read_since = 0.0
         #: ``False`` while the broker view could not be refreshed: every read
         #: since the last success has failed, been parked by a gate, or outran
         #: the bridge wait. :meth:`_guard_stuck_reads` refuses to open new
         #: exposure until a real read restores confirmation.
         self._read_view_confirmed = True
         #: Monotonic timestamp at which confirmation was lost. Drives the
-        #: :data:`READ_STUCK_GRACE_S` fail-closed check in :meth:`sync`.
+        #: :data:`READ_STUCK_GRACE_S` outage escalation in :meth:`sync`.
         #: ``0.0`` while the view is confirmed.
         self._reads_unconfirmed_since = 0.0
+        #: Monotonic timestamp of the last ERROR-level read-outage log line, so
+        #: a long outage is escalated once per grace window rather than on
+        #: every sync (``calc_on_every_tick`` syncs on every market update).
+        self._read_outage_logged_at = 0.0
         #: Monotonic deadline until which broker reads are parked after a venue
         #: rate limit, honouring the ``retry_after`` the venue asked for.
         #: ``0.0`` means "not throttled".
@@ -2426,14 +2435,14 @@ class OrderSyncEngine:
         # also called from contexts that don't pre-drain (e.g. tests, the
         # backtest path with broker mode), so this remains the safety net.
         self._drain_events()
-        # Fail closed if the broker view can no longer be refreshed: never open
-        # new exposure against a position state the engine could not re-read.
-        # Runs BEFORE the restart scans and ``_verify_pending_dispatches``
-        # below, because each of those reads through the same bridge and bails
-        # out of ``sync`` with an ``ExchangeConnectionError`` of its own — a
-        # guard placed after them would never be reached on exactly the wedged
-        # runs it exists to catch, so the grace halt could never latch. The
-        # verdict is kept for the rest of the cycle: ``_diff_and_dispatch``
+        # Never open new exposure against a position state the engine could
+        # not re-read. Runs BEFORE the restart scans and
+        # ``_verify_pending_dispatches`` below, because each of those reads
+        # through the same bridge and bails out of ``sync`` with an
+        # ``ExchangeConnectionError`` of its own — a guard placed after them
+        # would never be reached on exactly the wedged runs it exists to
+        # catch, so a wedged read could never be abandoned. The verdict is
+        # kept for the rest of the cycle: ``_diff_and_dispatch``
         # (which gates only its exposure-opening ``EntryIntent`` branches) and
         # ``_drive_entry_stop_triggers`` can both open new exposure and must
         # obey it too.
@@ -18969,7 +18978,7 @@ class OrderSyncEngine:
             return None, exc
 
     def _guard_stuck_reads(self) -> bool:
-        """Halt before dispatching if broker reads have been wedged too long.
+        """Gate new exposure while the broker view cannot be refreshed.
 
         A read that outran ``execute_timeout`` is retained by
         :meth:`_submit_read` and parks every later read behind it. That alone is
@@ -18977,9 +18986,16 @@ class OrderSyncEngine:
         periodic reconcile runs *after* ``_diff_and_dispatch`` and swallows its
         ``ExchangeConnectionError`` with a warning, so nothing else stops the
         engine from continuing to place and modify orders against a position
-        view it can no longer refresh. Past :data:`READ_STUCK_GRACE_S` that is
-        no longer a transient blip, so the engine latches a manual-intervention
-        halt instead of trading blind.
+        view it can no longer refresh. This guard is what does: it defers every
+        exposure-opening branch until a real read lands again. Past
+        :data:`READ_STUCK_GRACE_S` it additionally abandons a retained read
+        that has itself outlived the grace — otherwise a plugin read with no
+        finite timeout would park every re-read forever — and escalates the
+        outage to an ERROR log line once per grace window. It never halts: a
+        venue outage is recoverable, exits and closes still dispatch (they
+        reduce exposure and reject harmlessly against a position the venue has
+        already closed), and a stopped bot would strand the user with the
+        position it was managing.
 
         A retained read that has *already* resolved is collected here rather
         than left for the periodic reconcile at the end of ``sync``: that runs
@@ -18994,15 +19010,11 @@ class OrderSyncEngine:
         to inspect), and a late value that arrived too long after its cycle to
         be applied. Confirmation is not assumed back: the engine issues a real
         :meth:`reconcile` here, *before* dispatch rather than after it, so the
-        position it is about to trade against has actually been re-read. Only
-        when that fails for longer than :data:`READ_STUCK_GRACE_S` does the
-        engine latch a manual-intervention halt instead of trading blind.
+        position it is about to trade against has actually been re-read.
 
         No-op while reads are healthy.
 
         :return: ``True`` when dispatch may proceed this cycle.
-        :raises BrokerManualInterventionError: When the view has been
-            unconfirmable for longer than :data:`READ_STUCK_GRACE_S`.
         """
         collected = self._collect_retained_read()
         if collected is not None:
@@ -19028,7 +19040,10 @@ class OrderSyncEngine:
         # applies the broker's own position state, which is the whole point of
         # gating here rather than trusting the reconcile that runs after the
         # diff. A connection error keeps the run alive — reads are idempotent,
-        # so the next cycle simply tries again.
+        # so the next cycle simply tries again. A retained read that has
+        # outlived the grace is abandoned first, or the re-read would park
+        # behind it.
+        self._abandon_overdue_read()
         try:
             self.reconcile()
         except ExchangeConnectionError as e:
@@ -19038,7 +19053,8 @@ class OrderSyncEngine:
         if self._read_view_confirmed:
             return True
 
-        unconfirmed_for = time.monotonic() - self._reads_unconfirmed_since
+        now = time.monotonic()
+        unconfirmed_for = now - self._reads_unconfirmed_since
         if unconfirmed_for <= READ_STUCK_GRACE_S:
             _blog_warning(
                 "dispatch skipped: broker position view unconfirmed for "
@@ -19046,20 +19062,45 @@ class OrderSyncEngine:
                 unconfirmed_for,
             )
             return False
-        halt = BrokerManualInterventionError(
-            f"Broker reads have been unusable for {unconfirmed_for:.0f}s "
-            f"(grace {READ_STUCK_GRACE_S:.0f}s): position state can no longer "
-            f"be refreshed, so further dispatch would trade blind — manual "
-            f"intervention required",
-            context={
-                'symbol': self._symbol,
-                'unconfirmed_for_s': round(unconfirmed_for, 1),
-                'grace_s': READ_STUCK_GRACE_S,
-                'execute_timeout_s': self._timeout,
-            },
+        if now - self._read_outage_logged_at >= READ_STUCK_GRACE_S:
+            self._read_outage_logged_at = now
+            _blog_error(
+                "broker reads have been unusable for %.0fs (grace %.0fs) on "
+                "%s: position state cannot be refreshed — new exposure stays "
+                "deferred until a read succeeds; exits and closes still "
+                "dispatch (execute_timeout %.0fs)",
+                unconfirmed_for, READ_STUCK_GRACE_S, self._symbol,
+                self._timeout,
+            )
+        return False
+
+    def _abandon_overdue_read(self) -> None:
+        """Drop a retained read that has outlived :data:`READ_STUCK_GRACE_S`.
+
+        :meth:`_submit_read` keeps a timed-out read on purpose so the next
+        cycle parks instead of stacking a second read on the same connection,
+        and normally the plugin's own request timeout resolves it within the
+        grace. A read still pending past the grace is a wedge Core cannot wait
+        out (the ``BrokerPlugin`` contract does not promise a finite read
+        timeout), so ownership ends here: the bridge future is cancelled, which
+        cancels the loop task at its next await, and the slot is freed for a
+        fresh read. A blocking request behind ``asyncio.to_thread`` finishes on
+        its own inside its worker thread and its result is discarded. Stacking
+        stays bounded — at most one abandoned read per grace window per wedge.
+        """
+        inflight = self._inflight_read
+        if inflight is None or inflight.done():
+            return
+        wedged_for = time.monotonic() - self._inflight_read_since
+        if wedged_for <= READ_STUCK_GRACE_S:
+            return
+        inflight.cancel()
+        self._inflight_read = None
+        _blog_warning(
+            "broker read abandoned after %.0fs in flight (grace %.0fs) — "
+            "issuing a fresh read instead of waiting behind it",
+            wedged_for, READ_STUCK_GRACE_S,
         )
-        self._record_halt(halt)
-        raise halt
 
     def _submit_read(self, coro: Coroutine[Any, Any, _T]) -> _T:
         """Run a read on the broker loop, owning its in-flight future.
@@ -19132,6 +19173,7 @@ class OrderSyncEngine:
 
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         self._inflight_read = future
+        self._inflight_read_since = time.monotonic()
         self._mark_reads_unconfirmed()
         try:
             value = future.result(timeout=self._timeout)
@@ -19146,10 +19188,12 @@ class OrderSyncEngine:
                 # Genuinely still running: keep ownership so the next cycle
                 # parks until this read resolves — at the latest when the
                 # plugin's own request timeout expires. Deliberately NOT
-                # cancelled: cancelling the bridge future flips it to ``done``
-                # immediately while the loop task is still unwinding, which
-                # would reopen the gate and let a second read stack on top of
-                # the one still in flight.
+                # cancelled here: cancelling the bridge future flips it to
+                # ``done`` immediately while the loop task is still unwinding,
+                # which would reopen the gate and let a second read stack on
+                # top of the one still in flight. Only
+                # :meth:`_abandon_overdue_read` gives up on it, once it has
+                # outlived :data:`READ_STUCK_GRACE_S`.
                 raise
             raced_value, raced_fault = raced
             if raced_fault is not None:

@@ -9,6 +9,7 @@ A stubbed :attr:`lib._script.initial_capital` keeps
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import threading
 from concurrent import futures
@@ -2852,13 +2853,16 @@ def __test_write_unresolved_past_the_grace_halts_controlled__():
         loop.close()
 
 
-def __test_permanently_wedged_read_halts_before_dispatching_blind__():
+def __test_permanently_wedged_read_is_abandoned_and_the_run_keeps_going__():
     """
     A read that never resolves parks every later read, which silently disables
     reconciliation — and the periodic reconcile runs AFTER ``_diff_and_dispatch``
     and swallows its connection error, so nothing else would stop the engine
-    from ordering against a position view it can no longer refresh. Past
-    ``READ_STUCK_GRACE_S`` the engine must fail closed instead.
+    from ordering against a position view it can no longer refresh. The guard
+    must keep new exposure deferred for as long as the view is unconfirmed,
+    and past ``READ_STUCK_GRACE_S`` it must abandon the wedge so a fresh read
+    can go out — never halt: a venue outage is recoverable, and the run must
+    pick up on its own the moment reads work again.
     """
     import threading
 
@@ -2872,7 +2876,11 @@ def __test_permanently_wedged_read_halts_before_dispatching_blind__():
     release = asyncio.Event()
 
     class _WedgedReadBroker(MockBroker):
+        reads_healthy = False
+
         async def get_position(self, symbol):
+            if self.reads_healthy:
+                return await MockBroker.get_position(self, symbol)
             await release.wait()
             return self.position
 
@@ -2890,27 +2898,43 @@ def __test_permanently_wedged_read_halts_before_dispatching_blind__():
     try:
         with pytest.raises(ExchangeConnectionError):
             engine._run_async_read(b.get_position(SYMBOL))
-        assert engine._inflight_read is not None
+        wedged = engine._inflight_read
+        assert wedged is not None
 
-        # Still inside the grace: dispatch is allowed to continue.
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+        # Inside the grace: the wedge is kept (no stacking) and new exposure
+        # is deferred, but the run is alive.
         engine.sync(BAR_TS)
         assert not engine.halted
+        assert b.entry_calls == [], "entry dispatched against an unconfirmed view"
+        assert engine._inflight_read is wedged, "a second read stacked inside the grace"
 
-        # Age the wedged read past the grace.
-        engine._reads_unconfirmed_since = time.monotonic() - (READ_STUCK_GRACE_S + 1.0)
+        # Age both the outage and the wedge past the grace.
+        aged = time.monotonic() - (READ_STUCK_GRACE_S + 1.0)
+        engine._reads_unconfirmed_since = aged
+        engine._inflight_read_since = aged
 
-        with pytest.raises(BrokerManualInterventionError):
-            engine.sync(BAR_TS + 60_000)
-        assert engine.halted
-    finally:
-        # Let the wedged read finish before stopping the loop — scheduling
-        # ``release.set`` and ``loop.stop`` in the same iteration would stop
-        # ``run_forever`` before the woken coroutine gets its turn, and
-        # ``loop.close()`` would then destroy it pending.
-        wedged = engine._inflight_read
+        engine.sync(BAR_TS + 60_000)
+        assert not engine.halted, "a read outage must never stop the run"
+        assert b.entry_calls == [], "entry dispatched against an unconfirmed view"
+        assert wedged.cancelled(), "the overdue read was not abandoned"
+        fresh = engine._inflight_read
+        assert fresh is not None, "no fresh read went out behind the abandoned one"
+        assert fresh is not wedged, "the abandoned read was kept instead of a fresh one"
+
+        # Connectivity returns: the fresh read resolves (late, so it only
+        # counts as stale news), the next cycle re-reads live and dispatch
+        # resumes without any restart.
+        b.reads_healthy = True
         loop.call_soon_threadsafe(release.set)
-        if wedged is not None:
-            wedged.result(timeout=5.0)
+        fresh.result(timeout=5.0)
+        engine.sync(BAR_TS + 120_000)
+        assert not engine.halted
+        assert engine._read_view_confirmed
+        assert len(b.entry_calls) == 1, "dispatch did not resume once reads recovered"
+    finally:
+        loop.call_soon_threadsafe(release.set)
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=5.0)
         loop.close()
@@ -2994,14 +3018,15 @@ def __test_late_read_failure_blocks_dispatch_in_the_same_sync__():
         loop.close()
 
 
-def __test_wedged_reads_halt_even_when_pending_verification_bails_out_first__():
+def __test_read_outage_past_the_grace_keeps_running_and_recovers__(caplog):
     """
-    The stuck-read grace halt must not sit behind another read.
-    ``_verify_pending_dispatches`` runs early in ``sync``, reads through the
-    same bridge, and returns out of ``sync`` on its own
-    ``ExchangeConnectionError`` — so a guard placed after it would never be
-    reached on exactly the wedged runs it exists to catch, and the halt could
-    never latch.
+    The guard must not sit behind another read: ``_verify_pending_dispatches``
+    runs early in ``sync``, reads through the same bridge, and returns out of
+    ``sync`` on its own ``ExchangeConnectionError`` — a guard placed after it
+    would never re-read or escalate on exactly the outage runs it exists for.
+    Past ``READ_STUCK_GRACE_S`` the outage is escalated to an ERROR log line
+    (once per grace window, not on every sync) while the run keeps going with
+    new exposure deferred, and the first successful read restores dispatch.
     """
     expected_coid = _preview_entry_coid("L", limit=50_000.0)
 
@@ -3034,10 +3059,26 @@ def __test_wedged_reads_halt_even_when_pending_verification_bails_out_first__():
     engine.sync(BAR_TS)
     assert not engine.halted, "a transient read outage must not halt inside the grace"
 
+    def outage_errors() -> list[logging.LogRecord]:
+        return [
+            rec for rec in caplog.records
+            if rec.levelno == logging.ERROR and "reads have been unusable" in rec.getMessage()
+        ]
+
     engine._reads_unconfirmed_since = time.monotonic() - (READ_STUCK_GRACE_S + 1.0)
-    with pytest.raises(BrokerManualInterventionError):
+    with caplog.at_level(logging.ERROR, logger="pyne_core_logger"):
         engine.sync(BAR_TS)
-    assert engine.halted
+        assert not engine.halted, "a read outage is recoverable and must never stop the run"
+        assert len(outage_errors()) == 1, "outage past the grace was not escalated"
+        engine.sync(BAR_TS)
+        assert not engine.halted
+        assert len(outage_errors()) == 1, "outage escalated again inside the same grace window"
+
+    # Reads are back: the very next sync confirms the view and the run goes on.
+    b.reads_down = False
+    engine.sync(BAR_TS + 60_000)
+    assert not engine.halted
+    assert engine._read_view_confirmed, "dispatch not re-enabled after reads recovered"
 
 
 def __test_rate_limit_backoff_blocks_new_exposure__():
