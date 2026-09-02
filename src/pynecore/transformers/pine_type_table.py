@@ -3,8 +3,13 @@ The result of the Pine type inference, and the error it raises.
 
 The inference stamps each expression's type on the node itself; what lives
 here is the derived index a consumer wants -- the per-scope bindings, the
-function signatures (originals and monomorphized clones), the call sites with
-their overload pin, and the diagnostics.
+function signatures, the per-call-site contexts a generic function was
+analysed in, the call sites with their overload pin, and the diagnostics.
+
+A generic function has ONE body, analysed once per distinct parameter-type
+tuple. Each analysis lands in ``contexts``, while ``bindings`` and ``funcs``
+report the JOIN over them -- the same thing the node stamps carry, and for the
+same reason: the tree the later passes read is one tree.
 
 The diagnostics are the same information in both modes. A hand-written script
 collects them and keeps running with runtime dispatch; ``@pyne edge`` raises on
@@ -14,8 +19,14 @@ from dataclasses import dataclass, field
 
 from .pine_type_rules import UNKNOWN
 
-__all__ = ['Unknown', 'Binding', 'FuncSig', 'CallSite', 'Diag', 'PineTypeTable',
-           'PineTypeError']
+__all__ = ['Unknown', 'Binding', 'FuncSig', 'CallSite', 'ContextKey',
+           'ContextResult', 'Diag', 'PineTypeTable', 'PineTypeError']
+
+#: How a context is addressed: the callee's scope id, the parameter types it
+#: was instantiated with, the context its caller was running in, the node id of
+#: the DEFINITION analysed (an overload group spells several under one scope
+#: id) and the types the enclosing scopes held for the names its body reads.
+ContextKey = tuple[str, tuple[str, ...], int, int | None, tuple[tuple[str, str], ...]]
 
 
 @dataclass(slots=True, frozen=True)
@@ -59,14 +70,39 @@ class FuncSig:
     """
     A user function's inferred signature.
 
-    ``origin`` names the function a monomorphized clone was made from, so a
-    consumer can fold the clones back together; it is None for an original.
+    A generic function has one signature and several contexts, so ``params``
+    and ``ret`` are the JOIN over every context it was analysed in -- what
+    holds for the function as a whole. What a particular call site sees is in
+    ``PineTypeTable.contexts``.
     """
     name: str
     params: list[str] = field(default_factory=list)
     ret: str = UNKNOWN
     line: int = 0
-    origin: str | None = None
+
+
+@dataclass(slots=True)
+class ContextResult:
+    """
+    One analysis of one function body under one parameter-type tuple.
+
+    MEASURED: TradingView types an unannotated parameter as JOIN(default,
+    argument) at the call site and behaves as if the body were instantiated per
+    distinct tuple. Here the body is walked again per tuple and only the
+    ANSWERS are kept apart, which is what a consumer needs to hand one instance
+    a different overload pin from another.
+    """
+    #: Identity of this context within the module; 0 is the module body itself
+    cid: int
+    #: Scope-qualified id of the function analysed
+    key: str
+    #: Type of each parameter, positional first then keyword-only
+    params: tuple[str, ...]
+    ret: str = UNKNOWN
+    #: Call node id -> the overload pin this context justified there. Where two
+    #: contexts disagree, the node itself carries no single pin and a later
+    #: pass has to hand each instance its own out of these
+    pins: dict[int, str | None] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -119,10 +155,12 @@ class PineTypeTable:
     module_path: str = ''
     #: scope id -> name -> binding; the module scope is the empty string
     bindings: dict[str, dict[str, Binding]] = field(default_factory=dict)
-    #: scope-qualified function id (clone names included) -> signature. The
+    #: scope-qualified function id -> signature. The
     #: key is the function's OWN scope id, the same identity ``bindings``
     #: uses, so two same-named nested helpers stay apart
     funcs: dict[str, FuncSig] = field(default_factory=dict)
+    #: (callee id, parameter tuple, calling context) -> what that context found
+    contexts: dict[ContextKey, ContextResult] = field(default_factory=dict)
     calls: list[CallSite] = field(default_factory=list)
     diags: list[Diag] = field(default_factory=list)
 

@@ -30,12 +30,13 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 
 from pynecore.transformers.pine_type_rules import (  # noqa: E402
-    annotation_type, UNKNOWN, VOID,
+    annotation_takes_none, annotation_type, constant_type, NONE_DEFAULT, TYPELESS,
+    UNKNOWN, VOID,
 )
 
 #: Registry format version. Bump whenever the shape below changes; the
 #: consumers (the inference engine, and the PyneAOT front end) pin it.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 
 class LibTypeCollector:
@@ -176,8 +177,20 @@ def _signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, Any]:
     same int-preserving call as ``math.abs(d)``, and the inference can only
     see that by binding the keyword back to its declared position.
 
+    The DEFAULTS' types ride along too, aligned to the last parameters the way
+    Python aligns the defaults themselves. The runtime selector binds an
+    omitted argument to its default and type-checks it with the rest, so an
+    implementation a call under-fills is selected on those types as much as on
+    the ones the call spells out.
+
+    A literal ``None`` default is the one whose acceptance the Pine type
+    character cannot express -- ``int`` and ``int | None`` are both int-typed,
+    and only the second takes it -- so a parallel ``default_none_ok`` records
+    what the annotation answers, and only where such a default exists.
+
     :param node: The function definition
-    :return: ``{'ret': .., 'params': [..], 'names': [..], 'defaults': <count>}``
+    :return: ``{'ret': .., 'params': [..], 'names': [..], 'defaults': <count>,
+              'default_ty': [..], 'default_none_ok': [..]}``
     """
     args = node.args
     positional = list(args.posonlyargs) + list(args.args)
@@ -187,11 +200,41 @@ def _signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, Any]:
         'names': [a.arg for a in positional],
         'defaults': len(args.defaults),
     }
+    if args.defaults:
+        default_ty = [_default_type(d) for d in args.defaults]
+        signature['default_ty'] = default_ty
+        if NONE_DEFAULT in default_ty:
+            signature['default_none_ok'] = [
+                annotation_takes_none(p.annotation)
+                for p in positional[len(positional) - len(args.defaults):]]
     if args.vararg is not None:
         # ``math.max(*numbers)`` takes any arity; the element type is what the
         # overload is chosen on
         signature['vararg'] = annotation_type(args.vararg.annotation)
     return signature
+
+
+def _default_type(node: ast.expr) -> str:
+    """
+    Pine type of one parameter default, as the overload selector reads it.
+
+    Only what a pure extractor can decide: a literal carries its own type,
+    ``na`` carries none at all, and a literal ``None`` carries its own
+    character, because whether it fits is a question about the ANNOTATION and
+    not about the annotation's Pine type. Anything the lib computes
+    (``_color.blue``, ``_xloc.bar_index``) stays UNKNOWN, which is what makes
+    the inference decline to pick rather than pick wrong.
+
+    :param node: The default expression
+    :return: Its type character, ``NONE_DEFAULT``, ``TYPELESS``, or UNKNOWN
+    """
+    if isinstance(node, ast.Constant):
+        return NONE_DEFAULT if node.value is None else constant_type(node.value)
+    if isinstance(node, ast.Name) and node.id == 'na':
+        return TYPELESS
+    if isinstance(node, ast.Attribute) and node.attr == 'na':
+        return TYPELESS
+    return UNKNOWN
 
 
 def collect_module_types(tree: ast.Module) -> dict[str, Any]:

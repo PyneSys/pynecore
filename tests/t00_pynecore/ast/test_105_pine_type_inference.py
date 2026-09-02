@@ -188,10 +188,9 @@ def __test_unannotated_parameter_is_the_known_leak__():
     """
     An unannotated parameter is UNKNOWN, and says so with provenance.
 
-    This is one of the two places int-ness genuinely cannot be derived; it is
-    closed by monomorphization, which instantiates the function per call-site
-    signature. Until then the origin has to name the parameter, so the
-    diagnostic can point at what to annotate.
+    A call site closes it -- the parameter is typed per context -- but a
+    function nothing calls has no context to be typed by, and then the origin
+    has to name the parameter so the diagnostic can point at what to annotate.
     """
     tree = ast.parse(
         'def f(x):\n'
@@ -460,3 +459,80 @@ def __test_folded_types_do_not_leak_between_branches__():
     ConstFoldTransformer().visit(tree)
     orelse = tree.body[2].orelse[0]  # type: ignore[attr-defined]
     assert get_ty(orelse.value) == 'i'
+
+
+def __test_a_script_entry_parameter_is_typed_by_its_default__():
+    """
+    The runner calls an entry point with NO arguments.
+
+    So an entry's parameter is not "the default if you omit it", it IS the
+    default, on every bar -- which is how a compiled script receives its
+    inputs, unannotated, because Pine's ``input.int``'s first parameter is the
+    input's default VALUE. The type comes from the input constructor.
+    """
+    types = _types(
+        'from pynecore import lib\n'
+        '\n'
+        '@lib.script.indicator("t")\n'
+        'def main(length=lib.input.int(14), src=lib.input.float(1.0), flag=True):\n'
+        '    step = length / 8\n'
+        '    return step\n',
+        'main',
+    )
+    assert types['length'] == 'i'
+    assert types['src'] == 'f'
+    assert types['flag'] == 'b'
+    assert types['step'] == 'i'
+
+
+def __test_an_ordinary_default_is_not_a_declaration__():
+    """
+    Everywhere else a default is what the caller MAY omit, and says nothing.
+
+    ``helper(1.5)`` is a legal call of ``def helper(x=0)``, so reading ``int``
+    off the ``0`` would be a guess -- and a guess that would go on to decide
+    an overload. The default is only ever the JOIN partner of an actual
+    argument, so with no call site the parameter stays unknown.
+    """
+    types = _types(
+        'def helper(x=0):\n'
+        '    return x\n',
+        'helper',
+    )
+    assert types['x'] == '?'
+
+
+def __test_an_annotation_still_wins_over_the_default__():
+    """A spelled-out type is a declaration; an entry's default only fills a gap"""
+    types = _types(
+        'from pynecore import lib\n'
+        '\n'
+        '@lib.script.indicator("t")\n'
+        'def main(x: float = lib.input.int(1)):\n'
+        '    return x\n',
+        'main',
+    )
+    assert types['x'] == 'f'
+
+
+@pytest.mark.parametrize("call,expected", [
+    ('cast_int(close)', 'i'),
+    ('cast_float(close)', 'f'),
+    ('cast_bool(close)', 'b'),
+    ('cast_string(close)', 's'),
+    ('cast_label(close)', 'o'),
+])
+def __test_the_compiled_pine_casts_are_typed__(call: str, expected: str):
+    """
+    A compiled script spells its Pine casts as bare ``pine_cast`` helpers.
+
+    They are imported by name and survive import normalization untouched, so
+    an unlisted one would drop the type of every value passing through it.
+    """
+    types = _types(
+        'from pynecore.core.pine_cast import '
+        'cast_int, cast_float, cast_bool, cast_string, cast_label\n'
+        'from pynecore.lib import close\n'
+        f'value = {call}\n'
+    )
+    assert types['value'] == expected

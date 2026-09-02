@@ -77,6 +77,28 @@ def __test_load_bearing_entries__():
     assert names['matrix.new']['ret'] == 'o'
 
 
+def __test_a_none_default_records_what_its_annotation_takes__():
+    """
+    A ``None`` default is decided by the ANNOTATION, not by its type character.
+
+    ``int`` and ``int | None`` are the same Pine type and only the second one
+    takes the ``None`` the selector binds into it, so the registry carries the
+    annotation's answer alongside the default's own character.
+    """
+    names = json.loads(_JSON_PATH.read_text())['names']
+
+    # ``table.clear(.., end_column: int = None, end_row: int = None)``
+    assert names['table.clear']['default_ty'] == ['0', '0']
+    assert names['table.clear']['default_none_ok'] == [False, False]
+
+    # ``barcolor(.., show_last: int | None = None, title: str | None = None, ..)``
+    assert names['barcolor']['default_ty'] == ['0', 'i', 'b', '0', '0', '0']
+    assert names['barcolor']['default_none_ok'] == [True, False, False, True, True, True]
+
+    # A group with no ``None`` default carries no flags at all
+    assert 'default_none_ok' not in names['ta.highest']['impls'][0]
+
+
 def __test_union_annotations_do_not_collapse__():
     """
     A conflicting union member must not be swallowed by an absence marker.

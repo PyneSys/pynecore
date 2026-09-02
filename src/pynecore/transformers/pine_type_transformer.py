@@ -6,13 +6,16 @@ is the last point where the tree still looks like Pine: the annotations are
 intact (``SeriesTransformer`` rewrites the parameter ones and consumes the
 declaration ones into the slot layout), the ``/`` is still a ``BinOp``
 (``SafeDivisionTransformer`` wraps it into a call), and the security-bearing
-functions have already been instantiated per call site, so a later
-monomorphization pass finds each of them with exactly one caller.
+functions have already been instantiated per call site, so each of them is
+reached by exactly one caller here.
 
-This pass changes nothing about the tree. It stamps ``_pine_ty`` on every
-expression and keeps the derived table on the module node, so the passes that
-follow -- the overload pin, and the artifact the AOT compiler consumes -- have
-the types without re-deriving them.
+This pass changes nothing about the tree -- it clones no function and builds
+no specialization. A generic helper is ANALYSED once per call-site context
+and the answers are kept apart in the type table, while the tree keeps one
+body carrying the join of what the contexts found. It stamps ``_pine_ty`` on
+every expression and keeps the derived table on the module node, so the passes
+that follow -- the overload pin, and the artifact the AOT compiler consumes --
+have the types without re-deriving them.
 """
 import ast
 

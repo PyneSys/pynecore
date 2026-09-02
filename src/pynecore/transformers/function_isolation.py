@@ -56,8 +56,33 @@ Classification sources:
 Unprovable always degrades to uniform (correct, only slower) — an error can
 only come from a false proof, never from missing knowledge.
 
+Overload pin and instance vector
+--------------------------------
+
+Two constants ride along on the emitted binder/state-creating calls. The
+overload ``pin`` selects the callee's implementation; the instance ``vector``
+configures the callee's INSTANCE, and both are decided by the type pass. A
+generic body is shared by every context it is instantiated in, so a site
+inside it whose pin differs per context cannot be a constant — the type pass
+marks such sites (``get_varying`` on the definition), this pass reserves ONE
+slot for the vector and the site reads its own entry out of it,
+``__state__[k][j]``. A call site whose callee has such sites passes the
+vector for the instance it creates, so the callee's body resolves per
+instance. Everything else emits exactly what it emitted before; a scope with
+no varying site gets no slot.
+
+The vector reaches an instance where the instance is CREATED, so a call site
+that creates none cannot hand one over. A ``@pine_method`` call is skipped
+here entirely and binds through the method cache
+(:mod:`~pynecore.core.pine_method`), and an overload dispatcher builds its
+implementations' vectors itself (``overload._anchored``): a varying site
+inside either falls back to value dispatch, with the type pass's
+``context-dependent-pin`` diagnostic left standing.
+
 Deliberately left untouched (raw calls): module-level call sites (a stateful
-callee there raises a transform error), decorator and default-argument
+callee there raises a transform error, and one carrying an overload pin binds
+in place through ``__bind_pinned·__`` — there is no anchor up there to resolve
+the pin in, and the module body runs once), decorator and default-argument
 expressions, class bodies, ``__test_*__`` functions (the test framework
 calls them with fixtures, they must not grow a hidden parameter), and calls
 whose callee is not a plain name/attribute. Calls inside lambdas are
@@ -74,7 +99,8 @@ import types
 
 from ..core.pine_export import Exported
 from ..utils.stdlib_checker import is_stdlib
-from .pine_type_rules import get_ty, stamp_lowering
+from .pine_type_rules import (get_pin, get_pins, get_ty, get_varying, get_vector,
+                              stamp_lowering)
 # noinspection PyProtectedMember
 from .slot_layout import DEFAULT_STATE_PARAM, ModuleLayout, scope_for_function
 
@@ -92,6 +118,7 @@ HELPER_ALIASES = {
     '__bind_slot__': '__bind_slot·__',
     '__loop_state__': '__loop_state·__',
     '__bind_loop__': '__bind_loop·__',
+    '__bind_pinned__': '__bind_pinned·__',
 }
 
 # Functions that should not be transformed because they:
@@ -369,6 +396,10 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         self._ordinals: dict[str, int] = {}
         self._used_helpers: set[str] = set()
         self._resolve_cache: dict[str, Any] = {}
+        # scope -> its instance-vector slot, and the index every varying site
+        # of that scope reads out of it (by node identity)
+        self._pin_slots: dict[str, int] = {}
+        self._pin_index: dict[str, dict[int, int]] = {}
 
     # --- classification ----------------------------------------------------
 
@@ -577,10 +608,17 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         return ast.Call(func=ast.Name(id=self._helper(name), ctx=ast.Load()),
                         args=args, keywords=[])
 
-    def _emit_fast(self, node: ast.Call, slot: int, in_loop: bool) -> ast.Call:
-        """Prepend the child-state expression as the hidden first argument."""
+    def _emit_fast(self, node: ast.Call, slot: int, in_loop: bool,
+                   vector: ast.expr | None = None) -> ast.Call:
+        """Prepend the child-state expression as the hidden first argument.
+
+        The instance vector, where there is one, is a trailing argument of the
+        state-CREATING helper — every shape here has one, and each of them is
+        the cold path, so the guard the hot path runs is unchanged.
+        """
         param = self._state_param()
         callee_copy = self._copy_callee(node.func)
+        extra: list[ast.expr] = [] if vector is None else [vector]
         state_expr: ast.expr
         if in_loop:
             # Shared instance + same-bar builtin rollback, folded into one
@@ -588,11 +626,11 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
             # iterables too
             state_expr = self._helper_call(
                 '__loop_state__', [ast.Name(id=param, ctx=ast.Load()),
-                                   ast.Constant(value=slot), callee_copy])
+                                   ast.Constant(value=slot), callee_copy] + extra)
         elif self._comp_iter_depth:
             state_expr = self._helper_call(
                 '__slot_state__', [ast.Name(id=param, ctx=ast.Load()),
-                                   ast.Constant(value=slot), callee_copy])
+                                   ast.Constant(value=slot), callee_copy] + extra)
         else:
             state_expr = ast.IfExp(
                 test=ast.Compare(
@@ -603,14 +641,33 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
                 orelse=ast.Call(func=ast.Name(id=self._helper('__resolve_slot__'),
                                               ctx=ast.Load()),
                                 args=[ast.Name(id=param, ctx=ast.Load()),
-                                      ast.Constant(value=slot), callee_copy],
+                                      ast.Constant(value=slot), callee_copy] + extra,
                                 keywords=[]))
         node.args.insert(0, state_expr)
         return node
 
-    def _emit_uniform(self, node: ast.Call, slot: int, in_loop: bool) -> ast.Call:
-        """Wrap the call in the anchored bind form."""
+    def _emit_uniform(self, node: ast.Call, slot: int, in_loop: bool,
+                      pin_expr: ast.expr | None = None,
+                      vector: ast.expr | None = None) -> ast.Call:
+        """Wrap the call in the anchored bind form.
+
+        Two trailing arguments ride along, and they are different quantities.
+        The overload pin reaches the dispatcher's ``__pyne_bind__`` factory,
+        which resolves it ONCE per anchor; a callee that publishes no such
+        factory ignores it. The instance vector configures the state vector the
+        binder creates for the callee. Both are absent on all but the sites
+        that have one, so the emitted form is unchanged wherever there is
+        nothing to say — and the vector needs the pin position filled in, since
+        the binder takes them positionally.
+        """
         param = self._state_param()
+        pin: list[ast.expr] = []
+        if pin_expr is not None:
+            pin.append(pin_expr)
+        if vector is not None:
+            if not pin:
+                pin.append(ast.Constant(value=None))
+            pin.append(vector)
         if in_loop or self._comp_iter_depth:
             # Helper form: the callee expression is evaluated exactly once, as
             # the helper's argument, so a callee that runs code needs no
@@ -618,7 +675,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
             bound: ast.expr = self._helper_call(
                 '__bind_loop__' if in_loop else '__bind_slot__',
                 [ast.Name(id=param, ctx=ast.Load()),
-                 ast.Constant(value=slot), node.func])
+                 ast.Constant(value=slot), node.func] + pin)
             return _stamped_call(bound, node)
         callee: ast.expr
         callee_copy: ast.expr
@@ -652,7 +709,8 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         ])
         rebind: ast.expr = ast.Call(
             func=ast.Name(id=bind_any, ctx=ast.Load()),
-            args=[ast.Name(id=param, ctx=ast.Load()), ast.Constant(value=slot), callee_copy],
+            args=[ast.Name(id=param, ctx=ast.Load()), ast.Constant(value=slot),
+                  callee_copy] + pin,
             keywords=[])
         if bind is not None:
             # FIRST operand: the callee (and any call site nested in it) must be
@@ -706,7 +764,13 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
             return node
         self._scope_stack.append(self.layout.scope_segment(node))
         scope = '·'.join(self._scope_stack)
-        scope_for_function(self.layout, scope, node)
+        scope_layout = scope_for_function(self.layout, scope, node)
+        varying = get_varying(node)
+        if varying:
+            # Reserved BEFORE the body is walked, so an inner site can address
+            # the slot with a literal index while the body is being emitted
+            self._pin_index[scope] = {id(call): j for j, call in enumerate(varying)}
+            self._pin_slots[scope] = scope_layout.add_pin(len(varying))
         old_loop, self._loop_depth = self._loop_depth, 0
         old_lambda, self._lambda_depth = self._lambda_depth, 0
 
@@ -797,6 +861,14 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
             if route in (_FAST, _FAST_SHARED) \
                     or (isinstance(route, tuple) and self._is_carrier(route[1])):
                 raise SyntaxError("Stateful function calls are not supported at module level")
+            pin = get_pin(node)
+            if pin is not None and route == _UNIFORM:
+                # An overload site up here has no anchor to resolve its pin in,
+                # so it binds once, in place: the module body runs once, and
+                # without the binding the site would dispatch from the VALUES
+                # and take the float implementation for an int-typed argument
+                return _stamped_call(self._helper_call(
+                    '__bind_pinned__', [node.func, ast.Constant(value=pin)]), node)
             return node
         if isinstance(route, tuple):
             route = _FAST if self._is_carrier(route[1]) else _DIRECT
@@ -822,8 +894,41 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         self._ordinals[scope] = ordinal + 1
         call_id = f'{scope}·{_get_func_path(node.func) or "<callee>"}·{ordinal}'
         scope_layout = self.layout.scope(scope)
+        pin_expr, vector = self._channel_args(node, scope)
         if route == _FAST:
             slot = scope_layout.add_child(call_id, in_loop=in_loop)
-            return self._emit_fast(node, slot, in_loop)
+            return self._emit_fast(node, slot, in_loop, vector)
         slot = scope_layout.add_anchor(call_id, in_loop=in_loop)
-        return self._emit_uniform(node, slot, in_loop)
+        return self._emit_uniform(node, slot, in_loop, pin_expr, vector)
+
+    def _channel_args(self, node: ast.Call,
+                      scope: str) -> tuple[ast.expr | None, ast.expr | None]:
+        """The overload pin and the instance vector this call site passes on.
+
+        Either is a constant where the type pass settled it for every instance
+        of the enclosing body. Where it could not, the value belongs to the
+        INSTANCE and lives in the caller's own vector, so the site reads its
+        entry out of the slot instead: ``__state__[k][j]``, with ``j`` the
+        site's index in that vector. A site is one kind or the other — an
+        overload group is never instantiated per call site, so it never carries
+        a vector, and a context-analysed callee has no overload to pin.
+
+        :param node: The call node
+        :param scope: Scope id of the call site
+        :return: (pin expression, vector expression); either may be None
+        """
+        stamped = get_pin(node)
+        constant = get_vector(node)
+        pin: ast.expr | None = None if stamped is None else ast.Constant(value=stamped)
+        vector: ast.expr | None = None if constant is None else ast.Constant(value=constant)
+        index = self._pin_index.get(scope)
+        position = index.get(id(node)) if index is not None else None
+        if position is not None:
+            entry = ast.Subscript(
+                value=self._slot_ref(self._state_param(), self._pin_slots[scope]),
+                slice=ast.Constant(value=position), ctx=ast.Load())
+            if get_pins(node) is not None:
+                pin = entry
+            else:
+                vector = entry
+        return pin, vector

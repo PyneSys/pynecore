@@ -1,6 +1,9 @@
 {
  "names": {
   "alert": {
+   "default_ty": [
+    "?"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -14,6 +17,9 @@
    "ret": "v"
   },
   "alert.alert": {
+   "default_ty": [
+    "?"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -131,6 +137,9 @@
    "ret": "o"
   },
   "array.covariance": {
+   "default_ty": [
+    "b"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -157,6 +166,10 @@
    "ret": "b"
   },
   "array.fill": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -284,6 +297,9 @@
    "ret": "i"
   },
   "array.max": {
+   "default_ty": [
+    "i"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -308,6 +324,9 @@
    "ret": "f"
   },
   "array.min": {
+   "default_ty": [
+    "i"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -332,6 +351,10 @@
    "ret": "?"
   },
   "array.new": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -345,6 +368,10 @@
    "ret": "o"
   },
   "array.new_bool": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -358,6 +385,10 @@
    "ret": "o"
   },
   "array.new_box": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -371,6 +402,10 @@
    "ret": "o"
   },
   "array.new_color": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -384,6 +419,10 @@
    "ret": "o"
   },
   "array.new_float": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -397,6 +436,10 @@
    "ret": "o"
   },
   "array.new_int": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -410,6 +453,10 @@
    "ret": "o"
   },
   "array.new_label": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -423,6 +470,10 @@
    "ret": "o"
   },
   "array.new_line": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -436,6 +487,10 @@
    "ret": "o"
   },
   "array.new_linefill": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -449,6 +504,10 @@
    "ret": "o"
   },
   "array.new_string": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -462,6 +521,10 @@
    "ret": "o"
   },
   "array.new_table": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -636,6 +699,9 @@
    "ret": "b"
   },
   "array.sort": {
+   "default_ty": [
+    "?"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -649,6 +715,9 @@
    "ret": "v"
   },
   "array.sort_indices": {
+   "default_ty": [
+    "?"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -673,6 +742,9 @@
    "ret": "o"
   },
   "array.stdev": {
+   "default_ty": [
+    "b"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -710,6 +782,9 @@
    "ret": "v"
   },
   "array.variance": {
+   "default_ty": [
+    "b"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -731,6 +806,22 @@
    "ty": "i"
   },
   "barcolor": {
+   "default_none_ok": [
+    true,
+    false,
+    false,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "i",
+    "b",
+    "0",
+    "0",
+    "0"
+   ],
    "defaults": 6,
    "kind": "function",
    "names": [
@@ -752,6 +843,24 @@
    "ret": "v"
   },
   "bgcolor": {
+   "default_none_ok": [
+    true,
+    false,
+    false,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "i",
+    "b",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
    "defaults": 7,
    "kind": "function",
    "names": [
@@ -851,6 +960,23 @@
   "box.new": {
    "impls": [
     {
+     "default_ty": [
+      "?",
+      "i",
+      "?",
+      "?",
+      "?",
+      "?",
+      "s",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "b",
+      "?"
+     ],
      "defaults": 15,
      "names": [
       "top_left",
@@ -893,6 +1019,23 @@
      "ret": "o"
     },
     {
+     "default_ty": [
+      "?",
+      "i",
+      "?",
+      "?",
+      "?",
+      "?",
+      "s",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "b",
+      "?"
+     ],
      "defaults": 15,
      "names": [
       "left",
@@ -1236,6 +1379,12 @@
    "ret": "v"
   },
   "chart.in_seconds": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -1300,6 +1449,9 @@
    "ret": "i"
   },
   "color.new": {
+   "default_ty": [
+    "i"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -1324,6 +1476,9 @@
    "ret": "i"
   },
   "color.rgb": {
+   "default_ty": [
+    "i"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -1496,6 +1651,14 @@
    "ty": "f"
   },
   "hline": {
+   "default_ty": [
+    "s",
+    "?",
+    "?",
+    "i",
+    "b",
+    "?"
+   ],
    "defaults": 6,
    "kind": "function",
    "names": [
@@ -1519,6 +1682,14 @@
    "ret": "o"
   },
   "hline.hline": {
+   "default_ty": [
+    "s",
+    "?",
+    "?",
+    "i",
+    "b",
+    "?"
+   ],
    "defaults": 6,
    "kind": "function",
    "names": [
@@ -1546,6 +1717,12 @@
    "ty": "i"
   },
   "is_na": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -1618,6 +1795,20 @@
   "label.new": {
    "impls": [
     {
+     "default_ty": [
+      "s",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "s",
+      "?",
+      "b",
+      "?"
+     ],
      "defaults": 12,
      "names": [
       "point",
@@ -1652,6 +1843,20 @@
      "ret": "o"
     },
     {
+     "default_ty": [
+      "s",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "s",
+      "?",
+      "b",
+      "?"
+     ],
      "defaults": 12,
      "names": [
       "x",
@@ -1983,6 +2188,14 @@
   "line.new": {
    "impls": [
     {
+     "default_ty": [
+      "?",
+      "?",
+      "?",
+      "?",
+      "i",
+      "b"
+     ],
      "defaults": 6,
      "names": [
       "first_point",
@@ -2007,6 +2220,14 @@
      "ret": "o"
     },
     {
+     "default_ty": [
+      "?",
+      "?",
+      "?",
+      "?",
+      "i",
+      "b"
+     ],
      "defaults": 6,
      "names": [
       "x1",
@@ -2703,6 +2924,11 @@
    "ret": "f"
   },
   "math.random": {
+   "default_ty": [
+    "i",
+    "i",
+    "?"
+   ],
    "defaults": 3,
    "kind": "function",
    "names": [
@@ -2849,6 +3075,14 @@
    "ret": "f"
   },
   "matrix.add_col": {
+   "default_none_ok": [
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -2864,6 +3098,14 @@
    "ret": "v"
   },
   "matrix.add_row": {
+   "default_none_ok": [
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -3010,6 +3252,18 @@
    "ret": "i"
   },
   "matrix.fill": {
+   "default_none_ok": [
+    false,
+    true,
+    false,
+    true
+   ],
+   "default_ty": [
+    "i",
+    "0",
+    "i",
+    "0"
+   ],
    "defaults": 4,
    "kind": "function",
    "names": [
@@ -3237,6 +3491,16 @@
    "ret": "o"
   },
   "matrix.new": {
+   "default_none_ok": [
+    false,
+    false,
+    true
+   ],
+   "default_ty": [
+    "i",
+    "i",
+    "0"
+   ],
    "defaults": 3,
    "kind": "function",
    "names": [
@@ -3287,6 +3551,12 @@
    "ret": "i"
   },
   "matrix.remove_col": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -3300,6 +3570,12 @@
    "ret": "o"
   },
   "matrix.remove_row": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -3380,6 +3656,10 @@
    "ret": "v"
   },
   "matrix.sort": {
+   "default_ty": [
+    "i",
+    "s"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -3395,6 +3675,18 @@
    "ret": "v"
   },
   "matrix.submatrix": {
+   "default_none_ok": [
+    false,
+    true,
+    false,
+    true
+   ],
+   "default_ty": [
+    "i",
+    "0",
+    "i",
+    "0"
+   ],
    "defaults": 4,
    "kind": "function",
    "names": [
@@ -3500,6 +3792,9 @@
    "ty": "i"
   },
   "nz": {
+   "default_ty": [
+    "i"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -3521,6 +3816,38 @@
    "ty": "f"
   },
   "plot": {
+   "default_none_ok": [
+    true,
+    true,
+    false,
+    true,
+    false,
+    false,
+    false,
+    false,
+    false,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "i",
+    "0",
+    "b",
+    "f",
+    "i",
+    "b",
+    "b",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
    "defaults": 14,
    "kind": "function",
    "names": [
@@ -3561,6 +3888,38 @@
    "vararg": "?"
   },
   "plot.plot": {
+   "default_none_ok": [
+    true,
+    true,
+    false,
+    true,
+    false,
+    false,
+    false,
+    false,
+    false,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "i",
+    "0",
+    "b",
+    "f",
+    "i",
+    "b",
+    "b",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
    "defaults": 14,
    "kind": "function",
    "names": [
@@ -3601,6 +3960,34 @@
    "vararg": "?"
   },
   "plotarrow": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    false,
+    false,
+    false,
+    false,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "i",
+    "i",
+    "i",
+    "b",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
    "defaults": 12,
    "kind": "function",
    "names": [
@@ -3636,6 +4023,26 @@
    "ret": "v"
   },
   "plotbar": {
+   "default_none_ok": [
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "b",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
    "defaults": 8,
    "kind": "function",
    "names": [
@@ -3669,6 +4076,30 @@
    "ret": "v"
   },
   "plotcandle": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "b",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
    "defaults": 10,
    "kind": "function",
    "names": [
@@ -3706,6 +4137,38 @@
    "ret": "v"
   },
   "plotchar": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true,
+    false,
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0",
+    "i",
+    "0",
+    "0",
+    "b",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
    "defaults": 14,
    "kind": "function",
    "names": [
@@ -3745,6 +4208,38 @@
    "ret": "v"
   },
   "plotshape": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true,
+    false,
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0",
+    "i",
+    "0",
+    "0",
+    "b",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
    "defaults": 14,
    "kind": "function",
    "names": [
@@ -3799,6 +4294,26 @@
    "ret": "v"
   },
   "polyline.new": {
+   "default_none_ok": [
+    false,
+    false,
+    false,
+    false,
+    true,
+    false,
+    false,
+    false
+   ],
+   "default_ty": [
+    "b",
+    "b",
+    "?",
+    "?",
+    "0",
+    "?",
+    "i",
+    "b"
+   ],
    "defaults": 8,
    "kind": "function",
    "names": [
@@ -3839,6 +4354,22 @@
    "ret": "f"
   },
   "request.dividends": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0",
+    "b",
+    "0"
+   ],
    "defaults": 6,
    "kind": "function",
    "names": [
@@ -3860,6 +4391,22 @@
    "ret": "f"
   },
   "request.earnings": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0",
+    "b",
+    "0"
+   ],
    "defaults": 6,
    "kind": "function",
    "names": [
@@ -3889,6 +4436,22 @@
    "vararg": "?"
   },
   "request.financial": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0",
+    "b",
+    "0"
+   ],
    "defaults": 6,
    "kind": "function",
    "names": [
@@ -3910,6 +4473,10 @@
    "ret": "f"
   },
   "request.footprint": {
+   "default_ty": [
+    "i",
+    "i"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -3951,6 +4518,18 @@
   "request.security_lower_tf": {
    "impls": [
     {
+     "default_none_ok": [
+      true,
+      true,
+      true,
+      true
+     ],
+     "default_ty": [
+      "b",
+      "0",
+      "b",
+      "0"
+     ],
      "defaults": 4,
      "names": [
       "symbol",
@@ -3973,6 +4552,18 @@
      "ret": "o"
     },
     {
+     "default_none_ok": [
+      true,
+      true,
+      true,
+      true
+     ],
+     "default_ty": [
+      "b",
+      "0",
+      "b",
+      "0"
+     ],
      "defaults": 4,
      "names": [
       "symbol",
@@ -3998,6 +4589,20 @@
    "kind": "overloads"
   },
   "request.seed": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "b",
+    "0"
+   ],
    "defaults": 5,
    "kind": "function",
    "names": [
@@ -4017,6 +4622,20 @@
    "ret": "?"
   },
   "request.splits": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
    "defaults": 5,
    "kind": "function",
    "names": [
@@ -4125,6 +4744,14 @@
    "ret": "?"
   },
   "strategy.close": {
+   "default_ty": [
+    "?",
+    "?",
+    "?",
+    "?",
+    "b",
+    "b"
+   ],
    "defaults": 6,
    "kind": "function",
    "names": [
@@ -4148,6 +4775,12 @@
    "ret": "?"
   },
   "strategy.close_all": {
+   "default_ty": [
+    "?",
+    "?",
+    "b",
+    "b"
+   ],
    "defaults": 4,
    "kind": "function",
    "names": [
@@ -4408,6 +5041,26 @@
    "ret": "f"
   },
   "strategy.entry": {
+   "default_none_ok": [
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "?",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
    "defaults": 8,
    "kind": "function",
    "names": [
@@ -4445,6 +5098,28 @@
    "ty": "i"
   },
   "strategy.exit": {
+   "default_ty": [
+    "s",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "b"
+   ],
    "defaults": 20,
    "kind": "function",
    "names": [
@@ -4723,6 +5398,26 @@
    "ret": "f"
   },
   "strategy.order": {
+   "default_none_ok": [
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "?",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
    "defaults": 8,
    "kind": "function",
    "names": [
@@ -4775,6 +5470,9 @@
    "ret": "v"
   },
   "strategy.risk.max_cons_loss_days": {
+   "default_ty": [
+    "?"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -4788,6 +5486,10 @@
    "ret": "v"
   },
   "strategy.risk.max_drawdown": {
+   "default_ty": [
+    "?",
+    "?"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -4803,6 +5505,9 @@
    "ret": "v"
   },
   "strategy.risk.max_intraday_filled_orders": {
+   "default_ty": [
+    "?"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -4816,6 +5521,10 @@
    "ret": "v"
   },
   "strategy.risk.max_intraday_loss": {
+   "default_ty": [
+    "?",
+    "?"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -4884,6 +5593,14 @@
    "vararg": "?"
   },
   "string.format_time": {
+   "default_none_ok": [
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -4947,6 +5664,9 @@
    "ret": "i"
   },
   "string.repeat": {
+   "default_ty": [
+    "s"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -4962,6 +5682,9 @@
    "ret": "s"
   },
   "string.replace": {
+   "default_ty": [
+    "i"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -5020,6 +5743,12 @@
    "ret": "b"
   },
   "string.substring": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -5046,6 +5775,9 @@
    "ret": "f"
   },
   "string.tostring": {
+   "default_ty": [
+    "s"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -5261,6 +5993,11 @@
    "ty": "f"
   },
   "ta.alma": {
+   "default_ty": [
+    "f",
+    "f",
+    "b"
+   ],
    "defaults": 3,
    "kind": "function",
    "names": [
@@ -5345,6 +6082,9 @@
    "ret": "f"
   },
   "ta.change": {
+   "default_ty": [
+    "i"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -5449,6 +6189,12 @@
    "ret": "f"
   },
   "ta.dev": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -5505,6 +6251,11 @@
   "ta.highest": {
    "impls": [
     {
+     "default_ty": [
+      "b",
+      "b",
+      "b"
+     ],
      "defaults": 3,
      "names": [
       "source",
@@ -5580,6 +6331,9 @@
    "ty": "f"
   },
   "ta.kc": {
+   "default_ty": [
+    "b"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -5597,6 +6351,9 @@
    "ret": "o"
   },
   "ta.kcw": {
+   "default_ty": [
+    "b"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -5631,6 +6388,11 @@
   "ta.lowest": {
    "impls": [
     {
+     "default_ty": [
+      "b",
+      "b",
+      "b"
+     ],
      "defaults": 3,
      "names": [
       "source",
@@ -5831,6 +6593,9 @@
    "ret": "f"
   },
   "ta.pivot_point_levels": {
+   "default_ty": [
+    "b"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -5994,6 +6759,11 @@
    "ret": "f"
   },
   "ta.sar": {
+   "default_ty": [
+    "f",
+    "f",
+    "f"
+   ],
    "defaults": 3,
    "kind": "function",
    "names": [
@@ -6022,6 +6792,9 @@
    "ret": "f"
   },
   "ta.stdev": {
+   "default_ty": [
+    "b"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -6112,6 +6885,9 @@
    "ret": "f"
   },
   "ta.variance": {
+   "default_ty": [
+    "b"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -6180,6 +6956,32 @@
    "ty": "o"
   },
   "table.cell": {
+   "default_none_ok": [
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false
+   ],
+   "default_ty": [
+    "s",
+    "i",
+    "i",
+    "?",
+    "?",
+    "?",
+    "?",
+    "0",
+    "s",
+    "?",
+    "?"
+   ],
    "defaults": 11,
    "kind": "function",
    "names": [
@@ -6404,6 +7206,14 @@
    "ret": "v"
   },
   "table.clear": {
+   "default_none_ok": [
+    false,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0"
+   ],
    "defaults": 2,
    "kind": "function",
    "names": [
@@ -6453,6 +7263,22 @@
    "ret": "v"
   },
   "table.new": {
+   "default_none_ok": [
+    false,
+    false,
+    false,
+    false,
+    false,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "i",
+    "0",
+    "i",
+    "b"
+   ],
    "defaults": 6,
    "kind": "function",
    "names": [
@@ -6608,6 +7434,18 @@
    "ret": "s"
   },
   "ticker.modify": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0"
+   ],
    "defaults": 4,
    "kind": "function",
    "names": [
@@ -6627,6 +7465,18 @@
    "ret": "s"
   },
   "ticker.new": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0"
+   ],
    "defaults": 4,
    "kind": "function",
    "names": [
@@ -6648,6 +7498,18 @@
    "ret": "s"
   },
   "ticker.pointfigure": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0"
+   ],
    "defaults": 4,
    "kind": "function",
    "names": [
@@ -6667,6 +7529,18 @@
    "ret": "s"
   },
   "ticker.renko": {
+   "default_none_ok": [
+    true,
+    true,
+    false,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "b",
+    "0"
+   ],
    "defaults": 4,
    "kind": "function",
    "names": [
@@ -6686,6 +7560,12 @@
    "ret": "s"
   },
   "ticker.standard": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -6731,6 +7611,12 @@
    "ret": "s"
   },
   "timeframe.in_seconds": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
    "defaults": 1,
    "kind": "function",
    "names": [
@@ -6812,6 +7698,11 @@
      "ret": "i"
     },
     {
+     "default_ty": [
+      "i",
+      "i",
+      "i"
+     ],
      "defaults": 3,
      "names": [
       "timezone",
@@ -6834,6 +7725,11 @@
      "ret": "i"
     },
     {
+     "default_ty": [
+      "i",
+      "i",
+      "i"
+     ],
      "defaults": 3,
      "names": [
       "year",
@@ -6935,5 +7831,5 @@
    "ty": "i"
   }
  },
- "v": 2
+ "v": 4
 }

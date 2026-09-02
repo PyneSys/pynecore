@@ -84,7 +84,7 @@ def collect_scope_segments(tree: ast.Module) -> dict[int, str]:
 class _Slot:
     """One slot of a scope's state vector."""
     index: int
-    kind: str  # 'var' | 'flag' | 'series' | 'child' | 'anchor'
+    kind: str  # 'var' | 'flag' | 'series' | 'child' | 'anchor' | 'pin'
     name: str  # debug name for the layout 'names' tuple
     init: ast.expr  # template expression for the layout 'init' tuple
     max_bars_back: ast.expr | None = None  # series slots only
@@ -100,6 +100,10 @@ class ScopeLayout:
     scope: str
     slots: list[_Slot] = field(default_factory=list)
     state_param: str = DEFAULT_STATE_PARAM
+    #: Slot holding the instance vector, for a scope whose body resolves
+    #: something per instance; None for every other scope, which is nearly
+    #: all of them (see :meth:`add_pin`)
+    pin_slot: int | None = None
 
     def _add(self, slot: _Slot) -> int:
         self.slots.append(slot)
@@ -142,6 +146,25 @@ class ScopeLayout:
         """
         return self._add(_Slot(len(self.slots), 'series', name, ast.Constant(value=None),
                                max_bars_back=max_bars_back, series_elem=elem))
+
+    def add_pin(self, count: int) -> int:
+        """Allocate the scope's instance-vector slot.
+
+        Reserved only for a body whose inner sites do not resolve to the same
+        thing in every context it is instantiated in (the type pass stamps
+        those on the definition). The slot holds one entry per such site; the
+        init template is the all-None vector, which means "configure nothing"
+        and is what an instance created with no vector -- a cross-module call,
+        a call the type pass could not resolve -- keeps.
+
+        :param count: Number of instance-varying sites in the body.
+        :return: The allocated slot index.
+        """
+        index = self._add(_Slot(
+            len(self.slots), 'pin', '·pins',
+            ast.Tuple(elts=[ast.Constant(value=None) for _ in range(count)], ctx=ast.Load())))
+        self.pin_slot = index
+        return index
 
     def add_child(self, call_id: str, *, in_loop: bool) -> int:
         """Allocate a child slot for an isolated call site.
@@ -288,6 +311,9 @@ def _scope_entry_ast(scope: ScopeLayout, compacted: bool = False) -> ast.Dict:
         ctx=ast.Load())
     keys = ['init', 'series', 'varip', 'children', 'names']
     values: list[ast.expr] = [init, series, varip, children, names]
+    if scope.pin_slot is not None:
+        keys.append('pin')
+        values.append(ast.Constant(value=scope.pin_slot))
     if compacted:
         keys.append('compacted')
         values.append(ast.Constant(value=True))

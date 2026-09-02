@@ -210,19 +210,30 @@ def __test_attach_layout__():
 
 def __test_bind_any_dispatcher_hook__():
     """ __bind_any__: a callee with __pyne_bind__ gets a fresh per-anchor
-    binding from the factory """
+    binding from the factory, and the call site's overload pin reaches it """
+    seen = []
+
     def fake_dispatcher():
         raise AssertionError("the anchor must call the factory's binding")
 
     def bound_instance(x):
         return x * 10
-    fake_dispatcher.__pyne_bind__ = lambda: bound_instance
+
+    def factory(pin=None):
+        seen.append(pin)
+        return bound_instance
+    fake_dispatcher.__pyne_bind__ = factory
 
     parent = _make_state(LAYOUT_PARENT)
     bound = __bind_any__(parent, 2, fake_dispatcher)
     assert bound is bound_instance
     assert parent[2] == (fake_dispatcher, bound_instance)
     assert bound(2) == 20
+    assert seen == [None]  # an unpinned site still binds
+
+    parent = _make_state(LAYOUT_PARENT)
+    __bind_any__(parent, 2, fake_dispatcher, 'if')
+    assert seen == [None, 'if']
 
 
 def __test_bind_loop__():

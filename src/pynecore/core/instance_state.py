@@ -42,6 +42,15 @@ as ``func.__pyne_layout__``. An entry is a plain dict with these keys:
 ``names``
     Optional tuple of per-slot debug names (same order as ``init``); used
     only by :func:`explain_state` and the dump display-rewrite.
+``pin``
+    Present only for a scope whose body resolves something PER INSTANCE: the
+    slot holding the instance vector, one entry per instance-varying site of
+    the body (see :mod:`~pynecore.transformers.function_isolation`). The
+    ``init`` template is the all-None vector, meaning "configure nothing"; a
+    call site that knows better passes its own vector to the helper that
+    creates the instance, and the helper writes it into this slot. The slot is
+    excluded from every rollback: it configures the instance, it is not part
+    of what the instance computed.
 ``compacted``
     Present and true only for ``@pyne lib`` modules: their series are the
     rolling windows of the builtin machines, which skip na bars on purpose,
@@ -115,7 +124,7 @@ from ..types.na import NA, na_float
 
 __all__ = [
     '__resolve_slot__', '__bind_any__', '__slot_state__', '__bind_slot__',
-    '__loop_state__', '__bind_loop__',
+    '__loop_state__', '__bind_loop__', '__bind_pinned__',
     '__attach_layout__', '__dyn_default__',
     'create_root', 'get_root', 'discard_root', 'reset', 'register_shared_cache',
     'RootVarSnapshot', 'RootSeriesSnapshot', 'RootChildSnapshot', 'explain_state',
@@ -180,16 +189,39 @@ def _make_state(layout: dict[str, Any]) -> list:
     return state
 
 
-def __resolve_slot__(parent: list, slot: int, func: Any) -> list:
+def _configure(state: list, layout: dict[str, Any], vector: tuple | None) -> list:
+    """Write a call site's instance vector into a freshly created instance.
+
+    The vector says what the callee's instance-varying inner sites resolve to
+    for THIS caller (an overload pin, or a nested vector for a generic callee
+    of its own). Absent — a cross-module call site, a call the type pass could
+    not resolve, a callee with nothing to configure — the instance keeps the
+    all-None default its layout carries, which is dispatch from the values.
+
+    :param state: The new state vector.
+    :param layout: Its layout entry.
+    :param vector: The call site's vector, or None.
+    :return: ``state``
+    """
+    if vector is not None:
+        slot = layout.get('pin')
+        if slot is not None:
+            state[slot] = vector
+    return state
+
+
+def __resolve_slot__(parent: list, slot: int, func: Any, vector: tuple | None = None) -> list:
     """Cold path of a straight-line fast-path call site: create the child
     state and park it in the parent's slot.
 
     :param parent: The caller's state vector.
     :param slot: Child slot index assigned at transform time.
     :param func: The state-carrying callee (carries ``__pyne_layout__``).
+    :param vector: The call site's instance vector (see :func:`_configure`).
     :return: The new child state vector.
     """
-    state = _make_state(func.__pyne_layout__)
+    layout = func.__pyne_layout__
+    state = _configure(_make_state(layout), layout, vector)
     parent[slot] = state
     return state
 
@@ -314,7 +346,14 @@ def _restore_collected(current: list, snaps: list) -> None:
     for vec, layout_ in current:
         entry = saved.get(id(vec))
         if entry is None:
+            # The instance vector survives the re-init: it was written by the
+            # call site that created this machine, not by the bar it is being
+            # rolled back out of
+            pin = layout_.get('pin')
+            configured = None if pin is None else vec[pin]
             vec[:] = _make_state(layout_)
+            if pin is not None:
+                vec[pin] = configured
             continue
         var_vals, series_vals = entry
         for i, value in var_vals:
@@ -340,7 +379,7 @@ def _restore_builtins(state: list, layout: dict[str, Any], snaps: list) -> None:
     _restore_collected(current, snaps)
 
 
-def __loop_state__(parent: list, slot: int, func: Any) -> list:
+def __loop_state__(parent: list, slot: int, func: Any, vector: tuple | None = None) -> list:
     """Whole loop-shaped fast-path call site: ONE instance shared by every
     iteration, with the same-bar builtin rollback.
 
@@ -361,13 +400,14 @@ def __loop_state__(parent: list, slot: int, func: Any) -> list:
     :param parent: The caller's state vector.
     :param slot: Child slot index assigned at transform time.
     :param func: The state-carrying callee (carries ``__pyne_layout__``).
+    :param vector: The call site's instance vector (see :func:`_configure`).
     :return: The shared child state vector.
     """
     cell = parent[slot]
     bar = _current_bar()
     if cell is None:
         layout = func.__pyne_layout__
-        state = _make_state(layout)
+        state = _configure(_make_state(layout), layout, vector)
         parent[slot] = [state, bar, _snap_builtins(state, layout)]
         return state
     state = cell[0]
@@ -379,7 +419,7 @@ def __loop_state__(parent: list, slot: int, func: Any) -> list:
     return state
 
 
-def __slot_state__(parent: list, slot: int, func: Any) -> list:
+def __slot_state__(parent: list, slot: int, func: Any, vector: tuple | None = None) -> list:
     """Whole straight-line fast-path call site, guard included.
 
     Emitted where the inline guard cannot be: Python rejects an assignment
@@ -389,10 +429,11 @@ def __slot_state__(parent: list, slot: int, func: Any) -> list:
     :param parent: The caller's state vector.
     :param slot: Child slot index assigned at transform time.
     :param func: The state-carrying callee (carries ``__pyne_layout__``).
+    :param vector: The call site's instance vector (see :func:`_configure`).
     :return: The child state vector.
     """
     state = parent[slot]
-    return state if state is not None else __resolve_slot__(parent, slot, func)
+    return state if state is not None else __resolve_slot__(parent, slot, func, vector)
 
 
 def __attach_layout__(layout: dict[str, Any]) -> Callable[[Callable], Callable]:
@@ -444,19 +485,26 @@ def _carry_state(prev: tuple | None, layout: dict[str, Any]) -> list:
     return _make_state(layout)
 
 
-def _bind_target(func: Any, prev: tuple | None = None) -> Callable:
+def _bind_target(func: Any, prev: tuple | None = None, pin: str | None = None,
+                 vector: tuple | None = None) -> Callable:
     """Binding logic of the uniform path: the legacy per-call entry guards
     (type, classmethod, Exported unwrap) run here, once per binding, not per
     call; state-carrying callees get a state vector baked into a partial,
     reused from ``prev`` across a per-bar redefinition (see :func:`_carry_state`).
 
-    Callees that publish a ``__pyne_bind__`` factory (overload dispatchers)
-    get a fresh per-anchor binding from it — that is how the dispatcher
-    receives the caller's anchor and keeps one instance per implementation
-    in it.
+    Callees that publish a ``__pyne_bind__`` factory (overload dispatchers,
+    ``inline_series``) get a fresh per-anchor binding from it — that is how the
+    dispatcher receives the caller's anchor and keeps one instance per
+    implementation in it. The factory takes the call site's overload pin, so a
+    dispatcher can resolve it once here instead of selecting on every bar; a
+    factory with nothing to pin simply ignores it.
 
     :param func: The callee as it appears at the call site.
     :param prev: The anchor's previous ``(callee, bound)`` entry, if any.
+    :param pin: The call site's overload pin, when the type pass decided on one.
+    :param vector: The call site's instance vector (see :func:`_configure`). It
+        is re-applied to a vector carried across a per-bar redefinition too: it
+        is a property of the CALL SITE, so re-writing it says the same thing.
     :return: The bound callable to invoke.
     """
     target: Any = func
@@ -467,15 +515,18 @@ def _bind_target(func: Any, prev: tuple | None = None) -> Callable:
         target = unwrapped
     bind = getattr(target, '__pyne_bind__', None)
     if bind is not None:
-        return bind()
+        return bind(pin)
     if isinstance(target, type) or (
             hasattr(target, '__self__') and isinstance(target.__self__, type)):
         return target
     layout: dict[str, Any] | None = getattr(target, '__pyne_layout__', None)
-    return partial(target, _carry_state(prev, layout)) if layout is not None else target
+    if layout is None:
+        return target
+    return partial(target, _configure(_carry_state(prev, layout), layout, vector))
 
 
-def __bind_any__(parent: list, slot: int, func: Any) -> Callable:
+def __bind_any__(parent: list, slot: int, func: Any, pin: str | None = None,
+                 vector: tuple | None = None) -> Callable:
     """Bind a callee of unknown layout at an anchored call site (uniform
     path).
 
@@ -488,11 +539,31 @@ def __bind_any__(parent: list, slot: int, func: Any) -> Callable:
     :param parent: The caller's state vector.
     :param slot: Anchor slot index assigned at transform time.
     :param func: The callee as it appears at the call site.
+    :param pin: The call site's overload pin, emitted only where there is one.
+    :param vector: The call site's instance vector (see :func:`_configure`).
     :return: The bound callable to invoke.
     """
-    bound = _bind_target(func, parent[slot])
+    bound = _bind_target(func, parent[slot], pin, vector)
     parent[slot] = (func, bound)
     return bound
+
+
+def __bind_pinned__(func: Any, pin: str) -> Callable:
+    """Bind a pinned callee where there is no anchor to keep it in.
+
+    Module-level code owns no state vector, so an overload site up there has
+    nowhere to park a bound dispatcher — and without one the pin never reaches
+    ``__pyne_bind__`` and the call resolves from the VALUES, which is the whole
+    divergence the pin exists to close (``f(R / 8)`` is int-typed with a
+    fractional value). The module body runs once, so binding per call is free
+    there.
+
+    :param func: The callee as it appears at the call site.
+    :param pin: The call site's overload pin, one character per positional
+        argument.
+    :return: The bound callable to invoke.
+    """
+    return _bind_target(func, None, pin)
 
 
 def _snap_bound_builtins(bound: Any) -> list:
@@ -511,7 +582,8 @@ def _restore_bound_builtins(bound: Any, snaps: list) -> None:
     _restore_collected(vecs, snaps)
 
 
-def __bind_loop__(parent: list, slot: int, func: Any) -> Callable:
+def __bind_loop__(parent: list, slot: int, func: Any, pin: str | None = None,
+                  vector: tuple | None = None) -> Callable:
     """Whole loop-shaped anchored call site (uniform path): identity check,
     bind and the shared-instance same-bar rollback of :func:`__loop_state__`
     in one helper. The slot cell payload is the ``(callee, bound)`` pair; an
@@ -522,17 +594,19 @@ def __bind_loop__(parent: list, slot: int, func: Any) -> Callable:
     :param parent: The caller's state vector.
     :param slot: Anchor slot index assigned at transform time.
     :param func: The callee as it appears at the call site.
+    :param pin: The call site's overload pin, emitted only where there is one.
+    :param vector: The call site's instance vector (see :func:`_configure`).
     :return: The bound callable to invoke.
     """
     cell = parent[slot]
     bar = _current_bar()
     if cell is None:
-        bound = _bind_target(func, None)
+        bound = _bind_target(func, None, pin, vector)
         parent[slot] = [(func, bound), bar, _snap_bound_builtins(bound)]
         return bound
     pair = cell[0]
     if pair[0] is not func:
-        bound = _bind_target(func, pair)
+        bound = _bind_target(func, pair, pin, vector)
         cell[0] = (func, bound)
         cell[1] = bar
         cell[2] = _snap_bound_builtins(bound)
@@ -545,7 +619,8 @@ def __bind_loop__(parent: list, slot: int, func: Any) -> Callable:
     return pair[1]
 
 
-def __bind_slot__(parent: list, slot: int, func: Any) -> Callable:
+def __bind_slot__(parent: list, slot: int, func: Any, pin: str | None = None,
+                  vector: tuple | None = None) -> Callable:
     """Whole straight-line anchored call site, identity check included.
 
     Emitted where the inline guard cannot be (comprehension iterable
@@ -556,12 +631,14 @@ def __bind_slot__(parent: list, slot: int, func: Any) -> Callable:
     :param parent: The caller's state vector.
     :param slot: Anchor slot index assigned at transform time.
     :param func: The callee as it appears at the call site.
+    :param pin: The call site's overload pin, emitted only where there is one.
+    :param vector: The call site's instance vector (see :func:`_configure`).
     :return: The bound callable to invoke.
     """
     pair = parent[slot]
     if pair is not None and pair[0] is func:
         return pair[1]
-    return __bind_any__(parent, slot, func)
+    return __bind_any__(parent, slot, func, pin, vector)
 
 
 def create_root(key: str, layout: dict[str, Any]) -> list:
@@ -613,8 +690,13 @@ def reset() -> None:
 
 
 def _var_slots(layout: dict[str, Any]) -> tuple[int, ...]:
-    """Slots subject to var rollback: everything that is not a series, varip
-    or child slot.
+    """Slots subject to var rollback: everything that is not a series, varip,
+    child or instance-vector slot.
+
+    The instance vector is not state the body computed — it is how the call
+    site configured this instance, written once when the instance was created.
+    Rolling it back would restore the layout's all-None default and drop every
+    instance back to value dispatch.
 
     :param layout: Layout entry.
     :return: Rollback slot indexes.
@@ -622,6 +704,9 @@ def _var_slots(layout: dict[str, Any]) -> tuple[int, ...]:
     excluded = {slot for slot, _max_bars_back, _elem in layout['series']}
     excluded.update(layout['varip'])
     excluded.update(slot for slot, _call_id, _in_loop in layout['children'])
+    pin = layout.get('pin')
+    if pin is not None:
+        excluded.add(pin)
     return tuple(i for i in range(len(layout['init'])) if i not in excluded)
 
 
