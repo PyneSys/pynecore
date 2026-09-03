@@ -988,6 +988,41 @@ class SoftwarePartialBracketEngine:
             cleaned.append(leg)
         return cleaned
 
+    def abort_pending_legs_for_stale_parent(
+            self,
+            *,
+            symbol: str,
+            from_entry: str,
+            current_parent_refs: tuple[str, ...],
+            reason: str,
+    ) -> list[PartialBracketLeg]:
+        """Cancel ``pending_entry`` legs stamped with a parent ref that is not
+        one of the refs ``from_entry`` currently resolves to.
+
+        A leg that never armed carries the dispatch ref of the parent it was
+        issued against and is promoted by the next ENTRY fill on the same
+        ``from_entry`` — whichever parent that turns out to be. The ref goes
+        stale without a parent-keyed cascade when the position it protected
+        was adopted at startup and flattened by a reversal close, or when
+        another run's rows were replayed under an entry id the script
+        re-uses; the pending group also survives the orphan sweep by design.
+        Only ``pending_entry`` legs qualify: an armed leg with a foreign ref
+        is the adoption / orphan sweep's business.
+        """
+        aborted: list[PartialBracketLeg] = []
+        for leg in self.iter_legs_for_parent(symbol, from_entry):
+            if leg.leg_state != LEG_STATE_PENDING_ENTRY:
+                continue
+            if leg.parent_entry_dispatch_ref in current_parent_refs:
+                continue
+            self._transition(
+                leg, LEG_STATE_CASCADED_CANCEL,
+                close_row=True,
+                extras_patch={'cascade_reason': reason},
+            )
+            aborted.append(leg)
+        return aborted
+
     # === Cancel-tentative state machine ===================================
 
     def mark_legs_cancel_tentative(

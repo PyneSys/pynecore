@@ -77,6 +77,7 @@ from pynecore.lib.log import (
     broker_error as _blog_error,
 )
 from pynecore.core.broker.models import (
+    VENUE_DRIVEN_CANCEL_REASONS,
     BracketAttachRejectContext,
     BrokerEvent,
     CancelDispositionOutcome,
@@ -1639,6 +1640,7 @@ class OrderSyncEngine:
         # rebuilt intents arrive unflagged each time), but logging it per
         # sync floods the cycle log for hours on an event-driven lane.
         self._partial_restore_logged: set[str] = set()
+        self._whole_row_conflict_logged: set[str] = set()
 
         # Cross-restart recovery anchors. The state store persists envelope
         # identity and parked-verification entries; replay rebuilds these
@@ -5895,6 +5897,12 @@ class OrderSyncEngine:
                 # would leave :attr:`_position` long/short by the deferred
                 # qty while the broker is flat.
                 self._drain_unapplied_defensive_close_partials(event.pine_id)
+                # Before anything arms against this fill: legs a previous
+                # parent left ``pending_entry`` under the same id must not be
+                # promoted onto it or block its whole-row exit.
+                self._retire_stale_pending_partial_legs(
+                    event.pine_id, reason='stale_parent_at_entry_fill',
+                )
                 self._resolve_deferred_for_entry(event.pine_id)
                 self._amend_bracket_qty_for_entry_fill(event)
                 self._promote_pending_partial_bracket_legs(event)
@@ -6119,6 +6127,40 @@ class OrderSyncEngine:
                 # siblings (Bybit only auto-cancels the reduce-only TP limit;
                 # the conditional SL stop rests live until swept).
                 self._handle_expected_bracket_close_cancel(event, key)
+                return
+            if (key is not None
+                    and event.cancel_reason in VENUE_DRIVEN_CANCEL_REASONS
+                    and event.order.reduce_only
+                    and isinstance(self._active_intents.get(key), ExitIntent)):
+                # The venue says so itself: it terminated this reduce-only
+                # leg as fallout of the position it protects — a reduce-only
+                # cap squeeze after ANOTHER bracket's leg shrank the shared
+                # net position (measured live: bybit-inverse cycle 53, the
+                # L2-X TP was amended to the residual and then
+                # ``CancelByReduceOnly``-cancelled in the batch of the L3-X
+                # SL fill — no sibling fill of its OWN intent to match, so
+                # the batch classifiers below could not clear it and the
+                # run was quarantined for the rest of the cycle), or the
+                # sibling leg of a venue-linked pair triggered. Not an
+                # external cancel: trim the dead leg, keep the intent on its
+                # live sibling (or retire it when this was the last leg, so
+                # the next sync re-arms the protection), no quarantine.
+                _blog_warning(
+                    "reduce-only bracket leg %s cancelled by the venue itself "
+                    "(%s) — trimming the dead leg, no quarantine",
+                    format_intent_key(key), event.cancel_reason,
+                )
+                self._trim_cancelled_bracket_leg(event, key)
+                if self._store_ctx is not None:
+                    self._store_ctx.log_event(
+                        'venue_driven_cancel',
+                        client_order_id=(
+                            event.order.client_order_id
+                            if event.order is not None else None
+                        ),
+                        intent_key=key,
+                        payload={'cancel_reason': event.cancel_reason},
+                    )
                 return
             if (key is not None
                     and self._is_oca_sibling_fill_queued(event, key)):
@@ -8374,38 +8416,112 @@ class OrderSyncEngine:
         tracked for ``from_entry`` (mirrors the callers' existing ``None``
         guards).
         """
-        parent_envelope = self._envelopes.get(from_entry)
-        if parent_envelope is not None:
-            kind_entry_ref = parent_envelope.client_order_id(KIND_ENTRY)
-            stop_ref = parent_envelope.client_order_id(KIND_ENTRY_STOP)
-        else:
-            parent_anchor = self._persisted_envelope_anchors.get(from_entry)
-            if parent_anchor is None:
-                return None
-            kind_entry_ref = encode_wire_client_order_id(
-                build_client_order_id(
-                    run_tag=self._run_tag,
-                    pine_id=from_entry,
-                    bar_ts_ms=parent_anchor.bar_ts_ms,
-                    kind=KIND_ENTRY,
-                    retry_seq=parent_anchor.retry_seq,
-                ),
-                self._coid_max_len,
-            )
-            stop_ref = encode_wire_client_order_id(
-                build_client_order_id(
-                    run_tag=self._run_tag,
-                    pine_id=from_entry,
-                    bar_ts_ms=parent_anchor.bar_ts_ms,
-                    kind=KIND_ENTRY_STOP,
-                    retry_seq=parent_anchor.retry_seq,
-                ),
-                self._coid_max_len,
-            )
+        refs = self._parent_dispatch_refs(from_entry)
+        if refs is None:
+            return None
+        kind_entry_ref, stop_ref = refs
         if (self._store_ctx is not None
                 and self._store_ctx.get_order(stop_ref) is not None):
             return stop_ref
         return kind_entry_ref
+
+    def _parent_dispatch_refs(self, from_entry: str) -> tuple[str, str] | None:
+        """Return the ``(KIND_ENTRY, KIND_ENTRY_STOP)`` dispatch refs of ``from_entry``.
+
+        Both ids share one pinned envelope anchor and differ only in the kind
+        char. Resolved from the live envelope, else rebuilt from the persisted
+        anchor; ``None`` when neither is tracked for ``from_entry``.
+        """
+        parent_envelope = self._envelopes.get(from_entry)
+        if parent_envelope is not None:
+            return (
+                parent_envelope.client_order_id(KIND_ENTRY),
+                parent_envelope.client_order_id(KIND_ENTRY_STOP),
+            )
+        parent_anchor = self._persisted_envelope_anchors.get(from_entry)
+        if parent_anchor is None:
+            return None
+        kind_entry_ref = encode_wire_client_order_id(
+            build_client_order_id(
+                run_tag=self._run_tag,
+                pine_id=from_entry,
+                bar_ts_ms=parent_anchor.bar_ts_ms,
+                kind=KIND_ENTRY,
+                retry_seq=parent_anchor.retry_seq,
+            ),
+            self._coid_max_len,
+        )
+        stop_ref = encode_wire_client_order_id(
+            build_client_order_id(
+                run_tag=self._run_tag,
+                pine_id=from_entry,
+                bar_ts_ms=parent_anchor.bar_ts_ms,
+                kind=KIND_ENTRY_STOP,
+                retry_seq=parent_anchor.retry_seq,
+            ),
+            self._coid_max_len,
+        )
+        return kind_entry_ref, stop_ref
+
+    def _retire_stale_pending_partial_legs(
+            self, from_entry: str, *, reason: str,
+    ) -> None:
+        """Retire ``pending_entry`` partial legs that belong to a previous parent
+        under ``from_entry``.
+
+        A pending leg is stamped with the dispatch ref of the parent it was
+        issued against and is promoted by the next ENTRY fill on the same
+        ``from_entry`` — whichever parent that is. The ref goes stale without
+        a parent-keyed cascade when the position it protected was adopted at
+        startup and flattened by a reversal close (nothing maps that close to
+        ``from_entry``), or when another run's rows were replayed under an
+        entry id the script re-uses; the all-pending group also survives the
+        orphan sweep by design. Measured live (bybit-inverse cycle 52): the
+        previous bot's pending ``S-X1`` / ``S-X2`` legs counted as an active
+        partial bracket on the new ``S`` parent, so the deferred whole-row
+        ``S-X`` exit was refused and the run crashed — and had it survived,
+        the fill would have armed the old levels against the new position.
+
+        Acts only on a DEFINITE mismatch: ``from_entry`` must resolve to a
+        current parent (live envelope or persisted anchor) and the leg's ref
+        must match neither its ``KIND_ENTRY`` nor its ``KIND_ENTRY_STOP`` id.
+        The stale parent's §2.6.7 fail-safe state is retired with the legs (a
+        DEGRADED state on a gone parent would block new entries on the
+        symbol), and an intent left without legs releases its mapping and
+        envelope so Pine's next emission arms a fresh bracket against the
+        current parent. Pine's exit slot is not touched.
+        """
+        if self._partial_qty_bracket_exit_mode is not CapabilityLevel.SOFTWARE:
+            return
+        current_refs = self._parent_dispatch_refs(from_entry)
+        if current_refs is None:
+            return
+        aborted = self._partial_bracket_engine.abort_pending_legs_for_stale_parent(
+            symbol=self._symbol,
+            from_entry=from_entry,
+            current_parent_refs=current_refs,
+            reason=reason,
+        )
+        if not aborted:
+            return
+        stale_refs = {
+            leg.parent_entry_dispatch_ref
+            for leg in aborted if leg.parent_entry_dispatch_ref
+        }
+        _blog_warning(
+            "retired %d stale pending_entry partial leg(s) under parent %r (%s): "
+            "stamped with previous parent ref(s) %s, current parent is %r",
+            len(aborted), from_entry, reason, sorted(stale_refs), current_refs[0],
+        )
+        for stale_ref in stale_refs:
+            self._native_failsafe_manager.on_deal_id_disappeared(
+                stale_ref, now_ms=float(self._current_bar_ts_ms),
+            )
+        for ikey in {leg.intent_key for leg in aborted}:
+            if self._partial_bracket_engine.has_active_legs_for_intent(ikey):
+                continue
+            self._order_mapping.pop(ikey, None)
+            self._drop_envelope(ikey)
 
     def _retire_native_failsafe_for_entry(self, closed_entry_id: str) -> None:
         """Retire any §2.6.7 ``NativeStopState`` parked under ``closed_entry_id``.
@@ -11952,6 +12068,19 @@ class OrderSyncEngine:
                 )
                 self._order_mapping.pop(ikey, None)
                 self._drop_envelope(ikey)
+            # The all-``pending_entry`` groups kept above are only safe while
+            # they still belong to the parent ``from_entry`` resolves to; a
+            # group stamped with a previous parent's ref would be promoted by
+            # the next fill on the NEW parent (see
+            # :meth:`_retire_stale_pending_partial_legs`).
+            for pending_parent in {
+                leg.from_entry
+                for leg in self._partial_bracket_engine.iter_legs()
+                if leg.leg_state == LEG_STATE_PENDING_ENTRY
+            }:
+                self._retire_stale_pending_partial_legs(
+                    pending_parent, reason='stale_parent_after_restart',
+                )
 
             # Same-sync §12 #4 coexistence preflight: if THIS sync's
             # ``new_map`` contains both a partial-qty bracket and a
@@ -15171,6 +15300,13 @@ class OrderSyncEngine:
                     # protection until manual cleanup.
                     if (intent.from_entry is not None
                             and self._partial_qty_bracket_exit_mode
+                            is CapabilityLevel.SOFTWARE):
+                        self._retire_stale_pending_partial_legs(
+                            intent.from_entry,
+                            reason='stale_parent_before_whole_row_exit',
+                        )
+                    if (intent.from_entry is not None
+                            and self._partial_qty_bracket_exit_mode
                             is CapabilityLevel.SOFTWARE
                             and self._partial_bracket_engine
                                 .has_active_partial_bracket(
@@ -15236,12 +15372,33 @@ class OrderSyncEngine:
                             self._drop_envelope(intent.intent_key)
                             envelope = self._build_envelope(intent)
                         else:
-                            raise RuntimeError(
-                                "whole-row exit refuses: engine-trigger partial "
-                                "legs already tracked for "
-                                f"{intent.symbol!r}/{intent.from_entry!r}; the "
-                                "script must cancel the partial bracket before "
-                                "attaching a full-row exit.",
+                            # The parent already carries engine-trigger
+                            # partial legs under another intent key (§12 #4).
+                            # Refusing the whole-row exit is right; ending the
+                            # run is not (measured live: bybit-inverse cycle
+                            # 52 died on this branch) — the position keeps the
+                            # partial protection it has, the operator is told
+                            # once per key, and the next sync re-evaluates.
+                            if intent.intent_key not in self._whole_row_conflict_logged:
+                                self._whole_row_conflict_logged.add(intent.intent_key)
+                                _blog_error(
+                                    "whole-row exit %r refused: engine-trigger "
+                                    "partial legs already tracked for %r/%r — "
+                                    "the script must cancel the partial bracket "
+                                    "before attaching a full-row exit; the "
+                                    "partial protection stays in charge",
+                                    format_intent_key(intent.intent_key),
+                                    intent.symbol, intent.from_entry,
+                                )
+                            raise OrderSkippedByPlugin(
+                                f"Exit {intent.intent_key} skipped: engine-trigger "
+                                f"partial legs already tracked for "
+                                f"{intent.symbol!r}/{intent.from_entry!r}; "
+                                f"re-evaluating next bar.",
+                                intent_key=intent.intent_key,
+                                reason='partial_whole_row_conflict',
+                                context={'symbol': intent.symbol,
+                                         'from_entry': intent.from_entry},
                             )
                     elif (intent.from_entry is not None
                             and self._partial_qty_bracket_exit_mode

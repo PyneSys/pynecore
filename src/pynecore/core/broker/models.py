@@ -32,6 +32,10 @@ __all__ = [
     'CapabilityLevel',
     'ExchangeOrder',
     'OrderEvent',
+    'CANCEL_REASON_VENUE_REDUCE_ONLY',
+    'CANCEL_REASON_VENUE_OCA',
+    'CANCEL_REASON_VENUE_POSITION_CLEARED',
+    'VENUE_DRIVEN_CANCEL_REASONS',
     'ExchangePosition',
     'PositionLeg',
     'ExchangeCapabilities',
@@ -230,6 +234,27 @@ class ExchangeOrder:
     client_order_id: str | None = None
 
 
+#: Venue-side cancel reasons a plugin may stamp on a ``cancelled``
+#: :class:`OrderEvent` when the venue itself terminated the order as a
+#: deterministic consequence of the position / sibling orders it protects —
+#: never an operator or foreign actor. The sync engine trims such a leg and
+#: keeps running; an unclassified cancel of a bot-owned order still routes
+#: through the ``on_unexpected_cancel`` policy.
+CANCEL_REASON_VENUE_REDUCE_ONLY = 'venue_reduce_only'
+"""A reduce-only order shrunk to nothing because the net position it could
+reduce fell below the summed reduce-only quantity (Bybit
+``CancelByReduceOnly``)."""
+CANCEL_REASON_VENUE_OCA = 'venue_oca'
+"""The sibling leg of a venue-linked TP/SL pair triggered."""
+CANCEL_REASON_VENUE_POSITION_CLEARED = 'venue_position_cleared'
+"""Position-attached protection dropped because the position was cleared."""
+VENUE_DRIVEN_CANCEL_REASONS = frozenset({
+    CANCEL_REASON_VENUE_REDUCE_ONLY,
+    CANCEL_REASON_VENUE_OCA,
+    CANCEL_REASON_VENUE_POSITION_CLEARED,
+})
+
+
 @dataclass
 class OrderEvent:
     """
@@ -284,6 +309,11 @@ class OrderEvent:
     # the handler OFF for the tracker's own events — re-applying would double
     # the audit / sibling sweep and raise the ``halt`` from the wrong place.
     from_disappearance_tracker: bool = False
+    # Why the venue terminated the order, when the plugin can tell and the
+    # cause is one of :data:`VENUE_DRIVEN_CANCEL_REASONS`; ``None`` for an
+    # engine-requested cancel or an unclassified one. Only meaningful on
+    # ``cancelled`` events.
+    cancel_reason: str | None = None
 
     def __str__(self) -> str:
         parts = [

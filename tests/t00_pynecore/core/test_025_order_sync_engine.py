@@ -43,6 +43,7 @@ from pynecore.core.broker.sync_engine import (
 )
 from pynecore.core.plugin import ProviderError, TransientProviderError
 from pynecore.core.broker.models import (
+    CANCEL_REASON_VENUE_REDUCE_ONLY,
     BrokerEvent,
     CapabilityLevel,
     CloseIntent,
@@ -13565,3 +13566,236 @@ def __test_exit_modify_reject_over_a_live_parent_still_raises__():
     with pytest.raises(ExchangeOrderRejectedError):
         engine.sync(BAR_TS + 60_000)
     assert "L1" in engine.active_intents
+
+
+def _software_partial_native_exit_broker():
+    """SOFTWARE partial-qty brackets with the plain ``execute_entry`` / ``execute_exit``
+    surface (no one-way position port), so the mock's call lists record dispatches."""
+    b = MockBroker()
+    b.capabilities = ExchangeCapabilities(
+        short_selling=CapabilityLevel.NATIVE,
+        partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
+    )
+    return b
+
+
+def _persist_stale_pending_legs(ctx, *, exit_id: str) -> None:
+    """Two ``pending_entry`` legs for ``exit_id`` under parent ``L``, stamped with a
+    ref this run never dispatched (a previous bot's parent)."""
+    from pynecore.core.broker.store_helpers import (
+        LEG_KIND_TP_PARTIAL, LEG_KIND_SL_PARTIAL,
+    )
+    for leg_kind, level in ((LEG_KIND_TP_PARTIAL, 51_000.0), (LEG_KIND_SL_PARTIAL, 49_000.0)):
+        _persist_partial_leg(
+            ctx, leg_kind=leg_kind, leg_state="pending_entry", trigger_level=level,
+            intent_key=f"{exit_id}\0L", pine_id=exit_id, from_entry="L",
+            parent_entry_dispatch_ref="prev-run:L:e0",
+            oca_group=f"__partial_exit_{exit_id}_L__", oca_type="cancel",
+        )
+
+
+def __test_stale_pending_partial_legs_retired_on_new_parent_fill_deferred_whole_row_exit__(tmp_path):
+    """Measured live (bybit-inverse cycle 52): a previous bot left ``pending_entry``
+    partial legs under ``L``; the lane's next bot re-used the ``L`` entry id with a
+    tick-deferred whole-row exit. The legs are not orphan-swept (all pending) and
+    nothing cascades them (the adopted parent was flattened by a reversal close), so
+    at the new parent's fill they counted as an active partial bracket: the deferred
+    whole-row exit was refused with a RuntimeError and the run died. The fill must
+    retire the stale legs, retire their fail-safe state, and let the whole-row exit
+    dispatch."""
+    from pynecore.core.broker.storage import BrokerStore
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_stale_pending_legs(ctx, exit_id="S-X1")
+        b = _software_partial_native_exit_broker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos,  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0)
+        pos.exit_orders[("L-X", "L")] = _exit_order("L", -1.0, "L-X", loss_ticks=50.0)
+        engine.sync(BAR_TS)
+        assert len(b.entry_calls) == 1
+        assert "L-X\0L" in engine.deferred_exits
+        # Stale legs are still tracked: no fill has happened yet, the parent is
+        # anchored but the legs' ref belongs to nobody in this run.
+        assert engine._partial_bracket_engine.has_active_legs_for_intent("S-X1\0L")  # type: ignore[attr-defined]
+
+        engine.on_order_event(_fill_event(
+            "buy", qty=1.0, price=50_000.0, pine_id="L", leg=LegType.ENTRY,
+        ))
+        engine.sync(BAR_TS + 60_000)  # must not raise
+
+        assert not engine.halted
+        assert not engine._partial_bracket_engine.has_active_legs_for_intent("S-X1\0L")  # type: ignore[attr-defined]
+        assert len(b.exit_calls) == 1, "whole-row exit did not dispatch on the new parent"
+        assert b.exit_calls[0].intent.sl_price == 49_950.0
+        assert "L-X\0L" in engine.active_intents
+        assert "L-X\0L" not in engine.deferred_exits
+        stale_state = engine._native_failsafe_manager.get_state("prev-run:L:e0")  # type: ignore[attr-defined]
+        assert stale_state is None or stale_state.health is FailsafeHealth.RETIRED
+
+
+def __test_stale_pending_partial_legs_retired_before_same_sync_whole_row_exit__(tmp_path):
+    """Absolute-level variant: the whole-row exit dispatches in the SAME sync as the
+    parent entry (before any fill), so the stale legs are met at the whole-row
+    dispatch guard itself. They must be retired there and the exit must land."""
+    from pynecore.core.broker.storage import BrokerStore
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_stale_pending_legs(ctx, exit_id="S-X1")
+        b = _software_partial_native_exit_broker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos,  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0)
+        pos.exit_orders[("L-X", "L")] = _exit_order("L", -1.0, "L-X", stop=49_000.0)
+        engine.sync(BAR_TS)  # must not raise
+
+        assert not engine.halted
+        assert len(b.entry_calls) == 1
+        assert len(b.exit_calls) == 1, "whole-row exit refused by stale pending legs"
+        assert "L-X\0L" in engine.active_intents
+        assert not engine._partial_bracket_engine.has_active_legs_for_intent("S-X1\0L")  # type: ignore[attr-defined]
+
+
+def __test_pending_partial_legs_of_the_current_parent_survive_the_stale_retire__(tmp_path):
+    """The retire must act only on a DEFINITE mismatch: legs stamped with the ref the
+    parent currently resolves to are this run's own pending bracket and must stay."""
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+    from pynecore.core.broker.store_helpers import (
+        LEG_KIND_TP_PARTIAL, LEG_KIND_SL_PARTIAL,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        parent_ref = build_client_order_id(
+            run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+            kind=KIND_ENTRY, retry_seq=0,
+        )
+        ctx.record_envelope("L", BAR_TS, 0)
+        for leg_kind, level in ((LEG_KIND_TP_PARTIAL, 120.0), (LEG_KIND_SL_PARTIAL, 90.0)):
+            _persist_partial_leg(
+                ctx, leg_kind=leg_kind, leg_state="pending_entry", trigger_level=level,
+                parent_entry_dispatch_ref=parent_ref,
+                oca_group="__partial_exit_X_L__", oca_type="cancel",
+            )
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=_software_partial_native_exit_broker(), position=pos,  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        # Resting limit parent, Pine has not re-emitted the exit yet this bar.
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=100.0)
+        engine.sync(BAR_TS)
+        assert engine._partial_bracket_engine.has_active_legs_for_intent("X\0L")  # type: ignore[attr-defined]
+
+
+def __test_whole_row_exit_conflicting_with_live_partial_legs_is_skipped_not_fatal__(tmp_path, caplog):
+    """A genuine §12 #4 conflict (partial legs of THIS parent under another key, and
+    Pine attaches a whole-row exit) is refused — but the run must not end on it: the
+    exit is skipped with one ERROR per key and the partial protection stays."""
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+    from pynecore.core.broker.store_helpers import (
+        LEG_KIND_TP_PARTIAL, LEG_KIND_SL_PARTIAL,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        parent_ref = build_client_order_id(
+            run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+            kind=KIND_ENTRY, retry_seq=0,
+        )
+        ctx.record_envelope("L", BAR_TS, 0)
+        for leg_kind, level in ((LEG_KIND_TP_PARTIAL, 120.0), (LEG_KIND_SL_PARTIAL, 90.0)):
+            _persist_partial_leg(
+                ctx, leg_kind=leg_kind, leg_state="pending_entry", trigger_level=level,
+                parent_entry_dispatch_ref=parent_ref,
+                oca_group="__partial_exit_X_L__", oca_type="cancel",
+            )
+        b = _software_partial_native_exit_broker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos,  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        pos.size = 1.0
+        pos.reconstruct_parent_trade(entry_id="L", size=1.0, entry_price=100.0)
+        pos.exit_orders[("Y", "L")] = _exit_order("L", -1.0, "Y", stop=90.0)
+
+        def conflict_errors() -> list[logging.LogRecord]:
+            return [
+                rec for rec in caplog.records
+                if rec.levelno == logging.ERROR and "whole-row exit" in rec.getMessage()
+            ]
+
+        with caplog.at_level(logging.ERROR, logger="pyne_core_logger"):
+            engine.sync(BAR_TS)  # must not raise
+            assert not engine.halted
+            assert b.exit_calls == [], "conflicting whole-row exit was dispatched"
+            assert "Y\0L" not in engine.active_intents
+            assert engine._partial_bracket_engine.has_active_legs_for_intent("X\0L")  # type: ignore[attr-defined]
+            assert len(conflict_errors()) == 1
+            engine.sync(BAR_TS + 60_000)
+            assert not engine.halted
+            assert b.exit_calls == []
+            assert len(conflict_errors()) == 1, "conflict escalated again for the same key"
+
+
+def __test_stale_pending_partial_legs_are_not_promoted_by_the_new_parent_fill__(tmp_path):
+    """Without any whole-row exit in play the danger is promotion itself: the new
+    parent's ENTRY fill would arm the previous parent's ``pending_entry`` legs at their
+    old levels against the new position. The fill handler must retire them BEFORE the
+    promotion step, in the same event."""
+    from pynecore.core.broker.storage import BrokerStore
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_stale_pending_legs(ctx, exit_id="S-X1")
+        b = _software_partial_native_exit_broker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos,  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0)
+        engine.sync(BAR_TS)
+        assert len(b.entry_calls) == 1
+        assert engine._partial_bracket_engine.has_active_legs_for_intent("S-X1\0L")  # type: ignore[attr-defined]
+
+        engine.on_order_event(_fill_event(
+            "buy", qty=1.0, price=50_000.0, pine_id="L", leg=LegType.ENTRY,
+        ))
+        engine.apply_async_events()
+
+        assert pos.size == 1.0
+        assert not engine._partial_bracket_engine.has_active_legs_for_intent("S-X1\0L"), \
+            "previous parent's pending legs were promoted onto the new position"  # type: ignore[attr-defined]
+        assert not engine._partial_bracket_engine.has_active_partial_bracket(SYMBOL, "L")  # type: ignore[attr-defined]
+
+
+def __test_venue_reduce_only_cancel_with_reason_is_trimmed_not_quarantined__():
+    """A cancel the venue attributes to its own reduce-only handling is never
+    an external cancel, whatever else sits in the drain batch.
+
+    Measured live (bybit-inverse cycle 53): L3-X's SL fill shrank the shared
+    net position, the venue amended L2-X's TP to the residual and cancelled it
+    with ``cancelType=CancelByReduceOnly`` — no fill of L2-X's OWN sibling was
+    anywhere near, so the batch classifiers could not clear it and the run was
+    quarantined for the rest of the cycle. With the plugin passing the reason,
+    the lone cancel must trim only the dead TP leg and keep the intent on its
+    live SL leg.
+    """
+    b = MockBroker()
+    engine, _, tp_id, sl_id = _mk_two_leg_bracket_without_close(b)
+
+    engine._route_event(replace(
+        _reduce_only_cancel_event(tp_id),
+        cancel_reason=CANCEL_REASON_VENUE_REDUCE_ONLY,
+    ))
+
+    assert not engine._quarantined
+    assert engine.order_mapping.get("TP\0L") == [sl_id]
+    assert "TP\0L" in engine.active_intents
