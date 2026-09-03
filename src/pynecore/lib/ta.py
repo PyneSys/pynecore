@@ -13,6 +13,7 @@ import heapq
 from collections import deque
 
 from ..types import Series, Persistent, NA, PyneFloat, PyneInt, PyneBool, na_float
+from ..types.na import na_int
 from ..core.module_property import module_property, module_function_property
 from pynecore.core.overload import overload
 
@@ -199,10 +200,11 @@ def barssince(condition: bool) -> PyneInt:
     if condition:
         counter = 0
     elif counter == -1:
-        return NA(int)
+        return na_int
     else:
         counter += 1
-    return counter
+    # A Pine int is a double at runtime
+    return float(counter)
 
 
 def bb(series: float, length: int, mult: float | int) -> tuple[PyneFloat, PyneFloat, PyneFloat]:
@@ -288,11 +290,9 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB:
         return source
     if not (prev_val == prev_val):
         return NA(type(source))
-    if isinstance(source, float):
-        return cast(TFIB, source - prev_val)  # noqa
-    if isinstance(source, int):
-        return cast(TFIB, source - prev_val)  # noqa
-    return source != prev_val
+    if isinstance(source, bool):
+        return source != prev_val
+    return cast(TFIB, source - prev_val)  # noqa
 
 
 def cmo(series: float, length: int) -> PyneFloat:
@@ -695,10 +695,12 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     # An int-typed Pine value can still carry a fraction (``int / int``); the
     # truncation happens where an integer is required — see ``_check_type``.
     length = int(length)
+    # The bar clock addresses the ring: a Python int inside the machine
+    bi = int(bar_index)
     capacity: Persistent[int] = 0
     window: Persistent[list[float]] = []
     # MEASURED LAW — every CALL SITE owns a window buffer of ``length + 1`` slots
-    # addressed by the CHART BAR (``bar_index % capacity``) and written only on the
+    # addressed by the CHART BAR (``bi % capacity``) and written only on the
     # bars the call actually runs. A bar that skips the call leaves its slot holding
     # what was written a whole capacity earlier, and the extreme is then taken over
     # that stale value; a bar that calls it many times rewrites one slot. Probed on
@@ -712,7 +714,7 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
         new_capacity = length + 1
         new_window: list[float] = [na_float] * new_capacity
         for j in builtins.range(capacity):
-            b = bar_index - ((bar_index - j) % capacity)
+            b = bi - ((bi - j) % capacity)
             new_window[b % new_capacity] = window[j]
         window = new_window
         capacity = new_capacity
@@ -735,7 +737,7 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     # Aging per call instead misses 5991 of 143815 returned values there.
     # ``avail`` moves with the same bar clock: it counts how many older slots the
     # window may trust — everything before the last na reset is out of bounds.
-    gap = bar_index - last_bar
+    gap = bi - last_bar
     if last_bar >= 0 and gap > 0:
         last_max_index += gap
         avail += gap
@@ -745,8 +747,8 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
         # length ``capacity - 1`` IS ``length``, so nothing else moves.
         if avail > capacity - 1:
             avail = capacity - 1
-    last_bar = bar_index
-    window[bar_index % capacity] = source
+    last_bar = bi
+    window[bi % capacity] = source
 
     # A na input RESETS the machine: the window and the kept extreme are forgotten,
     # and the next non-na call starts a fresh window (probes ``hina_probe`` and
@@ -759,12 +761,12 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
         last_max = na_float
         last_max_index = 0
         avail = 0
-        if bar_index < length - 1:
+        if bi < length - 1:
             return na_float if not _tuple else (na_float, na_float)  # type: ignore[return-value]
         if _bars:
-            return 0
+            return 0.0
         if _tuple:
-            return na_float, 0  # type: ignore[return-value]
+            return na_float, 0.0  # type: ignore[return-value]
         return na_float
 
     if last_max < source or not (last_max == last_max) or (_check_eq and last_max == source):
@@ -785,7 +787,7 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
         last_max = source
         last_max_index = 0
         for i in builtins.range(1, length if avail >= length else avail + 1):
-            s = window[(bar_index - i) % capacity]
+            s = window[(bi - i) % capacity]
             if s > last_max:
                 last_max = s
                 last_max_index = i
@@ -796,13 +798,13 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
 
     max_index = last_max_index
 
-    if bar_index < length - 1:
+    if bi < length - 1:
         return na_float if not _tuple else (na_float, na_float)  # type: ignore[return-value]
 
     if _bars:
-        return -max_index
+        return float(-max_index)
     if _tuple:
-        return last_max, -max_index  # type: ignore[return-value]
+        return last_max, float(-max_index)  # type: ignore[return-value]
     return last_max
 
 
@@ -1037,6 +1039,8 @@ def lowest(source: Series[float], length: int,
     # An int-typed Pine value can still carry a fraction (``int / int``); the
     # truncation happens where an integer is required — see ``_check_type``.
     length = int(length)
+    # The bar clock addresses the ring: a Python int inside the machine
+    bi = int(bar_index)
     capacity: Persistent[int] = 0
     window: Persistent[list[float]] = []
     # See ``highest`` for the measured window law: a per-call-site buffer of
@@ -1046,7 +1050,7 @@ def lowest(source: Series[float], length: int,
         new_capacity = length + 1
         new_window: list[float] = [na_float] * new_capacity
         for j in builtins.range(capacity):
-            b = bar_index - ((bar_index - j) % capacity)
+            b = bi - ((bi - j) % capacity)
             new_window[b % new_capacity] = window[j]
         window = new_window
         capacity = new_capacity
@@ -1062,7 +1066,7 @@ def lowest(source: Series[float], length: int,
     # the rescan that lets a stale slot in fires on the same bar TradingView fires it
     # (see ``highest``). ``avail`` bounds the rescan to the slots since the last na
     # reset, on the same bar clock.
-    gap = bar_index - last_bar
+    gap = bi - last_bar
     if last_bar >= 0 and gap > 0:
         last_min_index += gap
         avail += gap
@@ -1070,8 +1074,8 @@ def lowest(source: Series[float], length: int,
         # back after a dip answers over the whole window immediately.
         if avail > capacity - 1:
             avail = capacity - 1
-    last_bar = bar_index
-    window[bar_index % capacity] = source
+    last_bar = bi
+    window[bi % capacity] = source
 
     # A na input resets the machine — window forgotten, next non-na call starts
     # fresh (see ``highest`` for the measured law).
@@ -1079,12 +1083,12 @@ def lowest(source: Series[float], length: int,
         last_min = na_float
         last_min_index = 0
         avail = 0
-        if bar_index < length - 1:
-            return na_float if not _tuple else (na_float, NA(int))  # type: ignore[return-value]
+        if bi < length - 1:
+            return na_float if not _tuple else (na_float, na_float)  # type: ignore[return-value]
         if _bars:
-            return 0
+            return 0.0
         if _tuple:
-            return na_float, 0  # type: ignore[return-value]
+            return na_float, 0.0  # type: ignore[return-value]
         return na_float
 
     if last_min > source or not (last_min == last_min) or (_check_eq and last_min == source):
@@ -1099,7 +1103,7 @@ def lowest(source: Series[float], length: int,
         last_min = source
         last_min_index = 0
         for i in builtins.range(1, length if avail >= length else avail + 1):
-            s = window[(bar_index - i) % capacity]
+            s = window[(bi - i) % capacity]
             if s < last_min:
                 last_min = s
                 last_min_index = i
@@ -1110,13 +1114,13 @@ def lowest(source: Series[float], length: int,
 
     min_index = last_min_index
 
-    if bar_index < length - 1:
-        return na_float if not _tuple else (na_float, NA(int))  # type: ignore[return-value]
+    if bi < length - 1:
+        return na_float if not _tuple else (na_float, na_float)  # type: ignore[return-value]
 
     if _bars:
-        return -min_index
+        return float(-min_index)
     if _tuple:
-        return last_min, -min_index  # type: ignore[return-value]
+        return last_min, float(-min_index)  # type: ignore[return-value]
     return last_min
 
 
@@ -1196,7 +1200,7 @@ def max(source: Series[float]) -> PyneFloat:
 # looks possibly-unbound because it is a series whose storage outlives the ``if``
 # that feeds it.
 # noinspection PyUnusedLocal,PyUnboundLocalVariable
-def median(source: Series[TFI], length: int) -> TFI:
+def median(source: Series[TFI], length: int) -> PyneFloat:
     """
     Calculate the median of the source series over a given period.
 
@@ -1306,7 +1310,8 @@ def median(source: Series[TFI], length: int) -> TFI:
     # Return median based on heap sizes
     if len(heap_low) > len(heap_high):
         return -heap_low[0]  # Max heap root
-    return -heap_low[0] if isinstance(source, int) else (-heap_low[0] + heap_high[0]) / 2  # type: ignore
+    # MEASURED: an int source gets the mean of the two middle values too (1.5 for 0,1,2,3)
+    return (-heap_low[0] + heap_high[0]) / 2
 
 
 def mfi(series: float, length: int) -> PyneFloat:
@@ -2462,7 +2467,7 @@ def supertrend(factor: float | int, atrPeriod: int) -> tuple[PyneFloat, PyneInt]
     prev_lower: Persistent[float] = na_float
     prev_upper: Persistent[float] = na_float
     prev_close: Persistent[float] = na_float
-    prev_direction: Persistent[int] = NA(int)
+    prev_direction: Persistent[int] = na_int
     prev_supertrend: Persistent[float] = na_float
 
     # Calculate base values

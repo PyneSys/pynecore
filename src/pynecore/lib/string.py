@@ -7,7 +7,7 @@ from math import isinf
 from datetime import datetime, UTC
 from decimal import Decimal, ROUND_HALF_UP, ROUND_HALF_EVEN, localcontext
 
-from ..types.na import NA, na_float
+from ..types.na import NA, na_float, na_int
 from ..types.pine_types import PyneFloat, PyneInt, PyneStr, PyneBool
 
 from ..types.format import Format
@@ -580,7 +580,7 @@ def format_time(time: int | NA[int], format: str | None = None,
     :return: Formatted time string, or na when ``time`` is na
     """
     # na timestamp formats to na (Pine na-propagation)
-    if isinstance(time, NA) or time is None:
+    if time is None or not (time == time):  # is_na_arg
         return NA(str)
 
     # Default format
@@ -597,14 +597,15 @@ def format_time(time: int | NA[int], format: str | None = None,
     return dt.strftime(py_fmt)
 
 
-def length(string: str) -> int:
+def length(string: str) -> PyneInt:
     """
     Returns an integer corresponding to the amount of chars in that string.
 
     :param string: String to get the length of
     :return: Amount of chars in the string
     """
-    return len(string)
+    # A Pine int is a double at runtime
+    return float(len(string))
 
 
 def lower(source: str) -> str:
@@ -663,8 +664,8 @@ def pos(source: str, str: str) -> PyneInt:
     """
     res = source.find(str)
     if res == -1:
-        return NA(int)
-    return res
+        return na_int
+    return float(res)
 
 
 # noinspection PyShadowingNames
@@ -684,7 +685,7 @@ def repeat(source: str, repeat: int, separator: str = '') -> PyneStr:
     # count evaluates through ``NA.__rmul__`` to na, and ``str.join(na)`` falls
     # back to the sequence protocol, which never terminates (NA.__getitem__
     # returns self for every index).
-    if isinstance(source, NA) or source is None or isinstance(repeat, NA) or repeat is None:
+    if isinstance(source, NA) or source is None or repeat is None or repeat != repeat:
         return NA(str)
     if repeat <= 0:
         return NA(str)

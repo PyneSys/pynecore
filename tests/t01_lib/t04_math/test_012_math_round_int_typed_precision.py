@@ -46,6 +46,7 @@ def __test_negative_float_precision_scales_up__():
 def __test_missing_precision_keeps_the_int_contract__():
     """Without a precision the one-argument overload still returns an int"""
     assert math.round(2.34567) == 2
-    assert isinstance(math.round(2.5), int)
+    # A Pine int is a double at runtime: the integral result is a float
+    assert math.round(2.5) == 3 and isinstance(math.round(2.5), float)
     # An explicit na precision is the same "not given"
     assert math.round(2.34567, NA(int)) == 2

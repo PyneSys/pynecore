@@ -114,7 +114,7 @@ if rich:
                 # Build row with styled Text objects
                 row = [
                     Text(time_str, style="log.time"),
-                    Text(f"bar: {lib.bar_index:6}", style="cyan"),
+                    Text(f"bar: {int(lib.bar_index):6}", style="cyan"),
                     level,
                     message_renderable,
                 ]
@@ -152,7 +152,7 @@ class PineLogFormatter(logging.Formatter):
 
         # Add bar_index to the time string
         if hasattr(lib, 'bar_index') and lib.bar_index is not None:
-            time_str = f"{time_str} bar: {lib.bar_index:6}"
+            time_str = f"{time_str} bar: {int(lib.bar_index):6}"
 
         return time_str
 
@@ -247,7 +247,7 @@ class SecurityFileFormatter(logging.Formatter):
 
         dt = _resolve_log_time(record)
         time_str = dt.strftime("%Y-%m-%d %H:%M:%S%z")
-        bar_str = f" bar: {lib.bar_index:6}" if hasattr(lib, 'bar_index') and lib.bar_index is not None else ""
+        bar_str = f" bar: {int(lib.bar_index):6}" if hasattr(lib, 'bar_index') and lib.bar_index is not None else ""
 
         return f"[{self.context_label}] [{time_str}]{bar_str} {record.levelname:<7} {msg}"
 

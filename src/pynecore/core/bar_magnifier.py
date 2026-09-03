@@ -18,7 +18,7 @@ from .aggregator import _merge_candles
 from .resampler import (
     Resampler, ObservedDayCounter, grid_mode, overnight_opens, trading_day,
 )
-from ..lib.timeframe import in_seconds, _process_tf
+from ..lib.timeframe import _in_seconds, _process_tf
 from ..types.ohlcv import OHLCV
 
 __all__ = ['BarMagnifier', 'MagnifiedWindow']
@@ -91,7 +91,7 @@ class BarMagnifier:
             # noinspection PyProtectedMember
             src_mod, _ = _process_tf(source_tf)
             if src_mod in ('', 'S'):
-                self._src_off = in_seconds(source_tf) - 1
+                self._src_off = _in_seconds(source_tf) - 1
                 # Intraday sub-bars carry the end instants the holiday half-day
                 # fold needs (a daily source stream is already folded).
                 self._fold = True

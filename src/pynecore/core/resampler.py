@@ -632,7 +632,7 @@ class Resampler:
     def _validate_timeframe(self) -> None:
         """Validate that the timeframe is supported."""
         try:
-            tf_module.in_seconds(self.timeframe)
+            tf_module._in_seconds(self.timeframe)
         except (ValueError, AssertionError) as e:
             raise ValueError(f"Invalid timeframe: {self.timeframe}") from e
 
@@ -701,7 +701,7 @@ class Resampler:
         current_time_sec = current_time_ms // 1000
 
         # Get timeframe in seconds
-        tf_seconds = tf_module.in_seconds(self.timeframe)
+        tf_seconds = tf_module._in_seconds(self.timeframe)
 
         # Calculate bar opening time based on timeframe type
         # noinspection PyProtectedMember

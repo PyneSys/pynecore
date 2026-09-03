@@ -7,9 +7,10 @@ import queue
 import threading
 from pathlib import Path
 from datetime import datetime, UTC
+from math import copysign as _copysign
 
 from pynecore.types.ohlcv import OHLCV
-from pynecore.types.na import NA
+from pynecore.types.na import NA, na_float
 
 DO_NOTHING = -1
 WRITE_TUPLE = 0
@@ -114,6 +115,17 @@ class CSVWriter:
             # branch representation-agnostic so both map to the same token.
             if not (x == x):
                 return "NaN"
+            if fast_repr and type(x) is float:
+                # An integral value prints as the integer, the way TradingView's
+                # export writes it ("14", "2451"): a Pine int is a double at
+                # runtime, so a bar index or a count arrives here as a float, and
+                # the float-typed Volume column shows TradingView does the same
+                # for every integral value. Beyond 2**53 a double has no
+                # fractional digits to drop, so the shortest repr stands.
+                if x.is_integer() and -9007199254740992.0 < x < 9007199254740992.0 and (
+                        x != 0.0 or _copysign(1.0, x) > 0.0):
+                    return repr(int(x))
+                return repr(x)
             return fmt.format(x)
 
         row = []
@@ -196,17 +208,11 @@ class CSVWriter:
 
                             # Format OHLCV values
                             ohlcv = (data.open, data.high, data.low, data.close, data.volume)
-                            if fast_repr:
-                                row.extend(repr(x) if type(x) is float and x == x else fmt_float(x)
-                                           for x in ohlcv)
-                            else:
-                                row.extend(fmt_float(x) for x in ohlcv)
+                            row.extend(fmt_float(x) for x in ohlcv)
                             # Format extra fields
                             if data.extra_fields:
                                 for value in data.extra_fields.values():
-                                    if fast_repr and type(value) is float:
-                                        row.append(repr(value) if value == value else "NaN")
-                                    elif isinstance(value, float):
+                                    if isinstance(value, float):
                                         row.append(fmt_float(value))
                                     elif isinstance(value, NA):
                                         row.append("NaN")
@@ -553,18 +559,14 @@ class CSVReader:
             try:
                 value = row[idx]
                 if value == "NaN" or value == "na" or value == "nan":
-                    extra[name] = NA()
+                    extra[name] = na_float
                 else:
                     try:
-                        # Try converting the value to an integer
-                        extra[name] = int(value)
+                        # A number is a double, the way every Pine number is
+                        extra[name] = float(value)
                     except ValueError:
-                        try:
-                            # Fallback to converting the value to a float
-                            extra[name] = float(value)
-                        except ValueError:
-                            # Value is not a valid numeric representation
-                            extra[name] = value
+                        # Value is not a valid numeric representation
+                        extra[name] = value
             except (ValueError, IndexError):
                 continue
         return extra

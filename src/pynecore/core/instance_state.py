@@ -179,7 +179,10 @@ def _make_state(layout: dict[str, Any]) -> list:
     state = list(layout['init'])
     compacted = layout.get('compacted', False)
     for slot, max_bars_back, elem in layout['series']:
-        state[slot] = SeriesImpl(max_bars_back, na_float if elem == 'float' else None, compacted)
+        # A numeric series keeps the native nan as its na; an int series also
+        # stores every value as a float (a Pine int is a double at runtime)
+        state[slot] = SeriesImpl(max_bars_back, na_float if elem in ('float', 'int') else None,
+                                 compacted, elem == 'int')
     # Trailing layout reference: slot addressing uses literal non-negative
     # indexes only, so the extra element is invisible to emitted code. It lets
     # a walker that meets a bare child state vector (fast-path slots hold the

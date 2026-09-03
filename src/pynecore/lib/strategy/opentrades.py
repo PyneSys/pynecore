@@ -1,4 +1,4 @@
-from ...types.na import NA, na_float
+from ...types.na import NA, na_float, na_int
 from ...types import PyneFloat, PyneInt, PyneStr
 from ... import lib
 
@@ -56,13 +56,13 @@ def entry_bar_index(trade_num: int) -> PyneInt:
     """
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
-        return NA(int)
+        return na_int
     try:
         assert lib._script is not None
         assert lib._script.position is not None
-        return lib._script.position.open_trades[trade_num].entry_bar_index
+        return float(lib._script.position.open_trades[trade_num].entry_bar_index)
     except (IndexError, AssertionError):
-        return NA(int)
+        return na_int
 
 
 # noinspection PyProtectedMember
@@ -134,13 +134,13 @@ def entry_time(trade_num: int) -> PyneInt:
     """
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
-        return NA(int)
+        return na_int
     try:
         assert lib._script is not None
         assert lib._script.position is not None
-        return lib._script.position.open_trades[trade_num].entry_time
+        return float(lib._script.position.open_trades[trade_num].entry_time)
     except (IndexError, AssertionError):
-        return NA(int)
+        return na_int
 
 
 # noinspection PyProtectedMember
@@ -280,16 +280,17 @@ def size(trade_num: int) -> PyneFloat:
 
 # noinspection PyProtectedMember
 @module_property
-def opentrades() -> int:
+def opentrades() -> PyneInt:
     """
     Number of market position entries, which were not closed and remain opened.
 
     :return: The number of open trades
     """
     if lib._script is None or lib._script.position is None:
-        return 0
+        return 0.0
     position = lib._script.position
-    return len(position.open_trades)
+    # A Pine int is a double at runtime
+    return float(len(position.open_trades))
 
 
 # noinspection PyProtectedMember

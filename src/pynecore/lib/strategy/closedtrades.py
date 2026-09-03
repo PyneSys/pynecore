@@ -1,4 +1,4 @@
-from ...types.na import NA, na_float
+from ...types.na import NA, na_float, na_int
 from ...types import PyneFloat, PyneInt, PyneStr
 from ... import lib
 
@@ -56,13 +56,13 @@ def entry_bar_index(trade_num: int) -> PyneInt:
     """
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
-        return NA(int)
+        return na_int
     try:
         assert lib._script is not None
         assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].entry_bar_index
+        return float(lib._script.position.closed_trades[trade_num].entry_bar_index)
     except (IndexError, AssertionError):
-        return NA(int)
+        return na_int
 
 
 # noinspection PyProtectedMember
@@ -134,13 +134,13 @@ def entry_time(trade_num: int) -> PyneInt:
     """
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
-        return NA(int)
+        return na_int
     try:
         assert lib._script is not None
         assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].entry_time
+        return float(lib._script.position.closed_trades[trade_num].entry_time)
     except (IndexError, AssertionError):
-        return NA(int)
+        return na_int
 
 
 # noinspection PyProtectedMember
@@ -153,13 +153,13 @@ def exit_bar_index(trade_num: int) -> PyneInt:
     """
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
-        return NA(int)
+        return na_int
     try:
         assert lib._script is not None
         assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].exit_bar_index
+        return float(lib._script.position.closed_trades[trade_num].exit_bar_index)
     except (IndexError, AssertionError):
-        return NA(int)
+        return na_int
 
 
 # noinspection PyProtectedMember
@@ -229,13 +229,13 @@ def exit_time(trade_num: int) -> PyneInt:
     """
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
-        return NA(int)
+        return na_int
     try:
         assert lib._script is not None
         assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].exit_time
+        return float(lib._script.position.closed_trades[trade_num].exit_time)
     except (IndexError, AssertionError):
-        return NA(int)
+        return na_int
 
 
 # noinspection PyProtectedMember
@@ -371,21 +371,22 @@ def size(trade_num: int) -> PyneFloat:
 
 # noinspection PyProtectedMember
 @module_property
-def closedtrades() -> int:
+def closedtrades() -> PyneInt:
     """
     Number of trades, which were closed for the whole trading range.
 
     :return: The number of closed trades
     """
     if lib._script is None or lib._script.position is None:
-        return 0
+        return 0.0
     position = lib._script.position
-    return len(position.closed_trades)
+    # A Pine int is a double at runtime
+    return float(len(position.closed_trades))
 
 
 # noinspection PyProtectedMember
 @module_property
-def first_index() -> int:
+def first_index() -> PyneInt:
     """
     The trade number of the oldest trade still listed in the List of Trades.
 
@@ -398,4 +399,4 @@ def first_index() -> int:
     # bars of a 2880-trade probe, including before the first trade closed. The
     # accessors index ``closed_trades`` directly, so PyneCore's head is always
     # trade 0 and the answer is the constant TradingView also reports.
-    return 0
+    return 0.0

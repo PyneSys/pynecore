@@ -257,9 +257,9 @@ class CurrencyRateProvider:
         :return: The bar length, or 0 when neither source can tell.
         """
         if declared:
-            from ..lib.timeframe import in_seconds
+            from ..lib.timeframe import _in_seconds
             try:
-                return in_seconds(declared) * 1000
+                return _in_seconds(declared) * 1000
             except (ValueError, AssertionError):
                 pass
         if len(timestamps) < 2:

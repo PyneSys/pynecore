@@ -418,7 +418,7 @@ def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None) -> "ast.M
     transformed = FunctionIsolationTransformer(slot_layout).visit(transformed)
     transformed = ScriptRequirementsTransformer().visit(transformed)
     transformed = InputTransformer().visit(transformed)
-    transformed = SafeConvertTransformer().visit(transformed)
+    transformed = SafeConvertTransformer(lib=pyne_mode == 'lib').visit(transformed)
     transformed = SafeDivisionTransformer().visit(transformed)
     # After SafeDivision so wrapped operands (safe_div calls) are bound
     # once by the walrus instead of evaluating twice. Only user/compiled

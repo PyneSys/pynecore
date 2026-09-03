@@ -4,7 +4,7 @@ from typing import TypeVar, Generic, Iterator, Callable, cast, overload
 from types import ModuleType
 
 # noinspection PyProtectedMember
-from ..types.na import NA
+from ..types.na import NA, na_float as _NAN
 
 __all__ = ['SeriesImpl', 'inline_series']
 
@@ -29,7 +29,7 @@ class SeriesImpl(Generic[T]):
     __slots__ = ('_buffer',
                  '_max_bars_back', '_max_bars_back_set',
                  '_capacity', '_write_pos', '_size',
-                 '_last_bar_index', '_na', '_compacted')
+                 '_last_bar_index', '_na', '_compacted', '_as_float')
 
     # MEASURED (probes m601/m602, BINANCE:BTCUSDT 30m): TradingView serves 5000 bars of
     # history for EVERY series — builtin, user-defined and ``ta.*`` output alike, under
@@ -42,15 +42,16 @@ class SeriesImpl(Generic[T]):
 
     # noinspection PyMissingConstructor
     def __init__(self, max_bars_back: int | None = None, na_value: T | None = None,
-                 compacted: bool = False):
+                 compacted: bool = False, as_float: bool = False):
         """
         :param max_bars_back: Optional initial capacity for historical lookback.
                               If not provided, DEFAULT_MAX_BARS_BACK is used.
                               The actual buffer capacity will be (max_bars_back + 1).
         :param na_value: The na sentinel returned for out-of-range reads.
-                         Float series pass the native nan here so a warmup /
-                         out-of-history read behaves exactly like every other
-                         float na; untyped series keep the interned NA object.
+                         Numeric (float and int) series pass the native nan
+                         here so a warmup / out-of-history read behaves exactly
+                         like every other numeric na; untyped series keep the
+                         interned NA object.
         :param compacted: History counts stored values instead of bars: a bar with
                           no :meth:`add` is simply absent rather than repeating the
                           previous value. Set for the rolling windows of the
@@ -58,6 +59,10 @@ class SeriesImpl(Generic[T]):
                           averages), which drop na bars on purpose so ``src[k]`` is
                           the k-th most recent non-na value — the window
                           TradingView's native builtins keep.
+        :param as_float: Store every value as a native float. Set for ``Series[int]``:
+                         a Pine int is a double at runtime, so an int series must
+                         not hand back the Python int a literal or a counter put
+                         in; a non-number (an na object) is stored as the nan.
         """
         # Importing the lib module here to avoid circular imports
         if not SeriesImpl._lib:
@@ -66,6 +71,7 @@ class SeriesImpl(Generic[T]):
 
         self._na: T | NA[T] = _NA_UNTYPED if na_value is None else na_value
         self._compacted = compacted
+        self._as_float = as_float
 
         self._max_bars_back = max_bars_back or self.DEFAULT_MAX_BARS_BACK
         self._max_bars_back_set = max_bars_back or 0
@@ -161,6 +167,9 @@ class SeriesImpl(Generic[T]):
         :param value: The new data to be added.
         :return: The same value that was added (for chaining or inline usage).
         """
+        if self._as_float:
+            value = float(value) if value == value else _NAN  # type: ignore[assignment]
+
         # Read the module attribute once: this runs for every series assignment
         # on every bar, and the three reads it replaces cannot see a different
         # value anyway — nothing between them advances the bar.
@@ -185,7 +194,7 @@ class SeriesImpl(Generic[T]):
         if missed > 0 and self._size > 0 and not self._compacted:
             fill = self._buffer[self._write_pos - 1]
             # Filling more than the whole buffer would only overwrite itself
-            for _ in range(missed if missed < self._capacity else self._capacity):
+            for _ in range(int(missed) if missed < self._capacity else self._capacity):
                 self._push(fill)
 
         # _push, inlined verbatim: this is THE per-bar write of every series in
@@ -239,6 +248,8 @@ class SeriesImpl(Generic[T]):
         """
         if self._size == 0:
             return self._na
+        if self._as_float:
+            value = float(value) if value == value else _NAN  # type: ignore[assignment]
 
         pos = self._write_pos - 1
         if pos < 0:
@@ -523,8 +534,6 @@ def _inline_series_instance(_pin: str | None = None) -> Callable[..., SeriesImpl
     series: SeriesImpl = SeriesImpl()
 
     def bound(value: T, idx: int) -> SeriesImpl[T]:
-        if isinstance(idx, float):
-            idx = int(idx)
         series.add(value)
         return cast(SeriesImpl[T], series[idx])
 
@@ -554,8 +563,6 @@ def inline_series(value: T, idx: int) -> SeriesImpl[T]:
     :param idx: The index, 0 is the last, 1 is the second last and so on
     :return:
     """
-    if isinstance(idx, float):
-        idx = int(idx)
     _inline_series_shared.add(value)
     return cast(SeriesImpl[T], _inline_series_shared[idx])
 

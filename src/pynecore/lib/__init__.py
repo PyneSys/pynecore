@@ -19,7 +19,7 @@ from pynecore.types.source import Source
 from ..core.module_property import module_property, module_function_property
 from ..core.script import script, input
 
-from ..types.na import NA
+from ..types.na import NA, na_int
 from ..types import Series, PyneInt
 from ..types.plot_meta import PlotMeta
 from . import syminfo  # This should be imported before core.datetime to avoid circular import!
@@ -98,8 +98,9 @@ DateStr: TypeAlias = str  # e.g. "2020-02-20", "20 Feb 2020"
 # Module variables
 #
 
-bar_index: Series[int] = 0
-last_bar_index: Series[int] = 0  # This always points to the bar_index
+# A Pine int is a double at runtime: the runner publishes these as floats
+bar_index: Series[int] = 0.0
+last_bar_index: Series[int] = 0.0  # This always points to the bar_index
 
 open: float = Source("open")  # noqa (shadowing built-in name (open) intentionally)
 high: float = Source("high")
@@ -134,7 +135,7 @@ _time: int = 0
 # the same peek to see an exchange's EARLY CLOSE, which no session schedule
 # carries (see ``core/security.py::_get_confirmed_time``).
 _next_time: int = 0
-last_bar_time: int = 0
+last_bar_time: PyneInt = 0.0
 
 # Datetime object in the exchange timezone
 _datetime: datetime = datetime.fromtimestamp(0, UTC)
@@ -202,17 +203,17 @@ def max_bars_back(var: Any, num: int) -> None:
 ### Date / Time ###
 
 # noinspection PyShadowingNames
-def _get_dt(time: int | None = None, timezone: str | None = None) -> datetime | NA[datetime]:
-    """ Get datetime object from time and timezone """
-    if isinstance(time, NA):
-        return time
+def _get_dt(time: int | float | None = None, timezone: str | None = None) -> datetime | None:
+    """ Get datetime object from time and timezone, None for an na time """
+    if time is not None and not (time == time):  # is_na_arg
+        return None
     dt = _datetime if time is None else datetime.fromtimestamp(time / 1000, UTC)
     assert dt is not None
     return dt.astimezone(_parse_timezone(timezone))
 
 
 @overload
-def timestamp(date_string: DateStr) -> int:  # It is more pythonic, but not supported by Pine Script
+def timestamp(date_string: DateStr) -> PyneInt:  # It is more pythonic, but not supported by Pine Script
     """
     Parse date string and return UNIX timestamp in milliseconds
 
@@ -226,12 +227,12 @@ def timestamp(date_string: DateStr) -> int:  # It is more pythonic, but not supp
     :return: UNIX timestamp in milliseconds
     """
     dt = _parse_datestring(date_string)
-    return int(dt.timestamp() * 1000)
+    return float(int(dt.timestamp() * 1000))
 
 
 # noinspection PyPep8Naming
 @overload
-def timestamp(dateString: DateStr) -> int:
+def timestamp(dateString: DateStr) -> PyneInt:
     """
     Parse date string and return UNIX timestamp in milliseconds
 
@@ -251,7 +252,7 @@ def timestamp(dateString: DateStr) -> int:
 # noinspection PyShadowingNames
 @overload
 def timestamp(timezone: TimezoneStr | None, year: int | float, month: int | float, day: int | float,
-              hour: int | float = 0, minute: int | float = 0, second: int | float = 0) -> int:
+              hour: int | float = 0, minute: int | float = 0, second: int | float = 0) -> PyneInt:
     """
     Create timestamp from date/time components with timezone:
     - timestamp("UTC-5", 2020, 2, 20, 15, 30)
@@ -315,7 +316,7 @@ def timestamp(timezone: TimezoneStr | None, year: int | float, month: int | floa
     dt = datetime(y, m, 1, tzinfo=tz) + timedelta(
         days=d - 1 + calendar_shift, seconds=second_of_day
     )
-    return int(dt.timestamp() * 1000) + cycles * _GREGORIAN_CYCLE_MS
+    return float(int(dt.timestamp() * 1000) + cycles * _GREGORIAN_CYCLE_MS)
 
 
 # noinspection PyShadowingNames
@@ -948,7 +949,7 @@ def __splits_tickerid(tickerid: str) -> str:
 
 # noinspection PyShadowingNames
 @module_function_property
-def dayofmonth(time: int | None = None, timezone: str | None = None) -> int:
+def dayofmonth(time: int | float | None = None, timezone: str | None = None) -> PyneInt:
     """
     Day of the month
 
@@ -956,12 +957,13 @@ def dayofmonth(time: int | None = None, timezone: str | None = None) -> int:
     :param timezone: The timezone of the time, if not specified the exchange timezone is used
     :return: The day of the month
     """
-    return _get_dt(time, timezone).day
+    dt = _get_dt(time, timezone)
+    return na_int if dt is None else float(dt.day)
 
 
 # noinspection PyShadowingNames
 @module_function_property
-def hour(time: int | None = None, timezone: str | None = None) -> int:
+def hour(time: int | float | None = None, timezone: str | None = None) -> PyneInt:
     """
     Hour of the day
 
@@ -969,12 +971,13 @@ def hour(time: int | None = None, timezone: str | None = None) -> int:
     :param timezone: The timezone of the time, if not specified the exchange timezone is used
     :return: The hour of the day
     """
-    return _get_dt(time, timezone).hour
+    dt = _get_dt(time, timezone)
+    return na_int if dt is None else float(dt.hour)
 
 
 # noinspection PyShadowingNames
 @module_function_property
-def minute(time: int | None = None, timezone: str | None = None) -> int:
+def minute(time: int | float | None = None, timezone: str | None = None) -> PyneInt:
     """
     Minute of the hour
 
@@ -982,12 +985,13 @@ def minute(time: int | None = None, timezone: str | None = None) -> int:
     :param timezone: The timezone of the time, if not specified the exchange timezone is used
     :return: The minute of the hour
     """
-    return _get_dt(time, timezone).minute
+    dt = _get_dt(time, timezone)
+    return na_int if dt is None else float(dt.minute)
 
 
 # noinspection PyShadowingNames
 @module_function_property
-def month(time: int | None = None, timezone: str | None = None) -> int:
+def month(time: int | float | None = None, timezone: str | None = None) -> PyneInt:
     """
     Month of the year
 
@@ -995,12 +999,13 @@ def month(time: int | None = None, timezone: str | None = None) -> int:
     :param timezone: The timezone of the time, if not specified the exchange timezone is used
     :return: The month of the year
     """
-    return _get_dt(time, timezone).month
+    dt = _get_dt(time, timezone)
+    return na_int if dt is None else float(dt.month)
 
 
 # noinspection PyShadowingNames
 @module_function_property
-def second(time: int | None = None, timezone: str | None = None) -> int:
+def second(time: int | float | None = None, timezone: str | None = None) -> PyneInt:
     """
     Second of the minute
 
@@ -1008,7 +1013,8 @@ def second(time: int | None = None, timezone: str | None = None) -> int:
     :param timezone: The timezone of the time, if not specified the exchange timezone is used
     :return: The second of the minute
     """
-    return _get_dt(time, timezone).second
+    dt = _get_dt(time, timezone)
+    return na_int if dt is None else float(dt.second)
 
 
 ### Session parsing and validation helpers ###
@@ -1606,7 +1612,7 @@ def _dg_on_roll(ts: float) -> None:
         _dg_tz = _parse_timezone(tz_name) if tz_name else None
         _dg_overnight = _overnight_opens(opening_hours, syminfo._session_starts)
         try:
-            chart_sec = timeframe_module.in_seconds(str(syminfo.period))
+            chart_sec = timeframe_module._in_seconds(str(syminfo.period))
             chart_mod, _ = timeframe_module._process_tf(str(syminfo.period))
         except (ValueError, AssertionError):
             chart_sec = 0
@@ -1703,7 +1709,7 @@ def _chart_span_off_ms() -> int:
         # noinspection PyProtectedMember
         chart_mod, _ = timeframe_module._process_tf(str(syminfo.period))
         if chart_mod in ('', 'S'):
-            return timeframe_module.in_seconds(str(syminfo.period)) * 1000 - 1
+            return timeframe_module._in_seconds(str(syminfo.period)) * 1000 - 1
     except (ValueError, AssertionError):
         pass
     return 0
@@ -1870,7 +1876,7 @@ def _requested_bar_time(resampler: Resampler, timeframe: str, modifier: str, mul
             return bar_time
         steps -= 1
         # The walk lands one instant before a resolved bar open rather than subtracting a
-        # nominal bar length, because a month is not a fixed span: taking in_seconds('M')
+        # nominal bar length, because a month is not a fixed span: taking _in_seconds('M')
         # (30.4375 days) off a bar early in the month reaches the month BEFORE the intended
         # one. ``_dwm_bar_time`` and ``_d_bar_time`` resolve a chart bar by its own last
         # instant, so the probe carries the same span back.
@@ -1911,13 +1917,14 @@ def time(timeframe: str | None = None, session: str | int | None = None,
                      and use the nominal bar length.
     :return: UNIX time in milliseconds or NA if bar is outside session or invalid parameters
     """
-    # Pine overload: time(timeframe, bars_back) -- an int second argument is a bar offset
-    if isinstance(session, int) and not isinstance(session, bool):
+    # Pine overload: time(timeframe, bars_back) -- a numeric second argument is a bar
+    # offset (a Pine int arrives as a float; bool is not a number here)
+    if isinstance(session, (int, float)) and not isinstance(session, bool):
         bars_back = session
         session = None
 
     if timeframe is None:
-        return _time
+        return float(_time)
 
     # An empty string selects the chart's timeframe
     if timeframe == '':
@@ -1928,7 +1935,7 @@ def time(timeframe: str | None = None, session: str | int | None = None,
         resampler = Resampler.get_resampler(timeframe)
     except ValueError:
         # Invalid timeframe
-        return NA(int)
+        return na_int
 
     # Get the current bar time for the requested timeframe
     current_time_ms = _time
@@ -1937,44 +1944,44 @@ def time(timeframe: str | None = None, session: str | int | None = None,
     if bars_back or timeframe_bars_back < 0:
         try:
             if bars_back:
-                current_time_ms -= bars_back * timeframe_module.in_seconds(str(syminfo.period)) * 1000
+                current_time_ms -= bars_back * timeframe_module._in_seconds(str(syminfo.period)) * 1000
             if timeframe_bars_back < 0:
                 # A future bar has no grid to walk yet, so its nominal length is used
-                current_time_ms -= timeframe_bars_back * timeframe_module.in_seconds(timeframe) * 1000
+                current_time_ms -= timeframe_bars_back * timeframe_module._in_seconds(timeframe) * 1000
         except (ValueError, AssertionError):
-            return NA(int)
+            return na_int
     bar_time = _requested_bar_time(resampler, timeframe, modifier, multiplier,
                                    current_time_ms, timeframe_bars_back)
 
     if session is None:
         # No session specified, return the bar time
-        return bar_time
+        return float(bar_time)
     if not isinstance(session, str):
         # A bool slips past the int(bars_back) overload guard (bool is an int):
         # it is not a valid session specification.
-        return NA(int)
+        return na_int
 
     # Parse session string
     try:
         session_infos = _parse_session_string(session, timezone)
     except ValueError:
         # Invalid session string
-        return NA(int)
+        return na_int
 
     # Resolve the session bar this call reports (see _session_bar_bounds)
     try:
         bounds = _session_bar_bounds(current_time_ms, session_infos, modifier, multiplier,
                                      bar_time, bar_time, max(timeframe_bars_back, 0))
         if bounds is None:
-            return NA(int)
-        return bounds[0]
+            return na_int
+        return float(bounds[0])
     except TimezoneNotFoundError:
         # A missing/unresolvable timezone is a configuration error: surface it with
         # the actionable message instead of silently treating every bar as closed.
         raise
     except Exception:  # noqa
         # Error during session validation
-        return NA(int)
+        return na_int
 
 
 # Pinned ``timenow`` for a bounded historical replay, Unix milliseconds; ``0``
@@ -2003,9 +2010,9 @@ def timenow():
     :return: Current time in milliseconds
     """
     if _timenow_ms:
-        return _timenow_ms
+        return float(_timenow_ms)
     # Get current UTC time and convert to milliseconds since Unix epoch
-    return int(datetime.now(UTC).timestamp() * 1000)
+    return float(int(datetime.now(UTC).timestamp() * 1000))
 
 
 # ``time_tradingday`` cache. The strategy engine calls the property on every bar
@@ -2054,13 +2061,13 @@ def time_tradingday() -> PyneInt:
         # Session structure changed — rebuild the per-weekday table of overnight
         # session opens (the only entries that can roll the trading day).
         _ttd_overnight_by_wd = _overnight_starts_by_weekday(opening_hours)
-        _ttd_period_delta = timedelta(seconds=timeframe_module.in_seconds(period))
+        _ttd_period_delta = timedelta(seconds=timeframe_module._in_seconds(period))
         _ttd_session_hours = opening_hours
         _ttd_session_period = period
         _ttd_memo_dt = None
 
     if _datetime is _ttd_memo_dt:
-        return _ttd_memo_result
+        return float(_ttd_memo_result)
 
     local_dt = _datetime  # already expressed in the exchange timezone
     trade_date = local_dt.date()
@@ -2087,7 +2094,7 @@ def time_tradingday() -> PyneInt:
     result = (trade_date.toordinal() - _EPOCH_ORDINAL) * 86_400_000
     _ttd_memo_dt = local_dt
     _ttd_memo_result = result
-    return result
+    return float(result)
 
 
 # Trading-day close cap for ``time_close``. TradingView closes a bar at
@@ -2209,8 +2216,9 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
                      and use the nominal bar length.
     :return: UNIX time in milliseconds of bar close or NA if bar is outside session or invalid parameters
     """
-    # Pine overload: time_close(timeframe, bars_back) -- an int second argument is a bar offset
-    if isinstance(session, int) and not isinstance(session, bool):
+    # Pine overload: time_close(timeframe, bars_back) -- a numeric second argument is a
+    # bar offset (a Pine int arrives as a float; bool is not a number here)
+    if isinstance(session, (int, float)) and not isinstance(session, bool):
         bars_back = session
         session = None
 
@@ -2218,14 +2226,14 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
         # Close time of the current chart bar — capped at the trading-day end,
         # because the last bar of a session may be shortened
         try:
-            close_ms = _time + timeframe_module.in_seconds(str(syminfo.period)) * 1000
+            close_ms = _time + timeframe_module._in_seconds(str(syminfo.period)) * 1000
             # noinspection PyProtectedMember
             chart_mod, chart_mult = timeframe_module._process_tf(str(syminfo.period))
         except (ValueError, AssertionError):
-            return NA(int)
+            return na_int
         if chart_mod in ('', 'S') or (chart_mod == 'D' and chart_mult == 1):
             close_ms = _tdc_cap_ms(_time, close_ms)
-        return close_ms
+        return float(close_ms)
 
     # An empty string selects the chart's timeframe
     if timeframe == '':
@@ -2236,7 +2244,7 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
         resampler = Resampler.get_resampler(timeframe)
     except ValueError:
         # Invalid timeframe
-        return NA(int)
+        return na_int
 
     # Get the current bar time for the requested timeframe
     current_time_ms = _time
@@ -2245,21 +2253,21 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
     if bars_back or timeframe_bars_back < 0:
         try:
             if bars_back:
-                current_time_ms -= bars_back * timeframe_module.in_seconds(str(syminfo.period)) * 1000
+                current_time_ms -= bars_back * timeframe_module._in_seconds(str(syminfo.period)) * 1000
             if timeframe_bars_back < 0:
                 # A future bar has no grid to walk yet, so its nominal length is used
-                current_time_ms -= timeframe_bars_back * timeframe_module.in_seconds(timeframe) * 1000
+                current_time_ms -= timeframe_bars_back * timeframe_module._in_seconds(timeframe) * 1000
         except (ValueError, AssertionError):
-            return NA(int)
+            return na_int
     bar_start_time = _requested_bar_time(resampler, timeframe, modifier, multiplier,
                                          current_time_ms, timeframe_bars_back)
 
     # Calculate bar close time by adding timeframe duration
     try:
-        tf_seconds = timeframe_module.in_seconds(timeframe)
+        tf_seconds = timeframe_module._in_seconds(timeframe)
         bar_close_time = bar_start_time + (tf_seconds * 1000)  # Convert to milliseconds
     except (ValueError, AssertionError):
-        return NA(int)
+        return na_int
 
     if modifier in ('', 'S') or (modifier == 'D' and multiplier == 1):
         # TradingView closes the (possibly shortened) last bar of the day at
@@ -2269,18 +2277,18 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
 
     if session is None:
         # No session specified, return the bar close time
-        return bar_close_time
+        return float(bar_close_time)
     if not isinstance(session, str):
         # A bool slips past the int(bars_back) overload guard (bool is an int):
         # it is not a valid session specification.
-        return NA(int)
+        return na_int
 
     # Parse session string
     try:
         session_infos = _parse_session_string(session, timezone)
     except ValueError:
         # Invalid session string
-        return NA(int)
+        return na_int
 
     # Resolve the session bar this call reports (see _session_bar_bounds)
     try:
@@ -2288,20 +2296,20 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
                                      bar_start_time, bar_close_time,
                                      max(timeframe_bars_back, 0))
         if bounds is None:
-            return NA(int)
-        return bounds[1]
+            return na_int
+        return float(bounds[1])
     except TimezoneNotFoundError:
         # A missing/unresolvable timezone is a configuration error: surface it with
         # the actionable message instead of silently treating every bar as closed.
         raise
     except Exception:  # noqa
         # Error during session validation
-        return NA(int)
+        return na_int
 
 
 # noinspection PyShadowingNames
 @module_function_property
-def weekofyear(time: int | None = None, timezone: str | None = None) -> int:
+def weekofyear(time: int | float | None = None, timezone: str | None = None) -> PyneInt:
     """
     Week of the year
 
@@ -2309,12 +2317,13 @@ def weekofyear(time: int | None = None, timezone: str | None = None) -> int:
     :param timezone: The timezone of the time, if not specified the exchange timezone is used
     :return: The week of the year
     """
-    return _get_dt(time, timezone).isocalendar()[1]
+    dt = _get_dt(time, timezone)
+    return na_int if dt is None else float(dt.isocalendar()[1])
 
 
 # noinspection PyShadowingNames
 @module_function_property
-def year(time: int | None = None, timezone: str | None = None) -> int:
+def year(time: int | float | None = None, timezone: str | None = None) -> PyneInt:
     """
     Year
 
@@ -2322,4 +2331,5 @@ def year(time: int | None = None, timezone: str | None = None) -> int:
     :param timezone: The timezone of the time, if not specified the exchange timezone is used
     :return: The year
     """
-    return _get_dt(time, timezone).year
+    dt = _get_dt(time, timezone)
+    return na_int if dt is None else float(dt.year)

@@ -102,7 +102,8 @@ class SeriesTransformer(ast.NodeTransformer):
 
         :param var_name: Source-level variable name.
         :param elem: Statically known element type name from the ``Series[T]``
-            annotation (``'float'`` selects the native-nan na value), or None.
+            annotation (``'float'`` and ``'int'`` select the native-nan na value,
+            ``'int'`` also stores every value as a float), or None.
         :return: The allocated slot index.
         """
         slot = self.layout.scope(self.current_scope).add_series(
@@ -124,17 +125,19 @@ class SeriesTransformer(ast.NodeTransformer):
     def _series_elem(annotation: ast.expr) -> str | None:
         """Element type name of a ``Series[T]`` annotation, if statically known.
 
-        Only ``'float'`` is meaningful downstream (it selects the native nan
-        as the series' na value); everything else — bare ``Series``, other
-        element types, complex annotations — yields None.
+        Only the numeric names are meaningful downstream: both select the
+        native nan as the series' na value, and ``'int'`` additionally makes
+        the series store every value as a float (a Pine int is a double at
+        runtime). Everything else — bare ``Series``, other element types,
+        complex annotations — yields None.
 
         :param annotation: The (Series) type annotation.
-        :return: ``'float'`` for ``Series[float]``, otherwise None.
+        :return: ``'float'`` or ``'int'`` for those element types, otherwise None.
         """
         if (isinstance(annotation, ast.Subscript)
                 and isinstance(annotation.slice, ast.Name)
-                and annotation.slice.id == 'float'):
-            return 'float'
+                and annotation.slice.id in ('float', 'int')):
+            return annotation.slice.id
         return None
 
     # --- visitors --------------------------------------------------------

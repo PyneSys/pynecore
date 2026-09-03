@@ -1635,23 +1635,6 @@
    "kind": "value",
    "ty": "c"
   },
-  "chart.in_seconds": {
-   "default_none_ok": [
-    true
-   ],
-   "default_ty": [
-    "0"
-   ],
-   "defaults": 1,
-   "kind": "function",
-   "names": [
-    "timeframe"
-   ],
-   "params": [
-    "s"
-   ],
-   "ret": "i"
-  },
   "chart.is_heikinashi": {
    "kind": "value",
    "ty": "b"
@@ -7801,7 +7784,7 @@
     "?",
     "i"
    ],
-   "ret": "?"
+   "ret": "f"
   },
   "ta.mfi": {
    "defaults": 0,

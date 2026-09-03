@@ -1,7 +1,7 @@
 """
 @pyne
 """
-__pyne_slot_layout__ = {'main': {'init': (1,), 'series': (), 'varip': (), 'children': (), 'names': ('p',)}, 'main·test': {'init': (1,), 'series': (), 'varip': (), 'children': (), 'names': ('p',)}}
+__pyne_slot_layout__ = {'main': {'init': (1.0,), 'series': (), 'varip': (), 'children': (), 'names': ('p',)}, 'main·test': {'init': (1.0,), 'series': (), 'varip': (), 'children': (), 'names': ('p',)}}
 
 def main(__state·main__):
     __state·main__[0] += 1

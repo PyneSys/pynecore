@@ -7,9 +7,9 @@ __all__ = [
 
 T = TypeVar('T')
 
-# The one float na: Pine's float-typed na IS a native IEEE-754 nan.
+# The one numeric na: Pine's float- and int-typed na IS a native IEEE-754 nan.
 # Interned so identity-based fast paths (dict key lookup, ``is`` checks)
-# always see the same object when the na came from ``NA(float)``.
+# always see the same object when the na came from ``NA(float)`` or ``NA(int)``.
 _NAN = float('nan')
 
 
@@ -39,16 +39,18 @@ def isna_num(x: Any) -> bool:
 
 class NA(Generic[T]):
     """
-    Class representing NA (Not Available) values for non-float types.
+    Class representing NA (Not Available) values for non-numeric types.
 
-    ``NA(float)`` does NOT construct an instance: it returns the interned
-    native ``float('nan')`` — Pine's float na is a real IEEE-754 nan, so
-    arithmetic and comparisons on it run at native float speed. This shim in
-    ``__new__`` is a permanent compatibility contract: every already-compiled
-    script calling ``NA(float)`` (and the ``na(float)`` constructor face)
+    ``NA(float)`` and ``NA(int)`` do NOT construct an instance: they return the
+    interned native ``float('nan')``. Pine's ``int`` is a static type only --
+    at runtime every number is a double, and so is its na -- so a numeric na
+    is a real IEEE-754 nan and arithmetic and comparisons on it run at native
+    float speed. This shim in ``__new__`` is a permanent compatibility
+    contract: every already-compiled script calling ``NA(float)`` or
+    ``NA(int)`` (and the ``na(float)`` / ``na(int)`` constructor faces)
     transparently produces the native nan.
 
-    All other types (int, str, drawing objects, UDTs, ...) get interned NA
+    All other types (str, bool, drawing objects, UDTs, ...) get interned NA
     instances: every operation returns self, every comparison is False.
     """
     __slots__ = ('type',)
@@ -57,7 +59,7 @@ class NA(Generic[T]):
 
     # noinspection PyShadowingBuiltins
     def __new__(cls, type: Type[T] | T | None = int) -> Self:
-        if type is float:
+        if type is float or type is int:
             return _NAN  # type: ignore[return-value]
         try:
             return cls._type_cache[type]  # type: ignore[reportReturnType]
@@ -73,6 +75,11 @@ class NA(Generic[T]):
         The default type is int.
         """
         self.type = type
+
+    def __reduce__(self) -> tuple:
+        # Pickle rebuilds through ``__new__(cls)`` otherwise, and the default
+        # type there is int -- which is the native nan, not an NA object
+        return NA, (self.type,)
 
     def __repr__(self) -> str:
         if self.type is None:
@@ -233,6 +240,6 @@ class NA(Generic[T]):
 
 
 na_float: float = _NAN
-na_int = NA(int)
+na_int: float = _NAN
 na_str = NA(str)
 na_bool = NA(bool)

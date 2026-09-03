@@ -3,7 +3,7 @@ import builtins
 import math
 
 from ..core import fdlibm, pine_math
-from ..types.na import NA, na_float
+from ..types.na import NA, na_float, na_int
 from ..types import PyneFloat, PyneInt
 
 from . import syminfo
@@ -125,8 +125,9 @@ def ceil(number: TFI | NA[TFI]) -> PyneInt:
     :return: The smallest integer greater than or equal to the number.
     """
     if not (number == number):  # is_na_arg
-        return NA(int)
-    return math.ceil(number)
+        return na_int
+    # A Pine int is a double at runtime: the integral result travels as a float
+    return float(math.ceil(number))
 
 
 def cos(angle: TFI | NA[TFI]) -> PyneFloat:
@@ -164,9 +165,10 @@ def floor(number: TFI | NA[TFI]) -> PyneInt:
     :return: The largest integer less than or equal to the number.
     """
     if not (number == number):  # is_na_arg
-        return NA(int)
-    # int() truncates toward zero; Pine's floor is a true floor (floor(-1.2) == -2)
-    return math.floor(number)
+        return na_int
+    # int() truncates toward zero; Pine's floor is a true floor (floor(-1.2) == -2).
+    # A Pine int is a double at runtime: the integral result travels as a float
+    return float(math.floor(number))
 
 
 def log(number: TFI | NA[TFI]) -> PyneFloat:
@@ -195,27 +197,18 @@ def log10(number: TFI | NA[TFI]) -> PyneFloat:
 
 def _na_of_operands(numbers: tuple[TFI | NA[TFI], ...]) -> PyneFloat:
     """
-    Return the na matching the operands' numeric contract: na_float when any
-    type-carrying operand is float-like, NA(int) when the type-carrying operands
-    are all int-like, the typeless na when no operand carries a type at all.
-    Typeless na operands are neutral — they must not push an int contract to float.
+    Return the na matching the operands' numeric contract: the typeless na when
+    no operand carries a type at all, the numeric na otherwise.
+
+    Pine's int is a static type only, so an int-typed na and a float-typed na
+    are the same native nan at runtime; only the typeless ``na`` (an ``NA``
+    with no type) is distinct, and it must stay typeless so it does not push
+    a contract on the caller.
     """
-    saw_typed = False
     for n in numbers:
-        if n != n:
-            # A native nan is a float-typed na by definition
+        if n == n or not isinstance(n, NA) or n.type is not None:
             return na_float
-        if isinstance(n, NA):
-            if n.type is None:
-                continue
-            saw_typed = True
-            if n.type is not int:
-                return na_float
-        else:
-            saw_typed = True
-            if not isinstance(n, int):
-                return na_float
-    return NA(int) if saw_typed else NA(None)
+    return NA(None)
 
 
 # noinspection PyShadowingBuiltins
@@ -317,7 +310,7 @@ def round(number: TFI | NA[TFI], precision: PyneInt) -> PyneFloat: ...
 
 
 # noinspection PyShadowingBuiltins
-def round(number: TFI | NA[TFI], precision: PyneInt = NA(int)) -> PyneFloat:
+def round(number: TFI | NA[TFI], precision: PyneInt = na_int) -> PyneFloat:
     """
     Returns a number rounded to a specified number of decimal places.
 
@@ -332,12 +325,12 @@ def round(number: TFI | NA[TFI], precision: PyneInt = NA(int)) -> PyneFloat:
     has_precision = precision == precision  # is_na_arg (inverted)
     if not (number == number):  # is_na_arg
         # No precision means the int contract (first overload), so an int-typed na
-        return na_float if has_precision else NA(int)
+        return na_float if has_precision else na_int
     if not math.isfinite(number):
         # Pine has no non-finite values (1/0 is na); the precision overload keeps
         # builtins.round() behavior (returns the float unchanged), but the
         # one-argument overload must honor its int contract, so it yields an int na
-        return cast(float, number) if has_precision else NA(int)
+        return cast(float, number) if has_precision else na_int
     # TV rounds the EXACT binary value of the double scaled by 10**precision, with
     # ties going away from zero and a 1e-10 absolute tolerance on that scaled value
     # -- the same slack its relational operators carry. Measured on BINANCE:BTCUSDT
@@ -371,7 +364,8 @@ def round(number: TFI | NA[TFI], precision: PyneInt = NA(int)) -> PyneFloat:
     if remainder * tie_scale >= tie_half * denominator:
         units += 1
     if not has_precision:
-        return -units if negative else units
+        # A Pine int is a double at runtime: the integral result travels as a float
+        return float(-units if negative else units)
     value = units / 10.0 ** p if p >= 0 else units * 10.0 ** -p
     return -value if negative else value
 
@@ -409,8 +403,9 @@ def round_to_mintick(number: PyneFloat | PyneInt) -> PyneFloat:
     slack = 1e-6 + scaled * 1.8e-15
     if -slack < offset < slack:
         numerator, denominator = float(magnitude).as_integer_ratio()
-        numerator *= pricescale
-        denominator *= minmove
+        # The tick pair is a Pine int (a double); the exact product needs the native ints
+        numerator *= builtins.int(pricescale)
+        denominator *= builtins.int(minmove)
         units, remainder = divmod(numerator, denominator)
         if remainder * _ROUND_TIE_SCALE >= _ROUND_TIE_HALF * denominator:
             units += 1

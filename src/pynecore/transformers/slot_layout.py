@@ -88,7 +88,7 @@ class _Slot:
     name: str  # debug name for the layout 'names' tuple
     init: ast.expr  # template expression for the layout 'init' tuple
     max_bars_back: ast.expr | None = None  # series slots only
-    series_elem: str | None = None  # series slots only: element type name ('float') or None
+    series_elem: str | None = None  # series slots only: element type name ('float'/'int') or None
     call_id: str | None = None  # child/anchor slots only
     in_loop: bool = False  # child slots only
     varip: bool = False  # var and flag slots only
@@ -140,8 +140,9 @@ class ScopeLayout:
         :param name: Source-level variable name (debug only).
         :param max_bars_back: Expression for the series' ``max_bars_back`` argument.
         :param elem: Element type name from the ``Series[T]`` annotation when it
-            is statically known (currently only ``'float'`` matters: those
-            series get the native nan as their out-of-range na value).
+            is statically known (``'float'`` and ``'int'`` matter: those series
+            get the native nan as their out-of-range na value, and an int series
+            stores every value as a float).
         :return: The allocated slot index.
         """
         return self._add(_Slot(len(self.slots), 'series', name, ast.Constant(value=None),

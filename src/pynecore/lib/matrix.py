@@ -3,7 +3,8 @@ from typing import Any
 
 from ..core.module_property import module_property
 from ..types.matrix import Matrix
-from ..types.na import NA, na_float
+from ..types.na import NA, na_float, na_int
+from ..types.pine_types import PyneInt
 from . import array as _array
 
 _registry: list[Matrix] = []
@@ -141,7 +142,7 @@ def col(id: Matrix | NA, column: int) -> list[Any] | NA:
 
 
 # noinspection PyShadowingBuiltins
-def columns(id: Matrix | NA) -> int | NA:
+def columns(id: Matrix | NA) -> PyneInt:
     """
     Return the number of columns in the matrix.
 
@@ -149,8 +150,9 @@ def columns(id: Matrix | NA) -> int | NA:
     :return: The number of columns.
     """
     if isinstance(id, NA):
-        return NA(int)
-    return id.cols
+        return na_int
+    # A Pine int is a double at runtime
+    return float(id.cols)
 
 
 # noinspection PyShadowingBuiltins
@@ -221,7 +223,7 @@ def eigenvectors(id: Matrix | NA) -> Matrix | NA:
 
 
 # noinspection PyShadowingBuiltins
-def elements_count(id: Matrix | NA) -> int | NA:
+def elements_count(id: Matrix | NA) -> PyneInt:
     """
     Return the total number of all matrix elements.
 
@@ -229,8 +231,9 @@ def elements_count(id: Matrix | NA) -> int | NA:
     :return: The total number of elements.
     """
     if isinstance(id, NA):
-        return NA(int)
-    return id.elements_count()
+        return na_int
+    # A Pine int is a double at runtime
+    return float(id.elements_count())
 
 
 # noinspection PyShadowingBuiltins
@@ -528,7 +531,7 @@ def pow(id: Matrix | NA, power: int) -> Matrix | NA:
 
 
 # noinspection PyShadowingBuiltins
-def rank(id: Matrix | NA) -> int | NA:
+def rank(id: Matrix | NA) -> PyneInt:
     """
     Calculate the rank of the matrix.
 
@@ -536,8 +539,9 @@ def rank(id: Matrix | NA) -> int | NA:
     :return: The rank of the matrix.
     """
     if isinstance(id, NA):
-        return NA(int)
-    return id.rank()
+        return na_int
+    # A Pine int is a double at runtime
+    return float(id.rank())
 
 
 # noinspection PyShadowingBuiltins
@@ -615,7 +619,7 @@ def row(id: Matrix | NA, row: int) -> list[Any] | NA:
 
 
 # noinspection PyShadowingBuiltins
-def rows(id: Matrix | NA) -> int | NA:
+def rows(id: Matrix | NA) -> PyneInt:
     """
     Return the number of rows in the matrix.
 
@@ -623,8 +627,9 @@ def rows(id: Matrix | NA) -> int | NA:
     :return: The number of rows.
     """
     if isinstance(id, NA):
-        return NA(int)
-    return id.rows
+        return na_int
+    # A Pine int is a double at runtime
+    return float(id.rows)
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames

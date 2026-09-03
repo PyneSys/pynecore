@@ -1,7 +1,7 @@
 """
 @pyne
 """
-__pyne_slot_layout__ = {'main': {'init': (1, None, False), 'series': (), 'varip': (), 'children': (), 'names': ('p1', 'p2', 'p2·flag')}}
+__pyne_slot_layout__ = {'main': {'init': (1.0, None, False), 'series': (), 'varip': (), 'children': (), 'names': ('p1', 'p2', 'p2·flag')}}
 
 def main(__state__):
     if not __state__[2]:

@@ -17,6 +17,7 @@ from pynecore.core.broker.models import ScriptRequirements
 from pynecore.types import script_type as _script_type
 from pynecore.types.color import Color
 from pynecore.types import PyneFloat, PyneInt
+from pynecore.types.na import na_float
 
 __all__ = ['script', 'input']
 
@@ -571,7 +572,12 @@ class _Input:
             group=group,
             display=display,
         )
-        return defval if _id not in _old_input_values else _old_input_values[_id]
+        # A Pine int is a double at runtime: the generic face hands an int input
+        # back the way ``input.int`` does
+        if _id in _old_input_values:
+            value = _old_input_values[_id]
+            return safe_convert.safe_int(value) if input_type == 'int' else value
+        return float(defval) if input_type == 'int' else defval
 
     # Pine's numeric inputs have TWO positional overloads after ``title``: the
     # minval/maxval/step form and the options form. A single Python parameter
@@ -654,7 +660,10 @@ class _Input:
             options=kwargs.get('options'),
             display=kwargs.get('display'),
         )
-        return defval if _id not in _old_input_values else safe_convert.safe_int(_old_input_values[_id])
+        if _id in _old_input_values:
+            return safe_convert.safe_int(_old_input_values[_id])
+        # A Pine int is a double at runtime
+        return float(defval) if defval == defval else na_float
 
     # noinspection PyUnusedLocal
     @classmethod

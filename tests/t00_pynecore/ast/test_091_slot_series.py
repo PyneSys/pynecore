@@ -71,14 +71,15 @@ def main(x):
 ''')
     layout = ns['__pyne_slot_layout__']['main']
     assert layout['init'] == (None,)
-    assert layout['series'] == ((0, None, None),)
+    # An int series stores floats (a Pine int is a double at runtime)
+    assert layout['series'] == ((0, None, 'int'),)
     assert layout['names'] == ('s',)
     state = _make_state(layout)
     assert isinstance(state[0], SeriesImpl)
     with _bars() as next_bar:
         value, prev = ns['main'](state, 10)
         assert value == 10
-        assert isinstance(prev, NA)
+        assert prev != prev  # na: an int series stores floats, its na is the nan
         next_bar()
         value, prev = ns['main'](state, 20)
         assert (value, prev) == (20, 10)

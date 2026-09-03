@@ -158,8 +158,12 @@ def __test_na_scalar_takes_the_type_it_was_declared_with__():
     """ A typed na scalar dispatches on its declared type """
     # Measured on TradingView: `int naI = na` answers from the int overload,
     # `float naF = na` from the float one, and a float na against an int-only
-    # parameter is a compile error (CE10123) -- float never narrows to int
-    assert _scalar(na(int)) == 2
+    # parameter is a compile error (CE10123) -- float never narrows to int.
+    # That int-ness is a STATIC fact: at runtime a Pine int na is the native
+    # nan, indistinguishable from a float na, so an unpinned call answers from
+    # the float overload; the type pass pins the int overload where the
+    # declaration says int (see the pin tests)
+    assert _scalar(na(int)) == 1
     assert _only_float(na(int)) == 9
 
 

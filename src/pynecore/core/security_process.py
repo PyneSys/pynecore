@@ -141,7 +141,7 @@ def _run_rate_source_loop(
     from .plugin.live_provider import LiveProviderPlugin
     from .live_runner import download_warmup_in_memory, LiveBarStreamer
     from .security_shm import write_result, write_na
-    from pynecore.lib.timeframe import in_seconds
+    from pynecore.lib.timeframe import _in_seconds
     from pynecore.lib import _parse_timezone
 
     provider_cls = load_plugin(data_source.provider_name)
@@ -169,7 +169,7 @@ def _run_rate_source_loop(
 
     tz = _parse_timezone(syminfo.timezone)
 
-    tf_seconds = in_seconds(data_source.timeframe)
+    tf_seconds = _in_seconds(data_source.timeframe)
     time_to = datetime.now(UTC)
     if data_source.time_from is not None:
         time_from = data_source.time_from
@@ -502,7 +502,7 @@ def security_process_main(
         from .plugin import load_plugin
         from .plugin.live_provider import LiveProviderPlugin
         from .live_runner import download_warmup_in_memory, LiveBarStreamer
-        from pynecore.lib.timeframe import in_seconds
+        from pynecore.lib.timeframe import _in_seconds
 
         provider_cls = load_plugin(data_source.provider_name)
         if not issubclass(provider_cls, LiveProviderPlugin):
@@ -529,7 +529,7 @@ def security_process_main(
         else:
             syminfo = live_provider.update_symbol_info()
 
-        tf_seconds = in_seconds(data_source.timeframe)
+        tf_seconds = _in_seconds(data_source.timeframe)
         # Mirror ``live_runner.bar_grace`` — 15..30s tracks how long an
         # exchange typically lags between bar close and WS publish, scaled
         # to the bar period (sub-15s windows would race against jitter).
@@ -615,8 +615,8 @@ def security_process_main(
 
     real_index_map: list[int] | None = None
     if reader is not None and is_legacy_feed and not is_ltf:
-        from pynecore.lib.timeframe import in_seconds
-        if in_seconds(syminfo.period) > 0:
+        from pynecore.lib.timeframe import _in_seconds
+        if _in_seconds(syminfo.period) > 0:
             # Mirror ``read_from(skip_gaps=True)`` exactly: a gap is ``volume < 0``
             # (the legacy -1 fill). ``>= 0`` would also drop NaN-volume real bars
             # (no-volume instruments import as ``volume == na``), which the reader keeps.
@@ -913,12 +913,12 @@ def security_process_main(
     _ltf_round: 'Callable[[int], None] | None' = None
     if (is_ltf and live_streamer is not None
             and isinstance(data_source, PluginSymbol)):
-        from pynecore.lib.timeframe import in_seconds
+        from pynecore.lib.timeframe import _in_seconds
         assert ltf_take_value is not None and ltf_publish is not None
         _streamer = cast('LiveBarStreamer', live_streamer)
         _take_value = ltf_take_value
         _publish = ltf_publish
-        ltf_span_ms = int(in_seconds(data_source.timeframe) * 1000)
+        ltf_span_ms = int(_in_seconds(data_source.timeframe) * 1000)
 
         # The REST warmup may end on a still-forming tail bar. On the window
         # path the developing intrabar must come ONLY from the live stream's
@@ -950,7 +950,7 @@ def security_process_main(
             _set_lib_properties(intrabar, bar_index, tz, lib, round_decimals,
                                 lossless_volume=lossless_volume,
                                 lossless_prices=lossless_prices)
-            lib.last_bar_index = bar_index
+            lib.last_bar_index = float(bar_index)
             barstate.isfirst = (bar_index == 0)
             barstate.islast = islast
             barstate.isconfirmed = confirmed
@@ -1076,10 +1076,10 @@ def security_process_main(
         :param is_history: True while the period replayed is historical
         """
         if is_history and reader is not None:
-            lib.last_bar_index = _current_total() - 1
+            lib.last_bar_index = float(_current_total() - 1)
             lib.last_bar_time = file_last_bar_time_ms
         else:
-            lib.last_bar_index = bar_idx
+            lib.last_bar_index = float(bar_idx)
 
     try:
         current_bar = 0
@@ -1300,7 +1300,7 @@ def security_process_main(
                                     lossless_volume=lossless_volume,
                                     lossless_prices=lossless_prices,
                                     derived_prices=_derived_prices)
-                lib.last_bar_index = total_bars - 1
+                lib.last_bar_index = float(total_bars - 1)
                 if reader is not None:
                     lib.last_bar_time = file_last_bar_time_ms
                 barstate.isfirst = (current_bar == 0)

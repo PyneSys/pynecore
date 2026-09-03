@@ -120,6 +120,9 @@
     "na": {
       "type": "property"
     },
+    "na_int": {
+      "type": "variable"
+    },
     "nz": {
       "type": "variable"
     },
@@ -234,6 +237,9 @@
     "NA": {
       "type": "variable"
     },
+    "PyneInt": {
+      "type": "variable"
+    },
     "SequenceView": {
       "type": "variable"
     },
@@ -319,6 +325,9 @@
       "type": "variable"
     },
     "na_float": {
+      "type": "variable"
+    },
+    "na_int": {
       "type": "variable"
     },
     "new": {
@@ -590,13 +599,13 @@
     "NA": {
       "type": "variable"
     },
+    "PyneInt": {
+      "type": "variable"
+    },
     "bg_color": {
       "type": "variable"
     },
     "fg_color": {
-      "type": "variable"
-    },
-    "in_seconds": {
       "type": "variable"
     },
     "is_heikinashi": {
@@ -626,6 +635,9 @@
     "lib": {
       "type": "variable"
     },
+    "na_int": {
+      "type": "variable"
+    },
     "point": {
       "type": "variable"
     },
@@ -638,6 +650,9 @@
       "type": "variable"
     },
     "NA": {
+      "type": "variable"
+    },
+    "PyneInt": {
       "type": "variable"
     },
     "aqua": {
@@ -890,6 +905,9 @@
     "DayOfWeek": {
       "type": "variable"
     },
+    "PyneInt": {
+      "type": "variable"
+    },
     "dayofweek": {
       "type": "property"
     },
@@ -897,6 +915,9 @@
       "type": "variable"
     },
     "monday": {
+      "type": "variable"
+    },
+    "na_int": {
       "type": "variable"
     },
     "saturday": {
@@ -968,6 +989,9 @@
     "NA": {
       "type": "variable"
     },
+    "PyneInt": {
+      "type": "variable"
+    },
     "actual": {
       "type": "variable"
     },
@@ -987,6 +1011,9 @@
       "type": "variable"
     },
     "na_float": {
+      "type": "variable"
+    },
+    "na_int": {
       "type": "variable"
     },
     "standardized": {
@@ -1506,6 +1533,9 @@
     "NA": {
       "type": "variable"
     },
+    "PyneInt": {
+      "type": "variable"
+    },
     "clear": {
       "type": "variable"
     },
@@ -1604,6 +1634,9 @@
     "na_float": {
       "type": "variable"
     },
+    "na_int": {
+      "type": "variable"
+    },
     "phi": {
       "type": "variable"
     },
@@ -1658,6 +1691,9 @@
       "type": "variable"
     },
     "NA": {
+      "type": "variable"
+    },
+    "PyneInt": {
       "type": "variable"
     },
     "add_col": {
@@ -1763,6 +1799,9 @@
       "type": "variable"
     },
     "na_float": {
+      "type": "variable"
+    },
+    "na_int": {
       "type": "variable"
     },
     "new": {
@@ -2501,6 +2540,9 @@
     "na_float": {
       "type": "variable"
     },
+    "na_int": {
+      "type": "variable"
+    },
     "profit": {
       "type": "variable"
     },
@@ -2603,6 +2645,9 @@
       "type": "variable"
     },
     "na_float": {
+      "type": "variable"
+    },
+    "na_int": {
       "type": "variable"
     },
     "opentrades": {
@@ -2720,6 +2765,9 @@
     "na_float": {
       "type": "variable"
     },
+    "na_int": {
+      "type": "variable"
+    },
     "pos": {
       "type": "variable"
     },
@@ -2819,6 +2867,9 @@
       "type": "variable"
     },
     "na_float": {
+      "type": "variable"
+    },
+    "na_int": {
       "type": "variable"
     },
     "opening_hours": {
@@ -3087,6 +3138,9 @@
     "na_float": {
       "type": "variable"
     },
+    "na_int": {
+      "type": "variable"
+    },
     "nvi": {
       "type": "property"
     },
@@ -3350,6 +3404,9 @@
     }
   },
   "lib.timeframe": {
+    "PyneInt": {
+      "type": "variable"
+    },
     "change": {
       "type": "variable"
     },

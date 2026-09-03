@@ -2,6 +2,7 @@ from typing import cast
 
 from ..types.color import Color
 from ..types.na import NA
+from ..types.pine_types import PyneInt
 
 #
 # Constants
@@ -26,34 +27,37 @@ white = Color('#FFFFFF')
 yellow = Color('#FDD835')
 
 
-def r(color: Color) -> int:
+def r(color: Color) -> PyneInt:
     """
     Return the red component of a color
 
     :param color: Color
     :return: The red component of the color
     """
-    return color.r
+    # A Pine int is a double at runtime; the component of a na color is 0
+    return 0.0 if isinstance(color, NA) else float(color.r)
 
 
-def g(color: Color) -> int:
+def g(color: Color) -> PyneInt:
     """
     Return the green component of a color
 
     :param color: Color
     :return: The green component of the color
     """
-    return color.g
+    # A Pine int is a double at runtime; the component of a na color is 0
+    return 0.0 if isinstance(color, NA) else float(color.g)
 
 
-def b(color: Color) -> int:
+def b(color: Color) -> PyneInt:
     """
     Return the blue component of a color
 
     :param color: Color
     :return: The blue component of the color
     """
-    return color.b
+    # A Pine int is a double at runtime; the component of a na color is 0
+    return 0.0 if isinstance(color, NA) else float(color.b)
 
 
 def t(color: Color) -> float:

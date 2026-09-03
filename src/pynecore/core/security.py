@@ -1303,7 +1303,7 @@ def _needs_session_anchor(
     modifier, _ = tf_module._process_tf(timeframe)
     if modifier not in ('S', ''):
         return any(s.time != time(0, 0) for s in session_starts)
-    tf_seconds = tf_module.in_seconds(timeframe)
+    tf_seconds = tf_module._in_seconds(timeframe)
     for probe in (_WINTER_PROBE, _SUMMER_PROBE):
         for s in session_starts:
             d = probe + timedelta(days=(s.day - probe.weekday()) % 7)
@@ -1522,7 +1522,7 @@ def _is_dense_feed(reader: OHLCVReader, real_bar_count: int, period_sec: int) ->
     if reader.size < 2:
         return True
     if reader.dense is not None and reader.period is not None:
-        return reader.dense and tf_module.in_seconds(reader.period) == period_sec
+        return reader.dense and tf_module._in_seconds(reader.period) == period_sec
     return (real_bar_count == reader.size
             and reader.read(1).timestamp - reader.read(0).timestamp == period_sec * 1000)
 
@@ -1578,7 +1578,7 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
     if not is_dwm:
         # Intraday HTF: only a GAPPY feed needs the real-opens clamp (see above);
         # a dense feed keeps the arithmetic grid.
-        period_sec = tf_module.in_seconds(state.timeframe)
+        period_sec = tf_module._in_seconds(state.timeframe)
         with OHLCVReader(data_path) as reader:
             start_ts = reader.start_timestamp
             if start_ts is None:
@@ -1632,7 +1632,7 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
         # grid clamp. Same-TF contexts need it for the same reason as HTF ones —
         # only their offset comes from the session, not from the period length.
         if not is_dwm and sec_hours:
-            period_ms = tf_module.in_seconds(state.timeframe) * 1000
+            period_ms = tf_module._in_seconds(state.timeframe) * 1000
             if si.has_schedule_history:
                 # The trading-day roll keys off the flat (newest) session opens;
                 # this Core path assumes the session OPEN / trading-day attribution
@@ -1754,7 +1754,7 @@ def setup_security_states(
     # session-aligned by construction and need no offset.
     # noinspection PyProtectedMember
     chart_mod, chart_mult = tf_module._process_tf(chart_timeframe)
-    chart_off = (tf_module.in_seconds(chart_timeframe) * 1000 - 1
+    chart_off = (tf_module._in_seconds(chart_timeframe) * 1000 - 1
                  if chart_mod in ('', 'S') else 0)
 
     # Single-period civil daily/weekly/monthly chart: the LTF window cannot use
@@ -1813,8 +1813,8 @@ def setup_security_states(
             # LTF merge (last/first intrabar of the chart bar), no resampler,
             # no HTF aggregator — the chart targets its own bar period.
             if not same_tf:
-                sec_seconds = tf_module.in_seconds(timeframe)
-                chart_seconds = tf_module.in_seconds(chart_timeframe)
+                sec_seconds = tf_module._in_seconds(timeframe)
+                chart_seconds = tf_module._in_seconds(chart_timeframe)
                 plain_ltf = 0 < sec_seconds < chart_seconds
             resampler = (None if same_tf or plain_ltf
                          else Resampler.get_resampler(timeframe))
@@ -1880,7 +1880,7 @@ def setup_security_states(
             tz=tz,
             is_ltf=is_ltf,
             plain_ltf=plain_ltf,
-            plain_ltf_span_ms=(tf_module.in_seconds(timeframe) * 1000
+            plain_ltf_span_ms=(tf_module._in_seconds(timeframe) * 1000
                                if plain_ltf else 0),
             lookahead=lookahead_mode,
             htf_aggregator=htf_aggregator,
