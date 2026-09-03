@@ -330,8 +330,12 @@ def __test_replay_round_trip_envelope_and_pending__(tmp_path: Path) -> None:
         envelopes, pending = ctx.replay()
 
     assert envelopes == {
-        "Long": EnvelopeRecord(key="Long", bar_ts_ms=BAR_TS, retry_seq=0),
-        "TP\0Long": EnvelopeRecord(key="TP\0Long", bar_ts_ms=BAR_TS, retry_seq=1),
+        "Long": EnvelopeRecord(
+            key="Long", bar_ts_ms=BAR_TS, retry_seq=0, run_tag=ctx.run_tag,
+        ),
+        "TP\0Long": EnvelopeRecord(
+            key="TP\0Long", bar_ts_ms=BAR_TS, retry_seq=1, run_tag=ctx.run_tag,
+        ),
     }
     park_row = pending.pop("coid-1")
     assert pending == {}
@@ -1025,3 +1029,31 @@ def __test_order_row_fields_are_typed__(tmp_path: Path) -> None:
     assert row.trailing_stop is True
     assert row.trailing_distance == 5.0
     assert row.closed_ts_ms is None
+
+
+def __test_envelope_replay_carries_the_dispatch_run_tag__(tmp_path: Path) -> None:
+    """An envelope replays under the tag it was dispatched with, not the reader's.
+
+    Envelopes replay on the logical ``run_id``, which a rotated bot with a
+    different script source (hence a different ``run_tag``) shares. The
+    anchor alone rebuilds a coid under the CURRENT run's tag — an order that
+    never existed (measured live: capitalcom cycle 113 classified every
+    replayed partial leg stale and re-armed against a parent with no order
+    row). An explicit tag round-trips; the default is the writer's own tag;
+    a row written before the column existed replays as ``None``.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        ctx.record_envelope(key="Long", bar_ts_ms=BAR_TS, retry_seq=0, run_tag="prev")
+        ctx.record_envelope(key="Short", bar_ts_ms=BAR_TS, retry_seq=0)
+        with store.transaction():
+            store._conn.execute(
+                "INSERT INTO envelopes (run_id, intent_key, bar_ts_ms, retry_seq, "
+                "updated_ts_ms) VALUES (?, ?, ?, ?, ?)",
+                (ctx.run_id, "Legacy", BAR_TS, 0, 1),
+            )
+        envelopes, _ = ctx.replay()
+
+    assert envelopes["Long"].run_tag == "prev"
+    assert envelopes["Short"].run_tag == ctx.run_tag
+    assert envelopes["Legacy"].run_tag is None

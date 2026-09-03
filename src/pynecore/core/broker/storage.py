@@ -102,6 +102,13 @@ class EnvelopeRecord:
     key: str
     bar_ts_ms: int
     retry_seq: int
+    # The ``run_tag`` the envelope was dispatched under. Envelopes replay on
+    # the logical ``run_id``, which a rotated bot (different script source,
+    # hence a different tag) can share, so the tag is part of the dispatch
+    # identity: rebuilding the coid with the CURRENT run's tag names an order
+    # that never existed. ``None`` on rows written before the column existed;
+    # the engine then falls back to its own tag.
+    run_tag: str | None = None
 
 
 @dataclass(frozen=True)
@@ -476,6 +483,16 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         -- dedups venue re-serves against retired rows.
         ALTER TABLE spot_executions
             ADD COLUMN retired INTEGER NOT NULL DEFAULT 0;
+    """),
+    (7, "envelopes run_tag column", """
+        -- The run_tag an envelope was dispatched under. Envelopes replay
+        -- on the logical run_id, which a rotated bot with a different
+        -- script source (and therefore a different tag) can share, so a
+        -- coid rebuilt from the anchor with the current run's tag names an
+        -- order that never existed. NULL on pre-existing rows: the engine
+        -- falls back to its own tag for those.
+        ALTER TABLE envelopes
+            ADD COLUMN run_tag TEXT;
     """),
 ]
 
@@ -1287,8 +1304,10 @@ class RunContext:
 
     # --- Core sync engine: envelope-identity ------------------------------
 
+    # noinspection SqlResolve
     def record_envelope(
             self, key: str, bar_ts_ms: int, retry_seq: int,
+            run_tag: str | None = None,
     ) -> None:
         """Persist the first envelope for an ``intent_key``.
 
@@ -1296,18 +1315,28 @@ class RunContext:
         key, so every new instance inherits the previous envelopes of
         the same bot. Because of the sync engine's pinning semantics, a
         conflict only occurs on a retry_seq bump.
+
+        :param key: The intent key the envelope belongs to.
+        :param bar_ts_ms: The pinned bar timestamp of the envelope.
+        :param retry_seq: The pinned retry sequence of the envelope.
+        :param run_tag: The tag the envelope's coids carry; defaults to
+            this run's own tag. An envelope rebuilt from a replayed anchor
+            of a rotated bot keeps that bot's tag.
         """
         now = _now_ms()
         with self._store.transaction():
             self._store._conn.execute(
                 "INSERT INTO envelopes ("
-                "  run_id, intent_key, bar_ts_ms, retry_seq, updated_ts_ms"
-                ") VALUES (?, ?, ?, ?, ?) "
+                "  run_id, intent_key, bar_ts_ms, retry_seq, updated_ts_ms, "
+                "  run_tag"
+                ") VALUES (?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(run_id, intent_key) DO UPDATE SET "
                 "  bar_ts_ms = excluded.bar_ts_ms, "
                 "  retry_seq = excluded.retry_seq, "
-                "  updated_ts_ms = excluded.updated_ts_ms",
-                (self.run_id, key, bar_ts_ms, retry_seq, now),
+                "  updated_ts_ms = excluded.updated_ts_ms, "
+                "  run_tag = excluded.run_tag",
+                (self.run_id, key, bar_ts_ms, retry_seq, now,
+                 self.run_tag if run_tag is None else run_tag),
             )
 
     # noinspection SqlResolve
@@ -1504,8 +1533,8 @@ class RunContext:
 
         with self._store.read_lock() as conn:
             envelope_rows = conn.execute(
-                "SELECT intent_key, bar_ts_ms, retry_seq FROM envelopes "
-                "WHERE run_id = ?",
+                "SELECT intent_key, bar_ts_ms, retry_seq, run_tag "
+                "FROM envelopes WHERE run_id = ?",
                 (self.run_id,),
             ).fetchall()
             pending_rows = conn.execute(
@@ -1521,6 +1550,7 @@ class RunContext:
                 key=row['intent_key'],
                 bar_ts_ms=int(row['bar_ts_ms']),
                 retry_seq=int(row['retry_seq']),
+                run_tag=row['run_tag'],
             )
 
         for row in pending_rows:

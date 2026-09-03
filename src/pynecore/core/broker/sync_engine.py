@@ -6932,20 +6932,24 @@ class OrderSyncEngine:
         if envelope is not None:
             bar_ts_ms = envelope.bar_ts_ms
             retry_seq = envelope.retry_seq
+            run_tag: str | None = envelope.run_tag
         else:
             anchor = self._persisted_envelope_anchors.get(key)
             if anchor is not None:
                 bar_ts_ms = anchor.bar_ts_ms
                 retry_seq = anchor.retry_seq
+                run_tag = anchor.run_tag
             else:
                 bar_ts_ms = self._current_bar_ts_ms
                 retry_seq = 0
+                run_tag = self._run_tag
         self._drop_envelope(key)
         next_retry_seq = retry_seq + 1
         bumped = EnvelopeRecord(
             key=key,
             bar_ts_ms=bar_ts_ms,
             retry_seq=next_retry_seq,
+            run_tag=run_tag,
         )
         self._persisted_envelope_anchors[key] = bumped
         # Record the bumped anchor in the dedicated in-memory map. This serves
@@ -8441,9 +8445,17 @@ class OrderSyncEngine:
         parent_anchor = self._persisted_envelope_anchors.get(from_entry)
         if parent_anchor is None:
             return None
+        # The anchor's own tag, not this run's: a rotated bot shares the
+        # logical run_id (so it replays the previous bot's anchors) but not
+        # its tag, and the legs / order rows carry the coid that was actually
+        # dispatched (measured live: capitalcom cycle 113 rebuilt the adopted
+        # parent under its own tag, classified every replayed leg stale,
+        # re-armed the bracket against a parent ref with no order row and the
+        # native fail-safe degraded on 136 refused PUTs).
+        anchor_tag = parent_anchor.run_tag or self._run_tag
         kind_entry_ref = encode_wire_client_order_id(
             build_client_order_id(
-                run_tag=self._run_tag,
+                run_tag=anchor_tag,
                 pine_id=from_entry,
                 bar_ts_ms=parent_anchor.bar_ts_ms,
                 kind=KIND_ENTRY,
@@ -8453,7 +8465,7 @@ class OrderSyncEngine:
         )
         stop_ref = encode_wire_client_order_id(
             build_client_order_id(
-                run_tag=self._run_tag,
+                run_tag=anchor_tag,
                 pine_id=from_entry,
                 bar_ts_ms=parent_anchor.bar_ts_ms,
                 kind=KIND_ENTRY_STOP,
@@ -12605,7 +12617,7 @@ class OrderSyncEngine:
                     # filled before the crash and the script no longer emits
                     # it). Fall back to ``_persisted_envelope_anchors`` —
                     # the anchor preserves ``bar_ts_ms`` / ``retry_seq`` and
-                    # ``self._run_tag`` is deterministic, so the rebuilt
+                    # the ``run_tag`` it was dispatched under, so the rebuilt
                     # ``KIND_ENTRY`` coid matches what the previous run
                     # stored on each leg. Without this fallback every leg
                     # would be classified stale even when the parent is the
@@ -13510,9 +13522,16 @@ class OrderSyncEngine:
                 adopted if adopted is not None
                 else (anchor.bar_ts_ms, anchor.retry_seq)
             )
+            # A live-order adoption is always this run's own tag (the scan
+            # only snapshots orders under it); a replayed anchor keeps the
+            # tag it was dispatched under so the rebuilt coids name the rows
+            # the venue and the journal actually hold.
             envelope = DispatchEnvelope(
                 intent=intent,
-                run_tag=self._run_tag,
+                run_tag=(
+                    self._run_tag if adopted is not None
+                    else anchor.run_tag or self._run_tag
+                ),
                 bar_ts_ms=bar_ts_ms,
                 retry_seq=retry_seq,
                 coid_max_len=self._coid_max_len,
@@ -13545,6 +13564,7 @@ class OrderSyncEngine:
                 key=intent.intent_key,
                 bar_ts_ms=envelope.bar_ts_ms,
                 retry_seq=envelope.retry_seq,
+                run_tag=envelope.run_tag,
             )
         return envelope
 
@@ -13563,7 +13583,7 @@ class OrderSyncEngine:
         for kind in (KIND_ENTRY, KIND_ENTRY_STOP):
             prior = DispatchEnvelope(
                 intent=intent,
-                run_tag=self._run_tag,
+                run_tag=anchor.run_tag or self._run_tag,
                 bar_ts_ms=anchor.bar_ts_ms,
                 retry_seq=anchor.retry_seq,
                 coid_max_len=self._coid_max_len,
@@ -13649,6 +13669,7 @@ class OrderSyncEngine:
             key=envelope.intent.intent_key,
             bar_ts_ms=envelope.bar_ts_ms,
             retry_seq=envelope.retry_seq,
+            run_tag=envelope.run_tag,
         )
 
     def _scan_live_entry_anchors_for_restart(self) -> None:

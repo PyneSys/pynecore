@@ -3338,7 +3338,7 @@ def __test_restart_adopts_higher_same_bar_retry_over_journal_anchor__(tmp_path):
     )
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
         ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
-        ctx.record_envelope(key="L", bar_ts_ms=BAR_TS, retry_seq=1)
+        ctx.record_envelope(key="L", bar_ts_ms=BAR_TS, retry_seq=1, run_tag=RUN_TAG)
         b = MockBroker()
         b.open_orders = [_live_working_order(coid2)]
         pos = BrokerPosition()
@@ -3370,7 +3370,7 @@ def __test_restart_keeps_journal_anchor_on_cross_bar_live_retry__(tmp_path):
     )
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
         ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
-        ctx.record_envelope(key="L", bar_ts_ms=BAR_TS, retry_seq=1)
+        ctx.record_envelope(key="L", bar_ts_ms=BAR_TS, retry_seq=1, run_tag=RUN_TAG)
         b = MockBroker()
         b.open_orders = [_live_working_order(cross_bar)]
         pos = BrokerPosition()
@@ -9409,7 +9409,7 @@ def __test_refresh_anchors_after_orphan_retire_drops_stale_envelope__(tmp_path):
             script_source="src",
             script_path="t025.py",
         )
-        ctx.record_envelope(key='L', bar_ts_ms=stale_bar_ts, retry_seq=0)
+        ctx.record_envelope(key='L', bar_ts_ms=stale_bar_ts, retry_seq=0, run_tag=RUN_TAG)
 
         b = MockBroker()
         pos = BrokerPosition()
@@ -11418,7 +11418,7 @@ def __test_restart_partial_bracket_adopted_not_swept__(tmp_path):
         # Persist the parent-entry envelope anchor so the engine's replay rebuilds
         # the SAME coid the legs were stamped with -> _resolve_parent_opening_ref
         # matches and the adoption branch does not treat the legs as stale.
-        ctx.record_envelope("L", BAR_TS, 0)
+        ctx.record_envelope("L", BAR_TS, 0, run_tag=RUN_TAG)
         _persist_partial_leg(ctx, leg_kind=LEG_KIND_TP_PARTIAL, trigger_level=120.0,
                              parent_entry_dispatch_ref=parent_ref,
                              oca_group="__partial_exit_X_L__", oca_type="cancel")
@@ -11466,7 +11466,7 @@ def __test_restart_multi_parent_partial_brackets_adopted_not_converted__(tmp_pat
                 run_tag=RUN_TAG, pine_id=parent, bar_ts_ms=BAR_TS,
                 kind=KIND_ENTRY, retry_seq=0,
             )
-            ctx.record_envelope(parent, BAR_TS, 0)
+            ctx.record_envelope(parent, BAR_TS, 0, run_tag=RUN_TAG)
             for leg_kind, level in (
                 (LEG_KIND_TP_PARTIAL, 120.0), (LEG_KIND_SL_PARTIAL, 90.0),
             ):
@@ -11523,7 +11523,7 @@ def __test_stale_replayed_legs_retire_their_foreign_failsafe_state__(tmp_path):
             run_tag="dead", pine_id="L", bar_ts_ms=BAR_TS - 60_000,
             kind=KIND_ENTRY, retry_seq=0,
         )
-        ctx.record_envelope("L", BAR_TS, 0)
+        ctx.record_envelope("L", BAR_TS, 0, run_tag=RUN_TAG)
         _persist_partial_leg(ctx, leg_kind=LEG_KIND_TP_PARTIAL, trigger_level=120.0,
                              parent_entry_dispatch_ref=foreign_ref,
                              oca_group="__partial_exit_X_L__", oca_type="cancel")
@@ -13676,7 +13676,7 @@ def __test_pending_partial_legs_of_the_current_parent_survive_the_stale_retire__
             run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
             kind=KIND_ENTRY, retry_seq=0,
         )
-        ctx.record_envelope("L", BAR_TS, 0)
+        ctx.record_envelope("L", BAR_TS, 0, run_tag=RUN_TAG)
         for leg_kind, level in ((LEG_KIND_TP_PARTIAL, 120.0), (LEG_KIND_SL_PARTIAL, 90.0)):
             _persist_partial_leg(
                 ctx, leg_kind=leg_kind, leg_state="pending_entry", trigger_level=level,
@@ -13709,7 +13709,7 @@ def __test_whole_row_exit_conflicting_with_live_partial_legs_is_skipped_not_fata
             run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
             kind=KIND_ENTRY, retry_seq=0,
         )
-        ctx.record_envelope("L", BAR_TS, 0)
+        ctx.record_envelope("L", BAR_TS, 0, run_tag=RUN_TAG)
         for leg_kind, level in ((LEG_KIND_TP_PARTIAL, 120.0), (LEG_KIND_SL_PARTIAL, 90.0)):
             _persist_partial_leg(
                 ctx, leg_kind=leg_kind, leg_state="pending_entry", trigger_level=level,
@@ -13799,3 +13799,52 @@ def __test_venue_reduce_only_cancel_with_reason_is_trimmed_not_quarantined__():
     assert not engine._quarantined
     assert engine.order_mapping.get("TP\0L") == [sl_id]
     assert "TP\0L" in engine.active_intents
+
+
+def __test_restart_partial_bracket_of_a_rotated_bot_is_adopted_not_cancelled__(tmp_path):
+    """The legs of a previous bot with another run_tag are adopted, not torn down.
+
+    Measured live (capitalcom cycle 113): the trailing bot replayed the
+    partial bot's ``L-X2|L`` legs (same logical run_id, different script,
+    different tag), rebuilt the parent ref under its OWN tag, saw a mismatch
+    on every leg, cancelled them and re-armed a fresh bracket against a
+    parent ref no order row carries — the native fail-safe then degraded on
+    136 refused PUTs in one bar. With the anchor carrying its tag the refs
+    match and the adoption branch pins the intent on the live legs.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+    from pynecore.core.broker.store_helpers import (
+        LEG_KIND_TP_PARTIAL, LEG_KIND_SL_PARTIAL,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        parent_ref = build_client_order_id(
+            run_tag="prev", pine_id="L", bar_ts_ms=BAR_TS,
+            kind=KIND_ENTRY, retry_seq=0,
+        )
+        ctx.record_envelope("L", BAR_TS, 0, run_tag="prev")
+        _persist_partial_leg(ctx, leg_kind=LEG_KIND_TP_PARTIAL, trigger_level=120.0,
+                             parent_entry_dispatch_ref=parent_ref,
+                             oca_group="__partial_exit_X_L__", oca_type="cancel")
+        _persist_partial_leg(ctx, leg_kind=LEG_KIND_SL_PARTIAL, trigger_level=90.0,
+                             parent_entry_dispatch_ref=parent_ref,
+                             oca_group="__partial_exit_X_L__", oca_type="cancel")
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=_software_partial_broker(), position=pos,  # type: ignore[arg-type]
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        assert RUN_TAG != "prev"
+        assert engine._resolve_parent_opening_ref("L") == parent_ref  # type: ignore[attr-defined]
+        pos.size = 1.0
+        pos.reconstruct_parent_trade(entry_id="L", size=1.0, entry_price=100.0)
+        engine.sync(BAR_TS)
+        assert "X\0L" in engine.active_intents
+        legs = [
+            leg for leg in engine._partial_bracket_engine.iter_legs()  # type: ignore[attr-defined]
+            if leg.intent_key == "X\0L"
+        ]
+        assert len(legs) == 2
+        assert all(leg.parent_entry_dispatch_ref == parent_ref for leg in legs), \
+            "the replayed legs were replaced by a fresh bracket"

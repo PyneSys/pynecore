@@ -231,3 +231,69 @@ def __test_retire_clears_limit_won_state_under_kind_entry_ref__(tmp_path):
     settled = eng._native_failsafe_manager.get_state(entry_ref)
     assert settled is not None and settled.health == FailsafeHealth.RETIRED
     store.close()
+
+
+def __test_resolve_and_rebuild_honour_the_anchor_run_tag__(tmp_path):
+    """A replayed anchor of a rotated bot resolves and rebuilds under ITS tag."""
+    # Lane rotation: the previous bot (tag "prev") dispatched the parent and
+    # its journal rows; the engine now running carries tag "tts0" but shares
+    # the logical run_id, so it replays the anchor. Both the parent-ref
+    # resolver and the envelope rebuild must produce the "prev" coid — the
+    # only one the venue and the order rows know.
+    from pynecore.core.broker.idempotency import (
+        build_client_order_id, encode_wire_client_order_id,
+    )
+    store, ctx = _make_store(tmp_path)
+    eng = _engine(ctx)
+    eng._persisted_envelope_anchors["Long"] = EnvelopeRecord(
+        key="Long", bar_ts_ms=1_700_000_000_000, retry_seq=0, run_tag="prev",
+    )
+    expected = encode_wire_client_order_id(
+        build_client_order_id(
+            run_tag="prev", pine_id="Long", bar_ts_ms=1_700_000_000_000,
+            kind=KIND_ENTRY, retry_seq=0,
+        ),
+        eng._coid_max_len,
+    )
+    assert eng._resolve_parent_opening_ref("Long") == expected
+    env = eng._build_envelope(_both_set_entry())
+    assert env.run_tag == "prev"
+    assert env.client_order_id(KIND_ENTRY) == expected
+    # A legacy anchor without a tag keeps the old behaviour: this run's tag.
+    eng._envelopes.clear()
+    eng._persisted_envelope_anchors["Long"] = EnvelopeRecord(
+        key="Long", bar_ts_ms=1_700_000_000_000, retry_seq=0,
+    )
+    assert eng._resolve_parent_opening_ref("Long").startswith("tts0-")
+    store.close()
+
+
+def __test_spent_reversal_probe_and_reject_bump_keep_the_anchor_run_tag__(tmp_path):
+    """The anchor's tag survives the two other rebuild paths as well."""
+    # Spent-reversal probe: the durable row that proves the previous cycle's
+    # fill sits under the previous bot's tag; probing under this run's tag
+    # would miss it and re-use the consumed anchor. Reject bump: the bumped
+    # anchor must keep naming the same bot's coid family.
+    from pynecore.core.broker.idempotency import build_client_order_id
+    store, ctx = _make_store(tmp_path)
+    eng = _engine(ctx)
+    anchor = EnvelopeRecord(
+        key="Long", bar_ts_ms=1_700_000_000_000, retry_seq=0, run_tag="prev",
+    )
+    prev_ref = build_client_order_id(
+        run_tag="prev", pine_id="Long", bar_ts_ms=1_700_000_000_000,
+        kind=KIND_ENTRY, retry_seq=0,
+    )
+    create_entry_order_row(
+        ctx, coid=prev_ref, symbol=SYMBOL, side="sell", qty=1.0,
+        intent_key="Long", pine_entry_id="Long", kind=ENTRY_KIND_POSITION,
+        order_type=OrderType.MARKET.value,
+    )
+    ctx.set_filled(prev_ref, 1.0)
+    assert eng._persisted_entry_anchor_is_spent_reversal(_both_set_entry(), anchor)
+
+    eng._persisted_envelope_anchors["Long"] = anchor
+    eng._reanchor_envelope_after_reject("Long")
+    bumped = eng._persisted_envelope_anchors["Long"]
+    assert (bumped.retry_seq, bumped.run_tag) == (1, "prev")
+    store.close()
