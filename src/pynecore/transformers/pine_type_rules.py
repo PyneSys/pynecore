@@ -16,6 +16,7 @@ int-typed on TradingView, and ``int / int`` is int-typed there while Python
 gives a float. Where the two disagree, the measurement wins.
 """
 import ast
+from collections.abc import Callable, Collection
 from typing import Final, NamedTuple, TypeVar
 
 #: Any expression node -- ``stamp_lowering`` hands back exactly what it got.
@@ -32,7 +33,7 @@ __all__ = [
     'VECTOR_ATTR', 'VARYING_ATTR', 'get_vector', 'set_vector', 'get_varying', 'set_varying',
     'pin_for', 'overload_result', 'ImplSig', 'overload_pick',
     'TYPELESS', 'NONE_DEFAULT', 'FIT_OMISSIBLE', 'FIT_REQUIRED', 'FIT_UNSURE',
-    'default_fit', 'annotation_takes_none',
+    'default_fit', 'annotation_takes_none', 'impl_sig', 'param_fit', 'default_ty',
 ]
 
 # --- the stamp ------------------------------------------------------------
@@ -468,7 +469,7 @@ _OBJECT_NAMES: Final = frozenset({
 })
 
 
-def annotation_type(node: ast.expr | None) -> str:
+def annotation_type(node: ast.expr | None, classes: Collection[str] = ()) -> str:
     """
     Map a Python annotation onto a Pine type character.
 
@@ -478,7 +479,15 @@ def annotation_type(node: ast.expr | None) -> str:
     not recognize is UNKNOWN, which is what makes a missing annotation and an
     exotic one behave alike.
 
+    A name in ``classes`` is an OBJECT, not an unknown. A UDT is a type a
+    script declares and a library publishes, and a parameter typed by one is
+    fully annotated -- reading it as unknown made such a parameter behave like
+    an unannotated one, which is what took the whole export out of the typed
+    world for its callers.
+
     :param node: The annotation expression, or None when there is none
+    :param classes: Class names visible where the annotation stands, the ones
+                    imported from another module included
     :return: The type character
     """
     if node is None:
@@ -487,26 +496,29 @@ def annotation_type(node: ast.expr | None) -> str:
     if isinstance(node, ast.Constant):
         if node.value is None:
             return VOID
-        # A stringized forward reference: ``'_ExitOrderKey'``
+        # A stringized forward reference: ``'_ExitOrderKey'``, ``'list[Pivot]'``
         if isinstance(node.value, str):
-            return _named_type(node.value)
+            try:
+                return annotation_type(ast.parse(node.value, mode='eval').body, classes)
+            except SyntaxError:
+                return UNKNOWN
         return UNKNOWN
 
     if isinstance(node, ast.Name):
-        return _named_type(node.id)
+        return _named_type(node.id, classes)
 
     if isinstance(node, ast.Attribute):
-        return _named_type(node.attr)
+        return _named_type(node.attr, classes)
 
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
-        return _union_type(node)
+        return _union_type(node, classes)
 
     if isinstance(node, ast.Subscript):
         head = node.value
         name = head.id if isinstance(head, ast.Name) else \
             (head.attr if isinstance(head, ast.Attribute) else '')
         if name in _TRANSPARENT_SUBSCRIPTS:
-            return annotation_type(node.slice)
+            return annotation_type(node.slice, classes)
         if name in _OBJECT_SUBSCRIPTS:
             return OBJECT
         return UNKNOWN
@@ -514,11 +526,11 @@ def annotation_type(node: ast.expr | None) -> str:
     return UNKNOWN
 
 
-def _named_type(name: str) -> str:
+def _named_type(name: str, classes: Collection[str] = ()) -> str:
     """Resolve a bare annotation name to a type character."""
     if name in ANNOTATION_TYPES:
         return ANNOTATION_TYPES[name]
-    if name in _OBJECT_NAMES:
+    if name in _OBJECT_NAMES or name in classes:
         return OBJECT
     return UNKNOWN
 
@@ -543,11 +555,12 @@ def _is_typeless(node: ast.expr) -> bool:
     return False
 
 
-def _union_type(node: ast.BinOp) -> str:
+def _union_type(node: ast.BinOp, classes: Collection[str] = ()) -> str:
     """
     Type of an annotation union, ignoring its absence markers.
 
     :param node: The ``X | Y`` annotation node
+    :param classes: Class names visible where the annotation stands
     :return: The joined type character
     """
     members: list[ast.expr] = []
@@ -565,9 +578,9 @@ def _union_type(node: ast.BinOp) -> str:
         # ``NA | None`` and friends: absence only, no type to speak of
         return UNKNOWN
 
-    result = annotation_type(contributing[0])
+    result = annotation_type(contributing[0], classes)
     for member in contributing[1:]:
-        result = join(result, annotation_type(member))
+        result = join(result, annotation_type(member, classes))
     return result
 
 
@@ -839,6 +852,134 @@ def _takes(impl: ImplSig, wanted: tuple[str, ...], exact_arity: bool) -> int:
         if fit == FIT_UNSURE:
             verdict = _MAYBE
     return verdict
+
+
+# --- reading a definition -------------------------------------------------
+
+#: Name ``DynamicDefaultTransformer`` leaves in place of a default that
+#: reads per-bar lib state. The selector skips such a parameter, so the
+#: sentinel fits whatever the parameter declares.
+_DYN_DEFAULT: Final = '__dyn_default__'
+
+
+def impl_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, ret: str,
+             ty_of: Callable[[ast.AST], str] = get_ty,
+             classes: Collection[str] = ()) -> ImplSig:
+    """
+    One definition's shape, as the static overload selection reads it.
+
+    The single place a definition becomes an ``ImplSig``: the selection reads
+    these to answer a pinned call site, and a module's published interface
+    carries the same ones so another module's call sites get the same answer.
+
+    :param node: The definition to measure
+    :param ret: What it returns -- the inference's answer, not the annotation's
+    :param ty_of: Types a default expression; the walk passes its OWN view, a
+                  consumer reading a finished tree the node stamps
+    :param classes: Class names visible in the definition's module
+    :return: The implementation's shape
+    """
+    args = node.args
+    positional = list(args.posonlyargs) + list(args.args)
+    defaults = _param_defaults(node)
+    return ImplSig(
+        params=tuple(annotation_type(a.annotation, classes) for a in positional),
+        required=len(positional) - len(args.defaults),
+        open_ended=args.vararg is not None, ret=ret,
+        fits=''.join(param_fit(arg, defaults.get(arg.arg), ty_of, classes)
+                     for arg in positional + list(args.kwonlyargs)))
+
+
+def param_fit(arg: ast.arg, default: ast.expr | None,
+              ty_of: Callable[[ast.AST], str] = get_ty,
+              classes: Collection[str] = ()) -> str:
+    """
+    What one parameter contributes to a call that omits it.
+
+    An UNANNOTATED parameter contributes nothing: the selector has no declared
+    type to check its default against, so it takes whatever the default is.
+    That is not the same as an annotation this pass cannot read, which
+    ``default_fit`` declines on.
+
+    :param arg: The parameter
+    :param default: Its default expression, or None when it has none
+    :param ty_of: Types the default expression
+    :param classes: Class names visible where the annotation stands
+    :return: One of the ``FIT_*`` characters
+    """
+    if default is None:
+        return FIT_REQUIRED
+    if arg.annotation is None:
+        return FIT_OMISSIBLE
+    return default_fit(annotation_type(arg.annotation, classes), default_ty(default, ty_of),
+                       annotation_takes_none(arg.annotation))
+
+
+def default_ty(default: ast.expr, ty_of: Callable[[ast.AST], str] = get_ty) -> str:
+    """
+    Type of a default expression, as the overload selector reads it.
+
+    ``na`` carries no type of its own, and neither does the sentinel
+    ``DynamicDefaultTransformer`` leaves where a default read per-bar lib
+    state -- the selector skips that one outright. A literal ``None`` is a
+    VALUE the selector type-checks like any other, so it gets its own
+    character and is decided against the annotation, not against the
+    annotation's type.
+
+    :param default: The default expression
+    :param ty_of: Types anything the two special forms do not cover
+    :return: Its type character, ``NONE_DEFAULT`` or ``TYPELESS``
+    """
+    if isinstance(default, ast.Constant) and default.value is None:
+        return NONE_DEFAULT
+    dotted = _dotted(default)
+    if dotted is not None and dotted.split('.')[-1] in ('na', _DYN_DEFAULT):
+        return TYPELESS
+    return ty_of(default)
+
+
+def _param_defaults(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, ast.expr]:
+    """
+    Each parameter's default expression, by parameter name.
+
+    A default is one half of what types a parameter: at a call site the type is
+    JOIN(default, argument), and where the caller omits the argument the
+    default IS the value passed. A SCRIPT ENTRY POINT is the extreme of that
+    same rule -- ``run_main()`` passes no arguments, so an entry's parameter is
+    its default on every bar, which is how a compiled script receives its
+    inputs (``main(length=input.int(14))``, unannotated, because Pine's
+    ``input.int``'s first parameter is the input's default VALUE).
+
+    What a default never does on its own is DECLARE a type: with no call site
+    to join with, ``def helper(x=0)`` says nothing about ``x``, because
+    ``helper(1.5)`` is a legal call.
+
+    :param node: The definition to read
+    :return: parameter name -> default expression, for the ones that have one
+    """
+    args = node.args
+    positional = list(args.posonlyargs) + list(args.args)
+    out: dict[str, ast.expr] = {}
+    # The defaults align to the LAST parameters, one per default
+    for arg, default in zip(positional[len(positional) - len(args.defaults):], args.defaults):
+        out[arg.arg] = default
+    for kwarg, kw_default in zip(args.kwonlyargs, args.kw_defaults):
+        if kw_default is not None:
+            out[kwarg.arg] = kw_default
+    return out
+
+
+def _dotted(node: ast.expr) -> str | None:
+    """Render a dotted name expression, or None when it is not one."""
+    parts: list[str] = []
+    current: ast.expr = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return None
+    parts.append(current.id)
+    return '.'.join(reversed(parts))
 
 
 # --- measured overrides ---------------------------------------------------

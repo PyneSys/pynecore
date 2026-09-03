@@ -23,6 +23,14 @@ call site whose overload pin the contexts disagree on carries the per-context
 pins (``node._pine_pins``) instead of a single one, for a later pass to turn
 into per-instance data.
 
+A call into an IMPORTED module is the one place that rule stops. Such a callee
+is typed from its DECLARED signature alone -- the interface its module
+publishes -- and never from the argument types at the call site: the callee's
+body belongs to another module, which is analysed once, on its own. An
+overload group is still pinned there, because a pin selects among signatures
+and needs no body. Every interface consulted is recorded in ``table.deps``, so
+the loader can tell when a dependency's signatures moved.
+
 The other bounded fixpoint that remains is the loop one: a loop-carried
 variable only reaches its type on the second walk of the body.
 
@@ -31,13 +39,16 @@ nothing. That keeps it testable one rule at a time, and keeps the rules
 (``pine_type_rules``) separable from the walking done here.
 """
 import ast
+import importlib.util
 import json
 from bisect import bisect_right
-from collections.abc import Iterator, Sequence
+from collections.abc import Container, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..utils.stdlib_checker import is_stdlib
+from . import pine_type_artifact
 from .dynamic_default import is_script_entry
 from .node_ids import assign_node_ids, node_id
 from .pine_type_rules import (
@@ -45,11 +56,12 @@ from .pine_type_rules import (
     join, binop_type, unaryop_type, compare_type, annotation_type,
     LIB_TYPE_OVERRIDES, BUILTIN_CALL_TYPES, TY_ATTR, get_ty, set_ty, inherit_ty,
     constant_type, pin_for, get_pins, set_pin, set_pins, set_vector, set_varying,
-    overload_result, ImplSig, overload_pick, default_fit, TYPELESS, NONE_DEFAULT,
-    annotation_takes_none, FIT_OMISSIBLE, FIT_REQUIRED,
+    overload_result, ImplSig, overload_pick, default_fit, FIT_REQUIRED,
+    impl_sig, _param_defaults, _dotted,
 )
 from .pine_type_table import (
-    Binding, CallSite, ContextKey, ContextResult, Diag, FuncSig, PineTypeTable, Unknown,
+    Analyser, Binding, CallSite, ContextKey, ContextResult, Diag, ExportSig, FuncSig,
+    ModuleInterface, PineTypeTable, Unknown, qualify,
 )
 
 __all__ = ['infer_module', 'lib_types', 'TY_ATTR', 'get_ty', 'set_ty', 'inherit_ty']
@@ -65,11 +77,6 @@ _MAX_LOOP_PASSES = 3
 #: scripts stay two orders of magnitude below this; the limit exists so a
 #: pathological one degrades to UNKNOWN instead of hanging the compiler.
 _MAX_CONTEXTS = 500
-
-#: Name ``DynamicDefaultTransformer`` leaves in place of a default that
-#: reads per-bar lib state. The selector skips such a parameter, so the
-#: sentinel fits whatever the parameter declares.
-_DYN_DEFAULT = '__dyn_default__'
 
 #: A node that opens a lexical scope of its own.
 _Scope = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef
@@ -101,7 +108,9 @@ def lib_types() -> dict[str, Any]:
     return _LIB_TYPES
 
 
-def infer_module(tree: ast.Module, module_path: str = '') -> PineTypeTable:
+def infer_module(tree: ast.Module, module_path: str = '', *,
+                 analyse: Analyser | None = None,
+                 pipeline_hash: str = '') -> PineTypeTable:
     """
     Infer and stamp the Pine types of a whole module.
 
@@ -113,11 +122,20 @@ def infer_module(tree: ast.Module, module_path: str = '') -> PineTypeTable:
 
     :param tree: The module to walk; it is stamped in place
     :param module_path: Absolute source path, for diagnostics
+    :param analyse: Re-derives an imported module's table from its source path,
+                    for resolving a call into another module
+    :param pipeline_hash: Digest of the transform pipeline, which an imported
+                          module's cached interface has to have been built by
     :return: The derived type table
     """
     assign_node_ids(tree)
-    engine = _Inference(module_path)
-    engine.run(tree)
+    engine = _Inference(module_path, analyse=analyse, pipeline_hash=pipeline_hash)
+    # The module answers None for itself while it is being walked, which is
+    # what terminates an import cycle -- and marking it HERE rather than only
+    # in ``lookup`` is what makes the cycle visible to the module that has it,
+    # instead of to a throwaway re-analysis one level further down
+    with pine_type_artifact.analysing_scope(module_path):
+        engine.run(tree)
     return engine.table
 
 
@@ -136,16 +154,74 @@ class _Frame:
     declared_nonlocal: set[str] = field(default_factory=set)
 
 
+@dataclass(slots=True, frozen=True)
+class _Import:
+    """
+    A module-level name an import binds, and the module it reaches.
+
+    ``attrs`` is what the import spelling already consumed: ``from m import f``
+    binds ``f`` with ``('f',)`` still to resolve against module ``m``, while
+    ``import a.b as x`` binds ``x`` to module ``a.b`` with nothing left over.
+    """
+    #: Dotted module the import statement names
+    module: str
+    #: Attribute path the spelling consumed, module-relative
+    attrs: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class _Shadowed:
+    """
+    A name bound to a Pine library merged over the builtin namespace it shadows.
+
+    MEASURED: ``shadowed_namespace`` resolves MEMBER BY MEMBER -- what the
+    library exports comes from the library, every other member from the
+    builtin namespace -- so the binding has to carry both halves.
+    """
+    #: The import the merged namespace wraps
+    source: _Import
+    #: Registry prefix of the builtin namespace, e.g. ``'ta'``
+    namespace: str
+
+
 class _Inference:
     """The walker. One instance per module."""
 
-    def __init__(self, module_path: str):
+    def __init__(self, module_path: str, *, analyse: Analyser | None = None,
+                 pipeline_hash: str = ''):
         self.table = PineTypeTable(module_path=module_path)
+        #: How an imported module's table is re-derived, when one is needed.
+        #: Not ``_analyse`` -- that name is the walker's own body analysis
+        self._analyser = analyse
+        #: Which pipeline an imported module's cached interface must come from
+        self._pipeline_hash = pipeline_hash
         #: Live lexical scopes, outermost first; the module scope is ``''``
         self._frames: list[_Frame] = [_Frame('')]
         self.table.bindings[''] = self._frames[0].names
         #: Names bound by the enclosing lib import, e.g. ``lib``
         self._lib_aliases: set[str] = set()
+        #: Module-level name -> the import that binds it. Module level only: a
+        #: function-level import is a local of that scope and stays opaque,
+        #: the same shapes the isolation pass declines to resolve
+        self._imports: dict[str, _Import] = {}
+        #: Module-level name -> the merged namespace ``shadowed_namespace``
+        #: binds it to
+        self._shadowed: dict[str, _Shadowed] = {}
+        #: Name -> the positions its OWN import (or its ``shadowed_namespace``
+        #: assignment) binds it at. Every other module-level binding of that
+        #: name is a rebinding, and makes the import unusable
+        self._import_positions: dict[str, set[tuple[int, int]]] = {}
+        #: Names more than one import binds. ``_imports`` holds one entry per
+        #: name, so such a name has no single answer to give -- which module
+        #: it reaches depends on which statement ran last, and two of them in
+        #: exclusive branches make even that unanswerable
+        self._multi_imports: set[str] = set()
+        #: Dotted module name -> its source path, resolved without importing
+        #: the module itself
+        self._module_paths: dict[str, str | None] = {}
+        #: Source path -> the interface that module publishes. One lookup per
+        #: module for the whole walk, however many call sites reach it
+        self._interfaces: dict[str, ModuleInterface | None] = {}
         #: Whether each function spelled its return type out
         self._annotated_returns: dict[str, bool] = {}
         #: Scope-qualified ids of the module's ``@overload`` groups -- the only
@@ -219,6 +295,9 @@ class _Inference:
         #: body runs again after its own later statements, so a rebinding
         #: anywhere in one reaches the calls above it on the next iteration
         self._loop_stack: list[ast.stmt] = []
+        #: Every class name an annotation of this module may name, its own and
+        #: its imports' alike -- filled in before anything reads an annotation
+        self._classes: frozenset[str] = frozenset()
 
     # --- scope plumbing --------------------------------------------------
 
@@ -233,7 +312,7 @@ class _Inference:
     @staticmethod
     def _qualify(scope: str, name: str) -> str:
         """The scope-qualified identity of a name declared in one scope."""
-        return f'{scope}·{name}' if scope else name
+        return qualify(scope, name)
 
     def _resolve_func(self, name: str, node: ast.AST) -> tuple[str, int, bool] | None:
         """
@@ -444,7 +523,7 @@ class _Inference:
     # --- entry point -----------------------------------------------------
 
     def run(self, tree: ast.Module) -> None:
-        """Walk a module: collect the lib aliases, the definitions, the body."""
+        """Walk a module: the lib aliases, the imports, the definitions, the body."""
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module == 'pynecore':
                 self._lib_aliases.update(a.asname or a.name for a in node.names)
@@ -461,10 +540,191 @@ class _Inference:
             name: [(position, self._branches.of(position)) for position in positions]
             for name, positions in _bound_positions(tree.body).items()}
         self._rebound[''] = set(self._module_rebinds)
+        self._collect_imports(tree)
+        self._collect_classes(tree)
         self._collect(tree.body, '')
         self._body(tree.body)
         self._flush_pending()
         self._stamp_instance_vectors(tree)
+        # The implementations are only final once every body has been walked:
+        # an unannotated return only gets its type from the walk. Published
+        # here so a consumer -- the module interface, and through it another
+        # module's call sites -- reads the same shapes the selection does.
+        for key in self._overload_groups:
+            self.table.groups[key] = tuple(self._impl_sigs(key))
+        # What the module interface publishes. Computed here rather than from
+        # the shapes alone, because the answer is POSITIONAL: which binding a
+        # name ends the module's run under is what an importer receives, and
+        # the groups are only known once every definition has been collected
+        self.table.exportable = _exportable_names(
+            tree.body, self._module_rebinds, self._overload_groups)
+
+    def _collect_imports(self, tree: ast.Module) -> None:
+        """
+        Record what the module's own imports bind, before anything is typed.
+
+        Module level only, and for the same reason the isolation pass reads
+        only those: a function-level import binds a local of that scope, and a
+        relative one names a package this pass has no anchor for. ``pynecore``
+        itself is left out because the lib registry already owns those names,
+        and the standard library because it publishes no Pine interface.
+
+        The ``shadowed_namespace`` bindings come second: what they merge is one
+        of the imports, so the import map has to be complete first.
+
+        One name, one import. A name two statements bind is recorded as
+        unusable instead: the map holds a single entry per name, and picking
+        either of two imports would type the call against a module it may
+        never reach -- two spellings in exclusive branches have no answer at
+        all, and a later import simply replaces the earlier one.
+
+        :param tree: The module being walked
+        """
+        statements = list(_module_statements(tree.body))
+        for stmt in statements:
+            if isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    if alias.asname:
+                        self._add_import(alias.asname, _Import(alias.name, ()), alias)
+                    else:
+                        # ``import a.b.c`` binds ``a``, and the rest of the
+                        # path is spelled out again at every use
+                        head = alias.name.split('.')[0]
+                        self._add_import(head, _Import(head, ()), alias)
+            elif isinstance(stmt, ast.ImportFrom) and stmt.module and not stmt.level:
+                for alias in stmt.names:
+                    self._add_import(alias.asname or alias.name,
+                                     _Import(stmt.module, (alias.name,)), alias)
+        for stmt in statements:
+            self._add_shadowed(stmt)
+
+    def _collect_classes(self, tree: ast.Module) -> None:
+        """
+        Every class name an annotation of this module may name.
+
+        A UDT is a type, so a parameter annotated with one is annotated --
+        reading such a name as unknown made the parameter behave like an
+        unannotated one and took the whole export out of the typed world for
+        its callers. Which names ARE classes cannot be answered from the
+        annotation alone: ``Pivot`` is a class here and a stray name there, so
+        the set has to be collected before anything reads an annotation.
+
+        The module's own classes come from the tree, whatever scope they are
+        declared in -- a forward reference names a class that stands further
+        down, and a nested one is nameable from the body it lives in. An
+        imported one is resolved through the same interface the calls go
+        through, and only for a name some annotation actually spells: an
+        import nothing annotates with is not worth an interface lookup.
+
+        The set is FLAT, and deliberately so on two counts. A dotted spelling
+        is matched by its leaf, the way ``annotation_type`` matches the
+        builtin type names, so ``a.Settings`` and ``b.Settings`` are one name
+        here -- two libraries publishing the same class name is not a shape
+        Pine produces. And a class declared inside a function is nameable from
+        every scope, not only from the body it lives in; scoping it would mean
+        threading a per-scope class set through every annotation read, and an
+        annotation naming a nested class it cannot see is not a shape Pine
+        produces either. What IS excluded is a class name the module binds
+        again at module scope (``class Amount: ...`` then ``Amount = int``):
+        the name is that binding's, and reading an annotation on it as an
+        object would type against a class nothing holds.
+
+        :param tree: The module being walked
+        """
+        own = self._own_classes(tree)
+        imported: set[str] = set()
+        for spelled, node in _annotation_names(tree).items():
+            parts = spelled.split('.')
+            if parts[-1] in own or parts[-1] in imported:
+                continue
+            if parts[0] in self._multi_imports:
+                continue
+            binding = self._imports.get(parts[0])
+            if binding is None:
+                continue
+            if len(parts) == 1:
+                # ``from m import C``: the spelling consumed the name already
+                if not binding.attrs:
+                    continue
+                hops, wanted = binding.attrs[:-1], binding.attrs[-1]
+            else:
+                hops, wanted = binding.attrs + tuple(parts[1:-1]), parts[-1]
+            interface = self._interface_of(binding.module, hops, node)
+            if interface is not None and wanted in interface.classes:
+                imported.add(parts[-1])
+        self._classes = frozenset(own | imported)
+        self.table.classes = self._classes
+
+    def _own_classes(self, tree: ast.Module) -> set[str]:
+        """
+        The class names this module declares and still holds.
+
+        A name the module binds at module scope by anything but its own
+        ``class`` statement is not one: what stands under it at import time is
+        the assignment's value, so an annotation naming it describes an object
+        that never exists. The comparison is by POSITION, the same way an
+        import's own binding is told from a rebinding of it -- the class
+        statement is itself a module-scope binding, so nothing else would tell
+        the two apart.
+
+        :param tree: The module being walked
+        :return: The class names an annotation of this module may name
+        """
+        declared: dict[str, set[tuple[int, int]]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                declared.setdefault(node.name, set()).add((_line(node), _col(node)))
+        return {name for name, positions in declared.items()
+                if all(position in positions
+                       for position, _ in self._module_rebinds.get(name, ()))}
+
+    def _add_import(self, name: str, binding: _Import, node: ast.AST) -> None:
+        """
+        Record one import binding, unless the module behind it is not ours.
+
+        :param name: The name the import binds
+        :param binding: What it names
+        :param node: The ``alias`` node, whose position identifies the binding
+        """
+        if binding.module == 'pynecore' or binding.module.startswith('pynecore.') \
+                or is_stdlib(binding.module):
+            return
+        if name in self._imports:
+            self._multi_imports.add(name)
+        self._imports[name] = binding
+        self._import_positions.setdefault(name, set()).add((_line(node), _col(node)))
+
+    def _add_shadowed(self, stmt: ast.stmt) -> None:
+        """
+        Record a ``N = shadowed_namespace(<import>, lib.<ns>)`` binding.
+
+        :param stmt: A module-level statement, which may be that assignment
+        """
+        if isinstance(stmt, ast.Assign):
+            targets, value = stmt.targets, stmt.value
+        elif isinstance(stmt, ast.AnnAssign):
+            targets, value = [stmt.target], stmt.value
+        else:
+            return
+        if not isinstance(value, ast.Call) or len(value.args) != 2:
+            return
+        called = _dotted(value.func)
+        if called is None or called.split('.')[-1] != 'shadowed_namespace':
+            return
+        library = value.args[0]
+        if not isinstance(library, ast.Name):
+            return
+        source = self._imports.get(library.id)
+        namespace = self._lib_name(value.args[1])
+        if source is None or namespace is None:
+            return
+        for target in targets:
+            if isinstance(target, ast.Name):
+                if target.id in self._imports or target.id in self._shadowed:
+                    self._multi_imports.add(target.id)
+                self._shadowed[target.id] = _Shadowed(source=source, namespace=namespace)
+                self._import_positions.setdefault(target.id, set()).add(
+                    (_line(target), _col(target)))
 
     def _collect(self, body: list[ast.stmt], scope: str) -> None:
         """
@@ -482,9 +742,9 @@ class _Inference:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 key = self._qualify(scope, stmt.name)
                 self._defs.setdefault(key, []).append(stmt)
-                params = [annotation_type(a.annotation)
+                params = [annotation_type(a.annotation, self._classes)
                           for a in list(stmt.args.posonlyargs) + list(stmt.args.args)]
-                declared = annotation_type(stmt.returns)
+                declared = annotation_type(stmt.returns, self._classes)
                 annotated = declared != UNKNOWN
                 if _is_overload(stmt):
                     # One name, several implementations: each contributes its
@@ -527,7 +787,7 @@ class _Inference:
                 for target in stmt.targets:
                     self._store(target, ty, stmt.value)
             case ast.AnnAssign():
-                declared = annotation_type(stmt.annotation)
+                declared = annotation_type(stmt.annotation, self._classes)
                 if stmt.value is not None:
                     self._expr(stmt.value)
                 # An explicit annotation is a DECLARATION: it wins over what
@@ -679,7 +939,7 @@ class _Inference:
         defaults = _param_defaults(node) if is_script_entry(node) else {}
         out: list[str] = []
         for arg in _every_param(node):
-            ty = annotation_type(arg.annotation)
+            ty = annotation_type(arg.annotation, self._classes)
             if ty == UNKNOWN:
                 default = defaults.get(arg.arg)
                 ty = UNKNOWN if default is None else self._ty_of(default)
@@ -754,7 +1014,7 @@ class _Inference:
         try:
             self._bind_params(node, params)
             self._body(node.body)
-            declared = annotation_type(node.returns)
+            declared = annotation_type(node.returns, self._classes)
             result.ret = declared if declared != UNKNOWN else self._return_type(node)
             self._flush_pending()
             bound = self._frames[-1].names
@@ -1118,7 +1378,16 @@ class _Inference:
         if callee is None:
             self._expr(node.func)
             return self._user_call(node)
+        return self._lib_call(node, callee)
 
+    def _lib_call(self, node: ast.Call, callee: str) -> str:
+        """
+        Type a call to a lib name and record its call site.
+
+        :param node: The call node, whose arguments are already typed
+        :param callee: The registry key the callee resolves to
+        :return: The type the call evaluates to
+        """
         argc = _call_arity(node)
         entry = lib_types().get(callee)
         pin = self._pin(node, isinstance(entry, dict) and entry.get('kind') == 'overloads')
@@ -1176,6 +1445,7 @@ class _Inference:
             set_pin(node, pin)
             set_pins(node, None)
             return pin
+        self.table.call_pos[nid] = (_line(node), _col(node))
         seen = self._pins.setdefault(nid, {})
         seen[self._context] = pin
         sink = self._pin_sink[-1]
@@ -1269,10 +1539,19 @@ class _Inference:
         return override
 
     def _user_call(self, node: ast.Call) -> str:
-        """Result type of a call to a function defined in this module."""
+        """
+        Result type of a call to a function this module defines or imports.
+
+        A definition of this module wins, with its own shadowing rules. Only
+        when there is none does the import map speak -- the imported callee is
+        then typed from its DECLARED signature, never from this call site.
+        """
         name = _dotted(node.func) or ''
         resolved = self._resolve_func(name, node)
         if resolved is None:
+            imported = self._imported_call(node, name)
+            if imported is not None:
+                return imported
             # A module function shadows the builtin of the same name, so the
             # builtins are only consulted once the module has no such name
             builtin = BUILTIN_CALL_TYPES.get(name)
@@ -1346,62 +1625,12 @@ class _Inference:
         returns = self._group_returns.get(key, [])
         out: list[ImplSig] = []
         for impl in self._defs.get(key, ()):
-            args = impl.args
-            if any(default is None for default in args.kw_defaults):
+            if any(default is None for default in impl.args.kw_defaults):
                 continue
-            positional = list(args.posonlyargs) + list(args.args)
             slot = self._group_slot.get(node_id(impl) or -1)
             ret = returns[slot] if slot is not None and slot < len(returns) else UNKNOWN
-            defaults = _param_defaults(impl)
-            out.append(ImplSig(
-                params=tuple(annotation_type(a.annotation) for a in positional),
-                required=len(positional) - len(args.defaults),
-                open_ended=args.vararg is not None, ret=ret,
-                fits=''.join(self._fit(arg, defaults.get(arg.arg))
-                             for arg in positional + list(args.kwonlyargs))))
+            out.append(impl_sig(impl, ret, self._ty_of, self._classes))
         return out
-
-    def _fit(self, arg: ast.arg, default: ast.expr | None) -> str:
-        """
-        What one parameter of an implementation contributes to a call that
-        omits it.
-
-        An UNANNOTATED parameter contributes nothing: the selector has no
-        declared type to check its default against, so it takes whatever the
-        default is. That is not the same as an annotation this pass cannot
-        read, which ``default_fit`` declines on.
-
-        :param arg: The parameter
-        :param default: Its default expression, or None when it has none
-        :return: One of the ``FIT_*`` characters
-        """
-        if default is None:
-            return FIT_REQUIRED
-        if arg.annotation is None:
-            return FIT_OMISSIBLE
-        return default_fit(annotation_type(arg.annotation), self._default_ty(default),
-                           annotation_takes_none(arg.annotation))
-
-    def _default_ty(self, default: ast.expr) -> str:
-        """
-        Type of a default expression, as the overload selector reads it.
-
-        ``na`` carries no type of its own, and neither does the sentinel
-        ``DynamicDefaultTransformer`` leaves where a default read per-bar lib
-        state -- the selector skips that one outright. A literal ``None`` is a
-        VALUE the selector type-checks like any other, so it gets its own
-        character and is decided against the annotation, not against the
-        annotation's type.
-
-        :param default: The default expression
-        :return: Its type character, ``NONE_DEFAULT`` or ``TYPELESS``
-        """
-        if isinstance(default, ast.Constant) and default.value is None:
-            return NONE_DEFAULT
-        dotted = _dotted(default)
-        if dotted is not None and dotted.split('.')[-1] in ('na', _DYN_DEFAULT):
-            return TYPELESS
-        return self._ty_of(default)
 
     def _call_context(self, key: str, node: ast.Call, frame: int) -> str:
         """
@@ -1487,7 +1716,7 @@ class _Inference:
             default = defaults.get(arg.arg)
             if passed is None and default is None:
                 return None
-            annotated = annotation_type(arg.annotation)
+            annotated = annotation_type(arg.annotation, self._classes)
             if annotated != UNKNOWN:
                 out.append(annotated)
             elif passed is None:
@@ -1497,6 +1726,221 @@ class _Inference:
             else:
                 out.append(join(self._ty_of(default), self._ty_of(passed)))
         return tuple(out)
+
+    # --- calls into another module ---------------------------------------
+
+    def _imported_call(self, node: ast.Call, name: str) -> str | None:
+        """
+        Type a call whose callee comes from another module.
+
+        MEASURED: an imported function is typed from what it DECLARES and
+        nothing else. TradingView compiles a library on its own, so a caller's
+        argument types cannot reach into it the way they reach a helper of the
+        same script -- an unannotated library parameter stays unannotated
+        however the call spells its arguments.
+
+        :param node: The call node
+        :param name: The callee as written, dotted
+        :return: The call's type, or None when the callee is not imported
+        """
+        head, _, rest = name.partition('.')
+        parts = tuple(part for part in rest.split('.') if part)
+        shadow = self._shadowed.get(head)
+        binding = shadow.source if shadow is not None else self._imports.get(head)
+        if binding is None:
+            return None
+        if self._nearer_binding(head):
+            # A parameter or a local of some scope in between holds the name;
+            # what it holds is whatever was assigned to it, not the import
+            return UNKNOWN
+        if head in self._multi_imports:
+            self._diag(
+                f"'{head}' is imported more than once, so what it calls is unknown",
+                node, self._unknown('rebound-name', node, head),
+                fix=f"import '{head}' once, under a name nothing else binds")
+            return UNKNOWN
+        if self._import_rebound(head):
+            self._diag(
+                f"'{head}' is assigned as well as imported, so what it calls is unknown",
+                node, self._unknown('rebound-name', node, head),
+                fix=f"call '{head}' under a name nothing assigns to")
+            return UNKNOWN
+        if shadow is not None:
+            return self._shadowed_call(node, name, shadow, parts)
+
+        path = binding.attrs + parts
+        if not path:
+            # The module object itself is being called, which types nothing
+            return UNKNOWN
+        interface = self._interface_of(binding.module, path[:-1], node)
+        if interface is None:
+            return UNKNOWN
+        sig = interface.exports.get(path[-1])
+        return UNKNOWN if sig is None else self._export_call(node, name, sig, interface)
+
+    def _shadowed_call(self, node: ast.Call, name: str, shadow: _Shadowed,
+                       parts: tuple[str, ...]) -> str:
+        """
+        Type a call through an alias that merges a library over a builtin namespace.
+
+        The merge is per MEMBER, so the answer is too: the library's own
+        exports come from its interface, and every other member from the
+        builtin namespace the alias shadows. A library that cannot be resolved
+        at all decides neither half, so nothing is claimed for it.
+
+        :param node: The call node
+        :param name: The callee as written
+        :param shadow: The merged namespace the head is bound to
+        :param parts: The attribute path after the head
+        :return: The type the call evaluates to
+        """
+        if len(parts) != 1:
+            return UNKNOWN
+        member = parts[0]
+        interface = self._interface_of(shadow.source.module, shadow.source.attrs, node)
+        if interface is None:
+            return UNKNOWN
+        published = interface.all if interface.all is not None else tuple(interface.exports)
+        if member not in published:
+            return self._lib_call(node, f'{shadow.namespace}.{member}')
+        sig = interface.exports.get(member)
+        return UNKNOWN if sig is None else self._export_call(node, name, sig, interface)
+
+    def _export_call(self, node: ast.Call, name: str, sig: ExportSig,
+                     interface: ModuleInterface) -> str:
+        """
+        Type one call against the signature its module publishes.
+
+        A group is pinnable exactly as a same-module one is: the pin selects
+        among SIGNATURES, and needs no body to do it. A plain function has
+        nothing to select, so its declared return is the whole answer -- and
+        where its parameters carry no annotations there is no answer at all,
+        because the module was analysed without this call site and the types it
+        would have needed are the ones it never got.
+
+        :param node: The call node
+        :param name: The callee as written, for the call site record
+        :param sig: The published signature
+        :param interface: The module that publishes it
+        :return: The type the call evaluates to
+        """
+        is_group = sig.kind == 'group'
+        pin = self._pin(node, is_group)
+        if is_group:
+            picked = None if pin is None else overload_pick(list(sig.impls), pin)
+            ty = sig.ret if picked is None else picked
+        elif sig.annotated:
+            ty = sig.ret
+        else:
+            ty = UNKNOWN
+            where = f'{interface.path}:{sig.line}'
+            self._diag(
+                f"'{sig.name}' is imported from {where}, where its parameters carry no "
+                f"annotations, so what it returns is unknown", node,
+                self._unknown('unannotated-import', node, sig.name),
+                fix=f"annotate the parameters of '{sig.name}' in {where}")
+        self.table.calls.append(CallSite(
+            callee=name, line=_line(node), col=_col(node),
+            argc=_call_arity(node), ty=ty, pin=pin))
+        return ty
+
+    def _interface_of(self, module: str, hops: tuple[str, ...],
+                      node: ast.AST) -> ModuleInterface | None:
+        """
+        The interface of the module a dotted callee reaches, and the dependency on it.
+
+        Every segment before the export name has to be a MODULE. One that is
+        not is an attribute path -- a UDT's method, an object's field -- and
+        this pass does not follow those, so the callee is simply unknown.
+
+        Consulting an interface is what creates a dependency: the record goes
+        into the table, the loader bakes it into the bytecode and re-checks it
+        before accepting the cache, so a signature that moves is noticed.
+
+        :param module: Dotted module the import names
+        :param hops: Attribute path leading to the module that owns the export
+        :param node: The node the interface is wanted for, for the cycle
+                     diagnostic
+        :return: The interface, or None when there is none to be had
+        """
+        dotted = '.'.join((module,) + hops)
+        path = self._module_source(dotted)
+        if path is None:
+            return None
+        if pine_type_artifact.analysing(path):
+            self._diag(
+                f"'{dotted}' imports this module back, so its signatures are not "
+                f"available yet", node, self._unknown('import-cycle', node, dotted),
+                fix=f'break the import cycle between {self.table.module_path} and {path}')
+            return None
+        if path not in self._interfaces:
+            interface = pine_type_artifact.lookup(path, self._analyser, self._pipeline_hash)
+            self._interfaces[path] = interface
+            if interface is not None:
+                record = pine_type_artifact.dep_record(interface)
+                self.table.deps[record.path] = record
+                # Its dependencies are this module's too. An export whose
+                # return was INFERRED from a call one module further out moves
+                # when THAT module's signature moves, and nothing about this
+                # module or its direct dependency changes when it does -- so
+                # the closure has to be carried, not just the edge
+                for inherited in interface.deps.values():
+                    if inherited.path == self.table.module_path:
+                        # A cyclic pair names this module in the other's
+                        # closure; its own source is not something it can be
+                        # invalidated by
+                        continue
+                    self.table.deps.setdefault(inherited.path, inherited)
+        return self._interfaces[path]
+
+    def _module_source(self, dotted: str) -> str | None:
+        """
+        Where a module's source lives, without importing the module itself.
+
+        ``find_spec`` is what keeps this free of side effects: the module whose
+        signatures are wanted is never executed -- the analysis reads its
+        source -- and a segment that is not a module has no spec at all, which
+        is exactly the question the caller is asking.
+
+        :param dotted: Dotted module name
+        :return: Its source path, or None when it is not a readable Python module
+        """
+        if dotted in self._module_paths:
+            return self._module_paths[dotted]
+        origin: str | None = None
+        try:
+            spec = importlib.util.find_spec(dotted)
+        except Exception:  # noqa: any resolution failure means "not a module here"
+            spec = None
+        if spec is not None and spec.origin and spec.origin.endswith('.py'):
+            origin = spec.origin
+        self._module_paths[dotted] = origin
+        return origin
+
+    def _nearer_binding(self, name: str) -> bool:
+        """
+        Whether a scope between the call and the module binds the imported name.
+
+        :param name: The head of the callee
+        :return: True when some enclosing function scope binds it
+        """
+        return any(name in self._rebound.get(frame.scope, ())
+                   for frame in self._frames[1:])
+
+    def _import_rebound(self, name: str) -> bool:
+        """
+        Whether the module binds an imported name by anything but the import.
+
+        Order says nothing here, unlike for a definition: an import is a VALUE
+        binding like every other one, so two of them are simply two stores to
+        the same name and neither is the one a call reaches.
+
+        :param name: The head of the callee
+        :return: True when a module-level binding other than the import has it
+        """
+        own = self._import_positions.get(name, frozenset())
+        return any(position not in own
+                   for position, _ in self._module_rebinds.get(name, ()))
 
     # --- the per-instance pin channel ------------------------------------
 
@@ -1701,6 +2145,81 @@ def _bound_positions(body: Sequence[ast.AST]) -> dict[str, list[tuple[int, int]]
     return {name: sorted(positions) for name, positions in out.items()}
 
 
+def _module_defs(body: Sequence[ast.stmt]) -> dict[str, list[tuple[tuple[int, int], bool]]]:
+    """
+    Every ``def`` the MODULE scope declares, with where it stands and whether
+    anything guards it.
+
+    Guarded means nested in a statement at all -- an ``if``, a ``for``, a
+    ``try``, a ``with``, a ``match``. Only a definition directly in the
+    module's own body is certain to have run by the time the module is
+    imported; every other one is a definition that MAY have bound the name.
+    Nested scopes are not descended into: a method or an inner helper binds a
+    name in its own scope, and no importer ever reaches it.
+
+    :param body: The module's own statements
+    :return: name -> (position, unguarded) per definition of it, in source order
+    """
+    out: dict[str, list[tuple[tuple[int, int], bool]]] = {}
+
+    def collect(stmts: Sequence[ast.stmt], unguarded: bool) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.setdefault(stmt.name, []).append(((_line(stmt), _col(stmt)), unguarded))
+            elif isinstance(stmt, ast.ClassDef):
+                continue
+            else:
+                for nested in _statement_lists(stmt):
+                    collect(nested, False)
+
+    collect(body, True)
+    return out
+
+
+def _exportable_names(body: Sequence[ast.stmt],
+                      rebinds: dict[str, list[tuple[tuple[int, int], _BranchPath]]],
+                      groups: Container[str]) -> frozenset[str]:
+    """
+    The module-level names an importer is guaranteed to find a definition under.
+
+    A module binds sequentially, so what an importer receives is whatever the
+    LAST binding of a name put there -- and that is a question of POSITION, not
+    of which shapes the module happens to contain. ``pick = other`` above
+    ``def pick`` leaves the definition bound and is perfectly exportable; the
+    same two lines the other way round are not, and an order-blind "the name is
+    bound by something else too" answers neither.
+
+    So the rule is the runtime one: the last module-level binding of the name
+    has to be a ``def``, and that def has to be one no branch guards. Two
+    definitions in exclusive branches (``if X: def f`` / ``else: def f``) fail
+    it -- publishing either would name a function half the runs never bind --
+    while a guarded definition CLOSED by a later unguarded one passes, because
+    the later one binds the name whatever the branch did.
+
+    An ``@overload`` group is held to more than its last member: a group
+    publishes every implementation, so one of them standing in a branch makes
+    the published set itself conditional.
+
+    :param body: The module's own statements
+    :param rebinds: Module-scope name -> where anything OTHER than a ``def``
+                    binds it, with the branch path of each
+    :param groups: The scope-qualified ids of the module's ``@overload``
+                   groups; a module-level group's id is its bare name
+    :return: The names the interface may publish a definition for
+    """
+    exportable: set[str] = set()
+    for name, positions in _module_defs(body).items():
+        last, unguarded = max(positions)
+        if not unguarded:
+            continue
+        if any(position > last for position, _ in rebinds.get(name, ())):
+            continue
+        if name in groups and not all(flag for _, flag in positions):
+            continue
+        exportable.add(name)
+    return frozenset(exportable)
+
+
 def _bound_names(body: Sequence[ast.AST]) -> set[str]:
     """
     Every name one scope's statements bind by something other than a ``def``.
@@ -1867,6 +2386,30 @@ def _labelled_lists(stmt: ast.stmt) -> Iterator[tuple[str, list[ast.stmt]]]:
         yield f'case:{index}', case.body
 
 
+def _module_statements(body: Sequence[ast.stmt]) -> Iterator[ast.stmt]:
+    """
+    Every statement that belongs to the MODULE scope, nested ones included.
+
+    An ``if`` or a ``try`` at module level opens no scope, so an import inside
+    one binds a module-level name like any other -- which is how a guarded
+    import (``try: import x``) is spelled. A ``def`` or a ``class`` does open
+    one and is not descended into.
+
+    Source order, which is the order the module RUNS in: a reader of this
+    sequence is deciding what a name is bound to, and the last statement to
+    bind it is the one that decides.
+
+    :param body: The module's own statements
+    :return: Its statements, in source order
+    """
+    for stmt in body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        yield stmt
+        for nested in _statement_lists(stmt):
+            yield from _module_statements(nested)
+
+
 def _statement_lists(stmt: ast.stmt) -> Iterator[list[ast.stmt]]:
     """
     Every statement list nested directly in one statement.
@@ -1978,37 +2521,6 @@ class _BranchIndex:
         return ()
 
 
-def _param_defaults(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, ast.expr]:
-    """
-    Each parameter's default expression, by parameter name.
-
-    A default is one half of what types a parameter: at a call site the type is
-    JOIN(default, argument), and where the caller omits the argument the
-    default IS the value passed. A SCRIPT ENTRY POINT is the extreme of that
-    same rule -- ``run_main()`` passes no arguments, so an entry's parameter is
-    its default on every bar, which is how a compiled script receives its
-    inputs (``main(length=input.int(14))``, unannotated, because Pine's
-    ``input.int``'s first parameter is the input's default VALUE).
-
-    What a default never does on its own is DECLARE a type: with no call site
-    to join with, ``def helper(x=0)`` says nothing about ``x``, because
-    ``helper(1.5)`` is a legal call.
-
-    :param node: The definition to read
-    :return: parameter name -> default expression, for the ones that have one
-    """
-    args = node.args
-    positional = list(args.posonlyargs) + list(args.args)
-    out: dict[str, ast.expr] = {}
-    # The defaults align to the LAST parameters, one per default
-    for arg, default in zip(positional[len(positional) - len(args.defaults):], args.defaults):
-        out[arg.arg] = default
-    for kwarg, kw_default in zip(args.kwonlyargs, args.kw_defaults):
-        if kw_default is not None:
-            out[kwarg.arg] = kw_default
-    return out
-
-
 def _is_overload(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     """
     Whether a definition is one implementation of an ``@overload`` group.
@@ -2029,6 +2541,44 @@ def _is_overload(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
         if isinstance(target, ast.Name) and target.id == 'overload':
             return True
     return False
+
+
+def _annotation_names(tree: ast.Module) -> dict[str, ast.expr]:
+    """
+    Every dotted name a module's annotations spell, with where it stands.
+
+    Only the annotations, not the whole tree: this is what decides which
+    imports are worth resolving an interface for, and an import a call reaches
+    is resolved by the call itself. A stringized annotation is parsed and read
+    the same way, since that is how a forward reference is spelled.
+
+    :param tree: The module to scan
+    :return: dotted spelling -> the annotation node it was found in
+    """
+    out: dict[str, ast.expr] = {}
+
+    def take(node: ast.expr, where: ast.expr) -> None:
+        for child in ast.walk(node):
+            if isinstance(child, (ast.Name, ast.Attribute)):
+                spelled = _dotted(child)
+                if spelled is not None:
+                    out.setdefault(spelled, where)
+            elif isinstance(child, ast.Constant) and isinstance(child.value, str):
+                try:
+                    take(ast.parse(child.value, mode='eval').body, where)
+                except SyntaxError:
+                    continue
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.arg, ast.AnnAssign)):
+            annotation = node.annotation
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            annotation = node.returns
+        else:
+            continue
+        if annotation is not None:
+            take(annotation, annotation)
+    return out
 
 
 def _line(node: ast.AST) -> int:
@@ -2144,19 +2694,6 @@ def _arity_fits(impl: dict[str, Any], argc: int) -> bool:
         return True
     params = impl['params']
     return len(params) - impl['defaults'] <= argc <= len(params)
-
-
-def _dotted(node: ast.expr) -> str | None:
-    """Render a dotted name expression, or None when it is not one."""
-    parts: list[str] = []
-    current: ast.expr = node
-    while isinstance(current, ast.Attribute):
-        parts.append(current.attr)
-        current = current.value
-    if not isinstance(current, ast.Name):
-        return None
-    parts.append(current.id)
-    return '.'.join(reversed(parts))
 
 
 def _own_calls(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.Call]:

@@ -15,12 +15,32 @@ The diagnostics are the same information in both modes. A hand-written script
 collects them and keeps running with runtime dispatch; ``@pyne edge`` raises on
 the first one. One code path, one message; only the raising is conditional.
 """
+import ast
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from .pine_type_rules import UNKNOWN
+from .pine_type_rules import UNKNOWN, ImplSig
 
 __all__ = ['Unknown', 'Binding', 'FuncSig', 'CallSite', 'ContextKey',
-           'ContextResult', 'Diag', 'PineTypeTable', 'PineTypeError']
+           'ContextResult', 'Diag', 'DepRecord', 'ExportSig', 'ModuleInterface',
+           'PineTypeTable', 'PineTypeError', 'Analyser', 'SCOPE_SEP', 'qualify']
+
+#: Separator the scope-qualified ids are spelled with. It is the same character
+#: the transformers reserve for their injected names, so a scope-qualified id
+#: can never collide with a name a script is allowed to spell.
+SCOPE_SEP = '·'
+
+
+def qualify(scope: str, name: str) -> str:
+    """
+    The scope-qualified identity of a name declared in one scope.
+
+    :param scope: Scope id, empty at module level
+    :param name: The name declared there
+    :return: The id ``bindings`` and ``funcs`` key it under
+    """
+    return f'{scope}{SCOPE_SEP}{name}' if scope else name
+
 
 #: How a context is addressed: the callee's scope id, the parameter types it
 #: was instantiated with, the context its caller was running in, the node id of
@@ -148,6 +168,95 @@ class Diag:
         return ' '.join(parts)
 
 
+@dataclass(slots=True, frozen=True)
+class DepRecord:
+    """
+    One module another module's types were derived from.
+
+    The stat pair is what makes the common case free: an untouched dependency
+    answers from ``os.stat`` alone, without parsing anything. It is only when
+    the file moved that the digest has to be re-derived and compared -- an
+    edit that leaves the INTERFACE alone (a body change, a comment) then keeps
+    the dependent's cached bytecode valid.
+    """
+    #: Resolved source path of the dependency
+    path: str
+    mtime_ns: int
+    size: int
+    #: The dependency's interface digest when the dependent was transformed
+    digest: str
+
+
+@dataclass(slots=True, frozen=True)
+class ExportSig:
+    """
+    One name a module publishes, as a consumer of the module reads it.
+
+    A group has no single shape -- each implementation has its own -- so
+    ``impls`` is where the authoritative shapes live and the fields beside it
+    mirror the FIRST implementation, the one declaration order reaches first.
+    """
+    name: str
+    #: ``'function'`` for a plain definition, ``'group'`` for an ``@overload``
+    #: group
+    kind: str
+    #: Type character of each positional parameter, in declaration order
+    params: tuple[str, ...] = ()
+    #: How many of them a call has to pass
+    required: int = 0
+    #: Whether a ``*args`` lets it take any number of them
+    open_ended: bool = False
+    ret: str = UNKNOWN
+    #: Whether every positional parameter carries an annotation this pass can
+    #: read. An export that does not is one a caller cannot type its arguments
+    #: against, whatever the arguments are
+    annotated: bool = False
+    #: Every implementation of a group, in declaration order; empty otherwise
+    impls: tuple[ImplSig, ...] = ()
+    line: int = 0
+
+
+@dataclass(slots=True, frozen=True)
+class ModuleInterface:
+    """
+    Everything one module publishes, and nothing about how it does it.
+
+    This is the whole cross-module contract: a dependent's types are a
+    function of its own source and of the INTERFACES it imports, so a
+    dependency whose interface digest is unchanged cannot invalidate it.
+    """
+    #: Resolved source path of the module
+    path: str
+    exports: dict[str, ExportSig]
+    #: The module's literal ``__all__``, or None when it spells none. A
+    #: namespace import reads the exports through it, so it is part of the
+    #: contract and not merely a hint
+    all: tuple[str, ...] | None
+    #: The classes the module publishes, ``__all__``-filtered. A dependent
+    #: annotating a parameter with one of them means an OBJECT, so which names
+    #: are classes is part of the contract: adding or removing one changes
+    #: what a dependent's annotations resolve to
+    classes: tuple[str, ...]
+    #: Digest of ``exports``, ``all`` and ``classes``, blind to every body
+    digest: str
+    #: Every module this one's types were derived from, its own dependencies'
+    #: dependencies included. An interface can be INFERRED from a third
+    #: module -- an export with annotated parameters and no return annotation
+    #: takes its return from whatever it calls -- so a consumer that only
+    #: checked this module's own source would keep believing a signature that
+    #: moved two modules away. Validation metadata, deliberately outside the
+    #: digest: what a module publishes does not change because a dependency's
+    #: file was touched
+    deps: dict[str, DepRecord] = field(default_factory=dict)
+    #: The source stat this interface was derived from. It travels WITH the
+    #: interface so a consumer can neither pair a fresh stat with an old
+    #: digest nor keep a registry entry whose file has since moved
+    mtime_ns: int = 0
+    #: Size of that same stat; -1 when the source could not be stat'd at all,
+    #: which no later stat matches
+    size: int = -1
+
+
 @dataclass(slots=True)
 class PineTypeTable:
     """Everything the inference learned about one module."""
@@ -163,6 +272,29 @@ class PineTypeTable:
     contexts: dict[ContextKey, ContextResult] = field(default_factory=dict)
     calls: list[CallSite] = field(default_factory=list)
     diags: list[Diag] = field(default_factory=list)
+    #: Scope-qualified id of every ``@overload`` group -> its implementations
+    #: in declaration order. The selection reads these, and so does the
+    #: interface a dependent module resolves the group's calls against
+    groups: dict[str, tuple[ImplSig, ...]] = field(default_factory=dict)
+    #: Resolved path -> the state of every module this one's types were
+    #: derived from. A dependent's cached bytecode is only valid while every
+    #: record here still describes the file on disk
+    deps: dict[str, DepRecord] = field(default_factory=dict)
+    #: Every class name an annotation in this module may name: the ones the
+    #: module declares in any scope, and the ones its imports bring in. An
+    #: annotation naming one of these is an OBJECT, not an unknown
+    classes: frozenset[str] = frozenset()
+    #: Module-scope names an importer is guaranteed to receive a DEFINITION
+    #: under: the name's last module-level binding is a ``def`` that no branch
+    #: guards, and no other binding of it stands after that def. What the
+    #: module interface publishes -- every other name reaches the importer as
+    #: whatever ran last, which is not a static question
+    exportable: frozenset[str] = frozenset()
+    #: Call node id -> the source position of that call. The pins a context
+    #: records are keyed by node id, which describes the tree the inference
+    #: walked and not the one a later pass emits, so anything written out has
+    #: to name the position instead
+    call_pos: dict[int, tuple[int, int]] = field(default_factory=dict)
 
     def binding(self, scope: str, name: str) -> Binding | None:
         """
@@ -197,3 +329,16 @@ class PineTypeError(SyntaxError):
         :return: The error, ready to raise
         """
         return cls(diag.render(), (filename, diag.line, diag.col + 1, text))
+
+
+#: Re-derives one module's tree and type table from its source path, without
+#: compiling or executing anything. The import hook owns the only real one
+#: (``core.import_hook.analyse_source``); it is passed in rather than imported
+#: so the analysis stays free of the loader.
+#:
+#: The third element is the ``(mtime_ns, size)`` of the very bytes that were
+#: parsed, read as one pair with them, or None when no such pair could be had.
+#: An interface built from the tree is only allowed to carry THAT fingerprint:
+#: a stat taken before the read describes whatever the file was then, and
+#: pairing it with signatures read afterwards records a state that never was.
+Analyser = Callable[[str], tuple[ast.Module, PineTypeTable, tuple[int, int] | None] | None]
