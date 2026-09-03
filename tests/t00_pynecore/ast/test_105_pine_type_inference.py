@@ -31,8 +31,10 @@ def _expr_type(expression: str, preamble: str = '') -> str:
     """Infer one expression in the standard measured setting."""
     source = (
         'from pynecore import lib\n'
+        'from pynecore.types import Series\n'
         'R = lib.input.int(14)\n'
         'd = R / 8\n'
+        'h: Series[int] = d\n'
         f'{preamble}'
         f'value = {expression}\n'
     )
@@ -64,9 +66,9 @@ def _expr_type(expression: str, preamble: str = '') -> str:
     # The ternary joins its arms rather than widening unconditionally
     ('d if d > 1 else R', 'i'),
     ('d if d > 1 else 1.0', 'f'),
-    # nz and the history index are type-preserving
+    # nz and the history index are type-preserving (the history is a series')
     ('lib.nz(d)', 'i'),
-    ('d[1]', 'i'),
+    ('h[1]', 'i'),
 ])
 def __test_tradingview_type_algebra__(expression: str, expected: str):
     """Each expression carries the type TradingView gives it"""
@@ -102,14 +104,20 @@ def __test_builtin_series_types__():
 
 def __test_annotation_declares_rather_than_follows__():
     """
-    An explicit annotation wins over the initializer.
+    An explicit annotation is the declaration, and the value has to fit it.
 
-    ``int x = 2.0`` is a declaration in Pine, and writing one is how a script
-    author states the intent the inference must honor.
+    ``float y = 2`` declares a float in Pine whatever the literal is, and
+    ``int x = 2.0`` is rejected outright: an int value is a float, a float
+    value is not an int, and a declaration the value contradicts would carry
+    the lie into every pin downstream.
     """
-    types = _types('x: int = 2.0\ny: float = 2\n')
-    assert types['x'] == 'i'
+    source = 'x: int = 2.0\ny: float = 2\n'
+    types = _types(source)
+    assert types['x'] == '?'
     assert types['y'] == 'f'
+    diags = infer_module(ast.parse(source), 'test').diags
+    assert [(d.origin.reason, d.line) for d in diags if d.origin is not None] \
+        == [('type-mismatch', 1)]
 
 
 def __test_series_and_na_wrappers_are_transparent__():
@@ -259,8 +267,8 @@ def __test_keyword_arguments_count_towards_arity__():
         'a = lib.math.round(1.5, 2)\n'
         'b = lib.math.round(1.5, precision=2)\n'
         'c = lib.math.round(1.5)\n'
-        'd = lib.math.max(x=1, y=2)\n'
-        'e = lib.math.max(1, y=2.0)\n'
+        'd = lib.math.max(1, 2)\n'
+        'e = lib.math.max(1, 2.0)\n'
     )
     assert types['a'] == 'f'
     assert types['b'] == 'f'

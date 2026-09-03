@@ -22,8 +22,9 @@ from dataclasses import dataclass, field
 from .pine_type_rules import UNKNOWN, ImplSig
 
 __all__ = ['Unknown', 'Binding', 'FuncSig', 'CallSite', 'ContextKey',
-           'ContextResult', 'Diag', 'DepRecord', 'ExportSig', 'ModuleInterface',
-           'PineTypeTable', 'PineTypeError', 'Analyser', 'SCOPE_SEP', 'qualify']
+           'ContextResult', 'Diag', 'DepRecord', 'ExportSig', 'ClassSig',
+           'ModuleInterface', 'PineTypeTable', 'PineTypeError', 'Analyser',
+           'SCOPE_SEP', 'qualify']
 
 #: Separator the scope-qualified ids are spelled with. It is the same character
 #: the transformers reserve for their injected names, so a scope-qualified id
@@ -83,6 +84,8 @@ class Binding:
     line: int = 0
     #: Provenance when ``ty`` is UNKNOWN
     unknown: Unknown | None = None
+    #: Declared as a series (``Series[...]``): its history ``x[n]`` is readable
+    series: bool = False
 
 
 @dataclass(slots=True)
@@ -157,6 +160,10 @@ class Diag:
     origin: Unknown | None = None
     #: Concrete remedy, e.g. "annotate 'length' as int"
     fix: str = ''
+    #: End of the construct the complaint is about, when it spans one (a
+    #: structural rejection covers everything written inside it); 0 = a point
+    end_line: int = 0
+    end_col: int = 0
 
     def render(self) -> str:
         """Full one-line form: what happened, where it came from, how to fix it."""
@@ -214,6 +221,35 @@ class ExportSig:
     #: Every implementation of a group, in declaration order; empty otherwise
     impls: tuple[ImplSig, ...] = ()
     line: int = 0
+    #: Name of each positional parameter (a group's: the first implementation's)
+    names: tuple[str, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class ClassSig:
+    """
+    One user-defined type, as everything that reads a value of it needs it.
+
+    A Pine object KNOWS its class, so ``obj.field`` has the field's DECLARED
+    type and ``obj.method(...)`` the method's. That is only answerable while
+    the class travels with the value, which is what the class id in the type
+    (``'o:<module>#Pivot'``) is for -- and why the id is (module, name) and
+    never the bare name: two libraries publishing a ``Settings`` publish two
+    different types.
+    """
+    #: The class name, as an annotation of its own module spells it
+    name: str
+    #: ``<module key>#<name>``, the identity a shaped type carries
+    id: str
+    #: Field name -> its declared type, in declaration order
+    fields: dict[str, str] = field(default_factory=dict)
+    #: How many of them a constructor call has to pass: the fields without a
+    #: default, which a dataclass keeps in front
+    required: int = 0
+    #: Method name -> its signature. A Pine method is a free function whose
+    #: first parameter is annotated with the class; it is published with the
+    #: class because that is how a receiver reaches it
+    methods: dict[str, ExportSig] = field(default_factory=dict)
 
 
 @dataclass(slots=True, frozen=True)
@@ -232,12 +268,20 @@ class ModuleInterface:
     #: namespace import reads the exports through it, so it is part of the
     #: contract and not merely a hint
     all: tuple[str, ...] | None
-    #: The classes the module publishes, ``__all__``-filtered. A dependent
-    #: annotating a parameter with one of them means an OBJECT, so which names
-    #: are classes is part of the contract: adding or removing one changes
-    #: what a dependent's annotations resolve to
-    classes: tuple[str, ...]
-    #: Digest of ``exports``, ``all`` and ``classes``, blind to every body
+    #: The classes the module publishes, ``__all__``-filtered, by name. A
+    #: dependent annotating a parameter with one of them means an object OF
+    #: THAT CLASS, so the whole class -- its id, its field types and its
+    #: methods -- is part of the contract: a field whose type moves changes
+    #: what every dependent reading that field resolves to
+    classes: dict[str, ClassSig]
+    #: The methods this module declares on ANOTHER module's class, by class id
+    #: and method name. Pine lets one library extend another library's UDT, and
+    #: the runtime finds such a method by searching the importing script's
+    #: library modules -- so what a receiver of that class resolves to depends
+    #: on this module too, and it is part of the contract
+    extensions: dict[str, dict[str, ExportSig]]
+    #: Digest of ``exports``, ``all``, ``classes`` and ``extensions``, blind to
+    #: every body
     digest: str
     #: Every module this one's types were derived from, its own dependencies'
     #: dependencies included. An interface can be INFERRED from a third
@@ -255,6 +299,12 @@ class ModuleInterface:
     #: Size of that same stat; -1 when the source could not be stat'd at all,
     #: which no later stat matches
     size: int = -1
+    #: Why NO pin may be built on anything this module publishes, or ``''``:
+    #: a container of its was mutated with something its type does not
+    #: hold and the aliases are not tracked, so a return type derived from
+    #: one may be a confident wrong answer. Part of the contract -- an
+    #: importer that consults such a module has to give its own pins up too
+    suppressed: str = ''
 
 
 @dataclass(slots=True)
@@ -280,10 +330,27 @@ class PineTypeTable:
     #: derived from. A dependent's cached bytecode is only valid while every
     #: record here still describes the file on disk
     deps: dict[str, DepRecord] = field(default_factory=dict)
-    #: Every class name an annotation in this module may name: the ones the
-    #: module declares in any scope, and the ones its imports bring in. An
-    #: annotation naming one of these is an OBJECT, not an unknown
-    classes: frozenset[str] = frozenset()
+    #: Every class name an annotation in this module may name -> its class
+    #: id: the ones the module declares in any scope, and the ones its imports
+    #: bring in. An annotation naming one of these is an object of that class,
+    #: not an unknown and not an anonymous object
+    classes: dict[str, str] = field(default_factory=dict)
+    #: The classes this module DECLARES, by id, with their fields and methods.
+    #: An imported one is not here -- it belongs to the module that declares
+    #: it, and travels in that module's interface
+    class_sigs: dict[str, ClassSig] = field(default_factory=dict)
+    #: The methods this module declares on classes it does NOT declare, by
+    #: class id and method name. A ``@method`` whose receiver is an imported
+    #: class extends that class for everyone who imports this module, which is
+    #: why it travels in the interface rather than with the class
+    extensions: dict[str, dict[str, ExportSig]] = field(default_factory=dict)
+    #: Why NO call site of the module carries an overload pin, when none
+    #: does: a container was mutated in place with something its type does
+    #: not hold, and the aliases of that container -- another name, a field,
+    #: a parameter, a ``var`` read earlier in source order on the next bar --
+    #: are not tracked, so no type downstream may drive a dispatch. None
+    #: while every pin the walk decided on stands.
+    pins_suppressed: Diag | None = None
     #: Module-scope names an importer is guaranteed to receive a DEFINITION
     #: under: the name's last module-level binding is a ``def`` that no branch
     #: guards, and no other binding of it stands after that def. What the

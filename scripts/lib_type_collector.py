@@ -30,13 +30,14 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 
 from pynecore.transformers.pine_type_rules import (  # noqa: E402
-    annotation_takes_none, annotation_type, constant_type, NONE_DEFAULT, TYPELESS,
+    annotation_takes_none, annotation_type, builtin_class_id, constant_type, join,
+    object_ty, ANNOTATION_TYPES, BOOL, FLOAT, INT, NONE_DEFAULT, OBJECT, STR, TYPELESS,
     UNKNOWN, VOID,
 )
 
 #: Registry format version. Bump whenever the shape below changes; the
 #: consumers (the inference engine, and the PyneAOT front end) pin it.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 8
 
 
 class LibTypeCollector:
@@ -47,6 +48,10 @@ class LibTypeCollector:
     def __init__(self, project_src: Path | None = None):
         self.project_root = project_src if project_src is not None else self._find_project_root()
         self.lib_path = self.project_root / 'pynecore' / 'lib'
+        #: The classes the lib publishes as Pine objects are declared here, not
+        #: under ``lib/`` -- a lib module imports them out of this package --
+        #: so their FIELDS have to be read from it
+        self.types_path = self.project_root / 'pynecore' / 'types'
         self.json_path = self.project_root / 'pynecore' / 'transformers' / 'lib_types.json'
 
     @staticmethod
@@ -72,11 +77,14 @@ class LibTypeCollector:
         """
         per_module: dict[str, dict[str, Any]] = {}
         reexports: dict[str, list[tuple[str, str, str]]] = {}
+        packages: dict[str, str] = {}
         for file_path in sorted(self.lib_path.rglob('*.py')):
             prefix = self._module_prefix(file_path)
             tree = ast.parse(file_path.read_text(), filename=str(file_path))
             per_module[prefix] = collect_module_types(tree)
             reexports[prefix] = _sibling_reexports(tree, prefix)
+            packages[prefix] = prefix if file_path.stem == '__init__' \
+                else prefix.rpartition('.')[0]
 
         # Names re-exported from a private sibling belong to the public module
         for prefix, imports in reexports.items():
@@ -86,11 +94,17 @@ class LibTypeCollector:
                     per_module[prefix].setdefault(alias, entry)
 
         names: dict[str, Any] = {}
+        aliases: list[tuple[str, str]] = []
         for prefix, entries in per_module.items():
             if prefix.rpartition('.')[2].startswith('_'):
                 continue
             for name, entry in entries.items():
-                names[f'{prefix}.{name}' if prefix else name] = entry
+                key = f'{prefix}.{name}' if prefix else name
+                names[key] = entry
+                if entry['kind'] == 'alias':
+                    package = packages[prefix]
+                    aliases.append(
+                        (key, f'{package}.{entry["to"]}' if package else entry['to']))
 
         # A module whose own name it also defines is spelled without the
         # repetition by a script: ``lib/plot.py::plot`` is written ``plot(...)``
@@ -102,7 +116,67 @@ class LibTypeCollector:
             if leaf in entries:
                 names[f'{parent}.{leaf}' if parent else leaf] = entries[leaf]
 
-        return {'v': SCHEMA_VERSION, 'names': names}
+        _resolve_aliases(names, aliases)
+        return {'v': SCHEMA_VERSION, 'names': names, 'classes': self._collect_fields(),
+                'scalar_classes': self._collect_scalars()}
+
+    def _collect_fields(self) -> dict[str, dict[str, str]]:
+        """
+        The fields of every class the lib publishes as a Pine object.
+
+        A ``chart.point`` KNOWS its class, so ``p.price`` is a float -- but
+        only if the class says what it holds, and a builtin class says it in
+        the type package rather than in an interface. The annotations are
+        already there (``price: PyneFloat``), so they are extracted the same
+        way the returns are.
+
+        :return: Class name -> field name -> type
+        """
+        declared: dict[str, ast.ClassDef] = {}
+        for file_path in sorted(self.types_path.rglob('*.py')):
+            tree = ast.parse(file_path.read_text(), filename=str(file_path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    declared.setdefault(node.name, node)
+        classes = {name: builtin_class_id(name) for name in declared}
+        out: dict[str, dict[str, str]] = {}
+        for name, node in declared.items():
+            fields = _class_fields(node, classes)
+            if fields:
+                out[name] = fields
+        return out
+
+    def _collect_scalars(self) -> dict[str, str]:
+        """
+        The classes of the type package that ARE a scalar.
+
+        ``Format`` derives from ``StrLiteral``, which is a ``str``: a
+        ``format.percent`` is a string wherever a string is taken, and the
+        registry says so by naming the scalar each such class is.
+
+        :return: Class name -> scalar type character
+        """
+        bases: dict[str, list[str]] = {}
+        for file_path in sorted(self.types_path.rglob('*.py')):
+            tree = ast.parse(file_path.read_text(), filename=str(file_path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    bases.setdefault(node.name, [
+                        base.id if isinstance(base, ast.Name) else base.attr
+                        for base in node.bases if isinstance(base, (ast.Name, ast.Attribute))])
+        scalars: dict[str, str] = {'str': STR, 'StrLiteral': STR, 'int': INT,
+                                   'float': FLOAT, 'bool': BOOL}
+        settled = False
+        while not settled:
+            settled = True
+            for name, parents in bases.items():
+                if name in scalars:
+                    continue
+                found = next((scalars[parent] for parent in parents if parent in scalars), None)
+                if found is not None:
+                    scalars[name] = found
+                    settled = False
+        return {name: scalar for name, scalar in sorted(scalars.items()) if name in bases}
 
     def _module_prefix(self, file_path: Path) -> str:
         """Dotted lib path of a module, as a script spells it (``''`` for lib itself)."""
@@ -119,6 +193,171 @@ class LibTypeCollector:
         with open(self.json_path, 'w') as f:
             json.dump(registry, f, indent=1, sort_keys=True)
             f.write('\n')
+
+
+def _resolve_aliases(names: dict[str, Any], aliases: list[tuple[str, str]]) -> None:
+    """
+    Replace every alias entry by the entry it names, and drop the rest.
+
+    A namespace re-publishes a constant of another one by plain assignment
+    (``lib/strategy/__init__.py`` spells ``long = direction.long``), and a
+    script reads the alias, not the original -- so the registry has to carry
+    the same type under both spellings. The target is resolved against the
+    aliasing module's own PACKAGE, which is how the source spells it.
+
+    An alias this cannot resolve is removed rather than left in: the ``alias``
+    kind is an internal note between the two halves of the collection, and no
+    consumer of the registry knows it.
+
+    :param names: The flattened registry, edited in place
+    :param aliases: (full name, resolved target key) per alias entry
+    """
+    for key, target in aliases:
+        entry = names.get(target)
+        # A module whose own name matches the target's leaf resolves to
+        # itself (``lib/math.py`` spells ``e = math.e`` for the STDLIB math);
+        # there is nothing to copy, and the alias is simply dropped
+        if entry is not None and entry['kind'] != 'alias' and target != key:
+            names[key] = entry
+        else:
+            del names[key]
+
+
+def _class_fields(node: ast.ClassDef, classes: dict[str, str]) -> dict[str, str]:
+    """
+    The annotated fields of one class, in declaration order.
+
+    :param node: The class
+    :param classes: Class name -> class id, for resolving a field's own type
+    :return: Field name -> type
+    """
+    return {stmt.target.id: annotation_type(stmt.annotation, classes)
+            for stmt in node.body
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+            and not stmt.target.id.startswith('_')}
+
+
+def _is_types_module(node: ast.ImportFrom) -> bool:
+    """
+    Whether an import statement pulls names out of ``pynecore.types``.
+
+    :param node: The import statement
+    :return: True when its names are type classes
+    """
+    module = node.module or ''
+    if node.level:
+        return module == 'types' or module.startswith('types.')
+    return module == 'pynecore.types' or module.startswith('pynecore.types.')
+
+
+def _class_names(tree: ast.Module) -> dict[str, str]:
+    """
+    Every name one lib module may spell a Pine type with, and its class id.
+
+    Two sources, and both are needed to type the constants: the classes the
+    module declares itself (``chart.py``'s ``_ChartPoint`` namespace) and the
+    ones it imports out of ``pynecore.types`` (``Display``, ``Color``,
+    ``XLoc``). Resolving them by WHERE THEY COME FROM rather than by their
+    spelling is what keeps ``TypeVar`` and ``logging.getLogger`` out.
+
+    Every one of them is a class the LIB publishes, so they share the reserved
+    module key -- a script naming ``Line`` in an annotation lands on the same
+    id ``line.new`` returns, which is what makes the two comparable at all.
+
+    :param tree: Parsed module AST
+    :return: Type name -> class id
+    """
+    names = {node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and _is_types_module(node):
+            names.update(alias.asname or alias.name
+                         for alias in node.names if alias.name != '*')
+    return {name: builtin_class_id(name) for name in names}
+
+
+def _value_type(node: ast.expr, classes: dict[str, str]) -> str:
+    """
+    Pine type of a module-level constant, from the expression that builds it.
+
+    A lib namespace publishes its constants as bare constructor calls
+    (``data_window = Display()``, ``red = Color('#F23645')``,
+    ``islast = False``), so an extractor that only reads annotations left every
+    one of them untyped -- and with them every script expression that passes
+    one. The class the call names IS the type: ``Color`` is Pine's color, and
+    every other type class is a known non-scalar.
+
+    ``NA(<type>)`` is the one call whose ARGUMENT carries the type: a typed
+    ``na`` is of the type it names, which is what makes
+    ``earnings.future_time = NA(int)`` an int.
+
+    :param node: The value expression
+    :param classes: The type names visible in the module
+    :return: The type character, UNKNOWN for anything this cannot decide
+    """
+    if isinstance(node, ast.Constant):
+        return constant_type(node.value)
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else \
+            (func.attr if isinstance(func, ast.Attribute) else '')
+        if name == 'NA':
+            return annotation_type(node.args[0], classes) if node.args else UNKNOWN
+        if name in classes:
+            # ``Color('#F23645')`` is Pine's color scalar; every other type
+            # class builds an object OF that class
+            return ANNOTATION_TYPES.get(name) or object_ty(classes[name])
+    return UNKNOWN
+
+
+def _own_returns(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.Return]:
+    """
+    Every ``return`` of a function's own body, nested definitions excluded.
+
+    :param node: The definition to scan
+    :return: The return statements, in no particular order
+    """
+    out: list[ast.Return] = []
+    stack: list[ast.AST] = list(node.body)
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if isinstance(current, ast.Return):
+            out.append(current)
+        stack.extend(ast.iter_child_nodes(current))
+    return out
+
+
+def _result_type(node: ast.FunctionDef | ast.AsyncFunctionDef,
+                 classes: dict[str, str]) -> str:
+    """
+    What one lib function evaluates to.
+
+    The annotation answers wherever there is one. Where there is none the BODY
+    still answers the case that matters most: a function with no ``return
+    <value>`` at all returns nothing, which is a VOID and not a typing failure
+    -- ``plot()``, ``strategy.entry()`` and ``line.delete()`` are statements,
+    and reading them as unknown put every script that calls one outside the
+    typed subset for no reason. Where it does return values, they are typed the
+    same way a constant is, so ``plot()``'s ``return Plot(t)`` comes out an
+    object.
+
+    :param node: The definition to measure
+    :param classes: The type names visible in the module
+    :return: The result type character
+    """
+    if node.returns is not None:
+        return annotation_type(node.returns, classes)
+    returns = _own_returns(node)
+    if not returns:
+        return VOID
+    result = VOID if any(r.value is None for r in returns) else None
+    for statement in returns:
+        if statement.value is None:
+            continue
+        ty = _value_type(statement.value, classes)
+        result = ty if result is None else join(result, ty)
+    return UNKNOWN if result is None else result
 
 
 def _sibling_reexports(tree: ast.Module, prefix: str) -> list[tuple[str, str, str]]:
@@ -164,7 +403,8 @@ def _decorator_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     return names
 
 
-def _signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, Any]:
+def _signature(node: ast.FunctionDef | ast.AsyncFunctionDef, classes: dict[str, str],
+               bound: bool = False) -> dict[str, Any]:
     """
     One implementation's Pine signature.
 
@@ -189,14 +429,20 @@ def _signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, Any]:
     what the annotation answers, and only where such a default exists.
 
     :param node: The function definition
+    :param classes: The type names visible in the module
+    :param bound: Whether the first parameter is the receiver a namespace
+                  instance binds away (``chart.point.new`` is called with the
+                  arguments the SCRIPT spells, not with the instance)
     :return: ``{'ret': .., 'params': [..], 'names': [..], 'defaults': <count>,
-              'default_ty': [..], 'default_none_ok': [..]}``
+              'default_ty': [..], 'default_none_ok': [..], 'vararg': .., 'kwarg': True}``
     """
     args = node.args
     positional = list(args.posonlyargs) + list(args.args)
+    if bound and positional:
+        positional = positional[1:]
     signature: dict[str, Any] = {
-        'ret': annotation_type(node.returns),
-        'params': [annotation_type(a.annotation) for a in positional],
+        'ret': _result_type(node, classes),
+        'params': [annotation_type(a.annotation, classes) for a in positional],
         'names': [a.arg for a in positional],
         'defaults': len(args.defaults),
     }
@@ -210,7 +456,11 @@ def _signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, Any]:
     if args.vararg is not None:
         # ``math.max(*numbers)`` takes any arity; the element type is what the
         # overload is chosen on
-        signature['vararg'] = annotation_type(args.vararg.annotation)
+        signature['vararg'] = annotation_type(args.vararg.annotation, classes)
+    if args.kwarg is not None:
+        # ``fill(*args, **kwargs)`` takes any keyword: the call shape is the
+        # function's own business
+        signature['kwarg'] = True
     return signature
 
 
@@ -247,23 +497,33 @@ def collect_module_types(tree: ast.Module) -> dict[str, Any]:
     ``@overload`` group keeps every implementation, in source order, which is
     the order the runtime dispatcher tries them in.
 
-    Module-level constants get a type only when they carry an annotation --
-    an unannotated ``red = Color(...)`` would need the value's class, which
-    this extractor deliberately does not evaluate.
+    A module-level CONSTANT is typed from its annotation, or -- for the bare
+    constructor calls every lib namespace publishes its constants as
+    (``data_window = Display()``) -- from the class the call names. A constant
+    that merely re-publishes another namespace's (``long = direction.long``)
+    is recorded as an ``alias`` for :func:`_resolve_aliases` to replace with
+    the entry it names.
+
+    A namespace that is an INSTANCE of a module-local class (``point =
+    _ChartPoint()``) publishes that class's public methods under the dotted
+    spelling a script uses: ``chart.point.new(...)``.
 
     :param tree: Parsed module AST
     :return: name -> entry mapping
     """
     info: dict[str, Any] = {}
+    classes = _class_names(tree)
+    declared = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
 
     def record_function(node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         if node.name.startswith('_'):
             return
         decorators = _decorator_names(node)
-        signature = _signature(node)
+        signature = _signature(node, classes)
         if {'module_property', 'module_function_property'} & decorators:
-            # Read as a value: its type IS the return type
-            info[node.name] = {'kind': 'value', 'ty': signature['ret']}
+            # Read as a value: its type IS the return type; a script may call
+            # it as well, which reads the same
+            info[node.name] = {'kind': 'value', 'ty': signature['ret'], 'callable': True}
             return
         if 'overload' in decorators:
             entry = info.get(node.name)
@@ -278,10 +538,29 @@ def collect_module_types(tree: ast.Module) -> dict[str, Any]:
             return
         info[node.name] = {'kind': 'function', **signature}
 
-    def record_annotated(target: ast.expr, annotation: ast.expr) -> None:
+    def record_namespace(name: str, node: ast.ClassDef) -> None:
+        for statement in node.body:
+            if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                    or statement.name.startswith('_'):
+                continue
+            bound = 'staticmethod' not in _decorator_names(statement)
+            info[f'{name}.{statement.name}'] = {
+                'kind': 'function', **_signature(statement, classes, bound)}
+
+    def record_value(target: ast.expr, annotation: ast.expr | None,
+                     value: ast.expr | None) -> None:
         if not isinstance(target, ast.Name) or target.id.startswith('_'):
             return
-        ty = annotation_type(annotation)
+        ty = annotation_type(annotation, classes) if annotation is not None else UNKNOWN
+        if ty == UNKNOWN and value is not None:
+            spelled = _dotted(value)
+            if spelled is not None:
+                info[target.id] = {'kind': 'alias', 'to': spelled}
+                return
+            ty = _value_type(value, classes)
+            if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) \
+                    and value.func.id in declared:
+                record_namespace(target.id, declared[value.func.id])
         if ty not in (UNKNOWN, VOID):
             info[target.id] = {'kind': 'value', 'ty': ty}
 
@@ -290,7 +569,10 @@ def collect_module_types(tree: ast.Module) -> dict[str, Any]:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 record_function(node)
             elif isinstance(node, ast.AnnAssign):
-                record_annotated(node.target, node.annotation)
+                record_value(node.target, node.annotation, node.value)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    record_value(target, None, node.value)
             elif isinstance(node, ast.If):
                 if not _is_type_checking(node.test):
                     walk(node.body)
@@ -303,6 +585,24 @@ def collect_module_types(tree: ast.Module) -> dict[str, Any]:
 
     walk(tree.body)
     return info
+
+
+def _dotted(node: ast.expr) -> str | None:
+    """
+    Render a dotted name expression, or None when it is not one.
+
+    :param node: The expression to render
+    :return: Its dotted spelling, or None
+    """
+    parts: list[str] = []
+    current: ast.expr = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return None
+    parts.append(current.id)
+    return '.'.join(reversed(parts))
 
 
 if __name__ == '__main__':

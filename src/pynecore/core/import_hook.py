@@ -10,7 +10,7 @@ from pathlib import Path
 if TYPE_CHECKING:
     import ast
 
-    from pynecore.transformers.pine_type_table import DepRecord, PineTypeTable
+    from pynecore.transformers.pine_type_table import DepRecord, Diag, PineTypeTable
 
 __all__ = ['PYNE_RESERVED_NAME_CHAR', 'PIPELINE_DIGEST', 'source_starts_with_pyne',
            'analyse_source', 'PyneLoader', 'PyneImportHook']
@@ -207,6 +207,41 @@ def _module_mode(tree: "ast.Module") -> tuple[bool, str | None]:
     return True, magic.group('mode')
 
 
+#: Which typed diagnostics a structural one already covers, by reason
+_STRUCTURAL_COVERS: dict[str, frozenset[str]] = {
+    'edge-call': frozenset({'unknown-call', 'unknown-lib', 'unknown-return', 'bad-call'}),
+    'edge-name': frozenset({'unknown-name', 'function-value', 'unknown-lib-name',
+                            'unknown-field', 'unknown-class'}),
+    'edge-syntax': frozenset({'not-pine', 'unknown-op', 'unknown-index', 'not-series'}),
+    'edge-lambda': frozenset({'not-pine'}),
+    'edge-subscript': frozenset({'unknown-index', 'not-pine'}),
+}
+
+
+def _repeats(structural: list['Diag'], diag: 'Diag') -> bool:
+    """
+    Whether a typed diagnostic only repeats a structural one.
+
+    It does when it stands at the structural diagnostic's position, or inside
+    the expression that one rejected, AND says the kind of thing the
+    rejection already says: a construct that is not Pine has no type, and
+    neither do its parts. Another problem at the same place -- a name nothing
+    binds, used inside a rejected operator -- stands.
+    """
+    if diag.origin is None:
+        return False
+    at = (diag.line, diag.col)
+    for found in structural:
+        if found.origin is None \
+                or diag.origin.reason not in _STRUCTURAL_COVERS.get(found.origin.reason, ()):
+            continue
+        if at == (found.line, found.col):
+            return True
+        if found.end_line and (found.line, found.col) <= at <= (found.end_line, found.end_col):
+            return True
+    return False
+
+
 def _analyse_tree(tree: "ast.Module", source: str, path: Path,
                   pyne_mode: str | None) -> "ast.Module":
     """Run the pipeline up to and including the Pine type pass.
@@ -239,6 +274,17 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
     transformed.body = [node for node in transformed.body
                         if not (isinstance(node, ast.FunctionDef)
                                 and node.name.startswith('__test_') and node.name.endswith('__'))]
+
+    # The edge gate reads the tree AS WRITTEN: what follows injects plumbing
+    # no profile should judge. Its findings join the type diagnostics below
+    from pynecore.transformers.pine_edge_gate import (
+        diag_dump_enabled, gate_module, gated, render_diags, strict_enabled,
+    )
+    from pynecore.transformers.pine_type_table import PineTypeError
+    from pynecore.transformers.pine_type_transformer import module_table
+
+    edge = gated(pyne_mode)
+    structural = gate_module(transformed) if edge else []
 
     # Transform AST - lazy import transformers only when needed
     from pynecore.transformers.import_lifter import ImportLifterTransformer
@@ -312,6 +358,25 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
     transformed = PineTypeTransformer(pyne_mode, analyse=analyse_source,
                                       pipeline_hash=_get_transform_pipeline_hash()
                                       ).visit(transformed)
+    table = module_table(transformed)
+    if table is not None:
+        # One node, one report: where the structural half names the
+        # construct, the typed half would only add that it has no type. Only
+        # a typed diagnostic ABOUT that construct is the repeat; another
+        # problem at the same position stands
+        table.diags = sorted(
+            structural + [diag for diag in table.diags if not _repeats(structural, diag)],
+            key=lambda diag: (diag.line, diag.col))
+        if table.diags and diag_dump_enabled():
+            sys.stderr.write(render_diags(table.diags, str(path)) + '\n')
+        if table.diags and edge and strict_enabled():
+            # One code path, two modes: a hand-written script keeps running
+            # and keeps the list; an edge module is a promise, and the first
+            # thing that breaks it is the error
+            first = table.diags[0]
+            lines = source.splitlines()
+            text = lines[first.line - 1] if 0 < first.line <= len(lines) else None
+            raise PineTypeError.from_diag(first, str(path), text)
     return transformed
 
 

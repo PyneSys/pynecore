@@ -16,19 +16,25 @@ int-typed on TradingView, and ``int / int`` is int-typed there while Python
 gives a float. Where the two disagree, the measurement wins.
 """
 import ast
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Mapping, Sequence
 from typing import Final, NamedTuple, TypeVar
 
 #: Any expression node -- ``stamp_lowering`` hands back exactly what it got.
 _E = TypeVar('_E', bound=ast.expr)
 
 __all__ = [
-    'INT', 'FLOAT', 'BOOL', 'STR', 'COLOR', 'OBJECT', 'VOID', 'UNKNOWN',
-    'NUMERIC', 'KNOWN',
+    'INT', 'FLOAT', 'BOOL', 'STR', 'COLOR', 'OBJECT', 'PINE_LOOP', 'VOID', 'UNKNOWN',
+    'NUMERIC', 'KNOWN', 'SCALARS',
+    'LIB_MODULE', 'CLASS_SEP', 'class_id', 'builtin_class_id', 'object_ty',
+    'array_of', 'matrix_of', 'map_of', 'tuple_of', 'head', 'is_shaped', 'is_array',
+    'is_matrix', 'is_map', 'is_tuple', 'arity', 'elements_of', 'class_of',
+    'element_of', 'key_of', 'value_of', 'shape_mismatch', 'shape_conflict', 'render_ty',
+    'BUILTIN_CLASSES', 'BUILTIN_NAMESPACES', 'namespace_of',
     'join', 'binop_type', 'unaryop_type', 'compare_type',
-    'annotation_type', 'ANNOTATION_TYPES', 'LIB_TYPE_OVERRIDES',
+    'annotation_type', 'bare_wrapper', 'ANNOTATION_TYPES', 'LIB_TYPE_OVERRIDES',
+    'OVERRIDE_PARAM_NAMES',
     'is_int_typed', 'TY_ATTR', 'get_ty', 'set_ty', 'inherit_ty',
-    'constant_type', 'stamp_lowering', 'BUILTIN_CALL_TYPES',
+    'constant_type', 'stamp_lowering', 'BUILTIN_CALL_TYPES', 'BUILTIN_NAME_TYPES',
     'PIN_ATTR', 'PINS_ATTR', 'PINNABLE', 'get_pin', 'set_pin', 'get_pins', 'set_pins',
     'VECTOR_ATTR', 'VARYING_ATTR', 'get_vector', 'set_vector', 'get_varying', 'set_varying',
     'pin_for', 'overload_result', 'ImplSig', 'overload_pick',
@@ -224,10 +230,429 @@ VOID: Final = 'v'
 #: ``@pyne edge`` gate rejects.
 UNKNOWN: Final = '?'
 
+#: Pine's ``na``: a value that carries no type of its own and takes the one of
+#: whatever it meets. It is what an untyped ``na`` literal reads as, and what
+#: a default that carries no type is -- the selector's exact pass takes such a
+#: default for whatever the parameter declares (MEASURED against
+#: ``core/overload.py::_check_type``: a typeless ``na`` answers every
+#: annotation, ``NA.type is None`` returns True outright, and the
+#: ``__dyn_default__`` sentinel is skipped before the check runs at all).
+TYPELESS: Final = '*'
+
 #: The types the arithmetic algebra is defined over.
 NUMERIC: Final = frozenset({INT, FLOAT})
-#: Everything the gate accepts -- UNKNOWN is the only failure.
-KNOWN: Final = frozenset({INT, FLOAT, BOOL, STR, COLOR, OBJECT, VOID})
+#: Everything the gate accepts -- UNKNOWN is the only failure, and a typeless
+#: ``na`` is a value the language has rather than a type it could not find.
+KNOWN: Final = frozenset({INT, FLOAT, BOOL, STR, COLOR, OBJECT, VOID, TYPELESS})
+#: The types a Pine value can be spelled as a single character: the scalars a
+#: map key is allowed to be, and the only tails a shape ever ends in.
+SCALARS: Final = frozenset({INT, FLOAT, BOOL, STR, COLOR})
+
+
+# --- shaped types ---------------------------------------------------------
+
+# Pine's types are fully static and fully spelled: an object KNOWS its class,
+# an ``array<int>`` is a different type from an ``array<float>``, and a
+# ``map<string, array<float>>`` holds float arrays. A single character cannot
+# say any of that, so the representation stays a ``str`` and grows a grammar:
+#
+#     ty  := <char> | 'o:' <class-id> | 'a:' <ty> | 'm:' <ty>
+#          | 'M:' <key-char> ':' <ty> | 'T:' <item>+
+#     item := <decimal length> ':' <ty>
+#
+# array, matrix and map, in that order; a map key is a Pine scalar so one
+# character is enough for it and the TAIL is the value type, which makes the
+# grammar unambiguous read left to right. A bare ``'o'`` stays what it always
+# was -- an object whose class was lost -- and is what the diagnostics point at.
+#
+# The tuple is the one form holding SEVERAL types in a row, and none of the
+# others is self-delimiting inside a sequence: a class id ends in a module key
+# that is a filesystem path, which may hold any character a path may hold --
+# commas, colons, spaces, even the ``#`` the id itself is spelled with. So an
+# item carries its own LENGTH, and a reader takes exactly that many characters
+# and stops. Nothing has to be escaped, nothing is ambiguous, and a shape of
+# any depth round-trips through ``tuple_of``/``elements_of`` unchanged.
+
+#: Module key the classes the LIB publishes are identified by. A real module
+#: key is an absolute source path, so this word can never collide with one.
+LIB_MODULE: Final = 'lib'
+
+#: What separates a class's module key from its name in a class id.
+CLASS_SEP: Final = '#'
+
+_OBJ: Final = 'o:'
+_ARRAY: Final = 'a:'
+_MATRIX: Final = 'm:'
+_MAP: Final = 'M:'
+_TUPLE: Final = 'T:'
+
+
+def class_id(module_key: str, name: str) -> str:
+    """
+    The identity of one class, which is (module, name) and never the bare name.
+
+    :param module_key: Resolved source path of the module declaring it
+    :param name: The class name
+    :return: The class id
+    """
+    return f'{module_key}{CLASS_SEP}{name}'
+
+
+def builtin_class_id(name: str) -> str:
+    """
+    The identity of a class the lib publishes (``Line``, ``Label``, ...).
+
+    :param name: The class name
+    :return: The class id
+    """
+    return f'{LIB_MODULE}{CLASS_SEP}{name}'
+
+
+def object_ty(cid: str) -> str:
+    """
+    The type of an instance of one class.
+
+    :param cid: The class id
+    :return: The shaped type
+    """
+    return _OBJ + cid
+
+
+#: The counter object a compiled ``for`` loop iterates: ``core/pine_range``'s
+#: ``PineLoop``, whose ``value`` is the counter and whose ``step(to)`` advances it
+PINE_LOOP: Final = object_ty(builtin_class_id('PineLoop'))
+
+
+def array_of(element: str) -> str:
+    """
+    The type of an array over one element type.
+
+    A shape whose element is UNKNOWN collapses to a bare object: keeping it
+    would claim a shape while carrying no information, and two such arrays
+    would then read as a shape MISMATCH rather than as the one thing they
+    honestly are -- containers nothing is known about.
+
+    :param element: The element type
+    :return: The shaped type, or OBJECT when the element is not known
+    """
+    return OBJECT if element in (UNKNOWN, VOID) else _ARRAY + element
+
+
+def matrix_of(element: str) -> str:
+    """
+    The type of a matrix over one element type.
+
+    :param element: The element type
+    :return: The shaped type, or OBJECT when the element is not known
+    """
+    return OBJECT if element in (UNKNOWN, VOID) else _MATRIX + element
+
+
+def map_of(key: str, value: str) -> str:
+    """
+    The type of a map from one scalar key type to one value type.
+
+    :param key: The key type, which Pine requires to be a scalar
+    :param value: The value type
+    :return: The shaped type, or OBJECT when either half is not known
+    """
+    if key not in SCALARS or value in (UNKNOWN, VOID):
+        return OBJECT
+    return f'{_MAP}{key}:{value}'
+
+
+def tuple_of(elements: Sequence[str]) -> str:
+    """
+    The type of a Pine tuple over its element types, in order.
+
+    Every element is length-prefixed, so an element of any shape -- a class id
+    whose module key is a path full of punctuation included -- survives being
+    put next to another one. An element type is kept exactly as it is: an
+    UNKNOWN one only makes that POSITION unknown, and collapsing the whole
+    tuple for it would take the types of the other positions down with it,
+    which is the opposite of what an unpack needs. A typeless element stays
+    typeless for the same reason -- ``[na, na]`` takes its types from the
+    branch it meets.
+
+    :param elements: The element types, in order
+    :return: The shaped type, or OBJECT when there are no elements
+    """
+    if not elements:
+        return OBJECT
+    return _TUPLE + ''.join(f'{len(element)}:{element}' for element in elements)
+
+
+def head(ty: str) -> str:
+    """
+    The lattice character a type behaves as.
+
+    Every shape is an object, so this is what the char-based rules -- the
+    arithmetic, the pin, the overload selection -- read. It is also why the
+    pin wire format is untouched by shapes: ``pin_for(['a:i', 'i'])`` and
+    ``pin_for(['o', 'i'])`` are the same question.
+
+    :param ty: Any type
+    :return: Its single-character head
+    """
+    return ty if len(ty) == 1 else OBJECT
+
+
+def is_shaped(ty: str) -> bool:
+    """
+    Whether a type carries more than its lattice character.
+
+    :param ty: Any type
+    :return: True for a class, an array, a matrix or a map
+    """
+    return len(ty) > 1
+
+
+def class_of(ty: str) -> str | None:
+    """
+    The class id an object type names.
+
+    :param ty: Any type
+    :return: The class id, or None when the type is not a classed object
+    """
+    return ty[len(_OBJ):] if ty.startswith(_OBJ) else None
+
+
+def is_array(ty: str) -> bool:
+    """
+    Whether a type is an array of a known element type.
+
+    :param ty: Any type
+    :return: True for ``a:<ty>``
+    """
+    return ty.startswith(_ARRAY)
+
+
+def is_matrix(ty: str) -> bool:
+    """
+    Whether a type is a matrix of a known element type.
+
+    :param ty: Any type
+    :return: True for ``m:<ty>``
+    """
+    return ty.startswith(_MATRIX)
+
+
+def is_map(ty: str) -> bool:
+    """
+    Whether a type is a map of known key and value types.
+
+    :param ty: Any type
+    :return: True for ``M:<key>:<ty>``
+    """
+    return ty.startswith(_MAP)
+
+
+def is_tuple(ty: str) -> bool:
+    """
+    Whether a type is a Pine tuple.
+
+    :param ty: Any type
+    :return: True for ``T:<item>+``
+    """
+    return ty.startswith(_TUPLE)
+
+
+def elements_of(ty: str) -> tuple[str, ...]:
+    """
+    The element types of a tuple, in order.
+
+    The encoding is read the way it was written: a decimal length, a colon,
+    and exactly that many characters. Anything that does not read back that
+    way is not a tuple this module produced, and has no elements to give.
+
+    :param ty: Any type
+    :return: The element types, empty when the type is not a tuple
+    """
+    if not ty.startswith(_TUPLE):
+        return ()
+    out: list[str] = []
+    index = len(_TUPLE)
+    while index < len(ty):
+        colon = ty.find(':', index)
+        digits = ty[index:colon]
+        if colon < 0 or not digits.isdigit():
+            return ()
+        size = int(digits)
+        start = colon + 1
+        if start + size > len(ty):
+            return ()
+        out.append(ty[start:start + size])
+        index = start + size
+    return tuple(out)
+
+
+def arity(ty: str) -> int:
+    """
+    How many elements a tuple holds.
+
+    :param ty: Any type
+    :return: The element count, 0 when the type is not a tuple
+    """
+    return len(elements_of(ty))
+
+
+def element_of(ty: str) -> str:
+    """
+    The element type of an array or a matrix.
+
+    :param ty: Any type
+    :return: The element type, UNKNOWN when the type is neither
+    """
+    if ty.startswith(_ARRAY) or ty.startswith(_MATRIX):
+        return ty[2:]
+    return UNKNOWN
+
+
+def key_of(ty: str) -> str:
+    """
+    The key type of a map.
+
+    :param ty: Any type
+    :return: The key character, UNKNOWN when the type is not a map
+    """
+    return ty[len(_MAP)] if ty.startswith(_MAP) else UNKNOWN
+
+
+def value_of(ty: str) -> str:
+    """
+    The value type of a map.
+
+    :param ty: Any type
+    :return: The value type, UNKNOWN when the type is not a map
+    """
+    return ty[len(_MAP) + 2:] if ty.startswith(_MAP) else UNKNOWN
+
+
+def shape_mismatch(left: str, right: str) -> bool:
+    """
+    Whether two types are objects of DIFFERENT shape.
+
+    Pine rejects a variable whose branches produce two different types, so
+    this is the case worth a diagnostic of its own: the join is UNKNOWN
+    because the program is wrong, not because anything was untypable. A bare
+    object counts as different from a shape -- the class was lost somewhere,
+    and that is the thing to point at.
+
+    A tuple is the one shape that also disagrees with the SCALARS: ``[float,
+    int]`` and ``float`` are two types, and a function returning one on one
+    path and the other on another is rejected the same way.
+
+    :param left: One type
+    :param right: The other type
+    :return: True when the two are types that cannot both be right here
+    """
+    if left == right or left in (UNKNOWN, TYPELESS) or right in (UNKNOWN, TYPELESS):
+        return False
+    if is_tuple(left) or is_tuple(right):
+        return True
+    return head(left) == OBJECT and head(right) == OBJECT
+
+
+def shape_conflict(left: str, right: str) -> tuple[str, str] | None:
+    """
+    The pair of types that keeps two types from being joined, if any.
+
+    Two tuples of one arity join position by position, so their conflict --
+    when they have one -- sits at a POSITION: ``[array<int>, int]`` against
+    ``[array<float>, int]`` disagrees in the first element and nowhere else,
+    and the join keeps the second position while the first is unknown. That
+    partial answer is still a Pine error, and the element pair is the thing
+    worth pointing at. Two tuples of different arity, or a tuple against a
+    scalar, conflict as wholes.
+
+    :param left: One type
+    :param right: The other type
+    :return: The two types that disagree, or None when the join is clean
+    """
+    if is_tuple(left) and is_tuple(right):
+        items, others = elements_of(left), elements_of(right)
+        if len(items) != len(others):
+            return left, right
+        for item, other in zip(items, others):
+            found = shape_conflict(item, other)
+            if found is not None:
+                return found
+        return None
+    return (left, right) if shape_mismatch(left, right) else None
+
+
+#: How each type is spelled in a message: Pine's own spelling, not the
+#: character.
+_RENDERED: Final[dict[str, str]] = {
+    INT: 'int', FLOAT: 'float', BOOL: 'bool', STR: 'string', COLOR: 'color',
+    OBJECT: 'object', VOID: 'void', UNKNOWN: 'unknown', TYPELESS: 'na',
+}
+
+
+def render_ty(ty: str) -> str:
+    """
+    A type in Pine's own spelling, for a message a user reads.
+
+    ``'o:/lib/zigzag.py#Pivot'`` renders as ``Pivot``, ``'a:i'`` as
+    ``array<int>``, ``'M:s:a:f'`` as ``map<string, array<float>>`` and a tuple
+    as ``[float, int]``, which is how Pine spells one.
+
+    :param ty: Any type
+    :return: Its Pine spelling
+    """
+    cid = class_of(ty)
+    if cid is not None:
+        return cid.rpartition(CLASS_SEP)[2]
+    if ty.startswith(_ARRAY):
+        return f'array<{render_ty(element_of(ty))}>'
+    if ty.startswith(_MATRIX):
+        return f'matrix<{render_ty(element_of(ty))}>'
+    if ty.startswith(_MAP):
+        return f'map<{render_ty(key_of(ty))}, {render_ty(value_of(ty))}>'
+    if is_tuple(ty):
+        return f"[{', '.join(render_ty(element) for element in elements_of(ty))}]"
+    return _RENDERED.get(ty, ty)
+
+
+#: The classes the lib publishes as Pine objects, by the name an annotation
+#: spells them with. They are the one family whose module key is not a path --
+#: a script names ``Line`` without importing anything.
+BUILTIN_CLASSES: Final[dict[str, str]] = {
+    name: object_ty(builtin_class_id(name)) for name in (
+        'Line', 'LineFill', 'Label', 'Box', 'Table', 'Polyline', 'HLine',
+        'ChartPoint', 'VolumeRow', 'Currency', 'DayOfWeek', 'Extend',
+        'Footprint', 'Position', 'Size', 'Format', 'AlignEnum',
+        'FontFamilyEnum', 'FormatEnum',
+    )
+}
+
+#: The lib namespace a builtin object's methods live in, by class name. This
+#: is what lets ``method_call('get_top', box)`` resolve to ``box.get_top``
+#: once the receiver's class is known.
+BUILTIN_NAMESPACES: Final[dict[str, str]] = {
+    'Line': 'line', 'LineFill': 'linefill', 'Label': 'label', 'Box': 'box',
+    'Table': 'table', 'Polyline': 'polyline',
+}
+
+
+def namespace_of(ty: str) -> str | None:
+    """
+    The lib namespace a shaped receiver's methods are looked up in.
+
+    :param ty: The receiver's type
+    :return: The namespace, or None when the shape names none
+    """
+    if ty.startswith(_ARRAY):
+        return 'array'
+    if ty.startswith(_MATRIX):
+        return 'matrix'
+    if ty.startswith(_MAP):
+        return 'map'
+    cid = class_of(ty)
+    if cid is None:
+        return None
+    module, _, name = cid.rpartition(CLASS_SEP)
+    return BUILTIN_NAMESPACES.get(name) if module == LIB_MODULE else None
 
 
 def join(left: str, right: str) -> str:
@@ -237,14 +662,35 @@ def join(left: str, right: str) -> str:
     Used wherever one expression has two possible types: the arms of a
     ternary, the branches feeding a variable, the iterations of a loop.
     ``int`` widens to ``float`` because every int-typed value already IS a
-    double; anything else that disagrees is UNKNOWN.
+    double; anything else that disagrees is UNKNOWN -- two different shapes
+    included, since Pine rejects such a variable outright and a silent
+    widening to "some object" would hide exactly the class the next field read
+    needs.
 
-    :param left: One type character
-    :param right: The other type character
-    :return: The joined type character
+    A TYPELESS operand carries no type of its own and cannot disagree with
+    anything, so it takes the other side's -- a typed ``na`` already IS the
+    shape it names and needs no rule. A TUPLE joins element by element, which
+    is the same rule one level down.
+
+    :param left: One type
+    :param right: The other type
+    :return: The joined type
     """
     if left == right:
         return left
+    if left == TYPELESS:
+        return right
+    if right == TYPELESS:
+        return left
+    if is_tuple(left) and is_tuple(right):
+        # A tuple joins POSITION BY POSITION: the branches of ``[a, b] = cond
+        # ? [x, 1] : [y, 2]`` each say something about both halves, and one
+        # position disagreeing says nothing about the other. Two different
+        # arities are two different types, which is the mismatch case.
+        items, others = elements_of(left), elements_of(right)
+        if len(items) != len(others):
+            return UNKNOWN
+        return tuple_of([join(item, other) for item, other in zip(items, others)])
     if left in NUMERIC and right in NUMERIC:
         return FLOAT
     return UNKNOWN
@@ -275,6 +721,18 @@ def binop_type(op: ast.operator, left: str, right: str) -> str:
     :param right: Type of the right operand
     :return: Type of the result
     """
+    left, right = head(left), head(right)
+    # MEASURED (FX:EURUSD@60, ``na_probe1``/``3``/``4``): an untyped ``na``
+    # operand takes the OTHER operand's type -- ``int a = na + (R + z)``,
+    # ``float h = na + (R + z)`` and ``string g = na + 'x'`` all compile, while
+    # ``int i = na + 1.0`` is rejected with CE10173 ("const float"). Two of
+    # them are int: the same channel reports ``na + na`` as "const int"
+    if left == TYPELESS and right == TYPELESS:
+        left = right = INT
+    elif left == TYPELESS:
+        left = right
+    elif right == TYPELESS:
+        right = left
     if isinstance(op, ast.Add) and left == STR and right == STR:
         return STR
     if isinstance(op, _ARITHMETIC):
@@ -293,7 +751,9 @@ def unaryop_type(op: ast.unaryop, operand: str) -> str:
     Type of a unary expression.
 
     MEASURED: ``-d`` on an int-typed 1.75 stays int-typed (and plots -1.75),
-    so the unary sign is type-preserving. ``not`` is always bool.
+    so the unary sign is type-preserving. ``not`` is always bool. An untyped
+    ``na`` stays untyped under a sign, which is what makes ``int e = -na``
+    compile (MEASURED, ``na_probe3``).
 
     :param op: The operator node
     :param operand: Type of the operand
@@ -302,7 +762,9 @@ def unaryop_type(op: ast.unaryop, operand: str) -> str:
     if isinstance(op, ast.Not):
         return BOOL
     if isinstance(op, (ast.UAdd, ast.USub)):
-        return operand if operand in NUMERIC else UNKNOWN
+        if operand == TYPELESS:
+            return TYPELESS
+        return operand if head(operand) in NUMERIC else UNKNOWN
     return UNKNOWN
 
 
@@ -338,11 +800,12 @@ def constant_type(value: object) -> str:
 
 
 #: Names a module calls under their BARE spelling, with the Pine type of the
-#: result -- the ones import normalization leaves alone. Two families live
-#: here: the Python builtins a hand-written Pyne script uses, and the
+#: result -- the ones import normalization leaves alone. Three families live
+#: here: the Python builtins a hand-written Pyne script uses, the
 #: ``pine_cast`` helpers a compiled script gets its Pine casts as (the lib
-#: spellings ``lib.int`` and friends are in ``LIB_TYPE_OVERRIDES`` instead).
-#: ``'arg0'`` means the first argument's type.
+#: spellings ``lib.int`` and friends are in ``LIB_TYPE_OVERRIDES`` instead),
+#: and the plumbing the pipeline itself emits around a script.
+#: The values take the same forms ``LIB_TYPE_OVERRIDES`` does.
 BUILTIN_CALL_TYPES: Final[dict[str, object]] = {
     'int': INT,
     'float': FLOAT,
@@ -350,6 +813,39 @@ BUILTIN_CALL_TYPES: Final[dict[str, object]] = {
     'str': STR,
     'len': INT,
     'abs': 'arg0',
+    # ``NA(int)``, ``NA(Line)``: a typed na IS of the type it names. Without a
+    # type to name it is the na object itself, which is Pine's typeless marker
+    'NA': ['na_arg', TYPELESS],
+    # The tail every compiled script carries: ``if __name__ == '__main__':
+    # run(__file__)``. ``run`` is the runner entry point and returns nothing a
+    # script can read
+    'run': VOID,
+    # ``SecurityTransformer``'s plumbing. The write, the signal and the wait
+    # are statements; the unzip transposes an intrabar buffer into arrays. The
+    # READ is the one that carries a value, and it is typed from the write of
+    # the same id (see ``_security_read``)
+    '__sec_write__': VOID,
+    '__sec_signal__': VOID,
+    '__sec_wait__': VOID,
+    '__ltf_unzip__': OBJECT,
+    # A Pine ``for`` iterates over one of these; the loop VARIABLE's type is
+    # the join of the bounds (see ``_element_type``), while the iterable
+    # itself is an ordinary known non-scalar
+    'range': OBJECT,
+    'pine_range': OBJECT,
+    # The compiled forms of a loop with a re-read bound and of an inline
+    # history read: ``pine_loop(from, step)`` builds the counter object whose
+    # ``value`` the walker types from the bounds (see ``_loop_counter``);
+    # ``inline_series(expr, n)`` is ``expr[n]``, type-preserving
+    'pine_loop': PINE_LOOP,
+    'inline_series': 'arg0',
+    # ``core/pine_export.Exported()``: the module-level proxy a compiled
+    # library binds every export to, which ``@export`` fills in at run time.
+    # A callable reference, like a bare function name
+    'Exported': OBJECT,
+    # ``import_normalizer``'s builtin-namespace merge: the value is a
+    # namespace object, and its members are resolved per member
+    'shadowed_namespace': OBJECT,
     # Python's own arity split, and the same one TradingView measures for
     # ``math.round``: without a precision the result is an integer
     'round': {1: INT, 2: FLOAT},
@@ -366,6 +862,27 @@ BUILTIN_CALL_TYPES: Final[dict[str, object]] = {
     'cast_box': OBJECT,
     'cast_line': OBJECT,
     'cast_linefill': OBJECT,
+    # The edge profile's own builtins: ``max``/``min`` are ``math.max``/
+    # ``math.min`` (MEASURED: all-int arguments give an int), ``print`` is a
+    # statement, ``enumerate`` is the iterable a ``for [i, x] in arr`` compiles to
+    'max': 'all_int',
+    'min': 'all_int',
+    'print': VOID,
+    'enumerate': OBJECT,
+}
+
+
+#: Bare names the pipeline's own plumbing binds, with the type a READ of them
+#: has. None of them is a Pine value: they are the module's dunders and the
+#: security transformer's process-identity globals, and they only ever appear
+#: inside a comparison the ``Compare`` rule already types as a bool. Naming
+#: them here is what keeps the comparison's operands from being the untyped
+#: nodes under a typed one.
+BUILTIN_NAME_TYPES: Final[dict[str, str]] = {
+    '__name__': STR,
+    '__file__': STR,
+    '__active_security__': OBJECT,
+    '__same_context__': OBJECT,
 }
 
 
@@ -457,19 +974,53 @@ _TRANSPARENT_SUBSCRIPTS: Final = frozenset({
     'IBPersistentSeries', 'Optional',
 })
 
-#: Annotation heads that denote a known non-scalar.
-_OBJECT_SUBSCRIPTS: Final = frozenset({'list', 'tuple', 'dict', 'set', 'Array', 'Matrix'})
+#: Annotation heads whose payload is the ARRAY element type. PyneComp emits
+#: ``T[]`` as ``list[T]``; ``SequenceView`` is what ``array.slice`` hands back,
+#: and the runtime dispatches a view to the array namespace like an array.
+_ARRAY_SUBSCRIPTS: Final = frozenset({'list', 'Array', 'SequenceView'})
 
-#: Concrete lib classes: known objects, not typing failures.
-_OBJECT_NAMES: Final = frozenset({
-    'Array', 'Matrix', 'Map', 'Line', 'LineFill', 'Label', 'Box', 'Table',
-    'Polyline', 'HLine', 'ChartPoint', 'VolumeRow', 'Currency', 'DayOfWeek',
-    'Extend', 'Footprint', 'Position', 'Size', 'Format', 'AlignEnum',
-    'FontFamilyEnum', 'FormatEnum', 'list', 'tuple', 'dict', 'set',
+#: Annotation heads whose payload is the MATRIX element type.
+_MATRIX_SUBSCRIPTS: Final = frozenset({'Matrix'})
+
+#: Annotation heads whose payload is a (key, value) pair. PyneComp emits
+#: ``map<K, V>`` as ``dict[K, V]``.
+_MAP_SUBSCRIPTS: Final = frozenset({'dict', 'Map'})
+
+#: Annotation heads whose payload is the tuple's element types, one per
+#: position: ``tuple[float, int]`` is Pine's ``[float, int]``.
+_TUPLE_SUBSCRIPTS: Final = frozenset({'tuple', 'Tuple'})
+
+#: Annotation heads that denote a known non-scalar carrying no element type.
+_OBJECT_SUBSCRIPTS: Final = frozenset({'set'})
+
+#: Container names with no payload at all: known objects whose element type
+#: the annotation simply does not spell.
+_CONTAINER_NAMES: Final = frozenset({
+    'Array', 'Matrix', 'Map', 'SequenceView', 'list', 'tuple', 'dict', 'set',
 })
 
+#: The class map of a caller that has none to offer.
+NO_CLASSES: Final[Mapping[str, str]] = {}
 
-def annotation_type(node: ast.expr | None, classes: Collection[str] = ()) -> str:
+
+def bare_wrapper(node: ast.expr) -> bool:
+    """
+    Whether an annotation is a series/persistence wrapper that names no type.
+
+    ``x: Series = ta.ema(close, 9)`` and ``var x = ...`` in Pine say HOW the
+    variable lives, not what it holds: the wrapper without a subscript is a
+    storage marker, and the type is whatever the value has. ``Series[int]``,
+    by contrast, declares.
+
+    :param node: The annotation
+    :return: True for a bare ``Series``, ``Persistent``, ``NA`` and their kin
+    """
+    name = node.id if isinstance(node, ast.Name) else \
+        (node.attr if isinstance(node, ast.Attribute) else '')
+    return name in _TRANSPARENT_SUBSCRIPTS
+
+
+def annotation_type(node: ast.expr | None, classes: Mapping[str, str] = NO_CLASSES) -> str:
     """
     Map a Python annotation onto a Pine type character.
 
@@ -479,16 +1030,27 @@ def annotation_type(node: ast.expr | None, classes: Collection[str] = ()) -> str
     not recognize is UNKNOWN, which is what makes a missing annotation and an
     exotic one behave alike.
 
-    A name in ``classes`` is an OBJECT, not an unknown. A UDT is a type a
-    script declares and a library publishes, and a parameter typed by one is
-    fully annotated -- reading it as unknown made such a parameter behave like
-    an unannotated one, which is what took the whole export out of the typed
-    world for its callers.
+    A name in ``classes`` is an object OF THAT CLASS, not an unknown and not
+    an anonymous object. A UDT is a type a script declares and a library
+    publishes, and a parameter typed by one is fully annotated -- reading it
+    as unknown made such a parameter behave like an unannotated one, which is
+    what took the whole export out of the typed world for its callers, while
+    reading it as a bare object lost the field types the class declares.
+
+    The containers carry their element type the same way: ``list[int]`` is an
+    ``array<int>``, ``Matrix[float]`` a ``matrix<float>`` and ``dict[str,
+    list[float]]`` a ``map<string, array<float>>`` -- the spellings PyneComp
+    emits for Pine's ``array<T>``, ``matrix<T>`` and ``map<K, V>``. A
+    ``tuple[float, int]`` is Pine's ``[float, int]``, one type per position.
 
     :param node: The annotation expression, or None when there is none
-    :param classes: Class names visible where the annotation stands, the ones
-                    imported from another module included
-    :return: The type character
+    :param classes: Class SPELLING -> class id, for every class visible where
+                    the annotation stands, the imported ones included. An
+                    imported class is keyed by the spelling that reaches it
+                    (``Settings`` for ``from m import Settings``, ``m.Settings``
+                    for a namespace import), because identity is (module, name)
+                    and two modules' same-named classes are two types
+    :return: The type
     """
     if node is None:
         return UNKNOWN
@@ -508,30 +1070,82 @@ def annotation_type(node: ast.expr | None, classes: Collection[str] = ()) -> str
         return _named_type(node.id, classes)
 
     if isinstance(node, ast.Attribute):
+        # A QUALIFIED spelling is resolved as a whole first: ``a.Settings`` and
+        # ``b.Settings`` are two different classes, and the leaf cannot tell
+        # them apart. Only a spelling nothing published under its full path
+        # falls back to the leaf -- a class nested in another one, and the lib
+        # classes a script names through ``lib.``
+        spelled = _dotted(node)
+        if spelled is not None and spelled in classes:
+            return object_ty(classes[spelled])
         return _named_type(node.attr, classes)
 
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
         return _union_type(node, classes)
 
     if isinstance(node, ast.Subscript):
-        head = node.value
-        name = head.id if isinstance(head, ast.Name) else \
-            (head.attr if isinstance(head, ast.Attribute) else '')
-        if name in _TRANSPARENT_SUBSCRIPTS:
-            return annotation_type(node.slice, classes)
-        if name in _OBJECT_SUBSCRIPTS:
-            return OBJECT
-        return UNKNOWN
+        return _subscript_type(node, classes)
 
     return UNKNOWN
 
 
-def _named_type(name: str, classes: Collection[str] = ()) -> str:
-    """Resolve a bare annotation name to a type character."""
+def _subscript_type(node: ast.Subscript, classes: Mapping[str, str]) -> str:
+    """
+    Type of a subscripted annotation.
+
+    :param node: The ``X[...]`` annotation node
+    :param classes: Class name -> class id, visible where it stands
+    :return: The type
+    """
+    value = node.value
+    name = value.id if isinstance(value, ast.Name) else \
+        (value.attr if isinstance(value, ast.Attribute) else '')
+    if name in _TRANSPARENT_SUBSCRIPTS:
+        return annotation_type(node.slice, classes)
+    if name in _ARRAY_SUBSCRIPTS:
+        return array_of(annotation_type(node.slice, classes))
+    if name in _MATRIX_SUBSCRIPTS:
+        return matrix_of(annotation_type(node.slice, classes))
+    if name in _MAP_SUBSCRIPTS:
+        pair = node.slice.elts if isinstance(node.slice, ast.Tuple) else ()
+        if len(pair) != 2:
+            return OBJECT
+        return map_of(annotation_type(pair[0], classes),
+                      annotation_type(pair[1], classes))
+    if name in _TUPLE_SUBSCRIPTS:
+        # ``tuple[int]`` subscripts with the element itself, ``tuple[int,
+        # float]`` with a tuple of them: one element or many, the arity is
+        # fixed either way
+        items = node.slice.elts if isinstance(node.slice, ast.Tuple) else (node.slice,)
+        if any(isinstance(item, ast.Constant) and item.value is Ellipsis for item in items):
+            # ``tuple[X, ...]`` is a sequence of unknown length, which is not
+            # a Pine tuple at all -- Pine's has a fixed arity, and that arity
+            # is what an unpack is checked against
+            return OBJECT
+        return tuple_of([annotation_type(item, classes) for item in items])
+    if name in _OBJECT_SUBSCRIPTS:
+        return OBJECT
+    return UNKNOWN
+
+
+def _named_type(name: str, classes: Mapping[str, str] = NO_CLASSES) -> str:
+    """Resolve a bare annotation name to a type."""
     if name in ANNOTATION_TYPES:
         return ANNOTATION_TYPES[name]
-    if name in _OBJECT_NAMES or name in classes:
+    # A container spelled without its payload is an object whose element type
+    # the annotation does not say -- and it stays that even where the module
+    # has the container class itself in scope, which is how the lib spells its
+    # own ``Matrix`` and ``SequenceView`` returns
+    if name in _CONTAINER_NAMES:
         return OBJECT
+    # A class the module declares or imports wins over the builtin of the same
+    # name: a script's own ``Line`` is the class it wrote, not the lib's
+    found = classes.get(name)
+    if found is not None:
+        return object_ty(found)
+    builtin = BUILTIN_CLASSES.get(name)
+    if builtin is not None:
+        return builtin
     return UNKNOWN
 
 
@@ -555,13 +1169,13 @@ def _is_typeless(node: ast.expr) -> bool:
     return False
 
 
-def _union_type(node: ast.BinOp, classes: Collection[str] = ()) -> str:
+def _union_type(node: ast.BinOp, classes: Mapping[str, str] = NO_CLASSES) -> str:
     """
     Type of an annotation union, ignoring its absence markers.
 
     :param node: The ``X | Y`` annotation node
-    :param classes: Class names visible where the annotation stands
-    :return: The joined type character
+    :param classes: Class name -> class id, visible where the annotation stands
+    :return: The joined type
     """
     members: list[ast.expr] = []
 
@@ -616,6 +1230,9 @@ def pin_for(arg_types: list[str]) -> str | None:
     :param arg_types: Type of each positional argument, in order
     :return: One character per argument, or None when the site is not pinnable
     """
+    # A shaped argument pins as its head, which is an object -- and an object
+    # is not pinnable, so the wire format never sees a shape
+    arg_types = [head(t) for t in arg_types]
     if not arg_types or any(t not in PINNABLE for t in arg_types):
         return None
     if INT not in arg_types:
@@ -644,14 +1261,6 @@ def overload_result(returns: list[str]) -> str:
     first = returns[0]
     return first if all(ret == first for ret in returns[1:]) else UNKNOWN
 
-
-#: Type character of a default that carries no type of its own: ``na`` and the
-#: ``__dyn_default__`` sentinel the dynamic-default pass leaves behind. The
-#: selector's exact pass takes such a default for whatever the parameter
-#: declares -- MEASURED against ``core/overload.py::_check_type``, a typeless
-#: ``na`` answers every annotation (``NA.type is None`` returns True outright),
-#: and the sentinel is skipped before the check runs at all.
-TYPELESS: Final = '*'
 
 #: Type character of a literal ``None`` default. It is NOT typeless: the
 #: selector type-checks it like any other bound value, and ``_check_type``
@@ -699,7 +1308,9 @@ def default_fit(declared: str, default: str | None, takes_none: bool) -> str:
         return FIT_OMISSIBLE
     if default == UNKNOWN or declared == UNKNOWN:
         return FIT_UNSURE
-    return FIT_OMISSIBLE if default == declared else FIT_REQUIRED
+    # Heads, not shapes: what the runtime checks a default against is an
+    # ``isinstance``, which cannot see a class or an element type
+    return FIT_OMISSIBLE if head(default) == head(declared) else FIT_REQUIRED
 
 
 #: Annotation names that accept ``None`` whatever they wrap.
@@ -780,6 +1391,8 @@ class ImplSig(NamedTuple):
     #: ``params`` order, then the keyword-only ones. Its LENGTH is what says
     #: whether the implementation has keyword-only parameters at all.
     fits: str
+    #: Name of each positional parameter, so a keyword argument can be matched
+    names: tuple[str, ...] = ()
 
 
 def overload_pick(impls: list[ImplSig], pin: str) -> str | None:
@@ -840,6 +1453,7 @@ def _takes(impl: ImplSig, wanted: tuple[str, ...], exact_arity: bool) -> int:
         return _NO
     verdict = _YES
     for declared, want in zip(impl.params, wanted):
+        declared = head(declared)
         if declared == UNKNOWN:
             verdict = _MAYBE
         elif declared != want:
@@ -864,7 +1478,7 @@ _DYN_DEFAULT: Final = '__dyn_default__'
 
 def impl_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, ret: str,
              ty_of: Callable[[ast.AST], str] = get_ty,
-             classes: Collection[str] = ()) -> ImplSig:
+             classes: Mapping[str, str] = NO_CLASSES) -> ImplSig:
     """
     One definition's shape, as the static overload selection reads it.
 
@@ -876,7 +1490,7 @@ def impl_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, ret: str,
     :param ret: What it returns -- the inference's answer, not the annotation's
     :param ty_of: Types a default expression; the walk passes its OWN view, a
                   consumer reading a finished tree the node stamps
-    :param classes: Class names visible in the definition's module
+    :param classes: Class name -> class id, visible in the definition's module
     :return: The implementation's shape
     """
     args = node.args
@@ -887,12 +1501,13 @@ def impl_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, ret: str,
         required=len(positional) - len(args.defaults),
         open_ended=args.vararg is not None, ret=ret,
         fits=''.join(param_fit(arg, defaults.get(arg.arg), ty_of, classes)
-                     for arg in positional + list(args.kwonlyargs)))
+                     for arg in positional + list(args.kwonlyargs)),
+        names=tuple(a.arg for a in positional))
 
 
 def param_fit(arg: ast.arg, default: ast.expr | None,
               ty_of: Callable[[ast.AST], str] = get_ty,
-              classes: Collection[str] = ()) -> str:
+              classes: Mapping[str, str] = NO_CLASSES) -> str:
     """
     What one parameter contributes to a call that omits it.
 
@@ -904,7 +1519,7 @@ def param_fit(arg: ast.arg, default: ast.expr | None,
     :param arg: The parameter
     :param default: Its default expression, or None when it has none
     :param ty_of: Types the default expression
-    :param classes: Class names visible where the annotation stands
+    :param classes: Class name -> class id, visible where the annotation stands
     :return: One of the ``FIT_*`` characters
     """
     if default is None:
@@ -984,11 +1599,41 @@ def _dotted(node: ast.expr) -> str | None:
 
 # --- measured overrides ---------------------------------------------------
 
-#: Lib functions whose TradingView type is NOT what the Python annotation
-#: says, keyed by the dotted lib path. A value is either a type character
-#: (fixed result), the string ``'arg0'``..``'arg9'`` (echoes that argument's
-#: type), ``'all_int'`` (int when EVERY argument is int, float otherwise), or
-#: a dict mapping an argument COUNT to any of those (an arity split).
+#: Lib names whose TradingView type is NOT what the Python annotation says,
+#: keyed by the dotted lib path. A value is either a TYPE (a fixed result: a
+#: character, or a whole shape such as ``'a:i'``), one of the forms below, a
+#: dict mapping an argument COUNT to any of those (an arity split), or a list
+#: of any of those tried in order until one answers.
+#:
+#: The forms, with ``N`` a declared parameter position:
+#:
+#: ``'argN'``            echoes that argument's type, UNKNOWN when it has none
+#: ``'all_int'``         int when EVERY argument is int, float otherwise
+#: ``'join_args'``       the join of every argument's type
+#: ``'na_arg'``          the type the first argument NAMES (typed ``na``)
+#: ``'same_arrayN'``     that argument's own type, but only while it is an ARRAY
+#: ``'same_matrixN'``    that argument's own type, but only while it is a MATRIX
+#: ``'same_mapN'``       that argument's own type, but only while it is a MAP
+#: ``'merge_array'``     the first argument's array, after checking that the
+#:                       SECOND is an array whose elements fit into it
+#: ``'merge_matrix'``    the same for two matrices
+#: ``'merge_matrix_or_scalar'``  the same, the second operand a matrix or a
+#:                       number that fits the elements
+#: ``'elemN'``           the element type of that array or matrix
+#: ``'map_keyN'``        the key type of that map
+#: ``'map_valueN'``      the value type of that map
+#: ``'array_of_argN'``   an array over that argument's type
+#: ``'array_of_elemN'``  an array over that array's or matrix's element type
+#: ``'array_of_map_keysN'``    an array over that map's key type
+#: ``'array_of_map_valuesN'``  an array over that map's value type
+#: ``'matrix_of_argN'``  a matrix over that argument's type
+#: ``'array_of_join_args'``    an array over the join of every argument
+#: ``'matrix_mult'``     ``matrix.mult``, whose result follows its SECOND
+#:                       operand: a matrix by an array yields an array
+#:
+#: Every form from ``'same_arrayN'`` down DECLINES -- answers nothing at all --
+#: where the shape it reads is not known, so the call falls through to the
+#: annotation instead of claiming an UNKNOWN the annotation could have typed.
 #:
 #: MEASURED on TradingView (FX:EURUSD@60, ``d = (R + z) / 8`` int-typed 1.75):
 #: ``math.max(d, 1)`` is int while ``math.max(d, 1.0)`` is float,
@@ -1022,10 +1667,29 @@ LIB_TYPE_OVERRIDES: Final[dict[str, object]] = {
     'math.toradians': FLOAT,
     'math.random': FLOAT,
     'math.round_to_mintick': FLOAT,
-    # ``nz`` and the history index are type-preserving: ``nz(d)`` and ``d[1]``
-    # are both int-typed on TradingView
-    'nz': 'arg0',
-    'na': BOOL,
+    'math.pi': FLOAT,
+    'math.e': FLOAT,
+    # MEASURED (FX:EURUSD@60, ``R = input.int(14)``): ``int e = nz(R, 1.0)`` is
+    # rejected with CE10173 "simple float", while ``int e = nz(R, 2)`` and
+    # ``int e = nz(R)`` both compile -- so ``nz`` widens with its REPLACEMENT
+    # and is not simply type-preserving. The history index still is: ``d[1]``
+    # on an int-typed ``d`` is int
+    'nz': 'join_args',
+    # ``na(x)`` is the predicate; ``na(int)`` and ``na(Line)`` are the typed-na
+    # constructors the compiled form spells a declared na with
+    'na': ['na_arg', BOOL],
+    # The interned typeless na ``module_property`` rewrites a value-position
+    # bare ``na`` to. Pine's ``na`` is TYPELESS: it carries no type of its own
+    # and takes the one of whatever it meets, which is why ``x = cond ?
+    # line.new(...) : na`` is a line and ``float x = na`` is a float. MEASURED
+    # (``na_probe3``): ``int f = na`` compiles, and so does every other
+    # declared type -- so joining it with a type must yield that type, not the
+    # UNKNOWN a void would give
+    '_na_none': TYPELESS,
+    # MEASURED: ``int a = ta.change(bar_index)``, ``float b = ta.change(close)``
+    # and ``bool c = ta.change(close > open)`` all compile, so the result is the
+    # source's own type
+    'ta.change': 'arg0',
     'fixnan': 'arg0',
     # The casts are the only place the TYPE and the VALUE move together
     'int': INT,
@@ -1033,7 +1697,11 @@ LIB_TYPE_OVERRIDES: Final[dict[str, object]] = {
     'bool': BOOL,
     'string': STR,
     'color': COLOR,
-    # Inputs are typed by the constructor that made them
+    # Inputs are typed by the constructor that made them, and the GENERIC one
+    # by its default value -- MEASURED: ``int g = input(14)``,
+    # ``float h = input(1.5)``, ``bool i = input(true)``,
+    # ``string j = input("x")`` and ``color k = input(color.red)`` all compile
+    'input': 'arg0',
     'input.int': INT,
     'input.float': FLOAT,
     'input.bool': BOOL,
@@ -1047,4 +1715,100 @@ LIB_TYPE_OVERRIDES: Final[dict[str, object]] = {
     'input.price': FLOAT,
     'input.time': INT,
     'input.enum': OBJECT,
+
+    # --- the containers ---------------------------------------------------
+    # MEASURED (FX:EURUSD@60, probes ``shape_probe1``/``3``/``4``/``5``, an
+    # ``array<int>`` holding the int-typed 3.5, an ``matrix<int>`` and a
+    # ``map<string, int>``): a container reduction returns the ELEMENT type,
+    # not a float. ``int v = array.avg(ai)`` compiles, and so do ``sum``,
+    # ``min``, ``max``, ``range``, ``median``, ``mode``, ``stdev``,
+    # ``variance``, ``percentile_nearest_rank``,
+    # ``percentile_linear_interpolation`` and ``percentrank`` -- while
+    # ``int v = math.sqrt(4 + z)`` on the same probe is rejected with CE10173,
+    # which is what makes the channel a measurement. ``array.covariance`` is
+    # the ONE exception measured: it is a float over an int array.
+    # The derivations follow the same law -- ``abs``, ``standardize``,
+    # ``copy``, ``slice``, ``concat`` and ``from`` over an ``array<int>`` all
+    # read back as int, ``array.from(int, float)`` widens to ``array<float>``,
+    # and every matrix and map accessor answers with its own element type.
+    'array.get': 'elem0',
+    'array.first': 'elem0',
+    'array.last': 'elem0',
+    'array.pop': 'elem0',
+    'array.shift': 'elem0',
+    'array.remove': 'elem0',
+    'array.min': 'elem0',
+    'array.max': 'elem0',
+    'array.mode': 'elem0',
+    'array.median': 'elem0',
+    'array.range': 'elem0',
+    'array.avg': 'elem0',
+    'array.sum': 'elem0',
+    'array.stdev': 'elem0',
+    'array.variance': 'elem0',
+    'array.percentile_nearest_rank': 'elem0',
+    'array.percentile_linear_interpolation': 'elem0',
+    'array.percentrank': 'elem0',
+    'array.abs': 'same_array0',
+    'array.standardize': 'same_array0',
+    'array.copy': 'same_array0',
+    'array.slice': 'same_array0',
+    'array.concat': 'merge_array',
+    # One element goes INTO the array: it has to fit the element type, or the
+    # array holds something its type does not say (see ``_merge_override``)
+    'array.push': 'put_array:1',
+    'array.unshift': 'put_array:1',
+    'array.fill': 'put_array:1',
+    'array.set': 'put_array:2',
+    'array.insert': 'put_array:2',
+    'map.put': 'put_map:2',
+    'matrix.set': 'put_matrix:3',
+    'matrix.fill': 'put_matrix:1',
+    'matrix.add_row': 'put_matrix_array:2',
+    'matrix.add_col': 'put_matrix_array:2',
+    'array.from_items': 'array_of_join_args',
+    # ``array.new(size, initial)`` is the generic constructor a compiled
+    # ``array.new<T>()`` becomes; the typed ``na`` it passes NAMES the element
+    'array.new': 'array_of_arg1',
+    'matrix.get': 'elem0',
+    'matrix.avg': 'elem0',
+    'matrix.min': 'elem0',
+    'matrix.max': 'elem0',
+    'matrix.mode': 'elem0',
+    'matrix.median': 'elem0',
+    'matrix.det': 'elem0',
+    'matrix.trace': 'elem0',
+    'matrix.row': 'array_of_elem0',
+    'matrix.col': 'array_of_elem0',
+    'matrix.remove_row': 'array_of_elem0',
+    'matrix.remove_col': 'array_of_elem0',
+    'matrix.eigenvalues': 'array_of_elem0',
+    'matrix.copy': 'same_matrix0',
+    'matrix.transpose': 'same_matrix0',
+    'matrix.inv': 'same_matrix0',
+    'matrix.pinv': 'same_matrix0',
+    'matrix.pow': 'same_matrix0',
+    'matrix.submatrix': 'same_matrix0',
+    'matrix.eigenvectors': 'same_matrix0',
+    'matrix.kron': 'merge_matrix',
+    'matrix.concat': 'merge_matrix',
+    'matrix.sum': 'merge_matrix_or_scalar',
+    'matrix.diff': 'merge_matrix_or_scalar',
+    'matrix.mult': 'matrix_mult',
+    'matrix.new': 'matrix_of_arg2',
+    'map.get': 'map_value0',
+    'map.remove': 'map_value0',
+    'map.keys': 'array_of_map_keys0',
+    'map.values': 'array_of_map_values0',
+    'map.copy': 'same_map0',
+}
+
+#: Declared parameter order of the lib names whose module lives outside
+#: ``pynecore/lib`` and therefore has no registry entry to read it from. A
+#: type-preserving override names the parameter it copies from, and a keyword
+#: spelling (``input(title='WMA Length', defval=10)``) only binds back to that
+#: position with the order in hand.
+OVERRIDE_PARAM_NAMES: Final[dict[str, list[str]]] = {
+    # ``core/script.py::_Input.__call__``
+    'input': ['defval', 'title', 'tooltip', 'inline', 'group', 'display', 'active'],
 }

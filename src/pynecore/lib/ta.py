@@ -826,7 +826,7 @@ for _impl in getattr(highest, '__pyne_impls__'):
 
 # noinspection PyUnusedLocal
 @overload
-def highestbars(source: Series[float], length: int) -> PyneFloat:
+def highestbars(source: Series[float], length: int) -> PyneInt:
     """
     Calculate the number of bars since the highest value of the source series with the given length.
 
@@ -834,12 +834,14 @@ def highestbars(source: Series[float], length: int) -> PyneFloat:
     :param length: The length of the highest value
     :return: The number of bars since the highest value of the source series
     """
-    return highest(source, length, _bars=True)
+    # The bars form of ``highest`` yields the offset, an int; the annotation
+    # of the shared machine says what the VALUE form yields
+    return cast(PyneInt, highest(source, length, _bars=True))
 
 
 @overload
-def highestbars(length: int) -> PyneFloat:
-    return highest(high, length, _bars=True)
+def highestbars(length: int) -> PyneInt:
+    return cast(PyneInt, highest(high, length, _bars=True))
 
 
 def hma(source: float, length: int) -> PyneFloat:
@@ -1130,7 +1132,7 @@ for _impl in getattr(lowest, '__pyne_impls__'):
 
 # noinspection PyUnusedLocal
 @overload
-def lowestbars(source: Series[float], length: int) -> PyneFloat:
+def lowestbars(source: Series[float], length: int) -> PyneInt:
     """
     Calculate the number of bars since the lowest value of the source series with the given length.
 
@@ -1138,12 +1140,12 @@ def lowestbars(source: Series[float], length: int) -> PyneFloat:
     :param length: The length of the lowest value
     :return: The number of bars since the lowest value of the source series
     """
-    return lowest(source, length, _bars=True)
+    return cast(PyneInt, lowest(source, length, _bars=True))
 
 
 @overload
-def lowestbars(length: int) -> PyneFloat:
-    return lowest(low, length, _bars=True)
+def lowestbars(length: int) -> PyneInt:
+    return cast(PyneInt, lowest(low, length, _bars=True))
 
 
 def macd(source: float, fastlen: int, slowlen: int, siglen: int) \

@@ -27,7 +27,9 @@ from pynecore.transformers.pine_type_artifact import (
     build_interface, interface_digest, registered, table_json, _interface_from_json,
 )
 from pynecore.transformers.pine_type_infer import infer_module
-from pynecore.transformers.pine_type_rules import INT, OBJECT, UNKNOWN, annotation_type, get_ty
+from pynecore.transformers.pine_type_rules import (
+    INT, OBJECT, UNKNOWN, annotation_type, class_id, get_ty, object_ty,
+)
 from pynecore.transformers.pine_type_table import ModuleInterface, PineTypeTable
 
 
@@ -98,19 +100,27 @@ class Pivot:
     price: float = 0.0
 '''
 
+#: What a ``Pivot`` of a module analysed under the path ``'test'`` is typed as.
+#: The id is (module, name), so the module key is part of every expectation
+#: here -- two modules' same-named classes are two different types.
+PIVOT = object_ty(class_id('test', 'Pivot'))
+
 
 @pytest.mark.parametrize('annotation,expected', [
     # The bare name, and the wrappers that change the storage and not the type
-    ('Pivot', OBJECT),
-    ('Series[Pivot]', OBJECT),
-    ('Persistent[Pivot]', OBJECT),
-    ('NA[Pivot]', OBJECT),
+    ('Pivot', PIVOT),
+    ('Series[Pivot]', PIVOT),
+    ('Persistent[Pivot]', PIVOT),
+    ('NA[Pivot]', PIVOT),
     # A stringized forward reference is resolved the same way
-    ("'Pivot'", OBJECT),
-    ("'Series[Pivot]'", OBJECT),
+    ("'Pivot'", PIVOT),
+    ("'Series[Pivot]'", PIVOT),
     # ``NA`` is an absence marker, so the union keeps the class
-    ('Pivot | NA', OBJECT),
-    ('Pivot | None', OBJECT),
+    ('Pivot | NA', PIVOT),
+    ('Pivot | None', PIVOT),
+    # A container carries the class as its ELEMENT
+    ('list[Pivot]', f'a:{PIVOT}'),
+    ('Series[list[Pivot]]', f'a:{PIVOT}'),
     # A name that is not a class is still nothing this pass can read
     ('Missing', UNKNOWN),
     ('Series[Missing]', UNKNOWN),
@@ -133,7 +143,7 @@ class Later:
     pass
 '''
 
-    assert _param_type(source) == OBJECT
+    assert _param_type(source) == object_ty(class_id('test', 'Later'))
 
 
 def __test_a_nested_class_is_nameable_from_the_body_it_lives_in__():
@@ -148,7 +158,7 @@ def __test_a_nested_class_is_nameable_from_the_body_it_lives_in__():
     return take
 '''
 
-    assert _param_type(source, scope='outer·take') == OBJECT
+    assert _param_type(source, scope='outer·take') == object_ty(class_id('test', 'Inner'))
 
 
 def __test_a_rebound_class_name_is_no_class__():
@@ -181,7 +191,7 @@ def __test_a_class_the_module_only_declares_stays_a_class__():
 def take(thing: Amount):
     return thing
 """
-    assert _param_type(source) == OBJECT
+    assert _param_type(source) == object_ty(class_id('test', 'Amount'))
 
 
 def __test_an_annotated_class_variable_is_an_object__():
@@ -189,7 +199,7 @@ def __test_an_annotated_class_variable_is_an_object__():
     table = infer_module(ast.parse(f'{PREAMBLE}\n\nlast: Pivot = None\n'), 'test')
     binding = table.binding('', 'last')
 
-    assert binding is not None and binding.ty == OBJECT
+    assert binding is not None and binding.ty == PIVOT
 
 
 def __test_the_module_records_the_classes_it_can_name__():
@@ -205,7 +215,7 @@ def __test_the_rules_answer_unknown_without_a_class_set__():
     annotation = ast.parse('Pivot', mode='eval').body
 
     assert annotation_type(annotation) == UNKNOWN
-    assert annotation_type(annotation, ('Pivot',)) == OBJECT
+    assert annotation_type(annotation, {'Pivot': 'm#Pivot'}) == 'o:m#Pivot'
 
 
 # --- the classes an import brings in --------------------------------------
@@ -235,7 +245,7 @@ def depth(settings: Series[Settings]) -> int:
 def __test_a_from_import_brings_the_class_in__(tmp_path, monkeypatch):
     """``from m import C`` makes ``C`` a class name in the importing module"""
     monkeypatch.syspath_prepend(tmp_path)
-    _write(tmp_path, 'ob_from_lib', UDT_LIB)
+    lib = _write(tmp_path, 'ob_from_lib', UDT_LIB)
     app = _write(tmp_path, 'ob_from_app', '''"""
 @pyne
 """
@@ -248,15 +258,18 @@ def take(thing: Settings):
 
     _, table = _analysed(app)
 
-    assert 'Settings' in table.classes
+    # The identity travels with the class: the importing module types the
+    # parameter as the DEPENDENCY's ``Settings``, not as one of its own.
+    imported = object_ty(class_id(str(lib.resolve()), 'Settings'))
+    assert table.classes['Settings'] == class_id(str(lib.resolve()), 'Settings')
     binding = table.binding('take', 'thing')
-    assert binding is not None and binding.ty == OBJECT
+    assert binding is not None and binding.ty == imported
 
 
 def __test_a_module_import_brings_its_classes_in__(tmp_path, monkeypatch):
     """``import m`` then ``m.C``: the attribute tail is resolved the same way"""
     monkeypatch.syspath_prepend(tmp_path)
-    _write(tmp_path, 'ob_dotted_lib', UDT_LIB)
+    lib = _write(tmp_path, 'ob_dotted_lib', UDT_LIB)
     app = _write(tmp_path, 'ob_dotted_app', '''"""
 @pyne
 """
@@ -271,7 +284,8 @@ def take(thing: Series[m.Settings]):
     _, table = _analysed(app)
 
     binding = table.binding('take', 'thing')
-    assert binding is not None and binding.ty == OBJECT
+    assert binding is not None
+    assert binding.ty == object_ty(class_id(str(lib.resolve()), 'Settings'))
 
 
 def __test_an_imported_name_that_is_no_class_stays_unknown__(tmp_path, monkeypatch):
@@ -314,7 +328,8 @@ def build(settings: Settings):
     interface = registered(str(lib))
     assert interface is not None, 'the dependency published no interface'
     assert interface.exports['newInstance'].annotated is True
-    assert get_ty(_call(tree, 'newInstance')) == OBJECT
+    assert get_ty(_call(tree, 'newInstance')) == object_ty(
+        class_id(str(lib.resolve()), 'Settings'))
     assert [diag.render() for diag in table.diags
             if diag.origin is not None and diag.origin.reason == 'unannotated-import'] == []
 
@@ -341,7 +356,10 @@ def __test_the_interface_publishes_the_classes__(tmp_path):
     """Module level and ``__all__``-filtered, the way the exports are"""
     interface = _interface(tmp_path, 'ob_pub_mod', CLASS_BASE)
 
-    assert interface.classes == ('Settings',)
+    assert list(interface.classes) == ['Settings']
+    # A published class is its fields too -- a dependent reads ``s.depth`` as
+    # INT only because the interface carries the field's declared type.
+    assert interface.classes['Settings'].fields == {'depth': INT}
 
 
 def __test_an_unlisted_class_is_not_published__(tmp_path):
@@ -349,7 +367,7 @@ def __test_an_unlisted_class_is_not_published__(tmp_path):
     interface = _interface(tmp_path, 'ob_hidden_mod',
                            CLASS_BASE + '\n\nclass Hidden:\n    pass\n')
 
-    assert interface.classes == ('Settings',)
+    assert list(interface.classes) == ['Settings']
 
 
 def __test_adding_a_class_moves_the_digest__(tmp_path):
@@ -371,7 +389,10 @@ def __test_the_artifact_round_trips_the_classes__(tmp_path):
     data = json.loads(json.dumps(
         table_json(tree, table, interface, path.read_bytes(), PIPELINE_DIGEST)))
 
-    assert data['interface']['classes'] == ['Settings']
-    restored = _interface_from_json(interface.path, data, os.stat(path))
-    assert restored.classes == ('Settings',)
+    assert list(data['interface']['classes']) == ['Settings']
+    assert data['interface']['classes']['Settings']['fields'] == {'depth': INT}
+    stat = os.stat(path)
+    restored = _interface_from_json(interface.path, data, (stat.st_mtime_ns, stat.st_size))
+    assert list(restored.classes) == ['Settings']
+    assert restored.classes['Settings'] == interface.classes['Settings']
     assert restored.digest == interface.digest

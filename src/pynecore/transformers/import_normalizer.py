@@ -7,6 +7,23 @@ NON_MODULE_ATTRS = {
 }
 
 
+
+def _dotted(path: list[str], node: ast.AST) -> ast.expr:
+    """
+    Build ``a.b.c`` for a path, at the position of the name it replaces.
+
+    Every node of the chain takes the original name's location, so a
+    diagnostic about the rewritten spelling still points at the source.
+
+    :param path: The dotted path, split
+    :param node: The name being rewritten
+    :return: The attribute chain
+    """
+    result: ast.expr = ast.copy_location(ast.Name(id=path[0], ctx=ast.Load()), node)
+    for part in path[1:]:
+        result = ast.copy_location(ast.Attribute(value=result, attr=part, ctx=ast.Load()), node)
+    return result
+
 class ImportNormalizerTransformer(ast.NodeTransformer):
     """
     AST transformer that normalizes pynecore.lib imports.
@@ -252,39 +269,18 @@ class ImportNormalizerTransformer(ast.NodeTransformer):
             # Handle regular imports
             if node.id in self.names_to_replace:
                 path = self.import_map[node.id]
-                result: ast.expr = cast(ast.expr, ast.Name(id=path[0], ctx=ast.Load()))
-                for part in path[1:]:
-                    result = cast(ast.expr, ast.Attribute(
-                        value=result,
-                        attr=part,
-                        ctx=ast.Load()
-                    ))
-                return result
+                return _dotted(path, node)
             # Handle module imports
             elif node.id in self.module_imports:
                 path = self.module_imports[node.id].split('.')
-                result: ast.expr = cast(ast.expr, ast.Name(id=path[0], ctx=ast.Load()))
-                for part in path[1:]:
-                    result = cast(ast.expr, ast.Attribute(
-                        value=result,
-                        attr=part,
-                        ctx=ast.Load()
-                    ))
-                return result
+                return _dotted(path, node)
             # Handle names from wildcard imports
             else:
                 # Check each wildcard imported module
                 for module, exposed in self.wildcard_imports.items():
                     if node.id in exposed:
                         path = ['lib'] + module.split('.')[2:] + [node.id]
-                        result: ast.expr = cast(ast.expr, ast.Name(id=path[0], ctx=ast.Load()))
-                        for part in path[1:]:
-                            result = cast(ast.expr, ast.Attribute(
-                                value=result,
-                                attr=part,
-                                ctx=ast.Load()
-                            ))
-                        return result
+                        return _dotted(path, node)
         return node
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:

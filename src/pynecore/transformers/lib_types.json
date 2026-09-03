@@ -1,5 +1,192 @@
 {
+ "classes": {
+  "Box": {
+   "bgcolor": "c",
+   "border_color": "c",
+   "border_style": "o:lib#LineEnum",
+   "border_width": "i",
+   "bottom": "f",
+   "extend": "o:lib#Extend",
+   "force_overlay": "b",
+   "left": "i",
+   "right": "i",
+   "text": "s",
+   "text_color": "c",
+   "text_font_family": "o:lib#FontFamilyEnum",
+   "text_formatting": "o:lib#FormatEnum",
+   "text_halign": "o:lib#AlignEnum",
+   "text_size": "o:lib#Size",
+   "text_valign": "o:lib#AlignEnum",
+   "text_wrap": "o:lib#WrapEnum",
+   "top": "f",
+   "vid": "i",
+   "xloc": "o:lib#XLoc"
+  },
+  "ChartPoint": {
+   "index": "i",
+   "price": "f",
+   "time": "i"
+  },
+  "HLine": {
+   "color": "c",
+   "display": "o:lib#Display",
+   "editable": "b",
+   "id": "s",
+   "linestyle": "o:lib#HLineEnum",
+   "linewidth": "i",
+   "price": "?",
+   "title": "s"
+  },
+  "Label": {
+   "color": "c",
+   "force_overlay": "b",
+   "size": "o:lib#Size",
+   "style": "o:lib#LabelStyleEnum",
+   "text": "s",
+   "text_font_family": "o:lib#FontFamilyEnum",
+   "text_formatting": "o:lib#FormatEnum",
+   "textalign": "o:lib#AlignEnum",
+   "textcolor": "c",
+   "tooltip": "s",
+   "vid": "i",
+   "x": "i",
+   "xloc": "o:lib#XLoc",
+   "y": "f",
+   "yloc": "o:lib#YLoc"
+  },
+  "Line": {
+   "color": "c",
+   "extend": "o:lib#Extend",
+   "force_overlay": "b",
+   "style": "o:lib#LineEnum",
+   "vid": "i",
+   "width": "i",
+   "x1": "i",
+   "x2": "i",
+   "xloc": "o:lib#XLoc",
+   "y1": "f",
+   "y2": "f"
+  },
+  "LineFill": {
+   "color": "c",
+   "line1": "o:lib#Line",
+   "line2": "o:lib#Line",
+   "vid": "i"
+  },
+  "Matrix": {
+   "data": "a:o"
+  },
+  "OHLCV": {
+   "close": "f",
+   "extra_fields": "o",
+   "high": "f",
+   "is_closed": "b",
+   "low": "f",
+   "open": "f",
+   "timestamp": "i",
+   "volume": "f"
+  },
+  "PlotMeta": {
+   "bordercolor": "c",
+   "char": "s",
+   "color": "c",
+   "colordown": "c",
+   "colorup": "c",
+   "display": "?",
+   "dynamic": "b",
+   "editable": "b",
+   "fillgaps": "b",
+   "force_overlay": "b",
+   "format": "s",
+   "histbase": "f",
+   "hline1": "s",
+   "hline2": "s",
+   "id": "s",
+   "join": "b",
+   "kind": "s",
+   "linestyle": "?",
+   "linewidth": "i",
+   "location": "?",
+   "maxheight": "i",
+   "minheight": "i",
+   "offset": "i",
+   "plot1": "s",
+   "plot2": "s",
+   "precision": "i",
+   "price": "f",
+   "show_last": "i",
+   "size": "?",
+   "style": "?",
+   "text": "s",
+   "textcolor": "c",
+   "title": "s",
+   "trackprice": "b",
+   "wickcolor": "c"
+  },
+  "Polyline": {
+   "closed": "b",
+   "curved": "b",
+   "fill_color": "c",
+   "force_overlay": "b",
+   "line_color": "c",
+   "line_style": "o:lib#LineEnum",
+   "line_width": "i",
+   "points": "a:o:lib#ChartPoint",
+   "vid": "i",
+   "xloc": "o:lib#XLoc"
+  },
+  "SessionInfo": {
+   "days": "?",
+   "end_time": "?",
+   "is_overnight": "b",
+   "start_time": "?",
+   "timezone": "s"
+  },
+  "Table": {
+   "bgcolor": "c",
+   "border_color": "c",
+   "border_width": "i",
+   "cells": "?",
+   "columns": "i",
+   "force_overlay": "b",
+   "frame_color": "c",
+   "frame_width": "i",
+   "position": "o:lib#Position",
+   "rows": "i",
+   "vid": "i"
+  },
+  "TableCell": {
+   "bgcolor": "c",
+   "height": "f",
+   "is_merged": "b",
+   "merge_end_col": "i",
+   "merge_end_row": "i",
+   "merge_start_col": "i",
+   "merge_start_row": "i",
+   "text": "s",
+   "text_color": "c",
+   "text_font_family": "o:lib#FontFamilyEnum",
+   "text_formatting": "o:lib#FormatEnum",
+   "text_halign": "o:lib#AlignEnum",
+   "text_size": "?",
+   "text_valign": "o:lib#AlignEnum",
+   "tooltip": "s",
+   "width": "f"
+  }
+ },
  "names": {
+  "adjustment.dividends": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "adjustment.none": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "adjustment.splits": {
+   "kind": "value",
+   "ty": "i"
+  },
   "alert": {
    "default_ty": [
     "?"
@@ -12,7 +199,7 @@
    ],
    "params": [
     "s",
-    "?"
+    "o:lib#AlertEnum"
    ],
    "ret": "v"
   },
@@ -28,16 +215,29 @@
    ],
    "params": [
     "s",
-    "?"
+    "o:lib#AlertEnum"
    ],
    "ret": "v"
+  },
+  "alert.freq_all": {
+   "kind": "value",
+   "ty": "o:lib#AlertEnum"
+  },
+  "alert.freq_once_per_bar": {
+   "kind": "value",
+   "ty": "o:lib#AlertEnum"
+  },
+  "alert.freq_once_per_bar_close": {
+   "kind": "value",
+   "ty": "o:lib#AlertEnum"
   },
   "alertcondition": {
    "defaults": 0,
    "kind": "function",
+   "kwarg": true,
    "names": [],
    "params": [],
-   "ret": "?",
+   "ret": "v",
    "vararg": "?"
   },
   "array.abs": {
@@ -47,9 +247,9 @@
     "id"
    ],
    "params": [
-    "o"
+    "a:f"
    ],
-   "ret": "o"
+   "ret": "a:f"
   },
   "array.avg": {
    "defaults": 0,
@@ -108,7 +308,7 @@
     "id"
    ],
    "params": [
-    "?"
+    "o"
    ],
    "ret": "v"
   },
@@ -120,10 +320,10 @@
     "id2"
    ],
    "params": [
-    "?",
-    "?"
+    "o",
+    "o"
    ],
-   "ret": "?"
+   "ret": "o"
   },
   "array.copy": {
    "defaults": 0,
@@ -179,7 +379,7 @@
     "index_to"
    ],
    "params": [
-    "?",
+    "o",
     "?",
     "i",
     "i"
@@ -213,7 +413,7 @@
     "index"
    ],
    "params": [
-    "?",
+    "o",
     "i"
    ],
    "ret": "?"
@@ -253,7 +453,7 @@
     "value"
    ],
    "params": [
-    "?",
+    "o",
     "i",
     "?"
    ],
@@ -267,7 +467,7 @@
     "separator"
    ],
    "params": [
-    "?",
+    "o",
     "s"
    ],
    "ret": "s"
@@ -382,7 +582,7 @@
     "i",
     "b"
    ],
-   "ret": "o"
+   "ret": "a:b"
   },
   "array.new_box": {
    "default_ty": [
@@ -397,9 +597,9 @@
    ],
    "params": [
     "i",
-    "o"
+    "o:lib#Box"
    ],
-   "ret": "o"
+   "ret": "a:o:lib#Box"
   },
   "array.new_color": {
    "default_ty": [
@@ -416,7 +616,7 @@
     "i",
     "c"
    ],
-   "ret": "o"
+   "ret": "a:c"
   },
   "array.new_float": {
    "default_ty": [
@@ -433,7 +633,7 @@
     "i",
     "f"
    ],
-   "ret": "o"
+   "ret": "a:f"
   },
   "array.new_int": {
    "default_ty": [
@@ -450,7 +650,7 @@
     "i",
     "i"
    ],
-   "ret": "o"
+   "ret": "a:i"
   },
   "array.new_label": {
    "default_ty": [
@@ -465,9 +665,9 @@
    ],
    "params": [
     "i",
-    "o"
+    "o:lib#Label"
    ],
-   "ret": "o"
+   "ret": "a:o:lib#Label"
   },
   "array.new_line": {
    "default_ty": [
@@ -482,9 +682,9 @@
    ],
    "params": [
     "i",
-    "o"
+    "o:lib#Line"
    ],
-   "ret": "o"
+   "ret": "a:o:lib#Line"
   },
   "array.new_linefill": {
    "default_ty": [
@@ -499,9 +699,9 @@
    ],
    "params": [
     "i",
-    "o"
+    "o:lib#LineFill"
    ],
-   "ret": "o"
+   "ret": "a:o:lib#LineFill"
   },
   "array.new_string": {
    "default_ty": [
@@ -518,7 +718,7 @@
     "i",
     "s"
    ],
-   "ret": "o"
+   "ret": "a:s"
   },
   "array.new_table": {
    "default_ty": [
@@ -533,9 +733,9 @@
    ],
    "params": [
     "i",
-    "o"
+    "o:lib#Table"
    ],
-   "ret": "o"
+   "ret": "a:o:lib#Table"
   },
   "array.percentile_linear_interpolation": {
    "defaults": 0,
@@ -545,7 +745,7 @@
     "percentage"
    ],
    "params": [
-    "o",
+    "a:f",
     "f"
    ],
    "ret": "f"
@@ -558,7 +758,7 @@
     "percentage"
    ],
    "params": [
-    "o",
+    "a:f",
     "f"
    ],
    "ret": "f"
@@ -583,7 +783,7 @@
     "id"
    ],
    "params": [
-    "?"
+    "o"
    ],
    "ret": "?"
   },
@@ -595,7 +795,7 @@
     "value"
    ],
    "params": [
-    "?",
+    "o",
     "?"
    ],
    "ret": "v"
@@ -619,7 +819,7 @@
     "index"
    ],
    "params": [
-    "?",
+    "o",
     "i"
    ],
    "ret": "?"
@@ -631,7 +831,7 @@
     "id"
    ],
    "params": [
-    "?"
+    "o"
    ],
    "ret": "v"
   },
@@ -644,7 +844,7 @@
     "value"
    ],
    "params": [
-    "?",
+    "o",
     "i",
     "?"
    ],
@@ -657,7 +857,7 @@
     "id"
    ],
    "params": [
-    "?"
+    "o"
    ],
    "ret": "?"
   },
@@ -668,7 +868,7 @@
     "id"
    ],
    "params": [
-    "?"
+    "o"
    ],
    "ret": "i"
   },
@@ -681,11 +881,11 @@
     "index_to"
    ],
    "params": [
-    "?",
+    "o",
     "i",
     "i"
    ],
-   "ret": "?"
+   "ret": "o"
   },
   "array.some": {
    "defaults": 0,
@@ -709,7 +909,7 @@
     "order"
    ],
    "params": [
-    "?",
+    "o",
     "?"
    ],
    "ret": "v"
@@ -728,7 +928,7 @@
     "o",
     "?"
    ],
-   "ret": "o"
+   "ret": "a:i"
   },
   "array.standardize": {
    "defaults": 0,
@@ -737,9 +937,9 @@
     "id"
    ],
    "params": [
-    "o"
+    "a:f"
    ],
-   "ret": "o"
+   "ret": "a:f"
   },
   "array.stdev": {
    "default_ty": [
@@ -764,7 +964,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "a:f"
    ],
    "ret": "f"
   },
@@ -776,7 +976,7 @@
     "value"
    ],
    "params": [
-    "?",
+    "o",
     "?"
    ],
    "ret": "v"
@@ -842,6 +1042,54 @@
    ],
    "ret": "v"
   },
+  "barmerge.gaps_off": {
+   "kind": "value",
+   "ty": "o:lib#BarMerge"
+  },
+  "barmerge.gaps_on": {
+   "kind": "value",
+   "ty": "o:lib#BarMerge"
+  },
+  "barmerge.lookahead_last_closed": {
+   "kind": "value",
+   "ty": "o:lib#BarMerge"
+  },
+  "barmerge.lookahead_off": {
+   "kind": "value",
+   "ty": "o:lib#BarMerge"
+  },
+  "barmerge.lookahead_on": {
+   "kind": "value",
+   "ty": "o:lib#BarMerge"
+  },
+  "barstate.isconfirmed": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "barstate.isfirst": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "barstate.ishistory": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "barstate.islast": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "barstate.islastconfirmedhistory": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "barstate.isnew": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "barstate.isrealtime": {
+   "kind": "value",
+   "ty": "b"
+  },
   "bgcolor": {
    "default_none_ok": [
     true,
@@ -888,8 +1136,9 @@
    "ty": "f"
   },
   "box.all": {
+   "callable": true,
    "kind": "value",
-   "ty": "o"
+   "ty": "a:o:lib#Box"
   },
   "box.copy": {
    "defaults": 0,
@@ -911,7 +1160,7 @@
    "params": [
     "?"
    ],
-   "ret": "?"
+   "ret": "v"
   },
   "box.get_bottom": {
    "defaults": 0,
@@ -920,7 +1169,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Box"
    ],
    "ret": "f"
   },
@@ -931,7 +1180,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Box"
    ],
    "ret": "i"
   },
@@ -942,7 +1191,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Box"
    ],
    "ret": "i"
   },
@@ -953,7 +1202,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Box"
    ],
    "ret": "f"
   },
@@ -998,25 +1247,25 @@
       "text_formatting"
      ],
      "params": [
-      "o",
-      "o",
+      "o:lib#ChartPoint",
+      "o:lib#ChartPoint",
       "c",
       "i",
       "?",
-      "o",
+      "o:lib#Extend",
       "?",
       "c",
       "s",
-      "o",
+      "o:lib#Size",
       "c",
-      "o",
-      "o",
+      "o:lib#AlignEnum",
+      "o:lib#AlignEnum",
       "?",
-      "o",
+      "o:lib#FontFamilyEnum",
       "b",
-      "o"
+      "o:lib#FormatEnum"
      ],
-     "ret": "o"
+     "ret": "o:lib#Box"
     },
     {
      "default_ty": [
@@ -1066,20 +1315,20 @@
       "c",
       "i",
       "?",
-      "o",
+      "o:lib#Extend",
       "?",
       "c",
       "s",
-      "o",
+      "o:lib#Size",
       "c",
-      "o",
-      "o",
+      "o:lib#AlignEnum",
+      "o:lib#AlignEnum",
       "?",
-      "o",
+      "o:lib#FontFamilyEnum",
       "b",
-      "o"
+      "o:lib#FormatEnum"
      ],
-     "ret": "o"
+     "ret": "o:lib#Box"
     }
    ],
    "kind": "overloads"
@@ -1092,7 +1341,7 @@
     "color"
    ],
    "params": [
-    "o",
+    "o:lib#Box",
     "c"
    ],
    "ret": "v"
@@ -1105,7 +1354,7 @@
     "color"
    ],
    "params": [
-    "o",
+    "o:lib#Box",
     "c"
    ],
    "ret": "v"
@@ -1118,7 +1367,7 @@
     "style"
    ],
    "params": [
-    "o",
+    "o:lib#Box",
     "?"
    ],
    "ret": "v"
@@ -1131,7 +1380,7 @@
     "width"
    ],
    "params": [
-    "o",
+    "o:lib#Box",
     "i"
    ],
    "ret": "v"
@@ -1144,7 +1393,7 @@
     "bottom"
    ],
    "params": [
-    "o",
+    "o:lib#Box",
     "f"
    ],
    "ret": "v"
@@ -1157,8 +1406,8 @@
     "point"
    ],
    "params": [
-    "o",
-    "o"
+    "o:lib#Box",
+    "o:lib#ChartPoint"
    ],
    "ret": "v"
   },
@@ -1170,8 +1419,8 @@
     "extend"
    ],
    "params": [
-    "o",
-    "o"
+    "o:lib#Box",
+    "o:lib#Extend"
    ],
    "ret": "v"
   },
@@ -1183,7 +1432,7 @@
     "left"
    ],
    "params": [
-    "o",
+    "o:lib#Box",
     "i"
    ],
    "ret": "v"
@@ -1197,7 +1446,7 @@
     "top"
    ],
    "params": [
-    "o",
+    "o:lib#Box",
     "i",
     "f"
    ],
@@ -1211,7 +1460,7 @@
     "right"
    ],
    "params": [
-    "o",
+    "o:lib#Box",
     "i"
    ],
    "ret": "v"
@@ -1225,7 +1474,7 @@
     "bottom"
    ],
    "params": [
-    "o",
+    "o:lib#Box",
     "i",
     "f"
    ],
@@ -1239,7 +1488,7 @@
     "text"
    ],
    "params": [
-    "o",
+    "o:lib#Box",
     "s"
    ],
    "ret": "v"
@@ -1252,7 +1501,7 @@
     "text_color"
    ],
    "params": [
-    "o",
+    "o:lib#Box",
     "c"
    ],
    "ret": "v"
@@ -1265,8 +1514,8 @@
     "text_font_family"
    ],
    "params": [
-    "o",
-    "o"
+    "o:lib#Box",
+    "o:lib#FontFamilyEnum"
    ],
    "ret": "v"
   },
@@ -1278,8 +1527,8 @@
     "text_formatting"
    ],
    "params": [
-    "o",
-    "o"
+    "o:lib#Box",
+    "o:lib#FormatEnum"
    ],
    "ret": "v"
   },
@@ -1291,8 +1540,8 @@
     "text_halign"
    ],
    "params": [
-    "o",
-    "o"
+    "o:lib#Box",
+    "o:lib#AlignEnum"
    ],
    "ret": "v"
   },
@@ -1304,8 +1553,8 @@
     "text_size"
    ],
    "params": [
-    "o",
-    "o"
+    "o:lib#Box",
+    "o:lib#Size"
    ],
    "ret": "v"
   },
@@ -1317,8 +1566,8 @@
     "text_valign"
    ],
    "params": [
-    "o",
-    "o"
+    "o:lib#Box",
+    "o:lib#AlignEnum"
    ],
    "ret": "v"
   },
@@ -1330,7 +1579,7 @@
     "text_wrap"
    ],
    "params": [
-    "o",
+    "o:lib#Box",
     "?"
    ],
    "ret": "v"
@@ -1343,7 +1592,7 @@
     "top"
    ],
    "params": [
-    "o",
+    "o:lib#Box",
     "f"
    ],
    "ret": "v"
@@ -1356,8 +1605,8 @@
     "point"
    ],
    "params": [
-    "o",
-    "o"
+    "o:lib#Box",
+    "o:lib#ChartPoint"
    ],
    "ret": "v"
   },
@@ -1371,12 +1620,20 @@
     "xloc"
    ],
    "params": [
-    "o",
+    "o:lib#Box",
     "i",
     "i",
     "?"
    ],
    "ret": "v"
+  },
+  "chart.bg_color": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "chart.fg_color": {
+   "kind": "value",
+   "ty": "c"
   },
   "chart.in_seconds": {
    "default_none_ok": [
@@ -1395,17 +1652,124 @@
    ],
    "ret": "i"
   },
+  "chart.is_heikinashi": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "chart.is_kagi": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "chart.is_linebreak": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "chart.is_pnf": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "chart.is_range": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "chart.is_renko": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "chart.is_standard": {
+   "kind": "value",
+   "ty": "b"
+  },
   "chart.left_visible_bar_time": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
+  "chart.point": {
+   "kind": "value",
+   "ty": "o:lib#_ChartPoint"
+  },
+  "chart.point.copy": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#ChartPoint"
+   ],
+   "ret": "o:lib#ChartPoint"
+  },
+  "chart.point.from_index": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "index",
+    "price"
+   ],
+   "params": [
+    "i",
+    "f"
+   ],
+   "ret": "o:lib#ChartPoint"
+  },
+  "chart.point.from_time": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "time",
+    "price"
+   ],
+   "params": [
+    "i",
+    "f"
+   ],
+   "ret": "o:lib#ChartPoint"
+  },
+  "chart.point.new": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "time",
+    "index",
+    "price"
+   ],
+   "params": [
+    "i",
+    "i",
+    "f"
+   ],
+   "ret": "o:lib#ChartPoint"
+  },
+  "chart.point.now": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "price"
+   ],
+   "params": [
+    "f"
+   ],
+   "ret": "o:lib#ChartPoint"
+  },
   "chart.right_visible_bar_time": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
   "close": {
    "kind": "value",
    "ty": "f"
+  },
+  "color.aqua": {
+   "kind": "value",
+   "ty": "c"
   },
   "color.b": {
    "defaults": 0,
@@ -1417,6 +1781,14 @@
     "c"
    ],
    "ret": "i"
+  },
+  "color.black": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.blue": {
+   "kind": "value",
+   "ty": "c"
   },
   "color.from_gradient": {
    "defaults": 0,
@@ -1437,6 +1809,10 @@
    ],
    "ret": "c"
   },
+  "color.fuchsia": {
+   "kind": "value",
+   "ty": "c"
+  },
   "color.g": {
    "defaults": 0,
    "kind": "function",
@@ -1447,6 +1823,26 @@
     "c"
    ],
    "ret": "i"
+  },
+  "color.gray": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.green": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.lime": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.maroon": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.navy": {
+   "kind": "value",
+   "ty": "c"
   },
   "color.new": {
    "default_ty": [
@@ -1464,6 +1860,18 @@
    ],
    "ret": "c"
   },
+  "color.olive": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.orange": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.purple": {
+   "kind": "value",
+   "ty": "c"
+  },
   "color.r": {
    "defaults": 0,
    "kind": "function",
@@ -1474,6 +1882,10 @@
     "c"
    ],
    "ret": "i"
+  },
+  "color.red": {
+   "kind": "value",
+   "ty": "c"
   },
   "color.rgb": {
    "default_ty": [
@@ -1495,6 +1907,10 @@
    ],
    "ret": "c"
   },
+  "color.silver": {
+   "kind": "value",
+   "ty": "c"
+  },
   "color.t": {
    "defaults": 0,
    "kind": "function",
@@ -1506,33 +1922,352 @@
    ],
    "ret": "f"
   },
+  "color.teal": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.white": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.yellow": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "currency.AED": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.ARS": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.AUD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.BDT": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.BHD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.BRL": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.BTC": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.CAD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.CHF": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.CLP": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.CNY": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.COP": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.CZK": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.DKK": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.EGP": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.ETH": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.EUR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.GBP": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.HKD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.HUF": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.IDR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.ILS": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.INR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.ISK": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.JPY": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.KES": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.KRW": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.KWD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.LKR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.MAD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.MXN": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.MYR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.NGN": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.NOK": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.NONE": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.NZD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.PEN": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.PHP": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.PKR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.PLN": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.QAR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.RON": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.RSD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.RUB": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.SAR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.SEK": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.SGD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.THB": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.TND": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.TRY": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.TWD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.USD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.USDT": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.VES": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.VND": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.ZAR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
   "dayofmonth": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
   "dayofweek": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
   "dayofweek.dayofweek": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
+  "dayofweek.friday": {
+   "kind": "value",
+   "ty": "o:lib#DayOfWeek"
+  },
+  "dayofweek.monday": {
+   "kind": "value",
+   "ty": "o:lib#DayOfWeek"
+  },
+  "dayofweek.saturday": {
+   "kind": "value",
+   "ty": "o:lib#DayOfWeek"
+  },
+  "dayofweek.sunday": {
+   "kind": "value",
+   "ty": "o:lib#DayOfWeek"
+  },
+  "dayofweek.thursday": {
+   "kind": "value",
+   "ty": "o:lib#DayOfWeek"
+  },
+  "dayofweek.tuesday": {
+   "kind": "value",
+   "ty": "o:lib#DayOfWeek"
+  },
+  "dayofweek.wednesday": {
+   "kind": "value",
+   "ty": "o:lib#DayOfWeek"
+  },
+  "display.all": {
+   "kind": "value",
+   "ty": "o:lib#Display"
+  },
+  "display.data_window": {
+   "kind": "value",
+   "ty": "o:lib#Display"
+  },
+  "display.none": {
+   "kind": "value",
+   "ty": "o:lib#Display"
+  },
+  "display.pane": {
+   "kind": "value",
+   "ty": "o:lib#Display"
+  },
+  "display.price_scale": {
+   "kind": "value",
+   "ty": "o:lib#Display"
+  },
+  "display.status_line": {
+   "kind": "value",
+   "ty": "o:lib#Display"
+  },
+  "dividends.gross": {
+   "kind": "value",
+   "ty": "o:lib#Dividends"
+  },
+  "dividends.net": {
+   "kind": "value",
+   "ty": "o:lib#Dividends"
+  },
+  "earnings.actual": {
+   "kind": "value",
+   "ty": "o:lib#Earnings"
+  },
+  "earnings.estimate": {
+   "kind": "value",
+   "ty": "o:lib#Earnings"
+  },
+  "earnings.future_period_end_time": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "earnings.future_time": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "earnings.standardized": {
+   "kind": "value",
+   "ty": "o:lib#Earnings"
+  },
   "extend.both": {
    "kind": "value",
-   "ty": "o"
+   "ty": "o:lib#Extend"
   },
   "extend.left": {
    "kind": "value",
-   "ty": "o"
+   "ty": "o:lib#Extend"
   },
   "extend.none": {
    "kind": "value",
-   "ty": "o"
+   "ty": "o:lib#Extend"
   },
   "extend.right": {
    "kind": "value",
-   "ty": "o"
+   "ty": "o:lib#Extend"
   },
   "extra_fields": {
    "kind": "value",
@@ -1541,6 +2276,7 @@
   "fill": {
    "defaults": 0,
    "kind": "function",
+   "kwarg": true,
    "names": [],
    "params": [],
    "ret": "v",
@@ -1557,6 +2293,14 @@
    ],
    "ret": "?"
   },
+  "font.family_default": {
+   "kind": "value",
+   "ty": "o:lib#FontFamilyEnum"
+  },
+  "font.family_monospace": {
+   "kind": "value",
+   "ty": "o:lib#FontFamilyEnum"
+  },
   "footprint.buy_volume": {
    "defaults": 0,
    "kind": "function",
@@ -1564,7 +2308,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Footprint"
    ],
    "ret": "f"
   },
@@ -1575,7 +2319,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Footprint"
    ],
    "ret": "f"
   },
@@ -1586,9 +2330,9 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Footprint"
    ],
-   "ret": "o"
+   "ret": "o:lib#VolumeRow"
   },
   "footprint.sell_volume": {
    "defaults": 0,
@@ -1597,7 +2341,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Footprint"
    ],
    "ret": "f"
   },
@@ -1608,7 +2352,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Footprint"
    ],
    "ret": "f"
   },
@@ -1619,9 +2363,9 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Footprint"
    ],
-   "ret": "o"
+   "ret": "o:lib#VolumeRow"
   },
   "footprint.val": {
    "defaults": 0,
@@ -1630,9 +2374,29 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Footprint"
    ],
-   "ret": "o"
+   "ret": "o:lib#VolumeRow"
+  },
+  "format.inherit": {
+   "kind": "value",
+   "ty": "o:lib#Format"
+  },
+  "format.mintick": {
+   "kind": "value",
+   "ty": "o:lib#Format"
+  },
+  "format.percent": {
+   "kind": "value",
+   "ty": "o:lib#Format"
+  },
+  "format.price": {
+   "kind": "value",
+   "ty": "o:lib#Format"
+  },
+  "format.volume": {
+   "kind": "value",
+   "ty": "o:lib#Format"
   },
   "high": {
    "kind": "value",
@@ -1674,12 +2438,12 @@
     "f",
     "s",
     "c",
-    "?",
+    "o:lib#HLineEnum",
     "i",
     "b",
     "?"
    ],
-   "ret": "o"
+   "ret": "o:lib#HLine"
   },
   "hline.hline": {
    "default_ty": [
@@ -1705,14 +2469,27 @@
     "f",
     "s",
     "c",
-    "?",
+    "o:lib#HLineEnum",
     "i",
     "b",
     "?"
    ],
-   "ret": "o"
+   "ret": "o:lib#HLine"
+  },
+  "hline.style_dashed": {
+   "kind": "value",
+   "ty": "o:lib#HLineEnum"
+  },
+  "hline.style_dotted": {
+   "kind": "value",
+   "ty": "o:lib#HLineEnum"
+  },
+  "hline.style_solid": {
+   "kind": "value",
+   "ty": "o:lib#HLineEnum"
   },
   "hour": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
@@ -1734,8 +2511,9 @@
    "ret": "b"
   },
   "label.all": {
+   "callable": true,
    "kind": "value",
-   "ty": "o"
+   "ty": "a:o:lib#Label"
   },
   "label.copy": {
    "defaults": 0,
@@ -1757,7 +2535,7 @@
    "params": [
     "?"
    ],
-   "ret": "?"
+   "ret": "v"
   },
   "label.get_text": {
    "defaults": 0,
@@ -1766,7 +2544,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Label"
    ],
    "ret": "s"
   },
@@ -1777,7 +2555,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Label"
    ],
    "ret": "i"
   },
@@ -1788,7 +2566,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Label"
    ],
    "ret": "f"
   },
@@ -1826,21 +2604,21 @@
       "text_formatting"
      ],
      "params": [
-      "o",
+      "o:lib#ChartPoint",
       "s",
       "?",
       "?",
       "c",
-      "?",
+      "o:lib#LabelStyleEnum",
       "c",
-      "o",
-      "o",
+      "o:lib#Size",
+      "o:lib#AlignEnum",
       "s",
-      "o",
+      "o:lib#FontFamilyEnum",
       "b",
-      "o"
+      "o:lib#FormatEnum"
      ],
-     "ret": "o"
+     "ret": "o:lib#Label"
     },
     {
      "default_ty": [
@@ -1881,16 +2659,16 @@
       "?",
       "?",
       "c",
-      "?",
+      "o:lib#LabelStyleEnum",
       "c",
-      "o",
-      "o",
+      "o:lib#Size",
+      "o:lib#AlignEnum",
       "s",
-      "o",
+      "o:lib#FontFamilyEnum",
       "b",
-      "o"
+      "o:lib#FormatEnum"
      ],
-     "ret": "o"
+     "ret": "o:lib#Label"
     }
    ],
    "kind": "overloads"
@@ -1903,7 +2681,7 @@
     "color"
    ],
    "params": [
-    "o",
+    "o:lib#Label",
     "c"
    ],
    "ret": "v"
@@ -1916,8 +2694,8 @@
     "point"
    ],
    "params": [
-    "o",
-    "o"
+    "o:lib#Label",
+    "o:lib#ChartPoint"
    ],
    "ret": "v"
   },
@@ -1929,8 +2707,8 @@
     "size"
    ],
    "params": [
-    "o",
-    "o"
+    "o:lib#Label",
+    "o:lib#Size"
    ],
    "ret": "v"
   },
@@ -1942,8 +2720,8 @@
     "style"
    ],
    "params": [
-    "o",
-    "?"
+    "o:lib#Label",
+    "o:lib#LabelStyleEnum"
    ],
    "ret": "v"
   },
@@ -1955,7 +2733,7 @@
     "text"
    ],
    "params": [
-    "o",
+    "o:lib#Label",
     "s"
    ],
    "ret": "v"
@@ -1968,8 +2746,8 @@
     "text_font_family"
    ],
    "params": [
-    "o",
-    "o"
+    "o:lib#Label",
+    "o:lib#FontFamilyEnum"
    ],
    "ret": "v"
   },
@@ -1981,8 +2759,8 @@
     "text_formatting"
    ],
    "params": [
-    "o",
-    "o"
+    "o:lib#Label",
+    "o:lib#FormatEnum"
    ],
    "ret": "v"
   },
@@ -1994,8 +2772,8 @@
     "textalign"
    ],
    "params": [
-    "o",
-    "o"
+    "o:lib#Label",
+    "o:lib#AlignEnum"
    ],
    "ret": "v"
   },
@@ -2007,7 +2785,7 @@
     "textcolor"
    ],
    "params": [
-    "o",
+    "o:lib#Label",
     "c"
    ],
    "ret": "v"
@@ -2020,7 +2798,7 @@
     "tooltip"
    ],
    "params": [
-    "o",
+    "o:lib#Label",
     "s"
    ],
    "ret": "v"
@@ -2033,7 +2811,7 @@
     "x"
    ],
    "params": [
-    "o",
+    "o:lib#Label",
     "i"
    ],
    "ret": "v"
@@ -2047,7 +2825,7 @@
     "xloc"
    ],
    "params": [
-    "o",
+    "o:lib#Label",
     "i",
     "?"
    ],
@@ -2062,7 +2840,7 @@
     "y"
    ],
    "params": [
-    "o",
+    "o:lib#Label",
     "i",
     "f"
    ],
@@ -2076,7 +2854,7 @@
     "y"
    ],
    "params": [
-    "o",
+    "o:lib#Label",
     "f"
    ],
    "ret": "v"
@@ -2089,10 +2867,94 @@
     "yloc"
    ],
    "params": [
-    "o",
+    "o:lib#Label",
     "?"
    ],
    "ret": "v"
+  },
+  "label.style_arrowdown": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_arrowup": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_circle": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_cross": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_diamond": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_flag": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_center": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_down": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_left": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_lower_left": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_lower_right": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_right": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_up": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_upper_left": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_upper_right": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_none": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_square": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_text_outline": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_triangledown": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_triangleup": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_xcross": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
   },
   "last_bar_index": {
    "kind": "value",
@@ -2103,8 +2965,9 @@
    "ty": "i"
   },
   "line.all": {
+   "callable": true,
    "kind": "value",
-   "ty": "o"
+   "ty": "a:o:lib#Line"
   },
   "line.copy": {
    "defaults": 0,
@@ -2126,7 +2989,7 @@
    "params": [
     "?"
    ],
-   "ret": "?"
+   "ret": "v"
   },
   "line.get_price": {
    "defaults": 0,
@@ -2136,7 +2999,7 @@
     "x"
    ],
    "params": [
-    "o",
+    "o:lib#Line",
     "i"
    ],
    "ret": "f"
@@ -2148,7 +3011,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Line"
    ],
    "ret": "i"
   },
@@ -2159,7 +3022,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Line"
    ],
    "ret": "i"
   },
@@ -2170,7 +3033,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Line"
    ],
    "ret": "f"
   },
@@ -2181,7 +3044,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Line"
    ],
    "ret": "f"
   },
@@ -2208,16 +3071,16 @@
       "force_overlay"
      ],
      "params": [
-      "o",
-      "o",
+      "o:lib#ChartPoint",
+      "o:lib#ChartPoint",
       "?",
-      "o",
+      "o:lib#Extend",
       "c",
-      "?",
+      "o:lib#LineEnum",
       "i",
       "b"
      ],
-     "ret": "o"
+     "ret": "o:lib#Line"
     },
     {
      "default_ty": [
@@ -2247,13 +3110,13 @@
       "f",
       "f",
       "?",
-      "o",
+      "o:lib#Extend",
       "c",
-      "?",
+      "o:lib#LineEnum",
       "i",
       "b"
      ],
-     "ret": "o"
+     "ret": "o:lib#Line"
     }
    ],
    "kind": "overloads"
@@ -2266,7 +3129,7 @@
     "color"
    ],
    "params": [
-    "o",
+    "o:lib#Line",
     "c"
    ],
    "ret": "v"
@@ -2279,8 +3142,8 @@
     "extend"
    ],
    "params": [
-    "o",
-    "o"
+    "o:lib#Line",
+    "o:lib#Extend"
    ],
    "ret": "v"
   },
@@ -2292,8 +3155,8 @@
     "point"
    ],
    "params": [
-    "o",
-    "o"
+    "o:lib#Line",
+    "o:lib#ChartPoint"
    ],
    "ret": "v"
   },
@@ -2305,8 +3168,8 @@
     "point"
    ],
    "params": [
-    "o",
-    "o"
+    "o:lib#Line",
+    "o:lib#ChartPoint"
    ],
    "ret": "v"
   },
@@ -2318,8 +3181,8 @@
     "style"
    ],
    "params": [
-    "o",
-    "?"
+    "o:lib#Line",
+    "o:lib#LineEnum"
    ],
    "ret": "v"
   },
@@ -2331,7 +3194,7 @@
     "width"
    ],
    "params": [
-    "o",
+    "o:lib#Line",
     "i"
    ],
    "ret": "v"
@@ -2344,7 +3207,7 @@
     "x"
    ],
    "params": [
-    "o",
+    "o:lib#Line",
     "i"
    ],
    "ret": "v"
@@ -2357,7 +3220,7 @@
     "x"
    ],
    "params": [
-    "o",
+    "o:lib#Line",
     "i"
    ],
    "ret": "v"
@@ -2372,7 +3235,7 @@
     "xloc"
    ],
    "params": [
-    "o",
+    "o:lib#Line",
     "i",
     "i",
     "?"
@@ -2388,7 +3251,7 @@
     "y"
    ],
    "params": [
-    "o",
+    "o:lib#Line",
     "i",
     "f"
    ],
@@ -2403,7 +3266,7 @@
     "y"
    ],
    "params": [
-    "o",
+    "o:lib#Line",
     "i",
     "f"
    ],
@@ -2417,7 +3280,7 @@
     "y"
    ],
    "params": [
-    "o",
+    "o:lib#Line",
     "f"
    ],
    "ret": "v"
@@ -2430,14 +3293,39 @@
     "y"
    ],
    "params": [
-    "o",
+    "o:lib#Line",
     "f"
    ],
    "ret": "v"
   },
-  "linefill.all": {
+  "line.style_arrow_both": {
    "kind": "value",
-   "ty": "o"
+   "ty": "o:lib#LineEnum"
+  },
+  "line.style_arrow_left": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "line.style_arrow_right": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "line.style_dashed": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "line.style_dotted": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "line.style_solid": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "linefill.all": {
+   "callable": true,
+   "kind": "value",
+   "ty": "a:o:lib#LineFill"
   },
   "linefill.delete": {
    "defaults": 0,
@@ -2446,7 +3334,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#LineFill"
    ],
    "ret": "v"
   },
@@ -2457,9 +3345,9 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#LineFill"
    ],
-   "ret": "o"
+   "ret": "o:lib#Line"
   },
   "linefill.get_line2": {
    "defaults": 0,
@@ -2468,9 +3356,9 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#LineFill"
    ],
-   "ret": "o"
+   "ret": "o:lib#Line"
   },
   "linefill.new": {
    "defaults": 0,
@@ -2481,11 +3369,11 @@
     "color"
    ],
    "params": [
-    "o",
-    "o",
+    "o:lib#Line",
+    "o:lib#Line",
     "c"
    ],
-   "ret": "o"
+   "ret": "o:lib#LineFill"
   },
   "linefill.set_color": {
    "defaults": 0,
@@ -2495,10 +3383,34 @@
     "color"
    ],
    "params": [
-    "o",
+    "o:lib#LineFill",
     "c"
    ],
    "ret": "v"
+  },
+  "location.abovebar": {
+   "kind": "value",
+   "ty": "o:lib#Location"
+  },
+  "location.absolute": {
+   "kind": "value",
+   "ty": "o:lib#Location"
+  },
+  "location.belowbar": {
+   "kind": "value",
+   "ty": "o:lib#Location"
+  },
+  "location.bottom": {
+   "kind": "value",
+   "ty": "o:lib#Location"
+  },
+  "location.top": {
+   "kind": "value",
+   "ty": "o:lib#Location"
+  },
+  "log.DURABLE_LOG_WIDTH": {
+   "kind": "value",
+   "ty": "i"
   },
   "log.broker_debug": {
    "defaults": 0,
@@ -2551,6 +3463,7 @@
   "log.error": {
    "defaults": 0,
    "kind": "function",
+   "kwarg": true,
    "names": [
     "formatString"
    ],
@@ -2560,9 +3473,14 @@
    "ret": "v",
    "vararg": "?"
   },
+  "log.handler": {
+   "kind": "value",
+   "ty": "o:lib#PineRichHandler"
+  },
   "log.info": {
    "defaults": 0,
    "kind": "function",
+   "kwarg": true,
    "names": [
     "formatString"
    ],
@@ -2612,6 +3530,7 @@
   "log.warning": {
    "defaults": 0,
    "kind": "function",
+   "kwarg": true,
    "names": [
     "formatString"
    ],
@@ -2634,7 +3553,7 @@
    "params": [
     "o"
    ],
-   "ret": "?"
+   "ret": "v"
   },
   "map.contains": {
    "defaults": 0,
@@ -2717,7 +3636,7 @@
     "o",
     "o"
    ],
-   "ret": "?"
+   "ret": "v"
   },
   "map.remove": {
    "defaults": 0,
@@ -3121,8 +4040,9 @@
    "ret": "v"
   },
   "matrix.all": {
+   "callable": true,
    "kind": "value",
-   "ty": "o"
+   "ty": "a:o"
   },
   "matrix.avg": {
    "defaults": 0,
@@ -3227,7 +4147,7 @@
    "params": [
     "o"
    ],
-   "ret": "o"
+   "ret": "a:f"
   },
   "matrix.eigenvectors": {
    "defaults": 0,
@@ -3784,12 +4704,31 @@
    "ret": "v"
   },
   "minute": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
   "month": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
+  },
+  "na": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "x"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "b"
   },
   "nz": {
    "default_ty": [
@@ -3814,6 +4753,38 @@
   "open": {
    "kind": "value",
    "ty": "f"
+  },
+  "order.ascending": {
+   "kind": "value",
+   "ty": "o:lib#Order"
+  },
+  "order.descending": {
+   "kind": "value",
+   "ty": "o:lib#Order"
+  },
+  "pivotpointtype.camarilla": {
+   "kind": "value",
+   "ty": "o:lib#PivotPointType"
+  },
+  "pivotpointtype.classic": {
+   "kind": "value",
+   "ty": "o:lib#PivotPointType"
+  },
+  "pivotpointtype.dm": {
+   "kind": "value",
+   "ty": "o:lib#PivotPointType"
+  },
+  "pivotpointtype.fibonacci": {
+   "kind": "value",
+   "ty": "o:lib#PivotPointType"
+  },
+  "pivotpointtype.traditional": {
+   "kind": "value",
+   "ty": "o:lib#PivotPointType"
+  },
+  "pivotpointtype.woodie": {
+   "kind": "value",
+   "ty": "o:lib#PivotPointType"
   },
   "plot": {
    "default_none_ok": [
@@ -3850,6 +4821,7 @@
    ],
    "defaults": 14,
    "kind": "function",
+   "kwarg": true,
    "names": [
     "series",
     "title",
@@ -3884,8 +4856,20 @@
     "i",
     "b"
    ],
-   "ret": "?",
+   "ret": "o:lib#Plot",
    "vararg": "?"
+  },
+  "plot.linestyle_dashed": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.linestyle_dotted": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.linestyle_solid": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
   },
   "plot.plot": {
    "default_none_ok": [
@@ -3922,6 +4906,7 @@
    ],
    "defaults": 14,
    "kind": "function",
+   "kwarg": true,
    "names": [
     "series",
     "title",
@@ -3956,8 +4941,52 @@
     "i",
     "b"
    ],
-   "ret": "?",
+   "ret": "o:lib#Plot",
    "vararg": "?"
+  },
+  "plot.style_area": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_areabr": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_circles": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_columns": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_cross": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_histogram": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_line": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_linebr": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_stepline": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_stepline_diamond": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_steplinebr": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
   },
   "plotarrow": {
    "default_none_ok": [
@@ -4279,8 +5308,9 @@
    "ret": "v"
   },
   "polyline.all": {
+   "callable": true,
    "kind": "value",
-   "ty": "o"
+   "ty": "a:o:lib#Polyline"
   },
   "polyline.delete": {
    "defaults": 0,
@@ -4289,7 +5319,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#Polyline"
    ],
    "ret": "v"
   },
@@ -4328,17 +5358,77 @@
     "force_overlay"
    ],
    "params": [
-    "o",
+    "a:o:lib#ChartPoint",
     "b",
     "b",
     "?",
     "c",
     "c",
-    "?",
+    "o:lib#LineEnum",
     "i",
     "b"
    ],
-   "ret": "o"
+   "ret": "o:lib#Polyline"
+  },
+  "polyline.style_arrow_both": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "polyline.style_arrow_left": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "polyline.style_arrow_right": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "polyline.style_dashed": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "polyline.style_dotted": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "polyline.style_solid": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "position.bottom_center": {
+   "kind": "value",
+   "ty": "o:lib#Position"
+  },
+  "position.bottom_left": {
+   "kind": "value",
+   "ty": "o:lib#Position"
+  },
+  "position.bottom_right": {
+   "kind": "value",
+   "ty": "o:lib#Position"
+  },
+  "position.middle_center": {
+   "kind": "value",
+   "ty": "o:lib#Position"
+  },
+  "position.middle_left": {
+   "kind": "value",
+   "ty": "o:lib#Position"
+  },
+  "position.middle_right": {
+   "kind": "value",
+   "ty": "o:lib#Position"
+  },
+  "position.top_center": {
+   "kind": "value",
+   "ty": "o:lib#Position"
+  },
+  "position.top_left": {
+   "kind": "value",
+   "ty": "o:lib#Position"
+  },
+  "position.top_right": {
+   "kind": "value",
+   "ty": "o:lib#Position"
   },
   "request.currency_rate": {
    "defaults": 0,
@@ -4430,6 +5520,7 @@
   "request.economic": {
    "defaults": 0,
    "kind": "function",
+   "kwarg": true,
    "names": [],
    "params": [],
    "ret": "f",
@@ -4489,11 +5580,12 @@
     "i",
     "i"
    ],
-   "ret": "o"
+   "ret": "o:lib#Footprint"
   },
   "request.quandl": {
    "defaults": 0,
    "kind": "function",
+   "kwarg": true,
    "names": [],
    "params": [],
    "ret": "f",
@@ -4502,6 +5594,7 @@
   "request.security": {
    "defaults": 0,
    "kind": "function",
+   "kwarg": true,
    "names": [
     "symbol",
     "timeframe",
@@ -4663,65 +5756,180 @@
    "params": [
     "s"
    ],
-   "ret": "?"
+   "ret": "v"
+  },
+  "scale.left": {
+   "kind": "value",
+   "ty": "o:lib#Scale"
+  },
+  "scale.none": {
+   "kind": "value",
+   "ty": "o:lib#Scale"
+  },
+  "scale.right": {
+   "kind": "value",
+   "ty": "o:lib#Scale"
   },
   "second": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
+  "session.extended": {
+   "kind": "value",
+   "ty": "o:lib#Session"
+  },
   "session.isfirstbar": {
+   "callable": true,
    "kind": "value",
    "ty": "b"
   },
   "session.isfirstbar_regular": {
+   "callable": true,
    "kind": "value",
    "ty": "b"
   },
   "session.islastbar": {
+   "callable": true,
    "kind": "value",
    "ty": "b"
   },
   "session.islastbar_regular": {
+   "callable": true,
    "kind": "value",
    "ty": "b"
   },
   "session.ismarket": {
+   "callable": true,
    "kind": "value",
    "ty": "b"
   },
   "session.ispostmarket": {
+   "callable": true,
    "kind": "value",
    "ty": "b"
   },
   "session.ispremarket": {
+   "callable": true,
    "kind": "value",
    "ty": "b"
   },
+  "session.regular": {
+   "kind": "value",
+   "ty": "o:lib#Session"
+  },
+  "shape.arrowdown": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.arrowup": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.circle": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.cross": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.diamond": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.flag": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.labeldown": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.labelup": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.square": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.triangledown": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.triangleup": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.xcross": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "size.auto": {
+   "kind": "value",
+   "ty": "o:lib#Size"
+  },
+  "size.huge": {
+   "kind": "value",
+   "ty": "o:lib#Size"
+  },
+  "size.large": {
+   "kind": "value",
+   "ty": "o:lib#Size"
+  },
+  "size.normal": {
+   "kind": "value",
+   "ty": "o:lib#Size"
+  },
+  "size.small": {
+   "kind": "value",
+   "ty": "o:lib#Size"
+  },
+  "size.tiny": {
+   "kind": "value",
+   "ty": "o:lib#Size"
+  },
+  "splits.denominator": {
+   "kind": "value",
+   "ty": "o:lib#Splits"
+  },
+  "splits.numerator": {
+   "kind": "value",
+   "ty": "o:lib#Splits"
+  },
   "strategy.account_currency": {
+   "callable": true,
    "kind": "value",
    "ty": "s"
   },
   "strategy.avg_losing_trade": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.avg_losing_trade_percent": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.avg_trade": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.avg_trade_percent": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.avg_winning_trade": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.avg_winning_trade_percent": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
@@ -4734,14 +5942,18 @@
    "params": [
     "s"
    ],
-   "ret": "?"
+   "ret": "v"
   },
   "strategy.cancel_all": {
    "defaults": 0,
    "kind": "function",
    "names": [],
    "params": [],
-   "ret": "?"
+   "ret": "v"
+  },
+  "strategy.cash": {
+   "kind": "value",
+   "ty": "o:lib#QtyType"
   },
   "strategy.close": {
    "default_ty": [
@@ -4772,7 +5984,7 @@
     "b",
     "b"
    ],
-   "ret": "?"
+   "ret": "v"
   },
   "strategy.close_all": {
    "default_ty": [
@@ -4795,13 +6007,15 @@
     "b",
     "b"
    ],
-   "ret": "?"
+   "ret": "v"
   },
   "strategy.closedtrades": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
   "strategy.closedtrades.closedtrades": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
@@ -4927,6 +6141,7 @@
    "ret": "i"
   },
   "strategy.closedtrades.first_index": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
@@ -5007,6 +6222,18 @@
    ],
    "ret": "f"
   },
+  "strategy.commission.cash_per_contract": {
+   "kind": "value",
+   "ty": "o:lib#Commission"
+  },
+  "strategy.commission.cash_per_order": {
+   "kind": "value",
+   "ty": "o:lib#Commission"
+  },
+  "strategy.commission.percent": {
+   "kind": "value",
+   "ty": "o:lib#Commission"
+  },
   "strategy.convert_to_account": {
    "defaults": 0,
    "kind": "function",
@@ -5039,6 +6266,18 @@
     "f"
    ],
    "ret": "f"
+  },
+  "strategy.direction.all": {
+   "kind": "value",
+   "ty": "o:lib#Direction"
+  },
+  "strategy.direction.long": {
+   "kind": "value",
+   "ty": "o:lib#Direction"
+  },
+  "strategy.direction.short": {
+   "kind": "value",
+   "ty": "o:lib#Direction"
   },
   "strategy.entry": {
    "default_none_ok": [
@@ -5087,13 +6326,15 @@
     "s",
     "b"
    ],
-   "ret": "?"
+   "ret": "v"
   },
   "strategy.equity": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.eventrades": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
@@ -5168,85 +6409,125 @@
     "s",
     "b"
    ],
-   "ret": "?"
+   "ret": "v"
+  },
+  "strategy.fixed": {
+   "kind": "value",
+   "ty": "o:lib#QtyType"
   },
   "strategy.grossloss": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.grossloss_percent": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.grossprofit": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.grossprofit_percent": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.initial_capital": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
+  "strategy.long": {
+   "kind": "value",
+   "ty": "o:lib#Direction"
+  },
   "strategy.losstrades": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
   "strategy.margin_liquidation_price": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.max_contracts_held_all": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.max_contracts_held_long": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.max_contracts_held_short": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.max_drawdown": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.max_drawdown_percent": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.max_runup": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.max_runup_percent": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.netprofit": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.netprofit_percent": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
+  "strategy.oca.cancel": {
+   "kind": "value",
+   "ty": "o:lib#Oca"
+  },
+  "strategy.oca.none": {
+   "kind": "value",
+   "ty": "o:lib#Oca"
+  },
+  "strategy.oca.reduce": {
+   "kind": "value",
+   "ty": "o:lib#Oca"
+  },
   "strategy.openprofit": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.openprofit_percent": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.opentrades": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
   "strategy.opentrades.capital_held": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
@@ -5361,6 +6642,7 @@
    "ret": "f"
   },
   "strategy.opentrades.opentrades": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
@@ -5444,17 +6726,24 @@
     "s",
     "b"
    ],
-   "ret": "?"
+   "ret": "v"
+  },
+  "strategy.percent_of_equity": {
+   "kind": "value",
+   "ty": "o:lib#QtyType"
   },
   "strategy.position_avg_price": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "strategy.position_entry_name": {
+   "callable": true,
    "kind": "value",
    "ty": "s"
   },
   "strategy.position_size": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
@@ -5548,9 +6837,14 @@
    "params": [
     "f"
    ],
-   "ret": "?"
+   "ret": "v"
+  },
+  "strategy.short": {
+   "kind": "value",
+   "ty": "o:lib#Direction"
   },
   "strategy.wintrades": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
@@ -5727,7 +7021,7 @@
     "s",
     "s"
    ],
-   "ret": "o"
+   "ret": "a:s"
   },
   "string.startswith": {
    "defaults": 0,
@@ -5920,6 +7214,10 @@
    "kind": "value",
    "ty": "i"
   },
+  "syminfo.regular": {
+   "kind": "value",
+   "ty": "o:lib#Session"
+  },
   "syminfo.root": {
    "kind": "value",
    "ty": "s"
@@ -5927,6 +7225,10 @@
   "syminfo.sector": {
    "kind": "value",
    "ty": "s"
+  },
+  "syminfo.session": {
+   "kind": "value",
+   "ty": "o:lib#Session"
   },
   "syminfo.session_ends": {
    "kind": "value",
@@ -5988,7 +7290,16 @@
    "kind": "value",
    "ty": "s"
   },
+  "syminfo.type": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "syminfo.volumetype": {
+   "kind": "value",
+   "ty": "s"
+  },
   "ta.accdist": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
@@ -6051,7 +7362,7 @@
     "i",
     "f"
    ],
-   "ret": "o"
+   "ret": "T:1:f1:f1:f"
   },
   "ta.bbw": {
    "defaults": 0,
@@ -6220,7 +7531,7 @@
     "i",
     "i"
    ],
-   "ret": "o"
+   "ret": "T:1:f1:f1:f"
   },
   "ta.ema": {
    "defaults": 0,
@@ -6298,7 +7609,7 @@
       "f",
       "i"
      ],
-     "ret": "f"
+     "ret": "i"
     },
     {
      "defaults": 0,
@@ -6308,7 +7619,7 @@
      "params": [
       "i"
      ],
-     "ret": "f"
+     "ret": "i"
     }
    ],
    "kind": "overloads"
@@ -6327,6 +7638,7 @@
    "ret": "f"
   },
   "ta.iii": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
@@ -6348,7 +7660,7 @@
     "f",
     "b"
    ],
-   "ret": "o"
+   "ret": "T:1:f1:f1:f"
   },
   "ta.kcw": {
    "default_ty": [
@@ -6435,7 +7747,7 @@
       "f",
       "i"
      ],
-     "ret": "f"
+     "ret": "i"
     },
     {
      "defaults": 0,
@@ -6445,7 +7757,7 @@
      "params": [
       "i"
      ],
-     "ret": "f"
+     "ret": "i"
     }
    ],
    "kind": "overloads"
@@ -6465,7 +7777,7 @@
     "i",
     "i"
    ],
-   "ret": "o"
+   "ret": "T:1:f1:f1:f"
   },
   "ta.max": {
    "defaults": 0,
@@ -6542,10 +7854,12 @@
    "ret": "f"
   },
   "ta.nvi": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "ta.obv": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
@@ -6608,7 +7922,7 @@
     "b",
     "b"
    ],
-   "ret": "o"
+   "ret": "a:f"
   },
   "ta.pivothigh": {
    "impls": [
@@ -6673,10 +7987,12 @@
    "kind": "overloads"
   },
   "ta.pvi": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "ta.pvt": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
@@ -6837,7 +8153,7 @@
     "f",
     "i"
    ],
-   "ret": "o"
+   "ret": "T:1:f1:i"
   },
   "ta.swma": {
    "defaults": 0,
@@ -6851,6 +8167,7 @@
    "ret": "f"
   },
   "ta.tr": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
@@ -6903,6 +8220,7 @@
    "ret": "f"
   },
   "ta.vwap": {
+   "callable": true,
    "kind": "value",
    "ty": "?"
   },
@@ -6920,6 +8238,7 @@
    "ret": "f"
   },
   "ta.wad": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
@@ -6948,12 +8267,14 @@
    "ret": "f"
   },
   "ta.wvad": {
+   "callable": true,
    "kind": "value",
    "ty": "f"
   },
   "table.all": {
+   "callable": true,
    "kind": "value",
-   "ty": "o"
+   "ty": "a:o:lib#Table"
   },
   "table.cell": {
    "default_none_ok": [
@@ -7001,20 +8322,20 @@
     "text_formatting"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "i",
     "i",
     "s",
     "f",
     "f",
     "c",
-    "o",
-    "o",
+    "o:lib#AlignEnum",
+    "o:lib#AlignEnum",
     "?",
     "c",
     "s",
-    "o",
-    "o"
+    "o:lib#FontFamilyEnum",
+    "o:lib#FormatEnum"
    ],
    "ret": "v"
   },
@@ -7028,7 +8349,7 @@
     "bgcolor"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "i",
     "i",
     "c"
@@ -7045,7 +8366,7 @@
     "height"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "i",
     "i",
     "f"
@@ -7062,7 +8383,7 @@
     "text"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "i",
     "i",
     "s"
@@ -7079,7 +8400,7 @@
     "text_color"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "i",
     "i",
     "c"
@@ -7096,10 +8417,10 @@
     "text_font_family"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "i",
     "i",
-    "o"
+    "o:lib#FontFamilyEnum"
    ],
    "ret": "v"
   },
@@ -7113,10 +8434,10 @@
     "text_formatting"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "i",
     "i",
-    "o"
+    "o:lib#FormatEnum"
    ],
    "ret": "v"
   },
@@ -7130,10 +8451,10 @@
     "text_halign"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "i",
     "i",
-    "o"
+    "o:lib#AlignEnum"
    ],
    "ret": "v"
   },
@@ -7147,7 +8468,7 @@
     "text_size"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "i",
     "i",
     "?"
@@ -7164,10 +8485,10 @@
     "text_valign"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "i",
     "i",
-    "o"
+    "o:lib#AlignEnum"
    ],
    "ret": "v"
   },
@@ -7181,7 +8502,7 @@
     "tooltip"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "i",
     "i",
     "s"
@@ -7198,7 +8519,7 @@
     "width"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "i",
     "i",
     "f"
@@ -7224,7 +8545,7 @@
     "end_row"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "i",
     "i",
     "i",
@@ -7239,7 +8560,7 @@
     "table_id"
    ],
    "params": [
-    "o"
+    "o:lib#Table"
    ],
    "ret": "v"
   },
@@ -7254,7 +8575,7 @@
     "end_row"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "i",
     "i",
     "i",
@@ -7293,7 +8614,7 @@
     "force_overlay"
    ],
    "params": [
-    "o",
+    "o:lib#Position",
     "i",
     "i",
     "c",
@@ -7303,7 +8624,7 @@
     "i",
     "b"
    ],
-   "ret": "o"
+   "ret": "o:lib#Table"
   },
   "table.set_bgcolor": {
    "defaults": 0,
@@ -7313,7 +8634,7 @@
     "bgcolor"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "c"
    ],
    "ret": "v"
@@ -7326,7 +8647,7 @@
     "border_color"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "c"
    ],
    "ret": "v"
@@ -7339,7 +8660,7 @@
     "border_width"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "i"
    ],
    "ret": "v"
@@ -7352,7 +8673,7 @@
     "frame_color"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "c"
    ],
    "ret": "v"
@@ -7365,7 +8686,7 @@
     "frame_width"
    ],
    "params": [
-    "o",
+    "o:lib#Table",
     "i"
    ],
    "ret": "v"
@@ -7378,10 +8699,50 @@
     "position"
    ],
    "params": [
-    "o",
-    "o"
+    "o:lib#Table",
+    "o:lib#Position"
    ],
    "ret": "v"
+  },
+  "text.align_bottom": {
+   "kind": "value",
+   "ty": "o:lib#AlignEnum"
+  },
+  "text.align_center": {
+   "kind": "value",
+   "ty": "o:lib#AlignEnum"
+  },
+  "text.align_left": {
+   "kind": "value",
+   "ty": "o:lib#AlignEnum"
+  },
+  "text.align_right": {
+   "kind": "value",
+   "ty": "o:lib#AlignEnum"
+  },
+  "text.align_top": {
+   "kind": "value",
+   "ty": "o:lib#AlignEnum"
+  },
+  "text.format_bold": {
+   "kind": "value",
+   "ty": "o:lib#FormatEnum"
+  },
+  "text.format_italic": {
+   "kind": "value",
+   "ty": "o:lib#FormatEnum"
+  },
+  "text.format_none": {
+   "kind": "value",
+   "ty": "o:lib#FormatEnum"
+  },
+  "text.wrap_auto": {
+   "kind": "value",
+   "ty": "o:lib#WrapEnum"
+  },
+  "text.wrap_none": {
+   "kind": "value",
+   "ty": "o:lib#WrapEnum"
   },
   "ticker.heikinashi": {
    "defaults": 0,
@@ -7577,14 +8938,17 @@
    "ret": "s"
   },
   "time": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
   "time_close": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
   "time_tradingday": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
@@ -7628,50 +8992,62 @@
    "ret": "i"
   },
   "timeframe.isdaily": {
+   "callable": true,
    "kind": "value",
    "ty": "b"
   },
   "timeframe.isdwm": {
+   "callable": true,
    "kind": "value",
    "ty": "b"
   },
   "timeframe.isintraday": {
+   "callable": true,
    "kind": "value",
    "ty": "b"
   },
   "timeframe.isminutes": {
+   "callable": true,
    "kind": "value",
    "ty": "b"
   },
   "timeframe.ismonthly": {
+   "callable": true,
    "kind": "value",
    "ty": "b"
   },
   "timeframe.isseconds": {
+   "callable": true,
    "kind": "value",
    "ty": "b"
   },
   "timeframe.isticks": {
+   "callable": true,
    "kind": "value",
    "ty": "b"
   },
   "timeframe.isweekly": {
+   "callable": true,
    "kind": "value",
    "ty": "b"
   },
   "timeframe.main_period": {
+   "callable": true,
    "kind": "value",
    "ty": "s"
   },
   "timeframe.multiplier": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
   "timeframe.period": {
+   "callable": true,
    "kind": "value",
    "ty": "s"
   },
   "timenow": {
+   "callable": true,
    "kind": "value",
    "ty": "?"
   },
@@ -7763,7 +9139,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#VolumeRow"
    ],
    "ret": "f"
   },
@@ -7774,7 +9150,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#VolumeRow"
    ],
    "ret": "f"
   },
@@ -7785,7 +9161,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#VolumeRow"
    ],
    "ret": "f"
   },
@@ -7796,7 +9172,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#VolumeRow"
    ],
    "ret": "f"
   },
@@ -7807,7 +9183,7 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#VolumeRow"
    ],
    "ret": "f"
   },
@@ -7818,18 +9194,78 @@
     "id"
    ],
    "params": [
-    "o"
+    "o:lib#VolumeRow"
    ],
    "ret": "f"
   },
   "weekofyear": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
   },
+  "xloc.bar_index": {
+   "kind": "value",
+   "ty": "o:lib#XLoc"
+  },
+  "xloc.bar_time": {
+   "kind": "value",
+   "ty": "o:lib#XLoc"
+  },
   "year": {
+   "callable": true,
    "kind": "value",
    "ty": "i"
+  },
+  "yloc.abovebar": {
+   "kind": "value",
+   "ty": "o:lib#YLoc"
+  },
+  "yloc.belowbar": {
+   "kind": "value",
+   "ty": "o:lib#YLoc"
+  },
+  "yloc.price": {
+   "kind": "value",
+   "ty": "o:lib#YLoc"
   }
  },
- "v": 4
+ "scalar_classes": {
+  "AlertEnum": "s",
+  "AlignEnum": "s",
+  "BarMerge": "i",
+  "Commission": "s",
+  "Currency": "s",
+  "DayOfWeek": "i",
+  "Direction": "s",
+  "Display": "i",
+  "Dividends": "s",
+  "Earnings": "s",
+  "Extend": "s",
+  "FontFamilyEnum": "s",
+  "Format": "s",
+  "FormatEnum": "s",
+  "HLineEnum": "s",
+  "IntEnum": "i",
+  "LabelStyleEnum": "s",
+  "LineEnum": "s",
+  "Location": "s",
+  "Oca": "s",
+  "Order": "s",
+  "PivotPointType": "s",
+  "PlotEnum": "i",
+  "Position": "s",
+  "QtyType": "s",
+  "Scale": "i",
+  "ScriptType": "i",
+  "Session": "s",
+  "Shape": "s",
+  "Size": "s",
+  "Splits": "s",
+  "StrLiteral": "s",
+  "Weekdays": "i",
+  "WrapEnum": "s",
+  "XLoc": "s",
+  "YLoc": "s"
+ },
+ "v": 8
 }

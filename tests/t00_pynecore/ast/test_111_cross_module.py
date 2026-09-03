@@ -23,7 +23,9 @@ from pynecore.core.import_hook import PyneLoader, _baked_deps, analyse_source
 from pynecore.core.instance_state import _make_state  # noqa: internal API
 from pynecore.transformers import pine_type_artifact
 from pynecore.transformers.pine_type_artifact import interface_digest, registered
-from pynecore.transformers.pine_type_rules import FLOAT, INT, OBJECT, UNKNOWN, get_pin, get_ty
+from pynecore.transformers.pine_type_rules import (
+    FLOAT, INT, OBJECT, UNKNOWN, get_pin, get_ty, tuple_of,
+)
 from pynecore.transformers.pine_type_table import PineTypeTable
 
 #: Name of the folded constant the loader bakes the dependency records into.
@@ -209,7 +211,8 @@ value = helper.method(3)
     tree, table = _analysed(app)
 
     assert get_ty(_call(tree, 'helper.method')) == UNKNOWN
-    assert table.diags == []
+    assert [diag.origin.reason for diag in table.diags
+            if diag.origin is not None] == ['unknown-call']
 
 
 # --- the shadowed namespace ------------------------------------------------
@@ -587,7 +590,9 @@ def main():
     tree, table = _analysed(app)
 
     assert get_ty(_call(tree, 'helper')) == UNKNOWN
-    assert table.diags == []
+    # Unresolved is unresolved: the call is reported as one nothing types
+    assert [diag.origin.reason for diag in table.diags
+            if diag.origin is not None] == ['unknown-call']
     assert table.deps == {}
 
 
@@ -608,7 +613,9 @@ def main(helper):
     tree, table = _analysed(app)
 
     assert get_ty(_call(tree, 'helper')) == UNKNOWN
-    assert table.diags == []
+    # Unresolved is unresolved: the call is reported as one nothing types
+    assert [diag.origin.reason for diag in table.diags
+            if diag.origin is not None] == ['unknown-call']
 
 
 def __test_a_relative_import_is_not_resolved__(tmp_path, monkeypatch):
@@ -627,7 +634,9 @@ value = helper(3)
 
     assert get_ty(_call(tree, 'helper')) == UNKNOWN
     assert table.deps == {}
-    assert table.diags == []
+    # Unresolved is unresolved: the call is reported as one nothing types
+    assert [diag.origin.reason for diag in table.diags
+            if diag.origin is not None] == ['unknown-call']
 
 
 def __test_a_stdlib_import_records_no_dependency__(tmp_path, monkeypatch):
@@ -645,7 +654,9 @@ value = math.floor(1.5)
 
     assert get_ty(_call(tree, 'math.floor')) == UNKNOWN
     assert table.deps == {}
-    assert table.diags == []
+    # Unresolved is unresolved: the call is reported as one nothing types
+    assert [diag.origin.reason for diag in table.diags
+            if diag.origin is not None] == ['unknown-call']
 
 
 def __test_a_non_pyne_dependency_is_left_unknown__(tmp_path, monkeypatch):
@@ -666,7 +677,9 @@ value = helper(3)
 
     assert get_ty(_call(tree, 'helper')) == UNKNOWN
     assert table.deps == {}
-    assert table.diags == []
+    # Unresolved is unresolved: the call is reported as one nothing types
+    assert [diag.origin.reason for diag in table.diags
+            if diag.origin is not None] == ['unknown-call']
 
 
 # --- the object-returning shapes -------------------------------------------
@@ -693,5 +706,140 @@ value = pair(3)
 
     tree, table = _analysed(app)
 
-    assert get_ty(_call(tree, 'pair')) == OBJECT
+    # The return is INFERRED from the body -- the module publishes what its
+    # own analysis found, and a tuple travels like any other shape
+    assert get_ty(_call(tree, 'pair')) == tuple_of([INT, INT])
     assert table.diags == []
+
+
+SHAPED_LIB = '''"""
+@pyne
+"""
+
+
+def add(a: int, b: int = 0) -> int:
+    return a + b
+'''
+
+SHAPED_APP = '''"""
+@pyne
+"""
+from xm_shaped_lib import add
+
+
+def main():
+    x = add(1)
+    y = add(1, 2, 3)
+    z = add(1, nosuch=2)
+    w = add(1, 2.5)
+    v = add(1, b=2)
+    u = add(1, a=2)
+    return x + y + z + w + v + u
+'''
+
+
+def __test_a_call_into_another_module_is_held_to_its_signature__(tmp_path, monkeypatch):
+    """The published shape -- arity, names, types -- is what the call has to meet"""
+    monkeypatch.syspath_prepend(tmp_path)
+    _write(tmp_path, 'xm_shaped_lib', SHAPED_LIB)
+    app = _write(tmp_path, 'xm_shaped_app', SHAPED_APP)
+
+    _, table = _analysed(app)
+
+    types = {name: binding.ty for name, binding in table.bindings['main'].items()}
+    assert types['x'] == INT and types['v'] == INT
+    assert all(types[name] == UNKNOWN for name in ('y', 'z', 'w', 'u'))
+    reasons = [diag.origin.reason for diag in table.diags if diag.origin is not None]
+    assert reasons == ['bad-call'] * 4
+    messages = [diag.message for diag in table.diags]
+    assert "'add' does not take 3 argument(s)" in messages[0]
+    assert "'add' has no parameter 'nosuch'" in messages[1]
+    assert "'add' takes int for 'b', float passed" in messages[2]
+    assert "'a' is passed to 'add' twice" in messages[3]
+
+
+METHOD_LIB = '''"""
+@pyne
+"""
+from pynecore.core.pine_method import method
+from pynecore.core.pine_udt import udt
+
+__all__ = ['Cfg', 'bump']
+
+
+@udt
+class Cfg:
+    level: int
+    tag: str = "x"
+
+
+@method
+def bump(this: Cfg, by: int) -> int:
+    return this.level + by
+'''
+
+METHOD_APP = '''"""
+@pyne
+"""
+from pynecore.core.pine_method import method_call
+import xm_method_lib as ordlib
+
+
+def main():
+    c = ordlib.Cfg.new(1)
+    a = method_call('bump', c)
+    b = method_call('bump', c, 1, 2)
+    d = method_call('bump', c, "x")
+    e = method_call('bump', c, 1)
+    f = method_call(ordlib.bump, c, 2.5)
+    return a
+'''
+
+
+def __test_a_method_of_an_imported_class_is_held_to_its_signature__(tmp_path, monkeypatch):
+    """The receiver is the first parameter; the rest has to fit what the module publishes"""
+    monkeypatch.syspath_prepend(tmp_path)
+    _write(tmp_path, 'xm_method_lib', METHOD_LIB)
+    app = _write(tmp_path, 'xm_method_app', METHOD_APP)
+
+    _, table = _analysed(app)
+
+    types = {name: binding.ty for name, binding in table.bindings['main'].items()}
+    assert types['e'] == INT
+    assert all(types[name] == UNKNOWN for name in ('a', 'b', 'd', 'f'))
+    reasons = [diag.origin.reason for diag in table.diags if diag.origin is not None]
+    assert reasons == ['bad-call'] * 4
+    messages = [diag.message for diag in table.diags]
+    assert "'bump' does not take 1 argument(s)" in messages[0]
+    assert "'bump' does not take 3 argument(s)" in messages[1]
+    assert "'bump' takes int for 'by', string passed" in messages[2]
+    assert "takes int for 'by', float passed" in messages[3]
+
+
+BARE_CLASS_APP = '''"""
+@pyne
+"""
+from xm_method_lib import Cfg
+
+
+def main():
+    s = Cfg.new(1)
+    t = Cfg(1, "a", 3)
+    return s
+'''
+
+
+def __test_a_class_imported_by_name_is_a_type__(tmp_path, monkeypatch):
+    """``from lib.m import Cfg`` binds the class itself, constructor and all"""
+    monkeypatch.syspath_prepend(tmp_path)
+    _write(tmp_path, 'xm_method_lib', METHOD_LIB)
+    app = _write(tmp_path, 'xm_bare_class_app', BARE_CLASS_APP)
+
+    _, table = _analysed(app)
+
+    types = {name: binding.ty for name, binding in table.bindings['main'].items()}
+    assert types['s'].startswith('o:') and types['s'].endswith('#Cfg')
+    assert types['t'] == UNKNOWN
+    reasons = [diag.origin.reason for diag in table.diags if diag.origin is not None]
+    assert reasons == ['bad-call']
+    assert "'Cfg' has 2 field(s), 3 argument(s) passed" in table.diags[0].message

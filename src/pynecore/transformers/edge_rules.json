@@ -1,0 +1,135 @@
+{
+  "bin_ops": [
+    "Add",
+    "Div",
+    "FloorDiv",
+    "Mod",
+    "Mult",
+    "Pow",
+    "Sub"
+  ],
+  "bool_ops": [
+    "And",
+    "Or"
+  ],
+  "builtin_calls": [
+    "abs",
+    "bool",
+    "enumerate",
+    "float",
+    "int",
+    "len",
+    "max",
+    "min",
+    "print",
+    "range",
+    "round",
+    "str"
+  ],
+  "class_decorators": [
+    [
+      "dataclasses",
+      "dataclass"
+    ],
+    [
+      "pynecore.core.pine_udt",
+      "udt"
+    ]
+  ],
+  "cmp_ops": [
+    "Eq",
+    "Gt",
+    "GtE",
+    "Lt",
+    "LtE",
+    "NotEq"
+  ],
+  "extras": {
+    "dunder_names": [
+      "__all__",
+      "__name__",
+      "__file__",
+      "__call__"
+    ],
+    "dunder_patterns": [
+      "^__block_result(_\\d+)?__$",
+      "^__block_keep_\\d+__$",
+      "^__switch(_\\d+)?__$",
+      "^__loop_\\d+__$",
+      "^__input_\\d+__$"
+    ],
+    "func_decorators": [
+      [
+        "pynecore.core.overload",
+        "overload"
+      ]
+    ]
+  },
+  "from_modules": {
+    "__future__": [
+      "annotations"
+    ],
+    "dataclasses": [
+      "dataclass",
+      "field"
+    ],
+    "typing": [
+      "Any",
+      "Protocol"
+    ]
+  },
+  "func_decorators": [
+    [
+      "pynecore.core.pine_export",
+      "export"
+    ],
+    [
+      "pynecore.core.pine_method",
+      "method"
+    ]
+  ],
+  "import_prefixes": [
+    "pynecore",
+    "lib"
+  ],
+  "nodes": [
+    "AnnAssign",
+    "Assign",
+    "Attribute",
+    "AugAssign",
+    "BinOp",
+    "BoolOp",
+    "Break",
+    "Call",
+    "ClassDef",
+    "Compare",
+    "Constant",
+    "Continue",
+    "Expr",
+    "For",
+    "FunctionDef",
+    "If",
+    "IfExp",
+    "Import",
+    "ImportFrom",
+    "Lambda",
+    "Module",
+    "Name",
+    "Pass",
+    "Return",
+    "Subscript",
+    "Tuple",
+    "UnaryOp",
+    "While",
+    "alias",
+    "arg",
+    "keyword"
+  ],
+  "rules_version": "2026.07.1",
+  "unary_ops": [
+    "Not",
+    "UAdd",
+    "USub"
+  ],
+  "v": 1
+}

@@ -38,7 +38,8 @@ from pathlib import Path
 from .node_ids import assign_node_ids, node_id
 from .pine_type_rules import TY_ATTR, UNKNOWN, ImplSig, annotation_type, impl_sig
 from .pine_type_table import (
-    Analyser, DepRecord, ExportSig, ModuleInterface, PineTypeTable, Unknown, qualify,
+    Analyser, ClassSig, DepRecord, ExportSig, ModuleInterface, PineTypeTable, Unknown,
+    qualify,
 )
 
 __all__ = [
@@ -51,7 +52,7 @@ __all__ = [
 
 #: Bumped whenever the JSON shape changes. An artifact of a different version
 #: is not read, the same way one of a different pipeline is not.
-ARTIFACT_VERSION = 3
+ARTIFACT_VERSION = 8
 
 #: Environment override for the artifact. ``'1'`` writes one for every Pyne
 #: module, ``'0'`` for none; unset leaves it to the module's mode.
@@ -152,9 +153,13 @@ def build_interface(tree: ast.Module, table: PineTypeTable, path: str,
         fingerprint = _fingerprint(path)
     all_names = _module_all(tree)
     interface = ModuleInterface(path=path, exports=exports, all=all_names,
-                                classes=_module_classes(tree, all_names), digest='',
-                                deps=dict(table.deps),
-                                mtime_ns=fingerprint[0], size=fingerprint[1])
+                                classes=_module_classes(tree, all_names, table),
+                                extensions={cid: dict(methods)
+                                            for cid, methods in table.extensions.items()},
+                                digest='', deps=dict(table.deps),
+                                mtime_ns=fingerprint[0], size=fingerprint[1],
+                                suppressed=table.pins_suppressed.message
+                                if table.pins_suppressed is not None else '')
     return replace(interface, digest=interface_digest(interface))
 
 
@@ -241,7 +246,7 @@ def _export_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, key: str,
             name=node.name, kind='group', params=first.params, required=first.required,
             open_ended=first.open_ended, ret=func.ret,
             annotated=all(UNKNOWN not in impl.params for impl in impls),
-            impls=impls, line=getattr(node, 'lineno', 0))
+            impls=impls, line=getattr(node, 'lineno', 0), names=first.names)
     sig = impl_sig(node, func.ret, classes=table.classes)
     positional = list(node.args.posonlyargs) + list(node.args.args)
     return ExportSig(
@@ -249,7 +254,7 @@ def _export_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, key: str,
         open_ended=sig.open_ended, ret=sig.ret,
         annotated=all(annotation_type(arg.annotation, table.classes) != UNKNOWN
                       for arg in positional),
-        line=getattr(node, 'lineno', 0))
+        line=getattr(node, 'lineno', 0), names=sig.names)
 
 
 def _collect_defs(node: ast.AST, scope: str,
@@ -339,24 +344,37 @@ def _module_all(tree: ast.Module) -> tuple[str, ...] | None:
     return found
 
 
-def _module_classes(tree: ast.Module, all_names: tuple[str, ...] | None) -> tuple[str, ...]:
+def _module_classes(tree: ast.Module, all_names: tuple[str, ...] | None,
+                    table: PineTypeTable) -> dict[str, ClassSig]:
     """
-    The classes a module publishes, in source order.
+    The classes a module publishes, in source order, with what they hold.
 
     Module level only: a class nested in a function is not reachable through
     the import, so no dependent can name it in an annotation. ``__all__``
     filters them for the same reason it filters the exports -- a namespace
     import reads the module through it.
 
+    What travels is the whole class: its id, its field types and the methods
+    declared on it. A dependent reading ``pivot.price`` needs the field's
+    type, and it can only get it from here -- the class is the contract, not
+    just its name.
+
     :param tree: The module
     :param all_names: Its literal ``__all__``, or None when it spells none
-    :return: The class names a dependent may annotate with
+    :param table: The table the type pass produced, which holds the classes
+    :return: Class name -> what it declares
     """
-    names = [stmt.name for stmt in tree.body if isinstance(stmt, ast.ClassDef)]
-    if all_names is None:
-        return tuple(names)
-    published = set(all_names)
-    return tuple(name for name in names if name in published)
+    published = None if all_names is None else set(all_names)
+    out: dict[str, ClassSig] = {}
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.ClassDef):
+            continue
+        if published is not None and stmt.name not in published:
+            continue
+        sig = table.class_sigs.get(table.classes.get(stmt.name, ''))
+        if sig is not None:
+            out[stmt.name] = sig
+    return out
 
 
 def interface_digest(interface: ModuleInterface) -> str:
@@ -366,20 +384,50 @@ def interface_digest(interface: ModuleInterface) -> str:
     The line numbers are left out on purpose: a body edit moves every
     definition below it, and a dependent has no business being invalidated by
     that. What IS in here is every signature, every implementation of every
-    group, ``__all__``, and the published classes -- adding or removing one
-    changes what a dependent's annotations resolve to.
+    group, ``__all__``, the published classes and the methods this module adds
+    to another module's class -- adding or removing one changes what a
+    dependent's annotations, and its method calls, resolve to.
 
     :param interface: The interface to digest
     :return: A short hex digest
     """
     payload = {
         'all': list(interface.all) if interface.all is not None else None,
-        'classes': list(interface.classes),
-        'exports': {name: {field: value for field, value in _export_json(sig).items()
-                           if field != 'line'}
+        # The class id is left out on the same grounds the line numbers are:
+        # its module half IS this interface's own path, so it says nothing a
+        # dependent could be invalidated by. The FIELDS are the contract --
+        # a field whose type moves changes what every reader of it resolves to
+        # The fields as an ORDERED list: a constructor binds them by position
+        'classes': {name: {'fields': list(sig.fields.items()), 'required': sig.required,
+                           'methods': {method: _unlined(_export_json(published))
+                                       for method, published in sig.methods.items()}}
+                    for name, sig in interface.classes.items()},
+        # An extension is keyed by the FOREIGN class id, whose module half is
+        # another module's path -- that is the identity, and a dependent
+        # resolving a method on that class does depend on it
+        'extensions': {cid: {name: _unlined(_export_json(published))
+                             for name, published in methods.items()}
+                       for cid, methods in interface.extensions.items()},
+        'exports': {name: _unlined(_export_json(sig))
                     for name, sig in interface.exports.items()},
+        # Whether the module's pins were given up is part of what a dependent
+        # resolves to: its own pins follow
+        'suppressed': interface.suppressed,
     }
     return _digest(_canonical(payload).encode('utf-8'))
+
+
+def _unlined(payload: dict) -> dict:
+    """
+    One signature with its line number taken out.
+
+    A body edit moves every definition below it, and a dependent has no
+    business being invalidated by that.
+
+    :param payload: The serialized signature
+    :return: The same, without ``line``
+    """
+    return {field: value for field, value in payload.items() if field != 'line'}
 
 
 def source_digest(source: bytes) -> str:
@@ -791,7 +839,8 @@ def table_json(tree: ast.Module, table: PineTypeTable, interface: ModuleInterfac
                    'argc': call.argc, 'ty': call.ty, 'pin': call.pin}
                   for call in table.calls],
         'diags': [{'message': diag.message, 'line': diag.line, 'col': diag.col,
-                   'origin': _unknown_json(diag.origin), 'fix': diag.fix}
+                   'origin': _unknown_json(diag.origin), 'fix': diag.fix,
+                   'end_line': diag.end_line, 'end_col': diag.end_col}
                   for diag in table.diags],
         # The module's dependency closure, which is also the interface's: a
         # reader validates it before it may trust the published signatures
@@ -800,8 +849,12 @@ def table_json(tree: ast.Module, table: PineTypeTable, interface: ModuleInterfac
                  for path, record in table.deps.items()},
         'interface': {
             'all': list(interface.all) if interface.all is not None else None,
-            'classes': list(interface.classes),
+            'classes': {name: _class_json(sig) for name, sig in interface.classes.items()},
+            'extensions': {cid: {name: _export_json(published)
+                                 for name, published in methods.items()}
+                           for cid, methods in interface.extensions.items()},
             'exports': {name: _export_json(sig) for name, sig in interface.exports.items()},
+            'suppressed': interface.suppressed,
         },
     }
 
@@ -837,6 +890,8 @@ def _binding_json(binding) -> dict:
     out: dict = {'ty': binding.ty, 'line': binding.line}
     if binding.unknown is not None:
         out['unknown'] = _unknown_json(binding.unknown)
+    if binding.series:
+        out['series'] = True
     return out
 
 
@@ -864,9 +919,10 @@ def _export_json(sig: ExportSig) -> dict:
         'kind': sig.kind, 'params': list(sig.params), 'required': sig.required,
         'open_ended': sig.open_ended, 'ret': sig.ret, 'annotated': sig.annotated,
         'impls': [{'params': list(impl.params), 'required': impl.required,
-                   'open_ended': impl.open_ended, 'ret': impl.ret, 'fits': impl.fits}
+                   'open_ended': impl.open_ended, 'ret': impl.ret, 'fits': impl.fits,
+                   'names': list(impl.names)}
                   for impl in sig.impls],
-        'line': sig.line,
+        'line': sig.line, 'names': list(sig.names),
     }
 
 
@@ -897,11 +953,17 @@ def _interface_from_json(path: str, data: dict,
         deps[dep_path] = DepRecord(path=dep_path, mtime_ns=record.get('mtime_ns', 0),
                                    size=record.get('size', -1),
                                    digest=record.get('digest', ''))
+    classes = {name: _class_from_json(name, sig)
+               for name, sig in (published.get('classes') or {}).items()}
+    extensions = {cid: {name: _export_from_json(name, method)
+                        for name, method in (methods or {}).items()}
+                  for cid, methods in (published.get('extensions') or {}).items()}
     interface = ModuleInterface(
         path=path, exports=exports,
         all=tuple(all_names) if all_names is not None else None,
-        classes=tuple(published.get('classes') or ()), digest='', deps=deps,
-        mtime_ns=fingerprint[0], size=fingerprint[1])
+        classes=classes, extensions=extensions, digest='', deps=deps,
+        mtime_ns=fingerprint[0], size=fingerprint[1],
+        suppressed=str(published.get('suppressed') or ''))
     return replace(interface, digest=interface_digest(interface))
 
 
@@ -921,6 +983,44 @@ def _export_from_json(name: str, data: dict) -> ExportSig:
         impls=tuple(ImplSig(params=tuple(impl.get('params') or ()),
                             required=impl.get('required', 0),
                             open_ended=bool(impl.get('open_ended')),
-                            ret=impl.get('ret', UNKNOWN), fits=impl.get('fits', ''))
+                            ret=impl.get('ret', UNKNOWN), fits=impl.get('fits', ''),
+                            names=tuple(impl.get('names') or ()))
                     for impl in (data.get('impls') or ())),
-        line=data.get('line', 0))
+        line=data.get('line', 0), names=tuple(data.get('names') or ()))
+
+
+def _class_json(sig: ClassSig) -> dict:
+    """
+    One published class, in the artifact's shape.
+
+    :param sig: The class to serialize
+    :return: Its JSON form
+    """
+    return {
+        'id': sig.id,
+        'fields': dict(sig.fields),
+        # The artifact is written with sorted keys, so the declaration order
+        # a constructor binds positional arguments by travels on its own
+        'order': list(sig.fields),
+        'required': sig.required,
+        'methods': {name: _export_json(method) for name, method in sig.methods.items()},
+    }
+
+
+def _class_from_json(name: str, data: dict) -> ClassSig:
+    """
+    Rebuild one published class an artifact carries.
+
+    :param name: The class name
+    :param data: Its JSON form
+    :return: The class
+    """
+    fields = dict(data.get('fields') or {})
+    ordered = {field_name: fields[field_name]
+               for field_name in (data.get('order') or ()) if field_name in fields}
+    ordered.update(fields)
+    return ClassSig(
+        name=name, id=data.get('id', ''), fields=ordered,
+        required=data.get('required', 0),
+        methods={method: _export_from_json(method, sig)
+                 for method, sig in (data.get('methods') or {}).items()})

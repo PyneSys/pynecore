@@ -52,7 +52,8 @@ def __test_load_bearing_entries__():
     # Builtin series and counters: the int/float split the whole pass exists for
     assert names['bar_index'] == {'kind': 'value', 'ty': 'i'}
     assert names['last_bar_index'] == {'kind': 'value', 'ty': 'i'}
-    assert names['time'] == {'kind': 'value', 'ty': 'i'}
+    # ... ``time`` is a module property: read as a value, callable as well
+    assert names['time'] == {'kind': 'value', 'ty': 'i', 'callable': True}
     for source in ('open', 'high', 'low', 'close', 'volume'):
         assert names[source] == {'kind': 'value', 'ty': 'f'}, source
 
@@ -72,9 +73,21 @@ def __test_load_bearing_entries__():
     assert names['math.random']['kind'] == 'function'
 
     # Known non-scalars are KNOWN, not typing failures: an array-using script
-    # must not be pushed out of the typed subset
-    assert names['array.new_float']['ret'] == 'o'
+    # must not be pushed out of the typed subset -- and a container carries its
+    # ELEMENT type, so ``array.get`` on one of these can be answered
+    assert names['array.new_float']['ret'] == 'a:f'
+    assert names['array.new_int']['ret'] == 'a:i'
+    assert names['array.new_line']['ret'] == 'a:o:lib#Line'
+    assert names['array.sort_indices']['ret'] == 'a:i'
+    # ... while a container the annotation spells without a payload is a plain
+    # object: ``matrix.new -> Matrix`` says nothing about what it holds
     assert names['matrix.new']['ret'] == 'o'
+    assert names['map.new']['ret'] == 'o'
+
+    # An object-returning lib name carries the CLASS it returns, under the
+    # module key reserved for the lib
+    assert names['line.new']['impls'][0]['ret'] == 'o:lib#Line'
+    assert names['chart.point.new']['ret'] == 'o:lib#ChartPoint'
 
 
 def __test_a_none_default_records_what_its_annotation_takes__():
@@ -110,3 +123,138 @@ def __test_union_annotations_do_not_collapse__():
     names = json.loads(_JSON_PATH.read_text())['names']
     assert names['string.tostring']['params'][0] == '?'
     assert names['string.tostring']['ret'] == 's'
+
+
+#: The lib names a compiled script reads as VALUES, with the type each carries.
+#: One entry per SHAPE the collector has to recognize, not a copy of the corpus:
+#: a constant published by an annotated assignment, by a bare constructor call,
+#: by a plain literal, and by an alias to another namespace's constant -- plus a
+#: namespace instance whose methods are reachable through it. A shape that stops
+#: being collected takes every script that mentions it out of the typed subset,
+#: silently, which is what this guard is for.
+_CONSTANT_COVERAGE = {
+    # ``data_window: Display = Display()`` -- object-typed annotation
+    'display.all': 'o:lib#Display',
+    'display.data_window': 'o:lib#Display',
+    'display.none': 'o:lib#Display',
+    'display.pane': 'o:lib#Display',
+    # ``white = Color('#FFFFFF')`` -- unannotated constructor call, and the one
+    # class whose instances are a Pine scalar
+    'color.black': 'c',
+    'color.blue': 'c',
+    'color.gray': 'c',
+    'color.green': 'c',
+    'color.orange': 'c',
+    'color.red': 'c',
+    'color.white': 'c',
+    'color.yellow': 'c',
+    # ... the same shape over every enum namespace, each carrying the class it
+    # is an instance of, so two constants of DIFFERENT namespaces no longer
+    # join to one anonymous object
+    'barmerge.gaps_off': 'o:lib#BarMerge',
+    'barmerge.lookahead_off': 'o:lib#BarMerge',
+    'extend.both': 'o:lib#Extend',
+    'extend.none': 'o:lib#Extend',
+    'extend.right': 'o:lib#Extend',
+    'format.mintick': 'o:lib#Format',
+    'hline.style_dashed': 'o:lib#HLineEnum',
+    'hline.style_dotted': 'o:lib#HLineEnum',
+    'hline.style_solid': 'o:lib#HLineEnum',
+    'line.style_dashed': 'o:lib#LineEnum',
+    'line.style_dotted': 'o:lib#LineEnum',
+    'line.style_solid': 'o:lib#LineEnum',
+    'location.absolute': 'o:lib#Location',
+    'plot.style_columns': 'o:lib#PlotEnum',
+    'plot.style_cross': 'o:lib#PlotEnum',
+    'position.top_right': 'o:lib#Position',
+    'shape.circle': 'o:lib#Shape',
+    'size.normal': 'o:lib#Size',
+    'text.align_center': 'o:lib#AlignEnum',
+    'xloc.bar_index': 'o:lib#XLoc',
+    'xloc.bar_time': 'o:lib#XLoc',
+    'yloc.price': 'o:lib#YLoc',
+    # ``islast = False`` -- a plain literal assignment
+    'barstate.isfirst': 'b',
+    'barstate.islast': 'b',
+    'barstate.isrealtime': 'b',
+    # ``long = direction.long`` -- an alias into another namespace
+    'strategy.long': 'o:lib#Direction',
+    'strategy.short': 'o:lib#Direction',
+    # An annotated primitive, and a module property read as a value
+    'syminfo.mintick': 'f',
+    'syminfo.pricescale': 'i',
+    'syminfo.tickerid': 's',
+    'bar_index': 'i',
+    # ``point = _ChartPoint()`` -- a namespace that is an instance
+    'chart.point': 'o:lib#_ChartPoint',
+}
+
+#: The lib calls a script makes as STATEMENTS. A body with no ``return
+#: <value>`` returns nothing, and reading that as unknown pushed every script
+#: that plots or trades out of the typed subset.
+_VOID_COVERAGE = (
+    'alertcondition',
+    'line.delete',
+    'runtime.error',
+    'strategy.cancel',
+    'strategy.close',
+    'strategy.close_all',
+    'strategy.entry',
+    'strategy.exit',
+    'strategy.order',
+)
+
+
+def __test_every_constant_shape_is_collected__():
+    """Each way a lib namespace publishes a constant reaches the registry"""
+    names = json.loads(_JSON_PATH.read_text())['names']
+    missing = [name for name in _CONSTANT_COVERAGE if name not in names]
+    assert not missing, f"the registry lost these constants: {missing}"
+    wrong = {name: names[name] for name, ty in _CONSTANT_COVERAGE.items()
+             if names[name] != {'kind': 'value', 'ty': ty}}
+    assert not wrong, wrong
+
+
+def __test_a_statement_call_returns_void__():
+    """A lib function with no returned value is VOID, not unknown"""
+    names = json.loads(_JSON_PATH.read_text())['names']
+    wrong = {name: names[name]['ret'] for name in _VOID_COVERAGE
+             if names[name]['ret'] != 'v'}
+    assert not wrong, wrong
+    # ... while one that DOES return a value keeps that value's type
+    assert names['plot']['ret'] == 'o:lib#Plot'
+    assert names['chart.point.from_index']['ret'] == 'o:lib#ChartPoint'
+    assert names['chart.point.new']['params'] == ['i', 'i', 'f']
+
+
+def __test_a_builtin_class_publishes_its_fields__():
+    """
+    A ``chart.point`` knows its class, so ``p.price`` has the field's type.
+
+    A builtin class says what it holds in the type package rather than in a
+    module interface, so the registry is where the inference can read it --
+    the same extraction as the returns.
+    """
+    classes = json.loads(_JSON_PATH.read_text())['classes']
+
+    # The one Pine scripts actually read fields off
+    assert classes['ChartPoint'] == {'index': 'i', 'time': 'i', 'price': 'f'}
+    # A field whose own type is a class carries the class id
+    assert classes['Line']['xloc'] == 'o:lib#XLoc'
+    assert classes['Line']['color'] == 'c'
+
+
+def __test_a_container_read_is_left_unknown__():
+    """
+    Element typing is a separate decision, and guessing one is worse than none.
+
+    ``array.get`` returns whatever the array holds, which the ANNOTATION
+    cannot say -- the element type comes from the array at the call site, and
+    the inference reads it there (``LIB_TYPE_OVERRIDES``'s ``'elem0'``). The
+    registry itself must keep saying nothing: a guess baked in here would
+    reach the enclosing overload pin and select an implementation the runtime
+    would not.
+    """
+    names = json.loads(_JSON_PATH.read_text())['names']
+    for name in ('array.get', 'array.pop', 'array.last', 'array.shift', 'array.remove'):
+        assert names[name]['ret'] == '?', name

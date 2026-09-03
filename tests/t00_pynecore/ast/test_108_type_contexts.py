@@ -144,7 +144,7 @@ def __test_the_canonical_dfs_dependency__():
         'from pynecore import lib\n'
         '\n'
         'def momentum(price, length):\n'
-        '    return price - price[length]\n'
+        '    return price - price / length\n'
         '\n'
         'mom0 = momentum(lib.close, 12)\n'
         'mom1 = momentum(mom0, 1)\n'
@@ -591,8 +591,9 @@ def main(n: int):
     assert ns['main'](state, 3) == ('int-impl', 'float-impl')
 
 
-#: Two implementations whose annotations collapse onto the SAME Pine
-#: characters: a container is an object, whatever its element type.
+#: Two implementations that differ only in their container's ELEMENT type.
+#: Both parameters head to an object, so anything reading the head alone --
+#: the overload pin among them -- cannot tell the two apart.
 CONTAINER_GROUP = '''
 @overload
 def take(xs: list[int], v: int) -> str:
@@ -608,10 +609,10 @@ def __test_every_implementation_of_a_group_is_analysed__():
     """
     Two implementations that look alike from here still get a context each.
 
-    ``list[int]`` and ``list[float]`` are both objects, so the parameter tuple
-    cannot tell the two bodies apart -- keyed on that alone, the second body
-    was never walked, and the pinnable call inside it went out with no pin and
-    dispatched on the fractional VALUE.
+    ``list[int]`` and ``list[float]`` are distinct types but the same object
+    HEAD, so anything keyed on the head alone cannot tell the two bodies
+    apart -- and the second body was never walked, so the pinnable call inside
+    it went out with no pin and dispatched on the fractional VALUE.
     """
     source = GROUP + CONTAINER_GROUP + '''
 def main(r: int):
@@ -622,7 +623,7 @@ def main(r: int):
 
     table = infer_module(ast.parse(source), 'test')
     assert [result.params for result in table.contexts.values()
-            if result.key == 'take'] == [('o', 'i'), ('o', 'i')]
+            if result.key == 'take'] == [('a:i', 'i'), ('a:f', 'i')]
 
     ns = _run(source, 'ctx_mod_container')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
@@ -683,8 +684,10 @@ g = other
     assert get_pin(calls[0]) == 'i'
 
     table = infer_module(ast.parse(source), 'test')
+    # The call site itself is clean; what is reported is the alias, since a
+    # function read as a value is no Pine value
     assert [diag.origin.reason for diag in table.diags
-            if diag.origin is not None] == []
+            if diag.origin is not None] == ['function-value']
 
     ns = _run(source, 'ctx_mod_before_rebind')
     assert ns['result'] == 'int-impl'
@@ -748,7 +751,7 @@ def __test_a_module_loop_completes_before_the_rebinding__(body: str, name: str):
 
     table = infer_module(ast.parse(source), 'test')
     assert [diag.origin.reason for diag in table.diags
-            if diag.origin is not None] == [], name
+            if diag.origin is not None] == ['function-value'], name
 
 
 def __test_a_module_loop_above_the_rebinding_runs_the_definition__():
@@ -794,8 +797,11 @@ def __test_a_rebinding_in_a_branch_the_call_cannot_share_reaches_nothing__(body:
     assert [get_pin(call) for call in calls] == ['i'], name
 
     table = infer_module(ast.parse(source), 'test')
+    # The call site is clean; what is reported is the alias, a function read
+    # as a value -- where there is one
+    expected = ['function-value'] if 'g = other' in body else []
     assert [diag.origin.reason for diag in table.diags
-            if diag.origin is not None] == [], name
+            if diag.origin is not None] == expected, name
 
 
 @pytest.mark.parametrize("body,name", [
