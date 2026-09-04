@@ -80,6 +80,7 @@ def _stub(**attrs):
     s._order_category = {}
     s._identity = {}
     s._pending_oco = set()
+    s.store_ctx = None               # #36: cancel core journals when a store exists
     for key, val in attrs.items():
         setattr(s, key, val)
     return s

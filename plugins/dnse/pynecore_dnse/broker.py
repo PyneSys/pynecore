@@ -32,7 +32,8 @@ from pynecore.core.plugin import override
 from pynecore.core.plugin.broker import BrokerPlugin
 from pynecore.core.broker.models import (
     CancelDispositionOutcome, CapabilityLevel, ExchangeCapabilities,
-    ExchangeOrder, ExchangePosition, OrderEvent, OrderStatus, OrderType,
+    ExchangeOrder, ExchangePosition, LegType, OrderEvent, OrderStatus,
+    OrderType,
 )
 
 from .cancel_disposition import (
@@ -40,6 +41,10 @@ from .cancel_disposition import (
     classify_readback as _classify_readback,
 )
 from .feed_health import FeedHealth
+from .journal_wiring import (
+    iter_journal_identities, journal_child_ref, journal_disposition_unknown,
+    journal_rejected, journal_server_ref, journal_submitted, journal_terminal,
+)
 from .transport_errors import guard as _guard_transport
 from .page_completeness import (
     BOOK_READ_DEADLINE_S, POSITIONS_PAGE_SIZE,
@@ -79,6 +84,9 @@ _TERMINAL_STATUSES = frozenset({
     OrderStatus.FILLED, OrderStatus.CANCELLED,
     OrderStatus.REJECTED, OrderStatus.EXPIRED,
 })
+
+#: Restore ``LegType`` from the journal's ``leg_kind`` extras (#36).
+_LEG_TYPE_BY_NAME = {member.name: member for member in LegType}
 
 #: Read-side dispositions that mean the CREDENTIAL is refused (#54): the only
 #: failure kinds that can satisfy the feed-health all-books halt condition.
@@ -289,6 +297,64 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         # surfaces on the first classified read/write (#68), not here.
         _ = self.client
         self._connected = True
+        self._restore_identity_from_journal()
+
+    def _restore_identity_from_journal(self) -> None:
+        '''#36: journal-ROOTED restart adoption (Live-L1-T16).
+
+        Restores the three in-memory maps from this run identity's live
+        journal rows so a same-label relaunch re-owns its resting venue
+        orders (identity, book category, cancellability). Panel rules:
+        adoption starts from JOURNALLED rows only — a book row with no
+        journal root is FOREIGN (the operator's) and is never touched; a
+        conditional parent whose child ref is missing (crash window) gets a
+        best-effort child CHASE via the parent detail's externalOrderId;
+        idempotent — existing in-memory entries are never overwritten (the
+        engine's own store_ctx.replay() re-points envelopes separately).
+        '''
+        if self.store_ctx is None:
+            return
+        adopted = 0
+        for journal_row in iter_journal_identities(self.store_ctx):
+            leg_type = _LEG_TYPE_BY_NAME.get(journal_row.leg_kind)
+            primary = journal_row.venue_ids[0] if journal_row.venue_ids else None
+            for venue_id in journal_row.venue_ids:
+                if venue_id in self._identity:
+                    continue
+                self._identity[venue_id] = (journal_row.pine_id or None,
+                                            journal_row.from_entry, leg_type)
+                self._order_category[venue_id] = (
+                    "NORMAL" if venue_id == journal_row.child_id
+                    else journal_row.category)
+                if journal_row.intent_key:
+                    self._order_ids.setdefault(
+                        journal_row.intent_key, []).append(venue_id)
+                adopted += 1
+            if (primary is not None and journal_row.child_id is None
+                    and journal_row.category in ("STOP", "OCO")):
+                # Crash-window chase: the parent may have triggered while we
+                # were down — its economics live on the un-journalled child.
+                try:
+                    detail = self._resolve_child_detail(primary,
+                                                        journal_row.category)
+                except Exception:                                   # noqa: BLE001
+                    detail = None        # venue unreachable: next poll retries
+                child = (detail or {}).get("externalOrderId")
+                if child and str(child) not in self._identity:
+                    child = str(child)
+                    self._identity[child] = (journal_row.pine_id or None,
+                                             journal_row.from_entry, leg_type)
+                    self._order_category[child] = "NORMAL"
+                    if journal_row.intent_key:
+                        self._order_ids.setdefault(
+                            journal_row.intent_key, []).append(child)
+                    journal_child_ref(self.store_ctx, parent_venue_id=primary,
+                                      child_id=child)
+                    adopted += 1
+        if adopted:
+            log.broker_info("%s", (
+                f"journal restore: re-owned {adopted} venue id(s) from the "
+                f"run's journal rows (#36) — foreign book rows untouched"))
 
     @override
     async def disconnect(self) -> None:
@@ -685,11 +751,35 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
             })
 
         ident = self._ident_str(envelope, leg_type)
+        coid = self._coid(envelope, leg_type)
+        intent = envelope.intent
+        # #36 persist-FIRST: the row exists BEFORE the POST leaves the process
+        # — a crash in ANY later window leaves an auditable restart bridge.
+        journal_submitted(
+            self.store_ctx, coid=coid, symbol=payload["symbol"], side=side,
+            qty=qty, intent_key=getattr(intent, "intent_key", None),
+            pine_id=getattr(intent, "pine_id", None),
+            from_entry=getattr(intent, "from_entry", None),
+            leg_kind=getattr(leg_type, "name", None),
+            category=category, order_type=payload["orderType"])
         status, body = self._write(lambda tok: self.client.post_order(
             self.account_id, self.market_type, payload, tok, order_category=category))
-        self._raise_write_error(status, body, action="place", ident=ident,
-                                coid=self._coid(envelope, leg_type))
+        try:
+            self._raise_write_error(status, body, action="place", ident=ident,
+                                    coid=coid)
+        except OrderDispositionUnknownError:
+            # #67 join: the reply was lost — the order may exist. phase comes
+            # from the sentinel BODY (it never escapes classify, #36 panel).
+            sentinel = body if isinstance(body, dict) else {}
+            journal_disposition_unknown(
+                self.store_ctx, coid=coid, phase=sentinel.get("phase"),
+                transport=sentinel.get("transport"))
+            raise
+        except Exception:
+            journal_rejected(self.store_ctx, coid=coid)  # write provably not live
+            raise
         if not isinstance(body, dict):
+            journal_rejected(self.store_ctx, coid=coid)
             raise ExchangeOrderRejectedError(
                 f"DNSE place: non-dict success body: {body!r}")
 
@@ -713,10 +803,14 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
                 log.broker_warning(
                     "OCO %s placed but its working LO is unresolved — queued for "
                     "poll-loop adoption (#43)", order.id)
-        key = getattr(envelope.intent, "intent_key", None)
+        journal_server_ref(
+            self.store_ctx, coid=coid, venue_id=order.id,
+            category=tracked_category,
+            umbrella_id=body.get("id") if tracked_category == "NORMAL"
+            and category == "OCO" else None)
+        key = getattr(intent, "intent_key", None)
         if key:
             self._order_ids.setdefault(key, []).append(order.id)
-        intent = envelope.intent
         self._identity[order.id] = (
             getattr(intent, "pine_id", None),
             getattr(intent, "from_entry", None),
@@ -779,6 +873,10 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
             if child not in self._identity:
                 self._identity[child] = (pine_id, from_entry, leg_type)
                 self._order_category[child] = "NORMAL"
+                # #36: the child is a SECOND ref on the parent's journal row —
+                # the crash-window chase (journal-ROOTED adoption) needs it.
+                journal_child_ref(self.store_ctx, parent_venue_id=parent_id,
+                                  child_id=child)
                 for ids in self._order_ids.values():
                     if parent_id in ids and child not in ids:
                         ids.append(child)
@@ -1124,6 +1222,8 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
                         f"retries | order={order_id}"))
                 else:
                     self._pending_oco.discard(order_id)
+                    journal_terminal(self.store_ctx, venue_id=order_id,
+                                     terminal_status=outcome.value)
                 return outcome
             code = errors.code_of(body)
             if code in errors.TERMINAL_CODES:
@@ -1133,6 +1233,8 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
                 outcome = await self._terminal_reject_disposition(order_id, category)
                 if outcome is not CancelDispositionOutcome.UNKNOWN:
                     self._pending_oco.discard(order_id)
+                    journal_terminal(self.store_ctx, venue_id=order_id,
+                                     terminal_status=outcome.value)
                 return outcome
             if code in errors.NOT_FOUND_CODES:  # not in THIS book -> probe the next
                 continue
@@ -1451,6 +1553,9 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         # Any other status retires a pending adoption for this parent.
         self._adopt_attempts.pop(order_id, None)
         self._last_seen[order_id] = (cumulative, raw_status)
+        if order.status in _TERMINAL_STATUSES:
+            journal_terminal(self.store_ctx, venue_id=order_id,
+                             terminal_status=raw_status, filled_qty=cumulative)
         delta = max(cumulative - previous, 0.0)
         event_type = ("filled" if order.status is OrderStatus.FILLED
                       else "partial" if order.status is OrderStatus.PARTIALLY_FILLED
