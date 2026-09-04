@@ -19,10 +19,8 @@ MEASURED on TradingView (FX:EURUSD@60, ``math.round(2.34567 + z, ...)``,
 | `(R + z) / 8`          | 1.75  | 2.3378730879 |
 | `(R + z) * 199 / 1400` | 1.99  | 2.3479196174 |
 
-The last two rows are an OPEN reverse-engineering question: TradingView uses a
-fractional precision continuously, and the formula is not
-``round(x * 10 ** p) / 10 ** p`` -- that gives 2.34734 at p = 1.75. Truncating a
-fractional precision is provisional, so those rows are not asserted here.
+The last two rows use the fractional precision continuously; the formula behind
+them is pinned in ``test_085_math_round_tv``.
 """
 from pynecore.lib import math
 from pynecore.types.na import NA
@@ -38,9 +36,10 @@ def __test_integral_float_precision_rounds__():
     assert math.round(2.34567, 14 / 14 + 1) == 2.35
 
 
-def __test_negative_float_precision_scales_up__():
-    """A negative precision keeps working when it arrives as a float"""
-    assert math.round(1234.5678, -2.0) == math.round(1234.5678, -2) == 1200.0
+def __test_negative_float_precision_rounds_to_an_integer__():
+    """A negative precision is integer rounding, whether it arrives as a float or an int"""
+    # MEASURED: 1234.5678 @ -0.5 and @ -1.5 -> 1235, 2.5 @ -3 -> 3 (mr1, mr3)
+    assert math.round(1234.5678, -2.0) == math.round(1234.5678, -2) == 1235.0
 
 
 def __test_missing_precision_keeps_the_int_contract__():
