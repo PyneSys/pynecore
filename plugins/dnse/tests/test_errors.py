@@ -213,3 +213,48 @@ def __test_cancel_of_already_canceled_normal_order_is_terminal__():
                               "message": "Order status is not valid to cancel"}, is_write=True)
     assert c.disposition is D.TERMINAL
     assert c.level == "info"
+
+
+# === #68: OA-400 (bad HMAC secret) is an AUTH failure, not an order reject ===
+# MEASURED live 2026-08-31 (read-only battery, real venue): a wrong API secret
+# returns http=400 code=OA-400 msg="Authorization field missing, malformed or
+# invalid". Today classify maps it to REJECT — so a rotated secret looks like
+# order rejections on writes and can never reach #54's all-books-AUTH halt.
+
+def __test_oa400_with_authorization_message_is_auth_class__():
+    """RED (#68): the measured bad-secret shape must classify AUTH-class."""
+    classified = errors.classify(
+        400, {"code": "OA-400",
+              "message": "Authorization field missing, malformed or invalid"},
+        is_write=False)
+    assert classified is not None
+    assert classified.disposition is errors.Disposition.AUTH, (
+        f"the measured bad-secret refusal classified {classified.disposition.name} "
+        f"— it must be exactly AUTH: AUTH_TOKEN would route #58's do-not-re-mint "
+        f"guidance, actively wrong advice for a dead secret (panel P3)")
+    lowered = classified.message.lower()
+    assert "secret" in lowered and "clock" in lowered, (
+        "the run-ending message must name BOTH documented causes (secret, clock) "
+        "— clock skew produces the identical venue reply (panel P1)")
+
+
+def __test_oa400_write_side_raises_authentication_error__():
+    """RED (#68): on the write path a dead secret must surface as a credential
+    problem, never a terminal order reject the operator chases per-order."""
+    stub = _stub()
+    with pytest.raises(AuthenticationError):
+        stub._raise_write_error(
+            400, {"code": "OA-400",
+                  "message": "Authorization field missing, malformed or invalid"},
+            action="place", ident="L/entry", coid="c")
+
+
+def __test_oa400_without_authorization_message_stays_reject__():
+    """GREEN control (#68): OA-400 may be the venue's GENERIC bad-request code —
+    without the Authorization message it must keep today's REJECT classification
+    (mis-promoting a malformed order payload to AUTH would mask real bugs)."""
+    classified = errors.classify(
+        400, {"code": "OA-400", "message": "field 'price' is malformed"},
+        is_write=True)
+    assert classified is not None
+    assert classified.disposition is errors.Disposition.REJECT

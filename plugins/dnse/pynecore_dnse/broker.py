@@ -284,8 +284,9 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
 
     @override
     async def connect(self) -> None:
-        # REST-only: nothing to connect. Touch the client so the endpoint banner
-        # is logged and credentials are validated up front.
+        # REST-only: nothing to connect. Touch the client so the endpoint
+        # banner is logged. NOTE: this validates NOTHING — a dead credential
+        # surfaces on the first classified read/write (#68), not here.
         _ = self.client
         self._connected = True
 

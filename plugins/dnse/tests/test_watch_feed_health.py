@@ -288,3 +288,24 @@ def __test_feed_health_ladder_throttle_and_reset__():
     # a transient interleaved into one book breaks ITS auth streak
     ladder.record_failure("STOP", "500", is_auth=False)
     assert ladder.halt_due() is None, "an interleaved transient breaks the AUTH streak"
+
+
+def __test_bad_secret_shape_reaches_the_designed_halt__(fake_client, tmp_path):
+    """#68 (panel P3's missing anchor): the MEASURED bad-secret reply
+    (OA-400 + Authorization message, live 2026-08-31) must drive the
+    all-books-AUTH streak to the designed halt — before #68 it classified
+    REJECT and could never halt."""
+    from pynecore.core.broker.exceptions import BrokerManualInterventionError
+
+    b = _broker(fake_client, tmp_path,
+                get_orders=(400, {"code": "OA-400",
+                                  "message": "Authorization field missing, "
+                                             "malformed or invalid"}))
+    b._feed_warn_after = 3
+    b._feed_halt_after = 6
+
+    raised, polls = _pump_watch(b, cycles=40)
+
+    assert isinstance(raised, BrokerManualInterventionError), (
+        f"the measured dead-secret shape never reached the designed halt; "
+        f"got {raised!r} after {polls} polls")

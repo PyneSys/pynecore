@@ -109,6 +109,15 @@ TERMINAL_CODES = frozenset({
 
 _AUTH = frozenset({"OA-401", "OA-403", "FORBIDDEN", "INVALID_OTP", "UNAUTHORIZED"})
 
+#: #68: OA-400 is (plausibly) the venue's GENERIC bad-request code, but with
+#: this message it is the HMAC/credential refusal — measured live 2026-08-31
+#: (wrong secret -> http=400 OA-400 "Authorization field missing, malformed or
+#: invalid") and documented verbatim in guide-intro-authentication.md:83-90,
+#: whose listed causes are: wrong API Secret, wrong/skewed Date header (venue
+#: tolerance +/-1 min), malformed Authorization header. Gate on the message so
+#: an ordinary malformed-payload OA-400 keeps its REJECT classification.
+_OA400_AUTH_MESSAGE_MARKER = "authorization"
+
 _TRANSIENT = frozenset({
     "OA-500", "OA-503", "SYSTEM_ERROR", "REMOTE_SERVER_ERROR", "THIRD_PARTY_ERROR",
     "TIMEOUT", "SERVICE_UNAVAILABLE",
@@ -160,6 +169,17 @@ def classify(status, body, *, is_write: bool) -> "Classified | None":
         return Classified(transient, code or "NO_RESPONSE", status,
                           msg or "no response from DNSE")
     # Classify on the code first, then fall back to HTTP status.
+    if code == "OA-400" and _OA400_AUTH_MESSAGE_MARKER in (msg or "").lower():
+        # #68: same run-ending severity as a dead key, but the guidance must
+        # name BOTH documented causes — clock skew produces the EXACT same
+        # message as a rotated secret (panel P1): an operator with NTP drift
+        # must not rotate a healthy secret.
+        guidance = ("HMAC signature refused — either the API SECRET is "
+                    "wrong/rotated or the SYSTEM CLOCK is skewed (Date header, "
+                    "venue tolerance +/-1 min). Check the clock first, then the "
+                    "secret. This is NOT the trading token and NOT the API key")
+        return Classified(Disposition.AUTH, code, status,
+                          f"{msg or 'authorization invalid'} | {guidance}")
     if code == "INVALID_TRADING_TOKEN":
         # #58: no auto-retry — _token() reads fresh state every call, so a
         # retry is a second identical write, and the measured #51/#46 windows

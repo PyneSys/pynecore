@@ -65,8 +65,11 @@ def token_is_live(client: DNSEClient, account: str, token: str) -> tuple[bool, s
     if status == 0:
         return False, f"could not reach DNSE ({errors.code_of(body) or 'network error'})"
     classified = errors.classify(status, body, is_write=True)
-    if classified and classified.disposition in (errors.Disposition.AUTH_TOKEN,
-                                                  errors.Disposition.AUTH):
+    if classified and classified.disposition is errors.Disposition.AUTH:
+        # #68: AUTH here is the credential layer (key/secret/clock), NOT the
+        # trading token — say so, or a dead secret sends the operator minting.
+        return False, f"DNSE rejected the CREDENTIALS, not the token ({classified.code})"
+    if classified and classified.disposition is errors.Disposition.AUTH_TOKEN:
         return False, f"DNSE rejected the token ({classified.code})"
     return True, f"accepted (probe -> {errors.code_of(body) or ('http ' + str(status))})"
 
