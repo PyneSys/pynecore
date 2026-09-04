@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     import ast
 
     from pynecore.transformers.pine_type_table import DepRecord, Diag, PineTypeTable
+    from pynecore.transformers.slot_layout import ModuleLayout
 
 __all__ = ['PYNE_RESERVED_NAME_CHAR', 'PIPELINE_DIGEST', 'source_starts_with_pyne',
            'analyse_source', 'PyneLoader', 'PyneImportHook']
@@ -468,17 +469,27 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
     return transformed
 
 
-def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None) -> "ast.Module":
+def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None,
+                *, emit_layout: bool = True) -> "tuple[ast.Module, ModuleLayout]":
     """Run the pipeline from the type pass to the finished emission.
 
     This half EMITS: it turns the analysed tree into the state-plumbed form the
     runtime executes, allocates the module's slot layout and fixes up the
     synthetic locations.
 
+    The allocated layout is returned beside the tree: it is the typed record of
+    what every slot is, and the ``__pyne_slot_layout__`` literal ``apply_layout``
+    emits is one consumer's materialization of it, not its definition. A consumer
+    that builds the state vector itself takes the object and turns the
+    materialization off.
+
     :param tree: The analysed, type-stamped tree.
     :param path: Source path; the script / lib profile is picked from it.
     :param pyne_mode: The module's mode word, None for a hand-written script.
-    :return: The tree the compiler is handed.
+    :param emit_layout: Whether to run ``apply_layout``, which materializes the
+        layout for CPython: the slot dict literal, the hidden state parameters
+        and the ``__pyne_layout__`` attachments.
+    :return: The tree the compiler is handed, and the module's slot layout.
     """
     import ast
 
@@ -515,7 +526,8 @@ def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None) -> "ast.M
     # raw ``x != x`` nan idiom, both of which the rewrite would break
     if not path.is_relative_to(Path(__file__).parent.parent):
         transformed = FloatToleranceTransformer().visit(transformed)
-    transformed = apply_layout(transformed, slot_layout)
+    if emit_layout:
+        transformed = apply_layout(transformed, slot_layout)
 
     # Debugger-safe variant of ast.fix_missing_locations: synthetic
     # nodes get point anchors, so no prologue bytecode maps onto the
@@ -552,7 +564,7 @@ def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None) -> "ast.M
         with open(f"/tmp/pyne/{path.stem}.py", "w") as f:
             f.write(display_dump(transformed, slot_layout))
 
-    return transformed
+    return transformed, slot_layout
 
 
 def analyse_source(path: str) -> \
@@ -816,7 +828,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
                     NO_FINGERPRINT if fingerprint is None else fingerprint)
                 register(interface)
 
-            transformed = _lower_tree(analysed, path, pyne_mode)
+            transformed, _ = _lower_tree(analysed, path, pyne_mode)
 
             # No fingerprint means no artifact: a reader validates one by
             # digesting the source it now finds, and nothing here knows which
