@@ -171,8 +171,9 @@ def get_x1(id: Line) -> PyneInt:
     :return: UNIX timestamp (in milliseconds) or bar index
     """
     if isinstance(id, NA):
-        return NA(int)
-    return id.x1
+        return na_int
+    # A Pine int is a double at runtime
+    return float(id.x1)
 
 
 # noinspection PyShadowingBuiltins
@@ -197,8 +198,9 @@ def get_x2(id: Line) -> PyneInt:
     :return: UNIX timestamp (in milliseconds) or bar index
     """
     if isinstance(id, NA):
-        return NA(int)
-    return id.x2
+        return na_int
+    # A Pine int is a double at runtime
+    return float(id.x2)
 
 
 # noinspection PyShadowingBuiltins

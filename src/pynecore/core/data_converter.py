@@ -13,7 +13,7 @@ from typing import Literal
 
 from pynecore.core._file_io import replace_file
 from pynecore.core.ohlcv import OHLCVReader, OHLCVWriter
-from pynecore.lib.timeframe import in_seconds
+from pynecore.lib.timeframe import _in_seconds
 from pynecore.core.ohlcv_importers import (
     infer_csv_period,
     infer_json_period,
@@ -51,7 +51,7 @@ def _same_period(left: str, right: str) -> bool:
     if left == right:
         return True
     try:
-        return in_seconds(left) == in_seconds(right)
+        return _in_seconds(left) == _in_seconds(right)
     except (AssertionError, ValueError):
         return False
 

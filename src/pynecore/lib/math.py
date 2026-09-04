@@ -3,7 +3,7 @@ import builtins
 import math
 
 from ..core import fdlibm, pine_math
-from ..types.na import NA, na_float
+from ..types.na import NA, na_float, na_int
 from ..types import PyneFloat, PyneInt
 
 from . import syminfo
@@ -27,6 +27,10 @@ rphi = 1 / phi
 # `0.5 - 1e-10` as an exact fraction, the tie threshold round() compares against
 _ROUND_TIE_SCALE = 10 ** 10
 _ROUND_TIE_HALF = 5 * 10 ** 9 - 1
+# round() uses a precision above this as this
+_ROUND_MAX_PRECISION = 16.0
+# From here up every double is an integer
+_ROUND_INT_LIMIT = 2.0 ** 52
 
 # noinspection PyShadowingBuiltins
 def abs(number: TFI | NA[TFI]) -> PyneFloat:
@@ -125,8 +129,9 @@ def ceil(number: TFI | NA[TFI]) -> PyneInt:
     :return: The smallest integer greater than or equal to the number.
     """
     if not (number == number):  # is_na_arg
-        return NA(int)
-    return math.ceil(number)
+        return na_int
+    # A Pine int is a double at runtime: the integral result travels as a float
+    return float(math.ceil(number))
 
 
 def cos(angle: TFI | NA[TFI]) -> PyneFloat:
@@ -164,9 +169,10 @@ def floor(number: TFI | NA[TFI]) -> PyneInt:
     :return: The largest integer less than or equal to the number.
     """
     if not (number == number):  # is_na_arg
-        return NA(int)
-    # int() truncates toward zero; Pine's floor is a true floor (floor(-1.2) == -2)
-    return math.floor(number)
+        return na_int
+    # int() truncates toward zero; Pine's floor is a true floor (floor(-1.2) == -2).
+    # A Pine int is a double at runtime: the integral result travels as a float
+    return float(math.floor(number))
 
 
 def log(number: TFI | NA[TFI]) -> PyneFloat:
@@ -195,27 +201,18 @@ def log10(number: TFI | NA[TFI]) -> PyneFloat:
 
 def _na_of_operands(numbers: tuple[TFI | NA[TFI], ...]) -> PyneFloat:
     """
-    Return the na matching the operands' numeric contract: na_float when any
-    type-carrying operand is float-like, NA(int) when the type-carrying operands
-    are all int-like, the typeless na when no operand carries a type at all.
-    Typeless na operands are neutral — they must not push an int contract to float.
+    Return the na matching the operands' numeric contract: the typeless na when
+    no operand carries a type at all, the numeric na otherwise.
+
+    Pine's int is a static type only, so an int-typed na and a float-typed na
+    are the same native nan at runtime; only the typeless ``na`` (an ``NA``
+    with no type) is distinct, and it must stay typeless so it does not push
+    a contract on the caller.
     """
-    saw_typed = False
     for n in numbers:
-        if n != n:
-            # A native nan is a float-typed na by definition
+        if n == n or not isinstance(n, NA) or n.type is not None:
             return na_float
-        if isinstance(n, NA):
-            if n.type is None:
-                continue
-            saw_typed = True
-            if n.type is not int:
-                return na_float
-        else:
-            saw_typed = True
-            if not isinstance(n, int):
-                return na_float
-    return NA(int) if saw_typed else NA(None)
+    return NA(None)
 
 
 # noinspection PyShadowingBuiltins
@@ -317,55 +314,92 @@ def round(number: TFI | NA[TFI], precision: PyneInt) -> PyneFloat: ...
 
 
 # noinspection PyShadowingBuiltins
-def round(number: TFI | NA[TFI], precision: PyneInt = NA(int)) -> PyneFloat:
+def round(number: TFI | NA[TFI], precision: PyneInt = na_int) -> PyneFloat:
     """
-    Returns a number rounded to a specified number of decimal places.
+    Returns a number rounded to a specified number of decimal places, ties going
+    away from zero.
+
+    Without a precision, or with a precision of zero or less, the number is
+    rounded to an integer. A positive precision keeps the integer part of the
+    number and rounds only its fractional part to ``precision`` decimals; a
+    fractional precision is used as it is, and a precision above 16 acts as 16.
 
     :param number: A number.
     :param precision: The number of decimal places to round to.
     :return: The rounded number.
     """
+    # The two overloads are told apart by the PRESENCE of a precision, never by
+    # its Python type: an int-TYPED Pine expression can arrive as a float
+    # (``math.round(x, 4 / 2)``), and an ``isinstance(precision, int)`` test
+    # silently took that for "no precision given" and dropped the rounding.
+    has_precision = precision == precision  # is_na_arg (inverted)
     if not (number == number):  # is_na_arg
         # No precision means the int contract (first overload), so an int-typed na
-        return na_float if isinstance(precision, int) else NA(int)
+        return na_float if has_precision else na_int
     if not math.isfinite(number):
         # Pine has no non-finite values (1/0 is na); the precision overload keeps
         # builtins.round() behavior (returns the float unchanged), but the
         # one-argument overload must honor its int contract, so it yields an int na
-        return cast(float, number) if isinstance(precision, int) else NA(int)
-    # TV rounds the EXACT binary value of the double scaled by 10**precision, with
-    # ties going away from zero and a 1e-10 absolute tolerance on that scaled value
-    # -- the same slack its relational operators carry. Measured on BINANCE:BTCUSDT
-    # 30m (roundprobe, 28397 bars x 5 series columns at precision 2/3/5): all
-    # 141985 values reproduce, and no tolerance between 0 and 5e-11 or above 2e-10
-    # does. The tolerance is what separates 118152.265 -> 118152.27 (short 5.8e-11
-    # of the tie) from 100019.7405 -> 100019.740 (short 1.2e-10); both scale to an
-    # exactly representable .5, so no double-precision model can tell them apart.
-    # Known limit: at precision 8 on single-digit values the tolerance no longer
-    # separates the ties (26697 of 28397) -- that regime is unmodelled.
-    p = precision if isinstance(precision, int) else 0
-    # The slack belongs to the decimal scaling, so precision 0 -- where nothing is
-    # scaled -- compares exactly. MEASURED: every value below the tie rounds down
-    # there however close it sits (452523.49999999994 -> 452523 at 5.8e-11,
-    # 2.4999999999999996 -> 2 at 4.4e-16), while an exact tie still goes away from
-    # zero (2.5 -> 3, -2.5 -> -3). Both `math.round(x)` and `math.round(x, 0)`.
-    tie_scale, tie_half = (2, 1) if p == 0 else (_ROUND_TIE_SCALE, _ROUND_TIE_HALF)
-    if p > 308 or p < -308:
-        # 10.0 ** p overflows; no attainable rounding changes a finite double here
-        return cast(float, number)
+        return cast(float, number) if has_precision else na_int
     negative = number < 0.0
-    numerator, denominator = float(abs(number)).as_integer_ratio()
-    if p >= 0:
-        numerator *= 10 ** p
-    else:
-        denominator *= 10 ** -p
-    units, remainder = divmod(numerator, denominator)
-    if remainder * tie_scale >= tie_half * denominator:
+    magnitude = -number if negative else number
+    if not has_precision or precision <= 0.0:
+        # Half away from zero, compared EXACTLY: a value below the tie rounds down
+        # however close it sits (452523.49999999994 -> 452523 at 5.8e-11), an exact
+        # tie goes away from zero (2.5 -> 3, -2.5 -> -3). MEASURED on
+        # BINANCE:BTCUSDT@30 and FX:EURUSD@60 (probes roundprobe, mr2, mr3, mr10).
+        # A negative precision does NOT round to tens or hundreds: it is the same
+        # integer rounding (1234.5678 @ -2 -> 1235, 2.5 @ -3 -> 3, mr2/mr3).
+        # From 2**52 up every double is an integer, and ``magnitude + 0.5`` would
+        # round to even there (2**52 + 1 -> 2**52 + 2); below it the sum is exact.
+        if magnitude >= _ROUND_INT_LIMIT:
+            return cast(float, number)
+        units = math.floor(magnitude + 0.5)
+        # A Pine int is a double at runtime: the integral result travels as a float
+        return float(-units if negative else units)
+    # TV splits the number into its integer part and its fraction and scales ONLY
+    # the fraction: ``i + round(f * scale) / scale``. That is why a fractional
+    # precision gives 2.34567 @ 0.25 -> 2.5623413251903493 (= 2 + 10**-0.25)
+    # rather than anything near the input. The scale is the reciprocal of
+    # ``10**-precision``, not ``10**precision`` -- the two differ by 1 ulp at
+    # precision 0.75, 1.75, 2.5 and 3.5 and the reciprocal reproduces every
+    # measurement; the very same double is the divisor. MEASURED on FX:EURUSD@60
+    # (probes mr1-mr14: 448/448 at precision <= 15, plus mrp1/mrp2 for the tie
+    # rule and the precision cap below).
+    # Above 16 the precision is clamped: every measured value at 16.001 .. 400 is
+    # bit-identical to the one at 16 (mrp2), while at 15.8 .. 16 TV's own last
+    # bit is not fully modelled (67/78 there) -- that noise is inherited by the
+    # clamped range.
+    p = precision if precision <= _ROUND_MAX_PRECISION else _ROUND_MAX_PRECISION
+    scale = 1.0 / math.pow(10.0, -p)
+    fraction = math.fmod(magnitude, 1.0)
+    scaled = fraction * scale
+    units = math.floor(scaled)
+    offset = scaled - units - 0.5
+    # The tie is decided on the EXACT product of the two doubles with the same
+    # 1e-10 tolerance the relational operators and round_to_mintick carry: the
+    # double product cannot tell 13.887175 @ 5 (exact product 9.7e-11 short, TV
+    # rounds up) from 63.986275 @ 5 (1.02e-10 short, TV rounds down) -- both
+    # scale to the same 88717.4999999999 -- yet the exact product does (mrp1:
+    # 59/59 where the double product misses 4), and the threshold sits at
+    # 1e-10 to within 1e-16 (0.266741911488056 @ 0.75 up at 9.99981e-11,
+    # 0.14999999999 @ 1 down at 1.0000e-10). Only a near-tie is worth the exact
+    # product; the window covers the double's own error (8 ulp) at any magnitude.
+    slack = 1e-9 + scaled * 1.8e-15
+    if -slack < offset < slack:
+        numerator, denominator = fraction.as_integer_ratio()
+        scale_numerator, scale_denominator = scale.as_integer_ratio()
+        numerator *= scale_numerator
+        denominator *= scale_denominator
+        remainder = numerator - units * denominator
+        if remainder * _ROUND_TIE_SCALE >= _ROUND_TIE_HALF * denominator:
+            units += 1
+    elif offset > 0.0:
         units += 1
-    if not isinstance(precision, int):
-        return -units if negative else units
-    value = units / 10.0 ** p if p >= 0 else units * 10.0 ** -p
-    return -value if negative else value
+    value = magnitude - fraction + units / scale
+    # ``0.0 - value``: a negative fraction rounded away to nothing is 0, not -0
+    # (-7.12675179601e-05 @ 2.5 -> 0 in mr10; TV prints -0 as "0" anyway).
+    return 0.0 - value if negative else value
 
 
 @overload
@@ -401,8 +435,9 @@ def round_to_mintick(number: PyneFloat | PyneInt) -> PyneFloat:
     slack = 1e-6 + scaled * 1.8e-15
     if -slack < offset < slack:
         numerator, denominator = float(magnitude).as_integer_ratio()
-        numerator *= pricescale
-        denominator *= minmove
+        # The tick pair is a Pine int (a double); the exact product needs the native ints
+        numerator *= builtins.int(pricescale)
+        denominator *= builtins.int(minmove)
         units, remainder = divmod(numerator, denominator)
         if remainder * _ROUND_TIE_SCALE >= _ROUND_TIE_HALF * denominator:
             units += 1

@@ -105,6 +105,38 @@ class PersistentTransformer(ast.NodeTransformer):
             return True
         return isinstance(node, ast.Name) and node.id == 'na'
 
+    @staticmethod
+    def _is_numeric_type(annotation: ast.expr) -> bool:
+        """Check if the annotation declares an int or float element (``Persistent[int]``)."""
+        return (isinstance(annotation, ast.Subscript)
+                and isinstance(annotation.slice, ast.Name)
+                and annotation.slice.id in ('int', 'float'))
+
+    def _numeric_init(self, annotation: ast.expr, value: ast.expr) -> ast.expr:
+        """The initializer of a numeric persistent, as the value the slot must hold.
+
+        A Pine int is a double at runtime, so an int literal initializing an int-
+        or float-typed persistent becomes the float literal (``x: Persistent[int]
+        = 0`` starts at ``0.0``, and the counter it feeds stays a float). A
+        ``@pyne lib`` module keeps the Python int: its persistents are internal
+        counters and ring indexes, computed in native int and converted only at
+        the lib boundary.
+
+        :param annotation: The declared type.
+        :param value: The written initializer.
+        :return: The initializer to put into the layout.
+        """
+        if self.layout.compacted_series or not self._is_numeric_type(annotation):
+            return value
+        if isinstance(value, ast.Constant) and type(value.value) is int:
+            return ast.copy_location(ast.Constant(value=float(value.value)), value)
+        if (isinstance(value, ast.UnaryOp) and isinstance(value.op, (ast.USub, ast.UAdd))
+                and isinstance(value.operand, ast.Constant) and type(value.operand.value) is int):
+            n = value.operand.value
+            signed = -n if isinstance(value.op, ast.USub) else n
+            return ast.copy_location(ast.Constant(value=float(signed)), value)
+        return value
+
     # --- visitors --------------------------------------------------------
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom | None:
@@ -173,6 +205,8 @@ class PersistentTransformer(ast.NodeTransformer):
         varip = self._is_varip_type(node.annotation)
         scope_layout = self.layout.scope(self.current_scope)
 
+        if node.value is not None:
+            node.value = self._numeric_init(node.annotation, node.value)
         if node.value is not None and not self._is_literal_or_na(node.value):
             # Lazy pattern: value slot + flag slot, initializer runs on first call
             slot = scope_layout.add_var(var_name, ast.Constant(value=None), varip=varip)

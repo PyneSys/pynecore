@@ -391,8 +391,9 @@ def get_left(id: Box) -> PyneInt:
     left border of the box.
     """
     if isinstance(id, NA):
-        return NA(int)
-    return id.left
+        return na_int
+    # A Pine int is a double at runtime
+    return float(id.left)
 
 
 # noinspection PyShadowingBuiltins
@@ -402,8 +403,9 @@ def get_right(id: Box) -> PyneInt:
     right border of the box.
     """
     if isinstance(id, NA):
-        return NA(int)
-    return id.right
+        return na_int
+    # A Pine int is a double at runtime
+    return float(id.right)
 
 
 # noinspection PyShadowingBuiltins

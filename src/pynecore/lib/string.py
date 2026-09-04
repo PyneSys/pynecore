@@ -7,7 +7,7 @@ from math import isinf
 from datetime import datetime, UTC
 from decimal import Decimal, ROUND_HALF_UP, ROUND_HALF_EVEN, localcontext
 
-from ..types.na import NA, na_float
+from ..types.na import NA, na_float, na_int
 from ..types.pine_types import PyneFloat, PyneInt, PyneStr, PyneBool
 
 from ..types.format import Format
@@ -580,7 +580,7 @@ def format_time(time: int | NA[int], format: str | None = None,
     :return: Formatted time string, or na when ``time`` is na
     """
     # na timestamp formats to na (Pine na-propagation)
-    if isinstance(time, NA) or time is None:
+    if time is None or not (time == time):  # is_na_arg
         return NA(str)
 
     # Default format
@@ -597,14 +597,15 @@ def format_time(time: int | NA[int], format: str | None = None,
     return dt.strftime(py_fmt)
 
 
-def length(string: str) -> int:
+def length(string: str) -> PyneInt:
     """
     Returns an integer corresponding to the amount of chars in that string.
 
     :param string: String to get the length of
     :return: Amount of chars in the string
     """
-    return len(string)
+    # A Pine int is a double at runtime
+    return float(len(string))
 
 
 def lower(source: str) -> str:
@@ -663,8 +664,8 @@ def pos(source: str, str: str) -> PyneInt:
     """
     res = source.find(str)
     if res == -1:
-        return NA(int)
-    return res
+        return na_int
+    return float(res)
 
 
 # noinspection PyShadowingNames
@@ -684,7 +685,7 @@ def repeat(source: str, repeat: int, separator: str = '') -> PyneStr:
     # count evaluates through ``NA.__rmul__`` to na, and ``str.join(na)`` falls
     # back to the sequence protocol, which never terminates (NA.__getitem__
     # returns self for every index).
-    if isinstance(source, NA) or source is None or isinstance(repeat, NA) or repeat is None:
+    if isinstance(source, NA) or source is None or repeat is None or repeat != repeat:
         return NA(str)
     if repeat <= 0:
         return NA(str)
@@ -717,13 +718,13 @@ def replace(source: str, target: str, replacement: str, occurrence=0) -> PyneStr
         # An empty target is an insertion point rather than a match: the replacement lands
         # at the nth character position, clamped to the end of the source. Measured:
         # replace("abc", "", "-", 2) == "ab-c" and replace("abc", "", "-", 4) == "abc-".
-        index = min(occurrence, len(source))
+        index = min(int(occurrence), len(source))
     else:
         # Occurrences are enumerated by an overlapping left-to-right scan, so "aa" occurs
         # at index 0 AND 1 in "aaa" — a split-based walk would only see the first one.
         # Measured: replace("aaa", "aa", "-", 1) == "a-".
         index = -1
-        for _ in range(occurrence + 1):
+        for _ in range(int(occurrence) + 1):
             index = source.find(target, index + 1)
             if index < 0:
                 return source
@@ -780,8 +781,14 @@ def substring(source: str, begin_pos: int, end_pos: int | None = None) -> str:
     :param end_pos: The ending position
     :return: The substring of the source string starting at the specified position and ending at the specified position
     """
+    # Pine's int is a static type only: an int-TYPED expression can carry a
+    # fractional value (``14 / 8``), so the positions are truncated where they
+    # are CONSUMED -- ahead of the range checks and of the empty-slice test,
+    # both of which must see the same integer the slice below uses.
+    begin_pos = int(begin_pos)
     assert begin_pos >= 0, "Positions must be >= 0!"
     if end_pos is not None:
+        end_pos = int(end_pos)
         assert end_pos >= begin_pos, "End position must be >= begin position!"
     if begin_pos == end_pos:
         return ""

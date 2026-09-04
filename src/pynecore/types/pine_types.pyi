@@ -10,6 +10,7 @@ from typing import TypeAlias
 from pynecore.types.type_checker import *
 
 PyneFloat: TypeAlias = float
-PyneInt: TypeAlias = int
+# A Pine int is a double at runtime: an int-typed value arrives as a float
+PyneInt: TypeAlias = float
 PyneStr: TypeAlias = str
 PyneBool: TypeAlias = bool

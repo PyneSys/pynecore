@@ -1,10 +1,10 @@
 from __future__ import annotations
-from typing import TypeVar, Generic, Iterator, Callable, cast, overload
+from typing import Any, TypeVar, Generic, Iterator, Callable, cast, overload
 
 from types import ModuleType
 
 # noinspection PyProtectedMember
-from ..types.na import NA
+from ..types.na import NA, na_float as _NAN
 
 __all__ = ['SeriesImpl', 'inline_series']
 
@@ -29,7 +29,7 @@ class SeriesImpl(Generic[T]):
     __slots__ = ('_buffer',
                  '_max_bars_back', '_max_bars_back_set',
                  '_capacity', '_write_pos', '_size',
-                 '_last_bar_index', '_na', '_compacted')
+                 '_last_bar_index', '_na', '_compacted', '_as_float')
 
     # MEASURED (probes m601/m602, BINANCE:BTCUSDT 30m): TradingView serves 5000 bars of
     # history for EVERY series — builtin, user-defined and ``ta.*`` output alike, under
@@ -42,15 +42,16 @@ class SeriesImpl(Generic[T]):
 
     # noinspection PyMissingConstructor
     def __init__(self, max_bars_back: int | None = None, na_value: T | None = None,
-                 compacted: bool = False):
+                 compacted: bool = False, as_float: bool = False):
         """
         :param max_bars_back: Optional initial capacity for historical lookback.
                               If not provided, DEFAULT_MAX_BARS_BACK is used.
                               The actual buffer capacity will be (max_bars_back + 1).
         :param na_value: The na sentinel returned for out-of-range reads.
-                         Float series pass the native nan here so a warmup /
-                         out-of-history read behaves exactly like every other
-                         float na; untyped series keep the interned NA object.
+                         Numeric (float and int) series pass the native nan
+                         here so a warmup / out-of-history read behaves exactly
+                         like every other numeric na; untyped series keep the
+                         interned NA object.
         :param compacted: History counts stored values instead of bars: a bar with
                           no :meth:`add` is simply absent rather than repeating the
                           previous value. Set for the rolling windows of the
@@ -58,6 +59,10 @@ class SeriesImpl(Generic[T]):
                           averages), which drop na bars on purpose so ``src[k]`` is
                           the k-th most recent non-na value — the window
                           TradingView's native builtins keep.
+        :param as_float: Store every value as a native float. Set for ``Series[int]``:
+                         a Pine int is a double at runtime, so an int series must
+                         not hand back the Python int a literal or a counter put
+                         in; a non-number (an na object) is stored as the nan.
         """
         # Importing the lib module here to avoid circular imports
         if not SeriesImpl._lib:
@@ -66,6 +71,7 @@ class SeriesImpl(Generic[T]):
 
         self._na: T | NA[T] = _NA_UNTYPED if na_value is None else na_value
         self._compacted = compacted
+        self._as_float = as_float
 
         self._max_bars_back = max_bars_back or self.DEFAULT_MAX_BARS_BACK
         self._max_bars_back_set = max_bars_back or 0
@@ -161,6 +167,9 @@ class SeriesImpl(Generic[T]):
         :param value: The new data to be added.
         :return: The same value that was added (for chaining or inline usage).
         """
+        if self._as_float:
+            value = float(value) if value == value else _NAN  # type: ignore[assignment]
+
         # Read the module attribute once: this runs for every series assignment
         # on every bar, and the three reads it replaces cannot see a different
         # value anyway — nothing between them advances the bar.
@@ -185,7 +194,7 @@ class SeriesImpl(Generic[T]):
         if missed > 0 and self._size > 0 and not self._compacted:
             fill = self._buffer[self._write_pos - 1]
             # Filling more than the whole buffer would only overwrite itself
-            for _ in range(missed if missed < self._capacity else self._capacity):
+            for _ in range(int(missed) if missed < self._capacity else self._capacity):
                 self._push(fill)
 
         # _push, inlined verbatim: this is THE per-bar write of every series in
@@ -239,6 +248,8 @@ class SeriesImpl(Generic[T]):
         """
         if self._size == 0:
             return self._na
+        if self._as_float:
+            value = float(value) if value == value else _NAN  # type: ignore[assignment]
 
         pos = self._write_pos - 1
         if pos < 0:
@@ -323,79 +334,77 @@ class SeriesImpl(Generic[T]):
     def __getitem__(self, key: slice) -> ReadOnlySeriesView[T]:
         ...
 
-    def __getitem__(self, key: int | float | NA | slice) -> T | NA[T] | ReadOnlySeriesView[T]:
+    def __getitem__(self, key: Any) -> T | NA[T] | ReadOnlySeriesView[T]:
         """
         Get item(s) using Pine indexing with slice support.
 
         Pine semantics: subscripting with `na` returns the current bar's value
         (offset 0) — TradingView's history-referencing operator treats an `na`
-        offset as 0. An out-of-range integer (negative = forward of the current
+        offset as 0. An out-of-range offset (negative = forward of the current
         bar, positive >= size = before available history) returns `na` rather
-        than raising.
+        than raising. A fractional offset is truncated: the subscript is a
+        consumer slot of a Pine int, which is a double at runtime.
 
-        :param key: Integer index, NA, or slice
-        :return: Single value for integer index, ReadOnlySeriesView for slice
-        :raises TypeError: If key is not int, NA, or slice
+        :param key: Number offset, NA, or slice
+        :return: Single value for a number offset, ReadOnlySeriesView for slice
+        :raises TypeError: If key is not a number, NA, or slice
         """
-        # Int first: it is the whole hot loop, and every other form reaches this
-        # branch through a one-off conversion, so the common subscript walks a
-        # single isinstance instead of the three the na/float order cost it.
-        if isinstance(key, int):
-            # Pine: out-of-range subscript -> na (covers both negative and
-            # positive past-end indices).
-            if key < 0 or key >= self._size:
-                return self._na
-            pos = self._write_pos - 1 - key
-            if pos < 0:
-                pos += self._capacity
-            return self._buffer[pos]
+        # One conversion is the whole hot loop: a Pine int offset is a float as
+        # often as a Python int (loop counters, bar_index arithmetic), and
+        # ``int()`` takes both in one C call where an isinstance chain would
+        # walk two or three checks and a recursive call for the float form.
+        try:
+            offset = int(key)
+        except (TypeError, ValueError):
+            if isinstance(key, slice):
+                return self._slice(key)
+            # Pine: series[na] -> series[0] (an na offset is treated as the
+            # current bar); the NA object and a nan both land here
+            if isinstance(key, NA) or key != key:
+                offset = 0
+            else:
+                raise TypeError("Series indices must be numbers or slices")  # noqa
+        # Pine: out-of-range subscript -> na (covers both negative and
+        # positive past-end indices).
+        if offset < 0 or offset >= self._size:
+            return self._na
+        pos = self._write_pos - 1 - offset
+        if pos < 0:
+            pos += self._capacity
+        return self._buffer[pos]
 
-        # Pine: series[na] -> series[0] (an na offset is treated as the current
-        # bar). Route through 0 rather than converting in place, since int(NA)
-        # raises; the bounds check above then returns na only for an empty series.
-        if isinstance(key, NA):
-            return self[0]
+    def _slice(self, key: slice) -> ReadOnlySeriesView[T]:
+        """The read-only view a slice subscript hands back."""
+        # Handle slice notation
+        start = 0 if key.start is None else key.start
+        stop = self._size if key.stop is None else key.stop
 
-        if isinstance(key, float):
-            # A native nan offset is an na offset -> current bar (int(nan) raises).
-            # The separate binding keeps the conversion on a plainly float-typed
-            # name; the IDE cannot narrow the reassigned union of ``key`` here.
-            f_key = key
-            return self[0 if f_key != f_key else int(f_key)]
+        if start < 0 or stop < 0:
+            raise IndexError("Negative indices not supported in slice!")
 
-        elif isinstance(key, slice):
-            # Handle slice notation
-            start = 0 if key.start is None else key.start
-            stop = self._size if key.stop is None else key.stop
+        if key.step is not None and key.step != 1:
+            raise ValueError("Step value not supported in slice!")
 
-            if start < 0 or stop < 0:
-                raise IndexError("Negative indices not supported in slice!")
+        if stop > self._size:
+            raise IndexError("Slice stop index out of range!")
 
-            if key.step is not None and key.step != 1:
-                raise ValueError("Step value not supported in slice!")
+        # Ensure start <= stop
+        if start > stop:
+            start = stop
 
-            if stop > self._size:
-                raise IndexError("Slice stop index out of range!")
-
-            # Ensure start <= stop
-            if start > stop:
-                start = stop
-
-            # Unsubscripted on purpose: the subscripted form routes construction
-            # through ``typing._GenericAlias.__call__``, which costs ~290ns per
-            # slice and buys nothing here -- it can only attach ``__orig_class__``,
-            # which a ``__slots__`` class rejects anyway. ``T`` still binds from
-            # the ``buffer`` argument, so the inferred type is unchanged.
-            return ReadOnlySeriesView(
-                self._buffer,
-                self._capacity,
-                self._write_pos,
-                self._size,
-                start,
-                stop
-            )
-
-        raise TypeError("Series indices must be integers or slices")  # noqa
+        # Unsubscripted on purpose: the subscripted form routes construction
+        # through ``typing._GenericAlias.__call__``, which costs ~290ns per
+        # slice and buys nothing here -- it can only attach ``__orig_class__``,
+        # which a ``__slots__`` class rejects anyway. ``T`` still binds from
+        # the ``buffer`` argument, so the inferred type is unchanged.
+        return ReadOnlySeriesView(
+            self._buffer,
+            self._capacity,
+            self._write_pos,
+            self._size,
+            start,
+            stop
+        )
 
     def __len__(self) -> int:
         """
@@ -445,10 +454,12 @@ class ReadOnlySeriesView(Generic[T]):
         self._start = start
         self._stop = min(stop, size)
 
-    def __getitem__(self, idx: int) -> T | NA[T]:
-        """Get item using Pine indexing"""
-        if not isinstance(idx, int):
-            raise TypeError("Only integer indexing is supported")  # noqa
+    def __getitem__(self, idx: int | float) -> T | NA[T]:
+        """Get item using Pine indexing (a fractional offset is truncated)"""
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            raise TypeError("Only number indexing is supported") from None  # noqa
         if idx < 0:
             raise IndexError("Negative indices not supported")
         if idx >= len(self):
@@ -508,7 +519,7 @@ class ReadOnlySeriesView(Generic[T]):
         return f"ReadOnlySeriesView({list(self)})"
 
 
-def _inline_series_instance() -> Callable[..., SeriesImpl]:
+def _inline_series_instance(_pin: str | None = None) -> Callable[..., SeriesImpl]:
     """One ``inline_series`` instance: a closure over its own series buffer.
 
     The slot transform routes ``inline_series`` call sites on the uniform
@@ -516,13 +527,13 @@ def _inline_series_instance() -> Callable[..., SeriesImpl]:
     iteration at loop sites) through the ``__pyne_bind__`` factory — that is
     what keeps two ``expr[n]`` rewrites in one scope independent (issue #61).
 
+    :param _pin: The call site's overload pin, part of the factory protocol.
+        There is one implementation here, so there is nothing to select.
     :return: The bound instance with the public ``inline_series`` signature.
     """
     series: SeriesImpl = SeriesImpl()
 
     def bound(value: T, idx: int) -> SeriesImpl[T]:
-        if isinstance(idx, float):
-            idx = int(idx)
         series.add(value)
         return cast(SeriesImpl[T], series[idx])
 
@@ -552,8 +563,6 @@ def inline_series(value: T, idx: int) -> SeriesImpl[T]:
     :param idx: The index, 0 is the last, 1 is the second last and so on
     :return:
     """
-    if isinstance(idx, float):
-        idx = int(idx)
     _inline_series_shared.add(value)
     return cast(SeriesImpl[T], _inline_series_shared[idx])
 

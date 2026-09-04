@@ -30,8 +30,8 @@ def new(position: _position.Position, columns: int, rows: int, bgcolor: _color.C
     """
     table = Table(
         position=position,
-        columns=columns,
-        rows=rows,
+        columns=int(columns),
+        rows=int(rows),
         bgcolor=bgcolor,
         frame_color=frame_color,
         frame_width=frame_width,
@@ -101,7 +101,7 @@ def cell(table_id: Table, column: int, row: int, text: str = "", width: int | fl
         return
 
     # Create or get the cell
-    cell_obj = table_id.get_cell(column, row)
+    cell_obj = table_id.get_cell(int(column), int(row))
 
     # Set all the cell properties
     cell_obj.text = text
@@ -138,7 +138,7 @@ def clear(table_id: Table, start_column: int, start_row: int, end_column: int = 
         end_row = start_row
 
     # Clear the specified range of cells
-    table_id.clear_cells(start_column, start_row, end_column, end_row)
+    table_id.clear_cells(int(start_column), int(start_row), int(end_column), int(end_row))
 
 
 def merge_cells(table_id: Table, start_column: int, start_row: int, end_column: int, end_row: int) -> None:
@@ -155,7 +155,7 @@ def merge_cells(table_id: Table, start_column: int, start_row: int, end_column: 
         return
 
     # Merge the specified range of cells
-    table_id.merge_cells(start_column, start_row, end_column, end_row)
+    table_id.merge_cells(int(start_column), int(start_row), int(end_column), int(end_row))
 
 
 # Cell setter functions
@@ -163,7 +163,7 @@ def cell_set_bgcolor(table_id: Table, column: int, row: int, bgcolor: _color.Col
     """Sets the background color of the cell."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(column, row)
+    cell_obj = table_id.get_cell(int(column), int(row))
     cell_obj.bgcolor = bgcolor
 
 
@@ -171,7 +171,7 @@ def cell_set_height(table_id: Table, column: int, row: int, height: int | float)
     """Sets the height of cell."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(column, row)
+    cell_obj = table_id.get_cell(int(column), int(row))
     cell_obj.height = height
 
 
@@ -179,7 +179,7 @@ def cell_set_text(table_id: Table, column: int, row: int, text: str) -> None:
     """Sets the text in the specified cell."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(column, row)
+    cell_obj = table_id.get_cell(int(column), int(row))
     cell_obj.text = text
 
 
@@ -187,7 +187,7 @@ def cell_set_text_color(table_id: Table, column: int, row: int, text_color: _col
     """Sets the color of the text inside the cell."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(column, row)
+    cell_obj = table_id.get_cell(int(column), int(row))
     cell_obj.text_color = text_color
 
 
@@ -195,7 +195,7 @@ def cell_set_text_font_family(table_id: Table, column: int, row: int, text_font_
     """Sets the font family of the text inside the cell."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(column, row)
+    cell_obj = table_id.get_cell(int(column), int(row))
     cell_obj.text_font_family = text_font_family
 
 
@@ -203,7 +203,7 @@ def cell_set_text_formatting(table_id: Table, column: int, row: int, text_format
     """Sets the formatting attributes the drawing applies to displayed text."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(column, row)
+    cell_obj = table_id.get_cell(int(column), int(row))
     cell_obj.text_formatting = text_formatting
 
 
@@ -211,7 +211,7 @@ def cell_set_text_halign(table_id: Table, column: int, row: int, text_halign: _t
     """Sets the horizontal alignment of the cell's text."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(column, row)
+    cell_obj = table_id.get_cell(int(column), int(row))
     cell_obj.text_halign = text_halign
 
 
@@ -219,7 +219,7 @@ def cell_set_text_size(table_id: Table, column: int, row: int, text_size: int | 
     """Sets the size of the cell's text."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(column, row)
+    cell_obj = table_id.get_cell(int(column), int(row))
     cell_obj.text_size = text_size
 
 
@@ -227,7 +227,7 @@ def cell_set_text_valign(table_id: Table, column: int, row: int, text_valign: _t
     """Sets the vertical alignment of a cell's text."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(column, row)
+    cell_obj = table_id.get_cell(int(column), int(row))
     cell_obj.text_valign = text_valign
 
 
@@ -235,7 +235,7 @@ def cell_set_tooltip(table_id: Table, column: int, row: int, tooltip: str) -> No
     """Sets the tooltip in the specified cell."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(column, row)
+    cell_obj = table_id.get_cell(int(column), int(row))
     cell_obj.tooltip = tooltip
 
 
@@ -243,7 +243,7 @@ def cell_set_width(table_id: Table, column: int, row: int, width: int | float) -
     """Sets the width of the cell."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(column, row)
+    cell_obj = table_id.get_cell(int(column), int(row))
     cell_obj.width = width
 
 

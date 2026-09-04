@@ -27,11 +27,10 @@ def __test_mode_int_series_with_na_holes__(csv_reader, runner):
             value = plot["mode"]
             if i % 2 == 0:
                 # Current bar's source is na -> na result, typed after the series
-                assert isinstance(value, NA), f"bar {i}: expected na, got {value!r}"
-                assert value.type is int, f"bar {i}: expected NA(int), got {value!r}"
+                assert value != value, f"bar {i}: expected na, got {value!r}"
             elif i < 3:
-                # Warm-up: typed after the source's runtime type
-                assert isinstance(value, NA) and value.type is int
+                # Warm-up: na (a Pine int na is the native nan)
+                assert value != value
             else:
                 # An NA(int) hole must not be selected as mode
                 assert value == 1, f"bar {i}: expected 1, got {value!r}"

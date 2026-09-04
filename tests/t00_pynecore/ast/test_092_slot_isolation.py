@@ -16,6 +16,7 @@ import pytest
 from pynecore.core.instance_state import _make_state
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
 from pynecore.transformers.persistent import PersistentTransformer
+from pynecore.transformers.safe_convert_transformer import SafeConvertTransformer
 from pynecore.transformers.series import SeriesTransformer
 from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
 
@@ -31,6 +32,8 @@ def _transform(source: str) -> tuple[dict, str]:
     tree = SeriesTransformer(layout).visit(tree)
     tree = PersistentTransformer(layout).visit(tree)
     tree = FunctionIsolationTransformer(layout).visit(tree)
+    # The counters are Pine ints, floats at runtime: ``range()`` needs the truncation pass
+    tree = SafeConvertTransformer().visit(tree)
     tree = apply_layout(tree, layout)
     ast.fix_missing_locations(tree)
     ns: dict = {}
@@ -507,9 +510,10 @@ def main():
     return str(bump()).zfill(3).lstrip('0')
 ''')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
-    assert ns['main'](state) == '1'
-    assert ns['main'](state) == '2'
-    assert ns['main'](state) == '3'
+    # A Pine int is a double at runtime: the counter prints as a float
+    assert ns['main'](state) == '1.0'
+    assert ns['main'](state) == '2.0'
+    assert ns['main'](state) == '3.0'
 
 
 def __test_module_level_impure_stateful_callee_rejected__():

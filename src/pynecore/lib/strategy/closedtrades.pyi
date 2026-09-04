@@ -7,7 +7,7 @@ from ...types import PyneFloat, PyneInt, PyneStr
 # on the bare name type-checking.
 class ClosedTradesModule(int):
 
-    def __call__(self) -> int: ...
+    def __call__(self) -> PyneInt: ...
 
     #
     # Functions
@@ -53,7 +53,7 @@ class ClosedTradesModule(int):
     # Module properties
     #
 
-    first_index: int
+    first_index: PyneInt
 
 
 closedtrades: ClosedTradesModule

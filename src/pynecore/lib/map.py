@@ -6,6 +6,7 @@ from typing import TypeVar, Any
 # (TV-verified: map.get / contains find a float(na) key after map.put with one).
 # Imported underscored so it stays out of the lib module-property registry.
 from pynecore.types.na import NA, na_float as _NAN_KEY
+from pynecore.types.pine_types import PyneInt
 
 TKey = TypeVar('TKey')
 TValue = TypeVar('TValue')
@@ -129,14 +130,15 @@ def remove(id: dict[TKey, TValue], key: TKey) -> TValue:
 
 
 # noinspection PyShadowingBuiltins
-def size(id: dict[TKey, TValue]) -> int:
+def size(id: dict[TKey, TValue]) -> PyneInt:
     """
     Get the size of the map.
 
     :param id: The map to get the size of.
     :return: The size of the map.
     """
-    return len(id)
+    # A Pine int is a double at runtime
+    return float(len(id))
 
 
 # noinspection PyShadowingBuiltins

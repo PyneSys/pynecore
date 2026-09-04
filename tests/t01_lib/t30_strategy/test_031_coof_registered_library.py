@@ -1,10 +1,10 @@
 """
-calc_on_order_fills regression: a state-carrying ``@script.library`` function
-in the SAME module as the strategy main must not collide with main's root
-vector (root keys are qualified per function). A collision detaches main's
-root, so ``instance_state.reset()`` and ``RootVarSnapshot`` silently stop
-covering main and the COOF var rollback is lost (var_exec would read
-1, 2, 4, 5, 6 instead of 1..5).
+calc_on_order_fills regression: a state-carrying library entry registered
+next to the strategy main (an imported ``@script.library`` module's ``main``)
+must not collide with main's root vector (root keys are qualified per
+function). A collision detaches main's root, so ``instance_state.reset()``
+and ``RootVarSnapshot`` silently stop covering main and the COOF var rollback
+is lost (var_exec would read 1, 2, 4, 5, 6 instead of 1..5).
 """
 import sys
 from pathlib import Path
@@ -40,8 +40,8 @@ def _make_ohlcv(num_bars: int, base_ts: int = 1_704_067_200_000, period: int = 3
     ]
 
 
-def __test_coof_same_module_library_var_rollback__():
-    """ var rollback keeps working with a same-module library registration """
+def __test_coof_registered_library_var_rollback__():
+    """ var rollback keeps working with a registered library entry """
     from pynecore.core import script as script_core
     from pynecore.core.script_runner import ScriptRunner
 
@@ -50,12 +50,13 @@ def __test_coof_same_module_library_var_rollback__():
     saved_libraries = list(script_core._registered_libraries)
     try:
         runner = ScriptRunner(
-            DATA_DIR / 'coof_same_module_lib.py', iter(_make_ohlcv(5)), _make_syminfo(),
+            DATA_DIR / 'coof_registered_lib_script.py', iter(_make_ohlcv(5)), _make_syminfo(),
         )
         results = [dict(plot_data) for _candle, plot_data, _trades in runner.run_iter()]
     finally:
         script_core._registered_libraries[:] = saved_libraries
-        sys.modules.pop('coof_same_module_lib', None)
+        sys.modules.pop('coof_registered_lib', None)
+        sys.modules.pop('coof_registered_lib_script', None)
 
     # Bar 1 fills the market order -> COOF re-execution; the rollback must keep
     # var_exec at exactly bar_index+1 on every bar

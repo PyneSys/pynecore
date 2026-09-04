@@ -30,6 +30,7 @@ shadows the parent's series.
 from typing import cast
 import ast
 
+from .pine_type_rules import OBJECT, get_ty, set_ty, stamp_lowering
 from .slot_layout import ModuleLayout, scope_for_function
 
 __all__ = ['SeriesTransformer']
@@ -86,18 +87,23 @@ class SeriesTransformer(ast.NodeTransformer):
             slice=ast.Constant(value=slot), ctx=ast.Load())
 
     def _buffer_call(self, scope: str, slot: int, method: str, args: list[ast.expr]) -> ast.Call:
-        """Build a ``<state param>[slot].<method>(...)`` call."""
-        return ast.Call(
+        """Build a ``<state param>[slot].<method>(...)`` call.
+
+        ``add`` and ``set`` both return the value they stored, so the call
+        stands where that value stood and carries its Pine type.
+        """
+        return stamp_lowering(ast.Call(
             func=ast.Attribute(value=self._state_ref(scope, slot),
                                attr=method, ctx=ast.Load()),
-            args=args, keywords=[])
+            args=args, keywords=[]), get_ty(args[0]) if args else OBJECT)
 
     def _register(self, var_name: str, elem: str | None = None) -> int:
         """Allocate a series slot for a declaration in the current scope.
 
         :param var_name: Source-level variable name.
         :param elem: Statically known element type name from the ``Series[T]``
-            annotation (``'float'`` selects the native-nan na value), or None.
+            annotation (``'float'`` and ``'int'`` select the native-nan na value,
+            ``'int'`` also stores every value as a float), or None.
         :return: The allocated slot index.
         """
         slot = self.layout.scope(self.current_scope).add_series(
@@ -119,17 +125,20 @@ class SeriesTransformer(ast.NodeTransformer):
     def _series_elem(annotation: ast.expr) -> str | None:
         """Element type name of a ``Series[T]`` annotation, if statically known.
 
-        Only ``'float'`` is meaningful downstream (it selects the native nan
-        as the series' na value); everything else — bare ``Series``, other
-        element types, complex annotations — yields None.
+        Only the scalar names are meaningful downstream: the numeric ones
+        select the native nan as the series' na value, and ``'int'``
+        additionally makes the series store every value as a float (a Pine int
+        is a double at runtime); ``'bool'`` selects the bool na the script runs
+        with. Everything else — bare ``Series``, other element types, complex
+        annotations — yields None.
 
         :param annotation: The (Series) type annotation.
-        :return: ``'float'`` for ``Series[float]``, otherwise None.
+        :return: ``'float'``, ``'int'`` or ``'bool'`` for those element types, otherwise None.
         """
         if (isinstance(annotation, ast.Subscript)
                 and isinstance(annotation.slice, ast.Name)
-                and annotation.slice.id == 'float'):
-            return 'float'
+                and annotation.slice.id in ('float', 'int', 'bool')):
+            return annotation.slice.id
         return None
 
     # --- visitors --------------------------------------------------------
@@ -245,9 +254,14 @@ class SeriesTransformer(ast.NodeTransformer):
         if isinstance(node.target, ast.Name):
             slots = self.series_slots.get(self.current_scope)
             if slots is not None and node.target.id in slots:
-                value = ast.BinOp(left=ast.Name(id=node.target.id, ctx=ast.Load()),
-                                  op=node.op,
-                                  right=cast(ast.expr, self.visit(node.value)))
+                # The target's stamp is the type of the AUGMENTED value, which
+                # is what both the read below and the whole expression carry
+                augmented = get_ty(node.target)
+                value = stamp_lowering(
+                    ast.BinOp(left=set_ty(ast.Name(id=node.target.id, ctx=ast.Load()),
+                                          augmented),
+                              op=node.op,
+                              right=cast(ast.expr, self.visit(node.value))), augmented)
                 return ast.Assign(
                     targets=[ast.Name(id=node.target.id, ctx=ast.Store())],
                     value=self._buffer_call(self.current_scope, slots[node.target.id],

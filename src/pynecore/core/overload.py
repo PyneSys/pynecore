@@ -23,12 +23,24 @@ compatible matching) and calls it through a per-anchor bound cache:
   own module-lifetime bound cache: one shared instance per implementation,
   the same semantics the legacy module-global scope gave such calls.
 
+A call site whose argument TYPES the Pine type pass could decide reaches the
+binder with an overload pin -- one type character per positional argument. The
+anchor then turns those characters into witness values and runs the ORDINARY
+selector on them once, at bind time, instead of selecting per bar from the
+values. That is what makes the dispatch match TradingView's: Pine resolves an
+overload from the static type, and the two answers differ exactly where an
+int-TYPED expression carries a fractional value (``14 / 8`` is int-typed and
+1.75 there), which the value-driven selector would widen to the float
+implementation. Set ``PYNE_NO_TYPE_PIN=1`` to ignore every pin and dispatch
+from the values alone.
+
 Implementation matching skips the hidden state parameter the slot transform
 injects (``__state__`` or the scope-qualified ``__state·{scope}__`` form):
 signatures and parameter types are computed from the VISIBLE parameters
 only, and the state argument is prepended by the bound partial, never by
 the caller.
 """
+import os
 from typing import (TypeVar, Callable, get_type_hints, overload as typing_overload,
                     Any, Type, Union, get_args, get_origin, cast)
 from functools import wraps, partial
@@ -291,6 +303,14 @@ def _select(impls: list[Implementation], args: tuple, kwargs: dict) -> Implement
     return None
 
 
+#: Value each pin character stands for. A pin records the STATIC types the
+#: type pass decided on; the witnesses turn them back into values the ordinary
+#: :func:`_select` understands, so the static and the dynamic decision run the
+#: SAME code and cannot drift apart. Only types with one unambiguous witness
+#: are pinnable, which is why there is no entry for a container or a drawing.
+_PIN_WITNESSES: dict[str, Any] = {'i': 0, 'f': 0.0, 'b': True, 's': ''}
+
+
 def _type_token(value: Any) -> Any:
     """Hashable token capturing exactly the properties ``_check_type``
     discriminates on, so that two arguments with equal tokens are
@@ -350,8 +370,8 @@ def _canonical_kwarg_renames(impls: list[Implementation],
 
 
 def _anchored(impls: list[Implementation], qualname: str,
-              cache: dict[Implementation, tuple[Callable, list | None, Callable]] | None = None
-              ) -> Callable:
+              cache: dict[Implementation, tuple[Callable, list | None, Callable]] | None = None,
+              pin: str | None = None) -> Callable:
     """Create an anchored dispatch entry with its own per-implementation
     bound cache. ``__pyne_bind__`` hands these out, one per anchor; the
     dispatcher itself is one too (the shared, anchorless fallback, whose
@@ -362,6 +382,9 @@ def _anchored(impls: list[Implementation], qualname: str,
     :param qualname: Qualified name for error messages.
     :param cache: Externally held cache dict (the dispatcher's registered
         one); per-anchor entries create their own.
+    :param pin: The call site's overload pin, when the type pass decided on
+        one: the implementation is then selected here, once, from the static
+        types rather than per bar from the values.
     :return: The dispatch callable.
     """
     _cache: dict[Implementation, tuple[Callable, list | None, Callable]] = \
@@ -450,7 +473,44 @@ def _anchored(impls: list[Implementation], qualname: str,
     # in ``lib.ta`` need exactly that).
     dispatch.__pyne_cache__ = _cache
     dispatch.__pyne_impls__ = impls
-    return dispatch
+
+    if not pin or os.environ.get('PYNE_NO_TYPE_PIN') == '1':
+        return dispatch
+
+    witnesses = tuple(_PIN_WITNESSES[c] for c in pin if c in _PIN_WITNESSES)
+    pinned = _select(impls, witnesses, {}) if len(witnesses) == len(pin) else None
+    if pinned is None:
+        # An unwitnessable character, or no implementation for the static
+        # shape: the values know more than the pin does, so let them decide,
+        # exactly as they did before there were pins
+        return dispatch
+    argc = len(pin)
+    group = len(impls)
+
+    def dispatch_pinned(*args: Any, **kwargs: Any) -> Any:
+        if kwargs or len(args) != argc or len(impls) != group:
+            # Not the shape the pin was computed for — a keyword spelling, a
+            # different arity, or an implementation registered after the bind
+            return dispatch(*args, **kwargs)
+        # The entry bookkeeping of ``dispatch``, repeated rather than shared:
+        # this is per-bar code, and the point of the pinned route is that it
+        # costs one dict lookup and nothing else — no type tuple, no token,
+        # no selection
+        entry = _cache.get(pinned)
+        if entry is None or entry[0] is not pinned.func:
+            func = pinned.func
+            layout: dict[str, Any] | None = getattr(func, '__pyne_layout__', None)
+            if layout is not None:
+                state = entry[1] if entry is not None and entry[1] is not None \
+                    else _make_state(layout)
+                entry = _cache[pinned] = (func, state, partial(func, state))
+            else:
+                entry = _cache[pinned] = (func, None, _bind_target(func))
+        return entry[2](*args)
+
+    dispatch_pinned.__pyne_cache__ = _cache
+    dispatch_pinned.__pyne_impls__ = impls
+    return dispatch_pinned
 
 
 def overload(func: Callable[..., T]) -> Callable[..., T]:
@@ -494,7 +554,7 @@ def overload(func: Callable[..., T]) -> Callable[..., T]:
         # _bind_target.
         _dispatcher.__dict__.pop('__pyne_layout__', None)
         setattr(_dispatcher, '__pyne_bind__',
-                lambda: _anchored(_registry[qualname], qualname))
+                lambda pin=None: _anchored(_registry[qualname], qualname, pin=pin))
         _dispatchers[qualname] = _dispatcher
 
     return _dispatcher

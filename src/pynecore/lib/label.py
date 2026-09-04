@@ -403,8 +403,9 @@ def get_x(id: Label) -> PyneInt:
     :return: Bar index or UNIX timestamp (in milliseconds)
     """
     if isinstance(id, NA):
-        return NA(int)
-    return id.x
+        return na_int
+    # A Pine int is a double at runtime
+    return float(id.x)
 
 
 # noinspection PyShadowingBuiltins

@@ -65,12 +65,19 @@ def __test_str__(runner, dummy_ohlcv_iter, file_reader, log_comparator):
 
 
 def __test_str_contains_na__():
-    """ str.contains(na, ...) returns na (Pine na-propagation) and never
-    iterates the na argument forever; a real source still searches normally """
+    """ str.contains(na, ...) answers the bool na (na with the three-state bool, false
+    without it) and never iterates the na argument forever; a real source still
+    searches normally """
     from pynecore.lib import string as _string
-    from pynecore.types.na import NA
-    assert isinstance(_string.contains(NA(str), "Closes"), NA)
-    assert isinstance(_string.contains("Market Closes", NA(str)), NA)
+    from pynecore.types.na import NA, na_bool, set_bool_na
+    assert _string.contains(NA(str), "Closes") is False
+    assert _string.contains("Market Closes", NA(str)) is False
+    set_bool_na(True)
+    try:
+        assert _string.contains(NA(str), "Closes") is na_bool
+        assert _string.contains("Market Closes", NA(str)) is na_bool
+    finally:
+        set_bool_na(False)
     assert _string.contains("Market Closes", "Closes") is True
     assert _string.contains("Market Open", "Closes") is False
 

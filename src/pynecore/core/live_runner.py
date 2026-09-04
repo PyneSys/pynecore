@@ -57,7 +57,7 @@ from pynecore.core.plugin.live_provider import LiveProviderPlugin
 from pynecore.core.script_runner import LIVE_TRANSITION
 from pynecore.lib.log import broker_info, broker_warning
 from pynecore.core.session import is_in_session, is_point_in_session
-from pynecore.lib.timeframe import in_seconds
+from pynecore.lib.timeframe import _in_seconds
 
 __all__ = ['live_ohlcv_generator', 'download_warmup_in_memory', 'LiveBarStreamer']
 
@@ -699,7 +699,7 @@ def live_ohlcv_generator(
     # stream matches what REST will later return. This lives in the
     # framework, not in each plugin, so providers stay free of bar-rhythm
     # bookkeeping — they only emit when their feed pushes a real bar.
-    tf_seconds = max(1, int(in_seconds(timeframe)))
+    tf_seconds = max(1, _in_seconds(timeframe))
     # OHLCV timestamps are Unix milliseconds, so every deadline compared
     # against a bar timestamp is computed on the millisecond axis.
     tf_ms = tf_seconds * 1000

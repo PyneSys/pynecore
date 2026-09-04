@@ -6765,8 +6765,9 @@ def equity() -> PyneFloat:
 @module_property
 def eventrades() -> PyneInt:
     if lib._script is None:
-        return 0
-    return lib._script.position.eventrades
+        return 0.0
+    # A Pine int is a double at runtime
+    return float(lib._script.position.eventrades)
 
 
 # noinspection PyProtectedMember
@@ -6822,10 +6823,11 @@ def grossprofit_percent() -> PyneFloat:
 
 # noinspection PyProtectedMember
 @module_property
-def losstrades() -> int:
+def losstrades() -> PyneInt:
     if lib._script is None:
-        return 0
-    return lib._script.position.losstrades
+        return 0.0
+    # A Pine int is a double at runtime
+    return float(lib._script.position.losstrades)
 
 
 # noinspection PyProtectedMember
@@ -7019,5 +7021,6 @@ def position_entry_name() -> PyneStr:
 @module_property
 def wintrades() -> PyneInt:
     if lib._script is None:
-        return 0
-    return lib._script.position.wintrades
+        return 0.0
+    # A Pine int is a double at runtime
+    return float(lib._script.position.wintrades)

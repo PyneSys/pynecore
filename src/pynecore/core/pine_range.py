@@ -1,43 +1,43 @@
-from typing import Generator, overload
+from typing import Iterable
 
 from pynecore.types.pine_types import PyneFloat, PyneInt
 
 
-@overload
-def pine_range(from_num: int, to_num: int, step_num: int | None = None) -> range: ...
-
-
-@overload
 def pine_range(from_num: PyneInt | PyneFloat, to_num: PyneInt | PyneFloat,
-               step_num: PyneInt | PyneFloat | None = None) -> Generator[float, None, None]: ...
-
-
-def pine_range(from_num: PyneInt | PyneFloat, to_num: PyneInt | PyneFloat, step_num: PyneInt | PyneFloat | None = None):
+               step_num: PyneInt | PyneFloat | None = None) -> Iterable[float]:
     """
     Emulates Pine Script's for loop range behavior.
+
+    The counter is a Pine number, so every value it takes is a float: a Pine int
+    is a double at runtime, and a ``for`` loop does not truncate its bounds
+    (MEASURED: a fractional ``from`` or ``by`` makes the counter fractional).
 
     :param from_num: Start value (inclusive)
     :param to_num: End value (inclusive)
     :param step_num: Step value (optional, defaults to +1/-1 based on direction)
-    :return: A native ``range`` for integer bounds, otherwise a generator that yields
-             values from from_num to to_num (inclusive)
+    :return: The counter values from from_num to to_num (inclusive)
     :raises ValueError: If step_num is zero
     """
-    # Fast path: pure-integer bounds map exactly onto a native range, which iterates at
-    # C speed instead of resuming a Python generator on every step. The vast majority of
-    # Pine for loops are integer index ranges, so this is the common case.
-    if isinstance(from_num, int) and isinstance(to_num, int) and (step_num is None or isinstance(step_num, int)):
-        if from_num <= to_num:
-            step = 1 if step_num is None else abs(step_num)
+    # Fast path: integral bounds map exactly onto a native range, which iterates at C
+    # speed instead of resuming a Python generator on every step; ``map(float, ...)``
+    # hands the values over as floats without a Python-level frame per step. The vast
+    # majority of Pine for loops are integer index ranges, so this is the common case.
+    # ``x % 1 == 0`` is the value test: it is False for nan, inf and the NA object, so
+    # every na bound takes the generator, which runs zero iterations for it.
+    if from_num % 1 == 0 and to_num % 1 == 0 and (step_num is None or step_num % 1 == 0):
+        start = int(from_num)
+        stop = int(to_num)
+        if start <= stop:
+            step = 1 if step_num is None else abs(int(step_num))
             if step == 0:
                 raise ValueError("Step cannot be zero in pine_range")
             # +1 makes the upper bound inclusive, matching Pine's `to`
-            return range(from_num, to_num + 1, step)
-        step = -1 if step_num is None else -abs(step_num)
+            return map(float, range(start, stop + 1, step))
+        step = -1 if step_num is None else -abs(int(step_num))
         if step == 0:
             raise ValueError("Step cannot be zero in pine_range")
         # -1 makes the lower bound inclusive for the descending direction
-        return range(from_num, to_num - 1, step)
+        return map(float, range(start, stop - 1, step))
 
     return _pine_range_float(from_num, to_num, step_num)
 
@@ -66,8 +66,8 @@ def _pine_range_float(from_num: PyneFloat, to_num: PyneFloat, step_num: PyneFloa
     if (direction > 0 > step_val) or (direction < 0 < step_val):
         step_val = -step_val
 
-    # Generate values
-    current = from_num
+    # Generate values: the counter is a Pine number, a float from the first value on
+    current = from_num + 0.0
     if direction > 0:
         # Ascending loop
         while current <= to_num:
@@ -108,7 +108,9 @@ class PineLoop:
     __slots__ = ('value', '_by', '_step', '_ascending', '_started')
 
     def __init__(self, from_num: PyneInt | PyneFloat, step_num: PyneInt | PyneFloat | None = None):
-        self.value = from_num
+        # The counter is a Pine number: a float from the first value on (an NA
+        # object passes through the addition unchanged)
+        self.value = from_num + 0.0
         # The ``by`` expression as written, absent when the loop has none; the
         # signed step it resolves to needs the direction, known only on entry.
         self._by = step_num

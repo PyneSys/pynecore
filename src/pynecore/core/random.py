@@ -16,7 +16,9 @@ class PineRandom:
         # If seed not given, use current time
         if seed is None:
             seed = int(time.time() * 1000)
-        self.state = (seed ^ 0x5DEECE66D) & (self.m - 1)
+        # ``seed`` is an int-TYPED Pine value, which may carry a fractional
+        # one; the bit operations below consume it as an integer
+        self.state = (int(seed) ^ 0x5DEECE66D) & (self.m - 1)
 
     def _next_bits(self, bits):
         """

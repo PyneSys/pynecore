@@ -18,7 +18,7 @@ from .resampler import (
     Resampler, ObservedDayCounter, grid_mode, overnight_opens, trading_day,
 )
 # noinspection PyProtectedMember
-from ..lib.timeframe import in_seconds, _process_tf
+from ..lib.timeframe import _in_seconds, _process_tf
 from ..types.ohlcv import OHLCV
 
 
@@ -30,8 +30,8 @@ def validate_aggregation(source_tf: str, target_tf: str) -> None:
     :param target_tf: Target timeframe string (e.g., '60', '1W')
     :raises ValueError: If timeframes are incompatible
     """
-    source_sec = in_seconds(source_tf)
-    target_sec = in_seconds(target_tf)
+    source_sec = _in_seconds(source_tf)
+    target_sec = _in_seconds(target_tf)
 
     if target_sec <= source_sec:
         raise ValueError(
@@ -123,7 +123,7 @@ def aggregate_ohlcv(
         # noinspection PyProtectedMember
         src_mod, _ = _process_tf(source_tf)
         if src_mod in ('', 'S'):
-            src_off = in_seconds(source_tf) - 1
+            src_off = _in_seconds(source_tf) - 1
             # An intraday source carries the per-bar end instants the observed
             # holiday half-day fold needs (a daily source is already folded).
             fold = True

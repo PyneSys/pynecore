@@ -83,6 +83,12 @@ class NA(Generic[T]):
 # interned constants (instead of an NA(float) call) would false-positive.
 # (na_float genuinely IS a float now — the interned native nan.)
 na_float: float
-na_int: int
+na_int: float
 na_str: str
 na_bool: bool
+
+
+def set_bool_na(enabled: bool) -> None: ...
+
+
+def new_bool_na() -> bool: ...

@@ -17,11 +17,15 @@ import pynecore.core.import_hook as import_hook
 from pynecore.core.import_hook import (
     PyneLoader,
     PYNE_RESERVED_NAME_CHAR,
+    _baked_deps,
     _cache_from_source,
     _get_transform_pipeline_hash,
     _reject_reserved_names,
     _PYNE_SENTINEL,
 )
+from pynecore.transformers import pine_type_artifact
+from pynecore.transformers.pine_type_artifact import dep_record, lookup
+from pynecore.transformers.pine_type_transformer import PineTypeTransformer, module_table
 
 
 def main():
@@ -318,3 +322,277 @@ def __test_import_script_installs_hook_from_namespace_package_cwd__(tmp_path):
     )
 
     assert completed.stdout.strip() == _get_transform_pipeline_hash()
+
+
+# --- dependency-aware invalidation ----------------------------------------
+#
+# A module's types are a function of its own source AND of the interfaces it
+# imports, so CPython's mtime/size check on the source alone cannot tell that a
+# cached .pyc has gone wrong. Every transformed module therefore carries the
+# state of its dependencies in a folded ``__pyne_type_deps__`` constant, which
+# ``get_code`` re-checks before it accepts the cache.
+
+
+@contextmanager
+def _typed_against(monkeypatch, dependent: str, dependency: Path):
+    """Make one module's transform record a dependency on another.
+
+    The inference does not resolve cross-module calls yet, so nothing fills
+    ``table.deps`` on its own; this injects the record the resolution will
+    produce. It hooks the type pass rather than the loader because that is
+    where the real record will be written — everything downstream (the baked
+    constant, the check on load, the invalidation) is the production path.
+
+    :param monkeypatch: The active monkeypatch fixture.
+    :param dependent: Stem of the module that gets the dependency record.
+    :param dependency: Source path of the module it depends on.
+    """
+    original = PineTypeTransformer.visit
+
+    def visit(self, tree):
+        tree = original(self, tree)
+        table = module_table(tree)
+        path = getattr(tree, '_module_file_path', '')
+        if table is not None and Path(path).stem == dependent:
+            interface = lookup(str(dependency), import_hook.analyse_source,
+                               _get_transform_pipeline_hash())
+            if interface is not None:
+                record = dep_record(interface)
+                table.deps[record.path] = record
+        return tree
+
+    monkeypatch.setattr(PineTypeTransformer, "visit", visit)
+    try:
+        yield
+    finally:
+        pine_type_artifact._registry.clear()
+        pine_type_artifact._analysing.clear()
+
+
+def _dependency_pair(tmp_path: Path, ret: str = "int") -> tuple[Path, Path]:
+    """Write a dependency and a dependent, and hand back both paths."""
+    lib = tmp_path / "dep_lib.py"
+    lib.write_text(f'"""\n@pyne\n"""\n\n\ndef area(width: int) -> {ret}:\n    return width * 2\n')
+    app = tmp_path / "dep_app.py"
+    app.write_text('"""\n@pyne\n"""\nSIZE: int = 3\n')
+    return lib, app
+
+
+def _build_dependent(app: Path, lib: Path, monkeypatch) -> tuple[str, float]:
+    """Transform the dependent once and report its baked digest and cache mtime."""
+    with _typed_against(monkeypatch, app.stem, lib), _bytecode_writing_enabled():
+        code = PyneLoader(app.stem, str(app)).get_code(app.stem)
+    records = _baked_deps(code)
+    assert len(records) == 1, "the dependency record was not baked into the module"
+    assert records[0].path == str(lib.resolve())
+    return records[0].digest, _cache_from_source(app).stat().st_mtime_ns
+
+
+@contextmanager
+def _counted(monkeypatch):
+    """Count the analyses and the retransforms one load costs."""
+    counts = {"analyse": 0, "transform": 0}
+    real_analyse = import_hook.analyse_source
+    real_transform = PyneLoader.source_to_code
+
+    def analyse(path: str):
+        counts["analyse"] += 1
+        return real_analyse(path)
+
+    def transform(self, data, path, *, _optimize: int = -1):
+        counts["transform"] += 1
+        return real_transform(self, data, path, _optimize=_optimize)
+
+    monkeypatch.setattr(import_hook, "analyse_source", analyse)
+    monkeypatch.setattr(PyneLoader, "source_to_code", transform)
+    yield counts
+
+
+def _reload(app: Path, lib: Path, monkeypatch) -> tuple[dict, tuple]:
+    """Load the dependent again from a cold registry, as a new process would."""
+    # The registry answers for this process only; a fresh process starts empty,
+    # which is the situation the invalidation exists for.
+    pine_type_artifact._registry.clear()
+    with _typed_against(monkeypatch, app.stem, lib), _counted(monkeypatch) as counts:
+        with _bytecode_writing_enabled():
+            code = PyneLoader(app.stem, str(app)).get_code(app.stem)
+    return counts, _baked_deps(code)
+
+
+def __test_untouched_dependency_costs_one_stat__(tmp_path, monkeypatch):
+    """A dependency whose file did not move is accepted without any analysis"""
+    lib, app = _dependency_pair(tmp_path)
+    digest, mtime = _build_dependent(app, lib, monkeypatch)
+
+    counts, records = _reload(app, lib, monkeypatch)
+
+    assert counts["analyse"] == 0, "an untouched dependency must not be re-analysed"
+    assert counts["transform"] == 0, "valid bytecode was needlessly retransformed"
+    assert _cache_from_source(app).stat().st_mtime_ns == mtime
+    assert records[0].digest == digest
+
+
+def __test_edited_dependency_body_keeps_the_cache__(tmp_path, monkeypatch):
+    """A body edit moves the file but not the interface, so the cache stands"""
+    lib, app = _dependency_pair(tmp_path)
+    digest, mtime = _build_dependent(app, lib, monkeypatch)
+
+    lib.write_text('"""\n@pyne\n"""\n\n\ndef area(width: int) -> int:\n'
+                   '    doubled: int = width * 2\n    return doubled\n')
+
+    counts, records = _reload(app, lib, monkeypatch)
+
+    assert counts["analyse"] == 1, "the moved file has to be re-analysed exactly once"
+    assert counts["transform"] == 0, "an unchanged interface must not invalidate the cache"
+    assert _cache_from_source(app).stat().st_mtime_ns == mtime
+    assert records[0].digest == digest
+
+
+def __test_changed_dependency_signature_drops_the_cache__(tmp_path, monkeypatch):
+    """A return-type change is exactly what the dependent has to be rebuilt for"""
+    lib, app = _dependency_pair(tmp_path)
+    digest, _ = _build_dependent(app, lib, monkeypatch)
+    pyc = _cache_from_source(app)
+
+    lib.write_text('"""\n@pyne\n"""\n\n\ndef area(width: int) -> float:\n    return width * 2\n')
+
+    counts, records = _reload(app, lib, monkeypatch)
+
+    assert counts["transform"] >= 1, "the stale bytecode was not retransformed"
+    assert records[0].digest != digest, "the rebuilt module kept the old dependency digest"
+    assert pyc.exists(), "invalidation must refresh the cache, not delete the cache dir"
+
+
+def __test_missing_dependency_drops_the_cache__(tmp_path, monkeypatch):
+    """A dependency that is gone cannot answer for itself, so nothing is assumed"""
+    lib, app = _dependency_pair(tmp_path)
+    _build_dependent(app, lib, monkeypatch)
+    lib.unlink()
+
+    counts, records = _reload(app, lib, monkeypatch)
+
+    assert counts["transform"] >= 1, "a vanished dependency must force a retransform"
+    assert records == (), "there is no dependency left to record"
+
+
+def _real_pair(tmp_path: Path, ret: str = "int") -> tuple[Path, Path]:
+    """Write a dependency and a dependent that really imports it."""
+    lib = tmp_path / "xm_real_lib.py"
+    lib.write_text(f'"""\n@pyne\n"""\n\n\ndef area(width: int) -> {ret}:\n    return width * 2\n')
+    app = tmp_path / "xm_real_app.py"
+    app.write_text('"""\n@pyne\n"""\nfrom xm_real_lib import area\n\nSIZE = area(3)\n')
+    return lib, app
+
+
+def _load(app: Path):
+    """Load the dependent from a cold registry, as a new process would."""
+    pine_type_artifact._registry.clear()
+    pine_type_artifact._analysing.clear()
+    with _bytecode_writing_enabled():
+        return PyneLoader(app.stem, str(app)).get_code(app.stem)
+
+
+def __test_the_inference_records_its_own_dependencies__(tmp_path, monkeypatch):
+    """The cross-module resolution fills ``table.deps`` on its own, end to end"""
+    monkeypatch.syspath_prepend(tmp_path)
+    lib, app = _real_pair(tmp_path)
+
+    records = _baked_deps(_load(app))
+    digest = records[0].digest
+    mtime = _cache_from_source(app).stat().st_mtime_ns
+    assert [record.path for record in records] == [str(lib.resolve())]
+
+    # A body edit moves the file but not the interface, so the cache stands
+    lib.write_text('"""\n@pyne\n"""\n\n\ndef area(width: int) -> int:\n'
+                   '    doubled: int = width * 2\n    return doubled\n')
+    assert _baked_deps(_load(app))[0].digest == digest
+    assert _cache_from_source(app).stat().st_mtime_ns == mtime
+
+    # A return-type change is exactly what the dependent has to be rebuilt for
+    lib.write_text('"""\n@pyne\n"""\n\n\ndef area(width: int) -> float:\n'
+                   '    return width * 2.0\n')
+    assert _baked_deps(_load(app))[0].digest != digest
+
+
+# --- the transitive closure -----------------------------------------------
+#
+# An export can be INFERRED from a third module: annotated parameters and no
+# return annotation take the return from whatever the body calls. The middle
+# module's own source then says nothing about a signature that moved, and its
+# stat short-circuit would keep answering "unchanged" forever -- so the
+# dependent has to remember the whole closure, not just the modules it names.
+
+
+def _chain(tmp_path: Path, prefix: str, ret: str = "float",
+           tail: str = " + 0.5") -> tuple[Path, Path, Path]:
+    """Write an app -> middle -> leaf chain whose middle return is inferred."""
+    leaf = tmp_path / f"{prefix}_leaf.py"
+    leaf.write_text(f'''"""
+@pyne
+"""
+
+
+def cval(x: int) -> {ret}:
+    return x{tail}
+''')
+    middle = tmp_path / f"{prefix}_mid.py"
+    middle.write_text(f'''"""
+@pyne
+"""
+from {prefix}_leaf import cval
+
+
+def bval(x: int):
+    return cval(x)
+''')
+    app = tmp_path / f"{prefix}_app.py"
+    app.write_text(f'''"""
+@pyne
+"""
+from {prefix}_mid import bval
+
+SIZE = bval(3)
+''')
+    return leaf, middle, app
+
+
+def __test_the_dependent_remembers_the_whole_chain__(tmp_path, monkeypatch):
+    """A module two hops away is a dependency like any other"""
+    monkeypatch.syspath_prepend(tmp_path)
+    leaf, middle, app = _chain(tmp_path, "xm_chain_all")
+
+    records = _baked_deps(_load(app))
+
+    assert sorted(record.path for record in records) == \
+        sorted([str(leaf.resolve()), str(middle.resolve())])
+
+
+def __test_a_changed_leaf_signature_drops_the_cache__(tmp_path, monkeypatch):
+    """The middle module's file never moves, and its published return still does"""
+    monkeypatch.syspath_prepend(tmp_path)
+    leaf, middle, app = _chain(tmp_path, "xm_chain_sig")
+    before = _baked_deps(_load(app))
+    middle_bytes = middle.read_bytes()
+    leaf_digest = {record.path: record.digest for record in before}[str(leaf.resolve())]
+
+    leaf.write_text(leaf.read_text().replace("-> float:", "-> int:").replace(" + 0.5", " * 2"))
+    records = _baked_deps(_load(app))
+
+    assert middle.read_bytes() == middle_bytes, "the middle module was not touched"
+    digests = {record.path: record.digest for record in records}
+    assert digests[str(leaf.resolve())] != leaf_digest, "the stale bytecode was kept"
+
+
+def __test_an_edited_leaf_body_keeps_the_cache__(tmp_path, monkeypatch):
+    """A body edit two hops away moves no signature, so nothing is rebuilt"""
+    monkeypatch.syspath_prepend(tmp_path)
+    leaf, _middle, app = _chain(tmp_path, "xm_chain_body")
+    before = {record.path: record.digest for record in _baked_deps(_load(app))}
+    mtime = _cache_from_source(app).stat().st_mtime_ns
+
+    leaf.write_text(leaf.read_text().replace(
+        "    return x + 0.5", "    doubled: float = x + 0.5\n    return doubled"))
+    records = _baked_deps(_load(app))
+
+    assert {record.path: record.digest for record in records} == before
+    assert _cache_from_source(app).stat().st_mtime_ns == mtime

@@ -2,11 +2,12 @@ from copy import copy as _copy
 
 from ..types.color import Color
 from ..types.chart import ChartPoint
-from ..types.na import NA
+from ..types.na import NA, na_int
+from ..types.pine_types import PyneInt
 from ..core.module_property import module_property
 
 from .. import lib
-from .timeframe import in_seconds
+from .timeframe import _in_seconds
 
 __all__ = [
     'bg_color',
@@ -43,12 +44,12 @@ is_standard = True
 # so ``time == chart.right_visible_bar_time`` is true once per historical run
 # (on the final bar) and on every realtime bar — matching TV.
 @module_property
-def left_visible_bar_time() -> int:
-    return lib.last_bar_time - int(in_seconds(lib.syminfo.period) * 1000) * _visible_bars
+def left_visible_bar_time() -> PyneInt:
+    return lib.last_bar_time - int(_in_seconds(lib.syminfo.period) * 1000) * _visible_bars
 
 
 @module_property
-def right_visible_bar_time() -> int:
+def right_visible_bar_time() -> PyneInt:
     return lib.last_bar_time
 
 
@@ -99,7 +100,7 @@ class _ChartPoint:
         :param price: The y-coordinate
         :return: A new chart.point object whose ``time`` field is ``na``
         """
-        return ChartPoint(index=index, time=NA(int), price=price)
+        return ChartPoint(index=index, time=na_int, price=price)
 
     @staticmethod
     def from_time(time: int, price: float) -> ChartPoint:
@@ -110,7 +111,7 @@ class _ChartPoint:
         :param price: The y-coordinate
         :return: A new chart.point object whose ``index`` field is ``na``
         """
-        return ChartPoint(index=NA(int), time=time, price=price)
+        return ChartPoint(index=na_int, time=time, price=price)
 
     @staticmethod
     def copy(id: ChartPoint) -> ChartPoint:

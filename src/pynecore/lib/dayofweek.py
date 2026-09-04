@@ -1,6 +1,8 @@
 from typing import Any
 
 from ..types.datetime import DayOfWeek
+from ..types.na import na_int
+from ..types.pine_types import PyneInt
 from ..core.module_property import module_function_property
 
 
@@ -29,7 +31,7 @@ _lib: Any = None
 
 # noinspection PyShadowingNames,PyProtectedMember
 @module_function_property
-def dayofweek(time: int | None = None, timezone: str | None = None) -> int:
+def dayofweek(time: int | float | None = None, timezone: str | None = None) -> PyneInt:
     """
     Day of the week
 
@@ -41,7 +43,10 @@ def dayofweek(time: int | None = None, timezone: str | None = None) -> int:
     if (lib := _lib) is None:
         from .. import lib
         _lib = lib
-    res = lib._get_dt(time, timezone).weekday() + 2
+    dt = lib._get_dt(time, timezone)
+    if dt is None:
+        return na_int
+    res = dt.weekday() + 2
     if res == 8:
         res = 1
-    return res
+    return float(res)

@@ -6,7 +6,7 @@ from ...types import PyneFloat, PyneInt, PyneStr
 # the AST transformer resolves both at runtime. The ``int`` base keeps arithmetic
 # on the bare name type-checking.
 class OpenTradesModule(int):
-    def __call__(self) -> int: ...
+    def __call__(self) -> PyneInt: ...
 
     #
     # Variables

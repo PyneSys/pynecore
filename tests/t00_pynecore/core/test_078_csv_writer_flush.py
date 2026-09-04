@@ -189,3 +189,16 @@ def __test_no_writes_accepted_after_stop_was_queued__(tmp_path: Path,
         writer.close()
 
     assert ''.join(blocking.written) == "a\nrow1\n"
+
+
+def __test_integral_floats_are_written_without_a_fraction__(tmp_path: Path):
+    """A Pine int is a float at runtime, the file still shows it as an integer"""
+    path = tmp_path / "ints.csv"
+    writer = CSVWriter(path, idle_time=30.0)
+    writer.open()
+    try:
+        assert writer.write_dict({'bar_index': 14.0, 'volume': 2451.0, 'price': 1.5, 'na': float('nan')})
+        assert writer.flush()
+    finally:
+        writer.close()
+    assert path.read_text().splitlines()[1] == "14,2451,1.5,NaN"

@@ -16,7 +16,7 @@ from pynecore.lib.log import (broker_debug, broker_info, broker_warning, ohlcv_i
                               logger)
 from pynecore.core.broker.exceptions import ExchangeConnectionError
 from pynecore.types.ohlcv import OHLCV
-from pynecore.types.na import na_float
+from pynecore.types.na import na_float, set_bool_na
 from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.csv_file import CSVWriter
 from pynecore.core.drawing_snapshot import DrawingSnapshot
@@ -304,8 +304,9 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
         props['_last_close'] = na_float if last_close_bar is None else props['close']
         props['_last_close_bar'] = bar_index
 
-    props['bar_index'] = bar_index
-    props['last_bar_index'] = bar_index if last_bar_index is None else last_bar_index
+    # A Pine int is a double at runtime: the published bar index is a float
+    props['bar_index'] = float(bar_index)
+    props['last_bar_index'] = float(bar_index if last_bar_index is None else last_bar_index)
 
     if derived_prices or lossless_prices:
         props['open'] = o = ohlcv.open
@@ -339,7 +340,7 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
     # Historical runs anchor ``last_bar_time`` to the chart's final bar (Pine
     # semantics — the whole history is known up front); live updates pass
     # ``None`` so it tracks the current (realtime) bar, which IS the last bar.
-    props['last_bar_time'] = t if last_bar_time is None else last_bar_time
+    props['last_bar_time'] = float(t if last_bar_time is None else last_bar_time)
 
     # Multi-period scheduled-grid tracker (lib._dg_*): one compare per bar,
     # the roll path runs at most once per trading day. It works in epoch seconds.
@@ -359,6 +360,9 @@ def _set_lib_syminfo_properties(syminfo: SymInfo):
     for slot_name in syminfo.__slots__:  # type: ignore
         value = getattr(syminfo, slot_name)
         if value is not None:
+            # A Pine int is a double at runtime (pricescale, minmove, ...)
+            if type(value) is int:
+                value = float(value)
             try:
                 setattr(lib.syminfo, slot_name, value)
             except AttributeError:
@@ -436,12 +440,12 @@ def _try_in_seconds(period: str | None) -> int | None:
     :param period: Period in TradingView notation, or ``None``.
     :return: The period in seconds, or ``None``.
     """
-    from ..lib.timeframe import in_seconds
+    from ..lib.timeframe import _in_seconds
 
     if not period:
         return None
     try:
-        return in_seconds(period)
+        return _in_seconds(period)
     except (ValueError, AssertionError):
         return None
 
@@ -503,7 +507,7 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
     import tempfile
     from .aggregator import aggregate_ohlcv
     from .datetime import parse_timezone
-    from ..lib.timeframe import in_seconds
+    from ..lib.timeframe import _in_seconds
 
     src = Path(data_path)
     toml_path = src.with_suffix('.toml')
@@ -511,7 +515,7 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
         # No syminfo metadata to drive the resample grid — keep the existing feed.
         return data_path
     try:
-        target_sec = in_seconds(target_tf)
+        target_sec = _in_seconds(target_tf)
     except (ValueError, AssertionError):
         return data_path
     si = SymInfo.load_toml(toml_path)
@@ -603,7 +607,7 @@ def _derives_from_chart_feed(symbol: str, timeframe: str, is_ltf: bool,
     if timeframe[-1] in 'DWMT':
         return False
     try:
-        return timeframe_lib.in_seconds(timeframe) >= timeframe_lib.in_seconds(chart_tf)
+        return timeframe_lib._in_seconds(timeframe) >= timeframe_lib._in_seconds(chart_tf)
     except (AssertionError, ValueError):
         return False
 
@@ -1307,6 +1311,9 @@ class ScriptRunner:
 
         # Set script data
         lib._script = self.script  # Store script object in lib
+        # The loader applied the script's bool na choice at import; a module imported
+        # earlier (another script ran since) needs it re-applied for this run
+        set_bool_na(self.script.na_bool)
 
         # Broker mode: refuse to start if the script needs capabilities the
         # exchange doesn't offer. Fail fast — never on the first bar.
@@ -1497,11 +1504,22 @@ class ScriptRunner:
                 root_keys.append(root_key)
                 bound_entries[id(entry_func)] = partial(
                     entry_func, instance_state.create_root(root_key, entry_layout))
-            run_main = bound_entries[id(main_func)]
+            na_bool = self.script.na_bool
+
+            def _in_bool_mode(entry: Callable[[], Any]) -> Callable[[], Any]:
+                # The bool na mode is process-wide: re-apply it on every entry
+                # (library mains included) so a script interleaved with another
+                # one's run keeps its own semantics
+                def run_entry():
+                    set_bool_na(na_bool)
+                    return entry()
+                return run_entry
+
+            run_main = _in_bool_mode(bound_entries[id(main_func)])
             # A library file run directly as the script registers its main as a
             # library entry too — run it once per bar, not twice
-            lib_mains = [bound_entries[id(f)] for _title, f in script._registered_libraries
-                         if id(f) != id(main_func)]
+            lib_mains = [_in_bool_mode(bound_entries[id(f)])
+                         for _title, f in script._registered_libraries if id(f) != id(main_func)]
 
             if sec_contexts:
                 import os
@@ -1756,8 +1774,8 @@ class ScriptRunner:
                     plain_ltf = False
                     if not same_tf and not sec_state.is_ltf:
                         from ..lib import timeframe as tf_module
-                        sec_seconds = tf_module.in_seconds(resolved_tf)
-                        chart_seconds = tf_module.in_seconds(current_chart_tf)
+                        sec_seconds = tf_module._in_seconds(resolved_tf)
+                        chart_seconds = tf_module._in_seconds(current_chart_tf)
                         plain_ltf = 0 < sec_seconds < chart_seconds
                     sec_state.plain_ltf = plain_ltf
                     sec_state.plain_ltf_span_ms = (

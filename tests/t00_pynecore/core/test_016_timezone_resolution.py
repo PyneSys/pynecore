@@ -92,6 +92,8 @@ def __test_time_session_in_and_out_unchanged__():
     chi = _REAL_ZONEINFO("America/Chicago")
     lib.syminfo.timezone = "America/New_York"
     lib._time = int(datetime(2025, 7, 1, 10, 0, tzinfo=chi).timestamp() * 1000)  # Tue RTH
-    assert not isinstance(lib.time("15", "0900-1600", "America/Chicago"), NA)
+    in_session = lib.time("15", "0900-1600", "America/Chicago")
+    assert in_session == in_session
     lib._time = int(datetime(2025, 7, 1, 3, 0, tzinfo=chi).timestamp() * 1000)  # pre-open
-    assert isinstance(lib.time("15", "0900-1600", "America/Chicago"), NA)
+    pre_open = lib.time("15", "0900-1600", "America/Chicago")
+    assert pre_open != pre_open  # na (a Pine int na is the native nan)

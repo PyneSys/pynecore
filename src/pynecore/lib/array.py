@@ -16,7 +16,8 @@ from ..utils.sequence_view import SequenceView
 # measured bit-exact and must stay that way.
 from ..core.pine_compare import EPSILON as _EPSILON, equal as _equal
 
-from ..types.na import NA, na_float
+from ..types.na import NA, na_float, na_int
+from ..types.pine_types import PyneInt
 from ..types.color import Color
 from ..types.box import Box
 from ..types.line import Line
@@ -192,7 +193,7 @@ def avg(id: list[Number]) -> float:
 
 
 # noinspection PyShadowingBuiltins
-def binary_search(id: list[Any], val: Any) -> int:
+def binary_search(id: list[Any], val: Any) -> PyneInt:
     """
     Returns the index of the specified value in the sorted array using binary search.
     If the value is not found, returns -1.
@@ -207,17 +208,17 @@ def binary_search(id: list[Any], val: Any) -> int:
     while low <= high:
         mid = (low + high) // 2
         if id[mid] == val:
-            return mid
+            return float(mid)
         else:
             if val < id[mid]:
                 high = mid - 1
             else:
                 low = mid + 1
-    return -1
+    return -1.0
 
 
 # noinspection PyShadowingBuiltins
-def binary_search_leftmost(id: list[Any], val: Any) -> int:
+def binary_search_leftmost(id: list[Any], val: Any) -> PyneInt:
     """
     Returns the index of the first occurrence of the value in the sorted array.
     If the value is not found, returns the index of the last element smaller than the
@@ -234,12 +235,12 @@ def binary_search_leftmost(id: list[Any], val: Any) -> int:
     # and a value below the whole array is clamped to 0 rather than returning -1.
     index = _bisect_left(id, val)
     if index < len(id) and id[index] == val:
-        return index
-    return index - 1 if index > 0 else 0
+        return float(index)
+    return float(index - 1 if index > 0 else 0)
 
 
 # noinspection PyShadowingBuiltins
-def binary_search_rightmost(id: list[Any], val: Any) -> int:
+def binary_search_rightmost(id: list[Any], val: Any) -> PyneInt:
     """
     Returns the index of the last occurrence of the value in the sorted array.
     If the value is not found, returns the index of the first element greater than the
@@ -256,8 +257,8 @@ def binary_search_rightmost(id: list[Any], val: Any) -> int:
     # greater element -- past the end for a value above the whole array.
     index = _bisect_right(id, val)
     if index > 0 and id[index - 1] == val:
-        return index - 1
-    return index
+        return float(index - 1)
+    return float(index)
 
 
 # noinspection PyShadowingBuiltins
@@ -346,7 +347,7 @@ def every(id: list[Any]) -> bool:
 
 # noinspection PyShadowingBuiltins
 def fill(id: list[T] | SequenceView[T], value: T,
-         index_from: int = 0, index_to: int | NA = NA(int)) -> None:
+         index_from: int = 0, index_to: int | NA = na_int) -> None:
     """
     Fills the elements in the array with the specified value.
 
@@ -468,7 +469,7 @@ def includes(id: list[T], value: T) -> bool:
 
 
 # noinspection PyShadowingBuiltins
-def indexof(id: list[T], value: T) -> int:
+def indexof(id: list[T], value: T) -> PyneInt:
     """
     Returns the index of the first occurrence of the specified value in the array.
 
@@ -481,8 +482,8 @@ def indexof(id: list[T], value: T) -> int:
     # Tolerance measured on TradingView (probes m548/m551)
     for i, item in enumerate(id):
         if _equal(item, value):
-            return i
-    return -1
+            return float(i)
+    return -1.0
 
 
 # noinspection PyShadowingBuiltins
@@ -547,7 +548,7 @@ def last(id: list[T]) -> T:
 
 
 # noinspection PyShadowingBuiltins
-def lastindexof(id: list[T], value: T) -> int:
+def lastindexof(id: list[T], value: T) -> PyneInt:
     """
     Returns the index of the last occurrence of the specified value in the array.
 
@@ -560,8 +561,8 @@ def lastindexof(id: list[T], value: T) -> int:
     # Tolerance measured on TradingView (probe m551)
     for i in builtins.range(len(id) - 1, -1, -1):
         if _equal(id[i], value):
-            return i
-    return -1
+            return float(i)
+    return -1.0
 
 
 # noinspection PyShadowingBuiltins
@@ -759,7 +760,7 @@ def new(size: int | NA = 0, initial_value: T = NA(T)) -> list[T]:
 
 
 # noinspection PyShadowingNames
-def new_bool(size: int | NA = 0, initial_value: bool = NA(bool)) -> list[bool]:
+def new_bool(size: int | NA = 0, initial_value: bool | None = None) -> list[bool]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -768,6 +769,9 @@ def new_bool(size: int | NA = 0, initial_value: bool = NA(bool)) -> list[bool]:
     :return: New array of the specified size
     """
     size = _na_size(size)
+    # The default is the bool na the script runs with (na or false), decided at call time
+    if initial_value is None:
+        initial_value = NA(bool)
     assert isinstance(initial_value, (bool, NA)), "Initial value must be bool!"
     return [initial_value] * size
 
@@ -803,7 +807,7 @@ def new_float(size: int | NA = 0, initial_value: float | int = na_float) -> list
 
 
 # noinspection PyShadowingNames
-def new_int(size: int | NA = 0, initial_value: int = NA(int)) -> list[int]:
+def new_int(size: int | NA = 0, initial_value: int = na_int) -> list[int]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -812,7 +816,10 @@ def new_int(size: int | NA = 0, initial_value: int = NA(int)) -> list[int]:
     :return: New array of the specified size
     """
     size = _na_size(size)
-    assert isinstance(initial_value, (int, NA)), "Initial value must be int!"
+    # No type assert on the value: an int-TYPED Pine expression may carry a
+    # fractional value (``14 / 8``), and TradingView stores it unchanged --
+    # ``array.get(array.new_int(1, 7 / 4), 0)`` is 1.75, not 1. Truncation
+    # belongs to the consuming slots, never to storage.
     return [initial_value] * size
 
 
@@ -1141,14 +1148,15 @@ def shift(id: list[T] | SequenceView[T]) -> T:
 
 
 # noinspection PyShadowingBuiltins
-def size(id: list[Any] | SequenceView[Any]) -> int:
+def size(id: list[Any] | SequenceView[Any]) -> PyneInt:
     """
     Returns the number of elements in the array.
 
     :param id: Input array
     :return: Number of elements in the array
     """
-    return len(id)
+    # A Pine int is a double at runtime
+    return float(len(id))
 
 
 # noinspection PyShadowingBuiltins

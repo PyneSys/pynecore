@@ -1,0 +1,9258 @@
+{
+ "classes": {
+  "Box": {
+   "bgcolor": "c",
+   "border_color": "c",
+   "border_style": "o:lib#LineEnum",
+   "border_width": "i",
+   "bottom": "f",
+   "extend": "o:lib#Extend",
+   "force_overlay": "b",
+   "left": "i",
+   "right": "i",
+   "text": "s",
+   "text_color": "c",
+   "text_font_family": "o:lib#FontFamilyEnum",
+   "text_formatting": "o:lib#FormatEnum",
+   "text_halign": "o:lib#AlignEnum",
+   "text_size": "o:lib#Size",
+   "text_valign": "o:lib#AlignEnum",
+   "text_wrap": "o:lib#WrapEnum",
+   "top": "f",
+   "vid": "i",
+   "xloc": "o:lib#XLoc"
+  },
+  "ChartPoint": {
+   "index": "i",
+   "price": "f",
+   "time": "i"
+  },
+  "HLine": {
+   "color": "c",
+   "display": "o:lib#Display",
+   "editable": "b",
+   "id": "s",
+   "linestyle": "o:lib#HLineEnum",
+   "linewidth": "i",
+   "price": "?",
+   "title": "s"
+  },
+  "Label": {
+   "color": "c",
+   "force_overlay": "b",
+   "size": "o:lib#Size",
+   "style": "o:lib#LabelStyleEnum",
+   "text": "s",
+   "text_font_family": "o:lib#FontFamilyEnum",
+   "text_formatting": "o:lib#FormatEnum",
+   "textalign": "o:lib#AlignEnum",
+   "textcolor": "c",
+   "tooltip": "s",
+   "vid": "i",
+   "x": "i",
+   "xloc": "o:lib#XLoc",
+   "y": "f",
+   "yloc": "o:lib#YLoc"
+  },
+  "Line": {
+   "color": "c",
+   "extend": "o:lib#Extend",
+   "force_overlay": "b",
+   "style": "o:lib#LineEnum",
+   "vid": "i",
+   "width": "i",
+   "x1": "i",
+   "x2": "i",
+   "xloc": "o:lib#XLoc",
+   "y1": "f",
+   "y2": "f"
+  },
+  "LineFill": {
+   "color": "c",
+   "line1": "o:lib#Line",
+   "line2": "o:lib#Line",
+   "vid": "i"
+  },
+  "Matrix": {
+   "data": "a:o"
+  },
+  "OHLCV": {
+   "close": "f",
+   "extra_fields": "o",
+   "high": "f",
+   "is_closed": "b",
+   "low": "f",
+   "open": "f",
+   "timestamp": "i",
+   "volume": "f"
+  },
+  "PlotMeta": {
+   "bordercolor": "c",
+   "char": "s",
+   "color": "c",
+   "colordown": "c",
+   "colorup": "c",
+   "display": "?",
+   "dynamic": "b",
+   "editable": "b",
+   "fillgaps": "b",
+   "force_overlay": "b",
+   "format": "s",
+   "histbase": "f",
+   "hline1": "s",
+   "hline2": "s",
+   "id": "s",
+   "join": "b",
+   "kind": "s",
+   "linestyle": "?",
+   "linewidth": "i",
+   "location": "?",
+   "maxheight": "i",
+   "minheight": "i",
+   "offset": "i",
+   "plot1": "s",
+   "plot2": "s",
+   "precision": "i",
+   "price": "f",
+   "show_last": "i",
+   "size": "?",
+   "style": "?",
+   "text": "s",
+   "textcolor": "c",
+   "title": "s",
+   "trackprice": "b",
+   "wickcolor": "c"
+  },
+  "Polyline": {
+   "closed": "b",
+   "curved": "b",
+   "fill_color": "c",
+   "force_overlay": "b",
+   "line_color": "c",
+   "line_style": "o:lib#LineEnum",
+   "line_width": "i",
+   "points": "a:o:lib#ChartPoint",
+   "vid": "i",
+   "xloc": "o:lib#XLoc"
+  },
+  "SessionInfo": {
+   "days": "?",
+   "end_time": "?",
+   "is_overnight": "b",
+   "start_time": "?",
+   "timezone": "s"
+  },
+  "Table": {
+   "bgcolor": "c",
+   "border_color": "c",
+   "border_width": "i",
+   "cells": "?",
+   "columns": "i",
+   "force_overlay": "b",
+   "frame_color": "c",
+   "frame_width": "i",
+   "position": "o:lib#Position",
+   "rows": "i",
+   "vid": "i"
+  },
+  "TableCell": {
+   "bgcolor": "c",
+   "height": "f",
+   "is_merged": "b",
+   "merge_end_col": "i",
+   "merge_end_row": "i",
+   "merge_start_col": "i",
+   "merge_start_row": "i",
+   "text": "s",
+   "text_color": "c",
+   "text_font_family": "o:lib#FontFamilyEnum",
+   "text_formatting": "o:lib#FormatEnum",
+   "text_halign": "o:lib#AlignEnum",
+   "text_size": "?",
+   "text_valign": "o:lib#AlignEnum",
+   "tooltip": "s",
+   "width": "f"
+  }
+ },
+ "names": {
+  "adjustment.dividends": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "adjustment.none": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "adjustment.splits": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "alert": {
+   "default_ty": [
+    "?"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "message",
+    "freq"
+   ],
+   "params": [
+    "s",
+    "o:lib#AlertEnum"
+   ],
+   "ret": "v"
+  },
+  "alert.alert": {
+   "default_ty": [
+    "?"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "message",
+    "freq"
+   ],
+   "params": [
+    "s",
+    "o:lib#AlertEnum"
+   ],
+   "ret": "v"
+  },
+  "alert.freq_all": {
+   "kind": "value",
+   "ty": "o:lib#AlertEnum"
+  },
+  "alert.freq_once_per_bar": {
+   "kind": "value",
+   "ty": "o:lib#AlertEnum"
+  },
+  "alert.freq_once_per_bar_close": {
+   "kind": "value",
+   "ty": "o:lib#AlertEnum"
+  },
+  "alertcondition": {
+   "defaults": 0,
+   "kind": "function",
+   "kwarg": true,
+   "names": [],
+   "params": [],
+   "ret": "v",
+   "vararg": "?"
+  },
+  "array.abs": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "a:f"
+   ],
+   "ret": "a:f"
+  },
+  "array.avg": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "f"
+  },
+  "array.binary_search": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "val"
+   ],
+   "params": [
+    "o",
+    "?"
+   ],
+   "ret": "i"
+  },
+  "array.binary_search_leftmost": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "val"
+   ],
+   "params": [
+    "o",
+    "?"
+   ],
+   "ret": "i"
+  },
+  "array.binary_search_rightmost": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "val"
+   ],
+   "params": [
+    "o",
+    "?"
+   ],
+   "ret": "i"
+  },
+  "array.clear": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "v"
+  },
+  "array.concat": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id1",
+    "id2"
+   ],
+   "params": [
+    "o",
+    "o"
+   ],
+   "ret": "o"
+  },
+  "array.copy": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "o"
+  },
+  "array.covariance": {
+   "default_ty": [
+    "b"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "id1",
+    "id2",
+    "biased"
+   ],
+   "params": [
+    "o",
+    "o",
+    "b"
+   ],
+   "ret": "f"
+  },
+  "array.every": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "b"
+  },
+  "array.fill": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "id",
+    "value",
+    "index_from",
+    "index_to"
+   ],
+   "params": [
+    "o",
+    "?",
+    "i",
+    "i"
+   ],
+   "ret": "v"
+  },
+  "array.first": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "?"
+  },
+  "array.from_items": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [],
+   "params": [],
+   "ret": "o",
+   "vararg": "?"
+  },
+  "array.get": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "index"
+   ],
+   "params": [
+    "o",
+    "i"
+   ],
+   "ret": "?"
+  },
+  "array.includes": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "value"
+   ],
+   "params": [
+    "o",
+    "?"
+   ],
+   "ret": "b"
+  },
+  "array.indexof": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "value"
+   ],
+   "params": [
+    "o",
+    "?"
+   ],
+   "ret": "i"
+  },
+  "array.insert": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "index",
+    "value"
+   ],
+   "params": [
+    "o",
+    "i",
+    "?"
+   ],
+   "ret": "v"
+  },
+  "array.join": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "separator"
+   ],
+   "params": [
+    "o",
+    "s"
+   ],
+   "ret": "s"
+  },
+  "array.last": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "?"
+  },
+  "array.lastindexof": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "value"
+   ],
+   "params": [
+    "o",
+    "?"
+   ],
+   "ret": "i"
+  },
+  "array.max": {
+   "default_ty": [
+    "i"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "id",
+    "nth"
+   ],
+   "params": [
+    "o",
+    "i"
+   ],
+   "ret": "?"
+  },
+  "array.median": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "f"
+  },
+  "array.min": {
+   "default_ty": [
+    "i"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "id",
+    "nth"
+   ],
+   "params": [
+    "o",
+    "i"
+   ],
+   "ret": "?"
+  },
+  "array.mode": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "?"
+  },
+  "array.new": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "size",
+    "initial_value"
+   ],
+   "params": [
+    "i",
+    "?"
+   ],
+   "ret": "o"
+  },
+  "array.new_bool": {
+   "default_none_ok": [
+    false,
+    true
+   ],
+   "default_ty": [
+    "i",
+    "0"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "size",
+    "initial_value"
+   ],
+   "params": [
+    "i",
+    "b"
+   ],
+   "ret": "a:b"
+  },
+  "array.new_box": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "size",
+    "initial_value"
+   ],
+   "params": [
+    "i",
+    "o:lib#Box"
+   ],
+   "ret": "a:o:lib#Box"
+  },
+  "array.new_color": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "size",
+    "initial_value"
+   ],
+   "params": [
+    "i",
+    "c"
+   ],
+   "ret": "a:c"
+  },
+  "array.new_float": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "size",
+    "initial_value"
+   ],
+   "params": [
+    "i",
+    "f"
+   ],
+   "ret": "a:f"
+  },
+  "array.new_int": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "size",
+    "initial_value"
+   ],
+   "params": [
+    "i",
+    "i"
+   ],
+   "ret": "a:i"
+  },
+  "array.new_label": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "size",
+    "initial_value"
+   ],
+   "params": [
+    "i",
+    "o:lib#Label"
+   ],
+   "ret": "a:o:lib#Label"
+  },
+  "array.new_line": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "size",
+    "initial_value"
+   ],
+   "params": [
+    "i",
+    "o:lib#Line"
+   ],
+   "ret": "a:o:lib#Line"
+  },
+  "array.new_linefill": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "size",
+    "initial_value"
+   ],
+   "params": [
+    "i",
+    "o:lib#LineFill"
+   ],
+   "ret": "a:o:lib#LineFill"
+  },
+  "array.new_string": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "size",
+    "initial_value"
+   ],
+   "params": [
+    "i",
+    "s"
+   ],
+   "ret": "a:s"
+  },
+  "array.new_table": {
+   "default_ty": [
+    "i",
+    "?"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "size",
+    "initial_value"
+   ],
+   "params": [
+    "i",
+    "o:lib#Table"
+   ],
+   "ret": "a:o:lib#Table"
+  },
+  "array.percentile_linear_interpolation": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "percentage"
+   ],
+   "params": [
+    "a:f",
+    "f"
+   ],
+   "ret": "f"
+  },
+  "array.percentile_nearest_rank": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "percentage"
+   ],
+   "params": [
+    "a:f",
+    "f"
+   ],
+   "ret": "f"
+  },
+  "array.percentrank": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "index"
+   ],
+   "params": [
+    "o",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "array.pop": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "?"
+  },
+  "array.push": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "value"
+   ],
+   "params": [
+    "o",
+    "?"
+   ],
+   "ret": "v"
+  },
+  "array.range": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "?"
+  },
+  "array.remove": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "index"
+   ],
+   "params": [
+    "o",
+    "i"
+   ],
+   "ret": "?"
+  },
+  "array.reverse": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "v"
+  },
+  "array.set": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "index",
+    "value"
+   ],
+   "params": [
+    "o",
+    "i",
+    "?"
+   ],
+   "ret": "v"
+  },
+  "array.shift": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "?"
+  },
+  "array.size": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "i"
+  },
+  "array.slice": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "index_from",
+    "index_to"
+   ],
+   "params": [
+    "o",
+    "i",
+    "i"
+   ],
+   "ret": "o"
+  },
+  "array.some": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "b"
+  },
+  "array.sort": {
+   "default_ty": [
+    "?"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "id",
+    "order"
+   ],
+   "params": [
+    "o",
+    "?"
+   ],
+   "ret": "v"
+  },
+  "array.sort_indices": {
+   "default_ty": [
+    "?"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "id",
+    "order"
+   ],
+   "params": [
+    "o",
+    "?"
+   ],
+   "ret": "a:i"
+  },
+  "array.standardize": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "a:f"
+   ],
+   "ret": "a:f"
+  },
+  "array.stdev": {
+   "default_ty": [
+    "b"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "id",
+    "biased"
+   ],
+   "params": [
+    "o",
+    "b"
+   ],
+   "ret": "f"
+  },
+  "array.sum": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "a:f"
+   ],
+   "ret": "f"
+  },
+  "array.unshift": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "value"
+   ],
+   "params": [
+    "o",
+    "?"
+   ],
+   "ret": "v"
+  },
+  "array.variance": {
+   "default_ty": [
+    "b"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "id",
+    "biased"
+   ],
+   "params": [
+    "o",
+    "b"
+   ],
+   "ret": "f"
+  },
+  "ask": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "bar_index": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "barcolor": {
+   "default_none_ok": [
+    true,
+    false,
+    false,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "i",
+    "b",
+    "0",
+    "0",
+    "0"
+   ],
+   "defaults": 6,
+   "kind": "function",
+   "names": [
+    "color",
+    "offset",
+    "editable",
+    "show_last",
+    "title",
+    "display"
+   ],
+   "params": [
+    "?",
+    "i",
+    "b",
+    "i",
+    "s",
+    "?"
+   ],
+   "ret": "v"
+  },
+  "barmerge.gaps_off": {
+   "kind": "value",
+   "ty": "o:lib#BarMerge"
+  },
+  "barmerge.gaps_on": {
+   "kind": "value",
+   "ty": "o:lib#BarMerge"
+  },
+  "barmerge.lookahead_last_closed": {
+   "kind": "value",
+   "ty": "o:lib#BarMerge"
+  },
+  "barmerge.lookahead_off": {
+   "kind": "value",
+   "ty": "o:lib#BarMerge"
+  },
+  "barmerge.lookahead_on": {
+   "kind": "value",
+   "ty": "o:lib#BarMerge"
+  },
+  "barstate.isconfirmed": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "barstate.isfirst": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "barstate.ishistory": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "barstate.islast": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "barstate.islastconfirmedhistory": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "barstate.isnew": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "barstate.isrealtime": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "bgcolor": {
+   "default_none_ok": [
+    true,
+    false,
+    false,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "i",
+    "b",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
+   "defaults": 7,
+   "kind": "function",
+   "names": [
+    "color",
+    "offset",
+    "editable",
+    "show_last",
+    "title",
+    "display",
+    "force_overlay"
+   ],
+   "params": [
+    "?",
+    "i",
+    "b",
+    "i",
+    "s",
+    "?",
+    "b"
+   ],
+   "ret": "v"
+  },
+  "bid": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "box.all": {
+   "callable": true,
+   "kind": "value",
+   "ty": "a:o:lib#Box"
+  },
+  "box.copy": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "?"
+  },
+  "box.delete": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "v"
+  },
+  "box.get_bottom": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Box"
+   ],
+   "ret": "f"
+  },
+  "box.get_left": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Box"
+   ],
+   "ret": "i"
+  },
+  "box.get_right": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Box"
+   ],
+   "ret": "i"
+  },
+  "box.get_top": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Box"
+   ],
+   "ret": "f"
+  },
+  "box.new": {
+   "impls": [
+    {
+     "default_ty": [
+      "?",
+      "i",
+      "?",
+      "?",
+      "?",
+      "?",
+      "s",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "b",
+      "?"
+     ],
+     "defaults": 15,
+     "names": [
+      "top_left",
+      "bottom_right",
+      "border_color",
+      "border_width",
+      "border_style",
+      "extend",
+      "xloc",
+      "bgcolor",
+      "text",
+      "text_size",
+      "text_color",
+      "text_halign",
+      "text_valign",
+      "text_wrap",
+      "text_font_family",
+      "force_overlay",
+      "text_formatting"
+     ],
+     "params": [
+      "o:lib#ChartPoint",
+      "o:lib#ChartPoint",
+      "c",
+      "i",
+      "?",
+      "o:lib#Extend",
+      "?",
+      "c",
+      "s",
+      "o:lib#Size",
+      "c",
+      "o:lib#AlignEnum",
+      "o:lib#AlignEnum",
+      "?",
+      "o:lib#FontFamilyEnum",
+      "b",
+      "o:lib#FormatEnum"
+     ],
+     "ret": "o:lib#Box"
+    },
+    {
+     "default_ty": [
+      "?",
+      "i",
+      "?",
+      "?",
+      "?",
+      "?",
+      "s",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "b",
+      "?"
+     ],
+     "defaults": 15,
+     "names": [
+      "left",
+      "top",
+      "right",
+      "bottom",
+      "border_color",
+      "border_width",
+      "border_style",
+      "extend",
+      "xloc",
+      "bgcolor",
+      "text",
+      "text_size",
+      "text_color",
+      "text_halign",
+      "text_valign",
+      "text_wrap",
+      "text_font_family",
+      "force_overlay",
+      "text_formatting"
+     ],
+     "params": [
+      "f",
+      "f",
+      "f",
+      "f",
+      "c",
+      "i",
+      "?",
+      "o:lib#Extend",
+      "?",
+      "c",
+      "s",
+      "o:lib#Size",
+      "c",
+      "o:lib#AlignEnum",
+      "o:lib#AlignEnum",
+      "?",
+      "o:lib#FontFamilyEnum",
+      "b",
+      "o:lib#FormatEnum"
+     ],
+     "ret": "o:lib#Box"
+    }
+   ],
+   "kind": "overloads"
+  },
+  "box.set_bgcolor": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "color"
+   ],
+   "params": [
+    "o:lib#Box",
+    "c"
+   ],
+   "ret": "v"
+  },
+  "box.set_border_color": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "color"
+   ],
+   "params": [
+    "o:lib#Box",
+    "c"
+   ],
+   "ret": "v"
+  },
+  "box.set_border_style": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "style"
+   ],
+   "params": [
+    "o:lib#Box",
+    "?"
+   ],
+   "ret": "v"
+  },
+  "box.set_border_width": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "width"
+   ],
+   "params": [
+    "o:lib#Box",
+    "i"
+   ],
+   "ret": "v"
+  },
+  "box.set_bottom": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "bottom"
+   ],
+   "params": [
+    "o:lib#Box",
+    "f"
+   ],
+   "ret": "v"
+  },
+  "box.set_bottom_right_point": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "point"
+   ],
+   "params": [
+    "o:lib#Box",
+    "o:lib#ChartPoint"
+   ],
+   "ret": "v"
+  },
+  "box.set_extend": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "extend"
+   ],
+   "params": [
+    "o:lib#Box",
+    "o:lib#Extend"
+   ],
+   "ret": "v"
+  },
+  "box.set_left": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "left"
+   ],
+   "params": [
+    "o:lib#Box",
+    "i"
+   ],
+   "ret": "v"
+  },
+  "box.set_lefttop": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "left",
+    "top"
+   ],
+   "params": [
+    "o:lib#Box",
+    "i",
+    "f"
+   ],
+   "ret": "v"
+  },
+  "box.set_right": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "right"
+   ],
+   "params": [
+    "o:lib#Box",
+    "i"
+   ],
+   "ret": "v"
+  },
+  "box.set_rightbottom": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "right",
+    "bottom"
+   ],
+   "params": [
+    "o:lib#Box",
+    "i",
+    "f"
+   ],
+   "ret": "v"
+  },
+  "box.set_text": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "text"
+   ],
+   "params": [
+    "o:lib#Box",
+    "s"
+   ],
+   "ret": "v"
+  },
+  "box.set_text_color": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "text_color"
+   ],
+   "params": [
+    "o:lib#Box",
+    "c"
+   ],
+   "ret": "v"
+  },
+  "box.set_text_font_family": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "text_font_family"
+   ],
+   "params": [
+    "o:lib#Box",
+    "o:lib#FontFamilyEnum"
+   ],
+   "ret": "v"
+  },
+  "box.set_text_formatting": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "text_formatting"
+   ],
+   "params": [
+    "o:lib#Box",
+    "o:lib#FormatEnum"
+   ],
+   "ret": "v"
+  },
+  "box.set_text_halign": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "text_halign"
+   ],
+   "params": [
+    "o:lib#Box",
+    "o:lib#AlignEnum"
+   ],
+   "ret": "v"
+  },
+  "box.set_text_size": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "text_size"
+   ],
+   "params": [
+    "o:lib#Box",
+    "o:lib#Size"
+   ],
+   "ret": "v"
+  },
+  "box.set_text_valign": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "text_valign"
+   ],
+   "params": [
+    "o:lib#Box",
+    "o:lib#AlignEnum"
+   ],
+   "ret": "v"
+  },
+  "box.set_text_wrap": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "text_wrap"
+   ],
+   "params": [
+    "o:lib#Box",
+    "?"
+   ],
+   "ret": "v"
+  },
+  "box.set_top": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "top"
+   ],
+   "params": [
+    "o:lib#Box",
+    "f"
+   ],
+   "ret": "v"
+  },
+  "box.set_top_left_point": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "point"
+   ],
+   "params": [
+    "o:lib#Box",
+    "o:lib#ChartPoint"
+   ],
+   "ret": "v"
+  },
+  "box.set_xloc": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "left",
+    "right",
+    "xloc"
+   ],
+   "params": [
+    "o:lib#Box",
+    "i",
+    "i",
+    "?"
+   ],
+   "ret": "v"
+  },
+  "chart.bg_color": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "chart.fg_color": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "chart.is_heikinashi": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "chart.is_kagi": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "chart.is_linebreak": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "chart.is_pnf": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "chart.is_range": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "chart.is_renko": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "chart.is_standard": {
+   "kind": "value",
+   "ty": "b"
+  },
+  "chart.left_visible_bar_time": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "chart.point": {
+   "kind": "value",
+   "ty": "o:lib#_ChartPoint"
+  },
+  "chart.point.copy": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#ChartPoint"
+   ],
+   "ret": "o:lib#ChartPoint"
+  },
+  "chart.point.from_index": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "index",
+    "price"
+   ],
+   "params": [
+    "i",
+    "f"
+   ],
+   "ret": "o:lib#ChartPoint"
+  },
+  "chart.point.from_time": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "time",
+    "price"
+   ],
+   "params": [
+    "i",
+    "f"
+   ],
+   "ret": "o:lib#ChartPoint"
+  },
+  "chart.point.new": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "time",
+    "index",
+    "price"
+   ],
+   "params": [
+    "i",
+    "i",
+    "f"
+   ],
+   "ret": "o:lib#ChartPoint"
+  },
+  "chart.point.now": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "price"
+   ],
+   "params": [
+    "f"
+   ],
+   "ret": "o:lib#ChartPoint"
+  },
+  "chart.right_visible_bar_time": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "close": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "color.aqua": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.b": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "color"
+   ],
+   "params": [
+    "c"
+   ],
+   "ret": "i"
+  },
+  "color.black": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.blue": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.from_gradient": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "value",
+    "bottom_value",
+    "top_value",
+    "bottom_color",
+    "top_color"
+   ],
+   "params": [
+    "f",
+    "f",
+    "f",
+    "c",
+    "c"
+   ],
+   "ret": "c"
+  },
+  "color.fuchsia": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.g": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "color"
+   ],
+   "params": [
+    "c"
+   ],
+   "ret": "i"
+  },
+  "color.gray": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.green": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.lime": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.maroon": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.navy": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.new": {
+   "default_ty": [
+    "i"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "color",
+    "transp"
+   ],
+   "params": [
+    "?",
+    "f"
+   ],
+   "ret": "c"
+  },
+  "color.olive": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.orange": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.purple": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.r": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "color"
+   ],
+   "params": [
+    "c"
+   ],
+   "ret": "i"
+  },
+  "color.red": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.rgb": {
+   "default_ty": [
+    "i"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "red",
+    "green",
+    "blue",
+    "transp"
+   ],
+   "params": [
+    "f",
+    "f",
+    "f",
+    "f"
+   ],
+   "ret": "c"
+  },
+  "color.silver": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.t": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "color"
+   ],
+   "params": [
+    "c"
+   ],
+   "ret": "f"
+  },
+  "color.teal": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.white": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "color.yellow": {
+   "kind": "value",
+   "ty": "c"
+  },
+  "currency.AED": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.ARS": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.AUD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.BDT": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.BHD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.BRL": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.BTC": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.CAD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.CHF": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.CLP": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.CNY": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.COP": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.CZK": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.DKK": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.EGP": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.ETH": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.EUR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.GBP": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.HKD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.HUF": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.IDR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.ILS": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.INR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.ISK": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.JPY": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.KES": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.KRW": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.KWD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.LKR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.MAD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.MXN": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.MYR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.NGN": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.NOK": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.NONE": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.NZD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.PEN": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.PHP": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.PKR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.PLN": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.QAR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.RON": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.RSD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.RUB": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.SAR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.SEK": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.SGD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.THB": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.TND": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.TRY": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.TWD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.USD": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.USDT": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.VES": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.VND": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "currency.ZAR": {
+   "kind": "value",
+   "ty": "o:lib#Currency"
+  },
+  "dayofmonth": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "dayofweek": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "dayofweek.dayofweek": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "dayofweek.friday": {
+   "kind": "value",
+   "ty": "o:lib#DayOfWeek"
+  },
+  "dayofweek.monday": {
+   "kind": "value",
+   "ty": "o:lib#DayOfWeek"
+  },
+  "dayofweek.saturday": {
+   "kind": "value",
+   "ty": "o:lib#DayOfWeek"
+  },
+  "dayofweek.sunday": {
+   "kind": "value",
+   "ty": "o:lib#DayOfWeek"
+  },
+  "dayofweek.thursday": {
+   "kind": "value",
+   "ty": "o:lib#DayOfWeek"
+  },
+  "dayofweek.tuesday": {
+   "kind": "value",
+   "ty": "o:lib#DayOfWeek"
+  },
+  "dayofweek.wednesday": {
+   "kind": "value",
+   "ty": "o:lib#DayOfWeek"
+  },
+  "display.all": {
+   "kind": "value",
+   "ty": "o:lib#Display"
+  },
+  "display.data_window": {
+   "kind": "value",
+   "ty": "o:lib#Display"
+  },
+  "display.none": {
+   "kind": "value",
+   "ty": "o:lib#Display"
+  },
+  "display.pane": {
+   "kind": "value",
+   "ty": "o:lib#Display"
+  },
+  "display.price_scale": {
+   "kind": "value",
+   "ty": "o:lib#Display"
+  },
+  "display.status_line": {
+   "kind": "value",
+   "ty": "o:lib#Display"
+  },
+  "dividends.gross": {
+   "kind": "value",
+   "ty": "o:lib#Dividends"
+  },
+  "dividends.net": {
+   "kind": "value",
+   "ty": "o:lib#Dividends"
+  },
+  "earnings.actual": {
+   "kind": "value",
+   "ty": "o:lib#Earnings"
+  },
+  "earnings.estimate": {
+   "kind": "value",
+   "ty": "o:lib#Earnings"
+  },
+  "earnings.future_period_end_time": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "earnings.future_time": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "earnings.standardized": {
+   "kind": "value",
+   "ty": "o:lib#Earnings"
+  },
+  "extend.both": {
+   "kind": "value",
+   "ty": "o:lib#Extend"
+  },
+  "extend.left": {
+   "kind": "value",
+   "ty": "o:lib#Extend"
+  },
+  "extend.none": {
+   "kind": "value",
+   "ty": "o:lib#Extend"
+  },
+  "extend.right": {
+   "kind": "value",
+   "ty": "o:lib#Extend"
+  },
+  "extra_fields": {
+   "kind": "value",
+   "ty": "o"
+  },
+  "fill": {
+   "defaults": 0,
+   "kind": "function",
+   "kwarg": true,
+   "names": [],
+   "params": [],
+   "ret": "v",
+   "vararg": "?"
+  },
+  "fixnan": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "?"
+  },
+  "font.family_default": {
+   "kind": "value",
+   "ty": "o:lib#FontFamilyEnum"
+  },
+  "font.family_monospace": {
+   "kind": "value",
+   "ty": "o:lib#FontFamilyEnum"
+  },
+  "footprint.buy_volume": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Footprint"
+   ],
+   "ret": "f"
+  },
+  "footprint.delta": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Footprint"
+   ],
+   "ret": "f"
+  },
+  "footprint.poc": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Footprint"
+   ],
+   "ret": "o:lib#VolumeRow"
+  },
+  "footprint.sell_volume": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Footprint"
+   ],
+   "ret": "f"
+  },
+  "footprint.total_volume": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Footprint"
+   ],
+   "ret": "f"
+  },
+  "footprint.vah": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Footprint"
+   ],
+   "ret": "o:lib#VolumeRow"
+  },
+  "footprint.val": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Footprint"
+   ],
+   "ret": "o:lib#VolumeRow"
+  },
+  "format.inherit": {
+   "kind": "value",
+   "ty": "o:lib#Format"
+  },
+  "format.mintick": {
+   "kind": "value",
+   "ty": "o:lib#Format"
+  },
+  "format.percent": {
+   "kind": "value",
+   "ty": "o:lib#Format"
+  },
+  "format.price": {
+   "kind": "value",
+   "ty": "o:lib#Format"
+  },
+  "format.volume": {
+   "kind": "value",
+   "ty": "o:lib#Format"
+  },
+  "high": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "hl2": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "hlc3": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "hlcc4": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "hline": {
+   "default_ty": [
+    "s",
+    "?",
+    "?",
+    "i",
+    "b",
+    "?"
+   ],
+   "defaults": 6,
+   "kind": "function",
+   "names": [
+    "price",
+    "title",
+    "color",
+    "linestyle",
+    "linewidth",
+    "editable",
+    "display"
+   ],
+   "params": [
+    "f",
+    "s",
+    "c",
+    "o:lib#HLineEnum",
+    "i",
+    "b",
+    "?"
+   ],
+   "ret": "o:lib#HLine"
+  },
+  "hline.hline": {
+   "default_ty": [
+    "s",
+    "?",
+    "?",
+    "i",
+    "b",
+    "?"
+   ],
+   "defaults": 6,
+   "kind": "function",
+   "names": [
+    "price",
+    "title",
+    "color",
+    "linestyle",
+    "linewidth",
+    "editable",
+    "display"
+   ],
+   "params": [
+    "f",
+    "s",
+    "c",
+    "o:lib#HLineEnum",
+    "i",
+    "b",
+    "?"
+   ],
+   "ret": "o:lib#HLine"
+  },
+  "hline.style_dashed": {
+   "kind": "value",
+   "ty": "o:lib#HLineEnum"
+  },
+  "hline.style_dotted": {
+   "kind": "value",
+   "ty": "o:lib#HLineEnum"
+  },
+  "hline.style_solid": {
+   "kind": "value",
+   "ty": "o:lib#HLineEnum"
+  },
+  "hour": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "is_na": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "x"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "b"
+  },
+  "label.all": {
+   "callable": true,
+   "kind": "value",
+   "ty": "a:o:lib#Label"
+  },
+  "label.copy": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "?"
+  },
+  "label.delete": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "v"
+  },
+  "label.get_text": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Label"
+   ],
+   "ret": "s"
+  },
+  "label.get_x": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Label"
+   ],
+   "ret": "i"
+  },
+  "label.get_y": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Label"
+   ],
+   "ret": "f"
+  },
+  "label.new": {
+   "impls": [
+    {
+     "default_ty": [
+      "s",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "s",
+      "?",
+      "b",
+      "?"
+     ],
+     "defaults": 12,
+     "names": [
+      "point",
+      "text",
+      "xloc",
+      "yloc",
+      "color",
+      "style",
+      "textcolor",
+      "size",
+      "textalign",
+      "tooltip",
+      "text_font_family",
+      "force_overlay",
+      "text_formatting"
+     ],
+     "params": [
+      "o:lib#ChartPoint",
+      "s",
+      "?",
+      "?",
+      "c",
+      "o:lib#LabelStyleEnum",
+      "c",
+      "o:lib#Size",
+      "o:lib#AlignEnum",
+      "s",
+      "o:lib#FontFamilyEnum",
+      "b",
+      "o:lib#FormatEnum"
+     ],
+     "ret": "o:lib#Label"
+    },
+    {
+     "default_ty": [
+      "s",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "s",
+      "?",
+      "b",
+      "?"
+     ],
+     "defaults": 12,
+     "names": [
+      "x",
+      "y",
+      "text",
+      "xloc",
+      "yloc",
+      "color",
+      "style",
+      "textcolor",
+      "size",
+      "textalign",
+      "tooltip",
+      "text_font_family",
+      "force_overlay",
+      "text_formatting"
+     ],
+     "params": [
+      "f",
+      "f",
+      "s",
+      "?",
+      "?",
+      "c",
+      "o:lib#LabelStyleEnum",
+      "c",
+      "o:lib#Size",
+      "o:lib#AlignEnum",
+      "s",
+      "o:lib#FontFamilyEnum",
+      "b",
+      "o:lib#FormatEnum"
+     ],
+     "ret": "o:lib#Label"
+    }
+   ],
+   "kind": "overloads"
+  },
+  "label.set_color": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "color"
+   ],
+   "params": [
+    "o:lib#Label",
+    "c"
+   ],
+   "ret": "v"
+  },
+  "label.set_point": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "point"
+   ],
+   "params": [
+    "o:lib#Label",
+    "o:lib#ChartPoint"
+   ],
+   "ret": "v"
+  },
+  "label.set_size": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "size"
+   ],
+   "params": [
+    "o:lib#Label",
+    "o:lib#Size"
+   ],
+   "ret": "v"
+  },
+  "label.set_style": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "style"
+   ],
+   "params": [
+    "o:lib#Label",
+    "o:lib#LabelStyleEnum"
+   ],
+   "ret": "v"
+  },
+  "label.set_text": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "text"
+   ],
+   "params": [
+    "o:lib#Label",
+    "s"
+   ],
+   "ret": "v"
+  },
+  "label.set_text_font_family": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "text_font_family"
+   ],
+   "params": [
+    "o:lib#Label",
+    "o:lib#FontFamilyEnum"
+   ],
+   "ret": "v"
+  },
+  "label.set_text_formatting": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "text_formatting"
+   ],
+   "params": [
+    "o:lib#Label",
+    "o:lib#FormatEnum"
+   ],
+   "ret": "v"
+  },
+  "label.set_textalign": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "textalign"
+   ],
+   "params": [
+    "o:lib#Label",
+    "o:lib#AlignEnum"
+   ],
+   "ret": "v"
+  },
+  "label.set_textcolor": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "textcolor"
+   ],
+   "params": [
+    "o:lib#Label",
+    "c"
+   ],
+   "ret": "v"
+  },
+  "label.set_tooltip": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "tooltip"
+   ],
+   "params": [
+    "o:lib#Label",
+    "s"
+   ],
+   "ret": "v"
+  },
+  "label.set_x": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "x"
+   ],
+   "params": [
+    "o:lib#Label",
+    "i"
+   ],
+   "ret": "v"
+  },
+  "label.set_xloc": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "x",
+    "xloc"
+   ],
+   "params": [
+    "o:lib#Label",
+    "i",
+    "?"
+   ],
+   "ret": "v"
+  },
+  "label.set_xy": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "x",
+    "y"
+   ],
+   "params": [
+    "o:lib#Label",
+    "i",
+    "f"
+   ],
+   "ret": "v"
+  },
+  "label.set_y": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "y"
+   ],
+   "params": [
+    "o:lib#Label",
+    "f"
+   ],
+   "ret": "v"
+  },
+  "label.set_yloc": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "yloc"
+   ],
+   "params": [
+    "o:lib#Label",
+    "?"
+   ],
+   "ret": "v"
+  },
+  "label.style_arrowdown": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_arrowup": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_circle": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_cross": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_diamond": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_flag": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_center": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_down": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_left": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_lower_left": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_lower_right": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_right": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_up": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_upper_left": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_label_upper_right": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_none": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_square": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_text_outline": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_triangledown": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_triangleup": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "label.style_xcross": {
+   "kind": "value",
+   "ty": "o:lib#LabelStyleEnum"
+  },
+  "last_bar_index": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "last_bar_time": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "line.all": {
+   "callable": true,
+   "kind": "value",
+   "ty": "a:o:lib#Line"
+  },
+  "line.copy": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "?"
+  },
+  "line.delete": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "v"
+  },
+  "line.get_price": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "x"
+   ],
+   "params": [
+    "o:lib#Line",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "line.get_x1": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Line"
+   ],
+   "ret": "i"
+  },
+  "line.get_x2": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Line"
+   ],
+   "ret": "i"
+  },
+  "line.get_y1": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Line"
+   ],
+   "ret": "f"
+  },
+  "line.get_y2": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Line"
+   ],
+   "ret": "f"
+  },
+  "line.new": {
+   "impls": [
+    {
+     "default_ty": [
+      "?",
+      "?",
+      "?",
+      "?",
+      "i",
+      "b"
+     ],
+     "defaults": 6,
+     "names": [
+      "first_point",
+      "second_point",
+      "xloc",
+      "extend",
+      "color",
+      "style",
+      "width",
+      "force_overlay"
+     ],
+     "params": [
+      "o:lib#ChartPoint",
+      "o:lib#ChartPoint",
+      "?",
+      "o:lib#Extend",
+      "c",
+      "o:lib#LineEnum",
+      "i",
+      "b"
+     ],
+     "ret": "o:lib#Line"
+    },
+    {
+     "default_ty": [
+      "?",
+      "?",
+      "?",
+      "?",
+      "i",
+      "b"
+     ],
+     "defaults": 6,
+     "names": [
+      "x1",
+      "y1",
+      "x2",
+      "y2",
+      "xloc",
+      "extend",
+      "color",
+      "style",
+      "width",
+      "force_overlay"
+     ],
+     "params": [
+      "f",
+      "f",
+      "f",
+      "f",
+      "?",
+      "o:lib#Extend",
+      "c",
+      "o:lib#LineEnum",
+      "i",
+      "b"
+     ],
+     "ret": "o:lib#Line"
+    }
+   ],
+   "kind": "overloads"
+  },
+  "line.set_color": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "color"
+   ],
+   "params": [
+    "o:lib#Line",
+    "c"
+   ],
+   "ret": "v"
+  },
+  "line.set_extend": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "extend"
+   ],
+   "params": [
+    "o:lib#Line",
+    "o:lib#Extend"
+   ],
+   "ret": "v"
+  },
+  "line.set_first_point": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "point"
+   ],
+   "params": [
+    "o:lib#Line",
+    "o:lib#ChartPoint"
+   ],
+   "ret": "v"
+  },
+  "line.set_second_point": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "point"
+   ],
+   "params": [
+    "o:lib#Line",
+    "o:lib#ChartPoint"
+   ],
+   "ret": "v"
+  },
+  "line.set_style": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "style"
+   ],
+   "params": [
+    "o:lib#Line",
+    "o:lib#LineEnum"
+   ],
+   "ret": "v"
+  },
+  "line.set_width": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "width"
+   ],
+   "params": [
+    "o:lib#Line",
+    "i"
+   ],
+   "ret": "v"
+  },
+  "line.set_x1": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "x"
+   ],
+   "params": [
+    "o:lib#Line",
+    "i"
+   ],
+   "ret": "v"
+  },
+  "line.set_x2": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "x"
+   ],
+   "params": [
+    "o:lib#Line",
+    "i"
+   ],
+   "ret": "v"
+  },
+  "line.set_xloc": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "x1",
+    "x2",
+    "xloc"
+   ],
+   "params": [
+    "o:lib#Line",
+    "i",
+    "i",
+    "?"
+   ],
+   "ret": "v"
+  },
+  "line.set_xy1": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "x",
+    "y"
+   ],
+   "params": [
+    "o:lib#Line",
+    "i",
+    "f"
+   ],
+   "ret": "v"
+  },
+  "line.set_xy2": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "x",
+    "y"
+   ],
+   "params": [
+    "o:lib#Line",
+    "i",
+    "f"
+   ],
+   "ret": "v"
+  },
+  "line.set_y1": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "y"
+   ],
+   "params": [
+    "o:lib#Line",
+    "f"
+   ],
+   "ret": "v"
+  },
+  "line.set_y2": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "y"
+   ],
+   "params": [
+    "o:lib#Line",
+    "f"
+   ],
+   "ret": "v"
+  },
+  "line.style_arrow_both": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "line.style_arrow_left": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "line.style_arrow_right": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "line.style_dashed": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "line.style_dotted": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "line.style_solid": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "linefill.all": {
+   "callable": true,
+   "kind": "value",
+   "ty": "a:o:lib#LineFill"
+  },
+  "linefill.delete": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#LineFill"
+   ],
+   "ret": "v"
+  },
+  "linefill.get_line1": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#LineFill"
+   ],
+   "ret": "o:lib#Line"
+  },
+  "linefill.get_line2": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#LineFill"
+   ],
+   "ret": "o:lib#Line"
+  },
+  "linefill.new": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "line1",
+    "line2",
+    "color"
+   ],
+   "params": [
+    "o:lib#Line",
+    "o:lib#Line",
+    "c"
+   ],
+   "ret": "o:lib#LineFill"
+  },
+  "linefill.set_color": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "color"
+   ],
+   "params": [
+    "o:lib#LineFill",
+    "c"
+   ],
+   "ret": "v"
+  },
+  "location.abovebar": {
+   "kind": "value",
+   "ty": "o:lib#Location"
+  },
+  "location.absolute": {
+   "kind": "value",
+   "ty": "o:lib#Location"
+  },
+  "location.belowbar": {
+   "kind": "value",
+   "ty": "o:lib#Location"
+  },
+  "location.bottom": {
+   "kind": "value",
+   "ty": "o:lib#Location"
+  },
+  "location.top": {
+   "kind": "value",
+   "ty": "o:lib#Location"
+  },
+  "log.DURABLE_LOG_WIDTH": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "log.broker_debug": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "message"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "v",
+   "vararg": "?"
+  },
+  "log.broker_error": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "message"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "v",
+   "vararg": "?"
+  },
+  "log.broker_info": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "message"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "v",
+   "vararg": "?"
+  },
+  "log.broker_warning": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "message"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "v",
+   "vararg": "?"
+  },
+  "log.error": {
+   "defaults": 0,
+   "kind": "function",
+   "kwarg": true,
+   "names": [
+    "formatString"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "v",
+   "vararg": "?"
+  },
+  "log.handler": {
+   "kind": "value",
+   "ty": "o:lib#PineRichHandler"
+  },
+  "log.info": {
+   "defaults": 0,
+   "kind": "function",
+   "kwarg": true,
+   "names": [
+    "formatString"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "v",
+   "vararg": "?"
+  },
+  "log.ohlcv_info": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "message"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "v",
+   "vararg": "?"
+  },
+  "log.setup_security_file_log": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "log_path",
+    "context_label"
+   ],
+   "params": [
+    "s",
+    "s"
+   ],
+   "ret": "v"
+  },
+  "log.sim_info": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "message"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "v",
+   "vararg": "?"
+  },
+  "log.warning": {
+   "defaults": 0,
+   "kind": "function",
+   "kwarg": true,
+   "names": [
+    "formatString"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "v",
+   "vararg": "?"
+  },
+  "low": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "map.clear": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "v"
+  },
+  "map.contains": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "key"
+   ],
+   "params": [
+    "o",
+    "?"
+   ],
+   "ret": "b"
+  },
+  "map.copy": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "o"
+  },
+  "map.get": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "key"
+   ],
+   "params": [
+    "o",
+    "?"
+   ],
+   "ret": "?"
+  },
+  "map.keys": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "o"
+  },
+  "map.new": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [],
+   "params": [],
+   "ret": "o"
+  },
+  "map.put": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "key",
+    "value"
+   ],
+   "params": [
+    "o",
+    "?",
+    "?"
+   ],
+   "ret": "?"
+  },
+  "map.put_all": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "id2"
+   ],
+   "params": [
+    "o",
+    "o"
+   ],
+   "ret": "v"
+  },
+  "map.remove": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "key"
+   ],
+   "params": [
+    "o",
+    "?"
+   ],
+   "ret": "?"
+  },
+  "map.size": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "i"
+  },
+  "map.values": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "o"
+  },
+  "math.abs": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "number"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "f"
+  },
+  "math.acos": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "angle"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "f"
+  },
+  "math.asin": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "angle"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "f"
+  },
+  "math.atan": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "angle"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "f"
+  },
+  "math.avg": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [],
+   "params": [],
+   "ret": "f",
+   "vararg": "?"
+  },
+  "math.ceil": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "number"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "i"
+  },
+  "math.cos": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "angle"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "f"
+  },
+  "math.exp": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "number"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "f"
+  },
+  "math.floor": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "number"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "i"
+  },
+  "math.log": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "number"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "f"
+  },
+  "math.log10": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "number"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "f"
+  },
+  "math.max": {
+   "impls": [
+    {
+     "defaults": 0,
+     "names": [],
+     "params": [],
+     "ret": "i",
+     "vararg": "i"
+    },
+    {
+     "defaults": 0,
+     "names": [],
+     "params": [],
+     "ret": "f",
+     "vararg": "?"
+    }
+   ],
+   "kind": "overloads"
+  },
+  "math.min": {
+   "impls": [
+    {
+     "defaults": 0,
+     "names": [],
+     "params": [],
+     "ret": "i",
+     "vararg": "i"
+    },
+    {
+     "defaults": 0,
+     "names": [],
+     "params": [],
+     "ret": "f",
+     "vararg": "?"
+    }
+   ],
+   "kind": "overloads"
+  },
+  "math.pow": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "base",
+    "exponent"
+   ],
+   "params": [
+    "?",
+    "?"
+   ],
+   "ret": "f"
+  },
+  "math.random": {
+   "default_ty": [
+    "i",
+    "i",
+    "?"
+   ],
+   "defaults": 3,
+   "kind": "function",
+   "names": [
+    "min",
+    "max",
+    "seed"
+   ],
+   "params": [
+    "?",
+    "?",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "math.round": {
+   "impls": [
+    {
+     "defaults": 0,
+     "names": [
+      "number"
+     ],
+     "params": [
+      "?"
+     ],
+     "ret": "i"
+    },
+    {
+     "defaults": 0,
+     "names": [
+      "number",
+      "precision"
+     ],
+     "params": [
+      "?",
+      "i"
+     ],
+     "ret": "f"
+    }
+   ],
+   "kind": "overloads"
+  },
+  "math.round_to_mintick": {
+   "impls": [
+    {
+     "defaults": 0,
+     "names": [
+      "number"
+     ],
+     "params": [
+      "f"
+     ],
+     "ret": "f"
+    },
+    {
+     "defaults": 0,
+     "names": [
+      "number"
+     ],
+     "params": [
+      "f"
+     ],
+     "ret": "f"
+    }
+   ],
+   "kind": "overloads"
+  },
+  "math.sign": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "number"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "f"
+  },
+  "math.sin": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "angle"
+   ],
+   "params": [
+    "f"
+   ],
+   "ret": "f"
+  },
+  "math.sqrt": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "number"
+   ],
+   "params": [
+    "f"
+   ],
+   "ret": "f"
+  },
+  "math.sum": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "?",
+    "i"
+   ],
+   "ret": "?"
+  },
+  "math.tan": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "angle"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "f"
+  },
+  "math.todegrees": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "radians"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "f"
+  },
+  "math.toradians": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "degrees"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "f"
+  },
+  "matrix.add_col": {
+   "default_none_ok": [
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "id",
+    "column",
+    "array_id"
+   ],
+   "params": [
+    "o",
+    "i",
+    "o"
+   ],
+   "ret": "v"
+  },
+  "matrix.add_row": {
+   "default_none_ok": [
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "id",
+    "row",
+    "array_id"
+   ],
+   "params": [
+    "o",
+    "i",
+    "o"
+   ],
+   "ret": "v"
+  },
+  "matrix.all": {
+   "callable": true,
+   "kind": "value",
+   "ty": "a:o"
+  },
+  "matrix.avg": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "f"
+  },
+  "matrix.col": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "column"
+   ],
+   "params": [
+    "o",
+    "i"
+   ],
+   "ret": "o"
+  },
+  "matrix.columns": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "i"
+  },
+  "matrix.concat": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id1",
+    "id2"
+   ],
+   "params": [
+    "o",
+    "o"
+   ],
+   "ret": "o"
+  },
+  "matrix.copy": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "o"
+  },
+  "matrix.delete": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "v"
+  },
+  "matrix.det": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "f"
+  },
+  "matrix.diff": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id1",
+    "id2"
+   ],
+   "params": [
+    "o",
+    "?"
+   ],
+   "ret": "o"
+  },
+  "matrix.eigenvalues": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "a:f"
+  },
+  "matrix.eigenvectors": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "o"
+  },
+  "matrix.elements_count": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "i"
+  },
+  "matrix.fill": {
+   "default_none_ok": [
+    false,
+    true,
+    false,
+    true
+   ],
+   "default_ty": [
+    "i",
+    "0",
+    "i",
+    "0"
+   ],
+   "defaults": 4,
+   "kind": "function",
+   "names": [
+    "id",
+    "value",
+    "from_row",
+    "to_row",
+    "from_column",
+    "to_column"
+   ],
+   "params": [
+    "o",
+    "?",
+    "i",
+    "i",
+    "i",
+    "i"
+   ],
+   "ret": "v"
+  },
+  "matrix.get": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "row",
+    "column"
+   ],
+   "params": [
+    "o",
+    "i",
+    "i"
+   ],
+   "ret": "?"
+  },
+  "matrix.inv": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "o"
+  },
+  "matrix.is_antidiagonal": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "b"
+  },
+  "matrix.is_antisymmetric": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "b"
+  },
+  "matrix.is_binary": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "b"
+  },
+  "matrix.is_diagonal": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "b"
+  },
+  "matrix.is_identity": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "b"
+  },
+  "matrix.is_square": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "b"
+  },
+  "matrix.is_stochastic": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "b"
+  },
+  "matrix.is_symmetric": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "b"
+  },
+  "matrix.is_triangular": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "b"
+  },
+  "matrix.is_zero": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "b"
+  },
+  "matrix.kron": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id1",
+    "id2"
+   ],
+   "params": [
+    "o",
+    "o"
+   ],
+   "ret": "o"
+  },
+  "matrix.max": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "f"
+  },
+  "matrix.median": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "f"
+  },
+  "matrix.min": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "f"
+  },
+  "matrix.mode": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "f"
+  },
+  "matrix.mult": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id1",
+    "id2"
+   ],
+   "params": [
+    "o",
+    "?"
+   ],
+   "ret": "o"
+  },
+  "matrix.new": {
+   "default_none_ok": [
+    false,
+    false,
+    true
+   ],
+   "default_ty": [
+    "i",
+    "i",
+    "0"
+   ],
+   "defaults": 3,
+   "kind": "function",
+   "names": [
+    "rows",
+    "columns",
+    "initial_value"
+   ],
+   "params": [
+    "i",
+    "i",
+    "?"
+   ],
+   "ret": "o"
+  },
+  "matrix.pinv": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "o"
+  },
+  "matrix.pow": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "power"
+   ],
+   "params": [
+    "o",
+    "i"
+   ],
+   "ret": "o"
+  },
+  "matrix.rank": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "i"
+  },
+  "matrix.remove_col": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "id",
+    "column"
+   ],
+   "params": [
+    "o",
+    "i"
+   ],
+   "ret": "o"
+  },
+  "matrix.remove_row": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "id",
+    "row"
+   ],
+   "params": [
+    "o",
+    "i"
+   ],
+   "ret": "o"
+  },
+  "matrix.reshape": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "rows",
+    "columns"
+   ],
+   "params": [
+    "o",
+    "i",
+    "i"
+   ],
+   "ret": "v"
+  },
+  "matrix.reverse": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "v"
+  },
+  "matrix.row": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "row"
+   ],
+   "params": [
+    "o",
+    "i"
+   ],
+   "ret": "o"
+  },
+  "matrix.rows": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "i"
+  },
+  "matrix.set": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "row",
+    "column",
+    "value"
+   ],
+   "params": [
+    "o",
+    "i",
+    "i",
+    "?"
+   ],
+   "ret": "v"
+  },
+  "matrix.sort": {
+   "default_ty": [
+    "i",
+    "s"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "id",
+    "column",
+    "order"
+   ],
+   "params": [
+    "o",
+    "i",
+    "s"
+   ],
+   "ret": "v"
+  },
+  "matrix.submatrix": {
+   "default_none_ok": [
+    false,
+    true,
+    false,
+    true
+   ],
+   "default_ty": [
+    "i",
+    "0",
+    "i",
+    "0"
+   ],
+   "defaults": 4,
+   "kind": "function",
+   "names": [
+    "id",
+    "from_row",
+    "to_row",
+    "from_column",
+    "to_column"
+   ],
+   "params": [
+    "o",
+    "i",
+    "i",
+    "i",
+    "i"
+   ],
+   "ret": "o"
+  },
+  "matrix.sum": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id1",
+    "id2"
+   ],
+   "params": [
+    "o",
+    "?"
+   ],
+   "ret": "o"
+  },
+  "matrix.swap_columns": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "column1",
+    "column2"
+   ],
+   "params": [
+    "o",
+    "i",
+    "i"
+   ],
+   "ret": "v"
+  },
+  "matrix.swap_rows": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id",
+    "row1",
+    "row2"
+   ],
+   "params": [
+    "o",
+    "i",
+    "i"
+   ],
+   "ret": "v"
+  },
+  "matrix.trace": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "f"
+  },
+  "matrix.transpose": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o"
+   ],
+   "ret": "o"
+  },
+  "max_bars_back": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "var",
+    "num"
+   ],
+   "params": [
+    "?",
+    "i"
+   ],
+   "ret": "v"
+  },
+  "minute": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "month": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "na": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "x"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "b"
+  },
+  "nz": {
+   "default_ty": [
+    "i"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "source",
+    "replacement"
+   ],
+   "params": [
+    "?",
+    "?"
+   ],
+   "ret": "?"
+  },
+  "ohlc4": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "open": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "order.ascending": {
+   "kind": "value",
+   "ty": "o:lib#Order"
+  },
+  "order.descending": {
+   "kind": "value",
+   "ty": "o:lib#Order"
+  },
+  "pivotpointtype.camarilla": {
+   "kind": "value",
+   "ty": "o:lib#PivotPointType"
+  },
+  "pivotpointtype.classic": {
+   "kind": "value",
+   "ty": "o:lib#PivotPointType"
+  },
+  "pivotpointtype.dm": {
+   "kind": "value",
+   "ty": "o:lib#PivotPointType"
+  },
+  "pivotpointtype.fibonacci": {
+   "kind": "value",
+   "ty": "o:lib#PivotPointType"
+  },
+  "pivotpointtype.traditional": {
+   "kind": "value",
+   "ty": "o:lib#PivotPointType"
+  },
+  "pivotpointtype.woodie": {
+   "kind": "value",
+   "ty": "o:lib#PivotPointType"
+  },
+  "plot": {
+   "default_none_ok": [
+    true,
+    true,
+    false,
+    true,
+    false,
+    false,
+    false,
+    false,
+    false,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "i",
+    "0",
+    "b",
+    "f",
+    "i",
+    "b",
+    "b",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
+   "defaults": 14,
+   "kind": "function",
+   "kwarg": true,
+   "names": [
+    "series",
+    "title",
+    "color",
+    "linewidth",
+    "style",
+    "trackprice",
+    "histbase",
+    "offset",
+    "join",
+    "editable",
+    "show_last",
+    "display",
+    "format",
+    "precision",
+    "force_overlay"
+   ],
+   "params": [
+    "?",
+    "s",
+    "?",
+    "i",
+    "?",
+    "b",
+    "f",
+    "i",
+    "b",
+    "b",
+    "i",
+    "?",
+    "s",
+    "i",
+    "b"
+   ],
+   "ret": "o:lib#Plot",
+   "vararg": "?"
+  },
+  "plot.linestyle_dashed": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.linestyle_dotted": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.linestyle_solid": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.plot": {
+   "default_none_ok": [
+    true,
+    true,
+    false,
+    true,
+    false,
+    false,
+    false,
+    false,
+    false,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "i",
+    "0",
+    "b",
+    "f",
+    "i",
+    "b",
+    "b",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
+   "defaults": 14,
+   "kind": "function",
+   "kwarg": true,
+   "names": [
+    "series",
+    "title",
+    "color",
+    "linewidth",
+    "style",
+    "trackprice",
+    "histbase",
+    "offset",
+    "join",
+    "editable",
+    "show_last",
+    "display",
+    "format",
+    "precision",
+    "force_overlay"
+   ],
+   "params": [
+    "?",
+    "s",
+    "?",
+    "i",
+    "?",
+    "b",
+    "f",
+    "i",
+    "b",
+    "b",
+    "i",
+    "?",
+    "s",
+    "i",
+    "b"
+   ],
+   "ret": "o:lib#Plot",
+   "vararg": "?"
+  },
+  "plot.style_area": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_areabr": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_circles": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_columns": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_cross": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_histogram": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_line": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_linebr": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_stepline": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_stepline_diamond": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plot.style_steplinebr": {
+   "kind": "value",
+   "ty": "o:lib#PlotEnum"
+  },
+  "plotarrow": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    false,
+    false,
+    false,
+    false,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "i",
+    "i",
+    "i",
+    "b",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
+   "defaults": 12,
+   "kind": "function",
+   "names": [
+    "series",
+    "title",
+    "colorup",
+    "colordown",
+    "offset",
+    "minheight",
+    "maxheight",
+    "editable",
+    "show_last",
+    "display",
+    "format",
+    "precision",
+    "force_overlay"
+   ],
+   "params": [
+    "?",
+    "s",
+    "?",
+    "?",
+    "i",
+    "i",
+    "i",
+    "b",
+    "i",
+    "?",
+    "s",
+    "i",
+    "b"
+   ],
+   "ret": "v"
+  },
+  "plotbar": {
+   "default_none_ok": [
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "b",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
+   "defaults": 8,
+   "kind": "function",
+   "names": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "title",
+    "color",
+    "editable",
+    "show_last",
+    "display",
+    "format",
+    "precision",
+    "force_overlay"
+   ],
+   "params": [
+    "?",
+    "?",
+    "?",
+    "?",
+    "s",
+    "?",
+    "b",
+    "i",
+    "?",
+    "s",
+    "i",
+    "b"
+   ],
+   "ret": "v"
+  },
+  "plotcandle": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "b",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
+   "defaults": 10,
+   "kind": "function",
+   "names": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "title",
+    "color",
+    "wickcolor",
+    "editable",
+    "show_last",
+    "bordercolor",
+    "display",
+    "format",
+    "precision",
+    "force_overlay"
+   ],
+   "params": [
+    "?",
+    "?",
+    "?",
+    "?",
+    "s",
+    "?",
+    "?",
+    "b",
+    "i",
+    "?",
+    "?",
+    "s",
+    "i",
+    "b"
+   ],
+   "ret": "v"
+  },
+  "plotchar": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true,
+    false,
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0",
+    "i",
+    "0",
+    "0",
+    "b",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
+   "defaults": 14,
+   "kind": "function",
+   "names": [
+    "series",
+    "title",
+    "char",
+    "location",
+    "color",
+    "offset",
+    "text",
+    "textcolor",
+    "editable",
+    "size",
+    "show_last",
+    "display",
+    "format",
+    "precision",
+    "force_overlay"
+   ],
+   "params": [
+    "?",
+    "s",
+    "s",
+    "?",
+    "?",
+    "i",
+    "s",
+    "?",
+    "b",
+    "?",
+    "i",
+    "?",
+    "s",
+    "i",
+    "b"
+   ],
+   "ret": "v"
+  },
+  "plotshape": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true,
+    false,
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0",
+    "i",
+    "0",
+    "0",
+    "b",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
+   "defaults": 14,
+   "kind": "function",
+   "names": [
+    "series",
+    "title",
+    "style",
+    "location",
+    "color",
+    "offset",
+    "text",
+    "textcolor",
+    "editable",
+    "size",
+    "show_last",
+    "display",
+    "format",
+    "precision",
+    "force_overlay"
+   ],
+   "params": [
+    "?",
+    "s",
+    "?",
+    "?",
+    "?",
+    "i",
+    "s",
+    "?",
+    "b",
+    "?",
+    "i",
+    "?",
+    "s",
+    "i",
+    "b"
+   ],
+   "ret": "v"
+  },
+  "polyline.all": {
+   "callable": true,
+   "kind": "value",
+   "ty": "a:o:lib#Polyline"
+  },
+  "polyline.delete": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#Polyline"
+   ],
+   "ret": "v"
+  },
+  "polyline.new": {
+   "default_none_ok": [
+    false,
+    false,
+    false,
+    false,
+    true,
+    false,
+    false,
+    false
+   ],
+   "default_ty": [
+    "b",
+    "b",
+    "?",
+    "?",
+    "0",
+    "?",
+    "i",
+    "b"
+   ],
+   "defaults": 8,
+   "kind": "function",
+   "names": [
+    "points",
+    "curved",
+    "closed",
+    "xloc",
+    "line_color",
+    "fill_color",
+    "line_style",
+    "line_width",
+    "force_overlay"
+   ],
+   "params": [
+    "a:o:lib#ChartPoint",
+    "b",
+    "b",
+    "?",
+    "c",
+    "c",
+    "o:lib#LineEnum",
+    "i",
+    "b"
+   ],
+   "ret": "o:lib#Polyline"
+  },
+  "polyline.style_arrow_both": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "polyline.style_arrow_left": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "polyline.style_arrow_right": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "polyline.style_dashed": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "polyline.style_dotted": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "polyline.style_solid": {
+   "kind": "value",
+   "ty": "o:lib#LineEnum"
+  },
+  "position.bottom_center": {
+   "kind": "value",
+   "ty": "o:lib#Position"
+  },
+  "position.bottom_left": {
+   "kind": "value",
+   "ty": "o:lib#Position"
+  },
+  "position.bottom_right": {
+   "kind": "value",
+   "ty": "o:lib#Position"
+  },
+  "position.middle_center": {
+   "kind": "value",
+   "ty": "o:lib#Position"
+  },
+  "position.middle_left": {
+   "kind": "value",
+   "ty": "o:lib#Position"
+  },
+  "position.middle_right": {
+   "kind": "value",
+   "ty": "o:lib#Position"
+  },
+  "position.top_center": {
+   "kind": "value",
+   "ty": "o:lib#Position"
+  },
+  "position.top_left": {
+   "kind": "value",
+   "ty": "o:lib#Position"
+  },
+  "position.top_right": {
+   "kind": "value",
+   "ty": "o:lib#Position"
+  },
+  "request.currency_rate": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "from_currency",
+    "to_currency"
+   ],
+   "params": [
+    "s",
+    "s"
+   ],
+   "ret": "f"
+  },
+  "request.dividends": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0",
+    "b",
+    "0"
+   ],
+   "defaults": 6,
+   "kind": "function",
+   "names": [
+    "ticker",
+    "field",
+    "gaps",
+    "lookahead",
+    "ignore_invalid_symbol",
+    "currency"
+   ],
+   "params": [
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?"
+   ],
+   "ret": "f"
+  },
+  "request.earnings": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0",
+    "b",
+    "0"
+   ],
+   "defaults": 6,
+   "kind": "function",
+   "names": [
+    "ticker",
+    "field",
+    "gaps",
+    "lookahead",
+    "ignore_invalid_symbol",
+    "currency"
+   ],
+   "params": [
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?"
+   ],
+   "ret": "f"
+  },
+  "request.economic": {
+   "defaults": 0,
+   "kind": "function",
+   "kwarg": true,
+   "names": [],
+   "params": [],
+   "ret": "f",
+   "vararg": "?"
+  },
+  "request.financial": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0",
+    "b",
+    "0"
+   ],
+   "defaults": 6,
+   "kind": "function",
+   "names": [
+    "symbol",
+    "financial_id",
+    "period",
+    "gaps",
+    "ignore_invalid_symbol",
+    "currency"
+   ],
+   "params": [
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?"
+   ],
+   "ret": "f"
+  },
+  "request.footprint": {
+   "default_ty": [
+    "i",
+    "i"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "ticks_per_row",
+    "va_percent",
+    "imbalance_percent"
+   ],
+   "params": [
+    "i",
+    "i",
+    "i"
+   ],
+   "ret": "o:lib#Footprint"
+  },
+  "request.quandl": {
+   "defaults": 0,
+   "kind": "function",
+   "kwarg": true,
+   "names": [],
+   "params": [],
+   "ret": "f",
+   "vararg": "?"
+  },
+  "request.security": {
+   "defaults": 0,
+   "kind": "function",
+   "kwarg": true,
+   "names": [
+    "symbol",
+    "timeframe",
+    "expression"
+   ],
+   "params": [
+    "?",
+    "?",
+    "?"
+   ],
+   "ret": "?",
+   "vararg": "?"
+  },
+  "request.security_lower_tf": {
+   "impls": [
+    {
+     "default_none_ok": [
+      true,
+      true,
+      true,
+      true
+     ],
+     "default_ty": [
+      "b",
+      "0",
+      "b",
+      "0"
+     ],
+     "defaults": 4,
+     "names": [
+      "symbol",
+      "timeframe",
+      "expression",
+      "ignore_invalid_symbol",
+      "currency",
+      "ignore_invalid_timeframe",
+      "calc_bars_count"
+     ],
+     "params": [
+      "?",
+      "?",
+      "o",
+      "?",
+      "?",
+      "?",
+      "?"
+     ],
+     "ret": "o"
+    },
+    {
+     "default_none_ok": [
+      true,
+      true,
+      true,
+      true
+     ],
+     "default_ty": [
+      "b",
+      "0",
+      "b",
+      "0"
+     ],
+     "defaults": 4,
+     "names": [
+      "symbol",
+      "timeframe",
+      "expression",
+      "ignore_invalid_symbol",
+      "currency",
+      "ignore_invalid_timeframe",
+      "calc_bars_count"
+     ],
+     "params": [
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?"
+     ],
+     "ret": "o"
+    }
+   ],
+   "kind": "overloads"
+  },
+  "request.seed": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "b",
+    "0"
+   ],
+   "defaults": 5,
+   "kind": "function",
+   "names": [
+    "source",
+    "symbol",
+    "expression",
+    "ignore_invalid_symbol",
+    "calc_bars_count"
+   ],
+   "params": [
+    "?",
+    "?",
+    "?",
+    "?",
+    "?"
+   ],
+   "ret": "?"
+  },
+  "request.splits": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
+   "defaults": 5,
+   "kind": "function",
+   "names": [
+    "ticker",
+    "field",
+    "gaps",
+    "lookahead",
+    "ignore_invalid_symbol"
+   ],
+   "params": [
+    "?",
+    "?",
+    "?",
+    "?",
+    "?"
+   ],
+   "ret": "f"
+  },
+  "runtime.error": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "message"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "v"
+  },
+  "scale.left": {
+   "kind": "value",
+   "ty": "o:lib#Scale"
+  },
+  "scale.none": {
+   "kind": "value",
+   "ty": "o:lib#Scale"
+  },
+  "scale.right": {
+   "kind": "value",
+   "ty": "o:lib#Scale"
+  },
+  "second": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "session.extended": {
+   "kind": "value",
+   "ty": "o:lib#Session"
+  },
+  "session.isfirstbar": {
+   "callable": true,
+   "kind": "value",
+   "ty": "b"
+  },
+  "session.isfirstbar_regular": {
+   "callable": true,
+   "kind": "value",
+   "ty": "b"
+  },
+  "session.islastbar": {
+   "callable": true,
+   "kind": "value",
+   "ty": "b"
+  },
+  "session.islastbar_regular": {
+   "callable": true,
+   "kind": "value",
+   "ty": "b"
+  },
+  "session.ismarket": {
+   "callable": true,
+   "kind": "value",
+   "ty": "b"
+  },
+  "session.ispostmarket": {
+   "callable": true,
+   "kind": "value",
+   "ty": "b"
+  },
+  "session.ispremarket": {
+   "callable": true,
+   "kind": "value",
+   "ty": "b"
+  },
+  "session.regular": {
+   "kind": "value",
+   "ty": "o:lib#Session"
+  },
+  "shape.arrowdown": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.arrowup": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.circle": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.cross": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.diamond": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.flag": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.labeldown": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.labelup": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.square": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.triangledown": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.triangleup": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "shape.xcross": {
+   "kind": "value",
+   "ty": "o:lib#Shape"
+  },
+  "size.auto": {
+   "kind": "value",
+   "ty": "o:lib#Size"
+  },
+  "size.huge": {
+   "kind": "value",
+   "ty": "o:lib#Size"
+  },
+  "size.large": {
+   "kind": "value",
+   "ty": "o:lib#Size"
+  },
+  "size.normal": {
+   "kind": "value",
+   "ty": "o:lib#Size"
+  },
+  "size.small": {
+   "kind": "value",
+   "ty": "o:lib#Size"
+  },
+  "size.tiny": {
+   "kind": "value",
+   "ty": "o:lib#Size"
+  },
+  "splits.denominator": {
+   "kind": "value",
+   "ty": "o:lib#Splits"
+  },
+  "splits.numerator": {
+   "kind": "value",
+   "ty": "o:lib#Splits"
+  },
+  "strategy.account_currency": {
+   "callable": true,
+   "kind": "value",
+   "ty": "s"
+  },
+  "strategy.avg_losing_trade": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.avg_losing_trade_percent": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.avg_trade": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.avg_trade_percent": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.avg_winning_trade": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.avg_winning_trade_percent": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.cancel": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "v"
+  },
+  "strategy.cancel_all": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [],
+   "params": [],
+   "ret": "v"
+  },
+  "strategy.cash": {
+   "kind": "value",
+   "ty": "o:lib#QtyType"
+  },
+  "strategy.close": {
+   "default_ty": [
+    "?",
+    "?",
+    "?",
+    "?",
+    "b",
+    "b"
+   ],
+   "defaults": 6,
+   "kind": "function",
+   "names": [
+    "id",
+    "comment",
+    "qty",
+    "qty_percent",
+    "alert_message",
+    "immediately",
+    "disable_alert"
+   ],
+   "params": [
+    "s",
+    "s",
+    "f",
+    "f",
+    "s",
+    "b",
+    "b"
+   ],
+   "ret": "v"
+  },
+  "strategy.close_all": {
+   "default_ty": [
+    "?",
+    "?",
+    "b",
+    "b"
+   ],
+   "defaults": 4,
+   "kind": "function",
+   "names": [
+    "comment",
+    "alert_message",
+    "immediately",
+    "disable_alert"
+   ],
+   "params": [
+    "s",
+    "s",
+    "b",
+    "b"
+   ],
+   "ret": "v"
+  },
+  "strategy.closedtrades": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "strategy.closedtrades.closedtrades": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "strategy.closedtrades.commission": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.closedtrades.entry_bar_index": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "i"
+  },
+  "strategy.closedtrades.entry_comment": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "s"
+  },
+  "strategy.closedtrades.entry_id": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "s"
+  },
+  "strategy.closedtrades.entry_price": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.closedtrades.entry_time": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "i"
+  },
+  "strategy.closedtrades.exit_bar_index": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "i"
+  },
+  "strategy.closedtrades.exit_comment": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "s"
+  },
+  "strategy.closedtrades.exit_id": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "s"
+  },
+  "strategy.closedtrades.exit_price": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.closedtrades.exit_time": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "i"
+  },
+  "strategy.closedtrades.first_index": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "strategy.closedtrades.max_drawdown": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.closedtrades.max_drawdown_percent": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.closedtrades.max_runup": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.closedtrades.max_runup_percent": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.closedtrades.profit": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.closedtrades.profit_percent": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.closedtrades.size": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.commission.cash_per_contract": {
+   "kind": "value",
+   "ty": "o:lib#Commission"
+  },
+  "strategy.commission.cash_per_order": {
+   "kind": "value",
+   "ty": "o:lib#Commission"
+  },
+  "strategy.commission.percent": {
+   "kind": "value",
+   "ty": "o:lib#Commission"
+  },
+  "strategy.convert_to_account": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "value"
+   ],
+   "params": [
+    "f"
+   ],
+   "ret": "f"
+  },
+  "strategy.convert_to_symbol": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "value"
+   ],
+   "params": [
+    "f"
+   ],
+   "ret": "f"
+  },
+  "strategy.default_entry_qty": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "fill_price"
+   ],
+   "params": [
+    "f"
+   ],
+   "ret": "f"
+  },
+  "strategy.direction.all": {
+   "kind": "value",
+   "ty": "o:lib#Direction"
+  },
+  "strategy.direction.long": {
+   "kind": "value",
+   "ty": "o:lib#Direction"
+  },
+  "strategy.direction.short": {
+   "kind": "value",
+   "ty": "o:lib#Direction"
+  },
+  "strategy.entry": {
+   "default_none_ok": [
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "?",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
+   "defaults": 8,
+   "kind": "function",
+   "names": [
+    "id",
+    "direction",
+    "qty",
+    "limit",
+    "stop",
+    "oca_name",
+    "oca_type",
+    "comment",
+    "alert_message",
+    "disable_alert"
+   ],
+   "params": [
+    "s",
+    "?",
+    "f",
+    "f",
+    "f",
+    "s",
+    "?",
+    "s",
+    "s",
+    "b"
+   ],
+   "ret": "v"
+  },
+  "strategy.equity": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.eventrades": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "strategy.exit": {
+   "default_ty": [
+    "s",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "?",
+    "b"
+   ],
+   "defaults": 20,
+   "kind": "function",
+   "names": [
+    "id",
+    "from_entry",
+    "qty",
+    "qty_percent",
+    "profit",
+    "limit",
+    "loss",
+    "stop",
+    "trail_price",
+    "trail_points",
+    "trail_offset",
+    "oca_name",
+    "comment",
+    "comment_profit",
+    "comment_loss",
+    "comment_trailing",
+    "alert_message",
+    "alert_profit",
+    "alert_loss",
+    "alert_trailing",
+    "disable_alert"
+   ],
+   "params": [
+    "s",
+    "s",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "s",
+    "s",
+    "s",
+    "s",
+    "s",
+    "s",
+    "s",
+    "s",
+    "s",
+    "b"
+   ],
+   "ret": "v"
+  },
+  "strategy.fixed": {
+   "kind": "value",
+   "ty": "o:lib#QtyType"
+  },
+  "strategy.grossloss": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.grossloss_percent": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.grossprofit": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.grossprofit_percent": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.initial_capital": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.long": {
+   "kind": "value",
+   "ty": "o:lib#Direction"
+  },
+  "strategy.losstrades": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "strategy.margin_liquidation_price": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.max_contracts_held_all": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.max_contracts_held_long": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.max_contracts_held_short": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.max_drawdown": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.max_drawdown_percent": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.max_runup": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.max_runup_percent": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.netprofit": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.netprofit_percent": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.oca.cancel": {
+   "kind": "value",
+   "ty": "o:lib#Oca"
+  },
+  "strategy.oca.none": {
+   "kind": "value",
+   "ty": "o:lib#Oca"
+  },
+  "strategy.oca.reduce": {
+   "kind": "value",
+   "ty": "o:lib#Oca"
+  },
+  "strategy.openprofit": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.openprofit_percent": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.opentrades": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "strategy.opentrades.capital_held": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.opentrades.commission": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.opentrades.entry_bar_index": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "i"
+  },
+  "strategy.opentrades.entry_comment": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "s"
+  },
+  "strategy.opentrades.entry_id": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "s"
+  },
+  "strategy.opentrades.entry_price": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.opentrades.entry_time": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "i"
+  },
+  "strategy.opentrades.max_drawdown": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.opentrades.max_drawdown_percent": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.opentrades.max_runup": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.opentrades.max_runup_percent": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.opentrades.opentrades": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "strategy.opentrades.profit": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.opentrades.profit_percent": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.opentrades.size": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "trade_num"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "strategy.order": {
+   "default_none_ok": [
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "default_ty": [
+    "?",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    "b"
+   ],
+   "defaults": 8,
+   "kind": "function",
+   "names": [
+    "id",
+    "direction",
+    "qty",
+    "limit",
+    "stop",
+    "oca_name",
+    "oca_type",
+    "comment",
+    "alert_message",
+    "disable_alert"
+   ],
+   "params": [
+    "s",
+    "?",
+    "f",
+    "f",
+    "f",
+    "s",
+    "?",
+    "s",
+    "s",
+    "b"
+   ],
+   "ret": "v"
+  },
+  "strategy.percent_of_equity": {
+   "kind": "value",
+   "ty": "o:lib#QtyType"
+  },
+  "strategy.position_avg_price": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.position_entry_name": {
+   "callable": true,
+   "kind": "value",
+   "ty": "s"
+  },
+  "strategy.position_size": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "strategy.risk.allow_entry_in": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "value"
+   ],
+   "params": [
+    "?"
+   ],
+   "ret": "v"
+  },
+  "strategy.risk.max_cons_loss_days": {
+   "default_ty": [
+    "?"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "count",
+    "alert_message"
+   ],
+   "params": [
+    "i",
+    "s"
+   ],
+   "ret": "v"
+  },
+  "strategy.risk.max_drawdown": {
+   "default_ty": [
+    "?",
+    "?"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "value",
+    "type",
+    "alert_message"
+   ],
+   "params": [
+    "f",
+    "?",
+    "s"
+   ],
+   "ret": "v"
+  },
+  "strategy.risk.max_intraday_filled_orders": {
+   "default_ty": [
+    "?"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "count",
+    "alert_message"
+   ],
+   "params": [
+    "i",
+    "s"
+   ],
+   "ret": "v"
+  },
+  "strategy.risk.max_intraday_loss": {
+   "default_ty": [
+    "?",
+    "?"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "value",
+    "type",
+    "alert_message"
+   ],
+   "params": [
+    "f",
+    "?",
+    "s"
+   ],
+   "ret": "v"
+  },
+  "strategy.risk.max_position_size": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "contracts"
+   ],
+   "params": [
+    "f"
+   ],
+   "ret": "v"
+  },
+  "strategy.short": {
+   "kind": "value",
+   "ty": "o:lib#Direction"
+  },
+  "strategy.wintrades": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "string.contains": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "str"
+   ],
+   "params": [
+    "s",
+    "s"
+   ],
+   "ret": "b"
+  },
+  "string.endswith": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "str"
+   ],
+   "params": [
+    "s",
+    "s"
+   ],
+   "ret": "b"
+  },
+  "string.format": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "formatString"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "s",
+   "vararg": "?"
+  },
+  "string.format_time": {
+   "default_none_ok": [
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "time",
+    "format",
+    "timezone"
+   ],
+   "params": [
+    "i",
+    "s",
+    "s"
+   ],
+   "ret": "s"
+  },
+  "string.length": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "string"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "i"
+  },
+  "string.lower": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "s"
+  },
+  "string.match": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "regex"
+   ],
+   "params": [
+    "s",
+    "s"
+   ],
+   "ret": "s"
+  },
+  "string.pos": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "str"
+   ],
+   "params": [
+    "s",
+    "s"
+   ],
+   "ret": "i"
+  },
+  "string.repeat": {
+   "default_ty": [
+    "s"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "source",
+    "repeat",
+    "separator"
+   ],
+   "params": [
+    "s",
+    "i",
+    "s"
+   ],
+   "ret": "s"
+  },
+  "string.replace": {
+   "default_ty": [
+    "i"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "source",
+    "target",
+    "replacement",
+    "occurrence"
+   ],
+   "params": [
+    "s",
+    "s",
+    "s",
+    "?"
+   ],
+   "ret": "s"
+  },
+  "string.replace_all": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "target",
+    "replacement"
+   ],
+   "params": [
+    "s",
+    "s",
+    "s"
+   ],
+   "ret": "s"
+  },
+  "string.split": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "string",
+    "separator"
+   ],
+   "params": [
+    "s",
+    "s"
+   ],
+   "ret": "a:s"
+  },
+  "string.startswith": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "str"
+   ],
+   "params": [
+    "s",
+    "s"
+   ],
+   "ret": "b"
+  },
+  "string.substring": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "source",
+    "begin_pos",
+    "end_pos"
+   ],
+   "params": [
+    "s",
+    "i",
+    "i"
+   ],
+   "ret": "s"
+  },
+  "string.tonumber": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "string"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "f"
+  },
+  "string.tostring": {
+   "default_ty": [
+    "s"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "value",
+    "format"
+   ],
+   "params": [
+    "?",
+    "?"
+   ],
+   "ret": "s"
+  },
+  "string.trim": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "s"
+  },
+  "string.upper": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "s"
+  },
+  "syminfo.avg_spread": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "syminfo.basecurrency": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "syminfo.country": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "syminfo.currency": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "syminfo.current_contract": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "syminfo.description": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "syminfo.employees": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "syminfo.expiration_date": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "syminfo.industry": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "syminfo.isin": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "syminfo.main_tickerid": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "syminfo.maker_fee": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "syminfo.mincontract": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "syminfo.minmove": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "syminfo.mintick": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "syminfo.opening_hours": {
+   "kind": "value",
+   "ty": "o"
+  },
+  "syminfo.period": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "syminfo.pointvalue": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "syminfo.prefix": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "syminfo.pricescale": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "syminfo.recommendations_buy": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "syminfo.recommendations_buy_strong": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "syminfo.recommendations_date": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "syminfo.recommendations_hold": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "syminfo.recommendations_sell": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "syminfo.recommendations_sell_strong": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "syminfo.recommendations_total": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "syminfo.regular": {
+   "kind": "value",
+   "ty": "o:lib#Session"
+  },
+  "syminfo.root": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "syminfo.sector": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "syminfo.session": {
+   "kind": "value",
+   "ty": "o:lib#Session"
+  },
+  "syminfo.session_ends": {
+   "kind": "value",
+   "ty": "o"
+  },
+  "syminfo.session_starts": {
+   "kind": "value",
+   "ty": "o"
+  },
+  "syminfo.shareholders": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "syminfo.shares_outstanding_float": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "syminfo.shares_outstanding_total": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "syminfo.taker_fee": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "syminfo.target_price_average": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "syminfo.target_price_date": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "syminfo.target_price_estimates": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "syminfo.target_price_high": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "syminfo.target_price_low": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "syminfo.target_price_median": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "syminfo.ticker": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "syminfo.tickerid": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "syminfo.timezone": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "syminfo.type": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "syminfo.volumetype": {
+   "kind": "value",
+   "ty": "s"
+  },
+  "ta.accdist": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "ta.alma": {
+   "default_ty": [
+    "f",
+    "f",
+    "b"
+   ],
+   "defaults": 3,
+   "kind": "function",
+   "names": [
+    "series",
+    "length",
+    "offset",
+    "sigma",
+    "floor"
+   ],
+   "params": [
+    "f",
+    "i",
+    "f",
+    "f",
+    "?"
+   ],
+   "ret": "f"
+  },
+  "ta.atr": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "length"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.barssince": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "condition"
+   ],
+   "params": [
+    "b"
+   ],
+   "ret": "i"
+  },
+  "ta.bb": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "series",
+    "length",
+    "mult"
+   ],
+   "params": [
+    "f",
+    "i",
+    "f"
+   ],
+   "ret": "T:1:f1:f1:f"
+  },
+  "ta.bbw": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "series",
+    "length",
+    "mult"
+   ],
+   "params": [
+    "f",
+    "i",
+    "f"
+   ],
+   "ret": "f"
+  },
+  "ta.cci": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.change": {
+   "default_ty": [
+    "i"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "?",
+    "i"
+   ],
+   "ret": "?"
+  },
+  "ta.cmo": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "series",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.cog": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.correlation": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source1",
+    "source2",
+    "length"
+   ],
+   "params": [
+    "f",
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.cross": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source1",
+    "source2"
+   ],
+   "params": [
+    "f",
+    "f"
+   ],
+   "ret": "b"
+  },
+  "ta.crossover": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source1",
+    "source2"
+   ],
+   "params": [
+    "f",
+    "f"
+   ],
+   "ret": "b"
+  },
+  "ta.crossunder": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source1",
+    "source2"
+   ],
+   "params": [
+    "f",
+    "f"
+   ],
+   "ret": "b"
+  },
+  "ta.cum": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source"
+   ],
+   "params": [
+    "f"
+   ],
+   "ret": "f"
+  },
+  "ta.dev": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "source",
+    "length",
+    "_mean"
+   ],
+   "params": [
+    "f",
+    "i",
+    "f"
+   ],
+   "ret": "f"
+  },
+  "ta.dmi": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "diLength",
+    "adxSmoothing"
+   ],
+   "params": [
+    "i",
+    "i"
+   ],
+   "ret": "T:1:f1:f1:f"
+  },
+  "ta.ema": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.falling": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "b"
+  },
+  "ta.highest": {
+   "impls": [
+    {
+     "default_ty": [
+      "b",
+      "b",
+      "b"
+     ],
+     "defaults": 3,
+     "names": [
+      "source",
+      "length",
+      "_bars",
+      "_tuple",
+      "_check_eq"
+     ],
+     "params": [
+      "f",
+      "i",
+      "b",
+      "b",
+      "b"
+     ],
+     "ret": "f"
+    },
+    {
+     "defaults": 0,
+     "names": [
+      "length"
+     ],
+     "params": [
+      "i"
+     ],
+     "ret": "f"
+    }
+   ],
+   "kind": "overloads"
+  },
+  "ta.highestbars": {
+   "impls": [
+    {
+     "defaults": 0,
+     "names": [
+      "source",
+      "length"
+     ],
+     "params": [
+      "f",
+      "i"
+     ],
+     "ret": "i"
+    },
+    {
+     "defaults": 0,
+     "names": [
+      "length"
+     ],
+     "params": [
+      "i"
+     ],
+     "ret": "i"
+    }
+   ],
+   "kind": "overloads"
+  },
+  "ta.hma": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.iii": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "ta.kc": {
+   "default_ty": [
+    "b"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "series",
+    "length",
+    "mult",
+    "useTrueRange"
+   ],
+   "params": [
+    "f",
+    "i",
+    "f",
+    "b"
+   ],
+   "ret": "T:1:f1:f1:f"
+  },
+  "ta.kcw": {
+   "default_ty": [
+    "b"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "series",
+    "length",
+    "mult",
+    "useTrueRange"
+   ],
+   "params": [
+    "f",
+    "i",
+    "f",
+    "b"
+   ],
+   "ret": "f"
+  },
+  "ta.linreg": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length",
+    "offset"
+   ],
+   "params": [
+    "f",
+    "i",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.lowest": {
+   "impls": [
+    {
+     "default_ty": [
+      "b",
+      "b",
+      "b"
+     ],
+     "defaults": 3,
+     "names": [
+      "source",
+      "length",
+      "_bars",
+      "_tuple",
+      "_check_eq"
+     ],
+     "params": [
+      "f",
+      "i",
+      "b",
+      "b",
+      "b"
+     ],
+     "ret": "f"
+    },
+    {
+     "defaults": 0,
+     "names": [
+      "length"
+     ],
+     "params": [
+      "i"
+     ],
+     "ret": "f"
+    }
+   ],
+   "kind": "overloads"
+  },
+  "ta.lowestbars": {
+   "impls": [
+    {
+     "defaults": 0,
+     "names": [
+      "source",
+      "length"
+     ],
+     "params": [
+      "f",
+      "i"
+     ],
+     "ret": "i"
+    },
+    {
+     "defaults": 0,
+     "names": [
+      "length"
+     ],
+     "params": [
+      "i"
+     ],
+     "ret": "i"
+    }
+   ],
+   "kind": "overloads"
+  },
+  "ta.macd": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "fastlen",
+    "slowlen",
+    "siglen"
+   ],
+   "params": [
+    "f",
+    "i",
+    "i",
+    "i"
+   ],
+   "ret": "T:1:f1:f1:f"
+  },
+  "ta.max": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source"
+   ],
+   "params": [
+    "f"
+   ],
+   "ret": "f"
+  },
+  "ta.median": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "?",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.mfi": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "series",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.min": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source"
+   ],
+   "params": [
+    "f"
+   ],
+   "ret": "f"
+  },
+  "ta.mode": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "?",
+    "i"
+   ],
+   "ret": "?"
+  },
+  "ta.mom": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.nvi": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "ta.obv": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "ta.percentile_linear_interpolation": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length",
+    "percentage"
+   ],
+   "params": [
+    "f",
+    "i",
+    "f"
+   ],
+   "ret": "f"
+  },
+  "ta.percentile_nearest_rank": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length",
+    "percentage"
+   ],
+   "params": [
+    "f",
+    "i",
+    "f"
+   ],
+   "ret": "f"
+  },
+  "ta.percentrank": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.pivot_point_levels": {
+   "default_ty": [
+    "b"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "type",
+    "anchor",
+    "developing"
+   ],
+   "params": [
+    "s",
+    "b",
+    "b"
+   ],
+   "ret": "a:f"
+  },
+  "ta.pivothigh": {
+   "impls": [
+    {
+     "defaults": 0,
+     "names": [
+      "source",
+      "leftbars",
+      "rightbars"
+     ],
+     "params": [
+      "f",
+      "i",
+      "i"
+     ],
+     "ret": "f"
+    },
+    {
+     "defaults": 0,
+     "names": [
+      "leftbars",
+      "rightbars"
+     ],
+     "params": [
+      "i",
+      "i"
+     ],
+     "ret": "f"
+    }
+   ],
+   "kind": "overloads"
+  },
+  "ta.pivotlow": {
+   "impls": [
+    {
+     "defaults": 0,
+     "names": [
+      "source",
+      "leftbars",
+      "rightbars"
+     ],
+     "params": [
+      "f",
+      "i",
+      "i"
+     ],
+     "ret": "f"
+    },
+    {
+     "defaults": 0,
+     "names": [
+      "leftbars",
+      "rightbars"
+     ],
+     "params": [
+      "i",
+      "i"
+     ],
+     "ret": "f"
+    }
+   ],
+   "kind": "overloads"
+  },
+  "ta.pvi": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "ta.pvt": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "ta.range": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.rci": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.rising": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "b"
+  },
+  "ta.rma": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.roc": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.rsi": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.sar": {
+   "default_ty": [
+    "f",
+    "f",
+    "f"
+   ],
+   "defaults": 3,
+   "kind": "function",
+   "names": [
+    "start",
+    "inc",
+    "max"
+   ],
+   "params": [
+    "f",
+    "f",
+    "f"
+   ],
+   "ret": "f"
+  },
+  "ta.sma": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.stdev": {
+   "default_ty": [
+    "b"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "source",
+    "length",
+    "biased"
+   ],
+   "params": [
+    "f",
+    "i",
+    "?"
+   ],
+   "ret": "f"
+  },
+  "ta.stoch": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "high",
+    "low",
+    "length"
+   ],
+   "params": [
+    "f",
+    "f",
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.supertrend": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "factor",
+    "atrPeriod"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "T:1:f1:i"
+  },
+  "ta.swma": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source"
+   ],
+   "params": [
+    "f"
+   ],
+   "ret": "f"
+  },
+  "ta.tr": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "ta.tsi": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "short_length",
+    "long_length"
+   ],
+   "params": [
+    "f",
+    "i",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.valuewhen": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "condition",
+    "source",
+    "occurrence"
+   ],
+   "params": [
+    "b",
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.variance": {
+   "default_ty": [
+    "b"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "source",
+    "length",
+    "biased"
+   ],
+   "params": [
+    "f",
+    "i",
+    "b"
+   ],
+   "ret": "f"
+  },
+  "ta.vwap": {
+   "callable": true,
+   "kind": "value",
+   "ty": "?"
+  },
+  "ta.vwma": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.wad": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "ta.wma": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "source",
+    "length"
+   ],
+   "params": [
+    "f",
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.wpr": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "length"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "f"
+  },
+  "ta.wvad": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
+  "table.all": {
+   "callable": true,
+   "kind": "value",
+   "ty": "a:o:lib#Table"
+  },
+  "table.cell": {
+   "default_none_ok": [
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false
+   ],
+   "default_ty": [
+    "s",
+    "i",
+    "i",
+    "?",
+    "?",
+    "?",
+    "?",
+    "0",
+    "s",
+    "?",
+    "?"
+   ],
+   "defaults": 11,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "column",
+    "row",
+    "text",
+    "width",
+    "height",
+    "text_color",
+    "text_halign",
+    "text_valign",
+    "text_size",
+    "bgcolor",
+    "tooltip",
+    "text_font_family",
+    "text_formatting"
+   ],
+   "params": [
+    "o:lib#Table",
+    "i",
+    "i",
+    "s",
+    "f",
+    "f",
+    "c",
+    "o:lib#AlignEnum",
+    "o:lib#AlignEnum",
+    "?",
+    "c",
+    "s",
+    "o:lib#FontFamilyEnum",
+    "o:lib#FormatEnum"
+   ],
+   "ret": "v"
+  },
+  "table.cell_set_bgcolor": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "column",
+    "row",
+    "bgcolor"
+   ],
+   "params": [
+    "o:lib#Table",
+    "i",
+    "i",
+    "c"
+   ],
+   "ret": "v"
+  },
+  "table.cell_set_height": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "column",
+    "row",
+    "height"
+   ],
+   "params": [
+    "o:lib#Table",
+    "i",
+    "i",
+    "f"
+   ],
+   "ret": "v"
+  },
+  "table.cell_set_text": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "column",
+    "row",
+    "text"
+   ],
+   "params": [
+    "o:lib#Table",
+    "i",
+    "i",
+    "s"
+   ],
+   "ret": "v"
+  },
+  "table.cell_set_text_color": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "column",
+    "row",
+    "text_color"
+   ],
+   "params": [
+    "o:lib#Table",
+    "i",
+    "i",
+    "c"
+   ],
+   "ret": "v"
+  },
+  "table.cell_set_text_font_family": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "column",
+    "row",
+    "text_font_family"
+   ],
+   "params": [
+    "o:lib#Table",
+    "i",
+    "i",
+    "o:lib#FontFamilyEnum"
+   ],
+   "ret": "v"
+  },
+  "table.cell_set_text_formatting": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "column",
+    "row",
+    "text_formatting"
+   ],
+   "params": [
+    "o:lib#Table",
+    "i",
+    "i",
+    "o:lib#FormatEnum"
+   ],
+   "ret": "v"
+  },
+  "table.cell_set_text_halign": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "column",
+    "row",
+    "text_halign"
+   ],
+   "params": [
+    "o:lib#Table",
+    "i",
+    "i",
+    "o:lib#AlignEnum"
+   ],
+   "ret": "v"
+  },
+  "table.cell_set_text_size": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "column",
+    "row",
+    "text_size"
+   ],
+   "params": [
+    "o:lib#Table",
+    "i",
+    "i",
+    "?"
+   ],
+   "ret": "v"
+  },
+  "table.cell_set_text_valign": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "column",
+    "row",
+    "text_valign"
+   ],
+   "params": [
+    "o:lib#Table",
+    "i",
+    "i",
+    "o:lib#AlignEnum"
+   ],
+   "ret": "v"
+  },
+  "table.cell_set_tooltip": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "column",
+    "row",
+    "tooltip"
+   ],
+   "params": [
+    "o:lib#Table",
+    "i",
+    "i",
+    "s"
+   ],
+   "ret": "v"
+  },
+  "table.cell_set_width": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "column",
+    "row",
+    "width"
+   ],
+   "params": [
+    "o:lib#Table",
+    "i",
+    "i",
+    "f"
+   ],
+   "ret": "v"
+  },
+  "table.clear": {
+   "default_none_ok": [
+    false,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0"
+   ],
+   "defaults": 2,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "start_column",
+    "start_row",
+    "end_column",
+    "end_row"
+   ],
+   "params": [
+    "o:lib#Table",
+    "i",
+    "i",
+    "i",
+    "i"
+   ],
+   "ret": "v"
+  },
+  "table.delete": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id"
+   ],
+   "params": [
+    "o:lib#Table"
+   ],
+   "ret": "v"
+  },
+  "table.merge_cells": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "start_column",
+    "start_row",
+    "end_column",
+    "end_row"
+   ],
+   "params": [
+    "o:lib#Table",
+    "i",
+    "i",
+    "i",
+    "i"
+   ],
+   "ret": "v"
+  },
+  "table.new": {
+   "default_none_ok": [
+    false,
+    false,
+    false,
+    false,
+    false,
+    false
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "i",
+    "0",
+    "i",
+    "b"
+   ],
+   "defaults": 6,
+   "kind": "function",
+   "names": [
+    "position",
+    "columns",
+    "rows",
+    "bgcolor",
+    "frame_color",
+    "frame_width",
+    "border_color",
+    "border_width",
+    "force_overlay"
+   ],
+   "params": [
+    "o:lib#Position",
+    "i",
+    "i",
+    "c",
+    "c",
+    "i",
+    "c",
+    "i",
+    "b"
+   ],
+   "ret": "o:lib#Table"
+  },
+  "table.set_bgcolor": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "bgcolor"
+   ],
+   "params": [
+    "o:lib#Table",
+    "c"
+   ],
+   "ret": "v"
+  },
+  "table.set_border_color": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "border_color"
+   ],
+   "params": [
+    "o:lib#Table",
+    "c"
+   ],
+   "ret": "v"
+  },
+  "table.set_border_width": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "border_width"
+   ],
+   "params": [
+    "o:lib#Table",
+    "i"
+   ],
+   "ret": "v"
+  },
+  "table.set_frame_color": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "frame_color"
+   ],
+   "params": [
+    "o:lib#Table",
+    "c"
+   ],
+   "ret": "v"
+  },
+  "table.set_frame_width": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "frame_width"
+   ],
+   "params": [
+    "o:lib#Table",
+    "i"
+   ],
+   "ret": "v"
+  },
+  "table.set_position": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "table_id",
+    "position"
+   ],
+   "params": [
+    "o:lib#Table",
+    "o:lib#Position"
+   ],
+   "ret": "v"
+  },
+  "text.align_bottom": {
+   "kind": "value",
+   "ty": "o:lib#AlignEnum"
+  },
+  "text.align_center": {
+   "kind": "value",
+   "ty": "o:lib#AlignEnum"
+  },
+  "text.align_left": {
+   "kind": "value",
+   "ty": "o:lib#AlignEnum"
+  },
+  "text.align_right": {
+   "kind": "value",
+   "ty": "o:lib#AlignEnum"
+  },
+  "text.align_top": {
+   "kind": "value",
+   "ty": "o:lib#AlignEnum"
+  },
+  "text.format_bold": {
+   "kind": "value",
+   "ty": "o:lib#FormatEnum"
+  },
+  "text.format_italic": {
+   "kind": "value",
+   "ty": "o:lib#FormatEnum"
+  },
+  "text.format_none": {
+   "kind": "value",
+   "ty": "o:lib#FormatEnum"
+  },
+  "text.wrap_auto": {
+   "kind": "value",
+   "ty": "o:lib#WrapEnum"
+  },
+  "text.wrap_none": {
+   "kind": "value",
+   "ty": "o:lib#WrapEnum"
+  },
+  "ticker.heikinashi": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "symbol"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "s"
+  },
+  "ticker.inherit": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "from_tickerid",
+    "symbol"
+   ],
+   "params": [
+    "s",
+    "s"
+   ],
+   "ret": "s"
+  },
+  "ticker.kagi": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "symbol",
+    "reversal"
+   ],
+   "params": [
+    "s",
+    "f"
+   ],
+   "ret": "s"
+  },
+  "ticker.linebreak": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "symbol",
+    "number_of_lines"
+   ],
+   "params": [
+    "s",
+    "i"
+   ],
+   "ret": "s"
+  },
+  "ticker.modify": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0"
+   ],
+   "defaults": 4,
+   "kind": "function",
+   "names": [
+    "tickerid",
+    "session",
+    "adjustment",
+    "backadjustment",
+    "settlement_as_close"
+   ],
+   "params": [
+    "s",
+    "s",
+    "s",
+    "s",
+    "s"
+   ],
+   "ret": "s"
+  },
+  "ticker.new": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0"
+   ],
+   "defaults": 4,
+   "kind": "function",
+   "names": [
+    "prefix",
+    "ticker",
+    "session",
+    "adjustment",
+    "backadjustment",
+    "settlement_as_close"
+   ],
+   "params": [
+    "s",
+    "s",
+    "s",
+    "s",
+    "s",
+    "s"
+   ],
+   "ret": "s"
+  },
+  "ticker.pointfigure": {
+   "default_none_ok": [
+    true,
+    true,
+    true,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "0",
+    "0"
+   ],
+   "defaults": 4,
+   "kind": "function",
+   "names": [
+    "symbol",
+    "source",
+    "style",
+    "param",
+    "reversal"
+   ],
+   "params": [
+    "s",
+    "s",
+    "s",
+    "f",
+    "i"
+   ],
+   "ret": "s"
+  },
+  "ticker.renko": {
+   "default_none_ok": [
+    true,
+    true,
+    false,
+    true
+   ],
+   "default_ty": [
+    "0",
+    "0",
+    "b",
+    "0"
+   ],
+   "defaults": 4,
+   "kind": "function",
+   "names": [
+    "symbol",
+    "style",
+    "param",
+    "request_wicks",
+    "source"
+   ],
+   "params": [
+    "s",
+    "s",
+    "f",
+    "b",
+    "s"
+   ],
+   "ret": "s"
+  },
+  "ticker.standard": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "symbol"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "s"
+  },
+  "time": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "time_close": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "time_tradingday": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "timeframe.change": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "timeframe"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "b"
+  },
+  "timeframe.from_seconds": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "seconds"
+   ],
+   "params": [
+    "i"
+   ],
+   "ret": "s"
+  },
+  "timeframe.in_seconds": {
+   "default_none_ok": [
+    true
+   ],
+   "default_ty": [
+    "0"
+   ],
+   "defaults": 1,
+   "kind": "function",
+   "names": [
+    "timeframe"
+   ],
+   "params": [
+    "s"
+   ],
+   "ret": "i"
+  },
+  "timeframe.isdaily": {
+   "callable": true,
+   "kind": "value",
+   "ty": "b"
+  },
+  "timeframe.isdwm": {
+   "callable": true,
+   "kind": "value",
+   "ty": "b"
+  },
+  "timeframe.isintraday": {
+   "callable": true,
+   "kind": "value",
+   "ty": "b"
+  },
+  "timeframe.isminutes": {
+   "callable": true,
+   "kind": "value",
+   "ty": "b"
+  },
+  "timeframe.ismonthly": {
+   "callable": true,
+   "kind": "value",
+   "ty": "b"
+  },
+  "timeframe.isseconds": {
+   "callable": true,
+   "kind": "value",
+   "ty": "b"
+  },
+  "timeframe.isticks": {
+   "callable": true,
+   "kind": "value",
+   "ty": "b"
+  },
+  "timeframe.isweekly": {
+   "callable": true,
+   "kind": "value",
+   "ty": "b"
+  },
+  "timeframe.main_period": {
+   "callable": true,
+   "kind": "value",
+   "ty": "s"
+  },
+  "timeframe.multiplier": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "timeframe.period": {
+   "callable": true,
+   "kind": "value",
+   "ty": "s"
+  },
+  "timenow": {
+   "callable": true,
+   "kind": "value",
+   "ty": "?"
+  },
+  "timestamp": {
+   "impls": [
+    {
+     "defaults": 0,
+     "names": [
+      "date_string"
+     ],
+     "params": [
+      "?"
+     ],
+     "ret": "i"
+    },
+    {
+     "defaults": 0,
+     "names": [
+      "dateString"
+     ],
+     "params": [
+      "?"
+     ],
+     "ret": "i"
+    },
+    {
+     "default_ty": [
+      "i",
+      "i",
+      "i"
+     ],
+     "defaults": 3,
+     "names": [
+      "timezone",
+      "year",
+      "month",
+      "day",
+      "hour",
+      "minute",
+      "second"
+     ],
+     "params": [
+      "?",
+      "f",
+      "f",
+      "f",
+      "f",
+      "f",
+      "f"
+     ],
+     "ret": "i"
+    },
+    {
+     "default_ty": [
+      "i",
+      "i",
+      "i"
+     ],
+     "defaults": 3,
+     "names": [
+      "year",
+      "month",
+      "day",
+      "hour",
+      "minute",
+      "second"
+     ],
+     "params": [
+      "f",
+      "f",
+      "f",
+      "f",
+      "f",
+      "f"
+     ],
+     "ret": "i"
+    }
+   ],
+   "kind": "overloads"
+  },
+  "volume": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "volume_row.buy_volume": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#VolumeRow"
+   ],
+   "ret": "f"
+  },
+  "volume_row.delta": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#VolumeRow"
+   ],
+   "ret": "f"
+  },
+  "volume_row.down_price": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#VolumeRow"
+   ],
+   "ret": "f"
+  },
+  "volume_row.sell_volume": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#VolumeRow"
+   ],
+   "ret": "f"
+  },
+  "volume_row.total_volume": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#VolumeRow"
+   ],
+   "ret": "f"
+  },
+  "volume_row.up_price": {
+   "defaults": 0,
+   "kind": "function",
+   "names": [
+    "id"
+   ],
+   "params": [
+    "o:lib#VolumeRow"
+   ],
+   "ret": "f"
+  },
+  "weekofyear": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "xloc.bar_index": {
+   "kind": "value",
+   "ty": "o:lib#XLoc"
+  },
+  "xloc.bar_time": {
+   "kind": "value",
+   "ty": "o:lib#XLoc"
+  },
+  "year": {
+   "callable": true,
+   "kind": "value",
+   "ty": "i"
+  },
+  "yloc.abovebar": {
+   "kind": "value",
+   "ty": "o:lib#YLoc"
+  },
+  "yloc.belowbar": {
+   "kind": "value",
+   "ty": "o:lib#YLoc"
+  },
+  "yloc.price": {
+   "kind": "value",
+   "ty": "o:lib#YLoc"
+  }
+ },
+ "scalar_classes": {
+  "AlertEnum": "s",
+  "AlignEnum": "s",
+  "BarMerge": "i",
+  "Commission": "s",
+  "Currency": "s",
+  "DayOfWeek": "i",
+  "Direction": "s",
+  "Display": "i",
+  "Dividends": "s",
+  "Earnings": "s",
+  "Extend": "s",
+  "FontFamilyEnum": "s",
+  "Format": "s",
+  "FormatEnum": "s",
+  "HLineEnum": "s",
+  "IntEnum": "i",
+  "LabelStyleEnum": "s",
+  "LineEnum": "s",
+  "Location": "s",
+  "Oca": "s",
+  "Order": "s",
+  "PivotPointType": "s",
+  "PlotEnum": "i",
+  "Position": "s",
+  "QtyType": "s",
+  "Scale": "i",
+  "ScriptType": "i",
+  "Session": "s",
+  "Shape": "s",
+  "Size": "s",
+  "Splits": "s",
+  "StrLiteral": "s",
+  "Weekdays": "i",
+  "WrapEnum": "s",
+  "XLoc": "s",
+  "YLoc": "s"
+ },
+ "v": 8
+}

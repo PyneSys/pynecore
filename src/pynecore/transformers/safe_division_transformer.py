@@ -2,6 +2,8 @@ from _ast import Call, BinOp
 from typing import cast
 import ast
 
+from .pine_type_rules import get_ty, stamp_lowering
+
 
 class SafeDivisionTransformer(ast.NodeTransformer):
     """
@@ -32,8 +34,10 @@ class SafeDivisionTransformer(ast.NodeTransformer):
                 # Mark that we need the safe_convert import
                 self.has_division_operations = True
 
-                # Transform to safe_convert.safe_div call
-                return ast.Call(
+                # Transform to safe_convert.safe_div call. The wrapper takes
+                # over the division's Pine type -- ``int / int`` is int-typed,
+                # and this is the node the overload pin lands on
+                return stamp_lowering(ast.Call(
                     func=ast.Attribute(
                         value=ast.Name(id='safe_convert', ctx=ast.Load()),
                         attr='safe_div',
@@ -41,7 +45,7 @@ class SafeDivisionTransformer(ast.NodeTransformer):
                     ),
                     args=[node.left, node.right],
                     keywords=[]
-                )
+                ), get_ty(node))
 
         return node
 

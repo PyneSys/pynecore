@@ -7,6 +7,7 @@ from functools import lru_cache
 from datetime import datetime, timedelta
 
 from ..core.module_property import module_property
+from ..types.pine_types import PyneInt
 
 from .. import lib
 from . import syminfo as _syminfo
@@ -75,7 +76,7 @@ def _is_new_session(current_dt: datetime, prev_dt: datetime | None = None, tf_se
     :return: True if this is the first candle of a new session
     """
     if tf_sec is None:
-        tf_sec: int = in_seconds(_syminfo.period)
+        tf_sec: int = _in_seconds(_syminfo.period)
     if prev_dt is None:
         prev_dt: datetime = current_dt - timedelta(seconds=tf_sec)
 
@@ -139,7 +140,7 @@ def from_seconds(seconds: int) -> str:
     return f"{seconds}S"
 
 
-def in_seconds(timeframe: str | None = None) -> int:
+def _in_seconds(timeframe: str | None = None) -> int:
     """
     Convert the timeframe to seconds
 
@@ -163,6 +164,17 @@ def in_seconds(timeframe: str | None = None) -> int:
         return _multiplier * 60
     else:
         raise ValueError("Not supported timeframe!")
+
+
+def in_seconds(timeframe: str | None = None) -> PyneInt:
+    """
+    Convert timeframe to seconds
+
+    :param timeframe: The timeframe string, if None the current timeframe is used
+    :return: The timeframe in seconds
+    """
+    # A Pine int is a double at runtime; the core keeps the int form (:func:`_in_seconds`)
+    return float(_in_seconds(timeframe))
 
 
 @module_property
@@ -273,14 +285,15 @@ def main_period() -> str:
 
 
 @module_property
-def multiplier() -> int:
+def multiplier() -> PyneInt:
     """
     Get the current timeframe multiplier
 
     :return: The current timeframe multiplier
     """
     _, _multiplier = _process_tf(_syminfo.period)
-    return _multiplier
+    # A Pine int is a double at runtime
+    return float(_multiplier)
 
 
 @module_property

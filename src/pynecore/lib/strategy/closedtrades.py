@@ -1,4 +1,4 @@
-from ...types.na import NA, na_float
+from ...types.na import NA, na_float, na_int
 from ...types import PyneFloat, PyneInt, PyneStr
 from ... import lib
 
@@ -9,6 +9,24 @@ from ...core.module_property import module_property
 # Functions
 #
 
+
+def _trade_index(trade_num: int) -> int:
+    """
+    Normalize a trade number into a list index.
+
+    Pine's ``int`` is a static type only, so an int-TYPED expression may arrive
+    carrying a fractional value; this consuming slot truncates it. An ``na``
+    trade number becomes -1, which every accessor already answers with ``na``
+    instead of reaching the subscript with a non-integer.
+
+    :param trade_num: Trade number of the trade, possibly fractional or ``na``
+    :return: Integer index, or -1 when there is none
+    """
+    if not (trade_num == trade_num):  # is_na_arg
+        return -1
+    return int(trade_num)
+
+
 # noinspection PyProtectedMember
 def commission(trade_num: int) -> PyneFloat:
     """
@@ -17,6 +35,7 @@ def commission(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the closed trade. The number of the first trade is zero
     :return: The sum of entry and exit fees paid in the closed trade, expressed in strategy.account_currency
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
     try:
@@ -35,14 +54,15 @@ def entry_bar_index(trade_num: int) -> PyneInt:
     :param trade_num: The trade number of the closed trade. The number of the first trade is zero
     :return: The bar_index of the closed trade's entry
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
-        return NA(int)
+        return na_int
     try:
         assert lib._script is not None
         assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].entry_bar_index
+        return float(lib._script.position.closed_trades[trade_num].entry_bar_index)
     except (IndexError, AssertionError):
-        return NA(int)
+        return na_int
 
 
 # noinspection PyProtectedMember
@@ -53,6 +73,7 @@ def entry_comment(trade_num: int) -> PyneStr:
     :param trade_num: The trade number of the closed trade. The number of the first trade is zero
     :return: The comment message of the closed trade's entry
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return NA(str)
     try:
@@ -72,6 +93,7 @@ def entry_id(trade_num: int) -> PyneStr:
     :param trade_num: The trade number of the closed trade. The number of the first trade is zero
     :return: The id of the closed trade's entry
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return NA(str)
     try:
@@ -91,6 +113,7 @@ def entry_price(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the closed trade. The number of the first trade is zero
     :return: The price of the closed trade's entry
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
     try:
@@ -109,14 +132,15 @@ def entry_time(trade_num: int) -> PyneInt:
     :param trade_num: The trade number of the closed trade. The number of the first trade is zero
     :return: The time of the closed trade's entry
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
-        return NA(int)
+        return na_int
     try:
         assert lib._script is not None
         assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].entry_time
+        return float(lib._script.position.closed_trades[trade_num].entry_time)
     except (IndexError, AssertionError):
-        return NA(int)
+        return na_int
 
 
 # noinspection PyProtectedMember
@@ -127,14 +151,15 @@ def exit_bar_index(trade_num: int) -> PyneInt:
     :param trade_num: The trade number of the closed trade. The number of the first trade is zero
     :return: The bar_index of the closed trade's exit
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
-        return NA(int)
+        return na_int
     try:
         assert lib._script is not None
         assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].exit_bar_index
+        return float(lib._script.position.closed_trades[trade_num].exit_bar_index)
     except (IndexError, AssertionError):
-        return NA(int)
+        return na_int
 
 
 # noinspection PyProtectedMember
@@ -145,6 +170,7 @@ def exit_comment(trade_num: int) -> PyneStr:
     :param trade_num: The trade number of the closed trade. The number of the first trade is zero
     :return: The comment message of the closed trade's exit
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return NA(str)
     try:
@@ -163,6 +189,7 @@ def exit_id(trade_num: int) -> PyneStr:
     :param trade_num: The trade number of the closed trade. The number of the first trade is zero
     :return: The id of the closed trade's exit
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return NA(str)
     try:
@@ -182,6 +209,7 @@ def exit_price(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the closed trade. The number of the first trade is zero
     :return: The price of the closed trade's exit
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
     try:
@@ -199,14 +227,15 @@ def exit_time(trade_num: int) -> PyneInt:
     :param trade_num: The trade number of the closed trade. The number of the first trade is zero
     :return: The time of the closed trade's exit
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
-        return NA(int)
+        return na_int
     try:
         assert lib._script is not None
         assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].exit_time
+        return float(lib._script.position.closed_trades[trade_num].exit_time)
     except (IndexError, AssertionError):
-        return NA(int)
+        return na_int
 
 
 # noinspection PyProtectedMember
@@ -217,6 +246,7 @@ def max_drawdown(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the closed trade. The number of the first trade is zero
     :return: The maximum drawdown of the closed trade
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
     try:
@@ -235,6 +265,7 @@ def max_drawdown_percent(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the closed trade. The number of the first trade is zero
     :return: The maximum drawdown percent of the closed trade
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
     try:
@@ -253,6 +284,7 @@ def max_runup(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the closed trade. The number of the first trade is zero
     :return: The maximum runup of the closed trade
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
     try:
@@ -271,6 +303,7 @@ def max_runup_percent(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the closed trade. The number of the first trade is zero
     :return: The maximum runup percent of the closed trade
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
     try:
@@ -289,6 +322,7 @@ def profit(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the closed trade. The number of the first trade is zero
     :return: The profit of the closed trade
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
     try:
@@ -307,6 +341,7 @@ def profit_percent(trade_num: int) -> PyneFloat:
     :param trade_num: The trade number of the closed trade. The number of the first trade is zero
     :return: The profit percent of the closed trade
     """
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
     try:
@@ -319,6 +354,7 @@ def profit_percent(trade_num: int) -> PyneFloat:
 
 # noinspection PyProtectedMember
 def size(trade_num: int) -> PyneFloat:
+    trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return 0.0
     try:
@@ -335,21 +371,22 @@ def size(trade_num: int) -> PyneFloat:
 
 # noinspection PyProtectedMember
 @module_property
-def closedtrades() -> int:
+def closedtrades() -> PyneInt:
     """
     Number of trades, which were closed for the whole trading range.
 
     :return: The number of closed trades
     """
     if lib._script is None or lib._script.position is None:
-        return 0
+        return 0.0
     position = lib._script.position
-    return len(position.closed_trades)
+    # A Pine int is a double at runtime
+    return float(len(position.closed_trades))
 
 
 # noinspection PyProtectedMember
 @module_property
-def first_index() -> int:
+def first_index() -> PyneInt:
     """
     The trade number of the oldest trade still listed in the List of Trades.
 
@@ -362,4 +399,4 @@ def first_index() -> int:
     # bars of a 2880-trade probe, including before the first trade closed. The
     # accessors index ``closed_trades`` directly, so PyneCore's head is always
     # trade 0 and the answer is the constant TradingView also reports.
-    return 0
+    return 0.0
