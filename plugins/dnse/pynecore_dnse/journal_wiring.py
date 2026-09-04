@@ -113,6 +113,23 @@ def journal_child_ref(store_ctx, *, parent_venue_id, child_id) -> None:
         coid, extras=_merged_extras(store_ctx, coid, child_order_id=str(child_id)))
 
 
+def journal_fill_progress(store_ctx, *, venue_id, filled_qty, raw_status) -> None:
+    """#56/item 5: persist the fill watermark on a LIVE partial — a restart
+    seeds ``_last_seen`` from ``row.filled_qty`` + ``last_raw_status`` and
+    re-emits nothing (the in-memory cursor IS ``_last_seen``; this is its
+    only durable copy)."""
+    if store_ctx is None:
+        return
+    coid = _coid_for_venue_id(store_ctx, venue_id)
+    if coid is None:
+        return
+    store_ctx.set_filled(coid, float(filled_qty))
+    store_ctx.upsert_order(
+        coid, extras=_merged_extras(store_ctx, coid,
+                                    last_raw_status=str(raw_status),
+                                    last_fill_venue_id=str(venue_id)))
+
+
 def journal_terminal(store_ctx, *, venue_id, terminal_status,
                      filled_qty=None) -> None:
     """A terminal observation (fill / cancel / reject) closes the row.
@@ -143,6 +160,9 @@ class JournalIdentity:
     venue_ids: "list[str]"           # primary + child + umbrella refs
     child_id: "str | None"
     state: str
+    filled_qty: float                # #56: the persisted fill watermark
+    last_raw_status: "str | None"
+    last_fill_venue_id: "str | None"
 
 
 def iter_journal_identities(store_ctx):
@@ -175,4 +195,7 @@ def iter_journal_identities(store_ctx):
             venue_ids=venue_ids,
             child_id=child_id,
             state=row.state,
+            filled_qty=float(row.filled_qty or 0.0),
+            last_raw_status=extras.get("last_raw_status"),
+            last_fill_venue_id=extras.get("last_fill_venue_id"),
         )

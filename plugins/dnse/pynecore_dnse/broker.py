@@ -41,9 +41,11 @@ from .cancel_disposition import (
     classify_readback as _classify_readback,
 )
 from .feed_health import FeedHealth
+from .fill_slices import parse_reports, select_events
 from .journal_wiring import (
     iter_journal_identities, journal_child_ref, journal_disposition_unknown,
-    journal_rejected, journal_server_ref, journal_submitted, journal_terminal,
+    journal_fill_progress, journal_rejected, journal_server_ref,
+    journal_submitted, journal_terminal,
 )
 from .transport_errors import guard as _guard_transport
 from .page_completeness import (
@@ -194,6 +196,11 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         #: socket (60 s timeout) counts as stuck cycles, never a stack of
         #: abandoned worker threads on the SHARED default executor.
         self._watch_read_deadline_s: float = 10.0
+        #: #56: executions read (slice prices) — own 10k/h bucket; ~2.5 s
+        #: wait then the VWAP-delta fallback (a fill is NEVER lost to a slow
+        #: slice read); a 429 backs the reads off until the cooldown passes.
+        self._executions_read_deadline_s: float = 2.5
+        self._executions_cooldown_until: float = 0.0
         #: Child-adoption retry shape for an Activated conditional whose
         #: ``externalOrderId`` is not published yet (#42-A). Counted in POLLS, not
         #: seconds, so the schedule is deterministic in tests and cannot hot-spin
@@ -330,6 +337,17 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
                     self._order_ids.setdefault(
                         journal_row.intent_key, []).append(venue_id)
                 adopted += 1
+            if journal_row.filled_qty > 0 and journal_row.last_raw_status:
+                # #56: seed the fill watermark so the first post-restart poll
+                # re-emits nothing. ONLY the filling id (the child, or a
+                # NORMAL primary) — never a conditional shell, whose
+                # Activated transition must stay un-deduped (#42-A).
+                seed_id = journal_row.last_fill_venue_id or (
+                    journal_row.child_id if journal_row.child_id is not None
+                    else (primary if journal_row.category == "NORMAL" else None))
+                if seed_id is not None and seed_id not in self._last_seen:
+                    self._last_seen[seed_id] = (journal_row.filled_qty,
+                                                journal_row.last_raw_status)
             if (primary is not None and journal_row.child_id is None
                     and journal_row.category in ("STOP", "OCO")):
                 # Crash-window chase: the parent may have triggered while we
@@ -1457,7 +1475,7 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
             scan_crash_kind = None
             for raw in rows:
                 try:
-                    event = await self._scan_row(raw)
+                    events = await self._scan_row(raw)
                 except BrokerManualInterventionError:
                     raise            # designed escalation: the engine halts
                 except Exception as exc:                          # noqa: BLE001
@@ -1465,7 +1483,7 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
                     # every other order. NOT marked seen -> retried next poll.
                     scan_crash_kind = type(exc).__name__
                     continue
-                if event is not None:
+                for event in events:
                     yield event
             if scan_crash_kind is None:
                 health.record_success("scan")
@@ -1497,12 +1515,13 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
                 outcomes[category] = None
         return rows, outcomes
 
-    async def _scan_row(self, raw: dict) -> "OrderEvent | None":
-        """Process ONE polled row; return its OrderEvent or None.
+    async def _scan_row(self, raw: dict) -> "list[OrderEvent]":
+        """Process ONE polled row; return its OrderEvents (usually 0 or 1 —
+        a multi-slice fill emits one event PER slice, #56).
 
         Extracted from the watch loop so each row runs under the G7 guard
         (#54) — the control flow is the loop body's, with ``continue``
-        translated to ``return None``.
+        translated to ``return []``.
         """
         order_id = str(raw.get("id"))
         order = self._to_exchange_order(raw)
@@ -1514,13 +1533,13 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         raw_status = str(raw.get("orderStatus") or "")
         previous, prev_status = self._last_seen.get(order_id, (0.0, None))
         if cumulative == previous and raw_status == prev_status:
-            return None
+            return []
         pine_id, from_entry, leg_type = self._identity_for(order_id)
         if pine_id is None:
             # NOT marked seen: identity can arrive later (a stop's child
             # is adopted only at the parent's Activated transition — #39),
             # and a row marked seen pre-adoption would dedup its fill away.
-            return None  # not ours (yet)
+            return []  # not ours (yet)
         if (raw_status.upper() == "ACTIVATED"
                 and self._order_category.get(order_id) == "STOP"):
             # Two-book mechanic (CLAUDE.md): Activated = the conditional
@@ -1547,26 +1566,94 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
                 # Deliberately NOT marked seen: the shell never changes
                 # again, so this is the only thing that makes the next
                 # poll retry (#42-A).
-                return None
+                return []
             self._last_seen[order_id] = (cumulative, raw_status)
-            return None  # events come from the child row, not the shell
+            return []  # events come from the child row, not the shell
         # Any other status retires a pending adoption for this parent.
         self._adopt_attempts.pop(order_id, None)
+        delta = max(cumulative - previous, 0.0)
+        average_price = float(raw.get("averagePrice") or 0)
+        # #56: fill-bearing transitions book PER-SLICE events at the slice's
+        # own price (the executions feed) — never the cumulative VWAP. The
+        # read is gated on delta > 0 (status-only transitions skip it, P2).
+        slice_events: "list[tuple[float, float]]" = []
+        if delta > 0:
+            slice_events = await self._fill_slice_events(
+                order_id, previous, cumulative, average_price)
+        # read-before-mark-seen: _last_seen advances only after the slice
+        # outcome is decided (the fallback keeps quantity conserved).
         self._last_seen[order_id] = (cumulative, raw_status)
         if order.status in _TERMINAL_STATUSES:
             journal_terminal(self.store_ctx, venue_id=order_id,
                              terminal_status=raw_status, filled_qty=cumulative)
-        delta = max(cumulative - previous, 0.0)
+        elif delta > 0:
+            # Persist the watermark on the live partial (#56/item 5 collapse):
+            # a restart seeds _last_seen from the row and re-emits nothing.
+            journal_fill_progress(self.store_ctx, venue_id=order_id,
+                                  filled_qty=cumulative, raw_status=raw_status)
         event_type = ("filled" if order.status is OrderStatus.FILLED
                       else "partial" if order.status is OrderStatus.PARTIALLY_FILLED
                       else "cancelled" if order.status is OrderStatus.CANCELLED
                       else "rejected" if order.status is OrderStatus.REJECTED
                       else "created")
-        return OrderEvent(
+        if delta > 0 and slice_events:
+            events = []
+            for index, (slice_qty, slice_price) in enumerate(slice_events):
+                final_slice = index == len(slice_events) - 1
+                events.append(OrderEvent(
+                    order=order,
+                    event_type=event_type if final_slice else "partial",
+                    fill_price=slice_price or None,
+                    fill_qty=slice_qty or None, timestamp=int(time.time()),
+                    pine_id=pine_id, from_entry=from_entry, leg_type=leg_type))
+            return events
+        return [OrderEvent(
             order=order, event_type=event_type,
-            fill_price=float(raw.get("averagePrice") or 0) or None,
+            fill_price=average_price or None,
             fill_qty=delta or None, timestamp=int(time.time()),
-            pine_id=pine_id, from_entry=from_entry, leg_type=leg_type)
+            pine_id=pine_id, from_entry=from_entry, leg_type=leg_type)]
+
+    async def _fill_slice_events(self, order_id: str, previous: float,
+                                 cumulative: float, average_price: float
+                                 ) -> "list[tuple[float, float]]":
+        '''#56: the per-slice (qty, price) emissions for one fill delta.
+
+        Availability beats precision on EVERY failure path (panel G2): a
+        failed/slow/429 executions read falls back to ONE average-priced
+        delta event — a fill is never lost to the slice feed. Selection is
+        the budget clamp in fill_slices.select_events.
+        '''
+        fallback = [(max(cumulative - previous, 0.0), average_price)]
+        if time.monotonic() < self._executions_cooldown_until:
+            return fallback
+        category = self._order_category.get(order_id, "NORMAL")
+        try:
+            status, body = await asyncio.wait_for(
+                asyncio.to_thread(lambda: _guard_transport(
+                    lambda: self.client.get_execution_detail(
+                        self.account_id, order_id, self.market_type,
+                        order_category=category))),
+                timeout=self._executions_read_deadline_s)
+        except (asyncio.TimeoutError, TimeoutError):
+            log.broker_warning("%s", (
+                f"slice pricing degraded: executions read timed out -> "
+                f"booking the delta at the cumulative VWAP | order={order_id}"))
+            return fallback
+        if status == 429:
+            self._executions_cooldown_until = time.monotonic() + 60.0
+            log.broker_warning("%s", (
+                f"slice pricing degraded: executions rate-limited -> VWAP "
+                f"fallback + 60 s cooldown | order={order_id}"))
+            return fallback
+        if status != 200:
+            log.broker_warning("%s", (
+                f"slice pricing degraded: executions read http={status} -> "
+                f"booking the delta at the cumulative VWAP | order={order_id}"))
+            return fallback
+        events = select_events(parse_reports(body), booked_cum=previous,
+                               venue_cum=cumulative,
+                               average_price=average_price)
+        return events or fallback
 
     @override
     async def get_open_orders(self, symbol: str | None = None) -> list[ExchangeOrder]:
