@@ -97,14 +97,15 @@ def main():
 
 Key parameters:
 
-| Parameter          | Default | Description                                   |
-|--------------------|---------|-----------------------------------------------|
-| `title`            | `''`    | Display name                                  |
-| `overlay`          | `False` | Show on price chart (`True`) or separate pane |
-| `format`           | inherit | Number formatting                             |
-| `precision`        | `None`  | Decimal digits                                |
-| `max_bars_back`    | `0`     | History buffer length (0 = auto)              |
-| `dynamic_requests` | `False` | Allow dynamic `request.*()` calls             |
+| Parameter          | Default | Description                                                      |
+|--------------------|---------|------------------------------------------------------------------|
+| `title`            | `''`    | Display name                                                     |
+| `overlay`          | `False` | Show on price chart (`True`) or separate pane                    |
+| `format`           | inherit | Number formatting                                                |
+| `precision`        | `None`  | Decimal digits                                                   |
+| `max_bars_back`    | `0`     | History buffer length (0 = auto)                                 |
+| `dynamic_requests` | `False` | Allow dynamic `request.*()` calls                                |
+| `na_bool`          | `False` | Keep Pine v4/v5's three-state `bool` (see [bool](types.md#bool)) |
 
 ### @script.strategy
 

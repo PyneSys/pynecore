@@ -16,7 +16,7 @@ from pynecore.lib.log import (broker_debug, broker_info, broker_warning, ohlcv_i
                               logger)
 from pynecore.core.broker.exceptions import ExchangeConnectionError
 from pynecore.types.ohlcv import OHLCV
-from pynecore.types.na import na_float
+from pynecore.types.na import na_float, set_bool_na
 from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.csv_file import CSVWriter
 from pynecore.core.drawing_snapshot import DrawingSnapshot
@@ -1311,6 +1311,9 @@ class ScriptRunner:
 
         # Set script data
         lib._script = self.script  # Store script object in lib
+        # The loader applied the script's bool na choice at import; a module imported
+        # earlier (another script ran since) needs it re-applied for this run
+        set_bool_na(self.script.na_bool)
 
         # Broker mode: refuse to start if the script needs capabilities the
         # exchange doesn't offer. Fail fast — never on the first bar.
@@ -1501,11 +1504,22 @@ class ScriptRunner:
                 root_keys.append(root_key)
                 bound_entries[id(entry_func)] = partial(
                     entry_func, instance_state.create_root(root_key, entry_layout))
-            run_main = bound_entries[id(main_func)]
+            na_bool = self.script.na_bool
+
+            def _in_bool_mode(entry: Callable[[], Any]) -> Callable[[], Any]:
+                # The bool na mode is process-wide: re-apply it on every entry
+                # (library mains included) so a script interleaved with another
+                # one's run keeps its own semantics
+                def run_entry():
+                    set_bool_na(na_bool)
+                    return entry()
+                return run_entry
+
+            run_main = _in_bool_mode(bound_entries[id(main_func)])
             # A library file run directly as the script registers its main as a
             # library entry too — run it once per bar, not twice
-            lib_mains = [bound_entries[id(f)] for _title, f in script._registered_libraries
-                         if id(f) != id(main_func)]
+            lib_mains = [_in_bool_mode(bound_entries[id(f)])
+                         for _title, f in script._registered_libraries if id(f) != id(main_func)]
 
             if sec_contexts:
                 import os

@@ -40,6 +40,11 @@ class ImportNormalizerTransformer(ast.NodeTransformer):
         self.names_to_replace: Set[str] = set()
         # Track if we need to add 'from pynecore import lib'
         self.needs_lib_import = False
+        #: A lib-module alias's bindings in source order: (top-level statement
+        #: index, lib path) for each lib import of the name, (index, None) for a
+        #: statement rebinding the name to something else
+        self.alias_bindings: dict[str, list[tuple[int, str | None]]] = {}
+        self._stmt_index = 0
         # Track function level imports to move up
         self.function_imports: List[ast.ImportFrom] = []
         # Current function being processed
@@ -175,8 +180,26 @@ class ImportNormalizerTransformer(ast.NodeTransformer):
                 else:
                     self._handle_import(stmt)
 
+        # A lib-module alias rebound later in the module (another lib module,
+        # an import of something else, a definition, an assignment) denotes
+        # that binding from there on: every reference is rewritten to the lib
+        # path bound where it stands, or left alone past a foreign rebinding
+        for index, stmt in enumerate(node.body):
+            if isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    if alias.name == 'pynecore.lib' or alias.name.startswith('pynecore.lib.'):
+                        parts = alias.name.split('.')
+                        target = 'lib' if len(parts) <= 2 else 'lib.' + '.'.join(parts[2:])
+                        bound = alias.asname or parts[-1]
+                        self.alias_bindings.setdefault(bound, []).append((index, target))
+            for name in self.module_imports:
+                if _rebinds(stmt, name):
+                    self.alias_bindings.setdefault(name, []).append((index, None))
+
         # Process the rest of the module to collect attribute usages
-        node = cast(ast.Module, self.generic_visit(node))
+        for index, stmt in enumerate(node.body):
+            self._stmt_index = index
+            node.body[index] = cast(ast.stmt, self.visit(stmt))
 
         # Filter out old lib imports
         new_body = []
@@ -218,9 +241,12 @@ class ImportNormalizerTransformer(ast.NodeTransformer):
         if self.function_imports:
             imports.extend(self.function_imports)
 
-        # Insert imports after docstring if exists
+        # Insert imports after the docstring and the ``__future__`` block
         insert_pos = 1 if (new_body and isinstance(new_body[0], ast.Expr) and
                            isinstance(cast(ast.Expr, new_body[0]).value, ast.Constant)) else 0
+        while insert_pos < len(new_body) and isinstance(new_body[insert_pos], ast.ImportFrom) \
+                and cast(ast.ImportFrom, new_body[insert_pos]).module == '__future__':
+            insert_pos += 1
         new_body[insert_pos:insert_pos] = imports
 
         node.body = new_body
@@ -272,8 +298,14 @@ class ImportNormalizerTransformer(ast.NodeTransformer):
                 return _dotted(path, node)
             # Handle module imports
             elif node.id in self.module_imports:
-                path = self.module_imports[node.id].split('.')
-                return _dotted(path, node)
+                target: str | None = self.module_imports[node.id]
+                for index, bound_target in self.alias_bindings.get(node.id, ()):
+                    if index > self._stmt_index:
+                        break
+                    target = bound_target
+                if target is None:
+                    return node
+                return _dotted(target.split('.'), node)
             # Handle names from wildcard imports
             else:
                 # Check each wildcard imported module
@@ -322,3 +354,16 @@ class ImportNormalizerTransformer(ast.NodeTransformer):
         self.current_function = old_function
         self.function_parameters = old_parameters
         return node
+
+
+def _rebinds(stmt: ast.stmt, name: str) -> bool:
+    """Whether a top-level statement binds ``name`` to something other than a lib module."""
+    if isinstance(stmt, ast.ImportFrom):
+        return any((alias.asname or alias.name) == name for alias in stmt.names)
+    if isinstance(stmt, ast.Import):
+        return any((alias.asname or alias.name.split('.')[0]) == name
+                   and not alias.name.startswith('pynecore.lib') for alias in stmt.names)
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return stmt.name == name
+    return any(isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Store)
+               for node in ast.walk(stmt))

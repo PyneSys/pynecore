@@ -31,6 +31,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Final
 
+from .pine_type_rules import FactoryFields
 from .pine_type_table import Diag, Unknown
 
 __all__ = ['EDGE_RULES_VERSION', 'STRICT_ENV', 'DIAG_ENV', 'edge_rules', 'strict_enabled',
@@ -239,21 +240,15 @@ class _Gate:
                 self.module_bound_at.setdefault(name, index)
         # ``field(default_factory=lambda: ...)`` is the one legitimate lambda:
         # a UDT field's default, which the compiler emits too -- and only
-        # there, as the value of a field in a decorated class body
+        # there, as the value of a field in a decorated class body (the
+        # predicate is the type pass's, so the gate and the typing agree)
+        factory = FactoryFields(self.tree)
         for node in ast.walk(self.tree):
             if not isinstance(node, ast.ClassDef) or len(node.decorator_list) != 1 \
                     or not self._decorator_ok(node.decorator_list[0], self.class_decorators):
                 continue
-            for stmt in node.body:
-                call = stmt.value if isinstance(stmt, ast.AnnAssign) else None
-                if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)) \
-                        or self.from_imports.get(call.func.id) != ('dataclasses', 'field'):
-                    continue
-                for keyword in call.keywords:
-                    value = keyword.value
-                    if keyword.arg == 'default_factory' and isinstance(value, ast.Lambda) \
-                            and not _has_parameters(value.args):
-                        self.allowed_lambdas.add(id(value))
+            for call in factory.of(node):
+                self.allowed_lambdas.add(id(call.keywords[0].value))
         # ``__all__ = ['name', ...]`` at module level is the one legitimate
         # list literal: the library emitter produces it
         for stmt in self.tree.body:
@@ -429,9 +424,7 @@ class _Gate:
         """
         if len(node.bases) != 1 or node.keywords or node.decorator_list \
                 or not isinstance(node.bases[0], ast.Name) \
-                or self.from_imports.get(node.bases[0].id) != ('typing', 'Protocol') \
-                or node.bases[0].id in self.module_bound_at \
-                or node.bases[0].id in self.def_names:
+                or not self._is_typing_protocol(node.bases[0].id):
             return False
         body = node.body
         if body and _is_docstring(body[0]):
@@ -501,6 +494,33 @@ class _Gate:
             return self.from_imports.get(decorator.id) in allowed
         return False
 
+    def _is_typing_protocol(self, name: str) -> bool:
+        """
+        Whether ``name`` denotes ``typing.Protocol`` at the current statement.
+
+        The binding in effect is the LAST one in source order before the
+        statement: a later import, assignment or definition of the same name
+        counterfeits the base, whatever an earlier ``from typing import``
+        said.
+        """
+        binding: str | None = None
+        for stmt in self.tree.body[:self._stmt_index]:
+            if isinstance(stmt, ast.ImportFrom):
+                for alias in stmt.names:
+                    if (alias.asname or alias.name) == name:
+                        binding = 'protocol' if (stmt.module == 'typing' and not stmt.level
+                                                 and alias.name == 'Protocol') else 'other'
+            elif isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    if (alias.asname or alias.name.split('.')[0]) == name:
+                        binding = 'other'
+            elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if stmt.name == name:
+                    binding = 'other'
+            elif name in _stored_names(stmt):
+                binding = 'other'
+        return binding == 'protocol'
+
     def _check_op(self, node: ast.AST, op: ast.AST, allowed: frozenset[str]) -> None:
         kind = type(op).__name__
         if kind not in allowed:
@@ -559,10 +579,6 @@ def _scope_bound(node: ast.FunctionDef) -> dict[str, int]:
         for name in _stored_names(stmt):
             out.setdefault(name, index)
     return out
-
-
-def _has_parameters(args: ast.arguments) -> bool:
-    return bool(args.posonlyargs or args.args or args.kwonlyargs or args.vararg or args.kwarg)
 
 
 def _has_special_parameters(args: ast.arguments) -> bool:

@@ -405,6 +405,49 @@ def __test_a_rebound_protocol_is_no_shim__():
     shim = ('from typing import Protocol as P, Any\nP = 1\n'
             'class _ProtocolF(P):\n    def __call__(self, x: int) -> Any: ...\n')
     assert _gate(HEAD + shim)
+    # A later import counterfeits the base as well as a value does
+    shim = ('from typing import Protocol, Any\nimport pynecore.lib as Protocol\n'
+            'class _ProtocolF(Protocol):\n    def __call__(self, x: int) -> Any: ...\n')
+    assert _gate(HEAD + shim)
+    # An earlier import is overridden by the typing one
+    shim = ('import pynecore.lib as Protocol\nfrom typing import Protocol, Any\n'
+            'class _ProtocolF(Protocol):\n    def __call__(self, x: int) -> Any: ...\n')
+    assert not _gate(HEAD + shim)
+
+
+def __test_only_a_dataclass_field_factory_is_plumbing__():
+    """A default_factory keyword on an ordinary call is a call like any other"""
+    factory = ('def factory(x):\n    return x\n'
+               '@udt\nclass Bag:\n    x: int = factory(default_factory=1)\n')
+    assert _type_diags(HEAD + factory)
+    real = ('from dataclasses import field as fld\n'
+            '@udt\nclass Bag:\n    items: list = fld(default_factory=lambda: array.new_float(0))\n')
+    assert not _type_diags(HEAD + real)
+
+
+def __test_the_field_binding_is_the_one_in_effect_at_the_class__():
+    """A later rebinding of the field name counterfeits it; an earlier one is overridden"""
+    bag = '@udt\nclass Bag:\n    items: list = fld(default_factory=lambda: array.new_float(0))\n'
+    counterfeit = 'from dataclasses import field as fld\ndef fld(**kw):\n    return 0\n' + bag
+    assert _type_diags(HEAD + counterfeit)
+    assert 'edge-lambda' in _reasons(_gate(HEAD + counterfeit))
+    overridden = 'def fld(**kw):\n    return 0\nfrom dataclasses import field as fld\n' + bag
+    assert not _type_diags(HEAD + overridden)
+    assert 'edge-lambda' not in _reasons(_gate(HEAD + overridden))
+    module = ('import dataclasses\n@udt\nclass Bag:\n'
+              '    items: list = dataclasses.field(default_factory=lambda: array.new_float(0))\n')
+    assert not _type_diags(HEAD + module)
+
+
+def __test_only_the_zero_argument_lambda_factory_is_plumbing__():
+    """``default_factory=dict`` or a lambda with parameters is an ordinary call"""
+    named = ('from dataclasses import field\n@udt\nclass Bag:\n'
+             '    items: list = field(default_factory=dict)\n')
+    assert _type_diags(HEAD + named)
+    with_arg = ('from dataclasses import field\n@udt\nclass Bag:\n'
+                '    items: list = field(default_factory=lambda n: array.new_float(n))\n')
+    assert _type_diags(HEAD + with_arg)
+    assert 'edge-lambda' in _reasons(_gate(HEAD + with_arg))
 
 
 def __test_a_script_decorator_is_always_called__():

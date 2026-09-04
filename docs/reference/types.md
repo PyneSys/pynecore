@@ -44,6 +44,19 @@ Boolean values. Python's `bool`.
 is_bull: bool = close > open
 ```
 
+A `bool` has two states, as in Pine v6: a bool history before warm-up, `na(bool)`,
+a fresh `array<bool>` element and an unset UDT `bool` field are all `False`. Pine v4
+and v5 scripts keep a third state, and a script converted from them asks for it with
+`na_bool=True` on its decorator:
+
+```python
+@script.indicator("Three-state bool", na_bool=True)
+```
+
+With it a bool can be `na`: `na(flag)` is true before the first assignment, `==` and
+`!=` on a na bool give `na`, while `not`, `and`, `or`, a branch condition and `nz()`
+treat it as `False`, the way TradingView does. Hand-written Pyne code can use it too.
+
 ### string
 
 Text values. Python's `str`.

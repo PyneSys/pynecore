@@ -86,3 +86,9 @@ na_float: float
 na_int: float
 na_str: str
 na_bool: bool
+
+
+def set_bool_na(enabled: bool) -> None: ...
+
+
+def new_bool_na() -> bool: ...

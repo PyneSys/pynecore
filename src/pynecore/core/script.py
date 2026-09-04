@@ -73,10 +73,12 @@ class Script:
     Script parameters dataclass
     """
     # These fields will be skipped when saving to toml
-    _SKIP_FIELDS = {'script_type', 'inputs', 'title', 'shorttitle', 'position'}
+    _SKIP_FIELDS = {'script_type', 'inputs', 'title', 'shorttitle', 'position', 'na_bool'}
 
     script_type: _script_type.ScriptType | None = None
     inputs: dict[str, InputData] = field(default_factory=dict)
+    #: The script keeps Pine v4/v5's three-state bool (``bool b = na`` is a real na)
+    na_bool: bool = False
 
     title: str | None = None
     shorttitle: str | None = None
@@ -297,6 +299,7 @@ class Script:
             max_polylines_count=50,
             dynamic_requests=False,
             behind_chart=True,
+            na_bool=False,
             *_, **__
     ) -> Callable[..., Any]:
         """
@@ -326,6 +329,9 @@ class Script:
                                  the `request.*()` namespace
         :param behind_chart: Controls whether the script's plots and drawings in the main chart pane
                              appear behind the chart display
+        :param na_bool: Keep Pine v4/v5's three-state bool: a bool may be na (a history
+                        before warm-up, ``na(bool)``, a fresh array or UDT bool); v6 has
+                        no such state
         """
         script = cls()
         script.script_type = _script_type.indicator
@@ -348,6 +354,7 @@ class Script:
         script.dynamic_requests = dynamic_requests
         script.behind_chart = behind_chart
 
+        script.na_bool = na_bool
         return script._decorate()
 
     # noinspection DuplicatedCode
@@ -397,6 +404,7 @@ class Script:
 
             _broker_requirements: ScriptRequirements | None = None,
 
+            na_bool=False,
             *_, **__
     ) -> Callable[..., Any]:
         """
@@ -448,6 +456,9 @@ class Script:
         :param max_polylines_count: The number of last polyline drawings displayed
         :param dynamic_requests: Specifies whether the script can dynamically call functions from
         :param behind_chart: Controls whether the script's plots and drawings in the main chart pane
+        :param na_bool: Keep Pine v4/v5's three-state bool: a bool may be na (a history
+                        before warm-up, ``na(bool)``, a fresh array or UDT bool); v6 has
+                        no such state
         :param _broker_requirements: Broker capability requirements of the script, internal use only
         """
         script = cls()
@@ -498,6 +509,7 @@ class Script:
 
         script._broker_requirements = _broker_requirements
 
+        script.na_bool = na_bool
         return script._decorate()
 
     @classmethod
@@ -506,6 +518,7 @@ class Script:
             title='',
             overlay=False,
             dynamic_requests=False,
+            na_bool=False,
             *_, **__
     ) -> Callable[..., Any]:
         """
@@ -515,6 +528,9 @@ class Script:
         :param title: The title of the script
         :param overlay: If True, the script will be displayed on the price chart as an overlay,
         :param dynamic_requests: Specifies whether the script can dynamically call functions from
+        :param na_bool: Keep Pine v4/v5's three-state bool: a bool may be na (a history
+                        before warm-up, ``na(bool)``, a fresh array or UDT bool); v6 has
+                        no such state
         """
         script = cls()
         script.script_type = _script_type.library
@@ -529,6 +545,7 @@ class Script:
             lib_entry = (script.title or 'Untitled Library', func)
             if lib_entry not in _registered_libraries:
                 _registered_libraries.append(lib_entry)
+            script.na_bool = na_bool
             return script._decorate()(func)
 
         return decorator

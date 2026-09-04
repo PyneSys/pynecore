@@ -20,7 +20,7 @@ run modes are pinned here: through a real import, and running the library
 module directly as the script.
 
 The library registration is process-global (see
-``test_031_coof_same_module_library``), so the tests restore it and drop the
+``test_031_coof_registered_library``), so the tests restore it and drop the
 imported modules afterwards.
 """
 import sys

@@ -884,7 +884,8 @@ def nz(source: Any, replacement: Any = 0) -> Any:
     if isinstance(source, float):
         return source if _math.isfinite(source) else replacement
     if isinstance(source, NA):
-        return replacement
+        # nz on a bool answers a bool (TV: ``nz(na_bool)`` is false)
+        return bool(replacement) if source.type is bool else replacement
     return source
 
 

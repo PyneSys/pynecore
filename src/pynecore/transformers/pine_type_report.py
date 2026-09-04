@@ -24,7 +24,7 @@ import re
 from collections.abc import Iterator
 
 from .node_ids import node_id
-from .pine_type_rules import UNKNOWN, get_ty, render_ty
+from .pine_type_rules import UNKNOWN, FactoryFields, get_ty, render_ty
 from .pine_type_table import Diag, PineTypeTable, Unknown, qualify
 
 __all__ = ['unknown_diags']
@@ -75,6 +75,7 @@ class _Report:
 
     def __init__(self, tree: ast.Module, table: PineTypeTable):
         self.tree = tree
+        self.factory = FactoryFields(tree)
         self.table = table
         self.parent_of: dict[int, ast.AST] = {}
         self.scope_of: dict[int, str] = {}
@@ -132,14 +133,11 @@ class _Report:
                 for base in node.bases:
                     for sub in ast.walk(base):
                         self.skip.add(id(sub))
-                # ``field(default_factory=...)`` as a field's default: the
+                # ``field(default_factory=...)`` as a UDT field's default: the
                 # dataclass machinery builds it, the annotation types the field
-                for stmt in node.body:
-                    value = stmt.value if isinstance(stmt, ast.AnnAssign) else None
-                    if isinstance(value, ast.Call) \
-                            and any(keyword.arg == 'default_factory' for keyword in value.keywords):
-                        for sub in ast.walk(value):
-                            self.skip.add(id(sub))
+                for value in self.factory.of(node):
+                    for sub in ast.walk(value):
+                        self.skip.add(id(sub))
             else:
                 for arg in node.args.args + node.args.posonlyargs + node.args.kwonlyargs:
                     if arg.annotation is not None:

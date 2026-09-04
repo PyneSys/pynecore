@@ -2,7 +2,7 @@ from math import isfinite
 from typing import Any, TypeVar, Generic, Type, Self
 
 __all__ = [
-    'NA', 'na_float', 'na_int', 'na_bool', 'na_str', 'isna_num',
+    'NA', 'na_float', 'na_int', 'na_bool', 'na_str', 'isna_num', 'set_bool_na', 'new_bool_na',
 ]
 
 T = TypeVar('T')
@@ -37,6 +37,28 @@ def isna_num(x: Any) -> bool:
         return False
 
 
+#: Whether a bool may be na. Pine v4/v5 keep a third bool state; v6 has none, so
+#: there ``NA(bool)`` is plain ``False``. Set per script by ``set_bool_na``.
+_bool_na: bool = False
+
+
+def set_bool_na(enabled: bool) -> None:
+    """
+    Choose whether a bool may be na.
+
+    Pine v4 and v5 scripts keep a three-state bool: ``bool b = na`` is a real
+    na, a bool history before warm-up is na and ``na(b)`` can be true. Pine v6
+    has no such state, every bool is true or false. The choice belongs to the
+    script (``script.indicator(..., na_bool=True)``) and takes effect for every
+    bool na built afterwards, so the loader applies it before the script module
+    body runs.
+
+    :param enabled: True for the v4/v5 three-state bool, False for the v6 two-state one
+    """
+    global _bool_na
+    _bool_na = enabled
+
+
 class NA(Generic[T]):
     """
     Class representing NA (Not Available) values for non-numeric types.
@@ -61,10 +83,19 @@ class NA(Generic[T]):
     def __new__(cls, type: Type[T] | T | None = int) -> Self:
         if type is float or type is int:
             return _NAN  # type: ignore[return-value]
+        if type is bool and not _bool_na:
+            return False  # type: ignore[return-value]
+        return cls._interned(type)
+
+    # noinspection PyShadowingBuiltins
+    @classmethod
+    def _interned(cls, type: Type[T] | T | None) -> Self:
+        """The interned na of a type, past the numeric and bool faces of ``__new__``."""
         try:
             return cls._type_cache[type]  # type: ignore[reportReturnType]
         except KeyError:
             na = super().__new__(cls)
+            na.type = type
             cls._type_cache[type] = na
             return na
 
@@ -191,9 +222,15 @@ class NA(Generic[T]):
     #
 
     def __eq__(self, _: Any) -> bool:
+        # A na bool compared with == or != is na again (TV v5, measured), the
+        # one place the third state propagates instead of collapsing to false
+        if self.type is bool:
+            return self  # type: ignore[return-value]
         return False
 
     def __ne__(self, _: Any) -> bool:
+        if self.type is bool:
+            return self  # type: ignore[return-value]
         return False
 
     def __gt__(self, _: Any) -> bool:
@@ -242,4 +279,16 @@ class NA(Generic[T]):
 na_float: float = _NAN
 na_int: float = _NAN
 na_str = NA(str)
-na_bool = NA(bool)
+# The bool na itself, built past the switch: the constant exists in both modes
+na_bool: NA[bool] = NA._interned(bool)
+
+
+def new_bool_na() -> "NA[bool] | bool":
+    """
+    The bool na under the mode in effect: the interned na when a bool may be na,
+    ``False`` otherwise.
+
+    The loader binds a UDT field's ``na(bool)`` default to this factory so the
+    field is built per construction, under the running script's choice.
+    """
+    return NA(bool)

@@ -58,7 +58,7 @@ from .pine_type_rules import (
     LIB_TYPE_OVERRIDES, OVERRIDE_PARAM_NAMES, BUILTIN_CALL_TYPES, BUILTIN_NAME_TYPES,
     TY_ATTR, get_ty, set_ty, inherit_ty,
     constant_type, pin_for, get_pins, set_pin, set_pins, set_vector, set_varying,
-    overload_result, ImplSig, overload_pick, default_fit, FIT_REQUIRED,
+    overload_result, ImplSig, overload_pick, default_fit, FIT_REQUIRED, FactoryFields,
     impl_sig, _param_defaults, _dotted, _DYN_DEFAULT,
     CLASS_SEP, LIB_MODULE, SCALARS, PINE_LOOP, array_of, builtin_class_id, class_id, class_of,
     element_of, elements_of, head, is_array,
@@ -415,6 +415,7 @@ class _Inference:
         self._shape_diags: set[int] = set()
         #: The ``field(default_factory=...)`` calls that stand as UDT field defaults
         self._factory_fields: set[int] = set()
+        self._factory = FactoryFields(ast.Module(body=[], type_ignores=[]))
         #: The diagnostic that took every pin away from the module, once one has
         self._pins_suppressed: Diag | None = None
         #: Call nodes whose shape or argument types the callee rejected
@@ -707,6 +708,7 @@ class _Inference:
 
     def run(self, tree: ast.Module) -> None:
         """Walk a module: the lib aliases, the imports, the definitions, the body."""
+        self._factory = FactoryFields(tree)
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module == 'pynecore':
                 self._lib_aliases.update(a.asname or a.name for a in node.names)
@@ -1195,11 +1197,8 @@ class _Inference:
 
         :param stmt: The class statement
         """
-        for field_stmt in stmt.body:
-            value = field_stmt.value if isinstance(field_stmt, ast.AnnAssign) else None
-            if isinstance(value, ast.Call) \
-                    and any(keyword.arg == 'default_factory' for keyword in value.keywords):
-                self._factory_fields.add(id(value))
+        for value in self._factory.of(stmt):
+            self._factory_fields.add(id(value))
         self._frames.append(_Frame(self._frames[-1].scope))
         try:
             self._body(stmt.body)

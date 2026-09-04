@@ -59,6 +59,7 @@ from datetime import datetime, timedelta, UTC
 from time import monotonic, sleep
 from typing import TYPE_CHECKING, Callable, cast
 
+from ..types.na import set_bool_na
 from .security_shm import (
     SyncBlock, ResultBlock, write_na,
     FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE, FLAG_DEV_HISTORICAL,
@@ -718,6 +719,7 @@ def security_process_main(
         bound_entries[id(entry_func)] = partial(
             entry_func, instance_state.create_root(entry_root_key, entry_layout))
     run_main = bound_entries[id(main_func)]
+    na_bool = main_func.script.na_bool
 
     # Set lib semaphore to suppress plot/strategy/alert side effects
     lib._lib_semaphore = True
@@ -731,6 +733,8 @@ def security_process_main(
         imported library function dies here with "Exported proxy has not been
         initialized". ``lib._lib_semaphore`` stays True for both (every side
         effect is suppressed in a security child)."""
+        # The script's bool na mode, re-applied on every entry (see ScriptRunner)
+        set_bool_na(na_bool)
         for _title, _lib_main in script_mod._registered_libraries:
             bound_entries.get(id(_lib_main), _lib_main)()
         run_main()

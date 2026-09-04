@@ -26,6 +26,8 @@ _PYNE_SENTINEL = '__pyne_transformed__'
 # the first element of that constant's tuple. A ``.pyc`` holds many tuples; this
 # marker is what tells the records apart from every other one in ``co_consts``.
 _PYNE_DEPS = '__pyne_type_deps__'
+#: Alias the loader binds ``set_bool_na`` to in a script module's baked prologue
+_PYNE_SET_BOOL_NA = '__pyne_set_bool_na·__'
 
 # A module is Pyne code only when its docstring STARTS with ``@pyne``. Matching the
 # raw source head mirrors the strict docstring check in ``source_to_code`` without
@@ -239,6 +241,92 @@ def _repeats(structural: list['Diag'], diag: 'Diag') -> bool:
             return True
         if found.end_line and (found.line, found.col) <= at <= (found.end_line, found.end_col):
             return True
+    return False
+
+
+def _script_bool_na(tree: "ast.Module", path: Path) -> bool | None:
+    """
+    Read the script's bool na choice off its ``script.*`` decorator.
+
+    The choice must hold before the module body runs -- a UDT field default or
+    a ``bool b = na`` at module level builds its na at import -- so the loader
+    reads the keyword statically and bakes the call into the module prologue.
+    The decorator is resolved through the module's own import bindings, so
+    ``@script.indicator``, ``@lib.script.indicator``, ``@pynecore.lib.script.indicator``,
+    an alias of ``script`` and an ``import pynecore.lib as X`` alias are all recognized.
+
+    :param tree: The parsed module, before analysis.
+    :param path: The module's path, for the error location.
+    :return: The ``na_bool`` keyword's value (False when the decorator omits it), or
+             None for a module without a ``script.indicator/strategy/library`` decorator.
+    :raises SyntaxError: When ``na_bool`` is not a literal ``True`` or ``False``, or a
+        script decorator stands on a function other than ``main``, or ``main`` is
+        decorated twice.
+    """
+    import ast
+
+    lib_names: set[str] = set()
+    script_names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom):
+            # ``from pynecore import lib as X`` is refused by the import normalizer
+            for alias in node.names:
+                if node.module == 'pynecore.lib' and alias.name == 'script':
+                    script_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == 'pynecore.lib' and alias.asname is not None:
+                    lib_names.add(alias.asname)
+
+    def is_script_decorator(func: ast.expr) -> bool:
+        chain: list[str] = []
+        while isinstance(func, ast.Attribute):
+            chain.append(func.attr)
+            func = func.value
+        if not isinstance(func, ast.Name) or not chain:
+            return False
+        chain.append(func.id)
+        chain.reverse()
+        if chain[-1] not in ('indicator', 'strategy', 'library'):
+            return False
+        head = chain[:-1]
+        return (head == ['script'] or head[0] in script_names and len(head) == 1
+                or head == ['pynecore', 'lib', 'script']
+                or len(head) == 2 and head[1] == 'script' and (head[0] == 'lib' or head[0] in lib_names))
+
+    # A module has ONE entry point: the script decorator stands on ``main`` --
+    # that is the function the runner runs, and an imported library's own
+    # entry is the ``main`` of its own module
+    entry: ast.Call | None = None
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for decorator in node.decorator_list:
+            if not isinstance(decorator, ast.Call) or not is_script_decorator(decorator.func):
+                continue
+            if node.name != 'main':
+                raise SyntaxError(
+                    f"the script decorator belongs on 'main', not on '{node.name}'",
+                    (str(path), decorator.lineno, decorator.col_offset + 1, None))
+            if entry is not None:
+                raise SyntaxError(
+                    "a module has one script decorator: 'main' is defined twice",
+                    (str(path), decorator.lineno, decorator.col_offset + 1, None))
+            entry = decorator
+            break
+    if entry is None:
+        return None
+    for keyword in entry.keywords:
+        if keyword.arg != 'na_bool':
+            continue
+        value = keyword.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, bool):
+            return value.value
+        # The loader must know the answer before the module runs
+        raise SyntaxError(
+            "na_bool must be a literal True or False: the script's bool "
+            "semantics are fixed before its module body runs",
+            (str(path), value.lineno, value.col_offset + 1, None))
     return False
 
 
@@ -710,6 +798,8 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
                             return compile(tree, path, 'exec', optimize=_optimize)
 
             pipeline_hash = _get_transform_pipeline_hash()
+            # Read off the source tree: the analysis rewrites the decorator
+            bool_na = _script_bool_na(tree, path)
             analysed = _analyse_tree(tree, data_str, path, pyne_mode)
             table = module_table(analysed)
 
@@ -768,6 +858,25 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
                    and cast(ast.ImportFrom, transformed.body[insert_at]).module == '__future__'):
                 insert_at += 1
             transformed.body[insert_at:insert_at] = baked
+            # The script's bool na choice, re-applied after EVERY top-level import
+            # (an imported library's own prologue must not outlive this module's,
+            # wherever the import stands) so that no statement of the module
+            # builds a bool na under another module's choice (see _script_bool_na)
+            if bool_na is not None:
+                insert_at += len(baked)
+                transformed.body.insert(insert_at, ast.ImportFrom(
+                    module='pynecore.types.na',
+                    names=[ast.alias(name='set_bool_na', asname=_PYNE_SET_BOOL_NA)], level=0))
+                body: list[ast.stmt] = []
+                for index, stmt in enumerate(transformed.body):
+                    body.append(stmt)
+                    if index >= insert_at and isinstance(stmt, (ast.Import, ast.ImportFrom)) \
+                            and not (index + 1 < len(transformed.body) and isinstance(
+                                transformed.body[index + 1], (ast.Import, ast.ImportFrom))):
+                        body.append(ast.Expr(value=ast.Call(
+                            func=ast.Name(id=_PYNE_SET_BOOL_NA, ctx=ast.Load()),
+                            args=[ast.Constant(value=bool_na)], keywords=[])))
+                transformed.body = body
             ast.fix_missing_locations(transformed)
 
             tree = transformed

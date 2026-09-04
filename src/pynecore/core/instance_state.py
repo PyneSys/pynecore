@@ -180,8 +180,11 @@ def _make_state(layout: dict[str, Any]) -> list:
     compacted = layout.get('compacted', False)
     for slot, max_bars_back, elem in layout['series']:
         # A numeric series keeps the native nan as its na; an int series also
-        # stores every value as a float (a Pine int is a double at runtime)
-        state[slot] = SeriesImpl(max_bars_back, na_float if elem in ('float', 'int') else None,
+        # stores every value as a float (a Pine int is a double at runtime). A
+        # bool series keeps the bool na the script runs with (na or false)
+        state[slot] = SeriesImpl(max_bars_back,
+                                 na_float if elem in ('float', 'int')
+                                 else NA(bool) if elem == 'bool' else None,
                                  compacted, elem == 'int')
     # Trailing layout reference: slot addressing uses literal non-negative
     # indexes only, so the extra element is invisible to emitted code. It lets

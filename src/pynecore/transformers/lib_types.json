@@ -568,9 +568,13 @@
    "ret": "o"
   },
   "array.new_bool": {
+   "default_none_ok": [
+    false,
+    true
+   ],
    "default_ty": [
     "i",
-    "?"
+    "0"
    ],
    "defaults": 2,
    "kind": "function",

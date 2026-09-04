@@ -38,6 +38,7 @@ __all__ = [
     'PIN_ATTR', 'PINS_ATTR', 'PINNABLE', 'get_pin', 'set_pin', 'get_pins', 'set_pins',
     'VECTOR_ATTR', 'VARYING_ATTR', 'get_vector', 'set_vector', 'get_varying', 'set_varying',
     'pin_for', 'overload_result', 'ImplSig', 'overload_pick',
+    'FactoryFields',
     'TYPELESS', 'NONE_DEFAULT', 'FIT_OMISSIBLE', 'FIT_REQUIRED', 'FIT_UNSURE',
     'default_fit', 'annotation_takes_none', 'impl_sig', 'param_fit', 'default_ty',
 ]
@@ -827,6 +828,9 @@ BUILTIN_CALL_TYPES: Final[dict[str, object]] = {
     '__sec_write__': VOID,
     '__sec_signal__': VOID,
     '__sec_wait__': VOID,
+    # ``DynamicDefaultTransformer``'s plumbing: the bool na factory a UDT
+    # field's ``na(bool)`` default is bound to
+    '__pyne_bool_na·__': BOOL,
     '__ltf_unzip__': OBJECT,
     # A Pine ``for`` iterates over one of these; the loop VARIABLE's type is
     # the join of the bounds (see ``_element_type``), while the iterable
@@ -1812,3 +1816,76 @@ OVERRIDE_PARAM_NAMES: Final[dict[str, list[str]]] = {
     # ``core/script.py::_Input.__call__``
     'input': ['defval', 'title', 'tooltip', 'inline', 'group', 'display', 'active'],
 }
+
+
+class FactoryFields:
+    """
+    The ``field(default_factory=...)`` defaults of a module's UDT classes.
+
+    Only a direct annotated field of a ``@udt`` / ``@dataclass`` class whose
+    default calls the name bound to ``dataclasses.field`` AT THAT STATEMENT
+    (a later import, definition or assignment of the name counterfeits it),
+    with a zero-argument lambda as the factory -- the one form the compiler
+    emits -- is dataclass plumbing: the machinery builds it and the annotation
+    types the field. Any other call carrying a ``default_factory`` keyword is
+    an ordinary call and is typed (and diagnosed) like one.
+    """
+
+    __slots__ = ('body', 'top_index')
+
+    def __init__(self, tree: ast.Module):
+        self.body = tree.body
+        #: Every class's top-level statement index
+        self.top_index: dict[int, int] = {}
+        for index, stmt in enumerate(tree.body):
+            for node in ast.walk(stmt):
+                if isinstance(node, ast.ClassDef):
+                    self.top_index[id(node)] = index
+
+    def _binding(self, name: str, before: int) -> str | None:
+        """What ``name`` denotes at statement ``before``: 'field', 'dataclasses' or other."""
+        binding: str | None = None
+        for stmt in self.body[:before]:
+            if isinstance(stmt, ast.ImportFrom):
+                for alias in stmt.names:
+                    if (alias.asname or alias.name) == name:
+                        binding = 'field' if (stmt.module == 'dataclasses' and not stmt.level
+                                              and alias.name == 'field') else 'other'
+            elif isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    if (alias.asname or alias.name.split('.')[0]) == name:
+                        binding = 'dataclasses' if alias.name == 'dataclasses' else 'other'
+            elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if stmt.name == name:
+                    binding = 'other'
+            else:
+                for node in ast.walk(stmt):
+                    if isinstance(node, ast.Name) and node.id == name \
+                            and isinstance(node.ctx, ast.Store):
+                        binding = 'other'
+        return binding
+
+    def of(self, cls: ast.ClassDef) -> list[ast.Call]:
+        """The factory-default calls of a class, empty for a class that is no UDT."""
+        if not any((_dotted(decorator) or '').rsplit('.', 1)[-1] in ('udt', 'dataclass')
+                   for decorator in cls.decorator_list):
+            return []
+        before = self.top_index.get(id(cls), len(self.body))
+        out: list[ast.Call] = []
+        for stmt in cls.body:
+            value = stmt.value if isinstance(stmt, ast.AnnAssign) else None
+            if not isinstance(value, ast.Call) or len(value.keywords) != 1 or value.args:
+                continue
+            keyword = value.keywords[0]
+            factory = keyword.value
+            if keyword.arg != 'default_factory' or not isinstance(factory, ast.Lambda) \
+                    or factory.args.args or factory.args.posonlyargs or factory.args.kwonlyargs \
+                    or factory.args.vararg or factory.args.kwarg:
+                continue
+            func = value.func
+            if (isinstance(func, ast.Name) and self._binding(func.id, before) == 'field') or (
+                    isinstance(func, ast.Attribute) and func.attr == 'field'
+                    and isinstance(func.value, ast.Name)
+                    and self._binding(func.value.id, before) == 'dataclasses'):
+                out.append(value)
+        return out

@@ -3,7 +3,7 @@
 """
 import math
 
-from pynecore.types.na import NA, na_float, na_int, na_str
+from pynecore.types.na import NA, na_float, na_int, na_str, na_bool
 from pynecore.core.safe_convert import safe_div
 from pynecore.lib import map as pine_map
 from pynecore.lib import na as is_na
@@ -35,12 +35,14 @@ def __test_na_float_is_interned__():
 
 
 def __test_non_float_na_stays_object__():
-    """str/bool na remain interned NA objects — Python str/bool have no nan;
-    the int na is the native nan like the float one (a Pine int is a double)"""
+    """str na remains an interned NA object; the int na is the native nan like the
+    float one (a Pine int is a double); the bool na is ``False`` unless the script
+    keeps the three-state bool"""
     assert NA(int) is na_float
     assert na_int is na_float
     assert isinstance(NA(str), NA)
-    assert isinstance(NA(bool), NA)
+    assert NA(bool) is False
+    assert isinstance(na_bool, NA)
     assert NA(str) is na_str
 
 
@@ -256,7 +258,7 @@ def __test_in_operator_on_na_is_false_not_infinite__():
     """
     assert ('anything' in NA(str)) is False
     assert (42 in na_str) is False
-    assert (None in NA(bool)) is False
+    assert (None in na_bool) is False
 
 
 def __test_na_object_pickles_to_the_interned_instance__():

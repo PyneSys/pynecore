@@ -125,18 +125,19 @@ class SeriesTransformer(ast.NodeTransformer):
     def _series_elem(annotation: ast.expr) -> str | None:
         """Element type name of a ``Series[T]`` annotation, if statically known.
 
-        Only the numeric names are meaningful downstream: both select the
-        native nan as the series' na value, and ``'int'`` additionally makes
-        the series store every value as a float (a Pine int is a double at
-        runtime). Everything else — bare ``Series``, other element types,
-        complex annotations — yields None.
+        Only the scalar names are meaningful downstream: the numeric ones
+        select the native nan as the series' na value, and ``'int'``
+        additionally makes the series store every value as a float (a Pine int
+        is a double at runtime); ``'bool'`` selects the bool na the script runs
+        with. Everything else — bare ``Series``, other element types, complex
+        annotations — yields None.
 
         :param annotation: The (Series) type annotation.
-        :return: ``'float'`` or ``'int'`` for those element types, otherwise None.
+        :return: ``'float'``, ``'int'`` or ``'bool'`` for those element types, otherwise None.
         """
         if (isinstance(annotation, ast.Subscript)
                 and isinstance(annotation.slice, ast.Name)
-                and annotation.slice.id in ('float', 'int')):
+                and annotation.slice.id in ('float', 'int', 'bool')):
             return annotation.slice.id
         return None
 

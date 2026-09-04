@@ -760,7 +760,7 @@ def new(size: int | NA = 0, initial_value: T = NA(T)) -> list[T]:
 
 
 # noinspection PyShadowingNames
-def new_bool(size: int | NA = 0, initial_value: bool = NA(bool)) -> list[bool]:
+def new_bool(size: int | NA = 0, initial_value: bool | None = None) -> list[bool]:
     """
     Creates a new array of the specified size, with each element initialized to the specified value.
 
@@ -769,6 +769,9 @@ def new_bool(size: int | NA = 0, initial_value: bool = NA(bool)) -> list[bool]:
     :return: New array of the specified size
     """
     size = _na_size(size)
+    # The default is the bool na the script runs with (na or false), decided at call time
+    if initial_value is None:
+        initial_value = NA(bool)
     assert isinstance(initial_value, (bool, NA)), "Initial value must be bool!"
     return [initial_value] * size
 
