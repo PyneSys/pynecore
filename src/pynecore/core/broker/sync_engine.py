@@ -212,6 +212,13 @@ EXTERNAL_FLATTEN_CONFIRM_GRACE_S = 120.0
 #: keeps going: a venue outage is recoverable, and stopping the bot would only
 #: strand the user with the position it was managing.
 READ_STUCK_GRACE_S = 60.0
+#: Minimum spacing (seconds) between the WARNING lines that report a read
+#: outage still inside the grace. ``calc_on_every_tick`` syncs on every market
+#: update, and a feed reconnect can replay a burst of ticks in well under a
+#: second, so without a throttle one outage writes the same lines once per
+#: tick. The first failure of a stretch is always reported immediately; the
+#: throttle resets when a read confirms the view again.
+READ_OUTAGE_WARN_INTERVAL_S = 30.0
 """Default stale-grace window (seconds) for cancel-tentative resolution.
 
 A pending-entry partial bracket leg may enter ``cancel_tentative`` when
@@ -986,6 +993,9 @@ class OrderSyncEngine:
         #: a long outage is escalated once per grace window rather than on
         #: every sync (``calc_on_every_tick`` syncs on every market update).
         self._read_outage_logged_at = 0.0
+        #: Monotonic timestamp of the last WARNING-level read-outage line
+        #: (:meth:`_warn_read_outage`); ``0.0`` while the view is confirmed.
+        self._read_outage_warned_at = 0.0
         #: Monotonic deadline until which broker reads are parked after a venue
         #: rate limit, honouring the ``retry_after`` the venue asked for.
         #: ``0.0`` means "not throttled".
@@ -2615,9 +2625,8 @@ class OrderSyncEngine:
             try:
                 self.reconcile()
             except ExchangeConnectionError as e:
-                _blog_warning(
-                    "periodic reconcile skipped after connection error: %s",
-                    e,
+                self._warn_read_outage(
+                    "periodic reconcile skipped after connection error: %s", e,
                 )
 
     def _verify_pending_dispatches(self) -> None:
@@ -19124,6 +19133,23 @@ class OrderSyncEngine:
         """Record that a read round trip completed, refreshing the broker view."""
         self._read_view_confirmed = True
         self._reads_unconfirmed_since = 0.0
+        self._read_outage_warned_at = 0.0
+
+    def _warn_read_outage(self, msg: str, *args: Any) -> None:
+        """Log a read-outage WARNING at most once per :data:`READ_OUTAGE_WARN_INTERVAL_S`.
+
+        Per unconfirmed stretch: the first line goes out immediately and the
+        stamp is cleared by :meth:`_mark_reads_confirmed`, so the next outage
+        is again reported at once.
+
+        :param msg: The log format string.
+        :param args: Its format arguments.
+        """
+        now = time.monotonic()
+        if now - self._read_outage_warned_at < READ_OUTAGE_WARN_INTERVAL_S:
+            return
+        self._read_outage_warned_at = now
+        _blog_warning(msg, *args)
 
     def _mark_reads_unconfirmed(self) -> None:
         """Record that the broker view could not be refreshed.
@@ -19222,22 +19248,22 @@ class OrderSyncEngine:
         # outlived the grace is abandoned first, or the re-read would park
         # behind it.
         self._abandon_overdue_read()
+        reason = "no read completed"
         try:
             self.reconcile()
         except ExchangeConnectionError as e:
-            _blog_warning(
-                "broker view could not be re-read before dispatch: %s", e,
-            )
+            reason = str(e)
         if self._read_view_confirmed:
             return True
 
         now = time.monotonic()
         unconfirmed_for = now - self._reads_unconfirmed_since
         if unconfirmed_for <= READ_STUCK_GRACE_S:
-            _blog_warning(
-                "dispatch skipped: broker position view unconfirmed for "
-                "%.0fs — deferring new exposure to the next cycle",
-                unconfirmed_for,
+            self._warn_read_outage(
+                "broker view could not be re-read before dispatch (%s): "
+                "position view unconfirmed for %.0fs — new exposure deferred "
+                "to the next cycle",
+                reason, unconfirmed_for,
             )
             return False
         if now - self._read_outage_logged_at >= READ_STUCK_GRACE_S:

@@ -36,6 +36,7 @@ from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.sync_engine import (
     EXTERNAL_FLATTEN_CONFIRM_GRACE_S,
     OrderSyncEngine,
+    READ_OUTAGE_WARN_INTERVAL_S,
     READ_STUCK_GRACE_S,
     _SEEN_FILL_IDS_CAP,
     _SETTLED_DEFENSIVE_CLOSE_IDS_CAP,
@@ -13848,3 +13849,63 @@ def __test_restart_partial_bracket_of_a_rotated_bot_is_adopted_not_cancelled__(t
         assert len(legs) == 2
         assert all(leg.parent_entry_dispatch_ref == parent_ref for leg in legs), \
             "the replayed legs were replaced by a fresh bracket"
+
+
+def __test_read_outage_warnings_are_throttled_across_tick_syncs__(caplog):
+    """
+    ``calc_on_every_tick`` syncs on every market update, and a feed reconnect
+    can replay a burst of ticks in well under a second: during a read outage
+    every one of those syncs used to write the same WARNING lines. The outage
+    is reported once per ``READ_OUTAGE_WARN_INTERVAL_S`` per unconfirmed
+    stretch — the first failure immediately — and the throttle resets once a
+    read confirms the view, so the next outage is again reported at once.
+    """
+    class _ReadsDownBroker(MockBroker):
+        down: bool = False
+
+        async def get_open_orders(self, symbol=None):
+            if self.down:
+                raise ExchangeConnectionError("not connected")
+            return await MockBroker.get_open_orders(self, symbol)
+
+        async def get_position(self, symbol):
+            if self.down:
+                raise ExchangeConnectionError("not connected")
+            return await MockBroker.get_position(self, symbol)
+
+    b = _ReadsDownBroker()
+    engine, _ = _mk_engine(b)
+    engine._reconcile_every = 1
+    engine.sync(BAR_TS)
+
+    def outage_warnings() -> list[logging.LogRecord]:
+        return [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING and "not connected" in rec.getMessage()
+        ]
+
+    with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+        b.down = True
+        # A burst of tick syncs inside one outage: reported exactly once.
+        for i in range(6):
+            engine.sync(BAR_TS + 1_000 * i)
+        assert not engine.halted
+        assert len(outage_warnings()) == 1, "burst syncs re-reported the same outage"
+        assert not engine._read_view_confirmed
+
+        # Past the interval the outage is reported again, with the view age.
+        engine._read_outage_warned_at -= READ_OUTAGE_WARN_INTERVAL_S + 1.0
+        engine._reads_unconfirmed_since -= 5.0
+        engine.sync(BAR_TS + 60_000)
+        assert len(outage_warnings()) == 2
+        assert "unconfirmed for 5s" in outage_warnings()[-1].getMessage()
+        assert "deferred" in outage_warnings()[-1].getMessage()
+
+        # Reads recover: the throttle resets, so a fresh outage is reported
+        # immediately rather than waiting out the previous stretch's interval.
+        b.down = False
+        engine.sync(BAR_TS + 120_000)
+        assert engine._read_view_confirmed
+        b.down = True
+        engine.sync(BAR_TS + 121_000)
+        assert len(outage_warnings()) == 3
