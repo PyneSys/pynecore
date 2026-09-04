@@ -35,7 +35,7 @@ __all__ = [
     'OVERRIDE_PARAM_NAMES',
     'is_int_typed', 'TY_ATTR', 'get_ty', 'set_ty', 'inherit_ty',
     'constant_type', 'stamp_lowering', 'BUILTIN_CALL_TYPES', 'BUILTIN_NAME_TYPES',
-    'PIN_ATTR', 'PINS_ATTR', 'PINNABLE', 'get_pin', 'set_pin', 'get_pins', 'set_pins',
+    'PIN_ATTR', 'PINS_ATTR', 'PINNABLE', 'PIN_ANY', 'get_pin', 'set_pin', 'get_pins', 'set_pins',
     'VECTOR_ATTR', 'VARYING_ATTR', 'get_vector', 'set_vector', 'get_varying', 'set_varying',
     'pin_for', 'overload_result', 'ImplSig', 'overload_pick',
     'FactoryFields',
@@ -1219,6 +1219,9 @@ def is_int_typed(ty: str) -> bool:
 #: single witness carries that.
 PINNABLE: Final = frozenset({INT, FLOAT, BOOL, STR})
 
+#: Pin character for a position the runtime has no witness value for
+PIN_ANY: Final = '*'
+
 
 def pin_for(arg_types: list[str]) -> str | None:
     """
@@ -1231,17 +1234,23 @@ def pin_for(arg_types: list[str]) -> str | None:
     implementation. Every other shape already agrees, and is left on the
     ordinary path rather than pinned for nothing.
 
+    A position the runtime cannot witness -- a container, a drawing, a user
+    type, an unsettled one -- pins as ``PIN_ANY``. It says nothing about that
+    argument, and the runtime treats it as such: the implementation is pinned
+    only where the witnessed positions alone name exactly one. An argument like
+    that sitting next to an int-typed one is common (``f(len, myEnum, src)``),
+    and refusing the whole site over it would leave the int argument to the
+    value dispatch, which is the divergence the pin exists to close.
+
     :param arg_types: Type of each positional argument, in order
     :return: One character per argument, or None when the site is not pinnable
     """
     # A shaped argument pins as its head, which is an object -- and an object
-    # is not pinnable, so the wire format never sees a shape
+    # has no witness, so the wire format never sees a shape
     arg_types = [head(t) for t in arg_types]
-    if not arg_types or any(t not in PINNABLE for t in arg_types):
+    if not arg_types or INT not in arg_types:
         return None
-    if INT not in arg_types:
-        return None
-    return ''.join(arg_types)
+    return ''.join(t if t in PINNABLE else PIN_ANY for t in arg_types)
 
 
 def overload_result(returns: list[str]) -> str:

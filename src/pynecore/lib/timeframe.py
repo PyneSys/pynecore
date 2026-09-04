@@ -129,6 +129,9 @@ def from_seconds(seconds: int) -> str:
     :param seconds: The seconds to convert
     :return: The timeframe string (e.g. ``"60"``, ``"1D"``)
     """
+    # A Pine int is a double at runtime, and the string this builds is a
+    # timeframe: it is a consuming slot, so the count is truncated here
+    seconds = int(seconds)
     if seconds % (60 * 60 * 24 * 7 * 4) == 0:
         return f"{seconds // (60 * 60 * 24 * 7 * 4)}M"
     if seconds % (60 * 60 * 24 * 7) == 0:

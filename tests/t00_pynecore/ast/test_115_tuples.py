@@ -37,7 +37,7 @@ from pynecore.transformers.pine_type_artifact import (
 )
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
-    BOOL, COLOR, FLOAT, INT, OBJECT, STR, TYPELESS, UNKNOWN, VOID,
+    BOOL, COLOR, FLOAT, INT, OBJECT, PIN_ANY, STR, TYPELESS, UNKNOWN, VOID,
     annotation_type, arity, array_of, builtin_class_id, class_id, elements_of, get_pin,
     get_ty, head, is_shaped, is_tuple, join, map_of, matrix_of, object_ty, render_ty,
     shape_mismatch, tuple_of,
@@ -411,9 +411,10 @@ def main(x: int):
     assert types['held'] == UNKNOWN
 
 
-def __test_the_pin_never_sees_a_tuple__():
+def __test_a_tuple_pins_as_a_wildcard__():
     """
-    The wire format is untouched: a tuple is an object to the pin.
+    The wire format is untouched: a tuple is an object to the pin, and an
+    object has no witness, so it takes the wildcard character.
 
     What the unpack does reach is the site AFTER it -- an int-typed half of a
     pair pins the call it feeds, which is the whole point of typing the halves
@@ -431,9 +432,11 @@ half = math.max(a, 1)
 ''')
     pins = [get_pin(node) for node in ast.walk(tree)
             if isinstance(node, ast.Call) and ast.unparse(node.func) == 'lib.math.max']
-    # The tuple itself pins nothing -- it is an object, and an object argument
-    # can never be the one an overload turns on
-    assert pins == [None, 'ii']
+    # The tuple says nothing about which implementation to take, so its
+    # position is left out of the selection instead of blocking the int one
+    # next to it (the runtime checks it against the chosen implementation
+    # before it trusts the pin)
+    assert pins == [PIN_ANY + 'i', 'ii']
 
 
 # --- 3. the lib table ------------------------------------------------------

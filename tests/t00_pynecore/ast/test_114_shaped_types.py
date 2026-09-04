@@ -44,7 +44,7 @@ from pynecore.transformers.pine_type_artifact import (
 )
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
-    BOOL, FLOAT, INT, OBJECT, PINE_LOOP, STR, TYPELESS, UNKNOWN, VOID,
+    BOOL, FLOAT, INT, OBJECT, PIN_ANY, PINE_LOOP, STR, TYPELESS, UNKNOWN, VOID,
     annotation_type, array_of, builtin_class_id, class_id, class_of, element_of, get_pin,
     get_ty, head, is_int_typed, is_shaped, join, key_of, map_of, matrix_of, object_ty, pin_for,
     render_ty, shape_mismatch, tuple_of, value_of,
@@ -217,9 +217,13 @@ def __test_every_shape_heads_to_an_object__(ty: str):
 def __test_the_pin_never_sees_a_shape__():
     """``pin_for(['a:i', 'i'])`` and ``pin_for(['o', 'i'])`` are one question"""
     assert pin_for([array_of(INT), INT]) == pin_for([OBJECT, INT])
-    assert pin_for([array_of(INT), INT]) is None
+    # A shape has no witness value, so it takes the wildcard: the position is
+    # left out of the selection, not allowed to block the int next to it
+    assert pin_for([array_of(INT), INT]) == PIN_ANY + 'i'
     # ... and the arguments a shape READS OUT are pinnable as usual
     assert pin_for([INT, INT]) == 'ii'
+    # A site with nothing int-typed in it is still not worth a pin
+    assert pin_for([array_of(INT), FLOAT]) is None
 
 
 @pytest.mark.parametrize("left,right,expected", [
@@ -336,14 +340,16 @@ def main(flag: bool):
     assert types['empty'] == TYPELESS
 
 
-def __test_a_typeless_argument_leaves_the_site_unpinned__():
+def __test_a_typeless_argument_pins_as_a_wildcard__():
     """
     A pin is a witness VALUE per argument, and na is no witness.
 
     The same rule the selector already follows for a typeless default: it
-    answers every annotation, so it discriminates nothing.
+    answers every annotation, so it discriminates nothing -- which is exactly
+    what the wildcard says. It never makes a site pinnable on its own: without
+    an int-typed argument there is nothing for the pin to correct.
     """
-    assert pin_for([TYPELESS, INT]) is None
+    assert pin_for([TYPELESS, INT]) == PIN_ANY + 'i'
     assert pin_for([TYPELESS]) is None
     assert not is_int_typed(TYPELESS)
 

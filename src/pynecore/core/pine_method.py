@@ -27,7 +27,7 @@ from ..types import polyline as polyline_types
 from ..types.na import NA
 
 from .instance_state import _make_state, register_shared_cache
-from .pine_export import Exported
+from .pine_export import Exported, in_module_bool_mode
 
 
 def method(func: Callable) -> Callable:
@@ -111,15 +111,20 @@ def _bound_method(method: Any) -> Callable:
     :return: The callable to invoke with the visible arguments.
     :raises ValueError: If an ``Exported`` proxy is not initialized yet.
     """
-    target = method
-    if isinstance(target, Exported):
-        target = target.__fn__
-        if target is None:
+    target: Callable = method
+    na_bool: bool | None = None
+    if isinstance(method, Exported):
+        na_bool = method.__na_bool__
+        unwrapped: Callable | None = method.__fn__
+        if unwrapped is None:
             raise ValueError("Exported proxy has not been initialized with a function yet")
+        target = unwrapped
     key = f"{getattr(target, '__module__', '?')}.{getattr(target, '__qualname__', '?')}"
     entry = _method_anchors.get(key)
     if entry is not None and entry[0] is target:
         return entry[2]
+    # A method of another module runs that module's bool semantics
+    # (see pine_export.in_module_bool_mode)
     if isinstance(target, type) or (
             hasattr(target, '__self__') and isinstance(target.__self__, type)):
         return target  # types and classmethods are called as-is (legacy guard)
@@ -128,13 +133,15 @@ def _bound_method(method: Any) -> Callable:
     if bind is not None:
         bound: Callable = bind()  # overload dispatcher: one shared anchored entry
     else:
-        layout = getattr(target, '__pyne_layout__', None)
+        layout: dict[str, Any] | None = getattr(target, '__pyne_layout__', None)
         if layout is not None:
             state = entry[1] if entry is not None and entry[1] is not None \
                 else _make_state(layout)
             bound = partial(target, state)
         else:
             bound = target  # stateless — called raw
+    if na_bool is not None:
+        bound = in_module_bool_mode(bound, na_bool)
     _method_anchors[key] = (target, state, bound)
     return bound
 

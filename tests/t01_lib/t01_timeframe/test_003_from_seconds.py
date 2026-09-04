@@ -28,6 +28,14 @@ def main():
     assert timeframe.from_seconds(180) == "3"  # 3 minutes
     assert timeframe.from_seconds(240) == "4"  # 4 minutes
 
+    # A Pine int is a double at runtime, and one carrying a fraction reaches
+    # here through ordinary arithmetic (``math.max(timeframe.in_seconds(''),
+    # userTF)``). The timeframe string is a consuming slot, so the count is
+    # truncated instead of formatting a "30.0" no timeframe parser accepts
+    assert timeframe.from_seconds(86400.0) == "1D"
+    assert timeframe.from_seconds(3600.5) == "60"
+    assert timeframe.from_seconds(60.999) == "1"
+
 
 def __test_timeframe_from_seconds__(runner, dummy_ohlcv_iter):
     """ timeframe.from_seconds() """

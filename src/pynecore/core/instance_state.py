@@ -117,7 +117,7 @@ from copy import copy, deepcopy
 from dataclasses import replace as dataclass_replace
 from functools import partial
 
-from .pine_export import Exported
+from .pine_export import Exported, in_module_bool_mode
 from .series import SeriesImpl
 from ..types.base import Drawing
 from ..types.na import NA, na_float
@@ -210,7 +210,7 @@ def _configure(state: list, layout: dict[str, Any], vector: tuple | None) -> lis
     :return: ``state``
     """
     if vector is not None:
-        slot = layout.get('pin')
+        slot: int | None = layout.get('pin')
         if slot is not None:
             state[slot] = vector
     return state
@@ -514,11 +514,22 @@ def _bind_target(func: Any, prev: tuple | None = None, pin: str | None = None,
     :return: The bound callable to invoke.
     """
     target: Any = func
+    na_bool: bool | None = None
     if isinstance(target, Exported):
         unwrapped = target.__fn__
         if unwrapped is None:
             raise ValueError("Exported proxy has not been initialized with a function yet")
+        # Crossing into another module's code: the callee's bool semantics are
+        # its own (see pine_export.in_module_bool_mode)
+        na_bool = target.__na_bool__
         target = unwrapped
+    bound = _bind_unwrapped(target, prev, pin, vector)
+    return bound if na_bool is None else in_module_bool_mode(bound, na_bool)
+
+
+def _bind_unwrapped(target: Any, prev: tuple | None, pin: str | None,
+                    vector: tuple | None) -> Callable:
+    """The binding proper, past the export proxy (see :func:`_bind_target`)."""
     bind = getattr(target, '__pyne_bind__', None)
     if bind is not None:
         return bind(pin)

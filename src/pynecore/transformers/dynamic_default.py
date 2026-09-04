@@ -64,7 +64,7 @@ must participate in them like any other body statement).
 
 import ast
 
-__all__ = ['DynamicDefaultTransformer', 'is_script_entry']
+__all__ = ['DynamicDefaultTransformer', 'is_script_entry', 'is_dynamic_default_guard']
 
 _SCRIPT_ENTRY_DECORATORS = frozenset({'indicator', 'strategy', 'library'})
 _SENTINEL_NAME = '__dyn_default__'
@@ -73,6 +73,23 @@ _FIELD_NAME = '__pyne_field·__'
 #: The alias the bool na factory (``pynecore.types.na.new_bool_na``) is bound to
 _BOOL_NA_NAME = '__pyne_bool_na·__'
 _UDT_DECORATORS = frozenset({'udt', 'dataclass'})
+
+
+def is_dynamic_default_guard(stmt: ast.stmt) -> bool:
+    """Whether a statement is one of this pass's parameter-default guards.
+
+    A later pass that prepends its own prologue has to land AFTER these: the
+    guard is what gives the parameter its value, so a statement placed above it
+    reads the sentinel instead.
+
+    :param stmt: A statement from a function body.
+    :return: True if the statement resolves a dynamic parameter default.
+    """
+    if not (isinstance(stmt, ast.If) and isinstance(stmt.test, ast.Compare)
+            and len(stmt.test.ops) == 1 and isinstance(stmt.test.ops[0], ast.Is)):
+        return False
+    right = stmt.test.comparators[0]
+    return isinstance(right, ast.Name) and right.id == _SENTINEL_NAME
 
 
 def _dotted_tail(node: ast.expr) -> str | None:

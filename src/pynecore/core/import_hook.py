@@ -29,6 +29,10 @@ _PYNE_SENTINEL = '__pyne_transformed__'
 _PYNE_DEPS = '__pyne_type_deps__'
 #: Alias the loader binds ``set_bool_na`` to in a script module's baked prologue
 _PYNE_SET_BOOL_NA = '__pyne_set_bool_na·__'
+#: Module-level record of the script's bool na choice, read at the module
+#: boundary (``pine_export.Exported``) so a library's exported function runs
+#: its own script's bool semantics, not its caller's
+_PYNE_NA_BOOL = '__pyne_na_bool__'
 
 # A module is Pyne code only when its docstring STARTS with ``@pyne``. Matching the
 # raw source head mirrors the strict docstring check in ``source_to_code`` without
@@ -879,6 +883,9 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
                 transformed.body.insert(insert_at, ast.ImportFrom(
                     module='pynecore.types.na',
                     names=[ast.alias(name='set_bool_na', asname=_PYNE_SET_BOOL_NA)], level=0))
+                transformed.body.insert(insert_at + 1, ast.Assign(
+                    targets=[ast.Name(id=_PYNE_NA_BOOL, ctx=ast.Store())],
+                    value=ast.Constant(value=bool_na)))
                 body: list[ast.stmt] = []
                 for index, stmt in enumerate(transformed.body):
                     body.append(stmt)

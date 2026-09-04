@@ -345,13 +345,21 @@ class _RouteCollector(ast.NodeVisitor):
     def __init__(self, transformer: 'FunctionIsolationTransformer'):
         self.transformer = transformer
         self.scope_routes: dict[str, list[_Route]] = {}
+        # Scopes that will get an instance-vector slot once the body is
+        # emitted. The slot does not exist yet, so the fixpoint cannot see it
+        # in the layout — but it makes the definition state-carrying, and a
+        # caller that routed around the state parameter would call it short
+        self.pin_carriers: set[str] = set()
         self._stack: list[str] = []
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         if _is_test_function(node.name):
             return
         self._stack.append(self.transformer.layout.scope_segment(node))
-        self.scope_routes.setdefault('·'.join(self._stack), [])
+        scope = '·'.join(self._stack)
+        self.scope_routes.setdefault(scope, [])
+        if get_varying(node):
+            self.pin_carriers.add(scope)
         for stmt in node.body:
             self.visit(stmt)
         self._stack.pop()
@@ -389,6 +397,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         self.layout = layout
         self.index = _ScopeIndex(layout)
         self.carrier: dict[str, bool] = {}
+        self._pin_carriers: set[str] = set()
         self._scope_stack: list[str] = []
         self._loop_depth = 0
         self._lambda_depth = 0
@@ -546,16 +555,21 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         try:
             return self.carrier[scope_id]
         except KeyError:
-            return self.layout.state_carrying(scope_id)
+            return self._own_state(scope_id)
+
+    def _own_state(self, scope_id: str) -> bool:
+        """Whether a scope carries state of its own: allocated slots, or the
+        instance vector its varying sites are about to be given."""
+        return self.layout.state_carrying(scope_id) or scope_id in self._pin_carriers
 
     def _run_fixpoint(self, scope_routes: dict[str, list[_Route]]) -> dict[str, bool]:
         """Carrier fixpoint: a scope carries state if it has own slots or any
         non-direct call site (fast/uniform, or same-module to a carrier)."""
-        carrier = {scope: self.layout.state_carrying(scope) for scope in scope_routes}
+        carrier = {scope: self._own_state(scope) for scope in scope_routes}
         for routes in scope_routes.values():
             for route in routes:
                 if isinstance(route, tuple):
-                    carrier.setdefault(route[1], self.layout.state_carrying(route[1]))
+                    carrier.setdefault(route[1], self._own_state(route[1]))
         changed = True
         while changed:
             changed = False
@@ -733,6 +747,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         self.index.visit(node)
         collector = _RouteCollector(self)
         collector.visit(node)
+        self._pin_carriers = collector.pin_carriers
         self.carrier = self._run_fixpoint(collector.scope_routes)
 
         node = cast(ast.Module, self.generic_visit(node))

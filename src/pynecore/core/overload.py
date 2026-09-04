@@ -310,6 +310,39 @@ def _select(impls: list[Implementation], args: tuple, kwargs: dict) -> Implement
 #: are pinnable, which is why there is no entry for a container or a drawing.
 _PIN_WITNESSES: dict[str, Any] = {'i': 0, 'f': 0.0, 'b': True, 's': ''}
 
+#: Pin character for a position with no witness — a container, a drawing, a
+#: user type, or a type the pass could not settle. The position carries no
+#: information, so it is left out of the selection instead of blocking it:
+#: an int argument next to a user-typed one is exactly the shape the pin
+#: exists for.
+_PIN_ANY = '*'
+
+
+def _select_pinned(impls: list[Implementation], pin: str) -> Implementation | None:
+    """Select the implementation a pin with wildcard positions names.
+
+    The witnessed positions are matched the way :func:`_select` matches them,
+    the wildcard ones are not looked at. That is only an answer while it is the
+    ONLY answer: where more than one implementation survives, the position the
+    pin knows nothing about is the one that decides, and the values know it and
+    the pin does not.
+
+    :param impls: Registered implementations (registration order).
+    :param pin: The call site's pin, one character per positional argument.
+    :return: The single matching implementation, or None.
+    """
+    argc = len(pin)
+    probes = [(index, _PIN_WITNESSES[char])
+              for index, char in enumerate(pin) if char != _PIN_ANY]
+    for strict in (True, False):
+        matches = [impl for impl in impls
+                   if len(impl.param_types) == argc
+                   and all(_check_type(value, impl.param_types[index][1], strict)
+                           for index, value in probes)]
+        if matches:
+            return matches[0] if len(matches) == 1 else None
+    return None
+
 
 def _type_token(value: Any) -> Any:
     """Hashable token capturing exactly the properties ``_check_type``
@@ -477,35 +510,53 @@ def _anchored(impls: list[Implementation], qualname: str,
     if not pin or os.environ.get('PYNE_NO_TYPE_PIN') == '1':
         return dispatch
 
-    witnesses = tuple(_PIN_WITNESSES[c] for c in pin if c in _PIN_WITNESSES)
-    pinned = _select(impls, witnesses, {}) if len(witnesses) == len(pin) else None
+    if _PIN_ANY in pin:
+        pinned = _select_pinned(impls, pin) \
+            if all(c in _PIN_WITNESSES or c == _PIN_ANY for c in pin) else None
+    else:
+        witnesses = tuple(_PIN_WITNESSES[c] for c in pin if c in _PIN_WITNESSES)
+        pinned = _select(impls, witnesses, {}) if len(witnesses) == len(pin) else None
     if pinned is None:
         # An unwitnessable character, or no implementation for the static
         # shape: the values know more than the pin does, so let them decide,
         # exactly as they did before there were pins
         return dispatch
+    # Narrowed alias: the closure below reads it on every call, and only the
+    # non-None case ever gets there
+    chosen: Implementation = pinned
     argc = len(pin)
     group = len(impls)
+    # Positions the pin carries no type for. The selection ignored them, so the
+    # first call checks the values against what the chosen implementation
+    # declares there: a witnessed position can name an implementation the
+    # arguments as a whole do not fit, and the values must win that.
+    wildcards = tuple(index for index, char in enumerate(pin) if char == _PIN_ANY)
+    verified = [not wildcards]
 
     def dispatch_pinned(*args: Any, **kwargs: Any) -> Any:
         if kwargs or len(args) != argc or len(impls) != group:
             # Not the shape the pin was computed for — a keyword spelling, a
             # different arity, or an implementation registered after the bind
             return dispatch(*args, **kwargs)
+        if not verified[0]:
+            if not all(_check_type(args[index], chosen.param_types[index][1], False)
+                       for index in wildcards):
+                return dispatch(*args, **kwargs)
+            verified[0] = True
         # The entry bookkeeping of ``dispatch``, repeated rather than shared:
         # this is per-bar code, and the point of the pinned route is that it
         # costs one dict lookup and nothing else — no type tuple, no token,
         # no selection
-        entry = _cache.get(pinned)
-        if entry is None or entry[0] is not pinned.func:
-            func = pinned.func
+        entry = _cache.get(chosen)
+        if entry is None or entry[0] is not chosen.func:
+            func = chosen.func
             layout: dict[str, Any] | None = getattr(func, '__pyne_layout__', None)
             if layout is not None:
                 state = entry[1] if entry is not None and entry[1] is not None \
                     else _make_state(layout)
-                entry = _cache[pinned] = (func, state, partial(func, state))
+                entry = _cache[chosen] = (func, state, partial(func, state))
             else:
-                entry = _cache[pinned] = (func, None, _bind_target(func))
+                entry = _cache[chosen] = (func, None, _bind_target(func))
         return entry[2](*args)
 
     dispatch_pinned.__pyne_cache__ = _cache

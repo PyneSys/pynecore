@@ -30,6 +30,7 @@ shadows the parent's series.
 from typing import cast
 import ast
 
+from .dynamic_default import is_dynamic_default_guard
 from .pine_type_rules import OBJECT, get_ty, set_ty, stamp_lowering
 from .slot_layout import ModuleLayout, scope_for_function
 
@@ -55,6 +56,9 @@ class SeriesTransformer(ast.NodeTransformer):
         self.series_slots: dict[str, dict[str, int]] = {}
         self.series_declarations: dict[str, set[str]] = {}
         self.local_vars: dict[str, set[str]] = {}
+        # Inside a parameter-default guard, where an assignment to a series
+        # parameter gives it its value instead of writing its history
+        self._in_default_guard = False
 
     # --- helpers ---------------------------------------------------------
 
@@ -184,6 +188,18 @@ class SeriesTransformer(ast.NodeTransformer):
             if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
                     and isinstance(first.value.value, str)):
                 insert_pos = 1
+            # A parameter whose default is dynamic arrives as the sentinel and
+            # gets its value in DynamicDefaultTransformer's guard block;
+            # recording it above that would put the sentinel into the series.
+            # The block is contiguous but need not be first — an earlier pass
+            # may have prepended a hoisted declaration of its own
+            guard = next((i for i, stmt in enumerate(node.body)
+                          if is_dynamic_default_guard(stmt)), None)
+            if guard is not None:
+                insert_pos = guard
+                while insert_pos < len(node.body) \
+                        and is_dynamic_default_guard(node.body[insert_pos]):
+                    insert_pos += 1
             node.body[insert_pos:insert_pos] = param_inits
 
         self.scope_stack.pop()
@@ -212,11 +228,34 @@ class SeriesTransformer(ast.NodeTransformer):
             value=self._buffer_call(self.current_scope, slot, 'add',
                                     [cast(ast.expr, self.visit(node.value))]))
 
+    def visit_If(self, node: ast.If) -> ast.AST:
+        """Leave a parameter-default guard's own assignment alone.
+
+        ``DynamicDefaultTransformer`` emits ``if p is <sentinel>: p = <default>``
+        at the top of the body, which gives a PARAMETER its value; the series
+        recording of that parameter happens right after the guard block. Writing
+        the default through the buffer instead would write into a series that
+        has not recorded this bar yet -- ``set()`` on an empty buffer answers na
+        and stores nothing.
+        """
+        if is_dynamic_default_guard(node):
+            outer, self._in_default_guard = self._in_default_guard, True
+            try:
+                node.body = [cast(ast.stmt, self.visit(stmt)) for stmt in node.body]
+            finally:
+                self._in_default_guard = outer
+            return node
+        return cast(ast.AST, self.generic_visit(node))
+
     def visit_Assign(self, node: ast.Assign) -> ast.AST | list[ast.stmt]:
         """Convert assignments to same-scope series variables into buffer writes."""
         if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             var_name = cast(ast.Name, node.targets[0]).id
             slots = self.series_slots.get(self.current_scope)
+            if self._in_default_guard and slots is not None and var_name in slots:
+                # The guard resolves the parameter; the buffer write follows it
+                node.value = cast(ast.expr, self.visit(node.value))
+                return node
             if slots is not None and var_name in slots:
                 return ast.Assign(
                     targets=[ast.Name(id=var_name, ctx=ast.Store())],

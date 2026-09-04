@@ -8,6 +8,7 @@ from ..types.label import LabelStyleEnum, Label
 from ..types.na import NA, na_int, na_float
 from ..types.pine_types import PyneFloat, PyneInt, PyneStr
 from ..lib import xloc as _xloc, yloc as _yloc, color as _color, size as _size, text as _text, font as _font
+from ._drawing import bar_coord as _bar_coord, price as _price
 from .. import lib
 
 _registry: dict[Label, None] = {}
@@ -120,8 +121,7 @@ def new(*args: Any, **kwargs: Any) -> Label:
     else:
         x = kwargs.get('x')
         y = kwargs.get('y')
-        x_val = int(x) if isinstance(x, (int, float)) and x == x else na_int
-        y_val = y if isinstance(y, (int, float)) else na_float
+        x_val, y_val = _bar_coord(x), _price(y)
 
     label_obj = Label(
         x=x_val,
@@ -318,7 +318,7 @@ def set_x(id: Label, x: int) -> None:
     """
     if isinstance(id, NA):
         return
-    id.x = x
+    id.x = _bar_coord(x)
 
 
 # noinspection PyShadowingBuiltins
@@ -331,7 +331,7 @@ def set_y(id: Label, y: int | float) -> None:
     """
     if isinstance(id, NA):
         return
-    id.y = y
+    id.y = _price(y)
 
 
 # noinspection PyShadowingBuiltins
@@ -345,8 +345,8 @@ def set_xy(id: Label, x: int, y: int | float) -> None:
     """
     if isinstance(id, NA):
         return
-    id.x = x
-    id.y = y
+    id.x = _bar_coord(x)
+    id.y = _price(y)
 
 
 # noinspection PyShadowingBuiltins
@@ -360,10 +360,10 @@ def set_point(id: Label, point: ChartPoint) -> None:
     if isinstance(id, NA):
         return
     if id.xloc == _xloc.bar_time:
-        id.x = point.time
+        id.x = _bar_coord(point.time)
     else:  # xloc.bar_index
-        id.x = point.index
-    id.y = point.price
+        id.x = _bar_coord(point.index)
+    id.y = _price(point.price)
 
 
 # noinspection PyShadowingBuiltins
@@ -377,7 +377,7 @@ def set_xloc(id: Label, x: int, xloc: _xloc.XLoc) -> None:
     """
     if isinstance(id, NA):
         return
-    id.x = x
+    id.x = _bar_coord(x)
     id.xloc = xloc
 
 
@@ -404,8 +404,7 @@ def get_x(id: Label) -> PyneInt:
     """
     if isinstance(id, NA):
         return na_int
-    # A Pine int is a double at runtime
-    return float(id.x)
+    return id.x
 
 
 # noinspection PyShadowingBuiltins

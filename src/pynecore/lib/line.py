@@ -9,6 +9,7 @@ from ..types.na import NA, na_int, na_float
 from ..types.pine_types import PyneFloat, PyneInt
 from ..lib import xloc as _xloc, extend as _extend, color as _color
 from ..lib import linefill as _linefill
+from ._drawing import bar_coord as _bar_coord, price as _price
 from .. import lib
 
 _registry: dict[Line, None] = {}
@@ -106,10 +107,8 @@ def new(*args: Any, **kwargs: Any) -> Line:
         y1 = kwargs.get('y1')
         x2 = kwargs.get('x2')
         y2 = kwargs.get('y2')
-        x1_val = int(x1) if isinstance(x1, (int, float)) and x1 == x1 else na_int
-        y1_val = y1 if isinstance(y1, (int, float)) else na_float
-        x2_val = int(x2) if isinstance(x2, (int, float)) and x2 == x2 else na_int
-        y2_val = y2 if isinstance(y2, (int, float)) else na_float
+        x1_val, y1_val = _bar_coord(x1), _price(y1)
+        x2_val, y2_val = _bar_coord(x2), _price(y2)
 
     line_obj = Line(
         x1=x1_val,
@@ -172,8 +171,7 @@ def get_x1(id: Line) -> PyneInt:
     """
     if isinstance(id, NA):
         return na_int
-    # A Pine int is a double at runtime
-    return float(id.x1)
+    return id.x1
 
 
 # noinspection PyShadowingBuiltins
@@ -199,8 +197,7 @@ def get_x2(id: Line) -> PyneInt:
     """
     if isinstance(id, NA):
         return na_int
-    # A Pine int is a double at runtime
-    return float(id.x2)
+    return id.x2
 
 
 # noinspection PyShadowingBuiltins
@@ -253,9 +250,9 @@ def set_first_point(id: Line, point: ChartPoint) -> None:
     if isinstance(id, NA):
         return
     if id.xloc == _xloc.bar_time:
-        id.x1, id.y1 = point.time, point.price
+        id.x1, id.y1 = _bar_coord(point.time), _price(point.price)
     else:  # xloc.bar_index
-        id.x1, id.y1 = point.index, point.price
+        id.x1, id.y1 = _bar_coord(point.index), _price(point.price)
 
 
 # noinspection PyShadowingBuiltins
@@ -269,9 +266,9 @@ def set_second_point(id: Line, point: ChartPoint) -> None:
     if isinstance(id, NA):
         return
     if id.xloc == _xloc.bar_time:
-        id.x2, id.y2 = point.time, point.price
+        id.x2, id.y2 = _bar_coord(point.time), _price(point.price)
     else:  # xloc.bar_index
-        id.x2, id.y2 = point.index, point.price
+        id.x2, id.y2 = _bar_coord(point.index), _price(point.price)
 
 
 # noinspection PyShadowingBuiltins
@@ -310,7 +307,7 @@ def set_x1(id: Line, x: int) -> None:
     """
     if isinstance(id, NA):
         return
-    id.x1 = x
+    id.x1 = _bar_coord(x)
 
 
 # noinspection PyShadowingBuiltins
@@ -323,7 +320,7 @@ def set_x2(id: Line, x: int) -> None:
     """
     if isinstance(id, NA):
         return
-    id.x2 = x
+    id.x2 = _bar_coord(x)
 
 
 # noinspection PyShadowingBuiltins
@@ -338,8 +335,8 @@ def set_xloc(id: Line, x1: int, x2: int, xloc: _xloc.XLoc) -> None:
     """
     if isinstance(id, NA):
         return
-    id.x1 = x1
-    id.x2 = x2
+    id.x1 = _bar_coord(x1)
+    id.x2 = _bar_coord(x2)
     id.xloc = xloc
 
 
@@ -354,8 +351,8 @@ def set_xy1(id: Line, x: int, y: float) -> None:
     """
     if isinstance(id, NA):
         return
-    id.x1 = x
-    id.y1 = y
+    id.x1 = _bar_coord(x)
+    id.y1 = _price(y)
 
 
 # noinspection PyShadowingBuiltins
@@ -369,8 +366,8 @@ def set_xy2(id: Line, x: int, y: float) -> None:
     """
     if isinstance(id, NA):
         return
-    id.x2 = x
-    id.y2 = y
+    id.x2 = _bar_coord(x)
+    id.y2 = _price(y)
 
 
 # noinspection PyShadowingBuiltins
@@ -383,7 +380,7 @@ def set_y1(id: Line, y: float) -> None:
     """
     if isinstance(id, NA):
         return
-    id.y1 = y
+    id.y1 = _price(y)
 
 
 # noinspection PyShadowingBuiltins
@@ -396,7 +393,7 @@ def set_y2(id: Line, y: float) -> None:
     """
     if isinstance(id, NA):
         return
-    id.y2 = y
+    id.y2 = _price(y)
 
 
 # noinspection PyShadowingBuiltins

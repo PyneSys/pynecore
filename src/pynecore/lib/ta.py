@@ -21,8 +21,7 @@ from ..core import safe_convert
 from ..core.series import SeriesImpl as _SeriesImpl
 # Pine's absolute comparison tolerance. Only the builtins MEASURED to compare
 # tolerantly use it (see core/pine_compare.py); the bit-exact ones must not.
-from ..core.pine_compare import (EPSILON as _EPSILON, lower_bound as _tol_lower_bound,
-                                 upper_bound as _tol_upper_bound)
+from ..core.pine_compare import EPSILON as _EPSILON
 
 # We need to use this kind of import to make transformer work. ``_last_close`` is
 # deliberately outside ``lib.__all__``: that list is the public Pine surface, and this
@@ -1249,9 +1248,16 @@ def median(source: Series[TFI], length: int) -> PyneFloat:
     if source_na:
         # An na bar is not part of the window at all, so it must not touch the
         # length bookkeeping either: the next non-na bar still has to see the
-        # length change this bar may have carried.
-        # type(source) would be the NA class itself — keep the source sentinel's type
-        return source
+        # length change this bar may have carried. The ANSWER still comes from
+        # the window as it stands — measured: TradingView keeps answering across
+        # an na bar (a window of [2,3,4,5,6] answers 4 on the na bar that
+        # follows it), it does not blank the series there.
+        if len(window) < length:
+            # type(source) would be the NA class itself — keep the sentinel's type
+            return source
+        if len(heap_low) > len(heap_high):
+            return -heap_low[0]
+        return (-heap_low[0] + heap_high[0]) / 2
 
     if length != prev_length and prev_length != 0:
         # ``length`` is a series value and changed: rebuild the window and both
@@ -1369,6 +1375,8 @@ def min(source: Series[float]) -> PyneFloat:
     return min_val
 
 
+# The na-compacted history buffer is written under a guard; see ``median``
+# noinspection PyUnboundLocalVariable
 def mode(source: Series[TFI], length: int) -> TFI:
     """
     Returns the mode of the series. If there are several values with the same frequency,
@@ -1379,6 +1387,17 @@ def mode(source: Series[TFI], length: int) -> TFI:
     :return: The most frequently occurring value from the source. If none exists, returns
              the smallest value instead. Returns na during warm-up period.
     """
+    capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
+
+    source_na = not (source == source)  # is_na_arg
+    if not source_na:
+        # The window drops na bars, so the history it is read from has to drop
+        # them too: this buffer is na-compacted (only non-na bars reach the
+        # assignment), which makes ``src[k]`` the k-th most recent NON-NA value.
+        # Fed ahead of every guard below, because a bar returning early is still
+        # part of the history a later bar reads. See ``median``, same law.
+        src: Series[TFI] = source
+
     if not (length == length):  # is_na_arg
         return cast(TFI, NA(builtins.type(source)))
     # An int-typed Pine value can still carry a fraction (``int / int``); the
@@ -1388,14 +1407,16 @@ def mode(source: Series[TFI], length: int) -> TFI:
     # invalid 0 rather than a value that passes ``> 0`` and then returns na.
     length = int(length)
     assert length > 0, "Invalid length, length must be greater than 0!"
-    if not (source == source):  # is_na_arg
-        return source
-    if bar_index < length - 1:
-        return cast(TFI, NA(builtins.type(source)))
+    if length > capacity:
+        capacity = length
+        max_bars_back(src, capacity)
 
-    # Store values for quick access
-    values = [source[i] for i in builtins.range(length) if source[i] == source[i]]
-    if not values:
+    # Measured (BINANCE:BTCUSDT 30m, a source that is na on every 7th bar): an
+    # na bar neither enters the window nor blanks the answer — the machine keeps
+    # answering from the non-na values it already holds — and the warm-up lasts
+    # until ``length`` NON-NA values exist, not until bar ``length - 1``.
+    values = [src[i] for i in builtins.range(length)]
+    if not (values[-1] == values[-1]):  # is_na_arg
         return cast(TFI, NA(builtins.type(source)))
 
     # Find mode - sort values to handle equal frequencies
@@ -1473,6 +1494,157 @@ def obv() -> PyneFloat:
     return cum(volume * chg)
 
 
+def _rank_insert_pos(ranks: list[float], value: float) -> int:
+    """
+    Slot a value takes in a rolling window's rank order.
+
+    The order is the tolerant one (a new value goes in front of the values it
+    ties with), with one measured addition: an na rank never holds a value back.
+    The search steps PAST an na, and an na being inserted steps past everything —
+    so a warm-up na stays at the front (every later value passes it) while an na
+    arriving into a filled window lands at the back.
+
+    Measured on TradingView (probe rank readout, BINANCE:BTCUSDT 30m, length 5,
+    ``ta.percentile_nearest_rank`` at 20/40/60/80/100 % reading the ranks
+    directly): a source that is na for its first bars ranks as
+    ``[na, na, na, 3, 4]``, while an na arriving after the window filled ranks as
+    ``[3, 4, 5, 6, na]`` and one evicted down the window keeps its slot
+    (``[4, 5, 6, na, 8]``). TradingView's own order is not a plain sorted vector
+    there — the linear and the nearest-rank machines can hold the SAME window in
+    different orders (bar 10 of the scattered-na probe) — so the na-transparent
+    search is the model, not a reconstruction of that internal structure.
+
+    :param ranks: The window in rank order, na elements included
+    :param value: The value to insert
+    :return: The insertion point
+    """
+    lo = 0
+    hi = len(ranks)
+    # ``not (x == x)`` and not ``x != x``: a window holds BOTH na representations
+    # (a native nan from the bar history, an ``NA`` object from a na source), and
+    # an ``NA`` answers False to ``!=`` just as it does to ``==``
+    value_na = not (value == value)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        other = ranks[mid]
+        if value_na or not (other == other) or other - value < -_EPSILON:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def _rank_remove_pos(ranks: list[float], value: float) -> int:
+    """
+    Slot an evicted value occupies in a rolling window's rank order.
+
+    The mirror of :func:`_rank_insert_pos`: an na is transparent to the search,
+    and an evicted na takes the oldest na slot — the front of the run a warm-up
+    left behind.
+
+    :param ranks: The window in rank order, na elements included
+    :param value: The value leaving the window
+    :return: The slot to delete
+    """
+    if not (value == value):  # is_na_arg
+        for i, other in enumerate(ranks):
+            if not (other == other):
+                return i
+        return 0
+    lo = 0
+    hi = len(ranks)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        other = ranks[mid]
+        # Tolerant equality is not transitive, so a long enough chain of ties can
+        # drift until nothing is left within tolerance of the evicted value; the
+        # first slot is then the closest match left.
+        if not (other == other) or value - other >= -_EPSILON:
+            lo = mid + 1
+        else:
+            hi = mid
+    pos = lo - 1
+    if 0 <= pos < len(ranks):
+        other = ranks[pos]
+        if other == other and -_EPSILON <= value - other <= _EPSILON:
+            return pos
+    # The search steps past na slots, so on a window that holds one it can walk
+    # off the evicted value's own slot. Locate it directly then — the last of
+    # its ties, which is where the binary search lands without na in the way.
+    found = -1
+    for i, other in enumerate(ranks):
+        if other == other and -_EPSILON <= value - other <= _EPSILON:
+            found = i
+    if found >= 0:
+        return found
+    # Tolerant equality is not transitive, so a long enough chain of ties can
+    # drift until nothing is left within tolerance of the evicted value; the
+    # first slot is then the closest match left.
+    return pos if pos > 0 else 0
+
+
+def _rank_linear(ranks: list[float], percentage: float) -> float:
+    """
+    Linear-interpolation percentile over a rolling window's rank order.
+
+    Unlike the array face (``array._select_linear_interpolation``), where the na
+    elements sort to the end and an exact rank answers past them, the window's
+    na elements sit at their own slots and the interpolation is evaluated
+    unconditionally: an na neighbour poisons the result even at a zero fraction
+    (measured — window ``[4, 5, 6, na, 8]`` answers na at 50 %, where rank 3 is
+    the numeric 6 and only rank 4 is na).
+
+    :param ranks: The window in rank order, na elements included
+    :param percentage: Percentile (0-100)
+    :return: The interpolated value, or na
+    :raises ValueError: If percentage is not in [0, 100]
+    """
+    if not (percentage == percentage):  # is_na_arg
+        return na_float
+    if not (0 <= percentage <= 100):
+        raise ValueError("Percentage must be between 0 and 100")
+    n = len(ranks)
+    # 1-based interpolation position over the full window length
+    pos = n * percentage / 100.0 + 0.5
+    # Snap to an exact integer rank when floating-point noise leaves us just shy
+    nearest = builtins.round(pos)
+    if builtins.abs(pos - nearest) < 1e-9:
+        pos = float(nearest)
+    if pos <= 1:
+        return ranks[0]
+    if pos >= n:
+        return ranks[n - 1]
+    lower = math.floor(pos)  # 1-based lower rank
+    frac = pos - lower
+    # Weighted average of the two ranks, not the ``lo + frac * (hi - lo)`` form:
+    # the two are algebraically equal but round differently, and TradingView
+    # follows this one (probe m580, 22k bars, zero mismatches).
+    return ranks[lower - 1] * (1 - frac) + ranks[lower] * frac
+
+
+def _rank_nearest(ranks: list[float], percentage: float) -> float:
+    """
+    Nearest-rank percentile over a rolling window's rank order.
+
+    An na percentage answers what 0 answers, which is rank 1 — the window's
+    first slot, na included (measured: a warm-up window answers na there, not
+    its smallest numeric value).
+
+    :param ranks: The window in rank order, na elements included
+    :param percentage: Percentile (0-100), na counts as 0
+    :return: The value at the nearest rank, or na if that rank holds one
+    :raises ValueError: If percentage is not in [0, 100]
+    """
+    if not (percentage == percentage):  # is_na_arg
+        percentage = 0
+    if not (0 <= percentage <= 100):
+        raise ValueError("Percentage must be between 0 and 100")
+    n = len(ranks)
+    rank = math.ceil(percentage * n / 100)
+    rank = builtins.max(1, builtins.min(rank, n))
+    return ranks[rank - 1]
+
+
 # noinspection PyUnusedLocal,PyProtectedMember
 def percentile_linear_interpolation(source: Series[float], length: int, percentage: int | float) \
         -> PyneFloat:
@@ -1489,7 +1661,7 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
     # length/percentage configurations, 22k bars each, zero mismatches), where an
     # exact order misses TradingView on up to 44% of the bars.
     window: Persistent[deque[float]] = deque()
-    sorted_buf: Persistent[list[float]] = []
+    ranks: Persistent[list[float]] = []
     capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
 
     # The percentile machines are the only rolling ``ta`` functions that accept an
@@ -1520,8 +1692,7 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
         max_bars_back(source, capacity)
 
     window.append(source)
-    if source == source:
-        sorted_buf.insert(_tol_lower_bound(sorted_buf, source), source)
+    ranks.insert(_rank_insert_pos(ranks, source), source)
     if len(window) < length:
         # Underfull window — the first bars, a longer length arriving on a
         # shared call-site machine, or a resume after na-length calls:
@@ -1536,26 +1707,23 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
         for v in fills:
             window.appendleft(v)
         for v in fills:
-            if v == v:
-                sorted_buf.insert(_tol_lower_bound(sorted_buf, v), v)
+            # A top-up entry is OLDER than everything already in the window, so
+            # an na one takes the front of the rank order — the slot a warm-up
+            # na would hold. Inserting it by the na rule instead would put it
+            # behind the values already there, and the search of every later
+            # value would step past it and land past them too.
+            ranks.insert(0 if not (v == v) else _rank_insert_pos(ranks, v), v)
     while len(window) > length:
         old = window.popleft()
-        if old == old:
-            pos = _tol_upper_bound(sorted_buf, old) - 1
-            del sorted_buf[pos if pos > 0 else 0]
-
-    if not (source == source):  # is_na_arg
-        return na_float
+        del ranks[_rank_remove_pos(ranks, old)]
 
     if bar_index < length - 1:
         return na_float
 
-    # The na elements of the window sort to the virtual end; n is the full
-    # window length, na included -- same semantics as the array form. The
-    # interpolation position ``pos = length * percentage / 100 + 0.5`` inside is
-    # TradingView's own (probe m554: a percentage sweep over a window of four
-    # separated values walks the ranks in exact half steps).
-    return array._select_linear_interpolation(sorted_buf, length, percentage)
+    # An na bar does NOT short-circuit the answer: the window holds it like any
+    # other element and the rank order decides (measured — a window whose newest
+    # bar is na still answers its lower percentiles).
+    return _rank_linear(ranks, percentage)
 
 
 # TradingView advances this machine once per EXECUTION of its call site — loop
@@ -1583,9 +1751,10 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     :param percentage: The percentage of the percentile
     :return: The percentile of the source series
     """
-    # Rolling state: the chronological window plus its ascending-ordered numeric
-    # part, maintained incrementally (insert/remove per bar instead of a full
-    # re-sort of the window).
+    # Rolling state: the chronological window plus its rank order, maintained
+    # incrementally (insert/remove per bar instead of a full re-sort of the
+    # window). The rank order carries the na elements too, at slots of their own
+    # — see ``_rank_insert_pos`` for that measured law.
     #
     # Measured law (probes m577-m579, twelve length/percentage configurations over
     # 22k bars each, zero mismatches): the order is the tolerant one, a new value
@@ -1609,7 +1778,7 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     # window elements (two consecutive top-ups leave two separate history
     # blocks with a one-bar gap between them — observed, not an artifact).
     window: Persistent[deque[float]] = deque()
-    sorted_buf: Persistent[list[float]] = []
+    ranks: Persistent[list[float]] = []
     capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
 
     # na length is an all-na series here, not an error; see
@@ -1635,8 +1804,7 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
         max_bars_back(source, capacity)
 
     window.append(source)
-    if source == source:
-        sorted_buf.insert(_tol_lower_bound(sorted_buf, source), source)
+    ranks.insert(_rank_insert_pos(ranks, source), source)
     if len(window) < length:
         # Top the window up to ``length`` with the source's bar history —
         # ``source[i]`` for ``i = len(window)..length - 1``, na beyond the
@@ -1648,28 +1816,24 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
         for v in fills:
             window.appendleft(v)
         for v in fills:
-            if v == v:
-                sorted_buf.insert(_tol_lower_bound(sorted_buf, v), v)
+            # A top-up entry is OLDER than everything already in the window, so
+            # an na one takes the front of the rank order — the slot a warm-up
+            # na would hold. Inserting it by the na rule instead would put it
+            # behind the values already there, and the search of every later
+            # value would step past it and land past them too.
+            ranks.insert(0 if not (v == v) else _rank_insert_pos(ranks, v), v)
     while len(window) > length:
         old = window.popleft()
-        if old == old:
-            # Tolerant equality is not transitive, so a long enough chain of ties
-            # can drift until nothing is left within tolerance of the evicted
-            # value; the first slot is then the closest match left.
-            pos = _tol_upper_bound(sorted_buf, old) - 1
-            del sorted_buf[pos if pos > 0 else 0]
-
-    if not (source == source):  # is_na_arg
-        return na_float
+        del ranks[_rank_remove_pos(ranks, old)]
 
     if bar_index < length - 1:
         return na_float
 
-    # The na elements of the window sort to the virtual end; n is the full
-    # window length, na included -- same semantics as the array form. The rank
-    # ``ceil(percentage * length / 100)`` inside is TradingView's own (probes
+    # An na bar does NOT short-circuit the answer; see
+    # ``percentile_linear_interpolation``. The rank
+    # ``ceil(percentage * length / 100)`` is TradingView's own (probes
     # m552/m554, measured with a percentage sweep over separated values).
-    return array._select_nearest_rank(sorted_buf, length, percentage)
+    return _rank_nearest(ranks, percentage)
 
 
 # Shared per-call-site machine on TradingView, advancing once per EXECUTION —

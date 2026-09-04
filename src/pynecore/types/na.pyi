@@ -88,6 +88,12 @@ na_str: str
 na_bool: bool
 
 
+# Module state the bool na mode is kept in. Read across the module boundary
+# (``core/pine_export.py``), so the stub has to carry them.
+_bool_na: bool
+_bool_na_seen: bool
+
+
 def set_bool_na(enabled: bool) -> None: ...
 
 

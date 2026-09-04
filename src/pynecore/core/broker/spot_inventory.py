@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from pynecore.core.broker.exceptions import SpotInventoryConflictError
 from pynecore.core.broker.models import ExchangePosition
+from pynecore.core.plugin import is_retryable_provider_error
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -993,13 +994,16 @@ class SpotInventoryManager:
         # noinspection PyBroadException
         try:
             balance = await port.fetch_base_balance()
-        except Exception:
+        except Exception as exc:
             # Transient read failure: skip the cycle, retry on the next
-            # poll — a live bot must not halt on a recoverable read.
+            # poll — a live bot must not halt on a recoverable read. A
+            # retryable transport fault is one line (its message already
+            # names the endpoint and errno); anything else keeps its
+            # traceback.
             logger.warning(
                 "spot inventory: base-balance read failed for %r; "
-                "skipping this reconcile cycle", port.product_id,
-                exc_info=True,
+                "skipping this reconcile cycle: %s", port.product_id, exc,
+                exc_info=not is_retryable_provider_error(exc),
             )
             return []
         if not isinstance(balance, Decimal) or not balance.is_finite():

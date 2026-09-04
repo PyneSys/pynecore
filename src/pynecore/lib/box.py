@@ -10,6 +10,7 @@ from ..types.pine_types import PyneFloat, PyneInt
 from ..types.chart import ChartPoint
 from ..lib import (color as _color, extend as _extend, xloc as _xloc, size as _size, line as _line,
                    text as _text, font as _font)
+from ._drawing import bar_coord as _bar_coord, price as _price
 from .. import lib
 
 _registry: dict[Box, None] = {}
@@ -109,20 +110,20 @@ def new(*args: Any, **kwargs: Any) -> Box:
     if isinstance(top_left, ChartPoint):
         bottom_right_point = bottom_right if isinstance(bottom_right, ChartPoint) else top_left
         if xloc == _xloc.bar_time:
-            left_val, top_val = top_left.time, top_left.price
-            right_val, bottom_val = bottom_right_point.time, bottom_right_point.price
+            left_val, top_val = _bar_coord(top_left.time), _price(top_left.price)
+            right_val = _bar_coord(bottom_right_point.time)
+            bottom_val = _price(bottom_right_point.price)
         else:
-            left_val, top_val = top_left.index, top_left.price
-            right_val, bottom_val = bottom_right_point.index, bottom_right_point.price
+            left_val, top_val = _bar_coord(top_left.index), _price(top_left.price)
+            right_val = _bar_coord(bottom_right_point.index)
+            bottom_val = _price(bottom_right_point.price)
     else:
         left = kwargs.get('left')
         top = kwargs.get('top')
         right = kwargs.get('right')
         bottom = kwargs.get('bottom')
-        left_val = int(left) if isinstance(left, (int, float)) and left == left else na_int
-        top_val = top if isinstance(top, (int, float)) else na_float
-        right_val = int(right) if isinstance(right, (int, float)) and right == right else na_int
-        bottom_val = bottom if isinstance(bottom, (int, float)) else na_float
+        left_val, top_val = _bar_coord(left), _price(top)
+        right_val, bottom_val = _bar_coord(right), _price(bottom)
 
     box = Box(
         left=left_val,
@@ -221,7 +222,7 @@ def set_bottom(id: Box, bottom: float) -> None:
     """Sets the bottom coordinate of the box."""
     if isinstance(id, NA):
         return
-    id.bottom = bottom
+    id.bottom = _price(bottom)
 
 
 # noinspection PyShadowingBuiltins
@@ -230,10 +231,10 @@ def set_bottom_right_point(id: Box, point: ChartPoint) -> None:
     if isinstance(id, NA):
         return
     if id.xloc == _xloc.bar_time:
-        id.right = point.time
+        id.right = _bar_coord(point.time)
     else:
-        id.right = point.index
-    id.bottom = point.price
+        id.right = _bar_coord(point.index)
+    id.bottom = _price(point.price)
 
 
 # noinspection PyShadowingBuiltins
@@ -249,7 +250,7 @@ def set_left(id: Box, left: int) -> None:
     """Sets the left coordinate of the box."""
     if isinstance(id, NA):
         return
-    id.left = left
+    id.left = _bar_coord(left)
 
 
 # noinspection PyShadowingBuiltins
@@ -257,8 +258,8 @@ def set_lefttop(id: Box, left: int, top: float) -> None:
     """Sets the left and top coordinates of the box."""
     if isinstance(id, NA):
         return
-    id.left = left
-    id.top = top
+    id.left = _bar_coord(left)
+    id.top = _price(top)
 
 
 # noinspection PyShadowingBuiltins
@@ -266,7 +267,7 @@ def set_right(id: Box, right: int) -> None:
     """Sets the right coordinate of the box."""
     if isinstance(id, NA):
         return
-    id.right = right
+    id.right = _bar_coord(right)
 
 
 # noinspection PyShadowingBuiltins
@@ -274,8 +275,8 @@ def set_rightbottom(id: Box, right: int, bottom: float) -> None:
     """Sets the right and bottom coordinates of the box."""
     if isinstance(id, NA):
         return
-    id.right = right
-    id.bottom = bottom
+    id.right = _bar_coord(right)
+    id.bottom = _price(bottom)
 
 
 # noinspection PyShadowingBuiltins
@@ -349,7 +350,7 @@ def set_top(id: Box, top: float) -> None:
     """Sets the top coordinate of the box."""
     if isinstance(id, NA):
         return
-    id.top = top
+    id.top = _price(top)
 
 
 # noinspection PyShadowingBuiltins
@@ -358,10 +359,10 @@ def set_top_left_point(id: Box, point: ChartPoint) -> None:
     if isinstance(id, NA):
         return
     if id.xloc == _xloc.bar_time:
-        id.left = point.time
+        id.left = _bar_coord(point.time)
     else:
-        id.left = point.index
-    id.top = point.price
+        id.left = _bar_coord(point.index)
+    id.top = _price(point.price)
 
 
 # noinspection PyShadowingBuiltins
@@ -369,8 +370,8 @@ def set_xloc(id: Box, left: int, right: int, xloc: _xloc.XLoc) -> None:
     """Sets the left and right borders of a box and updates its xloc property."""
     if isinstance(id, NA):
         return
-    id.left = left
-    id.right = right
+    id.left = _bar_coord(left)
+    id.right = _bar_coord(right)
     id.xloc = xloc
 
 
@@ -392,8 +393,7 @@ def get_left(id: Box) -> PyneInt:
     """
     if isinstance(id, NA):
         return na_int
-    # A Pine int is a double at runtime
-    return float(id.left)
+    return id.left
 
 
 # noinspection PyShadowingBuiltins
@@ -404,8 +404,7 @@ def get_right(id: Box) -> PyneInt:
     """
     if isinstance(id, NA):
         return na_int
-    # A Pine int is a double at runtime
-    return float(id.right)
+    return id.right
 
 
 # noinspection PyShadowingBuiltins

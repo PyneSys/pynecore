@@ -41,6 +41,11 @@ def isna_num(x: Any) -> bool:
 #: there ``NA(bool)`` is plain ``False``. Set per script by ``set_bool_na``.
 _bool_na: bool = False
 
+#: Whether the three-state bool was ever asked for in this process. Nothing
+#: needs to keep the mode straight across a module boundary while it was not:
+#: every module then agrees on the v6 bool, and the crossing guard is pure cost
+_bool_na_seen: bool = False
+
 
 def set_bool_na(enabled: bool) -> None:
     """
@@ -55,8 +60,9 @@ def set_bool_na(enabled: bool) -> None:
 
     :param enabled: True for the v4/v5 three-state bool, False for the v6 two-state one
     """
-    global _bool_na
+    global _bool_na, _bool_na_seen
     _bool_na = enabled
+    _bool_na_seen = _bool_na_seen or enabled
 
 
 class NA(Generic[T]):

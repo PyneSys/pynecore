@@ -25,14 +25,13 @@ def __test_mode_int_series_with_na_holes__(csv_reader, runner):
     with csv_reader('ma.csv', subdir="data") as cr:
         for i, (candle, plot) in enumerate(runner(cr).run_iter()):
             value = plot["mode"]
-            if i % 2 == 0:
-                # Current bar's source is na -> na result, typed after the series
+            if i < 7:
+                # Warm-up: the na bars never join the window, so four non-na
+                # values first exist on bar 7 (every other bar carries one)
                 assert value != value, f"bar {i}: expected na, got {value!r}"
-            elif i < 3:
-                # Warm-up: na (a Pine int na is the native nan)
-                assert value != value
             else:
-                # An NA(int) hole must not be selected as mode
+                # An NA(int) hole must not be selected as mode, and an na bar
+                # answers from the window it does not join
                 assert value == 1, f"bar {i}: expected 1, got {value!r}"
             if i > 20:
                 break

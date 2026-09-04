@@ -743,6 +743,36 @@ def __test_reconcile_transient_balance_failure_skips_cycle__(tmp_path: Path):
     store.close()
 
 
+def __test_reconcile_transient_balance_failure_logs_one_line__(tmp_path: Path, caplog):
+    """A retryable transport fault on the balance read is ONE warning line
+    carrying the fault's message — no traceback (the live log would count it
+    as errors) — while an unclassified failure keeps its traceback."""
+    import logging
+    from pynecore.core.plugin import TransientProviderError
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    port = FakeSpotPort(balance=Decimal('10'))
+    mgr = _manager(ctx, port)
+    assert not _run(mgr.startup()).quarantined
+
+    def read_failures() -> list[logging.LogRecord]:
+        return [r for r in caplog.records if "base-balance read failed" in r.getMessage()]
+
+    with caplog.at_level(logging.WARNING):
+        port.balance_error = TransientProviderError("wallet-balance: dns down")
+        _run(mgr.reconcile(T0_MS))
+        assert len(read_failures()) == 1
+        assert not read_failures()[0].exc_info
+        assert "dns down" in read_failures()[0].getMessage()
+
+        port.balance_error = ConnectionError("hiccup")
+        _run(mgr.reconcile(T0_MS + 60_000))
+        assert len(read_failures()) == 2
+        assert read_failures()[1].exc_info               # traceback attached
+    assert not mgr.quarantined and mgr.pending_halt is None
+    store.close()
+
+
 def __test_reconcile_locked_base_needs_total_ownership_read__(tmp_path: Path):
     """Base locked in a resting sell order stays owned: a port honouring
     the total-ownership contract shows no drift while the order rests."""
