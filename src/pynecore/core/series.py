@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import TypeVar, Generic, Iterator, Callable, cast, overload
+from typing import Any, TypeVar, Generic, Iterator, Callable, cast, overload
 
 from types import ModuleType
 
@@ -334,79 +334,77 @@ class SeriesImpl(Generic[T]):
     def __getitem__(self, key: slice) -> ReadOnlySeriesView[T]:
         ...
 
-    def __getitem__(self, key: int | float | NA | slice) -> T | NA[T] | ReadOnlySeriesView[T]:
+    def __getitem__(self, key: Any) -> T | NA[T] | ReadOnlySeriesView[T]:
         """
         Get item(s) using Pine indexing with slice support.
 
         Pine semantics: subscripting with `na` returns the current bar's value
         (offset 0) — TradingView's history-referencing operator treats an `na`
-        offset as 0. An out-of-range integer (negative = forward of the current
+        offset as 0. An out-of-range offset (negative = forward of the current
         bar, positive >= size = before available history) returns `na` rather
-        than raising.
+        than raising. A fractional offset is truncated: the subscript is a
+        consumer slot of a Pine int, which is a double at runtime.
 
-        :param key: Integer index, NA, or slice
-        :return: Single value for integer index, ReadOnlySeriesView for slice
-        :raises TypeError: If key is not int, NA, or slice
+        :param key: Number offset, NA, or slice
+        :return: Single value for a number offset, ReadOnlySeriesView for slice
+        :raises TypeError: If key is not a number, NA, or slice
         """
-        # Int first: it is the whole hot loop, and every other form reaches this
-        # branch through a one-off conversion, so the common subscript walks a
-        # single isinstance instead of the three the na/float order cost it.
-        if isinstance(key, int):
-            # Pine: out-of-range subscript -> na (covers both negative and
-            # positive past-end indices).
-            if key < 0 or key >= self._size:
-                return self._na
-            pos = self._write_pos - 1 - key
-            if pos < 0:
-                pos += self._capacity
-            return self._buffer[pos]
+        # One conversion is the whole hot loop: a Pine int offset is a float as
+        # often as a Python int (loop counters, bar_index arithmetic), and
+        # ``int()`` takes both in one C call where an isinstance chain would
+        # walk two or three checks and a recursive call for the float form.
+        try:
+            offset = int(key)
+        except (TypeError, ValueError):
+            if isinstance(key, slice):
+                return self._slice(key)
+            # Pine: series[na] -> series[0] (an na offset is treated as the
+            # current bar); the NA object and a nan both land here
+            if isinstance(key, NA) or key != key:
+                offset = 0
+            else:
+                raise TypeError("Series indices must be numbers or slices")  # noqa
+        # Pine: out-of-range subscript -> na (covers both negative and
+        # positive past-end indices).
+        if offset < 0 or offset >= self._size:
+            return self._na
+        pos = self._write_pos - 1 - offset
+        if pos < 0:
+            pos += self._capacity
+        return self._buffer[pos]
 
-        # Pine: series[na] -> series[0] (an na offset is treated as the current
-        # bar). Route through 0 rather than converting in place, since int(NA)
-        # raises; the bounds check above then returns na only for an empty series.
-        if isinstance(key, NA):
-            return self[0]
+    def _slice(self, key: slice) -> ReadOnlySeriesView[T]:
+        """The read-only view a slice subscript hands back."""
+        # Handle slice notation
+        start = 0 if key.start is None else key.start
+        stop = self._size if key.stop is None else key.stop
 
-        if isinstance(key, float):
-            # A native nan offset is an na offset -> current bar (int(nan) raises).
-            # The separate binding keeps the conversion on a plainly float-typed
-            # name; the IDE cannot narrow the reassigned union of ``key`` here.
-            f_key = key
-            return self[0 if f_key != f_key else int(f_key)]
+        if start < 0 or stop < 0:
+            raise IndexError("Negative indices not supported in slice!")
 
-        elif isinstance(key, slice):
-            # Handle slice notation
-            start = 0 if key.start is None else key.start
-            stop = self._size if key.stop is None else key.stop
+        if key.step is not None and key.step != 1:
+            raise ValueError("Step value not supported in slice!")
 
-            if start < 0 or stop < 0:
-                raise IndexError("Negative indices not supported in slice!")
+        if stop > self._size:
+            raise IndexError("Slice stop index out of range!")
 
-            if key.step is not None and key.step != 1:
-                raise ValueError("Step value not supported in slice!")
+        # Ensure start <= stop
+        if start > stop:
+            start = stop
 
-            if stop > self._size:
-                raise IndexError("Slice stop index out of range!")
-
-            # Ensure start <= stop
-            if start > stop:
-                start = stop
-
-            # Unsubscripted on purpose: the subscripted form routes construction
-            # through ``typing._GenericAlias.__call__``, which costs ~290ns per
-            # slice and buys nothing here -- it can only attach ``__orig_class__``,
-            # which a ``__slots__`` class rejects anyway. ``T`` still binds from
-            # the ``buffer`` argument, so the inferred type is unchanged.
-            return ReadOnlySeriesView(
-                self._buffer,
-                self._capacity,
-                self._write_pos,
-                self._size,
-                start,
-                stop
-            )
-
-        raise TypeError("Series indices must be integers or slices")  # noqa
+        # Unsubscripted on purpose: the subscripted form routes construction
+        # through ``typing._GenericAlias.__call__``, which costs ~290ns per
+        # slice and buys nothing here -- it can only attach ``__orig_class__``,
+        # which a ``__slots__`` class rejects anyway. ``T`` still binds from
+        # the ``buffer`` argument, so the inferred type is unchanged.
+        return ReadOnlySeriesView(
+            self._buffer,
+            self._capacity,
+            self._write_pos,
+            self._size,
+            start,
+            stop
+        )
 
     def __len__(self) -> int:
         """
@@ -456,10 +454,12 @@ class ReadOnlySeriesView(Generic[T]):
         self._start = start
         self._stop = min(stop, size)
 
-    def __getitem__(self, idx: int) -> T | NA[T]:
-        """Get item using Pine indexing"""
-        if not isinstance(idx, int):
-            raise TypeError("Only integer indexing is supported")  # noqa
+    def __getitem__(self, idx: int | float) -> T | NA[T]:
+        """Get item using Pine indexing (a fractional offset is truncated)"""
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            raise TypeError("Only number indexing is supported") from None  # noqa
         if idx < 0:
             raise IndexError("Negative indices not supported")
         if idx >= len(self):
