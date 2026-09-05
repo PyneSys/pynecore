@@ -47,6 +47,7 @@ from .journal_wiring import (
     journal_fill_progress, journal_rejected, journal_server_ref,
     journal_submitted, journal_terminal,
 )
+from .recovery_ladder import classify_recovery
 from .transport_errors import guard as _guard_transport
 from .page_completeness import (
     BOOK_READ_DEADLINE_S, POSITIONS_PAGE_SIZE,
@@ -373,6 +374,42 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
             log.broker_info("%s", (
                 f"journal restore: re-owned {adopted} venue id(s) from the "
                 f"run's journal rows (#36) — foreign book rows untouched"))
+        self._recovery_report()
+
+    def _recovery_report(self) -> None:
+        '''#71 (Phase B1): the report-only recovery verdict ladder.
+
+        Loud per-row verdicts for this run's unresolved lost-reply rows
+        (quarantine-marked; the still-unknown rule forbids every write) and
+        for sibling-label strands (#60 — reported, never adopted, never
+        cancelled). WARN, not halt: a halt would also block the operator's
+        own recovery commands while preventing nothing the still-unknown
+        rule does not already forbid (panel G4).
+        '''
+        if self.store_ctx is None:
+            return
+        from pynecore.core.broker.store_helpers import STATE_DISPOSITION_UNKNOWN
+        du_rows = [row for row in self.store_ctx.iter_live_orders()
+                   if row.state == STATE_DISPOSITION_UNKNOWN]
+        evidence_complete = True
+        strand_ids: "set[str]" = set()
+        try:
+            strand_ids = self.store_ctx.foreign_live_exchange_order_ids(
+                symbol=self.resolve_contract())
+        except Exception:                                           # noqa: BLE001
+            evidence_complete = False   # widens doubt, never narrows it
+        for verdict in classify_recovery(du_rows=du_rows,
+                                         strand_ids=sorted(strand_ids),
+                                         evidence_complete=evidence_complete):
+            log.broker_warning("%s", verdict.message)
+            if verdict.kind == "still_unknown":
+                # Quarantine mark: every later reader of the row knows the
+                # run trades beside unknown exposure.
+                from .journal_wiring import _merged_extras
+                self.store_ctx.upsert_order(
+                    verdict.subject,
+                    extras=_merged_extras(self.store_ctx, verdict.subject,
+                                          recovery_verdict="still_unknown"))
 
     @override
     async def disconnect(self) -> None:
@@ -779,7 +816,8 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
             pine_id=getattr(intent, "pine_id", None),
             from_entry=getattr(intent, "from_entry", None),
             leg_kind=getattr(leg_type, "name", None),
-            category=category, order_type=payload["orderType"])
+            category=category, order_type=payload["orderType"],
+            price=payload.get("price"))
         status, body = self._write(lambda tok: self.client.post_order(
             self.account_id, self.market_type, payload, tok, order_category=category))
         try:

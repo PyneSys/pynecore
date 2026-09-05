@@ -40,8 +40,12 @@ def _merged_extras(store_ctx, coid: str, **updates) -> dict:
 
 
 def journal_submitted(store_ctx, *, coid, symbol, side, qty, intent_key,
-                      pine_id, from_entry, leg_kind, category, order_type) -> None:
-    """The persist-FIRST row: written BEFORE the POST leaves the process."""
+                      pine_id, from_entry, leg_kind, category, order_type,
+                      price=None) -> None:
+    """The persist-FIRST row: written BEFORE the POST leaves the process.
+
+    ``price`` is EVIDENCE for a future recovery matcher (#71: today's ladder
+    deliberately has none to act on) — persisted now, consumed by nothing."""
     if store_ctx is None or not coid:
         return
     row = store_ctx.get_order(coid)
@@ -53,7 +57,8 @@ def journal_submitted(store_ctx, *, coid, symbol, side, qty, intent_key,
         pine_entry_id=pine_id or "", from_entry=from_entry,
         extras=_merged_extras(store_ctx, coid,
                               dnse_category=category, order_type=order_type,
-                              leg_kind=leg_kind or ""))
+                              leg_kind=leg_kind or "",
+                              submitted_price=price))
 
 
 def journal_server_ref(store_ctx, *, coid, venue_id, category,

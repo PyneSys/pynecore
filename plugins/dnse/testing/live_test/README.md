@@ -326,7 +326,12 @@ near leg fills and the far leg must be CANCELLED.
   DNSE's cancel is **idempotent**: 200+record on an already-Canceled conditional, not
   `CO-ORD-013`.
 - **A SIGKILLed run leaves a heartbeat row**; the engine's single-instance guard then
-  blocks relaunch ("Active run_id already exists") — resume with `--run-label <x>`.
+  blocks relaunch ("Active run_id already exists"). **Wait out the heartbeat-stale
+  window and resume with the SAME label** — #36's journal adoption re-owns the resting
+  orders only under the same run identity. A NEW `--run-label <x>` changes `run_id`
+  and STRANDS the previous run's orders (they are reported loudly at startup and never
+  adopted — #71/#60; the old recipe of always relaunching under a new label was the
+  very thing that defeated recovery).
 
 ## History / older docs
 
