@@ -21,7 +21,7 @@ assertions would also hold on data that produces nothing at all.
 from pynecore.lib import script, ta, bar_index
 
 # A rising trend with a couple of pullbacks, enough bars for both gates to bite
-BARS = ((100.0, 90.0), (110.0, 100.0), (120.0, 85.0), (130.0, 112.0), (140.0, 120.0),
+__test_helper_BARS = ((100.0, 90.0), (110.0, 100.0), (120.0, 85.0), (130.0, 112.0), (140.0, 120.0),
         (135.0, 118.0), (145.0, 125.0), (160.0, 140.0), (155.0, 130.0), (150.0, 128.0),
         (165.0, 142.0), (175.0, 155.0), (170.0, 150.0), (180.0, 160.0), (195.0, 172.0),
         (190.0, 168.0), (185.0, 160.0), (200.0, 175.0), (210.0, 190.0), (205.0, 185.0),
@@ -42,26 +42,26 @@ def main():
     return {"every": every, "half": half, "dense": dense, "dense_atr": dense_atr}
 
 
-def _rows():
+def __test_helper_rows():
     from datetime import datetime, UTC
     from pynecore.types.ohlcv import OHLCV
 
     base_ts = int(datetime.fromisoformat("2025-01-01T00:00:00").replace(tzinfo=UTC).timestamp())
     return [OHLCV(timestamp=base_ts + bar * 1800, open=(h + lo) / 2, high=h, low=lo,
                   close=(h + lo) / 2, volume=10.0)
-            for bar, (h, lo) in enumerate(BARS)]
+            for bar, (h, lo) in enumerate(__test_helper_BARS)]
 
 
 def __test_every_bar_sar_produces_values__(runner):
     """ Control: called on every bar, sar leaves na right after the first bar """
-    for bar, (_candle, plot) in enumerate(runner(iter(_rows())).run_iter()):
+    for bar, (_candle, plot) in enumerate(runner(iter(__test_helper_rows())).run_iter()):
         value = plot["every"]
         assert (value != value) == (bar == 0), f"bar {bar}: unexpected na state {value}"
 
 
 def __test_half_gated_sar_is_na_everywhere__(runner):
     """ Called on even bars only, sar never gets a previous bar of its own """
-    for bar, (_candle, plot) in enumerate(runner(iter(_rows())).run_iter()):
+    for bar, (_candle, plot) in enumerate(runner(iter(__test_helper_rows())).run_iter()):
         value = plot["half"]
         if bar % 2:
             assert value == -1.0, f"bar {bar}: the branch must not run"
@@ -72,7 +72,7 @@ def __test_half_gated_sar_is_na_everywhere__(runner):
 def __test_sparsely_gated_sar_is_na_everywhere__(runner):
     """ One skipped bar is enough: sar stays na, while the gated atr does not """
     seen_atr = 0
-    for bar, (_candle, plot) in enumerate(runner(iter(_rows())).run_iter()):
+    for bar, (_candle, plot) in enumerate(runner(iter(__test_helper_rows())).run_iter()):
         if bar % 10 == 0:
             assert plot["dense"] == -1.0, f"bar {bar}: the branch must not run"
             continue

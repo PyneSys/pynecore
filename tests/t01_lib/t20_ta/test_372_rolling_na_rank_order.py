@@ -22,7 +22,7 @@ from pynecore.lib import script, bar_index, ta, na
 from pynecore.types import Series
 
 #: TradingView's answer per bar for the warm-up-na source, ``[p0, p50, p75, p100]``
-LINEAR_WARMUP = {
+__test_helper_LINEAR_WARMUP = {
     4: (None, None, 3.25, 4.0),
     5: (None, 3.0, 4.25, 5.0),
     6: (None, 4.0, 5.25, 6.0),
@@ -30,7 +30,7 @@ LINEAR_WARMUP = {
 }
 
 #: TradingView's rank readout for the same source: ranks 1..5 (20/40/60/80/100 %)
-RANKS_WARMUP = {
+__test_helper_RANKS_WARMUP = {
     4: (None, None, None, 3.0, 4.0),
     5: (None, None, 3.0, 4.0, 5.0),
     6: (None, 3.0, 4.0, 5.0, 6.0),
@@ -39,7 +39,7 @@ RANKS_WARMUP = {
 
 #: ``ta.median`` / ``ta.mode`` on the same source: the na bars never join the
 #: window, so five non-na values first exist on bar 7
-MEDIAN_MODE_WARMUP = {4: None, 5: None, 6: None, 7: (5.0, 3.0)}
+__test_helper_MEDIAN_MODE_WARMUP = {4: None, 5: None, 6: None, 7: (5.0, 3.0)}
 
 
 @script.indicator(title="rolling na rank order")
@@ -68,7 +68,7 @@ def main():
     }
 
 
-def _check(bar: int, key: str, value, expected):
+def __test_helper_check(bar: int, key: str, value, expected):
     if expected is None:
         # ``not (x == x)`` covers both na representations: an ``NA`` object
         # answers False to ``!=`` just as it does to ``==``
@@ -81,15 +81,15 @@ def __test_warmup_na_holds_the_front_ranks__(csv_reader, runner):
     """A warm-up na keeps the low ranks, so the high percentiles answer early"""
     with csv_reader('ma.csv', subdir="data") as cr:
         for i, (_, plot) in enumerate(runner(cr).run_iter()):
-            if i in LINEAR_WARMUP:
-                p0, p50, p75, p100 = LINEAR_WARMUP[i]
-                _check(i, "l0", plot["l0"], p0)
-                _check(i, "l50", plot["l50"], p50)
-                _check(i, "l75", plot["l75"], p75)
-                _check(i, "l100", plot["l100"], p100)
-            if i in RANKS_WARMUP:
-                for slot, expected in enumerate(RANKS_WARMUP[i], start=1):
-                    _check(i, f"r{slot}", plot[f"r{slot}"], expected)
+            if i in __test_helper_LINEAR_WARMUP:
+                p0, p50, p75, p100 = __test_helper_LINEAR_WARMUP[i]
+                __test_helper_check(i, "l0", plot["l0"], p0)
+                __test_helper_check(i, "l50", plot["l50"], p50)
+                __test_helper_check(i, "l75", plot["l75"], p75)
+                __test_helper_check(i, "l100", plot["l100"], p100)
+            if i in __test_helper_RANKS_WARMUP:
+                for slot, expected in enumerate(__test_helper_RANKS_WARMUP[i], start=1):
+                    __test_helper_check(i, f"r{slot}", plot[f"r{slot}"], expected)
             if i > 8:
                 break
 
@@ -98,16 +98,16 @@ def __test_na_bar_does_not_blank_the_window__(csv_reader, runner):
     """An na bar joins the percentile window and is refused by median/mode"""
     with csv_reader('ma.csv', subdir="data") as cr:
         for i, (_, plot) in enumerate(runner(cr).run_iter()):
-            if i in MEDIAN_MODE_WARMUP:
-                expected = MEDIAN_MODE_WARMUP[i]
-                _check(i, "median", plot["median"], None if expected is None else expected[0])
-                _check(i, "mode", plot["mode"], None if expected is None else expected[1])
+            if i in __test_helper_MEDIAN_MODE_WARMUP:
+                expected = __test_helper_MEDIAN_MODE_WARMUP[i]
+                __test_helper_check(i, "median", plot["median"], None if expected is None else expected[0])
+                __test_helper_check(i, "mode", plot["mode"], None if expected is None else expected[1])
             if i == 7:
                 # scattered source: bar 7 IS na, window [3, 4, 5, 6, na]
-                _check(i, "s0", plot["s0"], 3.0)
-                _check(i, "s50", plot["s50"], 5.0)
+                __test_helper_check(i, "s0", plot["s0"], 3.0)
+                __test_helper_check(i, "s50", plot["s50"], 5.0)
                 # median/mode answer from the five non-na values they hold: [2..6]
-                _check(i, "s_median", plot["s_median"], 4.0)
-                _check(i, "s_mode", plot["s_mode"], 2.0)
+                __test_helper_check(i, "s_median", plot["s_median"], 4.0)
+                __test_helper_check(i, "s_mode", plot["s_mode"], 2.0)
             if i > 8:
                 break

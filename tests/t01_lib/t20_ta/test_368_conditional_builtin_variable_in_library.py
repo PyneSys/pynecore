@@ -26,10 +26,10 @@ imported modules afterwards.
 import sys
 from pathlib import Path
 
-DATA_DIR = Path(__file__).parent / 'data'
+__test_helper_DATA_DIR = Path(__file__).parent / 'data'
 
 
-def _make_syminfo():
+def __test_helper_make_syminfo():
     from pynecore.core.syminfo import SymInfo
     from pynecore.providers.ccxt import CCXTProvider
     # noinspection PyProtectedMember
@@ -44,7 +44,7 @@ def _make_syminfo():
     )
 
 
-def _make_ohlcv():
+def __test_helper_make_ohlcv():
     from pynecore.types.ohlcv import OHLCV
     # close and volume both alternate around the previous bar so nvi keeps moving
     bars = ((100.0, 50.0), (102.0, 40.0), (101.0, 60.0), (105.0, 30.0), (104.0, 70.0),
@@ -58,14 +58,14 @@ def _make_ohlcv():
     ]
 
 
-def _expected_nvi() -> list[float]:
+def __test_helper_expected_nvi() -> list[float]:
     # Straight re-computation of ta.nvi over the fixture bars: one advancement
     # per bar — this is what pins that the library main runs exactly once per
     # bar when the module is the script (it is registered as a lib main too)
     values = []
     nvi = 1.0
     prev_close = prev_volume = 0.0
-    for row in _make_ohlcv():
+    for row in __test_helper_make_ohlcv():
         if prev_close != 0.0 and row.volume < prev_volume:
             nvi += (row.close - prev_close) / prev_close * nvi
         values.append(nvi)
@@ -73,7 +73,7 @@ def _expected_nvi() -> list[float]:
     return values
 
 
-def _run_script(script_name: str) -> list[dict]:
+def __test_helper_run_script(script_name: str) -> list[dict]:
     from pynecore.core import script as script_core
     from pynecore.core.script_runner import ScriptRunner
 
@@ -81,7 +81,7 @@ def _run_script(script_name: str) -> list[dict]:
     saved_libraries = list(script_core._registered_libraries)
     try:
         runner = ScriptRunner(
-            DATA_DIR / script_name, iter(_make_ohlcv()), _make_syminfo(),
+            __test_helper_DATA_DIR / script_name, iter(__test_helper_make_ohlcv()), __test_helper_make_syminfo(),
         )
         return [dict(plot_data) for _candle, plot_data in runner.run_iter()]
     finally:
@@ -93,7 +93,7 @@ def _run_script(script_name: str) -> list[dict]:
 
 def __test_imported_library_helper_is_a_per_call_site_gated_machine__():
     """ Unconditional lib call tracks the engine; a gated lib call runs its own machine """
-    results = _run_script('gated_builtin_lib_script.py')
+    results = __test_helper_run_script('gated_builtin_lib_script.py')
 
     nvi_values = set()
     gated_mismatch = 0
@@ -114,11 +114,11 @@ def __test_imported_library_helper_is_a_per_call_site_gated_machine__():
 
 def __test_library_run_as_a_study_follows_the_same_laws__():
     """ Study mode: main-body and non-export reads track the engine, an export does not """
-    results = _run_script('gated_builtin_lib.py')
+    results = __test_helper_run_script('gated_builtin_lib.py')
 
     nvi_values = set()
     export_mismatch = 0
-    expected = _expected_nvi()
+    expected = __test_helper_expected_nvi()
     for bar, plot in enumerate(results):
         every = plot["every_nvi"]
         nvi_values.add(every)

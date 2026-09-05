@@ -29,7 +29,7 @@ from pynecore.lib import script, ta, bar_index
 
 # (close, volume): volume alternates around the previous bar so nvi/pvi update on
 # real bars, and close moves both ways so obv accumulates in both directions
-BARS = ((100.0, 50.0), (102.0, 40.0), (101.0, 60.0), (105.0, 30.0), (104.0, 70.0),
+__test_helper_BARS = ((100.0, 50.0), (102.0, 40.0), (101.0, 60.0), (105.0, 30.0), (104.0, 70.0),
         (108.0, 20.0), (107.0, 90.0), (110.0, 35.0), (109.0, 80.0), (113.0, 25.0),
         (112.0, 95.0), (116.0, 45.0), (114.0, 85.0), (118.0, 15.0), (117.0, 75.0),
         (121.0, 55.0), (119.0, 65.0), (124.0, 10.0), (122.0, 100.0), (127.0, 42.0))
@@ -64,7 +64,7 @@ def main():
             "half_acc": half_acc, "fn_acc": fn_acc}
 
 
-def _rows():
+def __test_helper_rows():
     from datetime import datetime, UTC
     from pynecore.types.ohlcv import OHLCV
 
@@ -72,13 +72,13 @@ def _rows():
     # close is off-center in the bar range, so accdist's money-flow term is nonzero
     return [OHLCV(timestamp=base_ts + bar * 1800, open=c, high=c + 1.0, low=c - 2.0,
                   close=c, volume=v)
-            for bar, (c, v) in enumerate(BARS)]
+            for bar, (c, v) in enumerate(__test_helper_BARS)]
 
 
 def __test_gated_variable_reads_match_the_unconditional_series__(runner):
     """ A gated builtin-variable read equals the unconditional one on every gated bar """
     nvi_values = set()
-    for bar, (_candle, plot) in enumerate(runner(iter(_rows())).run_iter()):
+    for bar, (_candle, plot) in enumerate(runner(iter(__test_helper_rows())).run_iter()):
         nvi_values.add(plot["every_nvi"])
         if bar % 2 == 0:
             assert plot["half_nvi"] == plot["every_nvi"], \
@@ -91,7 +91,7 @@ def __test_gated_variable_reads_match_the_unconditional_series__(runner):
 def __test_helper_function_read_matches_too__(runner):
     """ A read through a gated module-level helper sees the same engine series """
     obv_values = set()
-    for bar, (_candle, plot) in enumerate(runner(iter(_rows())).run_iter()):
+    for bar, (_candle, plot) in enumerate(runner(iter(__test_helper_rows())).run_iter()):
         every = plot["every_obv"]
         obv_values.add(every)
         if bar % 3 != 0:
@@ -108,7 +108,7 @@ def __test_accdist_is_global_in_main_but_instanced_in_a_helper__(runner):
     """ vwap/accdist law: main-body reads track the engine, helper reads do not """
     acc_values = set()
     fn_mismatch = 0
-    for bar, (_candle, plot) in enumerate(runner(iter(_rows())).run_iter()):
+    for bar, (_candle, plot) in enumerate(runner(iter(__test_helper_rows())).run_iter()):
         every = plot["every_acc"]
         acc_values.add(every)
         if bar % 2 == 0:

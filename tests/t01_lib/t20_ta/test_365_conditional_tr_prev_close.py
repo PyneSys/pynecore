@@ -21,7 +21,7 @@ from pynecore.lib import script, ta, bar_index
 # Flat bars (high == low == close) so tr collapses to |close - previous close|,
 # on a ladder whose steps all differ -- the gap to the previous bar and the gap to
 # the previous even bar can then never coincide by accident.
-CLOSES = (0.0, 10.0, 30.0, 60.0, 100.0, 150.0, 210.0, 280.0)
+__test_helper_CLOSES = (0.0, 10.0, 30.0, 60.0, 100.0, 150.0, 210.0, 280.0)
 
 
 @script.indicator(title="Conditional tr")
@@ -37,20 +37,20 @@ def main():
             "every_atr": every_atr, "gated_atr": gated_atr}
 
 
-def _rows():
+def __test_helper_rows():
     from datetime import datetime, UTC
     from pynecore.types.ohlcv import OHLCV
 
     base_ts = int(datetime.fromisoformat("2025-01-01T00:00:00").replace(tzinfo=UTC).timestamp())
     return [OHLCV(timestamp=base_ts + bar * 1800, open=close, high=close,
                   low=close, close=close, volume=10.0)
-            for bar, close in enumerate(CLOSES)]
+            for bar, close in enumerate(__test_helper_CLOSES)]
 
 
 def __test_gated_tr_uses_the_previous_bar__(runner):
     """ tr() called on even bars only still reads the bar before, not the call before """
     seen = 0
-    for bar, (_candle, plot) in enumerate(runner(iter(_rows())).run_iter()):
+    for bar, (_candle, plot) in enumerate(runner(iter(__test_helper_rows())).run_iter()):
         if bar % 2:
             assert plot["gated"] == -1.0, f"bar {bar}: the branch must not run"
             continue
@@ -62,14 +62,14 @@ def __test_gated_tr_uses_the_previous_bar__(runner):
 
 def __test_tr_is_the_gap_to_the_previous_bar__(runner):
     """ The flat bars make tr the step of the close ladder, na-handled on bar 0 """
-    for bar, (_candle, plot) in enumerate(runner(iter(_rows())).run_iter()):
-        expected = 0.0 if bar == 0 else CLOSES[bar] - CLOSES[bar - 1]
+    for bar, (_candle, plot) in enumerate(runner(iter(__test_helper_rows())).run_iter()):
+        expected = 0.0 if bar == 0 else __test_helper_CLOSES[bar] - __test_helper_CLOSES[bar - 1]
         assert plot["every"] == expected, f"bar {bar}: tr {plot['every']} != {expected}"
 
 
 def __test_gated_atr_accumulator_stays_call_gated__(runner):
     """ atr's rma still advances per call: a length of 3 needs 3 CALLS to leave na """
-    for bar, (_candle, plot) in enumerate(runner(iter(_rows())).run_iter()):
+    for bar, (_candle, plot) in enumerate(runner(iter(__test_helper_rows())).run_iter()):
         every_atr = plot["every_atr"]
         assert (every_atr != every_atr) == (bar < 2), (
             f"bar {bar}: every-bar atr(3) should be na only before bar 2, got {every_atr}")

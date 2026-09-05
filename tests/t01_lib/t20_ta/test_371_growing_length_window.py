@@ -22,18 +22,18 @@ covers it, then shrinks past it, then grows back over it again.
 from pynecore.lib import script, ta, bar_index, low, high
 
 # One deep low and one tall high at bar 5, flat noise everywhere else.
-SPIKE_BAR = 5
-LOWS = [100.0 + bar for bar in range(20)]
-LOWS[SPIKE_BAR] = 10.0
-HIGHS = [200.0 - bar for bar in range(20)]
-HIGHS[SPIKE_BAR] = 900.0
+__test_helper_SPIKE_BAR = 5
+__test_helper_LOWS = [100.0 + bar for bar in range(20)]
+__test_helper_LOWS[__test_helper_SPIKE_BAR] = 10.0
+__test_helper_HIGHS = [200.0 - bar for bar in range(20)]
+__test_helper_HIGHS[__test_helper_SPIKE_BAR] = 900.0
 
 WIDE = 10
 NARROW = 3
 SHRUNK_BARS = (10, 11)  # the spike is out of reach only here
 
 
-def _length(bar: int) -> int:
+def __test_helper_length(bar: int) -> int:
     return NARROW if bar in SHRUNK_BARS else WIDE
 
 
@@ -47,40 +47,40 @@ def main():
     }
 
 
-def _rows():
+def __test_helper_rows():
     from datetime import datetime, UTC
     from pynecore.types.ohlcv import OHLCV
 
     base_ts = int(datetime.fromisoformat("2025-01-01T00:00:00").replace(tzinfo=UTC).timestamp())
     return [OHLCV(timestamp=base_ts + bar * 1800, open=lo + 5.0, high=hi, low=lo,
                   close=lo + 5.0, volume=10.0)
-            for bar, (lo, hi) in enumerate(zip(LOWS, HIGHS))]
+            for bar, (lo, hi) in enumerate(zip(__test_helper_LOWS, __test_helper_HIGHS))]
 
 
 def __test_varying_length_window_is_always_the_plain_window__(runner):
     """ Every bar answers over exactly the length it asked for """
-    for bar, (_candle, plot) in enumerate(runner(iter(_rows())).run_iter()):
-        length = _length(bar)
+    for bar, (_candle, plot) in enumerate(runner(iter(__test_helper_rows())).run_iter()):
+        length = __test_helper_length(bar)
         if bar < length - 1:
             assert plot["lowest"] != plot["lowest"], f"bar {bar}: expected na"
             continue
         window = slice(bar - length + 1, bar + 1)
-        assert plot["lowest"] == min(LOWS[window]), f"bar {bar}: lowest {plot['lowest']}"
-        assert plot["highest"] == max(HIGHS[window]), f"bar {bar}: highest {plot['highest']}"
+        assert plot["lowest"] == min(__test_helper_LOWS[window]), f"bar {bar}: lowest {plot['lowest']}"
+        assert plot["highest"] == max(__test_helper_HIGHS[window]), f"bar {bar}: highest {plot['highest']}"
 
 
 def __test_the_spike_returns_the_bar_the_length_grows_back__(runner):
     """ The regression itself: bar 12 must see the spike again, not a bar later """
     growth_bar = max(SHRUNK_BARS) + 1
-    assert growth_bar - WIDE + 1 <= SPIKE_BAR, "the wide window must reach the spike"
-    values = [dict(plot) for _candle, plot in runner(iter(_rows())).run_iter()]
-    assert values[growth_bar]["lowest"] == LOWS[SPIKE_BAR]
-    assert values[growth_bar]["highest"] == HIGHS[SPIKE_BAR]
+    assert growth_bar - WIDE + 1 <= __test_helper_SPIKE_BAR, "the wide window must reach the spike"
+    values = [dict(plot) for _candle, plot in runner(iter(__test_helper_rows())).run_iter()]
+    assert values[growth_bar]["lowest"] == __test_helper_LOWS[__test_helper_SPIKE_BAR]
+    assert values[growth_bar]["highest"] == __test_helper_HIGHS[__test_helper_SPIKE_BAR]
 
 
 def __test_the_shrunk_window_really_loses_the_spike__(runner):
     """ Control: without the dip the test above would prove nothing """
-    values = [dict(plot) for _candle, plot in runner(iter(_rows())).run_iter()]
+    values = [dict(plot) for _candle, plot in runner(iter(__test_helper_rows())).run_iter()]
     for bar in SHRUNK_BARS:
-        assert values[bar]["lowest"] > LOWS[SPIKE_BAR], f"bar {bar} still sees the spike"
-        assert values[bar]["highest"] < HIGHS[SPIKE_BAR], f"bar {bar} still sees the spike"
+        assert values[bar]["lowest"] > __test_helper_LOWS[__test_helper_SPIKE_BAR], f"bar {bar} still sees the spike"
+        assert values[bar]["highest"] < __test_helper_HIGHS[__test_helper_SPIKE_BAR], f"bar {bar} still sees the spike"
