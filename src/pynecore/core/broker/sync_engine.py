@@ -4600,6 +4600,12 @@ class OrderSyncEngine:
                             entry_price=broker_entry_price,
                         )
         elif not is_startup and new_size == 0.0 and self._position.size != 0.0:
+            # RAW by design (#73/C2): this gate reads the venue net, never
+            # the journal-owned figure. ``net == 0`` on a netting account is
+            # a proof of ABSENCE — nobody holds anything, so clearing is
+            # safe. An owned figure here would be a belief, and a belief
+            # that reads 0 (fresh journal, retired rows) would fire this
+            # destructive clear against a live venue position.
             # Wait while bot-initiated work may be in flight — a close we
             # dispatched ourselves will flatten /positions seconds before
             # the matching ``OrderEvent`` reaches the queue. Pre-empting the
@@ -4820,6 +4826,28 @@ class OrderSyncEngine:
                 )
                 return
 
+        # Run-ownership isolation (#73/C1): the marker arithmetic below
+        # compares against the RAW venue net (the pre/post-close expectations
+        # are venue-truth statements), but the value ADOPTED into
+        # ``_position.size`` is clamped to the run-owned slice — same rule as
+        # the sibling startup branch above. Without this, a replayed
+        # defensive-close marker routes adoption around the clamp and copies
+        # another run's (or the operator's) exposure into this run.
+        adopt_signed = broker_signed
+        if self._store_ctx is not None:
+            owned_signed = self._durable_owned_signed_size()
+            adopt_signed = self._clamp_adoption_to_owned(
+                broker_signed, owned_signed,
+            )
+            if adopt_signed != broker_signed:
+                _blog_warning(
+                    "replayed-close startup adoption limited to run-owned "
+                    "exposure (exchange=%s, owned=%s, internal=%s) — the "
+                    "remaining venue net belongs to another run on this "
+                    "account+symbol",
+                    broker_signed, owned_signed, self._position.size,
+                )
+
         # noinspection PyShadowingNames
         def _signed_close_delta(
                 marker: PendingDefensiveClose, magnitude: float,
@@ -4907,12 +4935,12 @@ class OrderSyncEngine:
                 "expect FILL to reduce the in-memory aggregate",
                 new_size, self._position.size,
             )
-            self._position.size = broker_signed
+            self._position.size = adopt_signed
             self._position.sign = (
-                1.0 if broker_signed > 0.0
-                else (-1.0 if broker_signed < 0.0 else 0.0)
+                1.0 if adopt_signed > 0.0
+                else (-1.0 if adopt_signed < 0.0 else 0.0)
             )
-            if broker_signed == 0.0:
+            if adopt_signed == 0.0:
                 self._position.avg_price = na_float
                 self._position.open_trades.clear()
                 self._position.openprofit = 0.0
@@ -4930,12 +4958,12 @@ class OrderSyncEngine:
                 "seeding duplicate-fill caches",
                 new_size, self._position.size,
             )
-            self._position.size = broker_signed
+            self._position.size = adopt_signed
             self._position.sign = (
-                1.0 if broker_signed > 0.0
-                else (-1.0 if broker_signed < 0.0 else 0.0)
+                1.0 if adopt_signed > 0.0
+                else (-1.0 if adopt_signed < 0.0 else 0.0)
             )
-            if broker_signed == 0.0:
+            if adopt_signed == 0.0:
                 self._position.avg_price = na_float
                 self._position.open_trades.clear()
                 self._position.openprofit = 0.0
@@ -10539,6 +10567,11 @@ class OrderSyncEngine:
         # forward the failure as "no snapshot this tick" rather than
         # turning a transient blip into a live-runner halt.
         try:
+            # RAW by design (#73/C3): the snapshot's ``size`` acts as an
+            # over-close CAP on the partial legs. The cap must be the venue
+            # truth — capping at a (possibly stale/larger) journal-owned
+            # figure while the venue net is smaller would let a close
+            # over-sell and flip the account through flat.
             parent_snapshot = self._run_async_read(
                 self._broker.get_position(self._symbol),
             )

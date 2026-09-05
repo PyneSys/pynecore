@@ -220,11 +220,15 @@ def __test_rejected_place_is_journalled_and_skipped_by_restore__(fake_client, tm
         store.close()
 
 
-# --- terminal observation closes the row -------------------------------------
+# --- terminal observations: fills keep the ledger, cancels close it ----------
 
-def __test_fill_observation_closes_the_journal_row__(fake_client, tmp_path):
-    """The watch scan's FILLED observation must close the row (closed rows
-    leave iter_live_orders; refs are trimmed by design)."""
+def __test_fill_observation_keeps_the_exposure_row_live__(fake_client, tmp_path):
+    """#73 (supersedes the original close-on-fill anchor): a FILLED terminal
+    keeps the row LIVE with the watermark fields written — the rows are the
+    run's exposure ledger (core's ``_durable_owned_signed_size`` sums
+    ``filled_qty`` over LIVE rows only; closing the filled entry row made
+    the startup ownership clamp refuse the run's own position). A
+    zero-exposure terminal (cancel/reject) still closes the row."""
     from pynecore_dnse.journal_wiring import journal_terminal
 
     b = _broker(fake_client, tmp_path, post_order=_PLACED)
@@ -236,9 +240,31 @@ def __test_fill_observation_closes_the_journal_row__(fake_client, tmp_path):
         journal_terminal(ctx, venue_id="437346", terminal_status="Filled",
                          filled_qty=1.0)
 
-        assert list(ctx.iter_live_orders(symbol="VN30F1M")) == [], (
-            "a filled order's row must close")
+        rows = list(ctx.iter_live_orders(symbol="VN30F1M"))
+        assert len(rows) == 1, (
+            "a filled row is the run's exposure ledger — it must stay LIVE")
+        assert float(rows[0].filled_qty) == 1.0
+        extras = rows[0].extras or {}
+        assert extras.get("last_raw_status") == "Filled", (
+            "#56 watermark: without last_raw_status the restart seed gate "
+            "fails and the first poll re-emits the full fill")
+        assert extras.get("last_fill_venue_id") == "437346"
         journal_terminal(ctx, venue_id="437346", terminal_status="Filled")  # idempotent
+        assert len(list(ctx.iter_live_orders(symbol="VN30F1M"))) == 1
+    finally:
+        store.close()
+
+
+def __test_zero_exposure_terminal_still_closes_the_row__(fake_client, tmp_path):
+    from pynecore_dnse.journal_wiring import journal_terminal
+
+    b = _broker(fake_client, tmp_path, post_order=_PLACED)
+    store, ctx = _open_store_ctx(tmp_path, b)
+    try:
+        asyncio.run(b.execute_entry(_entry_envelope()))
+        journal_terminal(ctx, venue_id="437346", terminal_status="Canceled")
+        assert list(ctx.iter_live_orders(symbol="VN30F1M")) == [], (
+            "a cancelled-unfilled order carries no exposure — its row closes")
     finally:
         store.close()
 

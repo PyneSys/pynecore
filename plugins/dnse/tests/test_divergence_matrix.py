@@ -98,10 +98,13 @@ def _venue_long(qty: float):
 
 def __test_matrix_a_startup_adoption_is_clamped_to_nothing__(
         fake_client, tmp_path, caplog):
-    """MEASURED HOLE (#36 owns the fix): post-#49 the side label parses, but
-    the ownership clamp sums the store's orders journal — which the DNSE
-    plugin never writes — so startup adoption over a live 3-lot venue
-    position adopts NOTHING and the run believes it is flat."""
+    """CHARACTERIZATION (annotation corrected at #73 — "#36 owns the fix"
+    was stale): over an EMPTY journal, clamped startup adoption over a live
+    3-lot venue position adopts NOTHING. Post-#36+#73 this is the CORRECT
+    verdict — a run with no journalled fills owns nothing on the shared
+    netting account (that net is the operator's); a genuine restart over
+    the run's OWN fill is covered by
+    ``__test_restart_over_own_filled_position_adopts_it__`` below."""
     store = BrokerStore(tmp_path / "broker.sqlite", plugin_name="dnse")
     ctx = _open_ctx(store)
     b = _broker(fake_client, get_positions=_venue_long(3),
@@ -246,3 +249,96 @@ def __test_matrix_c_nothing_prevents_two_engines_on_one_account__(tmp_path):
     assert ctx_long is not None and ctx_short is not None, (
         "measured hole moved: open_run now refuses a second engine on the "
         "same account/symbol — flip this when a netting lease exists")
+
+
+# --- B2 (#59 item 4): the UNCLAMPED sibling startup branch ------------------
+
+def __test_replayed_close_startup_adoption_respects_the_clamp__(
+        fake_client, tmp_path, caplog):
+    """RED (Phase B2 owns the fix): matrix (a) proves the clamped startup
+    branch adopts NOTHING over a no-journal store — but its SIBLING branch
+    (`_adopt_size_with_replayed_close`, routed when a replayed defensive-
+    close marker exists at startup) adopts the RAW venue snapshot with the
+    ownership clamp never applied (#59 item-4, the first of the four
+    uncovered raw-net consumers). Same fixture, same empty journal: the
+    sibling must reach the same owned figure (nothing) — today it adopts
+    the operator's 3 lots as bot exposure in exactly the crash-mid-close
+    scenario Phase A exists for."""
+    import time as _time
+    from pynecore.core.broker.models import (
+        BracketAttachRejectContext, PendingDefensiveClose,
+    )
+
+    store = BrokerStore(tmp_path / "broker3.sqlite", plugin_name="dnse")
+    ctx = _open_ctx(store, "replayed")
+    b = _broker(fake_client, get_positions=_venue_long(3),
+                get_orders=(200, {"orders": []}))
+    engine, pos = _mk_engine(b, ctx)
+    engine._pending_defensive_close["Long"] = PendingDefensiveClose(
+        entry_id="Long",
+        close_intent_key="__pyne_defensive_close__coid-1",
+        close_order_ref=None,
+        pending_since=_time.time(),
+        reject_context=BracketAttachRejectContext(
+            intent_key="Bracket\0Long", position_coid="coid-1",
+            position_side="buy", qty=3.0, symbol=SYMBOL,
+        ),
+        close_client_order_id="CLOSE-COID-1",
+        pre_close_position_size=3.0,
+    )
+    engine._replayed_defensive_close_entry_ids.add("Long")
+
+    engine.reconcile()
+
+    assert pos.size == 0.0, (
+        f"the replayed-close sibling branch adopted {pos.size} — the RAW "
+        f"venue snapshot, clamp never applied, while the clamped branch on "
+        f"the identical empty journal adopts nothing (matrix a). On the "
+        f"shared netting account that is the operator's exposure adopted "
+        f"as the bot's (#59 item-4 consumer 1; Phase B2)")
+
+
+def __test_restart_over_own_filled_position_adopts_it__(
+        fake_client, tmp_path, caplog):
+    """RED (Phase B2 owns the fix — a #36/#56 interaction defect found at
+    B2's Step 0): core's owned sum reads `filled_qty` on LIVE rows and its
+    docstring assumes 'a genuine restart over its own open position finds
+    its entry row's cursor' — but `journal_terminal` CLOSES the row on
+    FILLED, so the run's own filled 3-lot position contributes ZERO and the
+    clamp adopts nothing. The startup-clamp-adopts-zero hole Phase A was
+    meant to fix is re-created by our own terminal-close policy."""
+    from pynecore.core.broker.models import DispatchEnvelope, EntryIntent, OrderType
+    from pynecore_dnse.journal_wiring import journal_terminal
+
+    store = BrokerStore(tmp_path / "broker4.sqlite", plugin_name="dnse")
+    ctx = _open_ctx(store, "own-fill")
+    b1 = _broker(fake_client,
+                 get_security_definition=(200, [{"ceilingPrice": "1550",
+                                                 "floorPrice": "1450",
+                                                 "securityGroupId": "FU"}]),
+                 get_loan_packages=(200, {"loanPackages": [{"id": 42}]}),
+                 post_order=(201, {"id": "437346", "symbol": SYMBOL, "side": "NB",
+                                   "quantity": 3, "orderStatus": "New"}))
+    b1.store_ctx = ctx
+    envelope = DispatchEnvelope(
+        intent=EntryIntent(pine_id="Long", symbol=SYMBOL, side="buy", qty=3,
+                           order_type=OrderType.LIMIT, limit=1500.0),
+        run_tag="abcd", bar_ts_ms=1_700_000_000_000, retry_seq=0, coid_max_len=30)
+    asyncio.run(b1.execute_entry(envelope))
+    journal_terminal(ctx, venue_id="437346", terminal_status="Filled",
+                     filled_qty=3.0)      # the watch scan's fill observation
+    ctx.close()
+
+    ctx2 = _open_ctx(store, "own-fill")
+    b2 = _broker(fake_client, get_positions=_venue_long(3),
+                 get_orders=(200, {"orders": []}))
+    b2.store_ctx = ctx2
+    engine, pos = _mk_engine(b2, ctx2)
+
+    engine.reconcile()
+
+    assert pos.size == 3.0, (
+        f"restart over the run's OWN filled position adopted {pos.size} — "
+        f"the filled entry's row was CLOSED by journal_terminal, so the "
+        f"owned sum sees zero and the clamp refuses our own exposure "
+        f"(#36/#56 interaction; Phase B2)")

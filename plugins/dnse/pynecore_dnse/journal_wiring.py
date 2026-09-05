@@ -137,9 +137,18 @@ def journal_fill_progress(store_ctx, *, venue_id, filled_qty, raw_status) -> Non
 
 def journal_terminal(store_ctx, *, venue_id, terminal_status,
                      filled_qty=None) -> None:
-    """A terminal observation (fill / cancel / reject) closes the row.
-    Idempotent: an already-closed or unknown id is a no-op — the watch scan
-    and the cancel core can both observe the same terminal."""
+    """A terminal observation. Zero-exposure terminals (cancel / reject
+    with nothing executed) close the row; a terminal WITH executed
+    quantity keeps the row LIVE — the rows are the run's durable exposure
+    ledger (#73): core's ``_durable_owned_signed_size`` sums ``filled_qty``
+    over LIVE rows only, so closing a filled entry row would make the
+    startup ownership clamp read owned=0 and refuse the run's own position
+    after a restart. The ledger nets itself (a filled exit row subtracts
+    what the entry added). The keep-live path also writes the #56
+    watermark fields (``last_raw_status``/``last_fill_venue_id``) so the
+    restart seed gate dedupes the fill instead of re-emitting it.
+    Idempotent: an already-closed or unknown id is a no-op — the watch
+    scan and the cancel core can both observe the same terminal."""
     if store_ctx is None:
         return
     coid = _coid_for_venue_id(store_ctx, venue_id)
@@ -147,6 +156,15 @@ def journal_terminal(store_ctx, *, venue_id, terminal_status,
         return
     if filled_qty:
         store_ctx.set_filled(coid, float(filled_qty))
+    row = store_ctx.get_order(coid)
+    has_exposure = row is not None and float(row.filled_qty or 0.0) > 0.0
+    if has_exposure:
+        store_ctx.upsert_order(
+            coid, extras=_merged_extras(store_ctx, coid,
+                                        terminal_status=str(terminal_status),
+                                        last_raw_status=str(terminal_status),
+                                        last_fill_venue_id=str(venue_id)))
+        return
     store_ctx.upsert_order(
         coid, extras=_merged_extras(store_ctx, coid,
                                     terminal_status=str(terminal_status)))
