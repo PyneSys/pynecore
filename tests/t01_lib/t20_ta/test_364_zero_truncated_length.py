@@ -12,6 +12,8 @@ Validating first let 0.5 pass ``> 0``, and the functions then ran with an empty
 window: ``median`` indexed an empty heap and crashed, while the other three
 answered na forever instead of reporting the bad argument.
 """
+import pytest
+
 from pynecore.lib import script, close, ta
 
 
@@ -38,6 +40,8 @@ def main():
     return {"caught": caught}
 
 
+@pytest.mark.aot_unsupported("try/except: a compiled script has no exceptions, a failed "
+                             "assert is a trap that ends the run")
 def __test_zero_truncated_length__(runner):
     """Every function of the na-length family rejects a length that truncates to 0"""
     from datetime import datetime, UTC
