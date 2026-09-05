@@ -13595,6 +13595,46 @@ def _persist_stale_pending_legs(ctx, *, exit_id: str) -> None:
         )
 
 
+def __test_partial_trigger_close_skipped_by_plugin_logs_warning_and_rearms__(caplog):
+    """A plugin decline of the engine-trigger partial close (the venue found the
+    position already gone: the native fail-safe took it in the same tick) is one
+    WARNING line, the leg re-arms with the skip reason, nothing halts."""
+    from pynecore.core.broker.software_partial_bracket_engine import PartialBracketLeg
+    from pynecore.core.broker.store_helpers import (
+        LEG_KIND_SL_PARTIAL, LEG_STATE_ARMED, LEG_STATE_TRIGGERING,
+    )
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+    leg = PartialBracketLeg(
+        coid='leg-sl', symbol=SYMBOL, pine_id='X1', from_entry='L',
+        leg_kind=LEG_KIND_SL_PARTIAL, leg_state=LEG_STATE_TRIGGERING,
+        side='sell', qty=0.5, intent_key="X1\0L", parent_pine_entry_id='L',
+        parent_entry_dispatch_ref='parent-coid', intent_partial_qty=0.5,
+        trigger_level=49_900.0, oca_group=None, oca_type=None,
+    )
+    pbe = engine._partial_bracket_engine  # type: ignore[attr-defined]
+    pbe._legs[leg.key] = leg
+    pbe._legs_by_parent.setdefault((leg.symbol, leg.from_entry), set()).add(leg.key)
+    b.raise_on_next_close = OrderSkippedByPlugin(
+        "execute_close: the position closed before the close landed "
+        "(POSITION_NOT_FOUND) for symbol 'BTCUSDT'; nothing to close",
+        intent_key="__pyne_partial_trigger__X1\0L\0sl_partial",
+        reason='nothing_to_close',
+    )
+    with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+        engine._dispatch_partial_bracket_close(leg)  # type: ignore[attr-defined]
+    assert len(b.close_calls) == 1
+    assert not engine.halted
+    assert leg.leg_state == LEG_STATE_ARMED
+    assert leg.extras['trigger_failed_reason'] == 'plugin_skipped:nothing_to_close'
+    records = [r for r in caplog.records if 'partial bracket close skipped' in r.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert 'nothing to close' in records[0].getMessage()
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
 def __test_stale_pending_partial_legs_retired_on_new_parent_fill_deferred_whole_row_exit__(tmp_path):
     """Measured live (bybit-inverse cycle 52): a previous bot left ``pending_entry``
     partial legs under ``L``; the lane's next bot re-used the ``L`` entry id with a

@@ -10680,6 +10680,10 @@ class OrderSyncEngine:
             # would survive a restart for the same collision). Drop the
             # synth envelope in lockstep with the failed settling so the
             # next dispatch starts with a fresh anchor.
+            _blog_warning(
+                "partial bracket close skipped by the plugin, leg re-armed "
+                "for the next tick: %s", e,
+            )
             self._order_mapping.pop(synth_pine_id, None)
             self._drop_envelope(synth_pine_id)
             self._partial_bracket_engine.mark_trigger_dispatch_failed(
