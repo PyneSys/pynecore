@@ -48,6 +48,7 @@ from .journal_wiring import (
     journal_submitted, journal_terminal,
 )
 from .recovery_ladder import classify_recovery
+from .residue_detector import ResidueTracker
 from .transport_errors import guard as _guard_transport
 from .page_completeness import (
     BOOK_READ_DEADLINE_S, POSITIONS_PAGE_SIZE,
@@ -202,6 +203,11 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         #: slice read); a 429 backs the reads off until the cooldown passes.
         self._executions_read_deadline_s: float = 2.5
         self._executions_cooldown_until: float = 0.0
+        #: #74 residue detector: grace before a vanished journalled id is
+        #: even ASKED about — 30 s flat, 3x the measured ~10 s stale-replica
+        #: lag, deliberately NOT a cadence formula (a 5x-cadence rule gives
+        #: 2.5 s at our 0.5 s poll, below the lag: measured false cancel).
+        self._residue_grace_s: float = 30.0
         #: Child-adoption retry shape for an Activated conditional whose
         #: ``externalOrderId`` is not published yet (#42-A). Counted in POLLS, not
         #: seconds, so the schedule is deterministic in tests and cannot hot-spin
@@ -1196,30 +1202,131 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
                 await asyncio.sleep(self._cancel_verify_delay)
         return CancelDispositionOutcome.UNKNOWN
 
+    def _read_history_rows_sync(self) -> "tuple[list[dict], bool]":
+        """Yesterday+today's ``/orders/history`` rows, paginated (#69).
+
+        Returns ``(rows, complete)``: ``complete`` only when the drain
+        covered a provable ``total`` with no failed page. A POSITIVE row
+        found in an incomplete read is still positive evidence (truncation
+        hides rows, never fabricates them) — only ABSENCE claims would need
+        ``complete``, and no caller concludes from absence. The endpoint has
+        no category parameter (doc/SDK verified, #74 P2): one call covers
+        whatever the venue puts there; conditional string ids appearing in
+        it is an UNMEASURED premise, so their absence stays inconclusive."""
+        today = datetime.now(timezone(timedelta(hours=7))).date()
+        rows: list[dict] = []
+        page_index = 0
+        while True:
+            status, body = _guard_transport(
+                lambda: self.client.get_order_history(
+                    self.account_id, self.market_type,
+                    from_date=str(today - timedelta(days=1)),
+                    to_date=str(today),
+                    page_size=200, page_index=page_index))
+            if status != 200 or not isinstance(body, dict):
+                return rows, False
+            page = body.get("data") or []
+            rows.extend(page)
+            total = body.get("total")
+            if not isinstance(total, int) or total < 0:
+                return rows, False       # completeness unprovable
+            if len(rows) >= total:
+                return rows, True
+            if not page or page_index >= 49:
+                return rows, False       # dead page / runaway cap
+            page_index += 1
+
     async def _history_disposition(self, order_id: str
                                    ) -> CancelDispositionOutcome:
         """Absence is not a disposition — only a POSITIVE ``/orders/history``
-        row may classify an id no book answers for (one call covers BOTH
-        books; rows are date-prefixed ``20260818_538916`` under ``data``,
-        measured 2026-08-19). No row -> ``UNKNOWN``: same-day row timeliness
-        is an UNPROVEN venue premise (#55), and this failure shape degrades to
-        a retry, never to a wrong terminal verdict."""
-        today = datetime.now(timezone(timedelta(hours=7))).date()
-        status, body = await asyncio.to_thread(lambda: _guard_transport(
-            lambda: self.client.get_order_history(
-                self.account_id, self.market_type,
-                from_date=str(today - timedelta(days=1)), to_date=str(today),
-                page_size=200)))
-        if status == 200 and isinstance(body, dict):
-            for row in body.get("data") or []:
-                if str(row.get("id", "")).split("_")[-1] != str(order_id):
-                    continue
-                try:
-                    order = self._to_exchange_order(row)
-                except Exception:                                   # noqa: BLE001
-                    return CancelDispositionOutcome.UNKNOWN
-                return _classify_readback(order.status, order.filled_qty)
+        row may classify an id no book answers for (rows are date-prefixed
+        ``20260818_538916`` under ``data``, measured 2026-08-19). No row ->
+        ``UNKNOWN``: same-day row timeliness is an UNPROVEN venue premise
+        (#55), and this failure shape degrades to a retry, never to a wrong
+        terminal verdict. Paginated to exhaustion via the shared reader
+        (#69: the old single-page read silently truncated at 200 rows)."""
+        rows, _complete = await asyncio.to_thread(self._read_history_rows_sync)
+        for row in rows:
+            if str(row.get("id", "")).split("_")[-1] != str(order_id):
+                continue
+            try:
+                order = self._to_exchange_order(row)
+            except Exception:                                   # noqa: BLE001
+                return CancelDispositionOutcome.UNKNOWN
+            return _classify_readback(order.status, order.filled_qty)
         return CancelDispositionOutcome.UNKNOWN
+
+    async def _residue_confirm(self, order_id: str) -> "OrderEvent | None":
+        """#74: CANCELLED only from a positive, ``_classify_readback``-graded
+        history row — a fill on the row outranks its ``Canceled`` status
+        string (panel P1: never let a residue verdict contradict executed
+        quantity). Everything else -> ``None`` (INCONCLUSIVE)."""
+        from pynecore.core.broker.models import OrderEvent
+        rows, _complete = await asyncio.to_thread(self._read_history_rows_sync)
+        for row in rows:
+            if str(row.get("id", "")).split("_")[-1] != str(order_id):
+                continue
+            try:
+                order = self._to_exchange_order({**row, "id": str(order_id)})
+                outcome = _classify_readback(order.status, order.filled_qty)
+            except Exception:                                   # noqa: BLE001
+                return None
+            if outcome is not CancelDispositionOutcome.CANCELLED:
+                return None
+            pine_id, from_entry, leg_type = self._identity_for(order_id)
+            journal_terminal(self.store_ctx, venue_id=order_id,
+                             terminal_status="Canceled")
+            self._last_seen[order_id] = (float(order.filled_qty or 0.0),
+                                         "Canceled")
+            if pine_id is None:
+                log.broker_warning(
+                    "residue: order %s is Canceled per history but carries "
+                    "no identity — journal closed, no event emitted",
+                    order_id)
+                return None
+            return OrderEvent(
+                order=order, event_type="cancelled", fill_price=None,
+                fill_qty=None, timestamp=int(time.time()),
+                pine_id=pine_id, from_entry=from_entry, leg_type=leg_type)
+        return None
+
+    async def _residue_step(self, residue_tracker, present_ids,
+                            all_books_readable) -> "list":
+        """#74: the residue backstop, one watch cycle. The POPULATION encodes
+        the exclusions (panel-adjudicated): exposure-ledger rows
+        (``filled_qty>0`` / terminal extras — #73 keeps filled rows LIVE, and
+        their ids legitimately leave the day book) are never residue
+        subjects; a #41 shell is tracked by its CHILD ref only. At most one
+        confirm per cycle, deadline-bounded (a hung history read must not
+        cost fill blindness — P2 G5)."""
+        if self.store_ctx is None:
+            return []
+        tracked: dict = {}
+        for journal_row in iter_journal_identities(self.store_ctx):
+            if journal_row.filled_qty > 0 or journal_row.terminal_status:
+                continue
+            if journal_row.child_id is not None:
+                tracked[str(journal_row.child_id)] = journal_row
+            elif journal_row.venue_ids:
+                tracked[str(journal_row.venue_ids[0])] = journal_row
+        due = residue_tracker.observe(
+            tracked_ids=set(tracked), present_ids=present_ids,
+            all_books_readable=all_books_readable, now=time.monotonic())
+        if due is None:
+            return []
+        try:
+            event = await asyncio.wait_for(
+                self._residue_confirm(due), self._watch_read_deadline_s)
+        except (asyncio.TimeoutError, TimeoutError):
+            event = None                 # hung read = INCONCLUSIVE (G5)
+        except Exception as exc:                                # noqa: BLE001
+            log.broker_warning("residue confirm raised for %s: %s: %s",
+                               due, type(exc).__name__, exc)
+            event = None
+        warn = residue_tracker.record_confirm(due, concluded=event is not None)
+        if warn:
+            log.broker_warning("%s", warn)
+        return [event] if event is not None else []
 
     async def _terminal_reject_disposition(self, order_id: str, category: str
                                            ) -> CancelDispositionOutcome:
@@ -1460,6 +1567,7 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
             rewarn_every=self._feed_rewarn_every,
             halt_after=self._feed_halt_after,
             books=tuple(_CATEGORIES))
+        residue = ResidueTracker(grace_s=self._residue_grace_s)
         poll_inflight = None
         while True:
             await asyncio.sleep(self._poll_interval)
@@ -1528,6 +1636,20 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
             else:
                 health.record_failure("scan", scan_crash_kind)
             self._emit_feed_warnings(health)
+            try:
+                residue_events = await self._residue_step(
+                    residue,
+                    {str(raw.get("id")) for raw in rows},
+                    all(o is None for o in book_outcomes.values()))
+            except BrokerManualInterventionError:
+                raise                # designed escalation: the engine halts
+            except Exception as exc:                              # noqa: BLE001
+                # G7: the backstop must never kill fill detection.
+                log.broker_warning("residue step raised: %s: %s",
+                                   type(exc).__name__, exc)
+                residue_events = []
+            for residue_event in residue_events:
+                yield residue_event
 
     @staticmethod
     def _emit_feed_warnings(health: FeedHealth) -> None:

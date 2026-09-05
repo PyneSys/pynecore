@@ -186,6 +186,9 @@ class JournalIdentity:
     filled_qty: float                # #56: the persisted fill watermark
     last_raw_status: "str | None"
     last_fill_venue_id: "str | None"
+    terminal_status: "str | None"    # #74: set = exposure-ledger row (kept
+    #                                  live by a FILL terminal), never a
+    #                                  residue subject
 
 
 def iter_journal_identities(store_ctx):
@@ -221,4 +224,5 @@ def iter_journal_identities(store_ctx):
             filled_qty=float(row.filled_qty or 0.0),
             last_raw_status=extras.get("last_raw_status"),
             last_fill_venue_id=extras.get("last_fill_venue_id"),
+            terminal_status=extras.get("terminal_status"),
         )
