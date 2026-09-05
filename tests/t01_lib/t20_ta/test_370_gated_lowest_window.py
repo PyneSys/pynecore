@@ -23,7 +23,7 @@ from pynecore.lib import script, ta, bar_index, low
 __test_helper_LOWS = [100.0 - bar for bar in range(12)] + [200.0 + bar for bar in range(24)]
 
 # The call is skipped on these bars -- a run of 12, longer than the window itself.
-SKIPPED = set(range(12, 24))
+SKIPPED = (12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23)  # a literal, so main() stays Edge code
 
 LENGTH = 4
 __test_helper_CAPACITY = LENGTH + 1
