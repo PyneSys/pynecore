@@ -78,6 +78,20 @@ loop can be cancelled).
 
 ## Card B2 — item-4 clamped-snapshot chokepoint
 
+**STATE (firing of 2026-09-05): Step-0 site verification DONE — inherit, don't
+re-derive.** All four consumers confirmed in today's engine:
+`_adopt_size_with_replayed_close` def :4656, routed at :4401 (branch:
+`is_startup AND replayed defensive-close markers AND new_size != 0` — the RAW
+snapshot, clamp not applied); periodic external-flatten gate `new_size == 0.0`
+~:4531; partial-bracket `parent_snapshot = get_position` ~:10288; halt/settle
+proofs `_broker_matches_post_close_expectation` :16403 +
+`_raise_if_stale_pending_flip_surplus_close` :3411 (MOVED from the review's
+:4358). Clamp's sole call site :4445. The prescribed red-first probe extends
+`test_divergence_matrix.py` (fixture at :99): pin the sibling branch adopting
+RAW on the same fixture where matrix (a) adopts nothing — the fixture needs a
+replayed defensive-close marker at startup (read `_pending_defensive_close`
+persistence/replay to construct it).
+
 - **Card:** create fresh ("engine/dnse Phase B2: clamped-snapshot chokepoint —
   raw-vs-owned split for the four raw-net consumers"). Read FIRST: the #59
   item-4 review (5420844968) for the four consumers + probes; plan doc item 4
