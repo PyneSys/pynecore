@@ -94,6 +94,30 @@ class Result:
         return any(ok is False for _, ok, _ in self.rows)
 
 
+#: VN exchange holidays (#70). VERIFICATION-DATED like the api_version pin:
+#: each entry names its source. The table is deliberately INCOMPLETE — an
+#: unlisted holiday degrades to today's time-of-day behavior (fails safe at
+#: the venue: a closed exchange rejects writes), while a listed date must be
+#: right (it makes L0 skip the day). Lunar holidays (Tet, Hung Kings) are
+#: not derivable from month/day — add them as dated entries when announced.
+_STATUTORY_HOLIDAYS_MMDD = {
+    (1, 1),    # New Year        — VN Labour Code, fixed date
+    (4, 30),   # Reunification   — VN Labour Code, fixed date
+    (5, 1),    # Labour Day      — VN Labour Code, fixed date
+    (9, 2),    # National Day    — VN Labour Code, fixed date
+}
+_DATED_HOLIDAYS = {
+    (2026, 8, 31),   # measured closed (venue.py status reported 'continuous'
+                     # while the exchange was shut — the #70 observation)
+}
+
+
+def is_exchange_holiday(day) -> bool:
+    """``day`` is a ``date`` (or datetime): listed VN exchange holiday?"""
+    return ((day.month, day.day) in _STATUTORY_HOLIDAYS_MMDD
+            or (day.year, day.month, day.day) in _DATED_HOLIDAYS)
+
+
 def session_phase(now: datetime | None = None) -> str:
     """Which VN30F1M trading phase we are in — this gates what is SAFE to place.
 
@@ -118,7 +142,11 @@ def session_phase(now: datetime | None = None) -> str:
                                               (both measured 2026-08-13 14:37 / 14:51).
     """
     now = now or datetime.now(ICT)
-    if now.weekday() > 4:
+    if now.weekday() > 4 or is_exchange_holiday(now):
+        # Holiday returns the plain "closed" token, NOT "closed(holiday)":
+        # three consumers match the exact string (a {...}[phase] dict lookup
+        # here in L0 would KeyError, `in ("atc","closed")`, `!= "closed"`).
+        # The holiday annotation is display-only, in venue.py status (#70).
         return "closed"
     minutes = now.hour * 60 + now.minute
     if (9 * 60 + 15) <= minutes < (11 * 60 + 30) or (13 * 60) <= minutes < (14 * 60 + 30):

@@ -64,10 +64,20 @@ def broker(symbol: str = SYMBOL) -> DNSEBroker:
 
 
 def session_phase() -> str:
-    """Reuse L0's phase logic — one definition, not two that drift."""
+    """Reuse L0's phase logic — one definition, not two that drift.
+
+    Display-only holiday annotation (#70): the phase TOKEN stays "closed"
+    (exact-string consumers), the WHY is appended here for the operator."""
     try:
         from l0_order_semantics import session_phase as _phase
-        return _phase()
+        phase = _phase()
+        try:
+            from l0_order_semantics import is_exchange_holiday
+            if phase == "closed" and is_exchange_holiday(datetime.now(ICT)):
+                return "closed (exchange holiday)"
+        except Exception:                                             # noqa: BLE001
+            pass                     # annotation is cosmetic, never load-bearing
+        return phase
     except Exception as exc:                                          # noqa: BLE001
         return f"UNKNOWN ({type(exc).__name__})"
 
