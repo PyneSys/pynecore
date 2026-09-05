@@ -13,9 +13,23 @@ fully, detect state, continue — never restart finished work.
 - Never `rm` (backup/deleteable), never `pyne run --from`, never echo secrets.
 - The FULL pipeline per card (backlog-startcard skill): red-first baseline →
   false-positive challenge → card body/Ready/active → SOLUTIONS FOR REVIEW →
-  3-lens panel (general-purpose agents: correctness / operational / maintainability)
-  → adjudicate (leader verifies claims in code) → implement → suites → decision
-  comment → commit skill closeout (In review). No waivers.
+  3-lens panel (correctness / operational / maintainability) → adjudicate
+  (leader verifies claims in code) → implement → suites → decision comment →
+  commit skill closeout (In review). No waivers.
+
+**Model tiering (cost policy, every firing):**
+- **Panel lenses → `Agent` with `model: "opus"`** (never inherit the session
+  model — the review depth needs opus, not more).
+- **Mechanical work → `Agent` with `model: "sonnet"`**: creating/updating
+  card BODIES from leader-written text, posting pre-written comments (after
+  the leader runs scrub locally), board column moves, the #53 digest,
+  runbook/memory-queue touch-ups, doc cross-reference edits. The leader
+  WRITES the content; sonnet ships it. Give the sonnet agent the exact text,
+  the exact gh commands with `--repo rubycell/pynecore`, and the scrub gate.
+- **Leader (session model) only for judgment**: Step 0 state detection,
+  baseline test design, false-positive challenges, adjudication, ALL
+  implementation and test code, suite gates, commit decisions. Never
+  delegate code edits or adjudication downward.
 
 ## Step 0 — STATE DETECTION (every firing, before anything)
 
@@ -115,6 +129,7 @@ loop can be cancelled).
 
 - Working tree committed & pushed OR parked in backup/ with a card comment
   saying exactly where it stopped.
-- The active card's thread reflects reality (a progress comment if mid-step).
+- The active card's thread reflects reality (a progress comment if mid-step
+  — shippable via a sonnet agent with leader-written text).
 - Suites green if anything was committed: `pytest plugins/dnse/tests/ -q` AND
   `pytest tests/ -q --ignore=tests/t00_pynecore/ast/test_045_lib_import_normalizer_invalid_alias.py`.
