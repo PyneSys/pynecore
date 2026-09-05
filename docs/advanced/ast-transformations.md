@@ -5,7 +5,7 @@ title: "AST Transformation"
 description: "How PyneCore uses AST transformation to implement Pine Script behavior"
 icon: "code"
 date: "2025-03-31"
-lastmod: "2026-06-12"
+lastmod: "2026-09-05"
 draft: false
 toc: true
 categories: ["Advanced", "Technical Implementation"]
@@ -59,7 +59,8 @@ PyneCore applies several key transformations to Python code to make it behave li
 12. **Persistent Transformer** - Manages persistent variables
 13. **Function Isolation Transformer** - Ensures separate state for each function call
 14. **Input Transformer** - Processes input parameters
-15. **Safe Convert Transformer** - Converts float()/int() calls to safe versions
+15. **Safe Convert Transformer** - Lowers the `float()`/`int()` casts to their Pine forms and truncates
+    a Pine int where a Python-native consumer needs a real `int`
 16. **Safe Division Transformer** - Protects against division by zero
 
 This order ensures that dependencies between transformations are properly handled. For example, PersistentSeries transformation must happen before both Persistent and Series transformations, and Function Isolation must run after them because it routes calls based on the state slots they allocated.
@@ -496,12 +497,16 @@ Key aspects:
 
 ### Safe Convert Transformer
 
-The Safe Convert transformer replaces float() and int() calls with safe versions that handle NA values properly.
+A Pine `int` is a double at run time (see [Types — int](../reference/types.md#int)), so the
+transformer has two jobs: lower the `float()`/`int()` casts to their Pine meaning, and truncate a
+Pine int to a real Python `int` at the places where Python itself insists on one.
 
 **Original code:**
 ```python
 value = float(some_value)
 number = int(another_value)
+for i in range(array.size(a)):
+    total += weights[offset + i]
 ```
 
 **Transformed code:**
@@ -510,13 +515,21 @@ from pynecore.core import safe_convert
 
 value = safe_convert.safe_float(some_value)
 number = safe_convert.safe_int(another_value)
+for i in range(safe_convert.native_int(array.size(a))):
+    total += weights[safe_convert.native_int(offset + i)]
 ```
 
 Key aspects:
-- Converts float() and int() to safe_float() and safe_int()
-- Returns NA(float) or NA(int) when TypeError occurs (e.g., from NA inputs)
-- Maintains Pine Script semantics for type conversions
-- Only adds import if conversion functions are actually used
+- `float()` becomes `safe_float()`, `int()` becomes `safe_int()`: both keep `na` as `na` (a `nan`),
+  and `safe_int()` returns the truncated value as a Pine int, i.e. a `float`
+- Inside a `@pyne lib` module `int()` becomes `native_int()` instead: a lib computes its lengths,
+  counts and ring indexes in native `int` and converts back only at its boundary
+- A `range()` argument and the index (or slice bound) of a subscript are Python-native consumers:
+  every one typed as a Pine int is wrapped in `native_int()`, a direct `int(x)` index becomes
+  `native_int(x)` outright, and a folded literal such as `2.0` becomes `2`
+- A `range()` loop counter, an `int` literal and a series buffer read (`Series.__getitem__`
+  truncates on its own, and it is the hot loop) are left alone
+- Only adds the import when a lowering was actually emitted
 
 ### Safe Division Transformer
 

@@ -5,7 +5,7 @@ title: "Pine Script Compatibility"
 description: "Implementation status of Pine Script v6 features in PyneCore"
 icon: "checklist"
 date: "2026-03-28"
-lastmod: "2026-04-13"
+lastmod: "2026-09-05"
 draft: false
 toc: true
 categories: ["Overview", "Compatibility"]
@@ -139,7 +139,7 @@ plot plugin will consume the stored drawing data to render charts.
 
 | Type                          | Status | Notes                                  |
 |-------------------------------|--------|----------------------------------------|
-| `int`, `float`, `bool`, `str` | full   | Native Python types                    |
+| `int`, `float`, `bool`, `str` | full   | Native Python types; an `int` travels as an integral `float`, as on TradingView |
 | `Series[T]`                   | full   | Circular buffer, historical access     |
 | `Persistent[T]`               | full   | Cross-bar state via AST transformation |
 | `na` / `NA[T]`                | full   | Full NA propagation                    |

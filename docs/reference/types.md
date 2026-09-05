@@ -5,7 +5,7 @@ title: "Type System"
 description: "PyneCore type system — primitives, annotations, collections, and special types"
 icon: "category"
 date: "2026-03-28"
-lastmod: "2026-08-05"
+lastmod: "2026-09-05"
 draft: false
 toc: true
 categories: ["Reference", "Types"]
@@ -22,11 +22,30 @@ annotations control how variables behave across bar executions. Everything else 
 
 ### int
 
-Integer values. Python's `int`.
+Integer values.
 
 ```python
 length: int = 14
 ```
+
+`int` is a static type, as in Pine: TradingView runs every number as a double, and so does
+PyneCore. A value typed `int` travels as a Python `float` carrying an integral value —
+`bar_index`, `math.floor()`, `array.size()`, `str.length()` and the `int()` cast all hand back
+`2.0`, not `2`. This keeps every arithmetic path on one representation, and it is what makes
+`na(int)` a plain `nan`: an int can be `na` without a wrapper object, and mixed int/float
+expressions never switch representation mid-way.
+
+Everything Pine-facing already accounts for it: `str.tostring`, `log.*`, the plot CSV export
+and `str.format` print an integral value without a fractional part, a `Series` truncates a
+fractional or float offset in its own `[]`, and `range()` bounds and the indexes of a Python
+`list`, `str` or `tuple` are truncated at the call site by the loader. Where plain Python meets
+the value directly, the float shows: an f-string writes `bar=0.0`, so format with
+`str.tostring` or a format spec (`f"{bar_index:.0f}"`), and use `round()` when a genuine
+Python `int` is needed for something the loader cannot see, such as a `dict` key it should
+share with an `int` literal.
+
+`int()` is Pine's cast, not Python's: it truncates toward zero and returns a Pine int (a
+float), and `na` stays `na`. `nan` and `inf` cannot be truncated, so `int(na)` is `na`.
 
 ### float
 

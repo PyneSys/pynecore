@@ -5,7 +5,7 @@ title: "Differences from Pine Script"
 description: "Key differences between PyneCore and TradingView Pine Script"
 icon: "compare"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-09-05"
 draft: false
 toc: true
 categories: ["Overview", "Comparisons"]
@@ -193,10 +193,9 @@ variables from outer scopes. Though in Pyne you can also modify outer scope vari
 ```javascript
 // Pine Script
 x = 1
-inner()
-=>
-x += 1  // This raises an error in Pine Script
-x
+inner() =>
+    x += 1  // This raises an error in Pine Script
+    x
 ```
 
 ```python
@@ -244,6 +243,11 @@ Both `x` and `y` will be `2` in this case.
 | string           | str           |
 | color            | Color         |
 
+`int` is a static type in both: at run time a Pine int is a double, and PyneCore keeps the same
+representation — an int-typed value is a `float` with an integral value, and `na(int)` is a
+`nan`. The consequences for hand-written code are listed under
+[Types — int](../reference/types.md#int).
+
 ### Other builtin types
 
 In Pine Script types are sometimes inconsistent. E.g. the `line` is also a type and also a package.
@@ -266,10 +270,8 @@ In Pine Script every basic types can be `na` (not available). In Pyne there is a
 the same way. Though in Pine if you write the following code:
 
 ```javascript
-int
-i = na  // Note that you must specify the type here
-float
-f = na
+int i = na  // Note that you must specify the type here
+float f = na
 ```
 
 `i` will be an `int(na)` and `f` will be a `float(na)`. So `na` will have the type of the variable.
