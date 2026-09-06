@@ -1080,15 +1080,19 @@ def __test_reemitted_old_exit_is_suppressed_while_the_close_is_in_flight__():
     assert pos.size == -1.0
 
 
-def __test_declined_reversal_close_defers_and_the_next_sync_retries__():
-    """A declined close leg defers the reversal without counting a reject.
+def __test_rejected_reversal_close_arms_the_marker_and_retries_after_the_stale_window__():
+    """A rejected close leg defers the reversal without counting a reject.
 
     ``execute_close`` raising a venue reject commonly proves a racing
-    protective fill already emptied the position; the reversal is skipped
-    with the non-counting ``reversal_close_pending`` reason and Pine's
-    re-emission drives the retry, where the protocol re-reads the settled
-    book.
+    protective fill already emptied the position (or the plugin retired
+    its row before the fill reached the book); the reversal is skipped
+    with the non-counting ``reversal_close_pending`` reason and the marker
+    is armed exactly as after a dispatched close, so the re-emitted entry
+    defers through the stale window and re-dispatches a fresh close only
+    after it — never straight back into the same reject on every sync.
     """
+    from pynecore.core.broker.sync_engine import _REVERSAL_CLOSE_STALE_SYNCS
+
     b = MockBroker()
     engine, pos = _mk_engine(b)
     _open_long_with_bracket(b, engine, pos)
@@ -1098,16 +1102,58 @@ def __test_declined_reversal_close_defers_and_the_next_sync_retries__():
     n_entries = len(b.entry_calls)
     engine.sync(BAR_TS + 60_000)
 
-    # No entry went out, nothing parked, nothing counted against the entry.
+    # No entry went out, nothing counted against the entry — but the
+    # reversal is parked, exactly like after a dispatched close.
     assert len(b.entry_calls) == n_entries
     assert "S" not in engine.active_intents
-    assert engine._pending_reversal_opens == {}
+    assert "S" in engine._pending_reversal_opens
     assert "S" not in engine._rejected_entry_intents
+    assert len(b.close_calls) == 1
 
-    # Next sync: the close confirms and the protocol proceeds normally.
-    engine.sync(BAR_TS + 120_000)
+    # The re-emitted entry defers through the stale window without a
+    # single fresh close dispatch.
+    for i in range(_REVERSAL_CLOSE_STALE_SYNCS):
+        engine.sync(BAR_TS + 120_000 + i * 60_000)
+        assert len(b.close_calls) == 1
+        assert len(b.entry_calls) == n_entries
+
+    # Past the window the protocol re-runs; this time the close confirms
+    # and the parked entry opens on the settled book.
+    engine.sync(BAR_TS + 600_000)
     assert len(b.close_calls) == 2
     assert "S" in engine._pending_reversal_opens
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(_dispatched_close(b.close_calls[1]), 1.0, 49_950.0))
+    assert b.entry_calls[-1].intent.pine_id == "S"
+    assert pos.size == 0.0
+
+
+def __test_persistently_rejected_reversal_close_dispatches_once_per_bar__():
+    """A close rejected on every attempt is re-driven once per bar, not per sync.
+
+    Event-driven sync passes run many times per second; a plugin that
+    keeps rejecting the close (its position row already retired while the
+    engine's book is still open) must not see a fresh dispatch on each of
+    them — the same-bar gate holds the retry until the next bar boundary.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    n_entries = len(b.entry_calls)
+    for _ in range(50):
+        b.raise_on_next_close = ExchangeOrderRejectedError("position not found")
+        engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
+    assert len(b.entry_calls) == n_entries
+    assert "S" in engine._pending_reversal_opens
+    assert "S" not in engine._rejected_entry_intents
+
+    # The next bar re-drives the close once; it confirms and the parked
+    # entry opens on the settled book.
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.close_calls) == 2
     engine._route_event(  # type: ignore[attr-defined]
         _reversal_close_fill(_dispatched_close(b.close_calls[1]), 1.0, 49_950.0))
     assert b.entry_calls[-1].intent.pine_id == "S"

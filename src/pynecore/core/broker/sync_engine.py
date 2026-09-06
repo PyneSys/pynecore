@@ -14761,53 +14761,20 @@ class OrderSyncEngine:
             comment="stop-and-reverse close leg: flatten before the raw "
                     "reversing entry",
         )
-        try:
-            self._dispatch_new(close_intent)
-        except OrderSkippedByPlugin as e:
-            _blog_warning(
-                "reversal close for %s was declined (%s); the re-emitted "
-                "entry retries the protocol next sync",
-                format_intent_key(key), e,
-            )
-            # Arm the marker even though nothing dispatched: a decline
-            # commonly means an earlier close for the same exposure is
-            # still in flight, and without the marker every sync pass
-            # would re-dispatch straight into the same decline (the
-            # tight-loop failure mode above). The deferred branch now
-            # throttles the retry to the stale window on the next bar,
-            # and a fill settling the book flat opens the parked entry
-            # through :meth:`_maybe_open_after_reversal_close` as usual.
-            self._pending_reversal_opens[key] = _PendingReversalOpen(
-                entry_intent=intent,
-                close_pine_id=close_intent.pine_id,
-                close_qty=close_qty,
-                consumed_entry_ids=consumed_ids,
-                armed_bar_ts_ms=self._current_bar_ts_ms,
-                armed_monotonic=time.monotonic(),
-            )
-            raise self._reversal_close_pending_skip(
-                intent,
-                f"Reversal entry {format_intent_key(key)} deferred: the "
-                f"close leg was declined; re-evaluating next sync.",
-            ) from e
-        except (ExchangeOrderRejectedError, OrderDispositionUnknownError) as e:
-            # A reject commonly proves a racing protective fill already
-            # emptied the position; an unknown disposition may leave the
-            # close live at the venue. Both defer to the next sync, where
-            # the protocol re-reads the settled book — and a duplicate
-            # close, if one ever goes out, no-ops by the reduce-only
-            # contract.
-            _blog_warning(
-                "reversal close for %s did not confirm (%s); the "
-                "re-emitted entry re-evaluates against the settled book "
-                "next sync", format_intent_key(key), e,
-            )
-            raise self._reversal_close_pending_skip(
-                intent,
-                f"Reversal entry {format_intent_key(key)} deferred: the "
-                f"close leg did not confirm; re-evaluating next sync.",
-            ) from e
-        self._pending_reversal_opens[key] = _PendingReversalOpen(
+        # The marker is armed on EVERY outcome of the close dispatch, not
+        # only on a confirmed one: a decline commonly means an earlier close
+        # for the same exposure is still in flight, a reject that the
+        # position is already gone (a racing protective fill, or the
+        # plugin's row retired before the fill reached the book), and an
+        # unknown disposition may leave the close live at the venue. In
+        # each case the right move is the same — wait for the fill that
+        # settles the book flat (which opens the parked entry through
+        # :meth:`_maybe_open_after_reversal_close`) and re-dispatch only
+        # after the stale window on the next bar. Without the marker every
+        # sync pass would re-dispatch straight into the same outcome:
+        # measured live, a persistent reject re-drove the close 139 times
+        # inside one bar (Capital.com lane, 2026-09-05, cycle 122).
+        parked = _PendingReversalOpen(
             entry_intent=intent,
             close_pine_id=close_intent.pine_id,
             close_qty=close_qty,
@@ -14815,6 +14782,33 @@ class OrderSyncEngine:
             armed_bar_ts_ms=self._current_bar_ts_ms,
             armed_monotonic=time.monotonic(),
         )
+        try:
+            self._dispatch_new(close_intent)
+        except OrderSkippedByPlugin as e:
+            _blog_warning(
+                "reversal close for %s was declined (%s); the re-emitted "
+                "entry retries the protocol after the stale window",
+                format_intent_key(key), e,
+            )
+            self._pending_reversal_opens[key] = parked
+            raise self._reversal_close_pending_skip(
+                intent,
+                f"Reversal entry {format_intent_key(key)} deferred: the "
+                f"close leg was declined; re-evaluating next sync.",
+            ) from e
+        except (ExchangeOrderRejectedError, OrderDispositionUnknownError) as e:
+            _blog_warning(
+                "reversal close for %s did not confirm (%s); the "
+                "re-emitted entry re-evaluates against the settled book "
+                "after the stale window", format_intent_key(key), e,
+            )
+            self._pending_reversal_opens[key] = parked
+            raise self._reversal_close_pending_skip(
+                intent,
+                f"Reversal entry {format_intent_key(key)} deferred: the "
+                f"close leg did not confirm; re-evaluating next sync.",
+            ) from e
+        self._pending_reversal_opens[key] = parked
         raise self._reversal_close_pending_skip(
             intent,
             f"Reversal entry {format_intent_key(key)} parked: close leg "
