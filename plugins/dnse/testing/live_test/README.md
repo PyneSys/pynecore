@@ -305,6 +305,19 @@ near leg fills and the far leg must be CANCELLED.
 
 ## Measured venue facts (why the tests look like this)
 
+- **`/orders/history` is NORMAL-book-only** (measured 2026-09-06,
+  `probe_b3_readonly_measurements.py`: 276/276 rows over 17 trading days —
+  a window full of placed-and-cancelled conditionals — carry numeric
+  NORMAL-book ids and NORMAL orderTypes only; zero conditional string ids).
+  Consequence for #74: a conditional residue can NEVER conclude CANCELLED
+  from history — it stays INCONCLUSIVE by construction. Pagination is
+  honest (`page_index` yields distinct rows, `total` stable across pages).
+- **Closed-session day books are readable-and-EMPTY** (measured 2026-09-06,
+  weekend: all three books answer `200, rows=0, totalPages=0`). An
+  off-session watch cycle therefore counts as "all books readable, id
+  absent" — the #74 residue detector ages stamps overnight on any resting
+  GTD conditional (safe: INCONCLUSIVE-only; noisy: see the follow-up card
+  for the session-phase stamping gate).
 - **A 2xx cancel is an ACK, not a completion** — the venue can report `New` for >12 s
   after `200 OK`; the plugin re-reads until the venue agrees (#20, fixed + live-verified).
 - **DNSE does not cascade** an entry cancel to its exit legs — and a *plugin*-side cascade
