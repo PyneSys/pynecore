@@ -3652,6 +3652,36 @@ def __test_marketable_whole_row_limit_exit_fires_with_persistent_parent__():
     assert ("TP", "L") not in pos.exit_orders
 
 
+
+def __test_marketable_whole_row_exit_never_closes_a_flat_position__():
+    """#82 (measured live, F5 2026-09-07): a whole-row exit whose stop is
+    already crossed must NOT dispatch a market close when the position is
+    FLAT — the parent entry is still resting/unfilled, so there is nothing
+    to close and a close OPENS a naked opposite position on a netting venue
+    (DNSE has no venue-side reduce-only on a marketable LO). A whole-row
+    exit exists only to close an EXISTING position.
+
+    Live chain: F5's stop-limit entry E rested unfilled; its protection P
+    (armed at placement, Pine-legal) had a resolved stop, so it was not
+    deferred; the crossed stop converted to an immediate close via
+    _dispatch_new, bypassing _clamp_close_intents, and opened a short at
+    1985.4 while the account was flat.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    # FLAT: the entry is resting/unfilled, no open trade, size 0.
+    pos.size = 0.0
+    pos.sign = 0.0
+    # A protection exit for entry "L" whose SELL stop is already crossed by
+    # the current price (long-exit stop above market -> triggered).
+    pos.exit_orders[("P", "L")] = _exit_order("L", -1.0, "P", stop=1987.2)
+
+    engine.sync(BAR_TS, last_price=1985.5)
+
+    assert len(b.close_calls) == 0, (
+        f"a marketable whole-row exit fired a CLOSE against a FLAT position "
+        f"-> naked short (#82): close_calls={b.close_calls}")
+
 def __test_non_marketable_whole_row_limit_exit_still_attaches_tp__():
     """A resting (not-yet-marketable) limit exit keeps the native TP attach path."""
     b = MockBroker()

@@ -11954,6 +11954,24 @@ class OrderSyncEngine:
             if not marketable:
                 converted.append(intent)
                 continue
+            # #82 (measured live, F5 2026-09-07): a whole-row exit closes an
+            # EXISTING position. When the parent entry is still resting /
+            # unfilled the position is flat (or a pyramiding short/long on the
+            # wrong side), and converting the crossed exit into an immediate
+            # market close would OPEN a naked opposite position — the
+            # synthesised close dispatches via ``_dispatch_new``, bypassing
+            # ``_clamp_close_intents``, and DNSE (like any software-bracket
+            # venue) has no venue-side reduce-only on a marketable LO. Only
+            # fire when the close would actually REDUCE the live position;
+            # otherwise leave it to the native path, which attaches to the
+            # position once the entry fills.
+            reduces = (
+                (intent.side == 'sell' and self._position.size > 0.0)
+                or (intent.side == 'buy' and self._position.size < 0.0)
+            )
+            if not reduces:
+                converted.append(intent)
+                continue
             if not self._dispatch_marketable_whole_row_close(
                     intent, last_price, trigger, comment,
             ):
