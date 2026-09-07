@@ -68,6 +68,26 @@ def native_int(value: PyneInt) -> int | NA:
         return NA(None)
 
 
+def native_int_or(value: PyneInt, default: int) -> int:
+    """
+    Truncate a Pine number to a native Python int, with a fallback for na.
+
+    Same truncation as :func:`native_int`, for the consuming slots that need a
+    real integer even when the value is na: TradingView substitutes a concrete
+    integer at those slots instead of propagating the na, and which integer it
+    substitutes is a property of the slot.
+
+    @param value: The value to truncate.
+    @param default: The integer the slot uses when the value is na.
+    @return: The native int, or the default when the input is na.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        # NA objects throw TypeError; int(nan) throws ValueError; int(inf) OverflowError
+        return default
+
+
 def safe_int(value: PyneInt) -> float:
     """
     Safe int conversion that returns na for na inputs.

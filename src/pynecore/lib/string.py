@@ -7,6 +7,7 @@ from math import isinf
 from datetime import datetime, UTC
 from decimal import Decimal, ROUND_HALF_UP, ROUND_HALF_EVEN, localcontext
 
+from ..core.safe_convert import native_int_or as _native_int_or
 from ..types.na import NA, na_float, na_int
 from ..types.pine_types import PyneFloat, PyneInt, PyneStr, PyneBool
 
@@ -685,7 +686,7 @@ def repeat(source: str, repeat: int, separator: str = '') -> PyneStr:
     # count evaluates through ``NA.__rmul__`` to na, and ``str.join(na)`` falls
     # back to the sequence protocol, which never terminates (NA.__getitem__
     # returns self for every index).
-    if isinstance(source, NA) or source is None or repeat is None or repeat != repeat:
+    if isinstance(source, NA) or source is None or repeat is None or not (repeat == repeat):
         return NA(str)
     if repeat <= 0:
         return NA(str)
@@ -714,17 +715,20 @@ def replace(source: str, target: str, replacement: str, occurrence=0) -> PyneStr
     # arrive from hand-written Pyne code; leaving the source untouched is the quiet option.
     if occurrence < 0:
         return source
+    # An na occurrence is the first one. Measured: replace("aaa", "a", "-", na) == "-aa"
+    # and replace("abc", "", "-", na) == "-abc".
+    occurrence = _native_int_or(occurrence, 0)
     if not target:
         # An empty target is an insertion point rather than a match: the replacement lands
         # at the nth character position, clamped to the end of the source. Measured:
         # replace("abc", "", "-", 2) == "ab-c" and replace("abc", "", "-", 4) == "abc-".
-        index = min(int(occurrence), len(source))
+        index = min(occurrence, len(source))
     else:
         # Occurrences are enumerated by an overlapping left-to-right scan, so "aa" occurs
         # at index 0 AND 1 in "aaa" — a split-based walk would only see the first one.
         # Measured: replace("aaa", "aa", "-", 1) == "a-".
         index = -1
-        for _ in range(int(occurrence) + 1):
+        for _ in range(occurrence + 1):
             index = source.find(target, index + 1)
             if index < 0:
                 return source
@@ -772,23 +776,32 @@ def startswith(source: str, str: str) -> bool:
     return source.startswith(str)
 
 
-def substring(source: str, begin_pos: int, end_pos: int | None = None) -> str:
+def substring(source: str, begin_pos: int, end_pos: int | None = None) -> PyneStr:
     """
     Returns a substring of the source string starting at the specified position and ending at the specified position.
 
     :param source: The source string
     :param begin_pos: The starting position
     :param end_pos: The ending position
-    :return: The substring of the source string starting at the specified position and ending at the specified position
+    :return: The substring of the source string starting at the specified position and ending at
+             the specified position, or na when the source is na
     """
+    # na-propagation (Pine): an na source has no substring, and no length either --
+    # the end position defaults to ``len(source)``, so the source has to be resolved
+    # before any position is.
+    if isinstance(source, NA) or source is None:
+        return NA(str)
     # Pine's int is a static type only: an int-TYPED expression can carry a
     # fractional value (``14 / 8``), so the positions are truncated where they
     # are CONSUMED -- ahead of the range checks and of the empty-slice test,
-    # both of which must see the same integer the slice below uses.
-    begin_pos = int(begin_pos)
+    # both of which must see the same integer the slice below uses. Measured on
+    # TradingView, the two positions answer na differently: substring("hello", na)
+    # is "hello" -- an na start is 0 -- while substring("hello", 3, na) is "lo", so
+    # an na end reaches the end of the source the way an omitted one does.
+    begin_pos = _native_int_or(begin_pos, 0)
     assert begin_pos >= 0, "Positions must be >= 0!"
     if end_pos is not None:
-        end_pos = int(end_pos)
+        end_pos = _native_int_or(end_pos, len(source))
         assert end_pos >= begin_pos, "End position must be >= begin position!"
     if begin_pos == end_pos:
         return ""

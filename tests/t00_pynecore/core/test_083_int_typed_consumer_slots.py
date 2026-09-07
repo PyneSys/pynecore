@@ -11,7 +11,10 @@ raised at runtime before this guard existed (``array.new_int``,
 
 The sanctioned forms are an inline ``int(x)`` at the point of use, or rebinding
 the parameter once at the top of the body (``x = int(x)``,
-``trade_num = _trade_index(trade_num)``, ``size = _na_size(size)``).
+``trade_num = _trade_index(trade_num)``, ``size = _na_size(size)``,
+``begin_pos = _native_int_or(begin_pos, 0)``). The ``native_int_or`` forms also
+answer the slot's own value for ``na``, which TradingView substitutes there
+instead of propagating the na.
 
 ``types/`` is deliberately NOT scanned: the normalization boundary is the
 ``lib/`` façade, which truncates every coordinate before it reaches
@@ -25,7 +28,7 @@ import pynecore
 LIB_ROOT = Path(pynecore.__file__).parent / "lib"
 
 INT_ANNOTATIONS = {"int", "PyneInt"}
-NORMALIZERS = {"int", "_trade_index", "_na_size"}
+NORMALIZERS = {"int", "_native_int_or", "_trade_index", "_na_size", "_coord"}
 
 # Verified exceptions: internal bookkeeping that never carries a Pine value.
 # ``closed_before`` is a list length captured by the caller inside the same

@@ -1,10 +1,27 @@
 from ..core.module_property import module_property
+from ..core.safe_convert import native_int_or as _native_int_or
 from ..types.base import next_vid
 from ..types.table import Table
 from ..types.na import NA
 from ..lib import (color as _color, position as _position, size as _size, text as _text, font as _font)
 
 _registry: list[Table] = []
+
+
+def _coord(value: int) -> int:
+    """
+    Normalize a table dimension or cell coordinate into a native integer.
+
+    Pine's ``int`` is a static type only, so an int-TYPED expression may arrive
+    carrying a fractional value; this consuming slot truncates it. An ``na``
+    behaves exactly as 0 here, measured on TradingView: ``table.new`` with na
+    dimensions builds a 0x0 table -- the first cell write then reports "number
+    of columns is 0" -- and an na cell coordinate addresses cell (0, 0).
+
+    :param value: A dimension or coordinate, possibly fractional or ``na``
+    :return: The truncated native integer, 0 when there is none
+    """
+    return _native_int_or(value, 0)
 
 
 def new(position: _position.Position, columns: int, rows: int, bgcolor: _color.Color = None,
@@ -30,8 +47,8 @@ def new(position: _position.Position, columns: int, rows: int, bgcolor: _color.C
     """
     table = Table(
         position=position,
-        columns=int(columns),
-        rows=int(rows),
+        columns=_coord(columns),
+        rows=_coord(rows),
         bgcolor=bgcolor,
         frame_color=frame_color,
         frame_width=frame_width,
@@ -101,7 +118,7 @@ def cell(table_id: Table, column: int, row: int, text: str = "", width: int | fl
         return
 
     # Create or get the cell
-    cell_obj = table_id.get_cell(int(column), int(row))
+    cell_obj = table_id.get_cell(_coord(column), _coord(row))
 
     # Set all the cell properties
     cell_obj.text = text
@@ -138,7 +155,7 @@ def clear(table_id: Table, start_column: int, start_row: int, end_column: int = 
         end_row = start_row
 
     # Clear the specified range of cells
-    table_id.clear_cells(int(start_column), int(start_row), int(end_column), int(end_row))
+    table_id.clear_cells(_coord(start_column), _coord(start_row), _coord(end_column), _coord(end_row))
 
 
 def merge_cells(table_id: Table, start_column: int, start_row: int, end_column: int, end_row: int) -> None:
@@ -155,7 +172,7 @@ def merge_cells(table_id: Table, start_column: int, start_row: int, end_column: 
         return
 
     # Merge the specified range of cells
-    table_id.merge_cells(int(start_column), int(start_row), int(end_column), int(end_row))
+    table_id.merge_cells(_coord(start_column), _coord(start_row), _coord(end_column), _coord(end_row))
 
 
 # Cell setter functions
@@ -163,7 +180,7 @@ def cell_set_bgcolor(table_id: Table, column: int, row: int, bgcolor: _color.Col
     """Sets the background color of the cell."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(int(column), int(row))
+    cell_obj = table_id.get_cell(_coord(column), _coord(row))
     cell_obj.bgcolor = bgcolor
 
 
@@ -171,7 +188,7 @@ def cell_set_height(table_id: Table, column: int, row: int, height: int | float)
     """Sets the height of cell."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(int(column), int(row))
+    cell_obj = table_id.get_cell(_coord(column), _coord(row))
     cell_obj.height = height
 
 
@@ -179,7 +196,7 @@ def cell_set_text(table_id: Table, column: int, row: int, text: str) -> None:
     """Sets the text in the specified cell."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(int(column), int(row))
+    cell_obj = table_id.get_cell(_coord(column), _coord(row))
     cell_obj.text = text
 
 
@@ -187,7 +204,7 @@ def cell_set_text_color(table_id: Table, column: int, row: int, text_color: _col
     """Sets the color of the text inside the cell."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(int(column), int(row))
+    cell_obj = table_id.get_cell(_coord(column), _coord(row))
     cell_obj.text_color = text_color
 
 
@@ -195,7 +212,7 @@ def cell_set_text_font_family(table_id: Table, column: int, row: int, text_font_
     """Sets the font family of the text inside the cell."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(int(column), int(row))
+    cell_obj = table_id.get_cell(_coord(column), _coord(row))
     cell_obj.text_font_family = text_font_family
 
 
@@ -203,7 +220,7 @@ def cell_set_text_formatting(table_id: Table, column: int, row: int, text_format
     """Sets the formatting attributes the drawing applies to displayed text."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(int(column), int(row))
+    cell_obj = table_id.get_cell(_coord(column), _coord(row))
     cell_obj.text_formatting = text_formatting
 
 
@@ -211,7 +228,7 @@ def cell_set_text_halign(table_id: Table, column: int, row: int, text_halign: _t
     """Sets the horizontal alignment of the cell's text."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(int(column), int(row))
+    cell_obj = table_id.get_cell(_coord(column), _coord(row))
     cell_obj.text_halign = text_halign
 
 
@@ -219,7 +236,7 @@ def cell_set_text_size(table_id: Table, column: int, row: int, text_size: int | 
     """Sets the size of the cell's text."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(int(column), int(row))
+    cell_obj = table_id.get_cell(_coord(column), _coord(row))
     cell_obj.text_size = text_size
 
 
@@ -227,7 +244,7 @@ def cell_set_text_valign(table_id: Table, column: int, row: int, text_valign: _t
     """Sets the vertical alignment of a cell's text."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(int(column), int(row))
+    cell_obj = table_id.get_cell(_coord(column), _coord(row))
     cell_obj.text_valign = text_valign
 
 
@@ -235,7 +252,7 @@ def cell_set_tooltip(table_id: Table, column: int, row: int, tooltip: str) -> No
     """Sets the tooltip in the specified cell."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(int(column), int(row))
+    cell_obj = table_id.get_cell(_coord(column), _coord(row))
     cell_obj.tooltip = tooltip
 
 
@@ -243,7 +260,7 @@ def cell_set_width(table_id: Table, column: int, row: int, width: int | float) -
     """Sets the width of the cell."""
     if isinstance(table_id, NA):
         return
-    cell_obj = table_id.get_cell(int(column), int(row))
+    cell_obj = table_id.get_cell(_coord(column), _coord(row))
     cell_obj.width = width
 
 
