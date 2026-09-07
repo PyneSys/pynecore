@@ -342,3 +342,75 @@ def __test_restart_over_own_filled_position_adopts_it__(
         f"the filled entry's row was CLOSED by journal_terminal, so the "
         f"owned sum sees zero and the clamp refuses our own exposure "
         f"(#36/#56 interaction; Phase B2)")
+
+
+# --- T16 live finding 2026-09-07: restart entry unreachable by cancel_all ----
+
+def __test_restart_reconstructs_the_resting_entry_for_cancel_all__(
+        fake_client, tmp_path, caplog):
+    """RED (measured live, Live-L1-T16 2026-09-07): the engine's restart
+    entry reconstruction (`_reconstruct_pine_entry_orders`)
+    exists and works from the journal — but its snapshot
+    (`_scan_live_entry_anchors_for_restart`) requires a client_order_id on
+    every `get_open_orders` row, and DNSE (idempotency=SOFTWARE) never
+    sends one to the venue, so every row is dropped, the snapshot is
+    empty, and the guard bails. Consequence measured live: the relaunch
+    re-owned order 62066 (plugin identity, #36) yet `strategy.cancel_all`
+    dispatched nothing and the order stayed stranded at the venue."""
+    from pynecore.core.broker.models import DispatchEnvelope, EntryIntent, OrderType
+
+    resting_row = {"id": "62066", "symbol": SYMBOL, "side": "NB",
+                   "quantity": 1, "orderStatus": "New", "price": 1889.0,
+                   "orderType": "LO"}
+    store = BrokerStore(tmp_path / "broker5.sqlite", plugin_name="dnse")
+    ctx = _open_ctx(store, "t16")
+    b1 = _broker(fake_client,
+                 get_security_definition=(200, [{"ceilingPrice": "1550",
+                                                 "floorPrice": "1450",
+                                                 "securityGroupId": "FU"}]),
+                 get_loan_packages=(200, {"loanPackages": [{"id": 42}]}),
+                 post_order=(201, resting_row))
+    b1.store_ctx = ctx
+    asyncio.run(b1.execute_entry(DispatchEnvelope(
+        intent=EntryIntent(pine_id="T16", symbol=SYMBOL, side="buy", qty=1,
+                           order_type=OrderType.LIMIT, limit=1889.0),
+        run_tag="abcd", bar_ts_ms=1_700_000_000_000, retry_seq=0,
+        coid_max_len=30)))
+    # G1 (panel P1, measured in the LIVE broker.sqlite: `41I1G9000|T16|62066`):
+    # journal rows store the venue WIRE symbol, not the provider alias — an
+    # alias-scoped reconstruction join matches zero rows. Mirror that here so
+    # the symbol bug is red, not just the coid bug.
+    journalled = next(iter(ctx.iter_live_orders()))
+    ctx.upsert_order(journalled.client_order_id, symbol="41I1G9000")
+    ctx.close()                          # crash: order rests at the venue
+
+    operator_row = {"id": "99911", "symbol": SYMBOL, "side": "NB",
+                    "quantity": 5, "orderStatus": "New", "price": 1880.0,
+                    "orderType": "LO"}   # no coid, journalled by NOBODY
+
+    def _books(*_a, **kwargs):
+        if kwargs.get("order_category") == "NORMAL":
+            return (200, {"orders": [resting_row, operator_row],
+                          "totalPages": 1})
+        return (200, {"orders": [], "totalPages": 1})
+
+    ctx2 = _open_ctx(store, "t16")
+    b2 = _broker(fake_client, get_orders=_books,
+                 get_positions=(200, {"positions": []}))
+    b2.store_ctx = ctx2
+    asyncio.run(b2.connect())            # plugin identity restore (#36) works
+    engine, pos = _mk_engine(b2, ctx2)
+
+    engine._scan_live_entry_anchors_for_restart()
+    engine._reconstruct_pine_entry_orders()
+
+    assert "T16" in engine._order_mapping and "T16" in pos.entry_orders, (
+        "the restarted engine never rebuilt the resting entry — the scan "
+        "drops every no-client_order_id row (SOFTWARE-idempotency venue), "
+        "so cancel_all has nothing to cancel and the order strands at the "
+        "venue (measured live, T16 2026-09-07)")
+    assert engine._order_mapping.get("T16") == ["62066"]
+    mapped_ids = [i for ids in engine._order_mapping.values() for i in ids]
+    assert "99911" not in mapped_ids, (
+        "the operator's no-coid order was reconstructed — journal-rooted "
+        "ownership must drop rows journalled by nobody")

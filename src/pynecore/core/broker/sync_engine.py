@@ -1755,6 +1755,10 @@ class OrderSyncEngine:
         # standing) are dropped from the set as the adoption branch pins them.
         self._restart_reconstructed_entry_keys: dict[str, EntryIntent] = {}
         self._restart_entry_scan_done: bool = False
+        #: #77 G2: True while the scan read succeeded but matched none of the
+        #: journal's live entry rows — the latch is withheld so the scan
+        #: retries next sync instead of silently starving reconstruction.
+        self._restart_entry_scan_incomplete: bool = False
         if store_ctx is not None:
             envelopes, pending = store_ctx.replay()
             self._persisted_envelope_anchors = dict(envelopes)
@@ -2310,7 +2314,9 @@ class OrderSyncEngine:
                     "complete (connection error: %s) — retrying next bar", e,
                 )
                 return
-            self._restart_entry_scan_done = True
+            # #77 G2: withhold the latch while the scan matched none of the
+            # journal's live entry rows — retry next sync, never starve.
+            self._restart_entry_scan_done = not self._restart_entry_scan_incomplete
         one_way_port: PositionPort | None = getattr(self._broker, 'position_port', None)
         if not self._one_way_replay_done and one_way_port is not None:
             try:
@@ -2481,7 +2487,9 @@ class OrderSyncEngine:
                     "complete (connection error: %s) — retrying next sync", e,
                 )
                 return
-            self._restart_entry_scan_done = True
+            # #77 G2: withhold the latch while the scan matched none of the
+            # journal's live entry rows — retry next sync, never starve.
+            self._restart_entry_scan_done = not self._restart_entry_scan_incomplete
         # One-time one-way emulation restart replay: resume any per-leg close
         # fan-out or bracket replication a crash interrupted. Driven here (not in
         # __init__) because ``restart_replay`` is async and reads the live legs
@@ -11481,7 +11489,13 @@ class OrderSyncEngine:
         """
         if self._store_ctx is None or not self._restart_live_entry_orders_by_id:
             return
-        for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+        # No symbol filter (#77 G1, measured live): plugins journal rows under
+        # the venue WIRE symbol (e.g. ``41I1G9000``) while ``self._symbol``
+        # holds the provider ticker (``VN30F1M``) — the alias-scoped join
+        # matched zero rows and left the reconstruction dead even with a
+        # populated snapshot. Same rationale as
+        # :meth:`_durable_owned_signed_size`: a run trades a single symbol.
+        for row in self._store_ctx.iter_live_orders():
             pine_id = row.pine_entry_id
             order_id = row.exchange_order_id
             if pine_id is None or not order_id:
@@ -13800,9 +13814,31 @@ class OrderSyncEngine:
         wire_orders: list[tuple[str, int, str]] = []
         wire_order_id_by_coid: dict[str, str] = {}
         orders_by_id: dict[str, ExchangeOrder] = {}
+        # SOFTWARE-idempotency venues (#77): the venue never echoes a client
+        # order id, so EVERY row would be dropped below and the snapshot would
+        # starve _reconstruct_pine_entry_orders (measured live, Live-L1-T16
+        # 2026-09-07: relaunch re-owned the resting order yet cancel_all
+        # reached nothing). For a no-coid row the ownership proof is the
+        # run's journal instead — the same proof the reconstruction's own
+        # join uses. Journal-matched rows land in ``orders_by_id`` ONLY:
+        # the pid-hash/anchor maps need coid fields the journal cannot
+        # supply, and the reconstruction consumes ``orders_by_id`` alone.
+        # No symbol filter: rows store the venue WIRE symbol while
+        # ``self._symbol`` holds the provider ticker (see
+        # :meth:`_durable_owned_signed_size`); a run trades a single symbol.
+        journal_entry_ids: set[str] = set()
+        if self._store_ctx is not None:
+            for journal_row in self._store_ctx.iter_live_orders():
+                if (journal_row.pine_entry_id
+                        and journal_row.from_entry is None
+                        and journal_row.exchange_order_id
+                        and not (journal_row.extras or {}).get("terminal_status")):
+                    journal_entry_ids.add(str(journal_row.exchange_order_id))
         for order in orders:
             coid = order.client_order_id
             if not coid:
+                if order.id and str(order.id) in journal_entry_ids:
+                    orders_by_id[order.id] = order
                 continue
             parsed = parse_client_order_id(coid)
             if parsed is None:
@@ -13846,11 +13882,27 @@ class OrderSyncEngine:
         self._restart_live_wire_entry_orders = wire_orders
         self._restart_live_wire_order_id_by_coid = wire_order_id_by_coid
         self._restart_live_entry_orders_by_id = orders_by_id
-        if adopted or wire_orders:
+        # #77 G2: a successful-but-EMPTY read reproduces the starved-snapshot
+        # symptom indistinguishably (the scan used to log only when non-empty
+        # and the reconstruction returns silently). When the journal says this
+        # run still has live entry orders but none matched, warn once and do
+        # NOT latch — the caller re-scans next sync until the venue read and
+        # the journal agree (reconcile/residue eventually close stale rows).
+        incomplete = bool(journal_entry_ids) and not orders_by_id
+        if incomplete and not self._restart_entry_scan_incomplete:
+            _blog_warning(
+                "restart entry-anchor scan: journal holds %d live entry "
+                "order(s) but the venue snapshot matched none — not "
+                "latching, re-scanning next sync (#77)",
+                len(journal_entry_ids),
+            )
+        self._restart_entry_scan_incomplete = incomplete
+        if adopted or wire_orders or orders_by_id:
             _blog_info(
                 "restart entry-anchor scan: %d live entry order(s) available "
-                "for COID adoption (%d wire-form)",
+                "for COID adoption (%d wire-form, %d journal-rooted)",
                 len(adopted) + len(wire_orders), len(wire_orders),
+                len(orders_by_id),
             )
 
     def _hydrate_restart_entry_adoptions(self, new_map: dict[str, Intent]) -> None:
