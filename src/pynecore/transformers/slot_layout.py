@@ -366,6 +366,25 @@ def _attach_decorator_ast(scope_id: str) -> ast.Call:
         keywords=[])
 
 
+def _process_nested_bodies(node: ast.AST, scope_prefix: str, layout: ModuleLayout,
+                           used_imports: set[str]) -> None:
+    """Run :func:`_process_defs` over every statement list hanging off a node.
+
+    A definition nested in a compound statement belongs to the ENCLOSING
+    scope (:func:`_scope_defs` collects it there), so it must get the same
+    hidden parameter and layout attach as a top-level one.
+    """
+    for name, value in ast.iter_fields(node):
+        if not isinstance(value, list) or not value:
+            continue
+        if isinstance(value[0], ast.stmt):
+            setattr(node, name, _process_defs(value, scope_prefix, layout, used_imports))
+            continue
+        for item in value:
+            if isinstance(item, (ast.ExceptHandler, ast.match_case)):
+                _process_nested_bodies(item, scope_prefix, layout, used_imports)
+
+
 def _process_defs(body: list[ast.stmt], scope_prefix: str, layout: ModuleLayout,
                   used_imports: set[str]) -> list[ast.stmt]:
     """Inject hidden state parameters and layout attaches into a statement list."""
@@ -373,6 +392,7 @@ def _process_defs(body: list[ast.stmt], scope_prefix: str, layout: ModuleLayout,
     for stmt in body:
         new_body.append(stmt)
         if not isinstance(stmt, ast.FunctionDef):
+            _process_nested_bodies(stmt, scope_prefix, layout, used_imports)
             continue
         segment = layout.scope_segment(stmt)
         scope_id = f'{scope_prefix}·{segment}' if scope_prefix else segment

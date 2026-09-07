@@ -497,6 +497,7 @@ def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None,
     """
     import ast
 
+    from pynecore.transformers.export_once import ExportOnceTransformer
     from pynecore.transformers.function_isolation import FunctionIsolationTransformer
     from pynecore.transformers.series import SeriesTransformer
     from pynecore.transformers.script_requirements import ScriptRequirementsTransformer
@@ -513,7 +514,12 @@ def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None,
     # state-contributing transformers fill it, apply_layout emits it
     slot_layout = ModuleLayout(compacted_series=pyne_mode == 'lib')
 
-    transformed = UnusedSeriesDetectorTransformer().optimize(tree)
+    # A library's export surface is defined once per RUN, not once per bar:
+    # the latch it runs under is a Persistent slot, so it must precede the
+    # slot transformers, and the guarded definitions must reach them in
+    # their final position
+    transformed = ExportOnceTransformer().visit(tree)
+    transformed = UnusedSeriesDetectorTransformer().optimize(transformed)
     transformed = SeriesTransformer(slot_layout).visit(transformed)
     transformed = PersistentTransformer(slot_layout).visit(transformed)
     # Call-site classification needs the var/series slots, so the
