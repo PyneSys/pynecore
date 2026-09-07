@@ -7,6 +7,34 @@ gate. The broker refuses mainnet without `allow_mainnet = true`. Every live
 verdict is graded from **Binance's own records** (fetch_orders / myTrades /
 balances), never from the run log alone.
 
+## Run order for a live session — MANDATORY escalation
+
+Adopted from the DNSE suite's operator rule (2026-08-19). Never start a
+session with a fill test. Escalate, and **stop at the first failure**:
+
+1. **Live-B0-Gate** — `tools/l0_gate.py`, must exit 0. Proves auth, clock
+   skew, symbol filters, a clean book and sufficient balance.
+2. **NO-FILL smoke** — `live_staged_place_cancel.py` states **0–2 (B1–B3)**:
+   two limit place/cancel round trips plus limit + `exit(stop)`. ~7 min after
+   warmup and it exercises the whole Pine→engine→plugin→venue chain cheaply,
+   including the protective-exit path. Set `winEnd` so the run stops after
+   state 2. *The full B1–B13 ladder is a periodic regression* — run it after
+   plugin changes, not before every session.
+3. **FILL tests LAST** — `live_staged_fill.py` (BF1–BF9). Only after 1 and 2
+   are green in THIS session.
+
+## Risk tiers — what may run when
+
+| Tier | Cases | Precondition |
+|---|---|---|
+| **NO-FILL** | B0, all B1 (T01–T13) | testnet keys + clean book. Every order is ≥4% away or cancelled before it can fill. |
+| **FILL** | all B2 (F01–F09) | testnet only, supervised. Spot **nets base inventory** — a fill merges with any existing BTC balance, and a protective SELL rests against inventory the bot does not own (that is the #82 exposure). Never point the FILL tier at mainnet. |
+
+Binance's tiering is milder than DNSE's (no shared user position on a testnet
+account), but the netting hazard is the same in kind: the account's 1 BTC
+foreign baseline is exactly what makes a naked pre-fill exit *executable*
+rather than venue-rejected.
+
 ## Canonical test registry — `Live-B<case>` names only
 
 Spot is LONG-ONLY (`short_selling` unsupported, enforced at startup), so the
@@ -18,7 +46,7 @@ case notes its DNSE ancestor.
 | **Live-B0-Gate** | `tools/l0_gate.py` — auth, clock skew, filters, book, balance; MUST exit 0 before every live run | ✅ 08-17 (skew 96–226 ms) |
 | **Live-B1-T01-LongLimitCancel** (T1) | long limit −5% place→cancel | ✅ 08-17 |
 | **Live-B1-T02-LongLimitCancel4** (T2, long-only) | long limit −4% place→cancel | ✅ 08-17 |
-| **Live-B1-T03-LimitWithStopExit** (T3) | limit + `exit(stop)`; MEASURED: the pre-fill exit **reaches the venue** (sell STOP_LOSS_LIMIT rests against base inventory); both cancelled explicitly | ✅ 08-17 |
+| **Live-B1-T03-LimitWithStopExit** (T3) | limit + `exit(stop)`. **08-17 (red):** the pre-fill exit REACHED the venue (SELL STOP_LOSS_LIMIT id 3828722 resting against base inventory, no position behind it) — the #82 naked-exit precondition. **09-07 (green, after declaring `exit_orders_execute_standalone`):** engine skips the dispatch (`Exit X3\|B3 skipped … no position to protect (#82b)`), venue record shows **0 SELL orders**, BTC balance unchanged | ✅ 08-17 red / ✅ **09-07 green** (evidence: `evidence_b82b_nofill_2026-09-07.txt`) |
 | **Live-B1-T04-OcaCancelEntryOnly** (T4) | OCA entry+exit, cancel entry only — X4 exit stayed working (orphan, engine #19 shape); swept by the T08 cancel_all | ✅ 08-17 |
 | **Live-B1-T05-NativeOcoCancelEntryOnly** (T5) | entry + `exit(tp+sl)` → NATIVE spot OCO (LIMIT_MAKER + STOP_LOSS_LIMIT legs confirmed at venue), cancel entry only — OCO legs stayed (orphan, ditto) | ✅ 08-17 |
 | **Live-B1-T06-AmendNormal** (T6) | limit re-issue → cancel+replace, fresh venue id, same coid | ✅ 08-17 |
@@ -68,8 +96,14 @@ after a mid-run fix — used live on 08-17).
   cancel+replace reused the coid, venue accepted).
 - The runner derives run identity BEFORE `connect()` → `account_id` resolves
   lazily in the property.
-- A pre-fill `strategy.exit` reaches the venue and rests against base
-  inventory (needs base balance on spot; testnet grants 1 BTC).
+- **Spot exits are STANDALONE, and that is why #82 applies here.** There are
+  no position rows on spot: an exit is a plain SELL resting against whatever
+  base inventory the account holds, so the venue does NOT reject a protective
+  exit placed before its entry fills (an attach-semantics venue would).
+  Measured 08-17: a pre-fill exit rested as order 3828722 with the bot flat.
+  The plugin therefore declares `exit_orders_execute_standalone = True` and
+  the engine withholds the exit until the entry fills (#82b) — re-measured
+  green 09-07, zero SELL orders reached the venue.
 - Entry-only cancels orphan their exit legs (engine #19 shape, same as
   DNSE) — a later `cancel_all` sweeps them; until #19 lands, strategies
   must cancel exit ids explicitly.

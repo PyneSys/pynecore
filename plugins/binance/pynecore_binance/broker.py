@@ -184,6 +184,14 @@ class BinanceBroker(BinanceProvider, BrokerPlugin[BinanceBrokerConfig]):
             fetch_position=CapabilityLevel.SOFTWARE, # synthesized from the ledger
             idempotency=CapabilityLevel.NATIVE,      # newClientOrderId
             short_selling=CapabilityLevel.UNSUPPORTED,
+            # #82b: spot has NO position rows — an exit is a STANDALONE SELL
+            # resting against whatever base inventory the account holds, so a
+            # protection dispatched before its entry fills can execute while
+            # the bot is flat (selling foreign//other-strategy inventory).
+            # Unlike an attach-semantics venue, Binance does not reject it.
+            # Measured precondition on testnet 2026-08-17 (probe B3): exit
+            # X3 rested as order 3828722 while entry B3 was still unfilled.
+            exit_orders_execute_standalone=True,
         )
 
     # --- live plumbing ---

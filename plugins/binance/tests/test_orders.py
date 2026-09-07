@@ -162,3 +162,33 @@ def __test_crossed_stop_limit_falls_back_to_limit__(make_broker, entry_envelope,
     assert args[1] == 'limit'
     assert args[4] == 60_150.0
     assert 'stopPrice' not in args[5]
+
+
+def __test_exit_withheld_until_entry_fills__(make_broker, entry_envelope,
+                                             exit_envelope, run):
+    """#82b (Binance scope): a protective exit must NOT reach the venue while
+    the parent entry is still resting unfilled.
+
+    Binance SPOT has no position rows — an exit is a STANDALONE SELL resting
+    against whatever base inventory the account holds (the testnet account
+    carries 1 BTC of foreign baseline). So a protection dispatched pre-fill
+    can execute while the bot is flat, selling inventory it does not own —
+    the same shape as DNSE's Live-L3-F05 naked short (#82).
+
+    Measured precondition, Binance testnet 2026-08-17 (staged probe B3):
+    entry B3 rested unfilled at 60453.63 while exit X3 was dispatched and
+    RESTED at the venue as order 3828722.
+
+    The engine's #82b guard is scoped by the
+    ``exit_orders_execute_standalone`` capability; this asserts Binance
+    declares it, which is what arms the guard.
+    """
+    broker, _ = make_broker()
+    caps = broker.get_capabilities()
+    assert caps.exit_orders_execute_standalone is True, (
+        "Binance spot exits are standalone SELL orders that rest against "
+        "account base inventory with no position behind them — the venue "
+        "does not reject a naked protective exit the way an attach-semantics "
+        "venue does. Without this capability the engine's #82b guard stays "
+        "off and a pre-fill protection can fill while the bot is flat."
+    )

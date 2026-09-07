@@ -1,0 +1,46 @@
+[2026-09-07 09:49:25+0000] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-09-07 09:49:25+0000] bar:      0 INFO     [BROKER] Binance connected: account=binance-testnet-1786972114406718119
+[2026-09-07 09:49:25+0000] bar:      0 INFO     [BROKER] WS connected and subscribed: BinanceBroker @1
+[2026-09-07 09:49:27+0000] bar:      0 INFO     [BROKER] spot inventory ready: net_base=0 fills=0 (recovered=0, adopted=0)
+[2026-09-07 09:49:27+0000] bar:      0 INFO     [BROKER] authenticated: plugin=BinanceBroker account=binance-testnet-1786972114406718119
+[2026-09-07 09:49:27+0000] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-09-07 09:49:00+0000] bar:    499 INFO     [BROKER] warmup phase complete — 500 bar(s) processed
+[2026-09-07 09:49:00+0000] bar:    499 INFO     [BROKER] live trading active
+[2026-09-07 09:53:00+0000] bar:    503 INFO     [B1] === BINANCE STAGED PLACE/CANCEL — long-only spot port of DNSE T1-T13. qty 0.001 BTC, every order >=4% away. startState=0 ===
+[2026-09-07 09:53:00+0000] bar:    503 INFO     [B1] TEST B1 PLACE long limit=75375.63 (-5%) — expect one LIMIT GTC, filled=0
+[2026-09-07 09:53:00+0000] bar:    503 INFO     [BROKER] dispatching ENTRY BUY id='B1' qty=0.001 type=limit limit=75375.63
+[2026-09-07 09:53:00+0000] bar:    503 INFO     [BROKER] dispatched ENTRY BUY id='B1' qty=0.001 type=limit limit=75375.63 -> ['13080258']
+[2026-09-07 09:54:00+0000] bar:    504 INFO     [B1] TEST B1 CANCEL
+[2026-09-07 09:54:00+0000] bar:    504 INFO     [B1] TEST state 0->1
+[2026-09-07 09:54:00+0000] bar:    504 INFO     [BROKER] cancelling CANCEL id='B1'
+[2026-09-07 09:54:00+0000] bar:    504 INFO     [BROKER] event CANCELLED id=13080258 side=buy qty=0.001 filled=0.0 pine='B1' leg=entry
+[2026-09-07 09:55:00+0000] bar:    505 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=13080258 side=buy qty=0.001 filled=0.0 pine='B1' leg=entry)
+[2026-09-07 09:55:00+0000] bar:    505 INFO     [B1] TEST B2 PLACE long limit=76164.48 (-4%) — spot is long-only; this replaces DNSEs short-side T2
+[2026-09-07 09:55:00+0000] bar:    505 INFO     [BROKER] dispatching ENTRY BUY id='B2' qty=0.001 type=limit limit=76164.48
+[2026-09-07 09:55:00+0000] bar:    505 INFO     [BROKER] dispatched ENTRY BUY id='B2' qty=0.001 type=limit limit=76164.48 -> ['13080622']
+[2026-09-07 09:56:00+0000] bar:    506 INFO     [B1] TEST B2 CANCEL
+[2026-09-07 09:56:00+0000] bar:    506 INFO     [B1] TEST state 1->2
+[2026-09-07 09:56:00+0000] bar:    506 INFO     [BROKER] cancelling CANCEL id='B2'
+[2026-09-07 09:56:00+0000] bar:    506 INFO     [BROKER] event CANCELLED id=13080622 side=buy qty=0.001 filled=0.0 pine='B2' leg=entry
+[2026-09-07 09:57:00+0000] bar:    507 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=13080622 side=buy qty=0.001 filled=0.0 pine='B2' leg=entry)
+[2026-09-07 09:57:00+0000] bar:    507 INFO     [B1] TEST B3 PLACE limit=75386.29 + X3 stop=74592.75 — MEASURE: does the pre-fill exit reach the spot venue? then cancel both explicitly
+[2026-09-07 09:57:00+0000] bar:    507 INFO     [BROKER] dispatching ENTRY BUY id='B3' qty=0.001 type=limit limit=75386.29
+[2026-09-07 09:57:00+0000] bar:    507 INFO     [BROKER] dispatched ENTRY BUY id='B3' qty=0.001 type=limit limit=75386.29 -> ['13081033']
+[2026-09-07 09:57:00+0000] bar:    507 WARNING  [BROKER] Exit X3|B3 skipped: parent entry unfilled / no position to protect (#82b); re-evaluating next sync.
+[2026-09-07 09:58:00+0000] bar:    508 INFO     [B1] TEST B3 CANCEL B3 and X3 (both, explicitly)
+[2026-09-07 09:58:00+0000] bar:    508 INFO     [B1] TEST state 2->3
+[2026-09-07 09:58:00+0000] bar:    508 INFO     [BROKER] cancelling CANCEL id='B3'
+[2026-09-07 09:58:00+0000] bar:    508 INFO     [BROKER] event CANCELLED id=13081033 side=buy qty=0.001 filled=0.0 pine='B3' leg=entry
+[2026-09-07 09:59:16+0000] bar:    509 INFO     [BROKER] run stopped (completed) position=flat equity=10,000.06 USDT
+
+--- VENUE RECORD (graded 2026-09-07, testnet, 30-min window) ---
+13080258 LIMIT BUY CANCELED exec=0   (B1)
+13080622 LIMIT BUY CANCELED exec=0   (B2)
+13081033 LIMIT BUY CANCELED exec=0   (B3 entry)
+SELL orders reaching the venue: 0    <-- the #82b proof
+open orders after run: 0 | BTC balance: 1.0 (foreign baseline untouched)
+
+--- RED CONTROL (same probe state, 2026-08-17, before the fix) ---
+[BROKER] dispatched EXIT id='X3' from='B3' qty=0.001 sl=59817.28 -> ['3828722']
+i.e. a standalone SELL STOP_LOSS_LIMIT RESTED at the venue with no position
+behind it while entry B3 was still unfilled.
