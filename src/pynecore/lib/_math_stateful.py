@@ -9,9 +9,12 @@ re-exports the functions, and the layouts travel on the function objects.
 # Absolute imports on purpose: the call-site classifier resolves absolute
 # imports at transform time, so NA() calls stay direct instead of anchored
 import builtins
+from functools import reduce as _reduce
+from operator import add as _add
 from typing import TypeVar
 
-from pynecore.types import NA, Persistent, PyneFloat, PyneInt, Series, na_float
+from pynecore.types import (NA, IBPersistent, Persistent, PyneFloat, PyneInt,
+                            Series, na_float)
 from pynecore.core.random import PineRandom as _PineRandom
 from pynecore.core.series import SeriesImpl as _SeriesImpl
 # lib import (normalized to ``from pynecore import lib``) so the statement-position
@@ -94,6 +97,14 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
     calls: Persistent[int] = 0
     prev_len: Persistent[int] = 0
     chg_at: Persistent[int] = -1 << 60
+    # Memo of the eviction walk below, deliberately ``varip`` so the loop-site
+    # rollback leaves it alone: it is not machine state, it is a replay of the
+    # walk the rolled-back state produces (issue #80). See there for the key.
+    # One ``None``-initialized slot holding the whole ``(key, s, c)`` triple:
+    # separate list variables would need a lazy-init flag each, and those are
+    # checked on EVERY call, including the overwhelming majority that never
+    # reaches the walk.
+    evict_memo: IBPersistent[tuple | None] = None
 
     # Representation-agnostic na test: an na source is either an NA object or a
     # native nan (OHLCV gaps can already deliver a bare nan). Both must be
@@ -199,17 +210,30 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
         # this regime (probe columns saw20/50/200), the walk in every other,
         # so the dense path re-baselines: newest-first raw linear sum, cleared
         # compensation, raw stored entries — the same shape a fire produces.
-        rebuilt = builtins.float(src[0])
-        for i in builtins.range(1, new_w):
-            rebuilt = builtins.float(src[i]) + rebuilt
+        # The window travels as ONE native list (oldest first) and the sum and
+        # the store are native list operations over it, instead of ``new_w``
+        # ``Series.__getitem__`` calls plus two interpreted loops. A shared
+        # loop call site re-derives this whole re-baseline on EVERY iteration
+        # of the bar, so a length that moves per iteration paid the window
+        # twice per iteration and dominated the run (issue #80).
+        # ``float`` addition is commutative, so the native left fold over the
+        # reversed window is bit-identical to the ``src[i] + rebuilt`` walk.
+        win = builtins.list(builtins.map(builtins.float, src[0:new_w].oldest))
+        rebuilt = _reduce(_add, builtins.reversed(win))
         base = at if not source_na else at - 1
         if base < 0:
             base += cap
-        for j in builtins.range(new_w):
-            e = base - j
-            if e < 0:
-                e += cap
-            ent[e] = builtins.float(src[j])
+        # ``ent[base - j] = win_newest_first[j]`` for the whole window is the
+        # oldest-first window written into ``base - new_w + 1 .. base``, split
+        # at the ring wrap. Every slot is inside the ring, so both assignments
+        # are same-length replacements and the list keeps its size.
+        low = base - new_w + 1
+        if low >= 0:
+            ent[low:base + 1] = win
+        else:
+            wrapped = -low
+            ent[low + cap:cap] = win[:wrapped]
+            ent[:base + 1] = win[wrapped:]
         summ = rebuilt
         compensation = 0.0
         seen = n
@@ -258,39 +282,103 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
         # the isolated 8->1, 100->1, 300->150, 610->100 and 5->3 events are all
         # bit-exact only this way), the newest leaving entry — the realized one,
         # exactly the steady-state eviction — left for the fused step below.
-        k = prev_w - 1 + shift
-        while k > new_w:
-            v = builtins.float(src[k - 1 + shift])
-            y1 = -v - c
-            t = s + y1
-            e1 = (t - s) - y1
-            y2 = -e1
-            s = t + y2
-            c = (s - t) - y2
-            k -= 1
+        # The offsets that leave are ``new_w + 1``..``top``, and an offset is
+        # its own ``src`` index in BOTH regimes: on a stored bar the buffer
+        # moved with the window, on an na bar neither moved. Reading one lower
+        # on an na bar would evict offset ``new_w`` twice (the fused step below
+        # already takes it) and leave ``top`` in the sum forever.
+        # A shared loop call site re-derives this walk from the SAME bar-start
+        # state on every iteration, so a length that moves per iteration
+        # replays one deep prefix of it over and over (issue #80: 20 lengths
+        # 20..400 each walked 400 -> length on every bar). The walk is a pure
+        # function of the state it starts from, so the state after every step
+        # is memoized and an iteration that needs fewer steps reads its answer
+        # straight out; the leaving offsets are contiguous, so the raw values
+        # of the steps that DO run come over as one native list in exactly the
+        # walk order (``oldest`` is oldest first) instead of one
+        # ``Series.__getitem__`` call per step.
+        # The key pins the starting state exactly: ``n`` fixes the stored
+        # history (a bar that stores nothing cannot change an offset above 0,
+        # and the walk never reads offset 0), ``prev_w``/``shift`` fix which
+        # offsets leave, and the accumulator pair fixes the arithmetic.
+        # Anything else — a new bar, a re-run with different data — misses and
+        # rebuilds, so a hit can only reproduce what the walk would compute.
+        top = prev_w - 1 + shift
+        if top > new_w:
+            need = top - new_w
+            key = (n, prev_w, shift, s, c)
+            memo = evict_memo
+            if memo is None or memo[0] != key:
+                ws = [s]
+                wc = [c]
+                evict_memo = (key, ws, wc)
+            else:
+                ws = memo[1]
+                wc = memo[2]
+            walked = builtins.len(ws) - 1
+            if need <= walked:
+                s = ws[need]
+                c = wc[need]
+            else:
+                s = ws[walked]
+                c = wc[walked]
+                # Grown by slice assignment and filled by index: an ``append``
+                # here is a method call, and the transform turns every call in
+                # a loop body into an isolated call site — the binding then
+                # costs more than the whole step it records.
+                i = walked + 1
+                tail = [0.0] * (need - walked)
+                ws[i:] = tail
+                wc[i:] = tail
+                for v in builtins.map(builtins.float,
+                                      src[new_w + 1:top - walked + 1].oldest):
+                    y1 = -v - c
+                    t = s + y1
+                    e1 = (t - s) - y1
+                    y2 = -e1
+                    s = t + y2
+                    c = (s - t) - y2
+                    ws[i] = s
+                    wc[i] = c
+                    i += 1
         e = base - new_w
         if e < 0:
             e += cap
         d0 = ent[e]
     elif new_w > prev_w + shift:
         # Oldest first: the deepest offset enters before the ones above it
-        k = new_w - 1
-        while k >= prev_w + shift:
-            admitted = builtins.float(src[k])
+        # Same native window read as the eviction walk above. Unlike that one
+        # this walk cannot be memoized across the iterations of a shared loop
+        # call site: it folds from the DEEPEST offset upwards, so two lengths
+        # share the tail of the input and not the prefix of the fold, and
+        # every length has to be folded from the bar-start state itself.
+        span = new_w - prev_w - shift
+        residues = [0.0] * span
+        i = 0
+        for admitted in builtins.map(builtins.float, src[prev_w + shift:new_w].oldest):
             y1 = -c
             t = s + y1
             e1 = (t - s) - y1
             y2 = admitted - e1
             s = t + y2
             c = (s - t) - y2
-            # The ring mirrors the window, so an admitted entry takes its slot
-            # too: without it a later eviction of that offset would read a slot
-            # the ring never filled (or one a capacity growth dropped).
-            e = base - k
-            if e < 0:
-                e += cap
-            ent[e] = y2
-            k -= 1
+            residues[i] = y2
+            i += 1
+        # The ring mirrors the window, so an admitted entry takes its slot too:
+        # without it a later eviction of that offset would read a slot the ring
+        # never filled (or one a capacity growth dropped). The offsets walked
+        # are contiguous and ascending in ring position, so the residues go in
+        # as native slices, split where the ring wraps.
+        low = base - new_w + 1
+        high = base - prev_w - shift
+        if low >= 0:
+            ent[low:high + 1] = residues
+        elif high < 0:
+            ent[low + cap:high + 1 + cap] = residues
+        else:
+            wrapped = -low
+            ent[low + cap:cap] = residues[:wrapped]
+            ent[:high + 1] = residues[wrapped:]
 
     # ``core.rolling_sum.sum_fires`` inlined: a call here would cost more than
     # the whole compensated step it guards, and the transform wraps every call
@@ -309,10 +397,12 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
 
     if fires:
         # Re-baseline: newest-first linear sum of the raw window, raw store
-        rebuilt = value
-        for i in builtins.range(1, new_w):
-            rebuilt = builtins.float(src[i]) + rebuilt
-        s = rebuilt
+        # Same native window fold as the dense re-baseline above, seeded with
+        # this bar's own raw value: ``win`` is oldest first, so dropping its
+        # last element drops ``src[0]`` and the reversed rest is ``src[1]``..
+        # ``src[new_w - 1]``.
+        win = builtins.list(builtins.map(builtins.float, src[0:new_w].oldest))
+        s = _reduce(_add, builtins.reversed(win[:-1]), value)
         compensation = 0.0
         if not source_na:
             ent[at] = value

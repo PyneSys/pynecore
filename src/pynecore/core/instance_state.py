@@ -304,29 +304,40 @@ def _collect_bound_builtins(bound: Any, out: list) -> None:
                 _collect_builtins(vec, vec[-1], out)
 
 
-def _snap_value(value: Any) -> Any:
-    """Snapshot one persistent slot value for the same-bar rollback. Builtin
-    machine persistents hold scalars or FLAT scalar containers by
-    construction, so a shallow container copy is a faithful baseline (and the
-    restore may share its elements); anything else falls back to
-    :func:`_copy_value`."""
-    t = type(value)
-    if t is list:
-        return value.copy()
-    if value is None or t in (int, float, bool, str) or isinstance(value, NA):
-        return value
-    return _copy_value(value)
-
-
 def _snap_collected(vecs: list) -> list:
     """Bar-start snapshot of collected builtin-machine vectors: per machine,
     its persistent values and the full-buffer series baselines (taken once
-    per bar — the per-iteration restore is the cheap side)."""
-    return [(vec,
-             tuple((i, _snap_value(vec[i])) for i in _var_slots_of(layout_)),
-             tuple((slot, vec[slot]._snapshot())  # noqa: cooperating core internals
-                   for slot, _max_bars_back, _elem in layout_['series']))
-            for vec, layout_ in vecs]
+    per bar — the per-iteration restore is the cheap side).
+
+    Whether a value can be written straight back or has to be copied is a
+    property of the value, so the split happens HERE: the snapshot is taken
+    once per bar and the restore runs once per loop iteration, and a shared
+    loop call site turns that into the run's hottest loop (issue #80).
+    Builtin machine persistents hold scalars or FLAT scalar containers by
+    construction, so a shallow container copy is a faithful baseline (and the
+    restore may share its elements); anything else falls back to
+    :func:`_copy_value`.
+
+    :param vecs: ``(state, layout)`` pairs of the machines to snapshot.
+    :return: One ``(state, direct, copied, series)`` entry per machine.
+    """
+    snaps: list = []
+    for vec, layout_ in vecs:
+        direct: list = []
+        copied: list = []
+        for i in _var_slots_of(layout_):
+            value = vec[i]
+            t = type(value)
+            if value is None or t in (int, float, bool, str) or isinstance(value, NA):
+                direct.append((i, value))
+            elif t is list:
+                copied.append((i, value.copy()))
+            else:
+                copied.append((i, _copy_value(value)))
+        snaps.append((vec, tuple(direct), tuple(copied),
+                      tuple((slot, vec[slot]._snapshot())  # noqa: cooperating core internals
+                            for slot, _max_bars_back, _elem in layout_['series'])))
+    return snaps
 
 
 def _snap_builtins(state: list, layout: dict[str, Any]) -> list:
@@ -343,39 +354,49 @@ def _restore_collected(current: list, snaps: list) -> None:
     that came alive MID-BAR (created inside an earlier iteration of the same
     bar, so it is missing from the bar-start snapshot) has "not existing yet"
     as its bar-start state — it is re-initialized in place rather than left
-    carrying the earlier iteration's advance. The restore itself is
-    O(changed): scalars by value, lists by an in-place slice copy (their
-    elements are scalars, see :func:`_snap_value`), series through the
-    incremental :meth:`SeriesImpl._restore_bar`.
+    carrying the earlier iteration's advance. That is also why the snapshot is
+    matched POSITIONALLY first: the collect walks the same tree in the same
+    order every iteration, so the two lists line up until such a machine
+    shifts them, and only then is the id map built. The restore itself is
+    O(changed): the values classified as writable by
+    :func:`_snap_collected` go back by assignment, lists by an in-place slice
+    copy (their elements are scalars), series through the incremental
+    :meth:`SeriesImpl._restore_bar`.
     """
-    saved = {id(vec): (var_vals, series_vals) for vec, var_vals, series_vals in snaps}
+    saved: dict[int, tuple] | None = None
+    at = 0
+    total = len(snaps)
     for vec, layout_ in current:
-        entry = saved.get(id(vec))
-        if entry is None:
-            # The instance vector survives the re-init: it was written by the
-            # call site that created this machine, not by the bar it is being
-            # rolled back out of
-            pin = layout_.get('pin')
-            configured = None if pin is None else vec[pin]
-            vec[:] = _make_state(layout_)
-            if pin is not None:
-                vec[pin] = configured
-            continue
-        var_vals, series_vals = entry
-        for i, value in var_vals:
+        if saved is None and at < total and snaps[at][0] is vec:
+            snap = snaps[at]
+            at += 1
+        else:
+            if saved is None:
+                saved = {id(entry[0]): entry for entry in snaps}
+            snap = saved.get(id(vec))
+            if snap is None:
+                # The instance vector survives the re-init: it was written by
+                # the call site that created this machine, not by the bar it
+                # is being rolled back out of
+                pin = layout_.get('pin')
+                configured = None if pin is None else vec[pin]
+                vec[:] = _make_state(layout_)
+                if pin is not None:
+                    vec[pin] = configured
+                continue
+        for i, value in snap[1]:
+            vec[i] = value
+        for i, value in snap[2]:
             if type(value) is list:
                 cur = vec[i]
                 if type(cur) is list:
                     cur[:] = value
                 else:
                     vec[i] = value.copy()
-            elif value is None or type(value) in (int, float, bool, str) \
-                    or isinstance(value, NA):
-                vec[i] = value
             else:
                 vec[i] = _copy_value(value)
-        for slot, snap in series_vals:
-            vec[slot]._restore_bar(snap)  # noqa: cooperating core internals
+        for slot, series_snap in snap[3]:
+            vec[slot]._restore_bar(series_snap)  # noqa: cooperating core internals
 
 
 def _restore_builtins(state: list, layout: dict[str, Any], snaps: list) -> None:
