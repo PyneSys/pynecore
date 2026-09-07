@@ -1,0 +1,203 @@
+[BROKER] WS connect starting (warmup blocks until subscribed)
+[BROKER] journal restore: re-owned 1 venue id(s) from the run's journal rows (#36) — foreign book rows untouched
+[BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[BROKER] warmup phase started — replaying historical bars
+[BROKER] warmup phase complete — 501 bar(s) processed
+[BROKER] live trading active
+[BROKER] event CANCELLED id=190686 side=sell qty=1.0 filled=0.0 pine='T2' leg=entry
+[BROKER] external cancel observed (CANCELLED id=190686 side=sell qty=1.0 filled=0.0 pine='T2' leg=entry)
+[L1] === STAGED PLACE/CANCEL v2 — window open. Tests T1-T9, 1 contract each, every order >=4.5% away so none can fill. startState=1 ===
+[L1] plan: T1/T2 limit place+cancel | T3 +exit(stop) | T4 OCA cancel-entry-only | T5 native-OCO cancel-entry-only | T6 amend NORMAL | T7 amend STOP (#18
+[L1] bar=502 close=1983.5 candle=RED state=1 step=0 pending=no pos=0
+[L1] TEST 2 PLACE id=T2 SHORT limit=2082.7 (+5%)
+[BROKER] dispatching ENTRY SELL id='T2' qty=1.0 type=limit limit=2082.7
+[BROKER] dispatched ENTRY SELL id='T2' qty=1.0 type=limit limit=2082.7 -> 
+[BROKER] event CREATED id=195736 side=sell qty=1.0 filled=0.0 pine='T2' leg=entry
+[L1] bar=503 close=1983.5 candle=RED state=1 step=0 pending=yes pos=0
+[L1] TEST 2 CANCEL id=T2
+[L1] TEST 2 DONE — state 1->2
+[BROKER] cancelling CANCEL id='T2'
+[BROKER] cancel
+[BROKER] event CANCELLED id=195736 side=sell qty=1.0 filled=0.0 pine='T2' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=195736 side=sell qty=1.0 filled=0.0 pine='T2' leg=entry)
+[L1] bar=504 close=1983.6 candle=GREEN state=2 step=0 pending=no pos=0
+[L1] TEST 3 PLACE id=T3 limit=1884.4 + X3 stop=1864.6 — exit reaches the venue pre-fill (measured); both cancelled explicitly next bar
+[BROKER] dispatching ENTRY BUY id='T3' qty=1.0 type=limit limit=1884.4
+[BROKER] dispatched ENTRY BUY id='T3' qty=1.0 type=limit limit=1884.4 -> 
+[BROKER] dispatching EXIT id='X3' from='T3' qty=1.0 sl=1864.5
+[BROKER] dispatched EXIT id='X3' from='T3' qty=1.0 sl=1864.5 -> 
+[BROKER] event CREATED id=196876 side=buy qty=1.0 filled=0.0 pine='T3' leg=entry
+[BROKER] event CREATED id=daf3khop4g19a630jhg0 side=sell qty=1.0 filled=0.0 pine='X3' from='T3' leg=sl
+[L1] bar=505 close=1983.3 candle=RED state=2 step=0 pending=yes pos=0
+[L1] TEST 3 CANCEL id=T3 and id=X3 (both, explicitly)
+[L1] TEST 3 DONE — state 2->3
+[BROKER] cancelling CANCEL id='T3'
+[BROKER] cancelling CANCEL id='X3' from='T3'
+[BROKER] event CANCELLED id=196876 side=buy qty=1.0 filled=0.0 pine='T3' leg=entry
+[BROKER] event CANCELLED id=daf3khop4g19a630jhg0 side=sell qty=1.0 filled=0.0 pine='X3' from='T3' leg=sl
+[BROKER] strategy cancel confirmed (CANCELLED id=196876 side=buy qty=1.0 filled=0.0 pine='T3' leg=entry)
+[BROKER] strategy cancel confirmed (CANCELLED id=daf3khop4g19a630jhg0 side=sell qty=1.0 filled=0.0 pine='X3' from='T3' leg=sl)
+[L1] bar=506 close=1983 candle=RED state=3 step=0 pending=no pos=0
+[L1] TEST 4 PLACE id=T4 limit=2082.2 + X4 stop=2092.1 (oca) — next bar cancels ENTRY ONLY; X4 EXPECTED TO REMAIN (cascade reverted, #19 open) — cancel  
+[BROKER] dispatching ENTRY SELL id='T4' qty=1.0 type=limit limit=2082.2
+[BROKER] dispatched ENTRY SELL id='T4' qty=1.0 type=limit limit=2082.2 -> 
+[BROKER] dispatching EXIT id='X4' from='T4' qty=1.0 sl=2092.1
+[BROKER] dispatched EXIT id='X4' from='T4' qty=1.0 sl=2092.1 -> 
+[BROKER] event CREATED id=197496 side=sell qty=1.0 filled=0.0 pine='T4' leg=entry
+[BROKER] event CREATED id=daf3lf8p4g19a630jhm0 side=buy qty=1.0 filled=0.0 pine='X4' from='T4' leg=sl
+[L1] bar=507 close=1983.4 candle=GREEN state=3 step=0 pending=yes pos=0
+[L1] TEST 4 CANCEL id=T4 ONLY — X4 EXPECTED TO REMAIN (no cascade post-revert, #19 open); cancel the orphan manually after grading
+[L1] TEST 4 DONE — state 3->4
+[BROKER] cancelling CANCEL id='T4'
+[BROKER] event CANCELLED id=197496 side=sell qty=1.0 filled=0.0 pine='T4' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=197496 side=sell qty=1.0 filled=0.0 pine='T4' leg=entry)
+[L1] bar=508 close=1983.3 candle=GREEN state=4 step=0 pending=no pos=0
+[L1] TEST 5 PLACE id=T5 limit=1884.1 + X5 tp=2082.5/sl=1864.3 -> NATIVE OCO — first Level-1 use of the OCO umbrella book. Next bar cancels ENTRY ONLY:  
+[BROKER] dispatching ENTRY BUY id='T5' qty=1.0 type=limit limit=1884.1
+[BROKER] dispatched ENTRY BUY id='T5' qty=1.0 type=limit limit=1884.1 -> 
+[BROKER] dispatching EXIT id='X5' from='T5' qty=1.0 tp=2082.5 sl=1864.3
+[BROKER] dispatched EXIT id='X5' from='T5' qty=1.0 tp=2082.5 sl=1864.3 -> 
+[BROKER] event CREATED id=197846 side=sell qty=1.0 filled=0.0 pine='X5' from='T5' leg=tp
+[BROKER] event CREATED id=197836 side=buy qty=1.0 filled=0.0 pine='T5' leg=entry
+[L1] bar=509 close=1985 candle=GREEN state=4 step=0 pending=yes pos=0
+[L1] TEST 5 CANCEL id=T5 ONLY — X5 (OCO leg) EXPECTED TO REMAIN (no cascade post-revert, #19 open); cancel it manually after grading
+[L1] TEST 5 DONE — state 4->5
+[BROKER] cancelling CANCEL id='T5'
+[BROKER] event CANCELLED id=197836 side=buy qty=1.0 filled=0.0 pine='T5' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=197836 side=buy qty=1.0 filled=0.0 pine='T5' leg=entry)
+[L1] bar=510 close=1984.7 candle=RED state=5 step=0 pending=no pos=0
+[L1] TEST 6 PLACE id=T6 LONG limit=1885.5 (-5%) — NEXT bar re-issues at 1895.4 (-4.5%): an AMEND on the NORMAL book (worked 2026-08-10; re-verify on    
+[BROKER] dispatching ENTRY BUY id='T6' qty=1.0 type=limit limit=1885.4
+[BROKER] dispatched ENTRY BUY id='T6' qty=1.0 type=limit limit=1885.4 -> 
+[BROKER] event CREATED id=203666 side=buy qty=1.0 filled=0.0 pine='T6' leg=entry
+[L1] bar=511 close=1984.6 candle=RED state=5 step=0 pending=yes pos=0
+[L1] TEST 6 AMEND id=T6 -> limit 1895.4 — expect 
+[BROKER] modifying ... then the venue accepting the new price
+[BROKER] modifying ENTRY BUY id='T6' qty=1.0 type=limit limit=1885.4 -> ENTRY BUY id='T6' qty=1.0 type=limit limit=1895.3
+[L1] bar=512 close=1983.2 candle=RED state=5 step=1 pending=yes pos=0
+[L1] TEST 6 CANCEL id=T6 (post-amend)
+[L1] TEST 6 DONE — state 5->6
+[BROKER] cancelling CANCEL id='T6'
+[BROKER] event CANCELLED id=203666 side=buy qty=1.0 filled=0.0 pine='T6' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=203666 side=buy qty=1.0 filled=0.0 pine='T6' leg=entry)
+[L1] bar=513 close=1982 candle=RED state=6 step=0 pending=no pos=0
+[L1] TEST 7 PLACE id=T7 buy-STOP 2081.1 (+5%) — NEXT bar re-issues at 2071.2 (+4.5%): an AMEND on a CONDITIONAL. DNSE 500s (#18); expect a 
+[BROKER]     
+[BROKER] dispatching ENTRY BUY id='T7' qty=1.0 type=stop stop=2081.1
+[BROKER] dispatched ENTRY BUY id='T7' qty=1.0 type=stop stop=2081.1 -> 
+[BROKER] event CREATED id=daf3oogp4g19a630jhsg side=buy qty=1.0 filled=0.0 pine='T7' leg=entry
+[L1] bar=514 close=1982.5 candle=GREEN state=6 step=0 pending=yes pos=0
+[L1] TEST 7 AMEND id=T7 -> stop 2071.2 — expect code=REMOTE_SERVER_ERROR http=500 -> park+verify (#18). KEY: the run must continue, and the order must  
+[BROKER] modifying ENTRY BUY id='T7' qty=1.0 type=stop stop=2081.1 -> ENTRY BUY id='T7' qty=1.0 type=stop stop=2071.2
+[BROKER] amend code=REMOTE_SERVER_ERROR http=500 -> park+verify | order=daf3oogp4g19a630jhsg intent=T7 msg="Error in backend service"
+[BROKER] modify parked (unknown disposition) for ENTRY BUY id='T7' qty=1.0 type=stop stop=2071.2: DNSE disposition unknown on amend: REMOTE_SERVER_ERROR
+[L1] bar=515 close=1982 candle=RED state=6 step=1 pending=yes pos=0
+[L1] TEST 7 CANCEL id=T7 (post-500) — proves a parked amend does not wedge the order: it must still cancel cleanly
+[L1] TEST 7 DONE — state 6->7
+[BROKER] cancelling CANCEL id='T7'
+[BROKER] event CANCELLED id=daf3oogp4g19a630jhsg side=buy qty=1.0 filled=0.0 pine='T7' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=daf3oogp4g19a630jhsg side=buy qty=1.0 filled=0.0 pine='T7' leg=entry)
+[L1] bar=516 close=1981.4 candle=RED state=7 step=0 pending=no pos=0
+[L1] TEST 8 PLACE T8a limit=1882.3 AND T8b stop=2080.5 — two ids across BOTH books; next bar strategy.cancel_all(), never before fired live
+[BROKER] dispatching ENTRY BUY id='T8a' qty=1.0 type=limit limit=1882.3
+[BROKER] dispatched ENTRY BUY id='T8a' qty=1.0 type=limit limit=1882.3 -> 
+[BROKER] dispatching ENTRY BUY id='T8b' qty=1.0 type=stop stop=2080.5
+[BROKER] dispatched ENTRY BUY id='T8b' qty=1.0 type=stop stop=2080.5 -> 
+[BROKER] event CREATED id=207796 side=buy qty=1.0 filled=0.0 pine='T8a' leg=entry
+[BROKER] event CREATED id=daf3q5gp4g19a630jhu0 side=buy qty=1.0 filled=0.0 pine='T8b' leg=entry
+[L1] bar=517 close=1981.4 candle=GREEN state=7 step=0 pending=yes pos=0
+[L1] TEST 8 strategy.cancel_all() — BOTH T8a (NORMAL) and T8b (STOP) must go; venue book must be clear of ours
+[L1] TEST 8 DONE — state 7->8
+[BROKER] cancelling CANCEL id='X4' from='T4'
+[BROKER] cancelling CANCEL id='X5' from='T5'
+[BROKER] cancelling CANCEL id='T8a'
+[BROKER] cancelling CANCEL id='T8b'
+[BROKER] event CANCELLED id=207796 side=buy qty=1.0 filled=0.0 pine='T8a' leg=entry
+[BROKER] event CANCELLED id=197846 side=sell qty=1.0 filled=0.0 pine='X5' from='T5' leg=tp
+[BROKER] event CANCELLED id=daf3q5gp4g19a630jhu0 side=buy qty=1.0 filled=0.0 pine='T8b' leg=entry
+[BROKER] event CANCELLED id=daf3lf8p4g19a630jhm0 side=buy qty=1.0 filled=0.0 pine='X4' from='T4' leg=sl
+[BROKER] strategy cancel confirmed (CANCELLED id=207796 side=buy qty=1.0 filled=0.0 pine='T8a' leg=entry)
+[BROKER] strategy cancel confirmed (CANCELLED id=197846 side=sell qty=1.0 filled=0.0 pine='X5' from='T5' leg=tp)
+[BROKER] strategy cancel confirmed (CANCELLED id=daf3q5gp4g19a630jhu0 side=buy qty=1.0 filled=0.0 pine='T8b' leg=entry)
+[BROKER] strategy cancel confirmed (CANCELLED id=daf3lf8p4g19a630jhm0 side=buy qty=1.0 filled=0.0 pine='X4' from='T4' leg=sl)
+[L1] bar=518 close=1982 candle=GREEN state=8 step=0 pending=no pos=0
+[L1] TEST 9 PLACE via strategy.order() LONG limit=1882.9 — order() has never touched the broker; expect identical NORMAL-LO routing to entry()
+[BROKER] dispatching ENTRY BUY id='T9' qty=1.0 type=limit limit=1882.9
+[BROKER] dispatched ENTRY BUY id='T9' qty=1.0 type=limit limit=1882.9 -> 
+[BROKER] event CREATED id=209756 side=buy qty=1.0 filled=0.0 pine='T9' leg=entry
+[L1] bar=519 close=1981 candle=RED state=8 step=0 pending=yes pos=0
+[L1] TEST 9 CANCEL id=T9
+[L1] TEST 9 DONE — state 8->9
+[BROKER] cancelling CANCEL id='T9'
+[BROKER] event CREATED id=209756 side=buy qty=1.0 filled=0.0 pine='T9' leg=entry
+[BROKER] cancel
+[BROKER] cancel of T9 did not land (execute_cancel returned False); entering cancel-tentative — the outcome-based retry loop resolves it (partial       
+[BROKER] cancel
+[BROKER] market closed: pausing live stream until next session open (skipped synth ts=1788755400000)
+[BROKER] event CANCELLED id=209756 side=buy qty=1.0 filled=0.0 pine='T9' leg=entry
+[BROKER] market reopened: resuming live stream (first real bar ts=1788760800000)
+[BROKER] cancel-tentative 'T9' resolved by broker cancelled event
+[L1] bar=520 close=1979.6 candle=RED state=9 step=0 pending=no pos=0
+[L1] TEST 11 PLACE oca.cancel x3 ACROSS BOOKS: Ga limit=1880.6 (NORMAL) + Gb limit=2078.6 (NORMAL) + Gc stop=2078.6 (CONDITIONAL) — next bar cancels    
+[BROKER] dispatching ENTRY BUY id='Ga' qty=1.0 type=limit limit=1880.6
+[BROKER] dispatched ENTRY BUY id='Ga' qty=1.0 type=limit limit=1880.6 -> 
+[BROKER] dispatching ENTRY SELL id='Gb' qty=1.0 type=limit limit=2078.6
+[BROKER] dispatched ENTRY SELL id='Gb' qty=1.0 type=limit limit=2078.6 -> 
+[BROKER] dispatching ENTRY BUY id='Gc' qty=1.0 type=stop stop=2078.6
+[BROKER] dispatched ENTRY BUY id='Gc' qty=1.0 type=stop stop=2078.6 -> 
+[BROKER] event CREATED id=214336 side=sell qty=1.0 filled=0.0 pine='Gb' leg=entry
+[BROKER] event CREATED id=214326 side=buy qty=1.0 filled=0.0 pine='Ga' leg=entry
+[BROKER] event CREATED id=daf56a8p4g19a630jivg side=buy qty=1.0 filled=0.0 pine='Gc' leg=entry
+[L1] bar=521 close=1980.5 candle=GREEN state=9 step=0 pending=yes pos=0
+[L1] TEST 11 CANCEL Ga ONLY — 
+[BROKER] must show exactly ONE cancel; Gb (NORMAL) and Gc (STOP book) must still be resting at the venue
+[BROKER] cancelling CANCEL id='Ga'
+[BROKER] event CANCELLED id=214326 side=buy qty=1.0 filled=0.0 pine='Ga' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=214326 side=buy qty=1.0 filled=0.0 pine='Ga' leg=entry)
+[L1] bar=522 close=1980.7 candle=GREEN state=9 step=1 pending=yes pos=0
+[L1] TEST 11 CANCEL Gb and Gc (the survivors) — book must then be clear of the whole g11 group
+[L1] TEST 11 DONE — state 9->10
+[BROKER] cancelling CANCEL id='Gb'
+[BROKER] cancelling CANCEL id='Gc'
+[BROKER] event CANCELLED id=214336 side=sell qty=1.0 filled=0.0 pine='Gb' leg=entry
+[BROKER] event CANCELLED id=daf56a8p4g19a630jivg side=buy qty=1.0 filled=0.0 pine='Gc' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=214336 side=sell qty=1.0 filled=0.0 pine='Gb' leg=entry)
+[BROKER] strategy cancel confirmed (CANCELLED id=daf56a8p4g19a630jivg side=buy qty=1.0 filled=0.0 pine='Gc' leg=entry)
+[L1] bar=523 close=1980.4 candle=RED state=10 step=0 pending=no pos=0
+[L1] TEST 12 PLACE oca.reduce x2: Ra limit=1881.4 + Rb stop=2079.4 — BOTH must rest FULL qty=1 at the venue (reduce acts only on a fill); next bar      
+[BROKER] dispatching ENTRY BUY id='Ra' qty=1.0 type=limit limit=1881.3
+[BROKER] dispatched ENTRY BUY id='Ra' qty=1.0 type=limit limit=1881.3 -> 
+[BROKER] dispatching ENTRY BUY id='Rb' qty=1.0 type=stop stop=2079.5
+[BROKER] dispatched ENTRY BUY id='Rb' qty=1.0 type=stop stop=2079.5 -> 
+[BROKER] event CREATED id=218436 side=buy qty=1.0 filled=0.0 pine='Ra' leg=entry
+[BROKER] event CREATED id=daf57kgp4g19a630jj4g side=buy qty=1.0 filled=0.0 pine='Rb' leg=entry
+[L1] bar=524 close=1981 candle=GREEN state=10 step=0 pending=yes pos=0
+[L1] TEST 12 cancel_all — Ra and Rb must both go
+[L1] TEST 12 DONE — state 10->11
+[BROKER] cancelling CANCEL id='Ra'
+[BROKER] cancelling CANCEL id='Rb'
+[BROKER] event CANCELLED id=218436 side=buy qty=1.0 filled=0.0 pine='Ra' leg=entry
+[BROKER] event CANCELLED id=daf57kgp4g19a630jj4g side=buy qty=1.0 filled=0.0 pine='Rb' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=218436 side=buy qty=1.0 filled=0.0 pine='Ra' leg=entry)
+[BROKER] strategy cancel confirmed (CANCELLED id=daf57kgp4g19a630jj4g side=buy qty=1.0 filled=0.0 pine='Rb' leg=entry)
+[L1] bar=525 close=1982.6 candle=GREEN state=11 step=0 pending=no pos=0
+[L1] TEST 13 PLACE oca.none (SHARED name g13): Na limit=1883.5 + Nb limit=2081.7 — next bar cancels ONLY Na; Nb must be untouched (none = independent)
+[BROKER] dispatching ENTRY BUY id='Na' qty=1.0 type=limit limit=1883.4
+[BROKER] dispatched ENTRY BUY id='Na' qty=1.0 type=limit limit=1883.4 -> 
+[BROKER] dispatching ENTRY SELL id='Nb' qty=1.0 type=limit limit=2081.8
+[BROKER] dispatched ENTRY SELL id='Nb' qty=1.0 type=limit limit=2081.8 -> 
+[BROKER] event CREATED id=220476 side=sell qty=1.0 filled=0.0 pine='Nb' leg=entry
+[BROKER] event CREATED id=220466 side=buy qty=1.0 filled=0.0 pine='Na' leg=entry
+[L1] bar=526 close=1983.4 candle=GREEN state=11 step=0 pending=yes pos=0
+[L1] TEST 13 CANCEL Na ONLY — Nb must be untouched (oca.none)
+[BROKER] cancelling CANCEL id='Na'
+[BROKER] event CANCELLED id=220466 side=buy qty=1.0 filled=0.0 pine='Na' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=220466 side=buy qty=1.0 filled=0.0 pine='Na' leg=entry)
+[L1] bar=527 close=1983.5 candle=GREEN state=11 step=1 pending=yes pos=0
+[L1] TEST 13 CANCEL Nb (the survivor)
+[L1] TEST 13 DONE — state 11->12
+[L1] === ALL TESTS DONE (T1-T9 + OCA T11-T13). Verify at the venue that NOTHING of ours is still working, then stop the run. ===
+[BROKER] cancelling CANCEL id='Nb'
+[BROKER] event CANCELLED id=220476 side=sell qty=1.0 filled=0.0 pine='Nb' leg=entry
+[BROKER] run stopped (completed) position=flat equity=493,884,009.00 VND

@@ -4,9 +4,9 @@
 // market: inside the +/-7% band so the venue ACCEPTS and RESTS it, far enough that it
 // cannot fill. Nothing should ever fill, so no position is ever held.
 //
-//   state 0 -> TEST 1  long  entry, limit -5%          (green candle only)
+//   state 0 -> TEST 1  long  entry, limit -5%   (2026-09-07: candle-color gates removed — no-fill orders never fill, every close advances)
 //   state 1 -> TEST 2  short entry, limit +5%
-//   state 2 -> TEST 3  long  entry, limit -5%  + exit(stop -6%)      (green candle only)
+//   state 2 -> TEST 3  long  entry, limit -5%  + exit(stop -6%)
 //   state 3 -> TEST 4  short entry, limit +5%  + exit(stop +5.5%), one OCA group;
 //                      cancel ENTRY only -> the exit X4 is EXPECTED TO REMAIN (the
 //                      plugin-side cascade was REVERTED — it broke engine ownership/
@@ -110,7 +110,7 @@ if started
 
     // ------------------------------------------------------------ placement
     if canPlace and not pending and state < 12
-        if state == 0 and isGreen
+        if state == 0
             lvlEntry := close * 0.95
             strategy.entry("T1", strategy.long, limit=lvlEntry, comment="T1")
             placedBar := bar_index
@@ -124,7 +124,7 @@ if started
             log.info("[L1] TEST 2 PLACE id=T2 SHORT limit={0} (+5%)",
                      str.tostring(lvlEntry, format.mintick))
 
-        else if state == 2 and isGreen
+        else if state == 2
             lvlEntry := close * 0.95
             lvlStop  := close * 0.94
             strategy.entry("T3", strategy.long, limit=lvlEntry, comment="T3")
@@ -146,7 +146,7 @@ if started
                      "the orphan manually after grading",
                      str.tostring(lvlEntry, format.mintick), str.tostring(lvlStop, format.mintick))
 
-        else if state == 4 and isGreen
+        else if state == 4
             lvlEntry := close * 0.95
             lvlTP    := close * 1.05
             lvlStop  := close * 0.94
@@ -160,7 +160,7 @@ if started
                      str.tostring(lvlEntry, format.mintick), str.tostring(lvlTP, format.mintick),
                      str.tostring(lvlStop, format.mintick))
 
-        else if state == 5 and isGreen
+        else if state == 5
             lvlEntry := close * 0.95
             lvlAmend := close * 0.955
             strategy.entry("T6", strategy.long, limit=lvlEntry, comment="T6")
@@ -179,7 +179,7 @@ if started
                      "park+verify WARNING, not a crash — then prove it still cancels",
                      str.tostring(lvlStop, format.mintick), str.tostring(lvlAmend, format.mintick))
 
-        else if state == 7 and isGreen
+        else if state == 7
             lvlEntry := close * 0.95
             lvlStop  := close * 1.05
             strategy.entry("T8a", strategy.long, limit=lvlEntry, comment="T8a")
@@ -189,7 +189,7 @@ if started
                      "books; next bar strategy.cancel_all(), never before fired live",
                      str.tostring(lvlEntry, format.mintick), str.tostring(lvlStop, format.mintick))
 
-        else if state == 8 and isGreen
+        else if state == 8
             lvlEntry := close * 0.95
             strategy.order("T9", strategy.long, limit=lvlEntry, comment="T9")
             placedBar := bar_index
@@ -197,7 +197,7 @@ if started
                      "touched the broker; expect identical NORMAL-LO routing to entry()",
                      str.tostring(lvlEntry, format.mintick))
 
-        else if state == 9 and isGreen
+        else if state == 9
             lvlEntry := close * 0.95
             lvlAmend := close * 1.05
             lvlStop  := close * 1.05
@@ -214,7 +214,7 @@ if started
                      str.tostring(lvlEntry, format.mintick), str.tostring(lvlAmend, format.mintick),
                      str.tostring(lvlStop, format.mintick))
 
-        else if state == 10 and isGreen
+        else if state == 10
             lvlEntry := close * 0.95
             lvlStop  := close * 1.05
             strategy.entry("Ra", strategy.long, limit=lvlEntry,
@@ -227,7 +227,7 @@ if started
                      "cancel_all sweeps them",
                      str.tostring(lvlEntry, format.mintick), str.tostring(lvlStop, format.mintick))
 
-        else if state == 11 and isGreen
+        else if state == 11
             lvlEntry := close * 0.95
             lvlAmend := close * 1.05
             strategy.entry("Na", strategy.long,  limit=lvlEntry,

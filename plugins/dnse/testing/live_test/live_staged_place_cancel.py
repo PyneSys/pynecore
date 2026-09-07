@@ -35,7 +35,7 @@ def main(
             announced = True
         log.info("[L1] bar={0} close={1} candle={2} state={3} step={4} pending={5} pos={6}", bar_index, string.tostring(close, format.mintick), ("GREEN" if isGreen else "RED"), state, stageStep, ("yes" if pending else "no"), strategy.position_size)
         if canPlace and (not pending) and state < 12:
-            if state == 0 and isGreen:
+            if state == 0:
                 lvlEntry = close * 0.95
                 strategy.entry("T1", strategy.long, limit=lvlEntry, comment="T1")
                 placedBar = bar_index
@@ -45,7 +45,7 @@ def main(
                 strategy.entry("T2", strategy.short, limit=lvlEntry, comment="T2")
                 placedBar = bar_index
                 log.info("[L1] TEST 2 PLACE id=T2 SHORT limit={0} (+5%)", string.tostring(lvlEntry, format.mintick))
-            elif state == 2 and isGreen:
+            elif state == 2:
                 lvlEntry = close * 0.95
                 lvlStop = close * 0.94
                 strategy.entry("T3", strategy.long, limit=lvlEntry, comment="T3")
@@ -59,7 +59,7 @@ def main(
                 strategy.exit("X4", from_entry="T4", stop=lvlStop, oca_name="t4", comment_loss="X4")
                 placedBar = bar_index
                 log.info("[L1] TEST 4 PLACE id=T4 limit={0} + X4 stop={1} (oca) — next bar cancels " + "ENTRY ONLY; X4 EXPECTED TO REMAIN (cascade reverted, #19 open) — cancel " + "the orphan manually after grading", string.tostring(lvlEntry, format.mintick), string.tostring(lvlStop, format.mintick))
-            elif state == 4 and isGreen:
+            elif state == 4:
                 lvlEntry = close * 0.95
                 lvlTP = close * 1.05
                 lvlStop = close * 0.94
@@ -67,7 +67,7 @@ def main(
                 strategy.exit("X5", from_entry="T5", limit=lvlTP, stop=lvlStop, comment_profit="X5tp", comment_loss="X5sl")
                 placedBar = bar_index
                 log.info("[L1] TEST 5 PLACE id=T5 limit={0} + X5 tp={1}/sl={2} -> NATIVE OCO — first " + "Level-1 use of the OCO umbrella book. Next bar cancels ENTRY ONLY: X5 " + "EXPECTED TO REMAIN (cascade reverted, #19 open) — cancel manually after", string.tostring(lvlEntry, format.mintick), string.tostring(lvlTP, format.mintick), string.tostring(lvlStop, format.mintick))
-            elif state == 5 and isGreen:
+            elif state == 5:
                 lvlEntry = close * 0.95
                 lvlAmend = close * 0.955
                 strategy.entry("T6", strategy.long, limit=lvlEntry, comment="T6")
@@ -79,19 +79,19 @@ def main(
                 strategy.entry("T7", strategy.long, stop=lvlStop, comment="T7")
                 placedBar = bar_index
                 log.info("[L1] TEST 7 PLACE id=T7 buy-STOP {0} (+5%) — NEXT bar re-issues at {1} " + "(+4.5%): an AMEND on a CONDITIONAL. DNSE 500s (#18); expect a [BROKER] " + "park+verify WARNING, not a crash — then prove it still cancels", string.tostring(lvlStop, format.mintick), string.tostring(lvlAmend, format.mintick))
-            elif state == 7 and isGreen:
+            elif state == 7:
                 lvlEntry = close * 0.95
                 lvlStop = close * 1.05
                 strategy.entry("T8a", strategy.long, limit=lvlEntry, comment="T8a")
                 strategy.entry("T8b", strategy.long, stop=lvlStop, comment="T8b")
                 placedBar = bar_index
                 log.info("[L1] TEST 8 PLACE T8a limit={0} AND T8b stop={1} — two ids across BOTH " + "books; next bar strategy.cancel_all(), never before fired live", string.tostring(lvlEntry, format.mintick), string.tostring(lvlStop, format.mintick))
-            elif state == 8 and isGreen:
+            elif state == 8:
                 lvlEntry = close * 0.95
                 strategy.order("T9", strategy.long, limit=lvlEntry, comment="T9")
                 placedBar = bar_index
                 log.info("[L1] TEST 9 PLACE via strategy.order() LONG limit={0} — order() has never " + "touched the broker; expect identical NORMAL-LO routing to entry()", string.tostring(lvlEntry, format.mintick))
-            elif state == 9 and isGreen:
+            elif state == 9:
                 lvlEntry = close * 0.95
                 lvlAmend = close * 1.05
                 lvlStop = close * 1.05
@@ -100,14 +100,14 @@ def main(
                 strategy.entry("Gc", strategy.long, stop=lvlStop, oca_name="g11", oca_type=strategy.oca.cancel, comment="Gc")
                 placedBar = bar_index
                 log.info("[L1] TEST 11 PLACE oca.cancel x3 ACROSS BOOKS: Ga limit={0} (NORMAL) + " + "Gb limit={1} (NORMAL) + Gc stop={2} (CONDITIONAL) — next bar cancels " + "ONLY Ga. KEY: Gb and Gc must REMAIN resting (OCA fires on FILL, not cancel)", string.tostring(lvlEntry, format.mintick), string.tostring(lvlAmend, format.mintick), string.tostring(lvlStop, format.mintick))
-            elif state == 10 and isGreen:
+            elif state == 10:
                 lvlEntry = close * 0.95
                 lvlStop = close * 1.05
                 strategy.entry("Ra", strategy.long, limit=lvlEntry, oca_name="g12", oca_type=strategy.oca.reduce, comment="Ra")
                 strategy.entry("Rb", strategy.long, stop=lvlStop, oca_name="g12", oca_type=strategy.oca.reduce, comment="Rb")
                 placedBar = bar_index
                 log.info("[L1] TEST 12 PLACE oca.reduce x2: Ra limit={0} + Rb stop={1} — BOTH must " + "rest FULL qty=1 at the venue (reduce acts only on a fill); next bar " + "cancel_all sweeps them", string.tostring(lvlEntry, format.mintick), string.tostring(lvlStop, format.mintick))
-            elif state == 11 and isGreen:
+            elif state == 11:
                 lvlEntry = close * 0.95
                 lvlAmend = close * 1.05
                 strategy.entry("Na", strategy.long, limit=lvlEntry, oca_name="g13", oca_type=strategy.oca.none, comment="Na")

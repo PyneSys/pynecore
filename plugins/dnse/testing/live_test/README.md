@@ -141,6 +141,19 @@ Every live test case has one ID: **`Live-L<level>-<case>`**. Logs, plans, cards 
 conversation all use these. (Script-internal log tags map as: `[L1] TEST n` -> Live-L1-Tnn,
 `[F] Fn` -> Live-L3-Fnn.)
 
+**2026-09-07 full no-fill regression rerun @1m** — T1–T13 ALL re-verified in one
+sitting (evidence: `logs/nofill_rerun*_evidence.txt`). Probe change: the
+green/red candle gates were removed from `live_staged_place_cancel.pine` — every
+bar close advances the state machine (no-fill orders never fill, so candle color
+was pure wait). Two incidents during the campaign, neither a test failure:
+(1) 11:02 engine bar-feed WEDGE — venue served fresh bars (direct probe 200) while
+the engine stopped consuming for 8+ min with NO warning (the #54 feed-health
+ladder covers the ORDER feed only — carded); recovered by kill→sweep→relaunch
+`startState`. (2) T9's cancel ACKed at 11:29, one minute before lunch: the venue
+held it `PendingCancel` through the break while the engine's cancel-tentative
+loop had already classified the CANCELLED — venue fact: a session-boundary cancel
+finalizes late but the ACK≠completion machinery reads it correctly.
+
 | ID | What it does | Live status |
 |----|--------------|--------------------------|
 | **Live-L0-Gate** | venue-semantics probe; MUST pass before every live run | ✅ passes (run per session) |

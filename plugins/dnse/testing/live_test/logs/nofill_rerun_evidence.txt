@@ -1,0 +1,24 @@
+[BROKER] WS connect starting (warmup blocks until subscribed)
+[BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[BROKER] warmup phase started — replaying historical bars
+[BROKER] warmup phase complete — 501 bar(s) processed
+[BROKER] live trading active
+[L1] === STAGED PLACE/CANCEL v2 — window open. Tests T1-T9, 1 contract each, every order >=4.5% away so none can fill. startState=0 ===
+[L1] plan: T1/T2 limit place+cancel | T3 +exit(stop) | T4 OCA cancel-entry-only | T5 native-OCO cancel-entry-only | T6 amend NORMAL | T7 amend STOP (#18
+[L1] bar=503 close=1983.7 candle=GREEN state=0 step=0 pending=no pos=0
+[L1] TEST 1 PLACE id=T1 LONG limit=1884.5 (-5%) — expect one NORMAL LO, filled=0
+[BROKER] dispatching ENTRY BUY id='T1' qty=1.0 type=limit limit=1884.5
+[BROKER] dispatched ENTRY BUY id='T1' qty=1.0 type=limit limit=1884.5 -> 
+[BROKER] event CREATED id=187766 side=buy qty=1.0 filled=0.0 pine='T1' leg=entry
+[L1] bar=504 close=1983.9 candle=GREEN state=0 step=0 pending=yes pos=0
+[L1] TEST 1 CANCEL id=T1
+[L1] TEST 1 DONE — state 0->1
+[BROKER] cancelling CANCEL id='T1'
+[BROKER] event CANCELLED id=187766 side=buy qty=1.0 filled=0.0 pine='T1' leg=entry
+[BROKER] strategy cancel confirmed (CANCELLED id=187766 side=buy qty=1.0 filled=0.0 pine='T1' leg=entry)
+[L1] bar=505 close=1983.7 candle=RED state=1 step=0 pending=no pos=0
+[L1] TEST 2 PLACE id=T2 SHORT limit=2082.9 (+5%)
+[BROKER] dispatching ENTRY SELL id='T2' qty=1.0 type=limit limit=2082.9
+[BROKER] dispatched ENTRY SELL id='T2' qty=1.0 type=limit limit=2082.9 -> 
+[BROKER] event CREATED id=190686 side=sell qty=1.0 filled=0.0 pine='T2' leg=entry
