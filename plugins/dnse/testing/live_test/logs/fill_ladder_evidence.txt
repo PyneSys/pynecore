@@ -1,0 +1,83 @@
+[BROKER] WS connect starting (warmup blocks until subscribed)
+[BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[BROKER] warmup phase started — replaying historical bars
+[BROKER] warmup phase complete — 501 bar(s) processed
+[BROKER] live trading active
+[F] === STAGED FILL — window open. 8 fill cases, 1 contract each, flatten on sight, protection armed at placement. startState=0 ===
+[F] bar=503 close=1986.6 state=0 pending=no flattening=no retries=0 pos=0
+[F] F1 PLACE long MARKET — expect marketable LO at the band edge, fills next bar
+[BROKER] dispatching ENTRY BUY id='E' qty=1.0 type=market
+[BROKER] dispatched ENTRY BUY id='E' qty=1.0 type=market -> 
+[BROKER] dispatching EXIT id='P' from='E' qty=1.0 sl=1985.0
+[BROKER] dispatched EXIT id='P' from='E' qty=1.0 sl=1985.0 -> 
+[BROKER] event CREATED id=240616 side=buy qty=1.0 filled=0.0 pine='E' leg=entry
+[BROKER] event CREATED id=daf5el8p4g19a630jjng side=sell qty=1.0 filled=0.0 pine='P' from='E' leg=sl
+[BROKER] event FILLED id=240616 side=buy qty=1.0 filled=1.0 price=1986.7 pine='E' leg=entry
+[BROKER] position size=1.0 sign=1.0 avg=1986.7 (after filled pine='E')
+[F] bar=504 close=1986.3 state=0 pending=yes flattening=no retries=0 pos=1
+[F] F1 FILLED pos=1 avg=1986.7  >>> OPERATOR: CLOSE THIS POSITION NOW (DNSE app) <<<  the strategy will NOT close it — it waits for flat, then advances
+[F] F1 waiting for the manual close (1/5) — engine still sees pos=1
+[F] bar=505 close=1987.5 state=0 pending=yes flattening=yes retries=0 pos=1
+[F] F1 waiting for the manual close (2/5) — engine still sees pos=1
+[F] bar=506 close=1987.2 state=0 pending=yes flattening=yes retries=0 pos=1
+[F] F1 waiting for the manual close (3/5) — engine still sees pos=1
+[BROKER] exchange shows flat, internal=1.0 — external close detected, clearing position state
+[BROKER] cancelling CANCEL id='P' from='E'
+[BROKER] event CANCELLED id=daf5el8p4g19a630jjng side=sell qty=1.0 filled=0.0 pine='P' from='E' leg=sl
+[BROKER] strategy cancel confirmed (CANCELLED id=daf5el8p4g19a630jjng side=sell qty=1.0 filled=0.0 pine='P' from='E' leg=sl)
+[F] bar=507 close=1986.8 state=0 pending=yes flattening=yes retries=0 pos=0
+[F] F1 DONE — flat again; state 0->1
+[F] bar=508 close=1986.8 state=1 pending=no flattening=no retries=0 pos=0
+[F] F2 PLACE short MARKET
+[BROKER] dispatching ENTRY SELL id='E' qty=1.0 type=market
+[BROKER] dispatched ENTRY SELL id='E' qty=1.0 type=market -> 
+[BROKER] dispatching EXIT id='P' from='E' qty=1.0 sl=1987.4
+[BROKER] dispatched EXIT id='P' from='E' qty=1.0 sl=1987.4 -> 
+[BROKER] event FILLED id=247636 side=sell qty=1.0 filled=1.0 price=1987.0 pine='E' leg=entry
+[BROKER] event CREATED id=daf5h08p4g19a630jjvg side=buy qty=1.0 filled=0.0 pine='P' from='E' leg=sl
+[BROKER] conditional ACTIVATED -> tracking child | parent=daf5h08p4g19a630jjvg child=247796 pine=P polls=1
+[BROKER] event FILLED id=247796 side=buy qty=1.0 filled=1.0 price=1987.4 pine='P' from='E' leg=sl
+[BROKER] position size=-1.0 sign=-1.0 avg=1987.0 (after filled pine='E')
+[BROKER] position size=0.0 sign=0.0 avg=nan (after filled pine='P')
+[BROKER] cancelling CANCEL id='P' from='E'
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel of P|E did not land (execute_cancel returned False); parked for per-sync retry — the diff will not adopt or re-dispatch the key until   
+[BROKER] cancelling CANCEL id='P' from='E'
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] forced cancel retry for 'P|E' returned False (still pending); will retry next sync
+[F] bar=509 close=1987 state=1 pending=yes flattening=no retries=0 pos=0
+[BROKER] cancelling CANCEL id='P' from='E'
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] forced cancel retry for 'P|E' returned False (still pending); will retry next sync
+[F] bar=510 close=1985 state=1 pending=yes flattening=no retries=0 pos=0
+[BROKER] cancelling CANCEL id='P' from='E'
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] forced cancel retry for 'P|E' returned False (still pending); will retry next sync
+[F] bar=511 close=1983.6 state=1 pending=yes flattening=no retries=0 pos=0
+[BROKER] cancelling CANCEL id='P' from='E'
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] forced cancel retry for 'P|E' returned False (still pending); will retry next sync
+[F] bar=512 close=1984.5 state=1 pending=yes flattening=no retries=0 pos=0
+[BROKER] cancelling CANCEL id='P' from='E'
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] forced cancel retry for 'P|E' returned False (still pending); will retry next sync
+[F] bar=513 close=1985 state=1 pending=yes flattening=no retries=0 pos=0
+[BROKER] cancelling CANCEL id='P' from='E'
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] forced cancel retry for 'P|E' returned False (still pending); will retry next sync
+[BROKER] run stopped (completed) position=flat equity=493,884,009.00 VND

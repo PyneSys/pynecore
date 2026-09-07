@@ -141,6 +141,22 @@ Every live test case has one ID: **`Live-L<level>-<case>`**. Logs, plans, cards 
 conversation all use these. (Script-internal log tags map as: `[L1] TEST n` -> Live-L1-Tnn,
 `[F] Fn` -> Live-L3-Fnn.)
 
+**2026-09-07 FILL-tier first systematic run (F1–F5, API-flatten protocol)** — the
+operator approved the fill tier on a flat account; flatten via the bot's API
+(`flatten_api.py`, plugin `execute_close`) instead of app-closes so the #51
+window never opens. Results (evidence `logs/fill_ladder*_evidence.txt`):
+F1 ✅ market long (fill → external flatten → #48 external-close detection →
+protection retired). F2 PARTIAL — entry fill ✅ AND protection-sl fill ✅
+(a race: the tight protection and the API flatten both closed → brief flip,
+re-flattened; the probe's bar-boundary fill observation missed the sub-bar
+round-trip → timeout path). F3 ✅ / F4 ✅ stop entries both directions —
+conditional → Activated → NORMAL child fill attributed to the pine id
+(the #39/#41 chain live-proven with real money). **F5 ❌ CRITICAL #82**: with
+the stop-limit entry RESTING (never filled), the engine dispatched the
+protection as `__pyne_marketable_exit__` CLOSE and opened a NAKED SHORT while
+flat — recovered by API flatten in seconds; ladder STOPPED for safety;
+F6–F8 not attempted. FILL tier stays ⚠️ until #82 is fixed and F5–F8 re-run.
+
 **2026-09-07 full no-fill regression rerun @1m** — T1–T13 ALL re-verified in one
 sitting (evidence: `logs/nofill_rerun*_evidence.txt`). Probe change: the
 green/red candle gates were removed from `live_staged_place_cancel.pine` — every
