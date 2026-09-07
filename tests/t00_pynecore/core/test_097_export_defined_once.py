@@ -105,6 +105,9 @@ def _run(script_name: str, runs: int = 1) -> list[list[dict]]:
         script_core._registered_libraries[:] = saved_libraries
         sys.modules.pop('export_once_lib', None)
         sys.modules.pop('export_once_script', None)
+        sys.modules.pop('export_once_shadow_lib', None)
+        sys.modules.pop('export_once_shadow_script', None)
+        sys.modules.pop('export_once_rebind_lib', None)
 
 
 def __test_an_imported_export_is_defined_once_per_run__():
@@ -154,3 +157,27 @@ def __test_a_rerun_rebuilds_the_exports__():
     assert counter.count == 4, \
         f"a second run rebound {counter.count - 2} exports, expected 2"
     assert runs[0] == runs[1], "the second run must reproduce the first"
+
+
+def __test_an_unexported_definition_does_not_shadow_the_proxy__():
+    """A same-named unexported definition must not reach the module scope"""
+    # The importing script reaches the EXPORTED overload across the boundary,
+    # which only resolves while the module-level proxy is still the export's
+    imported = _run('export_once_shadow_script.py')[0]
+    assert [r['picked'] for r in imported] == [c + 10.0 for c in CLOSES]
+
+    # ... while the library's own body keeps calling the unexported one
+    own = _run('export_once_shadow_lib.py')[0]
+    assert [r['local'] for r in own] == [13.0] * len(CLOSES)
+
+
+def __test_an_export_whose_name_is_rebound_survives_later_bars__():
+    """A name bound elsewhere in ``main`` keeps its export out of the latch"""
+    # Latched, the export's binding would only be written on bar 0: the name
+    # would fall back to the per-bar definition ahead of it from bar 1, and to
+    # an unbound local where the other binding is a branch that is not taken
+    rows = _run('export_once_rebind_lib.py')[0]
+    assert [r['ahead'] for r in rows] == [11.0] * len(CLOSES)
+    assert [r['branched'] for r in rows] == [12.0] * len(CLOSES)
+    # ... and the definition the export shadows keeps working on its own
+    assert [r['shadowed'] for r in rows] == [13.0] * len(CLOSES)

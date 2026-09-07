@@ -30,6 +30,15 @@ The definitions bind through ``global`` so a read on a later bar — the
 library's own global scope may call what it exports — resolves to the
 module-level ``Exported`` proxy instead of an unbound local. Writing the name
 up there changes nothing: ``export`` returns that very proxy.
+
+An export whose name ``main`` also binds somewhere else is left out of the
+latch entirely and keeps being rebuilt per bar. A library may export one
+overload of a name and keep another unexported (``jason5480/chrono_utils``'
+``is_bar_included``), and only one of the two bindings can own the name: latched
+under ``global`` the per-bar one overwrites the module-level proxy, and latched
+without it the export's own binding is written on bar 0 only, so from bar 1 the
+name inside ``main`` resolves to the other definition — or to nothing, when that
+other binding is conditional.
 """
 import ast
 
@@ -37,6 +46,33 @@ __all__ = ['ExportOnceTransformer']
 
 #: Per-root latch the definitions run under, a Persistent slot of ``main``
 EXPORT_LATCH = '__exports·__'
+
+
+def _bound_names(nodes: list[ast.stmt]) -> set[str]:
+    """Every name the statements bind in ``main``'s OWN scope.
+
+    Nested function and class bodies are not descended into: a name they bind
+    belongs to their scope, not to ``main``'s, so it cannot collide with an
+    export's binding. Everything else is walked, because an assignment at any
+    depth of ``main``'s own code rebinds the name for the whole bar.
+
+    :param nodes: The statements to scan.
+    :return: The set of names the statements bind.
+    """
+    bound: set[str] = set()
+    stack: list[ast.AST] = list(nodes)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            # The definition binds its own name here; its body is another scope
+            bound.add(node.name)
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            bound.add(node.id)
+        stack.extend(ast.iter_child_nodes(node))
+    return bound
 
 
 def _is_export(node: ast.FunctionDef) -> bool:
@@ -66,13 +102,24 @@ class ExportOnceTransformer(ast.NodeTransformer):
         if main is None:
             return node
 
-        # Contiguous runs of export definitions, so nothing between them is
-        # moved: a run is guarded where it stands
+        # A name the library binds anywhere ELSE in ``main`` stays out of the
+        # latch: that other binding runs on every bar and would take the name
+        # over from bar 1, while the export's own binding is written on bar 0
+        # only. Rebuilt where it stands, such a definition behaves exactly as it
+        # did before the latch, and the module-level ``Exported`` proxy the
+        # decorator registered is the only thing a caller ever resolves to
+        outside = _bound_names([
+            stmt for stmt in main.body
+            if not (isinstance(stmt, ast.FunctionDef) and _is_export(stmt))])
+
+        # Contiguous runs of latchable export definitions, so nothing between
+        # them is moved: a run is guarded where it stands
         runs: list[tuple[int, int]] = []
         names: list[str] = []
         start: int | None = None
         for i, stmt in enumerate(main.body):
-            if isinstance(stmt, ast.FunctionDef) and _is_export(stmt):
+            if (isinstance(stmt, ast.FunctionDef) and _is_export(stmt)
+                    and stmt.name not in outside):
                 if start is None:
                     start = i
                 if stmt.name not in names:
