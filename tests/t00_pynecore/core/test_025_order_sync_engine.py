@@ -3682,6 +3682,84 @@ def __test_marketable_whole_row_exit_never_closes_a_flat_position__():
         f"a marketable whole-row exit fired a CLOSE against a FLAT position "
         f"-> naked short (#82): close_calls={b.close_calls}")
 
+
+def __test_protection_exit_not_dispatched_to_venue_while_flat__():
+    """#82b (measured live, F5 re-grade 2026-09-07): a protection exit whose
+    parent entry is still RESTING/unfilled must NOT be dispatched to the
+    venue. On a software-bracket venue (DNSE) execute_exit places a STANDALONE
+    conditional; with no position behind it, the market crossing its trigger
+    opens a NAKED position. The hedging-`port` branch already skips on a flat
+    book ('no open position to protect'); the plain execute_exit branch
+    (:14741) does not.
+
+    Live chain: F5 entry E (stop-limit) rested unfilled; the engine dispatched
+    protection P (sl, resolved stop) to the venue at placement; the market
+    crossed P's stop and its child filled sell -> naked short.
+    """
+    b = MockBroker(capabilities=ExchangeCapabilities(
+        exit_orders_execute_standalone=True))
+    engine, pos = _mk_engine(b)
+    # FLAT: the parent entry is resting/unfilled, no open trade.
+    pos.size = 0.0
+    pos.sign = 0.0
+    # A pure-stop protection for entry "L" that is NOT already crossed by the
+    # current price (so the marketable-close conversion #82a does NOT fire —
+    # this isolates the native-dispatch door #82b).
+    pos.exit_orders[("P", "L")] = _exit_order("L", -1.0, "P", stop=1000.0)
+
+    engine.sync(BAR_TS, last_price=1500.0)
+
+    assert len(b.exit_calls) == 0, (
+        f"a protection exit was dispatched to the venue while FLAT (parent "
+        f"entry unfilled) -> naked position when its trigger crosses (#82b): "
+        f"exit_calls={[e.intent.intent_key for e in b.exit_calls]}")
+
+
+def __test_protection_exit_dispatches_once_position_exists__():
+    """#82b companion: the skip is a DEFERRAL, not a suppression — the same
+    exit must dispatch on the first sync after the entry's fill lands."""
+    b = MockBroker(capabilities=ExchangeCapabilities(
+        exit_orders_execute_standalone=True))
+    engine, pos = _mk_engine(b)
+    pos.size = 0.0
+    pos.sign = 0.0
+    pos.exit_orders[("P", "L")] = _exit_order("L", -1.0, "P", stop=1000.0)
+
+    engine.sync(BAR_TS, last_price=1500.0)
+    assert len(b.exit_calls) == 0          # flat: held back (#82b)
+
+    # The entry fills between syncs.
+    pos.size = 1.0
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 1.0)]
+    engine.sync(BAR_TS + 60_000, last_price=1500.0)
+
+    assert len(b.exit_calls) == 1, (
+        "the held-back protection must dispatch on the first sync after "
+        "the position appears")
+    assert b.exit_calls[0].intent.qty == 1.0
+
+
+def __test_exit_qty_clamped_to_live_position__():
+    """#82 qty clamp (panel P1, same commit): a pyramiding partial fill
+    leaves the whole-row exit qty above the live position — dispatching the
+    full qty would flip the account through flat. The dispatch must clamp
+    to the reducible quantity."""
+    b = MockBroker(capabilities=ExchangeCapabilities(
+        exit_orders_execute_standalone=True))
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0                        # only 1 of the entry's 3 filled
+    pos.sign = 1.0
+    pos.open_trades = [_long_trade("L", 1.0)]
+    pos.exit_orders[("P", "L")] = _exit_order("L", -3.0, "P", stop=1000.0)
+
+    engine.sync(BAR_TS, last_price=1500.0)
+
+    assert len(b.exit_calls) == 1
+    assert b.exit_calls[0].intent.qty == 1.0, (
+        f"exit qty must clamp to the live position (got "
+        f"{b.exit_calls[0].intent.qty}) — the overshoot flips through flat")
+
 def __test_non_marketable_whole_row_limit_exit_still_attaches_tp__():
     """A resting (not-yet-marketable) limit exit keeps the native TP attach path."""
     b = MockBroker()

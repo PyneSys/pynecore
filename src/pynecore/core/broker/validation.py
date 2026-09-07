@@ -230,6 +230,19 @@ def validate_plugin_contract(
     bad_fields: set[str] = set()
     for f in fields(ExchangeCapabilities):
         value = getattr(caps, f.name)
+        if f.type == 'bool' or f.type is bool:
+            # Boolean venue-property flags (e.g.
+            # ``exit_orders_execute_standalone``, #82) are declared as
+            # ``bool`` on the dataclass by design — they describe a venue
+            # mechanic, not a support level.
+            if not isinstance(value, bool):
+                bad_fields.add(f.name)
+                errors.append(
+                    f"{name}.get_capabilities().{f.name} is {value!r} "
+                    f"({type(value).__name__}) — this venue-property flag "
+                    f"must be a bool."
+                )
+            continue
         if not isinstance(value, CapabilityLevel):
             bad_fields.add(f.name)
             errors.append(

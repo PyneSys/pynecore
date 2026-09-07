@@ -1023,6 +1023,10 @@ class OrderSyncEngine:
         caps = broker.get_capabilities()
         self._oca_cancel_native = caps.oca_cancel is CapabilityLevel.NATIVE
         self._tp_sl_bracket_native = caps.tp_sl_bracket is CapabilityLevel.NATIVE
+        #: #82b: venue's exit orders execute standalone (no position needed)
+        #: — gates the pre-fill protection withhold + qty clamp below.
+        self._exit_orders_execute_standalone = getattr(
+            caps, 'exit_orders_execute_standalone', False)
         # Capability cache for the partial-qty bracket dispatch switch.
         # The companion ``partial_qty_bracket_exit_pyramiding`` level
         # is enforced once at startup by ``validate_at_startup``;
@@ -1223,6 +1227,12 @@ class OrderSyncEngine:
         # so pyramiding entries with multiple tick-deferred exits per
         # ``from_entry`` each get their own slot.
         self._deferred_exits: dict[str, ExitIntent] = {}
+        #: #82b log throttle: intent keys whose ``no_position_to_protect``
+        #: skip already warned this episode (the skip re-fires every sync
+        #: while the parent entry rests). Cleared per-key on a successful
+        #: dispatch so the next episode warns once again. Bounded by the
+        #: script's exit-intent count.
+        self._skip_warned_keys: set[str] = set()
         self._event_queue: queue.Queue[OrderEvent | _NativeCancelAllExpected] = queue.Queue()
         # The live :meth:`run_event_stream` task, recorded on the broker
         # event loop so :meth:`stop_event_stream` can cancel AND await it.
@@ -11849,6 +11859,26 @@ class OrderSyncEngine:
             corrected.append(intent)
         return corrected
 
+    def _reducible_exit_qty(self, side: str) -> float:
+        """Quantity of the live position an order on ``side`` can REDUCE.
+
+        The single #82 invariant, shared by the marketable-close conversion
+        (#82a) and the native exit dispatch (#82b): a protective exit exists
+        only to reduce an existing position, so ``0.0`` means "acting now
+        would OPEN or extend a position" — the caller must skip (and
+        re-evaluate next sync, when the parent entry's fill may have landed).
+        A positive return is also the CLAMP for the order quantity: a
+        pyramiding partial fill (position 1 of 3, whole-row exit qty 3) must
+        never dispatch more than the position holds, or the overshoot flips
+        the account through flat on a netting venue (measured live,
+        Live-L3-F05 2026-09-07 — both doors).
+        """
+        if side == 'sell' and self._position.size > 0.0:
+            return self._position.size
+        if side == 'buy' and self._position.size < 0.0:
+            return -self._position.size
+        return 0.0
+
     def _convert_marketable_whole_row_exits(
             self, intents: list[Intent], last_price: float | None,
     ) -> list[Intent]:
@@ -11965,11 +11995,7 @@ class OrderSyncEngine:
             # fire when the close would actually REDUCE the live position;
             # otherwise leave it to the native path, which attaches to the
             # position once the entry fills.
-            reduces = (
-                (intent.side == 'sell' and self._position.size > 0.0)
-                or (intent.side == 'buy' and self._position.size < 0.0)
-            )
-            if not reduces:
+            if self._reducible_exit_qty(intent.side) <= 0.0:
                 converted.append(intent)
                 continue
             if not self._dispatch_marketable_whole_row_close(
@@ -12002,11 +12028,16 @@ class OrderSyncEngine:
         synth_pine_id = (
             f"__pyne_marketable_exit__{intent.pine_id}\0{intent.from_entry}"
         )
+        # #82: never close more than the position holds — a pyramiding
+        # partial fill leaves ``intent.qty`` above the live size, and the
+        # overshoot would flip the account through flat (this synthesised
+        # path bypasses ``_clamp_close_intents``).
+        reducible = self._reducible_exit_qty(intent.side)
         close_intent = CloseIntent(
             pine_id=synth_pine_id,
             symbol=intent.symbol,
             side=intent.side,
-            qty=intent.qty,
+            qty=min(abs(intent.qty), reducible),
             immediately=True,
             synthetic_kind='marketable_exit',
             target_entry_id=intent.from_entry,
@@ -13203,6 +13234,10 @@ class OrderSyncEngine:
                         continue
                     try:
                         self._dispatch_new(intent)
+                        # A successful dispatch re-arms the skip warning for
+                        # this key (#82b throttle below): the next skip is a
+                        # NEW episode worth one loud line.
+                        self._skip_warned_keys.discard(key)
                     except OrderSkippedByPlugin as e:
                         # Plugin declined (e.g. qty below venue minimum) OR
                         # the bracket-attach-after-fill recovery path raised
@@ -13211,7 +13246,19 @@ class OrderSyncEngine:
                         # ``_defensively_closed_entries_this_sync`` so any
                         # remaining same-entry intents handled later in this
                         # loop short-circuit at the guard above.
-                        _blog_warning("%s", e)
+                        # #82b throttle: the pre-fill exit skip re-fires
+                        # EVERY sync while the parent entry rests (a
+                        # stop-limit can rest for many bars) — warn once per
+                        # episode, DEBUG thereafter; every other skip reason
+                        # keeps today's per-occurrence warning.
+                        if e.reason == "no_position_to_protect":
+                            if key in self._skip_warned_keys:
+                                _blog_debug("%s", e)
+                            else:
+                                self._skip_warned_keys.add(key)
+                                _blog_warning("%s", e)
+                        else:
+                            _blog_warning("%s", e)
                         if isinstance(intent, EntryIntent):
                             skipped_entry_ids_this_sync.add(intent.pine_id)
                             self._record_entry_reject(key, intent, e)
@@ -15314,6 +15361,46 @@ class OrderSyncEngine:
         # up on a halt).
         if isinstance(intent, EntryIntent):
             self._enforce_short_gate(intent)
+        # #82b (measured live, Live-L3-F05 2026-09-07): a protective exit must
+        # never reach the venue while its parent entry is unfilled — on a
+        # software-bracket venue ``execute_exit`` places a STANDALONE
+        # conditional, and with no position behind it the market crossing its
+        # trigger OPENS a naked position. Mirrors the hedging-``port``
+        # branch's flat-book skip: non-halting, the intent stays out of
+        # ``_active_intents`` and re-evaluates every sync, so the protection
+        # dispatches on the first sync after the entry's fill lands (up to
+        # one bar unprotected-but-positioned — strictly better than a naked
+        # order with NO position). The positive return is also the qty
+        # CLAMP: a pyramiding partial fill must not dispatch a whole-row
+        # exit larger than the live position (the overshoot would flip the
+        # account through flat). Judged BEFORE the envelope is built so a
+        # skip leaves no anchor residue and the clamped qty reaches the
+        # wire envelope. SCOPED to standalone-exit venues (the new
+        # ``exit_orders_execute_standalone`` capability): attach-semantics
+        # venues reject a naked attach venue-side and that path is owned by
+        # the bracket-reject recovery machinery — their pre-fill dispatch
+        # contract (and the partial-fill bracket-amend flow) is preserved.
+        if (isinstance(intent, ExitIntent)
+                and self._exit_orders_execute_standalone):
+            reducible = self._reducible_exit_qty(intent.side)
+            if reducible <= 0.0:
+                raise OrderSkippedByPlugin(
+                    f"Exit {format_intent_key(intent.intent_key)} skipped: "
+                    f"parent entry unfilled / no position to protect "
+                    f"(#82b); re-evaluating next sync.",
+                    intent_key=intent.intent_key,
+                    reason="no_position_to_protect",
+                    context={'symbol': intent.symbol,
+                             'from_entry': intent.from_entry},
+                )
+            if abs(intent.qty) > reducible:
+                _blog_warning(
+                    "exit %s qty %s exceeds the live position %s — "
+                    "clamping to the reducible quantity (#82)",
+                    format_intent_key(intent.intent_key),
+                    intent.qty, reducible,
+                )
+                intent = dataclasses.replace(intent, qty=reducible)
         envelope = self._build_envelope(intent)
         _blog_info("dispatching %s", intent)
         # Non-None only when the plugin opted into hedging-mode one-way
@@ -15447,6 +15534,9 @@ class OrderSyncEngine:
                         and not intent.stop_fired_market):
                     self._arm_entry_stop_watch(intent, envelope)
             elif isinstance(intent, ExitIntent):
+                # (#82b's no-position skip and qty clamp run at method
+                # entry, BEFORE the envelope build — see the guard above
+                # ``_build_envelope``.)
                 # Route engine-trigger partial brackets through the
                 # dedicated state-machine dispatch. The condition is
                 # deliberately conjunctive (mode AND intent flag) so a

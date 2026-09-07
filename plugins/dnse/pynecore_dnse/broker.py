@@ -279,6 +279,11 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
             # one-cancels-other; the plugin tracks the OCO's working LO via
             # externalOrderId. See execute_exit.
             tp_sl_bracket=CapabilityLevel.NATIVE,
+            # #82b (measured live 2026-09-07): DNSE protective exits are
+            # STANDALONE conditional-book orders that execute with no
+            # position behind them — the engine must withhold them until
+            # the parent entry fills and clamp qty to the live position.
+            exit_orders_execute_standalone=True,
             # SOFTWARE, not NATIVE (#33): the OCO above is the single-exit
             # bracket ONLY — no DNSE payload can link separate orders into a
             # group (Live-L1-T11: oca members are venue-strangers). Declaring

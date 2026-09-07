@@ -428,6 +428,18 @@ class ExchangeCapabilities:
     # last extreme and amends the SL each tick / bar.
     trailing_stop: CapabilityLevel = CapabilityLevel.UNSUPPORTED
 
+    # #82: True when the venue's exit/bracket orders are STANDALONE working
+    # orders that can EXECUTE with no position behind them (DNSE: a
+    # protective stop is a conditional-book order that fires and fills
+    # regardless of position — measured live 2026-09-07, a pre-entry-fill
+    # protection opened a naked short). When True the engine withholds a
+    # protective exit until its parent entry has filled and clamps its qty
+    # to the live position. False (default) = attach-semantics venues
+    # (Capital.com/Bybit position brackets): a naked attach is rejected by
+    # the venue and owned by the bracket-reject recovery path, so the
+    # pre-fill dispatch contract is preserved there.
+    exit_orders_execute_standalone: bool = False
+
     # === Exit bracket (TP+SL with OCA reduce semantics) ===
     # NATIVE = single atomic exchange call attaches both legs (Bybit V5
     # attached TP/SL, Capital.com position-attribute bracket). The sync
