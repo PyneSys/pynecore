@@ -104,6 +104,13 @@ after a mid-run fix — used live on 08-17).
   The plugin therefore declares `exit_orders_execute_standalone = True` and
   the engine withholds the exit until the entry fills (#82b) — re-measured
   green 09-07, zero SELL orders reached the venue.
+- **The #82b withhold costs an unprotected window of up to ONE BAR** (verified
+  in code 09-07): the engine's `sync()` runs once per bar from the script
+  runner, with no fill-triggered re-sync, so a protection withheld at
+  placement is dispatched at the *next bar close* after its entry fills.
+  That is ≤60 s on the 1m probes, but **≤15 min on a 15m strategy**. Mild on
+  unleveraged spot; if a strategy depends on a tight stop, prefer a lower
+  timeframe or arm protection only after a confirmed fill (what BF9 does).
 - Entry-only cancels orphan their exit legs (engine #19 shape, same as
   DNSE) — a later `cancel_all` sweeps them; until #19 lands, strategies
   must cancel exit ids explicitly.

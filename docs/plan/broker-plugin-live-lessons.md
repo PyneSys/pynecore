@@ -30,6 +30,31 @@ universally drop terminal orders from the "open orders" list); DNSE's
 day-book retention is the less common case and is easy to over-generalize
 from if DNSE was your first venue.
 
+## Second venue property: do exit orders execute standalone?
+
+Joint finding, 2026-09-07 (DNSE Live-L3-F05 → Binance staged probe B3). Same
+shape as the retention axis above: one measurable venue property decides a
+design branch, and each branch has its own failure mode if you pick wrong.
+
+**The question: does a protective exit execute on its own, or is it attached
+to a position and rejected without one?**
+
+| | Standalone exits (DNSE conditional book, Binance spot) | Attach-semantics exits (position-attached SL/TP) |
+|---|---|---|
+| **What an exit is** | An independent working order on the book. DNSE: a conditional-book order. Binance spot: a plain SELL resting against account base inventory — spot has no position rows at all | A protective level attached to a position row; the venue rejects it when no position exists |
+| **Correct engine behavior** | **Withhold** the exit until the parent entry fills (`exit_orders_execute_standalone = True` arms the engine's #82b guard, which also clamps exit qty to the live position) | **Pre-dispatch** at placement — this is the deliberate contract, and the partial-fill bracket-amend flow depends on it |
+| **Failure mode if you pick wrong** | **Naked position from a pre-fill protection.** The protection executes with nothing behind it: DNSE F5 opened a naked SHORT while flat; Binance would SELL foreign/other-strategy base inventory it does not own | **Misclassified bracket rejects.** Without pre-dispatch the engine's whole bracket-reject recovery family (`BracketAttachAfterFillRejectedError` and the defensive-close path) has nothing to recover from and the attach contract breaks — this is why the #82b guard is capability-scoped, not universal (a universal version broke 20 upstream contract tests) |
+| **Measured evidence** | DNSE F5 2026-09-07 (naked short, real money, ladder stopped for safety); Binance probe B3 red 2026-08-17 (exit 3828722 resting while flat) → green 2026-09-07 (0 SELL orders) | The 20 upstream attach-contract tests that the universal guard broke |
+
+**Known cost of the withhold, verified in code 2026-09-07:** the engine's
+`sync()` is called **once per bar** from the script runner (keyed to
+`lib.last_bar_time`); there is no fill-triggered re-sync. So a withheld
+protection is dispatched at the *next bar close* after the entry fills —
+an unprotected window of **up to one full bar**, which scales with the
+strategy's timeframe (≤60 s at 1m, but ≤15 min at 15m). Mild on unleveraged
+spot; material for tight stops or leveraged venues. Know it exists before
+choosing a timeframe for a stop-dependent strategy.
+
 ## Verified findings, by topic
 
 ### `execute_cancel_all` — settled, dead path on both sides
@@ -147,6 +172,21 @@ documents the SOFTWARE choice as measured, not assumed).
   needed for restart adoption — but ANY plugin state that isn't
   persist-first-before-the-POST (partial fills, bracket construction state)
   is equally vulnerable to a crash-in-the-window loss on either venue type.
+
+## Method note: re-read the other venue's evidence before writing a new probe
+
+When a new bug class lands on one venue, **re-read the other venue's existing
+evidence for the same shape before writing any new probe — the measurement is
+often already on disk, unrecognised.**
+
+Both sides have now hit this. The #82 naked-exit precondition was sitting in
+Binance's own 2026-08-17 B3 evidence (`dispatched EXIT id='X3' … ->
+['3828722']`, an exit resting at the venue while its entry was unfilled) for
+three weeks; it read as a neutral "measured: the pre-fill exit reaches the
+venue" until DNSE's F5 gave the shape a name and a consequence. DNSE reports
+the same pattern in their #51 timeline reconstruction. The cost of the
+re-read is minutes; the cost of missing it is a live incident on the second
+venue.
 
 ## Open items
 
