@@ -60,6 +60,10 @@ case notes its DNSE ancestor.
 | **Live-B2-F03-StopFill** (F3) | stop entry; crossed-at-placement → **market fallback** (found+fixed this run); rested stop fills through trigger | ✅ 08-17 |
 | **Live-B2-F05-StopLimitFill** (F5) | stop-limit = ONE STOP_LOSS_LIMIT carrying its cap; crossed → falls back to LIMIT at the cap (post-run fix, unit-tested) | ✅ 08-17 |
 | **Live-B2-F07-OcaEntryBreak** (F7) | entry-OCA near/far: near filled; **engine did NOT sibling-cancel under `oca_cancel=NATIVE`** — far leg survived until the script's explicit cancel → capability corrected to SOFTWARE | ✅ 08-17 (finding) |
+| **Live-B3-BP1-PyramidStack** (new) | 3 market entries stacked one per bar → pos 0.001/0.002/0.003; spot inventory ledger accumulates 3 separate venue fills into one synthesized position with exact VWAP (79114.00 → 79102.935 → 79099.26 on the first run) | ✅ 09-07 |
+| **Live-B3-BP2-PartialLimitExit** (new) | `strategy.exit(qty=)` **smaller than the position** — a resting SELL leg while the other 2 units stay open; not withheld (a position exists, so #82b correctly allows it) | ✅ 09-07 (filled); timeout path also exercised 09-07 run 1 |
+| **Live-B3-BP3-PartialMarketClose** (new) | `strategy.close(id, qty=)` against a multi-entry position — partial teardown with FIFO attribution | ✅ 09-07 |
+| **Live-B3-BP4-CloseAllRemainder** (new) | `close_all()` from a partial remainder → flat; venue net exactly 0.000 | ✅ 09-07 |
 | **Live-B2-F09-OcoBracketResolve** (new) | market fill → native OCO bracket → TP leg FILLED, venue auto-cancelled the SL sibling (status **EXPIRED**); engine observed the external cancel without quarantining | ✅ 08-17 |
 
 ## The four test types
@@ -116,6 +120,23 @@ after a mid-run fix — used live on 08-17).
   must cancel exit ids explicitly.
 - Testnet grants ~10k USDT + 1 BTC + a long tail of assets; book resets
   periodically.
+
+## Operational rule: flatten through the BOT, never raw venue API
+
+Learned the hard way 2026-09-07 (evidence in `evidence_pyramid_2026-09-07.txt`).
+A stuck probe left 0.002 BTC open; it was flattened with a raw ccxt market sell
+instead of the plugin's own close path. The spot inventory ledger never saw
+that sell, so the next startup measured `foreign_baseline 1 + bot_inventory
+0.002` against a real balance of `1` → `drift -0.002` → **quarantine before any
+dispatch**. That is the safety layer working correctly, not a bug — but it
+costs a run.
+
+DNSE solved this with `flatten_api.py` (flatten via the plugin's
+`execute_close` so the ledger stays consistent). Binance has no equivalent yet
+— until it does, recover a stuck run by letting the ladder's own `close_all`
+finish, or accept the quarantine and rely on the documented auto-recovery:
+the NEXT startup closes the poisoned epoch, retires its ledger rows and
+re-anchors `foreign_baseline` on the venue balance (**verified live 09-07**).
 
 ## Evidence (this directory)
 

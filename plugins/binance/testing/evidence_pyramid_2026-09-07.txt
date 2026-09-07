@@ -1,0 +1,73 @@
+[2026-09-07 16:02:21+0000] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-09-07 16:02:21+0000] bar:      0 INFO     [BROKER] Binance connected: account=binance-testnet-1786972114406718119
+[2026-09-07 16:02:21+0000] bar:      0 INFO     [BROKER] WS connected and subscribed: BinanceBroker @1
+[2026-09-07 16:02:22+0000] bar:      0 INFO     [BROKER] spot inventory ready: net_base=0 fills=0 (recovered=0, adopted=0)
+[2026-09-07 16:02:22+0000] bar:      0 INFO     [BROKER] authenticated: plugin=BinanceBroker account=binance-testnet-1786972114406718119
+[2026-09-07 16:02:22+0000] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-09-07 16:02:00+0000] bar:    499 INFO     [BROKER] warmup phase complete — 500 bar(s) processed
+[2026-09-07 16:02:00+0000] bar:    499 INFO     [BROKER] live trading active
+[2026-09-07 16:06:00+0000] bar:    503 INFO     [BP] === PYRAMID + SCALE-OUT — 3-unit stack then 3 different partial teardowns. startState=0 ===
+[2026-09-07 16:06:00+0000] bar:    503 INFO     [BP] BP1 PLACE market entry E1 (leg 1/3) — expect pos to reach 0.001
+[2026-09-07 16:06:00+0000] bar:    503 INFO     [BROKER] dispatching ENTRY BUY id='E1' qty=0.001 type=market
+[2026-09-07 16:06:00+0000] bar:    503 INFO     [BROKER] dispatched ENTRY BUY id='E1' qty=0.001 type=market -> ['13179429']
+[2026-09-07 16:06:00+0000] bar:    503 INFO     [BROKER] event FILLED id=13179429 side=buy qty=0.001 filled=0.001 price=78867.27 pine='E1' leg=entry
+[2026-09-07 16:07:00+0000] bar:    504 INFO     [BROKER] position size=0.001 sign=1.0 avg=78867.27 (after filled pine='E1')
+[2026-09-07 16:07:00+0000] bar:    504 INFO     [BP] BP1 PLACE market entry E2 (leg 2/3) — expect pos to reach 0.002
+[2026-09-07 16:07:00+0000] bar:    504 INFO     [BROKER] dispatching ENTRY BUY id='E2' qty=0.001 type=market
+[2026-09-07 16:07:00+0000] bar:    504 INFO     [BROKER] dispatched ENTRY BUY id='E2' qty=0.001 type=market -> ['13179692']
+[2026-09-07 16:07:00+0000] bar:    504 INFO     [BROKER] event FILLED id=13179692 side=buy qty=0.001 filled=0.001 price=78853.98 pine='E2' leg=entry
+[2026-09-07 16:08:00+0000] bar:    505 INFO     [BROKER] position size=0.002 sign=1.0 avg=78860.625 (after filled pine='E2')
+[2026-09-07 16:08:00+0000] bar:    505 INFO     [BP] BP1 PLACE market entry E3 (leg 3/3) — expect pos to reach 0.003
+[2026-09-07 16:08:00+0000] bar:    505 INFO     [BROKER] dispatching ENTRY BUY id='E3' qty=0.001 type=market
+[2026-09-07 16:08:00+0000] bar:    505 INFO     [BROKER] dispatched ENTRY BUY id='E3' qty=0.001 type=market -> ['13179928']
+[2026-09-07 16:09:00+0000] bar:    506 INFO     [BROKER] event FILLED id=13179928 side=buy qty=0.001 filled=0.001 price=78870.44 pine='E3' leg=entry
+[2026-09-07 16:09:00+0000] bar:    506 INFO     [BROKER] position size=0.003 sign=1.0 avg=78863.89666666667 (after filled pine='E3')
+[2026-09-07 16:09:00+0000] bar:    506 INFO     [BP] BP1 DONE — 3-unit stack built, pos=0.003 avg=78863.9; ledger must show 3 fills
+[2026-09-07 16:09:00+0000] bar:    506 INFO     [BP] BP2 PLACE partial exit X1 from E1 qty=0.001 limit=78906.34 — exit qty < pos(0.003); the other 2 units must stay open
+[2026-09-07 16:09:00+0000] bar:    506 INFO     [BROKER] dispatching EXIT id='X1' from='E1' qty=0.001 tp=78906.35
+[2026-09-07 16:09:00+0000] bar:    506 INFO     [BROKER] dispatched EXIT id='X1' from='E1' qty=0.001 tp=78906.35 -> ['13180188']
+[2026-09-07 16:13:00+0000] bar:    510 INFO     [BROKER] event FILLED id=13180188 side=sell qty=0.001 filled=0.001 price=78906.35 pine='X1' from='E1' leg=tp
+[2026-09-07 16:13:00+0000] bar:    510 INFO     [BROKER] position size=0.002 sign=1.0 avg=78863.89666666667 (after filled pine='X1')
+[2026-09-07 16:13:00+0000] bar:    510 INFO     [BROKER] cancelling CANCEL id='X1' from='E1'
+[2026-09-07 16:13:00+0000] bar:    510 INFO     [BP] BP2 DONE — partial exit filled, pos=0.002 (2 units remain)
+[2026-09-07 16:13:00+0000] bar:    510 INFO     [BP] BP3 PLACE market close of E2 qty=0.001 — partial close against a multi-entry position (FIFO attribution)
+[2026-09-07 16:13:00+0000] bar:    510 INFO     [BROKER] modifying ENTRY BUY id='E2' qty=0.001 type=market -> CLOSE id='E2' side=sell qty=0.001
+[2026-09-07 16:13:00+0000] bar:    510 INFO     [BROKER] dispatching keyed close E2 directly over consumed entry (filled=0.001 qty=0.001); dependent protection stays armed
+[2026-09-07 16:13:00+0000] bar:    510 INFO     [BROKER] dispatching CLOSE id='E2' side=sell qty=0.001
+[2026-09-07 16:13:00+0000] bar:    510 INFO     [BROKER] dispatched CLOSE id='E2' side=sell qty=0.001 -> ['13181430']
+[2026-09-07 16:14:00+0000] bar:    511 INFO     [BROKER] event FILLED id=13181430 side=sell qty=0.001 filled=0.001 price=78907.99 pine='E2' leg=close
+[2026-09-07 16:14:00+0000] bar:    511 INFO     [BROKER] script close E2 fully filled (qty=0.001) — close state retired; a later close on this id dispatches fresh
+[2026-09-07 16:14:00+0000] bar:    511 INFO     [BROKER] position size=0.001 sign=1.0 avg=78863.89666666667 (after filled pine='E2')
+[2026-09-07 16:14:00+0000] bar:    511 INFO     [BP] BP3 DONE — partial close filled, pos=0.001 (1 unit remains)
+[2026-09-07 16:14:00+0000] bar:    511 INFO     [BP] BP4 PLACE close_all — tearing down the remainder (0.001)
+[2026-09-07 16:14:00+0000] bar:    511 INFO     [BROKER] dispatching CLOSE id='' side=sell qty=0.001
+[2026-09-07 16:14:00+0000] bar:    511 INFO     [BROKER] dispatched CLOSE id='' side=sell qty=0.001 -> ['13181911']
+[2026-09-07 16:14:00+0000] bar:    511 INFO     [BROKER] event FILLED id=13181911 side=sell qty=0.001 filled=0.001 price=78915.12 leg=close
+[2026-09-07 16:15:00+0000] bar:    512 INFO     [BROKER] script close  fully filled (qty=0.001) — close state retired; a later close on this id dispatches fresh
+[2026-09-07 16:15:00+0000] bar:    512 INFO     [BROKER] position size=0.0 sign=0.0 avg=nan (after filled pine='')
+[2026-09-07 16:15:00+0000] bar:    512 INFO     [BP] BP4 DONE — flat. === ALL PYRAMID CASES DONE. Verify at the venue: flat, nothing working, ledger net_base back to 0. ===
+[2026-09-07 16:16:24+0000] bar:    513 INFO     [BROKER] run stopped (completed) position=flat equity=9,999.19 USDT
+
+--- VENUE RECORD (graded 2026-09-07 testnet) ---
+13179429 MARKET BUY  FILLED 0.001   (E1)
+13179692 MARKET BUY  FILLED 0.001   (E2)
+13179928 MARKET BUY  FILLED 0.001   (E3)   -> pos 0.003, VWAP 78863.90
+13180188 LIMIT  SELL FILLED 0.001   (X1 partial TP, qty < pos)
+13181430 MARKET SELL FILLED 0.001   (BP3 partial close of E2)
+13181911 MARKET SELL FILLED 0.001   (BP4 close_all remainder)
+bought 0.003 / sold 0.003 -> net 0.00000 | open orders 0 | BTC 1.0 (baseline)
+
+--- RUN 1 (same probe, earlier): two findings ---
+1. PROBE BUG (fixed): BP2's TP did not fill (price fell), so its timeout path
+   advanced state WITHOUT reducing the position. BP3's completion test was an
+   ABSOLUTE level (pos <= 0.001) and became unreachable at pos 0.002 -> ladder
+   wedged holding 0.002. Fixed: transitions now key on a RELATIVE reduction
+   from a recorded posMark, and BP3 gained its own timeout.
+2. SPOT INVENTORY CONFLICT DETECTION VALIDATED LIVE: the stuck position was
+   flattened out-of-band with raw ccxt (NOT through the bot), so the ledger
+   never saw the sell. Next startup measured
+   foreign_baseline 1 + bot_inventory 0.002 vs current_total 1 -> drift -0.002
+   and QUARANTINED before dispatching anything. The startup after that
+   auto-recovered as documented: "quarantined epoch 1 recovered at startup —
+   4 ledger row(s) retired (net 0.002), fresh baseline anchored on the venue
+   balance 1". Full conflict -> quarantine -> recovery cycle proven live.

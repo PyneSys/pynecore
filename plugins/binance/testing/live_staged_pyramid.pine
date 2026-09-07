@@ -1,0 +1,128 @@
+//@version=6
+// Binance testnet staged PYRAMID + SCALE-OUT probe (Live-B3 tier).
+//
+// Covers the biggest untested area on the Binance plugin: multi-entry
+// position building and partial exits. Every prior probe used a single
+// 0.001 entry closed whole, so none of this is exercised:
+//
+//   BP1 (state 0) stack 3 market entries, one per bar -> pos 0.001/0.002/0.003
+//                 tests: pyramiding accounting, the spot inventory ledger
+//                 accumulating 3 separate fills into one synthesized position,
+//                 and VWAP entry price across fills.
+//   BP2 (state 1) partial LIMIT exit of ONE unit (from_entry="E1", qty=0.001)
+//                 tests: exit qty < position (the #82b clamp's other half),
+//                 a resting SELL leg while the rest of the position stays open.
+//   BP3 (state 2) partial MARKET close of ONE unit (strategy.close qty=0.001)
+//                 tests: close() with an explicit qty against a multi-entry
+//                 position, and FIFO attribution (close_entries_rule).
+//   BP4 (state 3) close_all -> flat
+//                 tests: whole-position teardown from a partial remainder.
+//
+// Long-only: Binance spot cannot short. Sized 0.001 BTC/unit (~79 USDT,
+// above the 5 USDT MIN_NOTIONAL and the 1e-05 LOT_SIZE floor).
+// FILL tier: testnet only, supervised, never mainnet.
+strategy("BINANCE staged pyramid + scale-out", overlay=true, pyramiding=3,
+         initial_capital=10000, default_qty_type=strategy.fixed,
+         default_qty_value=0.001, calc_on_every_tick=false,
+         process_orders_on_close=false)
+
+winStart   = input.time(timestamp("2030-01-01T00:00:00+00:00"), "Trade window START")
+winEnd     = input.time(timestamp("2030-01-01T23:59:00+00:00"), "Trade window END")
+startState = input.int(0, "Start at state (0=BP1 .. 3=BP4)", minval=0, maxval=3)
+
+STEP_TIMEOUT_BARS = 8
+
+var int   state     = startState
+var int   markBar   = na
+var int   legs      = 0
+var bool  announced = false
+var float tpLevel   = na
+var float posMark   = na
+
+started  = time >= winStart
+canPlace = started and time <= winEnd
+pos      = strategy.position_size
+
+if started
+    if not announced
+        log.info("[BP] === PYRAMID + SCALE-OUT — 3-unit stack then 3 different partial teardowns. startState={0} ===", startState)
+        announced := true
+    log.info("[BP] bar={0} close={1} state={2} legs={3} pos={4} avg={5}", bar_index,
+             str.tostring(close, format.mintick), state, legs,
+             str.tostring(pos, "#.#####"),
+             str.tostring(strategy.position_avg_price, format.mintick))
+
+// --- BP1: build the stack, one market entry per bar -------------------------
+if canPlace and state == 0 and legs < 3 and pos == legs * 0.001
+    legs := legs + 1
+    entryId = "E" + str.tostring(legs)
+    strategy.entry(entryId, strategy.long, comment="BP1 leg " + str.tostring(legs))
+    markBar := bar_index
+    log.info("[BP] BP1 PLACE market entry {0} (leg {1}/3) — expect pos to reach {2}",
+             entryId, legs, str.tostring(legs * 0.001, "#.#####"))
+
+if state == 0 and legs == 3 and pos >= 0.003
+    log.info("[BP] BP1 DONE — 3-unit stack built, pos={0} avg={1}; ledger must show 3 fills",
+             str.tostring(pos, "#.#####"),
+             str.tostring(strategy.position_avg_price, format.mintick))
+    state := 1
+    markBar := na
+
+// --- BP2: partial LIMIT exit of one unit ------------------------------------
+if canPlace and state == 1 and na(markBar)
+    tpLevel := close * 1.0003
+    strategy.exit("X1", from_entry="E1", qty=0.001, limit=tpLevel, comment_profit="BP2 tp")
+    markBar := bar_index
+    posMark := pos
+    log.info("[BP] BP2 PLACE partial exit X1 from E1 qty=0.001 limit={0} — exit qty < pos({1}); "
+             + "the other 2 units must stay open", str.tostring(tpLevel, format.mintick),
+             str.tostring(pos, "#.#####"))
+
+if state == 1 and not na(markBar) and not na(posMark) and pos < posMark
+    log.info("[BP] BP2 DONE — partial exit filled, pos={0} (2 units remain)",
+             str.tostring(pos, "#.#####"))
+    state := 2
+    markBar := na
+
+if state == 1 and not na(markBar) and bar_index - markBar >= STEP_TIMEOUT_BARS
+    strategy.cancel("X1")
+    log.info("[BP] BP2 TIMEOUT after {0} bars — TP never filled; cancelling and advancing",
+             STEP_TIMEOUT_BARS)
+    state := 2
+    markBar := na
+
+// --- BP3: partial MARKET close of one unit ----------------------------------
+if canPlace and state == 2 and na(markBar)
+    strategy.close("E2", qty=0.001, comment="BP3 partial close")
+    markBar := bar_index
+    posMark := pos
+    log.info("[BP] BP3 PLACE market close of E2 qty=0.001 — partial close against a "
+             + "multi-entry position (FIFO attribution)")
+
+if state == 2 and not na(markBar) and not na(posMark) and pos < posMark
+    log.info("[BP] BP3 DONE — partial close filled, pos={0} (1 unit remains)",
+             str.tostring(pos, "#.#####"))
+    state := 3
+    markBar := na
+
+if state == 2 and not na(markBar) and bar_index - markBar >= STEP_TIMEOUT_BARS
+    log.error("[BP] BP3 TIMEOUT after {0} bars — partial close never reduced the position; advancing to close_all", STEP_TIMEOUT_BARS)
+    state := 3
+    markBar := na
+
+// --- BP4: close_all ---------------------------------------------------------
+if canPlace and state == 3 and na(markBar) and pos > 0
+    strategy.close_all(comment="BP4 close_all")
+    markBar := bar_index
+    log.info("[BP] BP4 PLACE close_all — tearing down the remainder ({0})",
+             str.tostring(pos, "#.#####"))
+
+if state == 3 and not na(markBar) and pos == 0
+    log.info("[BP] BP4 DONE — flat. === ALL PYRAMID CASES DONE. Verify at the venue: "
+             + "flat, nothing working, ledger net_base back to 0. ===")
+    state := 4
+    markBar := na
+
+plot(state, "state", display=display.data_window)
+plot(pos, "pos", display=display.data_window)
+plot(legs, "legs", display=display.data_window)
