@@ -89,6 +89,13 @@ class BinanceSpotPort:
         qty_step = plugin.qty_step
         self.position_dust_threshold = (
             Decimal(str(qty_step)) if qty_step > 0 else Decimal(0))
+        limits = market.get('limits', {}) or {}
+        minimum_amount = (limits.get('amount', {}) or {}).get('min')
+        minimum_cost = (limits.get('cost', {}) or {}).get('min')
+        self._minimum_sell_amount = (
+            Decimal(str(minimum_amount)) if minimum_amount else Decimal(0))
+        self._minimum_sell_notional = (
+            Decimal(str(minimum_cost)) if minimum_cost else Decimal(0))
 
     async def fetch_executions(self, cursor: str | None) -> SpotExecutionBatch:
         """Bot fills after trade-id ``cursor`` (exclusive), oldest first.
@@ -126,6 +133,27 @@ class BinanceSpotPort:
             next_cursor=str(last_id),
             has_more=len(trades) >= _TRADES_PAGE_LIMIT,
         )
+
+    async def min_sellable_base(self) -> Decimal | None:
+        """Smallest base quantity Binance would accept as a SELL right now.
+
+        Folds the two spot sell constraints the preflight already enforces —
+        ``LOT_SIZE`` minimum quantity and ``MIN_NOTIONAL`` converted at the
+        last observed price. Returns ``None`` while the notional bound cannot
+        be converted (no price seen yet), so the manager retries later instead
+        of compacting on a guess.
+
+        Errs LOW by construction: the notional floor is NOT rounded up onto
+        the quantity grid, because an overestimate would retire genuinely
+        sellable inventory into the epoch baseline.
+        """
+        floor = self._minimum_sell_amount
+        if self._minimum_sell_notional > 0:
+            last_price = self._plugin._last_price
+            if not last_price or last_price <= 0:
+                return None
+            floor = max(floor, self._minimum_sell_notional / Decimal(str(last_price)))
+        return floor if floor > 0 else None
 
     async def fetch_base_balance(self) -> Decimal:
         """TOTAL owned base asset — free + locked in open orders."""
