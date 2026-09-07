@@ -310,6 +310,47 @@ def __test_own_filled_position_row_is_never_a_residue__(fake_client, tmp_path):
         store.close()
 
 
+# --- #76: the tracker's time discipline, exercised for real ------------------
+# Every broker-driven test above runs grace=0; these pin the budget guards
+# the #74 panel demanded (P2), directly on the pure module with an injected
+# clock. Wrong impl caught: a tracker that confirms before grace, or every
+# cycle after it (the measured S3-DOA failure mode: 7,200 history calls/h).
+
+def __test_grace_gates_the_first_confirm__():
+    from pynecore_dnse.residue_detector import ResidueTracker
+
+    tracker = ResidueTracker(grace_s=30.0)
+    common = dict(tracked_ids={"437346"}, present_ids=set(),
+                  all_books_readable=True)
+    assert tracker.observe(now=0.0, **common) is None, "first absence stamps only"
+    assert tracker.observe(now=10.0, **common) is None, (
+        "10 s < 30 s grace: the measured ~10 s replica flap must never "
+        "reach a confirm")
+    assert tracker.observe(now=31.0, **common) == "437346"
+
+
+def __test_cooldown_spaces_repeat_confirms__():
+    from pynecore_dnse.residue_detector import ResidueTracker
+
+    tracker = ResidueTracker(grace_s=30.0)
+    common = dict(tracked_ids={"437346"}, present_ids=set(),
+                  all_books_readable=True)
+    tracker.observe(now=0.0, **common)
+    assert tracker.observe(now=31.0, **common) == "437346"
+    assert tracker.record_confirm("437346", concluded=False) is None
+    assert tracker.observe(now=40.0, **common) is None, (
+        "9 s after an inconclusive confirm: the cooldown (= grace) must "
+        "hold — one confirm per cooldown, never one per cycle")
+    assert tracker.observe(now=62.0, **common) == "437346"
+    assert tracker.record_confirm("unknown-id", concluded=False) is None
+    assert tracker.record_confirm("437346", concluded=True) is None
+    assert tracker.observe(now=93.0, **common) is None, (
+        "a CONCLUDED id was dropped — its next absence re-stamps fresh and "
+        "must wait out the full grace again, never inherit the old clock")
+    state = tracker._states["437346"]
+    assert state.missing_since == 93.0 and state.inconclusive_count == 0
+
+
 # --- R5 (control): normal terminal transition stays the primary, once -------
 
 def __test_terminal_transition_fires_once_with_no_residue_duplicate__(

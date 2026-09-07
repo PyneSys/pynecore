@@ -269,6 +269,54 @@ def __test_zero_exposure_terminal_still_closes_the_row__(fake_client, tmp_path):
         store.close()
 
 
+# --- #76: the crash-window child chase at restore ----------------------------
+
+def __test_restore_chases_the_child_of_a_journalled_stop_without_child_ref__(
+        fake_client, tmp_path):
+    """#36's crash-window recovery (suite double-check gap, card #76): a
+    journalled STOP row with NO child ref means the parent may have
+    TRIGGERED while we were down — restore must chase the venue detail's
+    externalOrderId and adopt the child (identity + NORMAL category + the
+    journalled child ref). Wrong impl caught: a restore that skips the
+    chase leaves the triggered stop's working child unattributed — the
+    exact 'fill on an id we never placed' blindness of #39."""
+    from pynecore_dnse.journal_wiring import iter_journal_identities
+
+    parent_id = "da203hg6p09g1n1vipog"
+    b1 = _broker(fake_client, tmp_path,
+                 post_order=(201, {"id": parent_id, "symbol": "VN30F1M",
+                                   "side": "NB", "quantity": 1,
+                                   "orderStatus": "New"}))
+    store, ctx = _open_store_ctx(tmp_path, b1)
+    asyncio.run(b1.execute_entry(DispatchEnvelope(
+        intent=EntryIntent(pine_id="S", symbol="VN30F1M", side="buy", qty=1,
+                           order_type=OrderType.STOP, stop=1520.0),
+        run_tag="abcd", bar_ts_ms=1_700_000_000_000, retry_seq=0,
+        coid_max_len=30)))
+    ctx.close()
+    store.close()                        # crash: parent journalled, NO child ref
+
+    b2 = _broker(fake_client, tmp_path,
+                 get_orders=(200, {"orders": [], "totalPages": 1}),
+                 get_order_detail=(200, {"id": parent_id,
+                                         "orderStatus": "Activated",
+                                         "externalOrderId": "437400"}))
+    store2, ctx2 = _open_store_ctx(tmp_path, b2)
+    try:
+        asyncio.run(b2.connect())
+
+        pine_id, _from_entry, _leg = b2._identity_for("437400")
+        assert pine_id == "S", (
+            "the triggered parent's NORMAL-book child was not adopted at "
+            "restore — the chase (#36 crash window) did not run")
+        assert b2._order_category.get("437400") == "NORMAL"
+        chased = [j for j in iter_journal_identities(ctx2)
+                  if j.child_id == "437400"]
+        assert chased, "the chased child must be journalled as the parent's ref"
+    finally:
+        store2.close()
+
+
 # --- widened None-store control: the cancel path -----------------------------
 
 def __test_without_store_ctx_cancel_works_as_today__(fake_client, tmp_path):

@@ -246,3 +246,26 @@ def __test_client_wrapper_sends_page_size__():
     assert seen["method"] == "GET"
     assert seen["path"] == "/accounts/ACC001/positions"
     assert seen["query"] == {"marketType": "DERIVATIVE", "pageSize": 500}
+
+
+# --- #76: the unparseable-total fail-open is a DESIGN, pinned ----------------
+
+def __test_unparseable_positions_total_is_never_proof_of_truncation__():
+    """#62 G1/G2b (suite double-check gap, card #76): ``positions_complete``
+    treats absent OR unparseable ``total`` metadata as complete — garbage
+    metadata is never proof of truncation. This deliberately OPPOSES
+    ``book_page_count``, where an unparseable ``totalPages`` makes the whole
+    book unreadable. Wrong impl caught: a 'consistency' refactor flipping
+    the positions read to fail-closed would raise on every venue reply
+    whose envelope drops ``total`` — a read outage manufactured from
+    cosmetic metadata."""
+    from pynecore_dnse.page_completeness import (
+        book_page_count, positions_complete,
+    )
+
+    assert positions_complete(3, None) is True
+    assert positions_complete(3, "not-a-number") is True
+    assert positions_complete(3, object()) is True
+    assert positions_complete(3, "7") is False        # parseable still enforces
+    assert book_page_count("not-a-number") is None, (
+        "the book side stays fail-closed — the asymmetry is the design")
