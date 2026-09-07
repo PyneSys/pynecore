@@ -560,3 +560,25 @@ def __test_crossed_detection_fails_open_to_conditional__(fake_client, tmp_path):
     asyncio.run(b.execute_entry(envelope))
     args, kwargs = _last_call(b._client, "post_order")
     assert kwargs["order_category"] == "STOP", "fail-open: unreadable price keeps the conditional path"
+
+
+# --- #78: order_type derived from stopPrice, not hardcoded --------------------
+
+def __test_to_exchange_order_stop_row_is_stop_type__(fake_client, tmp_path):
+    """A conditional row (carries stopPrice) must map to OrderType.STOP, not
+    LIMIT. Reachable since #77 populated the restart snapshot: the engine's
+    reconstruction reads stop_price for a STOP and price for a LIMIT, so a
+    hardcoded LIMIT rebuilt a re-owned stop entry as a limit AT the stop
+    price (marketable, wrong side of the book)."""
+    b = _broker(fake_client, tmp_path)
+    stop = b._to_exchange_order({"id": "1", "symbol": "VN30F1M", "side": "NB",
+                                 "quantity": 1, "orderStatus": "New",
+                                 "stopPrice": 1520.0, "price": 1520.0})
+    assert stop.order_type is OrderType.STOP
+    assert stop.stop_price == 1520.0
+
+    limit = b._to_exchange_order({"id": "2", "symbol": "VN30F1M", "side": "NB",
+                                  "quantity": 1, "orderStatus": "New",
+                                  "price": 1490.0})
+    assert limit.order_type is OrderType.LIMIT
+    assert limit.stop_price is None

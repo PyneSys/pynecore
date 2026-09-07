@@ -588,11 +588,18 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         filled = float(raw.get("fillQuantity") or 0)
         qty = float(raw.get("quantity") or 0)
         stop_price = raw.get("stopPrice")
+        # A conditional row carries a stopPrice; a plain LO does not (#78).
+        # OrderType has no STOP_LIMIT, so a stop-limit maps to STOP too — the
+        # engine's restart reconstruction reads stop_price for a STOP and
+        # price for a LIMIT, so a hardcoded LIMIT here rebuilt a re-owned
+        # stop entry as a limit AT the stop price (marketable, wrong book).
+        # Reachable since #77 made the restart snapshot non-empty.
+        has_stop = stop_price is not None and float(stop_price or 0) != 0.0
         return ExchangeOrder(
             id=str(raw.get("id")),
             symbol=raw.get("symbol") or self.symbol or "",
             side=_DNSE_TO_SIDE.get(raw.get("side", ""), "buy"),
-            order_type=OrderType.LIMIT,
+            order_type=OrderType.STOP if has_stop else OrderType.LIMIT,
             qty=qty, filled_qty=filled,
             remaining_qty=float(raw.get("leaveQuantity") or max(qty - filled, 0)),
             price=float(raw.get("price") or 0) or None,
