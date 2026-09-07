@@ -49,16 +49,30 @@ def journal_submitted(store_ctx, *, coid, symbol, side, qty, intent_key,
     if store_ctx is None or not coid:
         return
     row = store_ctx.get_order(coid)
-    if row is not None and row.closed_ts_ms is not None:
+    reopened = row is not None and row.closed_ts_ms is not None
+    if reopened:
         store_ctx.reopen_order(coid)
+    # A reopened row is a NEW submission on a DETERMINISTIC client-order-id
+    # (same run_tag+pine+bar hash every run — the row is reused). Its
+    # extras still carry the PRIOR order's terminal markers, and
+    # ``_merged_extras`` preserves them; a stale ``terminal_status`` then
+    # makes the restart entry scan (#77) treat this live order as
+    # already-terminal and skip it, and stale #56 fill watermarks would
+    # dedup a real fill away. Clear all three on reopen. (Measured live
+    # 2026-09-07: a reopened T16 entry was invisible to reconstruction and
+    # cancel_all could not reach it.)
+    extras = _merged_extras(store_ctx, coid,
+                            dnse_category=category, order_type=order_type,
+                            leg_kind=leg_kind or "", submitted_price=price)
+    if reopened:
+        for stale in ("terminal_status", "last_raw_status",
+                      "last_fill_venue_id"):
+            extras.pop(stale, None)
     store_ctx.upsert_order(
         coid, symbol=symbol, side=side, qty=float(qty),
         state=STATE_SUBMITTED, intent_key=intent_key or "",
         pine_entry_id=pine_id or "", from_entry=from_entry,
-        extras=_merged_extras(store_ctx, coid,
-                              dnse_category=category, order_type=order_type,
-                              leg_kind=leg_kind or "",
-                              submitted_price=price))
+        extras=extras)
 
 
 def journal_server_ref(store_ctx, *, coid, venue_id, category,

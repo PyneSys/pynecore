@@ -339,3 +339,43 @@ def __test_without_store_ctx_cancel_works_as_today__(fake_client, tmp_path):
     outcome = asyncio.run(b.execute_cancel_with_outcome(envelope))
 
     assert outcome is CancelDispositionOutcome.CANCEL_CONFIRMED
+
+
+# --- #77 live 2026-09-07: reopen must clear stale terminal markers -----------
+
+def __test_reopen_clears_stale_terminal_markers__(fake_client, tmp_path):
+    """The client-order-id is deterministic, so the journal ROW is reused
+    across runs. After a prior run's order was cancelled/filled, its extras
+    carry terminal_status / last_raw_status / last_fill_venue_id; a fresh
+    submission reopens the SAME row and _merged_extras would preserve them.
+    A stale terminal_status made the #77 restart scan skip a live entry
+    (measured live: T16 stranded); a stale fill watermark would dedup a
+    real fill away. Reopen must clear all three."""
+    from pynecore_dnse.journal_wiring import journal_submitted, journal_terminal
+
+    b = _broker(fake_client, tmp_path, post_order=_PLACED)
+    store, ctx = _open_store_ctx(tmp_path, b)
+    try:
+        # Run 1: place then cancel (writes terminal_status, closes the row).
+        asyncio.run(b.execute_entry(_entry_envelope()))
+        coid = next(iter(ctx.iter_live_orders(symbol="VN30F1M"))).client_order_id
+        journal_terminal(ctx, venue_id="437346", terminal_status="Canceled")
+        assert list(ctx.iter_live_orders(symbol="VN30F1M")) == [], "row closed"
+        assert (ctx.get_order(coid).extras or {}).get("terminal_status") == "Canceled"
+
+        # Run 2: the SAME coid is re-submitted (deterministic id) -> reopen.
+        journal_submitted(
+            ctx, coid=coid, symbol="VN30F1M", side="buy", qty=1,
+            intent_key="k2", pine_id="L", from_entry=None, leg_kind="ENTRY",
+            category="NORMAL", order_type="LO", price=1500.0)
+
+        live = list(ctx.iter_live_orders(symbol="VN30F1M"))
+        assert len(live) == 1, "the reopened row must be live again"
+        extras = live[0].extras or {}
+        assert "terminal_status" not in extras, (
+            "reopen kept a stale terminal_status — the #77 restart scan "
+            "would skip this live entry as already-terminal (measured live)")
+        assert "last_raw_status" not in extras
+        assert "last_fill_venue_id" not in extras
+    finally:
+        store.close()

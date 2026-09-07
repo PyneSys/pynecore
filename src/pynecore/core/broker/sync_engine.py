@@ -2296,10 +2296,6 @@ class OrderSyncEngine:
             ``lib.last_bar_time`` at the call site). Anchors the stale-window
             timer for the native-failsafe rehydrate, exactly as in :meth:`sync`.
         """
-        _blog_info(
-            "DIAG#77 settle_restart_state: bracket_done=%s scan_done=%s "
-            "store=%s", self._pine_bracket_reconstruct_done,
-            self._restart_entry_scan_done, self._store_ctx is not None)
         if self._pine_bracket_reconstruct_done:
             return
         self._current_bar_ts_ms = bar_ts_ms
