@@ -1232,8 +1232,43 @@ def _na_sorts_first(sample: Any) -> bool:
 
 
 # noinspection PyShadowingBuiltins
-def sort(id: list[int | float | str] | SequenceView[int | float | str],
-         order: _order.Order = _order.ascending) -> None:
+def _sorted_positions(id: Any, order: _order.Order, sort_field: str | None) -> list[int]:
+    """
+    Order the array's positions the way Pine sorts them.
+
+    :param id: Input array
+    :param order: Order to sort the elements in
+    :param sort_field: Field of an object element to sort by, None to sort the elements
+    :return: The positions of the elements in their sorted order
+    """
+    # Python's own sort cannot express this: every comparison against na is False,
+    # so a single na element leaves neighbouring values in their original order --
+    # sort([30, na, 10]) did not sort at all. Measured on TradingView:
+    #   sort([30, 20, 10, na])            -> 10, 20, 30, na
+    #   sort([30, 20, 10, na], descending) -> na, 30, 20, 10
+    #   sort(["b", "a", na])              -> na, "a", "b"
+    # A sort_field sorts by the FIELD and moves the whole element; the na rule then
+    # reads the field's type. Measured on TradingView (BINANCE:BTCUSDT 1D) with
+    # elements (3.0, "c"), (1.0, na-string), (na-float, "b"): the float field puts
+    # na last ascending and first descending, the string field puts it first.
+    keys = list(id) if sort_field is None \
+        else [getattr(element, sort_field) for element in id]
+    non_na: list[int] = []
+    nas: list[int] = []
+    for position, key in enumerate(keys):
+        (non_na if key == key else nas).append(position)
+    non_na.sort(key=keys.__getitem__)
+    sample = keys[non_na[0]] if non_na else None
+    positions = nas + non_na if _na_sorts_first(sample) else non_na + nas
+    if order == _order.descending:
+        positions.reverse()
+    return positions
+
+
+# noinspection PyShadowingBuiltins
+def sort(id: list[Any] | SequenceView[Any],
+         order: _order.Order = _order.ascending,
+         sort_field: str | None = None) -> None:
     """
     Sorts the elements in the array in ascending or descending order.
 
@@ -1242,26 +1277,14 @@ def sort(id: list[int | float | str] | SequenceView[int | float | str],
 
     :param id: Input array
     :param order: Order to sort the elements in
+    :param sort_field: Field of an object element to sort by, None to sort the elements
     """
-    # Python's own sort cannot express this: every comparison against na is False,
-    # so a single na element leaves neighbouring values in their original order --
-    # sort([30, na, 10]) did not sort at all. Measured on TradingView:
-    #   sort([30, 20, 10, na])            -> 10, 20, 30, na
-    #   sort([30, 20, 10, na], descending) -> na, 30, 20, 10
-    #   sort(["b", "a", na])              -> na, "a", "b"
-    non_na: list[Any] = []
-    nas: list[Any] = []
-    for value in id:
-        (non_na if value == value else nas).append(value)
-    non_na.sort()
-    ordered = nas + non_na if _na_sorts_first(non_na[0] if non_na else None) else non_na + nas
-    if order == _order.descending:
-        ordered.reverse()
-    id[:] = ordered
+    id[:] = [id[position] for position in _sorted_positions(id, order, sort_field)]
 
 
 # noinspection PyShadowingBuiltins
-def sort_indices(id: list[T], order: _order.Order = _order.ascending) -> list[int]:
+def sort_indices(id: list[T], order: _order.Order = _order.ascending,
+                 sort_field: str | None = None) -> list[int]:
     """
     Returns an array of indices which, when used to index the original array, will access its elements
     in their sorted order. It does not modify the original array.
@@ -1271,20 +1294,12 @@ def sort_indices(id: list[T], order: _order.Order = _order.ascending) -> list[in
 
     :param id: Input array
     :param order: Order to sort the elements in
+    :param sort_field: Field of an object element to sort by, None to sort the elements
     :return: Array of indices to access the elements in their sorted order
     """
     # Measured on TradingView: sort_indices([na, na, 5, 1]) -> 3, 2, 0, 1, so the
     # na indices keep their original relative order at the end of the result.
-    non_na: list[int] = []
-    nas: list[int] = []
-    for i, value in enumerate(id):
-        (non_na if value == value else nas).append(i)
-    non_na.sort(key=id.__getitem__)  # type: ignore[arg-type]
-    sample = id[non_na[0]] if non_na else None
-    indices = nas + non_na if _na_sorts_first(sample) else non_na + nas
-    if order == _order.descending:
-        indices.reverse()
-    return indices
+    return _sorted_positions(id, order, sort_field)
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames

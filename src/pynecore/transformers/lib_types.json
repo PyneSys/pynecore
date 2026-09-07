@@ -903,34 +903,48 @@
    "ret": "b"
   },
   "array.sort": {
-   "default_ty": [
-    "?"
+   "default_none_ok": [
+    false,
+    true
    ],
-   "defaults": 1,
+   "default_ty": [
+    "?",
+    "0"
+   ],
+   "defaults": 2,
    "kind": "function",
    "names": [
     "id",
-    "order"
+    "order",
+    "sort_field"
    ],
    "params": [
     "o",
-    "?"
+    "?",
+    "s"
    ],
    "ret": "v"
   },
   "array.sort_indices": {
-   "default_ty": [
-    "?"
+   "default_none_ok": [
+    false,
+    true
    ],
-   "defaults": 1,
+   "default_ty": [
+    "?",
+    "0"
+   ],
+   "defaults": 2,
    "kind": "function",
    "names": [
     "id",
-    "order"
+    "order",
+    "sort_field"
    ],
    "params": [
     "o",
-    "?"
+    "?",
+    "s"
    ],
    "ret": "a:i"
   },
