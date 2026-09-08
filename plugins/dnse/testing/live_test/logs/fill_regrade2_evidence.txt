@@ -1,0 +1,122 @@
+[BROKER] WS connect starting (warmup blocks until subscribed)
+[BROKER] journal restore: re-owned 12 venue id(s) from the run's journal rows (#36) — foreign book rows untouched
+[BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[BROKER] authenticated: plugin=DNSEBroker account=0001672126
+[BROKER] warmup phase started — replaying historical bars
+[BROKER] warmup phase complete — 501 bar(s) processed
+[BROKER] live trading active
+[BROKER] restart entry-anchor scan: journal holds 1 live entry order(s) but the venue snapshot matched none — not latching, re-scanning next sync (#77)
+[BROKER] residue: order daf68e8p4g19a630jmng has been missing from every readable book for 3 inconclusive confirms — no positive /orders/history record 
+[F] === STAGED FILL — window open. 8 fill cases, 1 contract each, flatten on sight, protection armed at placement. startState=4 ===
+[F] bar=503 close=1967 state=4 pending=no flattening=no retries=0 pos=0
+[F] F5 PLACE long STOP-LIMIT stop=1966.5 limit=1966.9 — #14: must go out as ONE STOP carrying a limit, not an OCO pair
+[BROKER] dispatching ENTRY BUY id='E' qty=1.0 type=limit limit=1966.8 stop=1966.5
+[BROKER] crossed stop at placement -> immediate capped LO (Pine: instant entry) | E/entry intent=E stop=1966.5
+[BROKER] dispatched ENTRY BUY id='E' qty=1.0 type=limit limit=1966.8 stop=1966.5 -> 
+[BROKER] Exit P|E skipped: parent entry unfilled / no position to protect (#82b); re-evaluating next sync.
+[BROKER] event REJECTED id=13216 side=buy qty=1.0 filled=0.0 pine='E' leg=entry
+[BROKER] order rejected for intent E (REJECTED id=13216 side=buy qty=1.0 filled=0.0 pine='E' leg=entry)
+[F] bar=504 close=1967.4 state=4 pending=yes flattening=no retries=0 pos=0
+[BROKER] dispatching ENTRY BUY id='E' qty=1.0 type=limit limit=1966.8 stop=1966.5
+[BROKER] crossed stop at placement -> immediate capped LO (Pine: instant entry) | E/entry intent=E stop=1966.5
+[BROKER] armed entry-stop watch for 'E': native LIMIT rests, software STOP @ 1966.5 fires a market on cross
+[BROKER] dispatched ENTRY BUY id='E' qty=1.0 type=limit limit=1966.8 stop=1966.5 -> 
+[BROKER] entry-stop 'E' crossed (price=1967.4 stop=1966.5): cancelling native LIMIT before firing market
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] event REJECTED id=14656 side=buy qty=1.0 filled=0.0 pine='E' leg=entry
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] entry-stop 'E': native LIMIT already filled — limit won the OCO, no market fired
+[BROKER] order rejected for intent E (REJECTED id=14656 side=buy qty=1.0 filled=0.0 pine='E' leg=entry)
+[F] bar=505 close=1968 state=4 pending=yes flattening=no retries=0 pos=0
+[BROKER] dispatching ENTRY BUY id='E' qty=1.0 type=limit limit=1966.8 stop=1966.5
+[BROKER] crossed stop at placement -> immediate capped LO (Pine: instant entry) | E/entry intent=E stop=1966.5
+[BROKER] armed entry-stop watch for 'E': native LIMIT rests, software STOP @ 1966.5 fires a market on cross
+[BROKER] dispatched ENTRY BUY id='E' qty=1.0 type=limit limit=1966.8 stop=1966.5 -> 
+[BROKER] entry-stop 'E' crossed (price=1968.0 stop=1966.5): cancelling native LIMIT before firing market
+[BROKER] cancel
+[BROKER] event REJECTED id=16826 side=buy qty=1.0 filled=0.0 pine='E' leg=entry
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] entry-stop 'E': native LIMIT already filled — limit won the OCO, no market fired
+[BROKER] order rejected for intent E (REJECTED id=16826 side=buy qty=1.0 filled=0.0 pine='E' leg=entry)
+[F] bar=506 close=1966.1 state=4 pending=yes flattening=no retries=0 pos=0
+[BROKER] dispatching ENTRY BUY id='E' qty=1.0 type=limit limit=1966.8 stop=1966.5
+[BROKER] armed entry-stop watch for 'E': native LIMIT rests, software STOP @ 1966.5 fires a market on cross
+[BROKER] dispatched ENTRY BUY id='E' qty=1.0 type=limit limit=1966.8 stop=1966.5 -> 
+[BROKER] event REJECTED id=dafn0nop4g19a630lb8g side=buy qty=1.0 filled=0.0 pine='E' leg=entry
+[BROKER] order rejected for intent E (REJECTED id=dafn0nop4g19a630lb8g side=buy qty=1.0 filled=0.0 pine='E' leg=entry)
+[F] bar=507 close=1966.1 state=4 pending=yes flattening=no retries=0 pos=0
+[BROKER] dispatching ENTRY BUY id='E' qty=1.0 type=limit limit=1966.8 stop=1966.5
+[BROKER] armed entry-stop watch for 'E': native LIMIT rests, software STOP @ 1966.5 fires a market on cross
+[BROKER] dispatched ENTRY BUY id='E' qty=1.0 type=limit limit=1966.8 stop=1966.5 -> 
+[BROKER] event CREATED id=dafn158p4g19a630lba0 side=buy qty=1.0 filled=0.0 pine='E' leg=entry
+[BROKER] event REJECTED id=dafn158p4g19a630lba0 side=buy qty=1.0 filled=0.0 pine='E' leg=entry
+[BROKER] order rejected for intent E (REJECTED id=dafn158p4g19a630lba0 side=buy qty=1.0 filled=0.0 pine='E' leg=entry)
+[F] bar=508 close=1966.5 state=4 pending=yes flattening=no retries=0 pos=0
+[BROKER] dispatching ENTRY BUY id='E' qty=1.0 type=limit limit=1966.8 stop=1966.5
+[BROKER] crossed stop at placement -> immediate capped LO (Pine: instant entry) | E/entry intent=E stop=1966.5
+[BROKER] armed entry-stop watch for 'E': native LIMIT rests, software STOP @ 1966.5 fires a market on cross
+[BROKER] dispatched ENTRY BUY id='E' qty=1.0 type=limit limit=1966.8 stop=1966.5 -> 
+[BROKER] entry-stop 'E' crossed (price=1966.5 stop=1966.5): cancelling native LIMIT before firing market
+[BROKER] event REJECTED id=19056 side=buy qty=1.0 filled=0.0 pine='E' leg=entry
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] entry-stop 'E': native LIMIT already filled — limit won the OCO, no market fired
+[BROKER] order rejected for intent E (REJECTED id=19056 side=buy qty=1.0 filled=0.0 pine='E' leg=entry)
+[F] bar=509 close=1966.6 state=4 pending=yes flattening=no retries=0 pos=0
+[F] F5 TIMEOUT after 6 bars — cancelled all, RETRY 1/1 with fresh levels next bar
+[F] bar=510 close=1965.4 state=4 pending=no flattening=no retries=1 pos=0
+[F] F5 PLACE long STOP-LIMIT stop=1967.4 limit=1967.8 — #14: must go out as ONE STOP carrying a limit, not an OCO pair
+[BROKER] dispatching ENTRY BUY id='E' qty=1.0 type=limit limit=1967.7 stop=1967.4
+[BROKER] armed entry-stop watch for 'E': native LIMIT rests, software STOP @ 1967.4 fires a market on cross
+[BROKER] dispatched ENTRY BUY id='E' qty=1.0 type=limit limit=1967.7 stop=1967.4 -> 
+[BROKER] event CREATED id=dafn2i8p4g19a630lbe0 side=buy qty=1.0 filled=0.0 pine='E' leg=entry
+[F] bar=511 close=1964.6 state=4 pending=yes flattening=no retries=1 pos=0
+[F] bar=512 close=1963.7 state=4 pending=yes flattening=no retries=1 pos=0
+[F] bar=513 close=1963.4 state=4 pending=yes flattening=no retries=1 pos=0
+[F] bar=514 close=1964.3 state=4 pending=yes flattening=no retries=1 pos=0
+[F] bar=515 close=1963.9 state=4 pending=yes flattening=no retries=1 pos=0
+[F] bar=516 close=1963.1 state=4 pending=yes flattening=no retries=1 pos=0
+[F] F5 SKIP — no fill after retry (quiet tape); state 4->5
+[BROKER] cancelling CANCEL id='E'
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel of E did not land (execute_cancel returned False); entering cancel-tentative — the outcome-based retry loop resolves it (partial        
+[BROKER] cancel
+[BROKER] event CANCELLED id=dafn2i8p4g19a630lbe0 side=buy qty=1.0 filled=0.0 pine='E' leg=entry
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] cancel
+[BROKER] unexpected cancel for intent E (CANCELLED id=dafn2i8p4g19a630lbe0 side=buy qty=1.0 filled=0.0 pine='E' leg=entry)
+[BROKER] sync engine quarantined: Bot-owned order cancelled unexpectedly on the venue: coid=None ref='dafn2i8p4g19a630lbe0' intent='E' (intent_key=None,
+[F] bar=517 close=1962 state=5 pending=no flattening=no retries=0 pos=0
+[F] F6 PLACE short STOP-LIMIT stop=1963 limit=1962.6
+[BROKER] entry dispatch ENTRY SELL id='E' qty=1.0 type=limit limit=1962.7 stop=1963.0 blocked by quarantine (Bot-owned order cancelled unexpectedly on  
+[BROKER] Entry dispatch blocked by quarantine on VN30F1M (pine_id='E'); signal dropped, no broker call.
+[BROKER] run stopped (completed) position=flat equity=376,522,210.00 VND
