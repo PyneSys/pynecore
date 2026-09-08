@@ -1,0 +1,72 @@
+[2026-09-08 01:59:09+0000] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-09-08 01:59:10+0000] bar:      0 INFO     [BROKER] Binance connected: account=binance-testnet-1786972114406718119
+[2026-09-08 01:59:10+0000] bar:      0 INFO     [BROKER] WS connected and subscribed: BinanceBroker @1
+[2026-09-08 01:59:13+0000] bar:      0 INFO     [BROKER] spot inventory ready: net_base=0 fills=0 (recovered=0, adopted=0)
+[2026-09-08 01:59:14+0000] bar:      0 INFO     [BROKER] authenticated: plugin=BinanceBroker account=binance-testnet-1786972114406718119
+[2026-09-08 01:59:14+0000] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-09-08 01:58:00+0000] bar:    499 INFO     [BROKER] warmup phase complete — 500 bar(s) processed
+[2026-09-08 01:58:00+0000] bar:    499 INFO     [BROKER] live trading active
+[2026-09-08 02:02:00+0000] bar:    503 INFO     [B1] === BINANCE STAGED PLACE/CANCEL — long-only spot port of DNSE T1-T13. qty 0.001 BTC, every order >=4% away. startState=3 ===
+[2026-09-08 02:02:00+0000] bar:    503 INFO     [B1] TEST B4 PLACE limit=75431.74 + X4 stop=74637.72 (oca) — next bar cancels ENTRY ONLY; observe whether X4 remains (DNSE: orphan expected, #19)
+[2026-09-08 02:02:00+0000] bar:    503 INFO     [BROKER] dispatching ENTRY BUY id='B4' qty=0.001 type=limit limit=75431.73
+[2026-09-08 02:02:00+0000] bar:    503 INFO     [BROKER] dispatched ENTRY BUY id='B4' qty=0.001 type=limit limit=75431.73 -> ['13326572']
+[2026-09-08 02:02:00+0000] bar:    503 WARNING  [BROKER] Exit X4|B4 skipped: parent entry unfilled / no position to protect (#82b); re-evaluating next sync.
+[2026-09-08 02:03:00+0000] bar:    504 INFO     [B1] TEST B4 CANCEL B4 ONLY — observe X4 at the venue
+[2026-09-08 02:03:00+0000] bar:    504 INFO     [B1] TEST state 3->4
+[2026-09-08 02:03:00+0000] bar:    504 INFO     [BROKER] cancelling CANCEL id='B4'
+[2026-09-08 02:03:00+0000] bar:    504 INFO     [BROKER] event CANCELLED id=13326572 side=buy qty=0.001 filled=0.0 pine='B4' leg=entry
+[2026-09-08 02:04:00+0000] bar:    505 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=13326572 side=buy qty=0.001 filled=0.0 pine='B4' leg=entry)
+[2026-09-08 02:04:00+0000] bar:    505 INFO     [B1] TEST B5 PLACE limit=75414.81 + X5 tp=83353.21/sl=74620.97 — the tp+sl pair routes to the NATIVE spot OCO (orderList). Next bar cancels ENTRY ONLY; 
+[2026-09-08 02:04:00+0000] bar:    505 INFO     [BROKER] dispatching ENTRY BUY id='B5' qty=0.001 type=limit limit=75414.8
+[2026-09-08 02:04:00+0000] bar:    505 INFO     [BROKER] dispatched ENTRY BUY id='B5' qty=0.001 type=limit limit=75414.8 -> ['13327122']
+[2026-09-08 02:04:00+0000] bar:    505 WARNING  [BROKER] Exit X5|B5 skipped: parent entry unfilled / no position to protect (#82b); re-evaluating next sync.
+[2026-09-08 02:05:00+0000] bar:    506 INFO     [B1] TEST B5 CANCEL B5 ONLY — observe the X5 OCO legs
+[2026-09-08 02:05:00+0000] bar:    506 INFO     [B1] TEST state 4->5
+[2026-09-08 02:05:00+0000] bar:    506 INFO     [BROKER] cancelling CANCEL id='B5'
+[2026-09-08 02:05:00+0000] bar:    506 INFO     [BROKER] event CANCELLED id=13327122 side=buy qty=0.001 filled=0.0 pine='B5' leg=entry
+[2026-09-08 02:06:00+0000] bar:    507 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=13327122 side=buy qty=0.001 filled=0.0 pine='B5' leg=entry)
+[2026-09-08 02:06:00+0000] bar:    507 INFO     [B1] TEST B6 PLACE long limit=75402.31 (-5%) — NEXT bar re-issues at 75799.16 (-4.5%): plugin amend is cancel+replace (SOFTWARE); expect a fresh venue  
+[2026-09-08 02:06:00+0000] bar:    507 INFO     [BROKER] dispatching ENTRY BUY id='B6' qty=0.001 type=limit limit=75402.3
+[2026-09-08 02:06:00+0000] bar:    507 INFO     [BROKER] dispatched ENTRY BUY id='B6' qty=0.001 type=limit limit=75402.3 -> ['13327636']
+[2026-09-08 02:07:00+0000] bar:    508 INFO     [B1] TEST B6 AMEND -> limit 75799.16 — expect cancel+replace, new venue id
+[2026-09-08 02:07:00+0000] bar:    508 INFO     [BROKER] modifying ENTRY BUY id='B6' qty=0.001 type=limit limit=75402.3 -> ENTRY BUY id='B6' qty=0.001 type=limit limit=75799.16
+[2026-09-08 02:07:00+0000] bar:    508 INFO     [BROKER] event CANCELLED id=13327636 side=buy qty=0.001 filled=0.0 pine='B6' leg=entry
+[2026-09-08 02:08:00+0000] bar:    509 INFO     [BROKER] external cancel observed (CANCELLED id=13327636 side=buy qty=0.001 filled=0.0 pine='B6' leg=entry)
+[2026-09-08 02:08:00+0000] bar:    509 INFO     [B1] TEST B6 CANCEL (post-amend)
+[2026-09-08 02:08:00+0000] bar:    509 INFO     [B1] TEST state 5->6
+[2026-09-08 02:08:00+0000] bar:    509 INFO     [BROKER] cancelling CANCEL id='B6'
+[2026-09-08 02:08:00+0000] bar:    509 INFO     [BROKER] event CANCELLED id=13328005 side=buy qty=0.001 filled=0.0 pine='B6' leg=entry
+[2026-09-08 02:09:00+0000] bar:    510 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=13328005 side=buy qty=0.001 filled=0.0 pine='B6' leg=entry)
+[2026-09-08 02:09:00+0000] bar:    510 INFO     [B1] TEST B7 PLACE buy-STOP 83297.21 (+5%) — NEXT bar re-issues at 82900.56 (+4.5%): amend on a STOP_LOSS_LIMIT (DNSE 500d here, #18; Binance should    
+[2026-09-08 02:09:00+0000] bar:    510 INFO     [BROKER] dispatching ENTRY BUY id='B7' qty=0.001 type=stop stop=83297.22
+[2026-09-08 02:09:00+0000] bar:    510 INFO     [BROKER] dispatched ENTRY BUY id='B7' qty=0.001 type=stop stop=83297.22 -> ['13328598']
+[2026-09-08 02:10:00+0000] bar:    511 INFO     [B1] TEST B7 AMEND -> stop 82900.56 — cancel+replace on a conditional; the run must continue and the order must still cancel next bar
+[2026-09-08 02:10:00+0000] bar:    511 INFO     [BROKER] modifying ENTRY BUY id='B7' qty=0.001 type=stop stop=83297.22 -> ENTRY BUY id='B7' qty=0.001 type=stop stop=82900.57
+[2026-09-08 02:11:00+0000] bar:    512 INFO     [BROKER] event CANCELLED id=13328598 side=buy qty=0.001 filled=0.0 pine='B7' leg=entry
+[2026-09-08 02:11:00+0000] bar:    512 INFO     [BROKER] external cancel observed (CANCELLED id=13328598 side=buy qty=0.001 filled=0.0 pine='B7' leg=entry)
+[2026-09-08 02:11:00+0000] bar:    512 INFO     [B1] TEST B7 CANCEL (post-amend)
+[2026-09-08 02:11:00+0000] bar:    512 INFO     [B1] TEST state 6->7
+[2026-09-08 02:11:00+0000] bar:    512 INFO     [BROKER] cancelling CANCEL id='B7'
+[2026-09-08 02:12:00+0000] bar:    513 INFO     [BROKER] event CANCELLED id=13328788 side=buy qty=0.001 filled=0.0 pine='B7' leg=entry
+[2026-09-08 02:12:12+0000] bar:    513 INFO     [BROKER] run stopped (completed) position=flat equity=9,999.33 USDT
+[2026-09-08 02:24:31+0000] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-09-08 02:24:31+0000] bar:      0 INFO     [BROKER] Binance connected: account=binance-testnet-1786972114406718119
+[2026-09-08 02:24:31+0000] bar:      0 INFO     [BROKER] WS connected and subscribed: BinanceBroker @1
+[2026-09-08 02:24:31+0000] bar:      0 INFO     [BROKER] spot inventory ready: net_base=0 fills=0 (recovered=0, adopted=0)
+[2026-09-08 02:24:32+0000] bar:      0 INFO     [BROKER] authenticated: plugin=BinanceBroker account=binance-testnet-1786972114406718119
+[2026-09-08 02:24:32+0000] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-09-08 02:24:00+0000] bar:    499 INFO     [BROKER] warmup phase complete — 500 bar(s) processed
+[2026-09-08 02:24:00+0000] bar:    499 INFO     [BROKER] live trading active
+[2026-09-08 02:28:00+0000] bar:    503 INFO     [B1] === BINANCE STAGED PLACE/CANCEL — long-only spot port of DNSE T1-T13. qty 0.001 BTC, every order >=4% away. startState=7 ===
+[2026-09-08 02:28:00+0000] bar:    503 INFO     [B1] TEST B8 PLACE B8a limit=75312.2 AND B8b stop=83239.8 — next bar strategy.cancel_all(): exercises the native bulk cancel + the expected-cancel sink
+[2026-09-08 02:28:00+0000] bar:    503 INFO     [BROKER] dispatching ENTRY BUY id='B8a' qty=0.001 type=limit limit=75312.2
+[2026-09-08 02:28:00+0000] bar:    503 INFO     [BROKER] dispatched ENTRY BUY id='B8a' qty=0.001 type=limit limit=75312.2 -> ['13334743']
+[2026-09-08 02:28:00+0000] bar:    503 INFO     [BROKER] dispatching ENTRY BUY id='B8b' qty=0.001 type=stop stop=83239.8
+[2026-09-08 02:28:00+0000] bar:    503 INFO     [BROKER] dispatched ENTRY BUY id='B8b' qty=0.001 type=stop stop=83239.8 -> ['13334745']
+[2026-09-08 02:29:00+0000] bar:    504 INFO     [B1] TEST B8 strategy.cancel_all() — both must go; book clear
+[2026-09-08 02:29:00+0000] bar:    504 INFO     [B1] TEST state 7->8
+[2026-09-08 02:29:00+0000] bar:    504 INFO     [BROKER] cancelling CANCEL id='B8a'
+[2026-09-08 02:29:00+0000] bar:    504 INFO     [BROKER] cancelling CANCEL id='B8b'
+[2026-09-08 02:29:00+0000] bar:    504 INFO     [BROKER] event CANCELLED id=13334743 side=buy qty=0.001 filled=0.0 pine='B8a' leg=entry
+[2026-09-08 02:29:00+0000] bar:    504 INFO     [BROKER] event CANCELLED id=13334745 side=buy qty=0.001 filled=0.0 pine='B8b' leg=entry
+[2026-09-08 02:30:38+0000] bar:    505 INFO     [BROKER] run stopped (completed) position=flat equity=9,999.33 USDT

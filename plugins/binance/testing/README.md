@@ -35,6 +35,29 @@ account), but the netting hazard is the same in kind: the account's 1 BTC
 foreign baseline is exactly what makes a naked pre-fill exit *executable*
 rather than venue-rejected.
 
+## Status freshness — what is verified on WHICH code
+
+A ✅ is only as good as the code it ran against. Two changes on 2026-09-07
+invalidate older runs: the **runtime rebase to upstream 6.9.1**, and the
+plugin declaring **`exit_orders_execute_standalone`** (#82b), which changes
+what reaches the venue for any exit dispatched before its entry fills.
+
+| Verified on current code (6.9.1 + #82b) | Still only proven on the 08-17 code |
+|---|---|
+| B0, B1 T03/T04/T05/T06/T07/T08, all B3 (BP1–BP4) | B1 T01, T02, T09, T11, T12, T13; **all B2 (F01–F09)** |
+
+The right-hand column is not "failing" — it is **unverified on today's
+code**. B1 T01/T02/T09/T11–T13 are low-risk (plain place/cancel and OCA
+grouping, no exit legs, so #82b cannot reach them). **B2 is the real gap**:
+those are fill tests whose protections are armed post-fill, so #82b's
+withhold changes their timing, and none has been re-run since. Re-run the
+B2 ladder before treating it as current.
+
+**T10 is absent by design** — DNSE's T10 is the dual-strategy isolation test
+(`run_t10_dual.sh`); it was never ported to Binance. Not a gap in coverage of
+a ported case, but a genuinely uncovered scenario if two bots ever share one
+Binance account.
+
 ## Levels — what the number in `Live-B<N>` means
 
 Mirrors the DNSE suite's `Live-L<level>` scheme; the level is the SCENARIO
@@ -64,11 +87,11 @@ case notes its DNSE ancestor.
 | **Live-B1-T01-LongLimitCancel** (T1) | long limit −5% place→cancel | ✅ 08-17 |
 | **Live-B1-T02-LongLimitCancel4** (T2, long-only) | long limit −4% place→cancel | ✅ 08-17 |
 | **Live-B1-T03-LimitWithStopExit** (T3) | limit + `exit(stop)`. **08-17 (red):** the pre-fill exit REACHED the venue (SELL STOP_LOSS_LIMIT id 3828722 resting against base inventory, no position behind it) — the #82 naked-exit precondition. **09-07 (green, after declaring `exit_orders_execute_standalone`):** engine skips the dispatch (`Exit X3\|B3 skipped … no position to protect (#82b)`), venue record shows **0 SELL orders**, BTC balance unchanged | ✅ 08-17 red / ✅ **09-07 green** (evidence: `evidence_b82b_nofill_2026-09-07.txt`) |
-| **Live-B1-T04-OcaCancelEntryOnly** (T4) | OCA entry+exit, cancel entry only — X4 exit stayed working (orphan, engine #19 shape); swept by the T08 cancel_all | ✅ 08-17 |
-| **Live-B1-T05-NativeOcoCancelEntryOnly** (T5) | entry + `exit(tp+sl)` → NATIVE spot OCO (LIMIT_MAKER + STOP_LOSS_LIMIT legs confirmed at venue), cancel entry only — OCO legs stayed (orphan, ditto) | ✅ 08-17 |
-| **Live-B1-T06-AmendNormal** (T6) | limit re-issue → cancel+replace, fresh venue id, same coid | ✅ 08-17 |
-| **Live-B1-T07-AmendConditional** (T7) | stop re-issue → cancel+replace clean (no DNSE-#18 500 analogue) | ✅ 08-17 |
-| **Live-B1-T08-CancelAll** (T8) | `cancel_all()` — swept both fresh orders AND the T04/T05 orphans; expected-cancel sink kept quarantine quiet | ✅ 08-17 |
+| **Live-B1-T04-OcaCancelEntryOnly** (T4) | OCA entry+exit, cancel entry only. **08-17:** X4 stayed working as an orphan (engine #19 shape), swept later by T08. **09-08 (superseded by #82b):** the entry never fills, so X4 is now WITHHELD (`Exit X4\|B4 skipped … no position to protect`) and no orphan can exist — the #19 orphan shape is unreachable on this venue for a pre-fill exit | ✅ 08-17 / ✅ **09-08 re-verified, behavior changed** |
+| **Live-B1-T05-NativeOcoCancelEntryOnly** (T5) | entry + `exit(tp+sl)` → native spot OCO. **08-17:** both OCO legs reached the venue and stayed as orphans. **09-08 (superseded by #82b):** X5 is WITHHELD pre-fill, so no orderList is created at all. The 08-17 run remains the only live proof that the OCO payload is venue-accepted — re-prove that via BF9/BP2 (post-fill), not here | ✅ 08-17 / ✅ **09-08 re-verified, behavior changed** |
+| **Live-B1-T06-AmendNormal** (T6) | limit re-issue → cancel+replace, fresh venue id, same coid | ✅ 08-17 / ✅ 09-08 |
+| **Live-B1-T07-AmendConditional** (T7) | stop re-issue → cancel+replace clean (no DNSE-#18 500 analogue) | ✅ 08-17 / ✅ 09-08 |
+| **Live-B1-T08-CancelAll** (T8) | `cancel_all()` across a LIMIT + a STOP. **08-17:** swept its own two orders plus the T04/T05 orphans. **09-08:** swept its own two only — there are no orphans left to collect post-#82b; expected-cancel sink still kept quarantine quiet | ✅ 08-17 / ✅ **09-08 re-verified** |
 | **Live-B1-T09-OrderFn** (T9) | `strategy.order()` routing identical to `entry()` | ✅ 08-17 |
 | **Live-B1-T11-OcaCancelMember** (T11) | `oca.cancel` ×3; cancel one member — venue snapshot shows exactly the two siblings still NEW | ✅ 08-17 |
 | **Live-B1-T12-OcaReduce** (T12) | `oca.reduce` pair rests full qty; cancel_all sweeps | ✅ 08-17 |

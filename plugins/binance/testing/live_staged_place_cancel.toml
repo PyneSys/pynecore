@@ -8,6 +8,7 @@
 #pyramiding = 1
 #calc_on_order_fills = false
 #calc_on_every_tick = false
+#calc_on_every_history_tick = false
 #max_bars_back = 0
 #timeframe =
 #timeframe_gaps = true
@@ -40,20 +41,20 @@
 [inputs.winStart]
 # Input metadata, cannot be modified
 # input_type: "int"
-#     defval: 1893456000000
+#     defval: 1893456000000.0
 #      title: "Trade window START"
 #    confirm: false
 # Change here to modify the input value
-value = 1788774734969
+value = 1788834440688
 
 [inputs.winEnd]
 # Input metadata, cannot be modified
 # input_type: "int"
-#     defval: 1893542340000
+#     defval: 1893542340000.0
 #      title: "Trade window END"
 #    confirm: false
 # Change here to modify the input value
-value = 1788775334969
+value = 1788835160688
 
 [inputs.startState]
 # Input metadata, cannot be modified
@@ -64,4 +65,4 @@ value = 1788775334969
 #     maxval: 11
 #    confirm: false
 # Change here to modify the input value
-value = 0
+value = 7
