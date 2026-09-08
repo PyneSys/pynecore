@@ -6319,6 +6319,53 @@ class OrderSyncEngine:
                             intent_key=key,
                         )
                     return
+                if key in self._forced_cancel_pending:
+                    # #83 (measured live, F5 2026-09-08; prior X5|T5
+                    # 2026-08-17): this key has an OUTSTANDING OWN cancel
+                    # that ``execute_cancel`` could not confirm (venue race,
+                    # e.g. DNSE CO-ORD-013 "order is done" → the #55-honest
+                    # ``False``) and parked for per-sync retry — the mapping
+                    # was deliberately kept. The venue's CANCELLED push is
+                    # that cancel LANDING, not an external cancel: firing the
+                    # ``on_unexpected_cancel`` policy here is a false
+                    # quarantine on the strategy's own requested outcome.
+                    # (The cancel-tentative twin of this park is already
+                    # handled above; the fully-filled echo guard above keeps
+                    # a filled order's late CANCELLED out of this branch.)
+                    # Resolve as our cancel: clear the park (or the retry
+                    # loop keeps re-driving a dead cancel every sync —
+                    # measured cancel-storm shape) and run the standard
+                    # teardown WITHOUT the policy. ``_drop_envelope`` also
+                    # purges the persisted pre-park row, mirroring the
+                    # landed-cancel path.
+                    _blog_info(
+                        "forced-cancel %s resolved by broker cancelled "
+                        "event — own parked cancel landed, not external",
+                        format_intent_key(key),
+                    )
+                    self._forced_cancel_pending.pop(key, None)
+                    if (isinstance(self._active_intents.get(key), EntryIntent)
+                            and event.order.filled_qty <= 0.0):
+                        self._retire_native_failsafe_for_entry(key)
+                    self._abort_pending_partial_legs_for_dead_entry(
+                        key, reason='parent_cancelled',
+                    )
+                    self._entry_stop_engine.mark_aborted(
+                        key, reason='parent_cancelled',
+                    )
+                    self._order_mapping.pop(key, None)
+                    self._active_intents.pop(key, None)
+                    self._drop_envelope(key)
+                    if self._store_ctx is not None:
+                        self._store_ctx.log_event(
+                            'forced_cancel_resolved_by_event',
+                            client_order_id=(
+                                event.order.client_order_id
+                                if event.order is not None else None
+                            ),
+                            intent_key=key,
+                        )
+                    return
                 _blog_error(
                     "unexpected cancel for intent %s (%s)",
                     format_intent_key(key), event,

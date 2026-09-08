@@ -3760,6 +3760,88 @@ def __test_exit_qty_clamped_to_live_position__():
         f"exit qty must clamp to the live position (got "
         f"{b.exit_calls[0].intent.qty}) — the overshoot flips through flat")
 
+
+def __test_own_unlanded_cancel_observed_as_cancelled_is_not_external__():
+    """#83 (measured live, F5 2026-09-08): the engine cancels its OWN entry;
+    the venue races (CO-ORD-013 'order is done'), execute_cancel returns
+    False per the #55 discipline, and the cancel is PARKED for retry — the
+    mapping is deliberately kept. The watch poll then observes the venue's
+    CANCELLED row and routes the event: the classifier finds the key still
+    mapped and fires the unexpected-cancel policy -> FALSE QUARANTINE,
+    blocking every later dispatch (F6-F8 never ran).
+
+    A key with an OUTSTANDING OWN cancel (forced-cancel park /
+    cancel-tentative) must classify an observed CANCELLED as our cancel
+    LANDING — normal teardown, no policy."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["E"] = _entry_order("E", 1.0)
+    engine.sync(BAR_TS)
+    assert engine._order_mapping["E"]          # entry dispatched + mapped
+    order_id = engine._order_mapping["E"][0]
+
+    # The script cancels the entry; the venue races and the plugin honestly
+    # reports "did not land" (#55: never claim success on an ambiguous race).
+    b.false_on_next_cancel = True
+    del pos.entry_orders["E"]
+    engine.sync(BAR_TS + 60_000)
+    assert engine._order_mapping.get("E"), (
+        "precondition: the un-landed cancel keeps the mapping parked")
+
+    # The watch poll observes the venue's Canceled row (our cancel DID land
+    # venue-side; the race just hid the confirmation).
+    engine._route_event(_fill_event(
+        'buy', 1.0, 0.0, pine_id="E", xchg_id=order_id,
+        event_type='cancelled', filled_qty=0.0))
+
+    assert not engine._quarantined, (
+        "the engine QUARANTINED on its own cancel landing — a key with an "
+        "outstanding own cancel must never classify its CANCELLED as "
+        "external (#83; measured live: blocked F6-F8)")
+    assert "E" not in engine._order_mapping, (
+        "the observed cancel must complete the teardown for the parked key")
+    assert "E" not in engine._forced_cancel_pending, (
+        "the park must be CLEARED — a retained park re-drives a dead cancel "
+        "every sync (the measured cancel-storm shape)")
+
+
+def __test_entry_stop_unlanded_cancel_race_no_quarantine_store_backed__(tmp_path):
+    """#83 live-shape pin: the EXACT F5 sequence — store-backed engine, a
+    both-set entry (limit+stop, entry-stop machinery armed), the cancel
+    returns False (venue race), the CANCELLED event routes. Byte-for-byte
+    the live log chain that quarantined on 2026-09-08."""
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+
+    with BrokerStore(tmp_path / "b.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(strategy_id="t83", symbol=SYMBOL, timeframe="60",
+                        account_id="A"),
+            script_source="// x")
+        b = MockBroker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=ctx.run_tag,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["E"] = _entry_order("E", 1.0, limit=50_000.0,
+                                             stop=51_000.0)
+        engine.sync(BAR_TS)
+        order_id = engine._order_mapping["E"][0]
+        b.false_on_next_cancel = True
+        del pos.entry_orders["E"]
+        engine.sync(BAR_TS + 60_000)
+        assert "E" in engine._forced_cancel_pending   # the live park shape
+
+        engine._route_event(_fill_event(
+            'buy', 1.0, 0.0, pine_id="E", xchg_id=order_id,
+            event_type='cancelled', filled_qty=0.0))
+
+        assert not engine._quarantined, "the live F5 false quarantine (#83)"
+        assert "E" not in engine._forced_cancel_pending
+        assert "E" not in engine._order_mapping
+
 def __test_non_marketable_whole_row_limit_exit_still_attaches_tp__():
     """A resting (not-yet-marketable) limit exit keeps the native TP attach path."""
     b = MockBroker()
