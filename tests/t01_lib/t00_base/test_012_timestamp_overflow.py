@@ -2,6 +2,7 @@
 @pyne
 """
 from pynecore.lib import timestamp
+from pynecore.types.na import NA
 
 
 def __test_timestamp_hour_overflow__():
@@ -80,3 +81,14 @@ def __test_timestamp_leap_day_rules_per_calendar__():
     assert timestamp("UTC", 1900, 2, 29, 0, 0) == timestamp("UTC", 1900, 3, 1, 0, 0)
     # 1600 is a leap year in both calendars
     assert timestamp("UTC", 1600, 2, 29, 0, 0) == -11670998400000
+
+
+def __test_timestamp_na_components_are_zero__():
+    """ an na component is substituted with 0, never propagated as na (measured on TV) """
+    n = NA(int)
+    assert timestamp("UTC", n, 1, 1, 0, 0) == timestamp("UTC", 0, 1, 1, 0, 0)
+    assert timestamp("UTC", 2025, n, 1, 0, 0) == timestamp("UTC", 2024, 12, 1, 0, 0)
+    assert timestamp("UTC", 2025, 1, n, 0, 0) == timestamp("UTC", 2024, 12, 31, 0, 0)
+    assert timestamp("UTC", 2025, 1, 1, n, 30) == timestamp("UTC", 2025, 1, 1, 0, 30)
+    assert timestamp("UTC", 2025, 1, 1, 9, n) == timestamp("UTC", 2025, 1, 1, 9, 0)
+    assert timestamp("UTC", 2025, 1, 1, 9, 30, n) == timestamp("UTC", 2025, 1, 1, 9, 30, 0)

@@ -31,6 +31,7 @@ from . import session as session_module
 from ._fixnan import fixnan
 
 from pynecore.core.overload import overload
+from pynecore.core.safe_convert import native_int_or as _native_int_or
 from pynecore.core.datetime import parse_datestring as _parse_datestring, parse_timezone as _parse_timezone, \
     TimezoneNotFoundError, civil_days as _civil_days, julian_civil_days as _julian_civil_days, \
     GREGORIAN_CUTOVER_DAY as _GREGORIAN_CUTOVER_DAY, GREGORIAN_CYCLE_DAYS as _GREGORIAN_CYCLE_DAYS
@@ -272,18 +273,23 @@ def timestamp(timezone: TimezoneStr | None, year: int | float, month: int | floa
     # next day + 2h, month 13 -> next January). Normalize the month into the
     # year, then carry the day through timedelta so the wall clock overflows
     # before the timezone conversion.
-    y = int(year)
-    m = int(month)
+    # TradingView substitutes 0 for an na component instead of propagating the na
+    # (measured: an na year/month/hour/second each lands on the year-0 / month-0 /
+    # hour-0 / second-0 timestamp, never on na), so every component truncates
+    # through the na-tolerant conversion.
+    y = _native_int_or(year, 0)
+    m = _native_int_or(month, 0)
     y += (m - 1) // 12
     m = (m - 1) % 12 + 1
-    d = int(day)
+    d = _native_int_or(day, 0)
     # The clock components roll over into days too, so they are carried into the
     # day count before every calendar decision below. The wall clock is not moved
     # by the carry (the timedelta at the end shifts wall time, not absolute time),
     # but a rollover that leaves datetime's range -- hour 24 on the last
     # representable day -- now folds like any other out-of-range date instead of
     # raising OverflowError.
-    clock_seconds = int(hour) * 3600 + int(minute) * 60 + int(second)
+    clock_seconds = (_native_int_or(hour, 0) * 3600 + _native_int_or(minute, 0) * 60
+                     + _native_int_or(second, 0))
     day_carry, second_of_day = divmod(clock_seconds, 86400)
     d += day_carry
     # TradingView runs the Julian calendar before 1582-10-15 and the Gregorian
