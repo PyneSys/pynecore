@@ -5,7 +5,7 @@ WHEN IT CAN RUN (measured 2026-08-13, partly the hard way):
   * lunch break 11:30-13:00  — FULL run: market orders queue harmlessly and cancel
     cleanly, conditionals rest and cancel. This is the only phase where every part
     is both meaningful and safe.
-  * continuous 09:15-11:30 / 13:00-14:30 — conditionals only; the market part is
+  * continuous 09:00-11:30 / 13:00-14:30 — conditionals only; the market part is
     skipped because those orders would FILL.
   * ATC 14:30-14:45 and outside trading hours — nothing is placed. DNSE rejects
     conditionals with CO-ORD-006, and refuses cancels in the ATC with
@@ -129,7 +129,7 @@ def session_phase(now: datetime | None = None) -> str:
     never leave behind.
 
     Phases:
-      "continuous" 09:15-11:30, 13:00-14:30 — market orders WOULD FILL; stops rest fine.
+      "continuous" 09:00-11:30, 13:00-14:30 — market orders WOULD FILL; stops rest fine.
       "lunch"      11:30-13:00              — the only phase where a market order both
                                               queues harmlessly AND can be cancelled.
       "atc"        14:30-14:45              — cancels are REFUSED; anything resting fills
@@ -149,7 +149,10 @@ def session_phase(now: datetime | None = None) -> str:
         # The holiday annotation is display-only, in venue.py status (#70).
         return "closed"
     minutes = now.hour * 60 + now.minute
-    if (9 * 60 + 15) <= minutes < (11 * 60 + 30) or (13 * 60) <= minutes < (14 * 60 + 30):
+    # Derivatives continuous starts 09:00 (ATO 08:45-09:00) — the earlier
+    # 09:15 boundary was the EQUITIES figure (operator-corrected 2026-09-08;
+    # symptom: L0 self-skipped as "closed" at 09:11 on a trading morning).
+    if (9 * 60) <= minutes < (11 * 60 + 30) or (13 * 60) <= minutes < (14 * 60 + 30):
         return "continuous"
     if (11 * 60 + 30) <= minutes < (13 * 60):
         return "lunch"
