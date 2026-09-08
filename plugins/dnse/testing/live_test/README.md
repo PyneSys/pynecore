@@ -352,6 +352,12 @@ near leg fills and the far leg must be CANCELLED.
 - **DNSE does not cascade** an entry cancel to its exit legs — and a *plugin*-side cascade
   breaks the engine's ownership model (quarantine + re-placed orphan, measured; #19 is an
   ENGINE fix, pending). Interim rule: cancel exit ids explicitly.
+- **NORMAL amend edits ONE field per call** (measured 2026-09-08, operator-recalled):
+  price OR quantity, never both — `400 INVALID_INPUT "Only allow edit order
+  quantity or price"`; the payload must still CARRY both keys (omitting
+  quantity → `400 EDIT_ORDER_QUANTITY_NOT_ENOUGH`). A combined edit = two
+  sequential amends (measured working). Our `_amend` sends both from the new
+  intent — combined-change modifies 400 today (carded).
 - **Conditional amend → HTTP 500** (#18); NORMAL amend works. The engine parks and the
   order stays cancellable; the venue keeps the OLD level.
 - **GTD must be a future day within the contract** — past `finalTradeDate` →
