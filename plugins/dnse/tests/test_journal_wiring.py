@@ -379,3 +379,78 @@ def __test_reopen_clears_stale_terminal_markers__(fake_client, tmp_path):
         assert "last_fill_venue_id" not in extras
     finally:
         store.close()
+
+
+# --- #87 (RED): a prior session's FILL must not answer the current cancel ----
+
+def __test_prior_session_fill_not_adopted_into_cancel_scope__(
+        fake_client, tmp_path):
+    """RED (#87, measured live F6 2026-09-08 bar 503, store-backed per the
+    panel: the direct-seeded variant could neither flip under an
+    adoption-time fix nor kill an aggregation mutant). Session 1 places an
+    entry under pine key 'E' and its FILL terminalizes the journal row
+    (exposure ledger keeps it LIVE, #73/#74). Session 2 re-opens the same
+    store (rows re-parent into the new run), restores at connect, places
+    the CURRENT entry under the same key — and cancels the key. Today the
+    restore re-owns the filled row into ``_order_ids`` and the aggregate's
+    any-ALREADY_FILLED-wins answers the cancel with YESTERDAY's fill: the
+    engine's entry-stop watch then logs 'native LIMIT already filled' for
+    an order the venue REJECTED (fill=0)."""
+    from pynecore_dnse.journal_wiring import journal_terminal
+    from pynecore.core.broker.models import (
+        CancelIntent, CancelDispositionOutcome,
+    )
+
+    placed_old = (201, {"id": "240616", "symbol": "VN30F1M", "side": "NS",
+                        "quantity": 1, "orderStatus": "New"})
+    b1 = _broker(fake_client, tmp_path, post_order=placed_old)
+    store, ctx = _open_store_ctx(tmp_path, b1)
+    try:
+        asyncio.run(b1.execute_entry(_entry_envelope(pine_id="E")))
+        journal_terminal(ctx, venue_id="240616", terminal_status="Filled",
+                         filled_qty=1.0)
+    finally:
+        ctx.close()
+        store.close()
+
+    placed_new = (201, {"id": "74296", "symbol": "VN30F1M", "side": "NS",
+                        "quantity": 1, "orderStatus": "New"})
+
+    def _cancel(_acct, _oid, _mkt, _tok, order_category=None):
+        return (400, {"code": "ORDER_CANCEL_STATUS_REJECTED"})
+
+    def _per_id_detail(_acct, oid, _mkt, order_category=None):
+        if str(oid) == "240616":   # the prior session's filled entry
+            return (200, {"id": oid, "symbol": "VN30F1M", "side": "NS",
+                          "quantity": 1, "orderStatus": "Filled",
+                          "fillQuantity": 1.0})
+        return (200, {"id": oid, "symbol": "VN30F1M", "side": "NS",
+                      "quantity": 1, "orderStatus": "Rejected",
+                      "fillQuantity": 0.0})
+
+    b2 = _broker(fake_client, tmp_path, post_order=placed_new,
+                 cancel_order=_cancel, get_order_detail=_per_id_detail,
+                 get_orders=(200, {"orders": [], "totalPages": 1}))
+    b2._cancel_verify_attempts = 1
+    b2._cancel_verify_delay = 0.0
+    store2 = BrokerStore(tmp_path / "broker.sqlite", plugin_name=b2.plugin_name)
+    identity = RunIdentity(strategy_id="t16", symbol="VN30F1M", timeframe="15",
+                           account_id="ACC001")
+    ctx2 = store2.open_run(identity, script_source="// t16")
+    b2.store_ctx = ctx2
+    try:
+        asyncio.run(b2.connect())
+        asyncio.run(b2.execute_entry(_entry_envelope(pine_id="E")))
+
+        cancel_env = DispatchEnvelope(
+            intent=CancelIntent(pine_id="E", symbol="VN30F1M"),
+            run_tag="abcd", bar_ts_ms=1_700_000_000_000, retry_seq=0,
+            coid_max_len=30)
+        outcome = asyncio.run(b2.execute_cancel_with_outcome(cancel_env))
+
+        assert outcome is not CancelDispositionOutcome.ALREADY_FILLED, (
+            "the CURRENT order was REJECTED with fill=0 — the prior "
+            "session's fill, re-owned at restore, answered the cancel "
+            "(#87 F6 misread)")
+    finally:
+        store2.close()

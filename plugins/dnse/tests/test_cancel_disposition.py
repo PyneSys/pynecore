@@ -274,3 +274,57 @@ def __test_event_loop_stays_live_during_cancel_verify__(fake_client, tmp_path):
     assert ticks >= 3, (
         f"only {ticks} ticks during ~0.3 s of venue reads — the loop is being "
         f"blocked; client calls must run via asyncio.to_thread")
+
+
+# --- #87 control: mixed-outcome aggregation ordering (mutant-killer) ---------
+
+def __test_aggregate_mixed_outcomes_already_filled_wins__():
+    """#87 panel 3/3 MEASURED: a mutant reordering ``aggregate``'s clauses
+    (confirmed-class checked before ALREADY_FILLED) passed the whole DNSE
+    suite while reintroducing the #55 double-open. Pin the fold directly:
+    any fill outranks every confirmed-cancel-class member."""
+    from pynecore_dnse.cancel_disposition import aggregate
+    assert aggregate([CancelDispositionOutcome.ALREADY_FILLED,
+                      CancelDispositionOutcome.TOO_LATE_TO_CANCEL]
+                     ) is CancelDispositionOutcome.ALREADY_FILLED
+    assert aggregate([CancelDispositionOutcome.CANCEL_CONFIRMED,
+                      CancelDispositionOutcome.ALREADY_FILLED]
+                     ) is CancelDispositionOutcome.ALREADY_FILLED
+    assert aggregate([CancelDispositionOutcome.TOO_LATE_TO_CANCEL,
+                      CancelDispositionOutcome.UNKNOWN]
+                     ) is CancelDispositionOutcome.UNKNOWN
+
+
+# --- #87 S3: an answered terminal id leaves the per-key cancel scope ---------
+
+def __test_answered_terminal_ids_pruned_from_cancel_scope__(fake_client, tmp_path):
+    """#87 S3 (measured: bar 509's cancel re-swept the bar-503/504 rejects —
+    24 cancel POSTs for at most one working order across three sweeps). Once
+    a cancel ANSWERS terminally for an id, the id leaves ``_order_ids``: the
+    next cancel of the key must issue ZERO new venue writes for it. Wrong
+    impl caught: the append-only mapping re-sweeping every historical id."""
+    def _cancel(_acct, _oid, _mkt, _tok, order_category=None):
+        return (400, {"code": "ORDER_CANCEL_STATUS_REJECTED"})
+
+    def _rejected_detail(_acct, oid, _mkt, order_category=None):
+        return (200, {"id": oid, "symbol": "VN30F1M", "side": "NS",
+                      "quantity": 1, "orderStatus": "Rejected",
+                      "fillQuantity": 0.0})
+
+    b = _broker(fake_client, tmp_path,
+                cancel_order=_cancel, get_order_detail=_rejected_detail)
+    b._order_ids["K"] = ["74296", "75476"]
+    b._order_category["74296"] = "NORMAL"
+    b._order_category["75476"] = "NORMAL"
+
+    first = asyncio.run(b.execute_cancel_with_outcome(_cancel_envelope()))
+    writes_after_first = b._client.count("cancel_order")
+    second = asyncio.run(b.execute_cancel_with_outcome(_cancel_envelope()))
+
+    assert first is not CancelDispositionOutcome.UNKNOWN
+    assert b._order_ids["K"] == [], "answered terminal ids must be pruned"
+    assert b._client.count("cancel_order") == writes_after_first, (
+        "the second sweep re-cancelled already-answered terminal ids "
+        "(#87: the measured 24-POST waste)")
+    assert second is CancelDispositionOutcome.UNKNOWN, (
+        "an empty scope is UNKNOWN — never a fabricated verdict")

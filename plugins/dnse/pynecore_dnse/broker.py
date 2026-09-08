@@ -295,6 +295,14 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
             # position behind them — the engine must withhold them until
             # the parent entry fills and clamp qty to the live position.
             exit_orders_execute_standalone=True,
+            # #87: a both-set entry is executed HERE as one stop-limit
+            # (native conditional STOP; crossed-at-placement -> immediate
+            # capped LO, #34). The engine must not also arm its software
+            # entry-stop watch — dual ownership measured live (F6): the
+            # watch cancelled the plugin's own placement and a poisoned
+            # id scope misread the disposition. Pine-semantics question
+            # (OCO vs stop-limit) stays open on card #14.
+            entry_stop_limit_native=True,
             # SOFTWARE, not NATIVE (#33): the OCO above is the single-exit
             # bracket ONLY — no DNSE payload can link separate orders into a
             # group (Live-L1-T11: oca members are venue-strangers). Declaring
@@ -348,6 +356,14 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         for journal_row in iter_journal_identities(self.store_ctx):
             leg_type = _LEG_TYPE_BY_NAME.get(journal_row.leg_kind)
             primary = journal_row.venue_ids[0] if journal_row.venue_ids else None
+            # #87: a terminal-marked row is the EXPOSURE LEDGER (#73/#74 keep
+            # it live after a FILL terminal), not a working order. It keeps
+            # identity + the _last_seen watermark below (late-event dedup),
+            # but must never re-enter _order_ids: prior-session fills adopted
+            # under a recurring pine key made every cancel of that key
+            # aggregate ALREADY_FILLED (any-fill-wins), so the entry-stop
+            # watch read a venue-REJECTED order as "limit won" (measured F6).
+            working = journal_row.terminal_status is None
             for venue_id in journal_row.venue_ids:
                 if venue_id in self._identity:
                     continue
@@ -356,7 +372,7 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
                 self._order_category[venue_id] = (
                     "NORMAL" if venue_id == journal_row.child_id
                     else journal_row.category)
-                if journal_row.intent_key:
+                if working and journal_row.intent_key:
                     self._order_ids.setdefault(
                         journal_row.intent_key, []).append(venue_id)
                 adopted += 1
@@ -371,7 +387,7 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
                 if seed_id is not None and seed_id not in self._last_seen:
                     self._last_seen[seed_id] = (journal_row.filled_qty,
                                                 journal_row.last_raw_status)
-            if (primary is not None and journal_row.child_id is None
+            if (working and primary is not None and journal_row.child_id is None
                     and journal_row.category in ("STOP", "OCO")):
                 # Crash-window chase: the parent may have triggered while we
                 # were down — its economics live on the un-journalled child.
@@ -1463,6 +1479,18 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
             self._pending_oco.discard(order_id)
         return outcome
 
+    def _prune_order_id(self, order_id: str) -> None:
+        """#87 S3: a terminal order leaves ``_order_ids`` by TARGETED removal
+        (#85-M2 style — never reassign, a concurrent #41 child must survive)
+        so per-key cancel/modify scopes stop aggregating historical
+        terminals. ``_identity`` / ``_last_seen`` stay — late-event dedup
+        and phantom-shell classification still need them."""
+        for tracked_ids in self._order_ids.values():
+            try:
+                tracked_ids.remove(order_id)
+            except ValueError:
+                continue
+
     @override
     async def execute_cancel_with_outcome(self, envelope):
         ids = self._ids_for(envelope)
@@ -1472,9 +1500,23 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         # [consumed parent shell, working child]. Aggregation is conservative
         # (cancel_disposition.aggregate): any ALREADY_FILLED wins, then any
         # UNKNOWN keeps the engine retrying, then confirmed-class.
-        return _aggregate_dispositions(
-            [await self._cancel_one_disposition(str(order_id))
-             for order_id in ids])
+        outcomes = [await self._cancel_one_disposition(str(order_id))
+                    for order_id in ids]
+        # #87 G-R6 (panel 2/3): the multi-id sweep was invisible — 4 of the 6
+        # wasted ids in the measured F6 episode took a silent NOT_FOUND ->
+        # history branch. One line per cancel envelope, always.
+        log.broker_info(
+            "cancel scope %s: ids=%s outcomes=%s",
+            getattr(envelope.intent, "pine_id", "?"), list(map(str, ids)),
+            [o.value for o in outcomes])
+        # #87 S3 (restricted): an id whose cancel ANSWERED terminally is
+        # historical — prune it so the next per-key cancel/modify never
+        # re-aggregates it (measured: bar 509 re-swept both bar-503/504
+        # rejects). UNKNOWN stays mapped for the engine's retry.
+        for order_id, outcome in zip(ids, outcomes):
+            if outcome is not CancelDispositionOutcome.UNKNOWN:
+                self._prune_order_id(str(order_id))
+        return _aggregate_dispositions(outcomes)
 
     async def _cancel_replace_entry(self, old, new, order_id: str
                                     ) -> list[ExchangeOrder]:
@@ -1957,6 +1999,12 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         if order.status in _TERMINAL_STATUSES:
             journal_terminal(self.store_ctx, venue_id=order_id,
                              terminal_status=raw_status, filled_qty=cumulative)
+            # #87 S3 (restricted): a NO-FILL terminal (cancelled / rejected /
+            # expired) leaves the per-key scope immediately. FILLED stays
+            # mapped — a fill-raced cancel must still answer ALREADY_FILLED
+            # (#55); the next restore's terminal filter (#87 S2) retires it.
+            if order.status is not OrderStatus.FILLED:
+                self._prune_order_id(order_id)
         elif delta > 0:
             # Persist the watermark on the live partial (#56/item 5 collapse):
             # a restart seeds _last_seen from the row and re-emits nothing.
@@ -1966,6 +2014,10 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
                       else "partial" if order.status is OrderStatus.PARTIALLY_FILLED
                       else "cancelled" if order.status is OrderStatus.CANCELLED
                       else "rejected" if order.status is OrderStatus.REJECTED
+                      # #87 panel precondition: EXPIRED fell through to
+                      # "created", so a GTD-expired order never retired its
+                      # engine-side tracking. No-fill expiry == cancelled.
+                      else "cancelled" if order.status is OrderStatus.EXPIRED
                       else "created")
         if delta > 0 and slice_events:
             events = []

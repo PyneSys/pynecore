@@ -1027,6 +1027,11 @@ class OrderSyncEngine:
         #: — gates the pre-fill protection withhold + qty clamp below.
         self._exit_orders_execute_standalone = getattr(
             caps, 'exit_orders_execute_standalone', False)
+        #: #87: plugin executes both-set entries natively as stop-limits —
+        #: the software entry-stop watch (arm + restart replay) is disabled
+        #: so exactly ONE handler owns the intent.
+        self._entry_stop_limit_native = getattr(
+            caps, 'entry_stop_limit_native', False)
         # Capability cache for the partial-qty bracket dispatch switch.
         # The companion ``partial_qty_bracket_exit_pyramiding`` level
         # is enforced once at startup by ``validate_at_startup``;
@@ -1793,8 +1798,12 @@ class OrderSyncEngine:
             # stop_market_pending) are reloaded as-is; the first
             # :meth:`_drive_entry_stop_triggers` re-drives them
             # deterministically (idempotent cancel / idempotent market POST),
-            # so no demotion or price re-evaluation is needed.
-            self._entry_stop_engine.restart_replay()
+            # so no demotion or price re-evaluation is needed. #87: skipped
+            # entirely for entry_stop_limit_native plugins — no watch is
+            # ever armed, and replaying a row persisted before the
+            # capability landed would resurrect the second handler.
+            if not self._entry_stop_limit_native:
+                self._entry_stop_engine.restart_replay()
             # Rehydrate the broker-native fail-safe manager from the
             # replayed legs. ``NativeFailsafeManager`` was just
             # constructed empty, so without this call there is no
@@ -10309,6 +10318,17 @@ class OrderSyncEngine:
         (e.g. a re-dispatch of an unchanged both-set entry) is a no-op.
         """
         pine_id = intent.intent_key
+        if self._entry_stop_limit_native:
+            # #87: the plugin owns both-set entries natively (stop-limit) —
+            # arming the software watch here would put TWO handlers on one
+            # intent (measured F6: the watch cancelled the plugin's own
+            # placement and misread the disposition).
+            _blog_info(
+                "entry-stop watch for %r NOT armed: plugin executes "
+                "both-set entries natively (entry_stop_limit_native) — "
+                "sole owner is the plugin's stop-limit", pine_id,
+            )
+            return
         if self._entry_stop_engine.has_watch(pine_id):
             return
         # Both-set only: the watch's KIND_ENTRY leg is the native LIMIT, so a

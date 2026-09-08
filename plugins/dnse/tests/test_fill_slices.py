@@ -277,3 +277,24 @@ def __test_parse_reports_survives_hostile_metadata__():
     assert slices[2].event_no == 5
     assert parse_reports("garbage") == []
     assert parse_reports({"lastQuantity": 0}) == []
+
+
+# --- #87 precondition: EXPIRED is a terminal no-fill -> "cancelled" event ----
+
+def __test_expired_row_emits_cancelled_event_and_prunes__(fake_client, tmp_path):
+    """#87 panel 1/3 (verified): the event-type ladder omitted EXPIRED — a
+    GTD-expired order fell through to "created", so the engine never retired
+    its tracking. No-fill expiry must route as "cancelled", and the no-fill
+    terminal leaves the per-key scope (#87 S3)."""
+    b = _broker(fake_client, tmp_path)
+    _own(b)
+    b._order_ids["L"] = ["437346"]
+
+    events = _scan(b, {"id": "437346", "symbol": "VN30F1M", "side": "NB",
+                       "quantity": 1, "fillQuantity": 0,
+                       "orderStatus": "Expired"})
+
+    assert events and events[0].event_type == "cancelled", (
+        f"Expired must route as a terminal 'cancelled' event, got "
+        f"{[e.event_type for e in events]}")
+    assert b._order_ids["L"] == [], "no-fill terminal must be pruned (#87 S3)"

@@ -14139,3 +14139,39 @@ def __test_read_outage_warnings_are_throttled_across_tick_syncs__(caplog):
         b.down = True
         engine.sync(BAR_TS + 121_000)
         assert len(outage_warnings()) == 3
+
+
+def __test_entry_stop_limit_native_capability_disarms_the_watch__():
+    """#87 (measured live F6 2026-09-08): on a venue whose plugin executes a
+    both-set entry natively as ONE stop-limit, the engine must NOT also arm
+    its software entry-stop watch — two handlers acted on the same intent
+    (the watch cancelled the plugin's own placement and misread the
+    disposition). Wrong impl caught: unconditional arming."""
+    b = MockBroker(capabilities=ExchangeCapabilities(
+        short_selling=CapabilityLevel.NATIVE,
+        entry_stop_limit_native=True))
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["E"] = _entry_order("E", 1.0, limit=50_000.0,
+                                         stop=51_000.0)
+
+    engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == 1, "the plugin still gets the full intent"
+    assert not engine._entry_stop_engine.has_watch("E"), (
+        "capability declared native stop-limit, yet the software watch was "
+        "armed — dual ownership of one intent (#87 F6)")
+
+
+def __test_default_capability_still_arms_the_watch_control__():
+    """#87 control (discriminating in the other direction): withOUT the
+    capability the dual-trigger decomposition must stay exactly as before —
+    watch armed. Wrong impl caught: disarming unconditionally."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["E"] = _entry_order("E", 1.0, limit=50_000.0,
+                                         stop=51_000.0)
+
+    engine.sync(BAR_TS)
+
+    assert engine._entry_stop_engine.has_watch("E"), (
+        "default capability must keep the engine's both-set watch")

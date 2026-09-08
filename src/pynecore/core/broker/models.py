@@ -440,6 +440,18 @@ class ExchangeCapabilities:
     # pre-fill dispatch contract is preserved there.
     exit_orders_execute_standalone: bool = False
 
+    # #87: True when the plugin executes a both-set entry (limit AND stop)
+    # natively as ONE stop-limit order (DNSE: conditional-book STOP-LIMIT;
+    # crossed-at-placement -> immediate capped LO, #34). When True the
+    # engine must NOT decompose the intent into a resting LIMIT + software
+    # entry-stop watch: both handlers acting on the same intent produced
+    # dual placements and a cancel of an order the plugin never placed as
+    # a limit (measured live F6 2026-09-08). False (default) keeps the
+    # engine's dual-trigger decomposition. NOTE: which model matches
+    # TradingView globally is card #14 — this flag only removes the double
+    # ownership; it does not decide Pine semantics.
+    entry_stop_limit_native: bool = False
+
     # === Exit bracket (TP+SL with OCA reduce semantics) ===
     # NATIVE = single atomic exchange call attaches both legs (Bybit V5
     # attached TP/SL, Capital.com position-attribute bracket). The sync
