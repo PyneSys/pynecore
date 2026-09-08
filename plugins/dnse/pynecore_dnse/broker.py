@@ -1555,22 +1555,117 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
                     f"parked, old order {order_id} stays armed",
                     client_order_id=order_id)
             return await self._cancel_replace_entry(old, new, order_id)
-        intent = new.intent
+        return self._amend_normal(old, new, order_id)
+
+    @staticmethod
+    def _intent_price(intent) -> float:
         price = (getattr(intent, "limit", None) or getattr(intent, "stop", None)
                  or getattr(intent, "tp_price", None) or getattr(intent, "sl_price", None))
-        category = self._order_category_for(order_id) or "NORMAL"
-        payload = {"price": round(float(price), 1) if price else 0.0,
-                   "quantity": int(intent.qty)}
+        return round(float(price), 1) if price else 0.0
+
+    def _order_detail_dict(self, order_id: str) -> "dict | None":
+        status, body = self.client.get_order_detail(
+            self.account_id, order_id, self.market_type, order_category="NORMAL")
+        return body if status == 200 and isinstance(body, dict) else None
+
+    def _amend_normal(self, old, new, order_id: str) -> list[ExchangeOrder]:
+        """One-changed-field-per-PUT amend (#86, measured live 2026-09-08).
+
+        The venue rejects a PUT changing BOTH price and quantity
+        (``400 INVALID_INPUT "Only allow edit order quantity or price"``)
+        yet requires the payload to CARRY both keys (omitting quantity ->
+        ``400 EDIT_ORDER_QUANTITY_NOT_ENOUGH``). So: diff, then one PUT per
+        changed field, price first. The diff runs against the VENUE's
+        resting values (one detail read), not the engine's old envelope —
+        after an earlier partial application the envelope lies, and a stale
+        diff would emit the venue's UNMEASURED no-op PUT shape (#86 panel).
+        A modify that changes neither field writes nothing for the same
+        reason.
+        """
+        intent = new.intent
+        new_price = self._intent_price(intent)
+        new_qty = int(intent.qty)
+        detail = self._order_detail_dict(order_id)
+        try:
+            cur_price = round(float(detail.get("price")), 1)  # type: ignore[union-attr]
+            cur_qty = int(detail.get("quantity"))             # type: ignore[union-attr, arg-type]
+        except (AttributeError, TypeError, ValueError):
+            # Venue truth unreadable this instant — best effort from the
+            # old envelope (correct in every case except a prior
+            # half-applied amend, which the next successful read heals).
+            cur_price = self._intent_price(old.intent)
+            cur_qty = int(old.intent.qty)
+        payloads = []
+        if new_price != cur_price:
+            payloads.append({"price": new_price, "quantity": cur_qty})
+        if new_qty != cur_qty:
+            payloads.append({"price": new_price, "quantity": new_qty})
+        if not payloads:
+            return [self._to_exchange_order(detail or {"id": order_id})]
+        for leg_index, payload in enumerate(payloads):
+            status, body = self._write(lambda tok, _p=payload: self.client.put_order(
+                self.account_id, order_id, self.market_type, _p, tok,
+                order_category="NORMAL"))
+            if status in (200, 201) and isinstance(body, dict):
+                last_body = body
+                continue
+            if leg_index == 0:
+                # Nothing applied yet — the pre-#86 failure semantics hold.
+                self._raise_write_error(
+                    status, body, action="amend",
+                    ident=f"{order_id} intent={getattr(intent, 'intent_key', '?')}",
+                    coid=order_id)
+                raise ExchangeOrderRejectedError(
+                    f"DNSE amend: non-dict success body: {body!r}")
+            return self._recover_half_applied_amend(order_id, payload, status)
+        return [self._to_exchange_order(last_body)]
+
+    def _recover_half_applied_amend(self, order_id: str, qty_payload: dict,
+                                    first_status) -> list[ExchangeOrder]:
+        """The qty leg failed AFTER the price leg landed: the venue rests at
+        NEW price + OLD quantity — a state neither intent describes. Never
+        raise here (#86 adjudication): a reject propagates out of ``sync()``
+        and kills the run, and a disposition-unknown park is UNRESOLVABLE on
+        DNSE (no ``client_order_id`` for the engine's promotion path) while
+        the engine promotes the NEW intent regardless. Resolve locally:
+        a terminal order means the fill/cancel outran the amend and the
+        event stream owns reconciliation; a working order gets ONE retry,
+        then a loud half-applied warning — any later modify re-diffs
+        against venue truth and self-heals the qty leg.
+        """
+        detail = self._order_detail_dict(order_id)
+        if detail is not None:
+            order = self._to_exchange_order(detail)
+            if order.status in (OrderStatus.FILLED, OrderStatus.CANCELLED,
+                                OrderStatus.REJECTED, OrderStatus.EXPIRED):
+                log.broker_warning(
+                    "amend qty leg overtaken on %s (order already %s, first "
+                    "refusal http=%s) — venue truth wins, events reconcile",
+                    order_id, order.status, first_status)
+                return [order]
+            try:
+                landed = (int(detail.get("quantity")) == int(qty_payload["quantity"])
+                          and round(float(detail.get("price")), 1)
+                          == float(qty_payload["price"]))
+            except (TypeError, ValueError):
+                landed = False
+            if landed:
+                # The write reached the venue and only the RESPONSE was lost
+                # (transport blip) — a retry here would be the unmeasured
+                # no-op PUT shape. Venue truth already matches the intent.
+                return [order]
         status, body = self._write(lambda tok: self.client.put_order(
-            self.account_id, order_id, self.market_type, payload, tok,
-            order_category=category))
-        self._raise_write_error(
-            status, body, action="amend",
-            ident=f"{order_id} intent={getattr(intent, 'intent_key', '?')}", coid=order_id)
-        if not isinstance(body, dict):
-            raise ExchangeOrderRejectedError(
-                f"DNSE amend: non-dict success body: {body!r}")
-        return [self._to_exchange_order(body)]
+            self.account_id, order_id, self.market_type, qty_payload, tok,
+            order_category="NORMAL"))
+        if status in (200, 201) and isinstance(body, dict):
+            return [self._to_exchange_order(body)]
+        log.broker_error(
+            "HALF-APPLIED amend on %s: price leg landed, qty leg refused "
+            "twice (http=%s then %s) — venue rests at NEW price/OLD qty; "
+            "the next modify re-diffs against venue truth and self-heals",
+            order_id, first_status, status)
+        detail = self._order_detail_dict(order_id)
+        return [self._to_exchange_order(detail or {"id": order_id})]
 
     # --- BrokerPlugin abstracts: state ---
 

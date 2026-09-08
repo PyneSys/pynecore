@@ -118,9 +118,14 @@ def __test_invalid_token_amend_writes_exactly_once__(fake_client, tmp_path):
     b._order_ids["L"] = ["ID1"]
     b._order_category["ID1"] = "NORMAL"
 
-    envelope = _entry_envelope()
+    # The #86 diff skips a no-change modify, so the refusal needs an
+    # actual price change to reach the PUT.
+    moved = DispatchEnvelope(
+        intent=EntryIntent(pine_id="L", symbol="VN30F1M", side="buy", qty=1,
+                           order_type=OrderType.LIMIT, limit=1501.0),
+        run_tag="abcd", bar_ts_ms=1_700_000_000_000, retry_seq=0, coid_max_len=30)
     with pytest.raises(_AuthErr):
-        asyncio.run(b.modify_entry(envelope, envelope))
+        asyncio.run(b.modify_entry(_entry_envelope(), moved))
 
     assert b._client.count("put_order") == 1, (
         f"{b._client.count('put_order')} amend writes for one refusal")

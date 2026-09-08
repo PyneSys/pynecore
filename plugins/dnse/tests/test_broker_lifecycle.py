@@ -220,8 +220,12 @@ def __test_place_oco_keeps_umbrella_when_resolve_never_completes__(fake_client, 
 ])
 def __test_amend_price_precedence_limit_or_stop_or_tp_or_sl__(
         fake_client, tmp_path, intent, expected_price, order_id):
+    # The venue detail rests at a price no intent uses, so the #86 diff
+    # always sees a price change and the precedence winner must be PUT.
     b = _broker(fake_client, tmp_path,
-               put_order=(200, {"id": order_id, "orderStatus": "New", "quantity": 2}))
+               put_order=(200, {"id": order_id, "orderStatus": "New", "quantity": 2}),
+               get_order_detail=(200, {"id": order_id, "orderStatus": "New",
+                                       "price": 1.0, "quantity": 2}))
     key = intent.intent_key
     b._order_ids[key] = [order_id]
     b._order_category[order_id] = "NORMAL"
@@ -243,8 +247,12 @@ def __test_amend_price_falls_back_to_zero_when_no_price_field_set__(fake_client,
     Flagging as a money-path risk for review — see the writer's final report."""
     intent = EntryIntent(pine_id="P1", symbol="VN30F1M", side="buy", qty=2,
                          order_type=OrderType.MARKET)  # no limit, no stop
+    # Venue rests at a real price so the #86 diff sees a price change and
+    # the fallback 0.0 actually reaches the wire.
     b = _broker(fake_client, tmp_path,
-               put_order=(200, {"id": "ORD-E3", "orderStatus": "New", "quantity": 2}))
+               put_order=(200, {"id": "ORD-E3", "orderStatus": "New", "quantity": 2}),
+               get_order_detail=(200, {"id": "ORD-E3", "orderStatus": "New",
+                                       "price": 5.0, "quantity": 2}))
     b._order_ids["P1"] = ["ORD-E3"]
     b._order_category["ORD-E3"] = "NORMAL"
 
@@ -310,7 +318,9 @@ def __test_modify_entry_with_tracked_id_amends_in_place__(fake_client, tmp_path)
                put_order=(200, {"id": "ORD1", "orderStatus": "New", "quantity": 3}))
     b._order_ids["P1"] = ["ORD1"]
     b._order_category["ORD1"] = "NORMAL"
-    old = _envelope(EntryIntent(pine_id="P1", symbol="VN30F1M", side="buy", qty=2,
+    # Price-only modify: the venue amends ONE changed field per PUT (#86),
+    # so the single-PUT pin holds only for a single-field change.
+    old = _envelope(EntryIntent(pine_id="P1", symbol="VN30F1M", side="buy", qty=3,
                                 order_type=OrderType.LIMIT, limit=100.0))
     new = _envelope(EntryIntent(pine_id="P1", symbol="VN30F1M", side="buy", qty=3,
                                 order_type=OrderType.LIMIT, limit=103.0))
@@ -834,3 +844,199 @@ def __test_conditional_exit_modify_parks_loudly_and_touches_nothing__(
              and "cannot be amended" in r.getMessage()]
     assert len(warns) == 1, (
         f"the limitation must warn exactly once per key (got {len(warns)})")
+
+
+def __test_combined_price_qty_modify_splits_into_two_amends__(
+        fake_client, tmp_path):
+    """RED (#86, measured live 2026-09-08): DNSE's edit accepts a change to
+    price OR quantity per call, never both — `400 INVALID_INPUT "Only allow
+    edit order quantity or price"` (payload must still CARRY both keys:
+    omitting quantity → 400 EDIT_ORDER_QUANTITY_NOT_ENOUGH). Two sequential
+    single-field amends work (measured 200+200). Today `_amend` sends the
+    new intent's price+qty in ONE PUT — a Pine modify changing both in one
+    bar 400s. The venue-faithful fake accepts single-field changes and
+    rejects combined ones."""
+    placed = {"price": 1866.0, "quantity": 1}
+    state = dict(placed)
+
+    def _put(_acct, _oid, _mkt, payload, _tok, order_category=None):
+        price_changed = ("price" in payload
+                         and float(payload["price"]) != state["price"])
+        qty_changed = ("quantity" in payload
+                       and int(payload["quantity"]) != state["quantity"])
+        if "price" not in payload or "quantity" not in payload:
+            return (400, {"code": "EDIT_ORDER_QUANTITY_NOT_ENOUGH",
+                          "message": "quantity not enough"})
+        if price_changed and qty_changed:
+            return (400, {"code": "INVALID_INPUT",
+                          "message": "Only allow edit order quantity or price"})
+        state.update(price=float(payload["price"]),
+                     quantity=int(payload["quantity"]))
+        return (200, {"id": "ORD-86", "orderStatus": "New",
+                      "price": state["price"], "quantity": state["quantity"]})
+
+    old = EntryIntent(pine_id="Q", symbol="VN30F1M", side="buy", qty=1,
+                      order_type=OrderType.LIMIT, limit=1866.0)
+    new = EntryIntent(pine_id="Q", symbol="VN30F1M", side="buy", qty=2,
+                      order_type=OrderType.LIMIT, limit=1870.0)
+    b = _broker(fake_client, tmp_path, put_order=_put)
+    b._order_ids["Q"] = ["ORD-86"]
+    b._order_category["ORD-86"] = "NORMAL"
+
+    result = asyncio.run(b.modify_entry(_envelope(old), _envelope(new)))
+
+    assert state == {"price": 1870.0, "quantity": 2}, (
+        f"the venue ended at {state} — a combined price+qty modify must "
+        f"land BOTH via two sequential single-field amends (#86)")
+    assert b._client.count("put_order") >= 2, (
+        "one combined PUT cannot succeed — the venue allows one changed "
+        "field per call (measured INVALID_INPUT)")
+    assert result and result[-1].id == "ORD-86"
+
+
+def _venue_book(price, quantity, order_status="New"):
+    """A tiny venue-faithful NORMAL-book sim for #86 amend tests: PUT
+    enforces the measured one-changed-field rule + carry-both rule; detail
+    serves the CURRENT resting state; no-op PUTs (neither field changed)
+    are counted — the venue's answer to them is UNMEASURED, so the plugin
+    pledged never to emit one."""
+    state = {"price": float(price), "quantity": int(quantity),
+             "status": order_status, "noop_puts": 0}
+
+    def _put(_acct, _oid, _mkt, payload, _tok, order_category=None):
+        if "price" not in payload or "quantity" not in payload:
+            return (400, {"code": "EDIT_ORDER_QUANTITY_NOT_ENOUGH",
+                          "message": "quantity not enough"})
+        price_changed = float(payload["price"]) != state["price"]
+        qty_changed = int(payload["quantity"]) != state["quantity"]
+        if price_changed and qty_changed:
+            return (400, {"code": "INVALID_INPUT",
+                          "message": "Only allow edit order quantity or price"})
+        if not price_changed and not qty_changed:
+            state["noop_puts"] += 1
+        state.update(price=float(payload["price"]),
+                     quantity=int(payload["quantity"]))
+        return (200, {"id": "ORD-86", "orderStatus": state["status"],
+                      "price": state["price"], "quantity": state["quantity"]})
+
+    def _detail(_acct, _oid, _mkt, order_category=None):
+        return (200, {"id": "ORD-86", "orderStatus": state["status"],
+                      "price": state["price"], "quantity": state["quantity"]})
+
+    return state, _put, _detail
+
+
+def _amend_intents(old_price, old_qty, new_price, new_qty):
+    old = EntryIntent(pine_id="Q", symbol="VN30F1M", side="buy", qty=old_qty,
+                      order_type=OrderType.LIMIT, limit=old_price)
+    new = EntryIntent(pine_id="Q", symbol="VN30F1M", side="buy", qty=new_qty,
+                      order_type=OrderType.LIMIT, limit=new_price)
+    return old, new
+
+
+def __test_amend_diff_basis_is_venue_truth_not_old_envelope__(
+        fake_client, tmp_path):
+    """#86 guard (panel seats 1-3, adjudication ruling 4): after a PRIOR
+    half-applied amend the venue rests at new-price/old-qty while the
+    engine's old envelope still claims the original price. A modify must
+    diff against VENUE truth: exactly one qty-leg PUT, zero no-op PUTs.
+    Wrong impl caught: diffing old-vs-new envelopes (emits a price PUT
+    equal to the resting state — the venue's unmeasured no-op shape)."""
+    state, _put, _detail = _venue_book(price=1870.0, quantity=1)
+    old, new = _amend_intents(old_price=1866.0, old_qty=1,
+                              new_price=1870.0, new_qty=2)
+    b = _broker(fake_client, tmp_path, put_order=_put, get_order_detail=_detail)
+    b._order_ids["Q"] = ["ORD-86"]
+    b._order_category["ORD-86"] = "NORMAL"
+
+    asyncio.run(b.modify_entry(_envelope(old), _envelope(new)))
+
+    assert state["noop_puts"] == 0, (
+        "a PUT changing NEITHER field reached the venue — the diff basis "
+        "is the stale old envelope, not venue truth (#86)")
+    assert b._client.count("put_order") == 1, "only the qty leg needed a PUT"
+    assert state == {"price": 1870.0, "quantity": 2, "status": "New",
+                     "noop_puts": 0}
+
+
+def __test_amend_with_no_field_change_writes_nothing__(fake_client, tmp_path):
+    """#86 guard: a modify whose price AND qty already match the resting
+    order must write NOTHING (the venue's no-op PUT answer is unmeasured).
+    Wrong impl caught: unconditionally PUTting the new intent."""
+    state, _put, _detail = _venue_book(price=1866.0, quantity=1)
+    old, new = _amend_intents(old_price=1866.0, old_qty=1,
+                              new_price=1866.0, new_qty=1)
+    b = _broker(fake_client, tmp_path, put_order=_put, get_order_detail=_detail)
+    b._order_ids["Q"] = ["ORD-86"]
+    b._order_category["ORD-86"] = "NORMAL"
+
+    result = asyncio.run(b.modify_entry(_envelope(old), _envelope(new)))
+
+    assert b._client.count("put_order") == 0
+    assert result and result[0].id == "ORD-86"
+
+
+def __test_amend_half_applied_qty_leg_recovers_without_raising__(
+        fake_client, tmp_path, caplog):
+    """#86 guard (adjudication ruling 6): price leg lands, qty leg is
+    refused persistently while the order still works. Must NOT raise (a
+    reject propagates out of sync() -> run death; a park is unresolvable
+    on DNSE) — one retry, then a LOUD half-applied error, venue state
+    returned. Wrong impls caught: raise-on-qty-failure (both exception
+    shapes) and silent swallowing (no WARNING+)."""
+    import logging
+    state, _put_ok, _detail = _venue_book(price=1866.0, quantity=1)
+    puts = {"n": 0}
+
+    def _put(_acct, _oid, _mkt, payload, _tok, order_category=None):
+        if int(payload.get("quantity", -1)) != state["quantity"]:
+            puts["n"] += 1
+            return (500, {"code": "REMOTE_SERVER_ERROR", "message": "boom"})
+        return _put_ok(_acct, _oid, _mkt, payload, _tok, order_category)
+
+    old, new = _amend_intents(old_price=1866.0, old_qty=1,
+                              new_price=1870.0, new_qty=2)
+    b = _broker(fake_client, tmp_path, put_order=_put, get_order_detail=_detail)
+    b._order_ids["Q"] = ["ORD-86"]
+    b._order_category["ORD-86"] = "NORMAL"
+
+    with caplog.at_level(logging.DEBUG):
+        result = asyncio.run(b.modify_entry(_envelope(old), _envelope(new)))
+
+    assert state["price"] == 1870.0, "the price leg landed"
+    assert state["quantity"] == 1, "the qty leg never landed"
+    assert puts["n"] == 2, "exactly one retry of the qty leg"
+    assert result and result[-1].id == "ORD-86", "venue state returned, no raise"
+    loud = [r for r in caplog.records if r.levelno >= logging.ERROR
+            and "HALF-APPLIED" in r.getMessage()]
+    assert loud, "a permanent half-applied amend must be LOUD (#86)"
+
+
+def __test_amend_qty_leg_overtaken_by_fill_defers_to_venue_truth__(
+        fake_client, tmp_path):
+    """#86 guard (fill-race): the qty refusal happened because the order
+    went terminal (Filled) between the two legs. Must return the venue's
+    terminal state with NO retry PUT and no raise — the event stream owns
+    reconciliation. Wrong impl caught: blind retry / raising on a race
+    that is not an error."""
+    state, _put_ok, _detail = _venue_book(price=1866.0, quantity=1)
+
+    def _put(_acct, _oid, _mkt, payload, _tok, order_category=None):
+        if int(payload.get("quantity", -1)) != state["quantity"]:
+            state["status"] = "Filled"    # the fill outran the amend
+            return (400, {"code": "EDIT_ORDER_QUANTITY_NOT_ENOUGH",
+                          "message": "quantity not enough"})
+        return _put_ok(_acct, _oid, _mkt, payload, _tok, order_category)
+
+    old, new = _amend_intents(old_price=1866.0, old_qty=1,
+                              new_price=1870.0, new_qty=2)
+    b = _broker(fake_client, tmp_path, put_order=_put, get_order_detail=_detail)
+    b._order_ids["Q"] = ["ORD-86"]
+    b._order_category["ORD-86"] = "NORMAL"
+
+    result = asyncio.run(b.modify_entry(_envelope(old), _envelope(new)))
+
+    assert result and result[-1].status == OrderStatus.FILLED, (
+        "the terminal venue state must be returned as-is")
+    assert b._client.count("put_order") == 2, (
+        "price leg + ONE refused qty leg — no retry against a terminal order")

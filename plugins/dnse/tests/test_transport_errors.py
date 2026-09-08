@@ -146,8 +146,14 @@ def __test_amend_transport_failure_parks__(fake_client, tmp_path):
     b = _broker(fake_client, tmp_path, put_order=_connect_fail_wrapped)
     b._order_ids["L"] = ["ID1"]
     b._order_category["ID1"] = "NORMAL"
+    # The #86 diff skips a no-change modify entirely, so the transport
+    # failure needs an actual price change to reach the PUT.
+    moved = DispatchEnvelope(
+        intent=EntryIntent(pine_id="L", symbol="VN30F1M", side="buy", qty=1,
+                           order_type=OrderType.LIMIT, limit=1501.0),
+        run_tag="abcd", bar_ts_ms=1_700_000_000_000, retry_seq=0, coid_max_len=30)
     with pytest.raises(OrderDispositionUnknownError):
-        asyncio.run(b.modify_entry(_entry_envelope(), _entry_envelope()))
+        asyncio.run(b.modify_entry(_entry_envelope(), moved))
 
 
 # --- bar feed (get_ohlc, GET) — engine-hard-called; a blip must not crash ----
