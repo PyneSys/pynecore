@@ -401,6 +401,7 @@ def security_process_main(
         chart_type: 'str | None' = None,
         chart_timeframe: 'str | None' = None,
         plain_ltf: bool = False,
+        chart_type_warmup: 'str | None' = None,
 ):
     assert result_locks is not None, "result_locks must be provided by script_runner"
     """
@@ -439,6 +440,10 @@ def security_process_main(
         the target; an empty round (no intrabar in the period — a feed gap)
         must keep the previous value (TradingView ``gaps_off`` forward-fill)
         instead of writing ``na``.
+    :param chart_type_warmup: ``.ohlcv`` at this context's resolution reaching
+        before the chart's first bar, used ONLY to seed the ``chart_type``
+        recurrence (the context's bars still come from the chart). ``None``
+        starts the transform cold on the first bar.
     """
     # Safety net first: exit if the parent is hard-killed (see the watchdog docstring).
     _start_parent_death_watchdog()
@@ -785,8 +790,44 @@ def security_process_main(
         })
         root_keys.append(_ha_key)
         _ha_pending: 'list[float | None]' = [None, None]
+        # The recurrence is seeded on the first bar rather than at setup, because
+        # only then is the context's first bar timestamp known — and that is the
+        # cut: every warmup bar STRICTLY BEFORE it advances the recurrence, the
+        # first bar itself is the context's own and must be transformed by the
+        # normal path. TradingView carries exactly this state into a context its
+        # chart aggregates (measured on BINANCE:BTCUSDT@30: the ``"120"`` Heikin
+        # Ashi context opens at ``bar_index`` 0 with the carried open, not with
+        # ``(open + close) / 2``).
+        _ha_needs_seed: 'list[bool]' = [chart_type_warmup is not None]
+
+        def _ha_seed(_first_ts_ms: int) -> None:
+            _ha_needs_seed[0] = False
+            from .ohlcv import OHLCVReader
+            _po: 'float | None' = None
+            _pc: 'float | None' = None
+            try:
+                with OHLCVReader(str(chart_type_warmup)) as _reader:
+                    for _wb in _reader:
+                        if _wb.timestamp >= _first_ts_ms:
+                            break
+                        _wo, _, _, _wc = _heikinashi_step(
+                            _po, _pc,
+                            _round_price(_wb.open, round_decimals),
+                            _round_price(_wb.high, round_decimals),
+                            _round_price(_wb.low, round_decimals),
+                            _round_price(_wb.close, round_decimals))
+                        _po, _pc = _wo, _wc
+            except (OSError, ValueError):
+                # A missing or unreadable warmup feed is not worth failing the
+                # run over: the recurrence simply stays cold, which is the
+                # behaviour without a warmup feed at all.
+                return
+            if _po is not None:
+                _ha_root[0], _ha_root[1] = _po, _pc
 
         def _ha_apply(_b: OHLCV) -> OHLCV:
+            if _ha_needs_seed[0]:
+                _ha_seed(_b.timestamp)
             if is_legacy_feed and _b.volume < 0:
                 # Legacy gap-fill bar: forward-fill the last HA close flat and do
                 # NOT advance the recurrence (mirrors the removed feed transform's

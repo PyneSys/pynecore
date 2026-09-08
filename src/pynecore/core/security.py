@@ -241,6 +241,14 @@ class SecurityState:
     # (sub-bar) chart types are rejected at spawn.
     chart_type: str | None = None
 
+    # Feed the chart-type transform warms up from: an ``.ohlcv`` at the CONTEXT's
+    # resolution whose bars reach before the chart's first one. Only set for a
+    # context the chart feed serves (:meth:`ScriptRunner._resolve_security_data`),
+    # where the file is a seed source and never the context's data. ``None``
+    # leaves the recurrence cold, which is what TradingView does when its own
+    # feed starts with the chart.
+    chart_type_warmup: str | None = None
+
     # LTF prefix-skip (chart-side, backtest/file-backed only). The LTF child's
     # ``.ohlcv`` feed first bar open, in ms. The child includes intrabars with
     # ``bar_open <= target_time`` and the historical target is the chart bar's

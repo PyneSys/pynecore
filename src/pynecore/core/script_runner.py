@@ -709,7 +709,8 @@ class ScriptRunner:
                  'equity_curve', 'first_price', 'last_price', '_trade_num',
                  '_script_path', '_security_data', '_magnifier_iter', '_magnifier_source_tf',
                  '_chart_provider_name', '_chart_provider_instance', '_chart_data_path',
-                 '_time_from', '_sec_syminfos', '_signal_rate_sources_fn',
+                 '_time_from', '_sec_syminfos', '_chart_type_warmup',
+                 '_signal_rate_sources_fn',
                  '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
                  '_engine_event_stream_future',
                  '_broker_store_ctx', '_log_ohlcv', '_price_decimals',
@@ -845,6 +846,12 @@ class ScriptRunner:
         # populated by ``_prefetch_sec_syminfos`` and consumed by the
         # currency-rate plumbing on the chart side. Empty in backtest mode.
         self._sec_syminfos: 'dict[str, SymInfo]' = {}
+        # Chart-type (``ticker.heikinashi()``) warmup feeds per sec_id: a
+        # ``--security`` file for a context the CHART feed serves, whose only
+        # job is to seed the transform's recurrence from the bars preceding the
+        # chart (see :meth:`_resolve_security_data`). Empty without such a
+        # mapping.
+        self._chart_type_warmup: 'dict[str, str]' = {}
         # Optional per-bar driver for ``__auto_rate_*`` rate-source
         # subprocesses. Installed by ``create_chart_protocol`` when any
         # auto-rate sec_ids exist; left as ``None`` for backtests / runs
@@ -1627,6 +1634,8 @@ class ScriptRunner:
                     _, _ct = _split_chart_type(str(_ctx.get('symbol', '')))
                     if _ct is not None:
                         sec_states[_sid].chart_type = _ct
+                        sec_states[_sid].chart_type_warmup = \
+                            self._chart_type_warmup.get(_sid)
 
                 # Currency rate provider — built after the SyncBlock exists so
                 # security-context lookups can read the latest pickled close
@@ -1722,6 +1731,7 @@ class ScriptRunner:
                             sec_state.chart_type,
                             chart_tf,
                             sec_state.plain_ltf,
+                            sec_state.chart_type_warmup,
                         ),
                         daemon=True,
                     )
@@ -1805,6 +1815,7 @@ class ScriptRunner:
                     )
                     resolved_path = resolved[sid]
                     sec_ohlcv_paths[sid] = resolved_path
+                    sec_state.chart_type_warmup = self._chart_type_warmup.get(sid)
                     # Now that the real symbol/timeframe are known, redo the
                     # session-anchor decision (the placeholder TF at setup may
                     # have been the chart TF, and the syminfo may only now be
@@ -3513,6 +3524,32 @@ class ScriptRunner:
             elif timeframe in self._security_data:
                 entry = self._security_data[timeframe]
 
+            # A chart-type context (``ticker.heikinashi()``) the CHART feed
+            # itself serves: a mapped file is not its data source. The chart
+            # drives such a context bar by bar and TradingView computes it on
+            # that same aggregation — measured on BINANCE:BTCUSDT@30, where a
+            # ``"120"`` Heikin Ashi context opens at ``bar_index`` 0 on the
+            # chart's first bar, exactly like the plain ``"120"`` one. What the
+            # file adds is the bars BEFORE the chart's first: the transform's
+            # recurrence carries over them (the same measurement reads the
+            # context's first ``open`` as the carried value, not ``(o + c) / 2``),
+            # and an aggregation of the chart window alone cannot reconstruct it.
+            # A context AT the chart's own resolution is excluded: the chart feed
+            # is already the whole series there, so a mapping can only mean the
+            # data itself.
+            if (entry is not None and not isinstance(entry, PluginSymbol)
+                    and chart_type is not None
+                    and self._chart_provider_instance is None
+                    and self._chart_data_path is not None
+                    and symbol == f"{self.syminfo.prefix}:{self.syminfo.ticker}"
+                    and timeframe and timeframe != str(self.syminfo.period)
+                    and _derives_from_chart_feed(
+                        symbol, timeframe, bool(ctx.get('is_ltf')),
+                        f"{self.syminfo.prefix}:{self.syminfo.ticker}",
+                        str(self.syminfo.period))):
+                self._chart_type_warmup[sec_id] = str(self._ensure_ohlcv_ext(entry))
+                result[sec_id] = str(self._chart_data_path)
+                continue
             if isinstance(entry, PluginSymbol):
                 if entry.time_from is None and self._time_from is not None:
                     entry = dc_replace(entry, time_from=self._time_from)
@@ -3532,6 +3569,22 @@ class ScriptRunner:
                     and self._chart_provider_instance is None
                     and self._chart_data_path is not None
                     and symbol == f"{self.syminfo.prefix}:{self.syminfo.ticker}"):
+                if timeframe and timeframe != str(self.syminfo.period):
+                    # At the chart's own resolution the chart feed IS the source
+                    # TradingView transforms too. At any other resolution TV reads
+                    # that resolution's OWN feed, which starts years before the
+                    # chart does, so its Heikin Ashi recursion (``ha_open`` carries
+                    # forward from the previous bar) is already warm on the chart's
+                    # first bar. Derived from the chart feed the recursion seeds
+                    # cold there instead, and the transient decays over the first
+                    # hundreds of bars. Name the resolved context so the difference
+                    # is visible, and so tooling can provision the feed.
+                    logger.warning(
+                        f"Chart-type security context (symbol={symbol!r}, "
+                        f"timeframe={timeframe!r}, type={chart_type!r}) derived "
+                        f"from the chart feed: no OHLCV data was provided for it, "
+                        f"so the transform starts cold at the chart's first bar"
+                    )
                 result[sec_id] = str(self._chart_data_path)
                 continue
 
