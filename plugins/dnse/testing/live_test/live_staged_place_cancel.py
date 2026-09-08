@@ -13,7 +13,7 @@ from pynecore.types import PersistentSeries, Series
 def main(
     winStart=input.time(timestamp("2030-01-01T00:00:00+07:00"), "Trade window START"),
     winEnd=input.time(timestamp("2030-01-01T23:59:00+07:00"), "Trade window END"),
-    startState=input.int(0, "Start at state (0=T1 .. 11=T13)", minval=0, maxval=11)
+    startState=input.int(0, "Start at state (0=T1 .. 14=T21)", minval=0, maxval=14)
 ):
     state: PersistentSeries[int] = startState
     placedBar: PersistentSeries[int] = na(int)
@@ -22,6 +22,7 @@ def main(
     lvlStop: PersistentSeries[float] = na(float)
     lvlTP: PersistentSeries[float] = na(float)
     lvlAmend: PersistentSeries[float] = na(float)
+    lvlAmend2: PersistentSeries[float] = na(float)
     announced: PersistentSeries[bool] = False
 
     isGreen = close > open
@@ -31,10 +32,10 @@ def main(
     if started:
         if not announced:
             log.info("[L1] === STAGED PLACE/CANCEL v2 — window open. Tests T1-T9, 1 contract " + "each, every order >=4.5% away so none can fill. startState={0} ===", startState)
-            log.info("[L1] plan: T1/T2 limit place+cancel | T3 +exit(stop) | T4 OCA cancel-entry-only " + "| T5 native-OCO cancel-entry-only | T6 amend NORMAL | T7 amend STOP (#18 500) " + "| T8 cancel_all both books | T9 strategy.order()")
+            log.info("[L1] plan: T1/T2 limit place+cancel | T3 +exit(stop) | T4 OCA cancel-entry-only " + "| T5 native-OCO cancel-entry-only | T6 amend NORMAL | T7 amend STOP (#18 500) " + "| T8 cancel_all both books | T9 strategy.order() | T19 #85 cancel+replace x2 " + "| T20 #86 dual-field amend split | T21 #87 both-set sole owner")
             announced = True
         log.info("[L1] bar={0} close={1} candle={2} state={3} step={4} pending={5} pos={6}", bar_index, string.tostring(close, format.mintick), ("GREEN" if isGreen else "RED"), state, stageStep, ("yes" if pending else "no"), strategy.position_size)
-        if canPlace and (not pending) and state < 12:
+        if canPlace and (not pending) and state < 15:
             if state == 0:
                 lvlEntry = close * 0.95
                 strategy.entry("T1", strategy.long, limit=lvlEntry, comment="T1")
@@ -114,6 +115,25 @@ def main(
                 strategy.entry("Nb", strategy.short, limit=lvlAmend, oca_name="g13", oca_type=strategy.oca.none, comment="Nb")
                 placedBar = bar_index
                 log.info("[L1] TEST 13 PLACE oca.none (SHARED name g13): Na limit={0} + Nb limit={1} " + "— next bar cancels ONLY Na; Nb must be untouched (none = independent)", string.tostring(lvlEntry, format.mintick), string.tostring(lvlAmend, format.mintick))
+            elif state == 12:
+                lvlStop = close * 1.05
+                lvlAmend = close * 1.046
+                lvlAmend2 = close * 1.047
+                strategy.entry("T19", strategy.long, stop=lvlStop, comment="T19")
+                placedBar = bar_index
+                log.info("[L1] TEST 19 PLACE id=T19 buy-STOP {0} (+5%) — next TWO bars re-issue at " + "{1} then {2}. Post-#85 expect CANCEL+REPLACE each time (old string id " + "Canceled, FRESH id placed), NO http=500 park. #51 caveat: run pre-open", string.tostring(lvlStop, format.mintick), string.tostring(lvlAmend, format.mintick), string.tostring(lvlAmend2, format.mintick))
+            elif state == 13:
+                lvlEntry = close * 0.95
+                lvlAmend = close * 0.955
+                strategy.entry("T20", strategy.long, limit=lvlEntry, comment="T20")
+                placedBar = bar_index
+                log.info("[L1] TEST 20 PLACE id=T20 LONG limit={0} (-5%) qty=1 — next bar re-issues " + "at {1} (-4.5%) AND qty=2: BOTH fields changed. #86 expects TWO sequential " + "single-field amends, SAME id, venue ends price+qty both new", string.tostring(lvlEntry, format.mintick), string.tostring(lvlAmend, format.mintick))
+            elif state == 14:
+                lvlStop = close * 1.05
+                lvlEntry = close * 0.95
+                strategy.entry("T21", strategy.long, limit=lvlEntry, stop=lvlStop, comment="T21")
+                placedBar = bar_index
+                log.info("[L1] TEST 21 PLACE id=T21 BOTH-SET stop={0} limit={1} — #87: plugin is " + "SOLE OWNER (one conditional stop-limit, string id). Expect 'entry-stop " + "watch ... NOT armed ... sole owner' and NO 'armed entry-stop watch' line", string.tostring(lvlStop, format.mintick), string.tostring(lvlEntry, format.mintick))
         if pending and bar_index > placedBar:
             if state == 5 and stageStep == 0:
                 strategy.entry("T6", strategy.long, limit=lvlAmend, comment="T6amend")
@@ -134,7 +154,22 @@ def main(
                 strategy.entry("T7", strategy.long, stop=lvlAmend, comment="T7amend")
                 stageStep = 1
                 placedBar = bar_index
-                log.info("[L1] TEST 7 AMEND id=T7 -> stop {0} — expect code=REMOTE_SERVER_ERROR " + "http=500 -> park+verify (#18). KEY: the run must continue, and the order " + "must still cancel next bar", string.tostring(lvlAmend, format.mintick))
+                log.info("[L1] TEST 7 AMEND id=T7 -> stop {0} — post-#85 expect CANCEL+REPLACE " + "(see TEST 19), no longer the #18 500-park. Run must continue and the " + "order must still cancel next bar", string.tostring(lvlAmend, format.mintick))
+            elif state == 12 and stageStep == 0:
+                strategy.entry("T19", strategy.long, stop=lvlAmend, comment="T19r1")
+                stageStep = 1
+                placedBar = bar_index
+                log.info("[L1] TEST 19 REPLACE 1 id=T19 -> stop {0} — expect [BROKER] cancel of the " + "original string id (Canceled at the venue) + a FRESH conditional id", string.tostring(lvlAmend, format.mintick))
+            elif state == 12 and stageStep == 1:
+                strategy.entry("T19", strategy.long, stop=lvlAmend2, comment="T19r2")
+                stageStep = 2
+                placedBar = bar_index
+                log.info("[L1] TEST 19 REPLACE 2 id=T19 -> stop {0} — the replacement itself must " + "replace again (mapping follows the newest id; warn-throttle re-armed)", string.tostring(lvlAmend2, format.mintick))
+            elif state == 13 and stageStep == 0:
+                strategy.entry("T20", strategy.long, 2, limit=lvlAmend, comment="T20amend")
+                stageStep = 1
+                placedBar = bar_index
+                log.info("[L1] TEST 20 AMEND id=T20 -> limit {0} AND qty 2 — expect TWO sequential " + "[BROKER] amend PUTs (one per field, price first), SAME NORMAL id; venue " + "detail must end price={0} quantity=2", string.tostring(lvlAmend, format.mintick))
             else:
                 if state == 0:
                     strategy.cancel("T1")
@@ -174,12 +209,21 @@ def main(
                 elif state == 11:
                     strategy.cancel("Nb")
                     log.info("[L1] TEST 13 CANCEL Nb (the survivor)")
-                log.info("[L1] TEST {0} DONE — state {1}->{2}", (state + 2 if state >= 9 else state + 1), state, state + 1)
+                elif state == 12:
+                    strategy.cancel("T19")
+                    log.info("[L1] TEST 19 CANCEL id=T19 — must hit the LATEST replacement id " + "(two ancestors already Canceled); venue then clear of all three")
+                elif state == 13:
+                    strategy.cancel("T20")
+                    log.info("[L1] TEST 20 CANCEL id=T20 (post-split-amend, same id throughout)")
+                elif state == 14:
+                    strategy.cancel("T21")
+                    log.info("[L1] TEST 21 CANCEL id=T21 (the single conditional stop-limit)")
+                log.info("[L1] TEST {0} DONE — state {1}->{2}", (state + 7 if state >= 12 else (state + 2 if state >= 9 else state + 1)), state, state + 1)
                 placedBar = na
                 stageStep = 0
                 state += 1
-                if state == 12:
-                    log.info("[L1] === ALL TESTS DONE (T1-T9 + OCA T11-T13). Verify at the venue that NOTHING of ours " + "is still working, then stop the run. ===")
+                if state == 15:
+                    log.info("[L1] === ALL TESTS DONE (T1-T9 + OCA T11-T13 + T19-T21). Verify at the venue that NOTHING of ours " + "is still working, then stop the run. ===")
         if strategy.position_size != 0:
             log.error("[L1] !!! UNEXPECTED FILL: pos={0} avg={1} — cancelling all and flattening", strategy.position_size, string.tostring(strategy.position_avg_price, format.mintick))
             strategy.cancel_all()
