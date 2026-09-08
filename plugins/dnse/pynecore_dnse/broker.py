@@ -203,6 +203,13 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         #: slice read); a 429 backs the reads off until the cooldown passes.
         self._executions_read_deadline_s: float = 2.5
         self._executions_cooldown_until: float = 0.0
+        #: #81 bar-feed poll-failure ladder — counters on the INSTANCE (the
+        #: runner re-enters watch_ohlcv every ≤2 s, so coroutine locals
+        #: reset per entry). Warn after N consecutive failures, re-warn
+        #: every M, reset on any success.
+        self._bar_poll_failures: int = 0
+        self._bar_poll_warn_after: int = 20
+        self._bar_poll_rewarn_every: int = 120
         #: #74 residue detector: grace before a vanished journalled id is
         #: even ASKED about — 30 s flat, 3x the measured ~10 s stale-replica
         #: lag, deliberately NOT a cadence formula (a 5x-cadence rule gives
@@ -441,7 +448,17 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         return await self._watch_ohlcv_closed(symbol, timeframe)
 
     async def _watch_ohlcv_closed(self, symbol: str, timeframe: str) -> OHLCV:
-        """Yield the next CLOSED bar by polling REST ``/price/ohlc``."""
+        """Yield the next CLOSED bar by polling REST ``/price/ohlc``.
+
+        #81: poll-failure accounting lives on ``self``, NEVER in coroutine
+        locals — the live runner re-enters ``watch_ohlcv`` under a ≤2 s
+        ``wait_for``, so each coroutine instance sees ~one poll and a local
+        counter can never accumulate (panel-measured). A failed-poll streak
+        warns (throttled by re-warn interval); success resets. The
+        staleness/wedge half is the CORE watchdog (``feed_timeout_bars``,
+        armed at 16 in provider.py) — this ladder covers the
+        failing-but-answering venue shape the watchdog cannot attribute.
+        """
         resolution = self.to_exchange_timeframe(timeframe)
         period = _TF_SECONDS.get(timeframe, 300)
         while True:
@@ -451,6 +468,24 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
                     self.market_type,
                     {"symbol": self.symbol, "resolution": resolution,
                      "from": now - period * 5, "to": now})))
+            if status != 200 or not isinstance(body, dict):
+                self._bar_poll_failures += 1
+                if (self._bar_poll_failures >= self._bar_poll_warn_after
+                        and (self._bar_poll_failures
+                             % self._bar_poll_rewarn_every
+                             == self._bar_poll_warn_after
+                             % self._bar_poll_rewarn_every)):
+                    log.broker_warning(
+                        "bar feed: %d consecutive failed OHLC polls "
+                        "(last http=%s) — the strategy is not receiving "
+                        "prices (#81)",
+                        self._bar_poll_failures, status)
+            else:
+                if self._bar_poll_failures >= self._bar_poll_warn_after:
+                    log.broker_info(
+                        "bar feed recovered after %d failed polls",
+                        self._bar_poll_failures)
+                self._bar_poll_failures = 0
             if status == 200 and isinstance(body, dict) and body.get("t"):
                 times = body["t"]
                 idx = len(times) - 1

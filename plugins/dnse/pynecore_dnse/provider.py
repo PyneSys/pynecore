@@ -127,10 +127,17 @@ class DNSEProvider(ProviderPlugin[DNSEConfigT]):
                else "LIVE DNSE" if self.is_production else "TEST VENUE (not DNSE)")
         return f"[{tag}] rest={self.config.base_url} ws={self.config.ws_url}"
 
-    #: VN30F1M has a lunch break and a 14:45 close, so quiet stretches are
-    #: normal and long. The framework default (3 bars) would reconnect-churn
-    #: across every session gap; CCXT raises it to 30 for the same reason.
-    feed_timeout_bars: int | None = 40
+    #: #81 (measured 2026-09-07): the engine went blind for 8+ minutes while
+    #: the venue served bars — silent, because 40 bars @1m = 2400 s of
+    #: allowed staleness. The old rationale (lunch break, 14:45 close) was
+    #: obsolete: the core watchdog's clock PAUSES outside ``opening_hours``
+    #: (lunch/overnight never count), so the only IN-SESSION bar gap is the
+    #: 14:30-14:45 ATC = 15 bars @1m. 16 clears the ATC (no daily false
+    #: reconnect) while converting a persistent bar-feed wedge from
+    #: silent-forever into a forced reconnect within 16 min @1m. Any value
+    #: below 16 false-fires in the ATC at 1m; pinned by the threshold
+    #: control in test_bar_feed_health.py.
+    feed_timeout_bars: int | None = 16
 
     def resolve_contract(self, symbol: str | None = None) -> str:
         """Map a ``symbolType`` alias to the tradable KRX contract code.
