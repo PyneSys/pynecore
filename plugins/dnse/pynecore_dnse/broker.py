@@ -203,6 +203,10 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
         #: slice read); a 429 backs the reads off until the cooldown passes.
         self._executions_read_deadline_s: float = 2.5
         self._executions_cooldown_until: float = 0.0
+        #: #85: intent keys already warned about the conditional-modify
+        #: limitation (exit park) — once per key per episode; an entry
+        #: replace clears its key so the next episode warns again.
+        self._modify_warned_keys: set = set()
         #: #81 bar-feed poll-failure ladder — counters on the INSTANCE (the
         #: runner re-enters watch_ohlcv every ≤2 s, so coroutine locals
         #: reset per entry). Warn after N consecutive failures, re-warn
@@ -1472,6 +1476,43 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
             [await self._cancel_one_disposition(str(order_id))
              for order_id in ids])
 
+    async def _cancel_replace_entry(self, old, new, order_id: str
+                                    ) -> list[ExchangeOrder]:
+        """#85: move a conditional ENTRY the only way the venue allows.
+
+        Outcome-gated: ONLY a positive ``CANCEL_CONFIRMED`` proceeds to the
+        replacement. ``ALREADY_FILLED`` means the entry executed mid-race —
+        replacing would DOUBLE-OPEN; ``TOO_LATE``/``UNKNOWN`` cannot prove
+        the old order is gone (measured: the venue serves a cancelled STOP
+        as ``New`` for >12 s) — replacing could rest TWO live stops on the
+        netting account. All non-positive outcomes raise the
+        disposition-unknown PARK (the engine keeps the OLD intent active —
+        sync_engine.py:13565 — and the watch events resolve reality;
+        self-limiting: a filled entry leaves Pine's book, so the modify is
+        not re-attempted). On confirmed cancel the old id is pruned by
+        TARGETED removal (reassigning the list would drop a concurrently
+        adopted #41 child, panel-probed) and the replacement goes through
+        the FULL ``execute_entry`` — persist-first journaling, and the #34
+        crossed-at-placement semantics (a replacement whose stop the market
+        crossed mid-gap fires immediately, exactly as TV treats a
+        modified-to-crossed stop).
+        """
+        outcome = await self._cancel_one_disposition(order_id)
+        if outcome is not CancelDispositionOutcome.CANCEL_CONFIRMED:
+            raise OrderDispositionUnknownError(
+                f"DNSE conditional entry modify: predecessor cancel not "
+                f"positively confirmed (outcome={outcome.value}) — parked, "
+                f"old order {order_id} treated as possibly live",
+                client_order_id=order_id)
+        key = getattr(old.intent, "intent_key", None)
+        if key and key in self._order_ids:
+            try:
+                self._order_ids[key].remove(order_id)
+            except ValueError:
+                pass
+        self._modify_warned_keys.discard(key)
+        return await self.execute_entry(new)
+
     @override
     async def modify_entry(self, old, new) -> list[ExchangeOrder]:
         return await self._amend(old, new, is_exit=False)
@@ -1486,6 +1527,34 @@ class DNSEBroker(DNSEProvider[DNSEBrokerConfig], BrokerPlugin[DNSEBrokerConfig])
             return await (super().modify_exit(old, new) if is_exit
                           else super().modify_entry(old, new))
         order_id = str(ids[0])
+        # #85 (operator-identified, panel-adjudicated): the conditional book
+        # CANNOT be amended (#18: HTTP 500 always — re-measured live
+        # 2026-09-08), so a per-bar Pine modify silently never reached the
+        # venue (the old trigger stayed armed). Conditionals now route:
+        # ENTRY -> plugin-local outcome-gated cancel+replace; EXIT -> the
+        # proven disposition-unknown PARK (old stop stays armed at the
+        # stale level — never naked) plus a loud once-per-key warning.
+        # NEVER super().modify_*: it discards the cancel outcome (a cancel
+        # the venue answers 'order is done' may mean FILLED — replacing
+        # then would double-open), and the venue was measured serving a
+        # cancelled STOP as `New` for >12 s.
+        if (self._order_category_for(order_id) or "NORMAL") != "NORMAL":
+            if is_exit:
+                if old.intent.intent_key not in self._modify_warned_keys:
+                    self._modify_warned_keys.add(old.intent.intent_key)
+                    log.broker_warning(
+                        "conditional EXIT %s cannot be amended on DNSE "
+                        "(venue limitation, #18/#85): the protective stop "
+                        "stays ARMED at its ORIGINAL level %s — trailing "
+                        "exits do not move on this venue. Parking the "
+                        "modify; manage trailing via strategy logic if "
+                        "the stale level is unacceptable.",
+                        old.intent.intent_key, order_id)
+                raise OrderDispositionUnknownError(
+                    f"DNSE conditional exit amend unsupported (#18) — "
+                    f"parked, old order {order_id} stays armed",
+                    client_order_id=order_id)
+            return await self._cancel_replace_entry(old, new, order_id)
         intent = new.intent
         price = (getattr(intent, "limit", None) or getattr(intent, "stop", None)
                  or getattr(intent, "tp_price", None) or getattr(intent, "sl_price", None))

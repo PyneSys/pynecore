@@ -323,6 +323,8 @@ def __test_modify_entry_with_tracked_id_amends_in_place__(fake_client, tmp_path)
 
 
 def __test_modify_exit_with_tracked_id_amends_in_place__(fake_client, tmp_path):
+    # NORMAL-book exit: the atomic amend path (PUT) is valid there — the venue
+    # only refuses amends on the conditional book (#18/#85, which now parks).
     b = _broker(fake_client, tmp_path,
                put_order=(200, {"id": "ORD2", "orderStatus": "New", "quantity": 2}))
     old_intent = ExitIntent(pine_id="X1", from_entry="P1", symbol="VN30F1M", side="sell",
@@ -330,7 +332,7 @@ def __test_modify_exit_with_tracked_id_amends_in_place__(fake_client, tmp_path):
     new_intent = ExitIntent(pine_id="X1", from_entry="P1", symbol="VN30F1M", side="sell",
                             qty=2, sl_price=88.0)
     b._order_ids[old_intent.intent_key] = ["ORD2"]
-    b._order_category["ORD2"] = "STOP"
+    b._order_category["ORD2"] = "NORMAL"
     old = _envelope(old_intent)
     new = _envelope(new_intent)
 
@@ -690,3 +692,145 @@ def __test_cancelling_an_entry_touches_only_its_own_ids__(fake_client, tmp_path)
         "an entry cancel must NOT unilaterally cancel its exit legs: the engine owns "
         "them, sees such a cancel as venue tampering, re-places the exit and "
         "quarantines (measured live 2026-08-14, test T5)")
+
+
+# === #85: conditional modify must reach the venue via cancel+replace =========
+
+def __test_conditional_modify_reaches_venue_via_cancel_replace__(
+        fake_client, tmp_path):
+    """RED (#85, operator-identified go-live blocker): DNSE conditional
+    amend is venue-broken (#18: HTTP 500 always — re-measured live
+    2026-09-08). Today `_amend` PUTs anyway, gets the 500, parks — and the
+    venue keeps the OLD trigger: a trailing entry/stop silently does not
+    trail. The new level must reach the venue the only way the venue
+    allows: cancel the old conditional + place the replacement."""
+    old = EntryIntent(pine_id="T", symbol="VN30F1M", side="buy", qty=1,
+                      order_type=OrderType.STOP, stop=2000.0)
+    new = EntryIntent(pine_id="T", symbol="VN30F1M", side="buy", qty=1,
+                      order_type=OrderType.STOP, stop=1990.0)
+    b = _broker(fake_client, tmp_path,
+                put_order=(500, {"code": "REMOTE_SERVER_ERROR",
+                                 "message": "Error in backend service"}),
+                cancel_order=(200, {"orderStatus": "Canceled"}),
+                get_order_detail=(200, {"id": "COND1", "symbol": "VN30F1M",
+                                        "side": "NB", "quantity": 1,
+                                        "orderStatus": "Canceled"}),
+                post_order=(201, {"id": "COND2", "symbol": "VN30F1M",
+                                  "side": "NB", "quantity": 1,
+                                  "orderStatus": "New"}))
+    b._order_ids["T"] = ["COND1"]
+    b._order_category["COND1"] = "STOP"
+    b._cancel_verify_attempts = 1
+    b._cancel_verify_delay = 0.0
+
+    result = asyncio.run(b.modify_entry(_envelope(old), _envelope(new)))
+
+    assert b._client.count("cancel_order") >= 1, (
+        "the old conditional was never cancelled — the modify cannot land "
+        "any other way (conditional amend = 500, measured live)")
+    assert b._client.count("post_order") >= 1, (
+        "no replacement was placed — the venue still holds the OLD trigger "
+        "level (the silent no-trail bug, #85)")
+    assert result and result[0].id == "COND2", (
+        "modify must return the REPLACEMENT order for engine re-mapping")
+
+
+# === #86: NORMAL amend edits ONE field per call — combined change must split =
+
+def __test_conditional_modify_aborts_replace_when_cancel_not_confirmed__(
+        fake_client, tmp_path):
+    """#85 guard (outcome-gated): a predecessor cancel answered 'order is
+    done' (could mean FILLED) must NOT proceed to the replacement —
+    replacing a filled entry DOUBLE-OPENS on the netting account. Expect
+    the disposition-unknown park with the old order treated as possibly
+    live. Wrong impl caught: an outcome-blind cancel+replace (the base
+    class's shape, which discards the cancel result)."""
+    from pynecore.core.broker.exceptions import OrderDispositionUnknownError
+
+    old = EntryIntent(pine_id="T", symbol="VN30F1M", side="buy", qty=1,
+                      order_type=OrderType.STOP, stop=2000.0)
+    new = EntryIntent(pine_id="T", symbol="VN30F1M", side="buy", qty=1,
+                      order_type=OrderType.STOP, stop=1990.0)
+    b = _broker(fake_client, tmp_path,
+                cancel_order=(400, {"code": "ORDER_CANCEL_STATUS_REJECTED"}),
+                get_order_detail=(200, {"id": "COND1", "symbol": "VN30F1M",
+                                        "side": "NB", "quantity": 1,
+                                        "orderStatus": "Filled",
+                                        "fillQuantity": 1}))
+    b._order_ids["T"] = ["COND1"]
+    b._order_category["COND1"] = "STOP"
+    b._cancel_verify_attempts = 1
+    b._cancel_verify_delay = 0.0
+
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(b.modify_entry(_envelope(old), _envelope(new)))
+
+    assert b._client.count("post_order") == 0, (
+        "the replacement was placed over an ALREADY_FILLED predecessor — "
+        "double-open on the netting account (#85)")
+    assert b._order_ids["T"] == ["COND1"], (
+        "the old id must stay mapped while its disposition is unresolved")
+
+
+def __test_conditional_modify_prune_keeps_concurrent_child_id__(
+        fake_client, tmp_path):
+    """#85 guard M2: pruning the cancelled predecessor must be a TARGETED
+    removal — a concurrently adopted #41 child on the same key survives.
+    Wrong impl caught: reassigning the id list (drops the child)."""
+    old = EntryIntent(pine_id="T", symbol="VN30F1M", side="buy", qty=1,
+                      order_type=OrderType.STOP, stop=2000.0)
+    new = EntryIntent(pine_id="T", symbol="VN30F1M", side="buy", qty=1,
+                      order_type=OrderType.STOP, stop=1990.0)
+    b = _broker(fake_client, tmp_path,
+                cancel_order=(200, {"orderStatus": "Canceled"}),
+                get_order_detail=(200, {"id": "COND1", "symbol": "VN30F1M",
+                                        "side": "NB", "quantity": 1,
+                                        "orderStatus": "Canceled"}),
+                post_order=(201, {"id": "COND2", "symbol": "VN30F1M",
+                                  "side": "NB", "quantity": 1,
+                                  "orderStatus": "New"}))
+    b._order_ids["T"] = ["COND1", "CHILD-437346"]   # adopted #41 child
+    b._order_category["COND1"] = "STOP"
+    b._cancel_verify_attempts = 1
+    b._cancel_verify_delay = 0.0
+
+    asyncio.run(b.modify_entry(_envelope(old), _envelope(new)))
+
+    assert "CHILD-437346" in b._order_ids["T"], (
+        "the concurrently adopted child was dropped by the prune — "
+        "targeted removal required (#85 M2)")
+    assert "COND1" not in b._order_ids["T"], "the cancelled predecessor is pruned"
+
+
+def __test_conditional_exit_modify_parks_loudly_and_touches_nothing__(
+        fake_client, tmp_path, caplog):
+    """#85 exit half: a conditional EXIT modify must dispatch NOTHING (no
+    doomed PUT, no cancel, no replacement) — the stale stop stays armed,
+    the park keeps the engine's OLD intent active (a skip would pop the
+    active slot and arm a SECOND stop next bar, panel M1), and the
+    limitation warns once per key. Wrong impls caught: the doomed per-bar
+    PUT (venue write waste), any cancel dispatch (naked window), and
+    OrderSkippedByPlugin (second-stop shape)."""
+    import logging
+    from pynecore.core.broker.exceptions import OrderDispositionUnknownError
+
+    old = ExitIntent(pine_id="P", from_entry="E", symbol="VN30F1M",
+                     side="sell", qty=1, tp_price=None, sl_price=1950.0)
+    new = ExitIntent(pine_id="P", from_entry="E", symbol="VN30F1M",
+                     side="sell", qty=1, tp_price=None, sl_price=1955.0)
+    b = _broker(fake_client, tmp_path)
+    b._order_ids["P\x00E"] = ["CONDX"]   # ExitIntent.intent_key is NUL-joined
+    b._order_category["CONDX"] = "STOP"
+
+    with caplog.at_level(logging.DEBUG):
+        for _ in range(3):                     # three bars of trailing
+            with pytest.raises(OrderDispositionUnknownError):
+                asyncio.run(b.modify_exit(_envelope(old), _envelope(new)))
+
+    assert b._client.count("put_order") == 0, "no doomed PUT per bar"
+    assert b._client.count("cancel_order") == 0, "no cancel — never naked"
+    assert b._client.count("post_order") == 0, "no replacement"
+    warns = [r for r in caplog.records if r.levelno >= logging.WARNING
+             and "cannot be amended" in r.getMessage()]
+    assert len(warns) == 1, (
+        f"the limitation must warn exactly once per key (got {len(warns)})")
