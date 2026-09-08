@@ -101,10 +101,15 @@ echo "-- grading --"
 L2=$LT/logs/t16_phase2.log
 STRIP() { sed 's/\x1b\[[0-9;]*m//g' "$1"; }
 ADOPT=$(STRIP $L2 | grep -acE "adopt|quarantin|reconcil|external order" || true)
-DUP=$(STRIP $L2 | grep -acE "event CREATED id=" || true)
+# #90: the ADOPTED order legitimately surfaces one CREATED event with
+# PHASE-1's OWN id (the watch loop's first sighting of the re-owned order —
+# measured 2026-09-08, graded a substance-PASS run FAIL). A duplicate
+# placement is a CREATED event with a DIFFERENT id than phase 1's.
+DUP=$(STRIP $L2 | grep -aoE "event CREATED id=[0-9A-Za-z_-]+" \
+      | grep -avc "id=${ID1:-__no_phase1_id__}$" || true)
 CANC=$(STRIP $L2 | grep -acE "cancel" || true)
 echo "phase-2 adoption/quarantine/reconcile lines : $ADOPT  (0 = SILENT ownership -> FAIL)"
-echo "phase-2 NEW placements (CREATED)            : $DUP  (>0 = duplicate placement -> FAIL)"
+echo "phase-2 NEW placements (CREATED, id != phase-1's ${ID1:-?}) : $DUP  (>0 = duplicate placement -> FAIL)"
 echo "phase-2 cancel activity lines               : $CANC  (0 = sweep never reached it -> FAIL)"
 if [ "${ADOPT:-0}" -gt 0 ] && [ "${DUP:-0}" -eq 0 ] && [ "${CANC:-0}" -gt 0 ]; then
   echo "T16 (SIG$MODE): tentative PASS — NOW CONFIRM AT THE VENUE: order ${ID1:-?} terminal, nothing working"
