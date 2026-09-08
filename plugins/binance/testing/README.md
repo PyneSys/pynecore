@@ -28,12 +28,29 @@ session with a fill test. Escalate, and **stop at the first failure**:
 | Tier | Cases | Precondition |
 |---|---|---|
 | **NO-FILL** | B0, all B1 (T01–T13) | testnet keys + clean book. Every order is ≥4% away or cancelled before it can fill. |
-| **FILL** | all B2 (F01–F09) | testnet only, supervised. Spot **nets base inventory** — a fill merges with any existing BTC balance, and a protective SELL rests against inventory the bot does not own (that is the #82 exposure). Never point the FILL tier at mainnet. |
+| **FILL** | all B2 (F01–F09), **all B3 (BP1–BP4)** | testnet only, supervised. Spot **nets base inventory** — a fill merges with any existing BTC balance, and a protective SELL rests against inventory the bot does not own (that is the #82 exposure). Never point the FILL tier at mainnet. |
 
 Binance's tiering is milder than DNSE's (no shared user position on a testnet
 account), but the netting hazard is the same in kind: the account's 1 BTC
 foreign baseline is exactly what makes a naked pre-fill exit *executable*
 rather than venue-rejected.
+
+## Levels — what the number in `Live-B<N>` means
+
+Mirrors the DNSE suite's `Live-L<level>` scheme; the level is the SCENARIO
+family, the tier (above) is the EXECUTION GATE. Case IDs are stable and are
+never renamed.
+
+| Level | Family | Tier |
+|---|---|---|
+| **B0** | venue-semantics gate — auth, clock, filters, book, balance | NO-FILL |
+| **B1** | no-fill order lifecycle — place/cancel, OCA groups, amends, `cancel_all`, `strategy.order()` | NO-FILL |
+| **B2** | single-entry fill lifecycle — market/stop/stop-limit entries, OCO bracket resolution | FILL |
+| **B3** | multi-entry position shape — pyramiding, partial exits, partial closes, scale-out teardowns | FILL |
+
+B2 and B3 are both fill-tier: the split is single-entry vs multi-entry
+scenarios, not a difference in risk. DNSE splits its fill work across L2/L3
+the same way.
 
 ## Canonical test registry — `Live-B<case>` names only
 
