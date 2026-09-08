@@ -1,0 +1,66 @@
+[2026-09-08 13:12:53+0700] bar:      0 INFO     [BROKER] WS connect starting (warmup blocks until subscribed)
+[2026-09-08 13:12:53+0700] bar:      0 WARNING  [BROKER] recovery: venue order 240616 is owned by ANOTHER run label on this account (stranded by a different-label relaunch, #60). Reported only — never
+[2026-09-08 13:12:53+0700] bar:      0 WARNING  [BROKER] recovery: venue order 247636 is owned by ANOTHER run label on this account (stranded by a different-label relaunch, #60). Reported only — never
+[2026-09-08 13:12:53+0700] bar:      0 WARNING  [BROKER] recovery: venue order 272776 is owned by ANOTHER run label on this account (stranded by a different-label relaunch, #60). Reported only — never
+[2026-09-08 13:12:53+0700] bar:      0 WARNING  [BROKER] recovery: venue order daf5h08p4g19a630jjvg is owned by ANOTHER run label on this account (stranded by a different-label relaunch, #60).        
+[2026-09-08 13:12:53+0700] bar:      0 WARNING  [BROKER] recovery: venue order daf5kogp4g19a630jk70 is owned by ANOTHER run label on this account (stranded by a different-label relaunch, #60).        
+[2026-09-08 13:12:53+0700] bar:      0 WARNING  [BROKER] recovery: venue order daf5n40p4g19a630jki0 is owned by ANOTHER run label on this account (stranded by a different-label relaunch, #60).        
+[2026-09-08 13:12:53+0700] bar:      0 WARNING  [BROKER] recovery: venue order dafnq0op4g19a630ld3g is owned by ANOTHER run label on this account (stranded by a different-label relaunch, #60).        
+[2026-09-08 13:12:53+0700] bar:      0 WARNING  [BROKER] recovery: venue order dafnqfop4g19a630ld4g is owned by ANOTHER run label on this account (stranded by a different-label relaunch, #60).        
+[2026-09-08 13:12:53+0700] bar:      0 INFO     [BROKER] WS connected and subscribed: DNSEBroker VN30F1M@1
+[2026-09-08 13:12:53+0700] bar:      0 INFO     [BROKER] authenticated: plugin=DNSEBroker account=[REDACTED]
+[2026-09-08 13:12:53+0700] bar:      0 INFO     [BROKER] warmup phase started — replaying historical bars
+[2026-09-08 13:11:00+0700] bar:    500 INFO     [BROKER] warmup phase complete — 501 bar(s) processed
+[2026-09-08 13:11:00+0700] bar:    500 INFO     [BROKER] live trading active
+[2026-09-08 13:15:00+0700] bar:    504 INFO     [L1] === STAGED PLACE/CANCEL v2 — window open. Tests T1-T9, 1 contract each, every order >=4.5% away so none can fill. startState=12 ===
+[2026-09-08 13:15:00+0700] bar:    504 INFO     [L1] plan: T1/T2 limit place+cancel | T3 +exit(stop) | T4 OCA cancel-entry-only | T5 native-OCO cancel-entry-only | T6 amend NORMAL | T7 amend STOP (#18
+[2026-09-08 13:15:00+0700] bar:    504 INFO     [L1] bar=504 close=1962.8 candle=RED state=12 step=0 pending=no pos=0
+[2026-09-08 13:15:00+0700] bar:    504 INFO     [L1] TEST 19 PLACE id=T19 buy-STOP 2060.9 (+5%) — next TWO bars re-issue at 2053.1 then 2055.1. Post-#85 expect CANCEL+REPLACE each time (old string id 
+[2026-09-08 13:15:00+0700] bar:    504 INFO     [BROKER] dispatching ENTRY BUY id='T19' qty=1.0 type=stop stop=2061.0
+[2026-09-08 13:15:00+0700] bar:    504 INFO     [BROKER] dispatched ENTRY BUY id='T19' qty=1.0 type=stop stop=2061.0 -> ['dafqg88p4g19a630lisg']
+[2026-09-08 13:15:00+0700] bar:    504 INFO     [BROKER] event CREATED id=dafqg88p4g19a630lisg side=buy qty=1.0 filled=0.0 pine='T19' leg=entry
+[2026-09-08 13:16:00+0700] bar:    505 INFO     [L1] bar=505 close=1962.5 candle=RED state=12 step=0 pending=yes pos=0
+[2026-09-08 13:16:00+0700] bar:    505 INFO     [L1] TEST 19 REPLACE 1 id=T19 -> stop 2053.1 — expect [BROKER] cancel of the original string id (Canceled at the venue) + a FRESH conditional id
+[2026-09-08 13:16:00+0700] bar:    505 INFO     [BROKER] modifying ENTRY BUY id='T19' qty=1.0 type=stop stop=2061.0 -> ENTRY BUY id='T19' qty=1.0 type=stop stop=2053.1
+[2026-09-08 13:16:00+0700] bar:    505 INFO     [BROKER] event CREATED id=dafqgn8p4g19a630litg side=buy qty=1.0 filled=0.0 pine='T19' leg=entry
+[2026-09-08 13:16:00+0700] bar:    505 INFO     [BROKER] event CANCELLED id=dafqg88p4g19a630lisg side=buy qty=1.0 filled=0.0 pine='T19' leg=entry
+[2026-09-08 13:17:00+0700] bar:    506 INFO     [BROKER] external cancel observed (CANCELLED id=dafqg88p4g19a630lisg side=buy qty=1.0 filled=0.0 pine='T19' leg=entry)
+[2026-09-08 13:17:00+0700] bar:    506 INFO     [L1] bar=506 close=1962.2 candle=RED state=12 step=1 pending=yes pos=0
+[2026-09-08 13:17:00+0700] bar:    506 INFO     [L1] TEST 19 REPLACE 2 id=T19 -> stop 2055.1 — the replacement itself must replace again (mapping follows the newest id; warn-throttle re-armed)
+[2026-09-08 13:17:00+0700] bar:    506 INFO     [BROKER] modifying ENTRY BUY id='T19' qty=1.0 type=stop stop=2053.1 -> ENTRY BUY id='T19' qty=1.0 type=stop stop=2055.1
+[2026-09-08 13:17:00+0700] bar:    506 INFO     [BROKER] event CREATED id=dafqh6gp4g19a630liug side=buy qty=1.0 filled=0.0 pine='T19' leg=entry
+[2026-09-08 13:17:00+0700] bar:    506 INFO     [BROKER] event CANCELLED id=dafqgn8p4g19a630litg side=buy qty=1.0 filled=0.0 pine='T19' leg=entry
+[2026-09-08 13:18:00+0700] bar:    507 INFO     [BROKER] external cancel observed (CANCELLED id=dafqgn8p4g19a630litg side=buy qty=1.0 filled=0.0 pine='T19' leg=entry)
+[2026-09-08 13:18:00+0700] bar:    507 INFO     [L1] bar=507 close=1963 candle=GREEN state=12 step=2 pending=yes pos=0
+[2026-09-08 13:18:00+0700] bar:    507 INFO     [L1] TEST 19 CANCEL id=T19 — must hit the LATEST replacement id (two ancestors already Canceled); venue then clear of all three
+[2026-09-08 13:18:00+0700] bar:    507 INFO     [L1] TEST 19 DONE — state 12->13
+[2026-09-08 13:18:00+0700] bar:    507 INFO     [BROKER] cancelling CANCEL id='T19'
+[2026-09-08 13:18:00+0700] bar:    507 INFO     [BROKER] event CANCELLED id=dafqh6gp4g19a630liug side=buy qty=1.0 filled=0.0 pine='T19' leg=entry
+[2026-09-08 13:19:00+0700] bar:    508 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=dafqh6gp4g19a630liug side=buy qty=1.0 filled=0.0 pine='T19' leg=entry)
+[2026-09-08 13:19:00+0700] bar:    508 INFO     [L1] bar=508 close=1962.4 candle=RED state=13 step=0 pending=no pos=0
+[2026-09-08 13:19:00+0700] bar:    508 INFO     [L1] TEST 20 PLACE id=T20 LONG limit=1864.3 (-5%) qty=1 — next bar re-issues at 1874.1 (-4.5%) AND qty=2: BOTH fields changed. #86 expects TWO          
+[2026-09-08 13:19:00+0700] bar:    508 INFO     [BROKER] dispatching ENTRY BUY id='T20' qty=1.0 type=limit limit=1864.2
+[2026-09-08 13:19:00+0700] bar:    508 INFO     [BROKER] dispatched ENTRY BUY id='T20' qty=1.0 type=limit limit=1864.2 -> ['174556']
+[2026-09-08 13:19:00+0700] bar:    508 INFO     [BROKER] event CREATED id=174556 side=buy qty=1.0 filled=0.0 pine='T20' leg=entry
+[2026-09-08 13:20:00+0700] bar:    509 INFO     [L1] bar=509 close=1962.4 candle=RED state=13 step=0 pending=yes pos=0
+[2026-09-08 13:20:00+0700] bar:    509 INFO     [L1] TEST 20 AMEND id=T20 -> limit 1874.1 AND qty 2 — expect TWO sequential [BROKER] amend PUTs (one per field, price first), SAME NORMAL id; venue     
+[2026-09-08 13:20:00+0700] bar:    509 INFO     [BROKER] modifying ENTRY BUY id='T20' qty=1.0 type=limit limit=1864.2 -> ENTRY BUY id='T20' qty=2.0 type=limit limit=1874.0
+[2026-09-08 13:21:00+0700] bar:    510 INFO     [L1] bar=510 close=1963.2 candle=GREEN state=13 step=1 pending=yes pos=0
+[2026-09-08 13:21:00+0700] bar:    510 INFO     [L1] TEST 20 CANCEL id=T20 (post-split-amend, same id throughout)
+[2026-09-08 13:21:00+0700] bar:    510 INFO     [L1] TEST 20 DONE — state 13->14
+[2026-09-08 13:21:00+0700] bar:    510 INFO     [BROKER] cancelling CANCEL id='T20'
+[2026-09-08 13:21:00+0700] bar:    510 INFO     [BROKER] event CANCELLED id=174556 side=buy qty=2.0 filled=0.0 pine='T20' leg=entry
+[2026-09-08 13:22:00+0700] bar:    511 INFO     [BROKER] strategy cancel confirmed (CANCELLED id=174556 side=buy qty=2.0 filled=0.0 pine='T20' leg=entry)
+[2026-09-08 13:22:00+0700] bar:    511 INFO     [L1] bar=511 close=1963.4 candle=GREEN state=14 step=0 pending=no pos=0
+[2026-09-08 13:22:00+0700] bar:    511 INFO     [L1] TEST 21 PLACE id=T21 BOTH-SET stop=2061.6 limit=1865.2 — #87: plugin is SOLE OWNER (one conditional stop-limit, string id). Expect entry-stop watch
+[2026-09-08 13:22:00+0700] bar:    511 INFO     [BROKER] dispatching ENTRY BUY id='T21' qty=1.0 type=limit limit=1865.2 stop=2061.6
+[2026-09-08 13:22:00+0700] bar:    511 INFO     [BROKER] entry-stop watch for 'T21' NOT armed: plugin executes both-set entries natively (entry_stop_limit_native) — sole owner is the plugin's         
+[2026-09-08 13:22:00+0700] bar:    511 INFO     [BROKER] dispatched ENTRY BUY id='T21' qty=1.0 type=limit limit=1865.2 stop=2061.6 -> ['dafqji0p4g19a630lj5g']
+[2026-09-08 13:22:00+0700] bar:    511 INFO     [BROKER] event CREATED id=dafqji0p4g19a630lj5g side=buy qty=1.0 filled=0.0 pine='T21' leg=entry
+[2026-09-08 13:23:00+0700] bar:    512 INFO     [L1] bar=512 close=1963.8 candle=GREEN state=14 step=0 pending=yes pos=0
+[2026-09-08 13:23:00+0700] bar:    512 INFO     [L1] TEST 21 CANCEL id=T21 (the single conditional stop-limit)
+[2026-09-08 13:23:00+0700] bar:    512 INFO     [L1] TEST 21 DONE — state 14->15
+[2026-09-08 13:23:00+0700] bar:    512 INFO     [L1] === ALL TESTS DONE (T1-T9 + OCA T11-T13 + T19-T21). Verify at the venue that NOTHING of ours is still working, then stop the run. ===
+[2026-09-08 13:23:00+0700] bar:    512 INFO     [BROKER] cancelling CANCEL id='T21'
+[2026-09-08 13:23:00+0700] bar:    512 INFO     [BROKER] event CANCELLED id=dafqji0p4g19a630lj5g side=buy qty=1.0 filled=0.0 pine='T21' leg=entry
+[2026-09-08 13:24:28+0700] bar:    512 INFO     [BROKER] run stopped (completed) position=flat equity=342,291,742.00 VND

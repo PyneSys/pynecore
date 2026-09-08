@@ -45,7 +45,7 @@
 #      title: "Trade window START"
 #    confirm: false
 # Change here to modify the input value
-value = 1788833040000
+value = 1788848100000
 
 [inputs.winEnd]
 # Input metadata, cannot be modified
@@ -54,7 +54,7 @@ value = 1788833040000
 #      title: "Trade window END"
 #    confirm: false
 # Change here to modify the input value
-value = 1788833580000
+value = 1788849000000
 
 [inputs.startState]
 # Input metadata, cannot be modified
@@ -65,4 +65,4 @@ value = 1788833580000
 #     maxval: 14
 #    confirm: false
 # Change here to modify the input value
-value = 0
+value = 12
