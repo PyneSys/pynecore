@@ -145,6 +145,8 @@ conversation all use these. (Script-internal log tags map as: `[L1] TEST n` -> L
 operator approved the fill tier on a flat account; flatten via the bot's API
 (`flatten_api.py`, plugin `execute_close`) instead of app-closes so the #51
 window never opens. Results (evidence `logs/fill_ladder*_evidence.txt`):
+
+**#91 protocol (2026-09-08, operator-caught defect):** the F-states WAIT for an external close (`>>> OPERATOR: CLOSE THIS POSITION NOW <<<`, HALT at 5 bars) — they never self-flatten. Run fill cases through **`run_fill_case.sh <state>`** (gates → window → launch → watches the CLOSE-NOW line → 4 s grace → flatten → teardown → final venue gate); never hand-monitor with ad-hoc greps. `flatten_api.py` is now close-FIRST plus a journal-rooted sweep of the bot's OWN protection (`tools/flatten.py`; attribution = read-only store query — the store speaks WIRE symbols, so no symbol filter; foreign orders reported, never cancelled). Exit codes: 0 flat+swept, 1 unresolved, 2 could-not-determine — never kill the engine between a flatten and its next sync unless the sweep ran.
 F1 ✅ market long (fill → external flatten → #48 external-close detection →
 protection retired). F2 PARTIAL — entry fill ✅ AND protection-sl fill ✅
 (a race: the tight protection and the API flatten both closed → brief flip,
