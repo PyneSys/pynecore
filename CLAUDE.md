@@ -43,7 +43,10 @@ Only tracked files exist there. Consequences:
   stays `pynecore`.
 - Tests use `__test_*__` naming (`pytest.ini`); full-suite runs need
   `--ignore=tests/t00_pynecore/ast/test_045_lib_import_normalizer_invalid_alias.py`
-  (a `@pyne` file that self-triggers at collection — long-standing upstream).
+  (a `@pyne` file that self-triggers at collection — long-standing upstream)
+  AND `--deselect tests/t01_lib/t04_math/test_009_math_log_correctly_rounded.py`
+  (pre-existing upstream red since the 6.9.1 sync, 818b63a; pytest.ini carries
+  `-x`, so without the deselect the run stops early and incomplete).
 
 ## Pine → Python: use the LOCAL pine2pyne transpiler, NOT the cloud API
 
