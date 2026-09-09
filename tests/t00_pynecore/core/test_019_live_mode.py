@@ -233,6 +233,38 @@ def __test_ticks_under_a_closed_bar_timestamp_do_not_corrupt_history__(
     assert results[2][1]["c1"] == 101.0
 
 
+def __test_a_closed_bar_behind_the_forming_bar_does_not_move_the_clock_backwards__(
+        script_path, module_key, syminfo,
+):
+    """A close arriving after the NEXT bar already opened is dropped.
+
+    A feed can open the next period from its first tick before the
+    previous period's close lands (measured on the Capital.com lane). The
+    late close is a real bar, but the strategy has moved on and Pine's
+    ``time`` never runs backwards — executing it would rebuild every
+    series behind the bar already on the clock.
+    """
+    historical = [_make_ohlcv(0, 100.0)]
+    live = [
+        _make_ohlcv(60, is_closed=False, close=101.0),   # bar 60 opens
+        _make_ohlcv(120, is_closed=False, close=102.0),  # bar 120 opens early
+        _make_ohlcv(60, is_closed=True, close=99.0),     # bar 60's late close
+        _make_ohlcv(120, is_closed=True, close=102.5),
+        _make_ohlcv(180, is_closed=True, close=103.0),
+    ]
+
+    runner = _create_live_runner(
+        script_path, module_key, syminfo,
+        _chain_live(historical, live),
+    )
+    results = [(c, dict(p)) for c, p in runner.run_iter()]
+
+    assert [candle.timestamp for candle, _ in results] == [0, 120, 180]
+    # Bar 180 compares against bar 120's close, not the late 99.0 for bar 60.
+    assert results[2][1]["c"] == 103.0
+    assert results[2][1]["c1"] == 102.5
+
+
 def __test_a_reserved_closed_bar_does_not_move_the_clock_backwards__(
         script_path, module_key, syminfo,
 ):

@@ -2552,6 +2552,25 @@ class ScriptRunner:
                             candle.timestamp, last_confirmed_timestamp,
                         )
                         continue
+                    # The same invariant against the FORMING bar: a feed that
+                    # opens the next period from its first tick before the
+                    # previous period's close lands delivers the closed bar
+                    # behind the bar already on the clock. It is not history
+                    # replayed — it is a real bar arriving out of order — but
+                    # the strategy has already moved on, and Pine's ``time``
+                    # never runs backwards.
+                    if (candle.is_closed
+                            and last_bar_timestamp is not None
+                            and candle.timestamp < last_bar_timestamp):
+                        broker_warning(
+                            "feed closed bar ts=%d behind the bar already "
+                            "open at ts=%d — dropped: executing it would move "
+                            "the strategy's clock backwards; the provider is "
+                            "opening the next period ahead of the previous "
+                            "period's close",
+                            candle.timestamp, last_bar_timestamp,
+                        )
+                        continue
 
                     if is_new_bar:
                         # Pre-increment on bar open; intra-bar ticks for the
