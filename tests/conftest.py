@@ -344,7 +344,7 @@ def dummy_ohlcv_iter():
 
 
 @pytest.fixture(scope="function")
-def runner(script_path, module_key, syminfo) -> RunnerProtocol:
+def runner(request, script_path, module_key, syminfo) -> RunnerProtocol:
     # Remove module from sys.modules to be able to re-import it. A second runner test in
     # the same file finds it already gone, so its absence is not an error.
     # Two keys, because the file is imported twice under different names: pytest uses the
@@ -366,12 +366,58 @@ def runner(script_path, module_key, syminfo) -> RunnerProtocol:
             for key, value in syminfo_override.items():
                 setattr(syminfo, key, value)
 
+        # Backend seam. With PYNE_BACKEND set to anything but "python" the
+        # script under test is run by an ALTERNATIVE engine instead of
+        # ScriptRunner -- everything else about the test (its data file, its
+        # reference columns, its assertions) is untouched, so the existing
+        # expectations validate that backend with nothing duplicated. The
+        # value names the module to import; "aot" is shorthand for PyneAOT's
+        # own, which must be importable (PYTHONPATH=<pyneaot>/conformance).
+        backend = os.environ.get('PYNE_BACKEND')
+        if backend and backend != 'python':
+            # A test marked `aot_unsupported` exercises a construct the
+            # compiled surface has no answer for (an `except` clause, say).
+            # Under the alternative backend it is SKIPPED with that reason,
+            # so a compile refusal there is not counted as a failure; under
+            # CPython the marker changes nothing.
+            marker = request.node.get_closest_marker('aot_unsupported')
+            if marker is not None:
+                pytest.skip(f"{backend} backend: {marker.args[0]}")
+            from importlib import import_module
+            module = 'pyneaot_backend' if backend == 'aot' else backend
+            return import_module(module).ScriptRunner(
+                script_path, ohlcv_iter, syminfo, security_data=security_data,
+                **runner_kwargs)
+
         r = ScriptRunner(script_path, ohlcv_iter, syminfo, security_data=security_data,
                          **runner_kwargs)
 
         return r
 
     return cast(RunnerProtocol, _runner)
+
+
+@pytest.fixture(scope="function", autouse=True)
+def _backend_script_runner(request, monkeypatch):
+    # The SECOND half of the backend seam. The `runner` fixture above covers
+    # the tests that take it, but most of `t01_lib/t30_strategy` imports
+    # `ScriptRunner` inside the test body and constructs it directly, so a
+    # fixture replacement never reaches them. Patching the MODULE ATTRIBUTE
+    # does: the import runs when the test body runs, i.e. after this fixture
+    # has installed the alternative class.
+    #
+    # Under `PYNE_BACKEND=python` (or unset) nothing happens at all.
+    backend = os.environ.get('PYNE_BACKEND')
+    if not backend or backend == 'python':
+        return
+    marker = request.node.get_closest_marker('aot_unsupported')
+    if marker is not None:
+        pytest.skip(f"{backend} backend: {marker.args[0]}")
+    from importlib import import_module
+    module = 'pyneaot_backend' if backend == 'aot' else backend
+    cls = import_module(module).ScriptRunner
+    import pynecore.core.script_runner as sr_module
+    monkeypatch.setattr(sr_module, 'ScriptRunner', cls)
 
 
 @pytest.fixture(scope="function")
