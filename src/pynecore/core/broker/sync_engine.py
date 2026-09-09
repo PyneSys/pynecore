@@ -14660,6 +14660,19 @@ class OrderSyncEngine:
             )
             manager.unregister_parent(ref)
 
+    def _reversal_close_fresh(self, marker: "_PendingReversalOpen") -> bool:
+        """Whether ``marker``'s close leg is still inside its settle window.
+
+        Fresh = fewer than :data:`_REVERSAL_CLOSE_STALE_SYNCS` deferrals, or
+        still on the arming bar within :data:`_CLOSE_DECLINE_RETRY_S`. A
+        fresh close is the one live close-then-open leg for the book; a
+        stale one may be re-driven.
+        """
+        return (marker.blocked_syncs <= _REVERSAL_CLOSE_STALE_SYNCS
+                or (marker.armed_bar_ts_ms == self._current_bar_ts_ms
+                    and (time.monotonic() - marker.armed_monotonic
+                         < _CLOSE_DECLINE_RETRY_S)))
+
     @staticmethod
     def _reversal_close_pending_skip(
             intent: EntryIntent, message: str,
@@ -14714,15 +14727,34 @@ class OrderSyncEngine:
             # additionally waits for the NEXT bar after arming, capped by
             # :data:`_CLOSE_DECLINE_RETRY_S` so a slow chart's bar cannot
             # park a stuck close for hours.
-            if (marker.blocked_syncs <= _REVERSAL_CLOSE_STALE_SYNCS
-                    or (marker.armed_bar_ts_ms == self._current_bar_ts_ms
-                        and (time.monotonic() - marker.armed_monotonic
-                             < _CLOSE_DECLINE_RETRY_S))):
+            if self._reversal_close_fresh(marker):
                 raise self._reversal_close_pending_skip(
                     intent,
                     f"Reversal entry {format_intent_key(key)} deferred: the "
                     f"close leg {marker.close_pine_id!r} has not settled "
                     f"the book flat yet; re-evaluating next sync.",
+                )
+            # A stale marker is not proof of a stuck close: its own leg may
+            # have settled while a same-side add kept the book open, and a
+            # LATER reversal's fresh close is already taking that remainder
+            # (measured live: cTrader pyramid lane, cycle 112 — the stale
+            # first marker fired a third close for exposure the second
+            # close was consuming; the venue rejected it POSITION_LOCKED).
+            # Only one reversal close may be live per book: while another
+            # marker's close is still fresh, keep deferring — the flat book
+            # opens every parked entry, and if that close goes stale too the
+            # first stale marker re-drives and the rest defer against it.
+            covering = next(
+                (other for other in self._pending_reversal_opens.values()
+                 if self._reversal_close_fresh(other)),
+                None,
+            )
+            if covering is not None:
+                raise self._reversal_close_pending_skip(
+                    intent,
+                    f"Reversal entry {format_intent_key(key)} deferred: the "
+                    f"fresh reversal close {covering.close_pine_id!r} already "
+                    f"covers the remaining exposure; re-evaluating next sync.",
                 )
             _blog_warning(
                 "reversal close %r has not settled after %d syncs with the "

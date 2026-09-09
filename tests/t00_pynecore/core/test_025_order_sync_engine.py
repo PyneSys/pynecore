@@ -1189,6 +1189,79 @@ def __test_stale_reversal_close_redispatches_after_the_grace_syncs__():
     assert "S" in engine._pending_reversal_opens
 
 
+def __test_stale_marker_defers_while_another_reversal_close_covers_the_book__():
+    """A stale marker must not re-drive a close another marker already covers.
+
+    Measured live (cTrader pyramid lane, cycle 112): the first reversal's
+    close settled its own exposure, but a same-side add that filled in the
+    meantime kept the book open; the second signal's reversal then closed
+    that remainder. The first marker went stale on the next bar and fired
+    a THIRD close for exposure the second close was already taking — the
+    venue rejected it (POSITION_LOCKED). While another marker's close is
+    still fresh the stale one keeps deferring; the flat book opens both.
+    """
+    from pynecore.core.broker.sync_engine import _REVERSAL_CLOSE_STALE_SYNCS
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L1"] = _entry_order("L1", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L1"))
+    assert pos.size == 1.0
+
+    # A same-side add dispatches; its fill is still on the wire.
+    pos.entry_orders["L2"] = _entry_order("L2", 1.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.entry_calls) == 2
+
+    # Pine reverses: the close leg covers the JOURNALED 1.0 (L1) only.
+    del pos.entry_orders["L1"]
+    del pos.entry_orders["L2"]
+    pos.entry_orders["S1"] = _entry_order("S1", -1.0)
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.close_calls) == 1
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_010.0, pine_id="L2", xchg_id="xchg-2"))
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(_dispatched_close(b.close_calls[0]), 1.0, 50_020.0))
+    assert pos.size == 1.0, "the add keeps the book open after the close settled"
+    assert "S1" in engine._pending_reversal_opens
+
+    # The second leg's reversal closes the remainder; S1 keeps deferring.
+    pos.entry_orders["S2"] = _entry_order("S2", -1.0)
+    engine.sync(BAR_TS + 180_000)
+    assert len(b.close_calls) == 2
+    assert {"S1", "S2"} <= engine._pending_reversal_opens.keys()
+
+    # S1 passes its stale bound on later bars — no third close while S2's
+    # fresh close already covers the whole remaining exposure.
+    for i in range(_REVERSAL_CLOSE_STALE_SYNCS):
+        engine.sync(BAR_TS + 240_000 + i * 60_000)
+    assert len(b.close_calls) == 2
+    assert {"S1", "S2"} <= engine._pending_reversal_opens.keys()
+
+    # Once S2's close is stale too the book has no live close: exactly ONE
+    # fresh close re-drives (the marker whose stale bound trips with no
+    # fresh cover left — S2, evaluated after S1 deferred against its still
+    # fresh close) and the other defers against it — never two closes for
+    # the same exposure.
+    stale_bar = BAR_TS + 240_000 + _REVERSAL_CLOSE_STALE_SYNCS * 60_000
+    engine.sync(stale_bar)
+    engine.sync(stale_bar)
+    assert len(b.close_calls) == 3
+    assert _dispatched_close(b.close_calls[2]).pine_id == "__pyne_reversal_close__S2"
+    assert {"S1", "S2"} <= engine._pending_reversal_opens.keys()
+
+    # The re-driven close settles the book flat: both parked entries open.
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(_dispatched_close(b.close_calls[2]), 1.0, 50_030.0,
+                             xchg_id="xchg-rc3", fill_id="rc-3"))
+    assert pos.size == 0.0
+    assert engine._pending_reversal_opens == {}
+    assert [c.intent.pine_id for c in b.entry_calls[2:]] == ["S1", "S2"]
+
+
 def __test_flat_snapshot_during_a_pending_reversal_only_starts_the_clock__():
     """A glitched flat /positions read must not clear a reversing book.
 
