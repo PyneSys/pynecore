@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 from ..types.footprint import Footprint
 from ..types.na import NA
+from . import syminfo
 
 if TYPE_CHECKING:
     from ..core.currency import CurrencyRateProvider
@@ -159,9 +160,10 @@ def dividends(
     :param ignore_invalid_symbol: If True, return na instead of raising
     :param currency: Currency the returned values are converted to
     :return: Dividend value or na
-    :raises NotImplementedError: When ignore_invalid_symbol is False
     """
-    if ignore_invalid_symbol:
+    if ignore_invalid_symbol or (
+            syminfo.type == 'crypto' and syminfo.tickerid and ticker == syminfo.tickerid
+    ):
         return nan
     raise NotImplementedError("request.dividends() is not yet implemented in PyneCore")
 
@@ -180,9 +182,10 @@ def splits(
     :param lookahead: Lookahead mode (barmerge.lookahead_on/off)
     :param ignore_invalid_symbol: If True, return na instead of raising
     :return: Split value or na
-    :raises NotImplementedError: When ignore_invalid_symbol is False
     """
-    if ignore_invalid_symbol:
+    if ignore_invalid_symbol or (
+            syminfo.type == 'crypto' and syminfo.tickerid and ticker == syminfo.tickerid
+    ):
         return nan
     raise NotImplementedError("request.splits() is not yet implemented in PyneCore")
 
@@ -202,9 +205,10 @@ def earnings(
     :param ignore_invalid_symbol: If True, return na instead of raising
     :param currency: Currency the returned values are converted to
     :return: Earnings value or na
-    :raises NotImplementedError: When ignore_invalid_symbol is False
     """
-    if ignore_invalid_symbol:
+    if ignore_invalid_symbol or (
+            syminfo.type == 'crypto' and syminfo.tickerid and ticker == syminfo.tickerid
+    ):
         return nan
     raise NotImplementedError("request.earnings() is not yet implemented in PyneCore")
 
