@@ -290,7 +290,7 @@ def __test_spent_reversal_probe_and_reject_bump_keep_the_anchor_run_tag__(tmp_pa
         order_type=OrderType.MARKET.value,
     )
     ctx.set_filled(prev_ref, 1.0)
-    assert eng._persisted_entry_anchor_is_spent_reversal(_both_set_entry(), anchor)
+    assert eng._persisted_entry_anchor_is_spent(_both_set_entry(), anchor)
 
     eng._persisted_envelope_anchors["Long"] = anchor
     eng._reanchor_envelope_after_reject("Long")

@@ -2182,6 +2182,98 @@ def __test_restart_adopts_live_entry_coid_when_anchor_missing__(tmp_path):
         assert anchor.retry_seq == 1
 
 
+def __test_re_entry_over_a_consumed_same_side_anchor_mints_a_fresh_coid__(tmp_path):
+    """A replayed entry anchor whose fill is already closed is spent.
+
+    The journal keeps an entry's envelope anchor so a restart rebuilds the
+    exact live COID for modify/cancel and for the bracket legs. Once the
+    durable row under that anchor is fully FILLED and CLOSED, the position
+    the entry opened is gone: the anchor names an order the venue already
+    consumed. A same-side re-entry on a later bar must therefore mint a
+    fresh current-bar COID — rebuilding the old one hands a dedup-adopting
+    venue's dead order back as the "dispatch" (no fill, no position, every
+    bracket attach rejected). Live shape: bybit-inverse cycle 85, where the
+    previous bot's filled entry anchor survived an exchange-position
+    adoption and a reversal, and the re-entry went out under the spent id.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    spent_coid = build_client_order_id(
+        run_tag="prev", pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=0,
+    )
+    later_bar = BAR_TS + 60_000
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        ctx.record_envelope(key="L", bar_ts_ms=BAR_TS, retry_seq=0, run_tag="prev")
+        ctx.upsert_order(
+            spent_coid, symbol=SYMBOL, side="buy", qty=1.0, filled_qty=1.0,
+            state="confirmed", intent_key="L", pine_entry_id="L",
+            exchange_order_id="xchg-prev",
+        )
+        ctx.close_order(spent_coid)
+        b = MockBroker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0)
+
+        engine.sync(later_bar)
+
+        assert len(b.entry_calls) == 1
+        envelope = b.entry_calls[0]
+        assert envelope.client_order_id(KIND_ENTRY) != spent_coid
+        assert (envelope.run_tag, envelope.bar_ts_ms, envelope.retry_seq) == (
+            RUN_TAG, later_bar, 0)
+        # The journal now carries the fresh anchor, not the consumed one.
+        replayed, _ = ctx.replay()
+        assert (replayed["L"].run_tag, replayed["L"].bar_ts_ms) == (RUN_TAG, later_bar)
+
+
+def __test_same_bar_re_entry_over_a_consumed_anchor_bumps_the_retry__(tmp_path):
+    """On the anchor's own bar the consumed same-side anchor bumps instead.
+
+    A fresh ``retry_seq=0`` mint on the same bar would rebuild the identical
+    COID, so the spent anchor takes the reject-bump path: same bar, next
+    retry — a distinct id the venue has never seen.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    spent_coid = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=0,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        ctx.record_envelope(key="L", bar_ts_ms=BAR_TS, retry_seq=0, run_tag=RUN_TAG)
+        ctx.upsert_order(
+            spent_coid, symbol=SYMBOL, side="buy", qty=1.0, filled_qty=1.0,
+            state="confirmed", intent_key="L", pine_entry_id="L",
+            exchange_order_id="xchg-prev",
+        )
+        ctx.close_order(spent_coid)
+        b = MockBroker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0)
+
+        engine.sync(BAR_TS)
+
+        assert len(b.entry_calls) == 1
+        envelope = b.entry_calls[0]
+        assert envelope.client_order_id(KIND_ENTRY) != spent_coid
+        assert (envelope.bar_ts_ms, envelope.retry_seq) == (BAR_TS, 1)
+
+
 def __test_restart_adopted_entry_is_cancelled_not_duplicated__(tmp_path):
     """Restart binds the live entry order and a later cancel retires it.
 
@@ -5667,6 +5759,97 @@ def __test_flat_close_spares_journal_legs_of_an_opening_parent__(tmp_path):
         engine._route_event(  # type: ignore[attr-defined]
             _fill_event('sell', 0.00999, 2494.87, pine_id="",
                         leg=LegType.CLOSE, xchg_id="xchg-close"))
+
+        assert pos.size == 0.0
+        assert ("N-X", "N") in pos.exit_orders
+        assert not any(
+            getattr(env.intent, 'from_entry', None) == "N"
+            for env in b.cancel_calls
+        )
+
+
+def __test_restart_on_a_flat_book_retires_journal_legs_of_gone_parents__(tmp_path):
+    """A flat restart must cancel adopted exit legs whose parent owns nothing.
+
+    The flat-close sweep only runs on a closing fill. When the prior
+    process died between a venue-side TP fill and the cancel of its OCA
+    sibling, the sibling SL rests on the venue under a parent no trade
+    owns and the restart adopts its journal row; nothing closes that
+    position again, so no fill ever triggers the sweep (measured live:
+    bybit-inverse cycle 84 — two reduce-only SL stops of a short whose TPs
+    filled while the lane was down survived the restart, armed to clip
+    any later short). The first sync must retire them.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025", symbol=SYMBOL, timeframe="60",
+                account_id="testbroker-demo", label=None,
+            ),
+            script_source="src", script_path="t025.py",
+        )
+        b = MockBroker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=0.01, store_ctx=ctx,
+        )
+        for parent in ("S2", "S3"):
+            ctx.upsert_order(
+                f"test-{parent.lower()}x-s0", symbol=SYMBOL, side="buy", qty=156.0,
+                state="confirmed", intent_key=f"{parent}-X\0{parent}",
+                exchange_order_id=f"X-SL-{parent}", from_entry=parent,
+                sl_level=78307.9,
+                extras={"kind": "exit_leg", "leg": "sl", "exit_id": f"{parent}-X"},
+            )
+        engine.sync(BAR_TS)
+
+        assert pos.size == 0.0
+        cancelled = {
+            getattr(env.intent, 'from_entry', None) for env in b.cancel_calls
+        }
+        assert cancelled == {"S2", "S3"}
+
+
+def __test_restart_on_a_flat_book_spares_journal_legs_of_an_opening_parent__(tmp_path):
+    """The restart sweep obeys the opening-parent guard like the flat close.
+
+    A same-script restart replays its own still-working entry and the
+    bracket armed for it; the sweep runs after the entry reconstruction
+    so that parent reads as opening and its journal leg stays.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025", symbol=SYMBOL, timeframe="60",
+                account_id="testbroker-demo", label=None,
+            ),
+            script_source="src", script_path="t025.py",
+        )
+        b = MockBroker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=0.01, store_ctx=ctx,
+        )
+        ctx.upsert_order(
+            "test-nx-s0", symbol=SYMBOL, side="sell", qty=0.01,
+            state="confirmed", intent_key="N-X\0N",
+            exchange_order_id="X-SL-N", from_entry="N", sl_level=2380.0,
+            extras={"kind": "exit_leg", "leg": "sl", "exit_id": "N-X"},
+        )
+        pos.entry_orders["N"] = _entry_order("N", 0.01, limit=2400.0)
+        pos.exit_orders[("N-X", "N")] = _exit_order(
+            "N", 0.01, "N-X", stop=2380.0)
+        engine.sync(BAR_TS)
 
         assert pos.size == 0.0
         assert ("N-X", "N") in pos.exit_orders

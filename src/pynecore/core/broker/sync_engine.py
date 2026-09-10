@@ -8340,7 +8340,9 @@ class OrderSyncEngine:
             return
         self._cleanup_position_tracking(closed_entry_id)
 
-    def _retire_orphan_exits_on_flat_book(self) -> None:
+    def _retire_orphan_exits_on_flat_book(
+            self, *, journal_only: bool = False,
+    ) -> None:
         """Retire exit tracking whose parent id owns nothing on a flat book.
 
         Complements the per-entry close-fill cleanup: that path keys on the
@@ -8371,14 +8373,20 @@ class OrderSyncEngine:
         ledger -> quarantine). The per-parent cleanup already recovers its
         cancel targets from these same durable rows, so journal-only
         parents cancel cleanly.
+
+        :param journal_only: Judge only the parents the durable journal's
+            live exit-leg rows name — the restart sweep's shape, where the
+            prior process's leftovers are exactly those rows and the
+            in-memory exits belong to the script's current bar.
         """
         parents: set[str] = set()
-        for active in self._active_intents.values():
-            if isinstance(active, ExitIntent) and active.from_entry:
-                parents.add(active.from_entry)
-        for ex_key in self._position.exit_orders:
-            if ex_key[1]:
-                parents.add(ex_key[1])
+        if not journal_only:
+            for active in self._active_intents.values():
+                if isinstance(active, ExitIntent) and active.from_entry:
+                    parents.add(active.from_entry)
+            for ex_key in self._position.exit_orders:
+                if ex_key[1]:
+                    parents.add(ex_key[1])
         if self._store_ctx is not None:
             for row in self._store_ctx.iter_live_orders():
                 if (row.from_entry is not None
@@ -11369,6 +11377,20 @@ class OrderSyncEngine:
         self._reconstruct_one_way_bracket_exits()
         self._reconstruct_partial_bracket_exits()
         self._reconstruct_pine_entry_orders()
+        # A book that is ALREADY flat at restart gets the same sweep the
+        # flat close-fill runs: the prior process may have died between a
+        # venue-side exit fill and the cancel of its OCA sibling, leaving
+        # the sibling resting on the venue under a parent no trade owns
+        # (measured live: bybit-inverse cycle 84 — the two SL stops of a
+        # short whose TPs filled while the lane was down survived the
+        # restart as reduce-only orders, armed to clip any later short).
+        # Runs AFTER the entry reconstruction so a still-working parent's
+        # legs are recognised as opening, not orphaned; the prior process's
+        # leftovers are exactly the durable rows, so only journal parents
+        # are judged — an exit the script declares on this first bar is
+        # the diff's business, as on any other bar.
+        if self._position.size == 0.0:
+            self._retire_orphan_exits_on_flat_book(journal_only=True)
 
     def _reconstruct_pine_entry_orders(self) -> None:
         """Re-install persistent ``strategy.entry`` working orders after a restart.
@@ -13497,11 +13519,17 @@ class OrderSyncEngine:
             )
         anchor = self._persisted_envelope_anchors.get(intent.intent_key)
         if (anchor is not None
-                and self._persisted_entry_anchor_is_spent_reversal(intent, anchor)):
+                and self._persisted_entry_anchor_is_spent(intent, anchor)):
             # A restart clears the in-memory active-intent sentinel. If the
-            # first re-emitted intent on the same bar reverses a fully-filled
-            # persisted entry, the stored anchor belongs to the consumed
-            # cycle and cannot be reused for the residual open.
+            # re-emitted intent reverses a fully-filled persisted entry, or
+            # re-enters after that entry's own position is already closed,
+            # the stored anchor belongs to the consumed cycle and cannot be
+            # reused: rebuilt as-is it names an order the venue already
+            # filled, and a dedup-adopting venue hands that dead order back
+            # as the "dispatch" (measured live: bybit-inverse cycle 85 — no
+            # fill, no position, every bracket attach rejected with
+            # "position is zero"). Bump on the same bar; the bar-advance
+            # branch below mints fresh once the bar moved on.
             self._reanchor_envelope_after_reject(intent.intent_key)
             anchor = self._persisted_envelope_anchors.get(intent.intent_key)
         self._persisted_envelope_anchors.pop(intent.intent_key, None)
@@ -13581,15 +13609,18 @@ class OrderSyncEngine:
             )
         return envelope
 
-    def _persisted_entry_anchor_is_spent_reversal(
+    def _persisted_entry_anchor_is_spent(
             self, intent: Intent, anchor: EnvelopeRecord,
     ) -> bool:
-        """Whether ``anchor`` names a filled opposite-side entry cycle.
+        """Whether ``anchor`` names an entry cycle the venue already consumed.
 
         This is the restart counterpart of the active-intent consumed-entry
         branch in :meth:`_diff_and_dispatch`. The durable order row proves the
-        old entry reached a full fill; an opposite-side re-emission is therefore
-        a new cycle even when it occurs on the same bar timestamp.
+        old entry reached a full fill; the anchor is spent when that fill is an
+        opposite-side cycle (a reversal is a new cycle even on the same bar
+        timestamp) or when the row is already closed — the position the entry
+        opened is gone, so a same-side re-emission is a fresh entry rather
+        than the pyramiding-cap re-declaration of a still-open fill.
         """
         if not isinstance(intent, EntryIntent) or self._store_ctx is None:
             return False
@@ -13602,9 +13633,9 @@ class OrderSyncEngine:
                 coid_max_len=self._coid_max_len,
             ).client_order_id(kind)
             row = self._store_ctx.get_order(prior)
-            if row is None or row.side == intent.side:
+            if row is None or row.filled_qty < row.qty - 1e-9:
                 continue
-            if row.filled_qty >= row.qty - 1e-9:
+            if row.side != intent.side or row.closed_ts_ms is not None:
                 return True
         return False
 

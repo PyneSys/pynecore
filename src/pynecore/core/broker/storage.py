@@ -1724,7 +1724,7 @@ class RunContext:
         self.upsert_order(client_order_id, filled_qty=filled_qty)
 
     def reopen_order(self, client_order_id: str) -> None:
-        """Re-activate a previously closed order: ``closed_ts_ms = NULL``.
+        """Re-activate a previously closed order for a fresh lifecycle.
 
         Typical use: a bracket leg row was closed by :meth:`close_order`
         on an earlier REJECTED attach (``state='rejected'``,
@@ -1734,11 +1734,15 @@ class RunContext:
         return to the live range (``iter_live_orders``, recovery,
         fill-fallback) or the post-persistence logic will not find it.
 
-        Reopen only nulls ``closed_ts_ms``; the caller is responsible
-        for harmonising ``state`` and other fields via
-        :meth:`upsert_order`. For audit purposes the reopen itself
-        writes an event (``order_reopened``), so the full lifecycle
-        remains traceable from the ``events`` table.
+        Nulls ``closed_ts_ms`` and restarts ``created_ts_ms`` at now: the
+        reopen begins a new dispatch lifecycle under the same id, and the
+        persist-first row's creation instant is what plugins anchor their
+        spent-duplicate guard on (a venue-returned original created long
+        before this instant belongs to the first lifecycle, not to this
+        send). The caller is responsible for harmonising ``state`` and
+        the other per-lifecycle fields via :meth:`upsert_order`. For audit
+        purposes the reopen itself writes an event (``order_reopened``),
+        so the full lifecycle remains traceable from the ``events`` table.
 
         :raises: no specific error signalling. If the row does not
             exist or is no longer closed the SQL UPDATE affects zero
@@ -1754,9 +1758,10 @@ class RunContext:
             if existing is None or existing['closed_ts_ms'] is None:
                 return
             self._store._conn.execute(
-                "UPDATE orders SET closed_ts_ms = NULL, updated_ts_ms = ? "
+                "UPDATE orders SET closed_ts_ms = NULL, created_ts_ms = ?, "
+                "updated_ts_ms = ? "
                 "WHERE run_instance_id = ? AND client_order_id = ?",
-                (now, self.run_instance_id, client_order_id),
+                (now, now, self.run_instance_id, client_order_id),
             )
             self._store._conn.execute(
                 "INSERT INTO events ("

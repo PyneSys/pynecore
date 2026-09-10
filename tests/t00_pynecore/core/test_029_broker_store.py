@@ -617,12 +617,27 @@ def __test_reopen_order_clears_closed_ts_ms_and_logs_event__(tmp_path: Path) -> 
         ctx.close_order("coid-1")
         pre = ctx.get_order("coid-1")
         assert pre is not None and pre.closed_ts_ms is not None
+        # Age the first lifecycle so the reopen's fresh creation instant is
+        # distinguishable from it.
+        aged_created = pre.created_ts_ms - 600_000
+        store._conn.execute(
+            "UPDATE orders SET created_ts_ms = ? WHERE client_order_id = ?",
+            (aged_created, "coid-1"),
+        )
+        store._conn.commit()
 
         ctx.reopen_order("coid-1")
         post = ctx.get_order("coid-1")
         assert post is not None
         assert post.closed_ts_ms is None, (
             f"reopen_order must null closed_ts_ms; got {post.closed_ts_ms!r}"
+        )
+        # A reopen starts a new dispatch lifecycle: the creation instant is
+        # the reopen's, not the first lifecycle's (plugins anchor their
+        # spent-duplicate guard on it).
+        assert post.created_ts_ms >= aged_created + 600_000, (
+            f"reopen_order must restart created_ts_ms; got {post.created_ts_ms!r} "
+            f"for a first lifecycle created at {aged_created!r}"
         )
         # The row is now visible to iter_live_orders again.
         live_ids = {r.client_order_id for r in ctx.iter_live_orders()}
