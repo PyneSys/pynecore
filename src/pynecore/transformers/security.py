@@ -1,6 +1,7 @@
 import ast
 import copy
 import hashlib
+from collections.abc import Container
 
 
 # Strategy state accessors are meaningful only in the chart context — the
@@ -67,6 +68,10 @@ class SecurityTransformer(ast.NodeTransformer):
         self._needs_ltf_unzip = False
         self._ltf_sec_ids: set[str] = set()
         self._module_file: str = '<script>'
+        # Sids whose __sec_signal__ is emitted in the function's top block
+        # (module-level or hoistable arguments). Only these may be depended on.
+        self._top_sec_ids: set[str] = set()
+        self._sid_lineno: dict[str, int] = {}
 
     def _gen_id(self) -> str:
         # The module hash keeps sec ids unique across modules: the main script and
@@ -196,6 +201,121 @@ class SecurityTransformer(ast.NodeTransformer):
                             for kw in node.keywords))
         return False
 
+    @classmethod
+    def _is_simple_chain(cls, node: ast.expr,
+                         hoistable: "Container[str]") -> bool:
+        """Whether ``node`` is a Pine "simple" expression chain.
+
+        Simple means: constants, ``lib.*`` attribute chains (``syminfo.*``,
+        ``timeframe.*``, ...), calls over such chains (``input.*``,
+        ``ticker.heikinashi(...)``), plain operators over them, and names bound
+        by a hoistable binding (see :meth:`_hoistable_bindings`). Such an
+        expression can be evaluated at the very start of the function, which is
+        what lets its ``__sec_signal__`` move into the top block.
+
+        :param node: expression to classify
+        :param hoistable: names bound by hoistable top-level bindings
+        :return: True if the whole chain is simple
+        """
+        if isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, ast.Name):
+            return node.id == 'lib' or node.id in hoistable
+        if isinstance(node, ast.Attribute):
+            return cls._is_simple_chain(node.value, hoistable)
+        if isinstance(node, ast.Call):
+            return (cls._is_simple_chain(node.func, hoistable)
+                    and all(cls._is_simple_chain(a, hoistable) for a in node.args)
+                    and all(cls._is_simple_chain(kw.value, hoistable)
+                            for kw in node.keywords))
+        if isinstance(node, (ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare,
+                             ast.IfExp, ast.Tuple, ast.List)):
+            return all(cls._is_simple_chain(child, hoistable)
+                       for child in ast.iter_child_nodes(node)
+                       if isinstance(child, ast.expr))
+        return False
+
+    @classmethod
+    def _hoistable_bindings(
+            cls, func: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> dict[str, ast.Assign]:
+        """Top-level bindings of ``func`` that may be moved to its first
+        statements.
+
+        A binding qualifies when it is a plain ``name = <simple chain>``
+        assignment standing directly in the function body, the name is assigned
+        exactly once in the whole function, and it is not declared ``global`` /
+        ``nonlocal``. A parameter counts too, but only while every preceding
+        statement is itself a hoistable binding — that is the form the
+        instantiation pass produces when it pins a call site's constant
+        argument into the function it instantiates. Such a value depends on nothing that
+        runs inside the function, so evaluating it first is equivalent —
+        and it makes a ``request.security()`` whose symbol/timeframe is built
+        from it startable at the top of the function.
+
+        Annotated assignments are excluded: those carry ``var`` / ``Persistent``
+        semantics that later passes rewrite.
+
+        :param func: the function being transformed
+        :return: mapping of binding name to its assignment statement
+        """
+        counts: dict[str, int] = {}
+        declared: set[str] = set()
+        for sub in ast.walk(func):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, (ast.Store, ast.Del)):
+                counts[sub.id] = counts.get(sub.id, 0) + 1
+            elif isinstance(sub, (ast.Global, ast.Nonlocal)):
+                declared.update(sub.names)
+        args = func.args
+        params = {a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)}
+        if args.vararg is not None:
+            params.add(args.vararg.arg)
+        if args.kwarg is not None:
+            params.add(args.kwarg.arg)
+
+        hoistable: dict[str, ast.Assign] = {}
+        # A parameter may only be rebound while the whole prefix of the body
+        # consists of hoistable bindings — otherwise an earlier statement could
+        # still read the value passed by the caller.
+        prefix = True
+        for stmt in func.body:
+            ok = False
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                target = stmt.targets[0]
+                if isinstance(target, ast.Name):
+                    name = target.id
+                    if (name not in declared and counts.get(name) == 1
+                            and (prefix or name not in params)
+                            and cls._is_simple_chain(stmt.value, hoistable)):
+                        hoistable[name] = stmt
+                        ok = True
+            prefix = prefix and ok
+        return hoistable
+
+    @staticmethod
+    def _referenced_names(node: ast.expr) -> set[str]:
+        """Names read by ``node`` (``lib`` excluded)."""
+        return {n.id for n in ast.walk(node)
+                if isinstance(n, ast.Name) and n.id != 'lib'}
+
+    @classmethod
+    def _collect_hoisted(
+            cls, hoistable: dict[str, ast.Assign], needed: set[str]
+    ) -> list[ast.Assign]:
+        """Transitive closure of the hoistable bindings ``needed`` requires,
+        in the original source order."""
+        selected: set[str] = set()
+        pending = [n for n in needed if n in hoistable]
+        while pending:
+            name = pending.pop()
+            if name in selected:
+                continue
+            selected.add(name)
+            for ref in cls._referenced_names(hoistable[name].value):
+                if ref in hoistable and ref not in selected:
+                    pending.append(ref)
+        return [stmt for name, stmt in hoistable.items() if name in selected]
+
     @staticmethod
     def _ohlcv_field(node: ast.expr) -> str | None:
         """Return the raw-OHLCV field name if ``node`` is a bare reference to one
@@ -289,13 +409,16 @@ class SecurityTransformer(ast.NodeTransformer):
         body = []
         for s in sec_ids:
             args: list[ast.expr] = [ast.Constant(value=s)]
-            # Lookahead is omitted here: a runtime-dependent lookahead forces the
-            # sid onto the inline-signal path (see _process_func classification).
-            sym_expr, tf_expr, _ = self._signal_args[s]
+            sym_expr, tf_expr, la_expr = self._signal_args[s]
             args.append(copy.deepcopy(sym_expr) if sym_expr is not None
                         else ast.Constant(value=None))
             args.append(copy.deepcopy(tf_expr) if tf_expr is not None
                         else ast.Constant(value=None))
+            # A lookahead that is not module-level evaluable (an input-derived
+            # Pine "simple" value) is still passed here when its chain is
+            # hoistable — the binding it reads is moved above this block.
+            if la_expr is not None:
+                args.append(copy.deepcopy(la_expr))
             body.append(ast.Expr(value=self._func_call('__sec_signal__', *args)))
         return ast.If(
             test=self._is_none_check(),
@@ -675,34 +798,67 @@ class SecurityTransformer(ast.NodeTransformer):
                         self._needs_barmerge = True
 
             self._all_contexts[sec_id] = ctx
+            self._sid_lineno[sec_id] = getattr(call, 'lineno', 0)
             sec_ids.append(sec_id)
 
-        # Separate module-level (constant) signals from runtime-dependent ones.
-        # Module-level signals can be emitted at function start for maximum
-        # parallelism. Runtime signals must be emitted inline, after the
-        # variables they reference have been assigned. A runtime-dependent
-        # lookahead forces the inline path too — its expression references
-        # locals that do not exist yet at function start.
+        # Separate top-block signals from runtime-dependent ones. A signal can
+        # start at function entry when every argument is a Pine "simple" chain:
+        # constants, lib.* values, or a local bound once from such a chain. In
+        # the last case the binding itself is hoisted above the signal block, so
+        # the value is already there. Everything else (function parameters,
+        # series-dependent expressions) must be signalled inline, after the
+        # variables it reads have been assigned.
+        hoistable = self._hoistable_bindings(node)
         top_sec_ids = []
         runtime_sec_ids: set[str] = set()
+        needed_names: set[str] = set()
         for sid in sec_ids:
-            sym_expr, tf_expr, la_expr = self._signal_args[sid]
-            sym_ok = sym_expr is None or self._is_module_level_expr(sym_expr)
-            tf_ok = tf_expr is None or self._is_module_level_expr(tf_expr)
-            if sym_ok and tf_ok and la_expr is None:
+            exprs = [e for e in self._signal_args[sid] if e is not None]
+            if all(self._is_simple_chain(e, hoistable) for e in exprs):
                 top_sec_ids.append(sid)
+                for expr in exprs:
+                    needed_names |= self._referenced_names(expr)
             else:
                 runtime_sec_ids.add(sid)
+        self._top_sec_ids.update(top_sec_ids)
 
-        original_body = node.body
+        hoisted = self._collect_hoisted(hoistable, needed_names)
+        hoisted_ids = {id(stmt) for stmt in hoisted}
+        original_body = [stmt for stmt in node.body if id(stmt) not in hoisted_ids]
         top_block = [self._signal_block(top_sec_ids)] if top_sec_ids else []
         node.body = (
-                top_block
+                list(hoisted)
+                + top_block
                 + self._transform_body(original_body, call_exprs, runtime_sec_ids)
                 + [self._wait_block(sec_ids)]
         )
 
         return self.generic_visit(node)
+
+    def _analyze_dependencies(self, node: ast.Module) -> None:
+        """Run the taint analysis on the lowered module and record its result.
+
+        Writes two keys into every context: ``depends`` (the sorted sids whose
+        results flow into this sid's ``__sec_write__`` expression) and, when the
+        write can run more than once per bar, ``in_loop``.
+
+        A dependency on a context that is only resolved while the bar runs is
+        legal — the runtime hands the resolved contexts to the children over the
+        registry pipe — so nothing is rejected here.
+
+        :param node: the lowered module
+        """
+        analyzer = _DependencyAnalyzer(node, list(self._all_contexts))
+        analyzer.run()
+
+        known = set(self._all_contexts)
+        for sid, ctx in self._all_contexts.items():
+            deps = sorted(analyzer.depends.get(sid, set()) & known)
+            ctx['depends'] = ast.List(
+                elts=[ast.Constant(value=d) for d in deps], ctx=ast.Load()
+            )
+            if sid in analyzer.in_loop:
+                ctx['in_loop'] = ast.Constant(value=True)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
         return self._process_func(node)  # type: ignore[return-value]
@@ -715,6 +871,8 @@ class SecurityTransformer(ast.NodeTransformer):
         node = self.generic_visit(node)  # type: ignore[assignment]
 
         if self._all_contexts:
+            self._analyze_dependencies(node)
+
             # Add barmerge import if needed (SecurityTransformer runs AFTER ImportNormalizer,
             # so we must add it ourselves)
             if self._needs_barmerge:
@@ -746,6 +904,589 @@ class SecurityTransformer(ast.NodeTransformer):
 
         return node
 
+# Statement / expression node types the dependency analyzer does not model.
+# Any scope containing one of them falls back to "depends on every other sid"
+# (a safe over-approximation: an unmodelled construct can only add flow).
+_UNMODELLED_NODES: tuple[type[ast.AST], ...] = tuple(
+    n for n in (
+        getattr(ast, name, None) for name in (
+            'Try', 'TryStar', 'With', 'AsyncWith', 'AsyncFor', 'Raise', 'Delete',
+            'Global', 'Nonlocal', 'ClassDef', 'Lambda', 'ListComp', 'SetComp',
+            'DictComp', 'GeneratorExp', 'Yield', 'YieldFrom', 'Await', 'Assert',
+        )
+    ) if n is not None
+)
+
+# Expression node types whose taint is simply the union of their children's.
+_UNION_EXPRS: tuple[type[ast.AST], ...] = (
+    ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare, ast.IfExp, ast.Tuple,
+    ast.List, ast.Set, ast.Dict, ast.Slice, ast.Starred, ast.JoinedStr,
+    ast.FormattedValue, ast.Subscript,
+)
+
+# Names that can never carry taint: ``lib`` is the library namespace root, so
+# ``lib.plot(tainted)`` must not make every later ``lib.close`` tainted.
+_UNTAINTABLE_ROOTS = frozenset({'lib'})
+
+# ``lib`` namespaces whose functions mutate the collection passed as their
+# first argument (``array.push(id, v)``, ``matrix.set(id, r, c, v)``, ...).
+# Only these propagate taint back into an argument — doing it for every call
+# would make an ordinary ``ta.sma(series, length)`` taint its length input.
+_MUTATING_NAMESPACES = frozenset({'array', 'matrix', 'map'})
+
+# Fixpoint safety net — the lattice is finite and monotone, so the loop always
+# converges; the cap only guards against an unforeseen non-monotone edit.
+_MAX_FIXPOINT_ROUNDS = 200
+
+
+class _DependencyAnalyzer:
+    """Forward taint analysis over an already lowered security AST.
+
+    After :class:`SecurityTransformer` has rewritten the module, every
+    ``request.security()`` result is read through ``__sec_read__("<sid>", ...)``
+    and every security expression is written through
+    ``__sec_write__("<sid>", <expr>)``. This pass answers one question: which
+    sids' results flow into which other sid's write expression.
+
+    The analysis is deliberately coarse:
+
+    - **Flow-insensitive on data**: a name's taint is the union over every
+      assignment to it anywhere in the module (so ``var`` backward flow and
+      loop-carried values are covered without ordering rules).
+    - **Flat namespace**: names are not scoped per function. Two unrelated
+      locals sharing a name merge their taint — an over-approximation only.
+    - **Flow-sensitive on control**: a control-taint set accumulates the taint
+      of enclosing ``if`` / ``for`` / ``while`` / ``match`` conditions, and a
+      tainted ``return`` / ``break`` / ``continue`` taints the rest of its
+      function.
+    - **Alias classes**: ``a = b`` merges the two names into one taint class,
+      so mutating a container through either alias is visible on both.
+    - **User functions**: a call's result carries the callee's return taint
+      plus the taint of every argument (arguments are conservatively assumed
+      to flow into the result).
+    - **Fallback**: a scope containing an unmodelled construct makes every
+      write in it depend on all other sids.
+
+    Over-approximation is safe only towards EARLIER-sited producers, and the
+    result is filtered to those: for them ``depends`` is just a wait filter, so
+    a too-large set costs extra synchronisation and nothing else. A back-edge
+    onto a later-sited producer is NOT safe — the child would block a write
+    that the chart is waiting for before it ever reaches the producer's site —
+    so every such edge is dropped (see :meth:`run`).
+    """
+
+    def __init__(self, module: ast.Module, all_sids: list[str]):
+        self._module = module
+        self._all: frozenset[str] = frozenset(all_sids)
+        self.depends: dict[str, set[str]] = {sid: set() for sid in all_sids}
+        self.in_loop: set[str] = set()
+        self._funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+        self._fallback_scopes: set[str] = set()
+        self.fallback_reasons: dict[str, str] = {}
+        self._ret: dict[str, set[str]] = {}
+        self._escape: dict[str, set[str]] = {}
+        self._parent: dict[str, str] = {}
+        self._taint: dict[str, set[str]] = {}
+        self._ctrl: set[str] = set()
+        self._order: dict[str, int] = {}
+        self._scope: str = ''
+        self._changed = False
+
+    # --- alias classes ---
+
+    def _find(self, name: str) -> str:
+        root = name
+        while self._parent.get(root, root) != root:
+            root = self._parent[root]
+        # Path compression
+        while self._parent.get(name, name) != name:
+            self._parent[name], name = root, self._parent[name]
+        return root
+
+    def _union(self, a: str, b: str) -> None:
+        ra, rb = self._find(a), self._find(b)
+        if ra == rb:
+            return
+        self._parent[rb] = ra
+        merged = self._taint.get(ra, set()) | self._taint.get(rb, set())
+        self._taint.pop(rb, None)
+        if merged != self._taint.get(ra, set()):
+            self._changed = True
+        self._taint[ra] = merged
+
+    def _get_taint(self, name: str) -> set[str]:
+        if name in _UNTAINTABLE_ROOTS:
+            return set()
+        return set(self._taint.get(self._find(name), ()))
+
+    def _add_taint(self, name: str, taint: set[str]) -> None:
+        if name in _UNTAINTABLE_ROOTS:
+            return
+        if not taint:
+            self._taint.setdefault(self._find(name), set())
+            return
+        root = self._find(name)
+        cur = self._taint.setdefault(root, set())
+        if not taint <= cur:
+            cur |= taint
+            self._changed = True
+
+    # --- helpers ---
+
+    @staticmethod
+    def _sid_arg(call: ast.Call) -> str | None:
+        """Return the sid string of a ``__sec_read__`` / ``__sec_write__`` call."""
+        if not call.args:
+            return None
+        first = call.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            return first.value
+        return None
+
+    @staticmethod
+    def _root_name(node: ast.expr) -> str | None:
+        """Base Name of a place expression (``a``, ``a.b``, ``a[i].c``)."""
+        while isinstance(node, (ast.Attribute, ast.Subscript)):
+            node = node.value
+        return node.id if isinstance(node, ast.Name) else None
+
+    @staticmethod
+    def _iter_stmts_skip_funcs(node: ast.AST):
+        """All descendant nodes of ``node``, not entering nested function defs."""
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            yield child
+            yield from _DependencyAnalyzer._iter_stmts_skip_funcs(child)
+
+    @classmethod
+    def _walk_loop_depth(cls, node: ast.AST, depth: int):
+        """Yield ``(node, loop_depth)`` pairs, not entering nested function defs.
+
+        The whole ``for`` / ``while`` subtree counts as one level deeper — the
+        iterator expression itself runs once, but treating it as in-loop only
+        over-approximates the ``in_loop`` marking.
+        """
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            sub_depth = depth + 1 if isinstance(
+                child, (ast.For, ast.AsyncFor, ast.While)
+            ) else depth
+            yield child, sub_depth
+            yield from cls._walk_loop_depth(child, sub_depth)
+
+    # --- program order of the write sites ---
+
+    def _compute_site_order(self) -> None:
+        """Number every sid by the program order of its ``__sec_write__`` site.
+
+        The walk starts at the module body and at every function nothing calls
+        (``main`` and friends), and descends into a user function AT ITS CALL
+        SITE — so a write inside a nested or cloned function takes the position
+        of the call that instantiates it. Recursion is cut with a visiting set.
+
+        Sites the walk never reaches (dead code) are numbered last, in
+        registration order.
+        """
+        counter = 0
+        visiting: set[str] = set()
+
+        def walk(node: ast.AST) -> None:
+            nonlocal counter
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                # Arguments are evaluated before the call they belong to
+                walk(child)
+                if not isinstance(child, ast.Call) or not isinstance(child.func, ast.Name):
+                    continue
+                name = child.func.id
+                if name == '__sec_write__':
+                    sid = self._sid_arg(child)
+                    if sid is not None and sid not in self._order:
+                        self._order[sid] = counter
+                        counter += 1
+                elif name in self._funcs and name not in visiting:
+                    visiting.add(name)
+                    walk(self._funcs[name])
+                    visiting.discard(name)
+
+        called = {
+            n.func.id for n in ast.walk(self._module)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id in self._funcs
+        }
+        walk(self._module)
+        for name, fn in self._funcs.items():
+            if name not in called:
+                walk(fn)
+        for sid in self._all:
+            if sid not in self._order:
+                self._order[sid] = counter
+                counter += 1
+
+    # --- in_loop ---
+
+    def _mark_in_loop(self) -> None:
+        """Mark sids whose ``__sec_write__`` runs more than once per bar.
+
+        Two sources: a write block standing directly in a ``for`` / ``while``
+        body (nesting included), and a write inside a user function that is
+        reached — through any number of call levels — from a loop body. The
+        instantiation pass clones a security-bearing function per CALL SITE,
+        not per iteration, so a single clone called from a loop writes its sids
+        several times on one bar.
+        """
+        own_sids: dict[str, set[str]] = {}
+        callees: dict[str, set[str]] = {}
+        loop_callees: set[str] = set()
+
+        scopes: list[tuple[str, ast.AST]] = [('', self._module)]
+        scopes.extend((name, fn) for name, fn in self._funcs.items())
+
+        for scope, root in scopes:
+            own_sids.setdefault(scope, set())
+            callees.setdefault(scope, set())
+            for node, depth in self._walk_loop_depth(root, 0):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                    continue
+                fname = node.func.id
+                if fname == '__sec_write__':
+                    sid = self._sid_arg(node)
+                    if sid is not None:
+                        own_sids[scope].add(sid)
+                        if depth > 0:
+                            self.in_loop.add(sid)
+                elif fname in self._funcs:
+                    callees[scope].add(fname)
+                    if depth > 0:
+                        loop_callees.add(fname)
+
+        reached: set[str] = set()
+        work = list(loop_callees)
+        while work:
+            name = work.pop()
+            if name in reached:
+                continue
+            reached.add(name)
+            work.extend(callees.get(name, ()))
+
+        for name in reached:
+            self.in_loop |= own_sids.get(name, set())
+
+    # --- expression taint ---
+
+    def _expr_taint(self, node: ast.expr | None) -> set[str]:
+        if node is None or isinstance(node, ast.Constant):
+            return set()
+        if isinstance(node, ast.Name):
+            return self._get_taint(node.id)
+        if isinstance(node, ast.Attribute):
+            return self._expr_taint(node.value)
+        if isinstance(node, ast.Call):
+            return self._call_taint(node)
+        if isinstance(node, ast.NamedExpr):
+            # Walrus assignments are injected by the lowering passes that run
+            # before this one; they behave exactly like a plain assignment.
+            taint = self._expr_taint(node.value)
+            self._assign(node.target, taint | self._ctrl, node.value)
+            return taint
+        if isinstance(node, _UNION_EXPRS):
+            taint: set[str] = set()
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.expr):
+                    taint |= self._expr_taint(child)
+            return taint
+        # Unmodelled expression form: the scope falls back instead of the
+        # value carrying every sid around through name taint.
+        self._mark_fallback(node)
+        return set()
+
+    def _call_taint(self, node: ast.Call) -> set[str]:
+        func = node.func
+        if isinstance(func, ast.Name):
+            if func.id == '__sec_read__':
+                sid = self._sid_arg(node)
+                return {sid} if sid is not None else set(self._all)
+            if func.id == '__sec_write__':
+                sid = self._sid_arg(node)
+                value = node.args[1] if len(node.args) > 1 else None
+                taint = self._expr_taint(value) | self._ctrl
+                if self._scope in self._fallback_scopes:
+                    taint |= self._all
+                if sid is not None:
+                    target = self.depends.setdefault(sid, set())
+                    new = (taint - {sid}) - target
+                    if new:
+                        target |= new
+                        self._changed = True
+                return set()
+            if func.id in ('__sec_signal__', '__sec_wait__'):
+                return set()
+
+        taint = self._expr_taint(func) if not isinstance(func, ast.Name) else set()
+        pos_taints = [self._expr_taint(a) for a in node.args]
+        kw_taints = [(kw.arg, self._expr_taint(kw.value)) for kw in node.keywords]
+        # A ``*iterable`` spread has an unknown length, so from its position on
+        # no argument has a known parameter of its own.
+        star_from: int | None = None
+        for i, arg in enumerate(node.args):
+            if isinstance(arg, ast.Starred):
+                star_from = i
+                break
+        for arg_taint in pos_taints:
+            taint |= arg_taint
+        for _kw_name, arg_taint in kw_taints:
+            taint |= arg_taint
+        if isinstance(func, ast.Name) and func.id in self._funcs:
+            self._bind_params(self._funcs[func.id], pos_taints, kw_taints, star_from)
+            taint |= self._ret.get(func.id, set())
+
+        # Mutation: a collection API writes into the id passed as its first
+        # argument (``array.push(id, v)``), and a method call writes into the
+        # object it runs on (``id.push(v)``).
+        if taint and isinstance(func, ast.Attribute):
+            if self._is_mutating_namespace_call(func):
+                if node.args:
+                    root = self._root_name(node.args[0])
+                    if root is not None:
+                        self._add_taint(root, taint)
+            else:
+                root = self._root_name(func.value)
+                if root is not None:
+                    self._add_taint(root, taint)
+        return taint
+
+    def _bind_params(self, fn: 'ast.FunctionDef | ast.AsyncFunctionDef',
+                     pos_taints: list[set[str]],
+                     kw_taints: list[tuple[str | None, set[str]]],
+                     star_from: int | None = None) -> None:
+        """Flow a call's argument taints into the callee's parameter names.
+
+        The taint namespace is flat (one entry per bare name), so a parameter
+        is just another name — but nothing writes it unless the argument taint
+        is bound here. Without the binding a dependency only reaches a write
+        inside the callee when the caller's variable happens to carry the same
+        name as the parameter.
+
+        :param fn: The callee's definition.
+        :param pos_taints: Taint of each positional argument, in call order.
+        :param kw_taints: ``(keyword name, taint)`` pairs; the name is ``None``
+            for a ``**mapping`` unpacking, whose targets are unknown.
+        :param star_from: Index of the first ``*iterable`` in ``pos_taints``,
+            ``None`` when the call spreads nothing. From that index on the
+            argument-to-parameter mapping is unknown at compile time.
+        """
+        spec = fn.args
+        positional = list(spec.posonlyargs) + list(spec.args)
+        every = positional + list(spec.kwonlyargs)
+        extra_pos: set[str] = set()
+        extra_kw: set[str] = set()
+        spread: set[str] = set()
+        for i, arg_taint in enumerate(pos_taints):
+            if star_from is not None and i >= star_from:
+                spread |= arg_taint
+            elif i < len(positional):
+                self._add_taint(positional[i].arg, arg_taint)
+            else:
+                extra_pos |= arg_taint
+        by_name = {a.arg for a in every}
+        unknown_kw: set[str] = set()
+        for name, arg_taint in kw_taints:
+            if name is None:
+                unknown_kw |= arg_taint
+            elif name in by_name:
+                self._add_taint(name, arg_taint)
+            else:
+                extra_kw |= arg_taint
+        # A spread of unknown length can fill every parameter from its own
+        # position on, so its taint goes to all of them (and to ``*args``).
+        if spread:
+            for param in positional[star_from:]:
+                self._add_taint(param.arg, spread)
+            if spec.vararg is not None:
+                self._add_taint(spec.vararg.arg, spread)
+        # A ``**mapping`` of unknown keys can fill any keyword-addressable
+        # parameter — positional-only ones are the sole exception.
+        if unknown_kw:
+            for param in list(spec.args) + list(spec.kwonlyargs):
+                self._add_taint(param.arg, unknown_kw)
+            if spec.kwarg is not None:
+                self._add_taint(spec.kwarg.arg, unknown_kw)
+        # An argument with no parameter of its own (``*args`` / ``**kwargs``,
+        # or a starred call the caller spread) lands in the catch-all if there
+        # is one, and over-approximates onto every parameter if there is not.
+        if extra_pos:
+            if spec.vararg is not None:
+                self._add_taint(spec.vararg.arg, extra_pos)
+            else:
+                for param in every:
+                    self._add_taint(param.arg, extra_pos)
+        if extra_kw:
+            if spec.kwarg is not None:
+                self._add_taint(spec.kwarg.arg, extra_kw)
+            else:
+                for param in every:
+                    self._add_taint(param.arg, extra_kw)
+
+    @staticmethod
+    def _is_mutating_namespace_call(func: ast.Attribute) -> bool:
+        """Whether ``func`` is ``lib.<array|matrix|map>.<fn>``."""
+        owner = func.value
+        return (isinstance(owner, ast.Attribute)
+                and owner.attr in _MUTATING_NAMESPACES
+                and isinstance(owner.value, ast.Name)
+                and owner.value.id == 'lib')
+
+    # --- assignment ---
+
+    def _assign(self, target: ast.expr, taint: set[str], value: ast.expr | None) -> None:
+        if isinstance(target, ast.Name):
+            self._add_taint(target.id, taint)
+            if value is not None and isinstance(value, (ast.Name, ast.Attribute, ast.Subscript)):
+                root = self._root_name(value)
+                if root is not None and root != 'lib':
+                    self._union(target.id, root)
+            return
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                self._assign(elt, taint, None)
+            return
+        if isinstance(target, ast.Starred):
+            self._assign(target.value, taint, None)
+            return
+        root = self._root_name(target)
+        if root is not None:
+            self._add_taint(root, taint)
+
+    # --- statements ---
+
+    def _visit_body(self, body: list[ast.stmt], ctrl: set[str]) -> set[str]:
+        """Visit a statement list; return the control taint after it."""
+        for stmt in body:
+            ctrl = self._visit_stmt(stmt, ctrl)
+        return ctrl
+
+    def _visit_stmt(self, stmt: ast.stmt, ctrl: set[str]) -> set[str]:
+        self._ctrl = ctrl
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return ctrl
+        if isinstance(stmt, ast.Assign):
+            taint = self._expr_taint(stmt.value) | ctrl
+            for target in stmt.targets:
+                self._assign(target, taint, stmt.value)
+            return ctrl
+        if isinstance(stmt, ast.AnnAssign):
+            if stmt.value is not None:
+                self._assign(stmt.target, self._expr_taint(stmt.value) | ctrl, stmt.value)
+            return ctrl
+        if isinstance(stmt, ast.AugAssign):
+            taint = self._expr_taint(stmt.value) | self._expr_taint(stmt.target) | ctrl
+            self._assign(stmt.target, taint, None)
+            return ctrl
+        if isinstance(stmt, ast.Expr):
+            self._expr_taint(stmt.value)
+            return ctrl
+        if isinstance(stmt, ast.If):
+            inner = ctrl | self._expr_taint(stmt.test)
+            self._visit_body(stmt.body, inner)
+            self._visit_body(stmt.orelse, inner)
+            return ctrl
+        if isinstance(stmt, (ast.For, ast.AsyncFor)):
+            inner = ctrl | self._expr_taint(stmt.iter)
+            self._assign(stmt.target, inner, None)
+            self._visit_body(stmt.body, inner)
+            self._visit_body(stmt.orelse, inner)
+            return ctrl
+        if isinstance(stmt, ast.While):
+            inner = ctrl | self._expr_taint(stmt.test)
+            self._visit_body(stmt.body, inner)
+            self._visit_body(stmt.orelse, inner)
+            return ctrl
+        if isinstance(stmt, ast.Match):
+            inner = ctrl | self._expr_taint(stmt.subject)
+            for case in stmt.cases:
+                case_ctrl = inner
+                if case.guard is not None:
+                    case_ctrl = inner | self._expr_taint(case.guard)
+                self._visit_body(case.body, case_ctrl)
+            return ctrl
+        if isinstance(stmt, ast.Return):
+            taint = self._expr_taint(stmt.value) | ctrl
+            self._record_escape(self._ret, taint)
+            self._record_escape(self._escape, ctrl)
+            return ctrl | taint
+        if isinstance(stmt, (ast.Break, ast.Continue)):
+            # The decision to leave the block is itself tainted, so everything
+            # after it runs conditionally on that taint.
+            self._record_escape(self._escape, ctrl)
+            return ctrl
+        return ctrl
+
+    def _mark_fallback(self, node: ast.AST | None = None) -> None:
+        """Mark the current scope as containing an unmodelled construct.
+
+        :param node: the construct that triggered the fallback, kept for
+            diagnostics
+        """
+        if self._scope not in self._fallback_scopes:
+            self._fallback_scopes.add(self._scope)
+            self.fallback_reasons.setdefault(
+                self._scope, type(node).__name__ if node is not None else '?'
+            )
+            self._changed = True
+
+    def _record_escape(self, store: dict[str, set[str]], taint: set[str]) -> None:
+        if not taint:
+            store.setdefault(self._scope, set())
+            return
+        cur = store.setdefault(self._scope, set())
+        if not taint <= cur:
+            cur |= taint
+            self._changed = True
+
+    # --- driver ---
+
+    def run(self) -> None:
+        self._funcs = {
+            n.name: n for n in ast.walk(self._module)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        self._mark_in_loop()
+        self._compute_site_order()
+
+        scopes: list[tuple[str, list[ast.stmt]]] = [('', self._module.body)]
+        scopes.extend((name, fn.body) for name, fn in self._funcs.items())
+        roots: list[tuple[str, ast.AST]] = [('', self._module)]
+        roots.extend((name, fn) for name, fn in self._funcs.items())
+        for scope, root in roots:
+            for sub in self._iter_stmts_skip_funcs(root):
+                if isinstance(sub, _UNMODELLED_NODES):
+                    self._fallback_scopes.add(scope)
+                    self.fallback_reasons.setdefault(scope, type(sub).__name__)
+                    break
+
+        for _ in range(_MAX_FIXPOINT_ROUNDS):
+            self._changed = False
+            for scope, body in scopes:
+                self._scope = scope
+                self._visit_body(body, set(self._escape.get(scope, set())))
+            if not self._changed:
+                break
+
+        # Only a producer whose site PRECEDES this write can be waited for.
+        # A later-sited producer would deadlock the historical warmup batch:
+        # the child replays many bars in one round, so blocking on a peer whose
+        # site the chart has not reached yet stops the very write that would
+        # release the round. Such an edge can only be a previous-bar carry
+        # anyway; the child reads the default for it.
+        for sid, deps in self.depends.items():
+            own = self._order.get(sid, 0)
+            self.depends[sid] = {
+                d for d in deps
+                if d != sid and self._order.get(d, own) < own
+            }
 
 class _CallReplacer(ast.NodeTransformer):
     """Replace marked request.security() call nodes with __sec_read__() calls."""

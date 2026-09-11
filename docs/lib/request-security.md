@@ -175,6 +175,7 @@ security_data = {
 | Multiple security calls          | supported | Each gets its own process                                                        |
 | Conditional calls                | supported | Inside `if`/`for`/`while` blocks                                                 |
 | Nested security calls            | supported | `security(... security(...) ...)`                                                |
+| Dependent security calls         | supported | One context's expression reads another's value (see below); a producer must precede its consumer |
 | `barmerge.gaps_off`              | supported | Forward-fills last value (default)                                               |
 | `barmerge.gaps_on`               | supported | Returns `na` between periods                                                     |
 | `barmerge.lookahead_off`         | supported | Most recently closed bar — historical + live (same-symbol HTF in live)           |
@@ -196,12 +197,44 @@ Under the hood, each `request.security()` call spawns a separate OS process:
 5. The chart process **waits** for security results only when a new period is confirmed
 6. **Pipeline parallelism**: security processes run on separate CPU cores concurrently
 
-### HTF Period Confirmation
+### Bar pairing: one close rule
 
-For higher-timeframe data, values are confirmed with **lookahead_off** semantics following
-TradingView's historical merge rule: an HTF bar is confirmed on the chart bar whose **close
-instant** reaches the HTF bar's close — the period's last chart bar already carries the
-period's final value, not the next period's first bar.
+Every pairing — the chart reading a context, or one context reading another — follows a
+single rule:
+
+> A consumer bar sees the peer's **last bar whose scheduled close is at or before the
+> consumer's as-of instant.**
+
+**Scheduled close.** A bar's close is its real one, never a nominal timeframe addition:
+
+* intraday — `min(open + span, next open, session end)`, so a session-closing stub
+  (15:30 → 16:00 on a 60-minute grid) and a bar shortened by the next open both close
+  where they really do;
+* daily/weekly/monthly — the end of the **last scheduled session** inside the period. An
+  equity weekly bar closes Friday 16:00, an FX weekly bar Friday 17:00 New York; never the
+  following Monday's open, and never a nominal month length.
+
+**As-of instant.** For a chart bar it is that bar's own scheduled close (on a developing
+live bar: the round's fixed tick instant, read once per bar cycle so every context of that
+bar agrees). A security context consuming another one takes the minimum of its own
+scheduled close, the calendar extension below, and the chart's as-of for that peer — the
+last term is what guarantees a consumer never waits for a bar the chart does not confirm.
+
+**Calendar extension.** When the peer is a daily/weekly/monthly context on the **same
+trading calendar** (same exchange timezone and `opening_hours`) and the as-of instant falls
+inside a scheduled break, it extends to the session open that ends that break. So a
+15:00–16:00 equity hourly bar, closing at 16:00 in the break, already sees that day's daily
+bar; a 09:30–10:30 bar, closing inside the session, does not. A 24h symbol has no break and
+is never extended, and a peer on a different calendar never is either — it may trade
+during this one's break.
+
+The rule was measured against TradingView on three pairings, which all reduce to it:
+
+| Pairing                                       | TradingView's answer                          | Agreement |
+|-----------------------------------------------|-----------------------------------------------|-----------|
+| Weekly consumer of a daily producer           | The week's LAST daily bar                     | 8000/8000 |
+| Daily consumer of a weekly producer           | The last weekly bar CLOSED by the day's close | 8000/8000 |
+| Daily consumer of another symbol's daily bar  | The bar paired by close instant               | 8000/8000 |
 
 ```
 Chart bars (5m):    10:00  10:05  10:10 ... 23:50  23:55  00:00
@@ -212,6 +245,18 @@ Chart bars (5m):    10:00  10:05  10:10 ... 23:50  23:55  00:00
 ```
 
 For same-timeframe contexts (different symbol), values are confirmed on every bar.
+
+### Lower-timeframe windows
+
+`request.security_lower_tf()` and a scalar `request.security()` on a finer timeframe take
+the same rule: a chart bar sees the intrabars whose scheduled close falls **inside its own
+period**. On a nested grid (a 1-minute context on a 5-minute chart) that is exactly the
+chart bar's window. On a non-nested grid, or behind a shortened session, an intrabar can
+**straddle** the chart bar's close — it opens inside the bar but closes after it. Such an
+intrabar carries a price from after the chart bar ended, so it is delivered on the **next**
+chart bar instead, the one its close falls into. Nothing is lost or duplicated: every
+intrabar is delivered exactly once, but a chart bar in which no intrabar closes returns an
+empty array (`na` for the scalar form).
 
 ### Chart types (Heikin Ashi)
 
@@ -315,6 +360,45 @@ htf_close_prev = lib.request.security(
 )
 ```
 
+## Dependent security expressions
+
+A security expression may read the value of **another** security context:
+
+```python
+rsi_m = lib.request.security(lib.syminfo.tickerid, "M", lib.ta.rsi(lib.close, 14))
+sma_m = lib.request.security(lib.syminfo.tickerid, "M", lib.ta.sma(rsi_m, 14))
+```
+
+The inner value is evaluated in the *requested* context, so `sma_m` is the monthly SMA of
+the monthly RSI — identical to the fully nested form
+`security(tickerid, "M", ta.sma(ta.rsi(close, 14), 14))`, warmup included. Chains of any
+depth work, and so do peers on different symbols, calendars and timeframes; each pairing
+uses the close rule above.
+
+Rules and limits of dependent expressions:
+
+* **Only earlier calls are dependencies.** A context's expression can read the result of
+  any `request.security()` call that appears **before** it in the script, including
+  contexts whose symbol or timeframe is only known at runtime. A value carried from a
+  *later* call (through a `var`, i.e. the previous bar's result) is read as `na` inside the
+  requested context: waiting for a later call would stall the warmup, where a context
+  replays many bars in one step. Order the calls so a producer comes before its consumer.
+* **`lookahead_on` peers use close semantics.** Reading a `lookahead_on` context from
+  another context pairs by scheduled close like every other peer — it does not expose the
+  peer's developing bar.
+* **A chart-context peer is `na` during the consumer's warmup.** A context evaluated on the
+  chart itself (same symbol, same timeframe) has no value before the chart's first bar, so a
+  consumer replaying its own warmup reads `na` there.
+* **`request.security_lower_tf()` as a peer** is supported for file-backed contexts: the
+  consumer receives the intrabars closing inside its **own** bar, not the chart bar's window.
+  A lower-timeframe context fed by a **live stream** publishes whole chart-bar windows and
+  has no per-intrabar history, so reading one from another context returns the default
+  (an empty array) without waiting.
+* **A security call inside a loop** writes several times per bar. The **first** write of a
+  bar publishes; an identical repeat is a no-op; a repeat with a **different** value raises
+  `loop-varying security expression is not supported`, because the chart may already have
+  read the first one. Loop-invariant arguments (the usual case) are unaffected.
+
 ## Limitations
 
 - **Cross-symbol HTF** — the live HTF transport aggregates chart OHLCV, so it
@@ -365,11 +449,29 @@ and futures) are unaffected: the session-anchored grid is identical to a plain c
 
 ## Known Differences from TradingView
 
+**Holidays and unscheduled early closes.** A holiday or an exchange early close is not in the
+trading schedule, and from the bar data alone it is indistinguishable from a data gap. PyneCore
+therefore never infers one: a daily/weekly/monthly bar shortened by such a day becomes visible
+**one consumer bar later** than on TradingView, rather than being guessed from the bar grid. A
+weekly bar ending on a holiday Friday, for example, appears on the following Monday. Backtest and
+live mode behave identically here — live has always followed the schedule — and no value is ever a
+price from after the consumer bar's own close.
+
+**Daily/weekly/monthly peers on a different calendar.** When a D/W/M context keeps a different
+trading calendar than the consumer (a different exchange timezone or `opening_hours`), no calendar
+extension applies: the peer may trade during the consumer's break, so only its scheduled close
+counts. The peer's bar therefore arrives one consumer bar later than TradingView shows it, instead
+of the consumer reading data from past the peer's close.
+
 On markets with **shortened trading sessions** (e.g., half-day sessions before holidays), minor
 differences may occur when the chart symbol and the security symbol follow different session
 calendars — one closes early while the other trades a full day. This can cause period boundary
 alignment to differ slightly from TradingView. In practice, this is rare and only affects a handful
 of bars on specific calendar dates.
+
+**Straddling lower-timeframe bars.** An intrabar that opens inside a chart bar but closes after it
+(a non-nested grid, or a session-shortened intrabar) is delivered on the next chart bar. See
+[Lower-timeframe windows](#lower-timeframe-windows).
 
 Markets with an **intraday recess** (e.g. a lunch break) keep a single grid anchored to the day's
 primary session open; the bar whose window spans the recess simply holds the data of the first

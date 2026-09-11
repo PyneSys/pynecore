@@ -128,3 +128,71 @@ def main():
     result = _transform(source)
     assert '__pyne_inst' not in result
     log.info("no-security fast path OK")
+
+
+def __test_call_site_constant_pinned_into_clone__(log):
+    """Each instance gets its call site's static arguments written back as
+    bindings at the top of its body.
+
+    After instantiation a security-bearing function has exactly one call site,
+    so its timeframe/symbol parameters are statically known. Pinning them makes
+    the ``__sec_signal__`` hoistable, which is what lets another
+    ``request.security()`` depend on this one.
+    """
+    source = """
+def f(tf):
+    return lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+def main():
+    a = f("60")
+    b = f("240")
+"""
+    result = _transform(source)
+    assert "tf = '60'" in result
+    assert "tf = '240'" in result
+    log.info("call-site constant pinning OK")
+
+
+def __test_single_call_site_constant_pinned__(log):
+    """A function with one call site is specialized too — no clone needed."""
+    source = """
+def f(tf):
+    return lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+def main():
+    a = f(lib.timeframe.period)
+"""
+    result = _transform(source)
+    assert '__pyne_inst' not in result
+    assert 'tf = lib.timeframe.period' in result
+    log.info("single-site specialization OK")
+
+
+def __test_call_site_call_argument_not_pinned__(log):
+    """A call-valued argument is never copied into the callee — duplicating
+    ``input.timeframe()`` would register the input twice."""
+    source = """
+def f(tf):
+    return lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+def main():
+    a = f(lib.input.timeframe("60", "HTF"))
+"""
+    result = _transform(source)
+    assert result.count('lib.input.timeframe') == 1
+    assert 'tf = lib.input' not in result
+    log.info("call argument not pinned OK")
+
+
+def __test_specialization_skips_bailed_out_functions__(log):
+    """A function excluded from instantiation (alias reference) keeps its
+    parameters untouched — its call sites are not statically paired."""
+    source = """
+def f(tf):
+    return lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+def main():
+    g = f
+    a = f("5")
+    b = f("15")
+"""
+    result = _transform(source)
+    assert "tf = '5'" not in result
+    assert "tf = '15'" not in result
+    log.info("bail-out functions not specialized OK")

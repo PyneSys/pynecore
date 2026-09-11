@@ -98,12 +98,12 @@ def __test_chart_protocol_signal_read_flow__(log):
     """Chart protocol: signal sets events, read returns value after wait"""
     sec_ids = ["sec_flow"]
     sb = SyncBlock(sec_ids)
-    rb = ResultBlock("sec_flow", create=True, version=0)
+    rb = ResultBlock("sec_flow", create=True, version=0, prefix=sb.block_prefix("sec_flow"))
 
     state = _make_state(sec_id="sec_flow", timeframe="5", same_timeframe=True)
     states = {"sec_flow": state}
 
-    signal_fn, write_fn, read_fn, wait_fn, cleanup, _ = create_chart_protocol(states, sb)
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, _, _begin_bar, _ = create_chart_protocol(states, sb)
 
     try:
         # Simulate: write a value to shared memory (as if security process did it)
@@ -129,13 +129,13 @@ def __test_chart_protocol_gaps_on__(log):
     """Chart protocol: gaps_on returns default when no new period"""
     sec_ids = ["sec_gaps"]
     sb = SyncBlock(sec_ids)
-    rb = ResultBlock("sec_gaps", create=True, version=0)
+    rb = ResultBlock("sec_gaps", create=True, version=0, prefix=sb.block_prefix("sec_gaps"))
 
     state = _make_state(sec_id="sec_gaps", timeframe="1D", gaps_on=True)
     state.new_period = False  # no new period
     states = {"sec_gaps": state}
 
-    signal_fn, write_fn, read_fn, wait_fn, cleanup, _ = create_chart_protocol(states, sb)
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, _, _begin_bar, _ = create_chart_protocol(states, sb)
 
     try:
         write_result(rb, sb, 100.0)
@@ -157,13 +157,19 @@ def __test_chart_protocol_gaps_on__(log):
 
 
 def __test_security_protocol_write_read__(log):
-    """Security protocol: write and immediate read"""
+    """Security protocol: own write/read, and a peer the context does not depend on.
+
+    A peer read only waits and pairs when the transformer listed that sid among
+    this context's dependencies AND something produces for it. Anything else —
+    an unrelated context, an ``ignore_invalid_symbol`` downgrade — answers with
+    the default immediately: waiting would never end, nothing moves its frontier.
+    """
     sec_ids = ["sec_a", "sec_b"]
     sb = SyncBlock(sec_ids)
-    rb_a = ResultBlock("sec_a", create=True, version=0)
-    rb_b = ResultBlock("sec_b", create=True, version=0)
+    rb_a = ResultBlock("sec_a", create=True, version=0, prefix=sb.block_prefix("sec_a"))
+    rb_b = ResultBlock("sec_b", create=True, version=0, prefix=sb.block_prefix("sec_b"))
 
-    signal_fn, write_fn, read_fn, wait_fn, cleanup, _, _, _, _ = create_security_protocol(
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, _, _, _, _, _ctx, _after_bar, _finish, _prime = create_security_protocol(
         "sec_a", sb, rb_a, sec_ids, _locks_for(sec_ids),
     )
 
@@ -175,16 +181,8 @@ def __test_security_protocol_write_read__(log):
         result = read_fn("sec_a", default=None)
         assert result == 55.5
 
-        # Write a value for sec_b externally (simulate another process)
+        # sec_b is not a declared dependency of sec_a → default, no wait
         write_result(rb_b, sb, "from_b")
-
-        # Read cross-context (B's value)
-        result = read_fn("sec_b", default=None)
-        assert result == "from_b"
-
-        # Read non-existent data → default
-        from pynecore.core.security_shm import write_na
-        write_na(rb_b, sb)
         result = read_fn("sec_b", default="NA")
         assert result == "NA"
     finally:
@@ -251,9 +249,9 @@ def __test_ltf_protocol_accumulation__(log):
     """LTF security protocol accumulates values into array via flush"""
     sec_ids = ["sec_ltf"]
     sb = SyncBlock(sec_ids)
-    rb = ResultBlock("sec_ltf", create=True, version=0)
+    rb = ResultBlock("sec_ltf", create=True, version=0, prefix=sb.block_prefix("sec_ltf"))
 
-    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _, _ = create_security_protocol(
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _, _, _ctx, _after_bar, _finish, _prime = create_security_protocol(
         "sec_ltf", sb, rb, sec_ids, _locks_for(sec_ids), is_ltf=True,
     )
 
@@ -292,9 +290,9 @@ def __test_ltf_protocol_empty_flush__(log):
     """LTF flush with no writes produces empty array (not na)"""
     sec_ids = ["sec_ltf2"]
     sb = SyncBlock(sec_ids)
-    rb = ResultBlock("sec_ltf2", create=True, version=0)
+    rb = ResultBlock("sec_ltf2", create=True, version=0, prefix=sb.block_prefix("sec_ltf2"))
 
-    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _, _ = create_security_protocol(
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _, _, _ctx, _after_bar, _finish, _prime = create_security_protocol(
         "sec_ltf2", sb, rb, sec_ids, _locks_for(sec_ids), is_ltf=True,
     )
 
@@ -317,9 +315,9 @@ def __test_ltf_htf_protocol_no_flush__(log):
     """Non-LTF protocol returns flush=None"""
     sec_ids = ["sec_htf"]
     sb = SyncBlock(sec_ids)
-    rb = ResultBlock("sec_htf", create=True, version=0)
+    rb = ResultBlock("sec_htf", create=True, version=0, prefix=sb.block_prefix("sec_htf"))
 
-    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _, _ = create_security_protocol(
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _, _, _ctx, _after_bar, _finish, _prime = create_security_protocol(
         "sec_htf", sb, rb, sec_ids, _locks_for(sec_ids), is_ltf=False,
     )
 
@@ -348,7 +346,7 @@ def __test_chart_protocol_currency_conversion__(log):
 
     sec_ids = ["sec_cur"]
     sb = SyncBlock(sec_ids)
-    rb = ResultBlock("sec_cur", create=True, version=0)
+    rb = ResultBlock("sec_cur", create=True, version=0, prefix=sb.block_prefix("sec_cur"))
 
     state = _make_state(sec_id="sec_cur", timeframe="5", same_timeframe=True)
     states = {"sec_cur": state}
@@ -387,7 +385,7 @@ def __test_chart_protocol_currency_conversion__(log):
             # Conversion: security result is in EUR, convert to USD
             currency_conversions = {"sec_cur": ("EUR", "USD")}
 
-            signal_fn, write_fn, read_fn, wait_fn, cleanup, _ = create_chart_protocol(
+            signal_fn, write_fn, read_fn, wait_fn, cleanup, _, _begin_bar, _ = create_chart_protocol(
                 states, sb, currency_conversions=currency_conversions,
             )
 
@@ -418,7 +416,7 @@ def __test_chart_protocol_currency_no_data__(log):
     """Chart protocol: currency conversion with no rate data returns unconverted result"""
     sec_ids = ["sec_nodata"]
     sb = SyncBlock(sec_ids)
-    rb = ResultBlock("sec_nodata", create=True, version=0)
+    rb = ResultBlock("sec_nodata", create=True, version=0, prefix=sb.block_prefix("sec_nodata"))
 
     state = _make_state(sec_id="sec_nodata", timeframe="5", same_timeframe=True)
     states = {"sec_nodata": state}
@@ -434,7 +432,7 @@ def __test_chart_protocol_currency_no_data__(log):
     try:
         currency_conversions = {"sec_nodata": ("EUR", "USD")}
 
-        signal_fn, write_fn, read_fn, wait_fn, cleanup, _ = create_chart_protocol(
+        signal_fn, write_fn, read_fn, wait_fn, cleanup, _, _begin_bar, _ = create_chart_protocol(
             states, sb, currency_conversions=currency_conversions,
         )
 

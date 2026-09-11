@@ -2076,6 +2076,9 @@
     },
     "splits": {
       "type": "variable"
+    },
+    "syminfo": {
+      "type": "variable"
     }
   },
   "lib.runtime": {

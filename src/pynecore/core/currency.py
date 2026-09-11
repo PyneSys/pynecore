@@ -201,7 +201,7 @@ class CurrencyRateProvider:
             return float('nan')
         reader = self._result_readers.get(sec_id)
         if reader is None:
-            reader = ResultReader(sec_id)
+            reader = ResultReader(sec_id, self._sync_block.block_prefix(sec_id))
             self._result_readers[sec_id] = reader
         try:
             value = reader.read(self._sync_block, default=None)

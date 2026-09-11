@@ -28,8 +28,7 @@ def __test_sync_block_basic__(log):
 
     try:
         # Initial values should be zero
-        ts, ver, rsize, target, flags = sb.get_slot("sec_a")
-        assert ts == 0
+        ver, rsize, target, flags = sb.get_slot("sec_a")
         assert ver == 0
         assert rsize == 0
         assert target == 0
@@ -39,11 +38,6 @@ def __test_sync_block_basic__(log):
         sb.set_target_time("sec_a", 1000000)
         assert sb.get_target_time("sec_a") == 1000000
         assert sb.get_target_time("sec_b") == 0  # other slot unchanged
-
-        # Set and read timestamp
-        sb.set_timestamp("sec_b", 2000000)
-        assert sb.get_timestamp("sec_b") == 2000000
-        assert sb.get_timestamp("sec_a") == 0
 
         # Set and read result meta
         sb.set_result_meta("sec_a", 3, 128)
@@ -64,7 +58,7 @@ def __test_result_block_write_read__(log):
     """ResultBlock write/read cycle with pickle data"""
     sec_ids = ["sec_test"]
     sb = SyncBlock(sec_ids)
-    rb = ResultBlock("sec_test", create=True, version=0)
+    rb = ResultBlock("sec_test", create=True, version=0, prefix=sb.block_prefix("sec_test"))
 
     try:
         # Write a float value
@@ -98,7 +92,7 @@ def __test_result_block_reallocation__(log):
     """ResultBlock reallocates when data exceeds OS-allocated block size"""
     sec_ids = ["sec_realloc"]
     sb = SyncBlock(sec_ids)
-    rb = ResultBlock("sec_realloc", create=True, version=0, size=64)
+    rb = ResultBlock("sec_realloc", create=True, version=0, size=64, prefix=sb.block_prefix("sec_realloc"))
 
     try:
         # Small write fits (OS allocates at least one page, typically 4-16 KB)
@@ -133,8 +127,8 @@ def __test_result_reader__(log):
     """ResultReader tracks version and re-attaches on reallocation"""
     sec_ids = ["sec_reader"]
     sb = SyncBlock(sec_ids)
-    rb = ResultBlock("sec_reader", create=True, version=0)
-    rr = ResultReader("sec_reader")
+    rb = ResultBlock("sec_reader", create=True, version=0, prefix=sb.block_prefix("sec_reader"))
+    rr = ResultReader("sec_reader", sb.block_prefix("sec_reader"))
 
     try:
         # No data yet — returns default
@@ -164,8 +158,8 @@ def __test_write_na__(log):
     """write_na sets result_size to 0, reader returns default"""
     sec_ids = ["sec_na"]
     sb = SyncBlock(sec_ids)
-    rb = ResultBlock("sec_na", create=True, version=0)
-    rr = ResultReader("sec_na")
+    rb = ResultBlock("sec_na", create=True, version=0, prefix=sb.block_prefix("sec_na"))
+    rr = ResultReader("sec_na", sb.block_prefix("sec_na"))
 
     try:
         # Write a real value first
@@ -191,7 +185,7 @@ def _stress_writer(sec_id, sync_block_name, lock, n_iterations, error_queue):
     """
     try:
         sb = SyncBlock([sec_id], create=False, name=sync_block_name)
-        rb = ResultBlock(sec_id, create=False, version=0)
+        rb = ResultBlock(sec_id, create=False, version=0, prefix=sb.block_prefix(sec_id))
         small_template = ("small", 0)
         large_template = ("large", 0, list(range(200)))
         for i in range(n_iterations):
@@ -218,7 +212,7 @@ def _stress_reader(sec_id, sync_block_name, lock, stop_event, result_queue, erro
     """
     try:
         sb = SyncBlock([sec_id], create=False, name=sync_block_name)
-        rr = ResultReader(sec_id)
+        rr = ResultReader(sec_id, sb.block_prefix(sec_id))
         n_reads = 0
         n_default = 0
         n_small = 0
@@ -268,7 +262,7 @@ def __test_concurrent_lock_protects_cross_context__(log):
     sec_id = "sec_stress"
     sync_block_name = "pyne_sync_stress"
     sb = SyncBlock([sec_id], create=True, name=sync_block_name)
-    rb = ResultBlock(sec_id, create=True, version=0)
+    rb = ResultBlock(sec_id, create=True, version=0, prefix=sb.block_prefix(sec_id))
 
     # Use fork context so the test-local target functions are reachable in the
     # children without needing the tests/ directory on sys.path.
@@ -383,8 +377,8 @@ def __test_multiple_slots_independent__(log):
     """Multiple security slots are independent in the SyncBlock"""
     sec_ids = ["sec_0", "sec_1", "sec_2"]
     sb = SyncBlock(sec_ids)
-    blocks = {sid: ResultBlock(sid, create=True, version=0) for sid in sec_ids}
-    readers = {sid: ResultReader(sid) for sid in sec_ids}
+    blocks = {sid: ResultBlock(sid, create=True, version=0, prefix=sb.block_prefix(sid)) for sid in sec_ids}
+    readers = {sid: ResultReader(sid, sb.block_prefix(sid)) for sid in sec_ids}
 
     try:
         # Write different values to each
