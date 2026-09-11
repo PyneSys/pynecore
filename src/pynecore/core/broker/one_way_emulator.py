@@ -60,6 +60,7 @@ from pynecore.core.broker.models import (
     ExitIntent,
     OrderType,
     PositionLeg,
+    format_intent_key,
 )
 from pynecore.lib.log import broker_warning as _blog_warning
 from pynecore.core.broker.store_helpers import (
@@ -250,22 +251,32 @@ class OneWayEmulator:
             intent_key=intent.intent_key, port=port,
         )
         parent_coid = envelope.client_order_id(KIND_CLOSE)
+        # A script close or an engine-trigger partial close may be declined
+        # per leg without halting (the leg settled or is busy on the venue;
+        # the book re-derives next tick). Marketable exits and defensive
+        # closes keep the definitive-reject contract.
         dispatched = await self._fan_out_closes(
             closes, symbol=intent.symbol, side=intent.side,
             intent_key=intent.intent_key, pine_id=intent.pine_id,
             parent_coid=parent_coid, port=port,
+            skippable=intent.synthetic_kind in (None, 'partial_trigger'),
         )
         if not dispatched:
             # Every slice rounded below the broker grid — skip, do not halt.
             return CloseFanResult(
                 legs=(), dispatched_qty=0.0, shortfall=shortfall, skipped=True,
             )
+        sent_legs = {leg_id for leg_id, _volume in dispatched}
         return CloseFanResult(
             legs=tuple(dispatched),
             # Pine units, NOT the broker-grid volumes above: the caller
             # compares this with the fill quantities the legs report back,
-            # and those arrive in Pine units on every venue.
-            dispatched_qty=round(sum(close.qty for close in closes), 12),
+            # and those arrive in Pine units on every venue. Only the legs
+            # that went on the wire count — a fan a plugin skip cut short
+            # covers less than the plan.
+            dispatched_qty=round(
+                sum(close.qty for close in closes if close.leg_id in sent_legs), 12,
+            ),
             shortfall=shortfall, skipped=False,
         )
 
@@ -353,7 +364,7 @@ class OneWayEmulator:
                 dispatched = await self._fan_out_closes(
                     plan.closes, symbol=intent.symbol, side=intent.side,
                     intent_key=intent.intent_key, pine_id=intent.pine_id,
-                    parent_coid=parent_coid, port=port,
+                    parent_coid=parent_coid, port=port, skippable=False,
                 )
             except ExchangeOrderRejectedError:
                 # A close leg was DEFINITIVELY refused — the fan-out raised
@@ -446,7 +457,7 @@ class OneWayEmulator:
     async def _fan_out_closes(
             self, closes: tuple[LegClose, ...], *,
             symbol: str, side: str, intent_key: str, pine_id: str,
-            parent_coid: str, port: 'PositionPort',
+            parent_coid: str, port: 'PositionPort', skippable: bool,
     ) -> list[tuple[str, int]]:
         """Snap a FIFO close plan to the broker grid and dispatch it per leg.
 
@@ -457,10 +468,23 @@ class OneWayEmulator:
         :meth:`PositionPort.close_leg` returns. Returns the
         ``(leg_id, broker-grid volume)`` pairs actually sent (empty when the
         whole plan rounded below the grid).
+
+        A leg the plugin declines with
+        :class:`~pynecore.core.broker.exceptions.OrderSkippedByPlugin` (the
+        leg is already gone, or busy with another venue operation) never went
+        on the wire, so its pending row is discharged before the skip is
+        surfaced. With ``skippable`` the skip propagates as-is when no leg
+        went on the wire yet — the caller's close is re-evaluated against the
+        next snapshot without halting — and ends the fan as a partial success
+        once earlier legs were dispatched, so their fills stay owned;
+        otherwise it is re-raised as a definitive
+        :class:`~pynecore.core.broker.exceptions.ExchangeOrderRejectedError`
+        so a reversal's or a replay's leg close keeps its loud contract.
         """
         quantize = await port.get_volume_quantizer(symbol)
-        dispatched = plan_leg_close_volumes(closes, quantize)
-        for leg_id, volume in dispatched:
+        planned = plan_leg_close_volumes(closes, quantize)
+        dispatched: list[tuple[str, int]] = []
+        for leg_id, volume in planned:
             leg_coid = f"{parent_coid}:{leg_id}"
             if self._store_ctx is not None:
                 create_close_leg_row(
@@ -475,12 +499,36 @@ class OneWayEmulator:
                     leg_id=leg_id,
                     leg_volume=volume,
                 )
-            await port.close_leg(symbol, leg_id, volume, leg_coid)
+            try:
+                await port.close_leg(symbol, leg_id, volume, leg_coid)
+            except OrderSkippedByPlugin as exc:
+                if self._store_ctx is not None:
+                    # Nothing reached the wire for this leg: a live pending
+                    # row would make a restart replay re-close a leg the
+                    # venue already settled, or double up with the caller's
+                    # own re-evaluation.
+                    self._store_ctx.close_order(leg_coid)
+                if not skippable:
+                    raise ExchangeOrderRejectedError(str(exc)) from exc
+                if not dispatched:
+                    raise
+                # Earlier legs already went on the wire: their fills are
+                # coming back and the caller must own them (order mapping,
+                # fill ledger), so the fan ends here as a partial success
+                # and the remainder re-derives from the next snapshot.
+                _blog_warning(
+                    "one-way close for %s stopped at leg %s (%s); %d leg(s) "
+                    "already dispatched, the rest re-evaluates next tick",
+                    format_intent_key(intent_key), leg_id, exc.reason,
+                    len(dispatched),
+                )
+                break
             if self._store_ctx is not None:
                 update_close_leg_state(
                     self._store_ctx, coid=leg_coid,
                     new_state=CLOSE_LEG_STATE_DISPATCHED, close_row=True,
                 )
+            dispatched.append((leg_id, volume))
         return dispatched
 
     # === Exit-bracket replication =========================================
@@ -1076,6 +1124,7 @@ class OneWayEmulator:
                 owed_closes, symbol=row.symbol, side=row.side,
                 intent_key=row.intent_key or row.pine_entry_id or '',
                 pine_id=row.pine_entry_id or '', parent_coid=parent_coid, port=port,
+                skippable=False,
             )
         # Quarantine gate: the reopen leg is a new-exposure dispatch. The
         # owed FIFO closes above still ran (risk-reducing), but the reopen
