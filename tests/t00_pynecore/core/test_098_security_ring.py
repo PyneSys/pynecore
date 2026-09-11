@@ -95,6 +95,134 @@ def __test_ring_frontier_semantics__(log):
         sb.unlink()
 
 
+def __test_developing_entry_does_not_cover_a_later_tick__(log):
+    """A developing round publishes only as far as its own tick instant.
+
+    One chart bar can run several live ticks. The producer appends the
+    developing bar at the round's tick and its frontier stops there, so a
+    consumer running on a LATER tick keeps waiting for that tick's round
+    instead of passing the wait and reading the previous tick's value. The
+    chart releases it when it settles a round it decided not to launch.
+    """
+    sb, conds = _make(["prod", "cons"])
+    w = RingWriter("prod", sb, conds["prod"])
+    r = RingReader("prod", sb, conds["prod"])
+    try:
+        bar_open, tick1, tick2 = 0, 1_000, 2_000
+
+        # Tick 1: the developing bar enters the ring AT the tick, and that is
+        # exactly how far the frontier goes.
+        w.append(bar_open, tick1, 1.0, frontier_close=tick1)
+        assert r.frontier_close() == tick1
+        assert r.wait_for_close(tick1, timeout=1.0) is True
+        assert r.last_close_at_or_before(tick1) == (bar_open, tick1, 1.0)
+
+        # Tick 2 is not covered: the consumer must wait for the producer's own
+        # round rather than be answered with tick 1's value.
+        assert r.wait_for_close(tick2, timeout=0.3) is False
+
+        # Either the producer runs the round...
+        w.append(bar_open, tick2, 2.0, frontier_close=tick2)
+        assert r.wait_for_close(tick2, timeout=1.0) is True
+        assert r.last_close_at_or_before(tick2) == (bar_open, tick2, 2.0)
+
+        # ...or the chart settles a round it did not launch, which releases the
+        # consumer with the last value the producer did publish.
+        tick3 = 3_000
+        assert r.wait_for_close(tick3, timeout=0.3) is False
+        w.set_frontier_close(tick3)
+        assert r.wait_for_close(tick3, timeout=1.0) is True
+        assert r.last_close_at_or_before(tick3) == (bar_open, tick2, 2.0)
+    finally:
+        r.close()
+        w.close()
+        w.unlink()
+        sb.close()
+        sb.unlink()
+
+
+def __test_closed_frontier_stays_inside_its_round__(log):
+    """A closed round may not claim the window its developing rounds publish in.
+
+    The bar grid alone would let a closed bar claim everything up to the next
+    scheduled close — but the developing rounds of that next period append AT
+    their round's tick, which lies inside exactly that window. Since the
+    frontier only rises, the wide claim would release a consumer of a later
+    tick before that tick's round is published. The producer therefore caps a
+    closed round's frontier at its own round's as-of.
+    """
+    sb, conds = _make(["prod", "cons"])
+    w = RingWriter("prod", sb, conds["prod"])
+    r = RingReader("prod", sb, conds["prod"])
+    try:
+        # Hourly producer: the 00:00 bar closes at 01:00, the next one at 02:00.
+        bar_open, bar_close, next_close = 0, 3_600_000, 7_200_000
+        # The closed round runs on a chart bar whose tick is 01:00.
+        round_tick = bar_close
+        grid_frontier = next_close - 1
+        capped = min(grid_frontier, round_tick)
+
+        w.append(bar_open, bar_close, 1.0, frontier_close=capped)
+        assert r.wait_for_close(round_tick, timeout=1.0) is True
+
+        # A LATER chart bar's developing tick falls inside the grid window but
+        # above the cap, so the consumer waits for that tick's own round.
+        later_tick = bar_close + 60_000
+        assert later_tick < grid_frontier
+        assert r.wait_for_close(later_tick, timeout=0.3) is False
+
+        w.append(bar_close, later_tick, 2.0, frontier_close=later_tick)
+        assert r.wait_for_close(later_tick, timeout=1.0) is True
+        assert r.last_close_at_or_before(later_tick) == (bar_close, later_tick, 2.0)
+    finally:
+        r.close()
+        w.close()
+        w.unlink()
+        sb.close()
+        sb.unlink()
+
+
+def __test_intermediate_step_frontier_stays_below_the_round_tick__(log):
+    """A step with a pending developing append may not advertise through the tick.
+
+    One chart bar can queue several rounds for the same context — a prefill
+    and/or a closed bar, then the developing bar — and they all carry the SAME
+    round tick. The developing round appends AT that tick, so an intermediate
+    step advertising the tick itself would release a consumer of that tick with
+    the earlier entry, and the dependent form would diverge from the nested one.
+    The producer therefore keeps a non-final step strictly below the tick and
+    only the chart bar's LAST step publishes it.
+    """
+    sb, conds = _make(["multi", "mcons"])
+    w = RingWriter("multi", sb, conds["multi"])
+    r = RingReader("multi", sb, conds["multi"])
+    try:
+        # Hourly producer on a chart bar whose round tick is 02:00: the 00:00
+        # period closes here AND the 02:00 period opens as a developing bar.
+        bar_open, bar_close = 0, 3_600_000
+        round_tick = 7_200_000
+
+        # Step 1 of 2 — the closed bar. Its own grid frontier would reach past
+        # the tick, and even the round's as-of cap would land exactly ON it.
+        w.append(bar_open, bar_close, 1.0, frontier_close=round_tick - 1)
+        # A consumer of the tick is NOT released by it.
+        assert r.wait_for_close(round_tick, timeout=0.3) is False
+        # Anything strictly before the tick still passes immediately.
+        assert r.wait_for_close(round_tick - 1, timeout=1.0) is True
+        assert r.last_close_at_or_before(round_tick - 1) == (bar_open, bar_close, 1.0)
+
+        # Step 2 of 2 — the developing bar appends at the tick and publishes it.
+        w.append(bar_close, round_tick, 2.0, frontier_close=round_tick)
+        assert r.wait_for_close(round_tick, timeout=1.0) is True
+        assert r.last_close_at_or_before(round_tick) == (bar_close, round_tick, 2.0)
+    finally:
+        r.close()
+        w.close()
+        w.unlink()
+        sb.close()
+        sb.unlink()
+
+
 def __test_ring_gc_keeps_last_entry_at_or_below_watermark__(log):
     """A full ring drops consumed entries but keeps the last one <= watermark."""
     sb, conds = _make(["gcprod", "gccons"])

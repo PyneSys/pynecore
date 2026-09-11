@@ -63,10 +63,11 @@ from ..types.na import set_bool_na
 from .security_shm import (
     SyncBlock, ResultBlock, write_na, FRONTIER_INF,
     FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE, FLAG_DEV_HISTORICAL,
-    is_ltf_window, is_ltf_chart_developing, is_ltf_live_phase,
+    FLAG_MORE_STEPS, is_ltf_window, is_ltf_chart_developing, is_ltf_live_phase,
 )
 from .security import (
     BarCalendar, actual_bar_close, create_security_protocol, inject_protocol,
+    same_calendar,
 )
 from .live_ltf_collector import LiveLtfCollector
 from .plugin.live_provider import PluginSymbol
@@ -698,6 +699,14 @@ def security_process_main(
     own_record['calendar'] = own_calendar
     registry[sec_id] = own_record
 
+    # A D/W/M context keeping the CHART's calendar is asked as far as the end of
+    # the scheduled break the round's tick falls in — that is the as-of both the
+    # chart (:func:`chart_asof`) and a peer child (``_peer_asof``) derive for it.
+    # Any other context is asked no further than the tick itself.
+    own_dwm_on_chart_calendar = (
+        bool(own_record.get('is_dwm')) and chart_calendar is not None
+        and same_calendar(own_calendar, chart_calendar))
+
     # Create protocol functions for security context
     (signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn,
      ltf_take_value, ltf_publish, ltf_buffer_len, sec_ctx, after_bar,
@@ -1198,6 +1207,66 @@ def security_process_main(
         return actual_bar_close(sec_ctx.bar_close, 0, own_calendar,
                                 own_timeframe) - 1
 
+    def _capped_frontier(frontier: int) -> int:
+        """Hold a closed round's frontier inside the round's own as-of.
+
+        The bar grid alone would let a closed round claim everything up to the
+        next scheduled close, but the ring also carries DEVELOPING entries, and
+        those close AT their round's tick — inside exactly that window. The
+        frontier only ever rises, so a wider claim here would tell a consumer
+        running on a later tick that the round it waits for is already
+        published, and it would read this round's value instead.
+
+        The cap is how far a consumer of this round can ask: the round's tick,
+        or the end of the scheduled break containing it for a D/W/M context
+        keeping the chart's calendar (:func:`chart_asof`). Nothing asks beyond
+        it, so capping never holds a consumer back. A round with no tick (no
+        chart bar cycle, as in unit tests) is left uncapped.
+
+        One chart bar can queue SEVERAL rounds for this context, all carrying
+        the same tick: a prefill and/or a closed bar, then the developing bar
+        that appends AT the tick. While such a step is still pending
+        (``FLAG_MORE_STEPS``), this round must stay strictly below the tick —
+        a consumer released at the tick by an intermediate step would pair with
+        this step's entry instead of waiting for the developing one, and the
+        dependent form would diverge from the nested one. MEASURED on a daily
+        chart with a weekly context and on an intraday chart missing the
+        period-closing bar: ``HTFAggregator.update()`` returns the closed AND
+        the developing bar in the same call there, so the two steps share a
+        round. Nothing deadlocks: the chart always drives the queue to its last
+        step within the same chart bar, and that step publishes uncapped.
+
+        :param frontier: Frontier close the bar grid suggests, in ms.
+        :return: The frontier to publish, in ms.
+        """
+        if more_steps and sec_ctx.round_tick:
+            cap = sec_ctx.round_tick - 1
+        else:
+            cap = sec_ctx.round_sched_next_open or sec_ctx.round_tick
+        if cap and frontier > cap:
+            return cap
+        return frontier
+
+    def _developing_frontier() -> int:
+        """How far a developing round publishes.
+
+        The round's tick — the instant the developing entry carries as its close
+        — except for a D/W/M context keeping the CHART's calendar, which is read
+        as far as the end of the scheduled break the tick falls in: the chart
+        derives that as-of with :func:`chart_asof` (and settles a context it does
+        NOT launch to exactly it), a peer child with ``_peer_asof``. A weekly
+        context on a daily equity chart is therefore asked for Thursday 09:30 on
+        the Wednesday bar closing at 16:00, and stopping the frontier at 16:00
+        would leave that consumer waiting forever for an instant no round of this
+        context ever reaches. Every other context is asked no further than the
+        tick, so it publishes no further either.
+
+        :return: The frontier to publish with the developing entry, in ms.
+        """
+        if own_dwm_on_chart_calendar and sec_ctx.round_sched_next_open:
+            return sec_ctx.round_sched_next_open
+        return sec_ctx.round_tick
+
     def _end_round() -> None:
         """Close the round: the chart's "one round outstanding" counter, then
         the wake-up. The counter, not the event, is what lets a chart bar keep
@@ -1235,6 +1304,9 @@ def security_process_main(
             sec_ctx.round_tick, sec_ctx.round_sched_next_open = (
                 sync_block.get_round_context(sec_id))
             flags = sync_block.get_flags(sec_id)
+            # Further rounds of the SAME chart bar (and so the same tick) are
+            # still queued chart-side — see ``_capped_frontier``.
+            more_steps = bool(flags & FLAG_MORE_STEPS)
             is_developing = bool(flags & FLAG_IS_DEVELOPING)
             closed_override = bool(flags & FLAG_CLOSED_OVERRIDE)
             # ``Lookahead.ON`` uses the pushed-OHLCV transport in historical
@@ -1264,14 +1336,18 @@ def security_process_main(
                     close=dev_close, volume=dev_volume,
                 )
 
-                # A developing bar never appends: its re-runs share one open and
-                # would scatter duplicate entries. The frontier still stops one
-                # ms below its scheduled close, so a consumer's developing tick
-                # is not held up by a bar that has not closed.
+                # A developing bar publishes only as far as the round's as-of
+                # (``_developing_frontier``): the tick instant is exactly how
+                # much of it has aggregated and the close its ring entry carries.
+                # Claiming the bar's own scheduled close would tell a consumer
+                # running on a LATER tick that this round is already published,
+                # and it would read the previous tick's value instead of waiting
+                # for its own. The chart raises the frontier of a producer it
+                # does not launch, so nothing waits on a round that never comes.
                 sec_ctx.bar_open = dev_time_ms
                 sec_ctx.bar_close = actual_bar_close(dev_time_ms, 0, own_calendar,
                                                      own_timeframe)
-                sec_ctx.frontier = sec_ctx.bar_close - 1
+                sec_ctx.frontier = _developing_frontier()
                 sec_ctx.developing = True
                 sec_ctx.is_round_last = True
 
@@ -1345,8 +1421,8 @@ def security_process_main(
                 sec_ctx.bar_open = dev_time_ms
                 sec_ctx.bar_close = actual_bar_close(dev_time_ms, 0, own_calendar,
                                                      own_timeframe)
-                sec_ctx.frontier = actual_bar_close(
-                    sec_ctx.bar_close, 0, own_calendar, own_timeframe) - 1
+                sec_ctx.frontier = _capped_frontier(actual_bar_close(
+                    sec_ctx.bar_close, 0, own_calendar, own_timeframe) - 1)
                 sec_ctx.developing = False
                 sec_ctx.is_round_last = True
 
@@ -1463,8 +1539,8 @@ def security_process_main(
                 sec_ctx.bar_open = bar_time_ms
                 sec_ctx.bar_close = actual_bar_close(
                     bar_time_ms, next_open, own_calendar, own_timeframe)
-                sec_ctx.frontier = _next_frontier(
-                    next_open, _bar_open_at(current_bar + 2) if next_open else 0)
+                sec_ctx.frontier = _capped_frontier(_next_frontier(
+                    next_open, _bar_open_at(current_bar + 2) if next_open else 0))
                 sec_ctx.developing = False
                 # The round's LAST bar releases the chart AT THE WRITE, not at
                 # the end of ``main()``: a peer read standing after the write
