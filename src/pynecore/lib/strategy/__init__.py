@@ -2380,8 +2380,117 @@ class SimPosition(PositionBase):
                     order, ohlc, start=entry_price, rising=rising) == _trail_pending:
                 close_leg_queue.append(order)
 
+    def _activate_brackets_on_fill(self, entry_id: str | None,
+                                   activated: list['Order']) -> None:
+        """Start the exit legs an entry fill just bound, at the fill price.
+
+        ``strategy.exit`` re-states its levels every bar, so the leg an intrabar
+        entry activates can already sit on the wrong side of the fill price: a
+        long's protective stop ABOVE it, a profit limit already in the money.
+        TradingView triggers such a leg the moment the entry opens the trade and
+        fills it right there, at the entry's own price -- the intrabar form of
+        the immediate fill :meth:`process_orders` gives a leg whose entry filled
+        at the bar open. MEASURED on the wild `robotrading ZZ-8 fractals`
+        reference (BINANCE:BTCUSDT 30m, 10/10 events, e.g. 2025-02-06 20:30):
+        the stop entry fills at the fractal high while the exit stop still
+        carries the previous bar's higher fractal low, and TV closes the trade
+        at the entry price for a pure double-commission loss.
+
+        A leg that survives keeps the rest of the assumed path ahead of it and
+        is collected for :meth:`_walk_activated_brackets`.
+
+        :param entry_id: ``from_entry`` id of the entry that just filled
+        :param activated: Collects the legs the fill left live
+        """
+        if not self.exit_orders:
+            return
+        fill_price = self._entry_fill_price(entry_id)
+        if fill_price is None:
+            return
+        slippage = lib._script.slippage
+        for order in list(self.exit_orders.values()):
+            if (order.is_market_order or order.cancelled
+                    or order.filled_by_type is not None
+                    or order.order_id != entry_id):
+                continue
+            if not self._has_bound(order.order_id):
+                continue
+            if order.limit is not None and ((order.size > 0 and fill_price <= order.limit)
+                                            or (order.size < 0 and fill_price >= order.limit)):
+                order.filled_by_type = 'profit'
+                self.fill_order(order, fill_price)
+                continue
+            if order.stop is not None and ((order.size > 0 and fill_price >= order.stop)
+                                           or (order.size < 0 and fill_price <= order.stop)):
+                p = fill_price
+                if slippage > 0:
+                    p += syminfo.mintick * slippage * order.sign
+                order.filled_by_type = 'loss'
+                self.fill_order(order, p)
+                continue
+            if order.stop is not None or order.limit is not None:
+                activated.append(order)
+
+    def _walk_activated_brackets(self, activated: list['Order'], start: float,
+                                 end: float) -> None:
+        """Walk the segment that runs from the first extreme back to the open.
+
+        The level walks are anchored at the bar OPEN in both directions, so the
+        stretch between the open and the extreme the first leg reached is only
+        ever travelled outward. That is enough for an order resting since the
+        previous bar -- a level on the far side of the open gapped through and
+        filled at the open before any walk started -- but not for a bracket an
+        entry activated mid-bar: its trade exists only from the fill on, and the
+        path still carries it back across that stretch. MEASURED on the wild
+        `robotrading ZZ-8 fractals` reference (BINANCE:BTCUSDT 30m, 2026-01-16
+        15:00): the stop entry fills at 95569.0 on the way to the high, and TV
+        closes the trade at the exit stop 95261.43 -- above the bar's open --
+        on the descent that follows, not at the next bar.
+
+        :param activated: Legs an entry fill activated on the first leg
+        :param start: The extreme the first leg reached
+        :param end: The bar open, where the anchored second-leg walk takes over
+        """
+        falling = start > end
+        slippage = lib._script.slippage
+        hits: list[tuple[float, Order, str]] = []
+        for order in activated:
+            if order.cancelled or order.filled_by_type is not None:
+                continue
+            if not self._has_bound(order.order_id):
+                continue
+            # A falling segment reaches sell stops and buy limits, a rising one
+            # buy stops and sell limits -- the sides the anchored walks check.
+            level = None
+            leg = ''
+            if order.stop is not None and ((order.size < 0) == falling):
+                level, leg = order.stop, 'loss'
+            if order.limit is not None and ((order.size > 0) == falling):
+                # Both legs stand in the segment: the one the path reaches first
+                if level is None or ((order.limit > level) != falling):
+                    level, leg = order.limit, 'profit'
+            if level is None:
+                continue
+            if (end < level <= start) if falling else (start <= level < end):
+                hits.append((level, order, leg))
+        if not hits:
+            return
+        # Chronological: the level nearest the extreme the segment starts at.
+        hits.sort(key=lambda hit: hit[0], reverse=falling)
+        for level, order, leg in hits:
+            if order.cancelled or order.filled_by_type is not None:
+                continue
+            if not self._has_bound(order.order_id):
+                continue
+            p = level
+            if slippage > 0:
+                p += syminfo.mintick * slippage * order.sign
+            order.filled_by_type = leg
+            self.fill_order(order, p)
+
     def _walk_leg(self, start: float, leg_end: float, rising: bool, ohlc: bool,
-                  trail_awaiting: set[Order], trail_close_leg: list[Order]) -> None:
+                  trail_awaiting: set[Order], trail_close_leg: list[Order],
+                  activated: list[Order]) -> None:
         """Walk one leg of the assumed intrabar path, level by level.
 
         A tick-based bracket has no price level until its entry fills, so an
@@ -2404,6 +2513,7 @@ class SimPosition(PositionBase):
         :param ohlc: The bar's intra-bar leg order (see :meth:`process_orders`)
         :param trail_awaiting: Trailing legs whose entry has not filled yet
         :param trail_close_leg: Collects trailing legs left for the closing-leg pass
+        :param activated: Collects the exit legs an entry fill activated here
         """
         book = self.orderbook
         resume = start
@@ -2429,6 +2539,7 @@ class SimPosition(PositionBase):
                     # never opens a trade, so it can activate nothing.
                     if filled and order.order_type != _order_type_close:
                         materialized = self._resolve_filled_entry_exits()
+                        self._activate_brackets_on_fill(order.order_id, activated)
                         self._activate_trails_on_fill(order.order_id, ohlc, rising,
                                                       trail_awaiting, trail_close_leg)
                         if materialized:
@@ -4105,6 +4216,11 @@ class SimPosition(PositionBase):
         # explicit one is in the book but inactive. An entry filling intrabar
         # activates them mid-walk instead (see ``_activate_trails_on_fill``).
         trail_awaiting: set[Order] = set()
+        # Exit legs an entry fill activates on the FIRST leg: the walk that
+        # follows is anchored at the open, so the stretch between the open and
+        # the extreme just reached is theirs alone (see
+        # :meth:`_walk_activated_brackets`).
+        activated: list[Order] = []
         for order in (self.exit_orders.values() if self.exit_orders else ()):
             if ((order.trail_price is not None or order.trail_points_ticks is not None)
                     and not order.cancelled and self._exit_awaits_entry(order)):
@@ -4126,7 +4242,8 @@ class SimPosition(PositionBase):
             self._walk_node = 1
             if self.orderbook.price_levels and walked <= 1:
                 self._walk_leg(self.o, self.h, rising=True, ohlc=ohlc,
-                               trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg)
+                               trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg,
+                               activated=activated)
 
             mc_deferred = self.sign < 0 and self._check_margin_call(self.h, for_short=True)
             if not mc_deferred:
@@ -4154,10 +4271,16 @@ class SimPosition(PositionBase):
                 if self.sign < 0:
                     self._check_margin_call(self.l, for_short=True, can_defer=False)
 
+                # high -> open: the stretch only a mid-bar activation can reach
+                if activated:
+                    self._walk_activated_brackets(activated, self.h, self.o)
+                    activated.clear()
+
                 # open -> low (descending: the level nearest the open fills first)
                 if self.orderbook.price_levels and walked <= 2:
                     self._walk_leg(self.o, self.l, rising=False, ohlc=ohlc,
-                                   trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg)
+                                   trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg,
+                                   activated=activated)
 
                 if self.sign > 0:
                     self._check_margin_call(self.l, for_short=False, can_defer=False)
@@ -4191,7 +4314,8 @@ class SimPosition(PositionBase):
             self._walk_node = 1
             if self.orderbook.price_levels and walked <= 1:
                 self._walk_leg(self.o, self.l, rising=False, ohlc=ohlc,
-                               trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg)
+                               trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg,
+                               activated=activated)
 
             mc_deferred = self.sign > 0 and self._check_margin_call(self.l, for_short=False)
             if not mc_deferred:
@@ -4206,10 +4330,16 @@ class SimPosition(PositionBase):
                 if self.sign > 0:
                     self._check_margin_call(self.h, for_short=False, can_defer=False)
 
+                # low -> open: the stretch only a mid-bar activation can reach
+                if activated:
+                    self._walk_activated_brackets(activated, self.l, self.o)
+                    activated.clear()
+
                 # open -> high
                 if self.orderbook.price_levels and walked <= 2:
                     self._walk_leg(self.o, self.h, rising=True, ohlc=ohlc,
-                                   trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg)
+                                   trail_awaiting=trail_awaiting, trail_close_leg=trail_close_leg,
+                                   activated=activated)
 
                 if self.sign < 0:
                     self._check_margin_call(self.h, for_short=True, can_defer=False)
