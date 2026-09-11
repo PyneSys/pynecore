@@ -4264,10 +4264,21 @@ class SimPosition(PositionBase):
             # out -- ``strategy.equity`` is built on it.
             self.openprofit = self.size * (_tick_snap(self.c) - self.avg_price) * pv
 
+            # Estimate an exit at the current mark. A flat order fee stays whole
+            # even when a partial close reduced the trade's remaining entry fee.
+            commission_type = lib._script.commission_type
+            commission_value = lib._script.commission_value
+            exit_commission_rate = (self.c * pv * commission_value * 0.01
+                                    if commission_type == _commission.percent else commission_value)
+            flat_commission = commission_type == _commission.cash_per_order
+
             # Calculate open drawdowns and runups
             for trade in self.open_trades:
                 # Profit of trade
-                trade.profit = trade.size * (self.c - trade.entry_price) * pv - 2 * trade.commission
+                exit_commission = (exit_commission_rate if flat_commission
+                                   else abs(trade.size) * exit_commission_rate)
+                trade.profit = (trade.size * (self.c - trade.entry_price) * pv
+                                - trade.commission - exit_commission)
 
                 # P/L from high/low to calculate drawdown and runup. The
                 # POSITION-level summation below measures every open leg against
@@ -4303,6 +4314,7 @@ class SimPosition(PositionBase):
                 # ``profit_percent`` (see the fill loop). ``trade.commission``
                 # still holds the entry leg alone while the trade is open.
                 entry_cost = abs(trade.size) * trade.entry_price * pv + trade.commission
+                trade.profit_percent = trade.profit / entry_cost * 100.0 if entry_cost else 0.0
                 if entry_cost > 0:
                     trade.max_drawdown_percent = trade.max_drawdown / entry_cost * 100.0
                     trade.max_runup_percent = trade.max_runup / entry_cost * 100.0

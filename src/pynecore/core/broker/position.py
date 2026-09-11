@@ -549,6 +549,7 @@ class BrokerPosition(PositionBase):
                     entry_comment=trade.entry_comment,
                     entry_equity=trade.entry_equity,
                 )
+                closed_entry_commission = closed_piece.commission
                 self._close_trade(
                     closed_piece, fill_price, event,
                     fee_share=fee * (remaining / fill_qty),
@@ -556,7 +557,7 @@ class BrokerPosition(PositionBase):
                 closed_profit += closed_piece.profit
                 # Shrink the remaining open trade
                 trade.size -= closed_piece.size
-                trade.commission -= closed_piece.commission
+                trade.commission -= closed_entry_commission
                 remaining = 0.0
 
         self.size += signed_delta
@@ -684,7 +685,10 @@ class BrokerPosition(PositionBase):
         return consumed
 
     def update_unrealized_pnl(self, current_price: float) -> None:
-        """Mark-to-market: recompute :attr:`openprofit` at the given price.
+        """Mark open trades and :attr:`openprofit` at the given price.
+
+        Per-trade returns include the exchange-reported entry fees;
+        :attr:`openprofit` tracks the aggregate gross unrealized profit.
 
         Also rolls the :attr:`max_equity` peak forward and the
         :attr:`max_drawdown` running maximum off the live price — these feed
@@ -697,7 +701,11 @@ class BrokerPosition(PositionBase):
         else:
             total = 0.0
             for trade in self.open_trades:
-                total += (current_price - trade.entry_price) * trade.size
+                gross_profit = (current_price - trade.entry_price) * trade.size
+                trade.profit = gross_profit - trade.commission
+                entry_cost = abs(trade.size) * trade.entry_price + trade.commission
+                trade.profit_percent = trade.profit / entry_cost * 100.0 if entry_cost else 0.0
+                total += gross_profit
             self.openprofit = total
         eq = float(self.equity)
         if eq > self.max_equity:

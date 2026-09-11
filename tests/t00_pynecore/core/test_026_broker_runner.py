@@ -15,12 +15,15 @@ No live thread, no real exchange — the engine runs with
 """
 from __future__ import annotations
 
+import sys
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from pynecore import lib as _lib
 from pynecore.core.broker.models import (
     CancelIntent,
     CapabilityLevel,
@@ -41,7 +44,8 @@ from pynecore.core.broker.exceptions import (
     ExchangeConnectionError,
 )
 from pynecore.core.broker.position import BrokerPosition
-from pynecore.core.script_runner import ScriptRunner
+from pynecore.core.plugin.broker import BrokerPlugin
+from pynecore.core.script_runner import LIVE_TRANSITION, ScriptRunner
 from pynecore.core.syminfo import SymInfo
 from pynecore.types.ohlcv import OHLCV
 
@@ -528,10 +532,6 @@ def __test_live_intra_bar_sync_dispatches_on_next_tick__(tmp_path):
     implies async fills from ``watch_orders`` become visible to the script on
     the very next tick instead of one bar late.
     """
-    import sys
-    from pynecore import lib as _lib
-    from pynecore.core.script_runner import LIVE_TRANSITION
-
     plugin = MockBrokerPlugin(capabilities=ExchangeCapabilities())
     script_path = _write_script(tmp_path, textwrap.dedent('''\
         """
@@ -603,6 +603,103 @@ def __test_live_intra_bar_sync_dispatches_on_next_tick__(tmp_path):
     # Bar close keeps the dispatch idempotent.
     assert obs['after_tick_3'] == 1, \
         f"entry should not re-dispatch at bar close, got {obs['after_tick_3']}"
+
+
+def __test_live_broker_marks_open_trade_before_each_tick__(tmp_path):
+    """The script sees current open-trade percent on live open, middle and close ticks."""
+    plugin = MockBrokerPlugin(capabilities=ExchangeCapabilities())
+    script_path = _write_script(tmp_path, textwrap.dedent('''\
+        """
+        @pyne
+        """
+        from pynecore.lib import barstate, plot, script, strategy
+        from pynecore.types import IBPersistent
+
+        @script.strategy("LiveOpenTradeProfit")
+        def main():
+            tick_count: IBPersistent[int] = 0
+            open_percent: IBPersistent[float] = 0.0
+            middle_percent: IBPersistent[float] = 0.0
+            close_percent: IBPersistent[float] = 0.0
+            saw_loss: IBPersistent[int] = 0
+            if barstate.isnew:
+                tick_count = 0
+                saw_loss = 0
+            tick_count += 1
+            current_percent = strategy.opentrades.profit_percent(0)
+            if tick_count == 1:
+                open_percent = current_percent
+            elif tick_count == 2:
+                middle_percent = current_percent
+            else:
+                close_percent = current_percent
+            if current_percent < -1.0:
+                saw_loss = 1
+            plot(open_percent, "open_percent")
+            plot(middle_percent, "middle_percent")
+            plot(close_percent, "close_percent")
+            plot(saw_loss, "saw_loss")
+    '''))
+
+    historical = _make_bars(1, start_price=100.0)
+    live_ts = historical[-1].timestamp + 86_400
+    live = [
+        OHLCV(timestamp=live_ts, open=100.0, high=110.0, low=100.0,
+              close=110.0, volume=1.0, is_closed=False),
+        OHLCV(timestamp=live_ts, open=100.0, high=110.0, low=90.0,
+              close=90.0, volume=1.0, is_closed=False),
+        OHLCV(timestamp=live_ts, open=100.0, high=110.0, low=90.0,
+              close=105.0, volume=1.0, is_closed=True),
+    ]
+
+    runner: ScriptRunner
+
+    def observing_iter():
+        yield from historical
+        yield LIVE_TRANSITION
+
+        position = runner.script.position
+        assert isinstance(position, BrokerPosition)
+        position.record_fill(OrderEvent(
+            order=ExchangeOrder(
+                id="manual-entry", symbol="BTCUSDT", side="buy",
+                order_type=OrderType.MARKET, qty=2.0, filled_qty=2.0,
+                remaining_qty=0.0, price=None, stop_price=None,
+                average_fill_price=100.0, status=OrderStatus.FILLED,
+                timestamp=0.0, fee=2.0, fee_currency="USDT",
+            ),
+            event_type="filled", fill_price=100.0, fill_qty=2.0,
+            timestamp=0.0, pine_id="L", leg_type=LegType.ENTRY,
+            fee=2.0, fee_currency="USDT",
+        ))
+        plugin.startup_position = ExchangePosition(
+            symbol="BTCUSDT", side="long", size=2.0, entry_price=100.0,
+            unrealized_pnl=0.0, liquidation_price=None,
+            leverage=1.0, margin_mode="isolated",
+        )
+        yield from live
+
+    sys.modules.pop(script_path.stem, None)
+    setattr(_lib, '_is_live', True)
+    setattr(_lib, '_strategy_suppressed', True)
+
+    runner = ScriptRunner(
+        script_path=script_path,
+        ohlcv_iter=observing_iter(),
+        syminfo=_make_syminfo(),
+        broker_plugin=cast(BrokerPlugin, plugin),
+    )
+    runner.script.calc_on_every_tick = True
+
+    results = []
+    for _candle, plot_data, _trades in runner.run_iter():
+        results.append(dict(plot_data))
+    final_plot = results[-1]
+    entry_cost = 2.0 * 100.0 + 2.0
+    assert final_plot["open_percent"] == pytest.approx(18.0 / entry_cost * 100.0)
+    assert final_plot["middle_percent"] == pytest.approx(-22.0 / entry_cost * 100.0)
+    assert final_plot["close_percent"] == pytest.approx(8.0 / entry_cost * 100.0)
+    assert final_plot["saw_loss"] == 1
 
 
 # === Startup authentication check (WS3) ===

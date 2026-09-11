@@ -187,6 +187,63 @@ def __test_update_unrealized_pnl_marks_to_market__():
     assert p.equity == pytest.approx(1_010_000.0)
 
 
+@pytest.mark.parametrize(
+    ("side", "entries", "marks"),
+    [
+        ("buy", [(2.0, 100.0, 4.0), (1.0, 120.0, 3.0)], [130.0, 90.0]),
+        ("sell", [(2.0, 100.0, 4.0), (1.0, 80.0, 3.0)], [70.0, 110.0]),
+    ],
+)
+def __test_update_unrealized_pnl_updates_each_open_trade__(side, entries, marks):
+    """Each long/short trade exposes fee-aware profit and percent at every mark."""
+    p = BrokerPosition()
+    for index, (qty, entry_price, fee) in enumerate(entries):
+        p.record_fill(_fill(side, qty, entry_price, pine_id=f"E{index}", fee=fee))
+
+    for mark in marks:
+        p.update_unrealized_pnl(mark)
+        expected_openprofit = 0.0
+        for trade in p.open_trades:
+            gross_profit = (mark - trade.entry_price) * trade.size
+            expected_profit = gross_profit - trade.commission
+            entry_cost = abs(trade.size) * trade.entry_price + trade.commission
+            assert trade.profit == pytest.approx(expected_profit)
+            assert trade.profit_percent == pytest.approx(expected_profit / entry_cost * 100.0)
+            expected_openprofit += gross_profit
+        assert p.openprofit == pytest.approx(expected_openprofit)
+
+
+def __test_update_unrealized_pnl_zero_entry_cost_clears_percent__():
+    """A zero entry cost writes zero instead of retaining the preceding mark's percent."""
+    p = BrokerPosition()
+    p.record_fill(_fill("buy", 1.0, 100.0))
+    p.update_unrealized_pnl(110.0)
+    assert p.open_trades[0].profit_percent == pytest.approx(10.0)
+
+    p.open_trades[0].entry_price = 0.0
+    p.update_unrealized_pnl(120.0)
+    assert p.open_trades[0].profit_percent == 0.0
+
+
+def __test_partial_close_retains_remaining_entry_fee_share__():
+    """A partial close removes only its entry-fee share from the remaining trade."""
+    p = BrokerPosition()
+    p.record_fill(_fill("buy", 4.0, 100.0, fee=8.0))
+    p.record_fill(_fill(
+        "sell", 1.0, 110.0, pine_id="Partial",
+        leg=LegType.TAKE_PROFIT, fee=3.0,
+    ))
+
+    assert len(p.open_trades) == 1
+    assert p.open_trades[0].size == pytest.approx(3.0)
+    assert p.open_trades[0].commission == pytest.approx(6.0)
+    assert p.closed_trades[0].commission == pytest.approx(5.0)
+
+    p.update_unrealized_pnl(120.0)
+    assert p.open_trades[0].profit == pytest.approx(54.0)
+    assert p.open_trades[0].profit_percent == pytest.approx(54.0 / 306.0 * 100.0)
+
+
 def __test_record_liquidation_closes_everything__():
     """Liquidation flattens the position and books the loss as ``netprofit``."""
     p = BrokerPosition()
