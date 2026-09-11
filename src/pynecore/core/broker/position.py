@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from pynecore import lib
 from pynecore.core.broker.intent_builder import CLOSE_ALL_EXIT_ID, CLOSE_EXIT_ID_PREFIX
 from pynecore.core.broker.models import LegType
+from pynecore.core.closed_trade_stats import ClosedTradeStats
 from pynecore.lib.log import broker_warning as _blog_warning
 from pynecore.lib.strategy import PositionBase, Trade
 from pynecore.types.na import na_float
@@ -49,7 +50,7 @@ class BrokerPosition(PositionBase):
         'netprofit', 'openprofit', 'grossprofit', 'grossloss',
         'open_commission',
         'eventrades', 'wintrades', 'losstrades',
-        'closed_trades_count',
+        'closed_trades_count', '_closed_trade_stats',
         'max_drawdown', 'max_drawdown_percent', 'max_runup', 'max_runup_percent',
         'max_equity', 'min_equity',
         'max_contracts_held_long', 'max_contracts_held_short',
@@ -90,6 +91,7 @@ class BrokerPosition(PositionBase):
         self.wintrades: int = 0
         self.losstrades: int = 0
         self.closed_trades_count: int = 0
+        self._closed_trade_stats = ClosedTradeStats()
         self.max_drawdown: float = 0.0
         self.max_drawdown_percent: float = 0.0
         self.max_runup: float = 0.0
@@ -429,6 +431,10 @@ class BrokerPosition(PositionBase):
         :param size: Signed parent open size (positive long, negative short).
         :param entry_price: Parent average entry price.
         """
+        if self.size > self.max_contracts_held_long:
+            self.max_contracts_held_long = self.size
+        elif -self.size > self.max_contracts_held_short:
+            self.max_contracts_held_short = -self.size
         if any(t.entry_id == entry_id for t in self.open_trades):
             return
         # ``entry_equity`` stays 0.0: the parent opened in a prior process so
@@ -891,3 +897,4 @@ class BrokerPosition(PositionBase):
         self.closed_trades.append(trade)
         self.new_closed_trades.append(trade)
         self.closed_trades_count += 1
+        self._closed_trade_stats.add(trade)

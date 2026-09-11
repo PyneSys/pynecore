@@ -9,7 +9,6 @@ import math
 from dataclasses import dataclass
 
 from ..types.na import NA
-from ..lib.strategy import Trade
 from .csv_file import CSVWriter
 from ..lib.strategy import PositionBase
 
@@ -184,6 +183,7 @@ class StrategyStatistics:
         }
 
 
+# noinspection PyProtectedMember
 def calculate_strategy_statistics(
         position: PositionBase,
         initial_capital: float,
@@ -202,6 +202,7 @@ def calculate_strategy_statistics(
     :return: StrategyStatistics object with all calculated metrics
     """
     stats = StrategyStatistics()
+    closed_trade_stats = position._closed_trade_stats
 
     # Basic metrics from position
     stats.net_profit = float(position.netprofit) if not isinstance(position.netprofit, NA) else 0.0
@@ -228,10 +229,6 @@ def calculate_strategy_statistics(
         stats.buy_and_hold_return = buy_hold_value - initial_capital
         stats.buy_and_hold_return_percent = (stats.buy_and_hold_return / initial_capital) * 100
 
-    # Get all trades (closed + open)
-    all_trades: list[Trade] = list(position.closed_trades) + position.open_trades
-    closed_trades = list(position.closed_trades)
-
     stats.total_trades = position.closed_trades_count
     stats.winning_trades = position.wintrades
     stats.losing_trades = position.losstrades
@@ -245,177 +242,103 @@ def calculate_strategy_statistics(
     if stats.gross_loss != 0:
         stats.profit_factor = abs(stats.gross_profit / stats.gross_loss)
 
-    # Calculate trade statistics
-    if closed_trades:
-        # Commission
-        stats.commission_paid = float(sum(trade.commission for trade in closed_trades))
-
-        # Average calculations
-        stats.avg_trade = stats.net_profit / len(closed_trades)
+    # Calculate trade statistics from the fixed-size cumulative summary.
+    if position.closed_trades_count > 0:
+        stats.commission_paid = closed_trade_stats.commission
+        stats.avg_trade = stats.net_profit / position.closed_trades_count
         # The percent averages are the mean of the per-trade profit RATIOS, not the
         # average profit taken against the initial capital. Each ratio's denominator
         # is that trade's own entry cost including the entry commission, and the
         # position keeps the running sums (see SimPosition's fill loop).
-        stats.avg_trade_percent = float(position.sum_profit_ratio) / len(closed_trades) * 100
+        stats.avg_trade_percent = (
+            float(position.sum_profit_ratio) / position.closed_trades_count * 100
+        )
 
-        # Separate winning and losing trades
-        winning_trades = [t for t in closed_trades if float(t.profit) > 0]
-        losing_trades = [t for t in closed_trades if float(t.profit) < 0]
+        if closed_trade_stats.winning_count > 0:
+            stats.avg_winning_trade = (
+                closed_trade_stats.winning_profit_sum / closed_trade_stats.winning_count
+            )
+            stats.avg_winning_trade_percent = (
+                float(position.sum_win_profit_ratio) / closed_trade_stats.winning_count * 100
+            )
+            stats.largest_winning_trade = closed_trade_stats.largest_winning_trade
+            stats.largest_winning_trade_percent = closed_trade_stats.largest_winning_trade_percent
+            if closed_trade_stats.winning_bar_length_count > 0:
+                stats.avg_bars_in_winning_trades = (
+                    closed_trade_stats.winning_bar_length_sum
+                    / closed_trade_stats.winning_bar_length_count
+                )
 
-        # Winning trades statistics
-        if winning_trades:
-            total_win_profit = sum(float(t.profit) for t in winning_trades)
-            stats.avg_winning_trade = total_win_profit / len(winning_trades)
-            stats.avg_winning_trade_percent = \
-                float(position.sum_win_profit_ratio) / len(winning_trades) * 100
+        if closed_trade_stats.losing_count > 0:
+            stats.avg_losing_trade = (
+                closed_trade_stats.losing_profit_sum / closed_trade_stats.losing_count
+            )
+            stats.avg_losing_trade_percent = (
+                float(position.sum_loss_profit_ratio) / closed_trade_stats.losing_count * 100
+            )
+            stats.largest_losing_trade = closed_trade_stats.largest_losing_trade
+            stats.largest_losing_trade_percent = closed_trade_stats.largest_losing_trade_percent
+            if closed_trade_stats.losing_bar_length_count > 0:
+                stats.avg_bars_in_losing_trades = (
+                    closed_trade_stats.losing_bar_length_sum
+                    / closed_trade_stats.losing_bar_length_count
+                )
 
-            # Largest winning trade
-            max_win = max(winning_trades, key=lambda t: float(t.profit))
-            stats.largest_winning_trade = float(max_win.profit)
-            stats.largest_winning_trade_percent = float(max_win.profit_percent)
-
-            # Average bars in winning trades
-            bars_in_wins = [t.exit_bar_index - t.entry_bar_index for t in winning_trades if t.exit_bar_index >= 0]
-            if bars_in_wins:
-                stats.avg_bars_in_winning_trades = sum(bars_in_wins) / len(bars_in_wins)
-
-        # Losing trades statistics
-        if losing_trades:
-            total_loss_profit = sum(float(t.profit) for t in losing_trades)
-            stats.avg_losing_trade = total_loss_profit / len(losing_trades)
-            stats.avg_losing_trade_percent = \
-                float(position.sum_loss_profit_ratio) / len(losing_trades) * 100
-
-            # Largest losing trade
-            max_loss = min(losing_trades, key=lambda t: float(t.profit))
-            stats.largest_losing_trade = float(max_loss.profit)
-            stats.largest_losing_trade_percent = float(max_loss.profit_percent)
-
-            # Average bars in losing trades
-            bars_in_losses = [t.exit_bar_index - t.entry_bar_index for t in losing_trades if t.exit_bar_index >= 0]
-            if bars_in_losses:
-                stats.avg_bars_in_losing_trades = sum(bars_in_losses) / len(bars_in_losses)
-
-        # Ratio of average win to average loss
         if stats.avg_losing_trade != 0:
             stats.ratio_avg_win_loss = abs(stats.avg_winning_trade / stats.avg_losing_trade)
 
-        # Average bars in all trades
-        bars_in_trades = [t.exit_bar_index - t.entry_bar_index for t in closed_trades if t.exit_bar_index >= 0]
-        if bars_in_trades:
-            stats.avg_bars_in_trades = sum(bars_in_trades) / len(bars_in_trades)
+        if closed_trade_stats.bar_length_count > 0:
+            stats.avg_bars_in_trades = (
+                closed_trade_stats.bar_length_sum / closed_trade_stats.bar_length_count
+            )
 
-        # Long/Short breakdown
-        long_trades = [t for t in closed_trades if t.sign > 0]
-        short_trades = [t for t in closed_trades if t.sign < 0]
+        long_stats = closed_trade_stats.long
+        if long_stats.count > 0:
+            stats.long_trades = long_stats.count
+            stats.long_winning_trades = long_stats.winning_count
+            stats.long_net_profit = long_stats.net_profit
+            stats.long_net_profit_percent = stats.long_net_profit / initial_capital * 100
+            stats.long_gross_profit = long_stats.gross_profit
+            stats.long_gross_profit_percent = stats.long_gross_profit / initial_capital * 100
+            stats.long_gross_loss = long_stats.gross_loss
+            stats.long_gross_loss_percent = stats.long_gross_loss / initial_capital * 100
+            stats.long_avg_trade = stats.long_net_profit / long_stats.count
+            # Side percentages express the average profit against initial capital.
+            stats.long_avg_trade_percent = stats.long_net_profit_percent / long_stats.count
+            stats.long_largest_winning_trade = long_stats.largest_winning_trade
+            stats.long_largest_winning_trade_percent = long_stats.largest_winning_trade_percent
+            stats.long_largest_losing_trade = long_stats.largest_losing_trade
+            stats.long_largest_losing_trade_percent = long_stats.largest_losing_trade_percent
+            if long_stats.bar_length_count > 0:
+                stats.long_avg_bars = long_stats.bar_length_sum / long_stats.bar_length_count
 
-        # Long statistics
-        if long_trades:
-            stats.long_trades = len(long_trades)
-            long_winning = [t for t in long_trades if float(t.profit) > 0]
-            long_losing = [t for t in long_trades if float(t.profit) < 0]
+        short_stats = closed_trade_stats.short
+        if short_stats.count > 0:
+            stats.short_trades = short_stats.count
+            stats.short_winning_trades = short_stats.winning_count
+            stats.short_net_profit = short_stats.net_profit
+            stats.short_net_profit_percent = stats.short_net_profit / initial_capital * 100
+            stats.short_gross_profit = short_stats.gross_profit
+            stats.short_gross_profit_percent = stats.short_gross_profit / initial_capital * 100
+            stats.short_gross_loss = short_stats.gross_loss
+            stats.short_gross_loss_percent = stats.short_gross_loss / initial_capital * 100
+            stats.short_avg_trade = stats.short_net_profit / short_stats.count
+            # Side percentages express the average profit against initial capital.
+            stats.short_avg_trade_percent = stats.short_net_profit_percent / short_stats.count
+            stats.short_largest_winning_trade = short_stats.largest_winning_trade
+            stats.short_largest_winning_trade_percent = short_stats.largest_winning_trade_percent
+            stats.short_largest_losing_trade = short_stats.largest_losing_trade
+            stats.short_largest_losing_trade_percent = short_stats.largest_losing_trade_percent
+            if short_stats.bar_length_count > 0:
+                stats.short_avg_bars = short_stats.bar_length_sum / short_stats.bar_length_count
 
-            stats.long_winning_trades = len(long_winning)
-            stats.long_net_profit = sum(float(t.profit) for t in long_trades)
-            stats.long_net_profit_percent = (stats.long_net_profit / initial_capital) * 100
+        stats.max_cons_winning_trades = closed_trade_stats.max_winning_streak
+        stats.max_cons_losing_trades = closed_trade_stats.max_losing_streak
 
-            if long_winning:
-                stats.long_gross_profit = sum(float(t.profit) for t in long_winning)
-                stats.long_gross_profit_percent = (stats.long_gross_profit / initial_capital) * 100
-                max_long_win = max(long_winning, key=lambda t: float(t.profit))
-                stats.long_largest_winning_trade = float(max_long_win.profit)
-                stats.long_largest_winning_trade_percent = float(max_long_win.profit_percent)
-
-            if long_losing:
-                stats.long_gross_loss = sum(float(t.profit) for t in long_losing)
-                stats.long_gross_loss_percent = (stats.long_gross_loss / initial_capital) * 100
-                max_long_loss = min(long_losing, key=lambda t: float(t.profit))
-                stats.long_largest_losing_trade = float(max_long_loss.profit)
-                stats.long_largest_losing_trade_percent = float(max_long_loss.profit_percent)
-
-            stats.long_avg_trade = stats.long_net_profit / len(long_trades)
-            stats.long_avg_trade_percent = stats.long_net_profit_percent / len(long_trades)
-
-            long_bars = [t.exit_bar_index - t.entry_bar_index for t in long_trades if t.exit_bar_index >= 0]
-            if long_bars:
-                stats.long_avg_bars = sum(long_bars) / len(long_bars)
-
-        # Short statistics
-        if short_trades:
-            stats.short_trades = len(short_trades)
-            short_winning = [t for t in short_trades if float(t.profit) > 0]
-            short_losing = [t for t in short_trades if float(t.profit) < 0]
-
-            stats.short_winning_trades = len(short_winning)
-            stats.short_net_profit = sum(float(t.profit) for t in short_trades)
-            stats.short_net_profit_percent = (stats.short_net_profit / initial_capital) * 100
-
-            if short_winning:
-                stats.short_gross_profit = sum(float(t.profit) for t in short_winning)
-                stats.short_gross_profit_percent = (stats.short_gross_profit / initial_capital) * 100
-                max_short_win = max(short_winning, key=lambda t: float(t.profit))
-                stats.short_largest_winning_trade = float(max_short_win.profit)
-                stats.short_largest_winning_trade_percent = float(max_short_win.profit_percent)
-
-            if short_losing:
-                stats.short_gross_loss = sum(float(t.profit) for t in short_losing)
-                stats.short_gross_loss_percent = (stats.short_gross_loss / initial_capital) * 100
-                max_short_loss = min(short_losing, key=lambda t: float(t.profit))
-                stats.short_largest_losing_trade = float(max_short_loss.profit)
-                stats.short_largest_losing_trade_percent = float(max_short_loss.profit_percent)
-
-            stats.short_avg_trade = stats.short_net_profit / len(short_trades)
-            stats.short_avg_trade_percent = stats.short_net_profit_percent / len(short_trades)
-
-            short_bars = [t.exit_bar_index - t.entry_bar_index for t in short_trades if t.exit_bar_index >= 0]
-            if short_bars:
-                stats.short_avg_bars = sum(short_bars) / len(short_bars)
-
-        # Max consecutive wins/losses
-        if closed_trades:
-            current_wins = 0
-            current_losses = 0
-            max_wins = 0
-            max_losses = 0
-
-            for trade in closed_trades:
-                profit = float(trade.profit)
-                if profit > 0:
-                    current_wins += 1
-                    current_losses = 0
-                    max_wins = max(max_wins, current_wins)
-                elif profit < 0:
-                    current_losses += 1
-                    current_wins = 0
-                    max_losses = max(max_losses, current_losses)
-                else:
-                    current_wins = 0
-                    current_losses = 0
-
-            stats.max_cons_winning_trades = max_wins
-            stats.max_cons_losing_trades = max_losses
-
-    # Max contracts held
-    if all_trades:
-        max_size = 0.0
-        current_positions: list[Trade] = []
-
-        # Sort all trades by entry time
-        sorted_trades = sorted(all_trades, key=lambda t: t.entry_time)
-
-        for trade in sorted_trades:
-            # Add to current positions
-            current_positions.append(trade)
-
-            # Remove closed positions that exit before this entry
-            current_positions = [t for t in current_positions
-                                 if t.exit_time < 0 or t.exit_time > trade.entry_time]
-
-            # Calculate current size
-            current_size = sum(abs(t.size) for t in current_positions)
-            max_size = max(max_size, current_size)
-
-        stats.max_contracts_held = max_size
+    stats.max_contracts_held = max(
+        position.max_contracts_held_long,
+        position.max_contracts_held_short,
+    )
 
     # Sharpe and Sortino ratios (if equity curve provided)
     if equity_curve and len(equity_curve) > 1:

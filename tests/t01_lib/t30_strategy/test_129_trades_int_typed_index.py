@@ -49,11 +49,10 @@ def main():
     plot(strategy.opentrades.size(open_frac), "osz_frac")
     plot(strategy.opentrades.size(0), "osz_int")
 
-    # An na trade number must answer like a missing trade instead of reaching
-    # the subscript -- each accessor has its own "no such trade" answer
+    # Closed-trade na indices normalize to global trade zero.
     na_num = NA(int)
     plot(strategy.closedtrades.entry_price(na_num), "epn_frac")
-    plot(strategy.closedtrades.entry_price(-1), "epn_int")
+    plot(strategy.closedtrades.entry_price(0), "epn_int")
     plot(strategy.opentrades.size(na_num), "oszn_frac")
     plot(strategy.opentrades.size(-1), "oszn_int")
     plot(close, "close")
