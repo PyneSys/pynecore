@@ -9,6 +9,9 @@
     "NA": {
       "type": "variable"
     },
+    "Plot": {
+      "type": "variable"
+    },
     "PlotMeta": {
       "type": "variable"
     },
