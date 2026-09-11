@@ -10,21 +10,27 @@ from ...core.module_property import module_property
 #
 
 
+# noinspection PyProtectedMember
 def _trade_index(trade_num: int) -> int:
     """
-    Normalize a trade number into a list index.
+    Normalize a global trade number into a retained-list index.
 
     Pine's ``int`` is a static type only, so an int-TYPED expression may arrive
     carrying a fractional value; this consuming slot truncates it. An ``na``
-    trade number becomes -1, which every accessor already answers with ``na``
-    instead of reaching the subscript with a non-integer.
+    trade number identifies global trade zero. Each accessor handles unavailable
+    trades before indexing the retained list.
 
     :param trade_num: Trade number of the trade, possibly fractional or ``na``
-    :return: Integer index, or -1 when there is none
+    :return: Retained-list index, or a negative index for an unavailable trade
     """
     if not (trade_num == trade_num):  # is_na_arg
-        return -1
-    return int(trade_num)
+        index = 0
+    else:
+        index = int(trade_num)
+    if lib._script is not None and lib._script.position is not None:
+        position = lib._script.position
+        index -= position.closed_trades_count - len(position.closed_trades)
+    return index
 
 
 # noinspection PyProtectedMember
@@ -37,7 +43,7 @@ def commission(trade_num: int) -> PyneFloat:
     """
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
-        return na_float
+        return 0.0
     try:
         assert lib._script is not None
         assert lib._script.position is not None
@@ -248,7 +254,7 @@ def max_drawdown(trade_num: int) -> PyneFloat:
     """
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
-        return na_float
+        return 0.0
     try:
         assert lib._script is not None
         assert lib._script.position is not None
@@ -267,7 +273,7 @@ def max_drawdown_percent(trade_num: int) -> PyneFloat:
     """
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
-        return na_float
+        return 0.0
     try:
         assert lib._script is not None
         assert lib._script.position is not None
@@ -286,7 +292,7 @@ def max_runup(trade_num: int) -> PyneFloat:
     """
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
-        return na_float
+        return 0.0
     try:
         assert lib._script is not None
         assert lib._script.position is not None
@@ -305,7 +311,7 @@ def max_runup_percent(trade_num: int) -> PyneFloat:
     """
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
-        return na_float
+        return 0.0
     try:
         assert lib._script is not None
         assert lib._script.position is not None
@@ -324,7 +330,7 @@ def profit(trade_num: int) -> PyneFloat:
     """
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
-        return na_float
+        return 0.0
     try:
         assert lib._script is not None
         assert lib._script.position is not None
@@ -343,7 +349,7 @@ def profit_percent(trade_num: int) -> PyneFloat:
     """
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
-        return na_float
+        return 0.0
     try:
         assert lib._script is not None
         assert lib._script.position is not None
@@ -381,7 +387,7 @@ def closedtrades() -> PyneInt:
         return 0.0
     position = lib._script.position
     # A Pine int is a double at runtime
-    return float(len(position.closed_trades))
+    return float(position.closed_trades_count)
 
 
 # noinspection PyProtectedMember
@@ -392,11 +398,7 @@ def first_index() -> PyneInt:
 
     :return: The index of the oldest retained closed trade
     """
-    # TradingView drops the oldest closed trades once their number passes the
-    # trade-list limit, and this is the surviving head's index. That limit is
-    # unreachable in practice -- a run long enough to hit it dies on the 9000
-    # order cap (RE10110/RE10138) first -- and the value stayed 0 on all 28837
-    # bars of a 2880-trade probe, including before the first trade closed. The
-    # accessors index ``closed_trades`` directly, so PyneCore's head is always
-    # trade 0 and the answer is the constant TradingView also reports.
-    return 0.0
+    if lib._script is None or lib._script.position is None:
+        return 0.0
+    position = lib._script.position
+    return float(position.closed_trades_count - len(position.closed_trades))

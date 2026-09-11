@@ -12,6 +12,7 @@ from collections import deque, defaultdict
 from copy import copy
 from bisect import insort, bisect_left
 
+from ...core.closed_trade_stats import ClosedTradeStats as _ClosedTradeStats
 from ...core.module_property import module_property
 from ... import lib
 from .. import request, syminfo
@@ -666,6 +667,7 @@ class PositionBase(ABC):
     wintrades: int
     losstrades: int
     closed_trades_count: int
+    _closed_trade_stats: _ClosedTradeStats
     max_drawdown: float
     max_drawdown_percent: float
     max_runup: float
@@ -937,7 +939,7 @@ class SimPosition(PositionBase):
         'openprofit', 'grossprofit', 'grossloss',
         'entry_orders', 'exit_orders', 'market_orders', 'orderbook',
         'open_trades', 'closed_trades', 'new_closed_trades',
-        'closed_trades_count', 'wintrades', 'eventrades', 'losstrades',
+        'closed_trades_count', '_closed_trade_stats', 'wintrades', 'eventrades', 'losstrades',
         'size', 'sign', 'avg_price', 'cum_profit',
         'min_equity', 'max_realized_equity',
         'drawdown_summ', 'runup_summ', 'max_drawdown', 'max_drawdown_percent',
@@ -994,6 +996,7 @@ class SimPosition(PositionBase):
 
         # Trade statistics
         self.closed_trades_count: int = 0
+        self._closed_trade_stats = _ClosedTradeStats()
         self.wintrades: int = 0
         self.eventrades: int = 0
         self.losstrades: int = 0
@@ -1761,6 +1764,8 @@ class SimPosition(PositionBase):
                             self.sum_loss_profit_ratio += profit_ratio
 
             self.new_closed_trades.extend(new_closed_trades)
+            for closed_trade in new_closed_trades:
+                self._closed_trade_stats.add(closed_trade)
 
             # close_all overshoot: when deferred MC reduced position, close_all
             # captures original size and overshoots → create opposite position.
