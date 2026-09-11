@@ -165,9 +165,12 @@ def __test_dated_session_schedule_single_consumer_and_fallback__(log):
             opening_hours=[SymInfoInterval(day=d, start=time(10, 0), end=time(18, 0))
                            for d in range(7)],
             session_starts=era_a.session_starts, session_ends=era_a.session_ends)
+        # An uncoverable variant cannot supply session ends, so the dated path
+        # declines — but every bar still gets a close: the generic
+        # ``actual_bar_close`` falls back to the bar's own period end.
         fallback = _load(tmp, "bad", _syminfo([uncoverable, era_b]), _MON_FRI)
-        assert fallback.bar_closes is None, \
-            "an uncoverable variant must leave bar_closes None so the grid clamp is kept"
+        assert fallback.bar_closes is not None and fallback.bar_closes != clean.bar_closes, \
+            "an uncoverable variant must fall back to plain period-end closes"
 
     log.info("dated session schedule: single-consumer invariant holds and None fallback is graceful")
 

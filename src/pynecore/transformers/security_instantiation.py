@@ -147,9 +147,11 @@ class SecurityInstantiationTransformer:
 
     # --- analysis ---
 
-    def _analyze(self, module: ast.Module) -> tuple[list[_FuncInfo], set[str]]:
-        """Return (eligible security-bearing functions with >1 call site,
-        bearing name set). Eligibility applies every bail-out."""
+    def _analyze(self, module: ast.Module,
+                 min_sites: int = 2) -> tuple[list[_FuncInfo], set[str]]:
+        """Return (eligible security-bearing functions with at least
+        ``min_sites`` call sites, bearing name set). Eligibility applies every
+        bail-out."""
         infos = self._collect_functions(module)
 
         by_name: dict[str, list[_FuncInfo]] = {}
@@ -212,7 +214,7 @@ class SecurityInstantiationTransformer:
                 continue
             if self._non_call_refs(info.region, name, info.node):
                 continue
-            if len(self._call_sites(info.region, name)) > 1:
+            if len(self._call_sites(info.region, name)) >= min_sites:
                 eligible.append(info)
         return eligible, bearing
 
@@ -259,6 +261,82 @@ class SecurityInstantiationTransformer:
             site_func.id = clone.name
         return True
 
+    # --- call-site specialization ---
+
+    @classmethod
+    def _is_static_arg(cls, node: ast.expr) -> bool:
+        """Whether ``node`` can be duplicated into the callee without changing
+        behaviour: a literal or a bare ``lib.*`` attribute chain.
+
+        Calls are excluded on purpose — copying ``input.int(...)`` into the
+        function body would register the input twice.
+        """
+        if isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, ast.Attribute):
+            return cls._is_static_arg(node.value)
+        if isinstance(node, ast.Name):
+            return node.id == 'lib'
+        return False
+
+    def _specialize(self, info: _FuncInfo, site: ast.Call) -> None:
+        """Pin ``site``'s static arguments as bindings at the top of ``info``.
+
+        After instantiation each security-bearing function has exactly one call
+        site, so the timeframe/symbol a parameter carries is statically known.
+        Writing it back as ``tf = "60"`` at the top of the body turns the
+        parameter into a compile-time constant chain, which lets
+        SecurityTransformer hoist the ``__sec_signal__`` into the top block
+        instead of emitting it inline — a prerequisite for any other security
+        expression to depend on this one.
+        """
+        fn = info.node
+        fn_args = fn.args
+        if fn_args.vararg is not None or fn_args.kwarg is not None:
+            return
+        if fn_args.posonlyargs:
+            return
+        if any(isinstance(a, ast.Starred) for a in site.args):
+            return
+        if any(kw.arg is None for kw in site.keywords):
+            return
+
+        positional = [a.arg for a in fn_args.args]
+        by_name = positional + [a.arg for a in fn_args.kwonlyargs]
+        bound: dict[str, ast.expr] = {}
+        if len(site.args) > len(positional):
+            return
+        for idx, value in enumerate(site.args):
+            bound[positional[idx]] = value
+        for kw in site.keywords:
+            if kw.arg not in by_name:
+                return
+            bound[kw.arg] = kw.value
+
+        pinned: list[ast.stmt] = []
+        for name in by_name:
+            value = bound.get(name)
+            if value is None or not self._is_static_arg(value):
+                continue
+            assign = ast.Assign(
+                targets=[ast.Name(id=name, ctx=ast.Store())],
+                value=copy.deepcopy(value),
+            )
+            ast.copy_location(assign, fn)
+            ast.fix_missing_locations(assign)
+            pinned.append(assign)
+        if pinned:
+            fn.body[0:0] = pinned
+
+    def _specialize_all(self, module: ast.Module) -> None:
+        """Pin call-site constants into every single-site security bearer."""
+        eligible, _ = self._analyze(module, min_sites=1)
+        for info in eligible:
+            sites = self._call_sites(info.region, info.node.name)
+            if len(sites) != 1:
+                continue
+            self._specialize(info, sites[0])
+
     # --- pipeline API ---
 
     def visit(self, module: ast.Module) -> ast.Module:
@@ -271,4 +349,5 @@ class SecurityInstantiationTransformer:
         for _ in range(_MAX_CLONES + 1):
             if not self._clone_one(module):
                 break
+        self._specialize_all(module)
         return module

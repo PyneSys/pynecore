@@ -30,6 +30,7 @@ from pynecore.types import script_type
 from pynecore.core.plugin.live_provider import PluginSymbol
 
 if TYPE_CHECKING:
+    from multiprocessing.connection import Connection
     from multiprocessing.process import BaseProcess
     from zoneinfo import ZoneInfo
     from pynecore.core.script import script
@@ -710,7 +711,7 @@ class ScriptRunner:
                  '_script_path', '_security_data', '_magnifier_iter', '_magnifier_source_tf',
                  '_chart_provider_name', '_chart_provider_instance', '_chart_data_path',
                  '_time_from', '_sec_syminfos', '_chart_type_warmup',
-                 '_signal_rate_sources_fn',
+                 '_signal_rate_sources_fn', '_sec_begin_bar_fn', '_sec_end_bar_fn',
                  '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
                  '_engine_event_stream_future',
                  '_broker_store_ctx', '_log_ohlcv', '_price_decimals',
@@ -857,6 +858,14 @@ class ScriptRunner:
         # auto-rate sec_ids exist; left as ``None`` for backtests / runs
         # without ``currency=`` conversions, so the bar loop short-circuits.
         self._signal_rate_sources_fn: 'Callable[[], None] | None' = None
+        # Chart bar-cycle hooks of the security protocol. ``begin`` fixes the
+        # round's tick instant before any ``__sec_signal__`` of the bar runs;
+        # ``end`` runs after ``main()`` returns — INCLUDING after an early
+        # ``return`` that skipped every write block and ``__sec_wait__`` — so a
+        # chart-context producer's frontier still rises and the bar's remaining
+        # live steps are driven to the end.
+        self._sec_begin_bar_fn: 'Callable[[int, int, bool], None] | None' = None
+        self._sec_end_bar_fn: 'Callable[[], None] | None' = None
 
         # Import lib module to set syminfo properties before script import
         from .. import lib
@@ -1458,6 +1467,8 @@ class ScriptRunner:
         sec_failed_children: set[str] = set()
         sec_resample_dirs: 'list[str]' = []  # per-run temp dirs for HTF feed resampling
         sec_cleanup_fn: Callable[[], None] | None = None
+        # Parent ends of the per-child registry pipes, closed at teardown.
+        sec_registry_pipes: 'dict[str, Connection]' = {}
         sec_states = None
         sec_sync_block = None
         sec_result_blocks = None
@@ -1543,8 +1554,9 @@ class ScriptRunner:
                     inject_protocol, cleanup_shared_memory, Lookahead,
                     load_htf_bar_opens, load_ltf_first_ms, watch_security_child,
                 )
+                from .security_shm import create_ring_conditions
                 from .security_process import security_process_main
-                from multiprocessing import Process
+                from multiprocessing import Pipe, Process
 
                 # Detect same-context: symbol+TF identical to chart. Pine names the
                 # chart instrument either bare (``syminfo.ticker``) or exchange
@@ -1665,6 +1677,92 @@ class ScriptRunner:
                 sec_result_locks = {
                     sid: state.result_lock for sid, state in sec_states.items()
                 }
+                # One condition per context — for EVERY sid in
+                # ``__security_contexts__``, including the ones whose symbol or
+                # timeframe only resolves at runtime. The sid set is static
+                # (the transformer assigns it at compile time), so creating them
+                # all here means a lazily spawned context's condition, like its
+                # SyncBlock slot and its watermark row, already exists when a
+                # consumer spawned earlier first waits on it. Shared with every
+                # child through the spawn argument tuple: a producer notifies
+                # its own, its consumers wait on it.
+                sec_ring_conditions = create_ring_conditions(all_sec_ids)
+                # Who consumes whom — the inverse of the transitive ``depends``.
+                # Static for the same reason: ``depends`` is compile-time, so
+                # this mapping is complete from the start and needs no rebuild
+                # when a runtime-resolved context finally materializes. A
+                # context nobody consumes publishes no ring at all; the
+                # consumers of one that does bound its GC watermark.
+                sec_consumers: dict[str, list[str]] = {sid: [] for sid in all_sec_ids}
+                for _cid, _cstate in sec_states.items():
+                    for _pid in _cstate.depends:
+                        if _pid in sec_consumers and _cid not in sec_consumers[_pid]:
+                            sec_consumers[_pid].append(_cid)
+
+                # Parent end of each child's registry pipe, by sec_id. A
+                # context whose symbol/timeframe only exist at runtime (an
+                # inline ``__sec_signal__`` with a computed symbol) is resolved
+                # AFTER its consumers were spawned, so its record cannot be in
+                # their spawn snapshot — it is pushed down these pipes instead.
+                def _sec_record(_sid: str) -> dict:
+                    """One context's peer record, as children see it."""
+                    _st = sec_states[_sid]  # noqa - non-None inside if sec_contexts
+                    return {
+                        'timeframe': _st.timeframe,
+                        'calendar': _st.calendar,
+                        'is_dwm': _st.is_dwm,
+                        'is_ltf': _st.is_ltf,
+                        # A live-streamed lower-timeframe array publishes whole
+                        # chart-bar windows instead of per-intrabar ring
+                        # entries, so it cannot be paired with a consumer's own
+                        # period and answers with the default.
+                        'ltf_live_stream': _st.ltf_live_stream,
+                        'plain_ltf': _st.plain_ltf,
+                        'gaps_on': _st.gaps_on,
+                        'depends': _st.depends,
+                        'in_loop': _st.in_loop,
+                        # A context with no process publishes nothing, so a
+                        # consumer must answer with the default at once instead
+                        # of waiting for a frontier that never moves. The
+                        # chart's own same-context sid DOES produce — the chart
+                        # writes its ring itself.
+                        'has_producer': (_sid not in no_process_ids
+                                         or _sid in same_context_ids),
+                    }
+
+                def _sec_registry() -> dict:
+                    """Peer records for the children spawned from now on.
+
+                    A context still waiting for its runtime symbol/timeframe is
+                    OMITTED, not guessed: "absent" is what tells a consumer to
+                    wait for the record rather than pair against a placeholder.
+                    Everything already resolved is included, so a child spawned
+                    later starts with as much as the chart knows.
+                    """
+                    return {_sid: _sec_record(_sid) for _sid in sec_states  # noqa
+                            if _sid not in deferred_sec_ids}
+
+                def _publish_sec_record(_sid: str) -> None:
+                    """Push one freshly resolved context's record to every child.
+
+                    Called the moment the chart learns what a runtime-resolved
+                    context IS — spawned, downgraded to the chart's own context,
+                    or left without a process at all. Deadlock-freedom: a
+                    consumer X only ever blocks on a peer P at P's OWN call
+                    site. If X's site precedes P's, the chart is not waiting on
+                    X when it reaches P's signal (X released the chart at its
+                    write); if P's site precedes X's, the chart already ran P's
+                    signal before X's round. Either way the chart resolves P and
+                    sends this record, so the wait ends.
+                    """
+                    record = {_sid: _sec_record(_sid)}
+                    for _target, _conn in list(sec_registry_pipes.items()):
+                        try:
+                            _conn.send(record)
+                        except (BrokenPipeError, OSError):
+                            # The child is gone; its death is handled by the
+                            # liveness watcher, not here.
+                            sec_registry_pipes.pop(_target, None)
 
                 def _spawn_security_process(sid: str, data_source):
                     sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
@@ -1712,6 +1810,8 @@ class ScriptRunner:
                     _ctx_meta = cast('dict[str, dict]', sec_contexts)[sid]
                     _ohlcv_fields = _ctx_meta.get('ohlcv_fields')
                     _ohlcv_tuple = bool(_ctx_meta.get('ohlcv_tuple'))
+                    _registry_parent_conn, _registry_child_conn = Pipe()
+                    sec_registry_pipes[sid] = _registry_parent_conn
                     proc = Process(
                         target=security_process_main,
                         args=(
@@ -1732,13 +1832,29 @@ class ScriptRunner:
                             chart_tf,
                             sec_state.plain_ltf,
                             sec_state.chart_type_warmup,
+                            _sec_registry(),
+                            sec_state.chart_calendar,
+                            sec_ring_conditions,
+                            sec_consumers.get(sid, []),
+                            _registry_child_conn,
                         ),
                         daemon=True,
                     )
                     proc.start()
+                    # The child owns its end now; keeping the parent's copy of
+                    # it open would stop the child from ever seeing EOF.
+                    _registry_child_conn.close()
+                    # Tell the children spawned EARLIER what this context is.
+                    # Their snapshots either omitted it (runtime-resolved) or
+                    # predate ``load_htf_bar_opens``, which is what fills the
+                    # calendar the as-of extension needs.
+                    _publish_sec_record(sid)
                     sec_processes[sid] = proc
-                    watch_security_child(sid, proc, sec_failed_children,
-                                         (sec_state.data_ready, sec_state.done_event))
+                    watch_security_child(
+                        sid, proc, sec_failed_children,
+                        (sec_state.data_ready, sec_state.done_event),
+                        tuple(st.stop_event for st in sec_states.values()),  # noqa
+                    )
 
                 # Callback for lazy resolution of deferred security contexts
                 def _deferred_resolve(sid: str, symbol: str, timeframe: str | None):
@@ -1771,6 +1887,7 @@ class ScriptRunner:
                         _state.resampler = None
                         same_context_ids.add(sid)
                         no_process_ids.add(sid)
+                        _publish_sec_record(sid)
                         return
                     # Update SecurityState with correct timeframe info
                     sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
@@ -1898,6 +2015,7 @@ class ScriptRunner:
                         # instead of waiting on a child that was never
                         # spawned.
                         no_process_ids.add(sid)
+                        _publish_sec_record(sid)
 
                 # Lazy spawn callback for static contexts. The ``sec_processes``
                 # check makes it safe to call after the deferred resolver too —
@@ -1960,7 +2078,8 @@ class ScriptRunner:
                     and sid not in no_process_ids
                 )
                 (signal_fn, write_fn, read_fn, wait_fn,
-                 sec_cleanup_fn, signal_rate_sources_fn) = create_chart_protocol(
+                 sec_cleanup_fn, signal_rate_sources_fn,
+                 sec_begin_bar_fn, sec_end_bar_fn) = create_chart_protocol(
                     sec_states, sec_sync_block,
                     deferred_resolve_fn=_deferred_resolve if deferred_sec_ids else None,
                     lazy_spawn_fn=_lazy_spawn if static_contexts else None,
@@ -1976,7 +2095,11 @@ class ScriptRunner:
                     sec_processes=sec_processes,
                     auto_rate_sec_ids=auto_rate_sec_ids,
                     failed_children=sec_failed_children,
+                    ring_conditions=sec_ring_conditions,
+                    consumers_by_sid=sec_consumers,
                 )
+                self._sec_begin_bar_fn = sec_begin_bar_fn
+                self._sec_end_bar_fn = sec_end_bar_fn
                 for _sec_mod in sec_modules:
                     inject_protocol(_sec_mod, signal_fn, write_fn, read_fn, wait_fn,
                                     same_context=same_ctx_ref)
@@ -2042,9 +2165,15 @@ class ScriptRunner:
 
             # --- Helper closures for DRY ---
             signal_rate_sources_fn = self._signal_rate_sources_fn
+            sec_begin_bar_fn = self._sec_begin_bar_fn
+            sec_end_bar_fn = self._sec_end_bar_fn
 
             # noinspection PyProtectedMember
             def _run_libs_and_main():
+                if sec_begin_bar_fn is not None:
+                    # noinspection PyCallingNonCallable
+                    sec_begin_bar_fn(lib._time, lib._next_time,
+                                     bool(barstate.isconfirmed))
                 # Broker mode only: open a fresh order-evaluation scope before
                 # any strategy.close() runs, so two same-bar closes net into one
                 # order while a calc_on_every_tick re-issue replaces rather than
@@ -2062,7 +2191,12 @@ class ScriptRunner:
                 for run_lib_main in lib_mains:
                     run_lib_main()
                 lib._lib_semaphore = False
-                r = run_main()
+                try:
+                    r = run_main()
+                finally:
+                    if sec_end_bar_fn is not None:
+                        # noinspection PyCallingNonCallable
+                        sec_end_bar_fn()
                 if r is not None:
                     assert isinstance(r, dict), "The 'main' function must return a dictionary!"
                     lib._plot_data.update(r)
@@ -2971,6 +3105,12 @@ class ScriptRunner:
                 for state in sec_states.values():
                     state.stop_event.set()
                     state.advance_event.set()  # wake up if waiting
+                for _conn in sec_registry_pipes.values():
+                    # A child still blocked on the registry pipe leaves on
+                    # ``stop_event``; closing the parent ends is resource
+                    # hygiene, and gives it an EOF either way.
+                    _conn.close()
+                sec_registry_pipes.clear()
                 for p in sec_processes.values():
                     p.join(timeout=5)
                     if p.is_alive():

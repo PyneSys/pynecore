@@ -15,7 +15,9 @@ from pynecore.core.resampler import (
     Resampler, ObservedDayCounter, grid_mode, overnight_opens, trading_day,
     trading_day_open_sec, weekday_ordinal, weekday_from_ordinal, first_monday,
 )
-from pynecore.core.security import SecurityState, _get_confirmed_time
+from pynecore.core.security import (
+    BarCalendar, SecurityState, _get_confirmed_time, actual_bar_close,
+)
 from pynecore.core.syminfo import SymInfoInterval, SymInfoSession
 
 _NY = ZoneInfo("America/New_York")
@@ -240,11 +242,19 @@ def __test_chart_bar_containment__():
 
 
 def _multiperiod_state(opens: list[int], chart_off: int = 0) -> SecurityState:
+    """Multi-period state over a CONTIGUOUS synthetic feed.
+
+    Confirmation rides real bar closes, so the synthetic opens need the closes
+    that go with them: each bar closes where the next one opens, and the last
+    one carries the feed's own final spacing forward.
+    """
     state = SecurityState(
         sec_id='s', timeframe='5D', gaps_on=False, same_timeframe=False,
         resampler=Resampler.get_resampler('5D'), tz=_UTC,
     )
     state.bar_opens = opens
+    state.bar_closes = opens[1:] + [2 * opens[-1] - opens[-2]] if len(opens) > 1 \
+        else [opens[0]]
     state.bar_opens_multiperiod = True
     state.chart_off = chart_off
     return state
@@ -258,6 +268,9 @@ def _single_period_state(tf: str, opens: 'list[int] | None',
         resampler=Resampler.get_resampler(tf), tz=_UTC,
     )
     state.bar_opens = opens
+    state.bar_closes = None if opens is None else [
+        actual_bar_close(o, 0, BarCalendar(tz=_UTC), tf) for o in opens
+    ]
     state.bar_opens_multiperiod = False
     state.chart_off = chart_off
     return state

@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import logging
 import threading
+from time import monotonic
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from enum import Enum, auto
 from multiprocessing import Event, Lock, connection
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from .datetime import parse_timezone
@@ -28,12 +29,15 @@ from .security_shm import (
     SyncBlock, ResultBlock, ResultReader, INITIAL_RESULT_SIZE,
     FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE, FLAG_DEV_HISTORICAL,
     FLAG_LTF_WINDOW, FLAG_LTF_CHART_DEVELOPING, FLAG_LTF_LIVE_PHASE,
-    write_result,
+    RingReader, RingWriter, write_result,
 )
 
 if TYPE_CHECKING:
     from multiprocessing.process import BaseProcess
-    from multiprocessing.synchronize import Event as EventType, Lock as LockType
+    from multiprocessing.synchronize import (
+        Condition as ConditionType, Event as EventType, Lock as LockType,
+    )
+    from multiprocessing.connection import Connection
     from typing import Callable
     from .ohlcv import OHLCVReader
     from .resampler import Resampler
@@ -115,6 +119,15 @@ def _lookahead_mode(value) -> Lookahead:
     return Lookahead.OFF
 
 
+# Upper bound of a single wait on the registry event while a child waits for a
+# runtime-resolved peer's record. Not a sleep: the event ends the wait the
+# moment the record lands; this only bounds how often ``stop_event`` is
+# re-checked.
+_REGISTRY_WAIT_SECONDS = 0.1
+
+# How long a child waits for a runtime-resolved peer's record before saying so.
+_REGISTRY_WARN_SECONDS = 30.0
+
 # Liveness poll interval for security-process waits without a death watcher
 # (legacy fallback). Short enough to detect a crashed child quickly.
 _LIVENESS_POLL_SECONDS = 0.5
@@ -125,6 +138,7 @@ def watch_security_child(
     proc: 'BaseProcess',
     failed_children: set[str],
     events: 'tuple[EventType, ...]',
+    stop_events: 'tuple[EventType, ...]' = (),
 ) -> None:
     """
     Start a daemon thread that watches a security child for abnormal death.
@@ -146,11 +160,19 @@ def watch_security_child(
     :param proc: The started child process
     :param failed_children: Shared registry of abnormally died sec_ids
     :param events: Events a chart wait may block on for this context
+    :param stop_events: Every child's shutdown event. One child's death has to
+        release them ALL: a sibling blocked on this context's ring would never
+        wake, and the chart waiting on that sibling would freeze instead of
+        raising.
     """
     def _watch() -> None:
         connection.wait([proc.sentinel])
         if proc.exitcode not in (0, None):
             failed_children.add(sec_id)
+            # Release every OTHER child too: a peer blocked on this one's ring
+            # would otherwise never wake, and the chart would wait on that peer.
+            for ev in stop_events:
+                ev.set()
             for ev in events:
                 ev.set()
 
@@ -183,11 +205,17 @@ def _wait_with_liveness(
         return
     if failed_children is not None:
         event.wait()
-        if sec_id in failed_children:
-            proc = sec_processes[sec_id]
+        if failed_children:
+            # ANY child's death can freeze this wait, not only the awaited
+            # one's: contexts read each other, so a dead consumer leaves a
+            # producer blocked and the chart waiting on that producer. Report
+            # the awaited context when it is the dead one, otherwise the child
+            # that actually died.
+            dead = sec_id if sec_id in failed_children else next(iter(failed_children))
+            proc = sec_processes.get(dead)
             raise RuntimeError(
-                f"Security process for '{sec_id}' died unexpectedly "
-                f"(exit code: {proc.exitcode})"
+                f"Security process for '{dead}' died unexpectedly "
+                f"(exit code: {proc.exitcode if proc is not None else '?'})"
             )
         return
     proc = sec_processes[sec_id]
@@ -347,6 +375,34 @@ class SecurityState:
     chart_off: int = 0
     sec_grid_args: tuple | None = None
 
+    # The security's own trading schedule, populated by ``load_htf_bar_opens``.
+    # Drives ``actual_bar_close`` for this context's bars and, together with the
+    # chart's own calendar, the as-of calendar extension (principle 6).
+    calendar: 'BarCalendar | None' = None
+    # The CHART's schedule — the same object for every context, so the
+    # ``same_calendar`` test against ``calendar`` is a plain comparison.
+    chart_calendar: 'BarCalendar | None' = None
+    # The chart's own timeframe string, for the chart bar's ``actual_bar_close``.
+    chart_timeframe: str = ''
+    # True when this context's timeframe is daily/weekly/monthly. Only such a
+    # peer gets the as-of calendar extension.
+    is_dwm: bool = False
+
+    # Sids this context's expression depends on (transitive closure of the
+    # transformer's DIRECT ``depends`` lists), and whether its write block sits
+    # inside a loop. Chart-side they only travel to the child at spawn.
+    depends: frozenset[str] = frozenset()
+    in_loop: bool = False
+
+    # Live step queue (``__sec_signal__`` enqueues, ``__sec_read__`` and the
+    # runner's bar-end hook drive it). Each entry is a zero-argument callable
+    # that writes the slot and sets ``advance_event`` for one round.
+    pending_live: list = field(default_factory=list)
+    # Rounds this context launched vs. the child's ``rounds_done`` counter in
+    # the SyncBlock. "One round outstanding" waits for equality instead of a
+    # bool ``done_event``, because one chart bar can launch several rounds.
+    rounds_launched: int = 0
+
     # LTF window on a daily/weekly/monthly CHART (chart-side, file-backed). A
     # single-period civil D/W/M chart bar has no fixed arithmetic span
     # (``chart_off == 0``), so the Phase 1 ``chart_time + chart_off`` target
@@ -384,214 +440,183 @@ class SecurityState:
     ltf_skip: bool = False
 
 
+def _same_value(a, b) -> bool:
+    """Repeat-write equality: Pine's ``na == na``, and tuples elementwise.
+
+    A security write block standing in a loop body runs several times per bar.
+    The first write publishes; an identical repeat is a no-op. Only this
+    comparison decides which, so ``na`` (a float NaN, never equal to itself)
+    has to count as unchanged.
+    """
+    if isinstance(a, tuple) and isinstance(b, tuple):
+        return len(a) == len(b) and all(_same_value(x, y) for x, y in zip(a, b))
+    if a is b:
+        return True
+    if isinstance(a, float) and isinstance(b, float) and a != a and b != b:
+        return True
+    return bool(a == b)
+
+
+def chart_asof(state: SecurityState, chart_time: int,
+               next_chart_time: int = 0, round_tick: int = 0) -> int:
+    """
+    The instant the CHART is as-of for this context in the current round.
+
+    The chart bar's own scheduled close (:func:`actual_bar_close`), or — on a
+    developing round — the round's fixed tick instant, which the runner reads
+    once per bar cycle so every signal, target and clamp of that bar agree.
+
+    For a daily/weekly/monthly peer keeping the CHART's calendar the base time
+    is extended to the end of the scheduled break it falls in
+    (:func:`break_end_after`): an equity hourly bar closing at 16:00 sits in the
+    break, so it already sees the daily bar closing at 16:00, while the
+    09:30-10:30 bar (closing inside the session) does not. A peer on another
+    calendar gets no extension — it may trade during this one's break.
+
+    :param state: Security context state.
+    :param chart_time: Current chart bar open time in ms.
+    :param next_chart_time: Open of the chart bar after this one, 0 when none.
+    :param round_tick: The round's fixed tick instant for a developing round;
+        0 selects the chart bar's scheduled close.
+    :return: The chart's as-of instant for this context, in ms.
+    """
+    if round_tick:
+        base = round_tick
+    elif state.chart_calendar is not None and state.chart_timeframe:
+        base = actual_bar_close(chart_time, next_chart_time,
+                                state.chart_calendar, state.chart_timeframe)
+    else:
+        # No chart calendar (unit-test / legacy callers): the nominal chart span.
+        base = chart_time + state.chart_off + 1
+    if (state.is_dwm and state.chart_calendar is not None
+            and state.calendar is not None
+            and same_calendar(state.calendar, state.chart_calendar)):
+        return break_end_after(base, state.chart_calendar)
+    return base
+
+
+def _ltf_bar_index(state: SecurityState, chart_time: int,
+                   next_chart_time: int, round_tick: int) -> int:
+    """
+    Index of the LAST intrabar the chart bar may see, ``-1`` when there is none.
+
+    The same pairing rule the rest of the module uses: the peer's last bar whose
+    scheduled close (``close_A``) is at or before the consumer's as-of instant
+    (:func:`chart_asof`). For a lower-timeframe context this is what keeps an
+    intrabar that straddles the chart bar's close — a non-nested grid (a 4-minute
+    context on a 3-minute chart) or a session-shortened intrabar — out of this
+    chart bar: its close lies after the chart bar's own close, so it belongs to
+    the next chart bar's round.
+
+    ``-1`` means the chart bar precedes the context's first usable intrabar; the
+    caller then skips the cross-process handshake and answers with the default
+    (an empty array, or ``na`` for the scalar merge), which is what TradingView
+    returns before the lower-timeframe series begins.
+
+    Requires the loaded feed (:func:`load_htf_bar_opens`); a live stream with no
+    static file keeps the nominal span target and its own closed-intrabar clamp.
+
+    :param state: Lower-timeframe security context state.
+    :param chart_time: Current chart bar open time in ms.
+    :param next_chart_time: Open of the chart bar after this one, 0 when none.
+    :param round_tick: The round's fixed tick instant on a developing round.
+    :return: Index into ``state.bar_opens`` / ``state.bar_closes``, or ``-1``.
+    """
+    opens = state.bar_opens
+    closes = state.bar_closes
+    assert opens is not None and closes is not None
+    asof = chart_asof(state, chart_time, next_chart_time, round_tick)
+    # ``asof`` never decreases across rounds and the closes ascend, so the
+    # persistent pointer only ever advances.
+    n = len(closes)
+    ptr = state.bar_ptr
+    while ptr + 1 < n and closes[ptr + 1] <= asof:
+        ptr += 1
+    state.bar_ptr = ptr
+    return ptr
+
+
 def _get_confirmed_time(state: SecurityState, chart_time: int,
-                        next_chart_time: int = 0) -> int:
+                        next_chart_time: int = 0, round_tick: int = 0) -> int:
     """
     Determine which security period the subprocess should advance to.
 
-    Same timeframe: a chart bar and its same-time security bar close at the same
-    instant, so the target is the chart bar's own open — clamped to the latest
-    real child bar open when ``bar_opens`` is loaded (gappy cross-symbol feed,
-    e.g. a session-bounded bond yield on a 24/7 crypto chart). Between real bars
-    nothing new is confirmed, so ``gaps_off`` forward-fills the last real value
-    and ``gaps_on`` emits ``na`` — TradingView never evaluates the expression on
-    the writer's synthetic gap-fill bars.
+    ONE rule for every peer kind (HTF daily/weekly/monthly, intraday HTF,
+    same-timeframe cross-symbol, plain lower-timeframe): the context's LAST bar
+    whose scheduled close (``close_A``) is at or before the chart's as-of
+    instant for it (:func:`chart_asof`); the target is that bar's open. The
+    three TradingView pairings measured for this rule (weekly consumer of a
+    daily producer, daily consumer of a weekly producer, same-timeframe
+    cross-symbol) all reduce to it, and so does the child-side peer read — the
+    chart is just another consumer.
 
-    Daily/weekly/monthly HTF (when ``bar_opens`` is loaded — see
-    ``SecurityState.bar_opens``): confirmation rides the child's real bar opens
-    so a sparse child (scattered macro days) forward-fills its last value
-    instead of confirming phantom calendar periods. Multi-period walks the opens
-    directly; single-period clamps the arithmetic grid's calendar-close target
-    to the latest real open. Falls back to the bare arithmetic grid when
-    ``bar_opens`` is ``None`` (intraday HTF, live streams, unit tests).
+    Confirmation therefore rides the child's REAL bars and their real closes:
+    a sparse child (scattered macro days) forward-fills its last value instead
+    of confirming phantom calendar periods, a session-closing stub bar is
+    confirmed on the chart bar its session end reaches, and a bar straddling
+    the chart bar's close is left for the next chart bar rather than exposing a
+    price from after that close.
 
-    HTF:
-      * ``OFF`` / ``LAST_CLOSED``: target is the most recent HTF period that has
-        CLOSED by the current chart bar's close instant. TradingView's historical
-        ``lookahead_off`` merge rule: an HTF bar's final value is carried already
-        by the chart bar whose close coincides with the HTF bar's close (the
-        period's last chart bar), not by the next period's first bar.
-      * ``ON`` never reaches this function on a same-symbol HTF: the developing
-        transport in ``__sec_signal__`` handles it in both live and historical
-        mode and returns before the closed-only flow. Cross-symbol ``ON`` has no
-        aggregator, so it lands here and keeps OFF (last-closed) semantics while
-        the chart-side read returns ``na`` inside an open period
-        (``na_on_developing``).
+    Falls back to the arithmetic period grid only when the child's bars are not
+    loaded (live streams, unit tests without a feed).
 
     :param state: Security context state
     :param chart_time: Current chart bar time in milliseconds
     :param next_chart_time: Open time (ms) of the chart bar after this one, 0
                             when none is known (last historical bar, live)
+    :param round_tick: The round's fixed tick instant on a developing round
     :return: Target time in milliseconds
     """
-    if state.same_timeframe:
-        if state.bar_opens is None:
-            return chart_time
-        opens = state.bar_opens
-        n = len(opens)
-        ptr = state.bar_ptr
-        if state.bar_closes is not None:
-            # The security's session does not start on the chart's grid, so its
-            # bars are OFFSET from the chart's: a US-equity session opening at
-            # 09:30 puts its bars on the half hour while a forex chart sits on
-            # the hour. Confirmation must then ride the child's close instants,
-            # exactly as the HTF path does — the bar is known to the chart bar
-            # whose close it reaches, and the session-closing stub bar (15:30 ->
-            # 16:00) ends on that chart bar's own close. Measured on TradingView
-            # (CAPITALCOM:EURUSD 60 requesting GOOG at the chart TF): the stub's
-            # close arrives on the 20:00 UTC chart bar, one bar earlier than the
-            # open-time clamp below places it, on all 897 affected bars.
-            closes = state.bar_closes
-            close_time = chart_time + state.chart_off + 1
-            while ptr + 1 < n and closes[ptr + 1] <= close_time:
-                ptr += 1
-            state.bar_ptr = ptr
-            if ptr >= 0 and closes[ptr] <= close_time:
-                return opens[ptr]
-            return state.last_confirmed
-        # Gappy same-TF cross-symbol feed: clamp to the latest real child bar
-        # open. ``chart_time`` and ``bar_opens`` are both monotonic across chart
-        # bars, so the persistent ``bar_ptr`` only ever advances. ``ptr == -1``
-        # means the chart still precedes the first real security bar — return
-        # ``last_confirmed`` (0) so nothing is confirmed yet and the read stays
-        # ``na``, matching TradingView before the security series begins.
-        while ptr + 1 < n and opens[ptr + 1] <= chart_time:
-            ptr += 1
-        state.bar_ptr = ptr
-        if ptr >= 0:
-            return opens[ptr]
-        return state.last_confirmed
-
-    resampler = state.resampler
-    assert resampler is not None
-
     if (ALLOW_LOOKAHEAD and state.lookahead is Lookahead.ON
             and state.htf_aggregator is not None):
         # ``PYNE_ALLOW_LOOKAHEAD`` only: step into the period CONTAINING the
-        # chart bar instead of the last closed one. The containing period's bar
-        # is already complete in the child's data file, so a bare expression
-        # reads its final OHLCV — TradingView's future-leak, reproduced on
-        # purpose so a script can be measured with and without it. ``chart_time``
-        # (not the close instant) selects the period, so the period's last chart
-        # bar still maps to that period rather than the next.
+        # chart bar instead of the last closed one, so a script can be measured
+        # with TradingView's future-leak and without it. ``chart_time`` (not the
+        # close instant) selects the period, so the period's last chart bar
+        # still maps to that period rather than the next.
+        resampler = state.resampler
+        assert resampler is not None
         if state.session_starts is not None:
             return resampler.get_bar_time(
                 chart_time, state.session_tz, state.session_starts,
                 state.session_opening_hours)
         return resampler.get_bar_time(chart_time, state.tz)
 
-    # The chart bar's close instant. ``chart_off`` is span-1 for intraday and
-    # seconds charts; D/W/M chart bars have no fixed arithmetic span
-    # (``chart_off == 0``), so confirmation degrades to the bar's open instant.
-    close_time = chart_time + state.chart_off + 1
-
-    if state.bar_opens is not None and state.bar_opens_multiperiod:
-        # Multi-period walk: advance the pointer to the child bar the chart bar's
-        # close instant falls in; entering bar ``ptr`` closes every bar before it
-        opens = state.bar_opens
-        ptr = state.bar_ptr
-        n = len(opens)
-        advanced = False
-        while ptr + 1 < n and opens[ptr + 1] <= close_time:
-            ptr += 1
-            advanced = True
-        state.bar_ptr = ptr
-        if advanced and ptr >= 1:
-            return opens[ptr - 1]
-        if n and ptr == n - 1 and state.sec_grid_args is not None:
-            # The chart marched past the child's last bar: no child bar
-            # realizes the next period, so the arithmetic grid decides when
-            # the last bar is closed
-            sec_tz, ss, oh, mode = state.sec_grid_args
-            if resampler.get_bar_time(close_time, sec_tz, ss, oh, mode) > opens[-1]:
-                return opens[-1]
-        return state.last_confirmed
-
-    # OFF / LAST_CLOSED: the period preceding
-    # the one ``close_time`` falls in. When the chart bar's close lands exactly
-    # on a period boundary, ``get_bar_time`` floors it to that boundary and the
-    # period ending there is returned — the just-closed HTF bar is confirmed on
-    # its own last chart bar.
-    if state.session_starts is not None:
-        # Off-grid intraday session → anchor HTF bars to the session open,
-        # using the security's own exchange timezone.
-        period = resampler.get_bar_time(
-            close_time, state.session_tz, state.session_starts,
-            state.session_opening_hours)
-        grid_target = resampler.get_bar_time(
-            period - 1, state.session_tz, state.session_starts,
-            state.session_opening_hours)
-    else:
-        period = resampler.get_bar_time(close_time, state.tz)
-        grid_target = resampler.get_bar_time(period - 1, state.tz)
-
-    # An EARLY EXCHANGE CLOSE (a US half-day session: Black Friday, Christmas
-    # Eve) ends the period before the schedule in ``opening_hours`` says it
-    # does, and TradingView -- which owns the real holiday calendar -- confirms
-    # the HTF bar on that day's LAST chart bar all the same. The chart's own bar
-    # grid realizes that calendar: when the NEXT chart bar already belongs to a
-    # later period, this bar IS the period's last one, so the period it sits in
-    # has closed here. On a full session the close instant already floors
-    # forward into the next period and this is a no-op. MEASURED on AMEX:SPY@5
-    # requesting ``"1D"``: 2025-11-28 and 2025-12-24 were the only two bars in
-    # 20207 where the daily value lagged TradingView by one trading day.
-    # Backtest only, exactly like ``bar_opens``: live has no next bar
-    # (``next_chart_time == 0``) and keeps the schedule, so no value is emitted
-    # that a real-time run could not have produced.
-    if next_chart_time:
-        if state.session_starts is not None:
-            next_period = resampler.get_bar_time(
-                next_chart_time, state.session_tz, state.session_starts,
-                state.session_opening_hours)
-        else:
-            next_period = resampler.get_bar_time(next_chart_time, state.tz)
-        if next_period > period:
-            grid_target = period
-
-    if state.bar_opens is None:
-        return grid_target
+    asof = chart_asof(state, chart_time, next_chart_time, round_tick)
 
     opens = state.bar_opens
-    n = len(opens)
-    ptr = state.bar_ptr
-
-    if state.bar_closes is not None:
-        # Session-bounded intraday HTF: each real bar closes at its session's
-        # scheduled end (calendar-known via ``opening_hours``), NOT at the
-        # arithmetic next-period boundary — a non-trading gap before the next
-        # session (e.g. the dead time between a futures day and night session)
-        # would otherwise delay confirmation by a full period. TradingView
-        # ``lookahead_off`` confirms the bar on its own last chart bar, whose
-        # close coincides with the session end. Confirm the latest real bar whose
-        # session end the chart bar's close (``close_time``) has reached.
-        # ``close_time`` and ``bar_closes`` are both monotonic across chart bars,
-        # so the persistent ``bar_ptr`` only ever advances.
-        closes = state.bar_closes
-        while ptr + 1 < n and closes[ptr + 1] <= close_time:
+    closes = state.bar_closes
+    if opens is not None and closes is not None:
+        # ``asof`` is monotonically non-decreasing across chart bars and the
+        # closes are ascending, so the persistent ``bar_ptr`` only ever advances.
+        # ``ptr == -1`` means the chart still precedes the context's first bar:
+        # ``last_confirmed`` (0) confirms nothing and the read stays ``na``.
+        n = len(opens)
+        ptr = state.bar_ptr
+        while ptr + 1 < n and closes[ptr + 1] <= asof:
             ptr += 1
         state.bar_ptr = ptr
-        if ptr >= 0 and closes[ptr] <= close_time:
+        if ptr >= 0 and closes[ptr] <= asof:
             return opens[ptr]
         return state.last_confirmed
 
-    # Single-period D/W/M with a loaded child: the grid above gives the correct
-    # calendar close instant, but the child may carry a bar only on scattered
-    # days (sparse macro series). Clamp the grid target to the latest real child
-    # open so the subprocess never advances into an empty window (which would
-    # ``write_na`` and wipe the forward-fill). Dense data has a bar on every
-    # period, so the clamp is a no-op and behaviour is identical to the bare
-    # grid; sparse data holds its last real value, matching TV ``gaps_off``.
-    # ``grid_target`` is monotonically non-decreasing across chart bars (it is
-    # ``get_bar_time(period - 1)`` of a monotonically increasing ``close_time``),
-    # so the persistent ``bar_ptr`` only ever advances. ``last_confirmed`` is a
-    # timestamp (0 = before any bar), returned while the chart precedes the first
-    # real open so nothing is confirmed yet.
-    while ptr + 1 < n and opens[ptr + 1] <= grid_target:
-        ptr += 1
-    state.bar_ptr = ptr
-    if ptr >= 0 and opens[ptr] <= grid_target:
-        return opens[ptr]
-    return state.last_confirmed
+    if state.same_timeframe:
+        # A chart bar and its same-time security bar close at the same instant.
+        return chart_time
+
+    resampler = state.resampler
+    assert resampler is not None
+    if state.session_starts is not None:
+        # Off-grid intraday session -> anchor the context's bars to the session
+        # open, using the security's own exchange timezone.
+        period = resampler.get_bar_time(
+            asof, state.session_tz, state.session_starts,
+            state.session_opening_hours)
+        return resampler.get_bar_time(
+            period - 1, state.session_tz, state.session_starts,
+            state.session_opening_hours)
+    period = resampler.get_bar_time(asof, state.tz)
+    return resampler.get_bar_time(period - 1, state.tz)
 
 
 def _next_civil_period_open(modifier: str, current_ms: int, tz: ZoneInfo) -> int:
@@ -639,6 +664,8 @@ def create_chart_protocol(
     sec_processes: 'dict[str, BaseProcess] | None' = None,
     auto_rate_sec_ids: frozenset[str] = frozenset(),
     failed_children: 'set[str] | None' = None,
+    ring_conditions: 'dict[str, ConditionType] | None' = None,
+    consumers_by_sid: 'dict[str, list[str]] | None' = None,
 ) -> tuple:
     """
     Create protocol functions for the **chart** process.
@@ -670,19 +697,161 @@ def create_chart_protocol(
                             :func:`watch_security_child` when a child dies
                             abnormally. Enables the cheap UNTIMED waits; when
                             None the waits fall back to liveness polling.
+    :param ring_conditions: Per-sid ``multiprocessing.Condition``, shared with
+                            the children. Needed for the chart-context
+                            producers, whose ring the chart itself writes.
+    :param consumers_by_sid: Sids consuming each context, for the ring GC
+                             watermark minimum.
     :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup,
-              signal_rate_sources)
+              signal_rate_sources, begin_bar, end_bar)
     """
+    # Module-level import would close a ``core`` <-> ``lib`` cycle; done once
+    # here rather than per bar inside the protocol functions.
+    from pynecore import lib
+
     readers: dict[str, ResultReader] = {
-        sid: ResultReader(sid) for sid in states
+        sid: ResultReader(sid, sync_block.block_prefix(sid)) for sid in states
     }
 
     resolved: set[str] = set()
+    ring_conditions = ring_conditions or {}
+    consumers_by_sid = consumers_by_sid or {}
+
+    # Chart-context producers: a sid the chart itself evaluates (same symbol and
+    # timeframe) whose value another context consumes. The chart owns its ring.
+    chart_writers: dict[str, RingWriter] = {}
+    chart_consumer_indexes: dict[str, list[int]] = {}
+    chart_bar_written: set[str] = set()
+    chart_bar_value: dict[str, object] = {}
+
+    def _ensure_chart_writer(_sid: str) -> None:
+        """Give a chart-context producer its ring writer, if it has consumers.
+
+        Called both at startup and from ``__sec_signal__``: a context whose
+        symbol or timeframe is only known at runtime can be downgraded to the
+        chart's own context by the deferred resolver, long after this factory
+        ran. It is advertised as a producer the moment that happens, so its
+        ring has to exist by then — otherwise its writes never reach a ring and
+        every dependent child blocks on a frontier nothing moves.
+        """
+        if _sid in chart_writers or _sid not in same_context_ids:
+            return
+        _consumers = consumers_by_sid.get(_sid)
+        if not _consumers or _sid not in ring_conditions:
+            return
+        chart_writers[_sid] = RingWriter(_sid, sync_block, ring_conditions[_sid])
+        chart_consumer_indexes[_sid] = [sync_block.index_of(c) for c in _consumers]
+
+    # The round's fixed instants, read ONCE per chart bar cycle by ``begin_bar``.
+    # Every target, live clamp and slot round-context of the bar uses the same
+    # values: a child reading a second later must not ask for a bar the chart
+    # did not target in this round.
+    round_state = {'tick': 0, 'sched_next_open': 0, 'chart_time': 0, 'next_time': 0}
+
+    def _chart_calendar() -> 'BarCalendar | None':
+        for st in states.values():
+            if st.chart_calendar is not None:
+                return st.chart_calendar
+        return None
+
+    def begin_bar(chart_time: int, next_chart_time: int, confirmed: bool) -> None:
+        """Open a chart bar cycle: fix the round's tick instant.
+
+        Read once, here, and used by every signal, target and live clamp of the
+        bar — and handed to each child in its slot. Reading a fresh clock per
+        signal would let a consumer ask for a peer bar the producer was not
+        targeted at in this round, which nothing would ever publish.
+
+        :param chart_time: The chart bar's open time in ms.
+        :param next_chart_time: Open of the following chart bar, 0 when none.
+        :param confirmed: Whether the chart bar is closed (historical/confirmed).
+        """
+        cal = _chart_calendar()
+        round_state['chart_time'] = chart_time
+        round_state['next_time'] = next_chart_time
+        if cal is not None and _chart_tf[0]:
+            bar_close = actual_bar_close(chart_time, next_chart_time, cal, _chart_tf[0])
+        else:
+            bar_close = chart_time + _chart_off[0] + 1
+        if confirmed:
+            tick = bar_close
+        else:
+            # A developing chart bar's as-of is "now" — but it must stay INSIDE
+            # the bar. The wall clock only does that when the feed really is
+            # real time; replaying recorded bars through the live transport
+            # puts it far beyond them, and an as-of past a peer's developing
+            # close_A asks for a bar nothing will ever publish (a developing
+            # bar never appends, so the peer's frontier stops one tick below
+            # its own close_A).
+            tick = int(datetime.now().timestamp() * 1000)
+            if tick >= bar_close:
+                tick = bar_close - 1
+            if tick < chart_time:
+                tick = chart_time
+        round_state['tick'] = tick
+        if cal is not None and cal.opening_hours:
+            extended = break_end_after(tick, cal)
+            round_state['sched_next_open'] = 0 if extended == tick else extended
+        else:
+            round_state['sched_next_open'] = 0
+
+    _chart_tf = ['']
+    _chart_off = [0]
+    for _st in states.values():
+        _chart_tf[0] = _st.chart_timeframe
+        _chart_off[0] = _st.chart_off
+        break
+
+    def _settle_round(sec_id: str, state: SecurityState) -> None:
+        """Wait until the child finished every round this context launched.
+
+        One chart bar can launch SEVERAL rounds on a live context (prefill,
+        closed override, developing), so a boolean ``done_event`` cannot say
+        whether the child is still unpacking an earlier round's slot — a
+        counter can. Overwriting the slot under an unpacking child mixes two
+        bars' OHLCV in one read.
+        """
+        if not state.needs_wait:
+            return
+        while sync_block.get_rounds_done(sec_id) < state.rounds_launched:
+            _wait_with_liveness(state.done_event, sec_id, sec_processes, failed_children)
+            state.done_event.clear()
+        state.done_event.clear()
+        state.needs_wait = False
+
+    def _launch(sec_id: str, state: SecurityState) -> None:
+        """Hand the prepared slot to the child and count the round.
+
+        The round context travels WITH the target, before the advance: the
+        child unpacks both at the start of its round and derives its chart-side
+        as-of cap from its own slot, never from a peer's, whose slot the chart
+        may already have written for the next round.
+        """
+        sync_block.set_round_context(sec_id, round_state['tick'],
+                                     round_state['sched_next_open'])
+        state.data_ready.clear()
+        state.rounds_launched += 1
+        state.advance_event.set()
+        state.needs_wait = True
+
+    def _drive_pending(sec_id: str, state: SecurityState) -> None:
+        """Run the queued live steps of one context to the end.
+
+        ``__sec_signal__`` launches the FIRST step and returns without waiting,
+        so the chart can go on to signal further contexts; each further step
+        waits for the previous step's value (``data_ready``, set at the child's
+        write) and then launches the next. Driving them from the read — and from
+        the runner's bar-end hook for the steps no read reaches — keeps a chart
+        bar free of any wait that a child's own peer read could extend.
+        """
+        while state.pending_live:
+            _wait_with_liveness(state.data_ready, sec_id, sec_processes, failed_children)
+            step = state.pending_live.pop(0)
+            step()
 
     def __sec_signal__(sec_id: str, symbol: str | None = None,
                        timeframe: str | None = None, lookahead=None,
                        _scope_id=None):
-        from pynecore import lib
         state = states[sec_id]
 
         # Resolve deferred symbol/timeframe on first call. The two callbacks are
@@ -711,6 +880,9 @@ def create_chart_protocol(
                 )
             if deferred_resolve_fn is not None and symbol is not None:
                 deferred_resolve_fn(sec_id, symbol, timeframe)
+                # The resolver may have turned this context into the chart's
+                # own: it now produces for its consumers, so it needs a ring.
+                _ensure_chart_writer(sec_id)
             if lazy_spawn_fn is not None:
                 lazy_spawn_fn(sec_id)
 
@@ -730,10 +902,7 @@ def create_chart_protocol(
         # both bars: MEASURED on ICT Master Suite — parent wrote
         # (o=115055.03 h=115127.81 l=112650.0 c=113848.3 t=1754352000000), the
         # child read (o=115055.03 h=0 l=0 c=0 t=0) and the script divided by it.
-        if state.needs_wait:
-            _wait_with_liveness(state.done_event, sec_id, sec_processes, failed_children)
-            state.done_event.clear()
-            state.needs_wait = False
+        _settle_round(sec_id, state)
 
         # noinspection PyProtectedMember
         chart_time = lib._time
@@ -748,6 +917,27 @@ def create_chart_protocol(
             # the bar's period end for OFF, the bar's open for ON.
             if state.lookahead is Lookahead.ON:
                 target_time = chart_time
+                # Prefix skip: a chart bar opening before the LTF feed's first
+                # bar has no intrabar to merge — TradingView returns ``na``
+                # before the lower-timeframe series begins.
+                if state.ltf_first_ms is not None and target_time < state.ltf_first_ms:
+                    state.ltf_skip = True
+                    state.new_period = True
+                    state.needs_wait = False
+                    return
+            elif state.bar_opens is not None and state.bar_closes is not None:
+                # File-backed: the last intrabar whose scheduled close reaches
+                # the chart bar's own close. A straddling intrabar closes after
+                # it and is left for the next chart bar.
+                idx = _ltf_bar_index(
+                    state, chart_time, round_state['next_time'],
+                    0 if lib.barstate.isconfirmed else round_state['tick'])
+                if idx < 0:
+                    state.ltf_skip = True
+                    state.new_period = True
+                    state.needs_wait = False
+                    return
+                target_time = state.bar_opens[idx]
             elif (state.chart_dwm_modifier and state.chart_resampler is not None
                     and state.chart_resampler.get_bar_time(chart_time, state.tz)
                     == chart_time):
@@ -757,29 +947,22 @@ def create_chart_protocol(
                     state.chart_dwm_modifier, chart_time, state.tz) - 1
             else:
                 target_time = chart_time + state.chart_off
-            # A developing live chart bar's period end lies in the future —
-            # clamp to the last surely-closed intrabar so the child never
-            # blocks waiting for intrabars that have not closed yet.
-            if state.is_live and not lib.barstate.isconfirmed and state.plain_ltf_span_ms:
-                now_ms = int(datetime.now().timestamp() * 1000)
+            # Live stream with no static file: a developing chart bar's period
+            # end lies in the future, so clamp to the last surely-closed
+            # intrabar instead. The round's fixed tick, not a fresh clock read:
+            # a peer whose target was set microseconds earlier must not be asked
+            # for a bar it was never targeted at in this round.
+            if (state.bar_closes is None and state.is_live
+                    and not lib.barstate.isconfirmed and state.plain_ltf_span_ms):
+                now_ms = round_state['tick']
                 elapsed_close = (now_ms // state.plain_ltf_span_ms
                                  ) * state.plain_ltf_span_ms - 1
                 if elapsed_close < target_time:
                     target_time = elapsed_close
-            # Prefix skip: a chart bar whose whole period ends before the LTF
-            # feed's first bar cannot contain an intrabar — TradingView
-            # returns ``na`` before the LTF series begins.
-            if state.ltf_first_ms is not None and target_time < state.ltf_first_ms:
-                state.ltf_skip = True
-                state.new_period = True
-                state.needs_wait = False
-                return
             state.ltf_skip = False
             state.new_period = True
-            state.data_ready.clear()
             sync_block.set_target_time(sec_id, target_time)
-            state.advance_event.set()
-            state.needs_wait = True
+            _launch(sec_id, state)
             return
 
         if state.is_ltf:
@@ -816,57 +999,42 @@ def create_chart_protocol(
                 sync_block.set_ltf_period_end(sec_id, period_end_exclusive)
                 state.ltf_skip = False
                 state.new_period = True
-                state.data_ready.clear()
-                state.advance_event.set()
-                state.needs_wait = True
+                _launch(sec_id, state)
                 return
 
             # Historical/file-backed LTF: the child includes intrabars with
-            # ``bar_open <= target_time``. Target the chart bar's last ms so the
-            # child returns the bar's OWN period — matching TradingView. Adjacent
-            # bars tile with no gap or overlap (the prior bar targeted that ms
-            # minus one). An empty static feed (no streamer) has no intrabars to
-            # window, so keep the legacy chart-open target there.
-            if state.ltf_first_ms is None:
+            # ``bar_open <= target_time``. The target is the LAST intrabar whose
+            # scheduled close reaches the chart bar's own close, so the array
+            # never carries a price from after that close: on a nested grid this
+            # is exactly the chart bar's own period, and on a non-nested one (a
+            # 4-minute context on a 3-minute chart) or behind a shortened
+            # session the straddling intrabar goes to the next chart bar's
+            # round. ``bar_opens`` is ``None`` only for an empty static feed (no
+            # streamer), which has no intrabars to window at all.
+            if state.bar_opens is None or state.bar_closes is None:
                 ltf_target_time = chart_time
-            elif (state.chart_dwm_modifier and state.chart_resampler is not None
-                  and state.chart_resampler.get_bar_time(chart_time, state.tz)
-                  == chart_time):
-                # Single-period civil D/W/M chart: ``chart_off`` is 0, so the
-                # period end is the next civil open minus one ms (not a fixed
-                # span). The civil-anchored guard above means we only do this
-                # when the chart bar actually opens on the civil boundary; an
-                # off-grid (session-anchored) D/W/M bar falls through to the
-                # ``chart_off`` path, keeping the documented limitation rather
-                # than mis-windowing on a civil-calendar guess.
-                ltf_target_time = _next_civil_period_open(
-                    state.chart_dwm_modifier, chart_time, state.tz) - 1
             else:
-                # Intraday/seconds chart: ``chart_off`` == span-1 gives the
-                # bar's own period ``[T, T+tf)``.
-                ltf_target_time = chart_time + state.chart_off
-            # Prefix skip: a chart bar whose whole period ends before the LTF
-            # feed's first bar (``target_time < ltf_first_ms``) cannot contain an
-            # intrabar, so the read is an empty array. Skip the cross-process
-            # signal+wait entirely — ``__sec_read__`` returns the empty-array
-            # default. Disabled (``ltf_first_ms is None``) for live streams,
-            # which keep signalling every bar.
-            if state.ltf_first_ms is not None and ltf_target_time < state.ltf_first_ms:
-                state.ltf_skip = True
-                state.new_period = True
-                state.needs_wait = False
-                return
+                idx = _ltf_bar_index(
+                    state, chart_time, round_state['next_time'],
+                    0 if lib.barstate.isconfirmed else round_state['tick'])
+                if idx < 0:
+                    # Nothing has closed inside this chart bar yet: the read is
+                    # the empty-array default, so skip the cross-process
+                    # signal+wait entirely.
+                    state.ltf_skip = True
+                    state.new_period = True
+                    state.needs_wait = False
+                    return
+                ltf_target_time = state.bar_opens[idx]
             state.ltf_skip = False
             # LTF: every chart bar needs intrabar data — always signal. The
             # period start bounds the flushed array to the bar's OWN intrabars:
             # the child still replays any earlier feed bars for expression
             # state, but their values are prefix, not array content.
             state.new_period = True
-            state.data_ready.clear()
             sync_block.set_ltf_period_start(sec_id, chart_time)
             sync_block.set_target_time(sec_id, ltf_target_time)
-            state.advance_event.set()
-            state.needs_wait = True
+            _launch(sec_id, state)
             return
 
         # Live HTF transport — the chart aggregates its own OHLCV into the
@@ -938,118 +1106,154 @@ def create_chart_protocol(
             # period stays on the aggregated developing bar, so the no-lookahead
             # rule is untouched. ``last_confirmed`` guards the live case, where
             # the closed-only warmup already advanced the child further.
-            if dev_transport and not state.htf_prefilled:
-                state.htf_prefilled = True
-                containing = dev_bar if dev_bar is not None else closed_bar
-                prefill_target = (containing.period_start - 1
-                                  if containing is not None else 0)
-                if prefill_target > state.last_confirmed:
-                    sync_block.set_flags(
-                        sec_id,
-                        sync_block.get_flags(sec_id) & ~(
-                            FLAG_IS_DEVELOPING | FLAG_CLOSED_OVERRIDE
-                            | FLAG_DEV_HISTORICAL
-                        ),
-                    )
-                    sync_block.set_target_time(sec_id, prefill_target)
-                    state.last_confirmed = prefill_target
-                    state.data_ready.clear()
-                    state.advance_event.set()
-                    _wait_with_liveness(state.done_event, sec_id, sec_processes,
-                                        failed_children)
-                    state.done_event.clear()
-
             if dev_transport:
-                # Phase 1: synchronously deliver any just-closed HTF bar
+                # The live steps of this chart bar, in order. Only the FIRST is
+                # launched here; the rest are driven by ``__sec_read__`` (and by
+                # the runner's bar-end hook for the steps no read reaches), each
+                # waiting for the previous step's VALUE rather than for the
+                # child's whole ``main()``. Launching them all synchronously in
+                # the signal block deadlocks two contexts that read each other:
+                # the chart would sit in a wait that a child's own peer read
+                # extends.
+                steps: list = []
+
+                if not state.htf_prefilled:
+                    state.htf_prefilled = True
+                    containing = dev_bar if dev_bar is not None else closed_bar
+                    prefill_target = (containing.period_start - 1
+                                      if containing is not None else 0)
+                    if prefill_target > state.last_confirmed:
+                        state.last_confirmed = prefill_target
+
+                        def _prefill_step(_target=prefill_target):
+                            sync_block.set_flags(
+                                sec_id,
+                                sync_block.get_flags(sec_id) & ~(
+                                    FLAG_IS_DEVELOPING | FLAG_CLOSED_OVERRIDE
+                                    | FLAG_DEV_HISTORICAL
+                                ),
+                            )
+                            sync_block.set_target_time(sec_id, _target)
+                            _launch(sec_id, state)
+
+                        steps.append(_prefill_step)
+
                 if closed_bar is not None:
-                    sync_block.set_developing_bar(
-                        sec_id,
-                        closed_bar.open, closed_bar.high, closed_bar.low,
-                        closed_bar.close, closed_bar.volume,
-                        closed_bar.period_start,
-                    )
-                    base_flags = (
-                        sync_block.get_flags(sec_id)
-                        & ~(FLAG_IS_DEVELOPING | FLAG_DEV_HISTORICAL)
-                    ) | FLAG_CLOSED_OVERRIDE | hist_phase
-                    sync_block.set_flags(sec_id, base_flags)
-                    sync_block.set_target_time(sec_id, closed_bar.period_start)
                     state.last_confirmed = closed_bar.period_start
-                    state.data_ready.clear()
-                    state.advance_event.set()
-                    # Block until the subprocess finishes processing the closed
-                    # bar (writes result, saves var_snapshot). For ON, this also
-                    # ensures the developing-bar phase below cannot race ahead
-                    # of the closed phase.
-                    _wait_with_liveness(state.done_event, sec_id, sec_processes, failed_children)
-                    state.done_event.clear()
 
-                # Phase 2: developing bar — only for ``Lookahead.ON``.
-                # ``dev_bar`` is None when the confirmed chart bar just
-                # completed the period (Phase 1 delivered it); no fresh
-                # developing bar exists until the next chart bar.
+                    def _closed_step(_bar=closed_bar):
+                        sync_block.set_developing_bar(
+                            sec_id, _bar.open, _bar.high, _bar.low,
+                            _bar.close, _bar.volume, _bar.period_start,
+                        )
+                        sync_block.set_flags(sec_id, (
+                            sync_block.get_flags(sec_id)
+                            & ~(FLAG_IS_DEVELOPING | FLAG_DEV_HISTORICAL)
+                        ) | FLAG_CLOSED_OVERRIDE | hist_phase)
+                        sync_block.set_target_time(sec_id, _bar.period_start)
+                        _launch(sec_id, state)
+
+                    steps.append(_closed_step)
+
+                # Developing bar — only for ``Lookahead.ON``. ``dev_bar`` is
+                # None when the confirmed chart bar just completed the period
+                # (the closed step delivered it); no fresh developing bar exists
+                # until the next chart bar.
                 if state.lookahead is Lookahead.ON and dev_bar is not None:
-                    sync_block.set_developing_bar(
-                        sec_id,
-                        dev_bar.open, dev_bar.high, dev_bar.low,
-                        dev_bar.close, dev_bar.volume, dev_bar.period_start,
-                    )
-                    base_flags = (
-                        sync_block.get_flags(sec_id)
-                        & ~(FLAG_CLOSED_OVERRIDE | FLAG_DEV_HISTORICAL)
-                    ) | FLAG_IS_DEVELOPING | hist_phase
-                    sync_block.set_flags(sec_id, base_flags)
-                    sync_block.set_target_time(sec_id, dev_bar.period_start)
-                    state.new_period = True
-                    state.data_ready.clear()
-                    state.advance_event.set()
-                    state.needs_wait = True
-                    return
+                    def _developing_step(_bar=dev_bar):
+                        sync_block.set_developing_bar(
+                            sec_id, _bar.open, _bar.high, _bar.low,
+                            _bar.close, _bar.volume, _bar.period_start,
+                        )
+                        sync_block.set_flags(sec_id, (
+                            sync_block.get_flags(sec_id)
+                            & ~(FLAG_CLOSED_OVERRIDE | FLAG_DEV_HISTORICAL)
+                        ) | FLAG_IS_DEVELOPING | hist_phase)
+                        sync_block.set_target_time(sec_id, _bar.period_start)
+                        _launch(sec_id, state)
 
-                # Closed-bar transport only: live OFF / LAST_CLOSED, and ON on a
-                # chart bar that just completed the period (Phase 1 shipped it,
-                # no fresh developing bar exists yet).
-                # ``new_period`` reflects whether a fresh HTF close just landed
-                # (drives ``gaps_on`` na/value selection in ``__sec_read__``).
-                # We already waited synchronously inside Phase 1, so no further
-                # wait is needed in ``__sec_wait__``.
-                state.new_period = closed_bar is not None
-                state.needs_wait = False
-                # Clear any stale developing flag from a prior ``Lookahead.ON``
-                # session (defensive — same SyncBlock slot).
-                if closed_bar is None:
-                    stale_flags = sync_block.get_flags(sec_id) & ~(
-                        FLAG_IS_DEVELOPING | FLAG_CLOSED_OVERRIDE
-                    )
-                    sync_block.set_flags(sec_id, stale_flags)
+                    steps.append(_developing_step)
+                    state.new_period = True
+                else:
+                    # ``new_period`` reflects whether a fresh HTF close just
+                    # landed (drives the ``gaps_on`` na/value selection in
+                    # ``__sec_read__``).
+                    state.new_period = closed_bar is not None
+                    if closed_bar is None:
+                        # Clear any stale developing flag from a prior
+                        # ``Lookahead.ON`` session (same SyncBlock slot).
+                        sync_block.set_flags(sec_id, sync_block.get_flags(sec_id) & ~(
+                            FLAG_IS_DEVELOPING | FLAG_CLOSED_OVERRIDE
+                        ))
+
+                if steps:
+                    steps[0]()
+                    state.pending_live = steps[1:]
                 return
             # Historical OFF / LAST_CLOSED warmup falls through to the
             # closed-only flow below; the aggregator state has already advanced
             # so the live transition starts with the correct in-progress HTF bar.
 
         # Closed-only flow (historical / lookahead_off / lookahead_last_closed)
-        target_time = _get_confirmed_time(state, chart_time, lib._next_time)
+        target_time = _get_confirmed_time(
+            state, chart_time, round_state['next_time'],
+            0 if lib.barstate.isconfirmed else round_state['tick'])
 
         if target_time > state.last_confirmed:
             state.last_confirmed = target_time
             state.new_period = True
-            state.data_ready.clear()
             # Make sure no stale developing/override flag leaks across modes.
             stale_flags = sync_block.get_flags(sec_id) & ~(
                 FLAG_IS_DEVELOPING | FLAG_CLOSED_OVERRIDE
             )
             sync_block.set_flags(sec_id, stale_flags)
             sync_block.set_target_time(sec_id, target_time)
-            state.advance_event.set()
-            state.needs_wait = True
+            _launch(sec_id, state)
         else:
             state.new_period = False
 
     def __sec_write__(sec_id: str, value, _scope_id=None):
-        if sec_id in same_context_ids and result_blocks is not None:
-            with states[sec_id].result_lock:
-                write_result(result_blocks[sec_id], sync_block, value)
-            states[sec_id].data_ready.set()
+        if sec_id not in same_context_ids or result_blocks is None:
+            return
+        state = states[sec_id]
+        if sec_id in chart_bar_written:
+            # A second write on one chart bar: legitimate only from a loop body,
+            # and only with a loop-INVARIANT value (a consumer may already have
+            # read the first one).
+            if not state.in_loop:
+                raise AssertionError(
+                    f"security context '{sec_id}' wrote twice on one bar "
+                    f"outside a loop"
+                )
+            if _same_value(chart_bar_value.get(sec_id), value):
+                return
+            raise RuntimeError("loop-varying security expression is not supported")
+        chart_bar_written.add(sec_id)
+        chart_bar_value[sec_id] = value
+        with state.result_lock:
+            write_result(result_blocks[sec_id], sync_block, value)
+        state.data_ready.set()
+        writer = chart_writers.get(sec_id)
+        if writer is not None and round_state['tick']:
+            # A chart-context producer publishes on the chart's own grid: the
+            # chart bar's open and its scheduled close. A developing chart bar
+            # is never appended — its re-runs would scatter entries sharing one
+            # open — so the frontier stops one ms below its close.
+            # noinspection PyProtectedMember
+            confirmed = bool(lib.barstate.isconfirmed)
+            if confirmed:
+                writer.append(round_state['chart_time'], round_state['tick'], value,
+                              chart_consumer_indexes.get(sec_id),
+                              round_state['tick'] - 1)
+            else:
+                # The developing value stays unpublished, but the frontier must
+                # still reach this round's tick: a consumer's as-of never goes
+                # above it (``begin_bar`` clamps the tick inside the bar), so
+                # without this an HTF ``lookahead_on`` peer would wait for a bar
+                # this producer never appends — while the chart is parked on
+                # that peer's result. Pairing then answers with the last CLOSED
+                # chart bar, which is what a chart-context producer exposes.
+                writer.set_frontier_close(round_state['tick'])
 
     def __sec_read__(sec_id: str, default=None, _scope_id=None):
         # ``ignore_invalid_symbol=True`` may downgrade a live security to
@@ -1069,6 +1273,8 @@ def create_chart_protocol(
             # ``__sec_read__``, so each read observes this bar's flag — the same
             # signal-before-read invariant ``new_period``/``needs_wait`` rely on.
             return default
+        if state.pending_live:
+            _drive_pending(sec_id, state)
         _wait_with_liveness(state.data_ready, sec_id, sec_processes, failed_children)
 
         if not state.is_ltf and not state.new_period:
@@ -1099,15 +1305,42 @@ def create_chart_protocol(
         return result
 
     def __sec_wait__(sec_id: str, _scope_id=None):
-        state = states[sec_id]
-        if state.needs_wait:
-            _wait_with_liveness(state.done_event, sec_id, sec_processes, failed_children)
-            state.done_event.clear()
-            state.needs_wait = False
+        _settle_round(sec_id, states[sec_id])
+
+    def end_bar() -> None:
+        """Close out a chart bar cycle, whatever ``main()`` did.
+
+        Runs from the runner after ``main()`` returns, so an early ``return``
+        that skipped a write block or a ``__sec_wait__`` cannot strand anything:
+        a chart-context producer that did not write still raises its frontier
+        (or a consumer waiting on it would never be released), and the live
+        steps no read reached are driven to the end here.
+        """
+        for sec_id, state in states.items():
+            if state.pending_live:
+                _drive_pending(sec_id, state)
+                _wait_with_liveness(state.data_ready, sec_id, sec_processes,
+                                    failed_children)
+        if round_state['tick']:
+            # A confirmed bar's own close is the round tick, so the frontier
+            # stops one ms below it; a developing round publishes nothing, so
+            # its frontier may reach the tick itself (see ``__sec_write__``).
+            # noinspection PyProtectedMember
+            frontier = (round_state['tick'] - 1 if lib.barstate.isconfirmed
+                        else round_state['tick'])
+            for sec_id, writer in chart_writers.items():
+                if sec_id not in chart_bar_written:
+                    writer.set_frontier_close(frontier)
+        chart_bar_written.clear()
+        chart_bar_value.clear()
 
     def cleanup():
         for r in readers.values():
             r.close()
+        for w in chart_writers.values():
+            w.finish()
+            w.close()
+            w.unlink()
 
     def signal_rate_sources():
         """Advance every auto-spawned rate-source subprocess by one bar.
@@ -1124,7 +1357,6 @@ def create_chart_protocol(
         """
         if not auto_rate_sec_ids:
             return
-        from pynecore import lib
         # noinspection PyProtectedMember
         chart_time = lib._time
         for sec_id in auto_rate_sec_ids:
@@ -1136,9 +1368,12 @@ def create_chart_protocol(
             state.advance_event.set()
             _wait_with_liveness(state.data_ready, sec_id, sec_processes, failed_children)
 
+    for _sid in consumers_by_sid:
+        _ensure_chart_writer(_sid)
+
     return (
         __sec_signal__, __sec_write__, __sec_read__, __sec_wait__,
-        cleanup, signal_rate_sources,
+        cleanup, signal_rate_sources, begin_bar, end_bar,
     )
 
 
@@ -1166,6 +1401,63 @@ def __ltf_unzip__(rows, n):
     return tuple(list(col) for col in zip(*rows))
 
 
+class SecurityChildContext:
+    """
+    Per-round / per-bar context the security child's protocol functions read.
+
+    The bar loop fills these in before every ``main()`` run; ``__sec_write__``
+    publishes with them and ``__sec_read__`` derives its as-of instant from
+    them. A plain attribute holder on purpose — this sits in the per-bar hot
+    path and must not grow a lookup layer.
+
+    :ivar bar_open: Open instant (ms) of the bar being run.
+    :ivar bar_close: That bar's scheduled close (``close_A``), in ms.
+    :ivar frontier: Frontier close to publish with the bar's append — the next
+        unpublished bar's ``close_A`` minus one ms.
+    :ivar is_round_last: Whether this is the round's last bar, i.e. the chart
+        may be released as soon as the value is written.
+    :ivar developing: Whether this run is a developing (unconfirmed) one. Such
+        a run never appends to the ring (its re-runs would duplicate the entry)
+        and takes the round's fixed tick as its as-of base instead of the
+        scheduled close, which lies in the future.
+    :ivar round_tick: The round's fixed tick instant, written by the chart into
+        this context's slot together with the target.
+    :ivar round_sched_next_open: End of the scheduled break containing
+        ``round_tick`` under the CHART's calendar, ``0`` when it is inside a
+        session or the chart symbol trades round the clock.
+    """
+
+    __slots__ = ('bar_open', 'bar_close', 'frontier', 'is_round_last',
+                 'developing', 'round_tick', 'round_sched_next_open')
+
+    def __init__(self) -> None:
+        self.bar_open = 0
+        self.bar_close = 0
+        self.frontier = 0
+        self.is_round_last = False
+        self.developing = False
+        self.round_tick = 0
+        self.round_sched_next_open = 0
+
+
+class _PeerReadState:
+    """Per-peer read state of one consumer, keyed by consumer bar and as-of.
+
+    Same bar and same as-of returns the cached value; the same bar with a
+    larger as-of (a developing tick, a live lower-timeframe clamp) is a fresh
+    wait; a new bar that brings no new entry forward-fills (``gaps_off``) or
+    yields ``na`` (``gaps_on``).
+    """
+
+    __slots__ = ('bar', 'asof', 'entry_close', 'value')
+
+    def __init__(self) -> None:
+        self.bar: int = -1
+        self.asof: int = -1
+        self.entry_close: int = -1
+        self.value: Any = None
+
+
 def create_security_protocol(
     sec_id: str,
     sync_block: SyncBlock,
@@ -1173,47 +1465,205 @@ def create_security_protocol(
     all_sec_ids: list[str],
     result_locks: 'dict[str, LockType]',
     is_ltf: bool = False,
+    *,
+    registry: 'dict[str, dict] | None' = None,
+    chart_calendar: 'BarCalendar | None' = None,
+    ring_conditions: 'dict[str, ConditionType] | None' = None,
+    consumer_ids: 'list[str] | None' = None,
+    stop_event: 'EventType | None' = None,
+    data_ready_event: 'EventType | None' = None,
+    registry_pipe: 'Connection | None' = None,
 ) -> tuple:
     """
     Create protocol functions for a **security** process.
 
-    In security context, __sec_signal__ and __sec_wait__ are no-ops (guarded by
-    AST ``if __active_security__ is None`` checks). __sec_write__ writes to shared
-    memory. __sec_read__ reads immediately without waiting (no deadlock).
+    ``__sec_signal__`` and ``__sec_wait__`` are no-ops (the chart drives the
+    rounds). ``__sec_write__`` publishes this context's value; ``__sec_read__``
+    reads a peer context's value by the ONE pairing rule: the peer's last bar
+    whose scheduled close is at or before this consumer's as-of instant.
 
-    When ``is_ltf=True``, __sec_write__ appends to an internal buffer instead of
-    writing to shared memory. The caller must invoke ``flush()`` at the end of
-    each round to write the accumulated array.
+    **Publication** (``__sec_write__``): the slot (so the chart can read it),
+    then — when this context has consumers — a ring append of
+    ``(bar_open, close_A, value)`` that raises the producer's frontier close in
+    the same, condition-held step, and finally ``data_ready`` on the round's
+    LAST bar. The chart therefore waits for the VALUE, never for the child's
+    whole ``main()``; a peer read standing after this write can no longer hold
+    the chart up.
+
+    **As-of** (``__sec_read__``): the minimum of this bar's own scheduled close
+    (a developing run takes the round's fixed tick instead — its close lies in
+    the future), the scheduled-break extension for a daily/weekly/monthly peer
+    keeping this context's calendar, and the chart's own as-of for that peer in
+    this round, computed from this context's OWN round context. That last cap
+    is what makes the wait terminate: a consumer can never ask for a peer bar
+    the chart does not confirm in this round or an earlier one.
+
+    **Waiting** (deadlock-freedom): the wait ends when an entry closes exactly
+    at the as-of instant or the peer's frontier reaches it. The peer's next
+    unpublished bar closes ABOVE the chart's as-of for it, hence above this
+    one, so the frontier passes the as-of as soon as that bar is published —
+    the wait always terminates, even when the chart does not wake the peer
+    again this round. A consumer can only depend on producers whose write site
+    precedes its own read in program order, and those have already published.
 
     :param sec_id: This security context's ID (the only slot it writes to).
     :param sync_block: Shared memory sync block
     :param result_block: Shared memory result block for writing
     :param all_sec_ids: All security context IDs (for cross-context reads)
     :param result_locks: Per-slot ``multiprocessing.Lock`` keyed by sec_id.
-                         Writers acquire ``result_locks[sec_id]``; cross-context
-                         readers acquire ``result_locks[<peer sid>]``.
     :param is_ltf: If True, enable LTF accumulation mode.
+    :param registry: Peer records by sec_id (``timeframe``, ``is_dwm``,
+        ``gaps_on``, ``has_producer``, ``calendar``, ``depends``, ``in_loop``).
+        ``None`` disables peer pairing entirely (no dependencies in the script).
+    :param chart_calendar: The chart's trading schedule, for the chart-as-of cap.
+    :param ring_conditions: Per-sid ``multiprocessing.Condition``, created by the
+        parent and shared with every child.
+    :param consumer_ids: Sids consuming THIS context — drives the ring GC
+        watermark minimum and whether a ring is allocated at all.
+    :param stop_event: Shutdown event; a peer wait ends when it is set.
+    :param data_ready_event: Set at the round's last write so the chart is
+        released on the VALUE rather than at the end of ``main()``.
+    :param registry_pipe: Child end of the parent's registry pipe. A context
+        whose symbol or timeframe is only known at runtime is resolved AFTER
+        its consumers were spawned, so its record cannot be in their snapshot;
+        the chart pushes it down this pipe the moment it resolves, and a read
+        of a not-yet-known dependency blocks on the pipe until it arrives.
     :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup, flush,
-             ltf_take_value, ltf_publish, buffer_len). ``flush``/
-             ``ltf_take_value``/``ltf_publish``/``buffer_len`` are None when
-             ``is_ltf=False``; ``flush``/``buffer_len`` serve the file-backed
-             array path, ``ltf_take_value``/``ltf_publish`` the live LTF-window
-             path.
+             ltf_take_value, ltf_publish, buffer_len, ctx, after_bar, finish,
+             prime_ring)
     """
-    readers: dict[str, ResultReader] = {
-        sid: ResultReader(sid) for sid in all_sec_ids
-    }
     own_lock = result_locks[sec_id]
+    ctx = SecurityChildContext()
+
+    own_record = (registry or {}).get(sec_id) or {}
+    own_calendar: BarCalendar = own_record.get('calendar') or BarCalendar()
+    depends: frozenset[str] = frozenset(own_record.get('depends') or ())
+    in_loop: bool = bool(own_record.get('in_loop', False))
+
+    ring_conditions = ring_conditions or {}
+    consumer_indexes: list[int] | None = None
+    writer: RingWriter | None = None
+    if consumer_ids and sec_id in ring_conditions:
+        consumer_indexes = [sync_block.index_of(cid) for cid in consumer_ids]
+        writer = RingWriter(sec_id, sync_block, ring_conditions[sec_id])
+
+    known: dict[str, dict] = dict(registry or {})
+    registry_lock = threading.Lock()
+    registry_arrived = threading.Event()
+
+    def _registry_reader() -> None:
+        """Absorb registry records as they arrive, off the bar loop.
+
+        The chart pushes every freshly resolved context's record to every
+        child. A child parked in a ring wait cannot poll its pipe, so draining
+        it only from the bar loop lets the records pile up until the pipe
+        buffer is full and the chart's ``send`` blocks — and the chart is
+        exactly who has to resolve the context that child is waiting for.
+        Reading here keeps the chart's send non-blocking whatever the child is
+        doing.
+        """
+        while True:
+            try:
+                record = registry_pipe.recv()  # type: ignore[union-attr]
+            except (EOFError, OSError):
+                # The chart closed the pipe (shutdown); nothing more arrives.
+                break
+            with registry_lock:
+                known.update(record)
+            registry_arrived.set()
+
+    if registry_pipe is not None:
+        threading.Thread(target=_registry_reader, name=f'sec-registry-{sec_id}',
+                         daemon=True).start()
+
+    def _peer_record(sid: str) -> 'dict | None':
+        """This peer's record, waiting for it when the chart has yet to send it.
+
+        A context whose symbol comes out of a user function only becomes real
+        at its own inline ``__sec_signal__``, which can run long after this
+        child was spawned. Blocking here is safe — and always ends:
+
+        A consumer X blocks on a peer P only at P's OWN call site. If X's site
+        precedes P's, X already released the chart at its write, so the chart
+        runs on and reaches P's signal. If P's site precedes X's, the chart
+        signalled P before this round of X even started. Either way the chart
+        resolves P — spawning it, downgrading it to its own context, or marking
+        it producerless — and sends the record down this pipe.
+
+        The wait is a bounded wait on the event the reader thread sets, so a
+        dead chart or a ``stop_event`` ends it instead of hanging.
+        """
+        record = known.get(sid)
+        if record is not None:
+            return record
+        if registry_pipe is None:
+            return None
+        warned = False
+        deadline = monotonic() + _REGISTRY_WARN_SECONDS
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return None
+            registry_arrived.clear()
+            with registry_lock:
+                record = known.get(sid)
+            if record is not None:
+                return record
+            registry_arrived.wait(_REGISTRY_WAIT_SECONDS)
+            if not warned and monotonic() >= deadline:
+                warned = True
+                # The one shape that can stall here: the peer's call site sits
+                # behind a chart-side branch that this bar did not take, so the
+                # chart never resolves it. Say so instead of hanging silently.
+                logger.warning(
+                    "Security context '%s' is still waiting for peer '%s' to be "
+                    "resolved by the chart after %.0fs. The peer's "
+                    "request.security() call may sit behind a branch the chart "
+                    "did not execute on this bar.",
+                    sec_id, sid, _REGISTRY_WARN_SECONDS,
+                )
+
+    peer_readers: dict[str, RingReader] = {}
+    peer_states: dict[str, _PeerReadState] = {}
+    own_index = sync_block.index_of(sec_id)
+
+    # Values written on the current bar: the first one publishes, an identical
+    # repeat inside a loop is a no-op, a differing one is an error.
+    bar_value: list = [None]
+    bar_written: list[bool] = [False]
+    last_own_value: list = [None]
 
     def __sec_signal__(_sid: str, _symbol=None, _timeframe=None, _lookahead=None,
                        _scope_id=None):
         pass
+
+    def _peer_asof(record: dict) -> int:
+        """This consumer bar's as-of instant for one peer (principle 6)."""
+        base = ctx.round_tick if ctx.developing else ctx.bar_close
+        peer_cal: BarCalendar = record.get('calendar') or BarCalendar()
+        peer_dwm = bool(record.get('is_dwm'))
+        if peer_dwm and own_calendar.opening_hours and same_calendar(peer_cal, own_calendar):
+            # The scheduled break the base instant falls in ends with a session
+            # open; a D/W/M peer closing inside that break is already final.
+            base = break_end_after(base, own_calendar)
+        cap = ctx.round_tick
+        if (peer_dwm and chart_calendar is not None
+                and ctx.round_sched_next_open
+                and same_calendar(peer_cal, chart_calendar)):
+            cap = ctx.round_sched_next_open
+        return base if base < cap else cap
 
     if is_ltf:
         _buffer: list = []
 
         def __sec_write__(_sid: str, value, _scope_id=None):
             _buffer.append(value)
+            if writer is not None and not ctx.developing and ctx.bar_close:
+                # Each intrabar is its own ring entry, so a consumer can take the
+                # slice covering ITS period instead of the chart bar's window.
+                # ``bar_close`` is unset on the live LTF-window path, which is
+                # not a pairable producer (see ``__sec_read__``).
+                writer.append(ctx.bar_open, ctx.bar_close, value,
+                              consumer_indexes, ctx.frontier)
 
         def flush(skip: int = 0):
             """Publish the round's intrabar array. ``skip`` drops the first N
@@ -1221,8 +1671,10 @@ def create_security_protocol(
             state but which open BEFORE the chart bar's own period (a cold
             start mid-feed, or intrabars in a chart session gap). TradingView
             arrays carry only the bar's own period."""
+            published = _buffer[skip:]
             with own_lock:
-                write_result(result_block, sync_block, _buffer[skip:])
+                write_result(result_block, sync_block, published)
+            last_own_value[0] = published
             _buffer.clear()
 
         def buffer_len() -> int:
@@ -1241,12 +1693,54 @@ def create_security_protocol(
 
         def ltf_publish(values):
             """Write a live LTF-window array under the result lock."""
+            published = list(values)
             with own_lock:
-                write_result(result_block, sync_block, list(values))
+                write_result(result_block, sync_block, published)
+            last_own_value[0] = published
     else:
         def __sec_write__(_sid: str, value, _scope_id=None):
+            if bar_written[0]:
+                # A second write on the same bar. Only a write block sitting in
+                # a loop body can do this legitimately, and only with a
+                # loop-INVARIANT value: the chart may already have read the
+                # first one, so a differing value has no single answer.
+                if not in_loop:
+                    raise AssertionError(
+                        f"security context '{sec_id}' wrote twice on one bar "
+                        f"outside a loop"
+                    )
+                if _same_value(bar_value[0], value):
+                    return
+                raise RuntimeError(
+                    "loop-varying security expression is not supported"
+                )
+            bar_written[0] = True
+            bar_value[0] = value
+            last_own_value[0] = value
             with own_lock:
                 write_result(result_block, sync_block, value)
+            if writer is not None:
+                # The frontier rises AT the append, not at the end of the bar:
+                # a consumer whose as-of the newly published bar covers must be
+                # released immediately, or two contexts writing on the same bar
+                # would wait for each other.
+                #
+                # A DEVELOPING bar has no scheduled close yet, so it enters the
+                # ring at the round's as-of instant instead: that is exactly how
+                # far it has aggregated, and it is what the chart's own
+                # ``lookahead_on`` read of this context returns on this bar.
+                # Publishing it is what keeps the dependent form equal to the
+                # nested one — a consumer of the same round would otherwise see
+                # the PREVIOUS closed bar while the chart sees this one. It
+                # cannot look ahead: the entry is paired by its as-of, and a
+                # consumer never asks beyond its own. The frontier still rises
+                # to the bar's own ``close_A - 1``, so a consumer whose as-of
+                # sits above this tick is not held back by it.
+                close_ms = ctx.round_tick if ctx.developing else ctx.bar_close
+                writer.append(ctx.bar_open, close_ms, value,
+                              consumer_indexes, ctx.frontier)
+            if ctx.is_round_last and data_ready_event is not None:
+                data_ready_event.set()
 
         flush = None
         ltf_take_value = None
@@ -1254,22 +1748,133 @@ def create_security_protocol(
         buffer_len = None
 
     def __sec_read__(sid: str, default=None, _scope_id=None):
-        # ``read_cached``: the child re-runs the script per (intra)bar, so a
-        # peer context's unchanged result must not be re-unpickled every run —
-        # a peer's deep-first-round LTF array would otherwise make the replay
-        # quadratic (hours instead of seconds). See ResultReader.read_cached.
-        with result_locks[sid]:
-            return readers[sid].read_cached(sync_block, default)
+        if sid == sec_id:
+            return last_own_value[0]
+        if sid not in depends:
+            # Not a dependency of this context: the read cannot influence this
+            # expression, so it never waits. ``depends`` also excludes producers
+            # whose call site comes AFTER this context's own: a warmup round
+            # replays many bars at once, so waiting for a peer the chart has not
+            # launched yet would block this context's remaining writes — and the
+            # chart is parked on one of them. Such a peer can only reach this
+            # expression as a previous-bar carry, which is already published.
+            return default
+        record = _peer_record(sid)
+        if (record is None or not record.get('has_producer')
+                or sid not in ring_conditions
+                or (record.get('is_ltf') and record.get('ltf_live_stream'))):
+            # A context nothing produces for — ``ignore_invalid_symbol``
+            # downgraded it — or a lower-timeframe array fed by a LIVE stream,
+            # which publishes whole chart-bar windows and keeps no per-intrabar
+            # ring. Answer with the default; waiting would never end, nothing
+            # moves that frontier.
+            return default
+        asof = _peer_asof(record)
+        state = peer_states.get(sid)
+        if state is None:
+            state = _PeerReadState()
+            peer_states[sid] = state
+        if state.bar == ctx.bar_open and state.asof == asof:
+            return state.value
+        reader = peer_readers.get(sid)
+        if reader is None:
+            reader = RingReader(sid, sync_block, ring_conditions[sid])
+            peer_readers[sid] = reader
+        reader.wait_for_close(asof, stop_event)
+        if record.get('is_ltf'):
+            # A lower-timeframe ARRAY peer: this consumer bar's own slice of the
+            # producer's intrabars — those closing after this bar opened and at
+            # or before its as-of. An intrabar straddling either end belongs to
+            # the neighbouring bar, exactly as it does on the chart.
+            values = [v for _o, _c, v in reader.range_by_close(ctx.bar_open, asof)]
+            state.bar = ctx.bar_open
+            state.asof = asof
+            state.entry_close = asof
+            state.value = values
+            return values
+        entry = reader.last_close_at_or_before(asof)
+        new_bar = state.bar != ctx.bar_open
+        state.bar = ctx.bar_open
+        state.asof = asof
+        if entry is None:
+            state.entry_close = -1
+            state.value = default
+            return default
+        _entry_open, entry_close, value = entry
+        if new_bar and entry_close == state.entry_close:
+            # No new peer bar closed in this consumer bar: TradingView holds the
+            # last value (``gaps_off``) or emits ``na`` (``gaps_on``).
+            if record.get('gaps_on'):
+                state.value = default
+                return default
+            state.value = value
+            return value
+        state.entry_close = entry_close
+        state.value = value
+        return value
 
     def __sec_wait__(_sid: str, _scope_id=None):
         pass
 
+    def after_bar() -> None:
+        """Close out one bar of this context, whatever the script did.
+
+        Runs from the bar loop, not from script-emitted code: an early
+        ``return`` in ``main()`` skips every protocol call, and a conditional
+        write leaves the bar without an append — yet the frontier must still
+        rise, or a consumer waiting on this context's as-of would never be
+        released. Also parks the GC watermark for every peer this context can
+        read, so a conditional read cannot pin a producer's ring forever.
+        """
+        if writer is not None and not bar_written[0] and not ctx.developing:
+            writer.set_frontier_close(ctx.frontier)
+        bar_written[0] = False
+        bar_value[0] = None
+        if depends:
+            for sid in depends:
+                # Never blocks: a peer the chart has not resolved yet has no
+                # ring to pin, so there is no watermark to park.
+                record = known.get(sid)
+                if record is None or not record.get('has_producer'):
+                    continue
+                # A lower-timeframe array peer is read from this bar's period
+                # START, so only entries below THAT may be collected.
+                mark = ctx.bar_open if record.get('is_ltf') else _peer_asof(record)
+                sync_block.set_watermark(
+                    own_index, sync_block.index_of(sid), mark)
+
+    def prime_ring(frontier_close: int) -> None:
+        """Publish the frontier this producer starts with.
+
+        A producer the chart has not woken yet has published nothing, and a
+        frontier left at zero would hold up any consumer whose own first bar
+        closes before this context's first one — the chart never targets this
+        context in that round, so nothing would ever raise it. The runner
+        therefore primes the frontier from the feed's first bar as soon as the
+        producer is ready: "nothing of mine closes at or before this".
+
+        :param frontier_close: Initial frontier close in epoch ms.
+        """
+        if writer is not None:
+            writer.set_frontier_close(frontier_close)
+
+    def finish() -> None:
+        """Mark this producer done: the frontier goes to ``+inf``."""
+        if writer is not None:
+            writer.finish()
+
     def cleanup():
-        for r in readers.values():
+        if registry_pipe is not None:
+            registry_pipe.close()
+        for r in peer_readers.values():
             r.close()
+        if writer is not None:
+            writer.close()
+            writer.unlink()
 
     return (__sec_signal__, __sec_write__, __sec_read__, __sec_wait__, cleanup,
-            flush, ltf_take_value, ltf_publish, buffer_len)
+            flush, ltf_take_value, ltf_publish, buffer_len, ctx, after_bar, finish,
+            prime_ring)
 
 
 # Representative dates for the off-grid session probe — one on each side of the
@@ -1277,6 +1882,14 @@ def create_security_protocol(
 # detected. Both are Mondays, so the weekday offset arithmetic below is exact.
 _WINTER_PROBE = date(2024, 1, 15)
 _SUMMER_PROBE = date(2024, 7, 15)
+
+# One civil day in ms — the probe step of the D/W/M period-end search.
+_DAY_MS = 86_400_000
+# Upper bound of that search: long enough for a 12M period (multi-period yearly
+# grids are the widest shape a D/W/M timeframe can take) plus DST headroom.
+_DWM_PROBE_DAYS = 400
+# Upper bound of the break scan: no market closes for more than a week.
+_BREAK_SCAN_DAYS = 9
 
 
 def _needs_session_anchor(
@@ -1403,49 +2016,73 @@ def _session_bar_closes(
         feed, so the caller keeps the arithmetic grid clamp rather than risk a
         wrong session end.
     """
-    from .resampler import crosses_midnight
     closes: list[int] = []
     for open_ms in opens:
-        open_dt = datetime.fromtimestamp(open_ms / 1000, tz=tz)
-        open_date = open_dt.date()
-        weekday = open_dt.weekday()
-        prev_weekday = (weekday - 1) % 7
-        open_time = open_dt.time()
-        if corrections:
-            today_hours = corrections.get(open_date, opening_hours)
-            prev_hours = corrections.get(open_date - timedelta(days=1), opening_hours)
-        else:
-            today_hours = prev_hours = opening_hours
-        end_ms: int | None = None
-        for interval in today_hours:
-            overnight = crosses_midnight(interval.start, interval.end)
-            if (interval.day == weekday and interval.start <= open_time
-                    and (overnight or open_time < interval.end)):
-                # Same-day session, or the pre-midnight leg of an overnight one
-                # (which closes on the following calendar day).
-                end_date = open_date + timedelta(days=1 if overnight else 0)
-            else:
-                continue
-            candidate = int(
-                datetime.combine(end_date, interval.end, tzinfo=tz).timestamp() * 1000)
-            if end_ms is None or candidate < end_ms:
-                end_ms = candidate
-        for interval in prev_hours:
-            # After-midnight leg of the PREVIOUS day's overnight session: the bar
-            # opens today but its session started yesterday and closes today
-            # (e.g. a 21:00->02:00 night session's 01:00 bar).
-            if (crosses_midnight(interval.start, interval.end)
-                    and interval.day == prev_weekday and open_time < interval.end):
-                candidate = int(
-                    datetime.combine(open_date, interval.end, tzinfo=tz).timestamp() * 1000)
-                if end_ms is None or candidate < end_ms:
-                    end_ms = candidate
+        end_ms = _session_end_of_open(open_ms, tz, opening_hours, corrections)
         if end_ms is None:
             return None
         # Whichever comes first: the bar's own period end, or the session end (a
         # non-trading gap before the next session must not delay confirmation).
         closes.append(min(open_ms + period_ms, end_ms))
     return closes
+
+
+def _session_end_of_open(
+        open_ms: int,
+        tz: ZoneInfo | None,
+        opening_hours: 'list[SymInfoInterval]',
+        corrections: 'dict[date, tuple[SymInfoInterval, ...]] | None' = None,
+) -> int | None:
+    """
+    Scheduled end instant (epoch ms) of the session that contains ``open_ms``.
+
+    Extracted from :func:`_session_bar_closes` so a single bar open can be
+    resolved on its own — :func:`actual_bar_close` needs exactly this for the
+    intraday branch, and the D/W/M branch needs it per trading day.
+
+    :param open_ms: Bar open (or any instant inside a session) in epoch ms.
+    :param tz: The security's exchange timezone.
+    :param opening_hours: The security's ``SymInfo.opening_hours`` intervals.
+    :param corrections: The security's ``SymInfo.session_corrections``, or ``None``.
+    :return: The session end in epoch ms, or ``None`` when no interval contains
+        ``open_ms`` (the schedule does not describe this instant).
+    """
+    from .resampler import crosses_midnight
+    open_dt = datetime.fromtimestamp(open_ms / 1000, tz=tz)
+    open_date = open_dt.date()
+    weekday = open_dt.weekday()
+    prev_weekday = (weekday - 1) % 7
+    open_time = open_dt.time()
+    if corrections:
+        today_hours = corrections.get(open_date, opening_hours)
+        prev_hours = corrections.get(open_date - timedelta(days=1), opening_hours)
+    else:
+        today_hours = prev_hours = opening_hours
+    end_ms: int | None = None
+    for interval in today_hours:
+        overnight = crosses_midnight(interval.start, interval.end)
+        if (interval.day == weekday and interval.start <= open_time
+                and (overnight or open_time < interval.end)):
+            # Same-day session, or the pre-midnight leg of an overnight one
+            # (which closes on the following calendar day).
+            end_date = open_date + timedelta(days=1 if overnight else 0)
+        else:
+            continue
+        candidate = int(
+            datetime.combine(end_date, interval.end, tzinfo=tz).timestamp() * 1000)
+        if end_ms is None or candidate < end_ms:
+            end_ms = candidate
+    for interval in prev_hours:
+        # After-midnight leg of the PREVIOUS day's overnight session: the bar
+        # opens today but its session started yesterday and closes today
+        # (e.g. a 21:00->02:00 night session's 01:00 bar).
+        if (crosses_midnight(interval.start, interval.end)
+                and interval.day == prev_weekday and open_time < interval.end):
+            candidate = int(
+                datetime.combine(open_date, interval.end, tzinfo=tz).timestamp() * 1000)
+            if end_ms is None or candidate < end_ms:
+                end_ms = candidate
+    return end_ms
 
 
 def _dated_session_bar_closes(
@@ -1506,6 +2143,250 @@ def _dated_session_bar_closes(
     return closes
 
 
+@dataclass
+class BarCalendar:
+    """
+    The trading schedule a security context's bars live on.
+
+    Everything :func:`actual_bar_close`, :func:`break_end_after` and
+    :func:`same_calendar` need, in one plain record: the exchange timezone, the
+    ``opening_hours`` intervals, the ``session_starts`` template, the
+    effective-dated session corrections and the scheduled-grid mode. Built once
+    per context (chart and children alike) and then only read.
+
+    An empty ``opening_hours`` means "schedule unknown": the close falls back to
+    the civil/arithmetic period end and no calendar extension ever applies.
+    """
+    tz: ZoneInfo | None = None
+    opening_hours: 'tuple[SymInfoInterval, ...]' = ()
+    session_starts: 'tuple[SymInfoSession, ...]' = ()
+    corrections: 'dict[date, tuple[SymInfoInterval, ...]] | None' = None
+    grid_mode: str | None = None
+
+
+def _day_hours(day: date, cal: BarCalendar) -> 'list[SymInfoInterval]':
+    """The intervals effective on one calendar date: its correction, or the template.
+
+    :param day: The calendar date.
+    :param cal: The context's calendar.
+    :return: The date's opening-hours intervals (empty when it does not trade).
+    """
+    if cal.corrections:
+        corrected = cal.corrections.get(day)
+        if corrected is not None:
+            return list(corrected)
+    return list(cal.opening_hours)
+
+
+def _trading_day_end_hours(day: date, cal: BarCalendar) -> 'list[SymInfoInterval]':
+    """The intervals that can END trading day ``day``, each taken from its own
+    OPENING date.
+
+    An effective-dated correction replaces the template for the date a session
+    OPENS on, and an interval's ``day`` is its opening weekday — so a rolling
+    (overnight) session that ends inside ``day`` is corrected on ``day - 1``.
+    Reading both legs off the closing date would apply the wrong day's
+    correction to an overnight market.
+
+    :param day: The trading day whose end is being resolved.
+    :param cal: The context's calendar.
+    :return: Intervals ending inside ``day``, resolved per opening date.
+    """
+    from .resampler import rolls_trading_day
+    weekday = day.weekday()
+    hours = [iv for iv in _day_hours(day, cal)
+             if iv.day == weekday and not rolls_trading_day(iv.start, iv.end)]
+    prev = day - timedelta(days=1)
+    prev_weekday = prev.weekday()
+    hours += [iv for iv in _day_hours(prev, cal)
+              if iv.day == prev_weekday and rolls_trading_day(iv.start, iv.end)]
+    return hours
+
+
+def same_calendar(a: BarCalendar, b: BarCalendar) -> bool:
+    """
+    Whether two contexts keep the same trading schedule.
+
+    Same exchange timezone, same ``opening_hours`` and the same effective-dated
+    corrections: only then does one context's scheduled break coincide with the
+    other's, which is what the as-of calendar extension (principle 6) requires.
+    The same tickerid satisfies it trivially. Two contexts sharing a weekly
+    template but differing on a half-day do NOT keep the same schedule on that
+    day, and extending one's as-of over the other's break would hand it a bar
+    from past its own close.
+
+    :param a: One context's calendar.
+    :param b: The other context's calendar.
+    :return: ``True`` when both keep the same schedule.
+    """
+    return (a.tz == b.tz and tuple(a.opening_hours) == tuple(b.opening_hours)
+            and (a.corrections or {}) == (b.corrections or {}))
+
+
+def break_end_after(ms: int, cal: BarCalendar) -> int:
+    """
+    ``ms`` itself when it falls inside a scheduled session, else the scheduled
+    session open that ENDS the break containing it.
+
+    Sessions are half-open ``[start, end)``, so a bar's own close instant (an
+    exclusive end) lands in the break that follows it — which is exactly the
+    case the as-of calendar extension is for: the 15:00-16:00 hourly bar of a
+    09:30-16:00 equity closes at 16:00, in the break, and therefore sees the
+    daily bar closing at 16:00; the 09:30-10:30 bar closes at 10:30, inside the
+    session, and does not. A 24h symbol is always inside a session, so it is
+    never extended.
+
+    The bound is the SCHEDULE, never the next existing record: a data gap is
+    indistinguishable from a holiday, and riding records would hand a consumer
+    data from past its own close.
+
+    :param ms: Base instant in epoch ms.
+    :param cal: The consumer's own calendar.
+    :return: ``ms``, or the next scheduled session open.
+    """
+    oh = cal.opening_hours
+    if not oh:
+        return ms
+    if _session_end_of_open(ms, cal.tz, list(oh), cal.corrections) is not None:
+        return ms
+    base = datetime.fromtimestamp(ms / 1000, tz=cal.tz)
+    for offset in range(_BREAK_SCAN_DAYS):
+        day = base.date() + timedelta(days=offset)
+        weekday = day.weekday()
+        best: int | None = None
+        # A corrected date opens on ITS hours; a date corrected to nothing is
+        # closed and contributes no candidate at all.
+        for interval in _day_hours(day, cal):
+            if interval.day != weekday:
+                continue
+            candidate = int(
+                datetime.combine(day, interval.start, tzinfo=cal.tz).timestamp() * 1000)
+            if candidate >= ms and (best is None or candidate < best):
+                best = candidate
+        if best is not None:
+            return best
+    return ms
+
+
+def _exclusive_session_end(ms: int, tz: ZoneInfo | None) -> int:
+    """
+    A scheduled session end as an EXCLUSIVE instant.
+
+    ``23:59:59`` is PyneCore's end-of-day marker for a round-the-clock schedule
+    — every writer of a 24/7 ``SymInfo`` emits it — so the session it ends
+    really runs up to midnight. Without this the daily bar of a 24/7 symbol
+    would close one second early and its own last intraday bar, closing exactly
+    at midnight, would fall outside it.
+
+    :param ms: Session end instant in epoch ms.
+    :param tz: The security's exchange timezone.
+    :return: The exclusive session end in epoch ms.
+    """
+    dt = datetime.fromtimestamp(ms / 1000, tz=tz)
+    if (dt.hour, dt.minute, dt.second, dt.microsecond) == (23, 59, 59, 0):
+        return ms + 1000
+    return ms
+
+
+def _dwm_period_end(open_ms: int, cal: BarCalendar, timeframe: str) -> int:
+    """
+    Exclusive end of the session-anchored D/W/M period opening at ``open_ms``.
+
+    Probes the period grid one day at a time: :meth:`Resampler.get_bar_time`
+    answers with the OPEN of the period a probe falls in, so the first probe
+    landing in a later period already IS this period's exclusive end. Never
+    nominal seconds — a month has no fixed length and a week ends where the
+    schedule says.
+
+    :param open_ms: The bar's open in epoch ms.
+    :param cal: The security's calendar.
+    :param timeframe: The context's D/W/M timeframe string.
+    :return: The next period's open in epoch ms.
+    """
+    from .resampler import Resampler
+    resampler = Resampler.get_resampler(timeframe)
+    starts = list(cal.session_starts) or None
+    hours = list(cal.opening_hours) or None
+    probe = open_ms
+    for _ in range(_DWM_PROBE_DAYS):
+        probe += _DAY_MS
+        nxt = resampler.get_bar_time(probe, cal.tz, starts, hours, cal.grid_mode)
+        if nxt > open_ms:
+            return nxt
+    return probe
+
+
+def actual_bar_close(open_ms: int, next_open_ms: int, cal: BarCalendar,
+                     timeframe: str) -> int:
+    """
+    The bar's SCHEDULED close instant (``close_A``) — exclusive, in epoch ms.
+
+    One rule pairs every consumer with every producer: a consumer sees the
+    peer's last bar whose ``close_A`` is at or before its own as-of instant. So
+    the close has to be the real one, not an arithmetic guess:
+
+    * intraday: ``min(open + span, next_open, session_end)`` — a session-closing
+      stub (15:30 -> 16:00 on a 60-minute grid) and a chart bar shortened by the
+      next bar's open both close where they really do;
+    * D/W/M: the end of the LAST scheduled session inside the session-anchored
+      period (an equity weekly bar closes Friday 16:00, an FX weekly bar Friday
+      17:00 New York — never the next Monday's open), falling back to the civil
+      period end for a 24h symbol, which has no session bounds.
+
+    Holidays and unscheduled early closes are NOT in the schedule and cannot be
+    told apart from a data gap, so such a bar becomes visible one consumer bar
+    late (see the as-of calendar extension) instead of being guessed from the
+    bar grid.
+
+    :param open_ms: The bar's open in epoch ms.
+    :param next_open_ms: Open of the following bar in epoch ms, ``0`` when
+        unknown (last historical bar, live edge). Intraday only.
+    :param cal: The bar's own calendar.
+    :param timeframe: The bar's timeframe string.
+    :return: The bar's scheduled close instant in epoch ms.
+    """
+    from ..lib import timeframe as tf_module
+    # noinspection PyProtectedMember
+    modifier, _multiplier = tf_module._process_tf(timeframe)
+
+    if modifier not in ('D', 'W', 'M'):
+        # noinspection PyProtectedMember
+        close = open_ms + tf_module._in_seconds(timeframe) * 1000
+        if next_open_ms and next_open_ms < close:
+            close = next_open_ms
+        if cal.opening_hours:
+            session_end = _session_end_of_open(
+                open_ms, cal.tz, list(cal.opening_hours), cal.corrections)
+            if session_end is not None:
+                session_end = _exclusive_session_end(session_end, cal.tz)
+                if session_end < close:
+                    close = session_end
+        return close
+
+    period_end = _dwm_period_end(open_ms, cal, timeframe)
+    if not cal.opening_hours:
+        # No schedule (or a 24h symbol with no usable session bounds): the civil
+        # period end IS the close.
+        return period_end
+    from .resampler import overnight_opens, trading_day, trading_day_end_sec
+    overnight = overnight_opens(list(cal.opening_hours), list(cal.session_starts) or None)
+    day = trading_day((period_end - 1) / 1000, cal.tz, overnight)
+    first_day = trading_day(open_ms / 1000, cal.tz, overnight)
+    while day >= first_day:
+        # An effective-dated correction REPLACES the weekly template for the
+        # date a session OPENS on (an empty one means the day is closed),
+        # exactly as the intraday branch resolves it — a D/W/M close computed
+        # off the uncorrected template would expose an extended session's bar
+        # hours early and misdate a shortened one.
+        end_sec = trading_day_end_sec(day, cal.tz, _trading_day_end_hours(day, cal))
+        if end_sec is not None:
+            end_ms = _exclusive_session_end(end_sec * 1000, cal.tz)
+            if open_ms < end_ms <= period_end:
+                return end_ms
+        day -= timedelta(days=1)
+    return period_end
+
+
 def _is_dense_feed(reader: OHLCVReader, real_bar_count: int, period_sec: int) -> bool:
     """
     Decide whether a feed's real bars tile the requested timeframe grid.
@@ -1552,8 +2433,13 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
     * Gappy intraday HTF: a session-gapped futures feed (e.g. a 720-minute HTF on
       a 3-session palm-oil contract) has no bar over its non-trading spans, so the
       grid would confirm periods the child never reaches. Dense intraday feeds
-      keep the cheaper arithmetic grid (this stays a no-op for them); LTF contexts
-      run their own intrabar machinery, not HTF confirmation.
+      keep the cheaper arithmetic grid (this stays a no-op for them).
+
+    Lower-timeframe contexts (``request.security_lower_tf`` arrays and the scalar
+    ``plain_ltf`` merge) load the same two lists: their chart-side target is the
+    LAST intrabar whose ``close_A`` is at or before the chart bar's own close, so
+    an intrabar straddling that close is left for the next chart bar instead of
+    exposing a price from after it.
 
     A gappy SAME-TF cross-symbol feed (a session-bounded symbol requested at the
     chart's own TF on a 24/7 chart) rides the same intraday path:
@@ -1578,26 +2464,12 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
     modifier, multiplier = tf_module._process_tf(state.timeframe)
     is_dwm = modifier in ('D', 'W', 'M')
 
-    # LTF contexts (array windows and the scalar plain-LTF merge alike) never
-    # use HTF confirmation — their target is the chart bar's own period.
-    if state.is_ltf or state.plain_ltf:
-        return
-
     if not is_dwm:
-        # Intraday HTF: only a GAPPY feed needs the real-opens clamp (see above);
-        # a dense feed keeps the arithmetic grid.
-        period_sec = tf_module._in_seconds(state.timeframe)
         with OHLCVReader(data_path) as reader:
             start_ts = reader.start_timestamp
             if start_ts is None:
                 return
             opens = [candle.timestamp for candle in reader.read_from(start_ts)]
-            if _is_dense_feed(reader, len(opens), period_sec):
-                return  # dense feed: the arithmetic grid is already correct
-        # Gappy fixed-span intraday HTF: keep the arithmetic (fixed-span) grid for
-        # the close instant, but CLAMP it to the latest real open so an empty
-        # (gap) period holds the last real bar instead of advancing into a phantom
-        # period and writing na — see ``_get_confirmed_time``.
         state.bar_opens_multiperiod = False
     else:
         # Multi-period (nD/nW/nM) walks the opens directly (the arithmetic grid
@@ -1621,6 +2493,7 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
 
     sec_tz: ZoneInfo | None = state.tz
     sec_starts = sec_hours = mode = None
+    si: 'SymInfo | None' = None
     toml_path = Path(data_path).with_suffix('.toml')
     if toml_path.exists():
         si = SymInfo.load_toml(toml_path)
@@ -1686,6 +2559,29 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
             else:
                 state.bar_closes = _session_bar_closes(
                     opens, sec_tz, sec_hours, period_ms, si.session_corrections)
+
+    state.calendar = BarCalendar(
+        tz=sec_tz,
+        opening_hours=tuple(sec_hours or ()),
+        session_starts=tuple(sec_starts or ()),
+        corrections=(si.session_corrections if si is not None else None),
+        grid_mode=mode,
+    )
+    state.is_dwm = is_dwm
+
+    if state.bar_closes is None:
+        # Every context confirms on real close instants (principle 2), so a feed
+        # whose schedule the branches above could not describe — a sessionless or
+        # 24h intraday one, and every D/W/M one — gets its closes here. The
+        # intraday branches above are the schedule-history and correction-aware
+        # specializations of the same formula and are left alone where they
+        # applied.
+        state.bar_closes = [
+            actual_bar_close(o, opens[i + 1] if i + 1 < len(opens) else 0,
+                             state.calendar, state.timeframe)
+            for i, o in enumerate(opens)
+        ]
+
     state.sec_grid_args = (sec_tz, sec_starts, sec_hours, mode)
 
 
@@ -1786,6 +2682,26 @@ def setup_security_states(
         if chart_syminfo is not None and chart_syminfo.prefix:
             _symbols.add(f"{chart_syminfo.prefix}:{chart_symbol}")
         chart_symbols = _symbols
+
+    # The chart's own schedule — the single source of the chart bar's scheduled
+    # close and of the ``same_calendar`` test every D/W/M peer's as-of extension
+    # is gated on.
+    from .resampler import grid_mode
+    chart_calendar = BarCalendar(tz=tz)
+    if chart_syminfo is not None:
+        chart_cal_tz = tz
+        if chart_syminfo.timezone:
+            try:
+                chart_cal_tz = parse_timezone(chart_syminfo.timezone)
+            except (ValueError, KeyError):
+                chart_cal_tz = tz
+        chart_calendar = BarCalendar(
+            tz=chart_cal_tz,
+            opening_hours=tuple(chart_syminfo.opening_hours or ()),
+            session_starts=tuple(chart_syminfo.session_starts or ()),
+            corrections=chart_syminfo.session_corrections or None,
+            grid_mode=grid_mode(chart_syminfo.type, chart_syminfo.opening_hours),
+        )
 
     sec_ids = list(contexts.keys())
     sync_block = SyncBlock(sec_ids)
@@ -1897,6 +2813,10 @@ def setup_security_states(
             session_tz=anchor_tz,
             session_opening_hours=anchor_oh,
             chart_off=chart_off,
+            chart_calendar=chart_calendar,
+            chart_timeframe=chart_timeframe,
+            depends=frozenset(ctx.get('depends') or ()),
+            in_loop=bool(ctx.get('in_loop', False)),
             chart_resampler=chart_ltf_resampler if (is_ltf or plain_ltf) else None,
             chart_dwm_modifier=chart_ltf_modifier if (is_ltf or plain_ltf) else '',
         )
@@ -1905,8 +2825,29 @@ def setup_security_states(
 
         states[sec_id] = state
 
-        result_block = ResultBlock(sec_id, create=True, version=0, size=INITIAL_RESULT_SIZE)
+        # noinspection PyProtectedMember
+        state.is_dwm = tf_module._process_tf(timeframe)[0] in ('D', 'W', 'M')
+
+        result_block = ResultBlock(sec_id, create=True, version=0, size=INITIAL_RESULT_SIZE,
+                                   prefix=sync_block.block_prefix(sec_id))
         result_blocks[sec_id] = result_block
+
+    # The transformer records DIRECT producers per sid; a consumer must wait for
+    # everything it transitively depends on, so close the relation here. The set
+    # is only a FILTER and an error scope — over-approximating it costs extra
+    # waiting, never correctness (deadlock-freedom rests on program order, not on
+    # this set).
+    direct = {sid: st.depends for sid, st in states.items()}
+    for sid, st in states.items():
+        closure: set[str] = set()
+        stack = list(direct[sid])
+        while stack:
+            dep = stack.pop()
+            if dep in closure or dep not in direct:
+                continue
+            closure.add(dep)
+            stack.extend(direct[dep])
+        st.depends = frozenset(closure)
 
     return states, sync_block, result_blocks
 

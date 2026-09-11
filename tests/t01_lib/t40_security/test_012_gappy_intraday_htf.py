@@ -179,14 +179,23 @@ def __test_load_htf_bar_opens_gappy_vs_dense_intraday__(log):
             f"gappy bar_opens={gappy.bar_opens} (must be the 5 real opens)"
         assert gappy.bar_opens_multiperiod is False, "gappy intraday must use the single-period clamp"
 
-        # Dense: a bar every hour → the grid tiles → no-op (arithmetic grid is right).
+        # Dense: a bar every hour → the real opens tile the grid, and confirmation
+        # rides them (and their real closes) exactly as it does for a gappy feed:
+        # one rule, no arithmetic-grid special case.
         dense = _state()
         load_htf_bar_opens(dense, _feed(tmp, "dense", list(range(8))))
-        assert dense.bar_opens is None, f"dense feed must stay a no-op (bar_opens={dense.bar_opens})"
+        assert dense.bar_opens == [_T0 + h * _HOUR for h in range(8)], \
+            f"dense bar_opens={dense.bar_opens} (must be the 8 real opens)"
+        assert dense.bar_closes == [_T0 + (h + 1) * _HOUR for h in range(8)], \
+            f"dense bar_closes={dense.bar_closes} (must be the period ends)"
 
-        # LTF context: never an HTF-confirmation concern.
+        # LTF context: the opens and their real closes drive the intrabar
+        # target instead of HTF confirmation, so they load just the same.
         ltf = _state(is_ltf=True)
         load_htf_bar_opens(ltf, _feed(tmp, "ltf", [0, 1, 2, 3, 6]))
-        assert ltf.bar_opens is None, f"LTF must stay a no-op (bar_opens={ltf.bar_opens})"
+        assert ltf.bar_opens == [_T0 + h * _HOUR for h in (0, 1, 2, 3, 6)], \
+            f"LTF bar_opens={ltf.bar_opens} (must be the 5 real opens)"
+        assert ltf.bar_closes == [_T0 + (h + 1) * _HOUR for h in (0, 1, 2, 3, 6)], \
+            f"LTF bar_closes={ltf.bar_closes} (must be the real intrabar closes)"
 
     log.info("load_htf_bar_opens arms the clamp for a non-tiling intraday feed only")

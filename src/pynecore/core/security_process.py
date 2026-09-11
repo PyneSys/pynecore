@@ -61,12 +61,12 @@ from typing import TYPE_CHECKING, Callable, cast
 
 from ..types.na import set_bool_na
 from .security_shm import (
-    SyncBlock, ResultBlock, write_na,
+    SyncBlock, ResultBlock, write_na, FRONTIER_INF,
     FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE, FLAG_DEV_HISTORICAL,
     is_ltf_window, is_ltf_chart_developing, is_ltf_live_phase,
 )
 from .security import (
-    create_security_protocol, inject_protocol,
+    BarCalendar, actual_bar_close, create_security_protocol, inject_protocol,
 )
 from .live_ltf_collector import LiveLtfCollector
 from .plugin.live_provider import PluginSymbol
@@ -274,6 +274,13 @@ def _run_rate_source_loop(
             data_ready_event.set()
             done_event.set()
     finally:
+        # Whatever ended this loop — a shutdown, an exception, the end of the
+        # feed — release anyone still waiting on this round. A sibling's death
+        # sets EVERY child's stop_event, so this child can leave with a round
+        # outstanding; it then exits cleanly, its own watcher fires nothing,
+        # and an untimed chart wait on these events would never wake.
+        data_ready_event.set()
+        done_event.set()
         live_streamer.stop()
         result_block.close()
         sync_block.close()
@@ -402,6 +409,11 @@ def security_process_main(
         chart_timeframe: 'str | None' = None,
         plain_ltf: bool = False,
         chart_type_warmup: 'str | None' = None,
+        registry: 'dict[str, dict] | None' = None,
+        chart_calendar=None,
+        ring_conditions: dict | None = None,
+        consumer_ids: 'list[str] | None' = None,
+        registry_pipe=None,
 ):
     assert result_locks is not None, "result_locks must be provided by script_runner"
     """
@@ -444,6 +456,20 @@ def security_process_main(
         before the chart's first bar, used ONLY to seed the ``chart_type``
         recurrence (the context's bars still come from the chart). ``None``
         starts the transform cold on the first bar.
+    :param registry: Peer records for every resolved security context, keyed by
+        sec_id — timeframe, calendar, ``is_dwm``, ``gaps_on``, ``has_producer``,
+        plus this context's own ``depends`` and ``in_loop``. Children build
+        their peer state from it lazily, on the first read of each peer.
+    :param chart_calendar: The chart's trading schedule, for the chart-as-of cap.
+    :param ring_conditions: Per-sid ``multiprocessing.Condition`` created by the
+        parent; a producer notifies its own, a consumer waits on the peer's.
+    :param consumer_ids: Sids consuming THIS context. Empty means no consumer,
+        and then this context publishes no ring at all.
+    :param registry_pipe: Child end of the parent's registry pipe. The chart
+        pushes a context's record down it the moment it resolves one whose
+        symbol or timeframe only exists at runtime — such a context can be a
+        dependency of a child that was already spawned, so its record cannot
+        have been in that child's snapshot.
     """
     # Safety net first: exit if the parent is hard-killed (see the watchdog docstring).
     _start_parent_death_watchdog()
@@ -461,7 +487,8 @@ def security_process_main(
 
     # Open shared memory blocks
     sync_block = SyncBlock(all_sec_ids, create=False, name=sync_block_name)
-    result_block = ResultBlock(sec_id, create=False, version=0)
+    result_block = ResultBlock(sec_id, create=False, version=0,
+                               prefix=sync_block.block_prefix(sec_id))
 
     # Rate-source-only contexts skip the Pine machinery entirely: they only
     # exist so the chart-side ``CurrencyRateProvider`` can read a fresh
@@ -473,12 +500,6 @@ def security_process_main(
             result_locks,
         )
         return
-
-    # Create protocol functions for security context
-    (signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn,
-     ltf_take_value, ltf_publish, ltf_buffer_len) = create_security_protocol(
-        sec_id, sync_block, result_block, all_sec_ids, result_locks, is_ltf=is_ltf,
-    )
 
     # ── Source dispatch: file (backtest) or live provider (cross-symbol live) ──
     from .syminfo import SymInfo
@@ -658,6 +679,35 @@ def security_process_main(
     # Parse timezone
     from pynecore.lib import _parse_timezone
     tz = _parse_timezone(syminfo.timezone)
+
+    # This context's OWN trading schedule, straight from its own syminfo — more
+    # authoritative than the parent's registry copy, which a live provider path
+    # may not have been able to fill. Its bars' scheduled closes and the as-of
+    # calendar extension both ride it.
+    from .resampler import grid_mode as _grid_mode
+    own_calendar = BarCalendar(
+        tz=tz,
+        opening_hours=tuple(syminfo.opening_hours or ()),
+        session_starts=tuple(syminfo.session_starts or ()),
+        corrections=syminfo.session_corrections or None,
+        grid_mode=_grid_mode(syminfo.type, syminfo.opening_hours),
+    )
+    own_timeframe = str(syminfo.period)
+    registry = dict(registry or {})
+    own_record = dict(registry.get(sec_id) or {})
+    own_record['calendar'] = own_calendar
+    registry[sec_id] = own_record
+
+    # Create protocol functions for security context
+    (signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn,
+     ltf_take_value, ltf_publish, ltf_buffer_len, sec_ctx, after_bar,
+     finish_ring, prime_ring) = create_security_protocol(
+        sec_id, sync_block, result_block, all_sec_ids, result_locks, is_ltf=is_ltf,
+        registry=registry, chart_calendar=chart_calendar,
+        ring_conditions=ring_conditions, consumer_ids=consumer_ids,
+        stop_event=stop_event, data_ready_event=data_ready_event,
+        registry_pipe=registry_pipe,
+    )
 
     # Mintick decimals for OHLC grid-snapping in ``_set_lib_properties``
     # (``None`` when the symbol has no real mintick -> falls back to the
@@ -1126,8 +1176,47 @@ def security_process_main(
         else:
             lib.last_bar_index = float(bar_idx)
 
+    def _bar_open_at(idx: int) -> int:
+        """Open instant (ms) of the source bar at ``idx``, 0 past the end."""
+        _bar = _read_bar(idx)
+        return 0 if _bar is None else _bar.timestamp
+
+    def _next_frontier(next_open: int, next2_open: int) -> int:
+        """Frontier close to publish with the bar preceding ``next_open``.
+
+        "Every bar of mine closing at or before this is already in the ring" —
+        that is the next UNPUBLISHED bar's scheduled close minus one ms. A static
+        file that has run out has no next bar at all, so its producer is done and
+        the frontier goes to ``+inf``; a streaming source instead assumes the
+        schedule's next bar, which is what the chart will target next.
+        """
+        if next_open:
+            return actual_bar_close(next_open, next2_open, own_calendar,
+                                    own_timeframe) - 1
+        if reader is not None:
+            return FRONTIER_INF
+        return actual_bar_close(sec_ctx.bar_close, 0, own_calendar,
+                                own_timeframe) - 1
+
+    def _end_round() -> None:
+        """Close the round: the chart's "one round outstanding" counter, then
+        the wake-up. The counter, not the event, is what lets a chart bar keep
+        several rounds of one context in flight without mixing their slots."""
+        sync_block.increment_rounds_done(sec_id)
+        done_event.set()
+
     try:
         current_bar = 0
+        if reader is not None:
+            # The frontier this producer starts with: its first bar has not been
+            # published yet, so everything closing before that bar's close is
+            # already (vacuously) in the ring. A consumer whose own first bars
+            # close before this context's first one is released by it without
+            # the chart ever having to wake this producer.
+            _first_open = _bar_open_at(0)
+            if _first_open:
+                prime_ring(actual_bar_close(_first_open, _bar_open_at(1),
+                                            own_calendar, own_timeframe) - 1)
 
         while True:
             # Wait for chart to signal this process
@@ -1139,6 +1228,12 @@ def security_process_main(
                 break
 
             target_time = sync_block.get_target_time(sec_id)
+            # The round context travels with the target and is unpacked ONCE,
+            # here: the chart may already be writing the next round's slot while
+            # this round's bars still run, so every as-of of this round must come
+            # from these two values, not from a later re-read.
+            sec_ctx.round_tick, sec_ctx.round_sched_next_open = (
+                sync_block.get_round_context(sec_id))
             flags = sync_block.get_flags(sec_id)
             is_developing = bool(flags & FLAG_IS_DEVELOPING)
             closed_override = bool(flags & FLAG_CLOSED_OVERRIDE)
@@ -1155,7 +1250,7 @@ def security_process_main(
             if _ltf_round is not None and is_ltf_window(flags):
                 _ltf_round(flags)
                 data_ready_event.set()
-                done_event.set()
+                _end_round()
                 continue
 
             # ── (3) Live developing bar ──
@@ -1168,6 +1263,17 @@ def security_process_main(
                     open=dev_open, high=dev_high, low=dev_low,
                     close=dev_close, volume=dev_volume,
                 )
+
+                # A developing bar never appends: its re-runs share one open and
+                # would scatter duplicate entries. The frontier still stops one
+                # ms below its scheduled close, so a consumer's developing tick
+                # is not held up by a bar that has not closed.
+                sec_ctx.bar_open = dev_time_ms
+                sec_ctx.bar_close = actual_bar_close(dev_time_ms, 0, own_calendar,
+                                                     own_timeframe)
+                sec_ctx.frontier = sec_ctx.bar_close - 1
+                sec_ctx.developing = True
+                sec_ctx.is_round_last = True
 
                 is_new_dev_period = (last_dev_period_start != dev_time_ms)
                 if is_new_dev_period:
@@ -1220,8 +1326,9 @@ def security_process_main(
                 # ``snap.restore()`` rolls these back to the period baseline.
                 _ha_commit()
 
+                after_bar()
                 data_ready_event.set()
-                done_event.set()
+                _end_round()
                 continue
 
             # ── (2) Live closed bar (OHLCV from SyncBlock) ──
@@ -1234,6 +1341,14 @@ def security_process_main(
                     open=dev_open, high=dev_high, low=dev_low,
                     close=dev_close, volume=dev_volume,
                 )
+
+                sec_ctx.bar_open = dev_time_ms
+                sec_ctx.bar_close = actual_bar_close(dev_time_ms, 0, own_calendar,
+                                                     own_timeframe)
+                sec_ctx.frontier = actual_bar_close(
+                    sec_ctx.bar_close, 0, own_calendar, own_timeframe) - 1
+                sec_ctx.developing = False
+                sec_ctx.is_round_last = True
 
                 # TV semantics: a developing HTF bar and its eventual close
                 # share the same security-series index (Series.add() degrades
@@ -1285,8 +1400,9 @@ def security_process_main(
                     snap.save()
                 _ensure_child_snapshot().save()
 
+                after_bar()
                 data_ready_event.set()
-                done_event.set()
+                _end_round()
                 continue
 
             # Historical path resets dev-period tracking.
@@ -1301,9 +1417,12 @@ def security_process_main(
             # bar arrives instead of falling through to ``write_na``.
             bars_run = False
             # File-backed LTF: values written while replaying feed bars that
-            # open BEFORE the chart bar's own period (cold start mid-feed,
-            # chart session gaps) are expression-state warmup, not array
-            # content — TradingView arrays hold only the bar's own period.
+            # CLOSE at or before the chart bar's period start (cold start
+            # mid-feed, chart session gaps, intrabars already delivered to an
+            # earlier chart bar) are expression-state warmup, not array content.
+            # An intrabar straddling the period start closed inside this period
+            # and therefore belongs to this array — it was pushed over from the
+            # previous chart bar, whose close it passed.
             ltf_period_start = (
                 sync_block.get_ltf_period_start(sec_id) if is_ltf else 0
             )
@@ -1340,6 +1459,18 @@ def security_process_main(
                 if bar_time_ms > target_time:
                     break
 
+                next_open = _bar_open_at(current_bar + 1)
+                sec_ctx.bar_open = bar_time_ms
+                sec_ctx.bar_close = actual_bar_close(
+                    bar_time_ms, next_open, own_calendar, own_timeframe)
+                sec_ctx.frontier = _next_frontier(
+                    next_open, _bar_open_at(current_bar + 2) if next_open else 0)
+                sec_ctx.developing = False
+                # The round's LAST bar releases the chart AT THE WRITE, not at
+                # the end of ``main()``: a peer read standing after the write
+                # must not be able to hold the chart up.
+                sec_ctx.is_round_last = not next_open or next_open > target_time
+
                 total_bars = _current_total()
                 _set_lib_properties(_ha_apply(ohlcv_file_bar), current_bar, tz, lib, round_decimals,
                                     lossless_volume=lossless_volume,
@@ -1368,7 +1499,9 @@ def security_process_main(
                 # ``save()`` below captures the last bar's HA as the baseline.
                 _ha_commit()
 
-                if is_ltf and bar_time_ms < ltf_period_start:
+                after_bar()
+
+                if is_ltf and sec_ctx.bar_close <= ltf_period_start:
                     ltf_prefix_len = ltf_buffer_len()  # noqa - non-None when is_ltf
                 current_bar += 1
                 bars_run = True
@@ -1386,9 +1519,17 @@ def security_process_main(
                     write_na(result_block, sync_block)
 
             data_ready_event.set()
-            done_event.set()
+            _end_round()
 
     finally:
+        # Whatever ended this loop — a shutdown, an exception, the end of the
+        # feed — release anyone still waiting on this round. A sibling's death
+        # sets EVERY child's stop_event, so this child can leave with a round
+        # outstanding; it then exits cleanly, its own watcher fires nothing,
+        # and an untimed chart wait on these events would never wake.
+        data_ready_event.set()
+        done_event.set()
+        finish_ring()
         cleanup()
         if reader is not None:
             reader.close()

@@ -6,6 +6,7 @@ import ast
 import pytest
 
 from pynecore.transformers.security import SecurityTransformer
+from pynecore.transformers.security_instantiation import SecurityInstantiationTransformer
 
 
 def _transform(source: str) -> str:
@@ -959,3 +960,562 @@ def main():
     assert '__sec_read__' in result
     read_line = next(ln for ln in result.splitlines() if '__sec_read__' in ln)
     assert read_line.count('lib.na') == 3, read_line
+
+
+# --- dependency analysis, in_loop marking and signal hoisting ---
+
+
+def _sec_meta(source: str, instantiate: bool = False) -> dict[str, dict]:
+    """Transform ``source`` and return per-context metadata.
+
+    Contexts are keyed by their timeframe literal (every fixture below uses a
+    distinct one), and ``depends`` entries are translated to the same keys, so
+    the assertions stay readable instead of carrying opaque sec ids.
+    """
+    tree = ast.parse(source)
+    if instantiate:
+        tree = SecurityInstantiationTransformer().visit(tree)
+    tree = SecurityTransformer().visit(tree)
+    ast.fix_missing_locations(tree)
+
+    ctx_assign = _find_contexts(tree)
+    tf_of: dict[str, str] = {}
+    raw: dict[str, dict] = {}
+    for key, val in zip(ctx_assign.value.keys, ctx_assign.value.values):
+        entry: dict = {}
+        for k, v in zip(val.keys, val.values):
+            if k.value == 'depends':
+                entry['depends'] = [e.value for e in v.elts]
+            elif k.value == 'in_loop':
+                entry['in_loop'] = v.value
+            elif k.value == 'timeframe' and isinstance(v, ast.Constant):
+                tf_of[key.value] = v.value
+        raw[key.value] = entry
+
+    return {
+        tf_of.get(sid, sid): {
+            'depends': sorted(tf_of.get(d, d) for d in entry.get('depends', [])),
+            'in_loop': entry.get('in_loop', False),
+        }
+        for sid, entry in raw.items()
+    }
+
+
+def __test_depends_monthly_rsi_chain__(log):
+    """The dependent monthly-RSI form: the SMA context consumes the RSI one."""
+    source = """
+def main():
+    rsiMonthly = lib.request.security(lib.syminfo.tickerid, "M", lib.ta.rsi(lib.close, 14))
+    rsiSma = lib.request.security(lib.syminfo.tickerid, "W", lib.ta.sma(rsiMonthly, 14))
+"""
+    meta = _sec_meta(source)
+    assert meta['M']['depends'] == []
+    assert meta['W']['depends'] == ['M']
+    log.info("monthly RSI dependency OK")
+
+
+def __test_depends_longer_chain_is_direct_only__(log):
+    """A three-link chain records DIRECT producers only — the transitive
+    closure is the runtime's business."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.ta.sma(a, 3))
+    c = lib.request.security(lib.syminfo.tickerid, "M", lib.ta.sma(b, 3))
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['depends'] == []
+    assert meta['W']['depends'] == ['D']
+    assert meta['M']['depends'] == ['W']
+    log.info("chain dependency OK")
+
+
+def __test_back_edge_onto_later_site_is_dropped__(log):
+    """A value carried back from a LATER site is not a dependency.
+
+    The consumer's write would block on a producer whose site the chart has not
+    reached yet, and in the historical warmup batch that stops the very write
+    that releases the round. Such a value can only be a previous-bar carry, so
+    the edge is dropped and the child reads the default.
+    """
+    source = """
+def main():
+    acc = 0.0
+    b = lib.request.security(lib.syminfo.tickerid, "W", acc)
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    acc = acc + a
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == []
+    assert meta['D']['depends'] == []
+    log.info("back edge dropped OK")
+
+
+def __test_depends_implicit_flow_via_if_condition__(log):
+    """A write block standing under a tainted condition depends on it even
+    though no value flows into the expression."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    if a > 0:
+        b = lib.request.security(lib.syminfo.tickerid, "W", lib.close)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("implicit flow OK")
+
+
+def __test_depends_alias_through_container__(log):
+    """Mutating a container through an alias taints the container itself."""
+    source = """
+def main():
+    box = lib.array.new_float()
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    alias = box
+    lib.array.push(alias, a)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.array.get(box, 0))
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("alias/mutation flow OK")
+
+
+def __test_depends_through_user_function__(log):
+    """Both directions of a user call carry taint: the callee's return value
+    and the arguments the caller passes in."""
+    source = """
+def producer():
+    return lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+def scale(x):
+    return x * 2
+def main():
+    p = producer()
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.ta.sma(p, 3))
+    c = lib.request.security(lib.syminfo.tickerid, "M", scale(b))
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    assert meta['M']['depends'] == ['W']
+    log.info("user function flow OK")
+
+
+def __test_depends_tainted_return_taints_what_follows__(log):
+    """A ``return`` taken under a tainted condition makes everything after it
+    conditional on that taint."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    if a > 0:
+        return
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.close)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("tainted return OK")
+
+
+def __test_depends_unhandled_construct_falls_back_to_all__(log):
+    """An unmodelled construct in a scope makes every write in it depend on
+    every EARLIER-sited context (safe over-approximation)."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.close)
+    c = lib.request.security(lib.syminfo.tickerid, "M", lib.close)
+    try:
+        lib.plot(a)
+    except Exception:
+        lib.plot(b)
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['depends'] == []
+    assert meta['W']['depends'] == ['D']
+    assert meta['M']['depends'] == ['D', 'W']
+    log.info("fallback to all earlier sids OK")
+
+
+def __test_mutual_cycle_keeps_only_the_forward_edge__(log):
+    """A two-way flow collapses to the forward (earlier-sited) edge only."""
+    source = """
+def main():
+    prevB = 0.0
+    a = lib.request.security(lib.syminfo.tickerid, "D", prevB)
+    b = lib.request.security(lib.syminfo.tickerid, "W", a)
+    prevB = b
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['depends'] == []
+    assert meta['W']['depends'] == ['D']
+    log.info("forward edge only OK")
+
+
+def __test_depends_independent_calls_have_none__(log):
+    """Unrelated contexts keep an empty depends list."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.high)
+    lib.plot(a + b)
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['depends'] == []
+    assert meta['W']['depends'] == []
+    log.info("independent contexts OK")
+
+
+def __test_in_loop_direct_and_nested__(log):
+    """A write block inside a ``for`` / ``while`` body is marked in_loop, at
+    any nesting depth; a call outside every loop is not."""
+    source = """
+def main():
+    plain = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    for i in range(3):
+        looped = lib.request.security(lib.syminfo.tickerid, "W", lib.close)
+    for i in range(3):
+        while i > 0:
+            nested = lib.request.security(lib.syminfo.tickerid, "M", lib.close)
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['in_loop'] is False
+    assert meta['W']['in_loop'] is True
+    assert meta['M']['in_loop'] is True
+    log.info("direct in_loop marking OK")
+
+
+def __test_in_loop_propagates_through_call_chain__(log):
+    """The marking follows the call graph: a function reached from a loop
+    body writes its sids several times per bar, however deep the chain."""
+    source = """
+def deep():
+    return lib.request.security(lib.syminfo.tickerid, "M", lib.close)
+def mid():
+    return deep()
+def outside():
+    return lib.request.security(lib.syminfo.tickerid, "W", lib.close)
+def main():
+    a = outside()
+    for i in range(3):
+        b = mid()
+    c = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+"""
+    meta = _sec_meta(source)
+    assert meta['M']['in_loop'] is True
+    assert meta['W']['in_loop'] is False
+    assert meta['D']['in_loop'] is False
+    log.info("call-chain in_loop propagation OK")
+
+
+def __test_in_loop_call_after_loop_not_marked__(log):
+    """A call site standing AFTER the loop is not in the loop body."""
+    source = """
+def helper():
+    return lib.request.security(lib.syminfo.tickerid, "W", lib.close)
+def main():
+    for i in range(3):
+        lib.plot(lib.close)
+    a = helper()
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['in_loop'] is False
+    log.info("post-loop call not marked OK")
+
+
+def __test_in_loop_marks_per_clone_call_site__(log):
+    """Instantiation clones per call site, so only the clone whose site is in
+    a loop body gets marked."""
+    source = """
+def f(tf):
+    return lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+def main():
+    a = f("60")
+    for i in range(3):
+        b = f("240")
+"""
+    tree = ast.parse(source)
+    tree = SecurityInstantiationTransformer().visit(tree)
+    tree = SecurityTransformer().visit(tree)
+    ast.fix_missing_locations(tree)
+
+    # The clone is inserted right after the original, so context order is
+    # (original = "60" site, clone = "240" site inside the loop).
+    ctxs = _find_contexts(tree).value.values
+    flags = [
+        dict(zip([k.value for k in c.keys], c.values)).get('in_loop')
+        for c in ctxs
+    ]
+    assert len(flags) == 2
+    assert flags[0] is None
+    assert flags[1] is not None and flags[1].value is True
+    log.info("per-clone in_loop OK")
+
+
+def __test_hoist_name_bound_timeframe__(log):
+    """A timeframe bound once from a literal is hoisted above the signal
+    block, so the signal can start at function entry."""
+    source = """
+def main():
+    lib.plot(lib.close)
+    tf = "240"
+    v = lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+"""
+    tree = _transform_tree(source)
+    func = _find_func(tree)
+
+    hoisted = func.body[0]
+    assert isinstance(hoisted, ast.Assign)
+    assert hoisted.targets[0].id == 'tf'
+
+    signal_if = func.body[1]
+    assert isinstance(signal_if, ast.If)
+    signal_call = signal_if.body[0].value
+    assert signal_call.func.id == '__sec_signal__'
+    assert isinstance(signal_call.args[2], ast.Name)
+    assert signal_call.args[2].id == 'tf'
+
+    # The original statement order is otherwise kept and the binding is not
+    # duplicated.
+    assert _transform(source).count("tf = '240'") == 1
+    log.info("literal binding hoisting OK")
+
+
+def __test_hoist_input_derived_timeframe__(log):
+    """``input.timeframe()`` results are hoistable too — the module-level ctx
+    keeps None and the top-block signal carries the runtime value."""
+    source = """
+def main():
+    lib.plot(lib.close)
+    tf = lib.input.timeframe("60", "HTF")
+    v = lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+"""
+    tree = _transform_tree(source)
+    func = _find_func(tree)
+    assert isinstance(func.body[0], ast.Assign)
+    assert func.body[0].targets[0].id == 'tf'
+    signal_if = func.body[1]
+    assert isinstance(signal_if, ast.If)
+    assert signal_if.body[0].value.func.id == '__sec_signal__'
+
+    ctx_dict = _find_contexts(tree).value.values[0]
+    ctx_keys = [k.value for k in ctx_dict.keys]
+    tf_val = ctx_dict.values[ctx_keys.index('timeframe')]
+    assert isinstance(tf_val, ast.Constant) and tf_val.value is None
+
+    # The input is evaluated exactly once — the binding moves, it is not copied
+    assert _transform(source).count('lib.input.timeframe') == 1
+    log.info("input-derived hoisting OK")
+
+
+def __test_hoist_only_what_the_signal_needs__(log):
+    """Bindings no signal reads stay where the author put them."""
+    source = """
+def main():
+    lib.plot(lib.close)
+    unrelated = "240"
+    v = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+"""
+    tree = _transform_tree(source)
+    func = _find_func(tree)
+    # Signal block first, plot second, unrelated binding still third
+    assert isinstance(func.body[0], ast.If)
+    assert isinstance(func.body[1], ast.Expr)
+    assert isinstance(func.body[2], ast.Assign)
+    assert func.body[2].targets[0].id == 'unrelated'
+    log.info("selective hoisting OK")
+
+
+def __test_parameter_timeframe_is_not_hoisted__(log):
+    """A function parameter cannot be known at function entry, so its signal
+    stays inline."""
+    source = """
+def main(tf):
+    lib.plot(lib.close)
+    v = lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+"""
+    tree = _transform_tree(source)
+    func = _find_func(tree)
+    # No top block: the first statement is the untouched plot call
+    assert isinstance(func.body[0], ast.Expr)
+    signal_if = func.body[1]
+    assert isinstance(signal_if, ast.If)
+    assert signal_if.body[0].value.func.id == '__sec_signal__'
+    log.info("parameter stays inline OK")
+
+
+def __test_depends_on_runtime_context_is_recorded_not_rejected__(log):
+    """A producer whose context is only resolved while the bar runs is a
+    legal dependency — the runtime hands the resolved context to the child
+    over the registry pipe, so the transformer only records the edge."""
+    source = """
+def main(sym):
+    a = lib.request.security(sym, "D", lib.close)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.ta.sma(a, 3))
+"""
+    tree = ast.parse(source)
+    tree = SecurityTransformer().visit(tree)
+    ast.fix_missing_locations(tree)
+    ctx_assign = _find_contexts(tree)
+    sids = [k.value for k in ctx_assign.value.keys]
+    ctx_b = ctx_assign.value.values[1]
+    keys_b = [k.value for k in ctx_b.keys]
+    assert [e.value for e in ctx_b.values[keys_b.index('depends')].elts] == [sids[0]]
+    log.info("runtime-context dependency recorded OK")
+
+
+def __test_hoisted_context_can_be_depended_on__(log):
+    """A hoistable (input-derived) producer is a legal dependency."""
+    source = """
+def main():
+    tf = lib.input.timeframe("D", "HTF")
+    a = lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.ta.sma(a, 3))
+"""
+    tree = ast.parse(source)
+    tree = SecurityTransformer().visit(tree)
+    ast.fix_missing_locations(tree)
+    ctx_assign = _find_contexts(tree)
+    sids = [k.value for k in ctx_assign.value.keys]
+    ctx_b = ctx_assign.value.values[1]
+    keys_b = [k.value for k in ctx_b.keys]
+    deps = [e.value for e in ctx_b.values[keys_b.index('depends')].elts]
+    assert deps == [sids[0]]
+    log.info("hoisted producer dependency OK")
+
+
+def __test_length_argument_is_not_tainted_by_the_series__(log):
+    """``ta.sma(<security result>, len)`` must not taint ``len``.
+
+    A shared length input reused by a second security expression would
+    otherwise link two completely independent contexts (measured on the wild
+    corpus' Swing Data script).
+    """
+    source = """
+def main():
+    length = lib.input.int(50)
+    vol = lib.request.security(lib.syminfo.tickerid, "60", lib.volume)
+    ma = lib.ta.sma(vol, length)
+    avg = lib.request.security(lib.syminfo.tickerid, "W", ma)
+    volDa = lib.request.security(lib.syminfo.tickerid, "D", lib.volume)
+    maDa = lib.request.security(lib.syminfo.tickerid, "M", lib.ta.sma(volDa, length))
+"""
+    meta = _sec_meta(source)
+    assert meta['60']['depends'] == []
+    assert meta['W']['depends'] == ['60']
+    assert meta['D']['depends'] == []
+    assert meta['M']['depends'] == ['D']
+    log.info("length argument not tainted OK")
+
+
+def __test_display_calls_do_not_taint_their_arguments__(log):
+    """``plot`` / ``fill`` / ``table.cell`` consume values, they do not feed
+    them back into their arguments."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    shared = lib.input.float(1.0)
+    lib.plot(a * shared)
+    lib.plot(a, shared)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.ta.sma(lib.close, shared))
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == []
+    log.info("display calls do not taint OK")
+
+
+def __test_nested_helper_function_is_analysed_not_a_fallback__(log):
+    """A ``def`` nested in ``main()`` is analysed like any other scope — it is
+    not an unmodelled construct, so independent contexts stay independent."""
+    source = """
+def main(tfSlope):
+    def ma(kind, src, length):
+        if kind == "EMA":
+            return lib.ta.ema(src, length)
+        return lib.ta.sma(src, length)
+    adr = lib.request.security(lib.syminfo.tickerid, "D", lib.ta.sma(lib.high - lib.low, 21))
+    slope = lib.request.security(lib.syminfo.tickerid, tfSlope, ma("SMA", lib.close, 20))
+    rising = lib.request.security(lib.syminfo.tickerid, "W", lib.ta.rising(slope, 1))
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['depends'] == []
+    # The tfSlope context has no timeframe literal, so it is keyed by its sid
+    slope_key = next(k for k in meta if k not in ('D', 'W'))
+    assert meta[slope_key]['depends'] == []
+    assert meta['W']['depends'] == [slope_key]
+    log.info("nested helper analysed OK")
+
+
+def __test_scoped_fallback_does_not_leak_to_other_functions__(log):
+    """An unmodelled construct only affects the writes of the scope it stands
+    in, not every context in the module."""
+    source = """
+def risky():
+    try:
+        lib.plot(lib.close)
+    except Exception:
+        pass
+    return lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+def main():
+    a = risky()
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.close)
+    c = lib.request.security(lib.syminfo.tickerid, "M", lib.close)
+"""
+    meta = _sec_meta(source)
+    # risky() is called first, so its write is the earliest site: the fallback
+    # has nothing earlier to depend on, and it does not leak into main()
+    assert meta['D']['depends'] == []
+    assert meta['W']['depends'] == []
+    assert meta['M']['depends'] == []
+    log.info("scoped fallback OK")
+
+
+def __test_symbol_alias_and_series_annotation__(log):
+    """``s = syminfo.tickerid`` aliases and ``Series``-annotated assignments
+    carry no taint of their own."""
+    source = """
+def main():
+    s = lib.syminfo.tickerid
+    a = lib.request.security(s, "D", (lib.bar_index + 1) / 252)
+    b: Series = lib.request.security(s, "W", lib.close)
+    c = lib.request.security(s, "M", lib.close if b > 0 else lib.open)
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['depends'] == []
+    assert meta['W']['depends'] == []
+    assert meta['M']['depends'] == ['W']
+    log.info("alias / annotation / conditional OK")
+
+
+def __test_walrus_is_modelled_as_an_assignment__(log):
+    """A walrus binding (injected by the earlier lowering passes) carries taint
+    like a plain assignment instead of falling back to every context."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.ta.sma((carry := a), 3))
+    c = lib.request.security(lib.syminfo.tickerid, "M", lib.close)
+    lib.plot(carry)
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['depends'] == []
+    assert meta['W']['depends'] == ['D']
+    # No fallback: the unrelated third context stays independent
+    assert meta['M']['depends'] == []
+    log.info("walrus modelled OK")
+
+
+def __test_back_edge_through_user_function_is_dropped__(log):
+    """The site of a write inside a user function is the site of the CALL that
+    instantiates it, so a call standing later cannot be depended on."""
+    source = """
+def late():
+    return lib.request.security(lib.syminfo.tickerid, "M", lib.close)
+def main():
+    carry = 0.0
+    early = lib.request.security(lib.syminfo.tickerid, "D", carry)
+    carry = late()
+    after = lib.request.security(lib.syminfo.tickerid, "W", carry)
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['depends'] == []
+    assert meta['M']['depends'] == []
+    assert meta['W']['depends'] == ['M']
+    log.info("call-site ordering OK")
