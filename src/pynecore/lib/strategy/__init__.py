@@ -5112,16 +5112,6 @@ def _size_round(qty: PyneFloat) -> PyneFloat:
 
 
 # noinspection PyShadowingNames
-@overload
-def _price_round(price: float, direction: int | float) -> float: ...
-
-
-# noinspection PyShadowingNames
-@overload
-def _price_round(price: PyneFloat, direction: int | float) -> PyneFloat: ...
-
-
-# noinspection PyShadowingNames
 def _price_round(price: PyneFloat, direction: int | float) -> PyneFloat:
     """
     Round price to the nearest tick (floor if direction < 0, ceil otherwise)
@@ -5176,7 +5166,7 @@ def cancel_all():
     lib._script.position._cancel_all_orders()
 
 
-# noinspection PyProtectedMember,PyShadowingBuiltins,PyShadowingNames,PyUnusedLocal
+# noinspection PyProtectedMember,PyShadowingBuiltins,PyShadowingNames,PyUnusedLocal,unused-parameter
 def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
           qty_percent: PyneFloat = na_float, alert_message: PyneStr = na_str,
           immediately: bool = False, disable_alert: bool = False):
@@ -5272,7 +5262,7 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
         position._deferred_immediate_closes.append(order)
 
 
-# noinspection PyProtectedMember,PyShadowingNames,PyUnusedLocal
+# noinspection PyProtectedMember,PyShadowingNames,PyUnusedLocal,unused-parameter
 def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immediately: bool = False,
               disable_alert: bool = False):
     """
@@ -5861,7 +5851,7 @@ def _judge_money_entry(size: float, price: float, market: bool = False,
     return sign * granted / rfactor
 
 
-# noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins,PyUnusedLocal,DuplicatedCode
+# noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins,PyUnusedLocal,unused-parameter,DuplicatedCode
 def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_float,
           limit: int | float | None = None, stop: int | float | None = None,
           oca_name: str | None = None, oca_type: _oca.Oca | None = None,
@@ -6156,7 +6146,7 @@ def _suppress_opening_leg(position: PositionBase, id: str, direction_sign: float
     position._add_order(closing_leg)
 
 
-# noinspection PyShadowingBuiltins,PyProtectedMember,PyShadowingNames,PyUnusedLocal
+# noinspection PyShadowingBuiltins,PyProtectedMember,PyShadowingNames,PyUnusedLocal,unused-parameter
 def exit(id: str, from_entry: str = "",
          qty: PyneFloat = na_float, qty_percent: PyneFloat = na_float,
          profit: PyneFloat = na_float, limit: PyneFloat = na_float,
@@ -6541,7 +6531,7 @@ def exit(id: str, from_entry: str = "",
                     exit_order.from_entry_na = True
 
 
-# noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins,PyUnusedLocal,DuplicatedCode
+# noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins,PyUnusedLocal,unused-parameter,DuplicatedCode
 def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_float,
           limit: int | float | None = None, stop: int | float | None = None,
           oca_name: str | None = None, oca_type: _oca.Oca | None = None,
@@ -6682,7 +6672,7 @@ def account_currency() -> PyneStr:
     # Measured on TradingView (FX:EURUSD 1D): with the default currency=currency.NONE the
     # account currency is the symbol's quote currency ("USD" on EURUSD); with
     # currency=currency.EUR it is "EUR".
-    if lib._script is None:
+    if not lib._script:
         return na_str
     cur = str(lib._script.currency)
     if cur == 'NONE':
@@ -6699,7 +6689,7 @@ def avg_losing_trade() -> PyneFloat:
     # with one losing trade of 602.310640000007 booked and a short leg open at
     # 186.8205 commission, TradingView reports 789.13114; the raw field alone
     # answers 602.31064 and drifts on 14410 of 28840 bars.
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     position = lib._script.position
     if position.losstrades == 0:
@@ -6710,7 +6700,7 @@ def avg_losing_trade() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def avg_losing_trade_percent() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     position = lib._script.position
     if position.losstrades == 0:
@@ -6721,7 +6711,7 @@ def avg_losing_trade_percent() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def avg_trade() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     position = lib._script.position
     if position.closed_trades_count == 0:
@@ -6740,7 +6730,7 @@ def avg_trade_percent() -> PyneFloat:
     # ``avg_trade_percent * closedtrades`` equals
     # ``avg_winning_trade_percent * wintrades + avg_losing_trade_percent *
     # losstrades`` on all 28837 bars.
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     position = lib._script.position
     if position.closed_trades_count == 0:
@@ -6751,7 +6741,7 @@ def avg_trade_percent() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def avg_winning_trade() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     position = lib._script.position
     if position.wintrades == 0:
@@ -6762,7 +6752,7 @@ def avg_winning_trade() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def avg_winning_trade_percent() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     position = lib._script.position
     if position.wintrades == 0:
@@ -6773,7 +6763,7 @@ def avg_winning_trade_percent() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def equity() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     return lib._script.position.equity
 
@@ -6781,7 +6771,7 @@ def equity() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def eventrades() -> PyneInt:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     # A Pine int is a double at runtime
     return float(lib._script.position.eventrades)
@@ -6790,7 +6780,7 @@ def eventrades() -> PyneInt:
 # noinspection PyProtectedMember
 @module_property
 def initial_capital() -> float:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     return lib._script.initial_capital
 
@@ -6798,7 +6788,7 @@ def initial_capital() -> float:
 # noinspection PyProtectedMember
 @module_property
 def grossloss() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     return lib._script.position.grossloss + lib._script.position.open_commission
 
@@ -6810,7 +6800,7 @@ def grossloss_percent() -> PyneFloat:
     # property reports -- open commission included, so a position that is
     # still open already shows a loss percent (measured: one open 1 BTC leg at
     # 0.05% commission reports 0.004688095 against a 1e6 capital).
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     initial = lib._script.initial_capital
     if initial == 0.0:
@@ -6822,7 +6812,7 @@ def grossloss_percent() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def grossprofit() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     return lib._script.position.grossprofit
 
@@ -6830,7 +6820,7 @@ def grossprofit() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def grossprofit_percent() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     initial = lib._script.initial_capital
     if initial == 0.0:
@@ -6841,7 +6831,7 @@ def grossprofit_percent() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def losstrades() -> PyneInt:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     # A Pine int is a double at runtime
     return float(lib._script.position.losstrades)
@@ -6869,7 +6859,7 @@ def margin_liquidation_price() -> PyneFloat:
     # margin_short=30). The pointvalue factor follows the engine's other monetary
     # values; the probe symbols have pointvalue 1.
     script = lib._script
-    if script is None:
+    if not script:
         return 0.0
     position = script.position
     if not isinstance(position, SimPosition):
@@ -6908,7 +6898,7 @@ def margin_liquidation_price() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def max_contracts_held_all() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     position = lib._script.position
     long_peak = position.max_contracts_held_long
@@ -6919,7 +6909,7 @@ def max_contracts_held_all() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def max_contracts_held_long() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     return lib._script.position.max_contracts_held_long
 
@@ -6927,7 +6917,7 @@ def max_contracts_held_long() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def max_contracts_held_short() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     return lib._script.position.max_contracts_held_short
 
@@ -6935,7 +6925,7 @@ def max_contracts_held_short() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def max_drawdown() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     return lib._script.position.max_drawdown
 
@@ -6943,7 +6933,7 @@ def max_drawdown() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def max_drawdown_percent() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     return lib._script.position.max_drawdown_percent
 
@@ -6951,7 +6941,7 @@ def max_drawdown_percent() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def max_runup() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     return lib._script.position.max_runup
 
@@ -6959,7 +6949,7 @@ def max_runup() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def max_runup_percent() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     return lib._script.position.max_runup_percent
 
@@ -6967,7 +6957,7 @@ def max_runup_percent() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def netprofit() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     return lib._script.position.netprofit
 
@@ -6975,7 +6965,7 @@ def netprofit() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def netprofit_percent() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     initial = lib._script.initial_capital
     if initial == 0.0:
@@ -6986,7 +6976,7 @@ def netprofit_percent() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def openprofit() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     return lib._script.position.openprofit
 
@@ -6994,7 +6984,7 @@ def openprofit() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def openprofit_percent() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     initial = lib._script.initial_capital
     if initial == 0.0:
@@ -7005,7 +6995,7 @@ def openprofit_percent() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def position_size() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     return lib._script.position.size
 
@@ -7013,7 +7003,7 @@ def position_size() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def position_avg_price() -> PyneFloat:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     return lib._script.position.avg_price
 
@@ -7021,7 +7011,7 @@ def position_avg_price() -> PyneFloat:
 # noinspection PyProtectedMember
 @module_property
 def position_entry_name() -> PyneStr:
-    if lib._script is None:
+    if not lib._script:
         return na_str
     open_trades = lib._script.position.open_trades
     if not open_trades:
@@ -7037,7 +7027,7 @@ def position_entry_name() -> PyneStr:
 # noinspection PyProtectedMember
 @module_property
 def wintrades() -> PyneInt:
-    if lib._script is None:
+    if not lib._script:
         return 0.0
     # A Pine int is a double at runtime
     return float(lib._script.position.wintrades)

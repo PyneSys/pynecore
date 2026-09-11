@@ -26,6 +26,7 @@ from . import syminfo  # This should be imported before core.datetime to avoid c
 from . import barstate, string, log, math, plot, hline, linefill, alert, dayofweek
 from .plot import plot as _plot
 from ..types.hline import HLine
+from ..types.plot import Plot
 from . import timeframe as timeframe_module
 from . import session as session_module
 from ._fixnan import fixnan
@@ -190,7 +191,7 @@ if TYPE_CHECKING:
 # Functions
 #
 
-# noinspection PyUnusedLocal
+# noinspection PyUnusedLocal,unused-parameter
 def max_bars_back(var: Any, num: int) -> None:
     """
     Function sets the maximum number of bars that is available for historical reference of a given
@@ -765,8 +766,8 @@ def fill(*args: Any, **kwargs: Any) -> None:
             if name in kwargs:
                 raise TypeError(f"fill() got multiple values for argument '{name}'")
             kwargs[name] = value
-    plot1 = kwargs.get('plot1') if 'plot1' in kwargs else kwargs.get('hline1')
-    plot2 = kwargs.get('plot2') if 'plot2' in kwargs else kwargs.get('hline2')
+    plot1: Plot | HLine | None = kwargs.get('plot1') if 'plot1' in kwargs else kwargs.get('hline1')
+    plot2: Plot | HLine | None = kwargs.get('plot2') if 'plot2' in kwargs else kwargs.get('hline2')
     color = kwargs.get('color')
     title = kwargs.get('title')
     if title is None:
@@ -785,16 +786,16 @@ def fill(*args: Any, **kwargs: Any) -> None:
     meta = _plot_meta.get(key)
     created = meta is None
     if meta is None:
+        id1 = None if plot1 is None else plot1.id
+        id2 = None if plot2 is None else plot2.id
         if isinstance(plot1, HLine):
             meta = PlotMeta(id=key, kind='fill', title=title, color=color, editable=editable,
                             show_last=show_last, fillgaps=fillgaps, display=display,
-                            hline1=plot1.id if plot1 is not None else None,
-                            hline2=plot2.id if plot2 is not None else None)
+                            hline1=id1, hline2=id2)
         else:
             meta = PlotMeta(id=key, kind='fill', title=title, color=color, editable=editable,
                             show_last=show_last, fillgaps=fillgaps, display=display,
-                            plot1=plot1.id if plot1 is not None else None,
-                            plot2=plot2.id if plot2 is not None else None)
+                            plot1=id1, plot2=id2)
         _plot_meta[key] = meta
         _plot_meta_new.append(meta)
     if top_color is not None or bottom_color is not None \
@@ -1716,6 +1717,7 @@ def _chart_span_off_ms() -> int:
         # noinspection PyProtectedMember
         chart_mod, _ = timeframe_module._process_tf(str(syminfo.period))
         if chart_mod in ('', 'S'):
+            # noinspection PyProtectedMember
             return timeframe_module._in_seconds(str(syminfo.period)) * 1000 - 1
     except (ValueError, AssertionError):
         pass
@@ -1951,9 +1953,11 @@ def time(timeframe: str | None = None, session: str | int | None = None,
     if bars_back or timeframe_bars_back < 0:
         try:
             if bars_back:
+                # noinspection PyProtectedMember
                 current_time_ms -= bars_back * timeframe_module._in_seconds(str(syminfo.period)) * 1000
             if timeframe_bars_back < 0:
                 # A future bar has no grid to walk yet, so its nominal length is used
+                # noinspection PyProtectedMember
                 current_time_ms -= timeframe_bars_back * timeframe_module._in_seconds(timeframe) * 1000
         except (ValueError, AssertionError):
             return na_int
@@ -2233,6 +2237,7 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
         # Close time of the current chart bar — capped at the trading-day end,
         # because the last bar of a session may be shortened
         try:
+            # noinspection PyProtectedMember
             close_ms = _time + timeframe_module._in_seconds(str(syminfo.period)) * 1000
             # noinspection PyProtectedMember
             chart_mod, chart_mult = timeframe_module._process_tf(str(syminfo.period))
@@ -2260,9 +2265,11 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
     if bars_back or timeframe_bars_back < 0:
         try:
             if bars_back:
+                # noinspection PyProtectedMember
                 current_time_ms -= bars_back * timeframe_module._in_seconds(str(syminfo.period)) * 1000
             if timeframe_bars_back < 0:
                 # A future bar has no grid to walk yet, so its nominal length is used
+                # noinspection PyProtectedMember
                 current_time_ms -= timeframe_bars_back * timeframe_module._in_seconds(timeframe) * 1000
         except (ValueError, AssertionError):
             return na_int
@@ -2271,6 +2278,7 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
 
     # Calculate bar close time by adding timeframe duration
     try:
+        # noinspection PyProtectedMember
         tf_seconds = timeframe_module._in_seconds(timeframe)
         bar_close_time = bar_start_time + (tf_seconds * 1000)  # Convert to milliseconds
     except (ValueError, AssertionError):
