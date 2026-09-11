@@ -2754,6 +2754,7 @@ class ScriptRunner:
                             if is_strat and position and broker_mode \
                                     and not lib._strategy_suppressed:
                                 self._process_orders(position)
+                                cast('BrokerPosition', position).update_unrealized_pnl(float(lib.close))
                             _run_libs_and_main()
                             bar_executed = True
                         last_bar_timestamp = candle.timestamp
@@ -2770,6 +2771,7 @@ class ScriptRunner:
                             if is_strat and position and broker_mode \
                                     and not lib._strategy_suppressed:
                                 self._process_orders(position)
+                                cast('BrokerPosition', position).update_unrealized_pnl(float(lib.close))
                             _run_libs_and_main()
                             bar_executed = True
 
