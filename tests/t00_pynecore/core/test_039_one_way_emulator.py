@@ -66,6 +66,7 @@ class _FakePort:
             fail_amend_unknown_leg: str | None = None,
             fail_place_leg: Exception | None = None,
             fail_close_leg: Exception | None = None,
+            fail_close_leg_id: str | None = None,
     ) -> None:
         self._legs = list(legs)
         self._min_qty = min_qty
@@ -79,6 +80,9 @@ class _FakePort:
         # close — models a reversal's FIFO close leg the exchange rejects
         # (definitive) or whose disposition is ambiguous.
         self._fail_close_leg = fail_close_leg
+        # When set, only THIS leg's close_leg raises ``fail_close_leg``; the
+        # other legs dispatch normally — models a fan the venue cuts short.
+        self._fail_close_leg_id = fail_close_leg_id
         # Per-leg ambiguous-timeout: amend_bracket for THIS leg raises
         # OrderDispositionUnknownError, modelling an independent broker round-trip
         # that times out while the other legs amend cleanly.
@@ -106,7 +110,8 @@ class _FakePort:
         return lambda u: int(u * scale)
 
     async def close_leg(self, symbol: str, leg_id: str, volume: int, coid: str) -> None:
-        if self._fail_close_leg is not None:
+        if self._fail_close_leg is not None and (
+                self._fail_close_leg_id is None or leg_id == self._fail_close_leg_id):
             raise self._fail_close_leg
         self.closed.append((symbol, leg_id, volume, coid))
 
@@ -1091,6 +1096,131 @@ def __test_reversal_clears_breadcrumb_on_definitive_close_reject__(tmp_path):
         _run(eng.run_reversal(env, port))
     assert port.placed == []
     assert list(iter_active_residual_opens(ctx)) == []
+    breadcrumb = ctx.get_order(residual_coid)
+    assert breadcrumb is not None and breadcrumb.closed_ts_ms is not None
+    store.close()
+
+
+def _skipped_close_env(side, qty, *, synthetic_kind, pine_id="Long") -> DispatchEnvelope:
+    if synthetic_kind == 'defensive_close':
+        intent = CloseIntent(pine_id=pine_id, symbol="EURUSD", side=side, qty=qty,
+                             synthetic_kind=synthetic_kind,
+                             target_position_coid="t000-x-y-e")
+    else:
+        intent = CloseIntent(pine_id=pine_id, symbol="EURUSD", side=side, qty=qty,
+                             synthetic_kind=synthetic_kind, target_entry_id=pine_id)
+    return DispatchEnvelope(intent=intent, run_tag="t000", bar_ts_ms=1000)
+
+
+def _leg_skip() -> OrderSkippedByPlugin:
+    return OrderSkippedByPlugin(
+        "leg busy", intent_key="Long", reason="position_locked",
+    )
+
+
+def __test_run_close_partial_trigger_leg_skip_is_non_halting_and_discharges_the_row__(tmp_path):
+    """A plugin-skipped leg on an engine-trigger partial close propagates as a skip."""
+    # Measured live (ctrader cycle 121): the native fail-safe fill locked the
+    # leg the engine-trigger partial close targeted, and the plugin's per-leg
+    # POSITION_LOCKED skip surfaced as a raw reject through the fan. The skip
+    # must reach the engine as-is (re-evaluated next tick, no halt), and the
+    # persist-first pending row must not survive for a restart replay to
+    # re-close a leg the venue settled itself.
+    store, ctx = _make_store(tmp_path)
+    env = _skipped_close_env("sell", 1.0, synthetic_kind='partial_trigger')
+    port = _FakePort([_leg("20", "buy", 2.0, open_time=0.0)],
+                     fail_close_leg=_leg_skip())
+    eng = OneWayEmulator(store_ctx=ctx)
+    with pytest.raises(OrderSkippedByPlugin) as info:
+        _run(eng.run_close(env, port))
+    assert info.value.reason == "position_locked"
+    assert port.closed == []
+    assert list(iter_active_close_legs(ctx)) == []
+    leg_row = ctx.get_order(f"{env.client_order_id(KIND_CLOSE)}:20")
+    assert leg_row is not None and leg_row.closed_ts_ms is not None
+    store.close()
+
+
+def __test_run_close_leg_skip_after_a_dispatched_leg_is_a_partial_success__(tmp_path):
+    """A skip on a later leg ends the fan as a partial success, keeping the sent legs."""
+    # Leg 10 went on the wire before leg 11 was declined: its fill is coming
+    # back, so the caller must own it (order mapping, fill ledger) — the fan
+    # returns what it sent instead of raising the skip, and the Pine-unit
+    # dispatched quantity covers only the sent leg.
+    store, ctx = _make_store(tmp_path)
+    env = _skipped_close_env("sell", 3.0, synthetic_kind='partial_trigger')
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0),
+                      _leg("11", "buy", 1.0, open_time=1.0)],
+                     fail_close_leg=_leg_skip(), fail_close_leg_id="11")
+    eng = OneWayEmulator(store_ctx=ctx)
+    res = _run(eng.run_close(env, port))
+    assert res.legs == (("10", 2),)
+    assert res.dispatched_qty == 2.0
+    assert res.skipped is False
+    assert _dispatched(port) == [("10", 2)]
+    assert list(iter_active_close_legs(ctx)) == []
+    parent = env.client_order_id(KIND_CLOSE)
+    skipped_row = ctx.get_order(f"{parent}:11")
+    assert skipped_row is not None and skipped_row.closed_ts_ms is not None
+    store.close()
+
+
+def __test_run_close_defensive_leg_skip_after_a_dispatched_leg_still_rejects__(tmp_path):
+    """A non-skippable close keeps the definitive reject even mid-fan."""
+    store, ctx = _make_store(tmp_path)
+    env = _skipped_close_env("sell", 3.0, synthetic_kind='defensive_close')
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0),
+                      _leg("11", "buy", 1.0, open_time=1.0)],
+                     fail_close_leg=_leg_skip(), fail_close_leg_id="11")
+    eng = OneWayEmulator(store_ctx=ctx)
+    with pytest.raises(ExchangeOrderRejectedError):
+        _run(eng.run_close(env, port))
+    assert _dispatched(port) == [("10", 2)]
+    assert list(iter_active_close_legs(ctx)) == []
+    store.close()
+
+
+def __test_run_close_script_close_leg_skip_is_non_halting__(tmp_path):
+    """A plain script close is skippable per leg the same way."""
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("20", "buy", 2.0, open_time=0.0)],
+                     fail_close_leg=_leg_skip())
+    eng = OneWayEmulator(store_ctx=ctx)
+    with pytest.raises(OrderSkippedByPlugin):
+        _run(eng.run_close(_close_env("sell", 2.0), port))
+    assert list(iter_active_close_legs(ctx)) == []
+    store.close()
+
+
+def __test_run_close_defensive_leg_skip_stays_a_definitive_reject__(tmp_path):
+    """A defensive close keeps the loud contract: the leg skip becomes a reject."""
+    store, ctx = _make_store(tmp_path)
+    env = _skipped_close_env("sell", 2.0, synthetic_kind='defensive_close')
+    port = _FakePort([_leg("20", "buy", 2.0, open_time=0.0)],
+                     fail_close_leg=_leg_skip())
+    eng = OneWayEmulator(store_ctx=ctx)
+    with pytest.raises(ExchangeOrderRejectedError) as info:
+        _run(eng.run_close(env, port))
+    assert isinstance(info.value.__cause__, OrderSkippedByPlugin)
+    assert list(iter_active_close_legs(ctx)) == []
+    store.close()
+
+
+def __test_reversal_leg_skip_is_a_definitive_reject_and_clears_breadcrumb__(tmp_path):
+    """A reversal's FIFO close leg skipped by the plugin is a definitive reject."""
+    # The residual never opens and the breadcrumb is discharged exactly as for
+    # a venue reject — a skipped close leg can never leave a reversal half-run.
+    store, ctx = _make_store(tmp_path)
+    env = _entry_env("buy", 3.0)
+    residual_coid = f"{env.client_order_id(KIND_CLOSE)}:residual"
+    port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)],
+                     fail_close_leg=_leg_skip())
+    eng = OneWayEmulator(store_ctx=ctx)
+    with pytest.raises(ExchangeOrderRejectedError):
+        _run(eng.run_reversal(env, port))
+    assert port.placed == []
+    assert list(iter_active_residual_opens(ctx)) == []
+    assert list(iter_active_close_legs(ctx)) == []
     breadcrumb = ctx.get_order(residual_coid)
     assert breadcrumb is not None and breadcrumb.closed_ts_ms is not None
     store.close()
