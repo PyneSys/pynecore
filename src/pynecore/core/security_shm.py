@@ -33,8 +33,8 @@ if TYPE_CHECKING:
 #   offset 8:   uint32  version         (4 bytes) — result block version (incremented on realloc)
 #   offset 12:  uint32  result_size     (4 bytes) — current pickle data size in bytes
 #   offset 16:  int64   target_time     (8 bytes) — target time the process should advance to
-#   offset 24:  uint8   flags           (1 byte)  — state flags
-#   offset 25:  3 bytes pad (alignment to 28)
+#   offset 24:  uint16  flags           (2 bytes) — state flags
+#   offset 26:  2 bytes pad (alignment to 28)
 #   offset 28:  int32   ring_count      (4 bytes) — number of live ring entries
 #   offset 32:  float64 dev_open        (8 bytes) — developing HTF bar OHLCV (lookahead_on live)
 #   offset 40:  float64 dev_high        (8 bytes)
@@ -68,9 +68,9 @@ if TYPE_CHECKING:
 # index, column = producer slot index): the oldest instant a consumer may still
 # need from that producer. The ring GC drops entries below the minimum over the
 # producer's consumers (keeping the last entry at or below it).
-SLOT_FORMAT = '<IIqB'
+SLOT_FORMAT = '<IIqH'
 SLOT_SIZE = 128
-SLOT_DATA_SIZE = struct.calcsize(SLOT_FORMAT)  # 17 bytes — original fields only
+SLOT_DATA_SIZE = struct.calcsize(SLOT_FORMAT)  # 18 bytes — original fields only
 _FRONTIER_OFFSET = 0
 _RESULT_META_OFFSET = 8
 _TARGET_TIME_OFFSET = 16
@@ -113,6 +113,11 @@ FLAG_DEV_HISTORICAL = 0x80  # the pushed developing/closed OHLCV was aggregated 
                             # HISTORICAL chart bar (backtest or live warmup), so the
                             # subprocess must keep history barstate instead of the
                             # realtime phase the live transport implies
+FLAG_MORE_STEPS = 0x100  # this round is NOT the last step the chart queued for the
+                         # current chart bar: a further publication (in particular a
+                         # developing append AT ``round_tick``) is still pending, so
+                         # this round must not advertise a frontier that reaches
+                         # ``round_tick`` (see ``_capped_frontier``)
 
 
 def is_ltf_window(flags: int) -> bool:
@@ -273,14 +278,14 @@ class SyncBlock:
         return self._get_i64(sec_id, _LTF_PERIOD_START_OFFSET)
 
     def set_flags(self, sec_id: str, flags: int):
-        """Set the flags byte."""
+        """Set the flags field."""
         off = self._offset(sec_id) + _FLAGS_OFFSET
-        struct.pack_into('<B', self._buf, off, flags)
+        struct.pack_into('<H', self._buf, off, flags)
 
     def get_flags(self, sec_id: str) -> int:
-        """Read the flags byte."""
+        """Read the flags field."""
         off = self._offset(sec_id) + _FLAGS_OFFSET
-        return struct.unpack_from('<B', self._buf, off)[0]
+        return struct.unpack_from('<H', self._buf, off)[0]
 
     # --- ring state -------------------------------------------------------
 

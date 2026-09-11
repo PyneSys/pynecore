@@ -29,7 +29,7 @@ from .security_shm import (
     SyncBlock, ResultBlock, ResultReader, INITIAL_RESULT_SIZE,
     FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE, FLAG_DEV_HISTORICAL,
     FLAG_LTF_WINDOW, FLAG_LTF_CHART_DEVELOPING, FLAG_LTF_LIVE_PHASE,
-    RingReader, RingWriter, write_result,
+    FLAG_MORE_STEPS, RingReader, RingWriter, write_result,
 )
 
 if TYPE_CHECKING:
@@ -819,6 +819,32 @@ def create_chart_protocol(
         state.done_event.clear()
         state.needs_wait = False
 
+    def _settle_no_round(sec_id: str, state: SecurityState) -> None:
+        """Publish the round's as-of as the frontier of a context NOT launched.
+
+        A producer's frontier reaches exactly as far as what it published: a
+        round goes no further than its own as-of instant, deliberately — a wider
+        claim would let a consumer running on the NEXT tick pass its wait and
+        read the value of this one. So whoever settles the round has to
+        raise the frontier: the producer itself at its write when the chart
+        launches it, and the chart here, at the producer's own signal, when it
+        decides there is no round to run.
+
+        Skipping the launch IS the statement that no bar of this context closes
+        at or before the chart's as-of beyond what its ring already holds, so
+        the raise is exactly as true as that decision — and a consumer's own
+        as-of never exceeds it, which is what releases the waiter.
+        """
+        cond = ring_conditions.get(sec_id)
+        if cond is None or not consumers_by_sid.get(sec_id):
+            return
+        asof = chart_asof(state, round_state['chart_time'], round_state['next_time'],
+                          0 if lib.barstate.isconfirmed else round_state['tick'])
+        with cond:
+            if asof > sync_block.get_frontier_close(sec_id):
+                sync_block.set_frontier_close(sec_id, asof)
+            cond.notify_all()
+
     def _launch(sec_id: str, state: SecurityState) -> None:
         """Hand the prepared slot to the child and count the round.
 
@@ -826,7 +852,22 @@ def create_chart_protocol(
         child unpacks both at the start of its round and derives its chart-side
         as-of cap from its own slot, never from a peer's, whose slot the chart
         may already have written for the next round.
+
+        ``FLAG_MORE_STEPS`` rides along: one chart bar can queue several rounds
+        for the same context (prefill, closed, developing) that all share the
+        SAME ``round_tick``, and a step that is not the last one must not
+        advertise a frontier reaching that tick -- a consumer released by it
+        would read this step's value instead of waiting for the pending
+        developing append at the very same instant. ``pending_live`` holds the
+        steps still to come, so it is filled BEFORE the first step runs and each
+        further step pops itself off before launching.
         """
+        flags = sync_block.get_flags(sec_id)
+        if state.pending_live:
+            flags |= FLAG_MORE_STEPS
+        else:
+            flags &= ~FLAG_MORE_STEPS
+        sync_block.set_flags(sec_id, flags)
         sync_block.set_round_context(sec_id, round_state['tick'],
                                      round_state['sched_next_open'])
         state.data_ready.clear()
@@ -924,6 +965,7 @@ def create_chart_protocol(
                     state.ltf_skip = True
                     state.new_period = True
                     state.needs_wait = False
+                    _settle_no_round(sec_id, state)
                     return
             elif state.bar_opens is not None and state.bar_closes is not None:
                 # File-backed: the last intrabar whose scheduled close reaches
@@ -936,6 +978,7 @@ def create_chart_protocol(
                     state.ltf_skip = True
                     state.new_period = True
                     state.needs_wait = False
+                    _settle_no_round(sec_id, state)
                     return
                 target_time = state.bar_opens[idx]
             elif (state.chart_dwm_modifier and state.chart_resampler is not None
@@ -1024,6 +1067,7 @@ def create_chart_protocol(
                     state.ltf_skip = True
                     state.new_period = True
                     state.needs_wait = False
+                    _settle_no_round(sec_id, state)
                     return
                 ltf_target_time = state.bar_opens[idx]
             state.ltf_skip = False
@@ -1187,8 +1231,12 @@ def create_chart_protocol(
                         ))
 
                 if steps:
-                    steps[0]()
+                    # The queue is filled FIRST: ``_launch`` reads it to decide
+                    # whether this round is the chart bar's last publication.
                     state.pending_live = steps[1:]
+                    steps[0]()
+                else:
+                    _settle_no_round(sec_id, state)
                 return
             # Historical OFF / LAST_CLOSED warmup falls through to the
             # closed-only flow below; the aggregator state has already advanced
@@ -1211,6 +1259,7 @@ def create_chart_protocol(
             _launch(sec_id, state)
         else:
             state.new_period = False
+            _settle_no_round(sec_id, state)
 
     def __sec_write__(sec_id: str, value, _scope_id=None):
         if sec_id not in same_context_ids or result_blocks is None:
@@ -1413,13 +1462,14 @@ class SecurityChildContext:
     :ivar bar_open: Open instant (ms) of the bar being run.
     :ivar bar_close: That bar's scheduled close (``close_A``), in ms.
     :ivar frontier: Frontier close to publish with the bar's append — the next
-        unpublished bar's ``close_A`` minus one ms.
+        unpublished bar's ``close_A`` minus one ms, or the round's own as-of on
+        a developing run, which is as far as such a run publishes.
     :ivar is_round_last: Whether this is the round's last bar, i.e. the chart
         may be released as soon as the value is written.
-    :ivar developing: Whether this run is a developing (unconfirmed) one. Such
-        a run never appends to the ring (its re-runs would duplicate the entry)
-        and takes the round's fixed tick as its as-of base instead of the
-        scheduled close, which lies in the future.
+    :ivar developing: Whether this run is a developing (unconfirmed) one. Such a
+        run appends at the round's fixed tick instead of a scheduled close, and
+        takes that same tick as its own as-of base — the scheduled close lies in
+        the future.
     :ivar round_tick: The round's fixed tick instant, written by the chart into
         this context's slot together with the target.
     :ivar round_sched_next_open: End of the scheduled break containing
@@ -1733,9 +1783,10 @@ def create_security_protocol(
                 # nested one — a consumer of the same round would otherwise see
                 # the PREVIOUS closed bar while the chart sees this one. It
                 # cannot look ahead: the entry is paired by its as-of, and a
-                # consumer never asks beyond its own. The frontier still rises
-                # to the bar's own ``close_A - 1``, so a consumer whose as-of
-                # sits above this tick is not held back by it.
+                # consumer never asks beyond its own. The frontier goes no
+                # further than the round's own as-of (``ctx.frontier``), so a
+                # consumer running on a LATER tick waits for that tick's round
+                # instead of passing the wait and reading this one.
                 close_ms = ctx.round_tick if ctx.developing else ctx.bar_close
                 writer.append(ctx.bar_open, close_ms, value,
                               consumer_indexes, ctx.frontier)
@@ -1826,7 +1877,7 @@ def create_security_protocol(
         released. Also parks the GC watermark for every peer this context can
         read, so a conditional read cannot pin a producer's ring forever.
         """
-        if writer is not None and not bar_written[0] and not ctx.developing:
+        if writer is not None and not bar_written[0]:
             writer.set_frontier_close(ctx.frontier)
         bar_written[0] = False
         bar_value[0] = None

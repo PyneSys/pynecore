@@ -142,6 +142,32 @@ def __test_gap_still_closes_on_next_period_bar__(log):
     assert dev.period_start == _ms(2026, 5, 21, 12, 0)
 
 
+def __test_dwm_chart_closes_together_with_a_fresh_developing_bar__(log):
+    """A D/W/M chart (no arithmetic span) always delivers the close WITH a developing bar.
+
+    ``chart_span_ms`` is 0 for daily/weekly/monthly charts, which disables the
+    close-instant completion rule — every period then closes through the
+    next-period fallback, and that branch returns the closed bar and the freshly
+    opened developing bar in the SAME call. The chart turns such a call into two
+    queued rounds sharing one tick, so the pair is not an edge case of gappy
+    data but the normal shape on a D/W/M chart.
+    """
+    agg = HTFAggregator("W", _UTC, chart_span_ms=0)
+    day = 86_400_000
+    # 2026-05-18 is a Monday: a full week of daily chart bars, then the next one.
+    start = _ms(2026, 5, 18)
+    for i in range(7):
+        _, dev, closed = agg.update(start + i * day, 1.0, 1.0, 1.0, 1.0 + i, 1.0)
+        assert closed is None
+        assert dev is not None
+
+    is_new, dev, closed = agg.update(start + 7 * day, 2.0, 2.0, 2.0, 2.0, 1.0)
+    assert is_new is True
+    assert closed is not None and dev is not None
+    assert closed.period_start == start
+    assert dev.period_start == start + 7 * day
+
+
 def __test_current_property_returns_state__(log):
     """``current`` is None before any update and after reset, else the developing bar."""
     agg = HTFAggregator("60", _UTC)
