@@ -238,6 +238,7 @@ class Order:
         "comm_booking",  # Commission pool shared by the two legs of a reversal (see _fill_order)
         "reversal_leg",  # Closing leg an entry order was split into when it flipped the position
         "placed_fill_seq",  # Fills processed before this order was booked (see _fill_order)
+        "act_seq",  # Activation slot: the order's place in a simultaneous-trigger batch
     )
 
     def __init__(
@@ -276,6 +277,14 @@ class Order:
 
         self.reversal_leg = False
         self.placed_fill_seq = -1
+        # Where this order stands among the orders triggering at one instant. A
+        # fresh order takes the next slot when it reaches the book; a re-issue
+        # that leaves the resting order's levels and quantity alone keeps that
+        # order's slot, one that changes them takes a new one; a sticky exit
+        # leg issued against a still-pending entry takes its slot only when that
+        # entry fills, because it did not exist as an order before (see
+        # ``SimPosition._add_order`` / ``_bind_entry``).
+        self.act_seq = 0
 
         self.oca_name = oca_name
         self.oca_type = oca_type if oca_type is not None else _oca.none
@@ -307,13 +316,15 @@ class Order:
                                 and self.trail_points_ticks is None)
 
         self.cancelled = False
-        # True while this exit leg sits in the bar-open gap batch. MEASURED on
-        # TradingView (BINANCE:BTCUSDT 30m, 6/6 events): when a stop entry that
-        # reverses the position and a strategy.exit stop BOTH gap through the
-        # same open, both fill there -- the exit is not cancelled by the reversal
-        # that filled a moment earlier. It sells its own quantity a second time
-        # and opens a fresh position under its own exit id. Only the gap batch
-        # behaves this way: an exit level first reached inside the bar (18/18
+        # True while this exit leg sits in a simultaneous-trigger batch: the
+        # bar-open gap batch, or one price level of the intrabar walk (see
+        # SimPosition._walk_leg). MEASURED on TradingView (BINANCE:BTCUSDT 30m,
+        # 6/6 events): when a stop entry that reverses the position and a
+        # strategy.exit stop BOTH gap through the same open, both fill there --
+        # the exit is not cancelled by the reversal that filled a moment earlier.
+        # It sells its own quantity a second time and opens a fresh position
+        # under its own exit id. Only a batch behaves this way: an exit level
+        # first reached inside the bar after a reversal at ANOTHER level (18/18
         # events) and one outlived by a MARKET reversal (6/6) are cancelled unfilled.
         self.gap_committed = False
         self.deferred_qty = False
@@ -480,6 +491,22 @@ class _EntryBinding:
 
 
 # noinspection PyShadowingNames,DuplicatedCode
+def _same_order_slot(resting: Order, issued: Order) -> bool:
+    """True if re-issuing ``issued`` over ``resting`` only modifies it in place.
+
+    The price levels and the quantity decide (see ``SimPosition._add_order``);
+    the comment, alert text and OCA settings ride along without re-slotting.
+    """
+    return (resting.size == issued.size
+            and resting.limit == issued.limit
+            and resting.stop == issued.stop
+            and resting.trail_price == issued.trail_price
+            and resting.trail_offset == issued.trail_offset
+            and resting.profit_ticks == issued.profit_ticks
+            and resting.loss_ticks == issued.loss_ticks
+            and resting.trail_points_ticks == issued.trail_points_ticks)
+
+
 class PriceOrderBook:
     """
     Price-based sorted order storage.
@@ -955,7 +982,7 @@ class SimPosition(PositionBase):
         'risk_cons_loss_days', 'risk_last_trading_day', 'risk_last_day_equity',
         'risk_intraday_filled_orders', 'risk_intraday_start_equity',
         '_deferred_margin_call', '_mc_stage2', '_fill_counter', '_last_fill_price', '_partial_close_bar',
-        '_entry_book', '_entry_seq', '_deferred_immediate_closes', '_coof_cursor', '_market_fill_price',
+        '_entry_book', '_entry_seq', '_act_counter', '_deferred_immediate_closes', '_coof_cursor', '_market_fill_price',
         '_walk_node', '_path_node'
     )
 
@@ -993,6 +1020,7 @@ class SimPosition(PositionBase):
         # above is the FIFO view TradingView reports (see _EntryBinding).
         self._entry_book: list[_EntryBinding] = []
         self._entry_seq: int = 0
+        self._act_counter: int = 0
 
         # Trade statistics
         self.closed_trades_count: int = 0
@@ -1209,9 +1237,25 @@ class SimPosition(PositionBase):
             existing_order = self.entry_orders.get(order.order_id)
             self.entry_orders[order.order_id] = order
 
-        # Remove existing order from order book before adding new one
+        # Remove existing order from order book before adding new one. A re-issue
+        # that leaves the price levels and the quantity alone modifies the resting
+        # order in place and keeps its activation slot; one that moves a level or
+        # changes the quantity replaces it with a NEW order, slotted behind
+        # everything already resting. MEASURED on TradingView (BINANCE:BTCUSDT
+        # 30m, a reversing stop entry and a `strategy.exit` stop leg on ONE
+        # level): re-placing the entry every bar unchanged (probe 11), or with
+        # only its comment changing (probe 13b), still fills it before the leg
+        # issued after it, and the leg re-issued unchanged every bar still fills
+        # before the entry placed after it (probe 12); re-placing the entry with
+        # a different quantity (probe 13a) or moving its stop away and back
+        # (probe 13c) puts it behind the leg.
         if existing_order is not None:
             self.orderbook.remove_order(existing_order)
+            if _same_order_slot(existing_order, order):
+                order.act_seq = existing_order.act_seq
+        if order.act_seq == 0:
+            self._act_counter += 1
+            order.act_seq = self._act_counter
 
         # Add order to order book (automatically adds to all relevant prices)
         self.orderbook.add_order(order)
@@ -1302,6 +1346,18 @@ class SimPosition(PositionBase):
         is re-keyed onto the new binding. Without the hand-over the script's next
         ``strategy.exit`` call would find the binding uncovered and add a SECOND
         leg beside the pending-bound one, and the pair would over-close.
+
+        The leg comes to life with this fill: it takes its activation slot here
+        (a batch it shares with an order placed while it was still waiting runs
+        that order first), and a no-qty "rest" leg is sized to the WHOLE fill.
+        Its reservation was taken off the pending order's openable estimate, and
+        a price-based reversal opens more than that when part of its frozen flip
+        finds nothing left to close (an exit leg of the old position got there
+        first): the unspent flip opens under the entry's id, and the leg covers
+        it too. MEASURED on TradingView (BINANCE:BTCUSDT 30m, probe 8): long 1 +
+        long 2, a stop leg on the second long and a reversing short stop of 2 on
+        ONE level -- the leg closes 2, the short closes 1 and opens 4, and its
+        pending-bound no-qty leg then closes all 4.
         """
         self._entry_seq += 1
         binding = _EntryBinding(self._entry_seq, entry_id, size, entry_price, exit_opened)
@@ -1314,6 +1370,15 @@ class SimPosition(PositionBase):
                 self.exit_orders.pop(_exit_order_key(exit_order), None)
                 exit_order.entry_seq = binding.seq
                 self.exit_orders[_exit_order_key(exit_order)] = exit_order
+                self._act_counter += 1
+                exit_order.act_seq = self._act_counter
+                if exit_order.rest_leg:
+                    extra = _size_round(binding.init_size - exit_order.bound_size)
+                    if extra != 0.0:
+                        grown = max(_size_round(exit_order.reserved_size + extra), 0.0)
+                        exit_order.reserved_size = grown
+                        exit_order.bound_size = binding.init_size
+                        exit_order.size = math.copysign(grown, exit_order.size)
 
     def _binding(self, seq: int | None) -> '_EntryBinding | None':
         """The live binding with this sequence number, or None once it is spent."""
@@ -1441,8 +1506,11 @@ class SimPosition(PositionBase):
         # broker records is that level snapped to a tick.
         price = _tick_snap(price)
 
-        # Close orders cannot fill when no position exists
-        if order.order_type == _order_type_close and self.size == 0.0:
+        # Close orders cannot fill when no position exists -- except a leg locked
+        # into a simultaneous-trigger batch, which opens what it could not close
+        # under its own exit id (see _commit_leg).
+        if (order.order_type == _order_type_close and self.size == 0.0
+                and not (order.gap_committed and order.exit_id is not None)):
             return
 
         # Record same-bar partial strategy.close() fills (stamped close carrying an
@@ -1800,8 +1868,13 @@ class SimPosition(PositionBase):
                 if entry_mark < self.min_equity:
                     self.min_equity = entry_mark
 
-        # New trade
-        elif order.order_type != _order_type_close or order.gap_committed:
+        # New trade. A gap-committed leg opens under its own exit id only while it
+        # still has size: a consumed tombstone is re-filled as a no-op on every
+        # later bar (see the `_partial_close_bar` note above), and opening that
+        # would leave a 0-size ghost trade holding a pyramiding slot — and divide
+        # by zero the next time a closing fill walks it.
+        elif (order.order_type != _order_type_close
+              or (order.gap_committed and _size_round(order.size) != 0.0)):
             # Calculate commission
             if commission_value:
                 if commission_type == _commission.cash_per_order:
@@ -1983,6 +2056,18 @@ class SimPosition(PositionBase):
             if (order.order_type == _order_type_close or close_only) and (
                     order.order_id is not None
                     or self._partial_close_bar == int(lib.bar_index)):
+                if order.gap_committed and order.exit_id is not None:
+                    # A leg locked into a simultaneous-trigger batch runs its
+                    # batch-start quantity out (see _commit_leg): the closing
+                    # part settles its binding under the exit id, and the rest
+                    # opens under that id. One TradingView order, one commission.
+                    order.comm_booking = [Decimal(0), 0.0, [], abs(order.size)]
+                    order.size = -self.size
+                    self._fill_order(order, price)
+                    order.size = new_size
+                    self._fill_order(order, price, counts_as_filled_order=False)
+                    order.comm_booking = None
+                    return True
                 # Limit the exit order size to just close the position
                 order.size = -self.size
                 self._fill_order(order, price)
@@ -2218,6 +2303,47 @@ class SimPosition(PositionBase):
 
         return None
 
+    def _commit_leg(self, leg: Order) -> None:
+        """Lock an exit leg into the simultaneous-trigger batch that is starting.
+
+        The leg fills with the quantity it had when the batch started, whatever
+        the batch's earlier fills do to its binding: TradingView sizes an exit
+        leg off its entry's remaining quantity (a partial ``strategy.close`` of
+        the entry shrinks the leg, probe 10), but a close from INSIDE the batch
+        comes too late to shrink it. So the size is capped to the binding here,
+        once, and :meth:`fill_order` then lets a committed leg run that size out
+        past flat, opening the remainder under its own exit id. MEASURED on the
+        wild `PercentX Trend Follower [Trendoscope]` reference (BINANCE:BTCUSDT
+        30m, 2025-01-13 00:30): a long stop entry of 0.10612 placed BEFORE the
+        leg closes that much of the short 0.21532, and the leg then closes the
+        remaining 0.1092 and opens long 0.10612 under `ExitShort`.
+        """
+        leg.gap_committed = True
+        binding = self._binding(leg.entry_seq)
+        cap = binding.bound if binding is not None else abs(self.size)
+        if abs(leg.size) > cap:
+            leg.size = math.copysign(cap, leg.size)
+
+    def _leg_locked_into_batch(self, order: Order) -> bool:
+        """True if this exit leg may be locked into the current level batch.
+
+        Only a leg standing on its OWN live binding qualifies. A sibling issued
+        against an entry order that has not filled yet (``entry_seq`` still None)
+        shares the ``from_entry`` id with a live binding but protects nothing, and
+        arming it would let it open a position of its own once the batch's reversal
+        flattens what the OTHER leg was bound to.
+
+        A ``from_entry``-less leg never qualifies. The batch rule was measured on
+        bound brackets only, and such legs close the position as a group: on the
+        wild `Two Take Profit Strategy` reference (CAPITALCOM:EURUSD 30m) an
+        `Exit1` half-size leg and a full-size `Exit2` share one stop level, and
+        locking them into the batch stops the half-close from splitting the trade
+        — 1229 reference trades against 1200, whole-trade agreement 1.0 -> 0.80.
+        """
+        if order.order_id is None or order.from_entry_na:
+            return False
+        return order.entry_seq is not None and self._binding(order.entry_seq) is not None
+
     def _exit_awaits_entry(self, order: Order) -> bool:
         """True while an exit leg bound to a ``from_entry`` has no open trade to act on.
 
@@ -2227,6 +2353,13 @@ class SimPosition(PositionBase):
         toward the filled-order caps even though there is nothing it can close.
         """
         if order.order_type != _order_type_close or order.order_id is None or order.from_entry_na:
+            return False
+        # A leg locked into the current simultaneous-trigger batch was active when
+        # that batch started (the arming point checks it here). A fill from INSIDE
+        # the batch — the reversal that just spent its binding — does not deactivate
+        # it: TradingView fills it too, opening under its own exit id (see
+        # ``Order.gap_committed`` and the level batch in :meth:`_walk_leg`).
+        if order.gap_committed:
             return False
         return not self._has_bound(order.order_id)
 
@@ -2369,7 +2502,7 @@ class SimPosition(PositionBase):
         """
         if not awaiting:
             return
-        entry_price = self._entry_fill_price(entry_id)
+        entry_price = self._latest_entry_fill_price(entry_id)
         if entry_price is None:
             return
         for order in [o for o in awaiting if o.order_id == entry_id]:
@@ -2379,6 +2512,24 @@ class SimPosition(PositionBase):
             if self._process_trailing_stop(
                     order, ohlc, start=entry_price, rising=rising) == _trail_pending:
                 close_leg_queue.append(order)
+
+    def _latest_entry_fill_price(self, entry_id: str | None) -> float | None:
+        """Fill price of the entry that JUST filled under this id.
+
+        :meth:`_entry_fill_price` answers for a leg's OWN binding and falls back to
+        the FIRST open trade of the id. The activation path needs the opposite end:
+        the binding this very fill created. A pyramid add — or a position a
+        gap-committed exit leg opened earlier on this same level — leaves older
+        trades under the id, and pricing the fresh bracket off one of those fires
+        it immediately at a stale price that is nowhere near the bar.
+
+        :param entry_id: ``from_entry`` id of the entry that just filled
+        :return: The newest binding's entry price, or None when there is none
+        """
+        for binding in reversed(self._entry_book):
+            if binding.entry_id == entry_id:
+                return binding.entry_price
+        return self._entry_fill_price(entry_id)
 
     def _activate_brackets_on_fill(self, entry_id: str | None,
                                    activated: list['Order']) -> None:
@@ -2404,7 +2555,7 @@ class SimPosition(PositionBase):
         """
         if not self.exit_orders:
             return
-        fill_price = self._entry_fill_price(entry_id)
+        fill_price = self._latest_entry_fill_price(entry_id)
         if fill_price is None:
             return
         slippage = lib._script.slippage
@@ -2526,6 +2677,45 @@ class SimPosition(PositionBase):
             else:
                 levels = book.iter_levels(max_price=resume, min_price=leg_end, desc=True)
             for price, orders in levels:
+                # Everything resting at ONE price triggers at the same instant, so a
+                # level is a batch just like the bar-open gap batch: it runs in
+                # ACTIVATION order (``Order.act_seq``) -- the order that reached the
+                # book first, a re-issue keeping its slot, a leg bound to a pending
+                # entry slotted at that entry's fill. An entry is not privileged
+                # over an exit leg: a leg activated before the reversing entry
+                # closes what it is bound to before that entry ever sees it. A leg
+                # activated after the entry is not cancelled by a fill from inside
+                # the batch -- it fills too, with its batch-start quantity, and
+                # opens what it cannot close under its own exit id.
+                # MEASURED on TradingView (BINANCE:BTCUSDT 30m, `strategy.exit`
+                # stop leg and a reversing stop entry on ONE level):
+                #   leg issued BEFORE the entry, bound to one layer of a larger
+                #     position -> the leg closes its own quantity, then the entry
+                #     closes the rest and opens its frozen-flip excess plus its
+                #     own quantity (both under the ENTRY's id) -- the layer the
+                #     leg is bound to may sit BEHIND another one (probe 8);
+                #   leg still unbound when the entry is issued (its entry fills
+                #     only later, so the leg activates after) -> the reversal
+                #     closes the position and the leg opens under its own id;
+                #   leg placed a bar earlier -> the leg closes and the entry opens
+                #     from flat, one open trade;
+                #   re-issuing either order unchanged every bar changes nothing
+                #     (probes 11 and 12); a re-issue that moves a level or the
+                #     quantity re-slots the order (see ``_add_order``).
+                if len(orders) > 1:
+                    orders = sorted(orders, key=lambda o: o.act_seq)
+                    committed = []
+                    behind_entry = False
+                    for o in orders:
+                        if o.order_type != _order_type_close:
+                            behind_entry = True
+                        elif behind_entry and o.exit_id is not None \
+                                and self._leg_locked_into_batch(o):
+                            committed.append(o)
+                    for leg in committed:
+                        self._commit_leg(leg)
+                else:
+                    committed = ()
                 for i, order in enumerate(orders):
                     if order in offered:
                         continue
@@ -2546,6 +2736,8 @@ class SimPosition(PositionBase):
                             resume, offered = price, tuple(orders[:i + 1])
                             resumed = True
                             break
+                for leg in committed:
+                    leg.gap_committed = False
                 if resumed:
                     break
             # Every resume consumes at least one still-unresolved tick offset, so
@@ -3489,6 +3681,13 @@ class SimPosition(PositionBase):
         fits the account while the resulting eleven-fold position does not, and
         TradingView fills that tenth on every one of its 16 grids (then margin
         calls) instead of cancelling it.
+
+        Of a reversal order only the part that OPENS is margined: the frozen flip
+        component closes the opposite position and needs no margin of its own.
+        Measured on the wild `PercentX Trend Follower [Trendoscope]` reference
+        (BINANCE:BTCUSDT 30m, 2026-05-12 13:30): a short stop of 1.64135 (flip
+        1.47892 + 0.16243 of its own) rested 24 bars at ~131k USD of gross
+        margin against ~130.6k of equity and TradingView filled it.
         """
         if not self.entry_orders:
             return
@@ -3502,7 +3701,8 @@ class SimPosition(PositionBase):
             margin_percent = script.margin_short if order.sign < 0 else script.margin_long
             if margin_percent <= 0:
                 continue
-            margin_needed = abs(order.size) * self.c * pv * (margin_percent / 100.0)
+            opening = abs(order.size) - order.flip_extra
+            margin_needed = opening * self.c * pv * (margin_percent / 100.0)
             if margin_needed > self.equity:
                 self._remove_order(order)
 
@@ -3930,7 +4130,7 @@ class SimPosition(PositionBase):
                 # longer does (see Order.gap_committed).
                 for leg in gap_batch:
                     if leg.exit_id is not None:
-                        leg.gap_committed = True
+                        self._commit_leg(leg)
             if order.cancelled:
                 continue
             if order.order_type == _order_type_entry:
