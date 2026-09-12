@@ -17,7 +17,7 @@ Three types of shared memory blocks:
 """
 import pickle
 import struct
-from bisect import bisect_left, bisect_right
+from bisect import bisect_right
 from multiprocessing import Condition
 from multiprocessing.shared_memory import SharedMemory
 from time import monotonic
@@ -965,10 +965,48 @@ class RingReader:
             self._version = version
         return self._block
 
-    def _closes(self, block: RingBlock, head: int, count: int) -> list[int]:
-        return [block.read_entry(i)[1] for i in range(head, head + count)]
+    @staticmethod
+    def _bisect_close(block: RingBlock, head: int, count: int, ms: int,
+                      left: bool = False) -> int:
+        """Place ``ms`` in the ring's close column, reading only what it must.
 
-    def _entry(self, block: RingBlock, index: int) -> tuple[int, int, Any]:
+        Entries are appended in close order, so the column is sorted and a
+        binary search touches ``log2(count)`` of them.
+
+        :param block: The attached ring block
+        :param head: Index of the oldest live entry
+        :param count: Number of live entries
+        :param ms: Close instant to place
+        :param left: Return the FIRST position ``ms`` could occupy instead of
+            the last (a left rather than a right insertion point)
+        :return: Insertion position relative to ``head``
+        """
+        # Reading the column into a list to bisect costs one ``unpack_from`` per
+        # live entry on EVERY lookup, and the lookups sit on the hot paths:
+        # ``has_close`` is the ``wait_for_close`` predicate, re-evaluated on each
+        # producer notification. Measured on the wild `Day Trading Booster by DGT`
+        # reference (BINANCE:BTCUSDT 30m, a 1-minute LTF context): 110 million
+        # entry reads in 60 seconds of ONE consumer, the whole run 2100s+ against
+        # 161s with the search below.
+        lo, hi = 0, count
+        if left:
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if block.read_entry(head + mid)[1] < ms:
+                    lo = mid + 1
+                else:
+                    hi = mid
+        else:
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if ms < block.read_entry(head + mid)[1]:
+                    hi = mid
+                else:
+                    lo = mid + 1
+        return lo
+
+    @staticmethod
+    def _entry(block: RingBlock, index: int) -> tuple[int, int, Any]:
         open_ms, close_ms, p_off, p_len = block.read_entry(index)
         return open_ms, close_ms, pickle.loads(block.read_payload(p_off, p_len))
 
@@ -994,7 +1032,7 @@ class RingReader:
             count, head, _ = self._sync.get_ring_state(self._sec_id)
             if count == 0:
                 return None
-            pos = bisect_right(self._closes(block, head, count), ms) - 1
+            pos = self._bisect_close(block, head, count, ms) - 1
             if pos < 0:
                 return None
             return self._entry(block, head + pos)
@@ -1008,9 +1046,8 @@ class RingReader:
             count, head, _ = self._sync.get_ring_state(self._sec_id)
             if count == 0:
                 return False
-            closes = self._closes(block, head, count)
-            pos = bisect_left(closes, ms)
-            return pos < count and closes[pos] == ms
+            pos = self._bisect_close(block, head, count, ms, left=True)
+            return pos < count and block.read_entry(head + pos)[1] == ms
 
     def range_by_close(self, start_ms: int, end_ms: int) -> list[tuple[int, int, Any]]:
         """
@@ -1027,9 +1064,8 @@ class RingReader:
             count, head, _ = self._sync.get_ring_state(self._sec_id)
             if count == 0:
                 return []
-            closes = self._closes(block, head, count)
-            lo = bisect_right(closes, start_ms)
-            hi = bisect_right(closes, end_ms)
+            lo = self._bisect_close(block, head, count, start_ms)
+            hi = self._bisect_close(block, head, count, end_ms)
             return [self._entry(block, head + i) for i in range(lo, hi)]
 
     def wait_until(self, predicate: Callable[[], bool],
