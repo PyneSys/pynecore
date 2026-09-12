@@ -1800,7 +1800,14 @@ def create_security_protocol(
 
     def __sec_read__(sid: str, default=None, _scope_id=None):
         if sid == sec_id:
-            return last_own_value[0]
+            # Nothing published yet -- the child replays the WHOLE script, so a
+            # context's own read can run before its write does on the first bar.
+            # The caller's default is what every other empty answer here returns,
+            # and an array read asks for `[]`: the alternative is handing the
+            # script a None no `array.*` builtin accepts. A published value is
+            # never None (na is a float), so the test cannot swallow a real one.
+            own = last_own_value[0]
+            return default if own is None else own
         if sid not in depends:
             # Not a dependency of this context: the read cannot influence this
             # expression, so it never waits. ``depends`` also excludes producers
