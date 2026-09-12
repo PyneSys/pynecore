@@ -207,11 +207,11 @@ def _trail_walk_order(orders: list['Order'], *, rising: bool) -> list['Order']:
     one and its activation otherwise. Legs sharing a level keep their activation
     slot order.
     """
-    def _key(order: 'Order') -> tuple[float, int]:
-        level = order.trail_stop if (order.trail_triggered and order.trail_stop is not None) \
-            else order.trail_price
+    def _key(order_: 'Order') -> tuple[float, int]:
+        level = order_.trail_stop if (order_.trail_triggered and order_.trail_stop is not None) \
+            else order_.trail_price
         level = 0.0 if level is None else level
-        return (level if rising else -level), order.act_seq
+        return (level if rising else -level), order_.act_seq
 
     return sorted(orders, key=_key)
 
@@ -555,8 +555,8 @@ class PriceOrderBook:
         self.orders_at_price: dict[float, list[Order]] = {}  # price -> [Order]
         self.order_prices: defaultdict[Order, set[float]] = defaultdict(set)  # Order -> {prices}
 
-    def _index_price(self, order: Order, price: float, existing: set) -> None:
-        """Register ``order`` at ``price`` in both the level list and the bucket.
+    def _index_price(self, order_: Order, price: float, existing: set) -> None:
+        """Register ``order_`` at ``price`` in both the level list and the bucket.
 
         The level-list insertion is gated on ``price_levels`` itself (the
         structure the walk reads), not on ``orders_at_price``, so the two can
@@ -566,10 +566,10 @@ class PriceOrderBook:
             return
         if price not in self.price_levels:
             insort(self.price_levels, price)
-        self.orders_at_price.setdefault(price, []).append(order)
+        self.orders_at_price.setdefault(price, []).append(order_)
         existing.add(price)
 
-    def add_order(self, order: Order):
+    def add_order(self, order_: Order):
         """Add order to all its relevant price levels.
 
         Idempotent per (order, price): callers that re-invoke after materializing
@@ -579,27 +579,27 @@ class PriceOrderBook:
         only removes one occurrence per price level, so a duplicate could
         otherwise survive past `_remove_order` and re-fill on the next bar.
         """
-        existing = self.order_prices[order]
-        if order.stop is not None:
-            self._index_price(order, order.stop, existing)
-        if order.limit is not None:
-            self._index_price(order, order.limit, existing)
-        if order.trail_price is not None:
-            self._index_price(order, order.trail_price, existing)
+        existing = self.order_prices[order_]
+        if order_.stop is not None:
+            self._index_price(order_, order_.stop, existing)
+        if order_.limit is not None:
+            self._index_price(order_, order_.limit, existing)
+        if order_.trail_price is not None:
+            self._index_price(order_, order_.trail_price, existing)
 
-    def remove_order(self, order: Order):
+    def remove_order(self, order_: Order):
         """Remove order from all price levels"""
-        for price in list(self.order_prices[order]):
+        for price in list(self.order_prices[order_]):
             bucket = self.orders_at_price.get(price)
             if bucket is not None:
-                if order in bucket:
-                    bucket.remove(order)
+                if order_ in bucket:
+                    bucket.remove(order_)
                 if not bucket:
                     idx = bisect_left(self.price_levels, price)
                     if idx < len(self.price_levels) and self.price_levels[idx] == price:
                         del self.price_levels[idx]
                     del self.orders_at_price[price]
-        del self.order_prices[order]
+        del self.order_prices[order_]
 
     def _range_levels(self, desc: bool, min_price: float | None, max_price: float | None) -> list[float]:
         """Price levels a walk covers, in walk order.
@@ -2731,7 +2731,7 @@ class SimPosition(PositionBase):
         """
         falling = start > end
         slippage = lib._script.slippage
-        hits: list[tuple[float, Order, str]] = []
+        hits: list[tuple[float, Order, Literal['profit', 'loss']]] = []
         for order in activated:
             if order.cancelled or order.filled_by_type is not None:
                 continue
@@ -2739,22 +2739,22 @@ class SimPosition(PositionBase):
                 continue
             # A falling segment reaches sell stops and buy limits, a rising one
             # buy stops and sell limits -- the sides the anchored walks check.
-            level = None
-            leg = ''
+            hit: tuple[float, Literal['profit', 'loss']] | None = None
             if order.stop is not None and ((order.size < 0) == falling):
-                level, leg = order.stop, 'loss'
+                hit = order.stop, 'loss'
             if order.limit is not None and ((order.size > 0) == falling):
                 # Both legs stand in the segment: the one the path reaches first
-                if level is None or ((order.limit > level) != falling):
-                    level, leg = order.limit, 'profit'
-            if level is None:
+                if hit is None or ((order.limit > hit[0]) != falling):
+                    hit = order.limit, 'profit'
+            if hit is None:
                 continue
+            level, leg = hit
             if (end < level <= start) if falling else (start <= level < end):
                 hits.append((level, order, leg))
         if not hits:
             return
         # Chronological: the level nearest the extreme the segment starts at.
-        hits.sort(key=lambda hit: hit[0], reverse=falling)
+        hits.sort(key=lambda h: h[0], reverse=falling)
         for level, order, leg in hits:
             if order.cancelled or order.filled_by_type is not None:
                 continue
