@@ -12,7 +12,8 @@ import heapq
 
 from collections import deque
 
-from ..types import Series, Persistent, NA, PyneFloat, PyneInt, PyneBool, na_float
+from ..types import (Series, Persistent, IBPersistent, NA, PyneFloat, PyneInt, PyneBool,
+                     na_float)
 from ..types.na import na_int
 from ..core.module_property import module_property, module_function_property
 from pynecore.core.overload import overload
@@ -2831,7 +2832,20 @@ def valuewhen(condition: bool, source: float, occurrence: int) -> PyneFloat:
     # from a condition bar whose source was na came back na while occurrence 2
     # reached past it to the older value, and a always-defined source held its
     # last value across the false bars.
-    values: Persistent[deque[PyneFloat]] = deque(maxlen=occurrence + 1)
+    # MEASURED LAW — the occurrence ring is filled ONCE PER EXECUTION of the
+    # body, and a discarded re-execution never gives its push back. On a
+    # ``calc_on_order_fills`` bar where the condition is true and one order
+    # fills, the current bar's value therefore occupies two slots; with two
+    # fills, three (CAPITALCOM:EURUSD 30m, condition ``bar_index % 10 == 0``,
+    # entry placed one bar earlier so it fills at the cond bar's open: with one
+    # fill occurrences 0 and 1 both read the current bar and occurrence 2 the
+    # previous cond bar, with a second intrabar fill 0/1/2 read the current bar
+    # and 3 the previous one; the same script with COOF off reads the clean
+    # 0/1/2 = current/previous/one-before ring). The shift stays for good — the
+    # duplicate ages out of the ring like any other occurrence. ``var``
+    # assignments and ``ta.cum`` are rolled back on the same bars, so this is
+    # the ring itself living outside the rollback, which is ``varip``.
+    values: IBPersistent[deque[PyneFloat]] = deque(maxlen=occurrence + 1)
 
     if condition:
         values.append(source)
