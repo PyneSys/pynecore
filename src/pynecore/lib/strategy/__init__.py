@@ -198,6 +198,24 @@ def _market_order_key(order_: 'Order') -> '_MarketOrderKey':
     return order_.order_type, order_.order_id, order_.exit_id, order_.book_seq
 
 
+def _trail_walk_order(orders: list['Order'], *, rising: bool) -> list['Order']:
+    """Trailing legs in the order one path segment reaches their trigger levels.
+
+    Their fills are booked in the order they are walked, and TradingView books
+    them in path time: a descending segment reaches the highest stop first, an
+    ascending one the lowest. The level is the leg's armed stop where it has
+    one and its activation otherwise. Legs sharing a level keep their activation
+    slot order.
+    """
+    def _key(order: 'Order') -> tuple[float, int]:
+        level = order.trail_stop if (order.trail_triggered and order.trail_stop is not None) \
+            else order.trail_price
+        level = 0.0 if level is None else level
+        return (level if rising else -level), order.act_seq
+
+    return sorted(orders, key=_key)
+
+
 #
 # Classes
 #
@@ -239,6 +257,8 @@ class Order:
         "reversal_leg",  # Closing leg an entry order was split into when it flipped the position
         "placed_fill_seq",  # Fills processed before this order was booked (see _fill_order)
         "act_seq",  # Activation slot: the order's place in a simultaneous-trigger batch
+        "issue_spec",  # strategy.exit arguments as issued, for the legs later adds inherit
+        "spawn_spent",  # A leg of this strategy.exit call fired: later adds inherit nothing
     )
 
     def __init__(
@@ -356,6 +376,16 @@ class Order:
         # where one TradingView order is executed as two PyneCore fills (the
         # reversal split in _process_order).
         self.comm_booking: list | None = None
+        # ``(limit, stop, trail_price, qty, qty_percent, oca_name)`` exactly as
+        # ``strategy.exit`` issued them, before the tick offsets resolved into
+        # levels. A pyramid add that fills while the call is still live inherits
+        # a leg built from this (see ``SimPosition._spawn_legs_for_add``); it
+        # stays empty on every other order, which is what keeps a broker-restored
+        # or non-exit order from spawning anything.
+        self.issue_spec: tuple = ()
+        # Set on every leg of a ``strategy.exit`` call once ONE of them fires: the
+        # call stops covering pyramid adds until the script issues it again.
+        self.spawn_spent = False
 
     def __repr__(self):
         return f"Order(order_id={self.order_id}; exit_id={self.exit_id}; size={self.size}; type: {self.order_type}; " \
@@ -983,7 +1013,7 @@ class SimPosition(PositionBase):
         'risk_intraday_filled_orders', 'risk_intraday_start_equity',
         '_deferred_margin_call', '_mc_stage2', '_fill_counter', '_last_fill_price', '_partial_close_bar',
         '_entry_book', '_entry_seq', '_act_counter', '_deferred_immediate_closes', '_coof_cursor', '_market_fill_price',
-        '_walk_node', '_path_node'
+        '_walk_node', '_path_node', '_spawned_trail_legs'
     )
 
     def __init__(self):
@@ -1020,6 +1050,10 @@ class SimPosition(PositionBase):
         # above is the FIFO view TradingView reports (see _EntryBinding).
         self._entry_book: list[_EntryBinding] = []
         self._entry_seq: int = 0
+        # Trailing legs a pyramid add inherited mid-walk: they were not in the
+        # bar's awaiting set, so the fill that created them hands them over (see
+        # _spawn_legs_for_add / _activate_trails_on_fill).
+        self._spawned_trail_legs: list[Order] = []
         self._act_counter: int = 0
 
         # Trade statistics
@@ -1379,6 +1413,84 @@ class SimPosition(PositionBase):
                         exit_order.reserved_size = grown
                         exit_order.bound_size = binding.init_size
                         exit_order.size = math.copysign(grown, exit_order.size)
+        self._spawn_legs_for_add(binding)
+
+    def _spawn_legs_for_add(self, binding: '_EntryBinding') -> None:
+        """Hand a pyramid add the legs a LIVE ``strategy.exit`` call already holds.
+
+        A ``strategy.exit`` order stands on its ``from_entry`` id, not on the one
+        entry that was open when the script issued it: an entry filling LATER
+        gets its own leg off the same call, priced from its OWN fill, and the
+        script never re-states anything. MEASURED on TradingView
+        (CAPITALCOM:EURUSD 60m, probe ``pyr2``): long 1 at 1.03349, one
+        ``strategy.exit("X", "E", trail_points=1000)`` five bars later, long 3
+        the next day -- TV fills two trailing exits, 1 at 1.04349 and 3 at
+        1.05276, each exactly 1000 ticks above its own entry price. A call whose
+        leg is already spent spawns nothing (probe ``pyr3``: the same add placed
+        after the exit had filled and flattened the position stayed open to the
+        end of the data), which falls out of :meth:`_drop_binding` retiring the
+        legs with their binding.
+
+        The inherited leg is built from the call as ISSUED (``Order.issue_spec``),
+        not from the source leg's resolved state: its tick offsets have to
+        re-resolve against the new entry's fill price.
+        """
+        entry_id = binding.entry_id
+        if entry_id is None or not self.exit_orders:
+            return
+        sources: dict[str | None, Order] = {}
+        for exit_order in self.exit_orders.values():
+            if (exit_order.order_id != entry_id
+                    or not exit_order.issue_spec
+                    or exit_order.entry_seq is None
+                    or exit_order.entry_seq == binding.seq
+                    or exit_order.book_seq is not None
+                    or exit_order.cancelled
+                    or exit_order.consumed
+                    or exit_order.spawn_spent
+                    or exit_order.filled_by_type is not None):
+                continue
+            sources.setdefault(exit_order.exit_id, exit_order)
+        for source in sources.values():
+            # A leg the script issued against the still-pending entry order was
+            # handed over above; a second one beside it would over-close.
+            if _exit_key(source.exit_id, entry_id, binding.seq) in self.exit_orders:
+                continue
+            limit, stop, trail_price, qty, qty_percent, oca_name = source.issue_spec
+            bound = binding.init_size
+            if qty is not None:
+                reserved = min(abs(qty), bound)
+                reserved = _explicit_qty_round(abs(qty)) if abs(qty) < bound else _size_round(reserved)
+            elif qty_percent is not None:
+                reserved = _size_round(min(bound * (qty_percent * 0.01), bound))
+            else:
+                reserved = _size_round(bound)
+            if reserved <= 0.0:
+                continue
+            leg = Order(
+                entry_id, -binding.sign * reserved,
+                exit_id=source.exit_id, order_type=_order_type_close,
+                limit=limit, stop=stop,
+                trail_price=trail_price, trail_offset=source.trail_offset,
+                profit_ticks=source.profit_ticks, loss_ticks=source.loss_ticks,
+                trail_points_ticks=source.trail_points_ticks,
+                oca_name=oca_name if oca_name is not None
+                else f"__exit_{source.exit_id}_{entry_id}_{binding.seq}_oca__",
+                oca_type=_oca.reduce,
+                comment=source.comment, alert_message=source.alert_message,
+                comment_profit=source.comment_profit, comment_loss=source.comment_loss,
+                comment_trailing=source.comment_trailing,
+                alert_profit=source.alert_profit, alert_loss=source.alert_loss,
+                alert_trailing=source.alert_trailing
+            )
+            leg.issue_spec = source.issue_spec
+            leg.rest_leg = source.rest_leg
+            leg.bound_size = bound
+            leg.entry_seq = binding.seq
+            leg.from_entry_na = source.from_entry_na
+            self._add_order(leg)
+            if leg.trail_price is not None or leg.trail_points_ticks is not None:
+                self._spawned_trail_legs.append(leg)
 
     def _binding(self, seq: int | None) -> '_EntryBinding | None':
         """The live binding with this sequence number, or None once it is spent."""
@@ -1772,6 +1884,16 @@ class SimPosition(PositionBase):
             closed_qty = filled_size - abs(order.size)
             if closed_qty > 0.0:
                 self._settle_entry_book(order, closed_qty)
+
+            # A ``strategy.exit`` call stops covering LATER pyramid adds once one
+            # of its legs has fired; the script re-arms it by issuing it again
+            # (see _spawn_legs_for_add).
+            if order.order_type == _order_type_close and order.exit_id is not None \
+                    and order.book_seq is None:
+                order.spawn_spent = True
+                for sibling in self.exit_orders.values():
+                    if sibling.exit_id == order.exit_id and sibling.order_id == order.order_id:
+                        sibling.spawn_spent = True
 
             if delete:
                 # A partial-exit leg that fired its whole slice while its entry's
@@ -2500,6 +2622,11 @@ class SimPosition(PositionBase):
             here is dropped, so a later fill of the same entry cannot restart it
         :param close_leg_queue: Legs left pending join the closing-leg pass
         """
+        # A leg this very fill created for a pyramid add (see _spawn_legs_for_add)
+        # never reached the bar's awaiting set, and starts here like any other.
+        if self._spawned_trail_legs:
+            awaiting.update(self._spawned_trail_legs)
+            self._spawned_trail_legs.clear()
         if not awaiting:
             return
         entry_price = self._latest_entry_fill_price(entry_id)
@@ -2802,7 +2929,8 @@ class SimPosition(PositionBase):
         return False
 
     def _process_trailing_stop(self, order: Order, ohlc: bool, close_leg: bool = False,
-                               start: float | None = None, rising: bool = False) -> int:
+                               start: float | None = None, rising: bool = False,
+                               phase: int | None = None) -> int:
         """Process a trailing-stop exit for the current bar (TradingView model).
 
         TradingView's broker emulator moves the market price along the assumed
@@ -2857,6 +2985,12 @@ class SimPosition(PositionBase):
             mid-bar; None starts it at the bar open.
         :param rising: With ``start``, True when the entry filled on an
             open -> high leg -- it selects the segments still ahead.
+        :param phase: Walk only ONE of the two pre-close segments -- 0 for
+            open -> first extreme, 1 for first extreme -> second extreme,
+            resuming the state phase 0 persisted. Several trailing legs on one
+            bar fill in the order the path reaches their stops, so the caller
+            walks the whole book through phase 0 before phase 1 instead of
+            running each leg over both segments in turn. None walks both.
         :return: ``_trail_filled`` if the order filled, ``_trail_deferred`` if
             the walk defers to the price walk (or cannot act this bar),
             ``_trail_pending`` if the closing leg is still outstanding.
@@ -2877,7 +3011,7 @@ class SimPosition(PositionBase):
             armed = order.trail_triggered
             stop = order.trail_stop if armed else None
 
-            if not close_leg and armed and stop is not None:
+            if not close_leg and phase != 1 and armed and stop is not None:
                 # A carried stop already passed at the first tick fills there --
                 # an inter-bar gap through the stop, or an entry filling past it.
                 if start_tick <= stop:
@@ -2899,7 +3033,7 @@ class SimPosition(PositionBase):
                         order.filled_by_type = 'trailing'
                         self.fill_order(order, p)
                         return _trail_filled
-            elif not close_leg and not armed and start_tick >= order.trail_price:
+            elif not close_leg and phase != 1 and not armed and start_tick >= order.trail_price:
                 # The walk starts beyond the activation level: the trail arms on
                 # its first tick with that tick as its water mark.
                 armed = True
@@ -2931,6 +3065,11 @@ class SimPosition(PositionBase):
                     # mark -- while on open -> low -> high -> close bars it closed
                     # 1497 of 1526, every one at exactly `high - trail_offset`.
                     path = path[1:]
+                elif phase == 1:
+                    prev = path[0]
+                    path = path[1:]
+                elif phase == 0:
+                    path = path[:1]
             for nxt in path:
                 self._walk_node = 3 if close_leg else (1 if (nxt == self.h) == ohlc else 2)
                 if nxt > prev:
@@ -3003,7 +3142,7 @@ class SimPosition(PositionBase):
             armed = order.trail_triggered
             stop = order.trail_stop if armed else None
 
-            if not close_leg and armed and stop is not None:
+            if not close_leg and phase != 1 and armed and stop is not None:
                 # A carried stop already passed at the first tick fills there --
                 # an inter-bar gap through the stop, or an entry filling past it.
                 if start_tick >= stop:
@@ -3025,7 +3164,7 @@ class SimPosition(PositionBase):
                         order.filled_by_type = 'trailing'
                         self.fill_order(order, p)
                         return _trail_filled
-            elif not close_leg and not armed and start_tick <= order.trail_price:
+            elif not close_leg and phase != 1 and not armed and start_tick <= order.trail_price:
                 # The walk starts beyond the activation level: the trail arms on
                 # its first tick with that tick as its water mark.
                 armed = True
@@ -3051,6 +3190,11 @@ class SimPosition(PositionBase):
                     # Second-leg activation drops the extreme already behind the
                     # fill -- see the mirrored comment in the long branch.
                     path = path[1:]
+                elif phase == 1:
+                    prev = path[0]
+                    path = path[1:]
+                elif phase == 0:
+                    path = path[:1]
             for nxt in path:
                 self._walk_node = 3 if close_leg else (1 if (nxt == self.h) == ohlc else 2)
                 if nxt < prev:
@@ -3155,11 +3299,12 @@ class SimPosition(PositionBase):
         """
         if order.trail_points_ticks is None and order.trail_price is None:
             return
-        entry_price: float | None = None
-        for trade in self.open_trades:
-            if trade.entry_id == order.order_id:
-                entry_price = trade.entry_price
-                break
+        # The leg's OWN entry, not the oldest FIFO row under the id: two pyramid
+        # adds sharing a ``from_entry`` arm at their own activation levels, and
+        # pricing a later add's leg off the first entry arms it on a level the
+        # path passed long ago (it then carries a stop from the issue bar's close
+        # instead of waiting for its own activation).
+        entry_price = self._entry_fill_price(order.order_id, order.entry_seq)
         if entry_price is None:
             return  # entry still pending -- seeded later on the fill bar
 
@@ -4416,6 +4561,9 @@ class SimPosition(PositionBase):
         # explicit one is in the book but inactive. An entry filling intrabar
         # activates them mid-walk instead (see ``_activate_trails_on_fill``).
         trail_awaiting: set[Order] = set()
+        # Anything spawned before the walk (a market entry filling at the open) is
+        # already resolved and indexed, so the pre-walk below covers it.
+        self._spawned_trail_legs.clear()
         # Exit legs an entry fill activates on the FIRST leg: the walk that
         # follows is anchored at the open, so the stretch between the open and
         # the extreme just reached is theirs alone (see
@@ -4427,13 +4575,33 @@ class SimPosition(PositionBase):
                 trail_awaiting.add(order)
         # Iterate a snapshot since fills mutate the order book; an order indexed at
         # several price levels is yielded once per level, so dedupe by identity.
+        # The order the legs are walked in is the order their fills are BOOKED
+        # in, and the book's price buckets say nothing about that: TradingView
+        # settles them in the order the assumed path reaches their stops. So the
+        # whole book is walked SEGMENT BY SEGMENT (open -> first extreme, then
+        # first extreme -> second extreme) instead of each leg over both segments
+        # in turn, with the activation slot ordering the legs a single segment
+        # fills. MEASURED on the wild `MTF stochastic strategy` reference
+        # (BINANCE:BTCUSDT 30m): 2025-02-16 12:00 fills two ratcheted short legs
+        # at the open tick and a third at its own activation on the way down,
+        # while 2025-05-13 18:00 fills the NEWER pyramid add's leg first, at the
+        # low, and the older one at the high after it.
         if self.orderbook.price_levels:
             seen: set[Order] = set()
-            for order in list(self.orderbook.iter_orders()):
+            walk: list[Order] = []
+            for order in self.orderbook.iter_orders():
                 if order in seen or order.cancelled or order.trail_price is None:
                     continue
                 seen.add(order)
-                if self._process_trailing_stop(order, ohlc) == _trail_pending:
+                walk.append(order)
+            second_segment: list[Order] = []
+            for order in _trail_walk_order(walk, rising=ohlc):
+                if self._process_trailing_stop(order, ohlc, phase=0) == _trail_pending:
+                    second_segment.append(order)
+            for order in _trail_walk_order(second_segment, rising=not ohlc):
+                if order.cancelled or order.filled_by_type is not None:
+                    continue
+                if self._process_trailing_stop(order, ohlc, phase=1) == _trail_pending:
                     trail_close_leg.append(order)
 
         # Process orders: open → high → low → close
@@ -6710,6 +6878,12 @@ def exit(id: str, from_entry: str = "",
         order.rest_leg = is_rest_leg
         order.bound_size = bound
         order.entry_seq = entry_seq
+        # Kept as issued: a pyramid add filling later inherits a leg off this call
+        # without the script re-stating it (see SimPosition._spawn_legs_for_add).
+        order.issue_spec = (_limit, _stop, _trail_price,
+                            qty if qty == qty else None,
+                            qty_percent if qty_percent == qty_percent else None,
+                            _na_to_none(oca_name))
         position._add_order(order)
         # Only an identical re-issue folds the issue bar's extreme into the water
         # mark -- and there it is a no-op, since the carried leg was already
