@@ -4,11 +4,17 @@
 from pynecore.lib import script, timeframe, syminfo
 
 
-@script.indicator(title="Timeframe Basic", shorttitle="tf_basic", timeframe="60")
+@script.indicator(title="Timeframe Basic", shorttitle="tf_basic")
 def main():
     import pytest
 
-    assert timeframe.main_period == "60"
+    # No script-level ``timeframe``: every ``timeframe.*`` builtin describes the
+    # chart, so they all follow ``syminfo.period`` below. A script that DOES declare
+    # one reports THAT timeframe instead -- MEASURED on TradingView
+    # (CAPITALCOM:GOLD@60 with ``timeframe='W'``: period, main_period, isweekly and
+    # multiplier all answer for the weekly context) and covered by
+    # ``tests/t00_pynecore/core/test_100_script_timeframe_gaps.py``.
+    assert timeframe.main_period == "5"
 
     syminfo.period = "10T"
     assert timeframe.multiplier == 10

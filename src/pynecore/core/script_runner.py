@@ -21,7 +21,8 @@ from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.csv_file import CSVWriter
 from pynecore.core.drawing_snapshot import DrawingSnapshot
 from pynecore.core.lookahead import ALLOW_LOOKAHEAD
-from pynecore.core.ohlcv import restore_f32_volume
+from pynecore.core.ohlcv import OHLCVReader, restore_f32_volume
+from pynecore.core.script_timeframe import ScriptTimeframe
 from pynecore.core.strategy_stats import calculate_strategy_statistics, write_strategy_statistics_csv
 from pynecore.core import viz
 from pynecore.core.viz import VizWriter
@@ -435,6 +436,41 @@ def _reset_lib_vars():
         strategy_mod._reset_currency_state()
 
 
+def _same_timeframe(one: str, other: str) -> bool:
+    """
+    Whether two timeframe strings name the same bar grid.
+
+    Compared canonically, so ``'W'`` and ``'1W'`` are the same context while
+    ``'1D'`` and ``'1440'`` — equal in seconds, different grids — are not.
+
+    :param one: First timeframe string.
+    :param other: Second timeframe string.
+    :return: Whether both name the same grid.
+    """
+    if one == other:
+        return True
+    one_sec = _try_in_seconds(one)
+    other_sec = _try_in_seconds(other)
+    if one_sec is None or other_sec is None or one_sec != other_sec:
+        return False
+    # noinspection PyProtectedMember
+    return timeframe_lib._process_tf(one)[0] == timeframe_lib._process_tf(other)[0]
+
+
+def _iter_chart_bar_times(path: Path, first_time_ms: int,
+                          last_time_ms: int) -> Iterator[int]:
+    """
+    Yield the bar open times of an OHLCV file inside an inclusive window.
+
+    :param path: The chart data file.
+    :param first_time_ms: Inclusive lower bound in milliseconds.
+    :param last_time_ms: Inclusive upper bound in milliseconds.
+    :return: Iterator of bar open times.
+    """
+    with OHLCVReader(path) as reader:
+        yield from reader.iter_timestamps(first_time_ms, last_time_ms)
+
+
 def _try_in_seconds(period: str | None) -> int | None:
     """Convert a TradingView period to seconds, or ``None`` when unparseable.
 
@@ -716,7 +752,7 @@ class ScriptRunner:
                  '_engine_event_stream_future',
                  '_broker_store_ctx', '_log_ohlcv', '_price_decimals',
                  '_round_decimals', '_lossless_volume', '_lossless_prices',
-                 '_config_dir', '_symbol_map',
+                 '_config_dir', '_symbol_map', '_script_timeframe',
                  'broker_balance', '_sim_logged_open_ids')
 
     # noinspection PyProtectedMember
@@ -1068,6 +1104,26 @@ class ScriptRunner:
 
         self.tz = lib._parse_timezone(syminfo.timezone)
 
+        # Script-level higher timeframe: ``indicator(..., timeframe='W')`` runs the
+        # body once per completed weekly bar built from the chart feed, not once per
+        # chart bar (see :mod:`pynecore.core.script_timeframe`). A script timeframe
+        # equal to the chart's is a plain run; a lower one is rejected there.
+        # Built before the output writers so a rejected timeframe leaves no open file.
+        self._script_timeframe: 'ScriptTimeframe | None' = None
+        script_tf = self.script.timeframe
+        if script_tf:
+            script_tf_sec = _try_in_seconds(script_tf)
+            if script_tf_sec is None:
+                raise ValueError(f"Invalid script timeframe: '{script_tf}'!")
+            chart_tf = str(syminfo.period)
+            # Modifier included: '1D' and '1440' are the same number of seconds
+            # but not the same grid, so a daily script on a 1440-minute chart is
+            # a higher-timeframe run, not a plain one.
+            if ((script_tf_sec, timeframe_lib._process_tf(script_tf)[0])
+                    != (_try_in_seconds(chart_tf), timeframe_lib._process_tf(chart_tf)[0])):
+                self._script_timeframe = ScriptTimeframe(
+                    script_tf, self.script.timeframe_gaps, chart_tf, syminfo, self.tz)
+
         # Initialize tracking variables for statistics
         self.equity_curve: list[float] = []
         self.first_price: float | None = None
@@ -1100,6 +1156,26 @@ class ScriptRunner:
             f"Run-up {_account_currency}", "Run-up %", f"Drawdown {_account_currency}",
             "Drawdown %",
         )) if trade_path else None
+
+
+    def _chart_bar_times(self, first_time_ms: int,
+                         last_time_ms: int | None) -> 'Iterator[int] | None':
+        """
+        Replay the chart bar open times of this run, when they are on disk.
+
+        Lets :meth:`ScriptTimeframe.prepare` count the higher-timeframe bars the
+        feed really contains instead of the scheduled ones (a market holiday or
+        a data gap has no bar). ``None`` whenever the feed is not a file (live
+        provider) or its end is unknown.
+
+        :param first_time_ms: First chart bar's open time in milliseconds.
+        :param last_time_ms: Last chart bar's open time in milliseconds.
+        :return: Iterator of chart bar open times, or ``None``.
+        """
+        if self._chart_data_path is None or last_time_ms is None:
+            return None
+        return _iter_chart_bar_times(Path(self._chart_data_path),
+                                     first_time_ms, last_time_ms)
 
     # === Broker startup ====================================================
 
@@ -1320,6 +1396,21 @@ class ScriptRunner:
 
         is_strat = self.script.script_type == script_type.strategy
 
+        # Script-level higher timeframe. The body then runs once per completed HTF
+        # bar; the timeframe the script executes on is what every security context
+        # compares itself against (``timeframe.period`` reports it too), so an inner
+        # ``request.security(syminfo.tickerid, timeframe.period, x)`` is the
+        # same-context no-op it is on TradingView.
+        stf = self._script_timeframe
+        run_tf = stf.timeframe if stf is not None else str(self.syminfo.period)
+        if stf is not None:
+            if lib._is_live:
+                raise NotImplementedError(
+                    f"Script timeframe '{stf.timeframe}' is not supported in live mode: "
+                    f"the current higher-timeframe bar is still developing and the "
+                    f"historical path only executes completed ones."
+                )
+
         # Reset bar_index — pre-increment scheme starts at -1.
         self.bar_index = -1
         # Drop function instances left over from a previous run
@@ -1327,6 +1418,9 @@ class ScriptRunner:
 
         # Set script data
         lib._script = self.script  # Store script object in lib
+        # Re-publish for this run: the ``@script.*`` decorator set it at import, and a
+        # second script imported since would have overwritten it.
+        lib._script_timeframe = self.script.timeframe
         # The loader applied the script's bool na choice at import; a module imported
         # earlier (another script ran since) needs it re-applied for this run
         set_bool_na(self.script.na_bool)
@@ -1564,7 +1658,9 @@ class ScriptRunner:
                 # ``"BINANCE:BTCUSDT"`` also takes) — both must short-circuit, or a
                 # request for the chart's own bars would go looking for a data file.
                 chart_ticker = str(lib.syminfo.ticker)
-                chart_tf = str(lib.syminfo.period)
+                # The timeframe the BODY runs on — the script timeframe when the
+                # declaration carries one, else the chart's own.
+                chart_tf = run_tf
                 # '' is the chart's own instrument in Pine, so a runtime-deferred
                 # empty symbol short-circuits here too
                 own_symbols = {'', chart_ticker, f"{lib.syminfo.prefix}:{chart_ticker}"}
@@ -1576,7 +1672,8 @@ class ScriptRunner:
                         # An empty string selects the chart's timeframe (Pine semantics)
                         tf_val = chart_tf
                     tf = str(tf_val)
-                    if sym is not None and str(sym) in own_symbols and tf == chart_tf:
+                    if (sym is not None and str(sym) in own_symbols
+                            and _same_timeframe(tf, chart_tf)):
                         same_context_ids.add(sec_id)
 
                 # Separate static and deferred contexts. The security transformer
@@ -1871,7 +1968,7 @@ class ScriptRunner:
                     from ..lib.ticker import _split_chart_type
                     base_symbol, chart_type = _split_chart_type(symbol)
                     # Resolve actual timeframe
-                    current_chart_tf = str(lib.syminfo.period)
+                    current_chart_tf = run_tf
                     resolved_tf = timeframe if timeframe else current_chart_tf
                     # The context may turn out to be the chart's own symbol and
                     # timeframe: no subprocess and no data file is needed, the
@@ -1880,7 +1977,7 @@ class ScriptRunner:
                     # subprocess that applies the per-bar transform.
                     if (chart_type is None and chart_ticker is not None
                             and str(base_symbol) in own_symbols
-                            and resolved_tf == current_chart_tf):
+                            and _same_timeframe(resolved_tf, current_chart_tf)):
                         _state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
                         _state.timeframe = resolved_tf
                         _state.same_timeframe = True
@@ -1893,7 +1990,7 @@ class ScriptRunner:
                     sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
                     sec_state.chart_type = chart_type
                     sec_state.timeframe = resolved_tf
-                    same_tf = (resolved_tf == current_chart_tf)
+                    same_tf = _same_timeframe(resolved_tf, current_chart_tf)
                     sec_state.same_timeframe = same_tf
                     # Plain security resolving to a timeframe FINER than the
                     # chart's: scalar LTF merge (last/first intrabar of the
@@ -2202,18 +2299,47 @@ class ScriptRunner:
                     lib._plot_data.update(r)
 
             # noinspection PyProtectedMember
-            def _write_bar_output(bar_candle):
-                nonlocal broker_trades_closed_written
-                if self.plot_writer and lib._plot_data:
-                    ef = {} if bar_candle.extra_fields is None else dict(bar_candle.extra_fields)
-                    ef.update(lib._plot_data)
+            def _write_plot_row(row_candle, values, echo_lib: bool):
+                """Write one output row of the plot CSV.
+
+                :param row_candle: The bar the row is keyed by — a CHART bar in
+                    script-timeframe mode, the executed bar otherwise.
+                :param values: Plot values for this row.
+                :param echo_lib: Take the OHLCV from ``lib.*`` (the bar the body
+                    saw) instead of snapping ``row_candle``'s own values.
+                """
+                if not self.plot_writer or not values:
+                    return
+                ef = {} if row_candle.extra_fields is None else dict(row_candle.extra_fields)
+                ef.update(values)
+                if echo_lib:
                     # Echo the bar the script actually saw: ``lib.open``… and
                     # ``lib.volume`` are snapped off the float32 storage grid by
                     # ``_round_price`` / ``restore_f32_volume``, so writing the raw candle
                     # would show an input no bar was ever computed from.
-                    self.plot_writer.write_ohlcv(bar_candle._replace(
+                    row_candle = row_candle._replace(
                         open=lib.open, high=lib.high, low=lib.low, close=lib.close,
-                        volume=lib.volume, extra_fields=ef))
+                        volume=lib.volume)
+                else:
+                    # Script-timeframe row: ``lib.*`` holds the higher-timeframe bar
+                    # while the row is a chart bar, so the chart candle is snapped off
+                    # the storage grid here instead.
+                    if not self._lossless_prices:
+                        rd = self._round_decimals
+                        row_candle = row_candle._replace(
+                            open=_round_price(row_candle.open, rd),
+                            high=_round_price(row_candle.high, rd),
+                            low=_round_price(row_candle.low, rd),
+                            close=_round_price(row_candle.close, rd))
+                    if not self._lossless_volume:
+                        row_candle = row_candle._replace(
+                            volume=restore_f32_volume(row_candle.volume))
+                self.plot_writer.write_ohlcv(row_candle._replace(extra_fields=ef))
+
+            # noinspection PyProtectedMember
+            def _write_bar_output(bar_candle, echo_lib: bool = True):
+                nonlocal broker_trades_closed_written
+                _write_plot_row(bar_candle, lib._plot_data, echo_lib)
 
                 self._write_viz_bar(bar_candle)
 
@@ -2420,6 +2546,9 @@ class ScriptRunner:
             # ``download_ohlcv`` brought in as historical).
             last_warmup_timestamp: int | None = None
             warmup_bars_processed = 0
+            # Script-timeframe mode: the HTF bar grid is derived from the chart's
+            # first bar, which only the loop knows.
+            htf_prepared = False
 
             # calc_bars_count: Pine restricts calculation to the last N chart
             # bars. Earlier bars are not calculated at all -- series start fresh
@@ -2435,6 +2564,35 @@ class ScriptRunner:
             while next_item is not LIVE_TRANSITION:
                 candle = next_item
                 next_item = next(ohlcv_iterator, LIVE_TRANSITION)
+
+                # --- Script-level higher timeframe ---
+                # The body runs once per COMPLETED HTF bar, on the chart bar whose
+                # close instant reaches the period end. Every other chart bar only
+                # carries an output row: ``na`` with ``timeframe_gaps=true``, the
+                # last confirmed value with ``timeframe_gaps=false``.
+                exec_candle = candle
+                if stf is not None:
+                    if not htf_prepared:
+                        htf_prepared = True
+                        stf.prepare(candle.timestamp, self.last_bar_time,
+                                    self._chart_bar_times(candle.timestamp,
+                                                          self.last_bar_time))
+                        # calc_bars_count counts the SCRIPT's bars, which are HTF
+                        # bars here — the window can only be placed once the HTF
+                        # series length is known.
+                        if calc_bars_count > 0 and stf.last_bar_index is not None:
+                            calc_start = stf.last_bar_index + 1 - calc_bars_count
+                    htf_candle = stf.feed(candle, next_item is LIVE_TRANSITION)
+                    if htf_candle is None:
+                        gap_values = stf.gap_values
+                        if gap_values is not None:
+                            _write_plot_row(candle, gap_values, False)
+                            yield candle, gap_values
+                        if on_progress:
+                            on_progress(datetime.fromtimestamp(
+                                candle.timestamp / 1000, self.tz).replace(tzinfo=None))
+                        continue
+                    exec_candle = htf_candle
 
                 # Pre-increment: bar_index becomes the index of the bar we
                 # are about to process (first bar -> 0).
@@ -2456,20 +2614,30 @@ class ScriptRunner:
                 if is_live:
                     barstate.islast = False
                     barstate.islastconfirmedhistory = (next_item is LIVE_TRANSITION)
+                elif stf is not None:
+                    # The script's last bar is the last HTF bar that COMPLETES
+                    # inside the chart feed — not the chart's own last bar, which
+                    # usually falls inside a still-developing period.
+                    barstate.islast = stf.is_last
                 else:
                     barstate.islast = (next_item is LIVE_TRANSITION)
 
                 # Update lib properties
                 _set_lib_properties(
-                    candle, self.bar_index, self.tz, lib, self._round_decimals,
-                    self.last_bar_index, self.last_bar_time, self._lossless_volume,
-                    self._lossless_prices,
+                    exec_candle, self.bar_index, self.tz, lib, self._round_decimals,
+                    (self.last_bar_index if stf is None else stf.last_bar_index),
+                    (self.last_bar_time if stf is None else stf.last_bar_time),
+                    self._lossless_volume, self._lossless_prices,
                 )
                 # The peek the last-bar detection above already holds: HTF
                 # security confirmation reads it to recognize a session that
                 # ended EARLY (see ``core/security.py::_get_confirmed_time``).
-                lib._next_time = (0 if next_item is LIVE_TRANSITION
-                                  else next_item.timestamp)
+                if stf is not None:
+                    lib._next_time = stf.next_period_start(
+                        None if next_item is LIVE_TRANSITION else next_item.timestamp)
+                else:
+                    lib._next_time = (0 if next_item is LIVE_TRANSITION
+                                      else next_item.timestamp)
 
                 # Store first price for buy & hold calculation
                 if self.first_price is None:
@@ -2528,8 +2696,14 @@ class ScriptRunner:
                 if is_strat and position and not lib._strategy_suppressed:
                     self._process_deferred_margin_call(position)
 
-                # Write output
-                _write_bar_output(candle)
+                # Write output — in script-timeframe mode the row stays keyed by
+                # the CHART bar that closed this HTF bar, so the output grid is the
+                # chart's and gap bars can be filled around it.
+                if stf is None:
+                    _write_bar_output(candle)
+                else:
+                    _write_bar_output(candle, echo_lib=False)
+                    stf.remember(lib._plot_data)
 
                 # Yield
                 if not is_strat:

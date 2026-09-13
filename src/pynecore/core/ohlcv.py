@@ -2571,6 +2571,22 @@ class _V2OHLCVReader:
         for position in range(start_position, end_position):
             yield self.read(position)
 
+    def iter_timestamps(
+        self, start_timestamp: int, end_timestamp: int | None = None
+    ) -> Iterator[int]:
+        """Iterate the bar open times of an inclusive millisecond window.
+
+        Reads the timestamp column only, without materialising OHLCV values.
+
+        :param start_timestamp: Inclusive lower timestamp bound in milliseconds.
+        :param end_timestamp: Inclusive upper bound, or ``None`` for the file end.
+        :return: Iterator over committed bar open times in the requested window.
+        """
+        start_position = self._bisect_left(start_timestamp)
+        end_position = self._size if end_timestamp is None else self._bisect_right(end_timestamp)
+        for position in range(start_position, end_position):
+            yield self._timestamp_at(position)
+
     def get_positions(
         self, start_timestamp: int | None = None, end_timestamp: int | None = None
     ) -> tuple[int, int]:
@@ -2888,6 +2904,17 @@ class OHLCVReader:
         :return: Iterator over matching OHLCV values.
         """
         return self._reader.read_from(start_timestamp, end_timestamp)
+
+    def iter_timestamps(
+        self, start_timestamp: int, end_timestamp: int | None = None
+    ) -> Iterator[int]:
+        """Read the bar open times of an inclusive millisecond range.
+
+        :param start_timestamp: Inclusive lower timestamp bound in milliseconds.
+        :param end_timestamp: Inclusive upper bound, or ``None`` for the file end.
+        :return: Iterator over matching bar open times.
+        """
+        return self._reader.iter_timestamps(start_timestamp, end_timestamp)
 
     def get_positions(
         self, start_timestamp: int | None = None, end_timestamp: int | None = None

@@ -218,6 +218,19 @@ class OHLCVReader:
 
         return OHLCV(data[0] * 1000, *data[1:], extra_fields=extra)
 
+    def iter_timestamps(
+        self, start_timestamp: int, end_timestamp: int | None = None
+    ) -> Iterator[int]:
+        """
+        Read the bar open times of an inclusive millisecond range.
+
+        :param start_timestamp: Start timestamp in milliseconds.
+        :param end_timestamp: End timestamp in milliseconds, or ``None`` for the end.
+        :return: An iterator over matching bar open times.
+        """
+        for ohlcv in self.read_from(start_timestamp, end_timestamp):
+            yield ohlcv.timestamp
+
     def read_from(
         self,
         start_timestamp: int,

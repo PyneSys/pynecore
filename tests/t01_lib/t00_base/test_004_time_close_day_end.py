@@ -75,6 +75,7 @@ def __test_time_close_trading_day_end__(runner, log):
 
     _check_overnight_session(runner)
     _check_24_7(runner)
+    _check_session_corrections(runner)
 
 
 def _check_overnight_session(runner):
@@ -157,3 +158,33 @@ def _check_24_7(runner):
         for k in results:
             results[k].append(plots[k])
     assert results == expected, f"mismatch: {results} != {expected}"
+
+
+def _check_session_corrections(runner):
+    """ An effective-dated half-day correction moves the monthly bar's close """
+    from datetime import date, time as dt_time
+    from pynecore.core.syminfo import SymInfoInterval, SymInfoSession
+
+    days = (0, 1, 2, 3, 4)
+    base = {
+        "period": "M",
+        "type": "stock",
+        "timezone": "America/New_York",
+        "opening_hours": [SymInfoInterval(day=d, start=dt_time(9, 30), end=dt_time(16, 0)) for d in days],
+        "session_starts": [SymInfoSession(day=d, time=dt_time(9, 30)) for d in days],
+        "session_ends": [SymInfoSession(day=d, time=dt_time(16, 0)) for d in days],
+    }
+    # 2024-11-29 is the last trading day of the month; the correction is a half day
+    corrected = dict(base)
+    corrected["session_corrections"] = {
+        date(2024, 11, 29): (SymInfoInterval(day=4, start=dt_time(9, 30), end=dt_time(13, 0)),),
+    }
+
+    bars = _bars(["2024-11-01T14:30:00"])  # 09:30 New York
+    tz = "America/New_York"
+    for override, hour in ((base, 16), (corrected, 13)):
+        got = []
+        for _candle, plots in runner(iter(bars), syminfo_override=override).run_iter():
+            got.append(plots["tc"])
+        expected = [_ms(tz, 2024, 11, 29, hour)]
+        assert got == expected, f"session-correction mismatch: {got} != {expected}"

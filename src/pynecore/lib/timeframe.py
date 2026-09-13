@@ -66,6 +66,26 @@ def _process_tf(timeframe: str) -> tuple[str, int]:
 
 
 # noinspection PyProtectedMember
+def _current_period() -> str:
+    """
+    Timeframe the running script executes on.
+
+    A script declared with ``indicator(..., timeframe='W')`` is evaluated on
+    higher-timeframe bars, and every ``timeframe.*`` builtin describes THAT
+    timeframe -- while ``syminfo.period`` keeps the chart (data feed) timeframe
+    the bar grid is built from.
+
+    :return: The script timeframe if the declaration carries one, else the chart's.
+    """
+    # A ``request.security()`` child is the one place that must answer with its
+    # OWN period: it evaluates the expression in the context's timeframe, not the
+    # script's. ``lib._main_timeframe`` is set only in such a child.
+    if lib._main_timeframe is None and lib._script_timeframe:
+        return lib._script_timeframe
+    return str(_syminfo.period)
+
+
+# noinspection PyProtectedMember
 def _is_new_session(current_dt: datetime, prev_dt: datetime | None = None, tf_sec: int | None = None) -> bool:
     """
     Check if current bar starts a new session.
@@ -153,7 +173,7 @@ def _in_seconds(timeframe: str | None = None) -> int:
     :raises ValueError: If the timeframe is invalid
     """
     if not timeframe:
-        timeframe: str = str(_syminfo.period)
+        timeframe: str = _current_period()
     _modifier, _multiplier = _process_tf(timeframe)
     if _modifier == 'S':
         return _multiplier
@@ -187,7 +207,7 @@ def isdaily() -> bool:
 
     :return: True if the current timeframe is daily
     """
-    modifier, _ = _process_tf(_syminfo.period)
+    modifier, _ = _process_tf(_current_period())
     return modifier == 'D'
 
 
@@ -198,7 +218,7 @@ def isdwm() -> bool:
 
     :return: True if the current timeframe is intraday, daily, weekly or monthly
     """
-    modifier, _ = _process_tf(_syminfo.period)
+    modifier, _ = _process_tf(_current_period())
     return modifier == 'D' or modifier == 'W' or modifier == 'M'
 
 
@@ -209,7 +229,7 @@ def isintraday() -> bool:
 
     :return: True if the current timeframe is intraday
     """
-    modifier, _ = _process_tf(_syminfo.period)
+    modifier, _ = _process_tf(_current_period())
     return modifier == '' or modifier == 'S' or modifier == 'T'
 
 
@@ -220,7 +240,7 @@ def isminutes() -> bool:
 
     :return: True if the current timeframe is minutes
     """
-    modifier, _ = _process_tf(_syminfo.period)
+    modifier, _ = _process_tf(_current_period())
     return modifier == ''
 
 
@@ -231,7 +251,7 @@ def ismonthly() -> bool:
 
     :return: True if the current timeframe is monthly
     """
-    modifier, _ = _process_tf(_syminfo.period)
+    modifier, _ = _process_tf(_current_period())
     return modifier == 'M'
 
 
@@ -242,7 +262,7 @@ def isseconds() -> bool:
 
     :return: True if the current timeframe is seconds
     """
-    modifier, _ = _process_tf(_syminfo.period)
+    modifier, _ = _process_tf(_current_period())
     return modifier == 'S'
 
 
@@ -253,7 +273,7 @@ def isticks() -> bool:
 
     :return: True if the current timeframe is ticks
     """
-    modifier, _ = _process_tf(_syminfo.period)
+    modifier, _ = _process_tf(_current_period())
     return modifier == 'T'
 
 
@@ -264,7 +284,7 @@ def isweekly() -> bool:
 
     :return: True if the current timeframe is weekly
     """
-    modifier, _ = _process_tf(_syminfo.period)
+    modifier, _ = _process_tf(_current_period())
     return modifier == 'W'
 
 
@@ -282,9 +302,7 @@ def main_period() -> str:
     # over on chart bars rather than on every intrabar.
     if lib._main_timeframe is not None:
         return lib._main_timeframe
-    if lib._script is None:
-        return str(_syminfo.period)
-    return lib._script.timeframe or str(_syminfo.period)
+    return _current_period()
 
 
 @module_property
@@ -294,7 +312,7 @@ def multiplier() -> PyneInt:
 
     :return: The current timeframe multiplier
     """
-    _, _multiplier = _process_tf(_syminfo.period)
+    _, _multiplier = _process_tf(_current_period())
     # A Pine int is a double at runtime
     return float(_multiplier)
 
@@ -306,4 +324,4 @@ def period() -> str:
 
     :return: The current period
     """
-    return str(_syminfo.period)
+    return _current_period()

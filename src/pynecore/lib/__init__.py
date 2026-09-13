@@ -36,6 +36,7 @@ from pynecore.core.safe_convert import native_int_or as _native_int_or
 from pynecore.core.datetime import parse_datestring as _parse_datestring, parse_timezone as _parse_timezone, \
     TimezoneNotFoundError, civil_days as _civil_days, julian_civil_days as _julian_civil_days, \
     GREGORIAN_CUTOVER_DAY as _GREGORIAN_CUTOVER_DAY, GREGORIAN_CYCLE_DAYS as _GREGORIAN_CYCLE_DAYS
+from ..core.security import BarCalendar as _BarCalendar, actual_bar_close as _actual_bar_close
 from ..core.resampler import (
     Resampler, ObservedDayCounter as _ObservedDayCounter,
     grid_mode as _grid_mode, overnight_opens as _overnight_opens,
@@ -149,6 +150,14 @@ _script: script = None  # type: ignore[assignment]
 # ``timeframe.main_period`` there reports the chart TF instead of the context's
 # own period. ``None`` on the chart side, where ``_script`` carries it directly.
 _main_timeframe: str | None = None
+
+#: Timeframe declared by the running script (``indicator(..., timeframe='W')``).
+#: Published by the ``@script.*`` decorator -- i.e. while the script module body is
+#: still executing -- because the security transformer's module-level
+#: ``__security_contexts__`` dict evaluates ``timeframe.period`` right there, and a
+#: script running on a higher timeframe must already see THAT timeframe. ``None``
+#: for a plain chart-timeframe script.
+_script_timeframe: str | None = None
 
 # Stores data to polot
 _plot_data: dict[str, Any] = {}
@@ -1620,8 +1629,9 @@ def _dg_on_roll(ts: float) -> None:
         _dg_tz = _parse_timezone(tz_name) if tz_name else None
         _dg_overnight = _overnight_opens(opening_hours, syminfo._session_starts)
         try:
-            chart_sec = timeframe_module._in_seconds(str(syminfo.period))
-            chart_mod, _ = timeframe_module._process_tf(str(syminfo.period))
+            run_tf = timeframe_module._current_period()
+            chart_sec = timeframe_module._in_seconds(run_tf)
+            chart_mod, _ = timeframe_module._process_tf(run_tf)
         except (ValueError, AssertionError):
             chart_sec = 0
             chart_mod = None
@@ -1715,10 +1725,11 @@ def _chart_span_off_ms() -> int:
     """
     try:
         # noinspection PyProtectedMember
-        chart_mod, _ = timeframe_module._process_tf(str(syminfo.period))
+        run_tf = timeframe_module._current_period()
+        chart_mod, _ = timeframe_module._process_tf(run_tf)
         if chart_mod in ('', 'S'):
             # noinspection PyProtectedMember
-            return timeframe_module._in_seconds(str(syminfo.period)) * 1000 - 1
+            return timeframe_module._in_seconds(run_tf) * 1000 - 1
     except (ValueError, AssertionError):
         pass
     return 0
@@ -1869,8 +1880,9 @@ def _requested_bar_time(resampler: Resampler, timeframe: str, modifier: str, mul
     daily = multiplier == 1 and modifier == 'D'
     if (dwm or daily) and steps <= 0:
         # noinspection PyProtectedMember
-        if (modifier, multiplier) == timeframe_module._process_tf(str(syminfo.period)):
-            # The chart's own bars are the requested grid
+        if (modifier, multiplier) == timeframe_module._process_tf(
+                timeframe_module._current_period()):
+            # The script's own bars are the requested grid
             return current_time_ms
     while True:
         if dwm:
@@ -1935,9 +1947,9 @@ def time(timeframe: str | None = None, session: str | int | None = None,
     if timeframe is None:
         return float(_time)
 
-    # An empty string selects the chart's timeframe
+    # An empty string selects the timeframe the script runs on
     if timeframe == '':
-        timeframe = str(syminfo.period)
+        timeframe = timeframe_module._current_period()
 
     # Get resampler for the requested timeframe
     try:
@@ -1954,7 +1966,8 @@ def time(timeframe: str | None = None, session: str | int | None = None,
         try:
             if bars_back:
                 # noinspection PyProtectedMember
-                current_time_ms -= bars_back * timeframe_module._in_seconds(str(syminfo.period)) * 1000
+                current_time_ms -= bars_back * timeframe_module._in_seconds(
+                    timeframe_module._current_period()) * 1000
             if timeframe_bars_back < 0:
                 # A future bar has no grid to walk yet, so its nominal length is used
                 # noinspection PyProtectedMember
@@ -2035,8 +2048,8 @@ def timenow():
 # would be wrong for overnight sessions where bars before/after the session
 # open on the same date belong to different trading days. The session-structure
 # table is rebuilt whenever ``syminfo._opening_hours`` is replaced
-# (``_set_lib_syminfo_properties`` always assigns a fresh list) or
-# ``syminfo.period`` changes.
+# (``_set_lib_syminfo_properties`` always assigns a fresh list) or the
+# timeframe the script runs on changes.
 _ttd_memo_dt: datetime | None = None
 _ttd_memo_result: int = 0
 _ttd_session_hours: list | None = None
@@ -2067,7 +2080,7 @@ def time_tradingday() -> PyneInt:
         _ttd_overnight_by_wd, _ttd_period_delta
 
     opening_hours = syminfo._opening_hours
-    period = syminfo.period
+    period = timeframe_module._current_period()
     if opening_hours is not _ttd_session_hours or period != _ttd_session_period:
         # Session structure changed — rebuild the per-weekday table of overnight
         # session opens (the only entries that can roll the trading day).
@@ -2193,6 +2206,62 @@ def _tdc_cap_ms(bar_open_ms: int, bar_close_ms: int) -> int:
     return min(bar_close_ms, day_end_ms)
 
 
+# Scheduled calendar of the chart symbol, used for D/W/M bar closes. Rebuilt
+# when the session template is replaced (identity guard, like the ``_tdc`` and
+# ``_dbt`` machinery). ``_dwc_cache`` memoises the probe-driven close per bar,
+# because ``time_close`` is called on every bar with the same arguments.
+_dwc_guard: tuple | None = None
+_dwc_cal: '_BarCalendar | None' = None
+_dwc_cache: dict[tuple[int, str], int] = {}
+
+
+# noinspection PyProtectedMember
+def _dwm_close_ms(bar_open_ms: int, timeframe: str) -> int:
+    """
+    Scheduled close of the D/W/M bar opening at ``bar_open_ms``.
+
+    A daily, weekly or monthly bar closes at the end of the last scheduled
+    trading day inside its calendar period — never at ``open + nominal span``,
+    because a month has no fixed length and the last session of a week or month
+    ends before the next period opens. Measured on TradingView (CAPITALCOM:GOLD):
+    a monthly bar's ``time_close - time`` varies per month and a weekly one is a
+    constant 4d23h, both landing on the last trading day's session end.
+
+    :param bar_open_ms: Bar opening time (UNIX ms)
+    :param timeframe: The bar's timeframe string ('D', 'W' or 'M' modifier)
+    :return: The bar's close instant (UNIX ms)
+    """
+    global _dwc_guard, _dwc_cal
+    oh = syminfo._opening_hours
+    ss = syminfo._session_starts
+    # Effective-dated session corrections (half-days, holidays) decide the last
+    # trading day of a period just as much as the template does.
+    corr = getattr(syminfo, 'session_corrections', None) or None
+    tz_name = getattr(syminfo, 'timezone', None)
+    if (_dwc_guard is None or _dwc_guard[0] is not oh or _dwc_guard[1] is not ss
+            or _dwc_guard[2] is not corr or _dwc_guard[3] != tz_name):
+        _dwc_cal = _BarCalendar(
+            tz=_parse_timezone(tz_name) if tz_name else None,
+            opening_hours=tuple(oh or ()),
+            session_starts=tuple(ss or ()),
+            corrections=corr,
+            grid_mode=_grid_mode(syminfo.type, oh or None),
+        )
+        _dwc_guard = (oh, ss, corr, tz_name)
+        _dwc_cache.clear()
+
+    key = (bar_open_ms, timeframe)
+    cached = _dwc_cache.get(key)
+    if cached is not None:
+        return cached
+    if len(_dwc_cache) >= 1024:
+        _dwc_cache.clear()
+    assert _dwc_cal is not None
+    close_ms = _actual_bar_close(bar_open_ms, 0, _dwc_cal, timeframe)
+    _dwc_cache[key] = close_ms
+    return close_ms
+
+
 @module_function_property
 def time_close(timeframe: str | None = None, session: str | int | None = None,
                timezone: str | None = None, bars_back: int = 0,
@@ -2238,18 +2307,22 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
         # because the last bar of a session may be shortened
         try:
             # noinspection PyProtectedMember
-            close_ms = _time + timeframe_module._in_seconds(str(syminfo.period)) * 1000
+            run_tf = timeframe_module._current_period()
             # noinspection PyProtectedMember
-            chart_mod, chart_mult = timeframe_module._process_tf(str(syminfo.period))
+            chart_mod, _chart_mult = timeframe_module._process_tf(run_tf)
+            if chart_mod in ('D', 'W', 'M'):
+                close_ms = _dwm_close_ms(_time, run_tf)
+            else:
+                # noinspection PyProtectedMember
+                close_ms = _time + timeframe_module._in_seconds(run_tf) * 1000
+                close_ms = _tdc_cap_ms(_time, close_ms)
         except (ValueError, AssertionError):
             return na_int
-        if chart_mod in ('', 'S') or (chart_mod == 'D' and chart_mult == 1):
-            close_ms = _tdc_cap_ms(_time, close_ms)
         return float(close_ms)
 
-    # An empty string selects the chart's timeframe
+    # An empty string selects the timeframe the script runs on
     if timeframe == '':
-        timeframe = str(syminfo.period)
+        timeframe = timeframe_module._current_period()
 
     # Get resampler for the requested timeframe
     try:
@@ -2266,7 +2339,8 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
         try:
             if bars_back:
                 # noinspection PyProtectedMember
-                current_time_ms -= bars_back * timeframe_module._in_seconds(str(syminfo.period)) * 1000
+                current_time_ms -= bars_back * timeframe_module._in_seconds(
+                    timeframe_module._current_period()) * 1000
             if timeframe_bars_back < 0:
                 # A future bar has no grid to walk yet, so its nominal length is used
                 # noinspection PyProtectedMember
@@ -2276,19 +2350,18 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
     bar_start_time = _requested_bar_time(resampler, timeframe, modifier, multiplier,
                                          current_time_ms, timeframe_bars_back)
 
-    # Calculate bar close time by adding timeframe duration
+    # Calculate the bar close time: D/W/M periods close at the end of their last
+    # scheduled trading day, intraday bars at the (possibly shortened) day end.
     try:
-        # noinspection PyProtectedMember
-        tf_seconds = timeframe_module._in_seconds(timeframe)
-        bar_close_time = bar_start_time + (tf_seconds * 1000)  # Convert to milliseconds
+        if modifier in ('D', 'W', 'M'):
+            bar_close_time = _dwm_close_ms(bar_start_time, timeframe)
+        else:
+            # noinspection PyProtectedMember
+            tf_seconds = timeframe_module._in_seconds(timeframe)
+            bar_close_time = _tdc_cap_ms(bar_start_time,
+                                         bar_start_time + (tf_seconds * 1000))
     except (ValueError, AssertionError):
         return na_int
-
-    if modifier in ('', 'S') or (modifier == 'D' and multiplier == 1):
-        # TradingView closes the (possibly shortened) last bar of the day at
-        # the trading-day end; weekly/monthly and multi-period close times
-        # are not session-capped.
-        bar_close_time = _tdc_cap_ms(bar_start_time, bar_close_time)
 
     if session is None:
         # No session specified, return the bar close time
