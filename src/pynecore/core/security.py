@@ -2421,7 +2421,23 @@ def actual_bar_close(open_ms: int, next_open_ms: int, cal: BarCalendar,
                     close = session_end
         return close
 
-    period_end = _dwm_period_end(open_ms, cal, timeframe)
+    return dwm_session_close(open_ms, _dwm_period_end(open_ms, cal, timeframe), cal)
+
+
+def dwm_session_close(open_ms: int, period_end: int, cal: BarCalendar) -> int:
+    """
+    Close instant of a D/W/M bar spanning ``[open_ms, period_end)``.
+
+    The end of the LAST scheduled session inside the period (an equity weekly
+    bar closes Friday 16:00, an FX weekly bar Friday 17:00 New York — never the
+    next Monday's open), falling back to the civil period end for a symbol with
+    no usable session bounds.
+
+    :param open_ms: The bar's open in epoch ms.
+    :param period_end: The period's exclusive civil end in epoch ms.
+    :param cal: The bar's own calendar.
+    :return: The bar's close instant in epoch ms.
+    """
     if not cal.opening_hours:
         # No schedule (or a 24h symbol with no usable session bounds): the civil
         # period end IS the close.

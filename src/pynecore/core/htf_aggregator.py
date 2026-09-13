@@ -80,11 +80,13 @@ class HTFAggregator:
     """Per-sec_id aggregator of chart OHLCV into a developing HTF bar."""
 
     __slots__ = ('_timeframe', '_tz', '_resampler', '_state', '_session_starts',
-                 '_chart_span_ms')
+                 '_chart_span_ms', '_opening_hours', '_grid_mode')
 
     def __init__(self, timeframe: str, tz: 'ZoneInfo',
                  session_starts: 'list | None' = None,
-                 chart_span_ms: int = 0):
+                 chart_span_ms: int = 0,
+                 opening_hours: 'list | None' = None,
+                 grid_mode: str | None = None):
         self._timeframe = timeframe
         self._tz = tz
         self._resampler = Resampler.get_resampler(timeframe)
@@ -92,6 +94,10 @@ class HTFAggregator:
         # Intraday session anchoring (TradingView aligns HTF bars to the session
         # open). ``None`` keeps the pure clock-floor — see ``Resampler.get_bar_time``.
         self._session_starts = session_starts
+        # Trading-day roll and scheduled-day calendar of the multi-period
+        # (nD/nW/nM) grid. ``None`` lets the resampler infer both.
+        self._opening_hours = opening_hours
+        self._grid_mode = grid_mode
         # Chart bar span in ms for the close-instant period completion check.
         # 0 (D/W/M charts: no fixed arithmetic span) disables it — the period
         # then closes on the first chart bar of the next period instead.
@@ -112,6 +118,7 @@ class HTFAggregator:
         chart_open: float, chart_high: float, chart_low: float,
         chart_close: float, chart_volume: float,
         chart_confirmed: bool = True,
+        period_complete: bool | None = None,
     ) -> tuple[bool, DevelopingBar | None, DevelopingBar | None]:
         """
         Fold one chart bar into the developing HTF bar.
@@ -127,6 +134,11 @@ class HTFAggregator:
             (``barstate.isconfirmed``). Only a confirmed chart bar may complete
             the period — a developing intra-bar tick must not freeze a
             non-final HTF close.
+        :param period_complete: Overrides the built-in close-instant rule with a
+            caller-computed decision — ``True`` when this chart bar's own close
+            reaches the HTF period's close instant. Used by the script-level
+            timeframe path, which resolves both closes from the trading
+            schedule (see :mod:`pynecore.core.script_timeframe`).
         :return: ``(is_new_period, developing_or_none, closed_or_none)``
 
             - ``is_new_period`` — True iff the chart bar opens a fresh HTF period.
@@ -139,7 +151,8 @@ class HTFAggregator:
               such bar arrived — with the first chart bar of the next period.
         """
         period_start = self._resampler.get_bar_time(
-            chart_time_ms, self._tz, self._session_starts)
+            chart_time_ms, self._tz, self._session_starts,
+            self._opening_hours, self._grid_mode)
 
         closed: DevelopingBar | None = None
         state = self._state
@@ -168,10 +181,12 @@ class HTFAggregator:
         # Skipped when a gap-closed bar is already pending (one closed bar per
         # update; the fresh period then closes via the fallback) or when the
         # chart bar span is unknown (``chart_span_ms == 0``).
-        if (closed is None and chart_confirmed and self._chart_span_ms
-                and self._resampler.get_bar_time(
-                    chart_time_ms + self._chart_span_ms, self._tz,
-                    self._session_starts) != period_start):
+        if period_complete is None:
+            period_complete = bool(self._chart_span_ms) and self._resampler.get_bar_time(
+                chart_time_ms + self._chart_span_ms, self._tz,
+                self._session_starts, self._opening_hours,
+                self._grid_mode) != period_start
+        if closed is None and chart_confirmed and period_complete:
             self._state = None
             return is_new, None, state
 

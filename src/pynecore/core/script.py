@@ -270,6 +270,18 @@ class Script:
             setattr(func, 'script', self)
 
             if self.script_type in (_script_type.indicator, _script_type.strategy):
+                # Publish the script timeframe while the module body is still running:
+                # the security transformer appends ``__security_contexts__`` AFTER this
+                # decorator, and it evaluates ``timeframe.period`` at module level. In a
+                # script running on a higher timeframe that must already resolve to the
+                # SCRIPT's timeframe -- which is what turns
+                # ``request.security(syminfo.tickerid, timeframe.period, x)`` into the
+                # same-context no-op TradingView makes of it.
+                # Local import: ``pynecore.lib`` imports this module at its own
+                # module level, so a top-level import here is a cycle.
+                from pynecore import lib as _lib
+                _lib._script_timeframe = self.timeframe
+
                 # Save toml file if not in pytest and not disabled by env var PYNE_SAVE_SCRIPT_TOML = 0
                 if os.environ.get('PYNE_SAVE_SCRIPT_TOML', '1') == '1' and 'pytest' not in sys.modules:
                     self.save(toml_path)
