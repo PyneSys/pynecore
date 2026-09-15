@@ -474,7 +474,8 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
 
 
 def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None,
-                *, emit_layout: bool = True) -> "tuple[ast.Module, ModuleLayout]":
+                *, emit_layout: bool = True,
+                na_bool: bool = False) -> "tuple[ast.Module, ModuleLayout]":
     """Run the pipeline from the type pass to the finished emission.
 
     This half EMITS: it turns the analysed tree into the state-plumbed form the
@@ -493,6 +494,9 @@ def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None,
     :param emit_layout: Whether to run ``apply_layout``, which materializes the
         layout for CPython: the slot dict literal, the hidden state parameters
         and the ``__pyne_layout__`` attachments.
+    :param na_bool: Whether the module keeps Pine's three-state bool, which
+        decides what a comparison with an na operand answers (see
+        ``FloatToleranceTransformer``).
     :return: The tree the compiler is handed, and the module's slot layout.
     """
     import ast
@@ -535,7 +539,7 @@ def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None,
     # lib modules implement the natively bit-exact builtins and use the
     # raw ``x != x`` nan idiom, both of which the rewrite would break
     if not path.is_relative_to(Path(__file__).parent.parent):
-        transformed = FloatToleranceTransformer().visit(transformed)
+        transformed = FloatToleranceTransformer(na_bool=na_bool).visit(transformed)
     if emit_layout:
         transformed = apply_layout(transformed, slot_layout)
 
@@ -838,7 +842,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
                     NO_FINGERPRINT if fingerprint is None else fingerprint)
                 register(interface)
 
-            transformed, _ = _lower_tree(analysed, path, pyne_mode)
+            transformed, _ = _lower_tree(analysed, path, pyne_mode, na_bool=bool(bool_na))
 
             # No fingerprint means no artifact: a reader validates one by
             # digesting the source it now finds, and nothing here knows which
