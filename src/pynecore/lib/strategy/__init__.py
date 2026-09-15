@@ -4944,31 +4944,40 @@ class SimPosition(PositionBase):
             seen.add(oid)
             candidates.append((order, 'market'))
 
+        def _close_trigger(order: Order) -> str | None:
+            """Which price level of `order` the close has already reached, if any."""
+            if order.stop is not None:
+                if order.sign > 0 and close >= order.stop:
+                    return 'stop'
+                if order.sign < 0 and close <= order.stop:
+                    return 'stop'
+            if order.limit is not None:
+                if order.sign > 0 and close <= order.limit:
+                    return 'limit'
+                if order.sign < 0 and close >= order.limit:
+                    return 'limit'
+            return None
+
+        def _arm_exit(order: Order) -> bool:
+            """Whether an exit leg may act on the close, resolving its tick offsets."""
+            if self._exit_awaits_entry(order):
+                return False
+            # Exits submitted during this bar's main() still carry raw tick
+            # offsets — the trigger check needs concrete price levels.
+            entry_price = self._entry_fill_price(order.order_id, order.entry_seq)
+            if entry_price is not None:
+                self._resolve_tick_exit(order, entry_price)
+            return True
+
         def _add_trigger(order: Order):
             oid = id(order)
             if oid in seen or order.cancelled or order.bar_index != current_bar:
                 return
             if order.is_market_order:
                 return
-            if order.order_type == _order_type_close:
-                if self._exit_awaits_entry(order):
-                    return
-                # Exits submitted during this bar's main() still carry raw tick
-                # offsets — the trigger check below needs concrete price levels.
-                entry_price = self._entry_fill_price(order.order_id, order.entry_seq)
-                if entry_price is not None:
-                    self._resolve_tick_exit(order, entry_price)
-            trigger: str | None = None
-            if order.stop is not None:
-                if order.sign > 0 and close >= order.stop:
-                    trigger = 'stop'
-                elif order.sign < 0 and close <= order.stop:
-                    trigger = 'stop'
-            if trigger is None and order.limit is not None:
-                if order.sign > 0 and close <= order.limit:
-                    trigger = 'limit'
-                elif order.sign < 0 and close >= order.limit:
-                    trigger = 'limit'
+            if order.order_type == _order_type_close and not _arm_exit(order):
+                return
+            trigger = _close_trigger(order)
             if trigger is not None:
                 seen.add(oid)
                 candidates.append((order, trigger))
@@ -5022,33 +5031,21 @@ class SimPosition(PositionBase):
         for order, trigger in candidates:
             _apply_fill(order, trigger)
 
-        # Phase 2: a current-bar entry may have just filled in Phase 1, opening a
-        # trade whose `entry_price` lets us resolve a same-bar `strategy.exit(...,
-        # profit=..., loss=...)` order whose ticks were unresolved before Phase 1.
-        # Mirror `_resolve_filled_entry_exits` — re-scan exit_orders for
-        # current-bar tick exits, materialize, and fill any newly executable.
+        # Phase 2: an entry that filled in Phase 1 changes what the exit book can
+        # do, in two ways. A same-bar `strategy.exit(..., profit=..., loss=...)`
+        # only gets concrete levels once its entry has a fill price, and a pyramid
+        # add hands `_spawn_legs_for_add` a brand new price leg that did not exist
+        # when the candidates were collected. Both are current-bar exit orders the
+        # close can already trigger, so re-scan the book the way Phase 1 did.
         for order in list(self.exit_orders.values()):
             oid = id(order)
             if oid in seen or order.cancelled or order.bar_index != current_bar:
                 continue
             if order.is_market_order:
                 continue
-            if order.profit_ticks is None and order.loss_ticks is None:
+            if not _arm_exit(order):
                 continue
-            entry_price = self._entry_fill_price(order.order_id, order.entry_seq)
-            if entry_price is not None:
-                self._resolve_tick_exit(order, entry_price)
-            trigger2: str | None = None
-            if order.stop is not None:
-                if order.sign > 0 and close >= order.stop:
-                    trigger2 = 'stop'
-                elif order.sign < 0 and close <= order.stop:
-                    trigger2 = 'stop'
-            if trigger2 is None and order.limit is not None:
-                if order.sign > 0 and close <= order.limit:
-                    trigger2 = 'limit'
-                elif order.sign < 0 and close >= order.limit:
-                    trigger2 = 'limit'
+            trigger2 = _close_trigger(order)
             if trigger2 is not None:
                 seen.add(oid)
                 _apply_fill(order, trigger2)
