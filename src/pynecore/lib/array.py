@@ -522,12 +522,12 @@ def insert(id: list[T] | SequenceView[T], index: int, value: T) -> None:
 
 
 # noinspection PyShadowingBuiltins
-def join(id: list[Any] | SequenceView[Any], separator: str) -> str:
+def join(id: list[Any] | SequenceView[Any], separator: str = '') -> str:
     """
     Concatenates the elements in the array into a single string, separated by the specified separator.
 
     :param id: Input array
-    :param separator: Separator to use
+    :param separator: Separator to use, empty string by default
     :return: String containing the concatenated elements
     """
     sa = [str(i) for i in id]  # Ensure all elements are strings
