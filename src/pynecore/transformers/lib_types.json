@@ -460,7 +460,10 @@
    "ret": "v"
   },
   "array.join": {
-   "defaults": 0,
+   "default_ty": [
+    "s"
+   ],
+   "defaults": 1,
    "kind": "function",
    "names": [
     "id",
