@@ -64,10 +64,16 @@ if TYPE_CHECKING:
 #
 # Total per slot: 128 bytes.
 #
-# The slots are followed by an N×N int64 watermark matrix (row = consumer slot
-# index, column = producer slot index): the oldest instant a consumer may still
-# need from that producer. The ring GC drops entries below the minimum over the
-# producer's consumers (keeping the last entry at or below it).
+# The slots are followed by an (N+1)×N int64 watermark matrix (row = consumer
+# slot index, column = producer slot index): the oldest instant a consumer may
+# still need from that producer. The ring GC drops entries below the minimum
+# over the producer's consumers (keeping the last entry at or below it).
+#
+# The extra row N belongs to the CHART, which is a ring consumer too whenever a
+# context runs its historical phase as one batch round (the chart then pairs
+# values out of the ring instead of handshaking per bar). The chart has no slot
+# of its own, so it parks its watermark in that row (see
+# :meth:`SyncBlock.chart_index`).
 SLOT_FORMAT = '<IIqH'
 SLOT_SIZE = 128
 SLOT_DATA_SIZE = struct.calcsize(SLOT_FORMAT)  # 18 bytes — original fields only
@@ -118,6 +124,11 @@ FLAG_MORE_STEPS = 0x100  # this round is NOT the last step the chart queued for 
                          # developing append AT ``round_tick``) is still pending, so
                          # this round must not advertise a frontier that reaches
                          # ``round_tick`` (see ``_capped_frontier``)
+FLAG_BATCH_ROUND = 0x200  # historical BATCH round: the chart launched this context once
+                          # for its whole historical phase instead of per chart bar, and
+                          # pairs the values out of the ring as-of each chart bar. Such a
+                          # round publishes uncapped -- its frontier must run ahead of the
+                          # chart, which is exactly what releases the chart's ring waits.
 
 
 def is_ltf_window(flags: int) -> bool:
@@ -154,8 +165,8 @@ class SyncBlock:
     Fixed-size shared memory block containing sync metadata for all security slots.
 
     Layout: N consecutive slots of :data:`SLOT_SIZE` bytes each, followed by an
-    N×N int64 watermark matrix (row = consumer slot index, column = producer
-    slot index).
+    (N+1)×N int64 watermark matrix (row = consumer slot index, column =
+    producer slot index). The last row is the chart's (:meth:`chart_index`).
     """
 
     def __init__(self, sec_ids: list[str], *, create: bool = True, name: str | None = None):
@@ -164,7 +175,7 @@ class SyncBlock:
         n = len(sec_ids)
         self._n = n
         self._watermark_offset = SLOT_SIZE * n
-        total_size = max(SLOT_SIZE * n + _WATERMARK_ITEM_SIZE * n * n, 1)
+        total_size = max(SLOT_SIZE * n + _WATERMARK_ITEM_SIZE * (n + 1) * n, 1)
 
         if create:
             self._shm = SharedMemory(
@@ -209,6 +220,16 @@ class SyncBlock:
     def index_of(self, sec_id: str) -> int:
         """Return the slot index of a security id."""
         return self._index[sec_id]
+
+    @property
+    def chart_index(self) -> int:
+        """Watermark row index of the CHART process.
+
+        The chart consumes a batched context's ring directly, so the GC has to
+        know how far it has read. It owns no slot, hence the extra row past the
+        security ones. Valid as a consumer index only — never as a producer.
+        """
+        return self._n
 
     def _offset(self, sec_id: str) -> int:
         return self._index[sec_id] * SLOT_SIZE
@@ -372,7 +393,7 @@ class SyncBlock:
     # --- watermark matrix -------------------------------------------------
 
     def _watermark_offset_of(self, consumer_index: int, producer_index: int) -> int:
-        if not (0 <= consumer_index < self._n and 0 <= producer_index < self._n):
+        if not (0 <= consumer_index <= self._n and 0 <= producer_index < self._n):
             raise IndexError(
                 f"watermark index out of range: ({consumer_index}, {producer_index})"
             )
@@ -396,12 +417,12 @@ class SyncBlock:
 
         :param producer_index: Slot index of the producer.
         :param consumer_indexes: Consumer slot indexes to consider; ``None``
-                                 means every slot. With no consumer at all the
-                                 result is :data:`FRONTIER_INF` (nothing needs
-                                 keeping).
+                                 means every slot, the chart's row included.
+                                 With no consumer at all the result is
+                                 :data:`FRONTIER_INF` (nothing needs keeping).
         :return: The minimum watermark in ms.
         """
-        indexes = range(self._n) if consumer_indexes is None else consumer_indexes
+        indexes = range(self._n + 1) if consumer_indexes is None else consumer_indexes
         result = FRONTIER_INF
         for idx in indexes:
             value = self.get_watermark(idx, producer_index)
@@ -898,18 +919,51 @@ class RingWriter:
             self._sync.set_ring_state(
                 self._sec_id, count=count + 1, head=head, used=used + len(payload))
 
+            published = close_ms
             if frontier_close is not None:
                 current = self._sync.get_frontier_close(self._sec_id)
                 if frontier_close > current:
                     self._sync.set_frontier_close(self._sec_id, frontier_close)
-            self._cond.notify_all()
+                    current = frontier_close
+                if current > published:
+                    published = current
 
-    def set_frontier_close(self, frontier_close: int) -> None:
-        """Raise the frontier close (monotonic) and wake the consumers."""
+            # Wake the consumers only when this publication can actually
+            # release one. A consumer's wait ends at an entry closing exactly
+            # at its as-of or at a frontier reaching it, and its watermark is
+            # the as-of it is asking for -- so a publication that stays below
+            # every watermark releases nobody, and the wake-up is pure cost.
+            # It is a large cost: a historical batch round appends its whole
+            # feed while the chart is parked on the ONE entry it needs, and
+            # every notify_all wakes it to re-evaluate the same false
+            # predicate (MEASURED: 24k such wake-ups, ~21 s on a 9-context
+            # daily script, four times the whole run).
+            if self._sync.min_watermark(
+                    self._sync.index_of(self._sec_id),
+                    None if consumer_indexes is None else list(consumer_indexes),
+            ) <= published:
+                self._cond.notify_all()
+
+    def set_frontier_close(self, frontier_close: int,
+                           consumer_indexes: Iterable[int] | None = None) -> None:
+        """
+        Raise the frontier close (monotonic) and wake the consumers.
+
+        :param frontier_close: New frontier close in ms; applied monotonically.
+        :param consumer_indexes: Slot indexes of this producer's consumers.
+            When given, the wake-up is skipped while the new frontier stays
+            below every consumer's watermark — it could release nobody (see
+            :meth:`append`). ``None`` always wakes.
+        """
         with self._cond:
             current = self._sync.get_frontier_close(self._sec_id)
             if frontier_close > current:
                 self._sync.set_frontier_close(self._sec_id, frontier_close)
+                current = frontier_close
+            if consumer_indexes is not None and self._sync.min_watermark(
+                    self._sync.index_of(self._sec_id), list(consumer_indexes)
+            ) > current:
+                return
             self._cond.notify_all()
 
     def finish(self) -> None:
@@ -1103,14 +1157,29 @@ class RingReader:
                 self._cond.wait(slice_timeout)
 
     def wait_for_close(self, ms: int, stop_event: 'EventType | None' = None,
-                       timeout: float | None = None) -> bool:
+                       timeout: float | None = None,
+                       watermark_index: int | None = None) -> bool:
         """
         Wait until the producer published everything closing at or before ``ms``.
 
         The wait ends as soon as an entry closes exactly at ``ms`` or the
         frontier close reaches it — the producer's next unpublished bar always
         closes above the consumer's as-of instant, so this always terminates.
+
+        :param ms: As-of instant to wait for, in ms.
+        :param stop_event: Optional shutdown event; a set event ends the wait.
+        :param timeout: Overall timeout in seconds; ``None`` waits forever.
+        :param watermark_index: This consumer's watermark row. When given, the
+            row is parked at ``ms`` BEFORE the wait — that is what the producer
+            reads to decide whether a publication can release anybody, so a
+            consumer that wants to be woken has to state what it is waiting
+            for. It is also exactly the GC contract ("I may still need the
+            last entry at or below this"), so parking it here rather than
+            after the read costs the ring nothing.
         """
+        if watermark_index is not None:
+            self._sync.set_watermark(
+                watermark_index, self._sync.index_of(self._sec_id), ms)
         return self.wait_until(
             lambda: self.has_close(ms) or self.frontier_close() >= ms,
             stop_event, timeout)

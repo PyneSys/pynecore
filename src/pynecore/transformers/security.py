@@ -209,12 +209,14 @@ class SecurityTransformer(ast.NodeTransformer):
         Simple means: constants, ``lib.*`` attribute chains (``syminfo.*``,
         ``timeframe.*``, ...), calls over such chains (``input.*``,
         ``ticker.heikinashi(...)``), plain operators over them, and names bound
-        by a hoistable binding (see :meth:`_hoistable_bindings`). Such an
-        expression can be evaluated at the very start of the function, which is
-        what lets its ``__sec_signal__`` move into the top block.
+        by a hoistable binding or by a never-rebound parameter (see
+        :meth:`_hoistable_bindings`). Such an expression can be evaluated at the
+        very start of the function, which is what lets its ``__sec_signal__``
+        move into the top block.
 
         :param node: expression to classify
-        :param hoistable: names bound by hoistable top-level bindings
+        :param hoistable: names that already hold their final value at function
+            entry — hoistable top-level bindings and stable parameters
         :return: True if the whole chain is simple
         """
         if isinstance(node, ast.Constant):
@@ -238,9 +240,16 @@ class SecurityTransformer(ast.NodeTransformer):
     @classmethod
     def _hoistable_bindings(
             cls, func: ast.FunctionDef | ast.AsyncFunctionDef
-    ) -> dict[str, ast.Assign]:
+    ) -> tuple[dict[str, ast.Assign], set[str]]:
         """Top-level bindings of ``func`` that may be moved to its first
-        statements.
+        statements, together with its stable parameters.
+
+        A parameter is stable when the function body never assigns or deletes
+        it and does not declare it ``global`` / ``nonlocal``: it keeps the value
+        bound at function entry for the whole call, so reading it in the first
+        statement is exactly what the call site passed. Stable parameters are
+        not hoisted (there is nothing to move), they only count as already
+        available names for :meth:`_is_simple_chain`.
 
         A binding qualifies when it is a plain ``name = <simple chain>``
         assignment standing directly in the function body, the name is assigned
@@ -257,7 +266,8 @@ class SecurityTransformer(ast.NodeTransformer):
         semantics that later passes rewrite.
 
         :param func: the function being transformed
-        :return: mapping of binding name to its assignment statement
+        :return: mapping of binding name to its assignment statement, and the
+            set of stable parameter names
         """
         counts: dict[str, int] = {}
         declared: set[str] = set()
@@ -273,7 +283,13 @@ class SecurityTransformer(ast.NodeTransformer):
         if args.kwarg is not None:
             params.add(args.kwarg.arg)
 
+        stable_params = {p for p in params
+                         if p not in counts and p not in declared}
+
         hoistable: dict[str, ast.Assign] = {}
+        # Names already holding their final value at function entry: the
+        # bindings accepted so far plus every stable parameter.
+        available: set[str] = set(stable_params)
         # A parameter may only be rebound while the whole prefix of the body
         # consists of hoistable bindings — otherwise an earlier statement could
         # still read the value passed by the caller.
@@ -286,11 +302,12 @@ class SecurityTransformer(ast.NodeTransformer):
                     name = target.id
                     if (name not in declared and counts.get(name) == 1
                             and (prefix or name not in params)
-                            and cls._is_simple_chain(stmt.value, hoistable)):
+                            and cls._is_simple_chain(stmt.value, available)):
                         hoistable[name] = stmt
+                        available.add(name)
                         ok = True
             prefix = prefix and ok
-        return hoistable
+        return hoistable, stable_params
 
     @staticmethod
     def _referenced_names(node: ast.expr) -> set[str]:
@@ -803,18 +820,20 @@ class SecurityTransformer(ast.NodeTransformer):
 
         # Separate top-block signals from runtime-dependent ones. A signal can
         # start at function entry when every argument is a Pine "simple" chain:
-        # constants, lib.* values, or a local bound once from such a chain. In
-        # the last case the binding itself is hoisted above the signal block, so
-        # the value is already there. Everything else (function parameters,
-        # series-dependent expressions) must be signalled inline, after the
-        # variables it reads have been assigned.
-        hoistable = self._hoistable_bindings(node)
+        # constants, lib.* values, a parameter the body never rebinds, or a
+        # local bound once from such a chain. In the last case the binding
+        # itself is hoisted above the signal block, so the value is already
+        # there. Everything else (rebound parameters, series-dependent
+        # expressions) must be signalled inline, after the variables it reads
+        # have been assigned.
+        hoistable, stable_params = self._hoistable_bindings(node)
+        available = set(hoistable) | stable_params
         top_sec_ids = []
         runtime_sec_ids: set[str] = set()
         needed_names: set[str] = set()
         for sid in sec_ids:
             exprs = [e for e in self._signal_args[sid] if e is not None]
-            if all(self._is_simple_chain(e, hoistable) for e in exprs):
+            if all(self._is_simple_chain(e, available) for e in exprs):
                 top_sec_ids.append(sid)
                 for expr in exprs:
                     needed_names |= self._referenced_names(expr)
@@ -911,7 +930,7 @@ _UNMODELLED_NODES: tuple[type[ast.AST], ...] = tuple(
     n for n in (
         getattr(ast, name, None) for name in (
             'Try', 'TryStar', 'With', 'AsyncWith', 'AsyncFor', 'Raise', 'Delete',
-            'Global', 'Nonlocal', 'ClassDef', 'Lambda', 'ListComp', 'SetComp',
+            'ClassDef', 'Lambda', 'ListComp', 'SetComp',
             'DictComp', 'GeneratorExp', 'Yield', 'YieldFrom', 'Await', 'Assert',
         )
     ) if n is not None
@@ -938,6 +957,43 @@ _MUTATING_NAMESPACES = frozenset({'array', 'matrix', 'map'})
 # converges; the cap only guards against an unforeseen non-monotone edit.
 _MAX_FIXPOINT_ROUNDS = 200
 
+# Prefix marking a symbolic parameter token inside a taint set. A call site
+# replaces the callee's own tokens with that call's argument taints, so two
+# calls of one function never share their arguments' taint.
+_PARAM_PREFIX = '\x00param\x00'
+
+# Pseudo-parameter name carrying the control taint a call site runs under —
+# the caller's ``if`` condition decides whether the callee's writes and
+# mutations happen at all, so it is substituted like any other argument.
+_CTRL_PARAM = '<ctrl>'
+
+
+class _Scope:
+    """One lexical scope of the analysed module (the module or a function).
+
+    :ivar key: unique dotted path of the scope (``''`` for the module)
+    :ivar node: the ``Module`` / ``FunctionDef`` the scope belongs to
+    :ivar parent: key of the enclosing scope, ``None`` for the module
+    :ivar locals: names bound inside the scope (parameters, assignment
+        targets, nested ``def`` names) that are not declared ``global`` /
+        ``nonlocal``
+    :ivar globals: names the scope declares ``global``
+    :ivar funcs: nested function name to scope key
+    :ivar body: the scope's statement list
+    """
+
+    __slots__ = ('key', 'node', 'parent', 'locals', 'globals', 'funcs', 'body')
+
+    def __init__(self, key: str, node: ast.AST, parent: str | None,
+                 body: list[ast.stmt]):
+        self.key = key
+        self.node = node
+        self.parent = parent
+        self.locals: set[str] = set()
+        self.globals: set[str] = set()
+        self.funcs: dict[str, str] = {}
+        self.body = body
+
 
 class _DependencyAnalyzer:
     """Forward taint analysis over an already lowered security AST.
@@ -948,24 +1004,41 @@ class _DependencyAnalyzer:
     ``__sec_write__("<sid>", <expr>)``. This pass answers one question: which
     sids' results flow into which other sid's write expression.
 
-    The analysis is deliberately coarse:
+    What the analysis models:
 
     - **Flow-insensitive on data**: a name's taint is the union over every
-      assignment to it anywhere in the module (so ``var`` backward flow and
+      assignment to it anywhere in its scope (so ``var`` backward flow and
       loop-carried values are covered without ordering rules).
-    - **Flat namespace**: names are not scoped per function. Two unrelated
-      locals sharing a name merge their taint — an over-approximation only.
+    - **Lexically scoped names**: a name belongs to the scope that binds it —
+      parameters and assignment targets are local, everything else resolves
+      outwards, so a nested ``def`` reading a ``main`` local (the usual closure
+      in a Pyne script) shares that local's taint while two same-named locals
+      of unrelated functions do not. A ``global`` / ``nonlocal`` declaration
+      rebinds the name to the module / the enclosing scope that owns it.
     - **Flow-sensitive on control**: a control-taint set accumulates the taint
       of enclosing ``if`` / ``for`` / ``while`` / ``match`` conditions, and a
       tainted ``return`` / ``break`` / ``continue`` taints the rest of its
       function.
     - **Alias classes**: ``a = b`` merges the two names into one taint class,
-      so mutating a container through either alias is visible on both.
-    - **User functions**: a call's result carries the callee's return taint
-      plus the taint of every argument (arguments are conservatively assumed
-      to flow into the result).
+      so mutating a container through either alias is visible on both. A
+      call whose callee returns one of its parameters (or an alias of it)
+      merges the receiving name with that argument the same way.
+    - **User functions, per call site**: each parameter carries a symbolic
+      token instead of a concrete sid. A call's result is the callee's return
+      taint with its own tokens replaced by this call's argument taints, so an
+      argument only reaches the result when the callee's return actually draws
+      on it, and two calls of one function do not mix. Taint the callee adds to
+      a parameter (a mutated array, matrix or map) flows back into the caller's
+      argument variable the same way. The control taint of the call site is a
+      pseudo-parameter: a mutation or write the callee performs happens only if
+      the caller reached the call, so it carries the caller's condition too. A
+      call whose callee is not a modelled
+      function keeps the conservative rule: every argument flows into the
+      result. Tokens that survive into a write inside a callee are resolved
+      against the union of that parameter's call sites, and a function that is
+      called somewhere the analysis could not model resolves to every sid.
     - **Fallback**: a scope containing an unmodelled construct makes every
-      write in it depend on all other sids.
+      write in it — and every call of it — depend on all other sids.
 
     Over-approximation is safe only towards EARLIER-sited producers, and the
     result is filtered to those: for them ``depends`` is just a wait filter, so
@@ -981,9 +1054,16 @@ class _DependencyAnalyzer:
         self.depends: dict[str, set[str]] = {sid: set() for sid in all_sids}
         self.in_loop: set[str] = set()
         self._funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+        self._scopes: dict[str, _Scope] = {}
+        self._key_of: dict[int, str] = {}
+        self._called_names: set[str] = set()
+        self._bound: set[str] = set()
         self._fallback_scopes: set[str] = set()
         self.fallback_reasons: dict[str, str] = {}
         self._ret: dict[str, set[str]] = {}
+        self._ret_alias: dict[str, set[str]] = {}
+        self._param_out: dict[str, dict[str, set[str]]] = {}
+        self._param_in: dict[str, set[str]] = {}
         self._escape: dict[str, set[str]] = {}
         self._parent: dict[str, str] = {}
         self._taint: dict[str, set[str]] = {}
@@ -991,6 +1071,92 @@ class _DependencyAnalyzer:
         self._order: dict[str, int] = {}
         self._scope: str = ''
         self._changed = False
+        self._final = False
+
+    # --- scopes ---
+
+    @classmethod
+    def _child_funcs(cls, node: ast.AST):
+        """Yield the function definitions directly owned by ``node``'s scope."""
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                yield child
+            else:
+                yield from cls._child_funcs(child)
+
+    @staticmethod
+    def _params(fn: 'ast.FunctionDef | ast.AsyncFunctionDef') -> list[ast.arg]:
+        spec = fn.args
+        params = list(spec.posonlyargs) + list(spec.args) + list(spec.kwonlyargs)
+        if spec.vararg is not None:
+            params.append(spec.vararg)
+        if spec.kwarg is not None:
+            params.append(spec.kwarg)
+        return params
+
+    def _build_scopes(self) -> None:
+        """Build the lexical scope tree and each scope's set of bound names."""
+        root = _Scope('', self._module, None, self._module.body)
+        self._scopes[''] = root
+        self._key_of[id(self._module)] = ''
+        work: list[_Scope] = [root]
+        used: set[str] = {''}
+        while work:
+            scope = work.pop()
+            declared: set[str] = set()
+            for sub in self._iter_stmts_skip_funcs(scope.node):
+                if isinstance(sub, ast.Global):
+                    scope.globals.update(sub.names)
+                    declared.update(sub.names)
+                elif isinstance(sub, ast.Nonlocal):
+                    declared.update(sub.names)
+            if isinstance(scope.node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                scope.locals.update(p.arg for p in self._params(scope.node))
+            for sub in self._iter_stmts_skip_funcs(scope.node):
+                if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                    scope.locals.add(sub.id)
+                elif isinstance(sub, (ast.Import, ast.ImportFrom)):
+                    for alias in sub.names:
+                        bound = alias.asname or alias.name.split('.')[0]
+                        scope.locals.add(bound)
+            for fn in self._child_funcs(scope.node):
+                scope.locals.add(fn.name)
+                key = (scope.key + '.' if scope.key else '') + fn.name
+                while key in used:
+                    key += '~'
+                used.add(key)
+                child = _Scope(key, fn, scope.key, fn.body)
+                self._scopes[key] = child
+                self._key_of[id(fn)] = key
+                scope.funcs[fn.name] = key
+                work.append(child)
+            scope.locals -= declared
+
+    def _q(self, name: str, scope_key: str | None = None) -> str:
+        """Qualify a bare name with the key of the scope that binds it."""
+        key = self._scope if scope_key is None else scope_key
+        while True:
+            scope = self._scopes.get(key)
+            if scope is None:
+                return '\x00' + name
+            if name in scope.globals:
+                return '\x00' + name
+            if name in scope.locals or scope.parent is None:
+                return key + '\x00' + name
+            key = scope.parent
+
+    def _lookup_func(self, name: str) -> str | None:
+        """Scope key of the user function ``name`` resolves to, if any."""
+        key: str | None = self._scope
+        while key is not None:
+            scope = self._scopes.get(key)
+            if scope is None:
+                break
+            if name in scope.funcs:
+                return scope.funcs[name]
+            key = scope.parent
+        fn = self._funcs.get(name)
+        return self._key_of.get(id(fn)) if fn is not None else None
 
     # --- alias classes ---
 
@@ -1014,13 +1180,18 @@ class _DependencyAnalyzer:
             self._changed = True
         self._taint[ra] = merged
 
+    @staticmethod
+    def _bare(name: str) -> str:
+        """The bare name of a scope-qualified name."""
+        return name.rpartition('\x00')[2]
+
     def _get_taint(self, name: str) -> set[str]:
-        if name in _UNTAINTABLE_ROOTS:
+        if self._bare(name) in _UNTAINTABLE_ROOTS:
             return set()
         return set(self._taint.get(self._find(name), ()))
 
     def _add_taint(self, name: str, taint: set[str]) -> None:
-        if name in _UNTAINTABLE_ROOTS:
+        if self._bare(name) in _UNTAINTABLE_ROOTS:
             return
         if not taint:
             self._taint.setdefault(self._find(name), set())
@@ -1030,6 +1201,69 @@ class _DependencyAnalyzer:
         if not taint <= cur:
             cur |= taint
             self._changed = True
+
+    # --- parameter tokens ---
+
+    @staticmethod
+    def _token(qualified_param: str) -> str:
+        return _PARAM_PREFIX + qualified_param
+
+    @classmethod
+    def _ctrl_token(cls, scope_key: str) -> str:
+        """Token standing for the control taint a call of ``scope_key`` runs under."""
+        return cls._token(scope_key + '\x00' + _CTRL_PARAM)
+
+    @staticmethod
+    def _subst(taint: set[str], token_map: dict[str, set[str]]) -> set[str]:
+        """Replace this call's parameter tokens with the argument taints.
+
+        Tokens the map does not name belong to an enclosing function (or to a
+        parameter this call left at its default) and are carried through
+        unchanged — :meth:`_resolve_tokens` settles them later.
+        """
+        out: set[str] = set()
+        for item in taint:
+            if item.startswith(_PARAM_PREFIX):
+                mapped = token_map.get(item)
+                if mapped is None:
+                    out.add(item)
+                else:
+                    out |= mapped
+            else:
+                out.add(item)
+        return out
+
+    def _resolve_tokens(self, taint: set[str]) -> set[str]:
+        """Turn a taint set into plain sids by expanding parameter tokens.
+
+        A token expands to the union of the argument taints seen at the
+        callee's call sites. A function the module calls somewhere the analysis
+        never reached has no recorded call site, so its tokens expand to every
+        sid instead of to nothing — but only in the final rounds
+        (``_final``): before the first fixpoint a callee visited ahead of its
+        call site merely has not been bound YET, and expanding it to every sid
+        then would pin a spurious dependency that no later round can retract.
+        """
+        out: set[str] = set()
+        seen: set[str] = set()
+        work = list(taint)
+        while work:
+            item = work.pop()
+            if not item.startswith(_PARAM_PREFIX):
+                out.add(item)
+                continue
+            if item in seen:
+                continue
+            seen.add(item)
+            key = item[len(_PARAM_PREFIX):].rpartition('\x00')[0]
+            scope = self._scopes.get(key)
+            if (self._final and key not in self._bound and scope is not None
+                    and isinstance(scope.node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and scope.node.name in self._called_names):
+                out |= self._all
+                continue
+            work.extend(self._param_in.get(item, ()))
+        return out
 
     # --- helpers ---
 
@@ -1112,14 +1346,9 @@ class _DependencyAnalyzer:
                     walk(self._funcs[name])
                     visiting.discard(name)
 
-        called = {
-            n.func.id for n in ast.walk(self._module)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-            and n.func.id in self._funcs
-        }
         walk(self._module)
         for name, fn in self._funcs.items():
-            if name not in called:
+            if name not in self._called_names:
                 walk(fn)
         for sid in self._all:
             if sid not in self._order:
@@ -1181,7 +1410,7 @@ class _DependencyAnalyzer:
         if node is None or isinstance(node, ast.Constant):
             return set()
         if isinstance(node, ast.Name):
-            return self._get_taint(node.id)
+            return self._get_taint(self._q(node.id))
         if isinstance(node, ast.Attribute):
             return self._expr_taint(node.value)
         if isinstance(node, ast.Call):
@@ -1212,7 +1441,7 @@ class _DependencyAnalyzer:
             if func.id == '__sec_write__':
                 sid = self._sid_arg(node)
                 value = node.args[1] if len(node.args) > 1 else None
-                taint = self._expr_taint(value) | self._ctrl
+                taint = self._resolve_tokens(self._expr_taint(value) | self._ctrl)
                 if self._scope in self._fallback_scopes:
                     taint |= self._all
                 if sid is not None:
@@ -1235,100 +1464,178 @@ class _DependencyAnalyzer:
             if isinstance(arg, ast.Starred):
                 star_from = i
                 break
-        for arg_taint in pos_taints:
-            taint |= arg_taint
-        for _kw_name, arg_taint in kw_taints:
-            taint |= arg_taint
-        if isinstance(func, ast.Name) and func.id in self._funcs:
-            self._bind_params(self._funcs[func.id], pos_taints, kw_taints, star_from)
-            taint |= self._ret.get(func.id, set())
+        callee = self._lookup_func(func.id) if isinstance(func, ast.Name) else None
+        if callee is not None:
+            taint |= self._call_user_func(callee, node, pos_taints, kw_taints, star_from)
+        else:
+            # Unknown callee: every argument is assumed to reach the result.
+            for arg_taint in pos_taints:
+                taint |= arg_taint
+            for _kw_name, arg_taint in kw_taints:
+                taint |= arg_taint
 
         # Mutation: a collection API writes into the id passed as its first
         # argument (``array.push(id, v)``), and a method call writes into the
-        # object it runs on (``id.push(v)``).
-        if taint and isinstance(func, ast.Attribute):
+        # object it runs on (``id.push(v)``). Whether the write happens at all
+        # depends on the enclosing conditions, so the control taint is part of
+        # the collection's new state even when the pushed value is a constant.
+        mutation = taint | self._ctrl
+        if mutation and isinstance(func, ast.Attribute):
             if self._is_mutating_namespace_call(func):
                 if node.args:
                     root = self._root_name(node.args[0])
                     if root is not None:
-                        self._add_taint(root, taint)
+                        self._add_taint(self._q(root), mutation)
             else:
                 root = self._root_name(func.value)
                 if root is not None:
-                    self._add_taint(root, taint)
+                    self._add_taint(self._q(root), mutation)
         return taint
 
-    def _bind_params(self, fn: 'ast.FunctionDef | ast.AsyncFunctionDef',
-                     pos_taints: list[set[str]],
-                     kw_taints: list[tuple[str | None, set[str]]],
-                     star_from: int | None = None) -> None:
-        """Flow a call's argument taints into the callee's parameter names.
+    def _call_user_func(self, key: str, node: ast.Call,
+                        pos_taints: list[set[str]],
+                        kw_taints: list[tuple[str | None, set[str]]],
+                        star_from: int | None) -> set[str]:
+        """Taint of one call of a modelled user function.
 
-        The taint namespace is flat (one entry per bare name), so a parameter
-        is just another name — but nothing writes it unless the argument taint
-        is bound here. Without the binding a dependency only reaches a write
-        inside the callee when the caller's variable happens to carry the same
-        name as the parameter.
+        The call's arguments are matched to the callee's parameters, giving a
+        substitution from the callee's parameter tokens to this call's argument
+        taints. The result is the callee's return taint under that
+        substitution — an argument the return does not draw on contributes
+        nothing. The same substitution carries taint the callee added to a
+        parameter (a mutated collection) back into the caller's variable.
 
-        :param fn: The callee's definition.
-        :param pos_taints: Taint of each positional argument, in call order.
+        :param key: scope key of the callee
+        :param node: the call site
+        :param pos_taints: taint of each positional argument, in call order
         :param kw_taints: ``(keyword name, taint)`` pairs; the name is ``None``
-            for a ``**mapping`` unpacking, whose targets are unknown.
-        :param star_from: Index of the first ``*iterable`` in ``pos_taints``,
-            ``None`` when the call spreads nothing. From that index on the
-            argument-to-parameter mapping is unknown at compile time.
+            for a ``**mapping`` unpacking, whose targets are unknown
+        :param star_from: index of the first ``*iterable`` in ``pos_taints``,
+            ``None`` when the call spreads nothing
+        :return: the taint of the call's result
         """
-        spec = fn.args
-        positional = list(spec.posonlyargs) + list(spec.args)
-        every = positional + list(spec.kwonlyargs)
-        extra_pos: set[str] = set()
-        extra_kw: set[str] = set()
-        spread: set[str] = set()
+        fn = self._scopes[key].node
+        assert isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        arg_expr = self._arg_exprs(fn, node, star_from)
+        bound: dict[str, set[str]] = {}
+        # Taint whose target parameter is not known at compile time
+        unknown: set[str] = set()
+        positional = list(fn.args.posonlyargs) + list(fn.args.args)
         for i, arg_taint in enumerate(pos_taints):
             if star_from is not None and i >= star_from:
-                spread |= arg_taint
+                unknown |= arg_taint
             elif i < len(positional):
-                self._add_taint(positional[i].arg, arg_taint)
+                bound.setdefault(positional[i].arg, set()).update(arg_taint)
             else:
-                extra_pos |= arg_taint
-        by_name = {a.arg for a in every}
-        unknown_kw: set[str] = set()
-        for name, arg_taint in kw_taints:
-            if name is None:
-                unknown_kw |= arg_taint
-            elif name in by_name:
-                self._add_taint(name, arg_taint)
+                unknown |= arg_taint
+        by_name = {a.arg for a in positional + list(fn.args.kwonlyargs)}
+        for kw_name, arg_taint in kw_taints:
+            if kw_name is not None and kw_name in by_name:
+                bound.setdefault(kw_name, set()).update(arg_taint)
             else:
-                extra_kw |= arg_taint
-        # A spread of unknown length can fill every parameter from its own
-        # position on, so its taint goes to all of them (and to ``*args``).
-        if spread:
-            for param in positional[star_from:]:
-                self._add_taint(param.arg, spread)
-            if spec.vararg is not None:
-                self._add_taint(spec.vararg.arg, spread)
-        # A ``**mapping`` of unknown keys can fill any keyword-addressable
-        # parameter — positional-only ones are the sole exception.
-        if unknown_kw:
-            for param in list(spec.args) + list(spec.kwonlyargs):
-                self._add_taint(param.arg, unknown_kw)
-            if spec.kwarg is not None:
-                self._add_taint(spec.kwarg.arg, unknown_kw)
-        # An argument with no parameter of its own (``*args`` / ``**kwargs``,
-        # or a starred call the caller spread) lands in the catch-all if there
-        # is one, and over-approximates onto every parameter if there is not.
-        if extra_pos:
-            if spec.vararg is not None:
-                self._add_taint(spec.vararg.arg, extra_pos)
-            else:
-                for param in every:
-                    self._add_taint(param.arg, extra_pos)
-        if extra_kw:
-            if spec.kwarg is not None:
-                self._add_taint(spec.kwarg.arg, extra_kw)
-            else:
-                for param in every:
-                    self._add_taint(param.arg, extra_kw)
+                unknown |= arg_taint
+        # A spread or a leftover argument can fill any parameter, so it binds
+        # all of them (the catch-alls included).
+        if unknown:
+            for param in self._params(fn):
+                bound.setdefault(param.arg, set()).update(unknown)
+
+        token_map = {
+            self._token(key + '\x00' + pname): arg_taint
+            for pname, arg_taint in bound.items()
+        }
+        token_map[self._ctrl_token(key)] = set(self._ctrl)
+        self._bound.add(key)
+        for token, arg_taint in token_map.items():
+            cur = self._param_in.setdefault(token, set())
+            if not arg_taint <= cur:
+                cur |= arg_taint
+                self._changed = True
+
+        result = self._subst(self._ret.get(key, set()), token_map)
+        if key in self._fallback_scopes:
+            # An unmodelled construct in the callee: its return can carry
+            # anything, and so can what it writes into its arguments.
+            result |= self._all
+            for expr in arg_expr.values():
+                root = self._root_name(expr)
+                if root is not None:
+                    self._add_taint(self._q(root), set(self._all))
+            return result
+
+        outs = self._param_out.get(key, {})
+        for pname, expr in arg_expr.items():
+            back = self._subst(outs.get(self._token(key + '\x00' + pname), set()), token_map)
+            if not back:
+                continue
+            root = self._root_name(expr)
+            if root is not None:
+                self._add_taint(self._q(root), back)
+        return result
+
+    @classmethod
+    def _arg_exprs(cls, fn: 'ast.FunctionDef | ast.AsyncFunctionDef', node: ast.Call,
+                   star_from: int | None) -> dict[str, ast.expr]:
+        """Map each parameter of ``fn`` to the argument expression ``node`` passes
+        for it, for the arguments whose parameter is known at compile time."""
+        positional = list(fn.args.posonlyargs) + list(fn.args.args)
+        by_name = {a.arg for a in positional + list(fn.args.kwonlyargs)}
+        out: dict[str, ast.expr] = {}
+        for i, arg in enumerate(node.args):
+            if star_from is not None and i >= star_from:
+                break
+            if i < len(positional):
+                out[positional[i].arg] = arg
+        for keyword in node.keywords:
+            if keyword.arg is not None and keyword.arg in by_name:
+                out[keyword.arg] = keyword.value
+        return out
+
+    def _alias_roots(self, expr: ast.expr) -> list[str]:
+        """Root names of the collections ``expr`` may evaluate to an alias of:
+        the root of a name/attribute/subscript chain, or — for a user-function
+        call — the roots of the arguments its summary says it returns. Calls
+        compose: a call-valued argument contributes its own alias roots, so
+        ``f(g(store))`` reaches ``store`` when both return their argument."""
+        if isinstance(expr, (ast.Name, ast.Attribute, ast.Subscript)):
+            root = self._root_name(expr)
+            return [] if root is None or root == 'lib' else [root]
+        if not isinstance(expr, ast.Call) or not isinstance(expr.func, ast.Name):
+            return []
+        key = self._lookup_func(expr.func.id)
+        if key is None:
+            return []
+        params = self._ret_alias.get(key)
+        if not params:
+            return []
+        fn = self._scopes[key].node
+        assert isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        star_from = next(
+            (i for i, a in enumerate(expr.args) if isinstance(a, ast.Starred)), None
+        )
+        exprs = self._arg_exprs(fn, expr, star_from)
+        roots: list[str] = []
+        for pname in params:
+            arg = exprs.get(pname)
+            if arg is not None:
+                roots.extend(self._alias_roots(arg))
+        return roots
+
+    def _record_ret_alias(self, value: ast.expr | None) -> None:
+        """Note which parameters the returned value shares an alias class with."""
+        scope = self._scopes[self._scope]
+        fn = scope.node
+        if value is None or not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return
+        aliased = self._ret_alias.setdefault(scope.key, set())
+        for root in self._alias_roots(value):
+            cls_root = self._find(self._q(root))
+            for param in self._params(fn):
+                if param.arg in aliased:
+                    continue
+                if self._find(scope.key + '\x00' + param.arg) == cls_root:
+                    aliased.add(param.arg)
+                    self._changed = True
 
     @staticmethod
     def _is_mutating_namespace_call(func: ast.Attribute) -> bool:
@@ -1342,12 +1649,15 @@ class _DependencyAnalyzer:
     # --- assignment ---
 
     def _assign(self, target: ast.expr, taint: set[str], value: ast.expr | None) -> None:
+        if self._scope in self._fallback_scopes:
+            # The assigned value may come from an unmodelled construct whose
+            # taint the analysis could not see.
+            taint = taint | self._all
         if isinstance(target, ast.Name):
-            self._add_taint(target.id, taint)
-            if value is not None and isinstance(value, (ast.Name, ast.Attribute, ast.Subscript)):
-                root = self._root_name(value)
-                if root is not None and root != 'lib':
-                    self._union(target.id, root)
+            self._add_taint(self._q(target.id), taint)
+            if value is not None:
+                for root in self._alias_roots(value):
+                    self._union(self._q(target.id), self._q(root))
             return
         if isinstance(target, (ast.Tuple, ast.List)):
             for elt in target.elts:
@@ -1358,7 +1668,7 @@ class _DependencyAnalyzer:
             return
         root = self._root_name(target)
         if root is not None:
-            self._add_taint(root, taint)
+            self._add_taint(self._q(root), taint)
 
     # --- statements ---
 
@@ -1415,6 +1725,7 @@ class _DependencyAnalyzer:
         if isinstance(stmt, ast.Return):
             taint = self._expr_taint(stmt.value) | ctrl
             self._record_escape(self._ret, taint)
+            self._record_ret_alias(stmt.value)
             self._record_escape(self._escape, ctrl)
             return ctrl | taint
         if isinstance(stmt, (ast.Break, ast.Continue)):
@@ -1446,6 +1757,55 @@ class _DependencyAnalyzer:
             cur |= taint
             self._changed = True
 
+    # --- per-scope pre/post steps ---
+
+    def _seed_params(self) -> None:
+        """Give every parameter its own symbolic token as a base taint."""
+        for key, scope in self._scopes.items():
+            if not isinstance(scope.node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for param in self._params(scope.node):
+                qualified = key + '\x00' + param.arg
+                self._add_taint(qualified, {self._token(qualified)})
+
+    def _visit_defaults(self, scope: _Scope) -> None:
+        """Fold parameter default expressions into the parameters' taint.
+
+        Defaults are evaluated in the ENCLOSING scope, and a call that omits
+        the argument leaves the default in place, so the taint belongs to the
+        parameter unconditionally.
+        """
+        fn = scope.node
+        assert isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        spec = fn.args
+        outer, self._scope = self._scope, scope.parent or ''
+        ctrl, self._ctrl = self._ctrl, set()
+        positional = list(spec.posonlyargs) + list(spec.args)
+        pairs: list[tuple[ast.arg, ast.expr | None]] = list(
+            zip(positional[len(positional) - len(spec.defaults):], spec.defaults)
+        )
+        pairs += list(zip(spec.kwonlyargs, spec.kw_defaults))
+        taints = [
+            (param, self._expr_taint(default))
+            for param, default in pairs if default is not None
+        ]
+        self._scope, self._ctrl = outer, ctrl
+        for param, taint in taints:
+            self._add_taint(scope.key + '\x00' + param.arg, taint)
+
+    def _record_param_out(self, scope: _Scope) -> None:
+        """Snapshot every parameter's taint at the end of the callee's body."""
+        fn = scope.node
+        assert isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        outs = self._param_out.setdefault(scope.key, {})
+        for param in self._params(fn):
+            qualified = scope.key + '\x00' + param.arg
+            taint = self._get_taint(qualified)
+            cur = outs.setdefault(self._token(qualified), set())
+            if not taint <= cur:
+                cur |= taint
+                self._changed = True
+
     # --- driver ---
 
     def run(self) -> None:
@@ -1453,27 +1813,47 @@ class _DependencyAnalyzer:
             n.name: n for n in ast.walk(self._module)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
+        self._called_names = {
+            n.func.id for n in ast.walk(self._module)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id in self._funcs
+        }
+        self._build_scopes()
         self._mark_in_loop()
         self._compute_site_order()
 
-        scopes: list[tuple[str, list[ast.stmt]]] = [('', self._module.body)]
-        scopes.extend((name, fn.body) for name, fn in self._funcs.items())
-        roots: list[tuple[str, ast.AST]] = [('', self._module)]
-        roots.extend((name, fn) for name, fn in self._funcs.items())
-        for scope, root in roots:
-            for sub in self._iter_stmts_skip_funcs(root):
+        for key, scope in self._scopes.items():
+            for sub in self._iter_stmts_skip_funcs(scope.node):
                 if isinstance(sub, _UNMODELLED_NODES):
-                    self._fallback_scopes.add(scope)
-                    self.fallback_reasons.setdefault(scope, type(sub).__name__)
+                    self._fallback_scopes.add(key)
+                    self.fallback_reasons.setdefault(key, type(sub).__name__)
                     break
 
+        self._seed_params()
+        ordered = list(self._scopes.values())
         for _ in range(_MAX_FIXPOINT_ROUNDS):
             self._changed = False
-            for scope, body in scopes:
-                self._scope = scope
-                self._visit_body(body, set(self._escape.get(scope, set())))
-            if not self._changed:
+            for scope in ordered:
+                self._scope = scope.key
+                ctrl = set(self._escape.get(scope.key, set()))
+                if scope.parent is not None:
+                    self._visit_defaults(scope)
+                    fn = scope.node
+                    assert isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    if fn.name in self._called_names:
+                        # Everything in a called function runs under the
+                        # conditions of its call sites (see _CTRL_PARAM).
+                        ctrl.add(self._ctrl_token(scope.key))
+                self._visit_body(scope.body, ctrl)
+                if scope.parent is not None:
+                    self._record_param_out(scope)
+            if self._changed:
+                continue
+            if self._final:
                 break
+            # Converged with every reachable call site bound: from here a
+            # token still without a call site belongs to an unreached call.
+            self._final = True
 
         # Only a producer whose site PRECEDES this write can be waited for.
         # A later-sited producer would deadlock the historical warmup batch:
@@ -1485,7 +1865,7 @@ class _DependencyAnalyzer:
             own = self._order.get(sid, 0)
             self.depends[sid] = {
                 d for d in deps
-                if d != sid and self._order.get(d, own) < own
+                if d != sid and d in self._all and self._order.get(d, own) < own
             }
 
 class _CallReplacer(ast.NodeTransformer):

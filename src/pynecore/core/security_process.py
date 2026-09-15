@@ -63,7 +63,8 @@ from ..types.na import set_bool_na
 from .security_shm import (
     SyncBlock, ResultBlock, write_na, FRONTIER_INF,
     FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE, FLAG_DEV_HISTORICAL,
-    FLAG_MORE_STEPS, is_ltf_window, is_ltf_chart_developing, is_ltf_live_phase,
+    FLAG_MORE_STEPS, FLAG_BATCH_ROUND, is_ltf_window, is_ltf_chart_developing,
+    is_ltf_live_phase,
 )
 from .security import (
     BarCalendar, actual_bar_close, create_security_protocol, inject_protocol,
@@ -415,6 +416,8 @@ def security_process_main(
         ring_conditions: dict | None = None,
         consumer_ids: 'list[str] | None' = None,
         registry_pipe=None,
+        chart_ring_capacity: int = 0,
+        chart_ring_arena: int = 0,
 ):
     assert result_locks is not None, "result_locks must be provided by script_runner"
     """
@@ -464,8 +467,16 @@ def security_process_main(
     :param chart_calendar: The chart's trading schedule, for the chart-as-of cap.
     :param ring_conditions: Per-sid ``multiprocessing.Condition`` created by the
         parent; a producer notifies its own, a consumer waits on the peer's.
-    :param consumer_ids: Sids consuming THIS context. Empty means no consumer,
-        and then this context publishes no ring at all.
+    :param consumer_ids: Sids consuming THIS context. Empty means no security
+        consumer; this context then publishes a ring only when the CHART
+        consumes it (``chart_ring_capacity``).
+    :param chart_ring_capacity: Non-zero when the chart runs this context's
+        historical phase as ONE batch round and pairs the values out of the
+        ring instead of handshaking per bar. The chart is then a ring consumer
+        (``SyncBlock.chart_index``) and the ring is pre-sized to this many
+        entries, so the whole batch fits without repeated reallocation.
+    :param chart_ring_arena: Payload arena size, in bytes, to pre-size the
+        chart-consumed ring with. Ignored when ``chart_ring_capacity`` is 0.
     :param registry_pipe: Child end of the parent's registry pipe. The chart
         pushes a context's record down it the moment it resolves one whose
         symbol or timeframe only exists at runtime — such a context can be a
@@ -716,6 +727,8 @@ def security_process_main(
         ring_conditions=ring_conditions, consumer_ids=consumer_ids,
         stop_event=stop_event, data_ready_event=data_ready_event,
         registry_pipe=registry_pipe,
+        chart_ring_capacity=chart_ring_capacity,
+        chart_ring_arena=chart_ring_arena,
     )
 
     # Mintick decimals for OHLC grid-snapping in ``_set_lib_properties``
@@ -1223,6 +1236,8 @@ def security_process_main(
         it, so capping never holds a consumer back. A round with no tick (no
         chart bar cycle, as in unit tests) is left uncapped.
 
+        A BATCH round is the exception -- see the first branch.
+
         One chart bar can queue SEVERAL rounds for this context, all carrying
         the same tick: a prefill and/or a closed bar, then the developing bar
         that appends AT the tick. While such a step is still pending
@@ -1239,6 +1254,14 @@ def security_process_main(
         :param frontier: Frontier close the bar grid suggests, in ms.
         :return: The frontier to publish, in ms.
         """
+        if batch_round:
+            # A batch round runs the whole historical phase in one go and
+            # carries no developing entry, so nothing of it can be read too
+            # early -- the ring pairs by close and a consumer never asks beyond
+            # its own as-of. It MUST publish uncapped: the chart's per-bar ring
+            # waits are released by this frontier, and a cap at the launching
+            # bar's tick would stall every later bar forever.
+            return frontier
         if more_steps and sec_ctx.round_tick:
             cap = sec_ctx.round_tick - 1
         else:
@@ -1307,6 +1330,7 @@ def security_process_main(
             # Further rounds of the SAME chart bar (and so the same tick) are
             # still queued chart-side — see ``_capped_frontier``.
             more_steps = bool(flags & FLAG_MORE_STEPS)
+            batch_round = bool(flags & FLAG_BATCH_ROUND)
             is_developing = bool(flags & FLAG_IS_DEVELOPING)
             closed_override = bool(flags & FLAG_CLOSED_OVERRIDE)
             # ``Lookahead.ON`` uses the pushed-OHLCV transport in historical

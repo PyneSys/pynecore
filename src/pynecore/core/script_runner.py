@@ -1647,6 +1647,7 @@ class ScriptRunner:
                     setup_security_states, create_chart_protocol,
                     inject_protocol, cleanup_shared_memory, Lookahead,
                     load_htf_bar_opens, load_ltf_first_ms, watch_security_child,
+                    batch_eligible, plan_historical_batch,
                 )
                 from .security_shm import create_ring_conditions
                 from .security_process import security_process_main
@@ -1861,8 +1862,15 @@ class ScriptRunner:
                             # liveness watcher, not here.
                             sec_registry_pipes.pop(_target, None)
 
+                # A batch round needs a chart end to plan against and a chart
+                # that never leaves the historical phase: live rounds take the
+                # per-bar transports over from where history ended.
+                _batch_allowed = (not lib._is_live) and self.last_bar_time is not None
+
                 def _spawn_security_process(sid: str, data_source):
                     sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
+                    _chart_ring_capacity = 0
+                    _chart_ring_arena = 0
                     # Chart-type request (``ticker.heikinashi()``): the child
                     # applies the per-bar transform (backtest and live alike), so
                     # there is no live-mode restriction. An LTF (sub-bar) chart
@@ -1894,6 +1902,19 @@ class ScriptRunner:
                                 sec_resample_dirs)
                         load_htf_bar_opens(sec_state, str(data_source))
                         load_ltf_first_ms(sec_state, str(data_source))
+                        # Historical BATCH round: the chart drives this context
+                        # once for its whole historical phase and pairs the
+                        # values out of the child's ring, instead of a wake-up
+                        # round trip per chart bar. Decided HERE because the
+                        # child has to allocate that ring at spawn — the plan
+                        # needs the real bars ``load_htf_bar_opens`` just read.
+                        if (_batch_allowed
+                                and batch_eligible(sec_state, sid,
+                                                   is_live=lib._is_live)
+                                and plan_historical_batch(
+                                    sec_state, int(self.last_bar_time or 0))):
+                            _chart_ring_capacity = sec_state.batch_capacity
+                            _chart_ring_arena = sec_state.batch_arena
                     elif sec_state.is_ltf:
                         # Live streaming LTF: no static first bar to load, so the
                         # subprocess pulls intrabars from its own streamer and
@@ -1934,6 +1955,8 @@ class ScriptRunner:
                             sec_ring_conditions,
                             sec_consumers.get(sid, []),
                             _registry_child_conn,
+                            _chart_ring_capacity,
+                            _chart_ring_arena,
                         ),
                         daemon=True,
                     )

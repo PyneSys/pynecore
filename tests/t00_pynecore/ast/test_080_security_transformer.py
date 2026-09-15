@@ -1323,22 +1323,44 @@ def main():
     log.info("selective hoisting OK")
 
 
-def __test_parameter_timeframe_is_not_hoisted__(log):
-    """A function parameter cannot be known at function entry, so its signal
-    stays inline."""
+def __test_stable_parameters_are_hoisted__(log):
+    """Parameters the body never rebinds hold the caller's value for the whole
+    call, so their signals start in the top block."""
+    source = """
+def main(sym1, tf1, sym2, tf2):
+    lib.plot(lib.close)
+    a = lib.request.security(sym1, tf1, lib.close)
+    b = lib.request.security(sym2, tf2, lib.close)
+"""
+    tree = _transform_tree(source)
+    func = _find_func(tree)
+    signal_if = func.body[0]
+    assert isinstance(signal_if, ast.If)
+    assert len(signal_if.body) == 2
+    assert all(stmt.value.func.id == '__sec_signal__' for stmt in signal_if.body)
+    # The plot call follows the top block, untouched
+    assert isinstance(func.body[1], ast.Expr)
+    log.info("stable parameter signals hoisted OK")
+
+
+def __test_rebound_parameter_is_not_hoisted__(log):
+    """A parameter the body reassigns is not known at function entry, so its
+    signal stays inline."""
     source = """
 def main(tf):
     lib.plot(lib.close)
+    tf = "60"
     v = lib.request.security(lib.syminfo.tickerid, tf, lib.close)
 """
     tree = _transform_tree(source)
     func = _find_func(tree)
     # No top block: the first statement is the untouched plot call
     assert isinstance(func.body[0], ast.Expr)
-    signal_if = func.body[1]
+    assert isinstance(func.body[1], ast.Assign)
+    signal_if = func.body[2]
     assert isinstance(signal_if, ast.If)
     assert signal_if.body[0].value.func.id == '__sec_signal__'
-    log.info("parameter stays inline OK")
+    log.info("rebound parameter stays inline OK")
 
 
 def __test_depends_on_runtime_context_is_recorded_not_rejected__(log):
@@ -1519,3 +1541,213 @@ def main():
     assert meta['M']['depends'] == []
     assert meta['W']['depends'] == ['M']
     log.info("call-site ordering OK")
+
+
+def __test_depends_same_function_different_call_sites__(log):
+    """One helper called from several expressions does not link them.
+
+    The taint of an argument belongs to its own call site: a tainted call of
+    ``fmt()`` must not put that taint on the results of the two untainted
+    calls.
+    """
+    source = """
+def main():
+    def fmt(v):
+        return lib.math.round(v)
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    lbl = fmt(a)
+    lib.plot(lbl)
+    b = lib.request.security(lib.syminfo.tickerid, "W", fmt(lib.high))
+    c = lib.request.security(lib.syminfo.tickerid, "M", fmt(lib.low))
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == []
+    assert meta['M']['depends'] == []
+    log.info("per-call-site argument taint OK")
+
+
+def __test_depends_argument_reaching_the_return__(log):
+    """An argument the callee's return actually draws on IS a dependency."""
+    source = """
+def main():
+    def scaled(v):
+        return v * 2
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    b = lib.request.security(lib.syminfo.tickerid, "W", scaled(a))
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['depends'] == []
+    assert meta['W']['depends'] == ['D']
+    log.info("argument reaching the return OK")
+
+
+def __test_depends_argument_mutated_inside_the_callee__(log):
+    """A callee that pushes a peer's value into its argument array taints the
+    caller's array — the consumer reading it depends on the peer."""
+    source = """
+def main():
+    def collect(box, v):
+        lib.array.push(box, v)
+    store = lib.array.new_float()
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    collect(store, a)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.array.get(store, 0))
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['depends'] == []
+    assert meta['W']['depends'] == ['D']
+    log.info("argument mutation write-back OK")
+
+
+def __test_same_named_locals_do_not_share_taint__(log):
+    """Two functions with a same-named parameter are separate taint classes."""
+    source = """
+def main():
+    def left(x):
+        return x
+    def right(x):
+        return lib.ta.sma(lib.close, x)
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    used = left(a)
+    lib.plot(used)
+    b = lib.request.security(lib.syminfo.tickerid, "W", right(lib.high))
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['depends'] == []
+    assert meta['W']['depends'] == []
+    log.info("scoped locals OK")
+
+
+def __test_closure_over_a_main_local_keeps_the_dependency__(log):
+    """A nested function reading a ``main`` local sees that local's taint —
+    the scoping separates same-named locals, it does not cut closures."""
+    source = """
+def main():
+    def carried():
+        return lib.ta.sma(shared, 3)
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    shared = a
+    b = lib.request.security(lib.syminfo.tickerid, "W", carried())
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['depends'] == []
+    assert meta['W']['depends'] == ['D']
+    log.info("closure taint OK")
+
+
+def __test_nonlocal_write_in_helper_taints_the_enclosing_variable__(log):
+    """A helper assigning a peer's value to a ``nonlocal`` name writes the
+    enclosing scope's variable, so a later reader of it depends on the peer
+    even though the helper's own result is discarded."""
+    source = """
+def main():
+    shared = 0.0
+    def helper():
+        nonlocal shared
+        shared = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    helper()
+    b = lib.request.security(lib.syminfo.tickerid, "W", shared)
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['depends'] == []
+    assert meta['W']['depends'] == ['D']
+    log.info("nonlocal write-back OK")
+
+
+def __test_returned_argument_alias_carries_later_mutations__(log):
+    """A callee returning its collection argument makes the receiving name an
+    alias of that argument: pushing into the alias afterwards is visible to a
+    reader of the original."""
+    source = """
+def main():
+    def identity(box):
+        return box
+    store = lib.array.new_float()
+    alias = identity(store)
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    lib.array.push(alias, a)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.array.get(store, 0))
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['depends'] == []
+    assert meta['W']['depends'] == ['D']
+    log.info("returned alias OK")
+
+
+def __test_returned_alias_composes_through_nested_calls__(log):
+    """Alias summaries compose: a wrapper that returns another identity call,
+    and an identity call fed with an identity call, both still alias the
+    original collection, so a later push through the alias reaches it."""
+    wrapper = """
+def main():
+    def identity(box):
+        return box
+    def wrapper(box):
+        return identity(box)
+    store = lib.array.new_float()
+    alias = wrapper(store)
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    lib.array.push(alias, a)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.array.get(store, 0))
+"""
+    nested_argument = """
+def main():
+    def identity(box):
+        return box
+    store = lib.array.new_float()
+    alias = identity(identity(store))
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    lib.array.push(alias, a)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.array.get(store, 0))
+"""
+    for source in (wrapper, nested_argument):
+        meta = _sec_meta(source)
+        assert meta['D']['depends'] == []
+        assert meta['W']['depends'] == ['D']
+    log.info("composed alias OK")
+
+
+def __test_conditional_constant_mutation_carries_the_control_taint__(log):
+    """Pushing a constant into a collection under a tainted condition changes
+    the collection's state depending on that taint — directly and through a
+    helper called from the conditional branch."""
+    direct = """
+def main():
+    store = lib.array.new_float()
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    if a > 0:
+        lib.array.push(store, 1)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.array.size(store))
+"""
+    through_helper = """
+def main():
+    def collect(box):
+        lib.array.push(box, 1)
+    store = lib.array.new_float()
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    if a > 0:
+        collect(store)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.array.size(store))
+"""
+    for source in (direct, through_helper):
+        meta = _sec_meta(source)
+        assert meta['D']['depends'] == []
+        assert meta['W']['depends'] == ['D']
+    log.info("conditional mutation control taint OK")
+
+
+def __test_write_inside_conditionally_called_helper_depends_on_the_condition__(log):
+    """A security write inside a helper that is only called under a tainted
+    condition depends on that condition's producer."""
+    source = """
+def main():
+    def writer():
+        return lib.request.security(lib.syminfo.tickerid, "W", lib.close)
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    if a > 0:
+        writer()
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['depends'] == []
+    assert meta['W']['depends'] == ['D']
+    log.info("call-site control taint OK")

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from bisect import bisect_right
 from time import monotonic
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
@@ -29,7 +30,8 @@ from .security_shm import (
     SyncBlock, ResultBlock, ResultReader, INITIAL_RESULT_SIZE,
     FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE, FLAG_DEV_HISTORICAL,
     FLAG_LTF_WINDOW, FLAG_LTF_CHART_DEVELOPING, FLAG_LTF_LIVE_PHASE,
-    FLAG_MORE_STEPS, RingReader, RingWriter, write_result,
+    FLAG_MORE_STEPS, FLAG_BATCH_ROUND, INITIAL_RING_CAPACITY, INITIAL_RING_ARENA,
+    RingReader, RingWriter, write_result,
 )
 
 if TYPE_CHECKING:
@@ -439,6 +441,24 @@ class SecurityState:
     # the empty-array default directly instead of waiting on shared memory.
     ltf_skip: bool = False
 
+    # Historical BATCH round (see :func:`plan_historical_batch`). Non-zero
+    # ``batch_target`` means the chart launches this context ONCE for the whole
+    # historical phase instead of once per chart bar, and pairs the values out
+    # of the child's ring as-of each chart bar. What this removes is the
+    # wake-up round trip per chart bar per context; the child's work and the
+    # values it publishes are unchanged.
+    batch_target: int = 0
+    # Ring entries the batch round publishes, for pre-sizing the ring block.
+    batch_capacity: int = 0
+    # Payload arena size (bytes) to pre-size that ring block with.
+    batch_arena: int = 0
+    # Whether the batch round has been launched (the first signal does it).
+    batch_launched: bool = False
+    # The chart's as-of instant for this context on the CURRENT bar — the same
+    # instant ``_get_confirmed_time`` paired the target with, kept for the ring
+    # lookup in ``__sec_read__``.
+    batch_asof: int = 0
+
 
 def _same_value(a, b) -> bool:
     """Repeat-write equality: Pine's ``na == na``, and tuples elementwise.
@@ -619,6 +639,103 @@ def _get_confirmed_time(state: SecurityState, chart_time: int,
     return resampler.get_bar_time(period - 1, state.tz)
 
 
+# How many security bars past the chart's own last as-of the batch round runs.
+# The chart's final as-of is derived here from ``last_bar_time`` with no
+# following bar, while the run itself may pair that bar with a real next open;
+# a couple of spare bars make the frontier reach whatever the run actually asks
+# for. Publishing them cannot leak anything: every read pairs by close against
+# its own as-of, so a bar closing later is never selected.
+_BATCH_MARGIN_BARS = 2
+
+# Bytes reserved per ring entry when pre-sizing a batch ring. A pickled scalar
+# or short tuple stays well under this; a larger value only makes the writer
+# grow the arena once, which is correct either way.
+_BATCH_ARENA_PER_ENTRY = 128
+
+
+def plan_historical_batch(state: SecurityState, last_chart_time: int) -> bool:
+    """
+    Plan this context's single historical batch round, if it can have one.
+
+    The chart's as-of for its LAST bar (:func:`chart_asof`) decides how far the
+    child has to run: the last of its bars whose scheduled close reaches that
+    instant, plus :data:`_BATCH_MARGIN_BARS`. That target is exactly where the
+    per-bar rounds would have left the child, so one round replaces all of them
+    without running the feed past the chart.
+
+    Requires the child's real bars (:func:`load_htf_bar_opens`), which is also
+    what proves the context is file-backed: a live streamer has no static feed
+    to run ahead on.
+
+    :param state: Security context state, after ``load_htf_bar_opens``.
+    :param last_chart_time: Open time (ms) of the chart's last historical bar.
+    :return: Whether a batch round was planned (``state.batch_target`` set).
+    """
+    opens = state.bar_opens
+    closes = state.bar_closes
+    if not opens or not closes or len(closes) != len(opens):
+        return False
+    asof_end = chart_asof(state, last_chart_time, 0, 0)
+    idx = bisect_right(closes, asof_end) - 1
+    if idx < 0:
+        # The chart ends before this context's first bar closes: nothing to
+        # batch, every bar reads ``na`` anyway.
+        return False
+    idx = min(idx + _BATCH_MARGIN_BARS, len(opens) - 1)
+    state.batch_target = opens[idx]
+    state.batch_capacity = idx + 1
+    state.batch_arena = state.batch_capacity * _BATCH_ARENA_PER_ENTRY
+    return True
+
+
+def batch_eligible(state: SecurityState, sec_id: str, *, is_live: bool) -> bool:
+    """
+    Whether a context's historical phase may run as ONE batch round.
+
+    Every excluded shape needs the chart to decide, per bar, what the child
+    should do next — so its round cannot be planned up front:
+
+    * a live run (the child would end up past the chart's history, and the
+      per-round transports below take over at the transition anyway);
+    * a context whose timeframe is COARSER than the chart's: the closed-only
+      flow already launches a round only when a fresh period confirms, so
+      there is barely a handshake to remove — while the ring lookup the batch
+      read costs is paid on every read (MEASURED: a daily context on a 30m
+      chart got ~20% slower). The whole win is in contexts that confirm a
+      fresh period on every chart bar, which after the lower-timeframe
+      exclusions below means the chart's own timeframe;
+    * a context with a non-empty ``depends`` set. Pairing a peer out of its
+      ring would be correct (it is as-of based like everything else), but the
+      round's chart tick is the batch's ONE tick, so the peer read's cap has to
+      go — and then the child runs its whole feed gated on peers that advance
+      at the chart's pace, one ring wait per dependency per bar. MEASURED on a
+      19-context screener whose contexts are all (spuriously) tainted by each
+      other: 277 s against 64 s for the per-bar rounds;
+    * ``Lookahead.ON``: the developing-bar transport pushes OHLCV into the slot
+      per chart bar, and with ``PYNE_ALLOW_LOOKAHEAD`` the target is the
+      CONTAINING period rather than the last closed one — neither is an as-of
+      pairing the ring can answer;
+    * lower-timeframe contexts (``request.security_lower_tf`` and the scalar
+      ``plain_ltf`` merge), whose per-bar target IS the merge rule;
+    * the synthetic ``__auto_rate_*`` feeds, driven by ``signal_rate_sources``
+      rather than by a Pine call.
+
+    :param state: Security context state, after ``load_htf_bar_opens``.
+    :param sec_id: The context's id.
+    :param is_live: Whether the run has a live phase.
+    :return: Whether the context may be batched.
+    """
+    return (not is_live
+            and state.same_timeframe
+            and not state.depends
+            and not state.is_ltf
+            and not state.plain_ltf
+            and not state.ltf_live_stream
+            and state.lookahead is not Lookahead.ON
+            and not state.na_on_developing
+            and not sec_id.startswith('__auto_rate_'))
+
+
 def _next_civil_period_open(modifier: str, current_ms: int, tz: ZoneInfo) -> int:
     """
     Open time (ms) of the civil period immediately following the one that
@@ -716,6 +833,14 @@ def create_chart_protocol(
     resolved: set[str] = set()
     ring_conditions = ring_conditions or {}
     consumers_by_sid = consumers_by_sid or {}
+
+    # Ring readers of the BATCHED contexts (see ``SecurityState.batch_target``).
+    # The chart is an ordinary ring consumer for them: it waits on the
+    # producer's frontier and pairs by close, exactly as a child does for a
+    # peer — only its GC watermark lives in the extra row the SyncBlock keeps
+    # for it rather than in a slot of its own.
+    batch_readers: dict[str, RingReader] = {}
+    chart_wm_index = sync_block.chart_index
 
     # Chart-context producers: a sid the chart itself evaluates (same symbol and
     # timeframe) whose value another context consumes. The chart owns its ring.
@@ -889,6 +1014,54 @@ def create_chart_protocol(
             _wait_with_liveness(state.data_ready, sec_id, sec_processes, failed_children)
             step = state.pending_live.pop(0)
             step()
+
+    def _batch_read(sec_id: str, state: SecurityState, default):
+        """Pair one chart bar's value out of a batched context's ring.
+
+        The same rule the rest of the module pairs by: the context's last bar
+        whose scheduled close is at or before the chart's as-of instant for it
+        — the very bar ``_get_confirmed_time`` picked as this round's target,
+        since both read the same ascending ``bar_closes``. The child runs far
+        ahead of the chart, so the wait below is normally already satisfied;
+        it blocks only while the batch is still catching up, on the producer's
+        condition rather than on a per-bar handshake. The wait also parks the
+        chart's GC watermark at this as-of, which is both what the ring may
+        collect below and what tells the producer whether waking the chart can
+        release it.
+
+        :param sec_id: The batched context's id.
+        :param state: Its runtime state (``batch_asof`` set by the signal).
+        :param default: Pine ``na`` for this read.
+        :return: The paired value, or ``default`` when nothing has closed yet.
+        """
+        reader = batch_readers.get(sec_id)
+        if reader is None:
+            reader = RingReader(sec_id, sync_block, ring_conditions[sec_id])
+            batch_readers[sec_id] = reader
+        asof = state.batch_asof
+        while not reader.wait_for_close(asof, state.stop_event,
+                                        timeout=_LIVENESS_POLL_SECONDS,
+                                        watermark_index=chart_wm_index):
+            # Only a dead producer can keep this from being satisfied: its next
+            # unpublished bar closes above the chart's as-of, so publishing it
+            # raises the frontier past this instant.
+            if failed_children:
+                dead = sec_id if sec_id in failed_children else next(iter(failed_children))
+                proc = sec_processes.get(dead) if sec_processes is not None else None
+                raise RuntimeError(
+                    f"Security process for '{dead}' died unexpectedly "
+                    f"(exit code: {proc.exitcode if proc is not None else '?'})"
+                )
+            if state.stop_event.is_set():
+                return default
+            proc = sec_processes.get(sec_id) if sec_processes is not None else None
+            if proc is not None and not proc.is_alive():
+                raise RuntimeError(
+                    f"Security process for '{sec_id}' died unexpectedly "
+                    f"(exit code: {proc.exitcode})"
+                )
+        entry = reader.last_close_at_or_before(asof)
+        return default if entry is None else entry[2]
 
     def __sec_signal__(sec_id: str, symbol: str | None = None,
                        timeframe: str | None = None, lookahead=None,
@@ -1247,6 +1420,44 @@ def create_chart_protocol(
             state, chart_time, round_state['next_time'],
             0 if lib.barstate.isconfirmed else round_state['tick'])
 
+        if state.batch_target:
+            # Historical BATCH: the child runs its whole historical phase in a
+            # single round while the chart walks its bars, and ``__sec_read__``
+            # pairs each bar's value out of the ring. Nothing is launched per
+            # bar; only the ``gaps_on`` bookkeeping (which chart bar opens a
+            # fresh security period) stays, and the as-of the read pairs with.
+            state.batch_asof = chart_asof(
+                state, chart_time, round_state['next_time'],
+                0 if lib.barstate.isconfirmed else round_state['tick'])
+            state.new_period = target_time > state.last_confirmed
+            if state.new_period:
+                state.last_confirmed = target_time
+            if not state.batch_launched:
+                state.batch_launched = True
+                sync_block.set_flags(sec_id, (sync_block.get_flags(sec_id) & ~(
+                    FLAG_IS_DEVELOPING | FLAG_CLOSED_OVERRIDE
+                )) | FLAG_BATCH_ROUND)
+                sync_block.set_target_time(sec_id, state.batch_target)
+                _launch(sec_id, state)
+                # The chart never settles this round as a whole — its values
+                # arrive through the ring while it runs — so no later bar is
+                # allowed to block on it.
+                state.needs_wait = False
+            elif target_time > state.batch_target:
+                # Safety net: the chart asked past what the batch was planned
+                # for. Settle it (the child must not have its slot rewritten
+                # while it is still unpacking one) and run an ordinary round.
+                state.needs_wait = True
+                _settle_round(sec_id, state)
+                state.batch_target = target_time
+                sync_block.set_flags(sec_id, sync_block.get_flags(sec_id) & ~(
+                    FLAG_IS_DEVELOPING | FLAG_CLOSED_OVERRIDE | FLAG_BATCH_ROUND
+                ))
+                sync_block.set_target_time(sec_id, target_time)
+                _launch(sec_id, state)
+                state.needs_wait = False
+            return
+
         if target_time > state.last_confirmed:
             state.last_confirmed = target_time
             state.new_period = True
@@ -1304,6 +1515,22 @@ def create_chart_protocol(
                 # chart bar, which is what a chart-context producer exposes.
                 writer.set_frontier_close(round_state['tick'])
 
+    def _convert_currency(conversion: tuple[str, str], result):
+        """Apply a context's ``currency=`` conversion to a read value."""
+        from ..lib import request
+        from math import isnan
+        from_cur, to_cur = conversion
+        rate = request.currency_rate(from_cur, to_cur)
+        if isnan(rate):
+            return result
+        if isinstance(result, (int, float)):
+            return result * rate
+        if isinstance(result, tuple):
+            return tuple(
+                v * rate if isinstance(v, (int, float)) else v for v in result
+            )
+        return result
+
     def __sec_read__(sec_id: str, default=None, _scope_id=None):
         # ``ignore_invalid_symbol=True`` may downgrade a live security to
         # ``no-process`` after syminfo prefetch fails — no subprocess is
@@ -1322,6 +1549,18 @@ def create_chart_protocol(
             # ``__sec_read__``, so each read observes this bar's flag — the same
             # signal-before-read invariant ``new_period``/``needs_wait`` rely on.
             return default
+        if state.batch_target:
+            # Batched context: no per-bar handshake ran, the value comes from
+            # the ring. ``gaps_on`` still emits ``na`` on a chart bar that opens
+            # no fresh security period, exactly as below.
+            batch_result = _batch_read(sec_id, state, default)
+            if state.gaps_on and not state.new_period:
+                batch_result = default
+            if (currency_conversions and sec_id in currency_conversions
+                    and batch_result is not default):
+                return _convert_currency(currency_conversions[sec_id], batch_result)
+            return batch_result
+
         if state.pending_live:
             _drive_pending(sec_id, state)
         _wait_with_liveness(state.data_ready, sec_id, sec_processes, failed_children)
@@ -1339,17 +1578,7 @@ def create_chart_protocol(
             result = readers[sec_id].read(sync_block, default)
 
         if currency_conversions and sec_id in currency_conversions and result is not default:
-            from ..lib import request
-            from math import isnan
-            from_cur, to_cur = currency_conversions[sec_id]
-            rate = request.currency_rate(from_cur, to_cur)
-            if not isnan(rate):
-                if isinstance(result, (int, float)):
-                    result = result * rate
-                elif isinstance(result, tuple):
-                    result = tuple(
-                        v * rate if isinstance(v, (int, float)) else v for v in result
-                    )
+            result = _convert_currency(currency_conversions[sec_id], result)
 
         return result
 
@@ -1386,6 +1615,8 @@ def create_chart_protocol(
     def cleanup():
         for r in readers.values():
             r.close()
+        for br in batch_readers.values():
+            br.close()
         for w in chart_writers.values():
             w.finish()
             w.close()
@@ -1523,6 +1754,8 @@ def create_security_protocol(
     stop_event: 'EventType | None' = None,
     data_ready_event: 'EventType | None' = None,
     registry_pipe: 'Connection | None' = None,
+    chart_ring_capacity: int = 0,
+    chart_ring_arena: int = 0,
 ) -> tuple:
     """
     Create protocol functions for a **security** process.
@@ -1570,6 +1803,11 @@ def create_security_protocol(
         parent and shared with every child.
     :param consumer_ids: Sids consuming THIS context — drives the ring GC
         watermark minimum and whether a ring is allocated at all.
+    :param chart_ring_capacity: Non-zero when the CHART consumes this context's
+        ring (its historical phase runs as one batch round). A ring is then
+        allocated even with no security consumer, pre-sized to this many
+        entries, and the chart's watermark row bounds its GC.
+    :param chart_ring_arena: Payload arena size in bytes for that pre-sizing.
     :param stop_event: Shutdown event; a peer wait ends when it is set.
     :param data_ready_event: Set at the round's last write so the chart is
         released on the VALUE rather than at the end of ``main()``.
@@ -1593,9 +1831,19 @@ def create_security_protocol(
     ring_conditions = ring_conditions or {}
     consumer_indexes: list[int] | None = None
     writer: RingWriter | None = None
-    if consumer_ids and sec_id in ring_conditions:
-        consumer_indexes = [sync_block.index_of(cid) for cid in consumer_ids]
-        writer = RingWriter(sec_id, sync_block, ring_conditions[sec_id])
+    if (consumer_ids or chart_ring_capacity) and sec_id in ring_conditions:
+        consumer_indexes = [sync_block.index_of(cid) for cid in (consumer_ids or ())]
+        if chart_ring_capacity:
+            # The chart pairs this context's values out of the ring for the
+            # whole historical phase, so it bounds the GC like any other
+            # consumer — from its own watermark row, having no slot of its own.
+            consumer_indexes.append(sync_block.chart_index)
+            writer = RingWriter(
+                sec_id, sync_block, ring_conditions[sec_id],
+                capacity=max(INITIAL_RING_CAPACITY, chart_ring_capacity),
+                arena_size=max(INITIAL_RING_ARENA, chart_ring_arena))
+        else:
+            writer = RingWriter(sec_id, sync_block, ring_conditions[sec_id])
 
     known: dict[str, dict] = dict(registry or {})
     registry_lock = threading.Lock()
@@ -1885,7 +2133,7 @@ def create_security_protocol(
         read, so a conditional read cannot pin a producer's ring forever.
         """
         if writer is not None and not bar_written[0]:
-            writer.set_frontier_close(ctx.frontier)
+            writer.set_frontier_close(ctx.frontier, consumer_indexes)
         bar_written[0] = False
         bar_value[0] = None
         if depends:
