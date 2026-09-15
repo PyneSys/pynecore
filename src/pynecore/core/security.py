@@ -400,6 +400,11 @@ class SecurityState:
     # runner's bar-end hook drive it). Each entry is a zero-argument callable
     # that writes the slot and sets ``advance_event`` for one round.
     pending_live: list = field(default_factory=list)
+    # The developing-transport rounds of a context not started yet, in bar
+    # order. ``_start`` runs them as one burst at the first read, so a context
+    # read late gets exactly the round sequence an eager start would have run.
+    # Every round carries its own OHLCV values, captured when it was queued.
+    deferred_steps: list = field(default_factory=list)
     # Rounds this context launched vs. the child's ``rounds_done`` counter in
     # the SyncBlock. "One round outstanding" waits for equality instead of a
     # bool ``done_event``, because one chart bar can launch several rounds.
@@ -423,6 +428,20 @@ class SecurityState:
     # TradingView ground truth exists for it (documented limitation).
     chart_resampler: Resampler | None = None
     chart_dwm_modifier: str = ''
+
+    # Lazy start (chart-side). ``True`` once this context's child process has
+    # been started and its rounds are actually launched. A context is started at
+    # its first ``__sec_read__``, not at its first ``__sec_signal__``: the
+    # transformer hoists every context's signal to the top of ``main()``, so a
+    # ``request.security()`` call sitting in a branch this run never takes is
+    # signalled on every bar — and would otherwise cost a process plus a round
+    # per bar for a value nothing ever reads.
+    started: bool = False
+    # A round the signal prepared (target time and flags are already written to
+    # the SyncBlock) while this context was not started yet. ``_start`` performs
+    # it; because the child runs its feed up to the round's target, that one
+    # late round also covers every bar skipped meanwhile.
+    pending_launch: bool = False
 
     # Tracking (chart-side only)
     last_confirmed: int = 0
@@ -773,6 +792,7 @@ def create_chart_protocol(
     states: dict[str, SecurityState],
     sync_block: SyncBlock,
     deferred_resolve_fn: 'Callable[[str, str, str | None], None] | None' = None,
+    prepare_fn: 'Callable[[str], None] | None' = None,
     lazy_spawn_fn: 'Callable[[str], None] | None' = None,
     same_context_ids: 'set[str] | frozenset[str]' = frozenset(),
     no_process_ids: 'set[str] | frozenset[str]' = frozenset(),
@@ -791,8 +811,15 @@ def create_chart_protocol(
     :param sync_block: Shared memory sync block
     :param deferred_resolve_fn: Optional callback for resolving deferred security contexts.
                                 Called with (sec_id, symbol, timeframe) on first __sec_signal__.
+    :param prepare_fn: Optional callback preparing a static context on its FIRST
+                       ``__sec_signal__``: it loads the child's real bar grid and
+                       plans its batch round, both of which every chart-side
+                       target computation from that bar on reads. It starts no
+                       process.
     :param lazy_spawn_fn: Optional callback for lazy-spawning static security processes.
-                          Called with sec_id on first __sec_signal__ for static contexts.
+                          Called with sec_id on the context's FIRST ``__sec_read__``
+                          (see ``_start``), so a context the run never reads never
+                          gets a process.
     :param same_context_ids: Security IDs that share the chart's symbol+timeframe.
                              These are handled directly by the chart (no separate process).
     :param no_process_ids: Security IDs that have no process (same-context + ignored).
@@ -831,6 +858,10 @@ def create_chart_protocol(
     }
 
     resolved: set[str] = set()
+    # Whether the batched contexts have been started as a group (see
+    # ``_start``). One flag for the whole run: after it, every batched context
+    # is already running.
+    cold_batch_start = [False]
     ring_conditions = ring_conditions or {}
     consumers_by_sid = consumers_by_sid or {}
 
@@ -959,7 +990,15 @@ def create_chart_protocol(
         at or before the chart's as-of beyond what its ring already holds, so
         the raise is exactly as true as that decision — and a consumer's own
         as-of never exceeds it, which is what releases the waiter.
+
+        Nothing can be waiting on a context that has not been started: a
+        consumer's child only exists once ``_start`` ran for it, and that starts
+        every producer it depends on FIRST. An unstarted producer therefore
+        publishes no frontier — it would be a claim about a ring no round of its
+        own has filled yet.
         """
+        if not state.started:
+            return
         cond = ring_conditions.get(sec_id)
         if cond is None or not consumers_by_sid.get(sec_id):
             return
@@ -970,8 +1009,106 @@ def create_chart_protocol(
                 sync_block.set_frontier_close(sec_id, asof)
             cond.notify_all()
 
-    def _launch(sec_id: str, state: SecurityState) -> None:
+    def _start(sec_id: str, state: SecurityState, *, run_pending: bool = True) -> None:
+        """Start a context: its producers, its child process, its first round.
+
+        Called from the FIRST ``__sec_read__`` of the context (and from
+        ``_launch`` for the shapes that cannot be started late, see below).
+        Until then the signal did all its per-bar bookkeeping but launched
+        nothing, so the whole start is one late round against the target the
+        signal last wrote — the child runs its feed up to that target, which is
+        exactly where the per-bar rounds would have left it.
+
+        Producers first, transitively: this context's child reads every sid in
+        ``depends`` out of that sid's ring and waits on its frontier, so a
+        producer must be running — and launched for this bar — before the
+        consumer's child exists. ``started`` is set before the recursion, so two
+        contexts reading each other cannot recurse forever.
+
+        A CONSUMER of this context is deliberately NOT started: a consumer that
+        is never read stays unstarted and keeps its watermark at zero, which
+        only stops the producer's ring from being garbage-collected (the writer
+        grows the ring instead of ever blocking), and keeping the whole history
+        is also what lets that consumer start correctly later.
+
+        :param sec_id: The context's id.
+        :param state: Its runtime state.
+        :param run_pending: Whether to run the round the signal prepared. False
+                            from ``_launch``, which is about to launch its own.
+        """
+        state.started = True
+        for producer_id in state.depends:
+            producer = states.get(producer_id)
+            if producer is not None and not producer.started:
+                _start(producer_id, producer)
+        if sec_id in no_process_ids:
+            # Chart-served (same symbol+timeframe) or ignored: no child, no
+            # round — the inline write/read path answers it.
+            return
+        if lazy_spawn_fn is not None:
+            lazy_spawn_fn(sec_id)
+            if state.batch_target and not cold_batch_start[0]:
+                # Cold start of a BATCHED context: every OTHER batched context
+                # starts with it. A batch round is the child's whole historical
+                # phase, and the chart's first read of it blocks until that
+                # child has booted and caught up to this bar — so starting them
+                # one read after the other serializes all of it into the first
+                # chart bar (MEASURED on a 19-context screener: 7 s became
+                # 34 s, and 28 s with only the processes started together).
+                # Running ahead of the chart IN PARALLEL is what a batch round
+                # is for, so the group is started as a group. A batched context
+                # behind a branch this run never takes therefore does get a
+                # child — but only when some OTHER batched context is read; if
+                # no read reaches any of them, none of them starts.
+                cold_batch_start[0] = True
+                for other_id, other in states.items():
+                    if (other_id != sec_id and other.batch_target
+                            and not other.started):
+                        _start(other_id, other)
+        if not run_pending:
+            return
+        if state.deferred_steps:
+            # Developing transport: run the whole queued round sequence now.
+            # The first step goes out here and ``__sec_read__`` drives the rest
+            # (``_drive_pending``), exactly as it does for a live chart bar's
+            # own multi-step round.
+            steps = state.deferred_steps
+            state.deferred_steps = []
+            state.pending_live = steps[1:]
+            steps[0]()
+        elif state.pending_launch:
+            _launch(sec_id, state)
+            if sync_block.get_flags(sec_id) & FLAG_BATCH_ROUND:
+                # The deferred round IS the child's whole historical phase: its
+                # values reach the chart through the ring while it runs, so no
+                # later bar may block on it — the same invariant the batch
+                # signal sets when it launches the round itself.
+                state.needs_wait = False
+        else:
+            # Nothing to run: every bar so far decided this context has no fresh
+            # bar for the chart. Its consumers still have to be released.
+            _settle_no_round(sec_id, state)
+
+    def _launch(sec_id: str, state: SecurityState, *, lazy_ok: bool = True) -> None:
         """Hand the prepared slot to the child and count the round.
+
+        A context the chart has not read yet has no child process: the slot the
+        caller prepared stays in shared memory and only the wake-up is deferred
+        (``pending_launch``), for ``_start`` to perform at the first read. One
+        late round then reaches the same target the per-bar rounds would have
+        left the child at, because the child runs its feed up to the target it
+        is given.
+
+        ``lazy_ok=False`` is for the rounds that cannot be replaced by a later
+        one: the LTF paths (``request.security_lower_tf`` and the scalar
+        ``plain_ltf`` merge), whose round IS the chart bar's own intrabar window
+        — a later round would window a different bar — and the developing-bar
+        transport's steps, which carry one specific chart bar's aggregated
+        OHLCV. Those steps are QUEUED while the context is unstarted
+        (``deferred_steps``) and run in order at the first read, so by the time
+        they call this the context is started anyway; the flag only matters for
+        a developing-transport context that produces for or consumes another,
+        which is never queued and so starts at its first signal as before.
 
         The round context travels WITH the target, before the advance: the
         child unpacks both at the start of its round and derives its chart-side
@@ -987,6 +1124,12 @@ def create_chart_protocol(
         steps still to come, so it is filled BEFORE the first step runs and each
         further step pops itself off before launching.
         """
+        if not state.started:
+            if lazy_ok:
+                state.pending_launch = True
+                return
+            _start(sec_id, state, run_pending=False)
+        state.pending_launch = False
         flags = sync_block.get_flags(sec_id)
         if state.pending_live:
             flags |= FLAG_MORE_STEPS
@@ -1072,8 +1215,9 @@ def create_chart_protocol(
         # NOT alternatives: in a script with both deferred and static contexts the
         # deferred resolver no-ops for a static sec_id (and the runtime symbol
         # argument is always present), so an elif here would leave every static
-        # context's subprocess unspawned and its first real read deadlocked.
-        # ``lazy_spawn_fn`` itself skips sids that already have a process.
+        # context's bar grid unloaded and every target of this bar computed off
+        # an arithmetic guess. ``prepare_fn`` itself skips sids that already
+        # have a process (a deferred context prepares inside the resolver).
         if sec_id not in resolved:
             resolved.add(sec_id)
             if lookahead is not None:
@@ -1097,11 +1241,15 @@ def create_chart_protocol(
                 # The resolver may have turned this context into the chart's
                 # own: it now produces for its consumers, so it needs a ring.
                 _ensure_chart_writer(sec_id)
-            if lazy_spawn_fn is not None:
-                lazy_spawn_fn(sec_id)
+            if prepare_fn is not None:
+                prepare_fn(sec_id)
 
         # No-process contexts (same-context, ignored): skip advance/wait
         if sec_id in no_process_ids:
+            # Nothing to start: the chart serves this context inline, so it is
+            # "started" from the first bar — its consumers read the ring the
+            # chart itself writes.
+            state.started = True
             if sec_id in same_context_ids:
                 state.new_period = True
                 state.data_ready.clear()
@@ -1178,7 +1326,7 @@ def create_chart_protocol(
             state.ltf_skip = False
             state.new_period = True
             sync_block.set_target_time(sec_id, target_time)
-            _launch(sec_id, state)
+            _launch(sec_id, state, lazy_ok=False)
             return
 
         if state.is_ltf:
@@ -1215,7 +1363,7 @@ def create_chart_protocol(
                 sync_block.set_ltf_period_end(sec_id, period_end_exclusive)
                 state.ltf_skip = False
                 state.new_period = True
-                _launch(sec_id, state)
+                _launch(sec_id, state, lazy_ok=False)
                 return
 
             # Historical/file-backed LTF: the child includes intrabars with
@@ -1251,7 +1399,7 @@ def create_chart_protocol(
             state.new_period = True
             sync_block.set_ltf_period_start(sec_id, chart_time)
             sync_block.set_target_time(sec_id, ltf_target_time)
-            _launch(sec_id, state)
+            _launch(sec_id, state, lazy_ok=False)
             return
 
         # Live HTF transport — the chart aggregates its own OHLCV into the
@@ -1333,6 +1481,15 @@ def create_chart_protocol(
                 # the chart would sit in a wait that a child's own peer read
                 # extends.
                 steps: list = []
+                # Whether this bar's rounds are queued for the first read
+                # instead of being run now. Only for a context that neither
+                # produces for nor consumes another: every round of the burst
+                # carries the FIRST READ's chart tick, which is what a ring
+                # entry's developing close and a peer read's as-of cap are
+                # derived from — an isolated context publishes no ring and caps
+                # no peer, so nothing observes the difference.
+                defer_steps = (not state.started and not state.depends
+                               and not consumers_by_sid.get(sec_id))
 
                 if not state.htf_prefilled:
                     state.htf_prefilled = True
@@ -1351,7 +1508,7 @@ def create_chart_protocol(
                                 ),
                             )
                             sync_block.set_target_time(sec_id, _target)
-                            _launch(sec_id, state)
+                            _launch(sec_id, state, lazy_ok=False)
 
                         steps.append(_prefill_step)
 
@@ -1368,7 +1525,7 @@ def create_chart_protocol(
                             & ~(FLAG_IS_DEVELOPING | FLAG_DEV_HISTORICAL)
                         ) | FLAG_CLOSED_OVERRIDE | hist_phase)
                         sync_block.set_target_time(sec_id, _bar.period_start)
-                        _launch(sec_id, state)
+                        _launch(sec_id, state, lazy_ok=False)
 
                     steps.append(_closed_step)
 
@@ -1377,17 +1534,23 @@ def create_chart_protocol(
                 # (the closed step delivered it); no fresh developing bar exists
                 # until the next chart bar.
                 if state.lookahead is Lookahead.ON and dev_bar is not None:
-                    def _developing_step(_bar=dev_bar):
-                        sync_block.set_developing_bar(
-                            sec_id, _bar.open, _bar.high, _bar.low,
-                            _bar.close, _bar.volume, _bar.period_start,
-                        )
+                    # The aggregator keeps ONE developing bar per period and
+                    # mutates it on every chart bar, so the values are copied
+                    # into the step instead of the object: a queued step
+                    # (``deferred_steps``) runs bars later and has to carry the
+                    # OHLCV of the bar it was built for.
+                    def _developing_step(_o=dev_bar.open, _h=dev_bar.high,
+                                         _l=dev_bar.low, _c=dev_bar.close,
+                                         _v=dev_bar.volume,
+                                         _ps=dev_bar.period_start):
+                        sync_block.set_developing_bar(sec_id, _o, _h, _l, _c,
+                                                      _v, _ps)
                         sync_block.set_flags(sec_id, (
                             sync_block.get_flags(sec_id)
                             & ~(FLAG_CLOSED_OVERRIDE | FLAG_DEV_HISTORICAL)
                         ) | FLAG_IS_DEVELOPING | hist_phase)
-                        sync_block.set_target_time(sec_id, _bar.period_start)
-                        _launch(sec_id, state)
+                        sync_block.set_target_time(sec_id, _ps)
+                        _launch(sec_id, state, lazy_ok=False)
 
                     steps.append(_developing_step)
                     state.new_period = True
@@ -1404,10 +1567,21 @@ def create_chart_protocol(
                         ))
 
                 if steps:
-                    # The queue is filled FIRST: ``_launch`` reads it to decide
-                    # whether this round is the chart bar's last publication.
-                    state.pending_live = steps[1:]
-                    steps[0]()
+                    if defer_steps:
+                        # Not read yet: keep this bar's rounds for the first
+                        # read instead of running them. EVERY round is kept, in
+                        # bar order: the child rolls back a developing re-tick's
+                        # var and function-instance slots but not its ``varip``
+                        # slots or its ``IBPersistent`` storage, so a dropped
+                        # developing round would leave the child in a state an
+                        # eager start never reaches.
+                        state.deferred_steps.extend(steps)
+                    else:
+                        # The queue is filled FIRST: ``_launch`` reads it to
+                        # decide whether this round is the chart bar's last
+                        # publication.
+                        state.pending_live = steps[1:]
+                        steps[0]()
                 else:
                     _settle_no_round(sec_id, state)
                 return
@@ -1549,6 +1723,11 @@ def create_chart_protocol(
             # ``__sec_read__``, so each read observes this bar's flag — the same
             # signal-before-read invariant ``new_period``/``needs_wait`` rely on.
             return default
+        if not state.started:
+            # FIRST read of this context: start its child now and run the round
+            # its signal prepared for this bar (see ``_start``). A context no
+            # read ever reaches never gets here — and never gets a process.
+            _start(sec_id, state)
         if state.batch_target:
             # Batched context: no per-bar handshake ran, the value comes from
             # the ring. ``gaps_on`` still emits ``na`` on a chart bar that opens

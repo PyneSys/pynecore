@@ -1867,7 +1867,34 @@ class ScriptRunner:
                 # per-bar transports over from where history ended.
                 _batch_allowed = (not lib._is_live) and self.last_bar_time is not None
 
-                def _spawn_security_process(sid: str, data_source):
+                # Everything ``_prepare_security_context`` derived, by sid: the
+                # (possibly re-resampled) data source and the ring pre-sizing a
+                # batch plan asks for. The preparation runs at the context's
+                # FIRST SIGNAL and the spawn only at its first READ, so the two
+                # halves have to hand their result over through this map.
+                _sec_prepared: dict[str, tuple] = {}
+
+                def _prepare_security_context(sid: str, data_source) -> tuple:
+                    """Derive everything the CHART needs before this context's
+                    first signal — without starting its child process.
+
+                    ``load_htf_bar_opens`` fills the real bar grid every
+                    chart-side target computation reads, and the batch plan that
+                    follows from it decides whether the context runs per bar or
+                    as one round. Both must therefore be in place from the
+                    context's very first signal, while the child process itself
+                    is only needed once the chart actually READS the context
+                    (see ``_start`` in :func:`create_chart_protocol`).
+
+                    Idempotent: the result is cached per sid.
+
+                    :param sid: The context's id.
+                    :param data_source: Its resolved OHLCV path or PluginSymbol.
+                    :return: ``(data_source, chart_ring_capacity, chart_ring_arena)``.
+                    """
+                    prepared = _sec_prepared.get(sid)
+                    if prepared is not None:
+                        return prepared
                     sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
                     _chart_ring_capacity = 0
                     _chart_ring_arena = 0
@@ -1921,6 +1948,15 @@ class ScriptRunner:
                         # ``__sec_signal__`` drives the LTF-window path for every
                         # round (warmup replay and live alike).
                         sec_state.ltf_live_stream = True
+                    prepared = (data_source, _chart_ring_capacity, _chart_ring_arena)
+                    _sec_prepared[sid] = prepared
+                    return prepared
+
+                def _spawn_security_process(sid: str, data_source):
+                    """Start this context's child process (preparing it first)."""
+                    sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
+                    data_source, _chart_ring_capacity, _chart_ring_arena = (
+                        _prepare_security_context(sid, data_source))
                     # Plain-OHLCV fast path: a context whose expression is only
                     # raw price series is served straight from each bar in the
                     # child, skipping the per-bar main() re-run (SecurityTransformer
@@ -2123,11 +2159,16 @@ class ScriptRunner:
                             and (not is_same_symbol)
                             and sec_state.lookahead is Lookahead.ON
                     )
-                    # OHLCV source and syminfo were resolved above; spawn the
-                    # security subprocess (or mark as no-process when the
-                    # symbol was downgraded to ``None``).
+                    # OHLCV source and syminfo were resolved above; prepare the
+                    # context (or mark it as no-process when the symbol was
+                    # downgraded to ``None``). The child process itself starts at
+                    # the context's first READ, like a static one's — but its
+                    # peer record goes out NOW: a consumer child blocked on this
+                    # context's record must be released by the resolution, not by
+                    # a spawn that may never happen.
                     if resolved_path is not None:
-                        _spawn_security_process(sid, resolved_path)
+                        _prepare_security_context(sid, resolved_path)
+                        _publish_sec_record(sid)
                     else:
                         # ``ignore_invalid_symbol=True`` downgraded the live
                         # syminfo lookup to ``None``; mark the sid as
@@ -2137,7 +2178,16 @@ class ScriptRunner:
                         no_process_ids.add(sid)
                         _publish_sec_record(sid)
 
-                # Lazy spawn callback for static contexts. The ``sec_processes``
+                # First-signal callback for static contexts: prepare the bar grid
+                # and the batch plan the chart-side target computation needs from
+                # this bar on, but do NOT start a child yet.
+                def _lazy_prepare(sid: str):
+                    resolved_path = sec_ohlcv_paths.get(sid)
+                    if (resolved_path is not None and sid not in no_process_ids
+                            and sid not in sec_processes):
+                        _prepare_security_context(sid, resolved_path)
+
+                # First-read callback for static contexts. The ``sec_processes``
                 # check makes it safe to call after the deferred resolver too —
                 # a deferred context spawns its process inside ``_deferred_resolve``,
                 # and spawning it again would leak a duplicate child.
@@ -2202,7 +2252,11 @@ class ScriptRunner:
                  sec_begin_bar_fn, sec_end_bar_fn) = create_chart_protocol(
                     sec_states, sec_sync_block,
                     deferred_resolve_fn=_deferred_resolve if deferred_sec_ids else None,
-                    lazy_spawn_fn=_lazy_spawn if static_contexts else None,
+                    # Both are unconditional: they key off ``sec_ohlcv_paths``,
+                    # which a static context fills at setup and a deferred one
+                    # at its own resolution, and no-op for anything else.
+                    prepare_fn=_lazy_prepare,
+                    lazy_spawn_fn=_lazy_spawn,
                     same_context_ids=same_ctx_ref,
                     no_process_ids=no_process_ids,
                     # Unconditional: ``same_context_ids`` can gain members AFTER setup
