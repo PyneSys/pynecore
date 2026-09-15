@@ -3276,8 +3276,9 @@ class ScriptRunner:
             if self.trades_writer:
                 self.trades_writer.close()
 
-            # Shutdown security processes
-            if sec_processes and sec_states is not None:
+            # Shutdown security infrastructure. Same-context and ignored contexts
+            # allocate shared memory even when no child process is needed.
+            if sec_states is not None:
                 for state in sec_states.values():
                     state.stop_event.set()
                     state.advance_event.set()  # wake up if waiting
@@ -3294,7 +3295,7 @@ class ScriptRunner:
                 if callable(sec_cleanup_fn):
                     sec_cleanup_fn: Callable
                     sec_cleanup_fn()
-                if sec_sync_block and sec_result_blocks:
+                if sec_sync_block is not None and sec_result_blocks is not None:
                     from .security import cleanup_shared_memory
                     cleanup_shared_memory(sec_sync_block, sec_result_blocks)
 

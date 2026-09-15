@@ -22,7 +22,6 @@ from pynecore.transformers.persistent import PersistentTransformer
 from pynecore.transformers.persistent_series import PersistentSeriesTransformer
 from pynecore.transformers.series import SeriesTransformer
 from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
-from pynecore.types.na import NA
 
 
 def _transform(source: str) -> tuple[dict, str]:
@@ -234,6 +233,33 @@ def main():
         assert nested() == 11.0
     assert '__lib·close = __state·main__[0].add(lib.close)' in dump
     assert '__state·main__[1][1]' in dump
+
+
+def __test_builtin_time_history_in_nested_helper_uses_chart_bars__():
+    """A conditionally called helper reads ``time[n]`` from chart history."""
+    ns, dump = _transform('''
+from pynecore import lib
+
+def main():
+    def nested():
+        return lib.time[2]
+    return nested
+''')
+    layouts = ns['__pyne_slot_layout__']
+    assert set(layouts) == {'main'}
+    layout = layouts['main']
+    assert layout['series'] == ((0, None, 'int'),)
+    state = _make_state(layout)
+    with _bars() as next_bar:
+        for value in (1000.0, 2000.0):
+            ns['lib'] = SimpleNamespace(time=value)
+            ns['main'](state)
+            next_bar()
+        ns['lib'] = SimpleNamespace(time=3000.0)
+        nested = ns['main'](state)
+        assert nested() == 1000.0
+    assert '__lib·time = __state·main__[0].add(lib.time)' in dump
+    assert '__state·main__[0][2]' in dump
 
 
 def __test_max_bars_back__():
