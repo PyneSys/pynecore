@@ -129,6 +129,15 @@ FLAG_BATCH_ROUND = 0x200  # historical BATCH round: the chart launched this cont
                           # pairs the values out of the ring as-of each chart bar. Such a
                           # round publishes uncapped -- its frontier must run ahead of the
                           # chart, which is exactly what releases the chart's ring waits.
+FLAG_DEV_BATCH_ROUND = 0x400  # historical DEVELOPING batch round: as FLAG_BATCH_ROUND, but
+                              # for a ``lookahead_on`` higher-timeframe context, whose bars
+                              # the chart aggregates itself. The child replays a PLANNED
+                              # round sequence (one developing entry per chart bar, plus the
+                              # period closes and the one-time prefill) instead of being fed
+                              # one chart bar at a time. Unlike the closed batch such a round
+                              # does NOT publish uncapped: every entry closes at its own
+                              # chart bar's tick, so the frontier has to stop there or the
+                              # chart would pair a bar with the previous bar's value.
 
 
 def is_ltf_window(flags: int) -> bool:
@@ -670,6 +679,32 @@ _RING_ENTRY_SIZE = 32  # 28 bytes of fields + 4 pad, keeping 8-byte alignment
 INITIAL_RING_CAPACITY = 64
 INITIAL_RING_ARENA = 8192
 
+# How many entries a BATCH producer may hold ahead of its consumer's watermark
+# before it waits. A batch round runs ahead of the chart on purpose, so this is
+# generous; it only stops a million-bar plan from holding a million live
+# entries. It is also what decides when a consumer bothers to wake the producer
+# after parking its watermark (see :meth:`RingReader.wait_for_close`) — below
+# half of it no producer can be parked, and the extra condition acquire is pure
+# cost on a hot path.
+RING_RUNAHEAD_ENTRIES = 4096
+
+# Lock-free frontier reads a consumer makes before it parks on the producer's
+# condition (see :meth:`RingReader.wait_for_close`). One read is an
+# ``unpack_from`` on shared memory, ~0.3 us, so this bounds the spin at a couple
+# of milliseconds — a few chart bars' worth of a producer's work.
+#
+# It exists because PARKING is expensive, not because the wait is long. Measured
+# on this project's benchmark machine, one ``multiprocessing.Condition``
+# notify->wake handoff costs ~1.3 ms whatever the producer is doing: a 3000-bar
+# ping-pong turns 0.9 s of producer work into a 4 s wall. A batch producer
+# publishing one entry per chart bar runs at roughly its consumer's own pace, so
+# it is never far behind and the spin resolves the wait without the operating
+# system ever getting involved (MEASURED on a 10-context ``lookahead_on``
+# benchmark: 2535 parks costing 3.5 s became 47 costing 0.06 s, and the wall
+# dropped from 11.0 s to 6.5 s). The condition wait stays as the fallback — a
+# child that is still booting is minutes, not microseconds, away.
+_FRONTIER_SPIN_READS = 8000
+
 
 def _ring_block_name(prefix: str, version: int) -> str:
     """Generate SharedMemory name for a ring block.
@@ -1158,7 +1193,8 @@ class RingReader:
 
     def wait_for_close(self, ms: int, stop_event: 'EventType | None' = None,
                        timeout: float | None = None,
-                       watermark_index: int | None = None) -> bool:
+                       watermark_index: int | None = None,
+                       spin: bool = False) -> bool:
         """
         Wait until the producer published everything closing at or before ``ms``.
 
@@ -1176,10 +1212,34 @@ class RingReader:
             for. It is also exactly the GC contract ("I may still need the
             last entry at or below this"), so parking it here rather than
             after the read costs the ring nothing.
+        :param spin: Read the frontier lock-free a bounded number of times
+            before parking on the condition (see :data:`_FRONTIER_SPIN_READS`).
+            For a producer running a planned batch just behind this consumer,
+            which is the shape where parking costs more than the wait.
         """
         if watermark_index is not None:
             self._sync.set_watermark(
                 watermark_index, self._sync.index_of(self._sec_id), ms)
+            if self._sync.get_ring_count(self._sec_id) >= RING_RUNAHEAD_ENTRIES // 2:
+                # The watermark is also how far the consumer has READ, which is
+                # what bounds a batch producer's run-ahead — and a producer
+                # parked on that bound is woken by nothing else. Only worth the
+                # condition acquire once the ring is deep enough for one to be
+                # parked: MEASURED on a 9-context ``lookahead_on`` batch,
+                # notifying on every read cost ~1 s of pure semaphore traffic.
+                with self._cond:
+                    self._cond.notify_all()
+        if self.frontier_close() >= ms:
+            # Lock-free fast path, and the normal one for a batch round: the
+            # producer runs ahead of this consumer, so everything closing at or
+            # before ``ms`` is long published. The frontier is a single aligned
+            # int64 that only ever rises, so a torn or stale read can only be
+            # too SMALL — it falls through to the locked wait, never past it.
+            return True
+        if spin:
+            for _ in range(_FRONTIER_SPIN_READS):
+                if self.frontier_close() >= ms:
+                    return True
         return self.wait_until(
             lambda: self.has_close(ms) or self.frontier_close() >= ms,
             stop_event, timeout)

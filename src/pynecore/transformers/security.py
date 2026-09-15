@@ -3,6 +3,8 @@ import copy
 import hashlib
 from collections.abc import Container
 
+from .dynamic_default import is_script_entry
+
 
 # Strategy state accessors are meaningful only in the chart context — the
 # security child process has no strategy state of its own, so referencing
@@ -29,6 +31,79 @@ _OHLCV_PASSTHROUGH_FIELDS = frozenset({
     "open", "high", "low", "close", "volume",
     "hl2", "hlc3", "ohlc4", "hlcc4",
 })
+
+
+# --- Cross-function signal lift ---
+
+# Statement forms that always run once when their body is entered, so a
+# ``request.security()`` reached through one of them runs exactly as often as
+# the body itself. ``return`` belongs here: everything ahead of it is what
+# decides whether it is reached, and ``_EXIT_STMTS`` already stops the scan at
+# it. Everything else (``if`` / loops / ``with`` / ``try`` / ``match``) can
+# skip or repeat the call and blocks the lift.
+_UNCONDITIONAL_STMTS: tuple[type[ast.AST], ...] = (
+    ast.Expr, ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Return,
+)
+
+# Expression forms that may leave a subexpression unevaluated (``a if c else
+# b``, ``and`` / ``or`` short-circuit) or defer it to another invocation
+# (lambda, comprehension). A call under one of them is not unconditional.
+_CONDITIONAL_EXPRS: tuple[type[ast.AST], ...] = (
+    ast.IfExp, ast.BoolOp, ast.Lambda, ast.ListComp, ast.SetComp,
+    ast.DictComp, ast.GeneratorExp,
+)
+
+# Statements that can end the caller's body before a later statement is
+# reached. One of them ahead of the call site means the call may not run on
+# every bar, so its signal must not move above it.
+_EXIT_STMTS: tuple[type[ast.AST], ...] = (
+    ast.Return, ast.Raise, ast.Break, ast.Continue,
+)
+
+# Lift rounds: each round moves a signal one call level up, so the cap only
+# has to exceed the deepest unconditional helper chain a script can have.
+_MAX_LIFT_ROUNDS = 16
+
+
+class _SignalArgSubstituter(ast.NodeTransformer):
+    """Rewrite one lifted ``__sec_signal__`` argument into the caller's scope.
+
+    A helper's signal argument is written in the helper's own names: its
+    parameters and the simple bindings standing above its signal block. Both
+    have an exact equivalent at the call site — the argument expression the
+    caller passed, and the binding's own value expression — so substituting
+    them yields the very expression the helper would have evaluated.
+
+    :ivar failed: set when a name has no such equivalent; the caller then
+        leaves the signal where it is
+    """
+
+    def __init__(self, mapping: dict[str, ast.expr],
+                 bindings: dict[str, ast.expr]):
+        self.mapping = mapping
+        self.bindings = bindings
+        self.failed = False
+        # Guards a binding that (illegally) reads itself: without it the
+        # substitution would recurse forever instead of bailing out.
+        self._active: set[str] = set()
+
+    def visit_Name(self, node: ast.Name) -> ast.expr:
+        if node.id == 'lib':
+            return node
+        # Bindings come first: one of them may shadow a parameter, and then the
+        # signal read the binding's value, not the argument the caller passed.
+        if node.id in self.bindings and node.id not in self._active:
+            self._active.add(node.id)
+            try:
+                return self.visit(copy.deepcopy(self.bindings[node.id]))
+            finally:
+                self._active.discard(node.id)
+        if node.id in self.mapping:
+            # The caller's expression is already in the target scope — return
+            # it unvisited so its own names are left alone.
+            return copy.deepcopy(self.mapping[node.id])
+        self.failed = True
+        return node
 
 
 class SecurityTransformer(ast.NodeTransformer):
@@ -879,6 +954,507 @@ class SecurityTransformer(ast.NodeTransformer):
             if sid in analyzer.in_loop:
                 ctx['in_loop'] = ast.Constant(value=True)
 
+    def _mark_always_read(self, module: ast.Module) -> None:
+        """Flag every context whose ``__sec_read__`` runs on every chart bar.
+
+        A read standing unconditionally in the script entry's body — directly,
+        or in a helper that body reaches unconditionally — is taken on every
+        bar the script runs. The runtime starts such contexts as a group when
+        it first has to wait for one of them, instead of one cold start after
+        the other (see ``_start`` in :mod:`pynecore.core.security`). A read
+        behind a branch, a loop or a short-circuit gets no flag: that run may
+        never take it, and a context nobody reads must not get a child process.
+
+        :param module: the transformed module, with the reads already emitted
+        """
+        funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+        ambiguous: set[str] = set()
+        entry: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+        for node in ast.walk(module):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name in funcs:
+                # Two definitions of one name: a call by that name cannot be
+                # attributed to either, so neither is followed.
+                ambiguous.add(node.name)
+            funcs[node.name] = node
+            if entry is None and is_script_entry(node):
+                entry = node
+        if entry is None:
+            return
+
+        pending = [entry]
+        seen = {id(entry)}
+        while pending:
+            func = pending.pop()
+            for stmt in self._unconditional_stmts(func.body):
+                for sub in self._walk_skip_funcs(stmt):
+                    if not (isinstance(sub, ast.Call)
+                            and isinstance(sub.func, ast.Name)
+                            and self._reached_unconditionally(stmt, sub)):
+                        continue
+                    if sub.func.id == '__sec_read__':
+                        sid = self._call_sid(sub)
+                        ctx = self._all_contexts.get(sid) if sid else None
+                        if ctx is not None:
+                            ctx['always_read'] = ast.Constant(value=True)
+                        continue
+                    callee = funcs.get(sub.func.id)
+                    if (callee is not None and sub.func.id not in ambiguous
+                            and id(callee) not in seen):
+                        seen.add(id(callee))
+                        pending.append(callee)
+
+    def _mark_signal_per_bar(self, module: ast.Module) -> None:
+        """Flag every context signalled exactly once per script entry run.
+
+        The developing batch plans one round per chart bar and every
+        ``__sec_signal__`` consumes the next one, so the runtime may only batch
+        a context whose signal is emitted once per ``main()`` call. That is
+        provable for exactly one shape: the sid's only ``__sec_signal__`` in the
+        whole module stands in a chart-guard block directly in the script
+        entry's body, ahead of anything that can end that body early. A signal
+        left in a helper (conditionally called, called twice, or called in a
+        loop) gets no flag and keeps the per-bar transport.
+
+        :param module: the transformed module, after the cross-function lift
+        """
+        counts: dict[str, int] = {}
+        for node in ast.walk(module):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == '__sec_signal__'):
+                sid = self._call_sid(node)
+                if sid is not None:
+                    counts[sid] = counts.get(sid, 0) + 1
+
+        entry: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+        for node in ast.walk(module):
+            if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and is_script_entry(node)):
+                entry = node
+                break
+        if entry is None:
+            return
+
+        for stmt in entry.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+                continue
+            calls = self._guard_block_calls(stmt, '__sec_signal__')
+            if calls is not None:
+                for call in calls:
+                    sid = self._call_sid(call)
+                    if sid is None or counts.get(sid) != 1:
+                        continue
+                    ctx = self._all_contexts.get(sid)
+                    if ctx is not None:
+                        ctx['signal_per_bar'] = ast.Constant(value=True)
+            if any(isinstance(sub, _EXIT_STMTS)
+                   for sub in self._walk_skip_funcs(stmt)):
+                return
+
+    @classmethod
+    def _unconditional_stmts(cls, body: list[ast.stmt]):
+        """The statements of ``body`` that run every time it is entered.
+
+        Stops after the first statement that can end the body early, and skips
+        nested definitions — what their own body does belongs to their scope.
+
+        :param body: the statement list to scan
+        """
+        for stmt in body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+                continue
+            if isinstance(stmt, _UNCONDITIONAL_STMTS):
+                yield stmt
+            if any(isinstance(sub, _EXIT_STMTS)
+                   for sub in cls._walk_skip_funcs(stmt)):
+                return
+
+    # --- Cross-function signal lift ---
+
+    @classmethod
+    def _guard_block_calls(cls, stmt: ast.stmt, name: str) -> list[ast.Call] | None:
+        """Return the calls of ``name`` in a chart-guard block, else None.
+
+        Recognises exactly the shape this transformer emits: an
+        ``if __active_security__ is None:`` whose body is nothing but
+        ``name(...)`` expression statements.
+
+        :param stmt: candidate statement
+        :param name: ``__sec_signal__`` or ``__sec_wait__``
+        :return: the calls in source order, or None if ``stmt`` is not such a
+            block
+        """
+        if not isinstance(stmt, ast.If) or stmt.orelse or not stmt.body:
+            return None
+        test = stmt.test
+        if not (isinstance(test, ast.Compare) and len(test.ops) == 1
+                and isinstance(test.ops[0], ast.Is)
+                and isinstance(test.left, ast.Name)
+                and test.left.id == '__active_security__'):
+            return None
+        comparator = test.comparators[0]
+        if not (isinstance(comparator, ast.Constant) and comparator.value is None):
+            return None
+        calls = []
+        for sub in stmt.body:
+            if not (isinstance(sub, ast.Expr) and isinstance(sub.value, ast.Call)
+                    and isinstance(sub.value.func, ast.Name)
+                    and sub.value.func.id == name):
+                return None
+            calls.append(sub.value)
+        return calls
+
+    @classmethod
+    def _find_guard_block(cls, body: list[ast.stmt],
+                          name: str) -> tuple[int, ast.If] | None:
+        """First chart-guard block of ``name`` in ``body`` with its index."""
+        for idx, stmt in enumerate(body):
+            if (isinstance(stmt, ast.If)
+                    and cls._guard_block_calls(stmt, name) is not None):
+                return idx, stmt
+        return None
+
+    @staticmethod
+    def _call_sid(call: ast.Call) -> str | None:
+        """The sid a ``__sec_signal__`` / ``__sec_wait__`` call carries."""
+        if not call.args:
+            return None
+        first = call.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            return first.value
+        return None
+
+    @classmethod
+    def _reached_unconditionally(cls, node: ast.AST, target: ast.Call) -> bool:
+        """Whether ``target`` is evaluated every time ``node`` is evaluated.
+
+        Walks only the expression children, stopping at any form that may skip
+        its operands (see ``_CONDITIONAL_EXPRS``). Call arguments count as
+        unconditional: Python evaluates every one of them before the call.
+        """
+        if node is target:
+            return True
+        if isinstance(node, _CONDITIONAL_EXPRS):
+            return False
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.expr, ast.keyword)):
+                if cls._reached_unconditionally(child, target):
+                    return True
+        return False
+
+    @classmethod
+    def _leading_bindings(cls, body: list[ast.stmt], limit: int,
+                          params: set[str]) -> dict[str, ast.expr] | None:
+        """``name = <expr>`` bindings standing in ``body[:limit]``.
+
+        These are the statements the signal block was placed after — the
+        bindings hoisted for its arguments and the call-site constants the
+        instantiation pass pinned — so a signal argument reading one of them
+        reads exactly the value expression recorded here.
+
+        Returns None when the region is not that shape, which blocks the lift:
+
+        - a statement that is not a plain single-name assignment could have
+          changed anything the signal reads,
+        - a name bound twice has no single value expression to substitute,
+        - a parameter rebound from something other than a static expression is
+          the case requirement (2) rules out: the value the helper signals is
+          no longer the argument the call site passed. A rebinding to a
+          constant or a ``lib.*`` chain (what the instantiation pass pins) is
+          exact, so it stays allowed.
+
+        :param body: the helper's statement list
+        :param limit: index of the signal block
+        :param params: the helper's parameter names
+        :return: the bindings, or None if the region blocks the lift
+        """
+        assigned: list[tuple[str, ast.expr]] = []
+        for stmt in body[:limit]:
+            if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1):
+                return None
+            target = stmt.targets[0]
+            if not isinstance(target, ast.Name):
+                return None
+            if target.id in params and cls._referenced_names(stmt.value):
+                return None
+            assigned.append((target.id, stmt.value))
+
+        bindings: dict[str, ast.expr] = {}
+        for idx, (name, value) in enumerate(assigned):
+            if name in bindings:
+                return None
+            # Names bound BELOW this statement. A value reading one of them
+            # would be substituted with that later value — the substituter
+            # resolves a binding against the whole region — while the helper
+            # evaluated what stood here at the assignment point.
+            later = {n for n, _ in assigned[idx + 1:]}
+            if cls._referenced_names(value) & later:
+                return None
+            bindings[name] = value
+        return bindings
+
+    @staticmethod
+    def _param_mapping(func: ast.FunctionDef | ast.AsyncFunctionDef,
+                       call: ast.Call) -> dict[str, ast.expr] | None:
+        """Map ``func``'s parameters to the expressions ``call`` passes.
+
+        Returns None for any shape whose binding is not statically decidable
+        (``*args`` / ``**kwargs`` on either side, an unknown keyword, too many
+        positional arguments). Parameters the call leaves to their default are
+        simply absent: substituting a default expression could duplicate an
+        ``input.*`` registration, so a signal argument reading one blocks the
+        lift.
+        """
+        args = func.args
+        if args.vararg is not None or args.kwarg is not None:
+            return None
+        if any(isinstance(a, ast.Starred) for a in call.args):
+            return None
+        if any(kw.arg is None for kw in call.keywords):
+            return None
+        positional = [a.arg for a in (*args.posonlyargs, *args.args)]
+        known = set(positional) | {a.arg for a in args.kwonlyargs}
+        if len(call.args) > len(positional):
+            return None
+        mapping: dict[str, ast.expr] = {}
+        for idx, value in enumerate(call.args):
+            mapping[positional[idx]] = value
+        for kw in call.keywords:
+            if kw.arg not in known or kw.arg in mapping:
+                return None
+            mapping[kw.arg] = kw.value
+        return mapping
+
+    def _lift_candidates(
+            self, module: ast.Module
+    ) -> list[tuple[ast.FunctionDef | ast.AsyncFunctionDef,
+                    ast.FunctionDef | ast.AsyncFunctionDef, ast.Call, int]]:
+        """Helper functions whose signal block may move up one call level.
+
+        A candidate is a function with a chart-guard signal block whose name is
+        read exactly once in the whole module, at a direct-``Name`` call site
+        that stands in an enclosing function's own statement list, is evaluated
+        unconditionally there, and has no statement ahead of it that can end
+        that body early.
+
+        :param module: the lowered module
+        :return: ``(helper, caller, call, stmt_index)`` tuples, ordered by call
+            site so lifted signals keep their source order
+        """
+        funcs: list[ast.FunctionDef | ast.AsyncFunctionDef] = [
+            n for n in ast.walk(module)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        # A name read anywhere else (an alias, a callback, a second call) means
+        # the helper may run a different number of times than the single site
+        # below suggests.
+        load_counts: dict[str, int] = {}
+        for sub in ast.walk(module):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                load_counts[sub.id] = load_counts.get(sub.id, 0) + 1
+
+        # Every unconditional direct-call site, keyed by callee name.
+        sites: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef,
+                               ast.Call, int]] = {}
+        for caller in funcs:
+            blocked = False
+            for idx, stmt in enumerate(caller.body):
+                if blocked:
+                    break
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                     ast.ClassDef)):
+                    # A definition neither calls nor exits this body; what its
+                    # own body does belongs to its scope.
+                    continue
+                if isinstance(stmt, _UNCONDITIONAL_STMTS):
+                    for sub in self._walk_skip_funcs(stmt):
+                        if (isinstance(sub, ast.Call)
+                                and isinstance(sub.func, ast.Name)
+                                and self._reached_unconditionally(stmt, sub)):
+                            sites[sub.func.id] = (caller, sub, idx)
+                # Anything beyond this statement may never be reached. A
+                # nested def's own ``return`` belongs to that function, not to
+                # this body, so nested scopes are skipped.
+                blocked = any(isinstance(sub, _EXIT_STMTS)
+                              for sub in self._walk_skip_funcs(stmt))
+
+        candidates = []
+        for helper in funcs:
+            if self._find_guard_block(helper.body, '__sec_signal__') is None:
+                continue
+            if load_counts.get(helper.name, 0) != 1:
+                continue
+            site = sites.get(helper.name)
+            if site is None:
+                continue
+            caller, call, idx = site
+            if caller is helper:
+                continue
+            candidates.append((helper, caller, call, idx))
+        candidates.sort(key=lambda c: c[3])
+        return candidates
+
+    def _lift_signal(self, helper: ast.FunctionDef | ast.AsyncFunctionDef,
+                     caller: ast.FunctionDef | ast.AsyncFunctionDef,
+                     call: ast.Call) -> bool:
+        """Move every provably liftable signal of ``helper`` into ``caller``.
+
+        :return: True if at least one signal moved
+        """
+        found = self._find_guard_block(helper.body, '__sec_signal__')
+        if found is None:
+            return False
+        sig_idx, sig_block = found
+        mapping = self._param_mapping(helper, call)
+        if mapping is None:
+            return False
+        args = helper.args
+        params = {a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)}
+        bindings = self._leading_bindings(helper.body, sig_idx, params)
+        if bindings is None:
+            return False
+
+        hoistable, stable_params = self._hoistable_bindings(caller)
+        available = set(hoistable) | stable_params
+
+        lifted: list[tuple[ast.Expr, str, list[ast.expr]]] = []
+        for stmt in list(sig_block.body):
+            if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
+                continue
+            sid = self._call_sid(stmt.value)
+            if sid is None:
+                continue
+            new_args: list[ast.expr] = []
+            ok = True
+            for arg in stmt.value.args[1:]:
+                substituter = _SignalArgSubstituter(mapping, bindings)
+                new_arg = substituter.visit(copy.deepcopy(arg))
+                if substituter.failed or not self._is_simple_chain(new_arg, available):
+                    ok = False
+                    break
+                new_args.append(new_arg)
+            if ok:
+                lifted.append((stmt, sid, new_args))
+
+        if not lifted:
+            return False
+
+        lifted_sids = {sid for _, sid, _ in lifted}
+        needed: set[str] = set()
+        for _, _, new_args in lifted:
+            for arg in new_args:
+                needed |= self._referenced_names(arg)
+
+        # The caller's signal block: reuse the one it already has, or start one
+        # at the top of its body (a caller without security calls of its own
+        # has none yet).
+        found_caller = self._find_guard_block(caller.body, '__sec_signal__')
+        if found_caller is None:
+            caller_block = ast.If(test=self._is_none_check(), body=[], orelse=[])
+            caller.body.insert(0, caller_block)
+        else:
+            caller_block = found_caller[1]
+
+        for stmt, sid, new_args in lifted:
+            sig_block.body.remove(stmt)
+            new_call = self._func_call(
+                '__sec_signal__', ast.Constant(value=sid), *new_args
+            )
+            new_stmt = ast.Expr(value=new_call)
+            ast.copy_location(new_stmt, call)
+            ast.fix_missing_locations(new_stmt)
+            caller_block.body.append(new_stmt)
+        if not sig_block.body:
+            helper.body.remove(sig_block)
+
+        # Every binding the moved arguments read has to stand above the block.
+        block_pos = caller.body.index(caller_block)
+        for stmt in self._collect_hoisted(hoistable, needed):
+            pos = caller.body.index(stmt)
+            if pos > block_pos:
+                caller.body.pop(pos)
+                caller.body.insert(block_pos, stmt)
+                block_pos += 1
+
+        self._move_waits(helper, caller, lifted_sids, call)
+        return True
+
+    def _move_waits(self, helper: ast.FunctionDef | ast.AsyncFunctionDef,
+                    caller: ast.FunctionDef | ast.AsyncFunctionDef,
+                    sids: set[str], call: ast.Call) -> None:
+        """Follow the lifted signals with their ``__sec_wait__`` calls.
+
+        ``__sec_wait__`` settles the round the signal launched, so it belongs to
+        the end of whatever scope signalled — leave it in the helper and the
+        helper would settle a round the caller starts on a later statement,
+        serialising exactly what the lift set out to overlap. The wait is
+        idempotent (``_settle_round`` clears ``needs_wait``), the next bar's
+        signal settles first anyway, and ``end_bar()`` catches whatever
+        ``main()`` skipped, so moving it can strand nothing.
+        """
+        found = self._find_guard_block(helper.body, '__sec_wait__')
+        if found is not None:
+            wait_block = found[1]
+            for stmt in list(wait_block.body):
+                if (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+                        and self._call_sid(stmt.value) in sids):
+                    wait_block.body.remove(stmt)
+            if not wait_block.body:
+                helper.body.remove(wait_block)
+
+        found_caller = self._find_guard_block(caller.body, '__sec_wait__')
+        if found_caller is None:
+            caller_block = ast.If(test=self._is_none_check(), body=[], orelse=[])
+            ast.copy_location(caller_block, call)
+            # A trailing ``return`` would make an appended block dead code.
+            if caller.body and isinstance(caller.body[-1], ast.Return):
+                caller.body.insert(len(caller.body) - 1, caller_block)
+            else:
+                caller.body.append(caller_block)
+        else:
+            caller_block = found_caller[1]
+        present = {self._call_sid(c)
+                   for c in self._guard_block_calls(caller_block, '__sec_wait__') or []}
+        for sid in sorted(sids):
+            if sid in present:
+                continue
+            new_stmt = ast.Expr(value=self._func_call(
+                '__sec_wait__', ast.Constant(value=sid)
+            ))
+            ast.copy_location(new_stmt, call)
+            ast.fix_missing_locations(new_stmt)
+            caller_block.body.append(new_stmt)
+
+    def _lift_helper_signals(self, module: ast.Module) -> None:
+        """Move helper-scoped ``__sec_signal__`` calls up to their caller.
+
+        A signal emitted at a helper's top runs where the helper is CALLED, so
+        N helper calls standing side by side in ``main()`` launch their rounds
+        one after another, each behind the previous one's read. Lifting the
+        signal to the caller's top block starts every round before the first
+        read, which is the shape a script with its ``request.security()`` calls
+        written directly in ``main()`` already gets.
+
+        The move is only made where it provably changes nothing: the helper's
+        single call site must run exactly once per invocation of the caller's
+        body, and every signal argument must translate into an expression the
+        caller can evaluate at its own top (see :meth:`_lift_signal`). Each
+        round moves one call level, so a chain of unconditional helpers ends up
+        signalling from the outermost caller.
+
+        :param module: the lowered module
+        """
+        for _ in range(_MAX_LIFT_ROUNDS):
+            moved = False
+            for helper, caller, call, _idx in self._lift_candidates(module):
+                if self._lift_signal(helper, caller, call):
+                    moved = True
+            if not moved:
+                break
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
         return self._process_func(node)  # type: ignore[return-value]
 
@@ -890,7 +1466,10 @@ class SecurityTransformer(ast.NodeTransformer):
         node = self.generic_visit(node)  # type: ignore[assignment]
 
         if self._all_contexts:
+            self._lift_helper_signals(node)
             self._analyze_dependencies(node)
+            self._mark_always_read(node)
+            self._mark_signal_per_bar(node)
 
             # Add barmerge import if needed (SecurityTransformer runs AFTER ImportNormalizer,
             # so we must add it ourselves)

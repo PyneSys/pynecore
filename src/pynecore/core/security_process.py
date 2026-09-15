@@ -53,22 +53,25 @@ import logging
 import os
 import sys
 import threading
+from array import array
 from functools import partial
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
 from time import monotonic, sleep
-from typing import TYPE_CHECKING, Callable, cast
+from typing import TYPE_CHECKING, Callable, Iterator, cast
 
 from ..types.na import set_bool_na
 from .security_shm import (
     SyncBlock, ResultBlock, write_na, FRONTIER_INF,
     FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE, FLAG_DEV_HISTORICAL,
-    FLAG_MORE_STEPS, FLAG_BATCH_ROUND, is_ltf_window, is_ltf_chart_developing,
+    FLAG_MORE_STEPS, FLAG_BATCH_ROUND, FLAG_DEV_BATCH_ROUND,
+    RING_RUNAHEAD_ENTRIES, is_ltf_window, is_ltf_chart_developing,
     is_ltf_live_phase,
 )
 from .security import (
-    BarCalendar, actual_bar_close, create_security_protocol, inject_protocol,
-    same_calendar,
+    BarCalendar, DEV_BATCH_CLOSED, DEV_BATCH_DEVELOPING, DEV_BATCH_RECORD_SIZE,
+    actual_bar_close, create_security_protocol, inject_protocol, same_calendar,
+    unpack_dev_batch_record,
 )
 from .live_ltf_collector import LiveLtfCollector
 from .plugin.live_provider import PluginSymbol
@@ -82,6 +85,12 @@ if TYPE_CHECKING:
 
 # Seconds between parent-liveness checks in the orphan watchdog.
 _ORPHAN_CHECK_INTERVAL = 2.0
+
+
+# Upper bound of one wait slice while throttled. The chart notifies the ring
+# condition when it parks its watermark, so this only bounds how long a child
+# sits before it re-checks ``stop_event`` (a chart that died notifies nobody).
+_DEV_BATCH_WAIT_SECONDS = 0.5
 
 
 def _start_parent_death_watchdog() -> None:
@@ -418,6 +427,7 @@ def security_process_main(
         registry_pipe=None,
         chart_ring_capacity: int = 0,
         chart_ring_arena: int = 0,
+        dev_batch_plan: 'bytes | None' = None,
 ):
     assert result_locks is not None, "result_locks must be provided by script_runner"
     """
@@ -482,6 +492,11 @@ def security_process_main(
         symbol or timeframe only exists at runtime — such a context can be a
         dependency of a child that was already spawned, so its record cannot
         have been in that child's snapshot.
+    :param dev_batch_plan: Packed round sequence of a historical DEVELOPING batch
+        (see :func:`security.plan_developing_batch`), or ``None``. The chart
+        launches ONE round for it (``FLAG_DEV_BATCH_ROUND``) and this process
+        replays every record in it as a round of its own, running ahead of the
+        chart while it walks its bars.
     """
     # Safety net first: exit if the parent is hard-killed (see the watchdog docstring).
     _start_parent_death_watchdog()
@@ -959,6 +974,15 @@ def security_process_main(
     # against the saved baseline).
     last_dev_period_start: int | None = None
 
+    # Record ticks of a developing-batch plan and how far the chart has read it
+    # (a record index), for the run-ahead bound in ``_dev_batch_throttle``.
+    dev_batch_ticks: 'array | None' = None
+    dev_batch_read = [-1]
+    if dev_batch_plan:
+        dev_batch_ticks = array('q')
+        for _rec in range(len(dev_batch_plan) // DEV_BATCH_RECORD_SIZE):
+            dev_batch_ticks.append(unpack_dev_batch_record(dev_batch_plan, _rec)[7])
+
     # Set after the first live bar has been consumed. The historical loop
     # leaves ``current_bar`` already pointing at the *next* unprocessed
     # security index, so the very first live bar (developing or closed
@@ -1236,7 +1260,12 @@ def security_process_main(
         it, so capping never holds a consumer back. A round with no tick (no
         chart bar cycle, as in unit tests) is left uncapped.
 
-        A BATCH round is the exception -- see the first branch.
+        A closed BATCH round is the exception -- see the first branch. A
+        DEVELOPING batch is NOT: its steps are replayed per planned chart bar,
+        each carrying that bar's own tick, so the per-round cap below is exactly
+        what each of them needs (and what the per-bar path gave it). Publishing
+        such a step uncapped would tell the chart that a later bar's entry is
+        already in the ring, and it would pair that bar with this step's value.
 
         One chart bar can queue SEVERAL rounds for this context, all carrying
         the same tick: a prefill and/or a closed bar, then the developing bar
@@ -1290,12 +1319,126 @@ def security_process_main(
             return sec_ctx.round_sched_next_open
         return sec_ctx.round_tick
 
+    # False while a developing-batch round still has records to replay: the
+    # chart counts ROUNDS, and the whole planned sequence is ONE round of its.
+    round_is_last_step = [True]
+
     def _end_round() -> None:
         """Close the round: the chart's "one round outstanding" counter, then
         the wake-up. The counter, not the event, is what lets a chart bar keep
         several rounds of one context in flight without mixing their slots."""
+        if not round_is_last_step[0]:
+            return
         sync_block.increment_rounds_done(sec_id)
         done_event.set()
+
+    def _chart_driven_step(round_flags: int) -> 'Iterator[tuple]':
+        """The one step of an ordinary round: whatever the chart put in the slot.
+
+        The round context is unpacked HERE, once: the chart may already be
+        writing the next round's slot while this round's bars still run, so
+        every as-of of the round must come from these two values and not from a
+        later re-read.
+
+        :param round_flags: The slot's flags, read by the caller.
+        :return: A one-item iterator of ``(target_time, flags, more_steps,
+            dev_values)``; ``dev_values`` is ``None`` — the pushed OHLCV is read
+            from the slot.
+        """
+        sec_ctx.round_tick, sec_ctx.round_sched_next_open = (
+            sync_block.get_round_context(sec_id))
+        round_is_last_step[0] = True
+        yield (sync_block.get_target_time(sec_id), round_flags,
+               bool(round_flags & FLAG_MORE_STEPS), None)
+
+    def _dev_batch_steps() -> 'Iterator[tuple]':
+        """Replay a planned developing-batch sequence, one record per step.
+
+        Each record IS a round the per-bar path would have launched, with its
+        own chart tick and scheduled next session open — so the flags are
+        synthesized from the record kind rather than read from the slot, and the
+        round context comes from the record. ``FLAG_DEV_BATCH_ROUND`` itself is
+        deliberately NOT passed on: the frontier of every step has to stay
+        inside its own bar's tick (unlike a closed batch, which publishes
+        uncapped), and the per-round caps in ``_capped_frontier`` already do
+        exactly that.
+
+        The records of ONE chart bar share a tick, and all but the last of them
+        carry ``FLAG_MORE_STEPS`` for the same reason they do per bar: a
+        consumer released at the tick by the closed step would pair with it
+        instead of with the developing entry that lands at the very same
+        instant.
+
+        :return: Iterator of ``(target_time, flags, more_steps, dev_values)``.
+        """
+        assert dev_batch_plan is not None
+        total = len(dev_batch_plan) // DEV_BATCH_RECORD_SIZE
+        prev_tick = -1
+        for index in range(total):
+            (kind, period_start, r_open, r_high, r_low, r_close, r_volume,
+             tick, sched_next_open) = unpack_dev_batch_record(dev_batch_plan, index)
+            if tick != prev_tick:
+                # A fresh chart bar: do not run further ahead of the chart than
+                # the ring is allowed to hold.
+                _dev_batch_throttle(index)
+                prev_tick = tick
+            sec_ctx.round_tick = tick
+            sec_ctx.round_sched_next_open = sched_next_open
+            if kind == DEV_BATCH_DEVELOPING:
+                step_flags = FLAG_IS_DEVELOPING | FLAG_DEV_HISTORICAL
+                dev_values = (r_open, r_high, r_low, r_close, r_volume,
+                              period_start)
+            elif kind == DEV_BATCH_CLOSED:
+                step_flags = FLAG_CLOSED_OVERRIDE | FLAG_DEV_HISTORICAL
+                dev_values = (r_open, r_high, r_low, r_close, r_volume,
+                              period_start)
+            else:
+                # Prefill: the child reads its OWN file up to this target, the
+                # closed periods that precede the first containing one.
+                step_flags = 0
+                dev_values = None
+            last = index + 1 >= total
+            more = not last and unpack_dev_batch_record(
+                dev_batch_plan, index + 1)[7] == tick
+            if more:
+                step_flags |= FLAG_MORE_STEPS
+            round_is_last_step[0] = last
+            yield period_start, step_flags, more, dev_values
+
+    def _dev_batch_throttle(index: int) -> None:
+        """Keep the batch from running unboundedly far ahead of the chart.
+
+        The ring writer never blocks on space — it grows — so a child replaying
+        a million-bar plan while the chart is still on bar one would hold a
+        million entries. The chart parks its watermark at each bar's as-of
+        before it waits (and wakes this condition doing so), which is exactly
+        how far it has read, so the run-ahead is measurable and can be bounded.
+
+        :param index: Index of the record about to be replayed.
+        """
+        if index <= RING_RUNAHEAD_ENTRIES or dev_batch_ticks is None:
+            # Not far enough in to be ahead of anything: skip even the condition
+            # acquire. It is contended — the chart holds the same condition while
+            # it evaluates its ring waits — and this runs per chart bar.
+            return
+        cond = ring_conditions.get(sec_id) if ring_conditions else None
+        if cond is None:
+            return
+        own = sync_block.index_of(sec_id)
+        chart = sync_block.chart_index
+        total = len(dev_batch_ticks)
+        with cond:
+            while index - dev_batch_read[0] > RING_RUNAHEAD_ENTRIES:
+                if stop_event.is_set():
+                    return
+                watermark = sync_block.get_watermark(chart, own)
+                pos = dev_batch_read[0]
+                while pos + 1 < total and dev_batch_ticks[pos + 1] <= watermark:
+                    pos += 1
+                dev_batch_read[0] = pos
+                if index - pos <= RING_RUNAHEAD_ENTRIES:
+                    return
+                cond.wait(_DEV_BATCH_WAIT_SECONDS)
 
     try:
         current_bar = 0
@@ -1305,10 +1448,19 @@ def security_process_main(
             # already (vacuously) in the ring. A consumer whose own first bars
             # close before this context's first one is released by it without
             # the chart ever having to wake this producer.
-            _first_open = _bar_open_at(0)
-            if _first_open:
-                prime_ring(actual_bar_close(_first_open, _bar_open_at(1),
-                                            own_calendar, own_timeframe) - 1)
+            if dev_batch_ticks is not None:
+                # A developing batch's entries do NOT close on this context's own
+                # bar grid — each closes at the CHART tick of the bar it was
+                # planned for, and the first of those lies inside this context's
+                # first period, far below its close. Priming from the bar grid
+                # would claim every chart tick of that first period as published
+                # and the chart would pair its first bars against an empty ring.
+                prime_ring(dev_batch_ticks[0] - 1)
+            else:
+                _first_open = _bar_open_at(0)
+                if _first_open:
+                    prime_ring(actual_bar_close(_first_open, _bar_open_at(1),
+                                                own_calendar, own_timeframe) - 1)
 
         while True:
             # Wait for chart to signal this process
@@ -1319,307 +1471,332 @@ def security_process_main(
             if stop_event.is_set():
                 break
 
-            target_time = sync_block.get_target_time(sec_id)
-            # The round context travels with the target and is unpacked ONCE,
-            # here: the chart may already be writing the next round's slot while
-            # this round's bars still run, so every as-of of this round must come
-            # from these two values, not from a later re-read.
-            sec_ctx.round_tick, sec_ctx.round_sched_next_open = (
-                sync_block.get_round_context(sec_id))
-            flags = sync_block.get_flags(sec_id)
-            # Further rounds of the SAME chart bar (and so the same tick) are
-            # still queued chart-side — see ``_capped_frontier``.
-            more_steps = bool(flags & FLAG_MORE_STEPS)
-            batch_round = bool(flags & FLAG_BATCH_ROUND)
-            is_developing = bool(flags & FLAG_IS_DEVELOPING)
-            closed_override = bool(flags & FLAG_CLOSED_OVERRIDE)
-            # ``Lookahead.ON`` uses the pushed-OHLCV transport in historical
-            # mode too (the child's file holds the containing period's COMPLETE
-            # bar, which would leak the future). The transport is the live one,
-            # the chart bar is not — so the phase comes from the flag, not from
-            # the fact that OHLCV arrived over the SyncBlock.
-            dev_is_history = bool(flags & FLAG_DEV_HISTORICAL)
+            # ONE chart round is normally ONE step. A historical developing
+            # batch is the exception: the chart launches a single round for the
+            # whole planned sequence and this process replays every record in it
+            # as a step of its own, each with the chart tick of the bar it was
+            # planned for. The step bodies below are unchanged by which of the
+            # two produced them — a ``continue`` in one of them moves on to the
+            # next step, which for a batch is the next record.
+            round_flags = sync_block.get_flags(sec_id)
+            if dev_batch_plan is not None and (round_flags & FLAG_DEV_BATCH_ROUND):
+                round_steps = _dev_batch_steps()
+                dev_batch_running = True
+            else:
+                round_steps = _chart_driven_step(round_flags)
+                dev_batch_running = False
 
-            # ── (4) Live LTF window round ──
-            # Checked first: a streaming request.security_lower_tf round carries
-            # its own flag and never the HTF developing/closed-override flags.
-            if _ltf_round is not None and is_ltf_window(flags):
-                _ltf_round(flags)
-                data_ready_event.set()
-                _end_round()
-                continue
+            for target_time, flags, more_steps, dev_values in round_steps:
+                batch_round = bool(flags & FLAG_BATCH_ROUND)
+                is_developing = bool(flags & FLAG_IS_DEVELOPING)
+                closed_override = bool(flags & FLAG_CLOSED_OVERRIDE)
+                # ``Lookahead.ON`` uses the pushed-OHLCV transport in historical
+                # mode too (the child's file holds the containing period's COMPLETE
+                # bar, which would leak the future). The transport is the live one,
+                # the chart bar is not — so the phase comes from the flag, not from
+                # the fact that OHLCV arrived over the SyncBlock.
+                dev_is_history = bool(flags & FLAG_DEV_HISTORICAL)
 
-            # ── (3) Live developing bar ──
-            if is_developing:
-                dev_open, dev_high, dev_low, dev_close, dev_volume, dev_time_ms = (
-                    sync_block.get_developing_bar(sec_id)
-                )
-                ohlcv = OHLCV(
-                    timestamp=dev_time_ms,
-                    open=dev_open, high=dev_high, low=dev_low,
-                    close=dev_close, volume=dev_volume,
-                )
+                # ── (4) Live LTF window round ──
+                # Checked first: a streaming request.security_lower_tf round carries
+                # its own flag and never the HTF developing/closed-override flags.
+                if _ltf_round is not None and is_ltf_window(flags):
+                    _ltf_round(flags)
+                    data_ready_event.set()
+                    _end_round()
+                    continue
 
-                # A developing bar publishes only as far as the round's as-of
-                # (``_developing_frontier``): the tick instant is exactly how
-                # much of it has aggregated and the close its ring entry carries.
-                # Claiming the bar's own scheduled close would tell a consumer
-                # running on a LATER tick that this round is already published,
-                # and it would read the previous tick's value instead of waiting
-                # for its own. The chart raises the frontier of a producer it
-                # does not launch, so nothing waits on a round that never comes.
-                sec_ctx.bar_open = dev_time_ms
-                sec_ctx.bar_close = actual_bar_close(dev_time_ms, 0, own_calendar,
-                                                     own_timeframe)
-                sec_ctx.frontier = _developing_frontier()
-                sec_ctx.developing = True
-                sec_ctx.is_round_last = True
+                # ── (3) Live developing bar ──
+                if is_developing:
+                    if dev_values is None:
+                        (dev_open, dev_high, dev_low, dev_close, dev_volume,
+                         dev_time_ms) = sync_block.get_developing_bar(sec_id)
+                    else:
+                        # Planned developing batch: the OHLCV rides the record,
+                        # not the slot — the chart wrote the slot once, for the
+                        # whole sequence.
+                        (dev_open, dev_high, dev_low, dev_close, dev_volume,
+                         dev_time_ms) = dev_values
+                    ohlcv = OHLCV(
+                        timestamp=dev_time_ms,
+                        open=dev_open, high=dev_high, low=dev_low,
+                        close=dev_close, volume=dev_volume,
+                    )
 
-                is_new_dev_period = (last_dev_period_start != dev_time_ms)
-                if is_new_dev_period:
-                    # Step the subprocess into a fresh bar slot — but reuse
-                    # the slot already pointed at by ``current_bar`` for the
-                    # very first live bar (the historical loop leaves it on
-                    # the next unprocessed index).
-                    if seen_live_bar:
-                        current_bar += 1
-                    seen_live_bar = True
-                    last_dev_period_start = dev_time_ms
-                else:
-                    # Same dev period: restore var globals AND the function
-                    # instances to the period baseline (saved either after the
-                    # prior closed run or at the start of this dev period) and
-                    # re-run.
-                    snap = _ensure_snapshot()
-                    if snap is not None:
-                        snap.restore()
-                    _ensure_child_snapshot().restore()
+                    # A developing bar publishes only as far as the round's as-of
+                    # (``_developing_frontier``): the tick instant is exactly how
+                    # much of it has aggregated and the close its ring entry carries.
+                    # Claiming the bar's own scheduled close would tell a consumer
+                    # running on a LATER tick that this round is already published,
+                    # and it would read the previous tick's value instead of waiting
+                    # for its own. The chart raises the frontier of a producer it
+                    # does not launch, so nothing waits on a round that never comes.
+                    sec_ctx.bar_open = dev_time_ms
+                    sec_ctx.bar_close = actual_bar_close(dev_time_ms, 0, own_calendar,
+                                                         own_timeframe)
+                    sec_ctx.frontier = _developing_frontier()
+                    sec_ctx.developing = True
+                    sec_ctx.is_round_last = True
 
-                _set_lib_properties(_ha_apply(ohlcv), current_bar, tz, lib, round_decimals,
-                                    lossless_volume=lossless_volume,
-                                    lossless_prices=lossless_prices,
-                                    derived_prices=_derived_prices)
-                _set_series_end(current_bar, dev_is_history)
+                    is_new_dev_period = (last_dev_period_start != dev_time_ms)
+                    if is_new_dev_period:
+                        # Step the subprocess into a fresh bar slot — but reuse
+                        # the slot already pointed at by ``current_bar`` for the
+                        # very first live bar (the historical loop leaves it on
+                        # the next unprocessed index).
+                        if seen_live_bar:
+                            current_bar += 1
+                        seen_live_bar = True
+                        last_dev_period_start = dev_time_ms
+                    else:
+                        # Same dev period: restore var globals AND the function
+                        # instances to the period baseline (saved either after the
+                        # prior closed run or at the start of this dev period) and
+                        # re-run.
+                        snap = _ensure_snapshot()
+                        if snap is not None:
+                            snap.restore()
+                        _ensure_child_snapshot().restore()
 
-                barstate.isfirst = (current_bar == 0)
-                # Only the developing period at the live edge is the chart's last bar.
-                # A historical developing period sits in the middle of the run, and
-                # claiming ``islast`` there fires every ``if barstate.islast`` block on
-                # EVERY chart bar -- including on the child's first, where the arrays
-                # such a block indexes hold a single element.
-                barstate.islast = not dev_is_history
-                barstate.isconfirmed = False
-                barstate.ishistory = dev_is_history
-                barstate.isrealtime = not dev_is_history
-                barstate.islastconfirmedhistory = False
-                barstate.isnew = is_new_dev_period
+                    _set_lib_properties(_ha_apply(ohlcv), current_bar, tz, lib, round_decimals,
+                                        lossless_volume=lossless_volume,
+                                        lossless_prices=lossless_prices,
+                                        derived_prices=_derived_prices)
+                    _set_series_end(current_bar, dev_is_history)
 
-                if is_new_dev_period:
+                    barstate.isfirst = (current_bar == 0)
+                    # Only the developing period at the live edge is the chart's last bar.
+                    # A historical developing period sits in the middle of the run, and
+                    # claiming ``islast`` there fires every ``if barstate.islast`` block on
+                    # EVERY chart bar -- including on the child's first, where the arrays
+                    # such a block indexes hold a single element.
+                    barstate.islast = not dev_is_history
+                    barstate.isconfirmed = False
+                    barstate.ishistory = dev_is_history
+                    barstate.isrealtime = not dev_is_history
+                    barstate.islastconfirmedhistory = False
+                    barstate.isnew = is_new_dev_period
+
+                    if is_new_dev_period:
+                        snap = _ensure_snapshot()
+                        if snap is not None:
+                            snap.save()
+                        _ensure_child_snapshot().save()
+
+                    _run_script_main()
+                    # Commit the developing HA open/close AFTER the run and the
+                    # new-period ``save()`` above; a same-period re-tick's
+                    # ``snap.restore()`` rolls these back to the period baseline.
+                    _ha_commit()
+
+                    after_bar()
+                    data_ready_event.set()
+                    _end_round()
+                    continue
+
+                # ── (2) Live closed bar (OHLCV from SyncBlock) ──
+                if closed_override:
+                    if dev_values is None:
+                        (dev_open, dev_high, dev_low, dev_close, dev_volume,
+                         dev_time_ms) = sync_block.get_developing_bar(sec_id)
+                    else:
+                        # Planned developing batch: the OHLCV rides the record,
+                        # not the slot — the chart wrote the slot once, for the
+                        # whole sequence.
+                        (dev_open, dev_high, dev_low, dev_close, dev_volume,
+                         dev_time_ms) = dev_values
+                    ohlcv = OHLCV(
+                        timestamp=dev_time_ms,
+                        open=dev_open, high=dev_high, low=dev_low,
+                        close=dev_close, volume=dev_volume,
+                    )
+
+                    sec_ctx.bar_open = dev_time_ms
+                    sec_ctx.bar_close = actual_bar_close(dev_time_ms, 0, own_calendar,
+                                                         own_timeframe)
+                    sec_ctx.frontier = _capped_frontier(actual_bar_close(
+                        sec_ctx.bar_close, 0, own_calendar, own_timeframe) - 1)
+                    sec_ctx.developing = False
+                    sec_ctx.is_round_last = True
+
+                    # TV semantics: a developing HTF bar and its eventual close
+                    # share the same security-series index (Series.add() degrades
+                    # to set() because the bar_index hasn't moved). Only allocate
+                    # a NEW bar_index when this closed bar is not the closing of
+                    # an in-flight dev period (e.g. live closed bar arriving with
+                    # no prior dev — currently unused, but kept correct). The
+                    # very first live bar reuses the next-unprocessed index the
+                    # historical loop left in ``current_bar``.
+                    if last_dev_period_start == dev_time_ms:
+                        # Same HTF bar — restore the var and instance baseline,
+                        # then re-run as confirmed close. Series writes overwrite
+                        # the dev value.
+                        snap = _ensure_snapshot()
+                        if snap is not None:
+                            snap.restore()
+                        _ensure_child_snapshot().restore()
+                        is_new_closed_period = False
+                    else:
+                        if seen_live_bar:
+                            current_bar += 1
+                        seen_live_bar = True
+                        is_new_closed_period = True
+
+                    last_dev_period_start = None
+
+                    _set_lib_properties(_ha_apply(ohlcv), current_bar, tz, lib, round_decimals,
+                                        lossless_volume=lossless_volume,
+                                        lossless_prices=lossless_prices,
+                                        derived_prices=_derived_prices)
+                    _set_series_end(current_bar, dev_is_history)
+                    barstate.isfirst = (current_bar == 0)
+                    barstate.islast = False
+                    barstate.isconfirmed = True
+                    barstate.ishistory = dev_is_history
+                    barstate.isrealtime = not dev_is_history
+                    barstate.islastconfirmedhistory = False
+                    barstate.isnew = is_new_closed_period
+
+                    _run_script_main()
+                    # Commit the closed HA open/close BEFORE the baseline ``save()``
+                    # below, so the confirmed values become the next period's seed.
+                    _ha_commit()
+
+                    # Snapshot AFTER the closed run completes — baseline for
+                    # subsequent developing iterations of the next HTF period.
                     snap = _ensure_snapshot()
                     if snap is not None:
                         snap.save()
                     _ensure_child_snapshot().save()
 
-                _run_script_main()
-                # Commit the developing HA open/close AFTER the run and the
-                # new-period ``save()`` above; a same-period re-tick's
-                # ``snap.restore()`` rolls these back to the period baseline.
-                _ha_commit()
+                    after_bar()
+                    data_ready_event.set()
+                    _end_round()
+                    continue
 
-                after_bar()
-                data_ready_event.set()
-                _end_round()
-                continue
-
-            # ── (2) Live closed bar (OHLCV from SyncBlock) ──
-            if closed_override:
-                dev_open, dev_high, dev_low, dev_close, dev_volume, dev_time_ms = (
-                    sync_block.get_developing_bar(sec_id)
-                )
-                ohlcv = OHLCV(
-                    timestamp=dev_time_ms,
-                    open=dev_open, high=dev_high, low=dev_low,
-                    close=dev_close, volume=dev_volume,
-                )
-
-                sec_ctx.bar_open = dev_time_ms
-                sec_ctx.bar_close = actual_bar_close(dev_time_ms, 0, own_calendar,
-                                                     own_timeframe)
-                sec_ctx.frontier = _capped_frontier(actual_bar_close(
-                    sec_ctx.bar_close, 0, own_calendar, own_timeframe) - 1)
-                sec_ctx.developing = False
-                sec_ctx.is_round_last = True
-
-                # TV semantics: a developing HTF bar and its eventual close
-                # share the same security-series index (Series.add() degrades
-                # to set() because the bar_index hasn't moved). Only allocate
-                # a NEW bar_index when this closed bar is not the closing of
-                # an in-flight dev period (e.g. live closed bar arriving with
-                # no prior dev — currently unused, but kept correct). The
-                # very first live bar reuses the next-unprocessed index the
-                # historical loop left in ``current_bar``.
-                if last_dev_period_start == dev_time_ms:
-                    # Same HTF bar — restore the var and instance baseline,
-                    # then re-run as confirmed close. Series writes overwrite
-                    # the dev value.
-                    snap = _ensure_snapshot()
-                    if snap is not None:
-                        snap.restore()
-                    _ensure_child_snapshot().restore()
-                    is_new_closed_period = False
-                else:
-                    if seen_live_bar:
-                        current_bar += 1
-                    seen_live_bar = True
-                    is_new_closed_period = True
-
+                # Historical path resets dev-period tracking.
                 last_dev_period_start = None
 
-                _set_lib_properties(_ha_apply(ohlcv), current_bar, tz, lib, round_decimals,
-                                    lossless_volume=lossless_volume,
-                                    lossless_prices=lossless_prices,
-                                    derived_prices=_derived_prices)
-                _set_series_end(current_bar, dev_is_history)
-                barstate.isfirst = (current_bar == 0)
-                barstate.islast = False
-                barstate.isconfirmed = True
-                barstate.ishistory = dev_is_history
-                barstate.isrealtime = not dev_is_history
-                barstate.islastconfirmedhistory = False
-                barstate.isnew = is_new_closed_period
+                # ── (1) Historical / cross-symbol-live closed bar from local source ──
+                # In cross-symbol live mode (``live_streamer is not None``), the
+                # upstream WS feed may publish the requested symbol's closed bar
+                # a few seconds after the chart symbol's close. The chart side
+                # has already advanced ``last_confirmed = target_time`` and will
+                # not re-signal this period, so we must block briefly until the
+                # bar arrives instead of falling through to ``write_na``.
+                bars_run = False
+                # File-backed LTF: values written while replaying feed bars that
+                # CLOSE at or before the chart bar's period start (cold start
+                # mid-feed, chart session gaps, intrabars already delivered to an
+                # earlier chart bar) are expression-state warmup, not array content.
+                # An intrabar straddling the period start closed inside this period
+                # and therefore belongs to this array — it was pushed over from the
+                # previous chart bar, whose close it passed.
+                ltf_period_start = (
+                    sync_block.get_ltf_period_start(sec_id) if is_ltf else 0
+                )
+                ltf_prefix_len = 0
+                grace_deadline: float | None = None
+                if live_streamer is not None:
+                    grace_deadline = monotonic() + live_bar_grace_seconds
+                while True:
+                    ohlcv_file_bar = _read_bar(current_bar)
+                    if ohlcv_file_bar is None:
+                        if grace_deadline is not None and live_streamer is not None:
+                            remaining = grace_deadline - monotonic()
+                            if remaining > 0:
+                                # Block on the streamer queue for the new bar.
+                                # ``_read_bar`` only consults the streamer when
+                                # ``current_bar >= len(bar_buffer)``, so any
+                                # bars returned here are appended to the buffer
+                                # via ``_read_bar`` on the next iteration.
+                                new_bars = live_streamer.wait_for_bars(remaining)
+                                if new_bars:
+                                    for _bar in new_bars:
+                                        if last_warmup_ts is None:
+                                            bar_buffer.append(_bar)
+                                        elif (_bar.timestamp == last_warmup_ts
+                                                and bar_buffer):
+                                            bar_buffer[-1] = _bar
+                                        elif _bar.timestamp > last_warmup_ts:
+                                            bar_buffer.append(_bar)
+                                    continue
+                        break
+                    # A UTC->tz datetime roundtrip preserves the instant, so the
+                    # raw timestamp is already the answer
+                    bar_time_ms = ohlcv_file_bar.timestamp
+                    if bar_time_ms > target_time:
+                        break
 
-                _run_script_main()
-                # Commit the closed HA open/close BEFORE the baseline ``save()``
-                # below, so the confirmed values become the next period's seed.
-                _ha_commit()
+                    next_open = _bar_open_at(current_bar + 1)
+                    sec_ctx.bar_open = bar_time_ms
+                    sec_ctx.bar_close = actual_bar_close(
+                        bar_time_ms, next_open, own_calendar, own_timeframe)
+                    sec_ctx.frontier = _capped_frontier(_next_frontier(
+                        next_open, _bar_open_at(current_bar + 2) if next_open else 0))
+                    sec_ctx.developing = False
+                    # The round's LAST bar releases the chart AT THE WRITE, not at
+                    # the end of ``main()``: a peer read standing after the write
+                    # must not be able to hold the chart up.
+                    sec_ctx.is_round_last = not next_open or next_open > target_time
 
-                # Snapshot AFTER the closed run completes — baseline for
-                # subsequent developing iterations of the next HTF period.
-                snap = _ensure_snapshot()
-                if snap is not None:
-                    snap.save()
-                _ensure_child_snapshot().save()
+                    total_bars = _current_total()
+                    _set_lib_properties(_ha_apply(ohlcv_file_bar), current_bar, tz, lib, round_decimals,
+                                        lossless_volume=lossless_volume,
+                                        lossless_prices=lossless_prices,
+                                        derived_prices=_derived_prices)
+                    lib.last_bar_index = float(total_bars - 1)
+                    if reader is not None:
+                        lib.last_bar_time = file_last_bar_time_ms
+                    barstate.isfirst = (current_bar == 0)
+                    barstate.islast = (current_bar == total_bars - 1)
+                    barstate.isconfirmed = True
+                    # In PluginSymbol mode, bars beyond the warmup tail come from
+                    # the live WS streamer and represent realtime closes. Without
+                    # a phase flip here, ``barstate.ishistory`` would stay ``True``
+                    # for streamed closed bars — diverging from the same-symbol
+                    # live path (see lines 511-513 and 568-570 above) and breaking
+                    # script branches that key off ``barstate.isrealtime``.
+                    if (live_streamer is not None
+                            and last_warmup_ts is not None
+                            and ohlcv_file_bar.timestamp > last_warmup_ts):
+                        barstate.ishistory = False
+                        barstate.isrealtime = True
 
-                after_bar()
+                    _run_script_main()
+                    # Advance the HA recurrence for this confirmed bar; the batch
+                    # ``save()`` below captures the last bar's HA as the baseline.
+                    _ha_commit()
+
+                    after_bar()
+
+                    if is_ltf and sec_ctx.bar_close <= ltf_period_start:
+                        ltf_prefix_len = ltf_buffer_len()  # noqa - non-None when is_ltf
+                    current_bar += 1
+                    bars_run = True
+
+                if bars_run:
+                    snap = _ensure_snapshot()
+                    if snap is not None:
+                        snap.save()
+                    _ensure_child_snapshot().save()
+
+                if is_ltf:
+                    flush_fn(ltf_prefix_len)
+                elif not bars_run and not plain_ltf:
+                    with result_locks[sec_id]:
+                        write_na(result_block, sync_block)
+
                 data_ready_event.set()
                 _end_round()
-                continue
 
-            # Historical path resets dev-period tracking.
-            last_dev_period_start = None
-
-            # ── (1) Historical / cross-symbol-live closed bar from local source ──
-            # In cross-symbol live mode (``live_streamer is not None``), the
-            # upstream WS feed may publish the requested symbol's closed bar
-            # a few seconds after the chart symbol's close. The chart side
-            # has already advanced ``last_confirmed = target_time`` and will
-            # not re-signal this period, so we must block briefly until the
-            # bar arrives instead of falling through to ``write_na``.
-            bars_run = False
-            # File-backed LTF: values written while replaying feed bars that
-            # CLOSE at or before the chart bar's period start (cold start
-            # mid-feed, chart session gaps, intrabars already delivered to an
-            # earlier chart bar) are expression-state warmup, not array content.
-            # An intrabar straddling the period start closed inside this period
-            # and therefore belongs to this array — it was pushed over from the
-            # previous chart bar, whose close it passed.
-            ltf_period_start = (
-                sync_block.get_ltf_period_start(sec_id) if is_ltf else 0
-            )
-            ltf_prefix_len = 0
-            grace_deadline: float | None = None
-            if live_streamer is not None:
-                grace_deadline = monotonic() + live_bar_grace_seconds
-            while True:
-                ohlcv_file_bar = _read_bar(current_bar)
-                if ohlcv_file_bar is None:
-                    if grace_deadline is not None and live_streamer is not None:
-                        remaining = grace_deadline - monotonic()
-                        if remaining > 0:
-                            # Block on the streamer queue for the new bar.
-                            # ``_read_bar`` only consults the streamer when
-                            # ``current_bar >= len(bar_buffer)``, so any
-                            # bars returned here are appended to the buffer
-                            # via ``_read_bar`` on the next iteration.
-                            new_bars = live_streamer.wait_for_bars(remaining)
-                            if new_bars:
-                                for _bar in new_bars:
-                                    if last_warmup_ts is None:
-                                        bar_buffer.append(_bar)
-                                    elif (_bar.timestamp == last_warmup_ts
-                                            and bar_buffer):
-                                        bar_buffer[-1] = _bar
-                                    elif _bar.timestamp > last_warmup_ts:
-                                        bar_buffer.append(_bar)
-                                continue
-                    break
-                # A UTC->tz datetime roundtrip preserves the instant, so the
-                # raw timestamp is already the answer
-                bar_time_ms = ohlcv_file_bar.timestamp
-                if bar_time_ms > target_time:
-                    break
-
-                next_open = _bar_open_at(current_bar + 1)
-                sec_ctx.bar_open = bar_time_ms
-                sec_ctx.bar_close = actual_bar_close(
-                    bar_time_ms, next_open, own_calendar, own_timeframe)
-                sec_ctx.frontier = _capped_frontier(_next_frontier(
-                    next_open, _bar_open_at(current_bar + 2) if next_open else 0))
-                sec_ctx.developing = False
-                # The round's LAST bar releases the chart AT THE WRITE, not at
-                # the end of ``main()``: a peer read standing after the write
-                # must not be able to hold the chart up.
-                sec_ctx.is_round_last = not next_open or next_open > target_time
-
-                total_bars = _current_total()
-                _set_lib_properties(_ha_apply(ohlcv_file_bar), current_bar, tz, lib, round_decimals,
-                                    lossless_volume=lossless_volume,
-                                    lossless_prices=lossless_prices,
-                                    derived_prices=_derived_prices)
-                lib.last_bar_index = float(total_bars - 1)
-                if reader is not None:
-                    lib.last_bar_time = file_last_bar_time_ms
-                barstate.isfirst = (current_bar == 0)
-                barstate.islast = (current_bar == total_bars - 1)
-                barstate.isconfirmed = True
-                # In PluginSymbol mode, bars beyond the warmup tail come from
-                # the live WS streamer and represent realtime closes. Without
-                # a phase flip here, ``barstate.ishistory`` would stay ``True``
-                # for streamed closed bars — diverging from the same-symbol
-                # live path (see lines 511-513 and 568-570 above) and breaking
-                # script branches that key off ``barstate.isrealtime``.
-                if (live_streamer is not None
-                        and last_warmup_ts is not None
-                        and ohlcv_file_bar.timestamp > last_warmup_ts):
-                    barstate.ishistory = False
-                    barstate.isrealtime = True
-
-                _run_script_main()
-                # Advance the HA recurrence for this confirmed bar; the batch
-                # ``save()`` below captures the last bar's HA as the baseline.
-                _ha_commit()
-
-                after_bar()
-
-                if is_ltf and sec_ctx.bar_close <= ltf_period_start:
-                    ltf_prefix_len = ltf_buffer_len()  # noqa - non-None when is_ltf
-                current_bar += 1
-                bars_run = True
-
-            if bars_run:
-                snap = _ensure_snapshot()
-                if snap is not None:
-                    snap.save()
-                _ensure_child_snapshot().save()
-
-            if is_ltf:
-                flush_fn(ltf_prefix_len)
-            elif not bars_run and not plain_ltf:
-                with result_locks[sec_id]:
-                    write_na(result_block, sync_block)
-
-            data_ready_event.set()
-            _end_round()
+            if dev_batch_running:
+                # The plan covers every chart bar, so nothing of this context
+                # will ever be asked for again: the producer is done. Saying so
+                # releases the chart's remaining ring waits — a chart bar whose
+                # own record was the plan's last one has no later publication to
+                # raise the frontier past its as-of.
+                finish_ring()
 
     finally:
         # Whatever ended this loop — a shutdown, an exception, the end of the

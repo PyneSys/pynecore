@@ -1433,12 +1433,24 @@ def run(
             last_bar_time = int(window_tail_bar.timestamp)
             break
         magnifier_iter = None
+
+        def chart_bar_source():
+            """A fresh iterator over the run's chart bar window.
+
+            The runner takes the bar loop's bars from here; a security context
+            whose historical rounds can be planned up front walks the same
+            production a second time (see
+            ``ScriptRunner._chart_bar_iterator``), which is what makes the
+            planned bars and the run's bars identical by construction.
+            """
+            return reader.read_from(time_from_ts, time_to_ts)
+
         if magnifier_mode:
             # Sub-TF data goes to magnifier; ohlcv_iter is unused (replaced in ScriptRunner)
             magnifier_iter = reader.read_from(time_from_ts, time_to_ts)
             ohlcv_iter = iter([])
         else:
-            ohlcv_iter = reader.read_from(time_from_ts, time_to_ts)
+            ohlcv_iter = chart_bar_source()
         lossless_volume = reader.lossless_volume
         lossless_prices = reader.lossless_prices
 
@@ -1697,6 +1709,7 @@ def run(
                                           security_data=security_data,
                                           magnifier_iter=magnifier_iter,
                                           magnifier_source_tf=magnifier_source_tf,
+                                          chart_bar_source=chart_bar_source,
                                           broker_plugin=broker_plugin,
                                           broker_event_loop=broker_event_loop,
                                           broker_store_ctx=broker_store_ctx,
