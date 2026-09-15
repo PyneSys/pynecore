@@ -1751,3 +1751,266 @@ def main():
     assert meta['D']['depends'] == []
     assert meta['W']['depends'] == ['D']
     log.info("call-site control taint OK")
+
+
+def __test_helper_signal_sids(source: str) -> dict[str, list[str]]:
+    """Sids signalled from each function's chart-guard signal block.
+
+    Only blocks standing directly in a function's statement list are read, and
+    every function of the module gets an entry (an empty list when it signals
+    nothing), so a test can assert both where a signal went and where it did
+    not.
+    """
+    tree = _transform_tree(source)
+    result: dict[str, list[str]] = {}
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        sids: list[str] = []
+        for stmt in func.body:
+            calls = SecurityTransformer._guard_block_calls(stmt, '__sec_signal__')
+            for call in calls or []:
+                sids.append(call.args[0].value)
+        result[func.name] = sids
+    return result
+
+
+def __test_helper_wait_sids(source: str) -> dict[str, list[str]]:
+    """Sids waited on from each function's chart-guard wait block."""
+    tree = _transform_tree(source)
+    result: dict[str, list[str]] = {}
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        sids: list[str] = []
+        for stmt in func.body:
+            calls = SecurityTransformer._guard_block_calls(stmt, '__sec_wait__')
+            for call in calls or []:
+                sids.append(call.args[0].value)
+        result[func.name] = sids
+    return result
+
+
+def __test_unconditional_helper_call_lifts_the_signal_to_main__(log):
+    """A helper called once, unconditionally, from main's own statement list
+    signals from main's top block — its round starts before any read."""
+    source = """
+def main():
+    def htf(tf):
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+    a = htf("D")
+    lib.plot(a)
+"""
+    sids = __test_helper_signal_sids(source)
+    assert len(sids['main']) == 1
+    assert sids['htf'] == []
+
+    # The wait follows the signal: it settles the round main now launches.
+    waits = __test_helper_wait_sids(source)
+    assert waits['main'] == sids['main']
+    assert waits['htf'] == []
+
+    # The substituted argument is the call site's own timeframe.
+    tree = _transform_tree(source)
+    func = _find_func(tree)
+    signal_call = func.body[0].body[0].value
+    assert ast.unparse(signal_call.args[2]) == "'D'"
+    log.info("unconditional helper call lifted")
+
+
+def __test_helper_call_inside_if_is_not_lifted__(log):
+    """A conditional call site would make main signal on bars the helper never
+    ran on."""
+    source = """
+def main():
+    def htf(tf):
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+    if lib.close > 0:
+        a = htf("D")
+        lib.plot(a)
+"""
+    sids = __test_helper_signal_sids(source)
+    assert sids['main'] == []
+    assert len(sids['htf']) == 1
+    log.info("conditional call site not lifted")
+
+
+def __test_helper_call_in_short_circuit_is_not_lifted__(log):
+    """A call under a ternary or an ``and`` may not be evaluated at all."""
+    ternary = """
+def main():
+    def htf(tf):
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+    a = htf("D") if lib.close > 0 else 0.0
+    lib.plot(a)
+"""
+    short_circuit = """
+def main():
+    def htf(tf):
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+    a = lib.close > 0 and htf("D")
+    lib.plot(a)
+"""
+    for source in (ternary, short_circuit):
+        sids = __test_helper_signal_sids(source)
+        assert sids['main'] == []
+        assert len(sids['htf']) == 1
+    log.info("short-circuited call site not lifted")
+
+
+def __test_helper_call_in_loop_body_is_not_lifted__(log):
+    """A call in a loop body runs once per iteration, not once per bar."""
+    source = """
+def main():
+    def htf(tf):
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+    for i in (1, 2):
+        a = htf("D")
+        lib.plot(a)
+"""
+    sids = __test_helper_signal_sids(source)
+    assert sids['main'] == []
+    assert len(sids['htf']) == 1
+    log.info("loop-body call site not lifted")
+
+
+def __test_rebound_helper_parameter_is_not_lifted__(log):
+    """A parameter rebound from itself no longer carries the value the call
+    site passed, so the signal stays in the helper."""
+    source = """
+def main():
+    def htf(tf):
+        tf = tf + "x"
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+    a = htf("D")
+    lib.plot(a)
+"""
+    sids = __test_helper_signal_sids(source)
+    assert sids['main'] == []
+    assert len(sids['htf']) == 1
+    log.info("rebound parameter not lifted")
+
+
+def __test_nested_unconditional_helpers_lift_to_main__(log):
+    """Two unconditional call levels lift the signal all the way to main."""
+    source = """
+def main():
+    def inner(tf):
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+    def outer(tf):
+        return inner(tf)
+    a = outer("D")
+    lib.plot(a)
+"""
+    sids = __test_helper_signal_sids(source)
+    assert len(sids['main']) == 1
+    assert sids['outer'] == []
+    assert sids['inner'] == []
+
+    tree = _transform_tree(source)
+    func = _find_func(tree)
+    signal_call = func.body[0].body[0].value
+    assert ast.unparse(signal_call.args[2]) == "'D'"
+    log.info("nested unconditional helpers lifted")
+
+
+def __test_conditionally_bound_call_argument_is_not_lifted__(log):
+    """A call-site argument assigned in a branch is not available at main's
+    top, so the signal cannot move there."""
+    source = """
+def main():
+    def htf(tf):
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+    tfv = "D"
+    if lib.close > 0:
+        tfv = "60"
+    a = htf(tfv)
+    lib.plot(a)
+"""
+    sids = __test_helper_signal_sids(source)
+    assert sids['main'] == []
+    assert len(sids['htf']) == 1
+    log.info("conditionally bound argument not lifted")
+
+
+def __test_helper_always_read_sids(source: str) -> dict[str, bool]:
+    """``always_read`` of every context of ``source``, keyed by sid.
+
+    :param source: the script source to transform
+    :return: sid -> whether the transformer flagged the read unconditional
+    """
+    tree = _transform_tree(source)
+    contexts = _find_contexts(tree)
+    assert isinstance(contexts.value, ast.Dict)
+    flags: dict[str, bool] = {}
+    for sid_node, ctx_node in zip(contexts.value.keys, contexts.value.values):
+        assert isinstance(sid_node, ast.Constant)
+        assert isinstance(ctx_node, ast.Dict)
+        value = False
+        for key, val in zip(ctx_node.keys, ctx_node.values):
+            if (isinstance(key, ast.Constant) and key.value == 'always_read'
+                    and isinstance(val, ast.Constant)):
+                value = bool(val.value)
+        flags[str(sid_node.value)] = value
+    return flags
+
+
+def __test_top_level_read_is_always_read__(log):
+    """A read standing in the entry's own body runs on every bar."""
+    source = """
+@lib.script.indicator("T")
+def main():
+    daily = lib.request.security(lib.syminfo.tickerid, "1D", lib.close)
+    lib.plot(daily)
+"""
+    flags = __test_helper_always_read_sids(source)
+    assert list(flags.values()) == [True]
+    log.info("top-level read flagged always_read")
+
+
+def __test_read_in_ternary_is_not_always_read__(log):
+    """Either branch of a ternary may go unevaluated for the whole run."""
+    source = """
+@lib.script.indicator("T")
+def main():
+    def htf(tf):
+        return (lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+                if lib.close > 0
+                else lib.request.security(lib.syminfo.tickerid, tf, lib.open))
+    a = htf("D")
+    lib.plot(a)
+"""
+    flags = __test_helper_always_read_sids(source)
+    assert len(flags) == 2
+    assert not any(flags.values())
+    log.info("ternary branches not flagged always_read")
+
+
+def __test_read_in_loop_body_is_not_always_read__(log):
+    """A loop body may run zero times, so its read is not unconditional."""
+    source = """
+@lib.script.indicator("T")
+def main():
+    a = 0.0
+    for i in lib.pine_range(0, 2, 1):
+        a = lib.request.security(lib.syminfo.tickerid, "1D", lib.close)
+    lib.plot(a)
+"""
+    flags = __test_helper_always_read_sids(source)
+    assert list(flags.values()) == [False]
+    log.info("loop-body read not flagged always_read")
+
+
+def __test_read_through_unconditional_helper_is_always_read__(log):
+    """A helper the entry always calls carries its reads with it."""
+    source = """
+@lib.script.indicator("T")
+def main():
+    def htf(tf):
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+    a = htf("D")
+    lib.plot(a)
+"""
+    flags = __test_helper_always_read_sids(source)
+    assert list(flags.values()) == [True]
+    log.info("read behind an unconditional helper flagged always_read")

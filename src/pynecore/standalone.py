@@ -80,7 +80,11 @@ def run(script_file: str) -> None:
             start_ts: int = reader.start_timestamp  # type: ignore[assignment]
             end_ts: int = reader.end_timestamp  # type: ignore[assignment]
             size = reader.get_size(start_ts, end_ts)
-            ohlcv_iter = reader.read_from(start_ts, end_ts)
+            def chart_bar_source():
+                """A fresh iterator over the run's chart bar window."""
+                return reader.read_from(start_ts, end_ts)
+
+            ohlcv_iter = chart_bar_source()
             print(
                 f"Running {script_path.name} on {data_path.stem} ({size} bars)...",
                 file=sys.stderr
@@ -90,7 +94,8 @@ def run(script_file: str) -> None:
                 script_path, ohlcv_iter, syminfo, last_bar_index=size - 1,
                 plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
                 lossless_volume=reader.lossless_volume,
-                lossless_prices=reader.lossless_prices
+                lossless_prices=reader.lossless_prices,
+                chart_bar_source=chart_bar_source,
             )
             runner.run()
 
