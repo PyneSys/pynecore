@@ -324,6 +324,13 @@ class FloatToleranceTransformer(ast.NodeTransformer):
         # hold, which is what Python's own chain semantics do
         rewritten = (clauses[0] if len(clauses) == 1
                      else ast.BoolOp(op=ast.And(), values=clauses))
+        # The comparisons the rewrite emitted are bools by construction: each
+        # one probes a type or a float difference, never an ``NA``. Marking them
+        # keeps the truthiness pass from casting them when it runs after this
+        # one (see ``PineTruthinessTransformer._bool_value``).
+        for emitted in ast.walk(rewritten):
+            if isinstance(emitted, ast.Compare):
+                emitted.pine_bool = True  # type: ignore[attr-defined]
         # Whatever shape the rewrite took, it stands where a comparison stood,
         # so it is a bool; the guards, differences and temporaries it emitted
         # around the preserved operands are typed from those operands

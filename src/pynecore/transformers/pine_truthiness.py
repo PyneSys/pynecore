@@ -152,9 +152,31 @@ class PineTruthinessTransformer(ast.NodeTransformer):
         node.test = self._convert(node.test)
         return node
 
+    @staticmethod
+    def _bool_value(node: ast.expr) -> ast.expr:
+        """Force an ``and``/``or`` operand to a real bool.
+
+        MEASURED (CAPITALCOM:GOLD@60, v4 three-state bools): a comparison with
+        an na operand IS na (``na(x > close)`` is true), but ``and``/``or``
+        never yield na — ``na and true``, ``na or false`` and ``na and false``
+        are all false, ``na or true`` is true. Python's ``and`` yields the
+        operand instead, so an na comparison leaks out as the expression's
+        value and a marker plot exports na where TradingView exports 0.
+
+        A comparison is the only bool-shaped operand the conversion above skips,
+        so it is the only one that needs the cast; two ``not``s are the cheapest
+        one and evaluate the operand exactly once.
+
+        :param node: An already-converted ``and``/``or`` operand.
+        :return: The operand, cast to bool when it could still be na.
+        """
+        if not isinstance(node, ast.Compare) or getattr(node, 'pine_bool', False):
+            return node
+        return ast.UnaryOp(op=ast.Not(), operand=ast.UnaryOp(op=ast.Not(), operand=node))
+
     def visit_BoolOp(self, node: ast.BoolOp) -> ast.BoolOp:
         self.generic_visit(node)
-        node.values = [self._convert(value) for value in node.values]
+        node.values = [self._bool_value(self._convert(value)) for value in node.values]
         return node
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> ast.UnaryOp:

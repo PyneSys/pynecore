@@ -2622,6 +2622,13 @@ class ScriptRunner:
                 else:
                     barstate.islast = (next_item is LIVE_TRANSITION)
 
+                # Every historical bar is a new bar: Pine computes history once
+                # per bar, so ``barstate.isnew`` is true on all of them (measured
+                # on CAPITALCOM:GOLD@60 — 1.0 on every history bar, 0.0 only on
+                # the still-forming realtime bar). The live loop below sets the
+                # flag itself, per tick.
+                barstate.isnew = True
+
                 # Update lib properties
                 _set_lib_properties(
                     exec_candle, self.bar_index, self.tz, lib, self._round_decimals,
@@ -3374,6 +3381,8 @@ class ScriptRunner:
             self.bar_index += 1
 
             barstate.islast = window.is_last_window
+            # See the plain history loop: every historical bar is a new bar.
+            barstate.isnew = True
 
             # Set lib OHLCV to the aggregated chart-bar values (what the script sees)
             _set_lib_properties(window.aggregated, self.bar_index, self.tz, lib, self._round_decimals,

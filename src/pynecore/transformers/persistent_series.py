@@ -1,17 +1,28 @@
 import ast
 
 
+#: Series-carrying persistent annotations mapped to their non-series half.
+#: ``IBPersistentSeries`` is the ``varip`` flavour — it must split the same way,
+#: otherwise the variable keeps its slot but stays a plain scalar and any
+#: history read (``x[1]``) raises ``'float' object is not subscriptable``.
+SERIES_PERSISTENT_TYPES = {
+    'PersistentSeries': 'Persistent',
+    'IBPersistentSeries': 'IBPersistent',
+}
+
+
 class PersistentSeriesTransformer(ast.NodeTransformer):
     """
-    Transform PersistentSeries declarations into Persistent + Series combination.
+    Transform PersistentSeries and IBPersistentSeries declarations into a
+    Persistent (resp. IBPersistent) + Series combination.
     Must be applied before PersistentTransformer and SeriesTransformer.
     """
 
     def visit_ImportFrom(self, node):
-        """Handle imports, only remove Series while keeping other imports"""
+        """Handle imports, only remove the split types while keeping the rest"""
         if node.module and node.module.startswith('pynecore'):
-            # Filter out Persistent from names
-            new_names = [name for name in node.names if name.name != 'PersistentSeries']
+            new_names = [name for name in node.names
+                         if name.name not in SERIES_PERSISTENT_TYPES]
             if not new_names:
                 # If no names left, remove the entire import
                 return None
@@ -20,27 +31,26 @@ class PersistentSeriesTransformer(ast.NodeTransformer):
         return node
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST | list[ast.AnnAssign]:
-        """Transform PersistentSeries type annotations into separate Persistent and Series declarations"""
+        """Split a series-carrying persistent annotation into its persistent and Series halves"""
         if hasattr(node, '_ps_transformed'):
             return node
 
         if not isinstance(node.target, ast.Name):
             return node
 
-        # Check if it's a PersistentSeries type
-        is_persistent_series = False
+        # Check if it's a series-carrying persistent type
+        persistent_type = None
         series_type = None
 
         if isinstance(node.annotation, ast.Subscript):
-            if (isinstance(node.annotation.value, ast.Name) and
-                    node.annotation.value.id == 'PersistentSeries'):
-                is_persistent_series = True
-                series_type = node.annotation.slice
-        elif (isinstance(node.annotation, ast.Name) and
-              node.annotation.id == 'PersistentSeries'):
-            is_persistent_series = True
+            if isinstance(node.annotation.value, ast.Name):
+                persistent_type = SERIES_PERSISTENT_TYPES.get(node.annotation.value.id)
+                if persistent_type is not None:
+                    series_type = node.annotation.slice
+        elif isinstance(node.annotation, ast.Name):
+            persistent_type = SERIES_PERSISTENT_TYPES.get(node.annotation.id)
 
-        if not is_persistent_series:
+        if persistent_type is None:
             return node
 
         # Create two declarations
@@ -51,10 +61,10 @@ class PersistentSeriesTransformer(ast.NodeTransformer):
         persistent_decl = ast.AnnAssign(
             target=ast.Name(id=var_name, ctx=ast.Store()),
             annotation=ast.Subscript(
-                value=ast.Name(id='Persistent', ctx=ast.Load()),
+                value=ast.Name(id=persistent_type, ctx=ast.Load()),
                 slice=series_type if series_type else ast.Name(id='float', ctx=ast.Load()),
                 ctx=ast.Load()
-            ) if series_type else ast.Name(id='Persistent', ctx=ast.Load()),
+            ) if series_type else ast.Name(id=persistent_type, ctx=ast.Load()),
             value=value,
             simple=1
         )
