@@ -1187,37 +1187,21 @@ class SimPosition(PositionBase):
         before the fill (MEASURED: an order created against a 0.04 long still
         opened 0.03 short after a 50% close, and 0.03 short after the position
         was flattened entirely). But the freeze reads the position as the market
-        closes ALREADY PLACED on this bar leave it: with
-        ``strategy.close(qty_percent=100)`` called before the entry the flip is
-        zero (0.01 short), with the same close called after it the flip is the
+        orders ALREADY PLACED on this bar leave it, walked in placement order:
+        with ``strategy.close(qty_percent=100)`` called before the entry the flip
+        is zero (0.01 short), with the same close called after it the flip is the
         full position (0.05 short) — the two probes differ only in script order.
-        """
-        size = self.size
-        if size == 0.0 or not self.market_orders:
-            return size
-        pending = 0.0
-        for order in self.market_orders.values():
-            if order.order_type is _order_type_close and not order.cancelled:
-                pending += order.size
-        if pending == 0.0:
-            return size
-        remaining = size + pending
-        # A close only ever shrinks the position; an over-close lands flat.
-        return remaining if remaining * size > 0.0 else 0.0
-
-    def _pyramid_sign_for_entry(self) -> float:
-        """Direction the pyramiding gate sees when a new entry is placed.
-
-        The gate reads the position as the market orders ALREADY PLACED on this
-        bar leave it, walked in placement order: a close hands its slot over (a
-        ``close_all`` ahead of a same-id re-entry is what lets that entry through
-        under ``pyramiding=1``), and a pending reversal entry makes the next
-        opposite-direction entry a reversal of its own instead of a pyramid add
-        (MEASURED on the "Pivot Extension Strategy" reference, whose long and
-        short entries are placed on the same bar, in that order).
+        A pending market ENTRY counts the same way: it is the position the
+        price-based order will actually meet. MEASURED on the wild
+        `Combined Strategy Trading Bot (RSI ADX 20SMA)` reference
+        (BINANCE:BTCUSDT 30m, 2025-03-03 00:30, 2025-09-10 17:00,
+        2025-09-29 02:00): a market reversal placed ahead of the stop entry makes
+        that stop a reversal of the NEW side, so it fills on the very bar the
+        market order flips the position — reading the raw position instead
+        freezes the stop at size 0 and it silently sits out the bar.
         """
         if not self.market_orders:
-            return self.sign
+            return self.size
         size = self.size
         for order in self.market_orders.values():
             if order.cancelled:
@@ -1228,8 +1212,23 @@ class SimPosition(PositionBase):
                 size = remaining if remaining * size > 0.0 else 0.0
             elif order.order_type is _order_type_entry:
                 # A reversal entry carries only its OPENING size until processing
-                # adds the flip, so its own sign is where the position ends up.
+                # adds the flip, so its own size is where the position ends up.
                 size = size + order.size if size * order.size >= 0.0 else order.size
+        return size
+
+    def _pyramid_sign_for_entry(self) -> float:
+        """Direction the pyramiding gate sees when a new entry is placed.
+
+        The gate reads the position as the market orders ALREADY PLACED on this
+        bar leave it: a close hands its slot over (a ``close_all`` ahead of a
+        same-id re-entry is what lets that entry through under ``pyramiding=1``),
+        and a pending reversal entry makes the next opposite-direction entry a
+        reversal of its own instead of a pyramid add (MEASURED on the
+        "Pivot Extension Strategy" reference, whose long and short entries are
+        placed on the same bar, in that order). That is the same walk the flip
+        quantity reads, so both come off :meth:`_size_flippable_by_entry`.
+        """
+        size = self._size_flippable_by_entry()
         return 0.0 if size == 0.0 else 1.0 if size > 0.0 else -1.0
 
     def _add_order(self, order: Order):
