@@ -120,9 +120,19 @@ def __test_already_bool_expressions_are_left_alone__():
     """ Comparisons and friends are not wrapped: the conversion would be cost only """
     assert _rewrite("1 if a > b else 0") == "1 if a > b else 0"
     assert _rewrite("1 if a and b > c else 0") == \
-        "1 if (-1e-10 > a or 1e-10 < a if a.__class__ is float else not not a) and b > c else 0"
+        "1 if (-1e-10 > a or 1e-10 < a if a.__class__ is float else not not a)" \
+        " and (not not b > c) else 0"
     assert _rewrite("1 if not (a > b) else 0") == "1 if not a > b else 0"
     assert _rewrite("1 if True else 0") == "1 if True else 0"
+
+
+def __test_na_comparison_does_not_leak_out_of_and_or__():
+    """ Pine's ``and``/``or`` never yield na, so a comparison operand is cast """
+    assert _rewrite("1 if a > b and c > d else 0") == \
+        "1 if not not a > b and (not not c > d) else 0"
+    assert _eval("a > b or c > d", a=NA(float), b=1.0, c=2.0, d=1.0) is True
+    assert _eval("a > b and c > d", a=NA(float), b=1.0, c=2.0, d=1.0) is False
+    assert _eval("a > b or c > d", a=NA(float), b=1.0, c=1.0, d=2.0) is False
 
 
 def __test_comparison_rewrite_output_is_not_wrapped__():
