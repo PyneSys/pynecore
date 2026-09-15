@@ -48,6 +48,10 @@ _READS: dict[type, int] = {
 # overloaded operator dunder, not just behind a call.
 _PURE_NODES = (ast.Name, ast.Constant, ast.expr_context)
 
+#: The alias the interned bool na (``pynecore.types.na.na_bool``) is bound to in a
+#: script that keeps the three-state bool
+_NA_BOOL_NAME = '__pyne_cmp_na·__'
+
 
 def _unreachable() -> ast.expr:
     """Guard for the reference factory of a single-use operand."""
@@ -57,6 +61,19 @@ def _unreachable() -> ast.expr:
 def _may_rebind(node: ast.expr) -> bool:
     """Whether evaluating this operand can change what another operand reads."""
     return not all(isinstance(n, _PURE_NODES) for n in ast.walk(node))
+
+
+def _insert_import(body: list[ast.stmt], stmt: ast.ImportFrom) -> None:
+    """Insert the generated import after the docstring and the ``__future__`` block."""
+    insert_at = 0
+    first = body[0] if body else None
+    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) \
+            and isinstance(first.value.value, str):
+        insert_at = 1
+    while insert_at < len(body) and isinstance(body[insert_at], ast.ImportFrom) \
+            and getattr(body[insert_at], 'module', None) == '__future__':
+        insert_at += 1
+    body.insert(insert_at, stmt)
 
 
 def _is_skippable_const(node: ast.expr) -> bool:
@@ -82,11 +99,29 @@ class FloatToleranceTransformer(ast.NodeTransformer):
         a == b   ->  a == b or -1e-10 <= a - b <= 1e-10
         a != b   ->  1e-10 < (d := a - b) or -1e-10 > d
 
-    The forms are na-correct for free, which is why they are written over the
-    difference instead of over ``abs()``: a native nan difference makes every
-    one of them False, and an ``NA`` object propagates itself through the
-    subtraction into comparisons that are False by definition — exactly Pine,
-    where every comparison involving na is false (including ``na != x``).
+    The forms are written over the difference instead of over ``abs()`` so a na
+    operand can never satisfy them: a native nan difference makes every one of
+    them False, and an ``NA`` object propagates itself through the subtraction
+    into comparisons that are False by definition.
+
+    False is the whole answer only where a bool has two states. A script that
+    keeps Pine's three-state bool (``na_bool``, i.e. v4/v5) answers ``na``
+    instead — MEASURED on TradingView (v5): with an na operand ``>=``, ``>``,
+    ``==`` and ``!=`` all report ``na(result)`` true, ``na == na`` included,
+    while ``and``/``or``/``not`` keep casting na to false. The distinction is
+    invisible where the result is only tested for truth and decisive where it
+    is stored and read back: ``b[1] == false`` is false for an na ``b``, but
+    true once that na has collapsed to False. Under ``na_bool`` each rewritten
+    comparison therefore gets a tail::
+
+        <tolerant form> or (not (a == a) or not (b == b)) and na_bool
+
+    which costs nothing when the comparison holds, two equality tests when it
+    does not, and nothing at all in a two-state (v6) script. ``not (x == x)``
+    is the na test that covers both representations — a nan answers False to
+    ``==``, and so does an ``NA`` object. A constant operand is never na, so it
+    contributes no test. Infinities are untouched: the test reads the operands,
+    not their nan difference.
 
     The operators that must hold for already-equal operands (``<=``, ``>=``,
     ``==``) keep the raw comparison in front of the tolerant one. The
@@ -123,8 +158,10 @@ class FloatToleranceTransformer(ast.NodeTransformer):
     break.
     """
 
-    def __init__(self):
+    def __init__(self, *, na_bool: bool = False):
         self._temp_counter = 0
+        self._na_bool = na_bool
+        self._na_bool_used = False
 
     def _binder(self, node: ast.expr, uses: int,
                 volatile: bool) -> tuple[ast.expr, Callable[[], ast.expr]]:
@@ -159,6 +196,39 @@ class FloatToleranceTransformer(ast.NodeTransformer):
         return ast.Compare(
             left=ast.Attribute(value=operand, attr='__class__', ctx=ast.Load()),
             ops=[ast.Is()], comparators=[ast.Name(id='float', ctx=ast.Load())])
+
+    @staticmethod
+    def _is_na(operand: ast.expr) -> ast.expr:
+        """``not (operand == operand)`` -- the na test that covers both
+        representations: a nan answers False to ``==``, and so does an ``NA``."""
+        return ast.UnaryOp(op=ast.Not(), operand=ast.Compare(
+            left=operand, ops=[ast.Eq()], comparators=[operand]))
+
+    def _na_tail(self, left: ast.expr, left_ref: Callable[[], ast.expr],
+                 right: ast.expr, right_ref: Callable[[], ast.expr]) -> ast.expr | None:
+        """``(not (a == a) or not (b == b)) and na_bool`` for one comparison pair.
+
+        None when neither operand can be na, which is what a constant operand
+        guarantees."""
+        probes = [self._is_na(ref()) for operand, ref in ((left, left_ref), (right, right_ref))
+                  if not isinstance(operand, ast.Constant)]
+        if not probes:
+            return None
+        self._na_bool_used = True
+        return ast.BoolOp(op=ast.And(), values=[
+            probes[0] if len(probes) == 1 else ast.BoolOp(op=ast.Or(), values=probes),
+            ast.Name(id=_NA_BOOL_NAME, ctx=ast.Load()),
+        ])
+
+    def visit_Module(self, node: ast.Module) -> ast.Module:
+        node = self.generic_visit(node)  # type: ignore[assignment]
+        if self._na_bool_used:
+            _insert_import(node.body, ast.ImportFrom(
+                module='pynecore.types.na',
+                names=[ast.alias(name='na_bool', asname=_NA_BOOL_NAME)],
+                level=0,
+            ))
+        return node
 
     def _rewrite_pair(self, op: ast.cmpop, left: ast.expr, left_ref: Callable[[], ast.expr],
                       right: ast.expr, right_ref: Callable[[], ast.expr]) -> ast.expr:
@@ -224,8 +294,10 @@ class FloatToleranceTransformer(ast.NodeTransformer):
 
         # In a chain the inner operands are read by both of their clauses
         uses = [0] * len(operands)
+        # The na tail reads each operand of every clause once more
+        extra = 1 if self._na_bool else 0
         for i, op in enumerate(node.ops):
-            reads = _READS[type(op)]
+            reads = _READS[type(op)] + extra
             uses[i] += reads
             uses[i + 1] += reads
 
@@ -240,8 +312,14 @@ class FloatToleranceTransformer(ast.NodeTransformer):
                 first, ref = binders[index]
                 pair.append(ref() if bound[index] else first)
                 bound[index] = True
-            clauses.append(self._rewrite_pair(op, pair[0], binders[i][1],
-                                              pair[1], binders[i + 1][1]))
+            clause = self._rewrite_pair(op, pair[0], binders[i][1],
+                                        pair[1], binders[i + 1][1])
+            if self._na_bool:
+                tail = self._na_tail(operands[i], binders[i][1],
+                                     operands[i + 1], binders[i + 1][1])
+                if tail is not None:
+                    clause = ast.BoolOp(op=ast.Or(), values=[clause, tail])
+            clauses.append(clause)
         # A chain evaluates the later operands only if the earlier comparisons
         # hold, which is what Python's own chain semantics do
         rewritten = (clauses[0] if len(clauses) == 1
