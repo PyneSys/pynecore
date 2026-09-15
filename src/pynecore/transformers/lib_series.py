@@ -1,12 +1,19 @@
 import ast
 from typing import cast
 
-# Builtin price series that are always global (declared in main, not nested functions)
+# Builtin price series accepted by generic ``input()`` as source names.
 BUILTIN_PRICE_SERIES = frozenset({
     'open', 'high', 'low', 'close', 'volume',
     'bid', 'ask',
-    'hl2', 'hlc3', 'ohlc4', 'hlcc4'
+    'hl2', 'hlc3', 'ohlc4', 'hlcc4',
 })
+
+# Builtin series that are always global (declared in main, not nested functions),
+# mapped to the element type their history buffer stores.
+BUILTIN_GLOBAL_SERIES = {
+    **dict.fromkeys(BUILTIN_PRICE_SERIES, 'float'),
+    'time': 'int',
+}
 
 # Lib attributes that are NOT Series — subscript access on these should not be transformed
 NON_SERIES_LIB_ATTRS = frozenset({
@@ -109,18 +116,18 @@ class LibrarySeriesTransformer(ast.NodeTransformer):
         Process a Series usage from a library, creating declaration if needed.
         Returns the local variable name to use.
 
-        For builtin price series (close, open, high, low, volume, hl2, hlc3, ohlc4, hlcc4),
+        Builtin series such as ``close`` and ``time`` are chart-global, so their
         declarations are always placed in the main function, not nested functions.
-        This matches TradingView behavior where these series are global.
         """
         if module not in self.lib_series_vars:
             self.lib_series_vars[module] = {}
 
-        # Determine if this is a builtin price series (single attribute like 'close', 'open', etc.)
-        is_builtin_price = len(attr_chain) == 1 and attr_chain[0] in BUILTIN_PRICE_SERIES
+        builtin_type = (BUILTIN_GLOBAL_SERIES.get(attr_chain[0])
+                        if len(attr_chain) == 1 else None)
 
-        # For builtin price series in nested functions, use the top-level parent (main)
-        if is_builtin_price and self.parent_functions:
+        # A nested helper reads builtin history on the chart-bar grid, not on the
+        # helper's conditional call grid.
+        if builtin_type is not None and self.parent_functions:
             target_function = self.parent_functions[0]  # First parent is 'main'
             function_key = target_function
         else:
@@ -139,15 +146,14 @@ class LibrarySeriesTransformer(ast.NodeTransformer):
         if (module, attr_key, function_key) not in self.used_series:
             self.used_series.add((module, attr_key, function_key))
 
-            # Create Series declaration with proper attribute chain. Builtin
-            # price series are float — a Series[float] annotation makes the
-            # SeriesTransformer carry the element type into the slot layout,
-            # so their buffers return the native nan for out-of-range reads.
+            # Create Series declaration with proper attribute chain. A concrete
+            # builtin element type makes the SeriesTransformer carry it into the
+            # slot layout, so numeric buffers return native nan for out-of-range reads.
             if type_annotation is None:
-                if is_builtin_price:
+                if builtin_type is not None:
                     annotation: ast.expr = ast.Subscript(
                         value=ast.Name(id='Series', ctx=ast.Load()),
-                        slice=ast.Name(id='float', ctx=ast.Load()),
+                        slice=ast.Name(id=builtin_type, ctx=ast.Load()),
                         ctx=ast.Load())
                 else:
                     annotation = ast.Name(id='Series', ctx=ast.Load())

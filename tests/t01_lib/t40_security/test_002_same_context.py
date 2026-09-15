@@ -3,7 +3,7 @@
 """
 import math
 
-from pynecore.lib import close, high, low, format, na, plot, request, script, syminfo, timeframe, ta
+from pynecore.lib import close, high, format, plot, request, script, syminfo, timeframe, ta
 
 
 @script.indicator(title="Same Context Test", shorttitle="SCT", format=format.price, precision=6)
@@ -18,11 +18,21 @@ def main():
     plot(sec_sma, title="SecSMA")
 
 
-def __test_same_context__(csv_reader, runner, log):
-    """Same symbol + same TF uses chart data directly without spawning a process"""
+def __test_same_context__(csv_reader, runner, log, monkeypatch):
+    """Same symbol + same TF uses chart data directly without spawning a process."""
     from pynecore import lib
+    from pynecore.core import security
     from pynecore.types.na import NA
 
+    cleanup_calls = 0
+    cleanup_shared_memory = security.cleanup_shared_memory
+
+    def count_cleanup(sync_block, result_blocks):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        cleanup_shared_memory(sync_block, result_blocks)
+
+    monkeypatch.setattr(security, "cleanup_shared_memory", count_cleanup)
     sma_values = []
     with csv_reader('advance_decline_ratio.csv', subdir="data") as cr:
         r = runner(
@@ -51,4 +61,5 @@ def __test_same_context__(csv_reader, runner, log):
                     assert math.isclose(sec_sma_val, expected_sma, rel_tol=1e-10), \
                         f"bar {i}: SecSMA={sec_sma_val} != expected={expected_sma}"
 
+    assert cleanup_calls == 1
     log.info("Same context test passed — values match chart data")
