@@ -3,7 +3,9 @@ import copy
 import hashlib
 from collections.abc import Container
 
+from ..core.import_hook import PYNE_RESERVED_NAME_CHAR
 from .dynamic_default import is_script_entry
+from .pine_type_rules import FactoryFields
 
 
 # Strategy state accessors are meaningful only in the chart context — the
@@ -147,6 +149,11 @@ class SecurityTransformer(ast.NodeTransformer):
         # (module-level or hoistable arguments). Only these may be depended on.
         self._top_sec_ids: set[str] = set()
         self._sid_lineno: dict[str, int] = {}
+        # Runtime-resolved sids kept out of the top block because their call is
+        # not reached on every run, and the ones that must stay there anyway
+        # because another context reads them (see ``visit_Module``).
+        self._deferred_by_reach: set[str] = set()
+        self._keep_top: frozenset[str] = frozenset()
 
     def _gen_id(self) -> str:
         # The module hash keeps sec ids unique across modules: the main script and
@@ -901,12 +908,35 @@ class SecurityTransformer(ast.NodeTransformer):
         # there. Everything else (rebound parameters, series-dependent
         # expressions) must be signalled inline, after the variables it reads
         # have been assigned.
+        #
+        # A context whose symbol or timeframe is only known at runtime is
+        # resolved -- its data located and loaded -- at its first signal. From
+        # the top block that would happen on every run, even one that never
+        # takes the branch the call stands in, and a feed nobody reads would
+        # have to exist. Such a signal moves up only when its call is reached
+        # every time the function runs -- or when another context depends on it:
+        # that consumer's child waits for the producer's record, which the chart
+        # only sends at the producer's signal, so a producer signalled behind a
+        # branch the chart skipped would stall the consumer for good.
         hoistable, stable_params = self._hoistable_bindings(node)
         available = set(hoistable) | stable_params
+        reached: set[str] = set()
+        for stmt in self._unconditional_stmts(node.body):
+            for call, sid, _is_ltf in calls:
+                if sid not in reached and self._reached_unconditionally(stmt, call):
+                    reached.add(sid)
         top_sec_ids = []
         runtime_sec_ids: set[str] = set()
         needed_names: set[str] = set()
         for sid in sec_ids:
+            sym_expr, tf_expr, _la_expr = self._signal_args[sid]
+            runtime_resolved = any(
+                e is not None and not self._is_module_level_expr(e)
+                for e in (sym_expr, tf_expr))
+            if runtime_resolved and sid not in reached and sid not in self._keep_top:
+                self._deferred_by_reach.add(sid)
+                runtime_sec_ids.add(sid)
+                continue
             exprs = [e for e in self._signal_args[sid] if e is not None]
             if all(self._is_simple_chain(e, available) for e in exprs):
                 top_sec_ids.append(sid)
@@ -1407,12 +1437,25 @@ class SecurityTransformer(ast.NodeTransformer):
 
         found_caller = self._find_guard_block(caller.body, '__sec_wait__')
         if found_caller is None:
-            caller_block = ast.If(test=self._is_none_check(), body=[], orelse=[])
-            ast.copy_location(caller_block, call)
-            # A trailing ``return`` would make an appended block dead code.
-            if caller.body and isinstance(caller.body[-1], ast.Return):
+            trailing = caller.body[-1] if caller.body else None
+            if isinstance(trailing, ast.Return):
+                if trailing.value is not None and any(
+                        node is call for node in ast.walk(trailing.value)):
+                    # The ``return`` itself runs the helper, and with it the
+                    # reads. A wait in front of it would settle the round
+                    # before the value is read: the chart would sit out the
+                    # child's whole ``main()`` instead of being released at the
+                    # write, one context after the other. This scope has no
+                    # statement after the reads, so the next signal and
+                    # ``end_bar()`` settle the round.
+                    return
+                caller_block = ast.If(test=self._is_none_check(), body=[], orelse=[])
+                ast.copy_location(caller_block, call)
+                # Appended after the ``return``, the block would be dead code.
                 caller.body.insert(len(caller.body) - 1, caller_block)
             else:
+                caller_block = ast.If(test=self._is_none_check(), body=[], orelse=[])
+                ast.copy_location(caller_block, call)
                 caller.body.append(caller_block)
         else:
             caller_block = found_caller[1]
@@ -1463,11 +1506,33 @@ class SecurityTransformer(ast.NodeTransformer):
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
         self._module_file = getattr(node, '_module_file_path', '<script>')
+        original = None
+        if not self._keep_top and any(
+                isinstance(sub, ast.Call) and (self._is_security_call(sub)
+                                               or self._is_security_lower_tf_call(sub))
+                for sub in ast.walk(node)):
+            original = copy.deepcopy(node)
         node = self.generic_visit(node)  # type: ignore[assignment]
 
         if self._all_contexts:
             self._lift_helper_signals(node)
             self._analyze_dependencies(node)
+            # Dependencies are only known on the lowered module. A deferred
+            # signal that turns out to be a producer must stay in the top block
+            # after all, so transform the module again with that decision fixed.
+            # Sids are counted in visit order, so the second pass names every
+            # context the same way.
+            producers: set[str] = set()
+            for ctx in self._all_contexts.values():
+                deps = ctx['depends']
+                if isinstance(deps, ast.List):
+                    producers.update(dep.value for dep in deps.elts
+                                     if isinstance(dep, ast.Constant))
+            keep_top = self._deferred_by_reach & producers
+            if keep_top and original is not None:
+                second = SecurityTransformer()
+                second._keep_top = frozenset(keep_top)
+                return second.visit(original)
             self._mark_always_read(node)
             self._mark_signal_per_bar(node)
 
@@ -1862,6 +1927,49 @@ class _DependencyAnalyzer:
         while isinstance(node, (ast.Attribute, ast.Subscript)):
             node = node.value
         return node.id if isinstance(node, ast.Name) else None
+
+    @staticmethod
+    def _is_plain_record(node: ast.ClassDef, factories: FactoryFields) -> bool:
+        """Whether a class body only declares fields — a Pine ``type``.
+
+        Such a body runs once, when the module is imported, before any security
+        value exists, so it carries no taint and needs no fallback. Creating an
+        instance is an ordinary call and assigning a field an ordinary attribute
+        store, and both are modelled where they happen. Anything else in the
+        body — a method above all — keeps the class unmodelled.
+
+        A field default the compiler lowered to a ``default_factory`` lambda
+        runs at every construction instead, so it only qualifies while its body
+        reads nothing a script can bind: the lowering's reserved-name helpers
+        and ``lib``.
+
+        :param node: the class definition
+        :param factories: the module's compiler-emitted field factories
+        :return: whether the body holds nothing but field declarations
+        """
+        factory_calls = {id(call) for call in factories.of(node)}
+        for stmt in node.body:
+            if isinstance(stmt, ast.AnnAssign):
+                lambdas = [sub for sub in ast.walk(stmt) if isinstance(sub, ast.Lambda)]
+                if not lambdas:
+                    continue
+                value = stmt.value
+                if (len(lambdas) != 1 or value is None or id(value) not in factory_calls
+                        or any(isinstance(sub, ast.Name)
+                               and PYNE_RESERVED_NAME_CHAR not in sub.id
+                               and sub.id != 'lib'
+                               for sub in ast.walk(lambdas[0].body))):
+                    return False
+                continue
+            if isinstance(stmt, ast.Pass):
+                continue
+            if (isinstance(stmt, ast.Assign)
+                    and all(isinstance(t, ast.Name) for t in stmt.targets)):
+                continue
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
+                continue
+            return False
+        return True
 
     @staticmethod
     def _iter_stmts_skip_funcs(node: ast.AST):
@@ -2401,8 +2509,17 @@ class _DependencyAnalyzer:
         self._mark_in_loop()
         self._compute_site_order()
 
+        factories = FactoryFields(self._module)
+        record_nodes: set[int] = set()
+        # Only a module-level class body runs at import time; one defined inside
+        # a function runs with the function and stays unmodelled.
+        for node in self._module.body:
+            if isinstance(node, ast.ClassDef) and self._is_plain_record(node, factories):
+                record_nodes.update(id(sub) for sub in ast.walk(node))
         for key, scope in self._scopes.items():
             for sub in self._iter_stmts_skip_funcs(scope.node):
+                if id(sub) in record_nodes:
+                    continue
                 if isinstance(sub, _UNMODELLED_NODES):
                     self._fallback_scopes.add(key)
                     self.fallback_reasons.setdefault(key, type(sub).__name__)
