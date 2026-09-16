@@ -103,6 +103,27 @@ def __test_helper_write_feed(tmp_dir, timeframe, span_ms):
     return str(path)
 
 
+def __test_helper_chart_window(tmp_dir, timeframe, bars):
+    """Write the chart's own bars to an ``.ohlcv`` file and window over it.
+
+    The developing batch is replayed in the CHILD, which reproduces the chart's
+    bars from the window it is handed — so the chart's stream has to be a static
+    feed here too, and the bar loop takes its bars from the same window.
+
+    :param tmp_dir: Directory to write into.
+    :param timeframe: The chart's timeframe.
+    :param bars: The chart bars to write.
+    :return: A :class:`ChartBarWindow` over the whole file.
+    """
+    from pynecore.core.ohlcv import ChartBarWindow, OHLCVWriter
+
+    path = tmp_dir / f"chart{timeframe}.ohlcv"
+    with OHLCVWriter(path, timeframe) as w:
+        for bar in bars:
+            w.write(bar)
+    return ChartBarWindow(path, bars[0].timestamp, bars[-1].timestamp)
+
+
 def __test_helper_chart_bars():
     """The chart's own 5-minute bars, with a moving close.
 
@@ -149,9 +170,9 @@ def __test_helper_run(runner, no_batch):
 
     ``no_batch`` flips :data:`pynecore.core.security.NO_BATCH`, the switch
     ``PYNE_NO_SECURITY_BATCH`` sets: every context then keeps the per-bar round
-    path. The chart bar source is handed to the runner as a factory, which is
-    what the developing-batch pre-walk needs — and what the bar loop itself
-    takes its bars from.
+    path. The chart's bars are handed to the runner as a window over a static
+    feed, which is what a developing batch's child reproduces its rounds from —
+    and what the bar loop itself takes its bars from.
 
     :param runner: The ``runner`` fixture.
     :param no_batch: Whether to force the per-bar path.
@@ -188,10 +209,11 @@ def __test_helper_run(runner, no_batch):
                 "D": __test_helper_write_feed(tmp, "1D", __test_helper_day_ms),
             }
             bars = __test_helper_chart_bars()
-            r = runner(list(bars), security_data=feeds,
+            window = __test_helper_chart_window(tmp, "5", bars)
+            r = runner(window.bars(), security_data=feeds,
                        last_bar_index=len(bars) - 1,
                        last_bar_time=bars[-1].timestamp,
-                       chart_bar_source=lambda: iter(bars))
+                       chart_bar_window=window)
             for _candle, pv in r.run_iter():
                 rows.append(dict(pv))
     finally:

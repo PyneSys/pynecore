@@ -53,7 +53,7 @@ import logging
 import os
 import sys
 import threading
-from array import array
+from collections import deque
 from functools import partial
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
@@ -65,13 +65,13 @@ from .security_shm import (
     SyncBlock, ResultBlock, write_na, FRONTIER_INF,
     FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE, FLAG_DEV_HISTORICAL,
     FLAG_MORE_STEPS, FLAG_BATCH_ROUND, FLAG_DEV_BATCH_ROUND,
-    RING_RUNAHEAD_ENTRIES, is_ltf_window, is_ltf_chart_developing,
-    is_ltf_live_phase,
+    RING_RESUME_ENTRIES, RING_RUNAHEAD_ENTRIES, is_ltf_window,
+    is_ltf_chart_developing, is_ltf_live_phase,
 )
 from .security import (
-    BarCalendar, DEV_BATCH_CLOSED, DEV_BATCH_DEVELOPING, DEV_BATCH_RECORD_SIZE,
-    actual_bar_close, create_security_protocol, inject_protocol, same_calendar,
-    unpack_dev_batch_record,
+    BarCalendar, DEV_BATCH_CLOSED, DEV_BATCH_DEVELOPING, actual_bar_close,
+    create_security_protocol, inject_protocol, iter_dev_batch_records,
+    same_calendar,
 )
 from .live_ltf_collector import LiveLtfCollector
 from .plugin.live_provider import PluginSymbol
@@ -81,6 +81,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from multiprocessing.synchronize import Lock as LockType
     from .live_runner import LiveBarStreamer
+    from .security import DevBatchSpec
     from ..types.ohlcv import OHLCV
 
 # Seconds between parent-liveness checks in the orphan watchdog.
@@ -427,7 +428,7 @@ def security_process_main(
         registry_pipe=None,
         chart_ring_capacity: int = 0,
         chart_ring_arena: int = 0,
-        dev_batch_plan: 'bytes | None' = None,
+        dev_batch_spec: 'DevBatchSpec | None' = None,
 ):
     assert result_locks is not None, "result_locks must be provided by script_runner"
     """
@@ -492,10 +493,11 @@ def security_process_main(
         symbol or timeframe only exists at runtime — such a context can be a
         dependency of a child that was already spawned, so its record cannot
         have been in that child's snapshot.
-    :param dev_batch_plan: Packed round sequence of a historical DEVELOPING batch
-        (see :func:`security.plan_developing_batch`), or ``None``. The chart
-        launches ONE round for it (``FLAG_DEV_BATCH_ROUND``) and this process
-        replays every record in it as a round of its own, running ahead of the
+    :param dev_batch_spec: What to reproduce a historical DEVELOPING batch's
+        round sequence from (see :func:`security.iter_dev_batch_records`), or
+        ``None``. The chart launches ONE round for it
+        (``FLAG_DEV_BATCH_ROUND``) and this process produces every record of
+        the sequence and replays it as a round of its own, running ahead of the
         chart while it walks its bars.
     """
     # Safety net first: exit if the parent is hard-killed (see the watchdog docstring).
@@ -974,14 +976,28 @@ def security_process_main(
     # against the saved baseline).
     last_dev_period_start: int | None = None
 
-    # Record ticks of a developing-batch plan and how far the chart has read it
-    # (a record index), for the run-ahead bound in ``_dev_batch_throttle``.
-    dev_batch_ticks: 'array | None' = None
-    dev_batch_read = [-1]
-    if dev_batch_plan:
-        dev_batch_ticks = array('q')
-        for _rec in range(len(dev_batch_plan) // DEV_BATCH_RECORD_SIZE):
-            dev_batch_ticks.append(unpack_dev_batch_record(dev_batch_plan, _rec)[7])
+    # A developing batch's records, produced one at a time while they are
+    # replayed. The first one is pulled here: its tick is what the ring is
+    # primed from, and every step needs to know the NEXT record's tick anyway
+    # (see ``_dev_batch_steps``), so the iterator is kept one record ahead.
+    dev_batch_records: 'Iterator[tuple] | None' = None
+    dev_batch_next: 'tuple | None' = None
+    # Ticks of the records replayed but not yet known to have been read by the
+    # chart, for the run-ahead bound in ``_dev_batch_throttle``. Bounded by that
+    # same bound plus one chart bar's records.
+    dev_batch_pending: 'deque[int]' = deque()
+    if dev_batch_spec is not None:
+        dev_batch_records = iter_dev_batch_records(dev_batch_spec)
+        dev_batch_next = next(dev_batch_records, None)
+        if dev_batch_next is None:
+            # The chart armed the batch because its window holds bars, and every
+            # chart bar produces at least one record. An empty sequence means
+            # this process reproduced a DIFFERENT window — fail here rather than
+            # leave the chart waiting for rounds that will never come.
+            raise RuntimeError(
+                f"security context '{sec_id}': the developing batch window "
+                f"'{dev_batch_spec.window.path}' produced no chart bars"
+            )
 
     # Set after the first live bar has been consumed. The historical loop
     # leaves ``current_bar`` already pointing at the *next* unprocessed
@@ -1371,17 +1387,24 @@ def security_process_main(
 
         :return: Iterator of ``(target_time, flags, more_steps, dev_values)``.
         """
-        assert dev_batch_plan is not None
-        total = len(dev_batch_plan) // DEV_BATCH_RECORD_SIZE
+        nonlocal dev_batch_next
+        assert dev_batch_records is not None
         prev_tick = -1
-        for index in range(total):
+        record = dev_batch_next
+        while record is not None:
             (kind, period_start, r_open, r_high, r_low, r_close, r_volume,
-             tick, sched_next_open) = unpack_dev_batch_record(dev_batch_plan, index)
+             tick, sched_next_open) = record
+            # One record of lookahead: whether this step is the last one of its
+            # chart bar (and of the whole sequence) is a property of the NEXT
+            # record, so the iterator always stands one record ahead.
+            following = next(dev_batch_records, None)
+            dev_batch_next = following
             if tick != prev_tick:
                 # A fresh chart bar: do not run further ahead of the chart than
                 # the ring is allowed to hold.
-                _dev_batch_throttle(index)
+                _dev_batch_throttle()
                 prev_tick = tick
+            dev_batch_pending.append(tick)
             sec_ctx.round_tick = tick
             sec_ctx.round_sched_next_open = sched_next_open
             if kind == DEV_BATCH_DEVELOPING:
@@ -1397,48 +1420,67 @@ def security_process_main(
                 # closed periods that precede the first containing one.
                 step_flags = 0
                 dev_values = None
-            last = index + 1 >= total
-            more = not last and unpack_dev_batch_record(
-                dev_batch_plan, index + 1)[7] == tick
+            last = following is None
+            more = not last and following[7] == tick
             if more:
                 step_flags |= FLAG_MORE_STEPS
             round_is_last_step[0] = last
             yield period_start, step_flags, more, dev_values
+            record = following
 
-    def _dev_batch_throttle(index: int) -> None:
+    def _dev_batch_throttle() -> None:
         """Keep the batch from running unboundedly far ahead of the chart.
 
         The ring writer never blocks on space — it grows — so a child replaying
-        a million-bar plan while the chart is still on bar one would hold a
+        a million-bar sequence while the chart is still on bar one would hold a
         million entries. The chart parks its watermark at each bar's as-of
-        before it waits (and wakes this condition doing so), which is exactly
-        how far it has read, so the run-ahead is measurable and can be bounded.
+        before it waits, which is exactly how far it has read, so the run-ahead
+        is measurable and can be bounded.
 
-        :param index: Index of the record about to be replayed.
+        ``dev_batch_pending`` holds the ticks of the records replayed since the
+        chart's watermark was last consulted; its length IS the run-ahead, and
+        dropping its head below the watermark is how far the chart has read.
+
+        Once the bound is reached the wait runs until the run-ahead is back down
+        to :data:`RING_RESUME_ENTRIES`, and the producer publishes that it is
+        parked so the chart's watermark park notifies it. Both halves matter: a
+        producer that resumed at the bound would re-park on the very next
+        record, and one the chart does not know about would only be released by
+        the liveness recheck below.
         """
-        if index <= RING_RUNAHEAD_ENTRIES or dev_batch_ticks is None:
-            # Not far enough in to be ahead of anything: skip even the condition
-            # acquire. It is contended — the chart holds the same condition while
-            # it evaluates its ring waits — and this runs per chart bar.
+        if len(dev_batch_pending) < RING_RUNAHEAD_ENTRIES:
+            # Not far enough ahead of anything: skip even the condition acquire.
+            # It is contended — the chart holds the same condition while it
+            # evaluates its ring waits — and this runs per chart bar.
             return
         cond = ring_conditions.get(sec_id) if ring_conditions else None
         if cond is None:
+            dev_batch_pending.clear()
             return
         own = sync_block.index_of(sec_id)
         chart = sync_block.chart_index
-        total = len(dev_batch_ticks)
         with cond:
-            while index - dev_batch_read[0] > RING_RUNAHEAD_ENTRIES:
-                if stop_event.is_set():
-                    return
-                watermark = sync_block.get_watermark(chart, own)
-                pos = dev_batch_read[0]
-                while pos + 1 < total and dev_batch_ticks[pos + 1] <= watermark:
-                    pos += 1
-                dev_batch_read[0] = pos
-                if index - pos <= RING_RUNAHEAD_ENTRIES:
-                    return
-                cond.wait(_DEV_BATCH_WAIT_SECONDS)
+            try:
+                while True:
+                    watermark = sync_block.get_watermark(chart, own)
+                    while dev_batch_pending and dev_batch_pending[0] <= watermark:
+                        dev_batch_pending.popleft()
+                    if (len(dev_batch_pending) < RING_RESUME_ENTRIES
+                            or stop_event.is_set()):
+                        return
+                    # What this wait needs: the chart has to have read past the
+                    # record that brings the run-ahead back under the resume
+                    # level. Published BEFORE the next look at the watermark, so
+                    # a chart parking its own watermark from here on cannot slip
+                    # between the two and leave this producer unwoken.
+                    sync_block.set_parked_until(
+                        sec_id,
+                        dev_batch_pending[len(dev_batch_pending) - RING_RESUME_ENTRIES])
+                    if sync_block.get_watermark(chart, own) != watermark:
+                        continue
+                    cond.wait(_DEV_BATCH_WAIT_SECONDS)
+            finally:
+                sync_block.set_parked_until(sec_id, 0)
 
     try:
         current_bar = 0
@@ -1448,14 +1490,14 @@ def security_process_main(
             # already (vacuously) in the ring. A consumer whose own first bars
             # close before this context's first one is released by it without
             # the chart ever having to wake this producer.
-            if dev_batch_ticks is not None:
+            if dev_batch_next is not None:
                 # A developing batch's entries do NOT close on this context's own
                 # bar grid — each closes at the CHART tick of the bar it was
                 # planned for, and the first of those lies inside this context's
                 # first period, far below its close. Priming from the bar grid
                 # would claim every chart tick of that first period as published
                 # and the chart would pair its first bars against an empty ring.
-                prime_ring(dev_batch_ticks[0] - 1)
+                prime_ring(dev_batch_next[7] - 1)
             else:
                 _first_open = _bar_open_at(0)
                 if _first_open:
@@ -1479,7 +1521,7 @@ def security_process_main(
             # two produced them — a ``continue`` in one of them moves on to the
             # next step, which for a batch is the next record.
             round_flags = sync_block.get_flags(sec_id)
-            if dev_batch_plan is not None and (round_flags & FLAG_DEV_BATCH_ROUND):
+            if dev_batch_records is not None and (round_flags & FLAG_DEV_BATCH_ROUND):
                 round_steps = _dev_batch_steps()
                 dev_batch_running = True
             else:

@@ -29,7 +29,7 @@ from ..pluggable import PluggableCommand
 from ...utils.rich.date_column import DateColumn
 # noinspection PyProtectedMember
 from pynecore.core._file_io import exclusive_file_lock, replace_file
-from pynecore.core.ohlcv import OHLCVReader, OHLCVWriter
+from pynecore.core.ohlcv import ChartBarWindow, OHLCVReader, OHLCVWriter
 from pynecore.core.data_converter import DataConverter, DataFormatError, ConversionError
 from pynecore.core.aggregator import validate_aggregation
 from pynecore.lib.log import logger as pyne_logger
@@ -1434,23 +1434,18 @@ def run(
             break
         magnifier_iter = None
 
-        def chart_bar_source():
-            """A fresh iterator over the run's chart bar window.
-
-            The runner takes the bar loop's bars from here; a security context
-            whose historical rounds can be planned up front walks the same
-            production a second time (see
-            ``ScriptRunner._chart_bar_iterator``), which is what makes the
-            planned bars and the run's bars identical by construction.
-            """
-            return reader.read_from(time_from_ts, time_to_ts)
+        # The run's chart bar window. The bar loop's bars come out of it, and so
+        # do the bars a security context's child walks to replay its own
+        # historical rounds (``ChartBarWindow.bars`` is the single production of
+        # both), which is what makes the two identical by construction.
+        chart_bar_window = ChartBarWindow(reader.path, time_from_ts, time_to_ts)
 
         if magnifier_mode:
             # Sub-TF data goes to magnifier; ohlcv_iter is unused (replaced in ScriptRunner)
             magnifier_iter = reader.read_from(time_from_ts, time_to_ts)
             ohlcv_iter = iter([])
         else:
-            ohlcv_iter = chart_bar_source()
+            ohlcv_iter = chart_bar_window.bars()
         lossless_volume = reader.lossless_volume
         lossless_prices = reader.lossless_prices
 
@@ -1709,7 +1704,7 @@ def run(
                                           security_data=security_data,
                                           magnifier_iter=magnifier_iter,
                                           magnifier_source_tf=magnifier_source_tf,
-                                          chart_bar_source=chart_bar_source,
+                                          chart_bar_window=chart_bar_window,
                                           broker_plugin=broker_plugin,
                                           broker_event_loop=broker_event_loop,
                                           broker_store_ctx=broker_store_ctx,
