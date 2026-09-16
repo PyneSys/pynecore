@@ -2855,8 +2855,26 @@ def _session_bar_closes(
         wrong session end.
     """
     closes: list[int] = []
+    # One prepared entry per exchange-local DATE, shared by every bar opening on
+    # it. The schedule work -- the correction lookups, the overnight
+    # classification of each interval and the end-instant arithmetic -- depends
+    # only on the date (:func:`_day_session_ends`); a 30-minute feed puts 48 bars
+    # on one date and each of them only needs the time-of-day comparison. The
+    # cache is local to this walk, so it cannot outlive the schedule it was
+    # built from.
+    prepared: 'dict[date, tuple[tuple[time | None, time | None, int], ...]]' = {}
     for open_ms in opens:
-        end_ms = _session_end_of_open(open_ms, tz, opening_hours, corrections)
+        open_dt = datetime.fromtimestamp(open_ms / 1000, tz=tz)
+        open_date = open_dt.date()
+        ends = prepared.get(open_date)
+        if ends is None:
+            # Exclusive ends, as in :func:`actual_bar_close`: a 24h schedule's
+            # 23:59:59 marker closes its last bar at midnight, not a second early.
+            ends = tuple(
+                (lo, hi, _exclusive_session_end(end, tz))
+                for lo, hi, end in _day_session_ends(open_date, tz, opening_hours, corrections))
+            prepared[open_date] = ends
+        end_ms = _match_session_end(open_dt.time(), ends)
         if end_ms is None:
             return None
         # Whichever comes first: the bar's own period end, or the session end (a
@@ -2885,41 +2903,101 @@ def _session_end_of_open(
     :return: The session end in epoch ms, or ``None`` when no interval contains
         ``open_ms`` (the schedule does not describe this instant).
     """
-    from .resampler import crosses_midnight
     open_dt = datetime.fromtimestamp(open_ms / 1000, tz=tz)
-    open_date = open_dt.date()
-    weekday = open_dt.weekday()
+    return _match_session_end(
+        open_dt.time(),
+        _day_session_ends(open_dt.date(), tz, opening_hours, corrections))
+
+
+def _day_session_ends(
+        open_date: date,
+        tz: ZoneInfo | None,
+        opening_hours: 'list[SymInfoInterval]',
+        corrections: 'dict[date, tuple[SymInfoInterval, ...]] | None' = None,
+) -> 'tuple[tuple[time | None, time | None, int], ...]':
+    """
+    Every session end a bar opening on ``open_date`` can take, as time-of-day
+    bounds plus the end instant.
+
+    The per-DATE half of :func:`_session_end_of_open`: which intervals are
+    effective (a date listed in ``corrections`` trades on its own hours instead
+    of its weekday's), which of them are overnight, and what epoch instant each
+    close falls on. None of that depends on the bar's time of day, so a walk
+    over a whole feed prepares it once per date and then only compares times of
+    day (:func:`_match_session_end`).
+
+    Each entry is ``(lo, hi, end_ms)`` and covers an ``open_time`` when
+    ``lo <= open_time`` (``lo`` of ``None``: no lower bound) and
+    ``open_time < hi`` (``hi`` of ``None``: no upper bound):
+
+    * a same-day interval bounds both sides and closes on ``open_date``;
+    * the pre-midnight leg of an overnight interval (``end <= start``) has no
+      upper bound -- every time of day from its open on belongs to it -- and
+      closes on the following calendar day;
+    * the after-midnight leg of the PREVIOUS day's overnight interval has no
+      lower bound and closes on ``open_date`` (a ``21:00->02:00`` night
+      session's ``01:00`` bar closes at that ``02:00``). Its correction is the
+      one of the date its session STARTED.
+
+    :param open_date: The bar's exchange-local calendar date.
+    :param tz: The security's exchange timezone.
+    :param opening_hours: The security's ``SymInfo.opening_hours`` intervals.
+    :param corrections: The security's ``SymInfo.session_corrections``, or ``None``.
+    :return: The date's candidate session ends, in schedule order.
+    """
+    from .resampler import crosses_midnight
+    weekday = open_date.weekday()
     prev_weekday = (weekday - 1) % 7
-    open_time = open_dt.time()
     if corrections:
         today_hours = corrections.get(open_date, opening_hours)
         prev_hours = corrections.get(open_date - timedelta(days=1), opening_hours)
     else:
         today_hours = prev_hours = opening_hours
-    end_ms: int | None = None
+    ends: 'list[tuple[time | None, time | None, int]]' = []
     for interval in today_hours:
-        overnight = crosses_midnight(interval.start, interval.end)
-        if (interval.day == weekday and interval.start <= open_time
-                and (overnight or open_time < interval.end)):
-            # Same-day session, or the pre-midnight leg of an overnight one
-            # (which closes on the following calendar day).
-            end_date = open_date + timedelta(days=1 if overnight else 0)
-        else:
+        if interval.day != weekday:
             continue
-        candidate = int(
-            datetime.combine(end_date, interval.end, tzinfo=tz).timestamp() * 1000)
+        overnight = crosses_midnight(interval.start, interval.end)
+        end_date = open_date + timedelta(days=1 if overnight else 0)
+        ends.append((
+            interval.start,
+            None if overnight else interval.end,
+            int(datetime.combine(end_date, interval.end,
+                                 tzinfo=tz).timestamp() * 1000),
+        ))
+    for interval in prev_hours:
+        if interval.day != prev_weekday or not crosses_midnight(interval.start,
+                                                                interval.end):
+            continue
+        ends.append((
+            None,
+            interval.end,
+            int(datetime.combine(open_date, interval.end,
+                                 tzinfo=tz).timestamp() * 1000),
+        ))
+    return tuple(ends)
+
+
+def _match_session_end(
+        open_time: time,
+        ends: 'tuple[tuple[time | None, time | None, int], ...]',
+) -> int | None:
+    """
+    The earliest prepared session end (:func:`_day_session_ends`) whose bounds
+    cover ``open_time``.
+
+    :param open_time: The bar's exchange-local time of day.
+    :param ends: The date's candidate session ends.
+    :return: The session end in epoch ms, or ``None`` when no session covers it.
+    """
+    end_ms: int | None = None
+    for lo, hi, candidate in ends:
+        if lo is not None and open_time < lo:
+            continue
+        if hi is not None and open_time >= hi:
+            continue
         if end_ms is None or candidate < end_ms:
             end_ms = candidate
-    for interval in prev_hours:
-        # After-midnight leg of the PREVIOUS day's overnight session: the bar
-        # opens today but its session started yesterday and closes today
-        # (e.g. a 21:00->02:00 night session's 01:00 bar).
-        if (crosses_midnight(interval.start, interval.end)
-                and interval.day == prev_weekday and open_time < interval.end):
-            candidate = int(
-                datetime.combine(open_date, interval.end, tzinfo=tz).timestamp() * 1000)
-            if end_ms is None or candidate < end_ms:
-                end_ms = candidate
     return end_ms
 
 
