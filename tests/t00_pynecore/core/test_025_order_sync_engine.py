@@ -3361,6 +3361,42 @@ def __test_unconfirmed_view_still_cancels_and_closes__():
     assert len(b.entry_calls) == 1, "new exposure opened during the venue backoff"
 
 
+def __test_unconfirmed_view_defers_the_bracket_of_a_deferred_fresh_entry__():
+    """
+    A fresh entry deferred on an unconfirmed view has no parent on the
+    exchange, so its bracket must be deferred with it: an exit dispatched
+    for a position that does not exist reaches the plugin as an orphan and a
+    non-entry dispatch failure halts the bot. The bracket of an entry that is
+    already working on the exchange must still go out.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+
+    b.raise_on_next_get_position = ExchangeRateLimitError(
+        "error.too-many.requests", retry_after=30.0,
+    )
+    with pytest.raises(ExchangeConnectionError):
+        engine.reconcile()
+
+    # Fresh bracketed entry plus a bracket for the already-working entry.
+    pos.entry_orders["N"] = _entry_order("N", -1.0, limit=51_000.0)
+    pos.exit_orders[("N-X", "N")] = _exit_order("N", -1.0, "N-X", stop=52_000.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    engine.sync(BAR_TS + 60_000)
+
+    assert len(b.entry_calls) == 1, "new exposure opened during the venue backoff"
+    dispatched_exits = [
+        c.intent.from_entry for c in b.exit_calls
+        if isinstance(c.intent, ExitIntent)
+    ]
+    assert len(dispatched_exits) == len(b.exit_calls)
+    assert dispatched_exits == ["L"], \
+        "bracket of a deferred, never-dispatched entry reached the plugin"
+
+
 def __test_read_resolving_at_the_timeout_boundary_is_not_lost__():
     """
     ``result(timeout=...)`` can raise while the coroutine completes in the same

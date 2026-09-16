@@ -12503,6 +12503,15 @@ class OrderSyncEngine:
                     "unconfirmed this cycle; retrying next sync",
                     format_intent_key(key),
                 )
+                if key not in self._active_intents:
+                    # A never-dispatched entry has no exchange-side parent,
+                    # so its bracket must be deferred with it: the exit
+                    # guard below keys on this set. Without it the bracket
+                    # reaches the plugin as an exit for a position that does
+                    # not exist — a non-entry dispatch failure is fatal.
+                    # Entries already working on the exchange keep their
+                    # exits dispatchable.
+                    skipped_entry_ids_this_sync.add(intent.pine_id)
                 continue
             if key not in self._active_intents:
                 # Refuse-and-defer guard for un-landed forced cancels. The
