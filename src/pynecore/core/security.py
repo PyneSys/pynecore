@@ -14,9 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
-import struct
 import threading
-from array import array
 from bisect import bisect_right
 from time import monotonic
 from dataclasses import dataclass, field
@@ -44,8 +42,8 @@ if TYPE_CHECKING:
         Condition as ConditionType, Event as EventType, Lock as LockType,
     )
     from multiprocessing.connection import Connection
-    from typing import Callable
-    from .ohlcv import OHLCVReader
+    from typing import Callable, Iterator
+    from .ohlcv import ChartBarWindow, OHLCVReader
     from .resampler import Resampler
     from .htf_aggregator import HTFAggregator
     from .syminfo import SymInfo, SymInfoSession, SymInfoInterval
@@ -503,19 +501,17 @@ class SecurityState:
     # instant ``_get_confirmed_time`` paired the target with, kept for the ring
     # lookup in ``__sec_read__``.
     batch_asof: int = 0
+    # The PREVIOUS bar's as-of for this context, the lower bound of the window a
+    # developing batch's entry for the current bar may close in (see
+    # ``_batch_read``).
+    batch_prev_asof: int = 0
 
-    # Historical DEVELOPING batch round (see :func:`plan_developing_batch`). The
-    # packed round sequence the child replays, ``None`` for every other shape.
-    # Set alongside ``batch_target``, so the read routes through ``_batch_read``
-    # and the cold group start covers this context too — only the child's round
-    # source differs (a planned sequence instead of the per-bar pushes).
-    dev_batch_plan: bytes | None = None
-    # The chart bar ticks the plan was walked with, one per chart bar. The signal
-    # checks its own tick against them: the plan and the bar loop take their bars
-    # from the same source, so a mismatch is a planner bug, and pairing a bar with
-    # a tick no record carries would silently answer with an earlier bar's value.
-    dev_batch_ticks: 'array | None' = None
-    dev_batch_bar: int = 0
+    # Historical DEVELOPING batch round (see :func:`prepare_developing_batch`).
+    # What the child reproduces its round sequence from, ``None`` for every other
+    # shape. Set alongside ``batch_target``, so the read routes through
+    # ``_batch_read`` and the cold group start covers this context too — only the
+    # child's round source differs (its own replay instead of the per-bar pushes).
+    dev_batch_spec: 'DevBatchSpec | None' = None
 
 
 def _same_value(a, b) -> bool:
@@ -796,19 +792,16 @@ def batch_eligible(state: SecurityState, sec_id: str, *, is_live: bool) -> bool:
             and not sec_id.startswith('__auto_rate_'))
 
 
-# Packed developing-batch record: kind, period_start, open, high, low, close,
-# volume, the chart bar's round tick and its scheduled next session open. One
-# record per push the per-bar path would have made — ``_DEV_BATCH_PREFILL``
-# carries only its target in ``period_start``.
+# One developing-batch record per push the per-bar path would have made:
+# ``(kind, period_start, open, high, low, close, volume, tick,
+# sched_next_open)``, where the last two are the chart bar's round tick and its
+# scheduled next session open — the two values ``_launch`` writes into the slot.
+# ``DEV_BATCH_PREFILL`` carries only its target in ``period_start``.
 #
-# The sequence travels to the child as ONE ``bytes`` object in the spawn
-# arguments rather than through a shared memory block: it is written once,
-# before the child exists, and read once, in order — there is nothing for a
-# shared segment to synchronize, and the existing blocks (sync/result/ring) are
-# all mutable rendezvous points, which this is not. The cost is 72 bytes per
-# record in the child's address space.
-_DEV_BATCH_RECORD = '<qqdddddqq'
-DEV_BATCH_RECORD_SIZE = struct.calcsize(_DEV_BATCH_RECORD)
+# The records are never materialized as a sequence: the CHILD produces them one
+# at a time from :class:`DevBatchSpec` while it replays them (see
+# :func:`iter_dev_batch_records`), so neither process ever holds more than the
+# record it is on, whatever the chart's length.
 
 # Record kinds, mirroring the three steps ``__sec_signal__`` builds per bar.
 DEV_BATCH_PREFILL = 0
@@ -816,19 +809,151 @@ DEV_BATCH_CLOSED = 1
 DEV_BATCH_DEVELOPING = 2
 
 
-_DEV_BATCH_STRUCT = struct.Struct(_DEV_BATCH_RECORD)
+@dataclass(frozen=True, slots=True)
+class DevBatchSpec:
+    """Everything a child needs to reproduce its developing-batch rounds.
 
+    Travels to the child in the spawn arguments (a few hundred bytes) in place
+    of the round sequence itself. Two halves:
 
-def unpack_dev_batch_record(plan: bytes, index: int) -> tuple:
+    * the chart's bar production — the window over the chart's own OHLCV file
+      and the cleaning parameters the bar loop publishes its bars with, so the
+      child walks the very bars the loop runs on;
+    * the chart-side context state the per-bar path derived each push from — the
+      aggregator's configuration and the chart's own schedule.
+
+    :param window: The run's chart bar window (see :class:`ChartBarWindow`).
+    :param round_decimals: Mintick decimals of the chart's price rounding.
+    :param lossless_volume: The chart feed reads its volume back exactly.
+    :param lossless_prices: The chart feed reads its OHLC back exactly.
+    :param timeframe: The context's timeframe.
+    :param tz: The context's session timezone.
+    :param session_starts: Its intraday session anchoring, or ``None``.
+    :param chart_span_ms: The aggregator's close-instant span (0 disables it).
+    :param chart_off: The chart bar's own span minus one, in ms.
+    :param chart_timeframe: The chart's timeframe, for the bar close rule.
+    :param chart_calendar: The chart's trading schedule, or ``None``.
     """
-    Read one record out of a packed developing-batch plan.
 
-    :param plan: The packed sequence (see :func:`plan_developing_batch`).
-    :param index: Record index, 0-based.
-    :return: ``(kind, period_start, open, high, low, close, volume, tick,
-        sched_next_open)``.
+    window: 'ChartBarWindow'
+    round_decimals: int | None
+    lossless_volume: bool
+    lossless_prices: bool
+    timeframe: str
+    tz: ZoneInfo
+    session_starts: 'list[SymInfoSession] | None'
+    chart_span_ms: int
+    chart_off: int
+    chart_timeframe: str | None
+    chart_calendar: 'BarCalendar | None'
+
+
+def iter_dev_batch_records(spec: DevBatchSpec) -> 'Iterator[tuple]':
+    """Produce the whole historical developing-transport sequence of a context.
+
+    Walks the CHART's bars — from ``spec.window``, the same production the bar
+    loop takes its bars from, cleaned by the same :func:`_clean_bar` the loop
+    publishes through — with a private :class:`HTFAggregator` configured exactly
+    like the runtime one, and yields per bar what ``__sec_signal__``'s
+    ``Lookahead.ON`` branch would have pushed: the one-time prefill target, then
+    the closed step of a period that just completed and the developing step of
+    the period in progress.
+
+    A GENERATOR on purpose: the child consumes each record as it replays it, so
+    the memory this costs is one record and one chart bar rather than the
+    ~72 bytes per chart bar a materialized sequence took in BOTH processes.
+
+    NOTHING is compressed. A period's developing bar is re-pushed on every chart
+    bar inside it, and every one of those pushes is a record: the child rolls a
+    same-period re-tick's ``var`` and function-instance slots back, but not its
+    ``varip`` slots or its ``IBPersistent`` storage, so dropping a re-tick would
+    leave it in a state the per-bar path never reaches.
+
+    :param spec: The context's batch specification.
+    :return: Iterator of ``(kind, period_start, open, high, low, close, volume,
+        tick, sched_next_open)`` records, in push order.
     """
-    return _DEV_BATCH_STRUCT.unpack_from(plan, index * DEV_BATCH_RECORD_SIZE)
+    # Neither can be imported at module level: ``htf_aggregator`` pulls in
+    # ``resampler``, which imports ``lib``, which imports THIS module, and
+    # ``script_runner`` imports ``lib`` too.
+    from .htf_aggregator import HTFAggregator
+    from .script_runner import _clean_bar
+
+    cal = spec.chart_calendar
+    # A private aggregator, same construction as ``setup_security_states``': the
+    # runtime one keeps feeding the per-bar ``new_period`` bookkeeping and must
+    # not see this walk.
+    aggregator = HTFAggregator(
+        spec.timeframe, spec.tz, session_starts=spec.session_starts,
+        chart_span_ms=spec.chart_span_ms)
+    chart_off = spec.chart_off
+    chart_timeframe = spec.chart_timeframe
+    round_decimals = spec.round_decimals
+    lossless_volume = spec.lossless_volume
+    lossless_prices = spec.lossless_prices
+    last_confirmed = 0
+    prefilled = False
+
+    def _bar_records(bar: tuple, next_time: int) -> list[tuple]:
+        """Every record ONE chart bar produces.
+
+        :param bar: The cleaned chart bar ``(open_ms, o, h, l, c, v)``.
+        :param next_time: Open time of the NEXT chart bar, 0 for the last one.
+        :return: The bar's records, in push order.
+        """
+        nonlocal last_confirmed, prefilled
+        bar_time, b_open, b_high, b_low, b_close, b_volume = bar
+        if cal is not None and chart_timeframe:
+            tick = actual_bar_close(bar_time, next_time, cal, chart_timeframe)
+        else:
+            tick = bar_time + chart_off + 1
+        if cal is not None and cal.opening_hours:
+            extended = break_end_after(tick, cal)
+            sched_next_open = 0 if extended == tick else extended
+        else:
+            sched_next_open = 0
+
+        _, dev_bar, closed_bar = aggregator.update(
+            bar_time, b_open, b_high, b_low, b_close, b_volume,
+            chart_confirmed=True)
+
+        out: list[tuple] = []
+        if not prefilled:
+            prefilled = True
+            containing = dev_bar if dev_bar is not None else closed_bar
+            prefill_target = (containing.period_start - 1
+                              if containing is not None else 0)
+            if prefill_target > last_confirmed:
+                last_confirmed = prefill_target
+                out.append((DEV_BATCH_PREFILL, prefill_target,
+                            0.0, 0.0, 0.0, 0.0, 0.0, tick, sched_next_open))
+        if closed_bar is not None:
+            last_confirmed = closed_bar.period_start
+            out.append((DEV_BATCH_CLOSED, closed_bar.period_start,
+                        closed_bar.open, closed_bar.high, closed_bar.low,
+                        closed_bar.close, closed_bar.volume,
+                        tick, sched_next_open))
+        if dev_bar is not None:
+            out.append((DEV_BATCH_DEVELOPING, dev_bar.period_start,
+                        dev_bar.open, dev_bar.high, dev_bar.low,
+                        dev_bar.close, dev_bar.volume,
+                        tick, sched_next_open))
+        return out
+
+    # One bar of lookahead: a bar's round tick is its close instant, which the
+    # trading schedule resolves from the NEXT bar's open time.
+    pending: tuple | None = None
+    for candle in spec.window.bars():
+        o, h, lo, c, v = _clean_bar(candle, round_decimals,
+                                    lossless_volume, lossless_prices)
+        cleaned = (candle.timestamp, o, h, lo, c, v)
+        if pending is not None:
+            for record in _bar_records(pending, cleaned[0]):
+                yield record
+        pending = cleaned
+    if pending is not None:
+        for record in _bar_records(pending, 0):
+            yield record
 
 
 def dev_batch_eligible(state: SecurityState, sec_id: str, *,
@@ -888,107 +1013,35 @@ def dev_batch_eligible(state: SecurityState, sec_id: str, *,
             and not sec_id.startswith('__auto_rate_'))
 
 
-def plan_developing_batch(
-    state: SecurityState,
-    bars: 'list[tuple[int, float, float, float, float, float]]',
-) -> bool:
+def prepare_developing_batch(state: SecurityState, spec: DevBatchSpec,
+                             chart_bar_count: int) -> bool:
     """
-    Plan the whole historical developing-transport sequence of one context.
+    Arm the historical developing batch of one context.
 
-    Walks the CHART's bars once with a private :class:`HTFAggregator` configured
-    exactly like the runtime one and records, per bar, what
-    ``__sec_signal__``'s ``Lookahead.ON`` branch would have pushed: the one-time
-    prefill target, then the closed step of a period that just completed and the
-    developing step of the period in progress — each with that chart bar's round
-    tick and scheduled next session open, the two values ``_launch`` writes into
-    the slot.
+    Only the ROUTING is decided here — the round sequence itself is produced in
+    the child, record by record, from ``spec`` (see
+    :func:`iter_dev_batch_records`). The chart therefore never walks its bars a
+    second time and never holds a plan: what this costs is independent of the
+    chart's length.
 
-    NOTHING is compressed. A period's developing bar is re-pushed on every chart
-    bar inside it, and every one of those pushes is a record: the child rolls a
-    same-period re-tick's ``var`` and function-instance slots back, but not its
-    ``varip`` slots or its ``IBPersistent`` storage, so dropping a re-tick would
-    leave it in a state the per-bar path never reaches.
-
-    :param state: Security context state (its aggregator is left untouched).
-    :param bars: The chart's bars as ``(open_ms, open, high, low, close, volume)``,
-        cleaned exactly as the bar loop hands them to ``lib`` — see
-        :func:`ScriptRunner._chart_bars`.
-    :return: Whether a sequence was planned (``state.dev_batch_plan`` set).
+    :param state: Security context state (nothing of its own is walked).
+    :param spec: The batch specification the child reproduces its rounds from.
+    :param chart_bar_count: Number of chart bars in the run's window.
+    :return: Whether the batch was armed (``state.dev_batch_spec`` set).
     """
-    if not bars:
+    if chart_bar_count <= 0 or not spec.window.to_ts:
         return False
-    # ``htf_aggregator`` cannot be imported at module level: it pulls in
-    # ``resampler``, which imports ``lib``, which imports THIS module.
-    from .htf_aggregator import HTFAggregator
-
-    cal = state.chart_calendar
-    # A private aggregator, same construction as ``setup_security_states``': the
-    # runtime one keeps feeding the per-bar ``new_period`` bookkeeping and must
-    # not see this walk.
-    aggregator = HTFAggregator(
-        state.timeframe, state.tz, session_starts=state.session_starts,
-        chart_span_ms=state.chart_off + 1 if state.chart_off else 0)
-
-    records: list[bytes] = []
-    ticks = array('q')
-    pack = struct.Struct(_DEV_BATCH_RECORD).pack
-    last_confirmed = 0
-    prefilled = False
-    last_period_start = 0
-    n = len(bars)
-    for i in range(n):
-        bar_time, b_open, b_high, b_low, b_close, b_volume = bars[i]
-        next_time = bars[i + 1][0] if i + 1 < n else 0
-        if cal is not None and state.chart_timeframe:
-            tick = actual_bar_close(bar_time, next_time, cal, state.chart_timeframe)
-        else:
-            tick = bar_time + state.chart_off + 1
-        if cal is not None and cal.opening_hours:
-            extended = break_end_after(tick, cal)
-            sched_next_open = 0 if extended == tick else extended
-        else:
-            sched_next_open = 0
-        ticks.append(tick)
-
-        _, dev_bar, closed_bar = aggregator.update(
-            bar_time, b_open, b_high, b_low, b_close, b_volume,
-            chart_confirmed=True)
-
-        if not prefilled:
-            prefilled = True
-            containing = dev_bar if dev_bar is not None else closed_bar
-            prefill_target = (containing.period_start - 1
-                              if containing is not None else 0)
-            if prefill_target > last_confirmed:
-                last_confirmed = prefill_target
-                records.append(pack(DEV_BATCH_PREFILL, prefill_target,
-                                    0.0, 0.0, 0.0, 0.0, 0.0, tick, sched_next_open))
-        if closed_bar is not None:
-            last_confirmed = closed_bar.period_start
-            last_period_start = closed_bar.period_start
-            records.append(pack(DEV_BATCH_CLOSED, closed_bar.period_start,
-                                closed_bar.open, closed_bar.high, closed_bar.low,
-                                closed_bar.close, closed_bar.volume,
-                                tick, sched_next_open))
-        if dev_bar is not None:
-            last_period_start = dev_bar.period_start
-            records.append(pack(DEV_BATCH_DEVELOPING, dev_bar.period_start,
-                                dev_bar.open, dev_bar.high, dev_bar.low,
-                                dev_bar.close, dev_bar.volume,
-                                tick, sched_next_open))
-
-    if not records:
-        return False
-    state.dev_batch_plan = b''.join(records)
-    state.dev_batch_ticks = ticks
-    state.dev_batch_bar = 0
+    state.dev_batch_spec = spec
     # ``batch_target`` is what routes the read through the ring and joins the
-    # cold group start; for this shape it is the last period the child reaches.
-    state.batch_target = last_period_start
-    # Pre-size the ring to the run-ahead bound rather than to the whole plan:
-    # the child never holds more live entries than that, and the GC compacts
-    # below the chart's watermark.
-    state.batch_capacity = min(len(records), RING_RUNAHEAD_ENTRIES * 2)
+    # cold group start. The child's replay carries the target of every one of
+    # its rounds in the record itself, so what the slot holds only has to be an
+    # instant no planned period start can exceed: the window's own end.
+    state.batch_target = spec.window.to_ts or 0
+    # Pre-size the ring to the run-ahead bound rather than to the whole
+    # sequence: the child never holds more live entries than that, and the GC
+    # compacts below the chart's watermark. At most one prefill plus a closed
+    # and a developing record per chart bar can exist.
+    state.batch_capacity = min(2 * chart_bar_count + 1, RING_RUNAHEAD_ENTRIES * 2)
     state.batch_arena = state.batch_capacity * _BATCH_ARENA_PER_ENTRY
     return True
 
@@ -1430,7 +1483,7 @@ def create_chart_protocol(
         while not reader.wait_for_close(asof, state.stop_event,
                                         timeout=_LIVENESS_POLL_SECONDS,
                                         watermark_index=chart_wm_index,
-                                        spin=state.dev_batch_plan is not None):
+                                        spin=state.dev_batch_spec is not None):
             # Only a dead producer can keep this from being satisfied: its next
             # unpublished bar closes above the chart's as-of, so publishing it
             # raises the frontier past this instant.
@@ -1450,7 +1503,31 @@ def create_chart_protocol(
                     f"(exit code: {proc.exitcode})"
                 )
         entry = reader.last_close_at_or_before(asof)
-        return default if entry is None else entry[2]
+        if entry is None:
+            return default
+        if (state.dev_batch_spec is not None
+                and entry[1] <= state.batch_prev_asof):
+            # Every entry a developing batch publishes for ONE chart bar closes
+            # inside that bar's own window — after the previous bar's as-of and
+            # at or before this one's. A developing record closes exactly at the
+            # round tick; a record closing a security period carries that
+            # period's own scheduled close, which is later than the previous
+            # chart tick but can fall BEFORE this one when the two grids do not
+            # align (a 60-minute context on a 45-minute chart completes the
+            # hourly period at 01:00 on the bar ticking at 01:30). The child
+            # reproduces the chart's bars from the same window and the same
+            # cleaning the bar loop publishes them with, so the sequences are
+            # the same by construction; if they were not, pairing would silently
+            # answer with an EARLIER bar's value instead of failing. O(1), and
+            # it covers every bar rather than only the ticks a pre-walked plan
+            # could have been compared against.
+            raise RuntimeError(
+                f"security context '{sec_id}': the developing batch published "
+                f"no round in ({state.batch_prev_asof}, {asof}] "
+                f"(nearest close {entry[1]}) — the child's chart bar stream "
+                f"diverged from the bar loop's"
+            )
+        return entry[2]
 
     def __sec_signal__(sec_id: str, symbol: str | None = None,
                        timeframe: str | None = None, lookahead=None,
@@ -1683,31 +1760,17 @@ def create_chart_protocol(
                 chart_confirmed=bool(lib.barstate.isconfirmed),
             )
 
-            if state.dev_batch_plan is not None:
-                # Historical DEVELOPING batch: the child replays the whole
-                # planned round sequence while the chart walks its bars, and
+            if state.dev_batch_spec is not None:
+                # Historical DEVELOPING batch: the child produces and replays
+                # its whole round sequence while the chart walks its bars, and
                 # ``__sec_read__`` pairs each bar's value out of the ring by
                 # as-of. Nothing is pushed and nothing is launched per bar; the
                 # aggregator ran above only for the ``new_period`` bookkeeping
                 # (which chart bar opens a fresh security period, the ``gaps_on``
                 # na/value selection), and the as-of the read pairs with is this
-                # chart bar's own round tick — exactly the close the planned
-                # developing record of this bar carries.
-                ticks = state.dev_batch_ticks
-                assert ticks is not None
-                bar_no = state.dev_batch_bar
-                state.dev_batch_bar = bar_no + 1
-                if bar_no >= len(ticks) or ticks[bar_no] != round_state['tick']:
-                    # The plan walked the chart's bars from the same source the
-                    # bar loop takes them from, so the tick sequences are the
-                    # same by construction. If they are not, the ring holds no
-                    # entry closing at this instant and pairing would answer
-                    # with an EARLIER bar's value instead of failing.
-                    raise RuntimeError(
-                        f"security context '{sec_id}': the planned developing "
-                        f"batch does not match the chart's bar stream at bar "
-                        f"{bar_no}"
-                    )
+                # chart bar's own round tick — exactly the close the developing
+                # record of this bar carries.
+                state.batch_prev_asof = state.batch_asof
                 state.batch_asof = round_state['tick']
                 # The per-bar path sets ``new_period`` True whenever a developing
                 # step goes out, and otherwise from whether a period just closed.

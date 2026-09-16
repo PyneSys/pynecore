@@ -21,8 +21,8 @@ from pynecore.core.ohlcv_legacy import OHLCVReader as _LegacyOHLCVReader
 from pynecore.core.syminfo import SymInfoInterval
 from pynecore.types.ohlcv import OHLCV
 
-__all__ = ["OHLCVWriter", "OHLCVReader", "parse_timezone_name", "record_count",
-           "restore_f32_volume"]
+__all__ = ["OHLCVWriter", "OHLCVReader", "ChartBarWindow", "parse_timezone_name",
+           "record_count", "restore_f32_volume"]
 
 _MAGIC = b"\x89PYN\r\n\x1a\n"
 _VERSION_MAJOR = 2
@@ -2953,3 +2953,43 @@ class OHLCVReader:
         :param as_datetime: Emit UTC datetimes instead of millisecond timestamps.
         """
         self._reader.save_to_json(str(path), as_datetime)
+
+
+class ChartBarWindow:
+    """One window over a static OHLCV file, and the ONE production of its bars.
+
+    The chart's bar stream of a run is defined by this object and produced ONLY
+    by :meth:`bars`. Everything that has to walk exactly the bars the script
+    runs on — the bar loop itself, and the ``lookahead_on`` higher-timeframe
+    security plan a child process replays (see
+    :func:`pynecore.core.security.iter_dev_batch_records`) — calls that method
+    instead of re-deriving a stream of its own, so the two walks are the same
+    production by construction. Each call opens its own reader, so the walks are
+    independent and may run in different processes.
+
+    Picklable on purpose: a security child process receives the window in its
+    spawn arguments and reproduces the chart's bars from it.
+
+    :param path: Source OHLCV file path.
+    :param from_ts: Inclusive lower bound of the window, in milliseconds.
+    :param to_ts: Inclusive upper bound, or ``None`` for the file end.
+    """
+
+    __slots__ = ("path", "from_ts", "to_ts")
+
+    def __init__(self, path: str | Path, from_ts: int, to_ts: int | None = None):
+        self.path = str(path)
+        self.from_ts = from_ts
+        self.to_ts = to_ts
+
+    def bars(self) -> Iterator[OHLCV]:
+        """Iterate the window's bars, closing the reader on every exit path.
+
+        :return: Iterator over the window's OHLCV records.
+        """
+        reader = OHLCVReader(self.path)
+        reader.open()
+        try:
+            yield from reader.read_from(self.from_ts, self.to_ts)
+        finally:
+            reader.close()

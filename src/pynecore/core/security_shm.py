@@ -61,8 +61,15 @@ if TYPE_CHECKING:
 #                       break that contains round_tick (0 = round_tick is inside an open
 #                       session, or the symbol trades 24h)
 #   offset 120: int64   rounds_done     (8 bytes) — rounds finished by the child
+#   offset 128: int64   parked_until    (8 bytes) — 0 when this producer is
+#                       running; otherwise the consumer watermark it is parked
+#                       waiting for (the batch run-ahead bound). A consumer that
+#                       parks its own watermark notifies the producer's ring
+#                       condition ONLY when this says the notify can release it
+#                       — see ``RingReader.wait_for_close`` and the developing
+#                       batch's throttle.
 #
-# Total per slot: 128 bytes.
+# Total per slot: 136 bytes.
 #
 # The slots are followed by an (N+1)×N int64 watermark matrix (row = consumer
 # slot index, column = producer slot index): the oldest instant a consumer may
@@ -75,7 +82,7 @@ if TYPE_CHECKING:
 # of its own, so it parks its watermark in that row (see
 # :meth:`SyncBlock.chart_index`).
 SLOT_FORMAT = '<IIqH'
-SLOT_SIZE = 128
+SLOT_SIZE = 136
 SLOT_DATA_SIZE = struct.calcsize(SLOT_FORMAT)  # 18 bytes — original fields only
 _FRONTIER_OFFSET = 0
 _RESULT_META_OFFSET = 8
@@ -89,6 +96,7 @@ _RING_USED_OFFSET = 100
 _ROUND_TICK_OFFSET = 104
 _ROUND_SCHED_NEXT_OPEN_OFFSET = 112
 _ROUNDS_DONE_OFFSET = 120
+_PARKED_UNTIL_OFFSET = 128
 
 _WATERMARK_ITEM_SIZE = 8
 
@@ -255,6 +263,12 @@ class SyncBlock:
     def _set_i32(self, sec_id: str, field_offset: int, value: int) -> None:
         struct.pack_into('<i', self._buf, self._offset(sec_id) + field_offset, value)
 
+    def _get_i64(self, sec_id: str, field_offset: int) -> int:
+        return struct.unpack_from('<q', self._buf, self._offset(sec_id) + field_offset)[0]
+
+    def _set_i64(self, sec_id: str, field_offset: int, value: int) -> None:
+        struct.pack_into('<q', self._buf, self._offset(sec_id) + field_offset, value)
+
     def get_slot(self, sec_id: str) -> tuple[int, int, int, int]:
         """
         Read a slot's core fields.
@@ -340,6 +354,30 @@ class SyncBlock:
     def get_ring_count(self, sec_id: str) -> int:
         """Read the number of live ring entries."""
         return self._get_i32(sec_id, _RING_COUNT_OFFSET)
+
+    def set_parked_until(self, sec_id: str, watermark: int) -> None:
+        """Publish the consumer watermark this producer is parked waiting for.
+
+        Written by the producer with the ring condition HELD, before its last
+        look at that watermark. A consumer that parks its own watermark after
+        that read is therefore guaranteed to see this value and to notify (see
+        :meth:`RingReader.wait_for_close`), so the handoff has no lost wake-up
+        in either direction — and a consumer whose watermark has not reached it
+        yet does not wake a producer that could not proceed anyway.
+
+        :param sec_id: The producer's context id.
+        :param watermark: The instant its wait needs the watermark to reach;
+            0 means the producer is running.
+        """
+        self._set_i64(sec_id, _PARKED_UNTIL_OFFSET, watermark)
+
+    def get_parked_until(self, sec_id: str) -> int:
+        """Read what this producer is parked waiting for.
+
+        :param sec_id: The producer's context id.
+        :return: The consumer watermark that would release it, 0 if it is running.
+        """
+        return self._get_i64(sec_id, _PARKED_UNTIL_OFFSET)
 
     def get_ring_head(self, sec_id: str) -> int:
         """Read the index of the first live ring entry."""
@@ -681,12 +719,20 @@ INITIAL_RING_ARENA = 8192
 
 # How many entries a BATCH producer may hold ahead of its consumer's watermark
 # before it waits. A batch round runs ahead of the chart on purpose, so this is
-# generous; it only stops a million-bar plan from holding a million live
-# entries. It is also what decides when a consumer bothers to wake the producer
-# after parking its watermark (see :meth:`RingReader.wait_for_close`) — below
-# half of it no producer can be parked, and the extra condition acquire is pure
-# cost on a hot path.
+# generous; it only stops a million-bar sequence from holding a million live
+# entries.
 RING_RUNAHEAD_ENTRIES = 4096
+
+# Where a producer that hit the bound resumes: it waits until its run-ahead has
+# fallen to this, rather than to one entry below the bound. Without the
+# hysteresis a bounded producer re-parks after EVERY record, and each of the
+# consumer's per-bar watermark notifications wakes a producer that immediately
+# parks again — a cross-process condition handoff per context per chart bar,
+# which is the very cost a batch round exists to avoid (MEASURED on a 5757-bar
+# 9-context ``lookahead_on`` script: 1661 parks per child, 78 s of an 87 s run,
+# woken by a notify and draining 0.5 entries each time). One park per half the
+# bound instead of one per bar makes the bound cost nothing at all.
+RING_RESUME_ENTRIES = RING_RUNAHEAD_ENTRIES // 2
 
 # Lock-free frontier reads a consumer makes before it parks on the producer's
 # condition (see :meth:`RingReader.wait_for_close`). One read is an
@@ -1220,13 +1266,19 @@ class RingReader:
         if watermark_index is not None:
             self._sync.set_watermark(
                 watermark_index, self._sync.index_of(self._sec_id), ms)
-            if self._sync.get_ring_count(self._sec_id) >= RING_RUNAHEAD_ENTRIES // 2:
+            parked_until = self._sync.get_parked_until(self._sec_id)
+            if parked_until and ms >= parked_until:
                 # The watermark is also how far the consumer has READ, which is
                 # what bounds a batch producer's run-ahead — and a producer
-                # parked on that bound is woken by nothing else. Only worth the
-                # condition acquire once the ring is deep enough for one to be
-                # parked: MEASURED on a 9-context ``lookahead_on`` batch,
-                # notifying on every read cost ~1 s of pure semaphore traffic.
+                # parked on that bound is woken by nothing else. It publishes
+                # the watermark it is waiting for with this condition held,
+                # before its last read of the value just written above, so a
+                # producer that parks is always notified, and one that cannot
+                # proceed yet is never woken for nothing: MEASURED on a
+                # 9-context ``lookahead_on`` batch, acquiring the condition on
+                # every read cost ~1 s of pure semaphore traffic, and on a
+                # 5757-bar one, waking the parked producers once per chart bar
+                # cost 78 s of an 87 s run.
                 with self._cond:
                     self._cond.notify_all()
         if self.frontier_close() >= ms:

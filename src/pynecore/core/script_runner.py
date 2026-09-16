@@ -21,7 +21,7 @@ from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.csv_file import CSVWriter
 from pynecore.core.drawing_snapshot import DrawingSnapshot
 from pynecore.core.lookahead import ALLOW_LOOKAHEAD
-from pynecore.core.ohlcv import OHLCVReader, restore_f32_volume
+from pynecore.core.ohlcv import ChartBarWindow, OHLCVReader, restore_f32_volume
 from pynecore.core.script_timeframe import ScriptTimeframe
 from pynecore.core.strategy_stats import calculate_strategy_statistics, write_strategy_statistics_csv
 from pynecore.core import viz
@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from pynecore.core.broker.sync_engine import OrderSyncEngine
     from pynecore.core.broker.storage import RunContext
     from pynecore.core.broker.models import ScriptRequirements
+    from pynecore.core.security import DevBatchSpec
     from pynecore.core.symbol_map import MappedSymbol
 
 __all__ = [
@@ -272,9 +273,10 @@ def _clean_bar(ohlcv: OHLCV, round_decimals: int | None,
 
     The ONE place the feed's float32 storage artifacts are cleaned off a chart
     bar: :func:`_set_lib_properties` publishes what this returns, and anything
-    else that has to reproduce the chart's own bar values — the developing-batch
-    pre-walk in :meth:`ScriptRunner._chart_bars` — asks the same function rather
-    than re-deriving them.
+    else that has to reproduce the chart's own bar values — a security child
+    replaying a developing batch, see
+    :func:`pynecore.core.security.iter_dev_batch_records` — asks the same
+    function rather than re-deriving them.
 
     :param ohlcv: The raw bar as the feed read it.
     :param round_decimals: Mintick decimals for :func:`_round_price`.
@@ -781,7 +783,7 @@ class ScriptRunner:
                  '_broker_store_ctx', '_log_ohlcv', '_price_decimals',
                  '_round_decimals', '_lossless_volume', '_lossless_prices',
                  '_config_dir', '_symbol_map', '_script_timeframe',
-                 '_chart_bar_source', '_chart_bars_cache',
+                 '_chart_bar_window',
                  'broker_balance', '_sim_logged_open_ids')
 
     # noinspection PyProtectedMember
@@ -805,23 +807,22 @@ class ScriptRunner:
                  chart_data_path: Path | None = None,
                  lossless_volume: bool = False,
                  lossless_prices: bool = False,
-                 chart_bar_source: 'Callable[[], Iterable[OHLCV]] | None' = None,
+                 chart_bar_window: 'ChartBarWindow | None' = None,
                  config_dir: Path | None = None):
         """
         Initialize the script runner
 
         :param script_path: The path to the script to run
         :param ohlcv_iter: Iterator of OHLCV data
-        :param chart_bar_source: Factory returning a FRESH iterator over exactly
-                                 the same chart bars as ``ohlcv_iter`` — the
-                                 caller's own window over its static feed. The
-                                 bar loop takes its bars from it (see
-                                 :meth:`_chart_bar_iterator`), which is what lets
-                                 a ``lookahead_on`` higher-timeframe security
-                                 context plan its whole historical round sequence
-                                 by walking the same stream up front. ``None``
-                                 keeps ``ohlcv_iter`` as the only source and
-                                 disables that plan.
+        :param chart_bar_window: The window ``ohlcv_iter`` was produced from
+                                 (:class:`ChartBarWindow`), when it was — the
+                                 caller's own window over its static feed. A
+                                 ``lookahead_on`` higher-timeframe security
+                                 context hands it to its child process, which
+                                 reproduces the chart's bars from it to replay
+                                 its whole historical round sequence while
+                                 running ahead of the chart. ``None`` disables
+                                 that.
         :param syminfo: Symbol information
         :param plot_path: Path to save the plot data
         :param strat_path: Path to save the strategy results
@@ -885,8 +886,7 @@ class ScriptRunner:
         self._security_data = security_data or {}
         self._magnifier_iter = magnifier_iter
         self._magnifier_source_tf = magnifier_source_tf
-        self._chart_bar_source = chart_bar_source
-        self._chart_bars_cache: 'list[tuple[int, float, float, float, float, float]] | None' = None
+        self._chart_bar_window = chart_bar_window
         self._log_ohlcv = log_ohlcv
         # Chart provider hooks — used in live mode by ``_resolve_security_data``
         # to translate Pine-style cross-symbol security keys to plugin-native
@@ -1419,52 +1419,34 @@ class ScriptRunner:
             return None
         return cast('OrderSyncEngine', self._order_sync_engine).exchange_position
 
-    # noinspection PyProtectedMember
-    def _chart_bar_iterator(self) -> 'Iterator[OHLCV]':
-        """The bar loop's own chart bar stream — the ONE place it comes from.
+    def _dev_batch_spec(self, sec_state) -> 'DevBatchSpec':
+        """What a context's child needs to reproduce its developing-batch rounds.
 
-        With a ``chart_bar_source`` factory the stream is taken from it rather
-        than from the single-shot ``ohlcv_iter``, so that the developing-batch
-        pre-walk (:meth:`_chart_bars`) and the loop are literally the same
-        production, and identity between the bars a security context is PLANNED
-        against and the bars it is RUN against holds by construction.
+        The chart's half is its bar window and the cleaning parameters the bar
+        loop publishes its bars with, so the child walks exactly the bars the
+        loop runs on: the same window object ``ohlcv_iter`` was produced from,
+        the same :func:`_clean_bar` arguments :func:`_set_lib_properties` uses.
+        The context's half is what the per-bar path derived each push from — the
+        aggregator's own configuration and the chart's schedule.
 
-        The factory is bypassed wherever something else owns the stream: the bar
-        magnifier replaces ``ohlcv_iter`` with its aggregated output, and live
-        mode chains the provider's updates onto it. Both also make a
-        developing batch ineligible, so the pre-walk never runs against a
-        stream the loop does not use.
-
-        :return: Iterator over the chart's bars.
+        :param sec_state: The context's state, after ``load_htf_bar_opens``.
+        :return: The spec to hand to the child.
         """
-        if self._chart_bar_source is not None and self._magnifier_iter is None:
-            # noinspection PyProtectedMember
-            from .. import lib
-            if not lib._is_live:
-                return iter(self._chart_bar_source())
-        return iter(self.ohlcv_iter)
-
-    def _chart_bars(self) -> 'list[tuple[int, float, float, float, float, float]]':
-        """The chart's bars as the script sees them, for a batch pre-walk.
-
-        ``(open_ms, open, high, low, close, volume)`` per bar, cleaned by
-        :func:`_clean_bar` — the same function :func:`_set_lib_properties`
-        publishes from — and read from :meth:`_chart_bar_iterator`, the same
-        production the bar loop uses. Cached: every eligible security context
-        walks the same list.
-
-        :return: One tuple per chart bar, in bar order.
-        """
-        cached = self._chart_bars_cache
-        if cached is not None:
-            return cached
-        bars: list[tuple[int, float, float, float, float, float]] = []
-        for candle in self._chart_bar_iterator():
-            o, h, lo, c, v = _clean_bar(candle, self._round_decimals,
-                                        self._lossless_volume, self._lossless_prices)
-            bars.append((candle.timestamp, o, h, lo, c, v))
-        self._chart_bars_cache = bars
-        return bars
+        from .security import DevBatchSpec
+        assert self._chart_bar_window is not None
+        return DevBatchSpec(
+            window=self._chart_bar_window,
+            round_decimals=self._round_decimals,
+            lossless_volume=self._lossless_volume,
+            lossless_prices=self._lossless_prices,
+            timeframe=sec_state.timeframe,
+            tz=sec_state.tz,
+            session_starts=sec_state.session_starts,
+            chart_span_ms=sec_state.chart_off + 1 if sec_state.chart_off else 0,
+            chart_off=sec_state.chart_off,
+            chart_timeframe=sec_state.chart_timeframe,
+            chart_calendar=sec_state.chart_calendar,
+        )
 
     def run_iter(self, on_progress: Callable[[datetime], None] | None = None,
                  on_tick: Callable[[OHLCV], None] | None = None) \
@@ -1736,7 +1718,7 @@ class ScriptRunner:
                     inject_protocol, cleanup_shared_memory, Lookahead,
                     load_htf_bar_opens, load_ltf_first_ms, watch_security_child,
                     batch_eligible, plan_historical_batch,
-                    dev_batch_eligible, plan_developing_batch,
+                    dev_batch_eligible, prepare_developing_batch,
                 )
                 from .security_shm import create_ring_conditions
                 from .security_process import security_process_main
@@ -1956,24 +1938,24 @@ class ScriptRunner:
                 # per-bar transports over from where history ended.
                 _batch_allowed = (not lib._is_live) and self.last_bar_time is not None
 
-                # A DEVELOPING batch additionally needs the chart's bar stream to
-                # be re-walkable and to be exactly what the loop runs: the
-                # pre-walk reproduces every push the per-bar path would make from
-                # those bars. The bar magnifier (which replaces the stream with
-                # its aggregate) and live mode are already excluded by the
-                # factory guard in ``_chart_bar_iterator``; a script-level
-                # timeframe runs ``main()`` once per HTF bar rather than per
-                # chart bar, and ``calc_bars_count`` skips a prefix of them
-                # entirely — in both cases the signals the loop emits are not
-                # this stream's bars. ``calc_on_order_fills`` and
-                # ``calc_on_every_history_tick`` run the body again inside one
-                # historical candle, with the bar built up to a path node: the
-                # plan holds ONE round per chart bar, so a re-execution would
-                # consume the next bar's round and read a value computed from
-                # the completed candle.
+                # A DEVELOPING batch additionally needs the chart's bar stream
+                # to be re-walkable and to be exactly what the loop runs: the
+                # child reproduces every push the per-bar path would make from
+                # those bars, out of the window ``ohlcv_iter`` itself came from.
+                # The bar magnifier replaces the stream with its aggregate, so
+                # the window no longer describes the loop's bars; live mode is
+                # excluded by ``_batch_allowed``. A script-level timeframe runs
+                # ``main()`` once per HTF bar rather than per chart bar, and
+                # ``calc_bars_count`` skips a prefix of them entirely — in both
+                # cases the signals the loop emits are not this stream's bars.
+                # ``calc_on_order_fills`` and ``calc_on_every_history_tick`` run
+                # the body again inside one historical candle, with the bar built
+                # up to a path node: the sequence holds ONE round per chart bar,
+                # so a re-execution would consume the next bar's round and read a
+                # value computed from the completed candle.
                 _dev_batch_allowed = (
                     _batch_allowed
-                    and self._chart_bar_source is not None
+                    and self._chart_bar_window is not None
                     and self._magnifier_iter is None
                     and stf is None
                     and not (getattr(self.script, 'calc_bars_count', 0) or 0)
@@ -2005,7 +1987,7 @@ class ScriptRunner:
                     :param sid: The context's id.
                     :param data_source: Its resolved OHLCV path or PluginSymbol.
                     :return: ``(data_source, chart_ring_capacity,
-                        chart_ring_arena, dev_batch_plan)``.
+                        chart_ring_arena, dev_batch_spec)``.
                     """
                     prepared = _sec_prepared.get(sid)
                     if prepared is not None:
@@ -2061,12 +2043,14 @@ class ScriptRunner:
                                 and dev_batch_eligible(
                                     sec_state, sid, is_live=lib._is_live,
                                     has_consumers=bool(sec_consumers.get(sid)))
-                                and plan_developing_batch(sec_state,
-                                                          self._chart_bars())):
+                                and prepare_developing_batch(
+                                    sec_state, self._dev_batch_spec(sec_state),
+                                    int(self.last_bar_index) + 1)):
                             # Historical DEVELOPING batch: the chart's own bars
                             # decide every push this context would have received,
-                            # so the whole sequence is planned here and the child
-                            # replays it while running ahead of the chart.
+                            # so the child reproduces the whole sequence from the
+                            # chart's own bar window and replays it while running
+                            # ahead of the chart.
                             _chart_ring_capacity = sec_state.batch_capacity
                             _chart_ring_arena = sec_state.batch_arena
                     elif sec_state.is_ltf:
@@ -2076,7 +2060,7 @@ class ScriptRunner:
                         # round (warmup replay and live alike).
                         sec_state.ltf_live_stream = True
                     prepared = (data_source, _chart_ring_capacity, _chart_ring_arena,
-                                sec_state.dev_batch_plan)
+                                sec_state.dev_batch_spec)
                     _sec_prepared[sid] = prepared
                     return prepared
 
@@ -2084,7 +2068,7 @@ class ScriptRunner:
                     """Start this context's child process (preparing it first)."""
                     sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
                     (data_source, _chart_ring_capacity, _chart_ring_arena,
-                     _dev_batch_plan) = _prepare_security_context(sid, data_source)
+                     _dev_batch_spec) = _prepare_security_context(sid, data_source)
                     # Plain-OHLCV fast path: a context whose expression is only
                     # raw price series is served straight from each bar in the
                     # child, skipping the per-bar main() re-run (SecurityTransformer
@@ -2121,7 +2105,7 @@ class ScriptRunner:
                             _registry_child_conn,
                             _chart_ring_capacity,
                             _chart_ring_arena,
-                            _dev_batch_plan,
+                            _dev_batch_spec,
                         ),
                         daemon=True,
                     )
@@ -2743,7 +2727,7 @@ class ScriptRunner:
 
             # --- Peek-ahead pattern: historical bars ---
             # LIVE_TRANSITION doubles as end-of-data sentinel → next() always returns OHLCV
-            ohlcv_iterator = self._chart_bar_iterator()
+            ohlcv_iterator = iter(self.ohlcv_iter)
             next_item = next(ohlcv_iterator, LIVE_TRANSITION)
             first_live_update: OHLCV | None = None
             # Tracks the last warmup-bar timestamp so the live loop can tell
