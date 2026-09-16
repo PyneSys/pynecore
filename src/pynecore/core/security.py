@@ -1087,6 +1087,7 @@ def create_chart_protocol(
     lazy_spawn_fn: 'Callable[[str], None] | None' = None,
     same_context_ids: 'set[str] | frozenset[str]' = frozenset(),
     no_process_ids: 'set[str] | frozenset[str]' = frozenset(),
+    unresolved_ids: 'set[str] | frozenset[str]' = frozenset(),
     result_blocks: dict[str, ResultBlock] | None = None,
     currency_conversions: dict[str, tuple[str, str]] | None = None,
     sec_processes: 'dict[str, BaseProcess] | None' = None,
@@ -1115,6 +1116,11 @@ def create_chart_protocol(
                              These are handled directly by the chart (no separate process).
     :param no_process_ids: Security IDs that have no process (same-context + ignored).
                            Signal/wait are skipped for these.
+    :param unresolved_ids: Security IDs whose symbol or timeframe is only known
+                           once their own ``__sec_signal__`` runs. Captured by
+                           reference: the resolver removes each id as it resolves
+                           it. Such a context cannot be started before that
+                           signal (see ``_start``).
     :param result_blocks: Result blocks for writing same-context values to shared memory.
     :param currency_conversions: Maps sec_id → (from_currency, to_currency) for auto-conversion.
     :param sec_processes: Live ``sec_id → Process`` map. Captured by reference, so
@@ -1149,6 +1155,9 @@ def create_chart_protocol(
     }
 
     resolved: set[str] = set()
+    # Producers a started consumer needs but that were still unresolved at the
+    # time (see ``_start``): each starts at its own first signal instead.
+    start_on_resolve: set[str] = set()
     # Whether the cold group start has run (see ``_start``). One flag for the
     # whole run: after it, every always-read batched context is running.
     cold_batch_start = [False]
@@ -1313,7 +1322,9 @@ def create_chart_protocol(
         ``depends`` out of that sid's ring and waits on its frontier, so a
         producer must be running — and launched for this bar — before the
         consumer's child exists. ``started`` is set before the recursion, so two
-        contexts reading each other cannot recurse forever.
+        contexts reading each other cannot recurse forever. A producer whose
+        symbol or timeframe is still unresolved is the exception: it starts at
+        its own first signal, once there is something to spawn.
 
         A CONSUMER of this context is deliberately NOT started: a consumer that
         is never read stays unstarted and keeps its watermark at zero, which
@@ -1335,8 +1346,17 @@ def create_chart_protocol(
         state.started = True
         for producer_id in state.depends:
             producer = states.get(producer_id)
-            if producer is not None and not producer.started:
-                _start(producer_id, producer)
+            if producer is None or producer.started:
+                continue
+            if producer_id in unresolved_ids:
+                # Its symbol or timeframe only exists once its own signal runs,
+                # so there is nothing to spawn yet. Marking it started here would
+                # skip it for good; its signal starts it instead. The consumer's
+                # child waits for the producer's registry record meanwhile, which
+                # the chart sends at that same signal.
+                start_on_resolve.add(producer_id)
+                continue
+            _start(producer_id, producer)
         if sec_id in no_process_ids:
             # Chart-served (same symbol+timeframe) or ignored: no child, no
             # round — the inline write/read path answers it.
@@ -1566,6 +1586,12 @@ def create_chart_protocol(
                 _ensure_chart_writer(sec_id)
             if prepare_fn is not None:
                 prepare_fn(sec_id)
+            if sec_id in start_on_resolve:
+                # A consumer started before this producer could be: start it
+                # now, the round below goes straight to its child.
+                start_on_resolve.discard(sec_id)
+                if not state.started:
+                    _start(sec_id, state, run_pending=False)
 
         # No-process contexts (same-context, ignored): skip advance/wait
         if sec_id in no_process_ids:
@@ -2229,6 +2255,10 @@ class SecurityChildContext:
         a developing run, which is as far as such a run publishes.
     :ivar is_round_last: Whether this is the round's last bar, i.e. the chart
         may be released as soon as the value is written.
+    :ivar released: Whether the current step has already released the chart.
+        A step releases it exactly once — at its last write, or at its end when
+        no write did. A second wake-up would land after the chart has launched
+        its NEXT step and answer that step's wait with this step's value.
     :ivar developing: Whether this run is a developing (unconfirmed) one. Such a
         run appends at the round's fixed tick instead of a scheduled close, and
         takes that same tick as its own as-of base — the scheduled close lies in
@@ -2241,13 +2271,14 @@ class SecurityChildContext:
     """
 
     __slots__ = ('bar_open', 'bar_close', 'frontier', 'is_round_last',
-                 'developing', 'round_tick', 'round_sched_next_open')
+                 'released', 'developing', 'round_tick', 'round_sched_next_open')
 
     def __init__(self) -> None:
         self.bar_open = 0
         self.bar_close = 0
         self.frontier = 0
         self.is_round_last = False
+        self.released = False
         self.developing = False
         self.round_tick = 0
         self.round_sched_next_open = 0
@@ -2570,7 +2601,9 @@ def create_security_protocol(
                 close_ms = ctx.round_tick if ctx.developing else ctx.bar_close
                 writer.append(ctx.bar_open, close_ms, value,
                               consumer_indexes, ctx.frontier)
-            if ctx.is_round_last and data_ready_event is not None:
+            if (ctx.is_round_last and not ctx.released
+                    and data_ready_event is not None):
+                ctx.released = True
                 data_ready_event.set()
 
         flush = None

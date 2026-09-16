@@ -1134,6 +1134,140 @@ def main():
     log.info("fallback to all earlier sids OK")
 
 
+def __test_depends_field_only_class_is_modelled__(log):
+    """A Pine ``type`` — a class of field declarations — keeps the analysis
+    precise: its body runs at import, before any security value exists."""
+    source = """
+from pynecore import lib
+
+@udt
+class Level:
+    top: float = lib.na(float)
+    bot: float = lib.na(float)
+
+LENGTH = 9
+
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.ta.ema(lib.close, LENGTH))
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.ta.ema(lib.high, LENGTH))
+    lvl = Level(top=a, bot=b)
+    lib.plot(lvl.top)
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['depends'] == []
+    assert meta['W']['depends'] == []
+    log.info("field-only class keeps the dependencies precise")
+
+
+def __test_depends_compiler_field_factory_is_modelled__(log):
+    """A bool field default lowered to ``field(default_factory=lambda: ...)``
+    reading only the lowering's reserved helper keeps the class a record."""
+    source = """
+from pynecore import lib
+from dataclasses import field as __pyne_field·__
+from pynecore.types.na import new_bool_na as __pyne_bool_na·__
+
+@udt
+class Flag:
+    on: bool = __pyne_field·__(default_factory=lambda: __pyne_bool_na·__())
+
+LENGTH = 9
+
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.ta.ema(lib.close, LENGTH))
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.ta.ema(lib.high, LENGTH))
+    lib.plot(a + b)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == []
+    log.info("compiler field factory keeps the dependencies precise")
+
+
+def __test_depends_factory_reading_a_script_name_falls_back__(log):
+    """A factory lambda reading a name the script can bind stays unmodelled."""
+    source = """
+from pynecore import lib
+from dataclasses import field as __pyne_field·__
+
+@udt
+class Flag:
+    on: float = __pyne_field·__(default_factory=lambda: LENGTH)
+
+LENGTH = 9
+
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.ta.ema(lib.close, LENGTH))
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.ta.ema(lib.high, LENGTH))
+    lib.plot(a + b)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("factory reading a script name falls back")
+
+
+def __test_depends_field_only_class_still_carries_instance_taint__(log):
+    """A value stored into an instance field flows on through that instance."""
+    source = """
+from pynecore import lib
+
+@udt
+class Level:
+    top: float = lib.na(float)
+
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    lvl = Level(top=a)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lvl.top)
+    lib.plot(b)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("instance field taint flows OK")
+
+
+def __test_depends_class_with_a_method_falls_back__(log):
+    """A class body with anything but field declarations stays unmodelled."""
+    source = """
+from pynecore import lib
+
+class Box:
+    top: float = 0.0
+
+    def grow(self, v):
+        self.top = v
+
+LENGTH = 9
+
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.ta.ema(lib.close, LENGTH))
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.ta.ema(lib.high, LENGTH))
+    lib.plot(a + b)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("class with a method falls back OK")
+
+
+def __test_depends_local_class_falls_back__(log):
+    """A class defined inside a function runs with it, so its field defaults can
+    read security values: it stays unmodelled."""
+    source = """
+from pynecore import lib
+
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+
+    class Box:
+        value = a
+
+    b = lib.request.security(lib.syminfo.tickerid, "W", Box.value)
+    lib.plot(b)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("local class falls back OK")
+
+
 def __test_mutual_cycle_keeps_only_the_forward_edge__(log):
     """A two-way flow collapses to the forward (earlier-sited) edge only."""
     source = """
@@ -1361,6 +1495,75 @@ def main(tf):
     assert isinstance(signal_if, ast.If)
     assert signal_if.body[0].value.func.id == '__sec_signal__'
     log.info("rebound parameter stays inline OK")
+
+
+def __test_runtime_resolved_signal_in_branch_stays_inline__(log):
+    """A context resolved at runtime keeps its signal inside the branch.
+
+    Its first signal locates and loads its data, so a top-block signal would
+    demand the feed on every run, even one that never takes the branch.
+    """
+    source = """
+def main(use_htf, htf_tf):
+    lib.plot(lib.close)
+    if use_htf:
+        v = lib.request.security(lib.syminfo.tickerid, htf_tf, lib.close)
+"""
+    tree = _transform_tree(source)
+    func = _find_func(tree)
+    # No top block: the first statement is the untouched plot call
+    assert isinstance(func.body[0], ast.Expr)
+    branch = func.body[1]
+    assert isinstance(branch, ast.If)
+    signal_if = branch.body[0]
+    assert isinstance(signal_if, ast.If)
+    assert signal_if.body[0].value.func.id == '__sec_signal__'
+    log.info("runtime-resolved signal in a branch stays inline OK")
+
+
+def __test_runtime_resolved_producer_in_branch_is_hoisted__(log):
+    """A runtime-resolved context another context reads keeps its top-block
+    signal even behind a branch: the consumer's child waits for its record,
+    which the chart only sends at that signal."""
+    source = """
+def main(tf='60'):
+    v = 0.0
+    if lib.close > 10:
+        v = lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+    w = lib.request.security(lib.syminfo.tickerid, "D", v + 1)
+    lib.plot(w)
+"""
+    tree = _transform_tree(source)
+    func = _find_func(tree)
+    signal_if = func.body[0]
+    assert isinstance(signal_if, ast.If)
+    signalled = [stmt.value.args[0].value for stmt in signal_if.body]
+    assert len(signalled) == 2
+    branch = next(stmt for stmt in func.body if isinstance(stmt, ast.If)
+                  and isinstance(stmt.test, ast.Compare)
+                  and isinstance(stmt.test.left, ast.Attribute)
+                  and stmt.test.left.attr == 'close')
+    inline = [sub for sub in ast.walk(branch) if isinstance(sub, ast.Call)
+              and isinstance(sub.func, ast.Name) and sub.func.id == '__sec_signal__']
+    assert inline == []
+    log.info("runtime-resolved producer in a branch is hoisted OK")
+
+
+def __test_static_signal_in_branch_is_still_hoisted__(log):
+    """A context with a module-level symbol and timeframe is resolved at setup,
+    so its signal still starts in the top block."""
+    source = """
+def main(use_htf):
+    lib.plot(lib.close)
+    if use_htf:
+        v = lib.request.security(lib.syminfo.tickerid, "60", lib.close)
+"""
+    tree = _transform_tree(source)
+    func = _find_func(tree)
+    signal_if = func.body[0]
+    assert isinstance(signal_if, ast.If)
+    assert signal_if.body[0].value.func.id == '__sec_signal__'
+    log.info("static signal in a branch is still hoisted OK")
 
 
 def __test_depends_on_runtime_context_is_recorded_not_rejected__(log):
@@ -1816,6 +2019,39 @@ def main():
     signal_call = func.body[0].body[0].value
     assert ast.unparse(signal_call.args[2]) == "'D'"
     log.info("unconditional helper call lifted")
+
+
+def __test_lift_into_a_returning_caller_puts_no_wait_before_the_reads__(log):
+    """A caller that returns the helper call reads inside its ``return``.
+
+    A wait placed in front of that ``return`` would settle the round before its
+    value is read, so the chart would wait for the child's whole bar on every
+    call instead of being released at the write. The lifted signal still starts
+    the caller, and no wait block precedes the reads.
+    """
+    source = """
+def main():
+    def htf(tf):
+        fast = lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+        return fast
+    def outer(tf):
+        return htf(tf)
+    if lib.close > 0:
+        lib.plot(outer("D"))
+"""
+    sids = __test_helper_signal_sids(source)
+    assert len(sids['outer']) == 1
+    assert sids['htf'] == []
+
+    waits = __test_helper_wait_sids(source)
+    assert waits['outer'] == []
+    assert waits['htf'] == []
+
+    tree = _transform_tree(source)
+    outer = next(n for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == 'outer')
+    assert isinstance(outer.body[-1], ast.Return)
+    log.info("no wait in front of a returning caller's reads")
 
 
 def __test_helper_call_inside_if_is_not_lifted__(log):

@@ -2372,6 +2372,7 @@ class ScriptRunner:
                     lazy_spawn_fn=_lazy_spawn,
                     same_context_ids=same_ctx_ref,
                     no_process_ids=no_process_ids,
+                    unresolved_ids=deferred_sec_ids,
                     # Unconditional: ``same_context_ids`` can gain members AFTER setup
                     # (a deferred context resolving to the chart's own symbol+TF), and
                     # ``__sec_write__`` no-ops on ``result_blocks=None`` — gating on the

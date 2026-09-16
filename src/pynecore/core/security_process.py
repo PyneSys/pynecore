@@ -1339,6 +1339,17 @@ def security_process_main(
     # chart counts ROUNDS, and the whole planned sequence is ONE round of its.
     round_is_last_step = [True]
 
+    def _release_round() -> None:
+        """Wake the chart for this step, unless the step's last write already did.
+
+        The write releases the chart early, while ``main()`` still runs; the
+        chart may then launch its next step at once. Waking it again here would
+        answer that next step's wait with this step's value.
+        """
+        if not sec_ctx.released:
+            sec_ctx.released = True
+            data_ready_event.set()
+
     def _end_round() -> None:
         """Close the round: the chart's "one round outstanding" counter, then
         the wake-up. The counter, not the event, is what lets a chart bar keep
@@ -1529,6 +1540,7 @@ def security_process_main(
                 dev_batch_running = False
 
             for target_time, flags, more_steps, dev_values in round_steps:
+                sec_ctx.released = False
                 batch_round = bool(flags & FLAG_BATCH_ROUND)
                 is_developing = bool(flags & FLAG_IS_DEVELOPING)
                 closed_override = bool(flags & FLAG_CLOSED_OVERRIDE)
@@ -1544,7 +1556,7 @@ def security_process_main(
                 # its own flag and never the HTF developing/closed-override flags.
                 if _ltf_round is not None and is_ltf_window(flags):
                     _ltf_round(flags)
-                    data_ready_event.set()
+                    _release_round()
                     _end_round()
                     continue
 
@@ -1632,7 +1644,7 @@ def security_process_main(
                     _ha_commit()
 
                     after_bar()
-                    data_ready_event.set()
+                    _release_round()
                     _end_round()
                     continue
 
@@ -1712,7 +1724,7 @@ def security_process_main(
                     _ensure_child_snapshot().save()
 
                     after_bar()
-                    data_ready_event.set()
+                    _release_round()
                     _end_round()
                     continue
 
@@ -1829,7 +1841,7 @@ def security_process_main(
                     with result_locks[sec_id]:
                         write_na(result_block, sync_block)
 
-                data_ready_event.set()
+                _release_round()
                 _end_round()
 
             if dev_batch_running:
