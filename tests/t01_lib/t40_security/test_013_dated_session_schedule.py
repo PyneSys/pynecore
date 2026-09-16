@@ -269,6 +269,57 @@ def __test_session_bar_closes_overnight_after_midnight__(log):
     log.info("session bar closes: after-midnight night bar confirms at its 02:00 session end")
 
 
+def __test_session_bar_closes_one_date_many_session_ends__(log):
+    """Bars sharing a calendar date each take their OWN session end.
+
+    The walk prepares the schedule once per date, so this pins that the date's
+    bars are still told apart by time of day: on one Tuesday a 6h HTF bar can
+    close at four different session ends -- the after-midnight leg of Monday's
+    ``21:00->02:00`` night session, the ``09:00->12:00`` and ``13:00->16:00``
+    day sessions, and Tuesday's own night session closing on Wednesday. A bar in
+    the lunch gap on that same date has no session, so the whole feed falls back
+    to the grid clamp (``None``).
+    """
+    from pynecore.core.security import _session_bar_closes
+    from pynecore.core.syminfo import SymInfoInterval
+
+    oh = []
+    for d in range(7):
+        oh.append(SymInfoInterval(day=d, start=time(9, 0), end=time(12, 0)))
+        oh.append(SymInfoInterval(day=d, start=time(13, 0), end=time(16, 0)))
+        oh.append(SymInfoInterval(day=d, start=time(21, 0), end=time(2, 0)))
+    six_hours = 6 * 60 * 60 * 1000
+    opens = [_ms(1, 6, 1), _ms(1, 6, 10), _ms(1, 6, 14), _ms(1, 6, 21)]  # all on Tue
+    closes = _session_bar_closes(opens, UTC, oh, six_hours)
+    expected = [_ms(1, 6, 2), _ms(1, 6, 12), _ms(1, 6, 16), _ms(1, 7, 2)]
+    assert closes == expected, f"closes={closes}\nexpected={expected}"
+
+    lunch = int(datetime(2026, 1, 6, 12, 30, tzinfo=UTC).timestamp() * 1000)
+    gappy = sorted(opens + [lunch])
+    assert _session_bar_closes(gappy, UTC, oh, six_hours) is None, \
+        "a bar outside every session must still fail the walk on an already-prepared date"
+    log.info("session bar closes: one date, four session ends, lunch-gap bar -> None")
+
+
+def __test_session_bar_closes_24h_schedule_closes_at_midnight__(log):
+    """A round-the-clock schedule's last bar closes at midnight, not 23:59:59.
+
+    ``23:59:59`` is the end-of-day marker of a 24h ``SymInfo``; the session really
+    runs up to midnight, so the final hourly bar must not be confirmed one second
+    before it actually closes (same rule as ``actual_bar_close``).
+    """
+    from pynecore.core.security import _session_bar_closes
+    from pynecore.core.syminfo import SymInfoInterval
+
+    oh = [SymInfoInterval(day=d, start=time(0, 0), end=time(23, 59, 59)) for d in range(7)]
+    one_hour = 60 * 60 * 1000
+    opens = [_ms(1, 6, 22), _ms(1, 6, 23)]
+    closes = _session_bar_closes(opens, UTC, oh, one_hour)
+    expected = [_ms(1, 6, 23), _ms(1, 7, 0)]
+    assert closes == expected, f"closes={closes}\nexpected={expected}"
+    log.info("session bar closes: 24h schedule's last bar closes at midnight")
+
+
 def _minimal_toml(flat_end="18:00:00"):
     """A minimal valid [symbol] section + one flat opening-hours block, for parse tests."""
     return (
