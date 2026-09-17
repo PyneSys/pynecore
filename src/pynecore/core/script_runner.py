@@ -784,7 +784,7 @@ class ScriptRunner:
                  '_round_decimals', '_lossless_volume', '_lossless_prices',
                  '_config_dir', '_symbol_map', '_script_timeframe',
                  '_chart_bar_window',
-                 'broker_balance', '_sim_logged_open_ids')
+                 'broker_balance', '_sim_logged_open_ids', '_inputs')
 
     # noinspection PyProtectedMember
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
@@ -959,7 +959,11 @@ class ScriptRunner:
         # This ensures that timestamp() calls in default parameters use the correct timezone
         _set_lib_syminfo_properties(syminfo)
 
-        # Set programmatic inputs before script import so they override .toml values
+        # Set programmatic inputs before script import so they override .toml values.
+        # The dict is kept: a security child re-imports the script in its own
+        # process, where nothing would apply these overrides otherwise, and it
+        # would compute the context with the .toml (or source) values instead.
+        self._inputs: dict[str, Any] = dict(inputs) if inputs else {}
         if inputs:
             from .script import _programmatic_inputs
             _programmatic_inputs.update(inputs)
@@ -2089,6 +2093,9 @@ class ScriptRunner:
                     _ctx_meta = cast('dict[str, dict]', sec_contexts)[sid]
                     _ohlcv_fields = _ctx_meta.get('ohlcv_fields')
                     _ohlcv_tuple = bool(_ctx_meta.get('ohlcv_tuple'))
+                    # Backward-sliced main() clone of this context, when the
+                    # slicer could build one (see transformers/security_slice.py).
+                    _slice_main = _ctx_meta.get('slice_main')
                     _registry_parent_conn, _registry_child_conn = Pipe()
                     sec_registry_pipes[sid] = _registry_parent_conn
                     proc = Process(
@@ -2107,6 +2114,7 @@ class ScriptRunner:
                             sec_result_locks,
                             _ohlcv_fields,
                             _ohlcv_tuple,
+                            _slice_main,
                             sec_state.chart_type,
                             chart_tf,
                             sec_state.plain_ltf,
@@ -2118,6 +2126,7 @@ class ScriptRunner:
                             _registry_child_conn,
                             _chart_ring_capacity,
                             _chart_ring_arena,
+                            self._inputs,
                             _dev_batch_spec,
                         ),
                         daemon=True,
