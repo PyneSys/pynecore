@@ -403,20 +403,20 @@ def _heikinashi_step(prev_open: float | None, prev_close: float | None,
 
 # noinspection PyProtectedMember
 def security_process_main(
-        sec_id: str,
+        sec_ids: list[str],
         script_path: str,
         data_source: 'str | PluginSymbol',
         sync_block_name: str,
         all_sec_ids: list[str],
-        # Events (multiprocessing.Event — picklable across spawn)
-        data_ready_event,
+        # Events (multiprocessing.Event — picklable across spawn), per served sid
+        data_ready_events,
         advance_event,
-        done_event,
+        done_event_map,
         stop_event,
         is_ltf: bool = False,
         result_locks: 'dict[str, LockType] | None' = None,
-        ohlcv_fields: 'list[str] | None' = None,
-        ohlcv_tuple: bool = False,
+        ohlcv_fields: 'dict[str, list[str] | None] | None' = None,
+        ohlcv_tuple: 'dict[str, bool] | None' = None,
         slice_main: 'str | None' = None,
         chart_type: 'str | None' = None,
         chart_timeframe: 'str | None' = None,
@@ -425,10 +425,10 @@ def security_process_main(
         registry: 'dict[str, dict] | None' = None,
         chart_calendar=None,
         ring_conditions: dict | None = None,
-        consumer_ids: 'list[str] | None' = None,
+        consumer_ids: 'dict[str, list[str]] | None' = None,
         registry_pipe=None,
-        chart_ring_capacity: int = 0,
-        chart_ring_arena: int = 0,
+        chart_ring_capacity: 'dict[str, int] | None' = None,
+        chart_ring_arena: 'dict[str, int] | None' = None,
         script_inputs: 'dict[str, Any] | None' = None,
         dev_batch_spec: 'DevBatchSpec | None' = None,
 ):
@@ -439,23 +439,35 @@ def security_process_main(
     Re-registers import hooks (needed for spawn mode on macOS/Windows),
     re-imports the script, and runs the bar loop.
 
-    :param sec_id: This security context's unique ID
+    :param sec_ids: The security contexts this process serves, PRIMARY first.
+        One process serves a whole GROUP when the transformer proved its members
+        resolve to the same feed: they share this bar loop and the group's single
+        ``main()`` clone, each keeping its own result block, ring and
+        ``data_ready``. Only the primary's SyncBlock slot carries scheduling —
+        target time, flags, round context and the advance event are read from it
+        — while ``rounds_done`` and the done event are raised for every member,
+        so the chart's per-sid wait path is unchanged
     :param script_path: Path to the script .py file
     :param data_source: Either a path to an ``.ohlcv`` file (backtest / file
                         mode) or a :class:`PluginSymbol` describing the live
                         provider, symbol, timeframe and pre-loaded config.
     :param sync_block_name: SharedMemory name of the SyncBlock
     :param all_sec_ids: List of ALL security context IDs (for cross-reads)
-    :param data_ready_event: Event signaling data is available for reading
-    :param advance_event: Event signaling this process should advance
-    :param done_event: Event signaling this process finished its current round
+    :param data_ready_events: Per served sid, the event signaling that this
+        context's value is available for reading
+    :param advance_event: Event signaling this process should advance (the
+        primary's)
+    :param done_event_map: Per served sid, the event signaling that this process
+        finished its current round
     :param stop_event: Event signaling this process should shut down
     :param is_ltf: If True, accumulate expression values into array per round
-    :param ohlcv_fields: When set, the requested expression is only raw price
-        series (open/high/low/close/volume/hl2/hlc3/ohlc4/hlcc4); the per-bar
-        run skips main() and writes these fields straight from the bar.
-    :param ohlcv_tuple: True when ``ohlcv_fields`` came from a tuple/list
-        expression (write a tuple), False for a scalar expression.
+    :param ohlcv_fields: Per served sid, the raw price series
+        (open/high/low/close/volume/hl2/hlc3/ohlc4/hlcc4) its expression consists
+        of, or None. When EVERY member has one, the per-bar run skips main() and
+        writes those fields straight from the bar; a group mixing passthrough and
+        computed members runs the clone, whose write blocks cover both.
+    :param ohlcv_tuple: Per served sid, True when its ``ohlcv_fields`` came from
+        a tuple/list expression (write a tuple), False for a scalar expression.
     :param slice_main: Name of this context's sliced ``main()`` clone in the
         script module (``transformers/security_slice.py``). When set, the clone
         runs on every bar in place of ``main()``: it holds the backward slice of
@@ -484,16 +496,16 @@ def security_process_main(
     :param chart_calendar: The chart's trading schedule, for the chart-as-of cap.
     :param ring_conditions: Per-sid ``multiprocessing.Condition`` created by the
         parent; a producer notifies its own, a consumer waits on the peer's.
-    :param consumer_ids: Sids consuming THIS context. Empty means no security
-        consumer; this context then publishes a ring only when the CHART
+    :param consumer_ids: Per served sid, the sids consuming it. Empty means no
+        security consumer; that member then publishes a ring only when the CHART
         consumes it (``chart_ring_capacity``).
-    :param chart_ring_capacity: Non-zero when the chart runs this context's
-        historical phase as ONE batch round and pairs the values out of the
-        ring instead of handshaking per bar. The chart is then a ring consumer
-        (``SyncBlock.chart_index``) and the ring is pre-sized to this many
-        entries, so the whole batch fits without repeated reallocation.
-    :param chart_ring_arena: Payload arena size, in bytes, to pre-size the
-        chart-consumed ring with. Ignored when ``chart_ring_capacity`` is 0.
+    :param chart_ring_capacity: Per served sid, non-zero when the chart runs that
+        member's historical phase as ONE batch round and pairs the values out of
+        the ring instead of handshaking per bar. The chart is then a ring
+        consumer (``SyncBlock.chart_index``) and the ring is pre-sized to this
+        many entries, so the whole batch fits without repeated reallocation.
+    :param chart_ring_arena: Per served sid, the payload arena size in bytes to
+        pre-size the chart-consumed ring with.
     :param registry_pipe: Child end of the parent's registry pipe. The chart
         pushes a context's record down it the moment it resolves one whose
         symbol or timeframe only exists at runtime — such a context can be a
@@ -524,10 +536,25 @@ def security_process_main(
         from pynecore import lib as _lib
         _lib._timenow_ms = int(_pinned_timenow)
 
+    # The group's primary drives every scheduling read below; the other members
+    # only carry results.
+    sec_id = sec_ids[0]
+    ohlcv_fields = ohlcv_fields or {}
+    ohlcv_tuple = ohlcv_tuple or {}
+    consumer_ids = consumer_ids or {}
+    chart_ring_capacity = chart_ring_capacity or {}
+    chart_ring_arena = chart_ring_arena or {}
+
     # Open shared memory blocks
     sync_block = SyncBlock(all_sec_ids, create=False, name=sync_block_name)
-    result_block = ResultBlock(sec_id, create=False, version=0,
-                               prefix=sync_block.block_prefix(sec_id))
+    result_blocks = {
+        _sid: ResultBlock(_sid, create=False, version=0,
+                          prefix=sync_block.block_prefix(_sid))
+        for _sid in sec_ids
+    }
+    result_block = result_blocks[sec_id]
+    data_ready_event = data_ready_events[sec_id]
+    done_event = done_event_map[sec_id]
 
     # Rate-source-only contexts skip the Pine machinery entirely: they only
     # exist so the chart-side ``CurrencyRateProvider`` can read a fresh
@@ -733,9 +760,13 @@ def security_process_main(
     )
     own_timeframe = str(syminfo.period)
     registry = dict(registry or {})
-    own_record = dict(registry.get(sec_id) or {})
-    own_record['calendar'] = own_calendar
-    registry[sec_id] = own_record
+    # Every member runs on this very feed, so they all get the calendar this
+    # process read from its own syminfo.
+    for _member in sec_ids:
+        _member_record = dict(registry.get(_member) or {})
+        _member_record['calendar'] = own_calendar
+        registry[_member] = _member_record
+    own_record = registry[sec_id]
 
     # A D/W/M context keeping the CHART's calendar is asked as far as the end of
     # the scheduled break the round's tick falls in — that is the as-of both the
@@ -748,11 +779,11 @@ def security_process_main(
     # Create protocol functions for security context
     (signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn,
      ltf_take_value, ltf_publish, ltf_buffer_len, sec_ctx, after_bar,
-     finish_ring, prime_ring) = create_security_protocol(
-        sec_id, sync_block, result_block, all_sec_ids, result_locks, is_ltf=is_ltf,
+     finish_ring, prime_ring, release_unwritten) = create_security_protocol(
+        sec_ids, sync_block, result_blocks, all_sec_ids, result_locks, is_ltf=is_ltf,
         registry=registry, chart_calendar=chart_calendar,
         ring_conditions=ring_conditions, consumer_ids=consumer_ids,
-        stop_event=stop_event, data_ready_event=data_ready_event,
+        stop_event=stop_event, data_ready_events=data_ready_events,
         registry_pipe=registry_pipe,
         chart_ring_capacity=chart_ring_capacity,
         chart_ring_arena=chart_ring_arena,
@@ -801,9 +832,18 @@ def security_process_main(
         _reg_mod = sys.modules.get(getattr(_reg_main, '__module__', ''))
         if _reg_mod is not None and _reg_mod is not script_module:
             sec_modules.append(_reg_mod)
+    # Plain-OHLCV members of a MIXED group publish from the feed fields below,
+    # before the clone runs, exactly as the fast path does for a context served
+    # alone. Their write block in the clone would then publish a second time on
+    # the same bar — and it carries whatever conditionals it had in ``main()``,
+    # which is precisely what must not decide whether the value appears — so
+    # they are left out of ``__active_security__`` and their block never fires.
+    _pt_sids = [_sid for _sid in sec_ids if ohlcv_fields.get(_sid)]
+    _mixed_pt_sids: frozenset[str] = (
+        frozenset(_pt_sids) if 0 < len(_pt_sids) < len(sec_ids) else frozenset())
     for _sec_mod in sec_modules:
         inject_protocol(_sec_mod, signal_fn, write_fn, read_fn, wait_fn,
-                        active_security=sec_id)
+                        active_security=frozenset(sec_ids) - _mixed_pt_sids)
 
     # Fresh per-process state: drop anything inherited (fork start method) and
     # create the root state vectors of the entry points this process drives —
@@ -864,17 +904,31 @@ def security_process_main(
     # main() re-run with a direct write of those fields — every loop path
     # (historical, live developing/closed, live LTF window) calls
     # ``_run_script_main`` and so picks this up through the closure cell.
-    if ohlcv_fields:
-        if ohlcv_tuple:
-            _pt_fields = tuple(ohlcv_fields)
+    # A GROUP replaces main() only when EVERY member is passthrough; one
+    # computed member means the clone has to run. The passthrough members of
+    # such a MIXED group still publish from the very same fields, ahead of the
+    # clone: the value a context served alone publishes on every bar of its feed
+    # cannot become conditional just because a sibling joined its child (their
+    # write block in the clone is disabled for that reason, see
+    # ``__active_security__`` above). Writing them FIRST is also what a sibling
+    # depending on one of them reads out of the bar state.
+    _pt_plan = tuple(
+        (_sid, tuple(ohlcv_fields[_sid] or ()), bool(ohlcv_tuple.get(_sid)))
+        for _sid in _pt_sids
+    )
+    if _pt_plan:
+        _clone_main = _run_script_main
+        _pt_only = not _mixed_pt_sids
 
-            def _run_script_main():
-                write_fn(sec_id, tuple(getattr(lib, _f) for _f in _pt_fields))
-        else:
-            _pt_field = ohlcv_fields[0]
-
-            def _run_script_main():
-                write_fn(sec_id, getattr(lib, _pt_field))
+        def _run_script_main():
+            for _pt_sid, _pt_fields, _pt_is_tuple in _pt_plan:
+                if _pt_is_tuple:
+                    write_fn(_pt_sid,
+                             tuple(getattr(lib, _f) for _f in _pt_fields))
+                else:
+                    write_fn(_pt_sid, getattr(lib, _pt_fields[0]))
+            if not _pt_only:
+                _clone_main()
 
     # Chart-type (Heikin Ashi) per-bar transform. The two carried HA values ride
     # a synthetic root vector whose var slots are captured/rolled back by the
@@ -1369,20 +1423,22 @@ def security_process_main(
 
         The write releases the chart early, while ``main()`` still runs; the
         chart may then launch its next step at once. Waking it again here would
-        answer that next step's wait with this step's value.
+        answer that next step's wait with this step's value. Per member, since
+        the chart waits on each context's own ``data_ready``.
         """
-        if not sec_ctx.released:
-            sec_ctx.released = True
-            data_ready_event.set()
+        release_unwritten()
 
     def _end_round() -> None:
         """Close the round: the chart's "one round outstanding" counter, then
         the wake-up. The counter, not the event, is what lets a chart bar keep
-        several rounds of one context in flight without mixing their slots."""
+        several rounds of one context in flight without mixing their slots.
+        Raised for EVERY member: the chart settles each context on its own
+        counter, whether or not this process serves it alone."""
         if not round_is_last_step[0]:
             return
-        sync_block.increment_rounds_done(sec_id)
-        done_event.set()
+        for _member in sec_ids:
+            sync_block.increment_rounds_done(_member)
+            done_event_map[_member].set()
 
     def _chart_driven_step(round_flags: int) -> 'Iterator[tuple]':
         """The one step of an ordinary round: whatever the chart put in the slot.
@@ -1565,7 +1621,7 @@ def security_process_main(
                 dev_batch_running = False
 
             for target_time, flags, more_steps, dev_values in round_steps:
-                sec_ctx.released = False
+                sec_ctx.released.clear()
                 batch_round = bool(flags & FLAG_BATCH_ROUND)
                 is_developing = bool(flags & FLAG_IS_DEVELOPING)
                 closed_override = bool(flags & FLAG_CLOSED_OVERRIDE)
@@ -1863,8 +1919,11 @@ def security_process_main(
                 if is_ltf:
                     flush_fn(ltf_prefix_len)
                 elif not bars_run and not plain_ltf:
-                    with result_locks[sec_id]:
-                        write_na(result_block, sync_block)
+                    # No bar of this feed ran, so no member wrote: each of them
+                    # publishes ``na``, exactly as a context served alone does.
+                    for _member in sec_ids:
+                        with result_locks[_member]:
+                            write_na(result_blocks[_member], sync_block)
 
                 _release_round()
                 _end_round()
@@ -1883,15 +1942,17 @@ def security_process_main(
         # sets EVERY child's stop_event, so this child can leave with a round
         # outstanding; it then exits cleanly, its own watcher fires nothing,
         # and an untimed chart wait on these events would never wake.
-        data_ready_event.set()
-        done_event.set()
+        for _member in sec_ids:
+            data_ready_events[_member].set()
+            done_event_map[_member].set()
         finish_ring()
         cleanup()
         if reader is not None:
             reader.close()
         if live_streamer is not None:
             live_streamer.stop()
-        result_block.close()
+        for _block in result_blocks.values():
+            _block.close()
         sync_block.close()
         lib._lib_semaphore = False
         lib._in_security = False

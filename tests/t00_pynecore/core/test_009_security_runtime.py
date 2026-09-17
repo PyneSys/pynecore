@@ -169,8 +169,11 @@ def __test_security_protocol_write_read__(log):
     rb_a = ResultBlock("sec_a", create=True, version=0, prefix=sb.block_prefix("sec_a"))
     rb_b = ResultBlock("sec_b", create=True, version=0, prefix=sb.block_prefix("sec_b"))
 
-    signal_fn, write_fn, read_fn, wait_fn, cleanup, _, _, _, _, _ctx, _after_bar, _finish, _prime = create_security_protocol(
-        "sec_a", sb, rb_a, sec_ids, _locks_for(sec_ids),
+    # ONE served context — the shape a child has whenever its context is not
+    # merged with the rest of its group.
+    (signal_fn, write_fn, read_fn, wait_fn, cleanup, _, _, _, _, _ctx,
+     _after_bar, _finish, _prime, _release) = create_security_protocol(
+        ["sec_a"], sb, {"sec_a": rb_a}, sec_ids, _locks_for(sec_ids),
     )
 
     try:
@@ -251,8 +254,9 @@ def __test_ltf_protocol_accumulation__(log):
     sb = SyncBlock(sec_ids)
     rb = ResultBlock("sec_ltf", create=True, version=0, prefix=sb.block_prefix("sec_ltf"))
 
-    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _, _, _ctx, _after_bar, _finish, _prime = create_security_protocol(
-        "sec_ltf", sb, rb, sec_ids, _locks_for(sec_ids), is_ltf=True,
+    (signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _, _, _ctx,
+     _after_bar, _finish, _prime, _release) = create_security_protocol(
+        ["sec_ltf"], sb, {"sec_ltf": rb}, sec_ids, _locks_for(sec_ids), is_ltf=True,
     )
 
     try:
@@ -292,8 +296,9 @@ def __test_ltf_protocol_empty_flush__(log):
     sb = SyncBlock(sec_ids)
     rb = ResultBlock("sec_ltf2", create=True, version=0, prefix=sb.block_prefix("sec_ltf2"))
 
-    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _, _, _ctx, _after_bar, _finish, _prime = create_security_protocol(
-        "sec_ltf2", sb, rb, sec_ids, _locks_for(sec_ids), is_ltf=True,
+    (signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _, _, _ctx,
+     _after_bar, _finish, _prime, _release) = create_security_protocol(
+        ["sec_ltf2"], sb, {"sec_ltf2": rb}, sec_ids, _locks_for(sec_ids), is_ltf=True,
     )
 
     try:
@@ -317,8 +322,9 @@ def __test_ltf_htf_protocol_no_flush__(log):
     sb = SyncBlock(sec_ids)
     rb = ResultBlock("sec_htf", create=True, version=0, prefix=sb.block_prefix("sec_htf"))
 
-    signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _, _, _ctx, _after_bar, _finish, _prime = create_security_protocol(
-        "sec_htf", sb, rb, sec_ids, _locks_for(sec_ids), is_ltf=False,
+    (signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn, _, _, _, _ctx,
+     _after_bar, _finish, _prime, _release) = create_security_protocol(
+        ["sec_htf"], sb, {"sec_htf": rb}, sec_ids, _locks_for(sec_ids), is_ltf=False,
     )
 
     try:

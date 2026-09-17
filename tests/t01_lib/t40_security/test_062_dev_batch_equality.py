@@ -177,7 +177,8 @@ def __test_helper_run(runner, no_batch):
     :param runner: The ``runner`` fixture.
     :param no_batch: Whether to force the per-bar path.
     :return: ``(rows, batched_sids)`` — the plot values per chart bar, and the
-        sids whose child was spawned with a planned developing sequence.
+        sids whose child was spawned with a planned developing sequence (one
+        child can serve a whole context group).
     """
     import multiprocessing
     import sys
@@ -194,7 +195,7 @@ def __test_helper_run(runner, no_batch):
     def _recording_process(*args, **kwargs):
         sec_args = kwargs.get('args') or ()
         if sec_args and sec_args[-1]:
-            batched.append(sec_args[0])
+            batched.extend(sec_args[0])
         return original(*args, **kwargs)
 
     rows: list[dict] = []
@@ -241,6 +242,7 @@ def __test_developing_batch_matches_per_bar_path__(runner, log):
     assert not unbatched, f"batch planned with the switch off: {unbatched}"
     # The dependent pair must NOT be batched: 5 of the 7 contexts are.
     assert len(batched) == 5, f"batched contexts: {batched}"
+    assert len(set(batched)) == 5, f"duplicate batched context: {batched}"
     assert len(batch_rows) == len(plain_rows) == __test_helper_bars
 
     for i, (got, want) in enumerate(zip(batch_rows, plain_rows)):

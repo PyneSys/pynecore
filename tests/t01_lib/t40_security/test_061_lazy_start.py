@@ -102,40 +102,50 @@ def __test_helper_same(a, b):
     :return: Whether the two reads answered the same.
     """
     from pynecore.types.na import NA
-    if isinstance(a, NA) or isinstance(b, NA):
-        return isinstance(a, NA) and isinstance(b, NA)
+
+    def is_na(value):
+        return value is None or isinstance(value, NA) or (
+            isinstance(value, float) and value != value)
+
+    if is_na(a) or is_na(b):
+        return is_na(a) and is_na(b)
     return a == b
 
 
-def __test_helper_run(runner):
-    """Run the script once, recording which sids got a child process.
+def __test_helper_run(runner, no_merge=False):
+    """Run the script once, recording which sids each child process serves.
 
     ``script_runner`` imports ``Process`` from :mod:`multiprocessing` inside the
     run, so patching the module attribute up front is what the spawn resolves —
-    and the first entry of the spawn's ``args`` is the sid, which is all the
-    test needs.
+    and the first entry of the spawn's ``args`` is the served sid list, which is
+    all the test needs.
 
     :param runner: The ``runner`` fixture.
-    :return: ``(rows, spawned_sids)``, rows keyed by chart bar index.
+    :param no_merge: Whether to force one child process per context.
+    :return: ``(rows, spawned)``, rows keyed by chart bar index and ``spawned``
+        one tuple of served sids per child process.
     """
     import multiprocessing
+    import os
     import sys
     import tempfile
     from pathlib import Path
 
     sys.modules.pop(Path(__file__).stem, None)
 
-    spawned: list[str] = []
+    spawned: list = []
     original = multiprocessing.Process
 
     def _recording_process(*args, **kwargs):
         sec_args = kwargs.get('args') or ()
         if sec_args:
-            spawned.append(sec_args[0])
+            spawned.append(tuple(sec_args[0]))
         return original(*args, **kwargs)
 
     rows = {}
     multiprocessing.Process = _recording_process
+    if no_merge:
+        os.environ['PYNE_NO_SECURITY_MERGE'] = '1'
     try:
         with tempfile.TemporaryDirectory() as td:
             feed = __test_helper_write_feed(Path(td))
@@ -144,29 +154,52 @@ def __test_helper_run(runner):
                 rows[i] = dict(pv)
     finally:
         multiprocessing.Process = original
+        if no_merge:
+            os.environ.pop('PYNE_NO_SECURITY_MERGE', None)
     return rows, spawned
 
 
 def __test_unread_branch_gets_no_process__(runner, log):
-    """A security context in a branch this run never takes gets no child process.
+    """A READ starts a context — and the whole group it belongs to with it.
 
-    The transformer hoists every context's ``__sec_signal__`` to the top of
-    ``main()``, so the untaken branch's context is signalled on every bar. Only
-    a READ may start it: of the EIGHT contexts the script declares (both branch
-    arms and the six named ones) the seven that are reached get a child, and the
-    untaken arm gets none.
+    The EIGHT contexts this script declares (both branch arms and the six named
+    ones) all request ``(syminfo.tickerid, "60")``, so the transformer puts them
+    in ONE group, and the first read starts the group as a group: ONE child
+    process serves all eight, the branch arm this run never takes included.
+
+    That arm being carried is deliberate. Pine evaluates every
+    ``request.security()`` call whatever conditional it sits in, so computing
+    its expression in the shared child is what TradingView does anyway — and it
+    costs no process and no round of its own, which is what the lazy start is
+    for: a context nothing reads never makes the chart spawn a child.
+
+    With ``PYNE_NO_SECURITY_MERGE=1`` the old shape is exact: one child per
+    context, and the untaken arm gets none of the seven.
     """
     rows, spawned = __test_helper_run(runner)
 
-    assert len(spawned) == 7, f"spawned children: {spawned}"
-    assert len(set(spawned)) == 7, f"duplicate spawn: {spawned}"
-    # The TAKEN arm is the same request as ``eager``, so it answers the same —
-    # the missing child belongs to the other arm.
+    assert len(spawned) == 1, f"spawned children: {spawned}"
+    assert len(spawned[0]) == 8, f"served contexts: {spawned[0]}"
+    assert len(set(spawned[0])) == 8, f"duplicate member: {spawned[0]}"
+    # The TAKEN arm is the same request as ``eager``, so it answers the same.
     for i in (0, 10, 100, 140):
         assert __test_helper_same(rows[i]["branch"], rows[i]["eager"]), \
             f"bar {i}: branch={rows[i]['branch']} != eager={rows[i]['eager']}"
 
-    log.info("untaken branch context ran without a child process")
+    unmerged_rows, unmerged = __test_helper_run(runner, no_merge=True)
+    assert len(unmerged) == 7, f"unmerged children: {unmerged}"
+    assert all(len(served) == 1 for served in unmerged), \
+        f"unmerged child serves several contexts: {unmerged}"
+    assert len({served[0] for served in unmerged}) == 7, \
+        f"duplicate spawn: {unmerged}"
+    for i in rows:
+        for key in rows[i]:
+            assert __test_helper_same(rows[i][key], unmerged_rows[i][key]), \
+                f"bar {i} '{key}': merged={rows[i][key]!r} " \
+                f"unmerged={unmerged_rows[i][key]!r}"
+
+    log.info("one child served the whole group; %d children without merging",
+             len(unmerged))
 
 
 def __test_late_first_read_matches_eager__(runner, log):

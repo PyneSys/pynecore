@@ -360,3 +360,105 @@ def main():
         assert 'noise()' not in body.replace('def noise()', ''), \
             f"{name}: an unrelated helper call survived the slice"
     log.info("the helper's call site survived in both clones")
+
+
+def __test_helper_slice_name_per_context(tree: ast.Module) -> list[str | None]:
+    """The ``slice_main`` of every context, in context order (None when absent)."""
+    names: list[str | None] = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        target = node.targets[0]
+        if not (isinstance(target, ast.Name) and target.id == '__security_contexts__'):
+            continue
+        assert isinstance(node.value, ast.Dict)
+        for ctx in node.value.values:
+            assert isinstance(ctx, ast.Dict)
+            found: str | None = None
+            for key, value in zip(ctx.keys, ctx.values):
+                if (isinstance(key, ast.Constant) and key.value == 'slice_main'
+                        and isinstance(value, ast.Constant)):
+                    found = value.value
+            names.append(found)
+    return names
+
+
+def __test_grouped_contexts_share_one_clone__(log):
+    """One group, one clone: it holds both write blocks and both cones
+
+    The third context is on another timeframe, so it is its own group and keeps
+    its own clone — and neither clone carries the other's input.
+    """
+    source = """
+@script.indicator("t")
+def main():
+    fast = lib.ta.sma(lib.close, 3)
+    slow = lib.ta.ema(lib.close, 9)
+    noise = lib.ta.rma(lib.close, 21)
+    a = lib.request.security(lib.syminfo.tickerid, "1D", fast)
+    b = lib.request.security(lib.syminfo.tickerid, "1D", slow)
+    c = lib.request.security(lib.syminfo.tickerid, "240", noise)
+    lib.plot(a + b + c)
+"""
+    tree = __test_helper_transform(source)
+    clones = __test_helper_clones(tree)
+    names = __test_helper_slice_name_per_context(tree)
+
+    assert names[0] == names[1] is not None, "the group members got different clones"
+    assert names[2] not in (None, names[0]), "the lone context lost its own clone"
+    assert len(clones) == 2, f"expected one clone per unit, got {sorted(clones)}"
+
+    merged = __test_helper_body(clones[names[0]])
+    assert merged.count('__sec_write__') == 2, "a group member's write block is missing"
+    assert 'lib.ta.sma' in merged and 'lib.ta.ema' in merged, \
+        "a group member's own input was dropped"
+    assert 'lib.ta.rma' not in merged, "the other group's input leaked in"
+    assert 'lib.plot' not in merged, "an unrelated plot survived the slice"
+
+    alone = __test_helper_body(clones[names[2]])
+    assert alone.count('__sec_write__') == 1, "the lone clone gained a foreign write block"
+    assert 'lib.ta.rma' in alone and 'lib.ta.sma' not in alone
+    log.info("the group shares one clone, the lone context keeps its own")
+
+
+def __test_a_group_keeps_its_ohlcv_member__(log):
+    """A plain-OHLCV member joins its group: its write block is one statement"""
+    source = """
+@script.indicator("t")
+def main():
+    fast = lib.ta.sma(lib.close, 3)
+    a = lib.request.security(lib.syminfo.tickerid, "1D", fast)
+    b = lib.request.security(lib.syminfo.tickerid, "1D", lib.close)
+    lib.plot(a + b)
+"""
+    tree = __test_helper_transform(source)
+    names = __test_helper_slice_name_per_context(tree)
+    assert names[0] == names[1] is not None, \
+        "the plain-OHLCV member did not join the group's clone"
+
+    body = __test_helper_body(__test_helper_only_clone(tree))
+    assert body.count('__sec_write__') == 2, "the OHLCV member's write block was dropped"
+    assert 'lib.ta.sma' in body, "the sliced member's input was dropped"
+    assert 'lib.plot' not in body
+    log.info("the group clone carries the plain-OHLCV write block too")
+
+
+def __test_an_all_ohlcv_group_gets_no_clone__(log):
+    """Nothing in such a group needs ``main()``, so the fast path stays"""
+    source = """
+@script.indicator("t")
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "1D", lib.close)
+    b = lib.request.security(lib.syminfo.tickerid, "1D", lib.high)
+    lib.plot(a + b)
+"""
+    tree = ast.parse(source)
+    tree = SecurityTransformer().visit(tree)
+    transformer = SecuritySliceTransformer()
+    tree = transformer.visit(tree)
+    ast.fix_missing_locations(tree)
+
+    assert not __test_helper_clones(tree), "an all-OHLCV group got a clone"
+    assert set(transformer.skipped.values()) == {'ohlcv_passthrough'}, \
+        f"unexpected per-context skip reasons: {transformer.skipped}"
+    log.info("the all-OHLCV group kept the main()-free child path")
