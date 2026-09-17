@@ -9,8 +9,16 @@ answer as an ordinary module-level function, one per static security context::
     def __sec_main_0__():
         <the backward slice of main() for sec·<hash>·0>
 
-The clone is recorded in ``__security_contexts__[sid]['slice_main']``; the child
-runs it instead of ``main()`` (see ``core/security_process.py``). Chart and child
+Contexts the security transformer put in the same ``group`` — those resolving to
+one and the same feed — share ONE clone: it keeps every member's write block and
+every member's reads, so a single child can serve all of them. The number in the
+clone's name is the position of the context it was built for, and for a group
+the position of its first member; a clone name therefore belongs to exactly one
+unit.
+
+The clone is recorded in ``__security_contexts__[sid]['slice_main']`` of every
+context it serves; the child runs it instead of ``main()`` (see
+``core/security_process.py``). Chart and child
 load the SAME bytecode, so the clones must live in the same module as ``main``
 — a child-only transform is impossible.
 
@@ -579,25 +587,31 @@ class SecuritySliceTransformer(ast.NodeTransformer):
         for entry in index_of_stmt:
             written_sids |= entry.write_sids
 
+        entries = list(enumerate(_iter_contexts(contexts)))
+        units = _slice_units(entries, written_sids, self.skipped)
+
         clones: list[ast.stmt] = []
-        for index, (sid, ctx) in enumerate(_iter_contexts(contexts)):
-            reason = _skip_reason(sid, ctx, written_sids)
-            if reason is not None:
-                self.skipped[sid] = reason
-                continue
-            keep_reads = {sid} | _sid_list(ctx, 'depends') | _sid_list(ctx, 'late_reads')
-            kept = _slice(index_of_stmt, sid, keep_reads)
+        for unit in units:
+            keep_reads: set[str] = set()
+            for _index, sid, ctx in unit:
+                keep_reads |= {sid} | _sid_list(ctx, 'depends') | _sid_list(ctx, 'late_reads')
+            write_sids = {sid for _index, sid, _ctx in unit}
+            kept = _slice(index_of_stmt, write_sids, keep_reads)
             if kept is None:
-                self.skipped[sid] = 'nothing_dropped'
+                for _index, sid, _ctx in unit:
+                    self.skipped[sid] = 'nothing_dropped'
                 continue
-            name = f'{CLONE_PREFIX}{index}{CLONE_SUFFIX}'
+            # The unit's first member names the clone: its index is its own,
+            # so no other unit can pick the same name.
+            name = f'{CLONE_PREFIX}{unit[0][0]}{CLONE_SUFFIX}'
             clones.append(_build_clone(node, main, kept, name))
             clones.extend(_bind_defaults(main.name, name))
-            # The type pass has already run, so the two new literals are
-            # stamped here — an unstamped node inside a stamped subtree loses
-            # the type of everything above it.
-            ctx.keys.append(stamp_lowering(ast.Constant(value='slice_main'), STR))
-            ctx.values.append(stamp_lowering(ast.Constant(value=name), STR))
+            for _index, _sid, ctx in unit:
+                # The type pass has already run, so the two new literals are
+                # stamped here — an unstamped node inside a stamped subtree
+                # loses the type of everything above it.
+                ctx.keys.append(stamp_lowering(ast.Constant(value='slice_main'), STR))
+                ctx.values.append(stamp_lowering(ast.Constant(value=name), STR))
 
         if clones:
             insert_at = node.body.index(main) + 1
@@ -786,6 +800,71 @@ def _skip_reason(sid: str, ctx: ast.Dict, written_sids: set[str]) -> str | None:
     return None
 
 
+def _ctx_group(ctx: ast.Dict) -> int | None:
+    """A context's compile-time group ordinal, if it has one."""
+    value = _ctx_get(ctx, 'group')
+    if isinstance(value, ast.Constant) and isinstance(value.value, int):
+        return value.value
+    return None
+
+
+def _slice_units(entries: list[tuple[int, tuple[str, ast.Dict]]],
+                 written_sids: set[str],
+                 skipped: dict[str, str]) -> list[list[tuple[int, str, ast.Dict]]]:
+    """Split the module's contexts into the units one clone is built for.
+
+    A context without a group is a unit of its own, as before. The contexts of
+    one group share a single clone: they resolve to the same feed, so one child
+    can serve all of them, and the clone must then hold every member's write
+    block and every member's reads.
+
+    A member the pass cannot slice at all (an LTF context, a write block
+    outside ``main()``) takes the whole group down with it — the group's child
+    would be missing that member's value. A plain-OHLCV member does NOT: its
+    write block is a single trivial statement the group clone simply keeps. A
+    group of nothing but plain-OHLCV members gets no clone, because its child
+    never runs ``main()`` in the first place.
+
+    :param entries: ``(index, (sid, context dict))`` in context order
+    :param written_sids: sids whose write block stands in ``main()``
+    :param skipped: filled with the per-sid reason wherever no clone is built
+    :return: the units, each a list of ``(index, sid, context dict)``
+    """
+    reasons: dict[str, str | None] = {}
+    groups: dict[int, list[tuple[int, str, ast.Dict]]] = {}
+    ordered: list[tuple[int, str, ast.Dict, int | None]] = []
+    for index, (sid, ctx) in entries:
+        reasons[sid] = _skip_reason(sid, ctx, written_sids)
+        group = _ctx_group(ctx)
+        ordered.append((index, sid, ctx, group))
+        if group is not None:
+            groups.setdefault(group, []).append((index, sid, ctx))
+
+    units: list[list[tuple[int, str, ast.Dict]]] = []
+    emitted: set[int] = set()
+    for index, sid, ctx, group in ordered:
+        if group is None:
+            reason = reasons[sid]
+            if reason is not None:
+                skipped[sid] = reason
+            else:
+                units.append([(index, sid, ctx)])
+            continue
+        if group in emitted:
+            continue
+        emitted.add(group)
+        members = groups[group]
+        blocking = [s for _i, s, _c in members
+                    if reasons[s] is not None and reasons[s] != 'ohlcv_passthrough']
+        sliceable = [s for _i, s, _c in members if reasons[s] is None]
+        if blocking or not sliceable:
+            for _i, member, _c in members:
+                skipped[member] = reasons[member] or 'group_unsliceable'
+            continue
+        units.append(members)
+    return units
+
+
 def _stmt_nodes(stmt: ast.stmt) -> list[ast.AST]:
     """The nodes of a top-level statement that RUN when the statement runs.
 
@@ -826,18 +905,18 @@ def _build_index(body: list[ast.stmt], collector: _Collector, aliases: _Aliases,
     return index
 
 
-def _slice(index: list[_StmtIndex], sid: str,
+def _slice(index: list[_StmtIndex], sids: set[str],
            keep_reads: set[str]) -> list[int] | None:
-    """Backward slice of ``main()``'s top-level statements for one context.
+    """Backward slice of ``main()``'s top-level statements for one unit.
 
     :param index: the per-statement index of ``main()``'s body
-    :param sid: the context being sliced for
+    :param sids: the contexts the clone must write (one, or a whole group)
     :param keep_reads: sids whose ``__sec_read__`` must run in this child
     :return: indexes of the kept statements, or None when nothing was dropped
     """
     kept: set[int] = set()
     for position, entry in enumerate(index):
-        if (entry.mandatory or sid in entry.write_sids
+        if (entry.mandatory or entry.write_sids & sids
                 or entry.read_sids & keep_reads):
             kept.add(position)
 

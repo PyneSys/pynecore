@@ -119,7 +119,7 @@ class SecurityTransformer(ast.NodeTransformer):
            __sec_signal__("sec_id", symbol_expr, timeframe_expr)
 
     2. Original call position:
-       if __active_security__ == "sec_id":
+       if __active_security__ is not None and "sec_id" in __active_security__:
            __sec_write__("sec_id", expression)
        var = __sec_read__("sec_id", lib.na)
 
@@ -131,6 +131,24 @@ class SecurityTransformer(ast.NodeTransformer):
     Non-constant symbol/timeframe/lookahead values (e.g., function parameters or
     input-derived expressions) are stored as None in __security_contexts__ and
     resolved at runtime via __sec_signal__ arguments.
+
+    Every context also carries a ``group`` key: the ordinal of the group of
+    contexts that are guaranteed to resolve to the very same feed, or None when
+    the context stands alone. Two contexts share a group when their signal
+    arguments are SYNTACTICALLY identical — the key is
+    ``(symbol, timeframe, lookahead, is_ltf, ignore_invalid_symbol)``, each
+    expression compared by ``ast.dump`` of the substituted signal argument (the
+    module-level expression for a lookahead that has one, the runtime one
+    otherwise). Only contexts signalled in the top block qualify: those run at
+    function entry with the same bindings, so an identical expression there
+    yields an identical value on every bar, input-derived timeframes included.
+    A context whose signal arguments are STABLE — unchanged for the whole bar
+    wherever they are evaluated (see :meth:`_stable_signal_args`) — is keyed by
+    those arguments alone and groups wherever its signal stands, inline and
+    behind branches included; such a group carries ``group_stable=True``.
+    Lower-timeframe contexts, groups of one and groups whose reads one child
+    could not answer unambiguously (see :meth:`_group_reads_are_unambiguous`)
+    get no group.
 
     Must be applied after ImportNormalizerTransformer, before PersistentSeriesTransformer.
     """
@@ -498,11 +516,28 @@ class SecurityTransformer(ast.NodeTransformer):
         )
 
     @staticmethod
-    def _eq_check(sec_id: str) -> ast.Compare:
-        """Build: __active_security__ == sec_id"""
-        return ast.Compare(
-            left=ast.Name(id='__active_security__', ctx=ast.Load()),
-            ops=[ast.Eq()], comparators=[ast.Constant(value=sec_id)]
+    def _in_active_check(sec_id: str) -> ast.BoolOp:
+        """Build: __active_security__ is not None and sec_id in __active_security__
+
+        ``__active_security__`` is the SET of contexts the running process
+        serves — one security child can serve a whole group — so the guard is a
+        membership test, like ``__same_context__``. It stays None in the chart
+        process (that is what the signal / wait blocks test for), which the
+        left conjunct guards against.
+        """
+        return ast.BoolOp(
+            op=ast.And(),
+            values=[
+                ast.Compare(
+                    left=ast.Name(id='__active_security__', ctx=ast.Load()),
+                    ops=[ast.IsNot()], comparators=[ast.Constant(value=None)]
+                ),
+                ast.Compare(
+                    left=ast.Constant(value=sec_id),
+                    ops=[ast.In()],
+                    comparators=[ast.Name(id='__active_security__', ctx=ast.Load())]
+                ),
+            ]
         )
 
     def _signal_block(self, sec_ids: list[str]) -> ast.If:
@@ -576,13 +611,14 @@ class SecurityTransformer(ast.NodeTransformer):
         """Build security-context write block.
 
         The condition fires in two cases:
-        1. This IS the security process for sec_id (__active_security__ == sec_id)
+        1. This IS a security process serving sec_id (sec_id in __active_security__,
+           which is None in the chart process)
         2. This is the chart process and sec_id is same-context (sec_id in __same_context__)
         """
         return ast.If(
             test=ast.BoolOp(
                 op=ast.Or(),
-                values=[self._eq_check(sec_id), self._in_same_context(sec_id)]
+                values=[self._in_active_check(sec_id), self._in_same_context(sec_id)]
             ),
             body=[
                 ast.Expr(value=self._func_call(
@@ -1004,6 +1040,368 @@ class SecurityTransformer(ast.NodeTransformer):
                 )
             if sid in analyzer.in_loop:
                 ctx['in_loop'] = ast.Constant(value=True)
+
+    def _signal_sites(self, module: ast.Module) -> dict[str, tuple[str, ...]]:
+        """Where every ``__sec_signal__`` stands and with which arguments.
+
+        Both halves are read off the FINAL tree, after
+        :meth:`_lift_helper_signals`: a lifted signal is evaluated in the
+        caller, with the arguments substituted into the caller's scope, and
+        that — not the shape it had in the helper — is what decides the feed.
+
+        :param module: the lowered module
+        :return: sid -> (host function key, ``ast.dump`` of each argument)
+        """
+        sites: dict[str, tuple[str, ...]] = {}
+        for func, key in self._function_keys(module).items():
+            for stmt in self._walk_skip_funcs_body(func):
+                if not (isinstance(stmt, ast.Call)
+                        and isinstance(stmt.func, ast.Name)
+                        and stmt.func.id == '__sec_signal__'):
+                    continue
+                sid = self._call_sid(stmt)
+                if sid is None:
+                    continue
+                sites[sid] = (key, *(ast.dump(arg) for arg in stmt.args[1:]))
+        return sites
+
+    @staticmethod
+    def _walk_skip_funcs_body(func: ast.FunctionDef | ast.AsyncFunctionDef):
+        """Nodes of a function's OWN body, nested definitions excluded."""
+        for stmt in func.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            yield from SecurityTransformer._walk_skip_funcs(stmt)
+
+    @staticmethod
+    def _function_keys(
+            module: ast.Module
+    ) -> dict[ast.FunctionDef | ast.AsyncFunctionDef, str]:
+        """A unique key per function definition of the module.
+
+        The key is the dotted path of the definition, with an occurrence index
+        where one scope defines the same name twice, so two functions never
+        share it.
+        """
+        keys: dict[ast.FunctionDef | ast.AsyncFunctionDef, str] = {}
+
+        def own_defs(body: list[ast.stmt]):
+            """Definitions this scope makes, at any statement depth of its own
+            body, without descending into the definitions themselves."""
+            for stmt in body:
+                for sub in SecurityTransformer._walk_skip_funcs(stmt):
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        yield sub
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    yield stmt
+
+        def walk(body: list[ast.stmt], prefix: str) -> None:
+            seen: dict[str, int] = {}
+            for func in own_defs(body):
+                count = seen.get(func.name, 0)
+                seen[func.name] = count + 1
+                key = f'{prefix}{func.name}' + (f'#{count}' if count else '')
+                keys[func] = key
+                walk(func.body, f'{key}.')
+
+        walk(module.body, '')
+        return keys
+
+    def _call_sites_by_name(
+            self, module: ast.Module
+    ) -> tuple[dict[str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, ast.Call]]],
+               dict[str, int]]:
+        """Every direct call of every name, and how often each name is read.
+
+        Unlike :meth:`_lift_candidates` this does not care whether a call is
+        reached unconditionally — a stable signal argument is the same value
+        wherever the call happens. What it does care about is seeing ALL of the
+        sites: the two counts together are what proves a name is only ever used
+        by calling it, so substituting its parameters covers every way the
+        function can run.
+
+        :param module: the lowered module
+        :return: callee name -> its call sites as ``(caller function, call
+            node)``, and how often each name is READ anywhere in the module
+        """
+        load_counts: dict[str, int] = {}
+        for sub in ast.walk(module):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                load_counts[sub.id] = load_counts.get(sub.id, 0) + 1
+        sites: dict[str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef,
+                                    ast.Call]]] = {}
+        for caller in ast.walk(module):
+            if not isinstance(caller, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for stmt in caller.body:
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for sub in self._walk_skip_funcs(stmt):
+                    if (isinstance(sub, ast.Call)
+                            and isinstance(sub.func, ast.Name)):
+                        sites.setdefault(sub.func.id, []).append((caller, sub))
+        return sites, load_counts
+
+    def _signal_call_sites(
+            self, module: ast.Module
+    ) -> dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, list[ast.expr]]]:
+        """Every ``__sec_signal__`` of the final tree, with its host function.
+
+        :param module: the lowered module
+        :return: sid -> ``(function the signal stands in, its arguments after
+            the sid)``
+        """
+        found: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef,
+                               list[ast.expr]]] = {}
+        for func in ast.walk(module):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for stmt in func.body:
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for sub in self._walk_skip_funcs(stmt):
+                    if not (isinstance(sub, ast.Call)
+                            and isinstance(sub.func, ast.Name)
+                            and sub.func.id == '__sec_signal__'):
+                        continue
+                    sid = self._call_sid(sub)
+                    if sid is not None:
+                        found[sid] = (func, list(sub.args[1:]))
+        return found
+
+    def _stable_signal_args(self, module: ast.Module) -> dict[str, tuple[str, ...]]:
+        """The signal arguments of every context that cannot change during a bar.
+
+        A context's signal decides WHICH feed it reads. When the expressions
+        that decide it are STABLE, the feed is a property of the script rather
+        than of the program point the signal happens to run at — and then two
+        contexts with the same such expressions read the same feed even if one
+        of them signals inline, behind a branch, or not at all on a given bar.
+        That is what lets those contexts share a child process.
+
+        Stable is decided by walking the arguments UP to the script entry,
+        substituting them into each caller exactly as :meth:`_lift_signal`
+        substitutes a lifted argument — the same :class:`_SignalArgSubstituter`,
+        the same :meth:`_param_mapping` — with two differences:
+
+        * the call need NOT be reached unconditionally. A value that cannot
+          change does not depend on whether the call runs;
+        * a function may have SEVERAL call sites, as long as every one of them
+          substitutes to the same expression. That is the shape a helper
+          wrapping ``request.security()`` and used a few times takes.
+
+        At every level the argument must be a :meth:`_is_simple_chain` over the
+        names that already hold their final value at function entry
+        (:meth:`_hoistable_bindings`): constants, ``lib.*`` chains such as
+        ``syminfo.tickerid``, ``input.*`` calls, operators over those, the
+        function's never-rebound parameters and its single-assignment simple
+        bindings. A local the body reassigns is therefore never stable, and
+        neither is anything reading a series. A name used in any way OTHER than
+        calling it (an alias, a callback) is not walked at all — the pass cannot
+        see how it is then invoked.
+
+        The walk ends at a function nobody calls — the script entry — whose
+        parameters are its ``input.*`` defaults, fixed for the run.
+
+        :param module: the lowered module
+        :return: sid -> ``ast.dump`` of each fully substituted argument, for
+            the contexts whose arguments are stable
+        """
+        call_sites, load_counts = self._call_sites_by_name(module)
+
+        def resolve(func: ast.FunctionDef | ast.AsyncFunctionDef,
+                    args: list[ast.expr], depth: int) -> tuple[str, ...] | None:
+            """The stable dumps of ``args`` as evaluated in ``func``, or None."""
+            if depth > _MAX_LIFT_ROUNDS:
+                return None
+            hoistable, stable_params = self._hoistable_bindings(func)
+            available = set(hoistable) | stable_params
+            if not all(self._is_simple_chain(a, available) for a in args):
+                return None
+            sites = call_sites.get(func.name, ())
+            if not sites:
+                if load_counts.get(func.name, 0):
+                    # Read without being called here: an alias or a callback,
+                    # so how its parameters are bound is unknown.
+                    return None
+                # Nobody calls it: the script entry.
+                return tuple(ast.dump(a) for a in args)
+            if len(sites) != load_counts.get(func.name, 0):
+                # Some read of the name is not one of these calls.
+                return None
+            bindings = {name: stmt.value for name, stmt in hoistable.items()}
+            answers: set[tuple[str, ...]] = set()
+            for caller, call in sites:
+                if caller is func:
+                    return None
+                mapping = self._param_mapping(func, call)
+                if mapping is None:
+                    return None
+                substituted: list[ast.expr] = []
+                for arg in args:
+                    substituter = _SignalArgSubstituter(mapping, bindings)
+                    new_arg = substituter.visit(copy.deepcopy(arg))
+                    if substituter.failed:
+                        return None
+                    substituted.append(new_arg)
+                answer = resolve(caller, substituted, depth + 1)
+                if answer is None:
+                    return None
+                answers.add(answer)
+            # Several call sites agree only when they pass the same thing.
+            return answers.pop() if len(answers) == 1 else None
+
+        stable: dict[str, tuple[str, ...]] = {}
+        for sid, (host, args) in self._signal_call_sites(module).items():
+            dumps = resolve(host, list(args), 0)
+            if dumps is not None:
+                stable[sid] = dumps
+        return stable
+
+    def _group_key(self, sid: str,
+                   sites: dict[str, tuple[str, ...]],
+                   stable_args: dict[str, tuple[str, ...]]
+                   ) -> tuple[tuple[str | None, ...] | None, bool]:
+        """Compile-time context key of ``sid``, or None when it may not group.
+
+        The key is the syntax of what decides WHICH feed the context resolves
+        to — symbol, timeframe, lookahead and ``ignore_invalid_symbol``.
+        ``gaps`` and ``currency`` are left out on purpose: they only shape how
+        the chart side reads the result, not what the child loads. A
+        lower-timeframe context never gets one (its write path is its own).
+
+        There are two kinds of key, and they never match each other:
+
+        * STABLE — the signal's arguments, walked up to the script entry, are
+          expressions whose value cannot change during a bar (see
+          :meth:`_stable_signal_args`). The feed then follows from the script
+          alone, so the key is position-independent: contexts match wherever
+          their signals stand, inline and behind branches included.
+        * HOSTED — the arguments are not stable, so identical syntax only means
+          an identical value at the SAME program point: two helpers may both
+          signal ``(syminfo.tickerid, tf)`` and mean two different ``tf``. The
+          host function is therefore part of the key, and only a context
+          signalled in a TOP block qualifies at all — there the arguments are
+          evaluated at function entry with the same bindings, so identical
+          syntax does mean an identical value on every bar.
+
+        :param sid: the context id
+        :param sites: the signal sites of the final tree (see :meth:`_signal_sites`)
+        :param stable_args: the stable substituted arguments per sid
+        :return: ``(key, stable)``; the key is None when the context must stand
+            alone
+        """
+        if sid in self._ltf_sec_ids:
+            return None, False
+        ctx = self._all_contexts[sid]
+        # A runtime lookahead travels in the signal args and is already part of
+        # the key below; a module-level one is only in the context.
+        _sym, _tf, la_rt = self._signal_args[sid]
+        la_expr = None if la_rt is not None else ctx.get('lookahead')
+        tail = (self._dump(la_expr), self._dump(ctx.get('ignore_invalid_symbol')))
+        args = stable_args.get(sid)
+        if args is not None:
+            return ('stable', *args, *tail), True
+        site = sites.get(sid)
+        if site is None or sid not in self._top_sec_ids:
+            return None, False
+        return ('hosted', *site, *tail), False
+
+    @staticmethod
+    def _dump(expr: ast.expr | None) -> str | None:
+        """``ast.dump`` of an optional expression."""
+        return None if expr is None else ast.dump(expr)
+
+    def _sid_set(self, sid: str, key: str) -> set[str]:
+        """One context's ``depends`` / ``late_reads`` list, as a set of sids.
+
+        :param sid: The context's id.
+        :param key: ``'depends'`` or ``'late_reads'``.
+        :return: The sids in that list (empty when the key is absent).
+        """
+        value = self._all_contexts[sid].get(key)
+        if not isinstance(value, ast.List):
+            return set()
+        return {elt.value for elt in value.elts
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str)}
+
+    def _group_reads_are_unambiguous(self, members: list[str]) -> bool:
+        """Whether one child could answer every read of these contexts exactly.
+
+        A child that serves a whole group answers a read of a context it serves
+        from its own bar state, never from that context's ring — waiting on a
+        frontier the child itself raises later in the same round would be a
+        deadlock on itself. The bar state says WHAT was read, but not WHO read
+        it: ``__sec_read__`` is handed the context being read, not the call site
+        doing the reading.
+
+        That is only enough while every site reading one context expects the
+        same answer, and the two shapes that break it are:
+
+        * a context read as a DEPENDENCY by one member (its write stands before
+          that read, so the answer is this bar's value) and as a LATE READ by
+          another (the producer writes afterwards, so the answer is the
+          default);
+        * a member of the group itself late-read by another member — the same
+          split, with the ambiguous context inside the group.
+
+        Rejecting the whole group in either case is what makes a merged run
+        equal to an unmerged one value for value, and it costs nothing else: the
+        members then run one child each, on the group clone, exactly as before.
+
+        :param members: The candidate group's contexts.
+        :return: Whether the group may be formed.
+        """
+        depends: set[str] = set()
+        late: set[str] = set()
+        for sid in members:
+            depends |= self._sid_set(sid, 'depends')
+            late |= self._sid_set(sid, 'late_reads')
+        return not (depends & late) and not (set(members) & late)
+
+    def _assign_groups(self, module: ast.Module) -> None:
+        """Write the ``group`` ordinal into every context.
+
+        Contexts with an identical :meth:`_group_key` form one group and get
+        its ordinal; a key with a single context, a group whose reads one child
+        could not answer unambiguously
+        (:meth:`_group_reads_are_unambiguous`), and every context without a key
+        get None. Ordinals follow the order of the contexts themselves, so they
+        are stable for a given module.
+
+        ``group_stable`` says which of the two key rules the group formed under.
+        It matters at runtime: a STABLE group's members are known to read the
+        seed's feed before they have signalled at all, so the chart may resolve
+        them from the seed and start them together; a hosted group's members
+        must have signalled and resolved to the same thing first.
+
+        :param module: the lowered module
+        """
+        sites = self._signal_sites(module)
+        stable_args = self._stable_signal_args(module)
+        by_key: dict[tuple[str | None, ...], list[str]] = {}
+        stable_of_key: dict[tuple[str | None, ...], bool] = {}
+        for sid in self._all_contexts:
+            key, stable = self._group_key(sid, sites, stable_args)
+            if key is not None:
+                by_key.setdefault(key, []).append(sid)
+                stable_of_key[key] = stable
+
+        group_of: dict[str, int] = {}
+        stable_of: dict[str, bool] = {}
+        ordinal = 0
+        for key, members in by_key.items():
+            if len(members) < 2 or not self._group_reads_are_unambiguous(members):
+                continue
+            for sid in members:
+                group_of[sid] = ordinal
+                stable_of[sid] = stable_of_key[key]
+            ordinal += 1
+
+        for sid, ctx in self._all_contexts.items():
+            ctx['group'] = ast.Constant(value=group_of.get(sid))
+            if sid in stable_of:
+                ctx['group_stable'] = ast.Constant(value=stable_of[sid])
 
     def _mark_always_read(self, module: ast.Module) -> None:
         """Flag every context whose ``__sec_read__`` runs on every chart bar.
@@ -1556,6 +1954,9 @@ class SecurityTransformer(ast.NodeTransformer):
                 return second.visit(original)
             self._mark_always_read(node)
             self._mark_signal_per_bar(node)
+            # Groups are decided on the FINAL pass only: the re-run above
+            # starts from the untransformed module and assigns its own.
+            self._assign_groups(node)
 
             # Add barmerge import if needed (SecurityTransformer runs AFTER ImportNormalizer,
             # so we must add it ourselves)

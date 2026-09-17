@@ -272,7 +272,8 @@ def __test_a_security_read_is_typed_from_its_write__():
     types = _types(
         'from pynecore import lib\n'
         "def main():\n"
-        "    if __active_security__ == 'sec-1':\n"
+        "    if __active_security__ is not None "
+        "and 'sec-1' in __active_security__:\n"
         "        __sec_write__('sec-1', lib.close * 2)\n"
         "    value = __sec_read__('sec-1', lib._na_none)\n"
         "    written = __sec_write__('sec-4', lib.close)\n"
@@ -315,11 +316,13 @@ def __test_the_process_identity_globals_are_known__():
         "    here = __active_security__\n"
         "    shared = __same_context__\n"
         "    is_chart = __active_security__ is None\n"
+        "    is_active = 'sec-1' in __active_security__\n"
         "    is_same = 'sec-1' in __same_context__\n",
         scope='main')
     assert types['here'] == 'o'
     assert types['shared'] == 'o'
     assert types['is_chart'] == 'b'
+    assert types['is_active'] == 'b'
     assert types['is_same'] == 'b'
 
 

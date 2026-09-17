@@ -764,6 +764,279 @@ def _drop_discarded_run(drawing_snapshot: DrawingSnapshot) -> None:
     lib._viz_seq.clear()
 
 
+def _security_cyclic_groups(contexts: dict, states: dict) -> set[int]:
+    """Context groups that must NOT be merged, because merging would deadlock.
+
+    A child publishes its own values and waits on its peers' rings, and what
+    keeps that free of deadlock is that a consumer only waits for producers
+    whose write site precedes its own read. Merging POOLS the dependencies of a
+    group: a context with no producer of its own inherits its group-mates'.
+    When two groups then depend on each other, each child has to wait for a
+    value the other will only publish after the wait it is itself parked in.
+
+    MEASURED shape (``test_032_dependent_cross_context``): a daily and a weekly
+    context each read the other's group, so the daily child stops on its first
+    bar waiting for the weekly one, which is waiting for the daily bars of that
+    whole week.
+
+    So the groups are laid over the dependency graph as units — every group as
+    one node, every other context as its own — and each group sitting on a cycle
+    is rejected. Rejecting all of them rather than just enough to break the cycle
+    keeps the answer independent of the order the contexts start in.
+
+    :param contexts: ``__security_contexts__``.
+    :param states: The per-context runtime states (for the resolved ``depends``).
+    :return: The ordinals of the groups that may not be merged.
+    """
+    unit_of: dict[str, tuple] = {}
+    for sid in states:
+        group = contexts.get(sid, {}).get('group')
+        unit_of[sid] = ('g', group) if group is not None else ('s', sid)
+    edges: dict[tuple, set[tuple]] = {}
+    for sid, state in states.items():
+        unit = unit_of[sid]
+        for dep in state.depends:
+            target = unit_of.get(dep)
+            if target is None or target == unit:
+                continue
+            edges.setdefault(unit, set()).add(target)
+
+    def _returns_to(unit: tuple) -> bool:
+        """Whether following the edges out of ``unit`` leads back to it."""
+        seen: set[tuple] = set()
+        stack = list(edges.get(unit, ()))
+        while stack:
+            node = stack.pop()
+            if node == unit:
+                return True
+            if node in seen:
+                continue
+            seen.add(node)
+            stack.extend(edges.get(node, ()))
+        return False
+
+    return {unit[1] for unit in edges if unit[0] == 'g' and _returns_to(unit)}
+
+
+def _security_merge_key(sid: str, contexts: dict, states: dict, prepared: dict):
+    """What a context must agree on to share a child process, or None.
+
+    Two halves, because they answer to different things:
+
+    * the FEED half — the resolved data source and the timeframe/lookahead shape
+      the round protocol follows. It follows from the signal arguments, so a
+      compile-time key that proves two contexts name the same feed proves this
+      half; a difference here means that proof was wrong.
+    * the BATCH half — whether the context's history runs as one batch round,
+      and with which plan, plus the ``main()`` clone it runs. This does NOT
+      follow from the feed: ``batch_eligible`` also asks whether the context has
+      dependencies or consumers, so two contexts on one and the same feed can
+      land in different batch classes. A batched and a per-bar context cannot
+      share one bar loop, so they simply do not group.
+
+    Comparing the PREPARED result rather than the declaration is what makes this
+    a runtime check: two contexts whose signal arguments are syntactically
+    identical but which nevertheless resolved differently get different keys and
+    stay apart.
+
+    :param sid: The context's id.
+    :param contexts: ``__security_contexts__``.
+    :param states: The per-context runtime states.
+    :param prepared: The per-sid ``_prepare_security_context`` results.
+    :return: ``(feed key, batch key)``, or None when the context is not prepared
+        and so cannot be compared at all.
+    """
+    entry = prepared.get(sid)
+    if entry is None:
+        return None
+    source, capacity, arena, spec = entry
+    state = states[sid]
+    # Every element compares with ``==`` and never raises: the data source is
+    # normalised to its ``repr``, the rest are strings, an enum, bools and ints,
+    # and ``DevBatchSpec`` is a frozen dataclass whose own fields compare the
+    # same way (its chart window is ONE object shared by every context of a run,
+    # so identity is the right answer for it).
+    feed = (
+        repr(source), str(state.timeframe), state.lookahead,
+        state.chart_type, state.chart_type_warmup,
+        state.is_ltf, state.plain_ltf, state.same_timeframe,
+        state.na_on_developing, state.ltf_live_stream,
+    )
+    batch = (state.batch_target, capacity, arena, spec,
+             contexts[sid].get('slice_main'))
+    return feed, batch
+
+
+def _security_merge_group(sid: str, all_sec_ids: list[str], contexts: dict,
+                          states: dict, prepared: dict, processes: dict,
+                          no_process_ids: set, unresolved_ids: set,
+                          ohlcv_paths: dict, missing_data: dict,
+                          disabled: bool, cyclic_groups: set) -> 'list[str] | None':
+    """The contexts that may share ONE child process with ``sid``.
+
+    The transformer's ``group`` is the compile-time half: those contexts' signal
+    arguments are syntactically identical at the same program point, so they
+    resolve to the same feed. This is the runtime half — a member joins only when
+    it is not chart-served or feedless and has not started yet. What else it
+    must satisfy depends on which rule the group formed under:
+
+    * ``group_stable`` — the key is the signal arguments themselves, walked up
+      to the script entry, and they cannot change during a bar. A member
+      therefore reads the seed's feed whether or not it has signalled, so an
+      unresolved member JOINS and the chart resolves it from the seed (see
+      ``_start`` in :func:`create_chart_protocol`). Once resolved its FEED key
+      must equal the seed's — that is exactly what the compile-time proof says —
+      so a difference there is a bug in the key rule and is raised rather than
+      filtered away. Its BATCH key may legitimately differ (batch eligibility
+      also depends on the context's dependencies and consumers), and then it
+      simply does not join.
+    * otherwise the key is only meaningful at the program point the signal
+      stands at, so a member joins only once it has actually signalled and
+      resolved to the very same thing.
+
+    A member read only behind a branch is NOT held back. Pine evaluates every
+    ``request.security()`` call regardless of the conditional around it, so
+    computing a member's expression in the shared child is Pine-consistent — and
+    in the clone the write block keeps the enclosing conditionals it had in
+    ``main()`` anyway. What the lazy start still guarantees is what it is for: a
+    context nothing reads costs no child process of its own.
+
+    :param sid: The context about to be started.
+    :param all_sec_ids: Every context id, in declaration order.
+    :param contexts: ``__security_contexts__``.
+    :param states: The per-context runtime states.
+    :param prepared: The per-sid ``_prepare_security_context`` results.
+    :param processes: The live ``sec_id -> Process`` map.
+    :param no_process_ids: Chart-served and ignored contexts.
+    :param unresolved_ids: Contexts still waiting for their runtime symbol/TF.
+    :param ohlcv_paths: Resolved data source per context.
+    :param missing_data: Per-context missing-feed message, if any.
+    :param disabled: ``PYNE_NO_SECURITY_MERGE`` — one child per context.
+    :param cyclic_groups: Groups merging would deadlock (see
+        :func:`_security_cyclic_groups`).
+    :return: Every member including ``sid``, or None for no merge.
+    """
+    if disabled or sid in no_process_ids or sid in processes:
+        return None
+    group = contexts[sid].get('group')
+    if group is None or group in cyclic_groups:
+        return None
+    stable = bool(contexts[sid].get('group_stable'))
+    group_sids = [other for other in all_sec_ids
+                  if contexts.get(other, {}).get('group') == group]
+    if any(states[other].depends & unresolved_ids for other in group_sids):
+        # A member depends on a context whose symbol or timeframe only exists
+        # once its own signal runs, so it cannot be started with the group: the
+        # child waits for that peer's registry record, which the chart sends at
+        # a signal LATER in ``main()``. Merging pools that wait onto every
+        # member, and the chart's read of the primary waits for all of them
+        # (see ``_drive_pending``) — so the chart parks before it ever reaches
+        # the signal the child is waiting for. Unmerged, only the member that
+        # truly depends on the peer waits, and it is read after that signal.
+        # The whole group is declined rather than just that member, so the
+        # answer does not depend on the order the contexts start in.
+        return None
+    key = _security_merge_key(sid, contexts, states, prepared)
+    if key is None:
+        return None
+    members = [sid]
+    for other in all_sec_ids:
+        if other == sid or contexts.get(other, {}).get('group') != group:
+            continue
+        if (other in no_process_ids or other in processes
+                or states[other].started
+                or missing_data.get(other) is not None):
+            continue
+        other_key = _security_merge_key(other, contexts, states, prepared)
+        if stable:
+            if other_key is None:
+                # Not resolved yet. The chart adopts it from the seed and asks
+                # again; only then is there a key to compare.
+                members.append(other)
+                continue
+            if other_key[0] != key[0]:
+                raise RuntimeError(
+                    f"security contexts '{sid}' and '{other}' were proved to "
+                    f"name the same feed at compile time but resolved "
+                    f"differently ({key[0]!r} vs {other_key[0]!r})"
+                )
+            if other_key[1] != key[1]:
+                continue
+            members.append(other)
+            continue
+        if other in unresolved_ids or ohlcv_paths.get(other) is None:
+            continue
+        if other_key != key:
+            continue
+        members.append(other)
+    return members if len(members) > 1 else None
+
+
+def _security_spawn_maps(sid: str, members: 'list[str] | None', contexts: dict,
+                         states: dict, prepared: dict, consumers: dict,
+                         capacity: int, arena: int) -> tuple:
+    """Build the per-member spawn arguments of one security child process.
+
+    One child serves either a single context or a whole group; everything the
+    members do not share travels as a map keyed by sid, so each of them keeps its
+    own result block, ring, events and plain-OHLCV fast path. ``sid`` is the
+    primary and comes first: its slot is the only one the chart schedules.
+
+    :param sid: The primary context's id.
+    :param members: The group's members, or None for a lone context.
+    :param contexts: ``__security_contexts__``.
+    :param states: The per-context runtime states.
+    :param prepared: The per-sid ``_prepare_security_context`` results.
+    :param consumers: Sids consuming each context.
+    :param capacity: The primary's chart-consumed ring capacity.
+    :param arena: The primary's chart-consumed ring arena size.
+    :return: ``(served, ohlcv_fields, ohlcv_tuple, slice_main, capacities,
+        arenas, ready_events, done_events, member_consumers, watch_events)``.
+    """
+    served = [sid] + [m for m in (members or ()) if m != sid]
+    # Plain-OHLCV fast path: a context whose expression is only raw price series
+    # is served straight from each bar in the child, skipping the per-bar main()
+    # re-run (SecurityTransformer records the field list per context).
+    ohlcv_fields = {m: contexts[m].get('ohlcv_fields') for m in served}
+    ohlcv_tuple = {m: bool(contexts[m].get('ohlcv_tuple')) for m in served}
+    capacities = {sid: capacity}
+    arenas = {sid: arena}
+    for member in served[1:]:
+        entry = prepared.get(member)
+        capacities[member] = entry[1] if entry else 0
+        arenas[member] = entry[2] if entry else 0
+    ready_events = {m: states[m].data_ready for m in served}
+    done_events = {m: states[m].done_event for m in served}
+    watch_events: list = []
+    for member in served:
+        watch_events.append(states[member].data_ready)
+        watch_events.append(states[member].done_event)
+    return (served, ohlcv_fields, ohlcv_tuple,
+            # One clone serves the whole group — it holds every member's write
+            # block — so the primary's name is the group's.
+            contexts[sid].get('slice_main'),
+            capacities, arenas, ready_events, done_events,
+            {m: consumers.get(m, []) for m in served}, tuple(watch_events))
+
+
+def _join_security_processes(processes: dict) -> None:
+    """Join every security child, terminating whatever outlives its grace period.
+
+    One process can serve a whole context group, so the same object shows up
+    under every member's sid — each is joined exactly once.
+
+    :param processes: The live ``sec_id -> Process`` map.
+    """
+    joined: set[int] = set()
+    for proc in processes.values():
+        if id(proc) in joined:
+            continue
+        joined.add(id(proc))
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+
+
 class ScriptRunner:
     """
     Script runner
@@ -1879,6 +2152,16 @@ class ScriptRunner:
                         if _pid in sec_consumers and _cid not in sec_consumers[_pid]:
                             sec_consumers[_pid].append(_cid)
 
+                # One child per context GROUP (see ``_merge_group`` below and
+                # ``create_chart_protocol``). Both maps are filled by the chart
+                # protocol at the group's start and read back here.
+                from .import_hook import security_merge_disabled
+                _merge_disabled = security_merge_disabled()
+                _cyclic_groups = _security_cyclic_groups(
+                    cast('dict[str, dict]', sec_contexts), sec_states)
+                sec_merge_primary: dict[str, str] = {}
+                sec_merge_members: dict[str, list[str]] = {}
+
                 # Parent end of each child's registry pipe, by sec_id. A
                 # context whose symbol/timeframe only exist at runtime (an
                 # inline ``__sec_signal__`` with a computed symbol) is resolved
@@ -2081,34 +2364,49 @@ class ScriptRunner:
                     _sec_prepared[sid] = prepared
                     return prepared
 
-                def _spawn_security_process(sid: str, data_source):
-                    """Start this context's child process (preparing it first)."""
+                def _merge_group(sid: str) -> 'list[str] | None':
+                    """Which contexts may share ONE child process with ``sid``."""
+                    return _security_merge_group(
+                        sid, all_sec_ids,
+                        cast('dict[str, dict]', sec_contexts),
+                        sec_states,  # noqa - non-None inside if sec_contexts
+                        _sec_prepared, sec_processes, no_process_ids,
+                        deferred_sec_ids, sec_ohlcv_paths,
+                        self._missing_sec_data, _merge_disabled,
+                        _cyclic_groups)
+
+                def _spawn_security_process(sid: str, data_source,
+                                            members: 'list[str] | None' = None):
+                    """Start the child process of this context (preparing it first).
+
+                    With ``members`` the child serves the whole group: ``sid`` is
+                    its primary and the only slot the chart schedules, while the
+                    per-context arguments below travel as maps so each member
+                    keeps its own result block, ring, events and fast path.
+                    """
                     sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
                     (data_source, _chart_ring_capacity, _chart_ring_arena,
                      _dev_batch_spec) = _prepare_security_context(sid, data_source)
-                    # Plain-OHLCV fast path: a context whose expression is only
-                    # raw price series is served straight from each bar in the
-                    # child, skipping the per-bar main() re-run (SecurityTransformer
-                    # records the field list in __security_contexts__).
-                    _ctx_meta = cast('dict[str, dict]', sec_contexts)[sid]
-                    _ohlcv_fields = _ctx_meta.get('ohlcv_fields')
-                    _ohlcv_tuple = bool(_ctx_meta.get('ohlcv_tuple'))
-                    # Backward-sliced main() clone of this context, when the
-                    # slicer could build one (see transformers/security_slice.py).
-                    _slice_main = _ctx_meta.get('slice_main')
+                    (served, _ohlcv_fields, _ohlcv_tuple, _slice_main,
+                     _capacities, _arenas, _ready_events, _done_events,
+                     _member_consumers, _watch_events) = _security_spawn_maps(
+                        sid, members, cast('dict[str, dict]', sec_contexts),
+                        sec_states,  # noqa - non-None inside if sec_contexts
+                        _sec_prepared, sec_consumers,
+                        _chart_ring_capacity, _chart_ring_arena)
                     _registry_parent_conn, _registry_child_conn = Pipe()
                     sec_registry_pipes[sid] = _registry_parent_conn
                     proc = Process(
                         target=security_process_main,
                         args=(
-                            sid,
+                            served,
                             script_path_str,
                             data_source,
                             sec_sync_block.name,  # noqa
                             all_sec_ids,
-                            sec_state.data_ready,
+                            _ready_events,
                             sec_state.advance_event,
-                            sec_state.done_event,
+                            _done_events,
                             sec_state.stop_event,
                             sec_state.is_ltf,
                             sec_result_locks,
@@ -2122,10 +2420,10 @@ class ScriptRunner:
                             _sec_registry(),
                             sec_state.chart_calendar,
                             sec_ring_conditions,
-                            sec_consumers.get(sid, []),
+                            _member_consumers,
                             _registry_child_conn,
-                            _chart_ring_capacity,
-                            _chart_ring_arena,
+                            _capacities,
+                            _arenas,
                             self._inputs,
                             _dev_batch_spec,
                         ),
@@ -2139,11 +2437,15 @@ class ScriptRunner:
                     # Their snapshots either omitted it (runtime-resolved) or
                     # predate ``load_htf_bar_opens``, which is what fills the
                     # calendar the as-of extension needs.
-                    _publish_sec_record(sid)
-                    sec_processes[sid] = proc
+                    for m in served:
+                        sec_processes[m] = proc
+                        _publish_sec_record(m)
+                    # ONE watcher for the whole group, with EVERY member's waits
+                    # among the events it releases: a death raises out of any
+                    # chart wait, whichever member it was waiting on.
                     watch_security_child(
                         sid, proc, sec_failed_children,
-                        (sec_state.data_ready, sec_state.done_event),
+                        _watch_events,
                         tuple(st.stop_event for st in sec_states.values()),  # noqa
                     )
 
@@ -2329,11 +2631,11 @@ class ScriptRunner:
                 # check makes it safe to call after the deferred resolver too —
                 # a deferred context spawns its process inside ``_deferred_resolve``,
                 # and spawning it again would leak a duplicate child.
-                def _lazy_spawn(sid: str):
+                def _lazy_spawn(sid: str, members: 'list[str] | None' = None):
                     resolved_path = sec_ohlcv_paths.get(sid)
                     if (resolved_path is not None and sid not in no_process_ids
                             and sid not in sec_processes):
-                        _spawn_security_process(sid, resolved_path)
+                        _spawn_security_process(sid, resolved_path, members)
 
                 # Eager-spawn auto-rate-source contexts. These hidden
                 # ``__auto_rate_*`` sec_ids carry the FX feed for
@@ -2411,6 +2713,9 @@ class ScriptRunner:
                     failed_children=sec_failed_children,
                     ring_conditions=sec_ring_conditions,
                     consumers_by_sid=sec_consumers,
+                    merge_group_fn=_merge_group,
+                    merge_primary=sec_merge_primary,
+                    merge_members=sec_merge_members,
                 )
                 self._sec_begin_bar_fn = sec_begin_bar_fn
                 self._sec_end_bar_fn = sec_end_bar_fn
@@ -3512,10 +3817,7 @@ class ScriptRunner:
                     # hygiene, and gives it an EOF either way.
                     _conn.close()
                 sec_registry_pipes.clear()
-                for p in sec_processes.values():
-                    p.join(timeout=5)
-                    if p.is_alive():
-                        p.terminate()
+                _join_security_processes(sec_processes)
                 if callable(sec_cleanup_fn):
                     sec_cleanup_fn: Callable
                     sec_cleanup_fn()
@@ -3584,6 +3886,35 @@ class ScriptRunner:
 
         ceht_active = is_strat and self.script.calc_on_every_history_tick
 
+        sec_begin_bar_fn = self._sec_begin_bar_fn
+        sec_end_bar_fn = self._sec_end_bar_fn
+
+        # noinspection PyProtectedMember
+        def _run_libs_and_main():
+            """Run the libraries and ``main()`` inside the security bar cycle.
+
+            Every execution of the ordinary loop is wrapped in the security
+            begin/end hooks, and the magnified loop's executions — the bar's own
+            and every discarded order-fill / history-tick re-execution — need
+            them just as much: the hooks fix the round's chart bar and close out
+            whatever the body left pending, so running without them freezes
+            merged groups and leaves rounds in flight.
+            """
+            if sec_begin_bar_fn is not None:
+                # noinspection PyCallingNonCallable
+                sec_begin_bar_fn(lib._time, lib._next_time,
+                                 bool(barstate.isconfirmed))
+            lib._lib_semaphore = True
+            for run_lib_main in lib_mains:
+                run_lib_main()
+            lib._lib_semaphore = False
+            try:
+                return run_main()
+            finally:
+                if sec_end_bar_fn is not None:
+                    # noinspection PyCallingNonCallable
+                    sec_end_bar_fn()
+
         chart_tf = str(lib.syminfo.period)
         assert self._magnifier_iter is not None
         magnifier = BarMagnifier(self._magnifier_iter, chart_tf, tz=self.tz,
@@ -3651,11 +3982,7 @@ class ScriptRunner:
                         child_snapshot.restore()
                     position._mark_to_last_fill(sub_close)
                     _set_partial_bar(lib, bar_prices[0], hi, lo, sub_close, vol)
-                    lib._lib_semaphore = True
-                    for run_lib_main in lib_mains:
-                        run_lib_main()
-                    lib._lib_semaphore = False
-                    run_main()
+                    _run_libs_and_main()
                     # Restore BEFORE processing orders: the emulator re-reads the
                     # bar's OHLC, and a truncated bar would hide the rest of it.
                     _set_partial_bar(lib, *bar_prices)
@@ -3700,11 +4027,7 @@ class ScriptRunner:
                     if child_snapshot:
                         child_snapshot.restore()
                     position._mark_to_last_fill()
-                    lib._lib_semaphore = True
-                    for run_lib_main in lib_mains:
-                        run_lib_main()
-                    lib._lib_semaphore = False
-                    run_main()
+                    _run_libs_and_main()
                     re_executions += 1
                     old_fills = new_fills
                     # Resume at the triggering fill's sub-bar (see
@@ -3724,14 +4047,8 @@ class ScriptRunner:
             elif position:
                 position.process_orders_magnified(window.sub_bars, window.aggregated)
 
-            # Execute registered library main functions before main script
-            lib._lib_semaphore = True
-            for run_lib_main in lib_mains:
-                run_lib_main()
-            lib._lib_semaphore = False
-
-            # Run the script
-            res = run_main()
+            # Run the libraries and the script
+            res = _run_libs_and_main()
 
             # Fill immediate closes enqueued during the body, at this bar's close —
             # after the body (magnified is backtest-only, position is SimPosition).

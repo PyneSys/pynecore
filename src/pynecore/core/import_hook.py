@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from pynecore.transformers.slot_layout import ModuleLayout
 
 __all__ = ['PYNE_RESERVED_NAME_CHAR', 'PIPELINE_DIGEST', 'security_slice_disabled',
+           'security_merge_disabled',
            'source_starts_with_pyne',
            'analyse_source', 'PyneLoader', 'PyneImportHook']
 
@@ -123,6 +124,13 @@ def _reject_reserved_names(tree: "ast.Module", source: str, path: Path) -> None:
 #: never end up on bytecode built under the other setting.
 SECURITY_SLICE_ENV = 'PYNE_NO_SECURITY_SLICE'
 
+#: Environment switch turning OFF the merge of one context group into ONE child
+#: process (see ``core/script_runner.py``). Runtime-only: the emitted bytecode is
+#: the same either way — a group clone is correct for a single member too — so it
+#: is deliberately NOT part of :func:`pipeline_hash`, and an A/B run of it reuses
+#: the very same ``.pyc``.
+SECURITY_MERGE_ENV = 'PYNE_NO_SECURITY_MERGE'
+
 _TRUTHY = frozenset({'1', 'true', 'yes', 'on'})
 
 
@@ -132,6 +140,14 @@ def security_slice_disabled() -> bool:
     :return: True when no ``main()`` clone may be emitted.
     """
     return os.environ.get(SECURITY_SLICE_ENV, '').strip().lower() in _TRUTHY
+
+
+def security_merge_disabled() -> bool:
+    """Whether ``PYNE_NO_SECURITY_MERGE`` asks for one child process per context.
+
+    :return: True when the contexts of one group may not share a child.
+    """
+    return os.environ.get(SECURITY_MERGE_ENV, '').strip().lower() in _TRUTHY
 
 
 def _cache_from_source(source_path: Path) -> Path:

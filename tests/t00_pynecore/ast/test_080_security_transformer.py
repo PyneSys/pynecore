@@ -74,13 +74,20 @@ def main():
     # Statement 2: original sma assignment (unchanged)
     assert isinstance(func.body[1], ast.Assign)
 
-    # Statement 3: write block (if __active_security__ == sec_id or sec_id in __same_context__)
+    # Statement 3: write block — the active-set membership test (None-guarded
+    # for the chart) or the same-context one
     write_if = func.body[2]
     assert isinstance(write_if, ast.If)
     assert isinstance(write_if.test, ast.BoolOp)
     assert isinstance(write_if.test.op, ast.Or)
-    assert isinstance(write_if.test.values[0].ops[0], ast.Eq)
+    active = write_if.test.values[0]
+    assert isinstance(active, ast.BoolOp) and isinstance(active.op, ast.And)
+    assert isinstance(active.values[0].ops[0], ast.IsNot)
+    assert active.values[0].left.id == '__active_security__'
+    assert isinstance(active.values[1].ops[0], ast.In)
+    assert active.values[1].comparators[0].id == '__active_security__'
     assert isinstance(write_if.test.values[1].ops[0], ast.In)
+    assert write_if.test.values[1].comparators[0].id == '__same_context__'
     write_call = write_if.body[0].value
     assert write_call.func.id == '__sec_write__'
 
@@ -2606,3 +2613,229 @@ def main():
     flags = __test_helper_always_read_sids(source)
     assert list(flags.values()) == [True]
     log.info("read behind an unconditional helper flagged always_read")
+
+
+def __test_helper_group_ordinals(source: str) -> list[int | None]:
+    """The ``group`` ordinal of every context of ``source``, in context order.
+
+    :param source: the script source to transform
+    :return: one ordinal (or None) per context
+    """
+    tree = _transform_tree(source)
+    contexts = _find_contexts(tree)
+    assert isinstance(contexts.value, ast.Dict)
+    ordinals: list[int | None] = []
+    for ctx_node in contexts.value.values:
+        assert isinstance(ctx_node, ast.Dict)
+        found: int | None = None
+        seen = False
+        for key, val in zip(ctx_node.keys, ctx_node.values):
+            if isinstance(key, ast.Constant) and key.value == 'group':
+                assert isinstance(val, ast.Constant)
+                found = val.value
+                seen = True
+        assert seen, "a context carries no 'group' key"
+        ordinals.append(found)
+    return ordinals
+
+
+def __test_same_arguments_share_one_group__(log):
+    """Three top-block calls on one feed are one group, a fourth feed another"""
+    source = """
+@lib.script.indicator("T")
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "1D", lib.ta.sma(lib.close, 3))
+    b = lib.request.security(lib.syminfo.tickerid, "1D", lib.ta.sma(lib.close, 5))
+    c = lib.request.security(lib.syminfo.tickerid, "1D", lib.ta.sma(lib.close, 7))
+    lib.plot(a + b + c)
+"""
+    assert __test_helper_group_ordinals(source) == [0, 0, 0]
+    log.info("three identical contexts merged into one group")
+
+
+def __test_a_different_timeframe_is_a_different_group__(log):
+    """The timeframe is part of the key, so it splits the group"""
+    source = """
+@lib.script.indicator("T")
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "1D", lib.ta.sma(lib.close, 3))
+    b = lib.request.security(lib.syminfo.tickerid, "1D", lib.ta.sma(lib.close, 5))
+    c = lib.request.security(lib.syminfo.tickerid, "240", lib.high)
+    d = lib.request.security(lib.syminfo.tickerid, "240", lib.low)
+    lib.plot(a + b + c + d)
+"""
+    assert __test_helper_group_ordinals(source) == [0, 0, 1, 1]
+    log.info("the two timeframes got two groups")
+
+
+def __test_a_lone_context_has_no_group__(log):
+    """A group of one is no group: the context runs on its own as before"""
+    source = """
+@lib.script.indicator("T")
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "1D", lib.ta.sma(lib.close, 3))
+    lib.plot(a)
+"""
+    assert __test_helper_group_ordinals(source) == [None]
+    log.info("the single context got no group")
+
+
+def __test_a_deferred_context_with_stable_args_groups__(log):
+    """A call behind a branch joins the group when its arguments are stable
+
+    ``sym`` is the entry's own input parameter and is never rebound, so the
+    third call reads the very same feed as the two above it however its branch
+    turns out. It signals inline — the chart must not resolve a feed a run may
+    never touch — but the FEED it names is decided by the script, so one child
+    can serve all three.
+    """
+    source = """
+@lib.script.indicator("T")
+def main(sym: str = lib.input.symbol("")):
+    a = lib.request.security(sym, "1D", lib.ta.sma(lib.close, 3))
+    b = lib.request.security(sym, "1D", lib.ta.sma(lib.close, 5))
+    if lib.close > lib.open:
+        c = lib.request.security(sym, "1D", lib.ta.sma(lib.close, 7))
+        lib.plot(c)
+    lib.plot(a + b)
+"""
+    assert __test_helper_group_ordinals(source) == [0, 0, 0]
+    log.info("the deferred context joined its peers on a stable argument")
+
+
+def __test_a_reassigned_local_is_not_stable__(log):
+    """A timeframe the body reassigns decides nothing at compile time
+
+    ``tf`` holds two different values during one bar, so the two calls may read
+    two different feeds and neither may be keyed by its syntax.
+    """
+    source = """
+@lib.script.indicator("T")
+def main():
+    tf = "1D"
+    a = lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+    tf = "240"
+    b = lib.request.security(lib.syminfo.tickerid, tf, lib.close)
+    lib.plot(a + b)
+"""
+    assert __test_helper_group_ordinals(source) == [None, None]
+    log.info("the reassigned local kept both contexts out of a group")
+
+
+def __test_a_helper_ternary_groups_every_call_site__(log):
+    """The gcBksf shape: a helper picking between two calls, called three times
+
+    Both arms of the ternary are a context of their own, and both signal inline
+    — a ternary arm is not reached on every run. Their symbol and timeframe
+    nevertheless come from ``main``'s inputs through the helper's never-rebound
+    parameters, whichever of the three call sites is running, so both read the
+    same feed and form ONE group.
+    """
+    source = """
+def __test_helper_pick(tf: str, mode: str):
+    return (lib.request.security(lib.syminfo.tickerid, tf, lib.ta.sma(lib.close, 3))
+            if mode == "SMA"
+            else lib.request.security(lib.syminfo.tickerid, tf, lib.ta.ema(lib.close, 3)))
+
+
+@lib.script.indicator("T")
+def main(res: str = lib.input.timeframe("60"), mode: str = lib.input.string("SMA")):
+    a = __test_helper_pick(res, mode)
+    b = __test_helper_pick(res, mode)
+    c = __test_helper_pick(res, mode)
+    lib.plot(a + b + c)
+"""
+    assert __test_helper_group_ordinals(source) == [0, 0]
+    log.info("both ternary arms grouped across the helper's three call sites")
+
+
+def __test_a_main_level_conditional_call_groups__(log):
+    """The LuxAlgo shape: ``security(...) if flag else na`` on an input timeframe
+
+    The call only runs when the input flag is on, so its signal stays inline —
+    but the timeframe it would name is an input, fixed for the run, so both
+    calls are keyed alike and share a child.
+    """
+    source = """
+@lib.script.indicator("T")
+def main(res: str = lib.input.timeframe("60"), htf: bool = lib.input.bool(True)):
+    a = lib.request.security(lib.syminfo.tickerid, res, lib.close) if htf else lib.na
+    b = lib.request.security(lib.syminfo.tickerid, res, lib.high) if htf else lib.na
+    lib.plot(a + b)
+"""
+    assert __test_helper_group_ordinals(source) == [0, 0]
+    log.info("both conditional calls grouped on the input timeframe")
+
+
+def __test_an_input_timeframe_groups_too__(log):
+    """Two calls reading the same input resolve alike, so they may share a child"""
+    source = """
+@lib.script.indicator("T")
+def main(tf: str = lib.input.timeframe("60")):
+    a = lib.request.security(lib.syminfo.tickerid, tf, lib.ta.sma(lib.close, 3))
+    b = lib.request.security(lib.syminfo.tickerid, tf, lib.ta.sma(lib.close, 5))
+    lib.plot(a + b)
+"""
+    assert __test_helper_group_ordinals(source) == [0, 0]
+    log.info("the input-derived timeframe grouped both contexts")
+
+
+def __test_identical_syntax_in_two_helpers_does_not_group__(log):
+    """One key per program point: two helpers' ``tf`` are two different values
+
+    Neither signal can be lifted (both helpers are called twice), so each stays
+    in its own helper's top block — where the same ``tf`` spelling stands for a
+    different binding.
+    """
+    source = """
+@lib.script.indicator("T")
+def main():
+    def f(tf):
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.ta.sma(lib.close, 3))
+    def g(tf):
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.ta.ema(lib.close, 3))
+    lib.plot(f("1D") + f("240"))
+    lib.plot(g("60") + g("120"))
+"""
+    assert __test_helper_group_ordinals(source) == [None, None]
+    log.info("the two helpers' look-alike signals stayed apart")
+
+
+def __test_lifted_signals_group_by_their_substituted_arguments__(log):
+    """A lifted signal is keyed where it RUNS, with the caller's own expressions"""
+    source = """
+@lib.script.indicator("T")
+def main():
+    def fast(tf):
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.ta.sma(lib.close, 3))
+    def slow(tf):
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.ta.ema(lib.close, 9))
+    a = fast("1D")
+    b = slow("1D")
+    lib.plot(a + b)
+"""
+    assert __test_helper_group_ordinals(source) == [0, 0]
+    log.info("both signals lifted into main with the same arguments and grouped")
+
+
+def __test_a_split_read_breaks_the_group__(log):
+    """A context one member depends on and another late-reads forms no group
+
+    ``b`` is written before ``c``'s call site, so ``c`` DEPENDS on it; ``a``
+    reaches the same ``b`` through a series assigned in the tail, which is a
+    LATE read. One child serving all three could not answer the two reads
+    differently — it is told which context is read, not which site reads it — so
+    the whole group is dropped and the three contexts run one child each.
+    """
+    source = """
+@lib.script.indicator("T")
+def main():
+    carry: Series[float] = 0.0
+    a = lib.request.security(lib.syminfo.tickerid, "1D", carry[1] + 1.0)
+    b = lib.request.security(lib.syminfo.tickerid, "1D", lib.close)
+    c = lib.request.security(lib.syminfo.tickerid, "1D", b * 2.0)
+    carry = b
+    lib.plot(a + c)
+"""
+    assert __test_helper_group_ordinals(source) == [None, None, None]
+    log.info("the split read kept the three contexts out of a group")

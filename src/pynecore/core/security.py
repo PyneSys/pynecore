@@ -218,7 +218,13 @@ def _wait_with_liveness(
         event.wait()
         return
     if failed_children is not None:
-        event.wait()
+        if not failed_children:
+            # Checked BEFORE blocking: the death watcher sets every wait event
+            # once, and a chart that clears one afterwards (a launch clears its
+            # group's events) would block on an event nothing sets again. The
+            # registry is filled before those sets, so a death that already
+            # happened is visible here and raises instead of parking forever.
+            event.wait()
         if failed_children:
             # ANY child's death can freeze this wait, not only the awaited
             # one's: contexts read each other, so a dead consumer leaves a
@@ -1088,7 +1094,7 @@ def create_chart_protocol(
     sync_block: SyncBlock,
     deferred_resolve_fn: 'Callable[[str, str, str | None], None] | None' = None,
     prepare_fn: 'Callable[[str], None] | None' = None,
-    lazy_spawn_fn: 'Callable[[str], None] | None' = None,
+    lazy_spawn_fn: 'Callable[[str, list[str] | None], None] | None' = None,
     same_context_ids: 'set[str] | frozenset[str]' = frozenset(),
     no_process_ids: 'set[str] | frozenset[str]' = frozenset(),
     unresolved_ids: 'set[str] | frozenset[str]' = frozenset(),
@@ -1100,9 +1106,25 @@ def create_chart_protocol(
     failed_children: 'set[str] | None' = None,
     ring_conditions: 'dict[str, ConditionType] | None' = None,
     consumers_by_sid: 'dict[str, list[str]] | None' = None,
+    merge_group_fn: 'Callable[[str], list[str] | None] | None' = None,
+    merge_primary: 'dict[str, str] | None' = None,
+    merge_members: 'dict[str, list[str]] | None' = None,
 ) -> tuple:
     """
     Create protocol functions for the **chart** process.
+
+    **Context groups.** The transformer marks the contexts that are guaranteed
+    to resolve to one and the same feed as a group, and ``_start`` asks
+    ``merge_group_fn`` whether the group's members may share ONE child process.
+    Only members the script reads UNCONDITIONALLY join (``always_read``), so a
+    context behind a branch this run does not take is never evaluated by the
+    group's child — it starts alone at its own first read, or not at all.
+    When members do share a child, the one whose ``__sec_signal__`` runs FIRST
+    becomes the group's primary and is the only one the chart schedules: the
+    other members' signals delegate to it and then copy its per-bar
+    bookkeeping, while their reads, waits and values stay entirely their own —
+    each member keeps its result block, its ring, its ``data_ready``, its
+    ``rounds_done`` counter and its own ``gaps``/``currency`` handling.
 
     :param states: Per-security-context runtime states
     :param sync_block: Shared memory sync block
@@ -1113,10 +1135,12 @@ def create_chart_protocol(
                        plans its batch round, both of which every chart-side
                        target computation from that bar on reads. It starts no
                        process.
-    :param lazy_spawn_fn: Optional callback for lazy-spawning static security processes.
-                          Called with sec_id on the context's FIRST ``__sec_read__``
-                          (see ``_start``), so a context the run never reads never
-                          gets a process.
+    :param lazy_spawn_fn: Optional callback for lazy-spawning static security
+                          processes. Called with ``(sec_id, members)`` on the
+                          context's FIRST ``__sec_read__`` (see ``_start``), so a
+                          context the run never reads never gets a process.
+                          ``members`` is the whole group when the contexts of one
+                          group share this process, None otherwise.
     :param same_context_ids: Security IDs that share the chart's symbol+timeframe.
                              These are handled directly by the chart (no separate process).
     :param no_process_ids: Security IDs that have no process (same-context + ignored).
@@ -1157,6 +1181,13 @@ def create_chart_protocol(
                             producers, whose ring the chart itself writes.
     :param consumers_by_sid: Sids consuming each context, for the ring GC
                              watermark minimum.
+    :param merge_group_fn: Asked at ``_start`` which OTHER contexts may share
+                           this one's child process. Returns the full member
+                           list (this sid included) or None for no merge.
+    :param merge_primary: Member sid -> its group's primary. Filled here and
+                          captured by reference, so the runner sees the mapping
+                          the spawn produced.
+    :param merge_members: Primary sid -> the group's OTHER members.
     :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup,
               signal_rate_sources, begin_bar, end_bar)
     """
@@ -1177,6 +1208,33 @@ def create_chart_protocol(
     cold_batch_start = [False]
     ring_conditions = ring_conditions or {}
     consumers_by_sid = consumers_by_sid or {}
+    merge_primary = {} if merge_primary is None else merge_primary
+    merge_members = {} if merge_members is None else merge_members
+    # Order of the FIRST ``__sec_signal__`` of each context. The transformer
+    # hoists every static context's signal into one straight-line block at the
+    # top of ``main()``, so this order is the program order of the block and it
+    # repeats on every bar — which is what makes "the member that signals first"
+    # a stable choice of primary, and lets a member's signal rely on the
+    # primary's having already run in the same invocation.
+    signal_order: dict[str, int] = {}
+    # The group primaries whose round this invocation of ``main()`` has already
+    # scheduled. A STABLE group's signals may stand inside branches, so the
+    # primary's own signal is not guaranteed to be reached on every invocation;
+    # the first member that IS reached schedules the group's round instead, and
+    # this set keeps that to exactly one round per invocation. Cleared by
+    # ``end_bar``, which the runner calls after every ``main()``.
+    signalled_primaries: set[str] = set()
+    # Every context whose signal was reached in THIS invocation, merged or not.
+    # A group forming here picks its primary out of this set, so the round the
+    # group launches is the one prepared on this invocation and not a round a
+    # member left pending on an earlier bar. Cleared by ``end_bar``.
+    signalled_this_call: set[str] = set()
+    # What each context's resolution was performed with. For a context the chart
+    # resolved on another member's behalf (a STABLE group, see ``_start``) these
+    # are the seed's values and ``adopted_from`` names that seed; the context's
+    # own signal, whenever it finally runs, is checked against them.
+    signal_values: dict[str, tuple] = {}
+    adopted_from: dict[str, str] = {}
 
     # Ring readers of the BATCHED contexts (see ``SecurityState.batch_target``).
     # The chart is an ordinary ring consumer for them: it waits on the
@@ -1291,6 +1349,13 @@ def create_chart_protocol(
     def _settle_no_round(sec_id: str, state: SecurityState) -> None:
         """Publish the round's as-of as the frontier of a context NOT launched.
 
+        For EVERY member of a merged group, not only the primary the chart
+        schedules. A member has a ring of its own, and the round it did not get
+        is the round none of the group got — so nothing else will ever raise
+        that ring's frontier, and a consumer parked on it would wait forever.
+        MEASURED on the Traders Reality corpus script: four children hung on the
+        non-primary member's frontier while its child sat idle.
+
         A producer's frontier reaches exactly as far as what it published: a
         round goes no further than its own as-of instant, deliberately — a wider
         claim would let a consumer running on the NEXT tick pass its wait and
@@ -1312,15 +1377,116 @@ def create_chart_protocol(
         """
         if not state.started:
             return
-        cond = ring_conditions.get(sec_id)
-        if cond is None or not consumers_by_sid.get(sec_id):
+        for member in (sec_id, *merge_members.get(sec_id, ())):
+            member_state = states[member]
+            cond = ring_conditions.get(member)
+            if cond is None or not consumers_by_sid.get(member):
+                continue
+            asof = chart_asof(member_state, round_state['chart_time'],
+                              round_state['next_time'],
+                              0 if lib.barstate.isconfirmed else round_state['tick'])
+            with cond:
+                if asof > sync_block.get_frontier_close(member):
+                    sync_block.set_frontier_close(member, asof)
+                cond.notify_all()
+
+    def _resolve_context(sec_id: str, state: SecurityState,
+                         symbol: str | None, timeframe: str | None,
+                         lookahead) -> None:
+        """Resolve a context once: its lookahead mode, its feed, its bar grid.
+
+        This is what a context's FIRST ``__sec_signal__`` performs, and it is
+        also what the chart performs for a stable group's members on the seed's
+        behalf (see ``_start``) — the two must be the same work, or an adopted
+        member would run on a half-built state.
+
+        :param sec_id: The context's id.
+        :param state: Its runtime state.
+        :param symbol: The symbol its signal names, or None.
+        :param timeframe: The timeframe its signal names, or None.
+        :param lookahead: Its runtime lookahead value, or None.
+        """
+        if sec_id in resolved:
             return
-        asof = chart_asof(state, round_state['chart_time'], round_state['next_time'],
-                          0 if lib.barstate.isconfirmed else round_state['tick'])
-        with cond:
-            if asof > sync_block.get_frontier_close(sec_id):
-                sync_block.set_frontier_close(sec_id, asof)
-            cond.notify_all()
+        resolved.add(sec_id)
+        signal_values[sec_id] = (symbol, timeframe, lookahead)
+        if lookahead is not None:
+            # Input-derived (Pine "simple") lookahead: the transformer stored
+            # None in __security_contexts__ and passes the actual value here.
+            # Resolve the mode BEFORE the deferred symbol/timeframe callback,
+            # which recomputes ``na_on_developing`` from ``state.lookahead``.
+            state.lookahead = _lookahead_mode(lookahead)
+            # Static symbol/timeframe with deferred lookahead: mirror the
+            # setup-time cross-symbol decision (no aggregator ⇒ cross-symbol
+            # HTF). A deferred symbol/timeframe context is recomputed by the
+            # resolver below instead.
+            state.na_on_developing = (
+                not state.is_ltf and not state.plain_ltf
+                and not state.same_timeframe
+                and state.htf_aggregator is None
+                and state.lookahead is Lookahead.ON
+            )
+        if deferred_resolve_fn is not None and symbol is not None:
+            deferred_resolve_fn(sec_id, symbol, timeframe)
+            # The resolver may have turned this context into the chart's own:
+            # it now produces for its consumers, so it needs a ring.
+            _ensure_chart_writer(sec_id)
+        if prepare_fn is not None:
+            prepare_fn(sec_id)
+        if sec_id in start_on_resolve:
+            # A consumer started before this producer could be: start it now,
+            # the round below goes straight to its child.
+            start_on_resolve.discard(sec_id)
+            if not state.started:
+                _start(sec_id, state, run_pending=False)
+
+    def _merge_group(sec_id: str) -> 'list[str] | None':
+        """The contexts that may share ONE child with this one, primary first.
+
+        The runner decides membership (same resolved feed, same batch class,
+        neither started nor chart-served); the ORDER is decided here, because
+        only the chart knows when each context signalled. The member that
+        signals first is the primary: its ``__sec_signal__`` has then already
+        run when any other member's does, so a member can delegate to it and
+        read off the result without a per-bar handshake of its own.
+
+        :param sec_id: The context being started.
+        :return: The member list with the primary first, or None for no merge.
+        """
+        if merge_group_fn is None:
+            return None
+        members = merge_group_fn(sec_id)
+        if not members or len(members) < 2:
+            return None
+        ordered = sorted(members, key=lambda m: signal_order.get(m, len(signal_order)))
+        return ordered
+
+    def _mirror_members(sec_id: str) -> None:
+        """Copy a group primary's per-bar bookkeeping onto its members.
+
+        The members do not signal for themselves — their round IS the primary's
+        — so everything their read and wait paths consult has to come from the
+        context that did signal. What stays the member's own is what the merge
+        never touched: its result block, its ring, its ``data_ready``, its
+        ``gaps``/``currency`` handling and its ``depends``.
+
+        :param sec_id: The group's primary (a no-op for anything else).
+        """
+        members = merge_members.get(sec_id)
+        if not members:
+            return
+        src = states[sec_id]
+        for member in members:
+            dst = states[member]
+            dst.new_period = src.new_period
+            dst.ltf_skip = src.ltf_skip
+            dst.needs_wait = src.needs_wait
+            dst.rounds_launched = src.rounds_launched
+            dst.last_confirmed = src.last_confirmed
+            dst.htf_prefilled = src.htf_prefilled
+            dst.batch_asof = src.batch_asof
+            dst.batch_prev_asof = src.batch_prev_asof
+            dst.batch_launched = src.batch_launched
 
     def _start(sec_id: str, state: SecurityState, *, run_pending: bool = True) -> None:
         """Start a context: its producers, its child process, its first round.
@@ -1354,29 +1520,91 @@ def create_chart_protocol(
 
         :param sec_id: The context's id.
         :param state: Its runtime state.
+        A context the runner lets SHARE a child with the rest of its group
+        starts the whole group here: every member is marked started, every
+        member's producers are started (the merged child runs one clone holding
+        every member's reads), one process is spawned for all of them, and from
+        here on the group's primary is what the chart schedules. A member that
+        signals or resolves only later is not adopted into a running child — it
+        starts alone, with the same clone.
+
         :param run_pending: Whether to run the round the signal prepared. False
                             from ``_launch``, which is about to launch its own.
         """
         state.started = True
-        for producer_id in state.depends:
-            producer = states.get(producer_id)
-            if producer is None or producer.started:
-                continue
-            if producer_id in unresolved_ids:
-                # Its symbol or timeframe only exists once its own signal runs,
-                # so there is nothing to spawn yet. Marking it started here would
-                # skip it for good; its signal starts it instead. The consumer's
-                # child waits for the producer's registry record meanwhile, which
-                # the chart sends at that same signal.
-                start_on_resolve.add(producer_id)
-                continue
-            _start(producer_id, producer)
+        group = _merge_group(sec_id)
+        if group and signal_values.get(sec_id) is not None:
+            # A STABLE group's members are known to read this very feed before
+            # they have signalled at all — that is what the compile-time key
+            # proves — so the ones that have not signalled yet are resolved here
+            # with the seed's own values instead of being left out. The runner
+            # then sees a fully resolved group and re-checks it below; an
+            # adopted member whose own signal later disagrees raises.
+            adopted = [m for m in group if m not in resolved]
+            if adopted:
+                for member in adopted:
+                    adopted_from[member] = sec_id
+                    _resolve_context(member, states[member],
+                                     *signal_values[sec_id])
+                group = _merge_group(sec_id)
+        if group:
+            # Whichever member signalled on THIS invocation carries the current
+            # bar's prepared round; group order only decides between equals.
+            # Taking ``group[0]`` unconditionally could pick a member whose last
+            # signal was on an earlier bar (its own branch not taken now) and
+            # launch that stale round while discarding the current one.
+            primary = group[0]
+            for member in group:
+                if member in signalled_this_call:
+                    primary = member
+                    break
+            for member in group:
+                states[member].started = True
+                merge_primary[member] = primary
+            merge_members[primary] = [m for m in group if m != primary]
+        else:
+            primary = sec_id
+        for holder in (group or (sec_id,)):
+            for producer_id in states[holder].depends:
+                producer = states.get(producer_id)
+                if producer is None or producer.started:
+                    continue
+                if producer_id in unresolved_ids:
+                    # Its symbol or timeframe only exists once its own signal
+                    # runs, so there is nothing to spawn yet. Marking it started
+                    # here would skip it for good; its signal starts it instead.
+                    # The consumer's child waits for the producer's registry
+                    # record meanwhile, which the chart sends at that signal.
+                    start_on_resolve.add(producer_id)
+                    continue
+                _start(producer_id, producer)
         if sec_id in no_process_ids:
             # Chart-served (same symbol+timeframe) or ignored: no child, no
             # round — the inline write/read path answers it.
             return
+        if group:
+            # The primary's slot is the group's only scheduled one; whatever the
+            # other members' own signals prepared is the SAME round and is
+            # dropped rather than launched a second time.
+            for member in group:
+                if member is primary:
+                    continue
+                states[member].pending_launch = False
+                states[member].deferred_steps = []
+                # Rounds a member's own signal prepared for THIS bar before the
+                # group existed: its slot is not the one the child reads, and
+                # the primary's signal already prepared the same bar.
+                states[member].pending_live = []
+            if primary != sec_id:
+                # The caller asked to start a MEMBER, and was going to launch
+                # that member's own round itself (``run_pending=False``). That
+                # round is dropped — the group's slot is the primary's — so
+                # whatever the primary's signal prepared has to run here, or the
+                # group would end this bar with no round at all.
+                run_pending = True
+            sec_id, state = primary, states[primary]
         if lazy_spawn_fn is not None:
-            lazy_spawn_fn(sec_id)
+            lazy_spawn_fn(sec_id, group)
             if state.batch_target and not cold_batch_start[0]:
                 # Cold start of a BATCHED context: every other batched context
                 # the transformer proved is read on every bar starts with it. A
@@ -1397,6 +1625,7 @@ def create_chart_protocol(
                             and other.always_read and not other.started):
                         _start(other_id, other)
         if not run_pending:
+            _mirror_members(sec_id)
             return
         if state.deferred_steps:
             # Developing transport: run the whole queued round sequence now.
@@ -1420,6 +1649,7 @@ def create_chart_protocol(
             # Nothing to run: every bar so far decided this context has no fresh
             # bar for the chart. Its consumers still have to be released.
             _settle_no_round(sec_id, state)
+        _mirror_members(sec_id)
 
     def _launch(sec_id: str, state: SecurityState, *, lazy_ok: bool = True) -> None:
         """Hand the prepared slot to the child and count the round.
@@ -1461,6 +1691,14 @@ def create_chart_protocol(
                 state.pending_launch = True
                 return
             _start(sec_id, state, run_pending=False)
+            if merge_primary.get(sec_id, sec_id) != sec_id:
+                # The start merged this context into a group. The round it was
+                # about to launch belongs to the group's primary — whose own
+                # signal, standing EARLIER in the hoisted signal block, has
+                # already prepared this bar — and its slot is the only one the
+                # shared child reads, so this one is dropped rather than
+                # launched into a slot nothing waits on.
+                return
         state.pending_launch = False
         flags = sync_block.get_flags(sec_id)
         if state.pending_live:
@@ -1471,6 +1709,11 @@ def create_chart_protocol(
         sync_block.set_round_context(sec_id, round_state['tick'],
                                      round_state['sched_next_open'])
         state.data_ready.clear()
+        for member in merge_members.get(sec_id, ()):
+            # BEFORE the advance: the child sets each member's own
+            # ``data_ready`` at that member's write, and clearing one afterwards
+            # would drop the release the chart is about to wait for.
+            states[member].data_ready.clear()
         state.rounds_launched += 1
         state.advance_event.set()
         state.needs_wait = True
@@ -1484,9 +1727,24 @@ def create_chart_protocol(
         write) and then launches the next. Driving them from the read — and from
         the runner's bar-end hook for the steps no read reaches — keeps a chart
         bar free of any wait that a child's own peer read could extend.
+
+        EVERY member of a merged group is waited for, not just the primary
+        whose slot carries the round. The child releases a member either at its
+        own last write — while ``main()`` still runs — or at the end of the step
+        (``release_unwritten``), so the primary can be released while siblings
+        are still outstanding. Launching the next step then clears their events
+        BEFORE those late releases land, and the stale wake-up would answer the
+        next step's wait with the previous step's value. Waiting for all of them
+        keeps one step's releases from crossing into the next one; a round
+        boundary is already guarded by the ``rounds_done`` counter, which the
+        child raises only after every member has been released.
         """
+        members = merge_members.get(sec_id, ())
         while state.pending_live:
             _wait_with_liveness(state.data_ready, sec_id, sec_processes, failed_children)
+            for member in members:
+                _wait_with_liveness(states[member].data_ready, member,
+                                    sec_processes, failed_children)
             step = state.pending_live.pop(0)
             step()
 
@@ -1566,7 +1824,62 @@ def create_chart_protocol(
     def __sec_signal__(sec_id: str, symbol: str | None = None,
                        timeframe: str | None = None, lookahead=None,
                        _scope_id=None):
-        state = states[sec_id]
+        """Signal one context's bar, or let its group's primary do it.
+
+        A member of a merged group has no round of its own: the primary's signal
+        prepares and launches the one round the shared child runs, and the
+        member then copies that bookkeeping. The primary is the member whose
+        signal stands FIRST in the hoisted signal block, so in the usual shape
+        it has already signalled this bar by the time a member gets here.
+
+        A STABLE group is keyed by the signal ARGUMENTS, not by where they are
+        evaluated, so its members' signals may stand inside branches — and then
+        an invocation can reach a member without reaching the primary at all.
+        Returning there would leave the whole group on the previous bar's value
+        (and a dependent peer waiting on a frontier that never rises), so the
+        first member reached schedules the group's round itself, on the
+        primary's slot. ``signalled_primaries`` keeps that to ONE round per
+        invocation whichever member comes first.
+        """
+        if sec_id not in signal_order:
+            signal_order[sec_id] = len(signal_order)
+        seed = adopted_from.get(sec_id)
+        if seed is not None and signal_values[sec_id] != (symbol, timeframe, lookahead):
+            # The chart resolved this context from its group's seed because the
+            # compile-time key said the two name the same feed. They do not, so
+            # the key rule is wrong — and silently carrying on would run the
+            # script against a feed it never asked for.
+            raise RuntimeError(
+                f"security context '{sec_id}' was resolved from its group seed "
+                f"'{seed}' as {signal_values[sec_id]!r} but signalled "
+                f"{(symbol, timeframe, lookahead)!r}"
+            )
+        primary = merge_primary.get(sec_id)
+        if primary is None:
+            # Not merged (yet): its own signal, exactly as before. Recording it
+            # covers the bar its first read merges it into a group ON: a member
+            # signalling later in the same invocation must not schedule a
+            # SECOND round for a context that has already signalled. A context
+            # whose signal stands in a loop body is left out — there every
+            # iteration signals, as before.
+            _signal_context(sec_id, states[sec_id], symbol, timeframe, lookahead)
+            _mirror_members(sec_id)
+            if not states[sec_id].in_loop:
+                signalled_primaries.add(sec_id)
+            return
+        if primary in signalled_primaries:
+            return
+        signalled_primaries.add(primary)
+        # The group's arguments are the same value wherever they are evaluated
+        # (that is what the key proves, and ``__sec_signal__`` raises above when
+        # a member disagrees), so the member's own arguments drive the primary's
+        # round.
+        _signal_context(primary, states[primary], symbol, timeframe, lookahead)
+        _mirror_members(primary)
+
+    def _signal_context(sec_id: str, state: SecurityState,
+                        symbol: str | None, timeframe: str | None, lookahead):
+        signalled_this_call.add(sec_id)
 
         # Resolve deferred symbol/timeframe on first call. The two callbacks are
         # NOT alternatives: in a script with both deferred and static contexts the
@@ -1575,37 +1888,7 @@ def create_chart_protocol(
         # context's bar grid unloaded and every target of this bar computed off
         # an arithmetic guess. ``prepare_fn`` itself skips sids that already
         # have a process (a deferred context prepares inside the resolver).
-        if sec_id not in resolved:
-            resolved.add(sec_id)
-            if lookahead is not None:
-                # Input-derived (Pine "simple") lookahead: the transformer stored
-                # None in __security_contexts__ and passes the actual value here.
-                # Resolve the mode BEFORE the deferred symbol/timeframe callback,
-                # which recomputes ``na_on_developing`` from ``state.lookahead``.
-                state.lookahead = _lookahead_mode(lookahead)
-                # Static symbol/timeframe with deferred lookahead: mirror the
-                # setup-time cross-symbol decision (no aggregator ⇒ cross-symbol
-                # HTF). A deferred symbol/timeframe context is recomputed by the
-                # resolver below instead.
-                state.na_on_developing = (
-                    not state.is_ltf and not state.plain_ltf
-                    and not state.same_timeframe
-                    and state.htf_aggregator is None
-                    and state.lookahead is Lookahead.ON
-                )
-            if deferred_resolve_fn is not None and symbol is not None:
-                deferred_resolve_fn(sec_id, symbol, timeframe)
-                # The resolver may have turned this context into the chart's
-                # own: it now produces for its consumers, so it needs a ring.
-                _ensure_chart_writer(sec_id)
-            if prepare_fn is not None:
-                prepare_fn(sec_id)
-            if sec_id in start_on_resolve:
-                # A consumer started before this producer could be: start it
-                # now, the round below goes straight to its child.
-                start_on_resolve.discard(sec_id)
-                if not state.started:
-                    _start(sec_id, state, run_pending=False)
+        _resolve_context(sec_id, state, symbol, timeframe, lookahead)
 
         # No-process contexts (same-context, ignored): skip advance/wait
         if sec_id in no_process_ids:
@@ -2138,8 +2421,13 @@ def create_chart_protocol(
                 return _convert_currency(currency_conversions[sec_id], batch_result)
             return batch_result
 
-        if state.pending_live:
-            _drive_pending(sec_id, state)
+        # The live steps of a merged group hang on its PRIMARY — the only
+        # context whose slot the chart schedules — so a member's read drives
+        # that queue, not one of its own (it has none).
+        driver = states[merge_primary.get(sec_id, sec_id)]
+        if driver.pending_live:
+            _drive_pending(driver.sec_id, driver)
+            _mirror_members(driver.sec_id)
         _wait_with_liveness(state.data_ready, sec_id, sec_processes, failed_children)
 
         if not state.is_ltf and not state.new_period:
@@ -2174,6 +2462,7 @@ def create_chart_protocol(
         for sec_id, state in states.items():
             if state.pending_live:
                 _drive_pending(sec_id, state)
+                _mirror_members(sec_id)
                 _wait_with_liveness(state.data_ready, sec_id, sec_processes,
                                     failed_children)
         if round_state['tick']:
@@ -2188,6 +2477,8 @@ def create_chart_protocol(
                     writer.set_frontier_close(frontier)
         chart_bar_written.clear()
         chart_bar_value.clear()
+        signalled_primaries.clear()
+        signalled_this_call.clear()
 
     def cleanup():
         for r in readers.values():
@@ -2274,10 +2565,11 @@ class SecurityChildContext:
         a developing run, which is as far as such a run publishes.
     :ivar is_round_last: Whether this is the round's last bar, i.e. the chart
         may be released as soon as the value is written.
-    :ivar released: Whether the current step has already released the chart.
-        A step releases it exactly once — at its last write, or at its end when
-        no write did. A second wake-up would land after the chart has launched
-        its NEXT step and answer that step's wait with this step's value.
+    :ivar released: The served contexts the current step has already released
+        the chart for. A step releases each of them exactly once — at that
+        context's last write, or at the step's end when no write of it happened.
+        A second wake-up would land after the chart has launched its NEXT step
+        and answer that step's wait with this step's value.
     :ivar developing: Whether this run is a developing (unconfirmed) one. Such a
         run appends at the round's fixed tick instead of a scheduled close, and
         takes that same tick as its own as-of base — the scheduled close lies in
@@ -2297,7 +2589,7 @@ class SecurityChildContext:
         self.bar_close = 0
         self.frontier = 0
         self.is_round_last = False
-        self.released = False
+        self.released: set[str] = set()
         self.developing = False
         self.round_tick = 0
         self.round_sched_next_open = 0
@@ -2322,9 +2614,9 @@ class _PeerReadState:
 
 
 def create_security_protocol(
-    sec_id: str,
+    sec_ids: list[str],
     sync_block: SyncBlock,
-    result_block: ResultBlock,
+    result_blocks: 'dict[str, ResultBlock]',
     all_sec_ids: list[str],
     result_locks: 'dict[str, LockType]',
     is_ltf: bool = False,
@@ -2332,15 +2624,25 @@ def create_security_protocol(
     registry: 'dict[str, dict] | None' = None,
     chart_calendar: 'BarCalendar | None' = None,
     ring_conditions: 'dict[str, ConditionType] | None' = None,
-    consumer_ids: 'list[str] | None' = None,
+    consumer_ids: 'dict[str, list[str]] | None' = None,
     stop_event: 'EventType | None' = None,
-    data_ready_event: 'EventType | None' = None,
+    data_ready_events: 'dict[str, EventType] | None' = None,
     registry_pipe: 'Connection | None' = None,
-    chart_ring_capacity: int = 0,
-    chart_ring_arena: int = 0,
+    chart_ring_capacity: 'dict[str, int] | None' = None,
+    chart_ring_arena: 'dict[str, int] | None' = None,
 ) -> tuple:
     """
     Create protocol functions for a **security** process.
+
+    ONE child can serve a whole GROUP of contexts — every context the
+    transformer proved resolves to the very same feed (see
+    ``transformers/security.py``'s ``group``). They then share this process's
+    bar loop and its single ``main()`` clone, while each of them keeps its own
+    result block, result lock, ring and ``data_ready`` event: the chart reads
+    every member exactly as it reads a context served alone. ``sec_ids[0]`` is
+    the group's PRIMARY, the only member whose SyncBlock slot carries
+    scheduling (target time, flags, round context) — the chart writes that one
+    slot and this process reads it.
 
     ``__sec_signal__`` and ``__sec_wait__`` are no-ops (the chart drives the
     rounds). ``__sec_write__`` publishes this context's value; ``__sec_read__``
@@ -2371,9 +2673,9 @@ def create_security_protocol(
     again this round. A consumer can only depend on producers whose write site
     precedes its own read in program order, and those have already published.
 
-    :param sec_id: This security context's ID (the only slot it writes to).
+    :param sec_ids: The contexts this process serves, PRIMARY first.
     :param sync_block: Shared memory sync block
-    :param result_block: Shared memory result block for writing
+    :param result_blocks: Per-served-sid shared memory result block
     :param all_sec_ids: All security context IDs (for cross-context reads)
     :param result_locks: Per-slot ``multiprocessing.Lock`` keyed by sec_id.
     :param is_ltf: If True, enable LTF accumulation mode.
@@ -2383,16 +2685,18 @@ def create_security_protocol(
     :param chart_calendar: The chart's trading schedule, for the chart-as-of cap.
     :param ring_conditions: Per-sid ``multiprocessing.Condition``, created by the
         parent and shared with every child.
-    :param consumer_ids: Sids consuming THIS context — drives the ring GC
-        watermark minimum and whether a ring is allocated at all.
-    :param chart_ring_capacity: Non-zero when the CHART consumes this context's
-        ring (its historical phase runs as one batch round). A ring is then
-        allocated even with no security consumer, pre-sized to this many
-        entries, and the chart's watermark row bounds its GC.
-    :param chart_ring_arena: Payload arena size in bytes for that pre-sizing.
+    :param consumer_ids: Per served sid, the sids consuming it — drives that
+        member's ring GC watermark minimum and whether it gets a ring at all.
+    :param chart_ring_capacity: Per served sid, non-zero when the CHART consumes
+        that member's ring (its historical phase runs as one batch round). A
+        ring is then allocated even with no security consumer, pre-sized to this
+        many entries, and the chart's watermark row bounds its GC.
+    :param chart_ring_arena: Per served sid, the payload arena size in bytes for
+        that pre-sizing.
     :param stop_event: Shutdown event; a peer wait ends when it is set.
-    :param data_ready_event: Set at the round's last write so the chart is
-        released on the VALUE rather than at the end of ``main()``.
+    :param data_ready_events: Per served sid, the event set at that member's
+        round-last write so the chart is released on the VALUE rather than at
+        the end of ``main()``.
     :param registry_pipe: Child end of the parent's registry pipe. A context
         whose symbol or timeframe is only known at runtime is resolved AFTER
         its consumers were spawned, so its record cannot be in their snapshot;
@@ -2402,33 +2706,74 @@ def create_security_protocol(
              ltf_take_value, ltf_publish, buffer_len, ctx, after_bar, finish,
              prime_ring)
     """
-    own_lock = result_locks[sec_id]
+    sec_id = sec_ids[0]
+    served: frozenset[str] = frozenset(sec_ids)
     ctx = SecurityChildContext()
+    consumer_ids = consumer_ids or {}
+    chart_ring_capacity = chart_ring_capacity or {}
+    chart_ring_arena = chart_ring_arena or {}
+    data_ready_events = data_ready_events or {}
 
     own_record = (registry or {}).get(sec_id) or {}
     own_calendar: BarCalendar = own_record.get('calendar') or BarCalendar()
-    depends: frozenset[str] = frozenset(own_record.get('depends') or ())
-    in_loop: bool = bool(own_record.get('in_loop', False))
+    # Every member's own flags, and the UNION of what they read: the clone this
+    # process runs holds every member's write block and every member's reads, so
+    # a peer any member depends on is a dependency of the process.
+    member_records: dict[str, dict] = {
+        sid: ((registry or {}).get(sid) or {}) for sid in sec_ids
+    }
+    _all_depends: frozenset[str] = frozenset().union(*(
+        frozenset(rec.get('depends') or ()) for rec in member_records.values()
+    ))
+    #: Peers OUTSIDE this process — the sids the peer-ring path serves.
+    depends: frozenset[str] = _all_depends - served
+    #: Members of this process that ANOTHER member depends on. A context's own
+    #: entry is dropped: a self-dependency is a context reading itself, which is
+    #: the own-read path, not a sibling read (see ``__sec_read__``).
+    depends_within: frozenset[str] = frozenset().union(*(
+        (frozenset(rec.get('depends') or ()) & served) - {sid}
+        for sid, rec in member_records.items()
+    ))
+    in_loop: dict[str, bool] = {
+        sid: bool(rec.get('in_loop', False)) for sid, rec in member_records.items()
+    }
+    gaps_on: dict[str, bool] = {
+        sid: bool(rec.get('gaps_on', False)) for sid, rec in member_records.items()
+    }
     # The reads a missing feed has to fail: every dependency, plus the reads of
     # a later-sited producer the dependency set leaves out.
-    fail_on_missing: frozenset[str] = depends | frozenset(own_record.get('late_reads') or ())
+    fail_on_missing: frozenset[str] = depends | (frozenset().union(*(
+        frozenset(rec.get('late_reads') or ()) for rec in member_records.values()
+    )) - served)
 
     ring_conditions = ring_conditions or {}
-    consumer_indexes: list[int] | None = None
-    writer: RingWriter | None = None
-    if (consumer_ids or chart_ring_capacity) and sec_id in ring_conditions:
-        consumer_indexes = [sync_block.index_of(cid) for cid in (consumer_ids or ())]
-        if chart_ring_capacity:
+    consumer_indexes: dict[str, list[int] | None] = {}
+    writers: dict[str, RingWriter] = {}
+    for _sid in sec_ids:
+        _capacity = chart_ring_capacity.get(_sid, 0)
+        consumer_indexes[_sid] = None
+        # A consumer this very process serves reads its sibling from the bar
+        # state, never from the ring (see ``__sec_read__``), and ``after_bar``
+        # parks watermarks only for the peers OUTSIDE the process. Such a
+        # sibling would therefore sit on this ring's GC minimum at zero for the
+        # whole run and no entry could ever be collected.
+        _external = [cid for cid in (consumer_ids.get(_sid) or ()) if cid not in served]
+        if not (_external or _capacity) or _sid not in ring_conditions:
+            continue
+        _indexes = [sync_block.index_of(cid) for cid in _external]
+        consumer_indexes[_sid] = _indexes
+        if _capacity:
             # The chart pairs this context's values out of the ring for the
             # whole historical phase, so it bounds the GC like any other
             # consumer — from its own watermark row, having no slot of its own.
-            consumer_indexes.append(sync_block.chart_index)
-            writer = RingWriter(
-                sec_id, sync_block, ring_conditions[sec_id],
-                capacity=max(INITIAL_RING_CAPACITY, chart_ring_capacity),
-                arena_size=max(INITIAL_RING_ARENA, chart_ring_arena))
+            _indexes.append(sync_block.chart_index)
+            writers[_sid] = RingWriter(
+                _sid, sync_block, ring_conditions[_sid],
+                capacity=max(INITIAL_RING_CAPACITY, _capacity),
+                arena_size=max(INITIAL_RING_ARENA, chart_ring_arena.get(_sid, 0)))
         else:
-            writer = RingWriter(sec_id, sync_block, ring_conditions[sec_id])
+            writers[_sid] = RingWriter(_sid, sync_block, ring_conditions[_sid])
+    writer: RingWriter | None = writers.get(sec_id)
 
     known: dict[str, dict] = dict(registry or {})
     registry_lock = threading.Lock()
@@ -2507,13 +2852,20 @@ def create_security_protocol(
 
     peer_readers: dict[str, RingReader] = {}
     peer_states: dict[str, _PeerReadState] = {}
-    own_index = sync_block.index_of(sec_id)
+    # One row per member. A merged child is ONE consumer, but its members each
+    # own a watermark row, and a producer's GC minimum runs over the rows of the
+    # sids that consume it — a row this process never advanced would pin that
+    # producer's ring forever. So every peer park below writes EVERY member's
+    # row with the same mark, which is exactly true: the members share one bar
+    # loop and one clone, so whatever one of them has read, all of them have.
+    # Nothing on the chart side has to map a consumer sid to its primary then.
+    own_indexes: list[int] = [sync_block.index_of(sid) for sid in sec_ids]
 
-    # Values written on the current bar: the first one publishes, an identical
-    # repeat inside a loop is a no-op, a differing one is an error.
-    bar_value: list = [None]
-    bar_written: list[bool] = [False]
-    last_own_value: list = [None]
+    # Values written on the current bar, per member: the first one publishes, an
+    # identical repeat inside a loop is a no-op, a differing one is an error.
+    bar_value: dict[str, object] = {sid: None for sid in sec_ids}
+    bar_written: dict[str, bool] = {sid: False for sid in sec_ids}
+    last_own_value: dict[str, object] = {sid: None for sid in sec_ids}
 
     def __sec_signal__(_sid: str, _symbol=None, _timeframe=None, _lookahead=None,
                        _scope_id=None):
@@ -2536,6 +2888,11 @@ def create_security_protocol(
         return base if base < cap else cap
 
     if is_ltf:
+        # A lower-timeframe context is never merged (its write path is its own),
+        # so this branch always serves exactly the primary.
+        assert len(sec_ids) == 1, "lower-timeframe contexts are never merged"
+        own_lock = result_locks[sec_id]
+        result_block = result_blocks[sec_id]
         _buffer: list = []
 
         def __sec_write__(_sid: str, value, _scope_id=None):
@@ -2546,7 +2903,7 @@ def create_security_protocol(
                 # ``bar_close`` is unset on the live LTF-window path, which is
                 # not a pairable producer (see ``__sec_read__``).
                 writer.append(ctx.bar_open, ctx.bar_close, value,
-                              consumer_indexes, ctx.frontier)
+                              consumer_indexes[sec_id], ctx.frontier)
 
         def flush(skip: int = 0):
             """Publish the round's intrabar array. ``skip`` drops the first N
@@ -2557,7 +2914,7 @@ def create_security_protocol(
             published = _buffer[skip:]
             with own_lock:
                 write_result(result_block, sync_block, published)
-            last_own_value[0] = published
+            last_own_value[sec_id] = published
             _buffer.clear()
 
         def buffer_len() -> int:
@@ -2579,30 +2936,39 @@ def create_security_protocol(
             published = list(values)
             with own_lock:
                 write_result(result_block, sync_block, published)
-            last_own_value[0] = published
+            last_own_value[sec_id] = published
     else:
-        def __sec_write__(_sid: str, value, _scope_id=None):
-            if bar_written[0]:
+        def __sec_write__(sid: str, value, _scope_id=None):
+            if sid not in served:
+                # The clone this process runs holds only the write blocks of the
+                # contexts it serves, and each is guarded by membership in
+                # ``__active_security__`` — reaching here means the two disagree.
+                raise AssertionError(
+                    f"security process {sorted(served)} was asked to write "
+                    f"context '{sid}'"
+                )
+            if bar_written[sid]:
                 # A second write on the same bar. Only a write block sitting in
                 # a loop body can do this legitimately, and only with a
                 # loop-INVARIANT value: the chart may already have read the
                 # first one, so a differing value has no single answer.
-                if not in_loop:
+                if not in_loop[sid]:
                     raise AssertionError(
-                        f"security context '{sec_id}' wrote twice on one bar "
+                        f"security context '{sid}' wrote twice on one bar "
                         f"outside a loop"
                     )
-                if _same_value(bar_value[0], value):
+                if _same_value(bar_value[sid], value):
                     return
                 raise RuntimeError(
                     "loop-varying security expression is not supported"
                 )
-            bar_written[0] = True
-            bar_value[0] = value
-            last_own_value[0] = value
-            with own_lock:
-                write_result(result_block, sync_block, value)
-            if writer is not None:
+            bar_written[sid] = True
+            bar_value[sid] = value
+            last_own_value[sid] = value
+            with result_locks[sid]:
+                write_result(result_blocks[sid], sync_block, value)
+            member_writer = writers.get(sid)
+            if member_writer is not None:
                 # The frontier rises AT the append, not at the end of the bar:
                 # a consumer whose as-of the newly published bar covers must be
                 # released immediately, or two contexts writing on the same bar
@@ -2621,12 +2987,16 @@ def create_security_protocol(
                 # consumer running on a LATER tick waits for that tick's round
                 # instead of passing the wait and reading this one.
                 close_ms = ctx.round_tick if ctx.developing else ctx.bar_close
-                writer.append(ctx.bar_open, close_ms, value,
-                              consumer_indexes, ctx.frontier)
-            if (ctx.is_round_last and not ctx.released
-                    and data_ready_event is not None):
-                ctx.released = True
-                data_ready_event.set()
+                member_writer.append(ctx.bar_open, close_ms, value,
+                                     consumer_indexes[sid], ctx.frontier)
+            if ctx.is_round_last and sid not in ctx.released:
+                # Per member: the chart waits on each context's OWN
+                # ``data_ready``, so a member is released by its own value and
+                # never by a sibling's.
+                ctx.released.add(sid)
+                member_event = data_ready_events.get(sid)
+                if member_event is not None:
+                    member_event.set()
 
         flush = None
         ltf_take_value = None
@@ -2634,14 +3004,46 @@ def create_security_protocol(
         buffer_len = None
 
     def __sec_read__(sid: str, default=None, _scope_id=None):
-        if sid == sec_id:
-            # Nothing published yet -- the child replays the WHOLE script, so a
-            # context's own read can run before its write does on the first bar.
-            # The caller's default is what every other empty answer here returns,
-            # and an array read asks for `[]`: the alternative is handing the
-            # script a None no `array.*` builtin accepts. A published value is
+        if sid in served:
+            # A context this very process serves: its own read, or a SIBLING's.
+            # Never the ring — the entry a sibling appends this bar carries this
+            # bar's own close, and waiting for a frontier this process itself
+            # raises later in the same round is a deadlock on itself.
+            #
+            # What the ring would answer is reproduced from the bar state
+            # instead, which the two cases below cover exactly:
+            #
+            # * ALREADY WRITTEN this bar. A dependency's write block stands
+            #   before the reading site (that is what ``depends`` means), so the
+            #   peer path would pair this bar's entry — closing exactly at the
+            #   reader's as-of — and hand back this bar's value. The context's
+            #   OWN read after its own write answers the same.
+            # * NOT WRITTEN this bar, and ANOTHER member depends on it: its
+            #   write block stands before that member's read and simply did not
+            #   fire (a conditional write, an early ``return``), which is where
+            #   the peer path pairs the LAST entry again — ``gaps_off`` repeats
+            #   its value, ``gaps_on`` answers ``na``.
+            # * NOT WRITTEN this bar, and no member depends on it: the only site
+            #   that can be reading it is its OWN, standing before its own write
+            #   — the child replays the WHOLE script — and that answers with the
+            #   value carried from the previous bar, or the default on the first.
+            #
+            # Which of the two applies is a property of the READ SID alone, and
+            # that is what makes these answers exact rather than approximate:
+            # the transformer refuses to group contexts whose reads a single
+            # child could not tell apart (``_group_reads_are_unambiguous`` in
+            # ``transformers/security.py``). No context served here is a
+            # dependency of one member and a late read of another, and no member
+            # is late-read by another member — so a member is never read by a
+            # site that expects the default while another expects its value.
+            #
+            # The caller's default is what every empty answer here returns, and
+            # an array read asks for ``[]``: the alternative is handing the
+            # script a None no ``array.*`` builtin accepts. A published value is
             # never None (na is a float), so the test cannot swallow a real one.
-            own = last_own_value[0]
+            own = last_own_value[sid]
+            if not bar_written[sid] and sid in depends_within and gaps_on[sid]:
+                return default
             return default if own is None else own
         if sid in fail_on_missing:
             # Resolved at runtime with no feed behind it. The producer never
@@ -2733,10 +3135,13 @@ def create_security_protocol(
         released. Also parks the GC watermark for every peer this context can
         read, so a conditional read cannot pin a producer's ring forever.
         """
-        if writer is not None and not bar_written[0]:
-            writer.set_frontier_close(ctx.frontier, consumer_indexes)
-        bar_written[0] = False
-        bar_value[0] = None
+        for member in sec_ids:
+            member_writer = writers.get(member)
+            if member_writer is not None and not bar_written[member]:
+                member_writer.set_frontier_close(ctx.frontier,
+                                                 consumer_indexes[member])
+            bar_written[member] = False
+            bar_value[member] = None
         if depends:
             for sid in depends:
                 # Never blocks: a peer the chart has not resolved yet has no
@@ -2747,8 +3152,9 @@ def create_security_protocol(
                 # A lower-timeframe array peer is read from this bar's period
                 # START, so only entries below THAT may be collected.
                 mark = ctx.bar_open if record.get('is_ltf') else _peer_asof(record)
-                sync_block.set_watermark(
-                    own_index, sync_block.index_of(sid), mark)
+                peer_index = sync_block.index_of(sid)
+                for own_index in own_indexes:
+                    sync_block.set_watermark(own_index, peer_index, mark)
 
     def prime_ring(frontier_close: int) -> None:
         """Publish the frontier this producer starts with.
@@ -2762,26 +3168,43 @@ def create_security_protocol(
 
         :param frontier_close: Initial frontier close in epoch ms.
         """
-        if writer is not None:
-            writer.set_frontier_close(frontier_close)
+        for member_writer in writers.values():
+            member_writer.set_frontier_close(frontier_close)
 
     def finish() -> None:
-        """Mark this producer done: the frontier goes to ``+inf``."""
-        if writer is not None:
-            writer.finish()
+        """Mark every member producer done: the frontier goes to ``+inf``."""
+        for member_writer in writers.values():
+            member_writer.finish()
+
+    def release_unwritten() -> None:
+        """Release the members whose value this step did not publish.
+
+        A step wakes the chart exactly once per member — at that member's last
+        write, or here when no write of it happened. The distinction matters for
+        the same reason it does with one context: a second wake-up would land
+        after the chart launched its NEXT step and answer that step's wait with
+        this step's value.
+        """
+        for member in sec_ids:
+            if member in ctx.released:
+                continue
+            ctx.released.add(member)
+            member_event = data_ready_events.get(member)
+            if member_event is not None:
+                member_event.set()
 
     def cleanup():
         if registry_pipe is not None:
             registry_pipe.close()
         for r in peer_readers.values():
             r.close()
-        if writer is not None:
-            writer.close()
-            writer.unlink()
+        for member_writer in writers.values():
+            member_writer.close()
+            member_writer.unlink()
 
     return (__sec_signal__, __sec_write__, __sec_read__, __sec_wait__, cleanup,
             flush, ltf_take_value, ltf_publish, buffer_len, ctx, after_bar, finish,
-            prime_ring)
+            prime_ring, release_unwritten)
 
 
 # Representative dates for the off-grid session probe — one on each side of the
@@ -3858,7 +4281,7 @@ def setup_security_states(
 
 
 def inject_protocol(module, signal_fn, write_fn, read_fn, wait_fn,
-                    active_security=None,
+                    active_security: 'frozenset[str] | None' = None,
                     same_context: 'set[str] | frozenset[str]' = frozenset()):
     """
     Inject protocol functions and __active_security__ into a script module's globals.
@@ -3868,7 +4291,8 @@ def inject_protocol(module, signal_fn, write_fn, read_fn, wait_fn,
     :param write_fn: __sec_write__ implementation
     :param read_fn: __sec_read__ implementation
     :param wait_fn: __sec_wait__ implementation
-    :param active_security: None for chart context, sec_id for security context
+    :param active_security: None in the chart context, the set of sec_ids this
+                            security process serves in a child
     :param same_context: Frozenset of sec_ids sharing the chart's symbol+timeframe
     """
     module.__sec_signal__ = signal_fn
