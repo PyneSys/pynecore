@@ -236,6 +236,16 @@ class SecurityTransformer(ast.NodeTransformer):
             yield from SecurityTransformer._walk_skip_funcs(child)
 
     @staticmethod
+    def _walk_skip_funcs_post(node: ast.AST):
+        """Walk AST nodes in post-order (children before their parent),
+        skipping nested function definitions."""
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            yield from SecurityTransformer._walk_skip_funcs_post(child)
+        yield node
+
+    @staticmethod
     def _find_forbidden_strategy_state(expr: ast.expr) -> ast.Attribute | None:
         """Return the first `lib.strategy.<state_attr>` Attribute node found in
         ``expr``, or None if there is none.
@@ -702,8 +712,12 @@ class SecurityTransformer(ast.NodeTransformer):
 
             self._recurse_subbodies(stmt, call_exprs, runtime_sec_ids)
 
+            # Post-order: a call nested in another call's expression gets its
+            # write block FIRST. Its producer then precedes the outer context
+            # in program order, so the outer context's child waits for it and
+            # pairs its value instead of answering the read with the default.
             call_nodes_here = [
-                n for n in self._walk_skip_funcs(stmt)
+                n for n in self._walk_skip_funcs_post(stmt)
                 if isinstance(n, ast.Call) and hasattr(n, '_sec_id')
             ]
 
@@ -962,9 +976,11 @@ class SecurityTransformer(ast.NodeTransformer):
     def _analyze_dependencies(self, node: ast.Module) -> None:
         """Run the taint analysis on the lowered module and record its result.
 
-        Writes two keys into every context: ``depends`` (the sorted sids whose
-        results flow into this sid's ``__sec_write__`` expression) and, when the
-        write can run more than once per bar, ``in_loop``.
+        Writes ``depends`` into every context: the sorted sids whose results
+        flow into this sid's ``__sec_write__`` expression and whose producers
+        come earlier in program order. The flowing sids whose producers come
+        later go to ``late_reads`` (only when there are any), and a write that
+        can run more than once per bar gets ``in_loop``.
 
         A dependency on a context that is only resolved while the bar runs is
         legal — the runtime hands the resolved contexts to the children over the
@@ -981,6 +997,11 @@ class SecurityTransformer(ast.NodeTransformer):
             ctx['depends'] = ast.List(
                 elts=[ast.Constant(value=d) for d in deps], ctx=ast.Load()
             )
+            late = sorted(analyzer.late_reads.get(sid, set()) & known)
+            if late:
+                ctx['late_reads'] = ast.List(
+                    elts=[ast.Constant(value=d) for d in late], ctx=ast.Load()
+                )
             if sid in analyzer.in_loop:
                 ctx['in_loop'] = ast.Constant(value=True)
 
@@ -1591,11 +1612,50 @@ _UNION_EXPRS: tuple[type[ast.AST], ...] = (
 # ``lib.plot(tainted)`` must not make every later ``lib.close`` tainted.
 _UNTAINTABLE_ROOTS = frozenset({'lib'})
 
-# ``lib`` namespaces whose functions mutate the collection passed as their
-# first argument (``array.push(id, v)``, ``matrix.set(id, r, c, v)``, ...).
-# Only these propagate taint back into an argument — doing it for every call
-# would make an ordinary ``ta.sma(series, length)`` taint its length input.
-_MUTATING_NAMESPACES = frozenset({'array', 'matrix', 'map'})
+# ``lib`` namespaces holding the collection APIs (``array.push(id, v)``,
+# ``matrix.set(id, r, c, v)``, ``map.put(id, k, v)``, ...). Only a call in one
+# of these can write taint back into the collection passed as its first
+# argument — doing it for every call would make an ordinary
+# ``ta.sma(series, length)`` taint its length input.
+_COLLECTION_NAMESPACES = frozenset({'array', 'matrix', 'map'})
+
+# Collection functions that only READ their collection. They derive a value
+# from it and leave it unchanged, so an index, key or search argument of theirs
+# must not become part of the collection's taint: ``array.get(store, i)`` does
+# not put ``i`` into ``store``. The index still reaches the call's RESULT, so
+# a value read out under a tainted index stays tainted.
+_COLLECTION_READERS: dict[str, frozenset[str]] = {
+    'array': frozenset({
+        'abs', 'avg', 'binary_search', 'binary_search_leftmost',
+        'binary_search_rightmost', 'copy', 'covariance', 'every', 'first',
+        'from_items', 'get', 'includes', 'indexof', 'join', 'last',
+        'lastindexof', 'max', 'median', 'min', 'mode', 'new', 'new_bool',
+        'new_box', 'new_color', 'new_float', 'new_int', 'new_label',
+        'new_line', 'new_linefill', 'new_string', 'new_table',
+        'percentile_linear_interpolation', 'percentile_nearest_rank',
+        'percentrank', 'range', 'size', 'some', 'sort_indices', 'standardize',
+        'stdev', 'sum', 'variance',
+    }),
+    'matrix': frozenset({
+        'all', 'avg', 'col', 'columns', 'copy', 'det', 'diff', 'eigenvalues',
+        'eigenvectors', 'elements_count', 'get', 'inv', 'is_antidiagonal',
+        'is_antisymmetric', 'is_binary', 'is_diagonal', 'is_identity',
+        'is_square', 'is_stochastic', 'is_symmetric', 'is_triangular',
+        'is_zero', 'kron', 'max', 'median', 'min', 'mode', 'mult', 'new',
+        'pinv', 'pow', 'rank', 'row', 'rows', 'submatrix', 'sum', 'trace',
+        'transpose',
+    }),
+    'map': frozenset({'contains', 'copy', 'get', 'keys', 'new', 'size', 'values'}),
+}
+
+# Nodes whose children may be skipped on a pass through the code around them:
+# branches, handlers, short-circuit operands, comprehensions and nested loops
+# (which can run zero times).
+_CONDITIONAL_NODES: tuple[type[ast.AST], ...] = (
+    ast.If, ast.IfExp, ast.BoolOp, ast.Try, ast.TryStar, ast.Match,
+    ast.For, ast.AsyncFor, ast.While,
+    ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
+)
 
 # Fixpoint safety net — the lattice is finite and monotone, so the loop always
 # converges; the cap only guards against an unforeseen non-monotone edit.
@@ -1652,7 +1712,11 @@ class _DependencyAnalyzer:
 
     - **Flow-insensitive on data**: a name's taint is the union over every
       assignment to it anywhere in its scope (so ``var`` backward flow and
-      loop-carried values are covered without ordering rules).
+      loop-carried values are covered without ordering rules). The exception
+      is a pure loop variable — a name every occurrence of which sits inside a
+      loop that writes it before reading it: it holds nothing between those
+      loops, so each of them gets a cell of its own instead of one counter
+      tying every loop of the scope together.
     - **Lexically scoped names**: a name belongs to the scope that binds it —
       parameters and assignment targets are local, everything else resolves
       outwards, so a nested ``def`` reading a ``main`` local (the usual closure
@@ -1661,8 +1725,17 @@ class _DependencyAnalyzer:
       rebinds the name to the module / the enclosing scope that owns it.
     - **Flow-sensitive on control**: a control-taint set accumulates the taint
       of enclosing ``if`` / ``for`` / ``while`` / ``match`` conditions, and a
-      tainted ``return`` / ``break`` / ``continue`` taints the rest of its
-      function.
+      tainted ``return`` / ``break`` / ``continue`` taints what runs AFTER it —
+      the rest of the block it escapes from, and, through the enclosing
+      statement, everything following that. Statements lexically before the
+      escape are untouched: leaving a block cannot hand a value backwards
+      inside one bar, and a value a later iteration or a later bar carries back
+      through a ``var`` is settled by the back-edge filter below.
+    - **Collections**: a call in the ``array`` / ``matrix`` / ``map``
+      namespace writes back into the collection passed as its first argument.
+      A reader writes nothing — an index only reaches the value it returns —
+      and a mutator writes back what it stores, not where it stores it. A
+      function neither table knows stays conservatively mutating.
     - **Alias classes**: ``a = b`` merges the two names into one taint class,
       so mutating a container through either alias is visible on both. A
       call whose callee returns one of its parameters (or an alias of it)
@@ -1689,7 +1762,8 @@ class _DependencyAnalyzer:
     a too-large set costs extra synchronisation and nothing else. A back-edge
     onto a later-sited producer is NOT safe — the child would block a write
     that the chart is waiting for before it ever reaches the producer's site —
-    so every such edge is dropped (see :meth:`run`).
+    so every such edge is dropped from ``depends`` and kept in ``late_reads``
+    (see :meth:`run`).
     """
 
     def __init__(self, module: ast.Module, all_sids: list[str]):
@@ -1697,6 +1771,7 @@ class _DependencyAnalyzer:
         self._all: frozenset[str] = frozenset(all_sids)
         self.depends: dict[str, set[str]] = {sid: set() for sid in all_sids}
         self.in_loop: set[str] = set()
+        self.late_reads: dict[str, set[str]] = {}
         self._funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
         self._scopes: dict[str, _Scope] = {}
         self._key_of: dict[int, str] = {}
@@ -1708,9 +1783,12 @@ class _DependencyAnalyzer:
         self._ret_alias: dict[str, set[str]] = {}
         self._param_out: dict[str, dict[str, set[str]]] = {}
         self._param_in: dict[str, set[str]] = {}
-        self._escape: dict[str, set[str]] = {}
+        self._escaped: set[str] = set()
+        self._broke: set[str] = set()
         self._parent: dict[str, str] = {}
         self._taint: dict[str, set[str]] = {}
+        self._loop_cells: dict[int, dict[str, str]] = {}
+        self._name_cells: dict[str, str] = {}
         self._ctrl: set[str] = set()
         self._order: dict[str, int] = {}
         self._scope: str = ''
@@ -1778,6 +1856,10 @@ class _DependencyAnalyzer:
 
     def _q(self, name: str, scope_key: str | None = None) -> str:
         """Qualify a bare name with the key of the scope that binds it."""
+        if scope_key is None:
+            cell = self._name_cells.get(name)
+            if cell is not None:
+                return cell
         key = self._scope if scope_key is None else scope_key
         while True:
             scope = self._scopes.get(key)
@@ -1929,7 +2011,8 @@ class _DependencyAnalyzer:
         return node.id if isinstance(node, ast.Name) else None
 
     @staticmethod
-    def _is_plain_record(node: ast.ClassDef, factories: FactoryFields) -> bool:
+    def _is_plain_record(node: ast.ClassDef, factories: FactoryFields,
+                         class_names: frozenset[str]) -> bool:
         """Whether a class body only declares fields — a Pine ``type``.
 
         Such a body runs once, when the module is imported, before any security
@@ -1940,11 +2023,14 @@ class _DependencyAnalyzer:
 
         A field default the compiler lowered to a ``default_factory`` lambda
         runs at every construction instead, so it only qualifies while its body
-        reads nothing a script can bind: the lowering's reserved-name helpers
-        and ``lib``.
+        reads nothing a script can bind: the lowering's reserved-name helpers,
+        ``lib``, and the module's own top-level class names — a field typed as
+        another record defaults to ``na(<that class>)``, and a class name is an
+        import-time constant binding that cannot carry security taint.
 
         :param node: the class definition
         :param factories: the module's compiler-emitted field factories
+        :param class_names: names of the module's top-level classes
         :return: whether the body holds nothing but field declarations
         """
         factory_calls = {id(call) for call in factories.of(node)}
@@ -1958,6 +2044,7 @@ class _DependencyAnalyzer:
                         or any(isinstance(sub, ast.Name)
                                and PYNE_RESERVED_NAME_CHAR not in sub.id
                                and sub.id != 'lib'
+                               and sub.id not in class_names
                                for sub in ast.walk(lambdas[0].body))):
                     return False
                 continue
@@ -2041,6 +2128,229 @@ class _DependencyAnalyzer:
             if sid not in self._order:
                 self._order[sid] = counter
                 counter += 1
+
+    # --- loop variables ---
+
+    def _mark_private_loop_vars(self) -> None:
+        """Give each loop its own taint cell for the variables only it uses.
+
+        A name has ONE taint cell per scope, so the counter of a loop running
+        over a tainted collection would carry that taint into every other loop
+        of the same scope that reuses the name — ``i`` usually runs every loop
+        of a script. A name qualifies as a loop variable of its scope when
+        every occurrence of it sits inside a loop that writes it before reading
+        it, in EVALUATION order: it then holds nothing between the loops, and
+        each of them can keep a cell of its own. A read anywhere else, a
+        nested loop rebinding the same name, a read-modify-write
+        (``acc = acc + 1``, ``acc += 1``) carrying the previous loop's value,
+        or a read from a nested function — which is visited as its own scope
+        and cannot see the private cell — keeps the single scope-wide cell.
+        """
+        for key, scope in self._scopes.items():
+            uses, loops, parents = self._collect_loop_names(scope)
+            if not loops:
+                continue
+            binders: dict[str, list[int]] = {}
+            for loop_id, names in loops.items():
+                for name in names:
+                    binders.setdefault(name, []).append(loop_id)
+            index = 0
+            for name, own in binders.items():
+                if not self._is_loop_var(name, uses.get(name, 0), own,
+                                          loops, parents):
+                    continue
+                for loop_id in own:
+                    index += 1
+                    self._loop_cells.setdefault(loop_id, {})[name] = (
+                        '%s\x00loop%d\x00%s' % (key, index, name))
+
+    def _collect_loop_names(self, scope: _Scope) -> tuple[
+            dict[str, int], dict[int, dict[str, tuple[int, bool]]],
+            dict[int, int | None]]:
+        """Walk a scope once, gathering everything the loop-variable rule needs.
+
+        Names are visited in EVALUATION order, which differs from document
+        order exactly where the rule cares: an ``Assign`` evaluates its value
+        before binding its targets, a ``For`` its iterable before its target,
+        an ``AnnAssign`` its value before binding its target, and an
+        ``AugAssign`` reads its target before storing it.
+
+        Only those four statements can establish a name, and only through a
+        target built from ``Name``, ``Tuple``, ``List`` and ``Starred``. Every
+        other binding form (assignment expression, ``with ... as``, ``except
+        ... as``, match capture, import, ``global`` / ``nonlocal``, ``del``,
+        comprehension target) is counted as an occurrence outside every loop,
+        so it disqualifies the name.
+
+        :param scope: the scope to walk
+        :return: occurrences of each name that belong to the scope; per
+            loop, ``name -> (occurrences, stored first)`` for the names of the
+            scope it mentions; and each loop's enclosing loop, ``None`` at the
+            top level. An occurrence inside a nested function belongs to the
+            scope but to no loop of it, so it can only disqualify the name.
+        """
+        uses: dict[str, int] = {}
+        loops: dict[int, dict[str, tuple[int, bool]]] = {}
+        parents: dict[int, int | None] = {}
+
+        def record(name: str, store: bool, stack: list[int],
+                   cond: frozenset[int], after: frozenset[int]) -> None:
+            uses[name] = uses.get(name, 0) + 1
+            for loop_id in stack:
+                seen = loops[loop_id]
+                # A store counts as establishing the name only where every pass
+                # through the loop body executes it.
+                count, first_store = seen.get(name, (0, store and loop_id not in cond))
+                if loop_id in after and not store:
+                    # A read in the loop's ``else`` clause also runs after zero
+                    # iterations, when it sees the value from before the loop.
+                    first_store = False
+                seen[name] = (count + 1, first_store)
+
+        def foreign(name: str, shadowed: frozenset[str]) -> None:
+            # An occurrence no loop owns: the name can only be disqualified.
+            if name not in shadowed:
+                uses[name] = uses.get(name, 0) + 1
+
+        def target(node: ast.AST, stack: list[int], shadowed: frozenset[str],
+                   in_func: bool, cond: frozenset[int],
+                   after: frozenset[int]) -> None:
+            if isinstance(node, ast.Name):
+                if in_func:
+                    foreign(node.id, shadowed)
+                elif node.id not in shadowed:
+                    record(node.id, True, stack, cond, after)
+            elif isinstance(node, (ast.Tuple, ast.List)):
+                for elt in node.elts:
+                    target(elt, stack, shadowed, in_func, cond, after)
+            elif isinstance(node, ast.Starred):
+                target(node.value, stack, shadowed, in_func, cond, after)
+            else:
+                visit(node, stack, shadowed, in_func, cond, after)
+
+        def visit(node: ast.AST, stack: list[int], shadowed: frozenset[str],
+                  in_func: bool, cond: frozenset[int],
+                  after: frozenset[int]) -> None:
+            if isinstance(node, ast.Name):
+                if in_func or not isinstance(node.ctx, ast.Load):
+                    foreign(node.id, shadowed)
+                elif node.id not in shadowed:
+                    record(node.id, False, stack, cond, after)
+                return
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    foreign((alias.asname or alias.name).split('.')[0], shadowed)
+                return
+            if isinstance(node, (ast.Global, ast.Nonlocal)):
+                for name in node.names:
+                    foreign(name, shadowed)
+                return
+            if isinstance(node, ast.ExceptHandler) and node.name is not None:
+                foreign(node.name, shadowed)
+            elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+                foreign(node.name, shadowed)
+            elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+                foreign(node.rest, shadowed)
+            if node is not scope.node and isinstance(
+                    node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                # A nested function binding the name owns its own variable, so
+                # nothing below it belongs to this scope.
+                inner = self._scopes.get(self._key_of.get(id(node), ''))
+                own = frozenset(inner.locals) if inner is not None else frozenset()
+                for child in ast.iter_child_nodes(node):
+                    visit(child, stack, shadowed | own, True, cond, after)
+                return
+            if isinstance(node, ast.Assign):
+                visit(node.value, stack, shadowed, in_func, cond, after)
+                for item in node.targets:
+                    target(item, stack, shadowed, in_func, cond, after)
+                return
+            if isinstance(node, ast.AnnAssign):
+                # ``x: T = v`` evaluates ``v`` before binding ``x``; a bare
+                # ``x: T`` binds nothing, so its name only counts as a use.
+                if node.value is not None:
+                    visit(node.value, stack, shadowed, in_func, cond, after)
+                visit(node.annotation, stack, shadowed, in_func, cond, after)
+                if node.value is not None or not isinstance(node.target, ast.Name):
+                    target(node.target, stack, shadowed, in_func, cond, after)
+                elif in_func:
+                    foreign(node.target.id, shadowed)
+                elif node.target.id not in shadowed:
+                    record(node.target.id, False, stack, cond, after)
+                return
+            if isinstance(node, ast.AugAssign):
+                # ``acc += x`` reads the target before it stores into it.
+                if isinstance(node.target, ast.Name):
+                    if in_func:
+                        foreign(node.target.id, shadowed)
+                    elif node.target.id not in shadowed:
+                        record(node.target.id, False, stack, cond, after)
+                else:
+                    visit(node.target, stack, shadowed, in_func, cond, after)
+                visit(node.value, stack, shadowed, in_func, cond, after)
+                return
+            if isinstance(node, _CONDITIONAL_NODES):
+                # Code below may be skipped on some pass through every loop
+                # already entered, so nothing it stores establishes a name there.
+                cond = cond | frozenset(stack)
+            if not in_func and isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+                loop_id = id(node)
+                parents[loop_id] = stack[-1] if stack else None
+                loops[loop_id] = {}
+                stack = stack + [loop_id]
+                # The ``else`` clause also runs after zero iterations, when
+                # nothing in the body has executed.
+                else_cond = cond | {loop_id}
+                if isinstance(node, (ast.For, ast.AsyncFor)):
+                    visit(node.iter, stack, shadowed, in_func, cond, after)
+                    target(node.target, stack, shadowed, in_func, cond, after)
+                else:
+                    visit(node.test, stack, shadowed, in_func, cond, after)
+                for child in node.body:
+                    visit(child, stack, shadowed, in_func, cond, after)
+                for child in node.orelse:
+                    visit(child, stack, shadowed, in_func, else_cond,
+                          after | {loop_id})
+                return
+            for child in ast.iter_child_nodes(node):
+                visit(child, stack, shadowed, in_func, cond, after)
+
+        visit(scope.node, [], frozenset(), False, frozenset(), frozenset())
+        written = {loop_id: {name: seen for name, seen in names.items()
+                             if name in scope.locals}
+                   for loop_id, names in loops.items()}
+        return uses, written, parents
+
+    @staticmethod
+    def _is_loop_var(name: str, uses: int, binders: list[int],
+                     loops: dict[int, dict[str, tuple[int, bool]]],
+                     parents: dict[int, int | None]) -> bool:
+        """Whether ``name`` lives only inside the loops that bind it.
+
+        :param name: the candidate name
+        :param uses: how many occurrences of the name the scope owns
+        :param binders: ids of the loops that write it
+        :param loops: per loop, ``name -> (occurrences, stored first)``
+        :param parents: each loop's enclosing loop
+        :return: whether each binder may keep a private cell for the name
+        """
+        binder_ids = set(binders)
+        found = 0
+        for loop_id in binders:
+            # A binder nested in another one would carry the inner loop's
+            # value over into the outer loop's body.
+            parent = parents[loop_id]
+            while parent is not None:
+                if parent in binder_ids:
+                    return False
+                parent = parents[parent]
+            count, first_store = loops[loop_id][name]
+            # The loop must establish the name before reading it — otherwise
+            # the value it reads comes from outside the loop.
+            if not first_store:
+                return False
+            found += count
+        return found == uses
 
     # --- in_loop ---
 
@@ -2163,21 +2473,45 @@ class _DependencyAnalyzer:
 
         # Mutation: a collection API writes into the id passed as its first
         # argument (``array.push(id, v)``), and a method call writes into the
-        # object it runs on (``id.push(v)``). Whether the write happens at all
-        # depends on the enclosing conditions, so the control taint is part of
-        # the collection's new state even when the pushed value is a constant.
-        mutation = taint | self._ctrl
-        if mutation and isinstance(func, ast.Attribute):
-            if self._is_mutating_namespace_call(func):
+        # object it runs on (``id.push(v)``).
+        if isinstance(func, ast.Attribute):
+            namespace = self._collection_namespace(func)
+            if namespace is not None:
                 if node.args:
-                    root = self._root_name(node.args[0])
-                    if root is not None:
-                        self._add_taint(self._q(root), mutation)
+                    self._mutate_collection(namespace, func.attr, node, taint)
             else:
+                mutation = taint | self._ctrl
                 root = self._root_name(func.value)
-                if root is not None:
+                if mutation and root is not None:
                     self._add_taint(self._q(root), mutation)
         return taint
+
+    def _mutate_collection(self, namespace: str, fname: str, node: ast.Call,
+                           call_taint: set[str]) -> None:
+        """Write a collection call's effect back into its first argument.
+
+        A pure reader writes nothing at all: it derives a value and leaves the
+        collection alone. Everything else writes back what the whole call
+        touches plus the control taint — whether the write happens depends on
+        the enclosing conditions, so the control taint is part of the
+        collection's new state even when the stored value is a constant. An
+        index or key is not exempt: a map hands its keys back out through
+        ``map.keys``, and a position decides which slot a later ``array.get``
+        observes, so both are content once the collection is read again.
+
+        :param namespace: the collection namespace the call belongs to
+        :param fname: the called function's name
+        :param node: the call site
+        :param call_taint: the taint of the call as a whole
+        """
+        if fname in _COLLECTION_READERS.get(namespace, frozenset()):
+            return
+        root = self._root_name(node.args[0])
+        if root is None:
+            return
+        back = call_taint | self._ctrl
+        if back:
+            self._add_taint(self._q(root), back)
 
     def _call_user_func(self, key: str, node: ast.Call,
                         pos_taints: list[set[str]],
@@ -2325,13 +2659,15 @@ class _DependencyAnalyzer:
                     self._changed = True
 
     @staticmethod
-    def _is_mutating_namespace_call(func: ast.Attribute) -> bool:
-        """Whether ``func`` is ``lib.<array|matrix|map>.<fn>``."""
+    def _collection_namespace(func: ast.Attribute) -> str | None:
+        """The collection namespace of a ``lib.<array|matrix|map>.<fn>`` callee."""
         owner = func.value
-        return (isinstance(owner, ast.Attribute)
-                and owner.attr in _MUTATING_NAMESPACES
+        if (isinstance(owner, ast.Attribute)
+                and owner.attr in _COLLECTION_NAMESPACES
                 and isinstance(owner.value, ast.Name)
-                and owner.value.id == 'lib')
+                and owner.value.id == 'lib'):
+            return owner.attr
+        return None
 
     # --- assignment ---
 
@@ -2365,6 +2701,78 @@ class _DependencyAnalyzer:
             ctrl = self._visit_stmt(stmt, ctrl)
         return ctrl
 
+    def _visit_block(self, body: list[ast.stmt], ctrl: set[str]) -> tuple[set[str], set[str]]:
+        """Visit a nested block and collect the escapes taken inside it.
+
+        A ``return`` / ``break`` / ``continue`` inside the block decides whether
+        what FOLLOWS the enclosing statement runs, so its control taint has to
+        cross the block boundary. The escapes stay in the enclosing block's
+        accumulators too, so one nested several levels deep still reaches the
+        outermost successors — up to the loop that swallows a ``break``.
+
+        :param body: the block's statements
+        :param ctrl: the control taint the block runs under
+        :return: the taint of the ``return`` escapes and of the ``break`` /
+            ``continue`` escapes taken inside the block
+        """
+        outer_returned, self._escaped = self._escaped, set()
+        outer_broke, self._broke = self._broke, set()
+        self._visit_body(body, ctrl)
+        returned, broke = self._escaped, self._broke
+        self._escaped = outer_returned | returned
+        self._broke = outer_broke | broke
+        return returned, broke
+
+    def _visit_loop(self, body: list[ast.stmt], orelse: list[ast.stmt],
+                    inner: set[str]) -> set[str]:
+        """Visit a loop's blocks; return the escape taint its successors inherit.
+
+        The loop consumes the ``break`` / ``continue`` escapes taken inside it:
+        they decide whether what follows the LOOP runs, and nothing beyond that.
+        A ``return`` keeps travelling outwards.
+
+        :param body: the loop body
+        :param orelse: the loop's ``else`` block
+        :param inner: the control taint the loop runs under
+        :return: the escape taint of the statements following the loop
+        """
+        # The loop swallows its own escapes: a ``break`` of THIS loop must not
+        # reach an enclosing one, which is why the accumulator is saved here.
+        outer_broke, self._broke = self._broke, set()
+        returned, broke = self._visit_block(body, inner)
+        if broke - inner:
+            # A tainted escape also decides whether the body runs AGAIN, so
+            # everything in it — the statements before the escape included —
+            # is conditional on that taint. One extra pass over the body under
+            # the widened control taint closes the back edge; the lattice is
+            # finite, so nothing further can be added by repeating it.
+            returned, broke = self._visit_block(body, inner | broke)
+        more_returned, more_broke = self._visit_block(orelse, inner)
+        broke |= more_broke
+        self._broke = outer_broke
+        return returned | more_returned | broke
+
+    def _enter_loop_cells(self, stmt: ast.stmt) -> dict[str, str | None]:
+        """Activate the private taint cells of a loop's own variables, if it has any.
+
+        :param stmt: the loop statement
+        :return: the overrides that were active before, to restore afterwards
+        """
+        cells = self._loop_cells.get(id(stmt))
+        saved: dict[str, str | None] = {}
+        if cells:
+            for name, cell in cells.items():
+                saved[name] = self._name_cells.get(name)
+                self._name_cells[name] = cell
+        return saved
+
+    def _leave_loop_cells(self, saved: dict[str, str | None]) -> None:
+        for name, previous in saved.items():
+            if previous is None:
+                self._name_cells.pop(name, None)
+            else:
+                self._name_cells[name] = previous
+
     def _visit_stmt(self, stmt: ast.stmt, ctrl: set[str]) -> set[str]:
         self._ctrl = ctrl
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -2387,38 +2795,41 @@ class _DependencyAnalyzer:
             return ctrl
         if isinstance(stmt, ast.If):
             inner = ctrl | self._expr_taint(stmt.test)
-            self._visit_body(stmt.body, inner)
-            self._visit_body(stmt.orelse, inner)
-            return ctrl
+            escaped = set().union(*self._visit_block(stmt.body, inner),
+                                  *self._visit_block(stmt.orelse, inner))
+            return ctrl | escaped
         if isinstance(stmt, (ast.For, ast.AsyncFor)):
             inner = ctrl | self._expr_taint(stmt.iter)
+            saved = self._enter_loop_cells(stmt)
             self._assign(stmt.target, inner, None)
-            self._visit_body(stmt.body, inner)
-            self._visit_body(stmt.orelse, inner)
-            return ctrl
+            escaped = self._visit_loop(stmt.body, stmt.orelse, inner)
+            self._leave_loop_cells(saved)
+            return ctrl | escaped
         if isinstance(stmt, ast.While):
             inner = ctrl | self._expr_taint(stmt.test)
-            self._visit_body(stmt.body, inner)
-            self._visit_body(stmt.orelse, inner)
-            return ctrl
+            saved = self._enter_loop_cells(stmt)
+            escaped = self._visit_loop(stmt.body, stmt.orelse, inner)
+            self._leave_loop_cells(saved)
+            return ctrl | escaped
         if isinstance(stmt, ast.Match):
             inner = ctrl | self._expr_taint(stmt.subject)
+            escaped: set[str] = set()
             for case in stmt.cases:
                 case_ctrl = inner
                 if case.guard is not None:
                     case_ctrl = inner | self._expr_taint(case.guard)
-                self._visit_body(case.body, case_ctrl)
-            return ctrl
+                escaped |= set().union(*self._visit_block(case.body, case_ctrl))
+            return ctrl | escaped
         if isinstance(stmt, ast.Return):
             taint = self._expr_taint(stmt.value) | ctrl
             self._record_escape(self._ret, taint)
             self._record_ret_alias(stmt.value)
-            self._record_escape(self._escape, ctrl)
+            self._escaped |= taint
             return ctrl | taint
         if isinstance(stmt, (ast.Break, ast.Continue)):
-            # The decision to leave the block is itself tainted, so everything
-            # after it runs conditionally on that taint.
-            self._record_escape(self._escape, ctrl)
+            # The decision to leave the loop is itself tainted, so everything
+            # that runs after the loop is conditional on that taint.
+            self._broke |= ctrl
             return ctrl
         return ctrl
 
@@ -2506,15 +2917,20 @@ class _DependencyAnalyzer:
             and n.func.id in self._funcs
         }
         self._build_scopes()
+        self._mark_private_loop_vars()
         self._mark_in_loop()
         self._compute_site_order()
 
         factories = FactoryFields(self._module)
+        class_names = frozenset(
+            node.name for node in self._module.body if isinstance(node, ast.ClassDef)
+        )
         record_nodes: set[int] = set()
         # Only a module-level class body runs at import time; one defined inside
         # a function runs with the function and stays unmodelled.
         for node in self._module.body:
-            if isinstance(node, ast.ClassDef) and self._is_plain_record(node, factories):
+            if (isinstance(node, ast.ClassDef)
+                    and self._is_plain_record(node, factories, class_names)):
                 record_nodes.update(id(sub) for sub in ast.walk(node))
         for key, scope in self._scopes.items():
             for sub in self._iter_stmts_skip_funcs(scope.node):
@@ -2531,7 +2947,10 @@ class _DependencyAnalyzer:
             self._changed = False
             for scope in ordered:
                 self._scope = scope.key
-                ctrl = set(self._escape.get(scope.key, set()))
+                self._escaped = set()
+                self._broke = set()
+                self._name_cells = {}
+                ctrl: set[str] = set()
                 if scope.parent is not None:
                     self._visit_defaults(scope)
                     fn = scope.node
@@ -2557,12 +2976,16 @@ class _DependencyAnalyzer:
         # site the chart has not reached yet stops the very write that would
         # release the round. Such an edge can only be a previous-bar carry
         # anyway; the child reads the default for it.
+        # The dropped edges are still reads of this write: a peer whose feed is
+        # missing must fail such a read instead of answering it with the
+        # default, so they are kept apart in ``late_reads``.
         for sid, deps in self.depends.items():
             own = self._order.get(sid, 0)
-            self.depends[sid] = {
-                d for d in deps
-                if d != sid and d in self._all and self._order.get(d, own) < own
-            }
+            valid = {d for d in deps if d != sid and d in self._all}
+            self.depends[sid] = {d for d in valid if self._order.get(d, own) < own}
+            late = valid - self.depends[sid]
+            if late:
+                self.late_reads[sid] = late
 
 class _CallReplacer(ast.NodeTransformer):
     """Replace marked request.security() call nodes with __sec_read__() calls."""

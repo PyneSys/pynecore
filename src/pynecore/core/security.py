@@ -407,6 +407,10 @@ class SecurityState:
     # inside a loop. Chart-side they only travel to the child at spawn.
     depends: frozenset[str] = frozenset()
     in_loop: bool = False
+    # Sids this context's expression reads whose producers come LATER in
+    # program order (the transformer's ``late_reads``). Never waited for, but a
+    # missing feed behind one of them fails the read like a dependency's does.
+    late_reads: frozenset[str] = frozenset()
 
     # Whether the transformer proved this context's ``__sec_read__`` runs on
     # every chart bar (``always_read`` in ``__security_contexts__``). Only such
@@ -1088,6 +1092,7 @@ def create_chart_protocol(
     same_context_ids: 'set[str] | frozenset[str]' = frozenset(),
     no_process_ids: 'set[str] | frozenset[str]' = frozenset(),
     unresolved_ids: 'set[str] | frozenset[str]' = frozenset(),
+    missing_data_ids: 'dict[str, str] | None' = None,
     result_blocks: dict[str, ResultBlock] | None = None,
     currency_conversions: dict[str, tuple[str, str]] | None = None,
     sec_processes: 'dict[str, BaseProcess] | None' = None,
@@ -1121,6 +1126,15 @@ def create_chart_protocol(
                            reference: the resolver removes each id as it resolves
                            it. Such a context cannot be started before that
                            signal (see ``_start``).
+    :param missing_data_ids: Runtime-resolved contexts whose feed turned out to
+                             be missing, mapped to the error message. Captured by
+                             reference: the resolver fills it as it resolves. A
+                             ternary or ``and``/``or`` branch evaluates its
+                             ``request.security()`` call every bar even when the
+                             branch is not taken, so the resolution itself must
+                             not fail on a missing feed — the first real
+                             ``__sec_read__`` raises instead, which is where the
+                             demand for the data is precise.
     :param result_blocks: Result blocks for writing same-context values to shared memory.
     :param currency_conversions: Maps sec_id → (from_currency, to_currency) for auto-conversion.
     :param sec_processes: Live ``sec_id → Process`` map. Captured by reference, so
@@ -2085,6 +2099,11 @@ def create_chart_protocol(
         return result
 
     def __sec_read__(sec_id: str, default=None, _scope_id=None):
+        # Resolved at runtime with no feed behind it. Tolerated up to here so
+        # an untaken branch costs nothing; an actual read has no value to
+        # return.
+        if missing_data_ids and sec_id in missing_data_ids:
+            raise ValueError(missing_data_ids[sec_id])
         # ``ignore_invalid_symbol=True`` may downgrade a live security to
         # ``no-process`` after syminfo prefetch fails — no subprocess is
         # ever spawned, so ``data_ready`` would never be set and a plain
@@ -2390,6 +2409,9 @@ def create_security_protocol(
     own_calendar: BarCalendar = own_record.get('calendar') or BarCalendar()
     depends: frozenset[str] = frozenset(own_record.get('depends') or ())
     in_loop: bool = bool(own_record.get('in_loop', False))
+    # The reads a missing feed has to fail: every dependency, plus the reads of
+    # a later-sited producer the dependency set leaves out.
+    fail_on_missing: frozenset[str] = depends | frozenset(own_record.get('late_reads') or ())
 
     ring_conditions = ring_conditions or {}
     consumer_indexes: list[int] | None = None
@@ -2621,6 +2643,18 @@ def create_security_protocol(
             # never None (na is a float), so the test cannot swallow a real one.
             own = last_own_value[0]
             return default if own is None else own
+        if sid in fail_on_missing:
+            # Resolved at runtime with no feed behind it. The producer never
+            # started, so the missing feed surfaces at the first real read of
+            # this expression — here as well as on the chart, never as a silent
+            # ``na``. Only an already delivered record is consulted for a late
+            # read: waiting for one is what the dependency check below exists
+            # to avoid. A read outside this expression is no demand for the
+            # feed: the child replays the whole script on its own prices, so
+            # it can take a branch the chart never does.
+            known_record = known.get(sid)
+            if known_record is not None and known_record.get('missing_data'):
+                raise ValueError(known_record['missing_data'])
         if sid not in depends:
             # Not a dependency of this context: the read cannot influence this
             # expression, so it never waits. ``depends`` also excludes producers
@@ -2631,6 +2665,8 @@ def create_security_protocol(
             # expression as a previous-bar carry, which is already published.
             return default
         record = _peer_record(sid)
+        if record is not None and record.get('missing_data'):
+            raise ValueError(record['missing_data'])
         if (record is None or not record.get('has_producer')
                 or sid not in ring_conditions
                 or (record.get('is_ltf') and record.get('ltf_live_stream'))):
@@ -3783,6 +3819,7 @@ def setup_security_states(
             chart_timeframe=chart_timeframe,
             depends=frozenset(ctx.get('depends') or ()),
             in_loop=bool(ctx.get('in_loop', False)),
+            late_reads=frozenset(ctx.get('late_reads') or ()),
             always_read=bool(ctx.get('always_read', False)),
             signal_per_bar=bool(ctx.get('signal_per_bar', False)),
             chart_resampler=chart_ltf_resampler if (is_ltf or plain_ltf) else None,
