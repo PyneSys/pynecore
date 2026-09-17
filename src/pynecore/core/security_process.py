@@ -58,7 +58,7 @@ from functools import partial
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
 from time import monotonic, sleep
-from typing import TYPE_CHECKING, Callable, Iterator, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterator, cast
 
 from ..types.na import set_bool_na
 from .security_shm import (
@@ -417,6 +417,7 @@ def security_process_main(
         result_locks: 'dict[str, LockType] | None' = None,
         ohlcv_fields: 'list[str] | None' = None,
         ohlcv_tuple: bool = False,
+        slice_main: 'str | None' = None,
         chart_type: 'str | None' = None,
         chart_timeframe: 'str | None' = None,
         plain_ltf: bool = False,
@@ -428,6 +429,7 @@ def security_process_main(
         registry_pipe=None,
         chart_ring_capacity: int = 0,
         chart_ring_arena: int = 0,
+        script_inputs: 'dict[str, Any] | None' = None,
         dev_batch_spec: 'DevBatchSpec | None' = None,
 ):
     assert result_locks is not None, "result_locks must be provided by script_runner"
@@ -454,6 +456,10 @@ def security_process_main(
         run skips main() and writes these fields straight from the bar.
     :param ohlcv_tuple: True when ``ohlcv_fields`` came from a tuple/list
         expression (write a tuple), False for a scalar expression.
+    :param slice_main: Name of this context's sliced ``main()`` clone in the
+        script module (``transformers/security_slice.py``). When set, the clone
+        runs on every bar in place of ``main()``: it holds the backward slice of
+        ``main()``'s statements this context's ``__sec_write__`` can depend on.
     :param chart_type: Synthetic chart type requested via ``ticker.heikinashi()``
         etc. (currently only ``"heikinashi"``). When set, the child applies the
         per-bar chart-type transform to every bar before the script reads it (so
@@ -493,6 +499,10 @@ def security_process_main(
         symbol or timeframe only exists at runtime — such a context can be a
         dependency of a child that was already spawned, so its record cannot
         have been in that child's snapshot.
+    :param script_inputs: The runner's programmatic input overrides. They are
+        applied before this process imports the script, so the child computes
+        its context with the very values the chart runs with instead of the
+        ``.toml`` (or source) defaults.
     :param dev_batch_spec: What to reproduce a historical DEVELOPING batch's
         round sequence from (see :func:`security.iter_dev_batch_records`), or
         ``None``. The chart launches ONE round for it
@@ -769,6 +779,14 @@ def security_process_main(
     # same user file. Disable the save for this process before importing.
     os.environ['PYNE_SAVE_SCRIPT_TOML'] = '0'
 
+    # The runner's programmatic inputs override the .toml values in the chart
+    # process; this process loads the same script from scratch, so they must be
+    # in place before the import or the child would silently run a differently
+    # configured script than the chart it feeds.
+    if script_inputs:
+        # noinspection PyProtectedMember
+        script_mod._programmatic_inputs.update(script_inputs)
+
     # Import the script
     script_module = import_script(Path(script_path))
 
@@ -794,25 +812,32 @@ def security_process_main(
     # argument, stateless ones are called as-is)
     instance_state.reset()
     main_func = script_module.main
+    # Per-context backward slice of main(): an ordinary module-level function
+    # with its own slot layout, so it becomes this process's entry point — root
+    # vector, root key and every snapshot below refer to the clone, not to
+    # main(). ``main_func`` stays the script entry the script metadata hangs on.
+    entry_func = getattr(script_module, slice_main, None) if slice_main else None
+    if entry_func is None:
+        entry_func = main_func
     root_keys: list[str] = []
     seen_keys: set[str] = set()
     bound_entries: dict[int, Callable] = {}
     # noinspection PyProtectedMember
-    for entry_func in [main_func] + [f for _title, f in script_mod._registered_libraries]:
-        if id(entry_func) in bound_entries:
+    for run_entry in [entry_func] + [f for _title, f in script_mod._registered_libraries]:
+        if id(run_entry) in bound_entries:
             continue
-        entry_layout = getattr(entry_func, '__pyne_layout__', None)
+        entry_layout = getattr(run_entry, '__pyne_layout__', None)
         if entry_layout is None:
-            bound_entries[id(entry_func)] = entry_func
+            bound_entries[id(run_entry)] = run_entry
             continue
-        entry_root_key = f'{entry_func.__module__}.{entry_func.__qualname__}'
+        entry_root_key = f'{run_entry.__module__}.{run_entry.__qualname__}'
         if entry_root_key in seen_keys:
             entry_root_key = f'{entry_root_key}#{len(root_keys)}'
         seen_keys.add(entry_root_key)
         root_keys.append(entry_root_key)
-        bound_entries[id(entry_func)] = partial(
-            entry_func, instance_state.create_root(entry_root_key, entry_layout))
-    run_main = bound_entries[id(main_func)]
+        bound_entries[id(run_entry)] = partial(
+            run_entry, instance_state.create_root(entry_root_key, entry_layout))
+    run_main = bound_entries[id(entry_func)]
     na_bool = main_func.script.na_bool
 
     # Set lib semaphore to suppress plot/strategy/alert side effects

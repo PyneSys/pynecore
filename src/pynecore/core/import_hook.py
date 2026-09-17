@@ -13,7 +13,8 @@ if TYPE_CHECKING:
     from pynecore.transformers.pine_type_table import DepRecord, Diag, PineTypeTable
     from pynecore.transformers.slot_layout import ModuleLayout
 
-__all__ = ['PYNE_RESERVED_NAME_CHAR', 'PIPELINE_DIGEST', 'source_starts_with_pyne',
+__all__ = ['PYNE_RESERVED_NAME_CHAR', 'PIPELINE_DIGEST', 'security_slice_disabled',
+           'source_starts_with_pyne',
            'analyse_source', 'PyneLoader', 'PyneImportHook']
 
 
@@ -116,6 +117,23 @@ def _reject_reserved_names(tree: "ast.Module", source: str, path: Path) -> None:
                 )
 
 
+#: Env switch turning the per-context ``main()`` slicing off (see
+#: ``transformers/security_slice.py``). It changes the EMITTED tree, so it is
+#: mixed into the pipeline digest below — a chart and its security children can
+#: never end up on bytecode built under the other setting.
+SECURITY_SLICE_ENV = 'PYNE_NO_SECURITY_SLICE'
+
+_TRUTHY = frozenset({'1', 'true', 'yes', 'on'})
+
+
+def security_slice_disabled() -> bool:
+    """Whether ``PYNE_NO_SECURITY_SLICE`` asks for the unsliced child behaviour.
+
+    :return: True when no ``main()`` clone may be emitted.
+    """
+    return os.environ.get(SECURITY_SLICE_ENV, '').strip().lower() in _TRUTHY
+
+
 def _cache_from_source(source_path: Path) -> Path:
     """Return the cached ``.pyc`` path CPython uses for a given ``.py`` source.
 
@@ -134,6 +152,8 @@ def _cache_from_source(source_path: Path) -> Path:
 
 
 _transform_pipeline_hash: str | None = None
+_transform_pipeline_flag: bool | None = None
+_transform_pipeline_files_hash: str | None = None
 
 
 def _get_transform_pipeline_hash() -> str:
@@ -153,33 +173,45 @@ def _get_transform_pipeline_hash() -> str:
     cache markers and read-only install locations. Every file a transformer bakes a
     value from must be hashed as well, or the constant could change while the
     digest stays put; ``core/pine_compare.py`` (the comparison tolerance the
-    ``FloatToleranceTransformer`` emits as a literal) is such a file.
+    ``FloatToleranceTransformer`` emits as a literal) is such a file. An env
+    switch that changes the emission is mixed in for the same reason
+    (``PYNE_NO_SECURITY_SLICE``).
 
     :return: Hex digest pinning the transform pipeline.
     """
-    global _transform_pipeline_hash
-    if _transform_pipeline_hash is not None:
+    global _transform_pipeline_hash, _transform_pipeline_flag, _transform_pipeline_files_hash
+    flag = security_slice_disabled()
+    if _transform_pipeline_hash is not None and _transform_pipeline_flag == flag:
         return _transform_pipeline_hash
-
-    # This module pins the transformer pipeline order; ``pine_compare`` holds
-    # a constant the pipeline bakes into the emitted bytecode
-    files = [Path(__file__), Path(__file__).parent / "pine_compare.py"]
-    transformers_dir = Path(__file__).parent.parent / "transformers"
-    try:
-        files.extend(transformers_dir.iterdir())
-    except OSError:
-        pass
-    digest = hashlib.sha256()
-    for f in sorted(files, key=lambda p: p.name):
+    files_hash = _transform_pipeline_files_hash
+    if files_hash is None:
+        # This module pins the transformer pipeline order; ``pine_compare`` holds
+        # a constant the pipeline bakes into the emitted bytecode
+        files = [Path(__file__), Path(__file__).parent / "pine_compare.py"]
+        transformers_dir = Path(__file__).parent.parent / "transformers"
         try:
-            if f.is_file():
-                digest.update(f.name.encode('utf-8'))
-                digest.update(f.read_bytes())
+            files.extend(transformers_dir.iterdir())
         except OSError:
             pass
-    pipeline_hash = digest.hexdigest()[:16]
-    _transform_pipeline_hash = pipeline_hash
-    return pipeline_hash
+        digest = hashlib.sha256()
+        for f in sorted(files, key=lambda p: p.name):
+            try:
+                if f.is_file():
+                    digest.update(f.name.encode('utf-8'))
+                    digest.update(f.read_bytes())
+            except OSError:
+                pass
+        files_hash = digest.hexdigest()
+        _transform_pipeline_files_hash = files_hash
+
+    # The switch is memoized WITH the digest instead of being folded into the
+    # file scan: flipping it mid-process must produce a different hash at once,
+    # so bytecode built under the other setting can never be loaded as current.
+    mixed = hashlib.sha256(files_hash.encode('utf-8'))
+    mixed.update(b'1' if flag else b'0')
+    _transform_pipeline_hash = mixed.hexdigest()[:16]
+    _transform_pipeline_flag = flag
+    return _transform_pipeline_hash
 
 
 #: The pipeline every transformed module in this process was produced by, taken
@@ -391,6 +423,7 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
     from pynecore.transformers.security_instantiation import (
         SecurityInstantiationTransformer,
     )
+    from pynecore.transformers.security_slice import SecuritySliceTransformer
     from pynecore.transformers.persistent_series import PersistentSeriesTransformer
     from pynecore.transformers.lib_series import LibrarySeriesTransformer
     from pynecore.transformers.closure_arguments_transformer import ClosureArgumentsTransformer
@@ -451,6 +484,12 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
     transformed = PineTypeTransformer(pyne_mode, analyse=analyse_source,
                                       pipeline_hash=_get_transform_pipeline_hash()
                                       ).visit(transformed)
+    # Per-context backward slices of main(), emitted as ordinary module-level
+    # functions the security children run instead of main(). Last of this half:
+    # the clones must see the tree every earlier pass produced (the hoisted ta
+    # assignments among them), and the lowering half then lays them out like any
+    # other function, with their own slot layout.
+    transformed = SecuritySliceTransformer().visit(transformed)
     table = module_table(transformed)
     if table is not None:
         # One node, one report: where the structural half names the
