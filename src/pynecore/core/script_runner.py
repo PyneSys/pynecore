@@ -776,7 +776,7 @@ class ScriptRunner:
                  'equity_curve', 'first_price', 'last_price', '_trade_num',
                  '_script_path', '_security_data', '_magnifier_iter', '_magnifier_source_tf',
                  '_chart_provider_name', '_chart_provider_instance', '_chart_data_path',
-                 '_time_from', '_sec_syminfos', '_chart_type_warmup',
+                 '_time_from', '_sec_syminfos', '_chart_type_warmup', '_missing_sec_data',
                  '_signal_rate_sources_fn', '_sec_begin_bar_fn', '_sec_end_bar_fn',
                  '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
                  '_engine_event_stream_future',
@@ -931,6 +931,13 @@ class ScriptRunner:
         # chart (see :meth:`_resolve_security_data`). Empty without such a
         # mapping.
         self._chart_type_warmup: 'dict[str, str]' = {}
+        # Runtime-resolved security contexts whose feed turned out to be
+        # missing, mapped to the error their first read raises. A context whose
+        # symbol or timeframe is only known at runtime may sit in a branch the
+        # run never takes, so its resolution tolerates a missing feed; the
+        # demand is only real at a ``__sec_read__``, and that is where the error
+        # belongs. Empty whenever every resolved context has data.
+        self._missing_sec_data: 'dict[str, str]' = {}
         # Optional per-bar driver for ``__auto_rate_*`` rate-source
         # subprocesses. Installed by ``create_chart_protocol`` when any
         # auto-rate sec_ids exist; left as ``None`` for backtests / runs
@@ -1890,6 +1897,7 @@ class ScriptRunner:
                         'gaps_on': _st.gaps_on,
                         'depends': _st.depends,
                         'in_loop': _st.in_loop,
+                        'late_reads': _st.late_reads,
                         # A context with no process publishes nothing, so a
                         # consumer must answer with the default at once instead
                         # of waiting for a frontier that never moves. The
@@ -1897,6 +1905,11 @@ class ScriptRunner:
                         # writes its ring itself.
                         'has_producer': (_sid not in no_process_ids
                                          or _sid in same_context_ids),
+                        # A runtime-resolved context with no feed behind it:
+                        # the message its first REAL read has to raise, on the
+                        # chart and in a consumer child alike. ``None`` when
+                        # the context is provisioned.
+                        'missing_data': self._missing_sec_data.get(_sid),
                     }
 
                 def _sec_registry() -> dict:
@@ -2195,7 +2208,8 @@ class ScriptRunner:
                             'ignore_invalid_symbol', False
                         ),
                     }
-                    resolved = self._resolve_security_data({sid: resolve_ctx})
+                    resolved = self._resolve_security_data(
+                        {sid: resolve_ctx}, defer_missing=True)
                     resolved = self._prefetch_sec_syminfos(
                         resolved, sec_contexts={sid: resolve_ctx},
                     )
@@ -2283,11 +2297,13 @@ class ScriptRunner:
                         _prepare_security_context(sid, resolved_path)
                         _publish_sec_record(sid)
                     else:
-                        # ``ignore_invalid_symbol=True`` downgraded the live
-                        # syminfo lookup to ``None``; mark the sid as
-                        # no-process so ``__sec_signal__`` short-circuits
-                        # instead of waiting on a child that was never
-                        # spawned.
+                        # Either ``ignore_invalid_symbol=True`` downgraded the
+                        # live syminfo lookup to ``None``, or no feed was found
+                        # for the resolved symbol at all (``defer_missing``).
+                        # Mark the sid as no-process so ``__sec_signal__``
+                        # short-circuits instead of waiting on a child that was
+                        # never spawned; an unprovisioned context raises at its
+                        # first read instead.
                         no_process_ids.add(sid)
                         _publish_sec_record(sid)
 
@@ -2373,6 +2389,7 @@ class ScriptRunner:
                     same_context_ids=same_ctx_ref,
                     no_process_ids=no_process_ids,
                     unresolved_ids=deferred_sec_ids,
+                    missing_data_ids=self._missing_sec_data,
                     # Unconditional: ``same_context_ids`` can gain members AFTER setup
                     # (a deferred context resolving to the chart's own symbol+TF), and
                     # ``__sec_write__`` no-ops on ``result_blocks=None`` — gating on the
@@ -4008,7 +4025,9 @@ class ScriptRunner:
                 out.append(ohlcv_path.stem)
         return out
 
-    def _resolve_security_data(self, contexts: dict) -> 'dict[str, str | PluginSymbol | None]':
+    def _resolve_security_data(
+            self, contexts: dict, *, defer_missing: bool = False,
+    ) -> 'dict[str, str | PluginSymbol | None]':
         """
         Resolve a data source for each security context.
 
@@ -4027,6 +4046,10 @@ class ScriptRunner:
           ``--security`` file mapping or ``ignore_invalid_symbol``.
 
         :param contexts: The ``__security_contexts__`` dict from the script module
+        :param defer_missing: Tolerate a missing feed instead of raising: the
+                              context resolves to ``None``, a warning names it,
+                              and the error it would have raised is stored on
+                              ``self._missing_sec_data`` for its first read.
         :return: Dict mapping sec_id to an OHLCV file path (``str``), a
                  :class:`PluginSymbol` for live-mode subprocesses, or
                  ``None`` when the context was opted out via
@@ -4202,13 +4225,28 @@ class ScriptRunner:
                 result[sec_id] = None
                 continue
 
-            raise ValueError(
+            message = (
                 f"No OHLCV data found for security context "
                 f"(symbol={symbol!r}, timeframe={timeframe!r}). "
                 f"Provide data via the security_data parameter, e.g.: "
                 f"security_data={{'{symbol}': 'path/to/data.ohlcv'}}"
                 f"{map_hint}"
             )
+            if defer_missing:
+                # A runtime-resolved context signals every bar even when it
+                # stands in a branch that is never taken (a ternary evaluates
+                # both branches in Pine), so resolution alone is no demand for
+                # data. Keep the run going and let the first real read raise.
+                logger.warning(
+                    f"Unprovisioned security context (symbol={symbol!r}, "
+                    f"timeframe={timeframe!r}): no OHLCV data found, so the "
+                    f"context stays without a data source and reading it fails"
+                )
+                self._missing_sec_data[sec_id] = message
+                result[sec_id] = None
+                continue
+
+            raise ValueError(message)
         return result
 
     def _prefetch_sec_syminfos(

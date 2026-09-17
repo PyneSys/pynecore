@@ -986,6 +986,8 @@ def _sec_meta(source: str, instantiate: bool = False) -> dict[str, dict]:
         for k, v in zip(val.keys, val.values):
             if k.value == 'depends':
                 entry['depends'] = [e.value for e in v.elts]
+            elif k.value == 'late_reads':
+                entry['late_reads'] = [e.value for e in v.elts]
             elif k.value == 'in_loop':
                 entry['in_loop'] = v.value
             elif k.value == 'timeframe' and isinstance(v, ast.Constant):
@@ -995,6 +997,7 @@ def _sec_meta(source: str, instantiate: bool = False) -> dict[str, dict]:
     return {
         tf_of.get(sid, sid): {
             'depends': sorted(tf_of.get(d, d) for d in entry.get('depends', [])),
+            'late_reads': sorted(tf_of.get(d, d) for d in entry.get('late_reads', [])),
             'in_loop': entry.get('in_loop', False),
         }
         for sid, entry in raw.items()
@@ -1203,6 +1206,359 @@ def main():
     meta = _sec_meta(source)
     assert meta['W']['depends'] == ['D']
     log.info("factory reading a script name falls back")
+
+
+def __test_depends_break_taints_the_whole_loop_body__(log):
+    """A tainted ``break`` decides whether the body runs again, so everything
+    in the body is conditional on it — the statements before it included."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    total = 0.0
+    for i in range(10):
+        b = lib.request.security(lib.syminfo.tickerid, "W", lib.close)
+        total += b
+        if a > 0:
+            break
+    lib.plot(total)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("break taint covers the loop body it can cut short")
+
+
+def __test_depends_break_taints_a_later_write__(log):
+    """A write placed after the loop does run conditionally on the ``break``."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    for i in range(3):
+        if a > 0:
+            break
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.close)
+    lib.plot(b)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("break taint reaches the following write")
+
+
+def __test_depends_collection_reader_leaves_the_container_alone__(log):
+    """``array.get`` reads: a tainted index reaches the VALUE it returns, never
+    the array it was read from."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    store = lib.array.new_float(4, 0.0)
+    value = lib.array.get(store, a)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.array.size(store))
+    c = lib.request.security(lib.syminfo.tickerid, "M", value)
+    lib.plot(b + c)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == []
+    assert meta['M']['depends'] == ['D']
+    log.info("reader keeps the index out of the container")
+
+
+def __test_depends_mutator_writes_back_index_and_value__(log):
+    """``array.set`` stores its value, and the position it writes at decides
+    which slot a later read observes — both are part of what the array holds."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    at_index = lib.array.new_float(4, 0.0)
+    lib.array.set(at_index, a, 1.0)
+    of_value = lib.array.new_float(4, 0.0)
+    lib.array.set(of_value, 0, a)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.array.size(at_index))
+    c = lib.request.security(lib.syminfo.tickerid, "M", lib.array.size(of_value))
+    lib.plot(b + c)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    assert meta['M']['depends'] == ['D']
+    log.info("mutator writes back its index as well as its value")
+
+
+def __test_depends_map_put_stores_key_and_value__(log):
+    """``map.put`` stores both arguments: a map hands its keys back out, so a
+    tainted key is part of what the map holds."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    of_key = lib.map.new()
+    lib.map.put(of_key, a, 1.0)
+    of_value = lib.map.new()
+    lib.map.put(of_value, 1.0, a)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.array.size(lib.map.keys(of_key)))
+    c = lib.request.security(lib.syminfo.tickerid, "M", lib.map.size(of_value))
+    lib.plot(b + c)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    assert meta['M']['depends'] == ['D']
+    log.info("map.put stores its key as well as its value")
+
+
+def __test_depends_unknown_collection_function_stays_mutating__(log):
+    """A collection function the analysis does not know keeps the conservative
+    rule: everything the call touches flows into the collection."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    store = lib.array.new_float(4, 0.0)
+    lib.array.no_such_function(store, a)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.array.size(store))
+    lib.plot(b)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("unknown collection function stays mutating")
+
+
+def __test_depends_loop_variable_is_private_to_its_loop__(log):
+    """A counter used by nothing but its own loops gets a taint cell per loop,
+    so a tainted loop does not taint the next one's counter."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    tainted = lib.array.new_float(4, 0.0)
+    lib.array.push(tainted, a)
+    for i in range(lib.array.size(tainted)):
+        lib.plot(i)
+    other = lib.array.new_float()
+    for i in range(3):
+        lib.array.push(other, i)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.array.size(other))
+    lib.plot(b)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == []
+    log.info("loop variable stays private to its loop")
+
+
+def __test_depends_loop_variable_read_after_the_loop_stays_shared__(log):
+    """A counter read outside its loops keeps the single scope-wide cell."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    tainted = lib.array.new_float(4, 0.0)
+    lib.array.push(tainted, a)
+    for i in range(lib.array.size(tainted)):
+        lib.plot(i)
+    lib.plot(i)
+    other = lib.array.new_float()
+    for i in range(3):
+        lib.array.push(other, i)
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.array.size(other))
+    lib.plot(b)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("loop variable read outside its loop stays shared")
+
+
+def __test_depends_conditional_loop_store_stays_shared__(log):
+    """A store the loop body may skip does not establish the name: the value a
+    skipped pass reads is still the one an earlier loop left behind."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    acc = 0.0
+    for i in range(3):
+        acc = lib.ta.sma(a, 3)
+    for i in range(3):
+        if lib.close < 0:
+            acc = 0.0
+        b = lib.request.security(lib.syminfo.tickerid, "W", acc)
+        lib.plot(b)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("conditional loop store keeps the shared cell")
+
+
+def __test_nested_call_writes_inner_context_first__(log):
+    """A call nested in another call's expression is written first, so the
+    outer context depends on it instead of reading it as a late producer."""
+    source = """
+def main():
+    v = lib.request.security("EXCH:OUT", "60", lib.ta.sma(lib.request.security("EXCH:INN", "D", lib.close), 3))
+    lib.plot(v)
+"""
+    meta = _sec_meta(source)
+    assert meta['60']['depends'] == ['D']
+    assert meta['60']['late_reads'] == []
+
+    func = _find_func(_transform_tree(source))
+    writes = [
+        stmt.body[0].value.args[0].value
+        for stmt in func.body
+        if isinstance(stmt, ast.If) and isinstance(stmt.body[0], ast.Expr)
+        and getattr(stmt.body[0].value.func, 'id', None) == '__sec_write__'
+    ]
+    assert [w.rsplit('·', 1)[1] for w in writes] == ['1', '0']
+    log.info("nested call writes the inner context first")
+
+
+def __test_late_producer_read_is_kept_in_late_reads__(log):
+    """A loop-carried read of a producer sited later is no dependency (it
+    cannot be waited for) but stays a read of the expression in ``late_reads``."""
+    source = """
+def main():
+    y = 0.0
+    for i in range(2):
+        x = lib.request.security("EXCH:A", "D", y + 1.0)
+        y = lib.request.security("EXCH:B", "W", lib.close * 2.0)
+    lib.plot(x)
+"""
+    meta = _sec_meta(source)
+    assert meta['D']['depends'] == []
+    assert meta['D']['late_reads'] == ['W']
+    assert meta['W']['late_reads'] == []
+    log.info("late producer read kept apart from depends")
+
+
+def __test_depends_annotated_loop_accumulator_carries_between_loops__(log):
+    """``acc: float = acc + 1.0`` evaluates its value before binding the
+    name, so the loop reads the value an earlier loop left behind."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    for i in range(2):
+        acc = lib.ta.sma(a, 3)
+    for j in range(2):
+        acc: float = acc + 1.0
+        b = lib.request.security(lib.syminfo.tickerid, "W", acc)
+    lib.plot(b)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("annotated read-modify-write keeps the shared cell")
+
+
+def __test_depends_loop_else_read_stays_shared__(log):
+    """A loop's ``else`` also runs after zero iterations, so a read there can
+    see the value from before the loop even when the body stores first."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    for i in range(2):
+        acc = lib.ta.sma(a, 3)
+    for j in range(0):
+        acc = 0.0
+    else:
+        b = lib.request.security(lib.syminfo.tickerid, "W", acc)
+        lib.plot(b)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("loop-else read keeps the shared cell")
+
+
+def __test_depends_loop_accumulator_carries_between_loops__(log):
+    """``acc = acc + x`` READS the name before it stores into it, so the loop
+    does not own it: the value an earlier loop left behind is carried over."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    for i in range(2):
+        acc = lib.ta.sma(a, 3)
+    for j in range(2):
+        acc = acc + 1
+        b = lib.request.security(lib.syminfo.tickerid, "W", acc)
+    lib.plot(b)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("read-modify-write keeps the shared cell")
+
+
+def __test_depends_named_expr_accumulator_carries_between_loops__(log):
+    """``(acc := acc + x)`` evaluates its value before binding, and an
+    assignment expression never establishes a loop-private name."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    for i in range(2):
+        acc = lib.ta.sma(a, 3)
+    for j in range(2):
+        (acc := acc + 1.0)
+        b = lib.request.security(lib.syminfo.tickerid, "W", acc)
+    lib.plot(b)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("assignment-expression accumulator keeps the shared cell")
+
+
+def __test_depends_loop_augmented_accumulator_carries_between_loops__(log):
+    """``acc += x`` is a read-modify-write too."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    for i in range(2):
+        acc = lib.ta.sma(a, 3)
+    for j in range(2):
+        acc += 1
+        b = lib.request.security(lib.syminfo.tickerid, "W", acc)
+    lib.plot(b)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("augmented accumulator keeps the shared cell")
+
+
+def __test_depends_loop_variable_read_by_a_closure_stays_shared__(log):
+    """A nested function is visited as its own scope and cannot see a loop's
+    private cell, so a name it closes over keeps the scope-wide one."""
+    source = """
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close)
+    tainted = lib.array.new_float(4, 0.0)
+    lib.array.push(tainted, a)
+    for j in range(2):
+        i = lib.array.size(tainted) + j
+
+        def inner():
+            return i
+
+        lib.plot(inner())
+    for i in range(3):
+        b = lib.request.security(lib.syminfo.tickerid, "W", i)
+    lib.plot(b)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == ['D']
+    log.info("closure read keeps the loop variable shared")
+
+
+def __test_depends_factory_naming_another_record_is_modelled__(log):
+    """A field defaulting to ``na(<another UDT>)`` keeps the class a record:
+    a class name is an import-time constant binding, taint-free."""
+    source = """
+from pynecore import lib
+from dataclasses import field as __pyne_field·__
+
+@udt
+class Inner:
+    top: float = lib.na(float)
+
+@udt
+class Outer:
+    info: Inner = __pyne_field·__(default_factory=lambda: lib.na(Inner))
+
+LENGTH = 9
+
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.ta.ema(lib.close, LENGTH))
+    b = lib.request.security(lib.syminfo.tickerid, "W", lib.ta.ema(lib.high, LENGTH))
+    lib.plot(a + b)
+"""
+    meta = _sec_meta(source)
+    assert meta['W']['depends'] == []
+    log.info("factory naming another record keeps the analysis precise")
 
 
 def __test_depends_field_only_class_still_carries_instance_taint__(log):
