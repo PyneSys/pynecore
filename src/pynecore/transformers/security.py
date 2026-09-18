@@ -1,10 +1,12 @@
 import ast
 import copy
 import hashlib
+import re
 from collections.abc import Container
 
 from ..core.import_hook import PYNE_RESERVED_NAME_CHAR
 from .dynamic_default import is_script_entry
+from .lib_series import NON_SERIES_LIB_ATTRS
 from .pine_type_rules import FactoryFields
 
 
@@ -33,6 +35,120 @@ _OHLCV_PASSTHROUGH_FIELDS = frozenset({
     "open", "high", "low", "close", "volume",
     "hl2", "hlc3", "ohlc4", "hlcc4",
 })
+
+#: Name shape of the temps ``InlineSeriesHoistTransformer`` lifts an
+#: ``inline_series`` call into (see :meth:`SecurityTransformer._scope_bindings`).
+_HIST_TEMP_RE = re.compile(r'__hist_\d+__')
+
+#: Annotations of an ``AnnAssign`` that DECLARE a history-bearing variable.
+#: ``PersistentSeries`` / ``IBPersistentSeries`` are split into a persistent
+#: half and a plain ``Series`` half by
+#: :class:`~pynecore.transformers.persistent_series.PersistentSeriesTransformer`
+#: (stage 501), so all three end up as a series. Bare ``Persistent`` /
+#: ``IBPersistent`` are NOT here: they only say the value survives the bar.
+_SERIES_ANNOTATIONS = frozenset({'Series', 'PersistentSeries', 'IBPersistentSeries'})
+
+
+def _is_series_annotation(node: ast.expr | None) -> bool:
+    """Whether an ``AnnAssign`` annotation declares a series variable.
+
+    :param node: The annotation node, or None.
+    :return: True for ``Series`` / ``PersistentSeries`` / ``IBPersistentSeries``,
+        bare or subscripted.
+    """
+    if isinstance(node, ast.Subscript):
+        node = node.value
+    return isinstance(node, ast.Name) and node.id in _SERIES_ANNOTATIONS
+
+
+def _is_param_series_annotation(node: ast.expr | None) -> bool:
+    """Whether a PARAMETER annotation gives the parameter a history buffer.
+
+    Only a plain ``Series`` / ``Series[T]``:
+    :meth:`~pynecore.transformers.series.SeriesTransformer.visit_FunctionDef`
+    converts exactly that, and ``PersistentSeriesTransformer`` rewrites
+    declarations only, never a parameter's annotation.
+
+    :param node: The annotation node, or None.
+    :return: True for ``Series`` / ``Series[T]``.
+    """
+    if isinstance(node, ast.Subscript):
+        node = node.value
+    return isinstance(node, ast.Name) and node.id == 'Series'
+
+
+def _is_history_index(node: ast.expr) -> bool:
+    """Whether ``node`` is an int constant >= 1 (a history offset)."""
+    return (isinstance(node, ast.Constant) and isinstance(node.value, int)
+            and not isinstance(node.value, bool) and node.value >= 1)
+
+
+def _is_inline_series_call(node: ast.expr | None) -> bool:
+    """Whether ``node`` is the ``inline_series(expr, k)`` call PyneComp emits in
+    place of an expression history reference, with ``k`` an offset >= 1.
+
+    :param node: Expression node, or None.
+    :return: True for such a call.
+    """
+    if not (isinstance(node, ast.Call) and len(node.args) == 2 and not node.keywords):
+        return False
+    func = node.func
+    name = (func.id if isinstance(func, ast.Name)
+            else func.attr if isinstance(func, ast.Attribute) else None)
+    return name == 'inline_series' and _is_history_index(node.args[1])
+
+
+def _is_lib_series_chain(node: ast.expr) -> bool:
+    """Whether ``node`` is a subscript receiver
+    :class:`~pynecore.transformers.lib_series.LibrarySeriesTransformer` turns
+    into a series.
+
+    Its criterion, mirrored from
+    :meth:`~pynecore.transformers.lib_series.LibrarySeriesTransformer.
+    visit_Subscript`: the receiver is an ``Attribute`` chain whose root ``Name``
+    is ``lib`` and whose first segment after ``lib`` is not one of
+    :data:`~pynecore.transformers.lib_series.NON_SERIES_LIB_ATTRS`. Nested
+    namespaces count (``lib.ta.tr``), a ``Call`` never does — which is what
+    keeps ``lib.ta.sma(...)[1]`` out.
+
+    :param node: The subscript's receiver.
+    :return: True when that pass would make a series of it.
+    """
+    if not isinstance(node, ast.Attribute):
+        return False
+    chain: list[str] = []
+    cur: ast.expr = node
+    while isinstance(cur, ast.Attribute):
+        chain.append(cur.attr)
+        cur = cur.value
+    if not (isinstance(cur, ast.Name) and cur.id == 'lib'):
+        return False
+    chain.reverse()
+    return not (chain and chain[0] in NON_SERIES_LIB_ATTRS)
+
+
+class _SeriesScope:
+    """What one function scope binds, as the passes AFTER this one see it.
+
+    :ivar series: every name a series annotation or a ``Series``-annotated
+        parameter gives a history buffer to, order-insensitively. Where the
+        declaration stands relative to the reference does not matter here: this
+        scope only makes the CANDIDATE, and
+        :func:`~pynecore.transformers.security_closed_shift_check.
+        verify_closed_shift` checks the lowered write exactly.
+    :ivar locals_: every name the scope binds; one that is NOT in ``series``
+        shadows a same-named parent series, exactly as
+        :meth:`~pynecore.transformers.series.SeriesTransformer._lookup` has it
+    :ivar hist: the value each ``__hist_N__`` temp of this scope holds
+    """
+
+    __slots__ = ('series', 'locals_', 'hist')
+
+    def __init__(self, series: set[str], locals_: set[str],
+                 hist: dict[str, ast.expr]):
+        self.series = series
+        self.locals_ = locals_
+        self.hist = hist
 
 
 # --- Cross-function signal lift ---
@@ -172,6 +288,9 @@ class SecurityTransformer(ast.NodeTransformer):
         # because another context reads them (see ``visit_Module``).
         self._deferred_by_reach: set[str] = set()
         self._keep_top: frozenset[str] = frozenset()
+        # Bindings of the function scope chain being processed, innermost last
+        # (see :meth:`_scope_bindings`).
+        self._scopes: list[_SeriesScope] = []
 
     def _gen_id(self) -> str:
         # The module hash keeps sec ids unique across modules: the main script and
@@ -478,6 +597,213 @@ class SecurityTransformer(ast.NodeTransformer):
         if field is not None:
             return [field], False
         return None
+
+    @staticmethod
+    def _is_lookahead_on(node: ast.expr | None) -> bool:
+        """Whether ``node`` literally names the lookahead-ON singleton.
+
+        Conservative on purpose: only the spellings of the constant itself
+        (``barmerge.lookahead_on``, a bare ``lookahead_on``, ``Lookahead.ON``)
+        count. An input-derived lookahead is resolved at runtime and never
+        reaches here with a value.
+        """
+        if isinstance(node, ast.Name):
+            return node.id == 'lookahead_on'
+        if isinstance(node, ast.Attribute):
+            return node.attr == 'lookahead_on' or (
+                node.attr == 'ON' and isinstance(node.value, ast.Name)
+                and node.value.id == 'Lookahead')
+        return False
+
+    def _scope_bindings(
+            self, func: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> _SeriesScope:
+        """Collect what ONE function scope binds (see :class:`_SeriesScope`).
+
+        Re-derived from the very source shapes the later passes consume: an
+        ``AnnAssign`` with a series annotation and a ``Series``-annotated
+        positional parameter declare a history buffer, every other binding is a
+        plain local, and a ``__hist_N__`` assignment records what
+        :class:`~pynecore.transformers.inline_series_hoist.
+        InlineSeriesHoistTransformer` lifted into the temp — the standard
+        non-repainting idiom (``request.security(..., close[1], lookahead_on) if
+        flag else na``) puts the history reference in a ternary branch, so the
+        split only ever sees the bare temp.
+
+        Nested functions are skipped: each is a scope of its own, collected when
+        it is visited. A temp bound twice in one scope is dropped rather than
+        guessed about.
+
+        :param func: The function whose own scope is being collected.
+        :return: The scope's bindings.
+        """
+        series: set[str] = set()
+        locals_: set[str] = set()
+        hist: dict[str, ast.expr] = {}
+        seen: set[str] = set()
+
+        args = func.args
+        for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+            locals_.add(arg.arg)
+        if args.vararg is not None:
+            locals_.add(args.vararg.arg)
+        if args.kwarg is not None:
+            locals_.add(args.kwarg.arg)
+        for arg in args.args:
+            if _is_param_series_annotation(arg.annotation):
+                series.add(arg.arg)
+
+        for stmt in func.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in self._walk_skip_funcs(stmt):
+                if (isinstance(node, ast.Name)
+                        and isinstance(node.ctx, (ast.Store, ast.Del))):
+                    locals_.add(node.id)
+                if isinstance(node, ast.AnnAssign):
+                    if (isinstance(node.target, ast.Name)
+                            and _is_series_annotation(node.annotation)):
+                        series.add(node.target.id)
+                    continue
+                if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
+                    continue
+                target = node.targets[0]
+                if not (isinstance(target, ast.Name)
+                        and _HIST_TEMP_RE.fullmatch(target.id)):
+                    continue
+                if target.id in seen:
+                    hist.pop(target.id, None)
+                    continue
+                seen.add(target.id)
+                hist[target.id] = node.value
+        return _SeriesScope(series, locals_, hist)
+
+    def _is_declared_series(self, name: str) -> bool:
+        """Whether ``name`` resolves to a series along the enclosing scope chain.
+
+        The same walk
+        :meth:`~pynecore.transformers.series.SeriesTransformer._lookup` makes: a
+        name bound in the CURRENT scope without a series declaration there
+        shadows any parent series of that name, otherwise the innermost
+        enclosing scope that declares it wins.
+
+        Order-insensitive on purpose. Whether the declaration is REACHED before
+        the reference — a name read as a plain list above its own
+        ``Series[float]`` declaration, or inside the declaring statement the
+        child's write is lifted out of — is a property of the lowered tree, and
+        :func:`~pynecore.transformers.security_closed_shift_check.
+        verify_closed_shift` decides it there on the emitted form instead of
+        re-deriving it from source lines here.
+
+        :param name: Source-level variable name.
+        :return: True when the name may address a history buffer.
+        """
+        if not self._scopes:
+            return False
+        current = self._scopes[-1]
+        if name in current.series:
+            return True
+        if name in current.locals_:
+            return False
+        for scope in reversed(self._scopes[:-1]):
+            if name in scope.series:
+                return True
+        return False
+
+    def _is_series_receiver(self, node: ast.expr) -> bool:
+        """Whether a ``[k]`` subscript of ``node`` addresses a history buffer.
+
+        Either a ``lib``-rooted chain :class:`~pynecore.transformers.lib_series.
+        LibrarySeriesTransformer` converts, or a name that resolves to a series
+        declaration / a ``Series``-annotated parameter (or to a hoisted
+        ``inline_series`` temp).
+
+        :param node: The subscript's receiver.
+        :return: True when the subscript is a history read.
+        """
+        if isinstance(node, ast.Name):
+            bound = self._scopes[-1].hist.get(node.id) if self._scopes else None
+            if bound is not None and _is_inline_series_call(bound):
+                return True
+            return self._is_declared_series(node.id)
+        return _is_lib_series_chain(node)
+
+    def _is_history_reference(self, node: ast.expr) -> bool:
+        """Whether ``node`` reads a CLOSED bar, i.e. lowers to a history read.
+
+        A POSITIVE rule, mirroring the lowering: nothing else is a history
+        reference at runtime, so the two shapes below are exhaustive.
+
+        1. ``inline_series(expr, k>=1)`` — what PyneComp emits for an expression
+           history reference (``ta.sma(close, 5)[1]``) — directly or through a
+           ``__hist_N__`` temp bound to one in this scope.
+        2. ``<receiver>[k>=1]`` where the receiver is what a later pass turns
+           into a series: a ``lib`` chain for ``LibrarySeriesTransformer``
+           (:func:`_is_lib_series_chain`) or a name declared / annotated series
+           for ``SeriesTransformer`` (:meth:`_is_series_receiver`).
+
+        Every other receiver — a call, an operator result, a collection, a name
+        bound to any of them — is NOT a history reference: a subscript of it is
+        element access or a tuple selection whose value follows the developing
+        bar. The rule is the CANDIDATE: a shape it misses only costs a
+        developing round that would have been skippable, and a source shape it
+        reads too generously is caught on the lowered write by
+        :func:`~pynecore.transformers.security_closed_shift_check.
+        verify_closed_shift`.
+
+        What is INSIDE a history reference does not matter: its value is fixed by
+        the bars before the one being computed, and a developing re-tick of a
+        security child re-runs the period's first tick from its own rolled-back
+        baseline, so every tick of one period computes the same ``[k>=1]`` value.
+
+        :param node: The expression to classify.
+        :return: True when the whole expression reads closed bars only.
+        """
+        if isinstance(node, ast.Name) and self._scopes:
+            bound = self._scopes[-1].hist.get(node.id)
+            if bound is not None:
+                node = bound
+        if _is_inline_series_call(node):
+            return True
+        if isinstance(node, ast.Subscript):
+            return (_is_history_index(node.slice)
+                    and self._is_series_receiver(node.value))
+        return False
+
+    def _closed_shift(self, expression: ast.expr | None,
+                      lookahead: ast.expr | None) -> bool:
+        """Whether a context's value can only change when its HTF period closes.
+
+        True for ``lookahead_on`` with an expression that is ENTIRELY a history
+        reference in the sense of :meth:`_is_history_reference` — ``close[1]``, a
+        history read of a declared series, the ``inline_series(..., 1)`` PyneComp
+        emits for ``ta.sma(close, 5)[1]`` and ``(close + open)[1]``, and a
+        tuple/list whose every element is one. The chart then runs a developing
+        round only on the FIRST chart bar of each period (see
+        ``core/security.py``); the other bars would recompute the same value.
+
+        The classifier is a positive one and deliberately kept small: a shape it
+        does not recognise keeps the period's developing rounds, which costs work
+        and never correctness. It also decides the merge grouping, so it must
+        run here, on the source shape; the exact check of the lowered write is
+        :func:`~pynecore.transformers.security_closed_shift_check.
+        verify_closed_shift`.
+
+        ``close[1] + close`` is NOT one of them: its second term reads the
+        developing bar, so it does change inside the period. (TradingView's own
+        ``lookahead_on`` hands such an expression the period's FINAL value on
+        every bar of it — lookahead PyneCore deliberately does not reproduce.)
+
+        :param expression: The ``expression`` argument's AST, or None.
+        :param lookahead: The ``lookahead`` argument's AST, or None.
+        :return: Whether the developing rounds of the period may be skipped.
+        """
+        if expression is None or not self._is_lookahead_on(lookahead):
+            return False
+        if isinstance(expression, (ast.Tuple, ast.List)):
+            return bool(expression.elts) and all(
+                self._is_history_reference(elt) for elt in expression.elts)
+        return self._is_history_reference(expression)
 
     # --- AST node builders ---
 
@@ -818,6 +1144,22 @@ class SecurityTransformer(ast.NodeTransformer):
     # --- Function & module visitors ---
 
     def _process_func(self, node: ast.FunctionDef | ast.AsyncFunctionDef):
+        """Transform a function, with its own scope on the scope stack.
+
+        The stack is what :meth:`_is_declared_series` resolves a name along, so
+        every function pushes its bindings — a function without a
+        ``request.security()`` of its own may still be the scope that DECLARES
+        the series a nested one reads. The body below finishes its own contexts
+        before ``generic_visit`` descends, so a nested scope always sees the
+        chain above it.
+        """
+        self._scopes.append(self._scope_bindings(node))
+        try:
+            return self._process_func_body(node)
+        finally:
+            self._scopes.pop()
+
+    def _process_func_body(self, node: ast.FunctionDef | ast.AsyncFunctionDef):
         """Transform a function containing request.security() / security_lower_tf() calls."""
         calls = self._collect_calls(node.body)
 
@@ -913,6 +1255,14 @@ class SecurityTransformer(ast.NodeTransformer):
                     # to ``__sec_signal__`` resolves the mode on the first bar.
                     ctx['lookahead'] = (copy.deepcopy(lookahead) if lookahead_rt is None
                                         else ast.Constant(value=None))
+                # Developing rounds inside one HTF period are skippable when
+                # the whole expression is a ``[k>=1]`` history reference under
+                # ``lookahead_on`` (see :meth:`_closed_shift`). Emitted for every
+                # non-LTF context, True or False: the runtime decides whether the
+                # skip applies, and ``PYNE_NO_SECURITY_DEV_SKIP`` turns it off
+                # without touching the emitted tree.
+                ctx['closed_shift'] = ast.Constant(
+                    value=self._closed_shift(expression, lookahead))
 
             if ignore_invalid is not None:
                 ctx['ignore_invalid_symbol'] = copy.deepcopy(ignore_invalid)
@@ -1265,7 +1615,8 @@ class SecurityTransformer(ast.NodeTransformer):
         """Compile-time context key of ``sid``, or None when it may not group.
 
         The key is the syntax of what decides WHICH feed the context resolves
-        to — symbol, timeframe, lookahead and ``ignore_invalid_symbol``.
+        to — symbol, timeframe, lookahead and ``ignore_invalid_symbol`` — plus
+        ``closed_shift``, which decides the round protocol the shared child runs.
         ``gaps`` and ``currency`` are left out on purpose: they only shape how
         the chart side reads the result, not what the child loads. A
         lower-timeframe context never gets one (its write path is its own).
@@ -1298,7 +1649,12 @@ class SecurityTransformer(ast.NodeTransformer):
         # the key below; a module-level one is only in the context.
         _sym, _tf, la_rt = self._signal_args[sid]
         la_expr = None if la_rt is not None else ctx.get('lookahead')
-        tail = (self._dump(la_expr), self._dump(ctx.get('ignore_invalid_symbol')))
+        # ``closed_shift`` decides whether the chart runs a developing round on
+        # every chart bar of a period or only on its first, and one child runs
+        # ONE round protocol for its whole group — so members of two different
+        # modes may not share it.
+        tail = (self._dump(la_expr), self._dump(ctx.get('ignore_invalid_symbol')),
+                self._dump(ctx.get('closed_shift')))
         args = stable_args.get(sid)
         if args is not None:
             return ('stable', *args, *tail), True

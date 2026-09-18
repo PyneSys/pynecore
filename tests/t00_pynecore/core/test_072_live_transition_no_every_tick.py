@@ -11,11 +11,7 @@ import sys
 import itertools
 
 from pynecore.lib import array, line, plot, script, strategy, bar_index
-from pynecore.types import Persistent
-
-# A module-level global is outside the slot scheme, so nothing rolls it back --
-# it counts body executions, not bars.
-_execs: list[int] = []
+from pynecore.types import IBPersistent, Persistent
 
 
 @script.strategy(
@@ -29,20 +25,23 @@ _execs: list[int] = []
 def main():
     counter: Persistent[int] = 0
     counter += 1
-    _execs.append(bar_index)
+    # A varip slot is the one piece of state a discarded execution keeps, so it
+    # counts body executions rather than bars
+    execs: IBPersistent[int] = 0
+    execs += 1
     line.new(bar_index, 0.0, bar_index, 1.0)
     plot(counter, 'var')
     plot(array.size(line.all), 'lines')
-    plot(len(_execs), 'total_execs')
+    plot(execs, 'total_execs')
 
 
-def _make_ohlcv(ts, close=100.0, is_closed=True):
+def __test_helper_make_ohlcv(ts, close=100.0, is_closed=True):
     from pynecore.types.ohlcv import OHLCV
     return OHLCV(timestamp=ts, open=close, high=close + 1, low=close - 1,
                  close=close, volume=1000.0, is_closed=is_closed)
 
 
-def _create_live_runner(script_path, module_key, syminfo, ohlcv_iter):
+def __test_helper_create_live_runner(script_path, module_key, syminfo, ohlcv_iter):
     """Helper: set live mode flags, clean module cache, create ScriptRunner."""
     from pynecore.core.script_runner import ScriptRunner
     from pynecore import lib
@@ -55,28 +54,30 @@ def _create_live_runner(script_path, module_key, syminfo, ohlcv_iter):
     return ScriptRunner(script_path, ohlcv_iter, syminfo)
 
 
-def _chain_live(historical, live):
+def __test_helper_chain_live(historical, live):
     """Chain historical OHLCV with LIVE_TRANSITION sentinel and live OHLCV."""
     from pynecore.core.script_runner import LIVE_TRANSITION
     return itertools.chain(historical, [LIVE_TRANSITION], live)
 
 
-def _run(script_path, module_key, syminfo, every_tick):
+def __test_helper_run(script_path, module_key, syminfo, every_tick):
     """Run four bars where the live feed continues the last warmup bar."""
     from pynecore.core import viz
-    _execs.clear()
 
-    historical = [_make_ohlcv(0, 100.0), _make_ohlcv(60, 101.0)]
+    historical = [__test_helper_make_ohlcv(0, 100.0),
+                  __test_helper_make_ohlcv(60, 101.0)]
     live = [
-        _make_ohlcv(60, 101.5, is_closed=False),  # continues the warmup bar
-        _make_ohlcv(60, 102.0, is_closed=True),
-        _make_ohlcv(120, 103.0, is_closed=True),
-        _make_ohlcv(180, 104.0, is_closed=True),
+        # continues the warmup bar
+        __test_helper_make_ohlcv(60, 101.5, is_closed=False),
+        __test_helper_make_ohlcv(60, 102.0, is_closed=True),
+        __test_helper_make_ohlcv(120, 103.0, is_closed=True),
+        __test_helper_make_ohlcv(180, 104.0, is_closed=True),
     ]
 
     try:
-        runner = _create_live_runner(
-            script_path, module_key, syminfo, _chain_live(historical, live))
+        runner = __test_helper_create_live_runner(
+            script_path, module_key, syminfo,
+            __test_helper_chain_live(historical, live))
         runner.script.calc_on_every_tick = every_tick
         results = []
         for _candle, plot_data, _trades in runner.run_iter():
@@ -89,7 +90,7 @@ def _run(script_path, module_key, syminfo, every_tick):
 def __test_warmup_bar_continued_live_counts_once__(script_path, module_key, syminfo):
     """ The continued warmup bar is one bar, whether or not the script runs on ticks """
     for every_tick in (False, True):
-        results = _run(script_path, module_key, syminfo, every_tick)
+        results = __test_helper_run(script_path, module_key, syminfo, every_tick)
 
         # Warmup bars 0 and 60, the closed live bar 60, then live bars 120, 180
         assert len(results) == 5, f"every_tick={every_tick}"
@@ -102,8 +103,8 @@ def __test_warmup_bar_continued_live_counts_once__(script_path, module_key, symi
 
 def __test_every_tick_runs_the_continued_bar_more_often__(script_path, module_key, syminfo):
     """ The rolled-back state is identical although the tick path executes more """
-    without_ticks = _run(script_path, module_key, syminfo, False)
-    with_ticks = _run(script_path, module_key, syminfo, True)
+    without_ticks = __test_helper_run(script_path, module_key, syminfo, False)
+    with_ticks = __test_helper_run(script_path, module_key, syminfo, True)
 
     # Bar 60 runs twice without tick execution (warmup + live close) and three
     # times with it (warmup + open tick + live close)

@@ -120,6 +120,7 @@ from functools import partial
 from .pine_export import Exported, in_module_bool_mode
 from .series import SeriesImpl
 from ..types.base import Drawing
+from ..types.matrix import Matrix
 from ..types.na import NA, na_float
 
 __all__ = [
@@ -750,8 +751,8 @@ def _var_slots(layout: dict[str, Any]) -> tuple[int, ...]:
 
 def _copy_value(value: Any) -> Any:
     """Copy a value for snapshot/restore: immutables and drawings as-is,
-    dicts/lists by deepcopy, dataclasses by ``replace``, everything else by
-    shallow copy.
+    dicts/lists/matrices by deepcopy, dataclasses by ``replace``, everything
+    else by shallow copy.
 
     :param value: Value to copy.
     :return: Copied (or immutable, as-is) value.
@@ -764,9 +765,12 @@ def _copy_value(value: Any) -> Any:
         # the registry: the script kept mutating an object with a duplicate vid that
         # never reached the chart, while the registered original went unreferenced.
         return value
-    if isinstance(value, (dict, list)):
+    if isinstance(value, (dict, list, Matrix)):
         # A container holding drawings is deep-copied too, but ``Drawing`` stops the
         # recursion at its own handles, matching TradingView's container copies.
+        # A matrix rolls back exactly like an array or a map: its row storage AND
+        # its elements are independent of the baseline, so a mutation reaching into
+        # a cell during a discarded execution does not survive it.
         return deepcopy(value)
     try:
         return dataclass_replace(value)  # type: ignore[type-var]
@@ -944,12 +948,21 @@ def _snap_child(entry: Any) -> tuple:
 
 
 def _restore_vector(state: list, snap: tuple) -> None:
-    """Restore one state vector (in place) from its :func:`_snap_vector` form."""
+    """Restore one state vector (in place) from its :func:`_snap_vector` form.
+
+    Series slots go through the O(changed slots) same-bar undo
+    (:meth:`SeriesImpl._restore_bar`): every user of this path re-runs the SAME
+    ``bar_index`` the snapshot was taken on (a calc_on_order_fills fill, a live
+    intra-bar tick, a ``request.security`` child's developing re-tick), so an
+    :meth:`SeriesImpl.add` could only have degraded to a ``set`` of the newest
+    slot, appended a tail or done the single at-capacity ring overwrite. Shapes
+    the undo cannot prove fall back to the full buffer copy on their own.
+    """
     var_vals, series_vals, child_vals = snap
     for i, value in var_vals:
         state[i] = _copy_value(value)
     for slot, series_snap in series_vals:
-        state[slot]._restore(series_snap)  # noqa: cooperating core internals
+        state[slot]._restore_bar(series_snap)  # noqa: cooperating core internals
     _restore_children(state, child_vals)
 
 
@@ -978,7 +991,7 @@ def _restore_payload(child_snap: tuple) -> Any:
         _restore_vector(child_snap[2], child_snap[3])
         return child_snap[1]
     if kind == 'series':
-        child_snap[2]._restore(child_snap[3])  # noqa: cooperating core internals
+        child_snap[2]._restore_bar(child_snap[3])  # noqa: cooperating core internals
         return child_snap[1]
     if kind == 'dispatch':
         cache, keys, vectors = child_snap[2], child_snap[3], child_snap[4]

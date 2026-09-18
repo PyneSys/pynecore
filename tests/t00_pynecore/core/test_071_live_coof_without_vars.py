@@ -11,10 +11,7 @@ import sys
 import itertools
 
 from pynecore.lib import plot, script, strategy, bar_index
-
-# A module-level global is outside the slot scheme, so nothing rolls it back --
-# it counts body executions, not bars.
-_execs: list[int] = []
+from pynecore.types import IBPersistent
 
 
 @script.strategy(
@@ -26,23 +23,26 @@ _execs: list[int] = []
     calc_on_order_fills=True,
 )
 def main():
-    _execs.append(bar_index)
+    # A varip slot is the one piece of state a discarded re-execution keeps,
+    # so it counts body executions rather than bars
+    execs: IBPersistent[int] = 0
+    execs += 1
 
     # Placed on the first live bar: warmup executions are suppressed, so an
     # order issued there would never reach the simulator
     if bar_index == 1:
         strategy.entry('Long', strategy.long)
 
-    plot(len(_execs), 'total_execs')
+    plot(execs, 'total_execs')
 
 
-def _make_ohlcv(ts, close=100.0, is_closed=True):
+def __test_helper_make_ohlcv(ts, close=100.0, is_closed=True):
     from pynecore.types.ohlcv import OHLCV
     return OHLCV(timestamp=ts, open=close, high=close + 1, low=close - 1,
                  close=close, volume=1000.0, is_closed=is_closed)
 
 
-def _create_live_runner(script_path, module_key, syminfo, ohlcv_iter):
+def __test_helper_create_live_runner(script_path, module_key, syminfo, ohlcv_iter):
     """Helper: set live mode flags, clean module cache, create ScriptRunner."""
     from pynecore.core.script_runner import ScriptRunner
     from pynecore import lib
@@ -55,7 +55,7 @@ def _create_live_runner(script_path, module_key, syminfo, ohlcv_iter):
     return ScriptRunner(script_path, ohlcv_iter, syminfo)
 
 
-def _chain_live(historical, live):
+def __test_helper_chain_live(historical, live):
     """Chain historical OHLCV with LIVE_TRANSITION sentinel and live OHLCV."""
     from pynecore.core.script_runner import LIVE_TRANSITION
     return itertools.chain(historical, [LIVE_TRANSITION], live)
@@ -63,18 +63,16 @@ def _chain_live(historical, live):
 
 def __test_live_coof_reexecutes_without_var_slots__(script_path, module_key, syminfo):
     """ A fill re-runs the body in live simulation even with no var slots """
-    _execs.clear()
-
-    historical = [_make_ohlcv(0, 100.0)]
+    historical = [__test_helper_make_ohlcv(0, 100.0)]
     live = [
-        _make_ohlcv(60, 101.0),   # entry queued here
-        _make_ohlcv(120, 102.0),  # entry fills -> body re-executes
-        _make_ohlcv(180, 103.0),
+        __test_helper_make_ohlcv(60, 101.0),   # entry queued here
+        __test_helper_make_ohlcv(120, 102.0),  # entry fills -> body re-executes
+        __test_helper_make_ohlcv(180, 103.0),
     ]
 
-    runner = _create_live_runner(
+    runner = __test_helper_create_live_runner(
         script_path, module_key, syminfo,
-        _chain_live(historical, live),
+        __test_helper_chain_live(historical, live),
     )
     results = [dict(plot_data) for _candle, plot_data, _trades in runner.run_iter()]
 

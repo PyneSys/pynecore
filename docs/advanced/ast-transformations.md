@@ -48,20 +48,21 @@ PyneCore applies several key transformations to Python code to make it behave li
 2. **TYPE_CHECKING Stripper** - Removes `if TYPE_CHECKING:` blocks (IDE-only hints)
 3. **Builtin Shadow Transformer** - Routes shadowed-alias accesses the library cannot serve back to the built-in namespace
 4. **Import Normalizer** - Standardizes import statements
-5. **Security Transformer** - Rewrites `request.security()` calls into signal/write/read/wait pattern
+5. **Outer Write Transformer** - Rejects writes into an object created outside a function
+6. **Security Transformer** - Rewrites `request.security()` calls into signal/write/read/wait pattern
    (see [request.security() Internals](./request-security-internals.md))
-6. **PersistentSeries Transformer** - Splits the hybrid PersistentSeries type
-7. **Library Series Transformer** - Prepares library Series variables
-8. **Module Property Transformer** - Handles module properties
-9. **Closure Arguments Transformer** - Converts closure variables to function arguments
-10. **Unused Series Detector** - Removes unnecessary Series annotations for performance
-11. **Series Transformer** - Handles Series variables
-12. **Persistent Transformer** - Manages persistent variables
-13. **Function Isolation Transformer** - Ensures separate state for each function call
-14. **Input Transformer** - Processes input parameters
-15. **Safe Convert Transformer** - Lowers the `float()`/`int()` casts to their Pine forms and truncates
+7. **PersistentSeries Transformer** - Splits the hybrid PersistentSeries type
+8. **Library Series Transformer** - Prepares library Series variables
+9. **Module Property Transformer** - Handles module properties
+10. **Closure Arguments Transformer** - Converts closure variables to function arguments
+11. **Unused Series Detector** - Removes unnecessary Series annotations for performance
+12. **Series Transformer** - Handles Series variables
+13. **Persistent Transformer** - Manages persistent variables
+14. **Function Isolation Transformer** - Ensures separate state for each function call
+15. **Input Transformer** - Processes input parameters
+16. **Safe Convert Transformer** - Lowers the `float()`/`int()` casts to their Pine forms and truncates
     a Pine int where a Python-native consumer needs a real `int`
-16. **Safe Division Transformer** - Protects against division by zero
+17. **Safe Division Transformer** - Protects against division by zero
 
 This order ensures that dependencies between transformations are properly handled. For example, PersistentSeries transformation must happen before both Persistent and Series transformations, and Function Isolation must run after them because it routes calls based on the state slots they allocated.
 
@@ -191,6 +192,36 @@ However, after using the import normalizer, it will work:
 a = lib.close
 ```
 Because the module level variable changed, and we access through the lib module object.
+
+### Outer Write Transformer
+
+An object a script creates at module level lives outside everything the runtime rolls back. A
+`request.security` child re-runs `main()` on a developing higher-timeframe bar and discards the
+result, `calc_on_order_fills` re-executes a bar once per fill, and a live intrabar tick re-executes
+the bar per tick. All three restore the script's own slots (`Persistent`, `Series`) and none of them
+can restore a plain Python object the script keeps for itself.
+
+This pass rejects the direct forms with a `SyntaxError` when the script is loaded:
+
+```python
+STORE = array.new_float(0)
+
+def main():
+    array.push(STORE, close)  # SyntaxError: 'STORE' is modified inside a function
+```
+
+Rejected inside any function: any `global` statement, an assignment, augmented assignment or `del`
+whose target chain is rooted at a module-level binding, a mutating method call
+on one (`append`, `extend`, `pop`, `clear`, `sort`, `update`, ...), and a mutating `array.*` /
+`matrix.*` / `map.*` builtin whose first argument is one. A local variable or a parameter of the same
+spelling shadows the module-level name, so it is not the outer object.
+
+Defining is free: only writing is rejected. A module-level binding whose value is a call
+(`color.new(...)`), an enum member (`strategy.fixed`) or an exported-function proxy is unaffected,
+and reading any of them from a function is unaffected as well.
+
+Functions whose name starts with `__test_` are exempt — they are test-harness code rather than script
+code.
 
 ### PersistentSeries Transformer
 

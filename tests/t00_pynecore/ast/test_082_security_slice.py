@@ -462,3 +462,537 @@ def main():
     assert set(transformer.skipped.values()) == {'ohlcv_passthrough'}, \
         f"unexpected per-context skip reasons: {transformer.skipped}"
     log.info("the all-OHLCV group kept the main()-free child path")
+
+
+def __test_helper_closed_shift(tree: ast.Module) -> list[bool | None]:
+    """The ``closed_shift`` flag of every context, in context order."""
+    flags: list[bool | None] = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        target = node.targets[0]
+        if not (isinstance(target, ast.Name) and target.id == '__security_contexts__'):
+            continue
+        assert isinstance(node.value, ast.Dict)
+        for ctx in node.value.values:
+            assert isinstance(ctx, ast.Dict)
+            found: bool | None = None
+            for key, value in zip(ctx.keys, ctx.values):
+                if (isinstance(key, ast.Constant) and key.value == 'closed_shift'
+                        and isinstance(value, ast.Constant)):
+                    found = value.value
+            flags.append(found)
+    return flags
+
+
+def __test_closed_shift_survives_a_varip_free_slice__(log):
+    """A slice with no ``varip`` of its own keeps the flag the transformer set
+
+    The counter lives in the OTHER context's expression, and that context's
+    write block is not in this one's slice — which is exactly the shape the
+    round-sequence fingerprint of the equivalence tests needs.
+    """
+    source = """
+@lib.script.indicator("t")
+def main():
+    def counted():
+        n: IBPersistent[int] = 0
+        n += 1
+        return n
+    shifted = lib.request.security(lib.syminfo.tickerid, "D", lib.close[1],
+                               lookahead=lib.barmerge.lookahead_on)
+    ticks = lib.request.security(lib.syminfo.tickerid, "60", counted(),
+                            lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+    lib.plot(ticks)
+"""
+    tree = __test_helper_transform(source)
+    assert __test_helper_closed_shift(tree) == [True, False]
+    log.info("the shifted context kept closed_shift beside a varip context")
+
+
+def __test_a_varip_in_the_slice_clears_closed_shift__(log):
+    """A ``varip`` the child runs is not rolled back, so no round may be skipped"""
+    source = """
+@lib.script.indicator("t")
+def main():
+    tick: IBPersistent[int] = 0
+    tick += 1
+    shifted = lib.request.security(lib.syminfo.tickerid, "D", (lib.close + tick)[1],
+                               lookahead=lib.barmerge.lookahead_on)
+    other = lib.request.security(lib.syminfo.tickerid, "60", lib.ta.sma(lib.close, 3),
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+    lib.plot(other)
+"""
+    tree = __test_helper_transform(source)
+    assert __test_helper_closed_shift(tree) == [False, False]
+    log.info("the varip declaration in the kept statements cleared the flag")
+
+
+def __test_a_varip_helper_the_slice_calls_clears_closed_shift__(log):
+    """The scan follows the calls: a counter one level down counts too"""
+    source = """
+@lib.script.indicator("t")
+def main():
+    def counted():
+        n: IBPersistent[int] = 0
+        n += 1
+        return n
+    shifted = lib.request.security(lib.syminfo.tickerid, "D", counted()[1],
+                               lookahead=lib.barmerge.lookahead_on)
+    other = lib.request.security(lib.syminfo.tickerid, "60", lib.ta.sma(lib.close, 3),
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+    lib.plot(other)
+"""
+    tree = __test_helper_transform(source)
+    assert __test_helper_closed_shift(tree) == [False, False]
+    log.info("the varip inside the called helper cleared the flag")
+
+
+def __test_a_per_execution_library_call_clears_closed_shift__(log):
+    """``ta.valuewhen`` fills its ring once per execution, re-ticks included"""
+    source = """
+@lib.script.indicator("t")
+def main():
+    shifted = lib.request.security(lib.syminfo.tickerid, "D",
+                               lib.ta.valuewhen(lib.close > lib.open, lib.close, 1)[1],
+                               lookahead=lib.barmerge.lookahead_on)
+    other = lib.request.security(lib.syminfo.tickerid, "60", lib.ta.sma(lib.close, 3),
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+    lib.plot(other)
+"""
+    tree = __test_helper_transform(source)
+    assert __test_helper_closed_shift(tree) == [False, False]
+    log.info("the per-execution library call cleared the flag")
+
+
+def __test_an_unsliced_context_is_judged_on_the_whole_main__(log):
+    """Without a clone the child runs ``main()``, so its ``varip`` counts
+
+    ``PYNE_NO_SECURITY_SLICE`` is the shape of it that needs no contrived
+    script: no clone is emitted at all, every child runs the whole ``main()``,
+    and the counter standing in that body is state the child carries.
+    """
+    import os
+
+    source = """
+@lib.script.indicator("t")
+def main():
+    tick: IBPersistent[int] = 0
+    tick += 1
+    shifted = lib.request.security(lib.syminfo.tickerid, "D", lib.close[1],
+                                   lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted + tick)
+"""
+    assert __test_helper_closed_shift(__test_helper_transform(source)) == [True]
+    os.environ['PYNE_NO_SECURITY_SLICE'] = '1'
+    try:
+        tree = __test_helper_transform(source)
+    finally:
+        os.environ.pop('PYNE_NO_SECURITY_SLICE', None)
+    assert not __test_helper_clones(tree), "expected no clone"
+    assert __test_helper_closed_shift(tree) == [False]
+    log.info("the unsliced context was judged on the whole main()")
+
+
+def __test_a_call_through_a_parameter_clears_closed_shift__(log):
+    """An opaque callee may run anything, ``varip`` included
+
+    A callable PARAMETER names no definition of the module, so the scan cannot
+    see the counter it is handed — the context keeps its developing rounds.
+    """
+    source = """
+@lib.script.indicator("t")
+def main():
+    def counter():
+        n: IBPersistent[int] = 0
+        n += 1
+        return n
+    def invoke(fn):
+        return fn()
+    shifted = lib.request.security(lib.syminfo.tickerid, "D", invoke(counter)[1],
+                               lookahead=lib.barmerge.lookahead_on)
+    other = lib.request.security(lib.syminfo.tickerid, "60", lib.ta.sma(lib.close, 3),
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+    lib.plot(other)
+"""
+    tree = __test_helper_transform(source)
+    assert __test_helper_closed_shift(tree) == [False, False]
+    log.info("the call through the parameter cleared the flag")
+
+
+def __test_an_imported_helper_clears_closed_shift__(log):
+    """An import of another module binds a body this module does not hold
+
+    Only ``pynecore`` imports are trusted (their per-execution state is
+    enumerated); ``from helper import counter`` may well bring ``varip`` state
+    along, so the context keeps its developing rounds.
+    """
+    source = """
+from helper import counter
+
+@lib.script.indicator("t")
+def main():
+    shifted = lib.request.security(lib.syminfo.tickerid, "D",
+                               inline_series(counter(), 1),
+                               lookahead=lib.barmerge.lookahead_on)
+    other = lib.request.security(lib.syminfo.tickerid, "60", lib.ta.sma(lib.close, 3),
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+    lib.plot(other)
+"""
+    tree = __test_helper_transform(source)
+    assert __test_helper_closed_shift(tree) == [False, False]
+    log.info("the imported helper cleared the flag")
+
+
+def __test_a_parameter_shadowing_a_builtin_clears_closed_shift__(log):
+    """A callable parameter named like a builtin is still opaque
+
+    ``abs`` resolves without a body only as the BUILTIN; a parameter of that
+    name stands for whatever was passed in, so the shadowed spelling must not
+    answer for it.
+    """
+    source = """
+@lib.script.indicator("t")
+def main():
+    def counter():
+        n: IBPersistent[int] = 0
+        n += 1
+        return n
+    def invoke(abs):
+        return abs()
+    shifted = lib.request.security(lib.syminfo.tickerid, "D",
+                               inline_series(invoke(counter), 1),
+                               lookahead=lib.barmerge.lookahead_on)
+    other = lib.request.security(lib.syminfo.tickerid, "60", lib.ta.sma(lib.close, 3),
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+    lib.plot(other)
+"""
+    tree = __test_helper_transform(source)
+    assert __test_helper_closed_shift(tree) == [False, False]
+    log.info("the builtin-shadowing parameter cleared the flag")
+
+
+def __test_an_unnamed_callee_clears_closed_shift__(log):
+    """A callee that is neither a name nor an attribute chain resolves to nothing
+
+    ``getattr(helper, "counter")()`` calls the RESULT of a call and
+    ``callbacks[0]()`` a subscript of a container: neither spelling names a body
+    the scan could read, so both must keep the developing rounds.
+    """
+    source = """
+import helper
+
+@lib.script.indicator("t")
+def main():
+    shifted = lib.request.security(lib.syminfo.tickerid, "D",
+                               inline_series(getattr(helper, "counter")(), 1),
+                               lookahead=lib.barmerge.lookahead_on)
+    other = lib.request.security(lib.syminfo.tickerid, "60", lib.ta.sma(lib.close, 3),
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+    lib.plot(other)
+"""
+    tree = __test_helper_transform(source)
+    assert __test_helper_closed_shift(tree) == [False, False]
+
+    source = """
+@lib.script.indicator("t")
+def main():
+    def counter():
+        n: IBPersistent[int] = 0
+        n += 1
+        return n
+    callbacks = [counter]
+    shifted = lib.request.security(lib.syminfo.tickerid, "D",
+                               inline_series(callbacks[0](), 1),
+                               lookahead=lib.barmerge.lookahead_on)
+    other = lib.request.security(lib.syminfo.tickerid, "60", lib.ta.sma(lib.close, 3),
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+    lib.plot(other)
+"""
+    tree = __test_helper_transform(source)
+    assert __test_helper_closed_shift(tree) == [False, False]
+    log.info("the getattr call and the subscript callee both cleared the flag")
+
+
+def __test_a_module_qualified_helper_clears_closed_shift__(log):
+    """``helper.counter()`` is as opaque as the bare-import spelling of it
+
+    A qualified call is resolvable only through the module its root names: the
+    ``pynecore`` library namespace has its per-execution state enumerated, a
+    user module does not, so the context keeps its developing rounds.
+    """
+    source = """
+import helper
+
+@lib.script.indicator("t")
+def main():
+    shifted = lib.request.security(lib.syminfo.tickerid, "D",
+                               inline_series(helper.counter(), 1),
+                               lookahead=lib.barmerge.lookahead_on)
+    other = lib.request.security(lib.syminfo.tickerid, "60", lib.ta.sma(lib.close, 3),
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+    lib.plot(other)
+"""
+    tree = __test_helper_transform(source)
+    assert __test_helper_closed_shift(tree) == [False, False]
+    log.info("the module-qualified helper cleared the flag")
+
+
+def __test_an_import_shadowing_a_builtin_clears_closed_shift__(log):
+    """``from helper import abs`` binds a user callable, not the builtin
+
+    A builtin name resolves without a body only while nothing rebinds it; an
+    import of a non-pynecore module is exactly such a rebinding, so the call
+    must answer "may carry varip state" and keep the developing rounds.
+    """
+    source = """
+from helper import abs
+
+@lib.script.indicator("t")
+def main():
+    shifted = lib.request.security(lib.syminfo.tickerid, "D",
+                               inline_series(abs(), 1),
+                               lookahead=lib.barmerge.lookahead_on)
+    other = lib.request.security(lib.syminfo.tickerid, "60", lib.ta.sma(lib.close, 3),
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+    lib.plot(other)
+"""
+    tree = __test_helper_transform(source)
+    assert __test_helper_closed_shift(tree) == [False, False]
+    log.info("the builtin-shadowing import cleared the flag")
+
+
+def __test_an_import_alias_shadowing_a_builtin_clears_closed_shift__(log):
+    """``import helper as abs`` is the same rebinding one spelling further"""
+    source = """
+import helper as abs
+
+@lib.script.indicator("t")
+def main():
+    shifted = lib.request.security(lib.syminfo.tickerid, "D",
+                               inline_series(abs.counter(), 1),
+                               lookahead=lib.barmerge.lookahead_on)
+    other = lib.request.security(lib.syminfo.tickerid, "60", lib.ta.sma(lib.close, 3),
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+    lib.plot(other)
+"""
+    tree = __test_helper_transform(source)
+    assert __test_helper_closed_shift(tree) == [False, False]
+    log.info("the aliased module import cleared the flag")
+
+
+def __test_a_module_level_helper_is_scanned_through__(log):
+    """A bare name the module defines is resolved and its body scanned (R1)
+
+    The helper standing at module level is reached by name, so the ``varip`` in
+    it counts; the same shape without ``varip`` keeps the flag.
+    """
+    source = """
+def helper():
+    n: IBPersistent[int] = 0
+    n += 1
+    return n
+
+@lib.script.indicator("t")
+def main():
+    shifted = lib.request.security(lib.syminfo.tickerid, "D",
+                               inline_series(helper(), 1),
+                               lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+"""
+    assert __test_helper_closed_shift(__test_helper_transform(source)) == [False]
+
+    source = """
+def helper():
+    return lib.close * 2
+
+@lib.script.indicator("t")
+def main():
+    shifted = lib.request.security(lib.syminfo.tickerid, "D",
+                               inline_series(helper(), 1),
+                               lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+"""
+    assert __test_helper_closed_shift(__test_helper_transform(source)) == [True]
+    log.info("the module-level helper was scanned through")
+
+
+def __test_a_global_helper_clears_closed_shift__(log):
+    """A module global the helper increments is outside the rollback (R0)
+
+    The child's re-tick rollback restores the state vector, not the module's own
+    names, so a period whose developing rounds are skipped ends on a different
+    count.
+    """
+    source = """
+ticks = 0
+
+def counter():
+    global ticks
+    ticks += 1
+    return float(ticks)
+
+@lib.script.indicator("t")
+def main():
+    shifted = lib.request.security(lib.syminfo.tickerid, "D",
+                               inline_series(counter(), 1),
+                               lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+"""
+    assert __test_helper_closed_shift(__test_helper_transform(source)) == [False]
+    log.info("the global helper cleared the flag")
+
+
+def __test_an_early_series_return_clears_closed_shift__(log):
+    """``if close <= open: return`` is decided by the developing bar"""
+    source = """
+@lib.script.indicator("t")
+def main():
+    if lib.close <= lib.open:
+        return
+    shifted = lib.request.security(lib.syminfo.tickerid, "D", lib.close[1],
+                                   lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+"""
+    assert __test_helper_closed_shift(__test_helper_transform(source)) == [False]
+    log.info("the series-guarded early return cleared the flag")
+
+
+def __test_a_series_guard_clears_closed_shift__(log):
+    """An ``if`` around the write clears the flag, whatever the test reads"""
+    source = """
+@lib.script.indicator("t")
+def main():
+    shifted = lib.na
+    if lib.close > 0:
+        shifted = lib.request.security(lib.syminfo.tickerid, "D", lib.close[1],
+                                       lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+"""
+    assert __test_helper_closed_shift(__test_helper_transform(source)) == [False]
+    log.info("the series guard cleared the flag")
+
+
+def __test_a_helper_called_unconditionally_keeps_closed_shift__(log):
+    """The write sits in a helper body; the one call site is unconditional"""
+    source = """
+@lib.script.indicator("t")
+def main():
+    def htf(tf):
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.close[1],
+                                    lookahead=lib.barmerge.lookahead_on)
+    lib.plot(htf("D"))
+"""
+    assert __test_helper_closed_shift(__test_helper_transform(source)) == [True]
+    log.info("the unconditional call site kept the flag")
+
+
+def __test_a_helper_called_under_a_series_guard_clears_closed_shift__(log):
+    """A call site behind a bar-data guard may skip the write inside a period"""
+    source = """
+@lib.script.indicator("t")
+def main():
+    def htf(tf):
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.close[1],
+                                    lookahead=lib.barmerge.lookahead_on)
+    shifted = lib.na
+    if lib.close > lib.open:
+        shifted = htf("D")
+    lib.plot(shifted)
+"""
+    assert __test_helper_closed_shift(__test_helper_transform(source)) == [False]
+    log.info("the guarded call site cleared the flag")
+
+
+def __test_a_helper_called_in_a_loop_clears_closed_shift__(log):
+    """A call site inside a ``for`` is not modelled, so the write is not either"""
+    source = """
+@lib.script.indicator("t")
+def main():
+    def htf(tf):
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.close[1],
+                                    lookahead=lib.barmerge.lookahead_on)
+    shifted = lib.na
+    for i in range(2):
+        shifted = htf("D")
+    lib.plot(shifted)
+"""
+    assert __test_helper_closed_shift(__test_helper_transform(source)) == [False]
+    log.info("the call site inside the loop cleared the flag")
+
+
+def __test_an_early_return_in_a_helper_clears_closed_shift__(log):
+    """An early exit ahead of the write may skip it for some bars"""
+    source = """
+@lib.script.indicator("t")
+def main():
+    def htf(tf):
+        if lib.close <= lib.open:
+            return lib.na
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.close[1],
+                                    lookahead=lib.barmerge.lookahead_on)
+    lib.plot(htf("D"))
+"""
+    assert __test_helper_closed_shift(__test_helper_transform(source)) == [False]
+    log.info("the early return inside the helper cleared the flag")
+
+
+def __test_two_helper_copies_each_keep_closed_shift__(log):
+    """Both isolation copies of a helper are called unconditionally"""
+    source = """
+@lib.script.indicator("t")
+def main():
+    def htf(tf):
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.close[1],
+                                    lookahead=lib.barmerge.lookahead_on)
+    def htf__pyne_inst1(tf):
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.close[1],
+                                    lookahead=lib.barmerge.lookahead_on)
+    lib.plot(htf("D"))
+    lib.plot(htf__pyne_inst1("W"))
+"""
+    assert __test_helper_closed_shift(__test_helper_transform(source)) == [True, True]
+    log.info("both isolation copies kept the flag")
+
+
+def __test_only_an_unguarded_top_level_write_keeps_closed_shift__(log):
+    """The flag survives a top-level write only; ANY ``if`` around it clears it
+
+    The write below stands at the top level of a helper that the entry calls at
+    its own top level, so it runs on every round. Putting the very same write
+    behind an ``if`` clears the flag even though the guard reads nothing but an
+    ``input.*`` value, which picks one branch for the whole run.
+    """
+    unguarded = """
+@lib.script.indicator("t")
+def main():
+    def htf():
+        return lib.request.security(lib.syminfo.tickerid, "D", lib.close[1],
+                                    lookahead=lib.barmerge.lookahead_on)
+    lib.plot(htf())
+"""
+    guarded = """
+@lib.script.indicator("t")
+def main():
+    flag = lib.input.bool(True, "use")
+    shifted = lib.na
+    if flag:
+        shifted = lib.request.security(lib.syminfo.tickerid, "D", lib.close[1],
+                                       lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+"""
+    assert __test_helper_closed_shift(__test_helper_transform(unguarded)) == [True]
+    assert __test_helper_closed_shift(__test_helper_transform(guarded)) == [False]
+    log.info("only the unguarded top-level write kept the flag")

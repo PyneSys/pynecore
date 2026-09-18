@@ -5,10 +5,7 @@ COOF regression script: ``ta.valuewhen`` reads the bar index of the first two
 occurrences of a condition that is true on bar 0 and on the fill bar 1.
 """
 from pynecore.lib import bar_index, plot, script, strategy, ta
-
-# A module-level global is outside the slot scheme, so the COOF rollback does
-# not touch it -- it counts body executions, not bars.
-_execs: list[int] = []
+from pynecore.types import IBPersistent
 
 
 @script.strategy(
@@ -20,7 +17,10 @@ _execs: list[int] = []
     calc_on_order_fills=True,
 )
 def main():
-    _execs.append(bar_index)
+    # A varip slot is outside the COOF rollback, so it counts body executions,
+    # not bars.
+    execs: IBPersistent[int] = 0
+    execs += 1
 
     cond = bar_index <= 1
 
@@ -35,4 +35,4 @@ def main():
     plot(ta.valuewhen(cond, bar_index, 0), 'occ0')
     plot(ta.valuewhen(cond, bar_index, 1), 'occ1')
     plot(ta.valuewhen(cond, bar_index, 2), 'occ2')
-    plot(len(_execs), 'total_execs')
+    plot(execs, 'total_execs')

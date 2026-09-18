@@ -290,7 +290,10 @@ class SeriesImpl(Generic[T]):
         """Same-bar rollback to a :meth:`_snapshot` baseline, O(changed slots).
 
         The loop-site rollback (``instance_state.__loop_state__``) restores a
-        builtin machine's windows once per loop ITERATION, so the full-copy
+        builtin machine's windows once per loop ITERATION and the child-subtree
+        rollback (``instance_state._restore_vector``) once per discarded
+        re-execution (a calc_on_order_fills fill, a live intra-bar tick, a
+        ``request.security`` child's developing re-tick), so the full-copy
         :meth:`_restore` would dominate the whole run. Between the bar-start
         snapshot and a same-bar restore the buffer can only have changed in a
         few recognizable ways: nothing structural (at most the newest slot was
@@ -307,20 +310,31 @@ class SeriesImpl(Generic[T]):
         if self._capacity == cap and self._max_bars_back == mbb \
                 and self._max_bars_back_set == mbb_set:
             own = self._buffer
-            if self._size == size and self._write_pos == write_pos \
-                    and self._last_bar_index == last_bar and len(own) == len(buffer):
+            # Every push comes from an :meth:`add` that advanced the bar (a
+            # same-bar add degrades to a set, and the gap fill pushes at most one
+            # element per skipped bar), so the bars elapsed since the snapshot
+            # bound the number of pushes. Without that bound the cursors alone
+            # cannot tell one ring overwrite from a full lap of them: after
+            # exactly ``cap`` pushes ``_write_pos`` is back where it started.
+            bars = self._last_bar_index - last_bar
+            if bars == 0 and self._size == size and self._write_pos == write_pos \
+                    and len(own) == len(buffer):
                 if size:  # only the newest slot could have been rewritten
                     pos = write_pos - 1
                     own[pos] = buffer[pos]
                 return
-            if size < cap and self._size == len(own) and size < self._size <= cap \
-                    and self._write_pos == self._size:
+            if size < cap and bars <= cap - size and self._size == len(own) \
+                    and size < self._size <= cap and self._write_pos == self._size:
                 del own[size:]  # appended tail (adds and gap fills)
+                if size:  # a set before the first push rewrote the newest slot
+                    own[size - 1] = buffer[size - 1]
                 self._size, self._write_pos, self._last_bar_index = size, write_pos, last_bar
                 return
-            if size == cap and self._size == cap \
+            if bars == 1 and size == cap and self._size == cap \
                     and self._write_pos == write_pos % cap + 1:
                 pos = write_pos % cap  # the single at-capacity ring overwrite
+                own[pos] = buffer[pos]
+                pos = write_pos - 1  # and a set that preceded it
                 own[pos] = buffer[pos]
                 self._write_pos, self._last_bar_index = write_pos, last_bar
                 return

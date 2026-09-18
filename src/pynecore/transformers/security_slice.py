@@ -37,9 +37,11 @@ under the other setting.
 """
 import ast
 import copy
+from collections.abc import Callable
 
 from ..core.import_hook import security_slice_disabled
 from .dynamic_default import is_script_entry
+from .persistent import VARIP_TYPES
 from .pine_type_rules import OBJECT, STR, stamp_lowering
 from .security import (
     _COLLECTION_NAMESPACES, _COLLECTION_READERS, _DependencyAnalyzer, _UNMODELLED_NODES,
@@ -69,6 +71,10 @@ _PROTOCOL_CALLS = frozenset({
     '__sec_read__', '__sec_write__', '__sec_signal__', '__sec_wait__',
     '__ltf_unzip__',
 })
+
+#: Calls the earlier passes emit that stand for a plain expression: they run
+#: no script code of their own, so an unresolved one is not opaque.
+_MARKER_CALLS = frozenset({'inline_series'})
 
 #: Fixpoint safety net for the call-graph summaries; the lattice is finite and
 #: monotone, so the loop always converges well below this.
@@ -545,29 +551,42 @@ class SecuritySliceTransformer(ast.NodeTransformer):
         self.skipped: dict[str, str] = {}
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
+        sliced = self._emit_clones(node)
+        contexts = _find_contexts(node)
+        if contexts is not None:
+            _finalize_closed_shift(node, contexts, sliced)
+        return node
+
+    def _emit_clones(self, node: ast.Module) -> dict[str, list[ast.stmt]]:
+        """Emit the clones and record what each served context's child runs.
+
+        :param node: the lowered module
+        :return: per sid, the ``main()`` statements its clone kept (absent for a
+            context that got no clone — its child runs the whole ``main()``)
+        """
         if security_slice_disabled():
             self.module_skip = 'disabled'
-            return node
+            return {}
         contexts = _find_contexts(node)
         main = _find_main(node)
         if contexts is None or main is None:
             self.module_skip = 'no_contexts' if main is not None else 'no_main'
-            return node
+            return {}
 
         scopes = _SliceScopes(node)
         main_key = scopes.scope_key_of(main)
         if main_key is None:
             self.module_skip = 'no_main_scope'
-            return node
+            return {}
         reachable = _reachable_scopes(scopes, main_key)
         for key in reachable:
             found = _unmodelled_kind(scopes.scope_node(key))
             if found is not None:
                 self.module_skip = f'unmodelled:{found}:{key or "<module>"}'
-                return node
+                return {}
             if _unresolved_collection(scopes.scope_node(key)):
                 self.module_skip = f'unresolved_collection:{key or "<module>"}'
-                return node
+                return {}
 
         import_names = _module_imports(node)
         aliases = _Aliases()
@@ -582,7 +601,7 @@ class SecuritySliceTransformer(ast.NodeTransformer):
         index_of_stmt = _build_index(main.body, collector, aliases, summaries, main_key)
         if collector.unresolved is not None:
             self.module_skip = collector.unresolved
-            return node
+            return {}
         written_sids: set[str] = set()
         for entry in index_of_stmt:
             written_sids |= entry.write_sids
@@ -591,6 +610,7 @@ class SecuritySliceTransformer(ast.NodeTransformer):
         units = _slice_units(entries, written_sids, self.skipped)
 
         clones: list[ast.stmt] = []
+        sliced: dict[str, list[ast.stmt]] = {}
         for unit in units:
             keep_reads: set[str] = set()
             for _index, sid, ctx in unit:
@@ -607,6 +627,7 @@ class SecuritySliceTransformer(ast.NodeTransformer):
             clones.append(_build_clone(node, main, kept, name))
             clones.extend(_bind_defaults(main.name, name))
             for _index, _sid, ctx in unit:
+                sliced[_sid] = [main.body[index] for index in kept]
                 # The type pass has already run, so the two new literals are
                 # stamped here — an unstamped node inside a stamped subtree
                 # loses the type of everything above it.
@@ -616,7 +637,7 @@ class SecuritySliceTransformer(ast.NodeTransformer):
         if clones:
             insert_at = node.body.index(main) + 1
             node.body[insert_at:insert_at] = clones
-        return node
+        return sliced
 
 
 # --- module inspection ---
@@ -805,6 +826,552 @@ def _ctx_group(ctx: ast.Dict) -> int | None:
     value = _ctx_get(ctx, 'group')
     if isinstance(value, ast.Constant) and isinstance(value.value, int):
         return value.value
+    return None
+
+
+#: Library functions whose own state is per EXECUTION rather than per bar — a
+#: ``varip`` slot the child's re-tick rollback leaves alone, so a period whose
+#: developing rounds are skipped would reach them a different number of times.
+#: ``ta.valuewhen`` pushes its occurrence ring once per execution (see
+#: ``lib/ta.py``); ``_math_stateful``'s only ``varip`` is a memo of a walk the
+#: rolled-back state reproduces, so its value does not depend on the count.
+_PER_EXECUTION_LIB_CALLS = frozenset({'valuewhen'})
+
+#: Pure Python builtins a call may name without a body to read: none of them
+#: touches state of the script, so an unresolved one is not opaque. The list is
+#: explicit rather than ``dir(builtins)`` — a builtin that runs arbitrary code
+#: (``eval``, ``exec``, ``getattr``) must stay unresolvable.
+_SAFE_BUILTIN_CALLS = frozenset({
+    'abs', 'all', 'any', 'bool', 'dict', 'enumerate', 'filter', 'float', 'int',
+    'len', 'list', 'map', 'max', 'min', 'range', 'reversed', 'round', 'set',
+    'sorted', 'str', 'sum', 'tuple', 'zip',
+})
+
+
+def _is_varip_annotation(annotation: ast.expr) -> bool:
+    """Whether an annotation declares a ``varip`` (``IBPersistent``) variable."""
+    if isinstance(annotation, ast.Name):
+        return annotation.id in VARIP_TYPES
+    if isinstance(annotation, ast.Subscript) and isinstance(annotation.value, ast.Name):
+        return annotation.value.id in VARIP_TYPES
+    if isinstance(annotation, ast.Attribute):
+        return annotation.attr in VARIP_TYPES
+    return False
+
+
+def _pynecore_imported_names(module: ast.Module) -> set[str]:
+    """Names an import of the PYNECORE package binds.
+
+    Such a name stands for a library function, and the library's per-execution
+    state is enumerated (:data:`_PER_EXECUTION_LIB_CALLS`), so a call through it
+    needs no body — the same trust the ``lib``-rooted attribute spelling gets.
+    An import of any other module binds a body this module does not hold and is
+    not in here (:func:`_imported_names`).
+
+    :param module: The lowered module.
+    :return: The bound names.
+    """
+    names: set[str] = set()
+    for node in ast.walk(module):
+        if isinstance(node, ast.ImportFrom):
+            if _is_pynecore_module(node.module):
+                for alias in node.names:
+                    names.add(alias.asname or alias.name.split('.')[0])
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if _is_pynecore_module(alias.name):
+                    names.add(alias.asname or alias.name.split('.')[0])
+    return names
+
+
+def _is_pynecore_module(module: str | None) -> bool:
+    """Whether a module path names the PyneCore package itself."""
+    return module is not None and (module == 'pynecore'
+                                   or module.startswith('pynecore.'))
+
+
+def _declares_varip(stmts: list[ast.stmt], funcs: dict[str, list[ast.AST]],
+                    rebound: set[str], pyne_imported: set[str]) -> bool:
+    """Whether the code these statements RUN carries ``varip`` state.
+
+    The child's re-tick rollback restores the state VECTOR; ``varip``
+    (``IBPersistent``) slots are deliberately outside it
+    (``core/instance_state.py``), so a period whose developing rounds are
+    skipped would end on a different number. Ordinary Python storage is outside
+    the rollback too, and is not searched for here: the language rule forbids it
+    (:mod:`~pynecore.transformers.outer_write` — an object created outside a
+    function cannot be modified inside one), so the only state left is the one
+    this scan enumerates.
+
+    The scan has to be COMPLETE over the code the child can execute, so a call
+    is followed only when its callee is statically visible:
+
+    - a ``lib``-rooted (or pynecore-import-rooted) attribute chain whose
+      attribute is not in :data:`_PER_EXECUTION_LIB_CALLS` — a library function,
+      whose own per-execution state is enumerated and which never calls back
+      into script code,
+    - a bare ``Name`` the module defines with a ``def``, whose body — EVERY
+      definition of that name — is then scanned with the same rules,
+    - a bare ``Name`` bound by a pynecore import, one of the protocol / marker
+      calls the earlier passes emit (:data:`_PROTOCOL_CALLS`,
+      :data:`_MARKER_CALLS`), or one of the pure builtins in
+      :data:`_SAFE_BUILTIN_CALLS`.
+
+    A name an assignment, a parameter or a non-pynecore import also binds
+    (``rebound``) is never resolved: it may shadow any of the above. Every other
+    callee shape is unresolvable, and an unresolvable callee gives the skip up.
+
+    :param stmts: The statements to scan.
+    :param funcs: The module's function bodies by name (nested ones included).
+    :param rebound: Names an assignment, parameter or foreign import binds.
+    :param pyne_imported: Names an import of the pynecore package binds.
+    :return: Whether state outside the rollback is reachable.
+    """
+    seen: set[int] = set()
+    work: list[ast.AST] = []
+    for stmt in stmts:
+        work.extend(_stmt_nodes(stmt))
+    while work:
+        node = work.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        for sub in [node, *_walk_own(node)]:
+            if isinstance(sub, ast.AnnAssign) and _is_varip_annotation(sub.annotation):
+                return True
+            if isinstance(sub, (ast.Global, ast.Nonlocal)):
+                return True
+            if not isinstance(sub, ast.Call):
+                continue
+            func = sub.func
+            if isinstance(func, ast.Name):
+                if func.id in rebound or func.id in _PER_EXECUTION_LIB_CALLS:
+                    return True
+                bodies = funcs.get(func.id)
+                if bodies:
+                    work.extend(bodies)
+                elif func.id not in pyne_imported and func.id not in _PROTOCOL_CALLS \
+                        and func.id not in _MARKER_CALLS \
+                        and func.id not in _SAFE_BUILTIN_CALLS:
+                    return True
+            elif isinstance(func, ast.Attribute):
+                if func.attr in _PER_EXECUTION_LIB_CALLS:
+                    return True
+                root = _chain_root_name(func)
+                if root is None or root in rebound \
+                        or not (root == 'lib' or root in pyne_imported):
+                    return True
+            else:
+                # Neither a name nor an attribute chain: nothing to resolve.
+                return True
+    return False
+
+
+def _chain_root_name(node: ast.expr) -> str | None:
+    """The base ``Name`` id of an attribute chain, or None when it has none."""
+    root: ast.expr = node
+    while isinstance(root, ast.Attribute):
+        root = root.value
+    return root.id if isinstance(root, ast.Name) else None
+
+
+def _imported_names(module: ast.Module) -> set[str]:
+    """Names an import of a NON-pynecore module binds.
+
+    A subset of :func:`_rebound_names` narrow enough to judge an ARGUMENT by:
+    such a name stands for a user callable this module does not hold, so handing
+    it to a call (``map(counter, ...)``) runs a body whose ``varip`` state the
+    scan cannot see. An ordinary variable is not in here, so a value argument
+    never trips the check.
+
+    :param module: The lowered module.
+    :return: The bound names.
+    """
+    names: set[str] = set()
+    for node in ast.walk(module):
+        if isinstance(node, ast.ImportFrom):
+            if not _is_pynecore_module(node.module):
+                for alias in node.names:
+                    names.add(alias.asname or alias.name.split('.')[0])
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if not _is_pynecore_module(alias.name):
+                    names.add(alias.asname or alias.name.split('.')[0])
+    return names
+
+
+def _rebound_names(module: ast.Module) -> set[str]:
+    """Names an assignment, a parameter, or a ``for``/``with``/comprehension
+    target binds.
+
+    A call through one of them is not resolvable by name, so
+    :func:`_declares_varip` gives its context up rather than guess. Parameters
+    belong here even though the R1 rule of :func:`_declares_varip` already
+    rejects an unresolvable Name call: a parameter may SHADOW a resolvable name — a
+    callable passed as ``abs`` shadows the builtin, a helper's ``src`` shadows
+    a module-level ``def src`` — and the shadowed spelling would otherwise
+    answer for the value actually passed in.
+
+    An import of a NON-pynecore module belongs here for the same reason: ``from
+    helper import abs`` and ``import helper as abs`` both bind an opaque user
+    callable to a spelling :data:`_SAFE_BUILTIN_CALLS` would otherwise trust as
+    a builtin, and the attribute root of ``helper.counter()`` is the same name.
+    """
+    names: set[str] = _imported_names(module)
+    for node in ast.walk(module):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            args = node.args
+            for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs,
+                        args.vararg, args.kwarg]:
+                if arg is not None:
+                    names.add(arg.arg)
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets = [node.target]
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+            targets = [node.target]
+        elif isinstance(node, ast.withitem):
+            targets = [node.optional_vars] if node.optional_vars is not None else []
+        for target in targets:
+            for sub in ast.walk(target):
+                if isinstance(sub, ast.Name):
+                    names.add(sub.id)
+    return names
+
+
+#: Test deciding whether a node IS the target whose reachability is judged: the
+#: sid's ``__sec_write__`` call (:func:`_sid_write`) or, while the static call
+#: chain is followed, one exact call node (:func:`_same_node`).
+_Hit = Callable[[ast.AST], bool]
+
+
+def _sid_write(sid: str) -> _Hit:
+    """A target test matching any ``__sec_write__`` call of ``sid``."""
+
+    def hit(node: ast.AST) -> bool:
+        return _protocol_sid(node, '__sec_write__') == sid
+
+    return hit
+
+
+def _same_node(target: ast.AST) -> _Hit:
+    """A target test matching one exact node."""
+
+    def hit(node: ast.AST) -> bool:
+        return node is target
+
+    return hit
+
+
+def _contains_write(node: ast.AST, hit: _Hit) -> bool:
+    """Whether ``node`` itself or one of its own descendants is the target."""
+    return any(hit(sub) for sub in [node, *_walk_own(node)])
+
+
+def _has_exit(stmt: ast.stmt) -> bool:
+    """Whether ``stmt`` can end the round before the next statement."""
+    return any(isinstance(sub, _EXIT_NODES) for sub in [stmt, *_walk_own(stmt)])
+
+
+def _expr_unguarded(node: ast.AST, hit: _Hit) -> bool:
+    """Whether the target stands under no expression-level branch inside ``node``.
+
+    The two expression-level branches are ``IfExp`` and the short-circuit
+    ``BoolOp``: a target in either of them is evaluated only for some values of
+    the test, so it is guarded. A target standing in a call argument or in an
+    operand of a plain operator is not guarded at all. A lambda or a
+    comprehension answers False as well: when its body runs is not visible here.
+
+    :param node: The node holding the target.
+    :param hit: The target test.
+    :return: Whether the target is free of expression-level guards.
+    """
+    if hit(node):
+        return True
+    if isinstance(node, ast.IfExp):
+        # Only the test itself runs unconditionally.
+        return (_contains_write(node.test, hit)
+                and not any(_contains_write(branch, hit)
+                            for branch in (node.body, node.orelse))
+                and _expr_unguarded(node.test, hit))
+    if isinstance(node, (ast.BoolOp, ast.Lambda, ast.ListComp, ast.SetComp,
+                         ast.DictComp, ast.GeneratorExp)):
+        return False
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if _contains_write(child, hit) and not _expr_unguarded(child, hit):
+            return False
+    return True
+
+
+def _write_unconditional(stmts: list[ast.stmt], hit: _Hit) -> bool:
+    """Whether the target runs on EVERY execution of ``stmts``.
+
+    ``closed_shift`` says the context's value is the same on every chart bar of
+    one HTF period, so the period's later developing rounds may be skipped —
+    which also means their WRITE is skipped. That is only unobservable while the
+    write is unconditional: a ``if close <= open: return`` ahead of it (an exit
+    node the slicer keeps on purpose) is decided by the child's DEVELOPING bar,
+    so it can turn from skipping the write to performing it inside one period,
+    and the skipped round would leave the previous period's value standing.
+
+    The rule is therefore purely structural: the target must stand in a TOP-LEVEL
+    statement of ``stmts``, with no early exit (:data:`_EXIT_NODES`) reachable
+    ahead of it, and with no branch of any kind around it — no ``if``, no
+    ``IfExp``, no short-circuit ``BoolOp``, no loop, no ``with``, no ``try``.
+    The only ``if`` that is not a user branch is the protocol's own
+    ``__active_security__`` dispatch (:func:`_is_dispatch_test`): the child
+    always has its own sid active, so that body runs on every round. A target the
+    scan does not find at all answers False.
+
+    This scan never enters a nested ``def``; a write standing in a helper body
+    is judged by :func:`_write_reached`, which follows the call chain.
+
+    :param stmts: The statements the child runs, in order.
+    :param hit: The target test.
+    :return: Whether the target is unconditional.
+    """
+    for stmt in stmts:
+        # A nested ``def`` only binds a name here (:func:`_stmt_nodes`), so
+        # neither its write nor its ``return`` belongs to this statement list.
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if any(hit(sub) for sub in _walk_own(stmt)):
+            return _stmt_unconditional(stmt, hit)
+        if _has_exit(stmt):
+            return False
+    return False
+
+
+def _stmt_unconditional(stmt: ast.stmt, hit: _Hit) -> bool:
+    """Whether the statement holding the target performs it on every run.
+
+    :param stmt: The statement holding the target.
+    :param hit: The target test.
+    :return: Whether the target is unconditional within ``stmt``.
+    """
+    if _holds_write(stmt, hit):
+        return _expr_unguarded(stmt, hit)
+    if not isinstance(stmt, ast.If):
+        return False
+    if _contains_write(stmt.test, hit):
+        # A target inside the test itself runs before the branch is taken.
+        return _expr_unguarded(stmt.test, hit)
+    if any(_contains_write(sub, hit) for sub in stmt.orelse):
+        return False
+    if any(_contains_write(sub, hit) for sub in stmt.body):
+        if not (_is_dispatch_test(stmt.test) and not stmt.orelse):
+            return False
+        return _write_unconditional(stmt.body, hit)
+    return True
+
+
+def _is_dispatch_test(test: ast.expr) -> bool:
+    """Whether ``test`` is the protocol's own ``__active_security__`` dispatch."""
+    return any(isinstance(sub, ast.Name) and sub.id == '__active_security__'
+               for sub in ast.walk(test))
+
+
+def _holds_write(stmt: ast.stmt, hit: _Hit) -> bool:
+    """Whether a simple statement holds the target itself."""
+    if not isinstance(stmt, (ast.Expr, ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        return False
+    return any(hit(sub) for sub in _walk_own(stmt))
+
+
+def _holds_node(stmt: ast.stmt, target: ast.AST) -> bool:
+    """Whether ``target`` stands anywhere inside ``stmt``, nested defs included."""
+    return any(sub is target for sub in ast.walk(stmt))
+
+
+def _def_chain(body: list[ast.stmt],
+               target: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunctionDef] | None:
+    """The nested ``def``s standing between ``body`` and ``target``.
+
+    An empty list means the target stands in ``body`` itself; ``None`` means the
+    chain is not one this pass models — the target is not in ``body`` at all, or
+    it is reached only through a ``def`` that is not a top-level statement of its
+    scope (a ``def`` inside an ``if`` binds its name conditionally).
+
+    :param body: The scope's statement list.
+    :param target: The node to reach.
+    :return: The defs from the outermost to the innermost, or ``None``.
+    """
+    for stmt in body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if not _holds_node(stmt, target):
+                continue
+            inner = _def_chain(stmt.body, target)
+            if inner is None:
+                # In a decorator or a default, or behind a conditional ``def``.
+                return None
+            return [stmt, *inner]
+        if _holds_node(stmt, target):
+            return []
+    return None
+
+
+def _def_called_unconditionally(func: ast.FunctionDef | ast.AsyncFunctionDef,
+                                body: list[ast.stmt],
+                                seen: frozenset[str]) -> bool:
+    """Whether ``func``'s body runs on every execution of ``body``.
+
+    The callee resolution is the closed R1 rule of the ``varip`` scan
+    (:func:`_declares_varip`) narrowed to the one shape this pass can follow: a
+    bare ``Name`` that resolves to this very ``def``. Anything else about the
+    name makes it unresolvable and the answer False — a second ``def`` or an
+    assignment binding it, a parameter shadowing it, or a reference outside
+    callee position (``cb = helper``), which would let the body run from a place
+    the scan does not see. Every call site must then run on every execution of
+    ``body`` itself (:func:`_node_reached`), so one conditional call cannot
+    weaken the others; recursion answers False through ``seen``.
+
+    :param func: The definition whose body holds the target.
+    :param body: The scope the definition stands in.
+    :param seen: Names already being resolved on this chain.
+    :return: Whether the body is entered on every execution of ``body``.
+    """
+    name = func.name
+    if name in seen:
+        return False
+    seen = seen | {name}
+    nodes = [sub for stmt in body for sub in ast.walk(stmt)]
+    for sub in nodes:
+        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and sub.name == name and sub is not func:
+            return False
+        if isinstance(sub, ast.arg) and sub.arg == name:
+            return False
+    exempt = {id(sub.func) for sub in nodes if isinstance(sub, ast.Call)}
+    for sub in nodes:
+        if isinstance(sub, ast.Name) and sub.id == name and id(sub) not in exempt:
+            return False
+    calls = [sub for sub in nodes if isinstance(sub, ast.Call)
+             and isinstance(sub.func, ast.Name) and sub.func.id == name]
+    if not calls:
+        return False
+    return all(_node_reached(call, body, seen) for call in calls)
+
+
+def _node_reached(target: ast.AST, body: list[ast.stmt],
+                  seen: frozenset[str]) -> bool:
+    """Whether ``target`` runs on every execution of ``body``.
+
+    Either the target stands in ``body`` itself, and the statement-level rule
+    decides (:func:`_write_unconditional`), or it stands in a nested ``def``,
+    and both links have to hold: the target must run on every execution of that
+    def's body, and the def must be entered on every execution of ``body``
+    (:func:`_def_called_unconditionally`). Applied recursively, this walks up to
+    the clone's top level.
+
+    :param target: The node to reach.
+    :param body: The scope's statement list.
+    :param seen: Names already being resolved on this chain.
+    :return: Whether the target runs on every execution of ``body``.
+    """
+    chain = _def_chain(body, target)
+    if chain is None:
+        return False
+    if not chain:
+        return _write_unconditional(body, _same_node(target))
+    outer = chain[0]
+    return (_node_reached(target, outer.body, seen)
+            and _def_called_unconditionally(outer, body, seen))
+
+
+def _write_reached(stmts: list[ast.stmt], sid: str) -> bool:
+    """Whether the sid's write runs on every execution of ``stmts``.
+
+    The statement-level rule answers first, for a write standing in ``stmts``
+    itself. A write inside a helper body — what the lowered scripts actually
+    emit, since :mod:`.security` puts the protocol block where the call is
+    written — is then judged along the static call chain
+    (:func:`_node_reached`). One sid belongs to ONE call site there: the
+    isolation pass gives every call of a helper its own copy of the def
+    (``get_ma_htf__pyne_inst<N>``) and the security pass numbers the sids per
+    copy, so the write node is unique and the chain is unambiguous. Two write
+    nodes for one sid would not be, and answer False.
+
+    :param stmts: The statements the child runs, in order.
+    :param sid: The context's id.
+    :return: Whether the write is unconditional.
+    """
+    hit = _sid_write(sid)
+    if _write_unconditional(stmts, hit):
+        return True
+    targets = [sub for stmt in stmts for sub in ast.walk(stmt) if hit(sub)]
+    if len(targets) != 1:
+        return False
+    return _node_reached(targets[0], stmts, frozenset())
+
+
+def _finalize_closed_shift(module: ast.Module, contexts: ast.Dict,
+                           sliced: dict[str, list[ast.stmt]]) -> None:
+    """Clear ``closed_shift`` wherever the child's rounds are observable.
+
+    Two reasons, both of them about the CODE the child runs and not about the
+    expression's value: ``varip`` state, and a write that does not run on every
+    round (:func:`_write_unconditional`).
+
+    The flag the security transformer emits says the context's VALUE cannot
+    change inside an HTF period. What makes skipping the period's developing
+    rounds unobservable is the child's re-tick rollback — and ``varip`` state is
+    deliberately outside it (``core/instance_state.py``), so a counter in the
+    code the child runs would end the period on a different number. The decision
+    belongs here because only the slicer knows WHAT the child runs: its own
+    clone's kept statements, or the whole ``main()`` when it got no clone.
+
+    Ordinary Python storage at module level is outside the rollback as well, and
+    is not analysed here: the language rule enforced by
+    :mod:`~pynecore.transformers.outer_write` makes writing such an object from
+    inside a function a compile error, so a script that reaches this point has
+    none. What a write through an alias or through a parameter does is
+    documented as unpredictable, not proven safe.
+
+    :param module: The lowered module.
+    :param contexts: The ``__security_contexts__`` dict literal.
+    :param sliced: Per sid, the statements its clone kept (see
+        :meth:`SecuritySliceTransformer._emit_clones`).
+    """
+    candidates = [(sid, ctx) for sid, ctx in _iter_contexts(contexts)
+                  if _ctx_closed_shift(ctx) is not None]
+    if not candidates:
+        return
+    funcs: dict[str, list[ast.AST]] = {}
+    for node in ast.walk(module):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            funcs.setdefault(node.name, []).append(node)
+    rebound = _rebound_names(module)
+    pyne_imported = _pynecore_imported_names(module)
+    main = _find_main(module)
+    whole: bool | None = None
+    for sid, ctx in candidates:
+        stmts = sliced.get(sid)
+        if stmts is None:
+            if main is None:
+                observable = True
+            else:
+                if whole is None:
+                    whole = _declares_varip(list(main.body), funcs, rebound,
+                                            pyne_imported)
+                observable = whole or not _write_reached(list(main.body), sid)
+        else:
+            observable = (_declares_varip(stmts, funcs, rebound, pyne_imported)
+                          or not _write_reached(stmts, sid))
+        if observable:
+            value = _ctx_closed_shift(ctx)
+            assert value is not None
+            value.value = False
+
+
+def _ctx_closed_shift(ctx: ast.Dict) -> ast.Constant | None:
+    """The context's ``closed_shift`` literal, only while it says True."""
+    value = _ctx_get(ctx, 'closed_shift')
+    if isinstance(value, ast.Constant) and value.value is True:
+        return value
     return None
 
 

@@ -233,28 +233,3 @@ def __test_inline_signalled_contexts_share_one_child__(runner, log):
     log.info("%d bars x %d plots identical; 1 child for 8 contexts merged, "
              "%d children unmerged", len(merged_rows), len(merged_rows[0]),
              len(plain))
-
-
-def __test_an_adopted_member_checks_its_own_signal__(log):
-    """The adoption guard has no constructible script, so it is not run here.
-
-    The chart resolves a stable group's not-yet-signalled members from the seed,
-    which is sound exactly while the compile-time key really does prove they
-    name the same feed. When such a member's own signal finally runs, the chart
-    compares what it names with what it was resolved as and raises a
-    ``RuntimeError`` naming both contexts and both values
-    (``__sec_signal__`` in ``core/security.py``), rather than running the script
-    against a feed it never asked for.
-
-    A script that reaches that branch cannot be written: producing one would
-    mean finding a pair of contexts the stable key calls identical while their
-    signals evaluate differently, which is precisely the bug the guard exists to
-    surface — and if such a script existed the right fix would be the key rule,
-    not the test. Reaching the branch from the outside is no cheaper: the
-    adoption bookkeeping lives in the protocol closure, so injecting a mismatch
-    would mean rebuilding ``_start``'s whole path (spawn callbacks, states,
-    shared memory) around a fake, which tests the fake rather than the guard.
-    Left deliberately unexercised, and said so here.
-    """
-    import pytest
-    pytest.skip("no constructible mismatch: see this test's docstring")

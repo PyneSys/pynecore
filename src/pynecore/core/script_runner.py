@@ -828,11 +828,13 @@ def _security_merge_key(sid: str, contexts: dict, states: dict, prepared: dict):
       compile-time key that proves two contexts name the same feed proves this
       half; a difference here means that proof was wrong.
     * the BATCH half — whether the context's history runs as one batch round,
-      and with which plan, plus the ``main()`` clone it runs. This does NOT
-      follow from the feed: ``batch_eligible`` also asks whether the context has
+      and with which plan, whether it skips a period's developing re-ticks, plus
+      the ``main()`` clone it runs. This does NOT follow from the feed:
+      ``batch_eligible`` and ``dev_skip_active`` also ask whether the context has
       dependencies or consumers, so two contexts on one and the same feed can
-      land in different batch classes. A batched and a per-bar context cannot
-      share one bar loop, so they simply do not group.
+      land in different round classes. A batched and a per-bar context cannot
+      share one bar loop, and neither can two contexts whose developing rounds
+      differ, so they simply do not group.
 
     Comparing the PREPARED result rather than the declaration is what makes this
     a runtime check: two contexts whose signal arguments are syntactically
@@ -862,7 +864,7 @@ def _security_merge_key(sid: str, contexts: dict, states: dict, prepared: dict):
         state.is_ltf, state.plain_ltf, state.same_timeframe,
         state.na_on_developing, state.ltf_live_stream,
     )
-    batch = (state.batch_target, capacity, arena, spec,
+    batch = (state.batch_target, capacity, arena, spec, state.dev_skip,
              contexts[sid].get('slice_main'))
     return feed, batch
 
@@ -1730,6 +1732,7 @@ class ScriptRunner:
             chart_off=sec_state.chart_off,
             chart_timeframe=sec_state.chart_timeframe,
             chart_calendar=sec_state.chart_calendar,
+            first_dev_only=sec_state.dev_skip,
         )
 
     def run_iter(self, on_progress: Callable[[datetime], None] | None = None,
@@ -2002,7 +2005,7 @@ class ScriptRunner:
                     inject_protocol, cleanup_shared_memory, Lookahead,
                     load_htf_bar_opens, load_ltf_first_ms, watch_security_child,
                     batch_eligible, plan_historical_batch,
-                    dev_batch_eligible, prepare_developing_batch,
+                    dev_batch_eligible, prepare_developing_batch, dev_skip_active,
                 )
                 from .security_shm import create_ring_conditions
                 from .security_process import security_process_main
@@ -2293,6 +2296,16 @@ class ScriptRunner:
                     if prepared is not None:
                         return prepared
                     sec_state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
+                    # THE single decision point of the developing-round skip.
+                    # Everything it is conditioned on is final once a context is
+                    # prepared — its lookahead mode and the feed it resolved to —
+                    # and the developing batch armed below plans the very rounds
+                    # the skip removes, so it has to be decided here, before the
+                    # spec is built. Every path leads through this function: the
+                    # static first signal (``_lazy_prepare``), the deferred
+                    # resolver, the lazy spawn and an adopted group member.
+                    sec_state.dev_skip = dev_skip_active(
+                        sec_state, sid, has_consumers=bool(sec_consumers.get(sid)))
                     _chart_ring_capacity = 0
                     _chart_ring_arena = 0
                     # Chart-type request (``ticker.heikinashi()``): the child
