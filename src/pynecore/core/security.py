@@ -181,6 +181,15 @@ def watch_security_child(
     """
     def _watch() -> None:
         connection.wait([proc.sentinel])
+        # The sentinel fires when the child closes its end of the pipe, which
+        # happens while it is still exiting: MEASURED on macOS, ~22% of the
+        # time the very next ``proc.exitcode`` is still None because the
+        # process has not become reapable yet. Reading it as "no exit code, so
+        # nothing to report" loses the death entirely — the registry stays
+        # empty, no event is set, and every chart wait on this child's contexts
+        # parks forever. ``join()`` is the blocking reap: the process is on its
+        # way out, so it returns promptly and leaves a real exit code behind.
+        proc.join()
         if proc.exitcode not in (0, None):
             failed_children.add(sec_id)
             # Release every OTHER child too: a peer blocked on this one's ring

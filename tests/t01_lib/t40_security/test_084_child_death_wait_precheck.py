@@ -17,9 +17,9 @@ block is what turns that into the RuntimeError the chart has to raise, which is
 why it cannot be reduced back to a post-wait check.
 """
 import multiprocessing
+import os
 import sys
 import threading
-import time
 
 import pytest
 
@@ -89,10 +89,12 @@ class _RecordingEvent:
         self.registry = registry
         self.registered_at_set = None
         self.set_count = 0
+        self.was_set = threading.Event()
 
     def set(self):
         self.registered_at_set = set(self.registry)
         self.set_count += 1
+        self.was_set.set()
 
 
 def __test_the_watcher_fills_the_registry_before_it_wakes_the_chart__(log):
@@ -113,9 +115,7 @@ def __test_the_watcher_fills_the_registry_before_it_wakes_the_chart__(log):
     try:
         # No ``proc.join()``: joining closes the sentinel the watcher polls.
         watch_security_child('sid', proc, failed, (wait_event,), (stop_event,))
-        deadline = time.monotonic() + 30
-        while wait_event.set_count == 0 and time.monotonic() < deadline:
-            time.sleep(0.01)
+        wait_event.was_set.wait(30)
     finally:
         proc.join(10)
 
@@ -129,6 +129,55 @@ def __test_the_watcher_fills_the_registry_before_it_wakes_the_chart__(log):
         f"{stop_event.registered_at_set}")
     log.info("watcher registered %s before setting %d events",
              wait_event.registered_at_set, wait_event.set_count + stop_event.set_count)
+
+
+class _ExitingProcess:
+    """A child whose exit code is not readable until it has been reaped.
+
+    The sentinel of a real process fires when the child closes its end of the
+    pipe, which happens while it is still exiting; until the parent reaps it,
+    ``exitcode`` reads ``None``. The sentinel here is the read end of a pipe
+    whose write end is already closed, so the watcher's wait returns at once.
+    """
+
+    def __init__(self, code):
+        self.sentinel, write_end = os.pipe()
+        os.close(write_end)
+        self._code = code
+        self._reaped = False
+
+    @property
+    def exitcode(self):
+        return self._code if self._reaped else None
+
+    def join(self, timeout=None):
+        self._reaped = True
+
+    def close(self):
+        os.close(self.sentinel)
+
+
+def __test_a_death_whose_exit_code_is_not_readable_yet_is_still_reported__(log):
+    """The watcher must reap the child before it reads the exit code.
+
+    An exit code that still reads ``None`` right after the sentinel fired is not
+    a clean exit. A watcher that takes it for one registers nothing and sets no
+    event, and the chart parks forever on a child that is already gone.
+    """
+    failed: set[str] = set()
+    proc = _ExitingProcess(1)
+    wait_event = _RecordingEvent(failed)
+    stop_event = _RecordingEvent(failed)
+    try:
+        watch_security_child('sid', proc, failed, (wait_event,), (stop_event,))
+        reported = wait_event.was_set.wait(10)
+    finally:
+        proc.close()
+
+    assert reported, "the watcher dropped a death whose exit code was not readable yet"
+    assert failed == {'sid'}, f"the death was not registered: {failed}"
+    assert stop_event.set_count == 1, "the sibling children were not released"
+    log.info("death reported after the reap: registry=%s", failed)
 
 
 @pytest.mark.parametrize('sec_id', ['sid', 'other'])
