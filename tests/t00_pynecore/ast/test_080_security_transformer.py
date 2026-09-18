@@ -2839,3 +2839,357 @@ def main():
 """
     assert __test_helper_group_ordinals(source) == [None, None, None]
     log.info("the split read kept the three contexts out of a group")
+
+
+def __test_helper_closed_shift_flags(source: str) -> list[bool | None]:
+    """The ``closed_shift`` flag of every context of ``source``, in context order.
+
+    :param source: the script source to transform
+    :return: one flag per context, None where the context carries no flag at all
+    """
+    tree = _transform_tree(source)
+    contexts = _find_contexts(tree)
+    assert isinstance(contexts.value, ast.Dict)
+    flags: list[bool | None] = []
+    for ctx_node in contexts.value.values:
+        assert isinstance(ctx_node, ast.Dict)
+        found: bool | None = None
+        for key, val in zip(ctx_node.keys, ctx_node.values):
+            if isinstance(key, ast.Constant) and key.value == 'closed_shift':
+                assert isinstance(val, ast.Constant)
+                found = val.value
+        flags.append(found)
+    return flags
+
+
+def __test_a_fully_shifted_expression_is_closed_shift__(log):
+    """Every shape whose whole value comes from a ``[k>=1]`` history reference
+
+    A builtin price chain, the compiled ``inline_series`` form and a tuple of
+    both are history references. A subscript of a CALL or of an operator result
+    is not: at runtime neither is subscriptable, and PyneComp compiles Pine's
+    ``ta.sma(close, 5)[1]`` / ``(close + open)[1]`` to ``inline_series`` instead.
+    """
+    source = """
+@lib.script.indicator("T")
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    b = lib.request.security(lib.syminfo.tickerid, "D",
+                             inline_series(lib.ta.sma(lib.close, 5), 1),
+                             lookahead=lib.barmerge.lookahead_on)
+    c = lib.request.security(lib.syminfo.tickerid, "D", lib.ta.sma(lib.close, 5)[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    f = lib.request.security(lib.syminfo.tickerid, "D", (lib.close + lib.open)[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    d, e = lib.request.security(lib.syminfo.tickerid, "D", [lib.close[1], lib.open[2]],
+                                lookahead=lib.barmerge.lookahead_on)
+    lib.plot(a + b + c + d + e + f)
+"""
+    assert __test_helper_closed_shift_flags(source) == [True, True, False, False, True]
+    log.info("chain, inline_series and tuple in; call and operator receivers out")
+
+
+def __test_a_developing_read_is_not_closed_shift__(log):
+    """Anything that can still change inside the period keeps its dev rounds
+
+    ``close`` reads the developing bar, ``close[1] + close`` reads it in one
+    term, ``close[0]`` is the developing bar itself, a variable index is not a
+    constant at all, and ``lookahead_off`` never runs a developing round.
+    """
+    source = """
+@lib.script.indicator("T")
+def main():
+    n = 1
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close,
+                             lookahead=lib.barmerge.lookahead_on)
+    b = lib.request.security(lib.syminfo.tickerid, "D", lib.close[1] + lib.close,
+                             lookahead=lib.barmerge.lookahead_on)
+    c = lib.request.security(lib.syminfo.tickerid, "D", lib.close[0],
+                             lookahead=lib.barmerge.lookahead_on)
+    d = lib.request.security(lib.syminfo.tickerid, "D", lib.close[n],
+                             lookahead=lib.barmerge.lookahead_on)
+    e = lib.request.security(lib.syminfo.tickerid, "D", lib.close[1],
+                             lookahead=lib.barmerge.lookahead_off)
+    f = lib.request.security(lib.syminfo.tickerid, "D", lib.close[1])
+    g = lib.request.security(lib.syminfo.tickerid, "D", [lib.close[1], lib.open],
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(a + b + c + d + e + f + g[0])
+"""
+    assert __test_helper_closed_shift_flags(source) == [False] * 7
+    log.info("developing reads, a variable index and lookahead_off stayed out")
+
+
+def __test_closed_shift_splits_the_merge_group__(log):
+    """One feed, two round protocols: the two contexts may not share a child"""
+    source = """
+@lib.script.indicator("T")
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D", lib.close[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    b = lib.request.security(lib.syminfo.tickerid, "D",
+                             inline_series(lib.ta.sma(lib.close, 3), 1),
+                             lookahead=lib.barmerge.lookahead_on)
+    c = lib.request.security(lib.syminfo.tickerid, "D", lib.ta.sma(lib.close, 3),
+                             lookahead=lib.barmerge.lookahead_on)
+    d = lib.request.security(lib.syminfo.tickerid, "D", lib.ta.ema(lib.close, 3),
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(a + b + c + d)
+"""
+    assert __test_helper_closed_shift_flags(source) == [True, True, False, False]
+    assert __test_helper_group_ordinals(source) == [0, 0, 1, 1]
+    log.info("the two closed_shift contexts grouped apart from the two others")
+
+
+def __test_a_lower_timeframe_context_carries_no_flag__(log):
+    """``request.security_lower_tf`` has no lookahead, so it has no flag"""
+    source = """
+@lib.script.indicator("T")
+def main():
+    a = lib.request.security_lower_tf(lib.syminfo.tickerid, "1", lib.close[1])
+    lib.plot(lib.array.size(a))
+"""
+    assert __test_helper_closed_shift_flags(source) == [None]
+    log.info("the LTF context got no closed_shift key")
+
+
+def __test_the_compiled_history_reference_is_closed_shift__(log):
+    """``inline_series(expr, k)`` is what the Pine compiler emits for ``expr[k]``
+
+    Every corpus script comes through that compiler, so the recogniser has to
+    see the call form as well as the subscript — and ``inline_series(expr, 0)``
+    is the developing bar itself, not history.
+    """
+    source = """
+@lib.script.indicator("T")
+def main():
+    a = lib.request.security(lib.syminfo.tickerid, "D",
+                             inline_series(lib.ta.sma(lib.close, 5), 1),
+                             lookahead=lib.barmerge.lookahead_on)
+    b = lib.request.security(lib.syminfo.tickerid, "D",
+                             [inline_series(lib.close + lib.open, 1), lib.high[1]],
+                             lookahead=lib.barmerge.lookahead_on)
+    c = lib.request.security(lib.syminfo.tickerid, "D",
+                             inline_series(lib.ta.sma(lib.close, 5), 0),
+                             lookahead=lib.barmerge.lookahead_on)
+    d = lib.request.security(lib.syminfo.tickerid, "D",
+                             inline_series(lib.ta.sma(lib.close, 5), 1) + lib.close,
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(a + b[0] + c + d)
+"""
+    assert __test_helper_closed_shift_flags(source) == [True, True, False, False]
+    log.info("the compiled history-reference call form is recognised")
+
+
+def __test_a_hoisted_history_temp_is_closed_shift__(log):
+    """The temp a lazily positioned ``inline_series`` was lifted into counts too
+
+    ``InlineSeriesHoistTransformer`` runs before the split, so a history
+    reference standing in a ternary branch — which is where the standard
+    ``repaint ? ... : ...`` and ``flag ? security(...) : na`` idioms put it —
+    reaches the split as a bare ``__hist_N__`` name.
+    """
+    source = """
+@lib.script.indicator("T")
+def main():
+    __hist_0__ = inline_series(lib.ta.sma(lib.close, 5), 1)
+    __hist_1__ = inline_series(lib.ta.ema(lib.close, 5), 0)
+    a = lib.request.security(lib.syminfo.tickerid, "D", __hist_0__,
+                             lookahead=lib.barmerge.lookahead_on)
+    b = lib.request.security(lib.syminfo.tickerid, "D", __hist_1__,
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(a + b)
+"""
+    assert __test_helper_closed_shift_flags(source) == [True, False]
+    log.info("the hoisted history temp was looked through")
+
+
+def __test_a_hoisted_temp_of_another_scope_is_not_looked_through__(log):
+    """The temps are resolved in the call's OWN scope, never across scopes
+
+    Two sibling helpers each get a ``__hist_0__`` of their own, so a map built
+    for the whole module could answer one scope's name from the other's binding.
+    """
+    source = """
+@lib.script.indicator("T")
+def main():
+    def shifted():
+        __hist_0__ = inline_series(lib.ta.sma(lib.close, 5), 1)
+        return lib.request.security(lib.syminfo.tickerid, "D", __hist_0__,
+                                    lookahead=lib.barmerge.lookahead_on)
+    def developing():
+        __hist_0__ = inline_series(lib.ta.sma(lib.close, 5), 0)
+        return lib.request.security(lib.syminfo.tickerid, "D", __hist_0__,
+                                    lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted() + developing())
+"""
+    assert __test_helper_closed_shift_flags(source) == [True, False]
+    log.info("each scope answered from its own binding")
+
+
+def __test_a_collection_receiver_is_not_a_history_reference__(log):
+    """``data[1]`` on an ordinary collection is element access, not history
+
+    None of the three receivers — a list literal, an alias of it, the value a
+    collection constructor returns — resolves to a series declaration or to a
+    ``lib`` chain, so the period keeps its developing rounds.
+    """
+    source = """
+@lib.script.indicator("T")
+def main():
+    data = [lib.open, lib.close]
+    alias = data
+    built = lib.array.new_float(2, lib.close)
+    a = lib.request.security(lib.syminfo.tickerid, "D", data[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    b = lib.request.security(lib.syminfo.tickerid, "D", alias[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    c = lib.request.security(lib.syminfo.tickerid, "D", built[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    d = lib.request.security(lib.syminfo.tickerid, "D", lib.close[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(a + b + c + d)
+"""
+    assert __test_helper_closed_shift_flags(source) == [False, False, False, True]
+    log.info("literal, alias and constructor receivers all stayed out")
+
+
+def __test_an_opaque_call_receiver_is_not_a_history_reference__(log):
+    """A call receiver is never a history reference, whatever it returns
+
+    ``values()[1]`` may be element access, and the name holding the result is no
+    better; the positive rule excludes both by shape, so the period keeps its
+    developing rounds. The compiled ``inline_series`` form is what a history
+    reference to a call's result actually looks like.
+    """
+    source = """
+@lib.script.indicator("T")
+def main():
+    def values():
+        return lib.array.new_float(2, lib.close)
+    held = values()
+    a = lib.request.security(lib.syminfo.tickerid, "D", values()[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    b = lib.request.security(lib.syminfo.tickerid, "D", held[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    c = lib.request.security(lib.syminfo.tickerid, "D",
+                             inline_series(lib.ta.sma(lib.close, 5), 1),
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(a + b + c)
+"""
+    assert __test_helper_closed_shift_flags(source) == [False, False, True]
+    log.info("the helper call and the name holding it stayed out, inline_series did not")
+
+
+def __test_a_persistent_container_is_not_a_history_reference__(log):
+    """``Persistent`` is storage, not history, so ``data[1]`` keeps its rounds
+
+    ``Persistent`` / ``IBPersistent`` only say that the value survives the bar;
+    the history-bearing declarations are ``PersistentSeries`` /
+    ``IBPersistentSeries``, which stage 501 splits into a plain ``Series``. A
+    persistent container filled from the developing bar still develops, and so
+    does a container a ternary may bind, so both must answer "no history".
+    """
+    source = """
+@lib.script.indicator("T")
+def main():
+    def values():
+        return lib.array.new_float(2, lib.close)
+    data: Persistent[list] = values()
+    picked = values() if lib.close > lib.open else lib.array.new_float(2, lib.close)
+    kept: PersistentSeries[float] = lib.ta.sma(lib.close, 5)
+    a = lib.request.security(lib.syminfo.tickerid, "D", data[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    b = lib.request.security(lib.syminfo.tickerid, "D", picked[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    c = lib.request.security(lib.syminfo.tickerid, "D", kept[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(a + b + c)
+"""
+    assert __test_helper_closed_shift_flags(source) == [False, False, True]
+    log.info("the persistent and ternary containers stayed out, the series declaration did not")
+
+
+def __test_a_declared_series_receiver_is_a_history_reference__(log):
+    """A ``Series``-annotated local, a series parameter and a lib chain are in
+
+    These are exactly the receivers ``SeriesTransformer`` /
+    ``LibrarySeriesTransformer`` give a history buffer to, so a ``[k>=1]`` of one
+    is a history read. A plain local bound from the same expression is not.
+    """
+    source = """
+@lib.script.indicator("T")
+def main():
+    declared: Series[float] = lib.ta.sma(lib.close, 5)
+    plain = lib.ta.sma(lib.close, 5)
+    a = lib.request.security(lib.syminfo.tickerid, "D", declared[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    b = lib.request.security(lib.syminfo.tickerid, "D", plain[1],
+                             lookahead=lib.barmerge.lookahead_on)
+
+    def helper(src: Series[float], other):
+        c = lib.request.security(lib.syminfo.tickerid, "D", src[1],
+                                 lookahead=lib.barmerge.lookahead_on)
+        d = lib.request.security(lib.syminfo.tickerid, "D", other[1],
+                                 lookahead=lib.barmerge.lookahead_on)
+        return c + d
+    lib.plot(a + b + helper(lib.close, lib.open))
+"""
+    assert __test_helper_closed_shift_flags(source) == [True, False, True, False]
+    log.info("the declared series and the series parameter are history, the plain names are not")
+
+
+def __test_a_local_binding_shadows_an_enclosing_series__(log):
+    """A nested scope reaches an enclosing series, unless it binds the name itself
+
+    ``SeriesTransformer._lookup`` resolves a name along the scope chain but lets a
+    plain local of the inner scope shadow the parent's series — the classifier
+    makes the same walk.
+    """
+    source = """
+@lib.script.indicator("T")
+def main():
+    outer: Series[float] = lib.ta.sma(lib.close, 5)
+
+    def reader():
+        return lib.request.security(lib.syminfo.tickerid, "D", outer[1],
+                                    lookahead=lib.barmerge.lookahead_on)
+
+    def shadower():
+        outer = lib.array.new_float(2, lib.close)
+        return lib.request.security(lib.syminfo.tickerid, "D", outer[1],
+                                    lookahead=lib.barmerge.lookahead_on)
+    lib.plot(reader() + shadower())
+"""
+    assert __test_helper_closed_shift_flags(source) == [True, False]
+    log.info("the enclosing series resolved, the shadowing local did not")
+
+
+def __test_a_tuple_valued_library_call_is_not_a_history_reference__(log):
+    """``lib.ta.bb(...)[1]`` selects a band of the CURRENT bar
+
+    A ``lib.*`` CALL is not a ``lib``-rooted attribute chain, so no call result
+    is a history reference — the tuple-valued ones included — and neither is a
+    ternary between two names that hold a container.
+    """
+    source = """
+@lib.script.indicator("T")
+def main():
+    first = lib.array.new_float(2, lib.close)
+    second = lib.array.new_float(2, lib.open)
+    data = first if lib.close > lib.open else second
+    a = lib.request.security(lib.syminfo.tickerid, "D",
+                             lib.ta.bb(lib.close, 2, 2.0)[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    b = lib.request.security(lib.syminfo.tickerid, "D", data[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    c = lib.request.security(lib.syminfo.tickerid, "D",
+                             lib.ta.macd(lib.close, 12, 26, 9)[2],
+                             lookahead=lib.barmerge.lookahead_on)
+    d = lib.request.security(lib.syminfo.tickerid, "D",
+                             inline_series(lib.ta.sma(lib.close, 5), 1),
+                             lookahead=lib.barmerge.lookahead_on)
+    lib.plot(a + b + c + d)
+"""
+    assert __test_helper_closed_shift_flags(source) == [False, False, False, True]
+    log.info("the tuple-valued lib calls and the ternary container stayed out")

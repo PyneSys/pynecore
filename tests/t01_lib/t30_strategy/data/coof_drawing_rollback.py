@@ -6,10 +6,7 @@ body runs several times, but only the last run counts, so the bar must still
 leave exactly one line behind.
 """
 from pynecore.lib import array, line, plot, script, strategy, bar_index
-
-# A module-level global is outside the slot scheme, so the COOF rollback does
-# not touch it -- it counts body executions, not bars.
-_execs: list[int] = []
+from pynecore.types import IBPersistent
 
 
 @script.strategy(
@@ -22,7 +19,10 @@ _execs: list[int] = []
     max_lines_count=500,
 )
 def main():
-    _execs.append(bar_index)
+    # A varip slot is outside the COOF rollback, so it counts body executions,
+    # not bars.
+    execs: IBPersistent[int] = 0
+    execs += 1
     line.new(bar_index, 0.0, bar_index, 1.0)
 
     # The close can only be placed once the fill is visible, so it is placed in
@@ -34,4 +34,4 @@ def main():
         strategy.close('Long')
 
     plot(array.size(line.all), 'lines')
-    plot(len(_execs), 'total_execs')
+    plot(execs, 'total_execs')

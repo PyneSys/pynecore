@@ -133,7 +133,78 @@ Two special types unique to PyneCore:
 
 These types are automatically transformed by PyneCore's AST transformers to implement Pine Script-like behavior. For more details, see [Core Concepts](/docs/overview/core-concepts/).
 
-### 5. NA Handling
+### 5. Module-Level Objects Are Read-Only Inside Functions
+
+A script may define anything at module level — a number, a string, a color, an array, a matrix, a
+map, an object — and read it from anywhere. What it may **not** do is write into such an object from
+inside a function. PyneCore rejects that with a `SyntaxError` when the script is loaded:
+
+```python
+STORE = array.new_float(0)
+
+@script.indicator("Rejected")
+def main():
+    array.push(STORE, close)   # SyntaxError: 'STORE' is modified inside a function
+```
+
+Rejected inside a function: any `global` statement, an assignment, augmented assignment or
+`del` whose target is rooted at a module-level name, a mutating method call on one (`append`, `pop`,
+`clear`, `sort`, `update`, ...), and a mutating `array.*` / `matrix.*` / `map.*` builtin whose first
+argument is one. A local variable or a parameter of the same name shadows the module-level binding,
+so writing *that* is fine.
+
+Defining is free — only writing is rejected:
+
+```python
+COL = color.new(color.red, 50)        # fine
+QTY = strategy.fixed                  # fine
+LIMITS = array.from_items(1.0, 2.0)   # fine to define, fine to read
+```
+
+**Why.** A module-level object lives outside everything PyneCore rolls back. The script's own
+`Series` and `Persistent` slots are restored whenever a bar is re-executed and the result discarded;
+a plain Python object the script keeps for itself is not. Bars are re-executed in three situations:
+
+- a `request.security` context on a **developing** higher-timeframe bar, which is recomputed on every
+  chart bar of the period,
+- `calc_on_order_fills`, which re-executes the bar once per fill,
+- a **live intrabar tick**, which re-executes the bar per tick.
+
+A counter or a buffer kept at module level would therefore count executions rather than bars, and its
+value would depend on how the run was driven.
+
+**What is not detected.** A write through an alias or through a parameter is invisible to the
+check:
+
+```python
+STORE = array.new_float(0)
+
+def record(buf):
+    array.push(buf, close)   # not detected
+
+@script.indicator("Unpredictable")
+def main():
+    record(STORE)            # behaviour is not predictable
+```
+
+This is not a supported loophole: such a script's behaviour in the re-execution situations above is
+unpredictable, and it may break at any time.
+
+**The correct pattern.** State that must survive from bar to bar belongs in a `Persistent` (rolled
+back with the bar) or an `IBPersistent` (Pine's `varip`, deliberately *not* rolled back), declared
+inside the function that uses it:
+
+```python
+@script.indicator("Correct")
+def main():
+    total: Persistent[float] = 0.0
+    total += close
+
+    ticks: IBPersistent[int] = 0
+    ticks += 1
+```
+
+### 6. NA Handling
 
 PyneCore implements Pine Script's NA (Not Available) concept for handling missing or undefined values:
 

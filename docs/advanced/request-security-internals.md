@@ -101,6 +101,35 @@ size when data outgrows the block.
 5. **Loop** — `advance_event.wait()` → run bars to `target_time` → `data_ready.set()` + `done_event.set()`
 6. **Shutdown** — `stop_event` detected → cleanup and exit
 
+## Skipping Developing Rounds
+
+With `barmerge.lookahead_on` and an expression that is entirely history-indexed (`close[1]`,
+`ta.sma(close, 5)[1]`, a tuple of such elements), the value a context produces is the same on every
+chart bar of one higher-timeframe period. PyneCore marks such a context `closed_shift` when the script
+is loaded, and the
+runtime then runs the period's **developing** round only on its first chart bar; the later bars read
+the value that round produced. For a daily context on a 30-minute chart this is 48x fewer child
+rounds and 48x fewer `main()` executions per period.
+
+The flag is cleared wherever the skipped rounds would be observable:
+
+- the context does not resolve to a higher timeframe, or it has dependents, consumers or gaps,
+- the child's code declares `varip` (`IBPersistent`) state, which is deliberately outside the
+  re-tick rollback, or calls a library function whose own state is per execution (`ta.valuewhen`),
+- the context's write does not run on every round of the child.
+
+Everything else the child runs is restored by the re-tick rollback, which is what makes the skip
+unobservable. The one kind of state the rollback cannot restore is a plain Python object created at
+module level. A language rule covers it instead: a script must not write such an object from inside a
+function (see [Module-Level Objects Are Read-Only Inside Functions](../scripting.md)). The direct
+forms are rejected with a `SyntaxError` when the script is loaded; a write through an alias or a
+parameter is not detected, and a script that does it anyway can get different values with the skip
+on and off. The dev-skip rests on that rule, not on a static proof about arbitrary Python.
+
+Set `PYNE_NO_SECURITY_DEV_SKIP=1` to turn the skip off at runtime and run every developing round, as
+before. It is a runtime switch, not a load-time one: the flag is always emitted and the decision
+is made when the context is prepared, so bytecode built with and without the switch is identical.
+
 ## Cross-Context Reads
 
 Security processes reading other contexts' values (nested dependencies) get **immediate** reads

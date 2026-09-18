@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from pynecore.transformers.slot_layout import ModuleLayout
 
 __all__ = ['PYNE_RESERVED_NAME_CHAR', 'PIPELINE_DIGEST', 'security_slice_disabled',
-           'security_merge_disabled',
+           'security_merge_disabled', 'security_dev_skip_disabled',
            'source_starts_with_pyne',
            'analyse_source', 'PyneLoader', 'PyneImportHook']
 
@@ -131,6 +131,15 @@ SECURITY_SLICE_ENV = 'PYNE_NO_SECURITY_SLICE'
 #: the very same ``.pyc``.
 SECURITY_MERGE_ENV = 'PYNE_NO_SECURITY_MERGE'
 
+#: Environment switch turning OFF the developing-round skip of a ``closed_shift``
+#: context — the one whose whole expression is ``<anything>[k>=1]`` under
+#: ``lookahead_on``, so its value cannot change inside an HTF period (see
+#: ``core/security.py``). Runtime-only: the compile-time ``closed_shift`` flag is
+#: emitted either way and only the chart's step building consults it, so this is
+#: deliberately NOT part of :func:`pipeline_hash` and an A/B run of it reuses the
+#: very same ``.pyc``.
+SECURITY_DEV_SKIP_ENV = 'PYNE_NO_SECURITY_DEV_SKIP'
+
 _TRUTHY = frozenset({'1', 'true', 'yes', 'on'})
 
 
@@ -148,6 +157,15 @@ def security_merge_disabled() -> bool:
     :return: True when the contexts of one group may not share a child.
     """
     return os.environ.get(SECURITY_MERGE_ENV, '').strip().lower() in _TRUTHY
+
+
+def security_dev_skip_disabled() -> bool:
+    """Whether ``PYNE_NO_SECURITY_DEV_SKIP`` asks for a developing round per chart bar.
+
+    :return: True when a ``closed_shift`` context must keep every re-tick round
+        inside an HTF period.
+    """
+    return os.environ.get(SECURITY_DEV_SKIP_ENV, '').strip().lower() in _TRUTHY
 
 
 def _cache_from_source(source_path: Path) -> Path:
@@ -432,6 +450,7 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
     from pynecore.transformers.type_checking_stripper import TypeCheckingStripperTransformer
     from pynecore.transformers.builtin_shadow import BuiltinShadowTransformer
     from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
+    from pynecore.transformers.outer_write import OuterWriteTransformer
     from pynecore.transformers.const_fold import ConstFoldTransformer
     from pynecore.transformers.dynamic_default import DynamicDefaultTransformer
     from pynecore.transformers.inline_series_hoist import InlineSeriesHoistTransformer
@@ -454,6 +473,13 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
     # so the lib.<ns>.<name> chains it emits get their imports added there
     transformed = BuiltinShadowTransformer().visit(transformed)
     transformed = ImportNormalizerTransformer().visit(transformed)
+    # The language rule that an object created outside a function may not be
+    # modified inside one. It reads the normalized ``lib.*`` chains and runs
+    # well before function isolation, whose per-call-site copies would report
+    # the same write once per copy. Only user scripts are subject to it --
+    # pynecore's own lib modules ARE the module-level machinery
+    if not path.is_relative_to(Path(__file__).parent.parent):
+        transformed = OuterWriteTransformer().visit(transformed)
     # TradingView folds constant subtrees at parse time with fdlibm
     # transcendentals and a 16-decimal embedding cap, while runtime
     # series-fed calls use the Intel-LIBM intrinsics (lib.math /
@@ -559,6 +585,7 @@ def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None,
     from pynecore.transformers.export_once import ExportOnceTransformer
     from pynecore.transformers.function_isolation import FunctionIsolationTransformer
     from pynecore.transformers.series import SeriesTransformer
+    from pynecore.transformers.security_closed_shift_check import verify_closed_shift
     from pynecore.transformers.script_requirements import ScriptRequirementsTransformer
     from pynecore.transformers.unused_series_detector import UnusedSeriesDetectorTransformer
     from pynecore.transformers.persistent import PersistentTransformer
@@ -580,6 +607,10 @@ def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None,
     transformed = ExportOnceTransformer().visit(tree)
     transformed = UnusedSeriesDetectorTransformer().optimize(transformed)
     transformed = SeriesTransformer(slot_layout).visit(transformed)
+    # The series pass has just emitted the only two forms a runtime history
+    # reference can take, so the source-level ``closed_shift`` candidate can now
+    # be checked exactly; the verifier only ever CLEARS the flag
+    transformed = verify_closed_shift(transformed, slot_layout)
     transformed = PersistentTransformer(slot_layout).visit(transformed)
     # Call-site classification needs the var/series slots, so the
     # isolation transformer must run after Persistent and Series

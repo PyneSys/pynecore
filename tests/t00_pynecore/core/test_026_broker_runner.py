@@ -207,17 +207,17 @@ def main():
 '''
 
 
-_script_counter = [0]
+__test_helper_script_counter = [0]
 
 
-def _write_script(tmp_path: Path, code: str) -> Path:
+def __test_helper_write_script(tmp_path: Path, code: str) -> Path:
     """Write the script to a uniquely-named file.
 
     Each test gets a fresh filename so Python's module cache doesn't
     serve a sibling test's script when the same tmp_path is recycled.
     """
-    _script_counter[0] += 1
-    p = tmp_path / f"strategy_test_{_script_counter[0]}.py"
+    __test_helper_script_counter[0] += 1
+    p = tmp_path / f"strategy_test_{__test_helper_script_counter[0]}.py"
     p.write_text(code)
     return p
 
@@ -228,7 +228,7 @@ def _write_script(tmp_path: Path, code: str) -> Path:
 def __test_broker_mode_swaps_position_to_broker_position__(tmp_path):
     """Broker mode swaps ``script.position`` to ``BrokerPosition`` and wires the sync engine."""
     plugin = MockBrokerPlugin(capabilities=ExchangeCapabilities())
-    script_path = _write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
+    script_path = __test_helper_write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
 
     runner = ScriptRunner(
         script_path=script_path,
@@ -258,7 +258,7 @@ def __test_startup_reconcile_seeds_broker_position_from_exchange__(tmp_path):
             leverage=1.0, margin_mode="cross",
         ),
     )
-    script_path = _write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
+    script_path = __test_helper_write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
 
     runner = ScriptRunner(
         script_path=script_path,
@@ -280,7 +280,7 @@ def __test_startup_reconcile_seeds_broker_position_from_exchange__(tmp_path):
 def __test_startup_validation_rejects_incompatible_script__(tmp_path):
     """Script uses TP+SL bracket, plugin declares no tp_sl_bracket."""
     plugin = MockBrokerPlugin(capabilities=ExchangeCapabilities())
-    script_path = _write_script(tmp_path, _LIMIT_EXIT_BRACKET_SCRIPT)
+    script_path = __test_helper_write_script(tmp_path, _LIMIT_EXIT_BRACKET_SCRIPT)
 
     runner = ScriptRunner(
         script_path=script_path,
@@ -304,7 +304,7 @@ def __test_startup_validation_accepts_compatible_script__(tmp_path):
             reduce_only=CapabilityLevel.NATIVE,
         ),
     )
-    script_path = _write_script(tmp_path, _LIMIT_EXIT_BRACKET_SCRIPT)
+    script_path = __test_helper_write_script(tmp_path, _LIMIT_EXIT_BRACKET_SCRIPT)
 
     runner = ScriptRunner(
         script_path=script_path,
@@ -320,7 +320,7 @@ def __test_startup_validation_accepts_compatible_script__(tmp_path):
 def __test_market_entry_dispatches_execute_entry__(tmp_path):
     """A market ``strategy.entry`` dispatches one ``execute_entry`` with matching side/qty/type."""
     plugin = MockBrokerPlugin(capabilities=ExchangeCapabilities())
-    script_path = _write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
+    script_path = __test_helper_write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
 
     runner = ScriptRunner(
         script_path=script_path,
@@ -354,7 +354,7 @@ def __test_broker_connection_error_parks_dispatch_no_crash__(tmp_path):
             raise ExchangeConnectionError("account authorization lost")
 
     plugin = _DisconnectingPlugin(capabilities=ExchangeCapabilities())
-    script_path = _write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
+    script_path = __test_helper_write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
 
     runner = ScriptRunner(
         script_path=script_path,
@@ -383,7 +383,7 @@ def __test_close_dispatches_execute_close__(tmp_path):
         capabilities=ExchangeCapabilities(reduce_only=CapabilityLevel.NATIVE),
     )
     # 3-bar script: enter on bar 0, hold, close on bar 2 once filled.
-    script_path = _write_script(tmp_path, textwrap.dedent('''\
+    script_path = __test_helper_write_script(tmp_path, textwrap.dedent('''\
         """
         @pyne
         """
@@ -442,7 +442,7 @@ def __test_close_dispatches_execute_close__(tmp_path):
 def __test_order_event_fill_updates_broker_position__(tmp_path):
     """A filled ``OrderEvent`` updates ``BrokerPosition`` size and records the open trade."""
     plugin = MockBrokerPlugin(capabilities=ExchangeCapabilities())
-    script_path = _write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
+    script_path = __test_helper_write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
 
     runner = ScriptRunner(
         script_path=script_path,
@@ -496,7 +496,7 @@ def __test_unchanged_intent_not_redispatched__(tmp_path):
     A pending limit entry that Pine re-emits bar-after-bar must not
     trigger repeated execute_entry calls."""
     plugin = MockBrokerPlugin(capabilities=ExchangeCapabilities())
-    script_path = _write_script(tmp_path, textwrap.dedent('''\
+    script_path = __test_helper_write_script(tmp_path, textwrap.dedent('''\
         """
         @pyne
         """
@@ -533,7 +533,7 @@ def __test_live_intra_bar_sync_dispatches_on_next_tick__(tmp_path):
     the very next tick instead of one bar late.
     """
     plugin = MockBrokerPlugin(capabilities=ExchangeCapabilities())
-    script_path = _write_script(tmp_path, textwrap.dedent('''\
+    script_path = __test_helper_write_script(tmp_path, textwrap.dedent('''\
         """
         @pyne
         """
@@ -608,7 +608,7 @@ def __test_live_intra_bar_sync_dispatches_on_next_tick__(tmp_path):
 def __test_live_broker_marks_open_trade_before_each_tick__(tmp_path):
     """The script sees current open-trade percent on live open, middle and close ticks."""
     plugin = MockBrokerPlugin(capabilities=ExchangeCapabilities())
-    script_path = _write_script(tmp_path, textwrap.dedent('''\
+    script_path = __test_helper_write_script(tmp_path, textwrap.dedent('''\
         """
         @pyne
         """
@@ -714,7 +714,7 @@ def __test_startup_rejects_script_on_authentication_failure__(tmp_path):
         capabilities=ExchangeCapabilities(),
         auth_error=AuthenticationError("Invalid API key", reason="invalid key"),
     )
-    script_path = _write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
+    script_path = __test_helper_write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
 
     runner = ScriptRunner(
         script_path=script_path,
@@ -814,7 +814,7 @@ def __test_broker_closed_trade_written_once_no_duplication__(tmp_path):
     plugin = MockBrokerPlugin(
         capabilities=ExchangeCapabilities(reduce_only=CapabilityLevel.NATIVE),
     )
-    script_path = _write_script(tmp_path, _ENTRY_THEN_CLOSE_SCRIPT)
+    script_path = __test_helper_write_script(tmp_path, _ENTRY_THEN_CLOSE_SCRIPT)
     trade_path = tmp_path / "trades.csv"
 
     runner = ScriptRunner(
@@ -850,7 +850,7 @@ def __test_broker_intrabar_close_flushed_on_shutdown__(tmp_path):
     plugin = MockBrokerPlugin(
         capabilities=ExchangeCapabilities(reduce_only=CapabilityLevel.NATIVE),
     )
-    script_path = _write_script(tmp_path, _ENTRY_THEN_CLOSE_SCRIPT)
+    script_path = __test_helper_write_script(tmp_path, _ENTRY_THEN_CLOSE_SCRIPT)
     trade_path = tmp_path / "trades.csv"
 
     runner = ScriptRunner(

@@ -26,6 +26,7 @@ from typing import Any, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from .datetime import parse_timezone
+from .import_hook import security_dev_skip_disabled
 from .lookahead import ALLOW_LOOKAHEAD
 from .security_shm import (
     SyncBlock, ResultBlock, ResultReader, INITIAL_RESULT_SIZE,
@@ -491,6 +492,22 @@ class SecurityState:
     needs_wait: bool = False
     new_period: bool = False
 
+    # Compile-time flag of the security transformer: the context's whole
+    # expression is a ``[k>=1]`` history reference under ``lookahead_on``, so its
+    # value cannot change inside one HTF period (see
+    # ``transformers/security.py``). Emitted for every non-LTF context; whether
+    # it is ACTED on is ``dev_skip``.
+    closed_shift: bool = False
+    # Whether ``closed_shift`` is active for this run: the context resolves to a
+    # real same-symbol HTF feed and nothing else observes the rounds themselves
+    # (decided by ``dev_skip_active`` when the runner PREPARES the context, right
+    # before its developing batch is armed). The chart then launches a developing
+    # round only on the FIRST chart bar of each period.
+    dev_skip: bool = False
+    # The period start of the last developing round this context got, for the
+    # ``dev_skip`` decision (0 before the first one).
+    dev_period_start: int = 0
+
     # ``Lookahead.ON``: set once the one-time historical prefill in
     # ``__sec_signal__`` has replayed the child's own ``.ohlcv`` bars that
     # closed before the first containing period. The developing transport
@@ -524,6 +541,12 @@ class SecurityState:
     # developing batch's entry for the current bar may close in (see
     # ``_batch_read``).
     batch_prev_asof: int = 0
+    # Whether the developing batch's replay publishes an entry for the CURRENT
+    # chart bar at all. False only under ``dev_skip``, on a bar inside a period
+    # whose one developing round went out on its first bar: the pairing then
+    # answers with that entry, which is the same value the per-bar path's result
+    # block still holds (see ``_batch_read``).
+    batch_expects_entry: bool = True
 
     # Historical DEVELOPING batch round (see :func:`prepare_developing_batch`).
     # What the child reproduces its round sequence from, ``None`` for every other
@@ -852,6 +875,9 @@ class DevBatchSpec:
     :param chart_off: The chart bar's own span minus one, in ms.
     :param chart_timeframe: The chart's timeframe, for the bar close rule.
     :param chart_calendar: The chart's trading schedule, or ``None``.
+    :param first_dev_only: Whether the context skips a period's developing
+        re-ticks (``dev_skip``), so only the period's FIRST chart bar gets a
+        developing record.
     """
 
     window: 'ChartBarWindow'
@@ -865,6 +891,7 @@ class DevBatchSpec:
     chart_off: int
     chart_timeframe: str | None
     chart_calendar: 'BarCalendar | None'
+    first_dev_only: bool = False
 
 
 def iter_dev_batch_records(spec: DevBatchSpec) -> 'Iterator[tuple]':
@@ -882,11 +909,17 @@ def iter_dev_batch_records(spec: DevBatchSpec) -> 'Iterator[tuple]':
     the memory this costs is one record and one chart bar rather than the
     ~72 bytes per chart bar a materialized sequence took in BOTH processes.
 
-    NOTHING is compressed. A period's developing bar is re-pushed on every chart
-    bar inside it, and every one of those pushes is a record: the child rolls a
-    same-period re-tick's ``var`` and function-instance slots back, but not its
-    ``varip`` slots or its ``IBPersistent`` storage, so dropping a re-tick would
-    leave it in a state the per-bar path never reaches.
+    A period's developing bar is re-pushed on every chart bar inside it and every
+    one of those pushes is a record — UNLESS ``spec.first_dev_only`` says the
+    context skips those re-ticks, in which case the developing record of a period
+    is emitted for its first chart bar only, exactly as the per-bar path builds
+    its steps. Nothing else is ever compressed, and the compression is not a
+    choice made here: the child rolls a same-period re-tick's ``var`` and
+    function-instance slots back, but not its ``varip`` slots or its
+    ``IBPersistent`` storage, so a dropped re-tick is unobservable only for the
+    shape ``dev_skip_active`` proves it for — a ``[k>=1]`` expression whose slice
+    declares no ``varip`` (see ``transformers/security_slice.py``). The two paths
+    therefore stay equal to each other bar for bar, whichever one runs.
 
     :param spec: The context's batch specification.
     :return: Iterator of ``(kind, period_start, open, high, low, close, volume,
@@ -912,6 +945,7 @@ def iter_dev_batch_records(spec: DevBatchSpec) -> 'Iterator[tuple]':
     lossless_prices = spec.lossless_prices
     last_confirmed = 0
     prefilled = False
+    dev_period_start = 0
 
     def _bar_records(bar: tuple, next_time: int) -> list[tuple]:
         """Every record ONE chart bar produces.
@@ -920,7 +954,7 @@ def iter_dev_batch_records(spec: DevBatchSpec) -> 'Iterator[tuple]':
         :param next_time: Open time of the NEXT chart bar, 0 for the last one.
         :return: The bar's records, in push order.
         """
-        nonlocal last_confirmed, prefilled
+        nonlocal last_confirmed, prefilled, dev_period_start
         bar_time, b_open, b_high, b_low, b_close, b_volume = bar
         if cal is not None and chart_timeframe:
             tick = actual_bar_close(bar_time, next_time, cal, chart_timeframe)
@@ -952,7 +986,9 @@ def iter_dev_batch_records(spec: DevBatchSpec) -> 'Iterator[tuple]':
                         closed_bar.open, closed_bar.high, closed_bar.low,
                         closed_bar.close, closed_bar.volume,
                         tick, sched_next_open))
-        if dev_bar is not None:
+        if dev_bar is not None and not (spec.first_dev_only
+                                        and dev_bar.period_start == dev_period_start):
+            dev_period_start = dev_bar.period_start
             out.append((DEV_BATCH_DEVELOPING, dev_bar.period_start,
                         dev_bar.open, dev_bar.high, dev_bar.low,
                         dev_bar.close, dev_bar.volume,
@@ -1029,6 +1065,57 @@ def dev_batch_eligible(state: SecurityState, sec_id: str, *,
             and not state.plain_ltf
             and not state.ltf_live_stream
             and not state.na_on_developing
+            and not sec_id.startswith('__auto_rate_'))
+
+
+def dev_skip_active(state: SecurityState, sec_id: str, *,
+                    has_consumers: bool) -> bool:
+    """
+    Whether a ``closed_shift`` context may skip a period's developing re-ticks.
+
+    The compile-time flag (``transformers/security.py``) says the context's VALUE
+    is the same on every chart bar of one HTF period: its whole expression is a
+    ``[k>=1]`` history reference, and a developing re-tick re-runs the period's
+    first tick from the child's own rolled-back baseline. What is left to decide
+    is whether anything else observes the rounds themselves — and that is the
+    same list the developing batch answers, for the same reasons:
+
+    * the developing transport has to be the one running at all: a same-symbol
+      HIGHER timeframe with an aggregator, no ``na_on_developing`` (a
+      cross-symbol ``ON``, which publishes ``na`` inside the period anyway), and
+      not the same timeframe or a lower one, where every chart bar IS a period;
+    * no ``depends`` and no consumers: a peer read's cap and a consumer's
+      pairing are relative to the round the chart is on, and a skipped bar
+      publishes no round to pair with — while a consumer parked on this
+      context's frontier is released by ``_settle_no_round`` only when nobody
+      reads it;
+    * ``gaps_on``: its ``na``-between-closes selection is driven by
+      ``new_period``, which the skip leaves exactly as it is — but the shape is
+      rare enough that it is not worth carrying the proof, so it stays out;
+    * the synthetic ``__auto_rate_*`` feeds, which no Pine call signals.
+
+    ``PYNE_NO_SECURITY_DEV_SKIP=1`` turns the whole thing off at runtime; the
+    compile-time flag is emitted either way, so an A/B run of it reuses the very
+    same bytecode.
+
+    :param state: Security context state, after its feed resolved.
+    :param sec_id: The context's id.
+    :param has_consumers: Whether another context reads this one.
+    :return: Whether the chart may launch a developing round only on the first
+        chart bar of each period.
+    """
+    return (state.closed_shift
+            and not security_dev_skip_disabled()
+            and state.lookahead is Lookahead.ON
+            and state.htf_aggregator is not None
+            and not state.same_timeframe
+            and not state.depends
+            and not has_consumers
+            and not state.is_ltf
+            and not state.plain_ltf
+            and not state.ltf_live_stream
+            and not state.na_on_developing
+            and not state.gaps_on
             and not sec_id.startswith('__auto_rate_'))
 
 
@@ -1440,6 +1527,11 @@ def create_chart_protocol(
             # The resolver may have turned this context into the chart's own:
             # it now produces for its consumers, so it needs a ring.
             _ensure_chart_writer(sec_id)
+        # ``state.dev_skip`` is NOT decided here: the deferred resolver above
+        # prepares the context itself, and the developing batch it arms plans the
+        # very rounds the skip removes — so the decision belongs to the runner's
+        # preparation, immediately before the batch is armed, which is the one
+        # point every path passes through (see ``_prepare_security_context``).
         if prepare_fn is not None:
             prepare_fn(sec_id)
         if sec_id in start_on_resolve:
@@ -1493,9 +1585,11 @@ def create_chart_protocol(
             dst.rounds_launched = src.rounds_launched
             dst.last_confirmed = src.last_confirmed
             dst.htf_prefilled = src.htf_prefilled
+            dst.dev_period_start = src.dev_period_start
             dst.batch_asof = src.batch_asof
             dst.batch_prev_asof = src.batch_prev_asof
             dst.batch_launched = src.batch_launched
+            dst.batch_expects_entry = src.batch_expects_entry
 
     def _start(sec_id: str, state: SecurityState, *, run_pending: bool = True) -> None:
         """Start a context: its producers, its child process, its first round.
@@ -1806,7 +1900,7 @@ def create_chart_protocol(
         entry = reader.last_close_at_or_before(asof)
         if entry is None:
             return default
-        if (state.dev_batch_spec is not None
+        if (state.dev_batch_spec is not None and state.batch_expects_entry
                 and entry[1] <= state.batch_prev_asof):
             # Every entry a developing batch publishes for ONE chart bar closes
             # inside that bar's own window — after the previous bar's as-of and
@@ -2108,6 +2202,18 @@ def create_chart_protocol(
                 # step goes out, and otherwise from whether a period just closed.
                 state.new_period = (dev_bar is not None
                                     or closed_bar is not None)
+                # Which chart bars the replay publishes an entry for — the same
+                # rule the per-bar path builds its steps by, ``first_dev_only``
+                # included (see :func:`iter_dev_batch_records`). A bar that gets
+                # none reads the entry of the bar that opened its period, so the
+                # window check in ``_batch_read`` has to be told to expect that.
+                fresh_dev = (dev_bar is not None
+                             and (not state.dev_skip
+                                  or dev_bar.period_start != state.dev_period_start))
+                if fresh_dev and dev_bar is not None:
+                    state.dev_period_start = dev_bar.period_start
+                state.batch_expects_entry = (not state.batch_launched
+                                             or closed_bar is not None or fresh_dev)
                 if not state.batch_launched:
                     state.batch_launched = True
                     sync_block.set_flags(sec_id, (sync_block.get_flags(sec_id) & ~(
@@ -2218,7 +2324,16 @@ def create_chart_protocol(
                 # None when the confirmed chart bar just completed the period
                 # (the closed step delivered it); no fresh developing bar exists
                 # until the next chart bar.
-                if state.lookahead is Lookahead.ON and dev_bar is not None:
+                # ``dev_skip``: the value of a ``closed_shift`` expression is
+                # the same on every chart bar of one period (see
+                # :func:`dev_skip_active`), so only the FIRST of them runs a
+                # round. The others launch nothing, exactly like a bar whose
+                # period brought no developing bar at all, and their read
+                # answers out of the result block the first round filled.
+                if state.lookahead is Lookahead.ON and dev_bar is not None and (
+                        not state.dev_skip
+                        or dev_bar.period_start != state.dev_period_start):
+                    state.dev_period_start = dev_bar.period_start
                     # The aggregator keeps ONE developing bar per period and
                     # mutates it on every chart bar, so the values are copied
                     # into the step instead of the object: a queued step
@@ -2242,8 +2357,13 @@ def create_chart_protocol(
                 else:
                     # ``new_period`` reflects whether a fresh HTF close just
                     # landed (drives the ``gaps_on`` na/value selection in
-                    # ``__sec_read__``).
-                    state.new_period = closed_bar is not None
+                    # ``__sec_read__``). A developing bar this context skipped
+                    # the round for is still a developing bar, so the
+                    # bookkeeping of the transport is left exactly as it is
+                    # without the skip.
+                    state.new_period = (closed_bar is not None
+                                        or (dev_bar is not None
+                                            and state.lookahead is Lookahead.ON))
                     if closed_bar is None:
                         # Clear any stale developing flag from a prior
                         # ``Lookahead.ON`` session (same SyncBlock slot).
@@ -4254,6 +4374,7 @@ def setup_security_states(
             late_reads=frozenset(ctx.get('late_reads') or ()),
             always_read=bool(ctx.get('always_read', False)),
             signal_per_bar=bool(ctx.get('signal_per_bar', False)),
+            closed_shift=bool(ctx.get('closed_shift', False)),
             chart_resampler=chart_ltf_resampler if (is_ltf or plain_ltf) else None,
             chart_dwm_modifier=chart_ltf_modifier if (is_ltf or plain_ltf) else '',
         )
