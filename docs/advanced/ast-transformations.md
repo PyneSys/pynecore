@@ -59,13 +59,14 @@ PyneCore applies several key transformations to Python code to make it behave li
 12. **Unused Series Detector** - Removes unnecessary Series annotations for performance
 13. **Series Transformer** - Handles Series variables
 14. **Persistent Transformer** - Manages persistent variables
-15. **Function Isolation Transformer** - Ensures separate state for each function call
-16. **Input Transformer** - Processes input parameters
-17. **Safe Convert Transformer** - Lowers the `float()`/`int()` casts to their Pine forms and truncates
+15. **Call Inline Transformer** - Copies the body of trivial stateless builtins into the call site
+16. **Function Isolation Transformer** - Ensures separate state for each function call
+17. **Input Transformer** - Processes input parameters
+18. **Safe Convert Transformer** - Lowers the `float()`/`int()` casts to their Pine forms and truncates
     a Pine int where a Python-native consumer needs a real `int`
-18. **Safe Division Transformer** - Protects against division by zero
+19. **Safe Division Transformer** - Protects against division by zero
 
-This order ensures that dependencies between transformations are properly handled. For example, PersistentSeries transformation must happen before both Persistent and Series transformations, and Function Isolation must run after them because it routes calls based on the state slots they allocated.
+This order ensures that dependencies between transformations are properly handled. For example, PersistentSeries transformation must happen before both Persistent and Series transformations, and Function Isolation must run after them because it routes calls based on the state slots they allocated. Call Inlining sits directly in front of Function Isolation, so a site that is no longer a call never gets an anchor slot.
 
 Each transformation step modifies the Python AST to implement Pine Script behavior while maintaining Python syntax and readability.
 
@@ -501,6 +502,38 @@ Key aspects:
 **Accumulation**: The `+=` operator stays a plain augmented assignment on the slot, so a running sum accumulates naively. That is deliberate: TradingView accumulates the same way (measured on `ta.cum` and every volume accumulator), and error compensation — a Kahan sum, for instance — would produce a mathematically better sum that no longer matches the reference.
 
 **Important Note**: The state-related transformers use the Unicode character `·` (middle dot, U+00B7) as the internal scope separator in slot names and call-site identifiers (e.g. `main·t·0`). This prevents conflicts when function names contain underscores. Avoid using the `·` character in function or variable names to prevent conflicts with the internal scoping system.
+
+### Call Inline Transformer
+
+A wrapper like `math.abs` is a few nanoseconds of work behind a Python call that costs tens of them, and a rolling-window script reaches such wrappers tens of millions of times over a run. This pass replaces an allow-listed call with the wrapper's own body, written out as a single expression.
+
+**Original code:**
+```python
+from pynecore.lib import math, close
+
+def main():
+    return math.abs(close - 1.0)
+```
+
+**Transformed code:**
+```python
+from pynecore.core.inline_support import na_float as __inl·na_float__, py_builtins as __inl·py_builtins__
+
+def main():
+    return __inl·na_float__ if not (__inl1·__ := lib.close - 1.0) == __inl1·__ else __inl·py_builtins__.abs(__inl1·__)
+```
+
+Key aspects:
+- The expression is **derived from the wrapper's own source AST**, never hand-written, and only from a restricted body shape: a docstring, `if <test>: return <expr>` guards, name aliases, and one final `return <expr>`. The same operations run in the same order on the same operands, so the result is the same double, the same `na` object and the same exception. A body that grows past that shape simply stops being inlinable.
+- `math.max` / `math.min` are varargs and get one written expansion for a fixed positional arity, guarded by a structural check of their real bodies.
+- Arguments are classified by what re-evaluating them costs. A constant, a plain name and a slot read emitted by the Series/Persistent lowering (`__state__[7]`) run no user code; anything else must run exactly once and is bound with an assignment expression, or goes in directly when the body reads it once on a path that always runs.
+- The call being replaced evaluated every argument before entering the body. When an impure argument is present and the body would read the raising arguments out of source order, all of them are forced in front as `x is x` probes, in source order. With no impure argument nothing is forced — the only observable difference would be which `NameError` an undefined name reports.
+- A guard the call decides with a literal (`math.pow(x, 2)`) is folded away at transform time, and so are the operations that guard reads (`isinstance(2, NA)`, `2 != 2`, `int(0)`) — by running the same operation on the same literal, never by reasoning about it. A `bool` does not count as a numeric literal.
+- Free names of a copied body resolve through `pynecore.core.inline_support`, not through the call site: a script's `math` is `pynecore.lib.math`, and a script may rebind `abs` or `float`.
+- The callee must be **provably** the library function: its dotted path is resolved through the module's import map and compared by object identity. A name the module binds anywhere takes the whole base name out of the pass.
+- Module level, class bodies, decorators, defaults, lambdas and comprehensions are skipped (the temporaries would bind in the wrong scope), as are keyword arguments, starred arguments and an unsupported arity. Leaving the call in place is always correct.
+- Every comparison the pass emits **for itself** is marked exact, so the Float Tolerance rewrite leaves the copied raw `x == x` na tests alone — but never a comparison inside an argument, which is the user's own Pine code and still gets the tolerant rewrite.
+- The inlined wrapper sources and `core/inline_support.py` take part in the pipeline digest, so editing a wrapper body or an anchor invalidates cached script bytecode.
 
 ### Function Isolation Transformer
 

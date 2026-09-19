@@ -236,6 +236,12 @@ def _get_transform_pipeline_hash() -> str:
         # This module pins the transformer pipeline order; ``pine_compare`` holds
         # a constant the pipeline bakes into the emitted bytecode
         files = [Path(__file__), Path(__file__).parent / "pine_compare.py"]
+        # The call-inlining pass copies these bodies into the emission, so a
+        # wrapper edit must invalidate cached script bytecode just like a
+        # transformer edit does (see transformers/call_inline.py)
+        lib_dir = Path(__file__).parent.parent / "lib"
+        files.extend([lib_dir / "math.py", lib_dir / "array.py",
+                      Path(__file__).parent / "inline_support.py"])
         transformers_dir = Path(__file__).parent.parent / "transformers"
         try:
             files.extend(transformers_dir.iterdir())
@@ -631,6 +637,7 @@ def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None,
     """
     import ast
 
+    from pynecore.transformers.call_inline import CallInlineTransformer
     from pynecore.transformers.export_once import ExportOnceTransformer
     from pynecore.transformers.function_isolation import FunctionIsolationTransformer
     from pynecore.transformers.series import SeriesTransformer
@@ -661,6 +668,12 @@ def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None,
     # be checked exactly; the verifier only ever CLEARS the flag
     transformed = verify_closed_shift(transformed, slot_layout)
     transformed = PersistentTransformer(slot_layout).visit(transformed)
+    # Trivial builtin wrappers are copied into their call sites BEFORE the
+    # isolation pass, so a site that is no longer a call gets no anchor slot
+    # and no binding guard. Its arguments are already lowered here, and the
+    # comparisons it emits are marked ``pine_exact`` so the float tolerance
+    # rewrite below leaves the copied raw na tests alone
+    transformed = CallInlineTransformer().visit(transformed)
     # Call-site classification needs the var/series slots, so the
     # isolation transformer must run after Persistent and Series
     transformed = FunctionIsolationTransformer(slot_layout).visit(transformed)

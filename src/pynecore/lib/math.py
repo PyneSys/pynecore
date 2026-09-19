@@ -483,10 +483,9 @@ def sqrt(number: float | int | NA) -> PyneFloat:
     """
     if not (number == number):  # is_na_arg
         return na_float
-    try:
-        return math.sqrt(number)
-    except ValueError:
+    if number < 0.0:
         return na_float
+    return math.sqrt(number)
 
 
 def tan(angle: TFI | NA[TFI]) -> PyneFloat:

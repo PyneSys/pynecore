@@ -40,6 +40,8 @@ def __test_import_normalizer_shadowed_alias__(ast_transformed_code):
     assert ast_transformed_code.count('lib.ta.sma(') == 2
     assert 'lib.ta()' not in ast_transformed_code
     assert 'def ta():' in ast_transformed_code
-    assert 'lib.math.max(' in ast_transformed_code
+    # ``x.max`` resolved to ``lib.math.max``, which the call-inlining pass then
+    # copied into the site -- its na helper is the proof the path was math's
+    assert '__inl·math_na_of_operands__' in ast_transformed_code
     assert 'lib.math.sma(' not in ast_transformed_code
     assert 'lib.math.sma(' not in ast_transformed_code
