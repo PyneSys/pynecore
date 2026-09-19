@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Literal, overload
+from typing import TYPE_CHECKING, Literal
 from typing import TypeAlias as _TypeAlias  # underscore-aliased: kept out of the module-property registry
 
 import logging as _logging  # underscore-aliased: kept out of the module-property registry
@@ -114,21 +114,6 @@ if True:
 #
 # Helpers
 #
-
-@overload
-def _na_to_none(value: PyneFloat | NA[float]) -> float | None: ...
-
-
-@overload
-def _na_to_none(value: PyneStr | NA[str]) -> str | None: ...
-
-
-def _na_to_none(value):  # type: ignore[misc]
-    """Convert na (NA object or native nan float) to None, pass through everything else."""
-    if not (value == value):  # is_na_arg
-        return None
-    return value
-
 
 # Call sites of ``strategy.close()`` / ``strategy.close_all()``, numbered in
 # first-seen order. The code object is part of the key, so the dict keeps it
@@ -6640,6 +6625,445 @@ def _suppress_opening_leg(position: PositionBase, id: str, direction_sign: float
     position._add_order(closing_leg)
 
 
+# noinspection PyProtectedMember
+def _exit_book_slot_stable(orderbook: PriceOrderBook, order_: Order) -> bool:
+    """True if re-indexing ``order_`` in the price book would be a pure no-op.
+
+    :meth:`PriceOrderBook.remove_order` followed by :meth:`~PriceOrderBook.add_order`
+    appends the order at the BACK of every bucket it sits in, and the bucket order
+    is what the bar-open gap scan and the closing-leg walks read (they iterate the
+    book directly instead of sorting by ``Order.act_seq``). The pair is therefore
+    unobservable only while the order is alone at each of its levels -- the level
+    is then dropped and re-inserted at the same sorted position, and its bucket
+    and price set come back identical.
+
+    :param orderbook: The price book the order rests in.
+    :param order_: The resting order an unchanged re-issue would re-index.
+    :return: True if the re-index can be skipped without changing the book.
+    """
+    prices = orderbook.order_prices.get(order_)
+    if prices is None:
+        return False
+    stop_ = order_.stop
+    limit_ = order_.limit
+    if stop_ is None:
+        expected = () if limit_ is None else (limit_,)
+    elif limit_ is None or limit_ == stop_:
+        expected = (stop_,)
+    else:
+        expected = (stop_, limit_)
+    if len(prices) != len(expected):
+        return False
+    buckets = orderbook.orders_at_price
+    for price in expected:
+        bucket = buckets.get(price)
+        if bucket is None or len(bucket) != 1 or bucket[0] is not order_:
+            return False
+    return True
+
+
+# noinspection PyProtectedMember,PyShadowingNames,PyShadowingBuiltins
+def _exit_leg(position: PositionBase, exit_id: str, from_entry: str,
+              entry_seq: int | None, direction: float, init_size: float,
+              qty: PyneFloat, qty_percent: PyneFloat,
+              profit: PyneFloat, limit: PyneFloat, loss: PyneFloat, stop: PyneFloat,
+              trail_price: PyneFloat, trail_points: PyneFloat, trail_offset: PyneFloat,
+              oca_name: PyneStr,
+              comment: PyneStr, comment_profit: PyneStr, comment_loss: PyneStr,
+              comment_trailing: PyneStr,
+              alert_message: PyneStr, alert_profit: PyneStr, alert_loss: PyneStr,
+              alert_trailing: PyneStr) -> None:
+    """Issue ONE sticky exit leg of a ``strategy.exit`` call.
+
+    A resting leg the call would rebuild unchanged is kept as it is; any other
+    call replaces the leg with a new order.
+
+    :param position: The position the leg is placed on.
+    :param exit_id: The ``id`` argument of the ``strategy.exit`` call.
+    :param from_entry: The entry id this leg binds to.
+    :param entry_seq: The filled entry the leg binds to, or None while its entry is pending.
+    :param direction: Sign of the position (or pending entry) the leg closes.
+    :param init_size: ORIGINAL size of the entry the leg reserves its slice off.
+    :param qty: The ``qty`` argument of the call.
+    :param qty_percent: The ``qty_percent`` argument of the call.
+    :param profit: The take-profit distance in ticks.
+    :param limit: The take-profit price.
+    :param loss: The stop-loss distance in ticks.
+    :param stop: The stop-loss price.
+    :param trail_price: The trailing stop activation price.
+    :param trail_points: The trailing stop activation distance in ticks.
+    :param trail_offset: The trailing stop offset in ticks.
+    :param oca_name: The OCA group name, or na for the per-leg default group.
+    :param comment: Comment of the filled order.
+    :param comment_profit: Comment of a take-profit fill.
+    :param comment_loss: Comment of a stop-loss fill.
+    :param comment_trailing: Comment of a trailing-stop fill.
+    :param alert_message: Alert text of the filled order.
+    :param alert_profit: Alert text of a take-profit fill.
+    :param alert_loss: Alert text of a stop-loss fill.
+    :param alert_trailing: Alert text of a trailing-stop fill.
+    """
+
+    # Sticky bracket (TV semantics): a leg is identified by (id, from_entry,
+    # entry_seq) — TradingView issues one leg per FILLED ENTRY, so two pyramid
+    # adds sharing a from_entry id get a leg each and each is consumed on its
+    # own. ``entry_seq`` is None only while the leg still waits on a pending
+    # entry order; :meth:`SimPosition._bind_entry` hands it over on the fill.
+    # Re-issuing it every bar updates its prices, but a leg that already fired
+    # its slice must not be resurrected (the ``consumed`` tombstone). The
+    # reservation is recomputed from ``init_size`` on every issue: that is the
+    # ORIGINAL size of the entry it is bound to — frozen at the fill, so
+    # margin-call shrinkage does not erode it — or, for a leg still waiting on
+    # an entry order, that order's CURRENT size, so a pending entry re-sized
+    # bar-to-bar keeps being tracked (locking the first bar's size would
+    # under-close the eventual fill and strand a sliver).
+    exit_key = _exit_key(exit_id, from_entry, entry_seq)
+    existing = position.exit_orders.get(exit_key)
+    if existing is not None and existing.consumed:
+        return
+
+    is_rest_leg = not (qty == qty) and not (qty_percent == qty_percent)  # is_na_arg
+    # Sibling legs reserve slices of the SAME entry first-come-first-served
+    # (consumed siblings keep their reservation until the entry fully
+    # closes). Only sticky exit legs (book_seq is None) count as siblings;
+    # a stacked strategy.close()/close_all() partial (book_seq set) is an
+    # immediate market close, not a reservation against this leg.
+    # A sibling that reserved its slice against a DIFFERENT bound size holds a
+    # stale share: the entry order it waits on was re-placed at a smaller size.
+    # It re-derives its own slice the next time the script issues it, so it must
+    # not block this leg in the meantime -- otherwise a shrunk bracket stays
+    # frozen at its first size and stops tracking the stop level the script
+    # keeps moving.
+    # A leg restored by ``BrokerPosition.reconstruct_exit_order`` after a restart
+    # carries no basis at all (``bound_size`` stays 0.0, which no issued leg can
+    # have -- a zero bound reserves nothing and returns above). It still holds a
+    # real live broker reservation, so it counts until the script re-issues it
+    # and stamps its own basis; skipping it would let the reissued sibling
+    # reserve the whole entry and protect more exposure than the script allocated.
+    bound = abs(init_size)
+    sibling = 0.0
+    for o in position.exit_orders.values():
+        if (o.entry_seq == entry_seq and o.order_id == from_entry
+                and o is not existing
+                and o.book_seq is None
+                and (o.bound_size == bound or o.bound_size == 0.0)):
+            sibling += o.reserved_size
+    unreserved = bound - sibling
+    # A qty/qty_percent leg is capped at the unreserved remainder --
+    # TradingView never lets a later exit call take a slice a pre-existing
+    # leg already holds. Verified on live TV (BINANCE:BTCUSDT 30m probes):
+    # a late qty_percent=50 or qty=1 leg issued while a no-qty stop leg
+    # holds 100% never creates an order (553/553 cycles), and against a
+    # qty_percent=75 stop leg the same call is reduced to the remaining
+    # 25% instead of being dropped.
+    if qty == qty:
+        reserved = min(abs(qty), unreserved)
+    elif qty_percent == qty_percent:
+        reserved = min(abs(init_size) * (qty_percent * 0.01), unreserved)
+    else:
+        # No-qty "rest" leg: the whole unreserved remainder, so it never
+        # over-closes the position.
+        reserved = unreserved
+
+    # The Pine-side lot floor is a backtest-only quantization. Broker
+    # positions can be smaller than syminfo.mincontract after venue-domain
+    # conversion, so preserve the raw reservation for plugin quantization.
+    if isinstance(position, SimPosition):
+        if qty == qty and abs(qty) < unreserved:
+            reserved = _explicit_qty_round(abs(qty))
+        else:
+            reserved = _size_round(reserved)
+    if reserved <= 0.0:
+        return
+    size = -direction * reserved
+
+    # Store tick values for later calculation when entry price is known
+    profit_ticks: float | None = profit if profit == profit else None  # is_na_arg
+    loss_ticks: float | None = loss if loss == loss else None  # is_na_arg
+    trail_points_ticks: float | None = trail_points if trail_points == trail_points else None  # is_na_arg
+    # TradingView truncates a fractional ``trail_offset`` tick count to
+    # whole ticks (like its qty precision). Verified against a TV
+    # reference (BINANCE:BTCUSDT 30m, ``trail_points=trail_offset=
+    # atr*mult``): TV's trailing fills land at ``water mark -/+
+    # floor(offset_ticks) * mintick``, while fractional ticks would round
+    # half the fills one tick further. ``trail_points`` stays fractional:
+    # the activation price resolves with directional tick-rounding
+    # (bracket trail probe 91, ``trail_points=atr``, matches TV that way).
+    _trail_offset = trail_offset if trail_offset == trail_offset else None  # is_na_arg
+    if _trail_offset is not None:
+        _trail_offset = float(int(_trail_offset))
+    _trail_price = trail_price if trail_price == trail_price else None  # is_na_arg
+
+    # A missing ``trail_offset`` does NOT disable the trailing leg. TradingView's
+    # compile rule only requires the offset when the trailing pair is the
+    # exit's SOLE trigger; alongside ``stop``/``limit`` the call compiles, and the
+    # TV reference exports (pynecomp bracket trail probes 88-91) prove the trailing
+    # stop arms with an offset of 0 ticks. The offset-0 default is applied at
+    # ``Order`` construction.
+
+    # An exit must arm at least one trigger. TradingView treats a call whose
+    # price/tick args ALL resolve to na as a no-op -- e.g. brackets computed
+    # from a flat position_avg_price (na) on a bar before the entry fills --
+    # not a level-less market close that fires at the next open.
+    if (not (limit == limit or stop == stop or profit == profit or loss == loss)
+            and _trail_price is None and trail_points_ticks is None):
+        return
+
+    _limit = limit if limit == limit else None  # is_na_arg
+    if _limit is not None:
+        _limit = _price_round(_limit, direction)
+    _stop = stop if stop == stop else None  # is_na_arg
+    if _stop is not None:
+        _stop = _price_round(_stop, -direction)
+    if _trail_price is not None:
+        _trail_price = _price_round(_trail_price, -direction)
+
+    _comment = comment if comment == comment else None  # is_na_arg
+    _alert_message = alert_message if alert_message == alert_message else None  # is_na_arg
+    _comment_profit = comment_profit if comment_profit == comment_profit else None  # is_na_arg
+    _comment_loss = comment_loss if comment_loss == comment_loss else None  # is_na_arg
+    _comment_trailing = comment_trailing if comment_trailing == comment_trailing else None  # is_na_arg
+    _alert_profit = alert_profit if alert_profit == alert_profit else None  # is_na_arg
+    _alert_loss = alert_loss if alert_loss == alert_loss else None  # is_na_arg
+    _alert_trailing = alert_trailing if alert_trailing == alert_trailing else None  # is_na_arg
+    # Kept as issued: a pyramid add filling later inherits a leg off this call
+    # without the script re-stating it (see SimPosition._spawn_legs_for_add).
+    issue_spec = (_limit, _stop, _trail_price,
+                  qty if qty == qty else None,
+                  qty_percent if qty_percent == qty_percent else None,
+                  oca_name if oca_name == oca_name else None)
+
+    # Default OCA settings for strategy.exit() - matches TradingView behavior.
+    # Pine's strategy.exit() has no oca_type parameter: its legs always form a
+    # reduce group. If no oca_name is specified, create a default one. It is
+    # per ENTRY as well as per exit id: the legs TradingView issues for two
+    # pyramid adds are independent, so one add's fill must not reduce the
+    # other's leg. The name is built into a local -- assigning the caller's
+    # ``oca_name`` would leak the first entry's group onto every later leg.
+    leg_oca = oca_name
+    if isinstance(leg_oca, NA):
+        # Use a unique name based on the exit id and from_entry
+        leg_oca = f"__exit_{exit_id}_{from_entry}_{entry_seq}_oca__"
+    _oca_name = leg_oca if leg_oca == leg_oca else None  # is_na_arg
+
+    # Unchanged re-issue: the resting leg already IS the order this call would
+    # build, so replacing it is pure cost. ``SimPosition._add_order`` would
+    # re-stamp ``bar_index``/``placed_fill_seq``, hand the new order the resting
+    # one's activation slot (``_same_order_slot`` holds -- every field it
+    # compares is required equal here) and re-index it in the price book; the
+    # two stamps are reproduced in place and the re-index is skipped only where
+    # :func:`_exit_book_slot_stable` proves it cannot move the leg inside a
+    # bucket. ``_seed_trail_at_issue`` returns on its first line for a leg with
+    # no trailing pair, which is why the whole early-out is gated on one.
+    # Every remaining slot of a fresh ``Order`` is either compared above or
+    # required to still hold its construction default, so nothing an earlier
+    # bar mutated (a gap-committed or consumed leg, a spawn-spent call, a
+    # bound-entry regrow) can slip through unreset. ``ticks_resolved`` is the
+    # one latch left alone: the early-out only takes calls that state no tick
+    # offset at all, and ``_resolve_tick_exit`` then moves no level and
+    # re-indexes nothing, so the latch's value is unobservable.
+    if (existing is not None and isinstance(position, SimPosition)
+            and _trail_price is None and trail_points_ticks is None
+            and profit_ticks is None and loss_ticks is None
+            and existing.trail_price is None and existing.trail_points_ticks is None
+            and not existing.trail_triggered and existing.trail_stop is None
+            and existing.size == size and existing.reserved_size == reserved
+            and existing.limit == _limit and existing.stop == _stop
+            and existing.profit_ticks == profit_ticks
+            and existing.loss_ticks == loss_ticks
+            and existing.trail_offset == (_trail_offset or 0)
+            and existing.bound_size == bound and existing.rest_leg == is_rest_leg
+            and existing.oca_type is _oca.reduce and existing.act_seq != 0
+            and existing.issue_spec == issue_spec
+            and existing.oca_name == _oca_name
+            and existing.comment == _comment
+            and existing.alert_message == _alert_message
+            and existing.comment_profit == _comment_profit
+            and existing.comment_loss == _comment_loss
+            and existing.comment_trailing == _comment_trailing
+            and existing.alert_profit == _alert_profit
+            and existing.alert_loss == _alert_loss
+            and existing.alert_trailing == _alert_trailing
+            and existing.filled_by_type is None and existing.comm_booking is None
+            and existing.budget_money is None and existing.filled_qty == 0.0
+            and existing.flip_extra == 0.0
+            and not (existing.cancelled or existing.gap_committed
+                     or existing.spawn_spent
+                     or existing.is_market_order or existing.from_entry_na
+                     or existing.skip_flip or existing.deferred_qty
+                     or existing.reversal_leg)
+            and _exit_book_slot_stable(position.orderbook, existing)):
+        existing.bar_index = int(lib.bar_index)
+        existing.placed_fill_seq = position._fill_counter
+        return
+
+    # Add order
+    order = Order(
+        from_entry, size, exit_id=exit_id, order_type=_order_type_close,
+        limit=_limit, stop=_stop,
+        trail_price=_trail_price, trail_offset=_trail_offset,
+        profit_ticks=profit_ticks, loss_ticks=loss_ticks, trail_points_ticks=trail_points_ticks,
+        oca_name=_oca_name, oca_type=_oca.reduce,
+        comment=_comment,
+        alert_message=_alert_message,
+        comment_profit=_comment_profit,
+        comment_loss=_comment_loss,
+        comment_trailing=_comment_trailing,
+        alert_profit=_alert_profit,
+        alert_loss=_alert_loss,
+        alert_trailing=_alert_trailing
+    )
+
+    # Sticky bracket (TV semantics): a re-issued live trailing leg keeps its
+    # activated high/low-water mark ONLY when the trailing parameters are
+    # unchanged. TradingView carries ONE logical trailing stop across
+    # identical re-issues -- a fresh Order must inherit the ratcheted
+    # ``trail_stop`` instead of re-arming at the bare activation level every
+    # bar, which would leave the stop permanently one or more bars behind
+    # the carried water mark. A re-issue with CHANGED trailing parameters
+    # (a per-bar recomputed atr-based trail, a stricter activation rebased
+    # on a pyramid add, ...) is a cancel+replace: the armed state and the
+    # carried water mark are dropped and the replaced leg re-arms from the
+    # issue bar's CLOSE tick (see ``_seed_trail_at_issue``); the prior
+    # bars' extremes stay out of its water mark. Verified against a TV
+    # reference (BINANCE:BTCUSDT 30m, per-bar ``trail_points=atr*mult``):
+    # TV's re-armed stop anchored to the issue bar's close instead of
+    # carrying the prior high-water mark. The activation is compared in
+    # the form it was given -- ``existing.trail_price`` may hold a
+    # points-resolved value, so the entry-anchored ``trail_points`` form
+    # compares tick counts.
+    had_trail = False
+    trail_unchanged = False
+    if existing is not None and (
+            existing.trail_price is not None or existing.trail_points_ticks is not None):
+        had_trail = True
+        trail_unchanged = (
+                existing.trail_offset == order.trail_offset
+                and ((order.trail_points_ticks is not None
+                      and existing.trail_points_ticks == order.trail_points_ticks)
+                     or (order.trail_points_ticks is None
+                         and existing.trail_points_ticks is None
+                         and existing.trail_price == order.trail_price)))
+        if trail_unchanged and existing.trail_triggered:
+            order.trail_triggered = True
+            order.trail_stop = existing.trail_stop
+
+    order.rest_leg = is_rest_leg
+    order.bound_size = bound
+    order.entry_seq = entry_seq
+    order.issue_spec = issue_spec
+    position._add_order(order)
+    # Only an identical re-issue folds the issue bar's extreme into the water
+    # mark -- and there it is a no-op, since the carried leg was already
+    # walked through this bar. A brand-new leg (first issue, or trailing added
+    # to a live bracket) and a changed-params re-issue both anchor to the
+    # issue bar's CLOSE tick (see ``_seed_trail_at_issue``).
+    position._seed_trail_at_issue(order, fold_extreme=had_trail and trail_unchanged)
+
+
+# noinspection PyProtectedMember
+def _exit_filled_targets(
+        position: PositionBase,
+        entry_id: str | None) -> list[tuple[int | None, str, float, float]]:
+    """``(entry_seq, entry_id, sign, ORIGINAL size)`` per entry an exit binds to.
+
+    TradingView issues ONE leg per FILLED ENTRY, so two pyramid adds sharing a
+    ``from_entry`` id each get their own leg reserved off their own entry size
+    — and each is consumed on its own, which is why a bracket can fire again
+    for a later add after it already fired for the first. The live broker has
+    no binding book, so it keeps the pre-fan-out shape: one target per entry
+    id, reserved off that id's combined open size.
+
+    :param position: The position whose entry book is scanned.
+    :param entry_id: The ``from_entry`` to bind to, or None for all entries
+    :return: One ``(entry_seq, entry_id, sign, original size)`` tuple per target.
+    """
+    if isinstance(position, SimPosition):
+        book = [b for b in position._entry_book
+                if entry_id is None or b.entry_id == entry_id]
+        # A position a gap-committed exit leg opened (see Order.gap_committed)
+        # takes its leg BEFORE the entries that were already open. MEASURED on
+        # TradingView (BINANCE:BTCUSDT 30m): closing long 1 / short 5 + exit-leg
+        # 1 with one from_entry-less strategy.exit reports the closed rows as
+        # 1, 4, 1 -- the exit-opened leg's single unit is taken off the OLDEST
+        # trade first, splitting it -- while the same exit over two plain
+        # pyramid adds (1 and 2) reports a clean 1, 2.
+        book.sort(key=lambda b: not b.exit_opened)
+        return [(b.seq, b.entry_id or "", b.sign, b.init_size) for b in book]
+    grouped: dict[str, list[float]] = {}
+    for open_trade in position.open_trades:
+        trade_id = open_trade.entry_id or ""
+        if entry_id is not None and open_trade.entry_id != entry_id:
+            continue
+        slot = grouped.setdefault(trade_id, [0.0, 0.0])
+        slot[0] = open_trade.sign
+        slot[1] += abs(open_trade.init_size)
+    return [(None, trade_id, slot[0], slot[1]) for trade_id, slot in grouped.items()]
+
+
+# noinspection PyProtectedMember
+def _exit_pending_size(position: PositionBase, entry_id: str) -> tuple[float, float]:
+    """Sign and bindable size of a still-pending entry order, at its CURRENT size.
+
+    A leg issued against it carries no ``entry_seq`` until the order fills;
+    :meth:`SimPosition._bind_entry` then hands it to the entry it produced.
+
+    :param position: The position whose entry order book is read.
+    :param entry_id: The entry id to look up.
+    :return: The order's sign and its bindable size; ``(0.0, 0.0)`` with no such order.
+    """
+    sign = 0.0
+    total = 0.0
+    pending = position.entry_orders.get(entry_id)
+    if pending is not None:
+        sign = pending.sign
+        # Only the not-yet-filled remainder of the entry order counts. The
+        # backtest simulator removes a market entry order on fill, so
+        # ``filled_qty`` stays 0.0 and this is simply ``abs(pending.size)``.
+        # The live broker keeps the entry Order in ``entry_orders`` for
+        # intent stability while ``record_fill`` moves the filled slice into
+        # ``open_trades``; counting the full order size there would
+        # double-count the fill and over-reserve the exit (issue BYBIT-001).
+        # A market entry that adds to a same-direction position is re-checked
+        # against the pyramiding limit when it is processed and dropped there
+        # without ever reaching the position, so it must not enlarge the slice
+        # this leg reserves. The inflated reservation would also be sticky: on
+        # the next bar the sibling leg finds nothing unreserved left and keeps
+        # its own oversized share, so a qty_percent leg goes on closing the
+        # whole position. TradingView keeps such an exit at half the position
+        # that actually exists -- measured on the CAPITALCOM:EURUSD 30m
+        # reference of the "TradingView Alerts to MT4 MT5" strategy, whose
+        # ``GoShort`` fires again while the short is already open.
+        rejected_pyramid = (pending.limit is None and pending.stop is None
+                            and position.sign == pending.sign
+                            and lib._script.pyramiding <= position._pyramid_count())
+        unfilled = 0.0 if rejected_pyramid else abs(pending.size) - pending.filled_qty
+        # Only the part of a reversal order that actually OPENS is bindable: the
+        # rest closes the opposite position, which carries its own bracket. A
+        # market order whose flip is still added at processing already carries
+        # the openable size; an order that has the flip baked in (a price-based
+        # entry, or one whose flip was consumed by the order it replaced) does
+        # not. Counting the closing leg here reserved half of the ORDER instead
+        # of half of the position, so a sibling leg then found nothing left and
+        # the whole sticky bracket stopped re-issuing its updated stop.
+        flip_pending = (pending.limit is None and pending.stop is None
+                        and not pending.skip_flip)
+        if not flip_pending and position.size != 0.0 and position.sign != pending.sign:
+            # A price-based entry FROZE its augmentation at placement time
+            # (``_size_flippable_by_entry``), so only that much of the order
+            # closes the opposite position — reading the live position instead
+            # subtracts a close the order never carries. It reads zero whenever
+            # the script flattens with its own ``strategy.close`` before placing
+            # the entry, and the whole sticky bracket then bound nothing and
+            # never armed. A market order that skipped its flip keeps carrying
+            # the live position.
+            priced = pending.limit is not None or pending.stop is not None
+            unfilled -= pending.flip_extra if priced else abs(position.size)
+        if unfilled > 0.0:
+            total += unfilled
+    return sign, total
+
+
 # noinspection PyShadowingBuiltins,PyProtectedMember,PyShadowingNames,PyUnusedLocal,unused-parameter
 def exit(id: str, from_entry: str = "",
          qty: PyneFloat = na_float, qty_percent: PyneFloat = na_float,
@@ -6688,313 +7112,35 @@ def exit(id: str, from_entry: str = "",
         return
 
     direction = 0
-    size = 0.0
     init_size = 0.0
     entry_seq: int | None = None
-
-    # noinspection PyProtectedMember,PyShadowingNames
-    def _exit():
-        nonlocal limit, stop, trail_price, from_entry, direction, size
-
-        # Sticky bracket (TV semantics): a leg is identified by (id, from_entry,
-        # entry_seq) — TradingView issues one leg per FILLED ENTRY, so two pyramid
-        # adds sharing a from_entry id get a leg each and each is consumed on its
-        # own. ``entry_seq`` is None only while the leg still waits on a pending
-        # entry order; :meth:`SimPosition._bind_entry` hands it over on the fill.
-        # Re-issuing it every bar updates its prices, but a leg that already fired
-        # its slice must not be resurrected (the ``consumed`` tombstone). The
-        # reservation is recomputed from ``init_size`` on every issue: that is the
-        # ORIGINAL size of the entry it is bound to — frozen at the fill, so
-        # margin-call shrinkage does not erode it — or, for a leg still waiting on
-        # an entry order, that order's CURRENT size, so a pending entry re-sized
-        # bar-to-bar keeps being tracked (locking the first bar's size would
-        # under-close the eventual fill and strand a sliver).
-        exit_key = _exit_key(id, from_entry, entry_seq)
-        existing = position.exit_orders.get(exit_key)
-        if existing is not None and existing.consumed:
-            return
-
-        is_rest_leg = not (qty == qty) and not (qty_percent == qty_percent)  # is_na_arg
-        # Sibling legs reserve slices of the SAME entry first-come-first-served
-        # (consumed siblings keep their reservation until the entry fully
-        # closes). Only sticky exit legs (book_seq is None) count as siblings;
-        # a stacked strategy.close()/close_all() partial (book_seq set) is an
-        # immediate market close, not a reservation against this leg.
-        # A sibling that reserved its slice against a DIFFERENT bound size holds a
-        # stale share: the entry order it waits on was re-placed at a smaller size.
-        # It re-derives its own slice the next time the script issues it, so it must
-        # not block this leg in the meantime -- otherwise a shrunk bracket stays
-        # frozen at its first size and stops tracking the stop level the script
-        # keeps moving.
-        # A leg restored by ``BrokerPosition.reconstruct_exit_order`` after a restart
-        # carries no basis at all (``bound_size`` stays 0.0, which no issued leg can
-        # have -- a zero bound reserves nothing and returns above). It still holds a
-        # real live broker reservation, so it counts until the script re-issues it
-        # and stamps its own basis; skipping it would let the reissued sibling
-        # reserve the whole entry and protect more exposure than the script allocated.
-        bound = abs(init_size)
-        sibling = sum(o.reserved_size for o in position.exit_orders.values()
-                      if o.entry_seq == entry_seq and o.order_id == from_entry
-                      and o is not existing
-                      and o.book_seq is None
-                      and (o.bound_size == bound or o.bound_size == 0.0))
-        unreserved = bound - sibling
-        # A qty/qty_percent leg is capped at the unreserved remainder --
-        # TradingView never lets a later exit call take a slice a pre-existing
-        # leg already holds. Verified on live TV (BINANCE:BTCUSDT 30m probes):
-        # a late qty_percent=50 or qty=1 leg issued while a no-qty stop leg
-        # holds 100% never creates an order (553/553 cycles), and against a
-        # qty_percent=75 stop leg the same call is reduced to the remaining
-        # 25% instead of being dropped.
-        if qty == qty:
-            reserved = min(abs(qty), unreserved)
-        elif qty_percent == qty_percent:
-            reserved = min(abs(init_size) * (qty_percent * 0.01), unreserved)
-        else:
-            # No-qty "rest" leg: the whole unreserved remainder, so it never
-            # over-closes the position.
-            reserved = unreserved
-
-        # The Pine-side lot floor is a backtest-only quantization. Broker
-        # positions can be smaller than syminfo.mincontract after venue-domain
-        # conversion, so preserve the raw reservation for plugin quantization.
-        if isinstance(position, SimPosition):
-            if qty == qty and abs(qty) < unreserved:
-                reserved = _explicit_qty_round(abs(qty))
-            else:
-                reserved = _size_round(reserved)
-        if reserved <= 0.0:
-            return
-        size = -direction * reserved
-
-        # Store tick values for later calculation when entry price is known
-        profit_ticks: float | None = _na_to_none(profit)
-        loss_ticks: float | None = _na_to_none(loss)
-        trail_points_ticks: float | None = _na_to_none(trail_points)
-        # TradingView truncates a fractional ``trail_offset`` tick count to
-        # whole ticks (like its qty precision). Verified against a TV
-        # reference (BINANCE:BTCUSDT 30m, ``trail_points=trail_offset=
-        # atr*mult``): TV's trailing fills land at ``water mark -/+
-        # floor(offset_ticks) * mintick``, while fractional ticks would round
-        # half the fills one tick further. ``trail_points`` stays fractional:
-        # the activation price resolves with directional tick-rounding
-        # (bracket trail probe 91, ``trail_points=atr``, matches TV that way).
-        _trail_offset = _na_to_none(trail_offset)
-        if _trail_offset is not None:
-            _trail_offset = float(int(_trail_offset))
-        _trail_price = _na_to_none(trail_price)
-
-        # A missing ``trail_offset`` does NOT disable the trailing leg. TradingView's
-        # compile rule only requires the offset when the trailing pair is the
-        # exit's SOLE trigger; alongside ``stop``/``limit`` the call compiles, and the
-        # TV reference exports (pynecomp bracket trail probes 88-91) prove the trailing
-        # stop arms with an offset of 0 ticks. The offset-0 default is applied at
-        # ``Order`` construction.
-
-        # An exit must arm at least one trigger. TradingView treats a call whose
-        # price/tick args ALL resolve to na as a no-op -- e.g. brackets computed
-        # from a flat position_avg_price (na) on a bar before the entry fills --
-        # not a level-less market close that fires at the next open.
-        if (not (limit == limit or stop == stop or profit == profit or loss == loss)
-                and _trail_price is None and trail_points_ticks is None):
-            return
-
-        _limit = _na_to_none(limit)
-        if _limit is not None:
-            _limit = _price_round(_limit, direction)
-        _stop = _na_to_none(stop)
-        if _stop is not None:
-            _stop = _price_round(_stop, -direction)
-        if _trail_price is not None:
-            _trail_price = _price_round(_trail_price, -direction)
-
-        # Default OCA settings for strategy.exit() - matches TradingView behavior.
-        # Pine's strategy.exit() has no oca_type parameter: its legs always form a
-        # reduce group. If no oca_name is specified, create a default one. It is
-        # per ENTRY as well as per exit id: the legs TradingView issues for two
-        # pyramid adds are independent, so one add's fill must not reduce the
-        # other's leg. The name is built into a local -- assigning the caller's
-        # ``oca_name`` would leak the first entry's group onto every later leg.
-        leg_oca = oca_name
-        if isinstance(leg_oca, NA):
-            # Use a unique name based on the exit id and from_entry
-            leg_oca = f"__exit_{id}_{from_entry}_{entry_seq}_oca__"
-
-        # Add order
-        order = Order(
-            from_entry, size, exit_id=id, order_type=_order_type_close,
-            limit=_limit, stop=_stop,
-            trail_price=_trail_price, trail_offset=_trail_offset,
-            profit_ticks=profit_ticks, loss_ticks=loss_ticks, trail_points_ticks=trail_points_ticks,
-            oca_name=_na_to_none(leg_oca), oca_type=_oca.reduce,
-            comment=_na_to_none(comment),
-            alert_message=_na_to_none(alert_message),
-            comment_profit=_na_to_none(comment_profit),
-            comment_loss=_na_to_none(comment_loss),
-            comment_trailing=_na_to_none(comment_trailing),
-            alert_profit=_na_to_none(alert_profit),
-            alert_loss=_na_to_none(alert_loss),
-            alert_trailing=_na_to_none(alert_trailing)
-        )
-
-        # Sticky bracket (TV semantics): a re-issued live trailing leg keeps its
-        # activated high/low-water mark ONLY when the trailing parameters are
-        # unchanged. TradingView carries ONE logical trailing stop across
-        # identical re-issues -- a fresh Order must inherit the ratcheted
-        # ``trail_stop`` instead of re-arming at the bare activation level every
-        # bar, which would leave the stop permanently one or more bars behind
-        # the carried water mark. A re-issue with CHANGED trailing parameters
-        # (a per-bar recomputed atr-based trail, a stricter activation rebased
-        # on a pyramid add, ...) is a cancel+replace: the armed state and the
-        # carried water mark are dropped and the replaced leg re-arms from the
-        # issue bar's CLOSE tick (see ``_seed_trail_at_issue``); the prior
-        # bars' extremes stay out of its water mark. Verified against a TV
-        # reference (BINANCE:BTCUSDT 30m, per-bar ``trail_points=atr*mult``):
-        # TV's re-armed stop anchored to the issue bar's close instead of
-        # carrying the prior high-water mark. The activation is compared in
-        # the form it was given -- ``existing.trail_price`` may hold a
-        # points-resolved value, so the entry-anchored ``trail_points`` form
-        # compares tick counts.
-        had_trail = False
-        trail_unchanged = False
-        if existing is not None and (
-                existing.trail_price is not None or existing.trail_points_ticks is not None):
-            had_trail = True
-            trail_unchanged = (
-                    existing.trail_offset == order.trail_offset
-                    and ((order.trail_points_ticks is not None
-                          and existing.trail_points_ticks == order.trail_points_ticks)
-                         or (order.trail_points_ticks is None
-                             and existing.trail_points_ticks is None
-                             and existing.trail_price == order.trail_price)))
-            if trail_unchanged and existing.trail_triggered:
-                order.trail_triggered = True
-                order.trail_stop = existing.trail_stop
-
-        order.rest_leg = is_rest_leg
-        order.bound_size = bound
-        order.entry_seq = entry_seq
-        # Kept as issued: a pyramid add filling later inherits a leg off this call
-        # without the script re-stating it (see SimPosition._spawn_legs_for_add).
-        order.issue_spec = (_limit, _stop, _trail_price,
-                            qty if qty == qty else None,
-                            qty_percent if qty_percent == qty_percent else None,
-                            _na_to_none(oca_name))
-        position._add_order(order)
-        # Only an identical re-issue folds the issue bar's extreme into the water
-        # mark -- and there it is a no-op, since the carried leg was already
-        # walked through this bar. A brand-new leg (first issue, or trailing added
-        # to a live bracket) and a changed-params re-issue both anchor to the
-        # issue bar's CLOSE tick (see ``_seed_trail_at_issue``).
-        position._seed_trail_at_issue(order, fold_extreme=had_trail and trail_unchanged)
-
-    # noinspection PyProtectedMember
-    def _filled_targets(entry_id: str | None) -> list[tuple[int | None, str, float, float]]:
-        """``(entry_seq, entry_id, sign, ORIGINAL size)`` per entry an exit binds to.
-
-        TradingView issues ONE leg per FILLED ENTRY, so two pyramid adds sharing a
-        ``from_entry`` id each get their own leg reserved off their own entry size
-        — and each is consumed on its own, which is why a bracket can fire again
-        for a later add after it already fired for the first. The live broker has
-        no binding book, so it keeps the pre-fan-out shape: one target per entry
-        id, reserved off that id's combined open size.
-
-        :param entry_id: The ``from_entry`` to bind to, or None for all entries
-        """
-        if isinstance(position, SimPosition):
-            book = [b for b in position._entry_book
-                    if entry_id is None or b.entry_id == entry_id]
-            # A position a gap-committed exit leg opened (see Order.gap_committed)
-            # takes its leg BEFORE the entries that were already open. MEASURED on
-            # TradingView (BINANCE:BTCUSDT 30m): closing long 1 / short 5 + exit-leg
-            # 1 with one from_entry-less strategy.exit reports the closed rows as
-            # 1, 4, 1 -- the exit-opened leg's single unit is taken off the OLDEST
-            # trade first, splitting it -- while the same exit over two plain
-            # pyramid adds (1 and 2) reports a clean 1, 2.
-            book.sort(key=lambda b: not b.exit_opened)
-            return [(b.seq, b.entry_id or "", b.sign, b.init_size) for b in book]
-        grouped: dict[str, list[float]] = {}
-        for open_trade in position.open_trades:
-            trade_id = open_trade.entry_id or ""
-            if entry_id is not None and open_trade.entry_id != entry_id:
-                continue
-            slot = grouped.setdefault(trade_id, [0.0, 0.0])
-            slot[0] = open_trade.sign
-            slot[1] += abs(open_trade.init_size)
-        return [(None, trade_id, slot[0], slot[1]) for trade_id, slot in grouped.items()]
-
-    # noinspection PyProtectedMember
-    def _pending_size(entry_id: str) -> tuple[float, float]:
-        """Sign and bindable size of a still-pending entry order, at its CURRENT size.
-
-        A leg issued against it carries no ``entry_seq`` until the order fills;
-        :meth:`SimPosition._bind_entry` then hands it to the entry it produced.
-        """
-        sign = 0.0
-        total = 0.0
-        pending = position.entry_orders.get(entry_id)
-        if pending is not None:
-            sign = pending.sign
-            # Only the not-yet-filled remainder of the entry order counts. The
-            # backtest simulator removes a market entry order on fill, so
-            # ``filled_qty`` stays 0.0 and this is simply ``abs(pending.size)``.
-            # The live broker keeps the entry Order in ``entry_orders`` for
-            # intent stability while ``record_fill`` moves the filled slice into
-            # ``open_trades``; counting the full order size there would
-            # double-count the fill and over-reserve the exit (issue BYBIT-001).
-            # A market entry that adds to a same-direction position is re-checked
-            # against the pyramiding limit when it is processed and dropped there
-            # without ever reaching the position, so it must not enlarge the slice
-            # this leg reserves. The inflated reservation would also be sticky: on
-            # the next bar the sibling leg finds nothing unreserved left and keeps
-            # its own oversized share, so a qty_percent leg goes on closing the
-            # whole position. TradingView keeps such an exit at half the position
-            # that actually exists -- measured on the CAPITALCOM:EURUSD 30m
-            # reference of the "TradingView Alerts to MT4 MT5" strategy, whose
-            # ``GoShort`` fires again while the short is already open.
-            rejected_pyramid = (pending.limit is None and pending.stop is None
-                                and position.sign == pending.sign
-                                and lib._script.pyramiding <= position._pyramid_count())
-            unfilled = 0.0 if rejected_pyramid else abs(pending.size) - pending.filled_qty
-            # Only the part of a reversal order that actually OPENS is bindable: the
-            # rest closes the opposite position, which carries its own bracket. A
-            # market order whose flip is still added at processing already carries
-            # the openable size; an order that has the flip baked in (a price-based
-            # entry, or one whose flip was consumed by the order it replaced) does
-            # not. Counting the closing leg here reserved half of the ORDER instead
-            # of half of the position, so a sibling leg then found nothing left and
-            # the whole sticky bracket stopped re-issuing its updated stop.
-            flip_pending = (pending.limit is None and pending.stop is None
-                            and not pending.skip_flip)
-            if not flip_pending and position.size != 0.0 and position.sign != pending.sign:
-                # A price-based entry FROZE its augmentation at placement time
-                # (``_size_flippable_by_entry``), so only that much of the order
-                # closes the opposite position — reading the live position instead
-                # subtracts a close the order never carries. It reads zero whenever
-                # the script flattens with its own ``strategy.close`` before placing
-                # the entry, and the whole sticky bracket then bound nothing and
-                # never armed. A market order that skipped its flip keeps carrying
-                # the live position.
-                priced = pending.limit is not None or pending.stop is not None
-                unfilled -= pending.flip_extra if priced else abs(position.size)
-            if unfilled > 0.0:
-                total += unfilled
-        return sign, total
 
     # Find direction and size
     if from_entry:
         # One leg per filled entry, plus one for a still-pending entry order.
         # The position should be open, or an entry order should exist.
-        for entry_seq, _target_id, direction, init_size in _filled_targets(from_entry):
-            _exit()
-        direction, init_size = _pending_size(from_entry)
+        for entry_seq, _target_id, direction, init_size in _exit_filled_targets(position, from_entry):
+            _exit_leg(position, id, from_entry, entry_seq, direction, init_size,
+                      qty, qty_percent, profit, limit, loss, stop,
+                      trail_price, trail_points, trail_offset, oca_name,
+                      comment, comment_profit, comment_loss, comment_trailing,
+                      alert_message, alert_profit, alert_loss, alert_trailing)
+        direction, init_size = _exit_pending_size(position, from_entry)
         if direction:
             entry_seq = None
-            _exit()
+            _exit_leg(position, id, from_entry, entry_seq, direction, init_size,
+                      qty, qty_percent, profit, limit, loss, stop,
+                      trail_price, trail_points, trail_offset, oca_name,
+                      comment, comment_profit, comment_loss, comment_trailing,
+                      alert_message, alert_profit, alert_loss, alert_trailing)
 
     else:
-        for entry_seq, from_entry, direction, init_size in _filled_targets(None):
-            _exit()
+        for entry_seq, from_entry, direction, init_size in _exit_filled_targets(position, None):
+            _exit_leg(position, id, from_entry, entry_seq, direction, init_size,
+                      qty, qty_percent, profit, limit, loss, stop,
+                      trail_price, trail_points, trail_offset, oca_name,
+                      comment, comment_profit, comment_loss, comment_trailing,
+                      alert_message, alert_profit, alert_loss, alert_trailing)
         in_position = bool(direction)
 
         # A still-pending entry order is a target too -- but only one that OPENS
@@ -7018,13 +7164,17 @@ def exit(id: str, from_entry: str = "",
             if in_position and order.sign != position.sign:
                 continue
             from_entry = order.order_id or ""
-            direction, init_size = _pending_size(from_entry)
+            direction, init_size = _exit_pending_size(position, from_entry)
             if not direction:
                 continue
             # Only mark as from_entry_na on first creation (not replacement)
             exit_key = _exit_key(id, from_entry)
             had_existing_exit = exit_key in position.exit_orders
-            _exit()
+            _exit_leg(position, id, from_entry, entry_seq, direction, init_size,
+                      qty, qty_percent, profit, limit, loss, stop,
+                      trail_price, trail_points, trail_offset, oca_name,
+                      comment, comment_profit, comment_loss, comment_trailing,
+                      alert_message, alert_profit, alert_loss, alert_trailing)
             if not had_existing_exit:
                 exit_order = position.exit_orders.get(exit_key)
                 if exit_order is not None:
