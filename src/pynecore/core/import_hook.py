@@ -7,6 +7,11 @@ import importlib.machinery
 import re
 from pathlib import Path
 
+# A leaf module (stdlib imports only), and imported here rather than inside the
+# loader on purpose: the loader runs it over pynecore's own modules, so a lazy
+# import would have the hook load the pass through itself
+from pynecore.transformers.type_erasure import erase_type_calls, has_erasure_marker
+
 if TYPE_CHECKING:
     import ast
 
@@ -24,6 +29,15 @@ __all__ = ['PYNE_RESERVED_NAME_CHAR', 'PIPELINE_DIGEST', 'security_slice_disable
 # pipeline hash in ``co_consts`` — certifies a loaded code object as current
 # pipeline output, so foreign or stale bytecode can be told apart and dropped.
 _PYNE_SENTINEL = '__pyne_transformed__'
+
+# The same certificate for a PLAIN module of the pynecore package, which gets the
+# type erasure pass and nothing else (see ``PyneLoader._compile_plain``). It is
+# paired with ``_get_type_erasure_hash``, not with the pipeline hash: what such a
+# module's bytecode depends on is that one pass.
+_PYNE_ERASED_SENTINEL = '__pyne_type_erased__'
+
+#: Directory of the pynecore package, the scope of the plain-module erasure
+_PACKAGE_DIR = str(Path(__file__).resolve().parent.parent) + os.sep
 
 # Name of the constant a transformed module carries its type dependencies in, and
 # the first element of that constant's tuple. A ``.pyc`` holds many tuples; this
@@ -248,6 +262,38 @@ def _get_transform_pipeline_hash() -> str:
     return _transform_pipeline_hash
 
 
+_type_erasure_hash: str | None = None
+
+
+def _get_type_erasure_hash() -> str:
+    """Return a content digest of the type erasure pass.
+
+    Bytecode of a plain pynecore module is current when it was compiled through
+    this exact pass; the rest of the pipeline never touches such a module, so its
+    cache must not be dropped whenever some other transformer changes.
+
+    :return: Hex digest pinning the pass.
+    """
+    global _type_erasure_hash
+    if _type_erasure_hash is None:
+        source = Path(__file__).parent.parent / "transformers" / "type_erasure.py"
+        try:
+            data = source.read_bytes()
+        except OSError:
+            data = b''
+        _type_erasure_hash = hashlib.sha256(b'type_erasure:' + data).hexdigest()[:16]
+    return _type_erasure_hash
+
+
+def _in_package(source_path: str) -> bool:
+    """Whether a source file belongs to the pynecore package.
+
+    :param source_path: Path of the module's source.
+    :return: True for a module the loader runs the type erasure over.
+    """
+    return os.path.realpath(source_path).startswith(_PACKAGE_DIR)
+
+
 #: The pipeline every transformed module in this process was produced by, taken
 #: once at import. It is the public face of ``_get_transform_pipeline_hash``:
 #: PyneAOT writes it into its bundle so a bundle built by one pipeline can be
@@ -469,6 +515,9 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
 
     transformed = ImportLifterTransformer().visit(transformed)
     transformed = TypeCheckingStripperTransformer().visit(transformed)
+    # Before import normalization: the pass trusts a callee by the module's own
+    # ``typing`` imports, which it reads as written
+    transformed = erase_type_calls(transformed)
     # The builtin-namespace fallback must run before import normalization
     # so the lib.<ns>.<name> chains it emits get their imports added there
     transformed = BuiltinShadowTransformer().visit(transformed)
@@ -796,29 +845,48 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
         except OSError:
             head = b''
 
-        # Only transformed modules carry the sentinel; leave everything else untouched.
         # ``get_code`` is typed Optional, but a real source file always yields a code
         # object — the ``None`` guard just narrows the type for the checks below.
-        if code is None or not source_starts_with_pyne(head):
+        if code is None:
             return code
+
+        if not source_starts_with_pyne(head):
+            # A plain module of the pynecore package is compiled through the type
+            # erasure pass. Foreign bytecode of one runs correctly, only slower, and
+            # pip's post-install ``compileall`` would make that the permanent state
+            # of every installation — so it is told apart like a transformed module.
+            erasure_hash = _get_type_erasure_hash()
+            if _PYNE_ERASED_SENTINEL in code.co_names and erasure_hash in code.co_consts:
+                return code
+            if not _in_package(source_path):
+                return code
+            try:
+                data = self.get_data(source_path)
+            except OSError:
+                return code
+            if not has_erasure_marker(data):
+                return code
+            return self._retransform(fullname, source_path, _PYNE_ERASED_SENTINEL,
+                                     erasure_hash)
 
         pipeline_hash = _get_transform_pipeline_hash()
         if _PYNE_SENTINEL not in code.co_names or pipeline_hash not in code.co_consts:
-            return self._retransform(fullname, source_path, pipeline_hash)
+            return self._retransform(fullname, source_path, _PYNE_SENTINEL, pipeline_hash)
 
         # The pipeline is current, but the types this module was compiled against
         # live in OTHER modules; an edit to one of their interfaces makes this
         # bytecode wrong while CPython still sees a valid cache for it.
         if _deps_current(code, pipeline_hash):
             return code
-        return self._retransform(fullname, source_path, pipeline_hash)
+        return self._retransform(fullname, source_path, _PYNE_SENTINEL, pipeline_hash)
 
-    def _retransform(self, fullname: str, source_path: str, pipeline_hash: str):
+    def _retransform(self, fullname: str, source_path: str, sentinel: str, digest: str):
         """Drop bytecode the checks rejected and produce the current transform.
 
         :param fullname: Fully-qualified module name being loaded.
         :param source_path: Path to the module's ``.py`` source.
-        :param pipeline_hash: Digest the recompiled code object has to carry.
+        :param sentinel: Name of the certificate the recompiled code object has to carry.
+        :param digest: Digest that certificate has to be paired with.
         :return: The compiled code object.
         """
         # Foreign, stale or dependency-invalidated bytecode slipped past CPython's
@@ -829,7 +897,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
         except OSError:
             pass  # no cached bytecode, or a read-only cache dir: nothing to drop
         code = super().get_code(fullname)
-        if code is None or (_PYNE_SENTINEL in code.co_names and pipeline_hash in code.co_consts):
+        if code is None or (sentinel in code.co_names and digest in code.co_consts):
             return code
 
         # The stale ``.pyc`` could not be removed (read-only / locked cache) and still
@@ -851,7 +919,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
         # docstring (e.g. standalone.py); the strict docstring check below still gates it.
         data_str = data.decode('utf-8') if isinstance(data, bytes) else data
         if not re.search(r'@pyne(\s|["\']|$)', data_str):
-            return compile(data, path, 'exec', optimize=_optimize)
+            return self._compile_plain(data, data_str, path, _optimize)
 
         import ast
 
@@ -907,7 +975,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
                         # too: what replaced this source need not be Pyne code
                         is_pyne_module, pyne_mode = _module_mode(tree)
                         if not is_pyne_module:
-                            return compile(tree, path, 'exec', optimize=_optimize)
+                            return self._compile_plain(tree, data_str, path, _optimize)
 
             pipeline_hash = _get_transform_pipeline_hash()
             # Read off the source tree: the analysis rewrites the decorator
@@ -994,10 +1062,47 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
                 transformed.body = body
             ast.fix_missing_locations(transformed)
 
-            tree = transformed
+            # Let Python handle bytecode caching
+            return compile(transformed, path, 'exec', optimize=_optimize)
 
-        # Let Python handle bytecode caching
-        return compile(tree, path, 'exec', optimize=_optimize)
+        return self._compile_plain(tree, data_str, path, _optimize)
+
+    @staticmethod
+    def _compile_plain(source: "bytes | str | ast.Module", text: str, path: Path,
+                       optimize: int):
+        """Compile a module that is not Pyne code.
+
+        Nothing of the pipeline applies to it. The one exception is a module of the
+        pynecore package itself: the builtins a script calls millions of times live
+        there, and the narrowing casts in them are erased (see
+        ``transformers.type_erasure``). Such a module carries its own certificate,
+        which ``get_code`` checks a cached ``.pyc`` against.
+
+        :param source: What to compile: the source as the loader read it, or the
+                       tree when the module has been parsed already.
+        :param text: The decoded source, for the prefilter.
+        :param path: Source path.
+        :param optimize: Optimization level handed through to ``compile``.
+        :return: The compiled code object.
+        """
+        if not has_erasure_marker(text) or not _in_package(str(path)):
+            return compile(source, path, 'exec', optimize=optimize)
+
+        import ast
+
+        tree = source if isinstance(source, ast.Module) else ast.parse(text)
+        tree = erase_type_calls(tree)
+        # After the docstring and any ``from __future__`` imports, which must lead
+        insert_at = 0 if ast.get_docstring(tree, clean=False) is None else 1
+        while (insert_at < len(tree.body)
+               and isinstance(tree.body[insert_at], ast.ImportFrom)
+               and cast(ast.ImportFrom, tree.body[insert_at]).module == '__future__'):
+            insert_at += 1
+        tree.body.insert(insert_at, ast.Assign(
+            targets=[ast.Name(id=_PYNE_ERASED_SENTINEL, ctx=ast.Store())],
+            value=ast.Constant(value=_get_type_erasure_hash())))
+        ast.fix_missing_locations(tree)
+        return compile(tree, path, 'exec', optimize=optimize)
 
 
 class PyneImportHook:

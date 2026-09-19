@@ -46,23 +46,24 @@ PyneCore applies several key transformations to Python code to make it behave li
 
 1. **Import Lifter** - Moves function-level imports to module level
 2. **TYPE_CHECKING Stripper** - Removes `if TYPE_CHECKING:` blocks (IDE-only hints)
-3. **Builtin Shadow Transformer** - Routes shadowed-alias accesses the library cannot serve back to the built-in namespace
-4. **Import Normalizer** - Standardizes import statements
-5. **Outer Write Transformer** - Rejects writes into an object created outside a function
-6. **Security Transformer** - Rewrites `request.security()` calls into signal/write/read/wait pattern
+3. **Type Erasure** - Replaces `typing.cast(T, x)` with `x` and resolves `if TYPE_CHECKING:`
+4. **Builtin Shadow Transformer** - Routes shadowed-alias accesses the library cannot serve back to the built-in namespace
+5. **Import Normalizer** - Standardizes import statements
+6. **Outer Write Transformer** - Rejects writes into an object created outside a function
+7. **Security Transformer** - Rewrites `request.security()` calls into signal/write/read/wait pattern
    (see [request.security() Internals](./request-security-internals.md))
-7. **PersistentSeries Transformer** - Splits the hybrid PersistentSeries type
-8. **Library Series Transformer** - Prepares library Series variables
-9. **Module Property Transformer** - Handles module properties
-10. **Closure Arguments Transformer** - Converts closure variables to function arguments
-11. **Unused Series Detector** - Removes unnecessary Series annotations for performance
-12. **Series Transformer** - Handles Series variables
-13. **Persistent Transformer** - Manages persistent variables
-14. **Function Isolation Transformer** - Ensures separate state for each function call
-15. **Input Transformer** - Processes input parameters
-16. **Safe Convert Transformer** - Lowers the `float()`/`int()` casts to their Pine forms and truncates
+8. **PersistentSeries Transformer** - Splits the hybrid PersistentSeries type
+9. **Library Series Transformer** - Prepares library Series variables
+10. **Module Property Transformer** - Handles module properties
+11. **Closure Arguments Transformer** - Converts closure variables to function arguments
+12. **Unused Series Detector** - Removes unnecessary Series annotations for performance
+13. **Series Transformer** - Handles Series variables
+14. **Persistent Transformer** - Manages persistent variables
+15. **Function Isolation Transformer** - Ensures separate state for each function call
+16. **Input Transformer** - Processes input parameters
+17. **Safe Convert Transformer** - Lowers the `float()`/`int()` casts to their Pine forms and truncates
     a Pine int where a Python-native consumer needs a real `int`
-17. **Safe Division Transformer** - Protects against division by zero
+18. **Safe Division Transformer** - Protects against division by zero
 
 This order ensures that dependencies between transformations are properly handled. For example, PersistentSeries transformation must happen before both Persistent and Series transformations, and Function Isolation must run after them because it routes calls based on the state slots they allocated.
 
@@ -113,7 +114,38 @@ Key aspects:
 
 ### TYPE_CHECKING Stripper
 
-Removes `if TYPE_CHECKING:` blocks and the `TYPE_CHECKING` import itself. These blocks carry IDE-only type hints (casts, re-annotations) that have no runtime role, so stripping them keeps the transformed module free of dead code.
+Removes `if TYPE_CHECKING:` blocks and the `TYPE_CHECKING` import itself; a statement's `else` body is what runs, so it is kept in the statement's place. These blocks carry IDE-only type hints (casts, re-annotations) that have no runtime role, so stripping them keeps the transformed module free of dead code.
+
+### Type Erasure
+
+`typing.cast(T, x)` exists for the static type checker only: at runtime it returns `x` unchanged, but it is still a Python-level function call. Inside a builtin that a script calls millions of times, that call costs more than the arithmetic around it. The pass rewrites the call to its value operand:
+
+```python
+b = cast(float, base)      # before
+b = base                   # after
+```
+
+An `if TYPE_CHECKING:` statement is resolved the same way. The name is `False` at runtime, so the statement is replaced by its `else` body, or dropped when it has none:
+
+```python
+if TYPE_CHECKING:          # before
+    import orjson as json
+else:
+    import json
+
+import json                # after
+```
+
+A rewrite happens only when it provably changes nothing:
+
+- the name (`cast`, `TYPE_CHECKING`) is bound by a module-level `from typing import ... [as name]` or `import typing [as name]`, and that name is bound nowhere else in the module (no assignment, parameter, definition, other import, `except ... as`, pattern capture, `global` or `del`). A module that rebinds the name keeps every call through it, so `ctypes.cast` or a local `cast` helper is never touched;
+- the call has exactly two positional operands, no keyword and no star operand;
+- the type operand is a plain type expression (names, attributes, subscripts, constants, tuples, lists and `|` unions of those), so dropping its evaluation loses no effect;
+- an `if` / `elif` is resolved only when its whole test is the trusted name; a compound test (`TYPE_CHECKING or x`) is left as written.
+
+The import statement stays in place.
+
+This is the one pass that also runs over PyneCore's **own plain modules** (`pynecore.lib.math`, `pynecore.lib.array`, `pynecore.core.series`, ...), which is where the casts on the hot path live. Such a module gets this pass and nothing else. Its bytecode carries a `__pyne_type_erased__` certificate paired with a digest of the pass, so a cached `.pyc` compiled without the import hook (`pip`'s post-install `compileall`, an IDE) is detected and recompiled, the same way a transformed `@pyne` module is. A package module that contains neither `cast(` nor `TYPE_CHECKING` is never parsed at all. Modules outside the `pynecore` package are left untouched unless they are `@pyne` code.
 
 ### Builtin Shadow Transformer
 
