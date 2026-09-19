@@ -41,13 +41,16 @@ def new(points: list[ChartPoint], curved: bool = False, closed: bool = False,
     if not points or len(points) == 0:
         return NA(Polyline)
 
-    # Check if any points are NA
+    # A polyline is immutable once created, so it keeps a snapshot of the points: later changes to
+    # the caller's array (clear/push reuse) or to its chart.point objects must not reshape it.
+    snapshot: list[ChartPoint] = []
     for point in points:
         if isinstance(point, NA):
             return NA(Polyline)
+        snapshot.append(ChartPoint(point.index, point.time, point.price))
 
     polyline_obj = Polyline(
-        points=points,
+        points=snapshot,
         curved=curved,
         closed=closed,
         xloc=xloc,
