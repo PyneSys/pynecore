@@ -178,6 +178,13 @@ Intent = EntryIntent | ExitIntent | CloseIntent
 
 CANCEL_TENTATIVE_STALE_GRACE_S = 10.0
 
+#: Restart pacing of :meth:`OrderSyncEngine.run_event_stream` after
+#: ``watch_orders`` died with an unexpected error (seconds; the last value
+#: repeats). The stream owns fill detection AND, on venues without a
+#: position object, the periodic inventory reconcile: a dead stream leaves
+#: the bot trading blind, so it is reopened instead of abandoned.
+EVENT_STREAM_RESTART_BACKOFF_S: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 30.0)
+
 #: Multiplier on ``execute_timeout`` for the write bridge's second wait: after
 #: the first window expires, :meth:`OrderSyncEngine._run_async_write` keeps
 #: waiting this many more windows for the plugin's OWN venue-call timeout to
@@ -2107,34 +2114,44 @@ class OrderSyncEngine:
         the *next* bar's ``bar_index``.  Logging here, on the broker event
         loop, captures the moment the broker actually observed the
         transition.
+
+        A stream that dies with an unexpected error is reopened with
+        bounded backoff (:data:`EVENT_STREAM_RESTART_BACKOFF_S`): the
+        plugin's ``watch_orders`` is the bot's only PUSH channel for fills
+        and cancels, so abandoning it would leave every later venue
+        transition unobserved while the strategy keeps dispatching. Only
+        a manual-intervention halt and cancellation end the task.
         """
         self._event_stream_task = asyncio.current_task()
-        try:
-            stream = self._broker.watch_orders()
-        except NotImplementedError:
-            _log.info(
-                "broker does not implement watch_orders; "
-                "reconcile() will poll for fills instead",
-            )
-            return
-        try:
-            async for event in stream:
-                _blog_info("event %s", event)
-                self._event_queue.put(event)
-        except NotImplementedError:
-            _log.info(
-                "broker does not implement watch_orders; "
-                "reconcile() will poll for fills instead",
-            )
-            return
-        except asyncio.CancelledError:
-            raise
-        except BrokerManualInterventionError as e:
-            self._record_halt(e)
-            raise
-        except Exception:  # pragma: no cover — defensive
-            _log.exception("watch_orders stream terminated with an error")
-            raise
+        attempt = 0
+        while True:
+            try:
+                stream = self._broker.watch_orders()
+                async for event in stream:
+                    _blog_info("event %s", event)
+                    self._event_queue.put(event)
+                return
+            except NotImplementedError:
+                _log.info(
+                    "broker does not implement watch_orders; "
+                    "reconcile() will poll for fills instead",
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except BrokerManualInterventionError as e:
+                self._record_halt(e)
+                raise
+            except Exception:
+                delay = EVENT_STREAM_RESTART_BACKOFF_S[
+                    min(attempt, len(EVENT_STREAM_RESTART_BACKOFF_S) - 1)]
+                attempt += 1
+                _log.exception(
+                    "watch_orders stream terminated with an error; "
+                    "reopening in %.0fs (attempt %d)", delay, attempt,
+                )
+                # Retry pacing tick, bounded by the backoff schedule.
+                await asyncio.sleep(delay)
 
     async def stop_event_stream(self) -> None:
         """Cancel the :meth:`run_event_stream` task and wait for it to unwind.
