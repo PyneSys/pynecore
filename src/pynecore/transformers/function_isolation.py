@@ -99,6 +99,7 @@ import types
 
 from ..core.pine_export import Exported
 from ..utils.stdlib_checker import is_stdlib
+from .call_inline import SUPPORT_ALIAS_PREFIX
 from .pine_type_rules import (get_pin, get_pins, get_ty, get_varying, get_vector,
                               stamp_lowering)
 # noinspection PyProtectedMember
@@ -502,6 +503,11 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         path = _get_func_path(func)
         if path is None:
             return _UNIFORM
+        if path.startswith(SUPPORT_ALIAS_PREFIX):
+            # An anchor of the call-inlining pass (see call_inline.py): a
+            # stdlib builtin or a stateless lib helper, imported under an
+            # alias no script can bind
+            return _SKIP
         if path in NON_TRANSFORMABLE_FUNCTIONS:
             return _SKIP
         parts = path.split('.')
