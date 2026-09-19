@@ -1,10 +1,10 @@
 """
 @pyne
 
-A ``Matrix`` in a var slot rolls back exactly like a Pine array (a list) or a
-Pine map (a dict): ``instance_state._copy_value`` deep-copies it, so neither the
-row storage nor a mutable element of a discarded re-execution reaches the
-restored baseline.
+A ``Matrix`` rolls back exactly like a Pine array (a list) or a Pine map (a
+dict): neither the row storage nor a mutable element of a discarded re-execution
+reaches the restored baseline, in a var slot and through
+``instance_state._copy_value`` alike.
 """
 from pynecore.core import instance_state
 from pynecore.lib import matrix as matrix_lib
