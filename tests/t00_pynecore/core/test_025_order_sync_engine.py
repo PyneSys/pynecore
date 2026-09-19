@@ -5087,6 +5087,70 @@ def __test_run_event_stream_handles_async_gen_not_implemented__():
     asyncio.run(engine.run_event_stream())
 
 
+def __test_run_event_stream_reopens_after_an_unexpected_error__(monkeypatch, caplog):
+    """A ``watch_orders`` that dies with an unexpected error is reopened, not abandoned.
+
+    The stream is the bot's only PUSH channel for fills; abandoning it after
+    one transport-layer surprise left a live bot dispatching orders for hours
+    without ever seeing their fills. The reopen is paced by
+    ``EVENT_STREAM_RESTART_BACKOFF_S``; the halt and cancel paths still end
+    the task."""
+    import logging
+    from pynecore.core.broker import sync_engine as se
+
+    b = MockBroker()
+    fill = _fill_event("buy", qty=1.0, price=50_000.0,
+                       pine_id="L", leg=LegType.ENTRY, xchg_id="x1")
+    calls = 0
+
+    def _flaky():
+        nonlocal calls
+        calls += 1
+        attempt = calls
+
+        async def _gen():
+            if attempt < 3:
+                raise RuntimeError(f"transport surprise {attempt}")
+            yield fill
+
+        return _gen()
+
+    slept: list[float] = []
+
+    async def _sleep(delay):
+        slept.append(delay)
+
+    monkeypatch.setattr(se.asyncio, "sleep", _sleep)
+    b.watch_orders = _flaky  # type: ignore[method-assign]
+    engine, _ = _mk_engine(b)
+
+    with caplog.at_level(logging.ERROR, logger=se._log.name):
+        asyncio.run(engine.run_event_stream())
+
+    assert calls == 3
+    assert slept == list(se.EVENT_STREAM_RESTART_BACKOFF_S[:2])
+    assert engine._event_queue.get_nowait() is fill
+    assert sum("reopening in" in r.getMessage() for r in caplog.records) == 2
+
+    # A manual-intervention halt still ends the task (and latches the halt).
+    def _halting():
+        async def _gen():
+            raise BrokerManualInterventionError("venue says stop")
+            yield  # pragma: no cover — unreachable
+
+        return _gen()
+
+    b.watch_orders = _halting  # type: ignore[method-assign]
+    engine, _ = _mk_engine(b)
+    try:
+        asyncio.run(engine.run_event_stream())
+    except BrokerManualInterventionError:
+        pass
+    else:
+        raise AssertionError("halt was swallowed by the reopen loop")
+    assert engine.halted
+
+
 def __test_stop_event_stream_waits_for_the_stream_to_fully_unwind__():
     """``stop_event_stream`` returns only after ``watch_orders`` unwound.
 
