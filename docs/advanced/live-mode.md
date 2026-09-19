@@ -116,6 +116,10 @@ meaningful during intra-bar re-executions — the same mechanism used by
   Every tick starts from the same baseline.
 - **`IBPersistent` (varip)**: **not** rolled back — accumulates across all ticks within the bar.
 
+Arrays, maps, matrices and UDT instances held by a `Persistent` are rolled back as objects, not
+replaced by copies: their content returns to the bar-open state, and two variables that name the
+same object keep naming the same object.
+
 ```python
 var_counter: Persistent[int] = 0
 varip_counter: IBPersistent[int] = 0

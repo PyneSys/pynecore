@@ -933,6 +933,32 @@ def main():
     log.info("the call site inside the loop cleared the flag")
 
 
+def __test_an_early_raise_clears_closed_shift__(log):
+    """A ``raise`` ahead of the write is an early exit like a ``return``"""
+    in_main = """
+@lib.script.indicator("t")
+def main():
+    if lib.close <= lib.open:
+        raise ValueError
+    shifted = lib.request.security(lib.syminfo.tickerid, "D", lib.close[1],
+                                   lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+"""
+    in_helper = """
+@lib.script.indicator("t")
+def main():
+    def htf(tf):
+        if lib.close <= lib.open:
+            raise ValueError
+        return lib.request.security(lib.syminfo.tickerid, tf, lib.close[1],
+                                    lookahead=lib.barmerge.lookahead_on)
+    lib.plot(htf("D"))
+"""
+    assert __test_helper_closed_shift(__test_helper_transform(in_main)) == [False]
+    assert __test_helper_closed_shift(__test_helper_transform(in_helper)) == [False]
+    log.info("the early raise cleared the flag in main and in a helper")
+
+
 def __test_an_early_return_in_a_helper_clears_closed_shift__(log):
     """An early exit ahead of the write may skip it for some bars"""
     source = """

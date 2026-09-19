@@ -116,7 +116,9 @@ The flag is cleared wherever the skipped rounds would be observable:
 - the context does not resolve to a higher timeframe, or it has dependents, consumers or gaps,
 - the child's code declares `varip` (`IBPersistent`) state, which is deliberately outside the
   re-tick rollback, or calls a library function whose own state is per execution (`ta.valuewhen`),
-- the context's write does not run on every round of the child.
+- the context's write does not run on every round of the child: it stands under a branch, or an
+  early `return` or a `raise` can be reached ahead of it, in `main()` or in a helper it is called
+  through.
 
 Everything else the child runs is restored by the re-tick rollback, which is what makes the skip
 unobservable. The one kind of state the rollback cannot restore is a plain Python object created at
