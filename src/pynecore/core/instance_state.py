@@ -167,6 +167,12 @@ def register_shared_cache(cache: dict) -> dict:
     return cache
 
 
+# Bumped by every state-vector creation. A callee subtree can only gain a
+# builtin machine through :func:`_make_state`, so an unchanged epoch means a
+# loop site's bar-start collect still lists exactly the machines under it.
+_state_epoch = 0
+
+
 def _make_state(layout: dict[str, Any]) -> list:
     """Instantiate a state vector from a layout entry.
 
@@ -177,6 +183,8 @@ def _make_state(layout: dict[str, Any]) -> list:
     :param layout: Layout entry (see module docstring).
     :return: New state vector.
     """
+    global _state_epoch
+    _state_epoch += 1
     state = list(layout['init'])
     compacted = layout.get('compacted', False)
     for slot, max_bars_back, elem in layout['series']:
@@ -341,11 +349,12 @@ def _snap_collected(vecs: list) -> list:
     return snaps
 
 
-def _snap_builtins(state: list, layout: dict[str, Any]) -> list:
-    """Bar-start snapshot of every builtin machine under a loop-site callee."""
+def _snap_builtins(state: list, layout: dict[str, Any]) -> tuple[int, list]:
+    """Bar-start snapshot of every builtin machine under a loop-site callee,
+    stamped with the state epoch it was collected at."""
     vecs: list = []
     _collect_builtins(state, layout, vecs)
-    return _snap_collected(vecs)
+    return _state_epoch, _snap_collected(vecs)
 
 
 def _restore_collected(current: list, snaps: list) -> None:
@@ -400,11 +409,33 @@ def _restore_collected(current: list, snaps: list) -> None:
             vec[slot]._restore_bar(series_snap)  # noqa: cooperating core internals
 
 
-def _restore_builtins(state: list, layout: dict[str, Any], snaps: list) -> None:
+def _restore_snapshot(snaps: list) -> None:
+    """Roll back exactly the machines a bar-start snapshot lists — valid while
+    no state vector was created since the snapshot was taken."""
+    for vec, direct, copied, series in snaps:
+        for i, value in direct:
+            vec[i] = value
+        for i, value in copied:
+            if type(value) is list:
+                cur = vec[i]
+                if type(cur) is list:
+                    cur[:] = value
+                else:
+                    vec[i] = value.copy()
+            else:
+                vec[i] = _copy_value(value)
+        for slot, series_snap in series:
+            vec[slot]._restore_bar(series_snap)  # noqa: cooperating core internals
+
+
+def _restore_builtins(state: list, layout: dict[str, Any], stamped: tuple[int, list]) -> None:
     """Roll the builtin machines under a loop-site callee back to bar start."""
+    if stamped[0] == _state_epoch:
+        _restore_snapshot(stamped[1])
+        return
     current: list = []
     _collect_builtins(state, layout, current)
-    _restore_collected(current, snaps)
+    _restore_collected(current, stamped[1])
 
 
 def __loop_state__(parent: list, slot: int, func: Any, vector: tuple | None = None) -> list:
@@ -604,20 +635,23 @@ def __bind_pinned__(func: Any, pin: str) -> Callable:
     return _bind_target(func, None, pin)
 
 
-def _snap_bound_builtins(bound: Any) -> list:
+def _snap_bound_builtins(bound: Any) -> tuple[int, list]:
     """Bar-start builtin snapshot for a uniform loop site's bound target
     (empty when the binding is opaque and carries no walkable state)."""
     vecs: list = []
     _collect_bound_builtins(bound, vecs)
-    return _snap_collected(vecs)
+    return _state_epoch, _snap_collected(vecs)
 
 
-def _restore_bound_builtins(bound: Any, snaps: list) -> None:
+def _restore_bound_builtins(bound: Any, stamped: tuple[int, list]) -> None:
     """Roll the builtin machines behind a uniform loop site's bound target
     back to bar start."""
+    if stamped[0] == _state_epoch:
+        _restore_snapshot(stamped[1])
+        return
     vecs: list = []
     _collect_bound_builtins(bound, vecs)
-    _restore_collected(vecs, snaps)
+    _restore_collected(vecs, stamped[1])
 
 
 def __bind_loop__(parent: list, slot: int, func: Any, pin: str | None = None,
