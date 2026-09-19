@@ -24,6 +24,26 @@ def _coord(value: int) -> int:
     return _native_int_or(value, 0)
 
 
+def _evict_position(position: _position.Position, keep: Table | None = None) -> None:
+    """
+    Drop the table currently occupying ``position``.
+
+    A chart shows at most one table per position: a table arriving at an occupied
+    position, created there or moved onto it, deletes the one already there. The
+    registry therefore never holds more than one entry per position.
+
+    :param position: The position to free up
+    :param keep: A table that must not be evicted, the arriving one
+    """
+    # TV-verified with ``array.size(table.all)``: a non-``var`` ``table.new`` at one
+    # position stays at 1, at two positions at 2; ``table.set_position`` onto an
+    # occupied position drops 2 to 1 and the MOVED table is the survivor.
+    for index, existing in enumerate(_registry):
+        if existing.position == position and existing is not keep:
+            del _registry[index]
+            return
+
+
 def new(position: _position.Position, columns: int, rows: int, bgcolor: _color.Color = None,
         frame_color: _color.Color = None, frame_width: int = 0, border_color: _color.Color = None,
         border_width: int = 0, force_overlay: bool = False) -> Table:
@@ -57,6 +77,7 @@ def new(position: _position.Position, columns: int, rows: int, bgcolor: _color.C
         force_overlay=force_overlay
     )
     table.vid = next_vid()
+    _evict_position(position)
     _registry.append(table)
     return table
 
@@ -304,4 +325,5 @@ def set_position(table_id: Table, position: _position.Position) -> None:
     """Sets the position of a table."""
     if isinstance(table_id, NA):
         return
+    _evict_position(position, table_id)
     table_id.position = position
