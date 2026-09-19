@@ -1336,11 +1336,9 @@ class ScriptRunner:
             # through the engine's own ``_run_async`` (identical loop + timeout
             # to every other broker call). Only wired when the plugin actually
             # provides the actuator — other plugins simply stay state-only.
-            _failsafe_publish = getattr(
-                broker_plugin, 'publish_native_failsafe_sl', None,
-            )
-            if _failsafe_publish is not None:
+            if hasattr(broker_plugin, 'publish_native_failsafe_sl'):
                 _engine = cast('OrderSyncEngine', self._order_sync_engine)
+                _failsafe_publish = broker_plugin.publish_native_failsafe_sl
 
                 # noinspection PyProtectedMember
                 def _native_failsafe_dispatcher(snapshot):
@@ -3496,7 +3494,6 @@ class ScriptRunner:
                         last_confirmed_timestamp = candle.timestamp
                         if is_new_bar:
                             sub_bars = []
-                            bar_executed = False
                             if var_snapshot and var_snapshot.has_vars:
                                 var_snapshot.save()
                             drawing_snapshot.save()

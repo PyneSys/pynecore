@@ -112,9 +112,9 @@ is a new object every bar) is NOT a change: the rebind reuses the prior state
 vector (matched by the module-level layout object), so the callee's series /
 var / varip slots survive across bars — see :func:`_carry_state`.
 """
-from typing import Any, Callable, Iterable, cast
+from typing import Any, Callable, Iterable
 from copy import copy, deepcopy
-from dataclasses import replace as dataclass_replace
+from dataclasses import fields as dataclass_fields, replace as dataclass_replace
 from functools import partial
 
 from .pine_export import Exported, in_module_bool_mode
@@ -364,15 +364,15 @@ def _restore_collected(current: list, snaps: list) -> None:
     copy (their elements are scalars), series through the incremental
     :meth:`SeriesImpl._restore_bar`.
     """
-    saved: dict[int, tuple] | None = None
+    saved: dict[int, tuple] = {}
     at = 0
     total = len(snaps)
     for vec, layout_ in current:
-        if saved is None and at < total and snaps[at][0] is vec:
+        if not saved and at < total and snaps[at][0] is vec:
             snap = snaps[at]
             at += 1
         else:
-            if saved is None:
+            if not saved:
                 saved = {id(entry[0]): entry for entry in snaps}
             snap = saved.get(id(vec))
             if snap is None:
@@ -552,9 +552,8 @@ def _bind_target(func: Any, prev: tuple | None = None, pin: str | None = None,
 def _bind_unwrapped(target: Any, prev: tuple | None, pin: str | None,
                     vector: tuple | None) -> Callable:
     """The binding proper, past the export proxy (see :func:`_bind_target`)."""
-    bind = getattr(target, '__pyne_bind__', None)
-    if bind is not None:
-        return bind(pin)
+    if hasattr(target, '__pyne_bind__'):
+        return target.__pyne_bind__(pin)
     if isinstance(target, type) or (
             hasattr(target, '__self__') and isinstance(target.__self__, type)):
         return target
@@ -778,6 +777,131 @@ def _copy_value(value: Any) -> Any:
         return copy(value)
 
 
+# Types a rollback baseline can hold by reference: nothing can mutate them
+_ATOMIC = frozenset((int, float, bool, str, type(None), NA))
+_ATOMIC_BASES = (int, float, str, NA, Drawing)
+
+# :class:`_Node` kinds. The two trailing ones are replaced on restore instead of
+# being rolled back in place, see :func:`_snap_value`
+_LIST_FLAT, _LIST, _DICT_FLAT, _DICT, _MATRIX, _FIELDS, _SHALLOW, _DEEP = range(8)
+
+# Field names per dataclass type
+_field_names: dict[type, tuple[str, ...]] = {}
+
+
+class _Node:
+    """Rollback baseline of one mutable object: the object and a copy of what it held."""
+
+    __slots__ = ('obj', 'kind', 'content')
+
+    def __init__(self, obj: Any):
+        self.obj = obj
+        self.kind = _SHALLOW
+        self.content: Any = None
+
+
+def _snap_value(value: Any, seen: dict[int, _Node], nested: bool = False) -> Any:
+    """Rollback baseline of a var slot value.
+
+    Pine arrays, maps, matrices and UDT instances are REFERENCES: two variables
+    may name the same object, a UDT field or an array element may be another
+    such object, and UDTs may form cycles. The baseline therefore records, per
+    mutable object, the object ITSELF next to a copy of its content, and
+    :func:`_restore_value` writes the content back into that same object. Every
+    reference to it -- from another slot, another function instance, a container
+    or a field -- keeps naming one object, and a discarded execution's mutation
+    is undone wherever it reached.
+
+    An object of any other type keeps the copy semantics it always had (shallow
+    in a slot, deep inside a container) and is REPLACED on restore.
+
+    :param value: Slot value, container element or field value.
+    :param seen: Nodes of this save by object id -- one node per object, which
+                 also ends the recursion on a cycle.
+    :param nested: Whether the value sits inside a container or a field.
+    :return: The value itself when nothing can mutate it, its node otherwise.
+    """
+    t = type(value)
+    if t in _ATOMIC or isinstance(value, _ATOMIC_BASES):
+        return value
+    node = seen.get(id(value))
+    if node is not None:
+        return node
+    node = seen[id(value)] = _Node(value)
+    if t is list:
+        content = value.copy()
+        node.kind = _LIST_FLAT
+        for i, item in enumerate(content):
+            if type(item) not in _ATOMIC:
+                item = content[i] = _snap_value(item, seen, True)
+                if type(item) is _Node:
+                    node.kind = _LIST
+        node.content = content
+    elif t is dict:
+        content = value.copy()
+        node.kind = _DICT_FLAT
+        for key, item in content.items():
+            if type(item) not in _ATOMIC:
+                item = content[key] = _snap_value(item, seen, True)
+                if type(item) is _Node:
+                    node.kind = _DICT
+        node.content = content
+    elif t is Matrix:
+        node.kind = _MATRIX
+        node.content = (value.rows, value.cols, _snap_value(value.data, seen, True))
+    elif hasattr(t, '__dataclass_fields__'):
+        names = _field_names.get(t)
+        if names is None:
+            names = _field_names[t] = tuple(f.name for f in dataclass_fields(t))
+        node.kind = _FIELDS
+        node.content = tuple((name, _snap_value(getattr(value, name), seen, True))
+                             for name in names)
+    elif nested:
+        node.kind = _DEEP
+        node.content = deepcopy(value)
+    else:
+        node.content = copy(value)
+    return node
+
+
+def _restore_value(snap: Any, done: dict[int, Any]) -> Any:
+    """Write a :func:`_snap_value` baseline back and return the slot value.
+
+    :param snap: Baseline of the value.
+    :param done: Restored objects of this restore by node id.
+    :return: The object the slot, element or field should hold.
+    """
+    if type(snap) is not _Node:
+        return snap
+    key = id(snap)
+    if key in done:
+        return done[key]
+    kind = snap.kind
+    if kind >= _SHALLOW:
+        obj = done[key] = copy(snap.content) if kind == _SHALLOW else deepcopy(snap.content)
+        return obj
+    obj = done[key] = snap.obj
+    content = snap.content
+    if kind == _LIST_FLAT:
+        obj[:] = content
+    elif kind == _LIST:
+        obj[:] = [_restore_value(item, done) for item in content]
+    elif kind == _DICT_FLAT:
+        obj.clear()
+        obj.update(content)
+    elif kind == _DICT:
+        obj.clear()
+        for item_key, item in content.items():
+            obj[item_key] = _restore_value(item, done)
+    elif kind == _MATRIX:
+        obj.rows, obj.cols = content[0], content[1]
+        obj.data = _restore_value(content[2], done)
+    else:
+        for name, item in content:
+            object.__setattr__(obj, name, _restore_value(item, done))
+    return obj
+
+
 class RootVarSnapshot:
     """Snapshot/restore of the ``var`` slots of the root vectors, for the
     calc_on_order_fills rollback. Parity with the legacy ``VarSnapshot``:
@@ -807,14 +931,16 @@ class RootVarSnapshot:
 
     def save(self) -> None:
         """Snapshot the var slots of all roots (called at bar start)."""
-        self._snapshots = [[_copy_value(state[i]) for i in slots]
+        seen: dict[int, _Node] = {}
+        self._snapshots = [[_snap_value(state[i], seen) for i in slots]
                            for state, slots in self._targets]
 
     def restore(self) -> None:
         """Restore the var slots of all roots to the saved snapshot."""
+        done: dict[int, Any] = {}
         for (state, slots), snapshot in zip(self._targets, self._snapshots):
             for i, value in zip(slots, snapshot):
-                state[i] = _copy_value(value)
+                state[i] = value if type(value) is not _Node else _restore_value(value, done)
 
 
 # noinspection PyProtectedMember
@@ -870,20 +996,20 @@ class RootSeriesSnapshot:
                 state[i]._restore(snap)
 
 
-def _snap_vector(state: list, layout: dict[str, Any]) -> tuple:
+def _snap_vector(state: list, layout: dict[str, Any], seen: dict[int, _Node]) -> tuple:
     """Deep snapshot of one state vector and its child subtree.
 
     varip slots are excluded on purpose: a varip keeps its intra-bar advances
     across discarded re-executions (calc_on_order_fills, live ticks), exactly
     like TradingView's realtime rollback keeps them.
     """
-    var_vals = tuple((i, _copy_value(state[i])) for i in _var_slots(layout))
+    var_vals = tuple((i, _snap_value(state[i], seen)) for i in _var_slots(layout))
     series_vals = tuple((slot, state[slot]._snapshot())  # noqa: cooperating core internals
                         for slot, _max_bars_back, _elem in layout['series'])
-    return var_vals, series_vals, _snap_children(state, layout)
+    return var_vals, series_vals, _snap_children(state, layout, seen)
 
 
-def _snap_children(state: list, layout: dict[str, Any]) -> tuple:
+def _snap_children(state: list, layout: dict[str, Any], seen: dict[int, _Node]) -> tuple:
     """Snapshot only the child slots of a state vector. A loop-site cell
     carries its bar-tracking fields along with the payload snapshot: a
     discarded re-execution must find the same bar-start rollback baseline the
@@ -897,13 +1023,13 @@ def _snap_children(state: list, layout: dict[str, Any]) -> tuple:
             if val is None:
                 child_vals.append((slot, True, ('none',), 0, None))
             else:
-                child_vals.append((slot, True, _snap_child(val[0]), val[1], val[2]))
+                child_vals.append((slot, True, _snap_child(val[0], seen), val[1], val[2]))
         else:
-            child_vals.append((slot, False, _snap_child(val)))
+            child_vals.append((slot, False, _snap_child(val, seen)))
     return tuple(child_vals)
 
 
-def _snap_child(entry: Any) -> tuple:
+def _snap_child(entry: Any, seen: dict[int, _Node]) -> tuple:
     """Snapshot one child-slot entry.
 
     A bare list is a fast-path child state vector (its layout rides in the
@@ -919,13 +1045,13 @@ def _snap_child(entry: Any) -> tuple:
     if entry is None:
         return ('none',)
     if type(entry) is list:
-        return 'vec', entry, _snap_vector(entry, entry[-1])
+        return 'vec', entry, _snap_vector(entry, entry[-1], seen)
     if type(entry) is tuple and len(entry) == 2:
         bound = entry[1]
         if type(bound) is partial and bound.args:
             layout: dict[str, Any] | None = getattr(bound.func, '__pyne_layout__', None)
             if layout is not None:
-                return 'pair', entry, bound.args[0], _snap_vector(bound.args[0], layout)
+                return 'pair', entry, bound.args[0], _snap_vector(bound.args[0], layout, seen)
         # An overload dispatcher's machines must be ROLLED BACK, never dropped.
         # Dropping re-binds the anchor with an EMPTY state vector, so every
         # multi-signature builtin (``ta.highest``/``ta.lowest`` and the other
@@ -936,7 +1062,7 @@ def _snap_child(entry: Any) -> tuple:
         cache: dict[Any, Any] | None = getattr(bound, '__pyne_cache__', None)
         if cache is not None:
             return ('dispatch', entry, cache, tuple(cache),
-                    tuple((vector, _snap_vector(vector, vector[-1]))
+                    tuple((vector, _snap_vector(vector, vector[-1], seen))
                           for vector in (impl_entry[1] for impl_entry in cache.values())
                           if vector is not None))
         # A closure-held series must be ROLLED BACK, never dropped: re-binding
@@ -947,7 +1073,7 @@ def _snap_child(entry: Any) -> tuple:
     return ('drop',)
 
 
-def _restore_vector(state: list, snap: tuple) -> None:
+def _restore_vector(state: list, snap: tuple, done: dict[int, Any]) -> None:
     """Restore one state vector (in place) from its :func:`_snap_vector` form.
 
     Series slots go through the O(changed slots) same-bar undo
@@ -960,17 +1086,17 @@ def _restore_vector(state: list, snap: tuple) -> None:
     """
     var_vals, series_vals, child_vals = snap
     for i, value in var_vals:
-        state[i] = _copy_value(value)
+        state[i] = value if type(value) is not _Node else _restore_value(value, done)
     for slot, series_snap in series_vals:
         state[slot]._restore_bar(series_snap)  # noqa: cooperating core internals
-    _restore_children(state, child_vals)
+    _restore_children(state, child_vals, done)
 
 
-def _restore_children(state: list, child_vals: tuple) -> None:
+def _restore_children(state: list, child_vals: tuple, done: dict[int, Any]) -> None:
     """Restore the child slots of a state vector from :func:`_snap_children`."""
     for entry in child_vals:
         slot, in_loop, child_snap = entry[0], entry[1], entry[2]
-        payload = _restore_payload(child_snap)
+        payload = _restore_payload(child_snap, done)
         if not in_loop:
             state[slot] = payload
         elif payload is None:
@@ -979,16 +1105,16 @@ def _restore_children(state: list, child_vals: tuple) -> None:
             state[slot] = [payload, entry[3], entry[4]]
 
 
-def _restore_payload(child_snap: tuple) -> Any:
+def _restore_payload(child_snap: tuple, done: dict[int, Any]) -> Any:
     """Restore one :func:`_snap_child` payload in place and return the value
     the slot (or loop cell) should hold — ``None`` when the entry was empty or
     opaque (a dropped binding re-binds fresh, exactly like :func:`reset`)."""
     kind = child_snap[0]
     if kind == 'vec':
-        _restore_vector(child_snap[1], child_snap[2])
+        _restore_vector(child_snap[1], child_snap[2], done)
         return child_snap[1]
     if kind == 'pair':
-        _restore_vector(child_snap[2], child_snap[3])
+        _restore_vector(child_snap[2], child_snap[3], done)
         return child_snap[1]
     if kind == 'series':
         child_snap[2]._restore_bar(child_snap[3])  # noqa: cooperating core internals
@@ -996,7 +1122,7 @@ def _restore_payload(child_snap: tuple) -> Any:
     if kind == 'dispatch':
         cache, keys, vectors = child_snap[2], child_snap[3], child_snap[4]
         for vector, vector_snap in vectors:
-            _restore_vector(vector, vector_snap)
+            _restore_vector(vector, vector_snap, done)
         # A signature the discarded pass reached first has no bar-start baseline
         # to return to; dropping it re-binds fresh on the next call, which is
         # what an unwalkable binding did for every entry before.
@@ -1037,13 +1163,15 @@ class RootChildSnapshot:
 
     def save(self) -> None:
         """Snapshot the child subtrees of all roots (bar-start state)."""
-        self._snapshots = [_snap_children(state, layout)
+        seen: dict[int, _Node] = {}
+        self._snapshots = [_snap_children(state, layout, seen)
                            for state, layout in self._roots]
 
     def restore(self) -> None:
         """Restore all roots' child subtrees to the saved snapshot."""
+        done: dict[int, Any] = {}
         for (state, _layout), snap in zip(self._roots, self._snapshots):
-            _restore_children(state, snap)
+            _restore_children(state, snap, done)
         for cache in _shared_caches:
             cache.clear()
 
@@ -1057,8 +1185,7 @@ def explain_state(func_or_layout: Any, state: list) -> dict[str, Any]:
     :param state: The instance's state vector.
     :return: Slot name (or descriptive fallback label) -> current value.
     """
-    layout: dict[str, Any] = cast(dict[str, Any],
-                                  getattr(func_or_layout, '__pyne_layout__', func_or_layout))
+    layout: dict[str, Any] = getattr(func_or_layout, '__pyne_layout__', func_or_layout)
     names: tuple[str, ...] | None = layout.get('names')
     series_slots = {slot for slot, _max_bars_back, _elem in layout['series']}
     child_ids = {slot: call_id for slot, call_id, _in_loop in layout['children']}
