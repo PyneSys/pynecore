@@ -32,9 +32,12 @@ NORMALIZERS = {"int", "_native_int_or", "_trade_index", "_na_size", "_coord"}
 
 # Verified exceptions: internal bookkeeping that never carries a Pine value.
 # ``closed_before`` is a list length captured by the caller inside the same
-# module, not an argument any script can reach.
+# module, not an argument any script can reach. ``decimals`` is the number of
+# fraction places a format mask spells out -- ``len()`` of a pattern slice,
+# capped at 16 inside the module -- never an argument of a script-callable.
 ALLOWED = {
     ("strategy/__init__.py", "_settle_close_pass_trades", "closed_before"),
+    ("string.py", "_round_digits_fast", "decimals"),
 }
 
 

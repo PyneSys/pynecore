@@ -29,6 +29,8 @@ __all__ = ['contains', 'endswith', 'format', 'format_time', 'length', 'lower', '
 
 # Enough digits for the integer part of any finite double (max ~1.8e308).
 _MAX_INT_DIGITS = 320
+# The largest finite double
+_MAX_DOUBLE = 1.7976931348623157e308
 
 
 def _round_digits(value: float, decimals: int, decimal_format: bool) -> str:
@@ -106,9 +108,243 @@ def _split_number_pattern(pattern: str) -> tuple[str, str, str]:
     return ''.join(chars[:lo]), ''.join(chars[lo:hi + 1]), ''.join(chars[hi + 1:])
 
 
+def _round_digits_fast(value: float, decimals: int, pad: bool) -> str | None:
+    """
+    Round a non-negative double half-up on its shortest round-trip digits, without ``Decimal``.
+
+    ``repr(value)`` already IS the digit string ``Decimal(repr(value))`` would carry -- the
+    shortest decimal that reads back as the same double, the same thing Java's
+    ``Double.toString`` produces -- so the half-up decision and the carry can be done with
+    plain integer arithmetic on those digits. The 16-fraction-digit cap at ``|value| >= 1e-3``
+    is applied exactly as in :func:`_round_digits`.
+
+    The caller must pass a non-negative finite double. A ``repr`` in exponential notation
+    (``|value| < 1e-4`` or ``>= 1e16``) and negative zero are not handled here and answer
+    ``None``, which routes the value to the general path.
+
+    :param value: The value to round (non-negative and finite)
+    :param decimals: Number of fraction digits the mask allows
+    :param pad: True to fill the unused fraction places with zeros. A caller whose mask has
+                no required decimal place strips them again right away, and asks for False
+    :return: The rounded value with the allowed number of fraction digits, or ``None`` when
+             this routine does not cover the value
+    """
+    r = repr(value)
+    if 'e' in r or r[0] == '-':
+        return None
+    dot = r.find('.')
+    if dot < 0:
+        int_part, frac = r, ''
+    else:
+        int_part = r[:dot]
+        frac = r[dot + 1:]
+    if decimals > 16 and value >= 1e-3:
+        decimals = 16
+
+    n_frac = len(frac)
+    if n_frac <= decimals:
+        # The shortest digits already fit the mask: only zero padding is needed
+        if decimals == 0:
+            return int_part
+        if not pad:
+            return r
+        return int_part + '.' + frac + '0' * (decimals - n_frac)
+
+    keep = (int_part + frac)[:len(int_part) + decimals]
+    if frac[decimals] >= '5':
+        # Half-up on the digit string; zfill restores the leading zeros int() dropped
+        keep = str(int(keep) + 1).zfill(len(keep))
+    if decimals == 0:
+        return keep
+    return keep[:-decimals] + '.' + keep[-decimals:]
+
+
+def _round_digits_exact(value: float, decimals: int) -> str:
+    """
+    Round a non-negative finite double on its exact binary value, ties to even.
+
+    This is the ``str.format`` rounding of :func:`_round_digits` -- Java's DecimalFormat
+    looks at the double's exact value, so 2.675, which is really 2.67499..., rounds down.
+    Python's fixed-point float formatting is correctly rounded from that same exact value
+    and breaks an exact tie to even, so it yields the digits ``Decimal(value).quantize``
+    does. The 16-fraction-digit cap at ``|value| >= 1e-3`` applies here as well.
+
+    :param value: The value to round (non-negative and finite)
+    :param decimals: Number of fraction digits the mask allows
+    :return: The rounded value with exactly the allowed number of fraction digits
+    """
+    if decimals > 16 and value >= 1e-3:
+        decimals = 16
+    return f"{value:.{decimals}f}"
+
+
+# One side of a parsed number pattern: literal prefix, literal suffix, the number of
+# required integer digits ('0' before the point), the number of required fraction digits
+# ('0' after it) and the total number of fraction places the mask allows.
+_PatternSide = tuple[str, str, int, int, int]
+
+
+@lru_cache(maxsize=128)
+def _parse_precision(precision: str) -> tuple[_PatternSide, _PatternSide] | None:
+    """
+    Parse a Java DecimalFormat number pattern into the two sides the formatter needs.
+
+    The pattern is split on ``;`` into a positive and an optional negative subpattern, each
+    of which is cut into affixes and a digit pattern by :func:`_split_number_pattern`. Without
+    a negative subpattern the negative side reuses the positive one with a ``-`` in front of
+    its prefix, which is what Java does. The result is cached per pattern string, because Pine
+    masks are compile-time constants re-applied on every bar.
+
+    A subpattern with more than one decimal point has no parsed form. The general path
+    looks only at the subpattern the value's sign selects, so such a pattern is left to it
+    whole: it formats through the well-formed side and raises on the other.
+
+    :param precision: The whole pattern, negative subpattern included
+    :return: The side used for non-negative values and the side used for negative ones,
+             or None when either subpattern has more than one decimal point
+    """
+    subpatterns = precision.split(';')
+    sides: list[_PatternSide] = []
+    for chosen, sign_prefix in ((subpatterns[0], ''),
+                                (subpatterns[1], '') if len(subpatterns) > 1 else (subpatterns[0], '-')):
+        affix, digits, suffix = _split_number_pattern(chosen)
+        before, dot, after = digits.partition('.')
+        if dot and '.' in after:
+            return None
+        sides.append((sign_prefix + affix, suffix,
+                      before.count('0'), after.count('0'), len(after)))
+    return sides[0], sides[1]
+
+
+@lru_cache(maxsize=32)
+def _mintick_precision(tick_size: float) -> tuple[_PatternSide, _PatternSide] | None:
+    """
+    Build the parsed pattern ``format.mintick`` derives from a symbol's tick size.
+
+    The mask is one ``#`` per fraction digit of the tick size, counted on its plain decimal
+    spelling; a tick in exponential notation is expanded first. Cached per tick value, so a
+    symbol switch picks up its own tick without re-deriving the mask on every call.
+
+    :param tick_size: The symbol's minimum tick
+    :return: The parsed pattern, in the form :func:`_parse_precision` returns
+    """
+    tick_str = str(tick_size)
+    if 'e' in tick_str or 'E' in tick_str:
+        tick_decimal = f"{tick_size:.20f}".rstrip('0')
+        dec_str = tick_decimal.split('.')[1] if '.' in tick_decimal else ''
+    elif '.' in tick_str:
+        dec_str = tick_str.rstrip('0').split('.')[1]
+    else:
+        dec_str = ''
+    return _parse_precision('#.' + '#' * len(dec_str))
+
+
+def _format_parsed(value: float, sides: tuple[_PatternSide, _PatternSide],
+                   decimal_format: bool = False) -> str | None:
+    """
+    Format a finite double with an already parsed pattern.
+
+    Applies the same digit handling as the general path: optional places lose their trailing
+    zeros, required places are truncated-then-padded, required integer digits are zero filled,
+    and a mask with required decimals drops a zero integer part. The digits come from
+    :func:`_round_digits_exact` for ``str.format`` and from :func:`_round_digits_fast` for
+    ``str.tostring``. Negative zero, and for ``str.tostring`` a value whose ``repr`` is
+    exponential, are not covered: the answer is ``None`` so the caller can fall back.
+
+    :param value: A finite double, of either sign
+    :param sides: The parsed pattern from :func:`_parse_precision`
+    :param decimal_format: True for the ``str.format()`` rounding, False for ``str.tostring()``
+    :return: The formatted string, or ``None`` when the value is not covered
+    """
+    if value < 0:
+        prefix, suffix, required_before, required_decimals, max_decimals = sides[1]
+        value = -value
+    else:
+        prefix, suffix, required_before, required_decimals, max_decimals = sides[0]
+
+    if decimal_format:
+        result = _round_digits_exact(value, max_decimals)
+        if result[0] == '-':
+            # Negative zero: the magnitude is non-negative here, so only it carries a sign
+            return None
+    else:
+        result = _round_digits_fast(value, max_decimals, required_decimals > 0)
+        if result is None:
+            return None
+
+    if max_decimals > 0:
+        if required_decimals == 0:
+            result = result.rstrip('0').rstrip('.')
+        else:
+            int_text, _, decimal_part = result.partition('.')
+            if len(decimal_part) > required_decimals:
+                decimal_part = decimal_part[:required_decimals].rstrip('0')
+            if decimal_part:
+                result = int_text + '.' + decimal_part.ljust(required_decimals, '0')
+            else:
+                result = int_text
+
+    if required_before > 0:
+        int_text, dot, decimal_part = result.partition('.')
+        result = int_text.zfill(required_before) + dot + decimal_part
+    elif required_decimals > 0 and result.startswith('0.'):
+        result = result[1:]
+
+    return prefix + result + suffix
+
+
 # noinspection PyProtectedMember
 def _format_number(value: float | int | NA, fmt_type: str = '', precision: str = '#.###',
                    *, decimal_format: bool = False) -> str:
+    """
+    Format a number according to Pine rules.
+
+    A fast path handles the shapes a running script hits millions of times -- a finite
+    double with a digit mask, from ``str.tostring`` or ``str.format``, and ``str.tostring``
+    with ``format.mintick`` -- by parsing the mask once per pattern string and rounding
+    without ``Decimal``: on the digits of ``repr`` for ``str.tostring``, with the float
+    formatter for ``str.format``. Every input it does not provably cover goes to
+    :func:`_format_number_general`, which stays the semantic reference.
+
+    :param value: Value to format
+    :param fmt_type: Format type (integer, currency, percent, mintick, volume, price, inherit)
+    :param precision: Custom precision format string (like '#.##')
+    :param decimal_format: True for ``str.format()`` (Java DecimalFormat engine),
+                           False for ``str.tostring()`` (chart number formatter)
+    :return: Formatted string
+    """
+    # The range tests also reject nan and both infinities, which never reach the digit masks
+    if decimal_format:
+        if type(value) is float and not fmt_type and type(precision) is str \
+                and -_MAX_DOUBLE <= value <= _MAX_DOUBLE:
+            sides = _parse_precision(precision)
+            if sides is not None:
+                result = _format_parsed(value, sides, True)
+                if result is not None:
+                    return result
+    elif type(value) is float and -1e16 < value < 1e16:
+        if not fmt_type:
+            # Only a plain str is a cache key the parser can take; anything else keeps the
+            # general path's own error
+            sides = _parse_precision(precision) if type(precision) is str else None
+            if sides is not None:
+                result = _format_parsed(value, sides)
+                if result is not None:
+                    return result
+        elif fmt_type == _format.mintick:
+            tick_size = _syminfo.mintick
+            if type(tick_size) is float and 0.0 < tick_size < 1e16:
+                sides = _mintick_precision(tick_size)
+                if sides is not None:
+                    result = _format_parsed(round(value / tick_size) * tick_size, sides)
+                    if result is not None:
+                        return result
+    return _format_number_general(value, fmt_type, precision, decimal_format=decimal_format)
+
+
+# noinspection PyProtectedMember
+def _format_number_general(value: float | int | NA, fmt_type: str = '', precision: str = '#.###',
+                           *, decimal_format: bool = False) -> str:
     """
     Format a number according to Pine rules.
 
@@ -832,6 +1068,12 @@ def tostring(value: int | float | str | bool | NA, format: str | Format = '#.###
     :param format: Format string like '#.##' or Format instance
     :return: String representation
     """
+    if type(value) is float:
+        # The hot case: a native double (na included) needs no conversion and none of the
+        # type tests below apply to it
+        if isinstance(format, Format):
+            return _format_number(value, fmt_type=format)
+        return _format_number(value, precision=format)
     if isinstance(value, NA) or value is None:
         return "NaN"
     if isinstance(value, bool):
