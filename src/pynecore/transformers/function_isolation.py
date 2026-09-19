@@ -135,9 +135,9 @@ NON_TRANSFORMABLE_FUNCTIONS = {
     'lib.alert.alert', 'lib.alertcondition', 'lib.na',
 
     # Other builtin functions
-    'lib.timestamp', 'lib.dayofmonth', 'lib.dayofweek.dayofweek', 'lib.hour', 'lib.minute', 'lib.month',
+    'lib.dayofmonth', 'lib.dayofweek.dayofweek', 'lib.hour', 'lib.minute', 'lib.month',
     'lib.second', 'lib.weekofyear', 'lib.year', 'lib.time', 'lib.time_close', 'lib.time_tradingday',
-    'lib.timenow', 'lib.is_na', 'lib.nz', 'lib.timestamp',
+    'lib.timenow', 'lib.is_na', 'lib.nz',
 
     # Strategy
     'lib.strategy.entry', 'lib.strategy.order', 'lib.strategy.exit', 'lib.strategy.close',
@@ -194,18 +194,32 @@ NON_TRANSFORMABLE_FUNCTIONS = {
     'lib.array.get', 'lib.array.includes', 'lib.array.indexof', 'lib.array.insert', 'lib.array.join',
     'lib.array.last', 'lib.array.lastindexof', 'lib.array.max', 'lib.array.median', 'lib.array.min',
     'lib.array.mode', 'lib.array.percentrank', 'lib.array.percentile_linear_interpolation',
-    'percentile_nearest_rank', 'percentile_nearest_rank', 'lib.array.pop', 'lib.array.push', 'lib.array.range',
+    'lib.array.percentile_nearest_rank', 'lib.array.pop', 'lib.array.push', 'lib.array.range',
     'lib.array.remove', 'lib.array.reverse', 'lib.array.set', 'lib.array.shift', 'lib.array.size', 'lib.array.slice',
     'lib.array.some', 'lib.array.sort', 'lib.array.sort_indices', 'lib.array.standardize', 'lib.array.stdev',
     'lib.array.sum', 'lib.array.unshift', 'lib.array.variance', 'lib.array.new',
     'lib.array.new_bool', 'lib.array.new_color', 'lib.array.new_float', 'lib.array.new_int', 'lib.array.new_string',
+
+    # Matrix functions
+    'lib.matrix.add_col', 'lib.matrix.add_row', 'lib.matrix.avg', 'lib.matrix.col', 'lib.matrix.columns',
+    'lib.matrix.concat', 'lib.matrix.copy', 'lib.matrix.delete', 'lib.matrix.det', 'lib.matrix.diff',
+    'lib.matrix.eigenvalues', 'lib.matrix.eigenvectors', 'lib.matrix.elements_count', 'lib.matrix.fill',
+    'lib.matrix.get', 'lib.matrix.inv', 'lib.matrix.is_antidiagonal', 'lib.matrix.is_antisymmetric',
+    'lib.matrix.is_binary', 'lib.matrix.is_diagonal', 'lib.matrix.is_identity', 'lib.matrix.is_square',
+    'lib.matrix.is_stochastic', 'lib.matrix.is_symmetric', 'lib.matrix.is_triangular', 'lib.matrix.is_zero',
+    'lib.matrix.kron', 'lib.matrix.max', 'lib.matrix.median', 'lib.matrix.min', 'lib.matrix.mode',
+    'lib.matrix.mult', 'lib.matrix.new', 'lib.matrix.pinv', 'lib.matrix.pow', 'lib.matrix.rank',
+    'lib.matrix.remove_col', 'lib.matrix.remove_row', 'lib.matrix.reshape', 'lib.matrix.reverse',
+    'lib.matrix.row', 'lib.matrix.rows', 'lib.matrix.set', 'lib.matrix.sort', 'lib.matrix.submatrix',
+    'lib.matrix.sum', 'lib.matrix.swap_columns', 'lib.matrix.swap_rows', 'lib.matrix.trace',
+    'lib.matrix.transpose',
 
     # Map functions
     'lib.map.clear', 'lib.map.contains', 'lib.map.copy', 'lib.map.get', 'lib.map.keys', 'lib.map.new',
     'lib.map.put', 'lib.map.put_all', 'lib.map.remove', 'lib.map.size', 'lib.map.values',
 
     # Color functions
-    'lib.color.new', 'lib.color.r', 'lib.color.g', 'lib.color.b', 'lib.color.a',
+    'lib.color.new', 'lib.color.r', 'lib.color.g', 'lib.color.b',
     'lib.color.rgb', 'lib.color.from_gradient',
 
     # Strategy functions
@@ -220,7 +234,67 @@ NON_TRANSFORMABLE_FUNCTIONS = {
     'copy', 'dataclass', 'dccopy',
     'pytest.raises',
 
-    'method_call', 'pine_range'
+    'method_call', 'pine_range',
+
+    # Line functions
+    'lib.line.new', 'lib.line.copy', 'lib.line.delete', 'lib.line.get_price', 'lib.line.get_x1',
+    'lib.line.get_x2', 'lib.line.get_y1', 'lib.line.get_y2', 'lib.line.set_color', 'lib.line.set_extend',
+    'lib.line.set_style', 'lib.line.set_width', 'lib.line.set_x1', 'lib.line.set_x2', 'lib.line.set_xloc',
+    'lib.line.set_xy1', 'lib.line.set_xy2', 'lib.line.set_y1', 'lib.line.set_y2',
+
+    # Label functions
+    'lib.label.new', 'lib.label.delete', 'lib.label.get_text', 'lib.label.get_x', 'lib.label.get_y',
+    'lib.label.set_color', 'lib.label.set_size', 'lib.label.set_style', 'lib.label.set_text',
+    'lib.label.set_textalign', 'lib.label.set_textcolor', 'lib.label.set_tooltip', 'lib.label.set_x',
+    'lib.label.set_xloc', 'lib.label.set_xy', 'lib.label.set_y', 'lib.label.set_yloc',
+
+    # Box functions
+    'lib.box.new', 'lib.box.copy', 'lib.box.delete', 'lib.box.get_bottom', 'lib.box.get_left',
+    'lib.box.get_right', 'lib.box.get_top', 'lib.box.set_bgcolor', 'lib.box.set_border_color',
+    'lib.box.set_border_style', 'lib.box.set_bottom', 'lib.box.set_extend', 'lib.box.set_left',
+    'lib.box.set_lefttop', 'lib.box.set_right', 'lib.box.set_rightbottom', 'lib.box.set_text',
+    'lib.box.set_text_color', 'lib.box.set_text_halign', 'lib.box.set_text_size',
+    'lib.box.set_text_valign', 'lib.box.set_top',
+
+    # Table functions
+    'lib.table.new', 'lib.table.cell', 'lib.table.clear', 'lib.table.delete', 'lib.table.merge_cells',
+    'lib.table.set_position', 'lib.table.cell_set_bgcolor', 'lib.table.cell_set_height',
+    'lib.table.cell_set_text_color', 'lib.table.cell_set_text_halign', 'lib.table.set_border_color',
+    'lib.table.set_border_width', 'lib.table.set_frame_color', 'lib.table.set_frame_width',
+
+    # Linefill and polyline functions
+    'lib.linefill.new', 'lib.linefill.delete', 'lib.linefill.set_color', 'lib.linefill.get_line1',
+    'lib.linefill.get_line2', 'lib.polyline.new', 'lib.polyline.delete',
+
+    # Chart points
+    'lib.chart.point.new', 'lib.chart.point.now', 'lib.chart.point.from_index', 'lib.chart.point.from_time',
+
+    # Array constructors of drawing element types
+    'lib.array.new_box', 'lib.array.new_label', 'lib.array.new_line', 'lib.array.new_linefill',
+
+    # Ticker functions
+    'lib.ticker.new', 'lib.ticker.standard', 'lib.ticker.heikinashi', 'lib.ticker.renko',
+    'lib.ticker.linebreak', 'lib.ticker.kagi', 'lib.ticker.pointfigure',
+
+    # Request functions that open no context
+    'lib.request.seed', 'lib.request.footprint', 'lib.request.dividends', 'lib.request.splits',
+    'lib.request.earnings', 'lib.request.financial',
+
+    # Strategy risk rules
+    'lib.strategy.risk.allow_entry_in', 'lib.strategy.risk.max_cons_loss_days',
+    'lib.strategy.risk.max_drawdown', 'lib.strategy.risk.max_intraday_filled_orders',
+    'lib.strategy.risk.max_intraday_loss', 'lib.strategy.default_entry_qty',
+
+    # Footprint and volume rows
+    'lib.footprint.buy_volume', 'lib.footprint.sell_volume', 'lib.footprint.delta',
+    'lib.footprint.total_volume', 'lib.footprint.poc', 'lib.footprint.vah', 'lib.footprint.val',
+    'lib.volume_row.up_price', 'lib.volume_row.down_price',
+
+    'lib.runtime.error', 'lib.color.t', 'lib.plotbar',
+
+    # Pine cast helpers
+    'cast_bool', 'cast_box', 'cast_color', 'cast_float', 'cast_int', 'cast_label', 'cast_line',
+    'cast_linefill', 'cast_string', 'cast_table',
 }
 
 # Call-site routes decided at transform time. Same-module defs resolve to a
