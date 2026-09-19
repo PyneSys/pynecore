@@ -65,6 +65,11 @@ _EXTERNAL = '\x00external'
 #: on a bar where ``main()`` returned ahead of it.
 _EXIT_NODES: tuple[type[ast.AST], ...] = (ast.Return,)
 
+#: Statements that can keep a later write from being performed. A ``raise`` is
+#: one of them next to the slicer's exits: whether it fires is decided by the
+#: developing bar exactly like an early ``return``.
+_WRITE_SKIPPING_NODES: tuple[type[ast.AST], ...] = (*_EXIT_NODES, ast.Raise)
+
 #: The protocol calls the security split injects. None of them touches a name
 #: of the script, so they carry no data dependency of their own.
 _PROTOCOL_CALLS = frozenset({
@@ -1072,7 +1077,7 @@ def _contains_write(node: ast.AST, hit: _Hit) -> bool:
 
 def _has_exit(stmt: ast.stmt) -> bool:
     """Whether ``stmt`` can end the round before the next statement."""
-    return any(isinstance(sub, _EXIT_NODES) for sub in [stmt, *_walk_own(stmt)])
+    return any(isinstance(sub, _WRITE_SKIPPING_NODES) for sub in [stmt, *_walk_own(stmt)])
 
 
 def _expr_unguarded(node: ast.AST, hit: _Hit) -> bool:
@@ -1119,7 +1124,7 @@ def _write_unconditional(stmts: list[ast.stmt], hit: _Hit) -> bool:
     and the skipped round would leave the previous period's value standing.
 
     The rule is therefore purely structural: the target must stand in a TOP-LEVEL
-    statement of ``stmts``, with no early exit (:data:`_EXIT_NODES`) reachable
+    statement of ``stmts``, with no early exit (:data:`_WRITE_SKIPPING_NODES`) reachable
     ahead of it, and with no branch of any kind around it — no ``if``, no
     ``IfExp``, no short-circuit ``BoolOp``, no loop, no ``with``, no ``try``.
     The only ``if`` that is not a user branch is the protocol's own

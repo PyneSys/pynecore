@@ -80,7 +80,10 @@ The key idea is the **parent-slot scheme**: the state of a callee instance occup
 The runner creates **root state vectors** for the entry points it drives directly — the script's `main()`, imported library mains and `request.security()` processes — via `create_root(key, layout)`. Everything else lives in the tree below them. The same module also provides:
 
 - `reset()` — clears the child slots of all roots (drops every function instance) between runs
-- `RootVarSnapshot` — snapshot/restore of the roots' `var` slots for the `calc_on_order_fills` rollback; `varip` slots and child instances are excluded
+- `RootVarSnapshot` — snapshot/restore of the roots' `var` slots for a discarded re-execution (a `calc_on_order_fills` fill, a live intra-bar tick, a `request.security` developing re-tick); `varip` slots and child instances are excluded
+- `RootChildSnapshot` — the same for the function-instance subtrees below the roots, series slots included
+
+Both restore **in place**. Arrays, maps, matrices and UDT instances are references in Pine, so the baseline keeps each such object next to a copy of its content and the restore writes the content back into that same object, recursively. Two variables naming one array still name one array after a rollback — in the same scope, in different function instances, or through a container element or a UDT field — and a mutation that reached a nested object is undone with it.
 - `explain_state(func, state)` — renders a state vector as a readable name -> value dict for debugging
 
 ## Call Routing

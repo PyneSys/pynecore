@@ -28,7 +28,7 @@ import ast
 
 from .slot_layout import ModuleLayout, scope_for_function
 
-__all__ = ['PersistentTransformer']
+__all__ = ['PersistentTransformer', 'VARIP_TYPES']
 
 PERSISTENT_TYPES = ('Persistent', 'IBPersistent', 'IBPersistentSeries')
 VARIP_TYPES = ('IBPersistent', 'IBPersistentSeries')

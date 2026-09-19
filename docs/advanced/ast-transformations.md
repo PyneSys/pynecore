@@ -9,7 +9,7 @@ lastmod: "2026-09-05"
 draft: false
 toc: true
 categories: ["Advanced", "Technical Implementation"]
-tags: ["ast", "python", "transformations", "compiler", "internals"]
+tags: ["ast", "python", "transformations", "internals"]
 ---
 -->
 
@@ -119,11 +119,11 @@ Removes `if TYPE_CHECKING:` blocks and the `TYPE_CHECKING` import itself. These 
 
 The Builtin Shadow transformer resolves workdir-library imports whose alias shadows a built-in namespace.
 
-On TradingView, an `import TradingView/ta/7 as ta` does **not** hide the built-in `ta.*` namespace: Pine resolves `ta.x` against the library's exports first and falls back to the built-in namespace for everything the library does not export. So `ta.valuewhen(...)` keeps working even though the `TradingView/ta` library has no `valuewhen` export (TV's own library deliberately names its functions `ema2`/`atr2`/`rma2` to avoid colliding with the built-ins). A compiled workdir library is imported as `import lib.tv.ta.v7 as ta`, which would route *every* access to the library module — and break the shadowed built-in accesses.
+On TradingView, an `import TradingView/ta/7 as ta` does **not** hide the built-in `ta.*` namespace: Pine resolves `ta.x` against the library's exports first and falls back to the built-in namespace for everything the library does not export. So `ta.valuewhen(...)` keeps working even though the `TradingView/ta` library has no `valuewhen` export (TV's own library deliberately names its functions `ema2`/`atr2`/`rma2` to avoid colliding with the built-ins). A workdir library is imported as `import lib.tv.ta.v7 as ta`, which would route *every* access to the library module — and break the shadowed built-in accesses.
 
 This transformer rewrites only the accesses the library cannot serve to the canonical built-in form, so the downstream transformers (import normalizer, module properties, isolation, series) handle them like any other built-in reference.
 
-**Original code (compiled workdir-library import):**
+**Original code (workdir-library import):**
 ```python
 import lib.tv.ta.v7 as ta
 
@@ -147,7 +147,7 @@ Key aspects:
 - A function parameter named like the alias masks the fallback inside that scope only
 - If the library cannot be imported, the alias is left untouched and the script fails at its own import statement, exactly as before; a member in neither the library nor the built-in namespace is also left on the library to fail at runtime, as before
 
-This keeps the compiler library-agnostic: PyneComp never needs to know a library's contents to compile a script that imports it (libraries compile independently), and all library-dependent resolution happens here at transform time, where the library is importable.
+This keeps a script independent of the libraries it imports: whoever writes or generates it needs no knowledge of a library's contents, and all library-dependent resolution happens here at transform time, where the library is importable.
 
 ### Import Normalizer
 
