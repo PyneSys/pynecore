@@ -1693,7 +1693,12 @@ def live_ohlcv_generator(
                     yield item
 
         except KeyboardInterrupt:
+            # Propagate after the teardown below so the run is reported as
+            # interrupted, the same as an interrupt landing outside the
+            # iterator; swallowing it here made a signalled stop look like
+            # a completed run.
             logger.info("Live streaming interrupted by user")
+            raise
         finally:
             stop_event.set()
             # Wake a reconnect handshake blocked on ``provider.connect()`` on the

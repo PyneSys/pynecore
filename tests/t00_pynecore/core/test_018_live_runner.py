@@ -6,6 +6,8 @@ import threading
 import time
 from datetime import UTC, datetime, time as datetime_time, timedelta
 
+import pytest
+
 from pynecore.core.live_runner import live_ohlcv_generator, LiveBarStreamer
 from pynecore.core.script_runner import LIVE_TRANSITION
 from pynecore.core.syminfo import SymInfo, SymInfoInterval
@@ -154,6 +156,22 @@ def __test_live_generator_connects_and_disconnects__():
     provider = MockLiveProvider(updates)
     list(live_ohlcv_generator(provider, "BTC/USDT", "1D"))
 
+    assert not provider.is_connected
+
+
+def __test_live_generator_propagates_interrupt_after_teardown__():
+    """An interrupt landing inside the iterator tears down AND propagates.
+
+    A signalled stop (Ctrl-C / SIGTERM translated to KeyboardInterrupt) must
+    reach the CLI so the run is reported as interrupted; the live lab saw
+    five bots stopped by one signal all logged as ``completed`` because the
+    iterator swallowed it."""
+    provider = MockLiveProvider([_make_ohlcv(1000, is_closed=True)])
+    gen = live_ohlcv_generator(provider, "BTC/USDT", "1D")
+    next(gen)
+    assert provider.is_connected
+    with pytest.raises(KeyboardInterrupt):
+        gen.throw(KeyboardInterrupt)
     assert not provider.is_connected
 
 
