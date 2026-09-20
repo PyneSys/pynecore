@@ -9,6 +9,7 @@ import re
 import struct
 import tempfile
 from collections import Counter
+from contextlib import contextmanager
 from datetime import UTC, datetime, time, timedelta, timezone as fixed_timezone, tzinfo
 from math import gcd as math_gcd
 from pathlib import Path
@@ -789,6 +790,10 @@ class OHLCVWriter:
         "_extra_headers",
         "_extra_row_count",
         "_rebuild_published",
+        "_batch_depth",
+        "_published_size",
+        "_published_header",
+        "_publish_broken",
     )
 
     def __init__(
@@ -859,6 +864,10 @@ class OHLCVWriter:
         self._extra_headers: list[str] | None = None
         self._extra_row_count = 0
         self._rebuild_published = False
+        self._batch_depth = 0
+        self._published_size = 0
+        self._published_header: bytes | None = None
+        self._publish_broken = False
 
     def __enter__(self) -> "OHLCVWriter":
         """Open the writer and return it.
@@ -937,7 +946,23 @@ class OHLCVWriter:
 
     def _rewrite_header(self) -> None:
         """Re-stamp the current header in place; counts and flags are unchanged."""
+        self._publish()
+
+    def _publish(self) -> None:
+        """Make every written record durable and only then let the header count it.
+
+        This is the whole append protocol in one place: the sidecar rows and the
+        record bytes are made durable BEFORE the header that names them, because a
+        header naming records whose bytes or extra values did not survive a crash
+        leaves the pair unreadable, not merely stale. A header write that does not
+        complete -- torn, short, or unsynced -- is undone from the last published
+        copy, so the file always describes a prefix of the durable records and the
+        caller can disown the failed append without the header still naming it.
+
+        :raises OSError: If the header could not be published.
+        """
         assert self._file is not None
+        self._sync_extra_csv()
         header = _build_header(
             self._columns,
             _DENSE_FLAG if self._dense else 0,
@@ -949,9 +974,77 @@ class OHLCVWriter:
             self._minmove,
             self._pricescale,
         )
-        if _pwrite(self._file.fileno(), header, 0) != len(header):
-            raise OSError("Could not write the complete OHLCV header")
-        os.fsync(self._file.fileno())
+        if self._size != self._published_size:
+            os.fsync(self._file.fileno())
+        try:
+            if _pwrite(self._file.fileno(), header, 0) != len(header):
+                raise OSError("Could not publish the complete OHLCV header")
+            os.fsync(self._file.fileno())
+        except OSError:
+            # The new header may already be on disk while its durability is not
+            # established, and the caller answers a failure here by disowning the
+            # append. The last published copy goes back first, so the count the file
+            # states never outlives the state the writer keeps.
+            restored = False
+            if self._published_header is not None:
+                try:
+                    _pwrite_all(
+                        self._file.fileno(),
+                        self._published_header,
+                        0,
+                        "Could not restore the previous OHLCV header",
+                    )
+                    os.fsync(self._file.fileno())
+                    restored = True
+                except OSError:
+                    pass
+            if not restored:
+                # The file may still name the record the caller is about to disown, so
+                # undoing the append would trim a sidecar row the header keeps counting
+                # and leave the pair unreadable. Nothing is taken back and nothing more
+                # is published: the durable rows stay, and recovery is left to a reopen.
+                self._publish_broken = True
+            raise
+        self._published_header = header
+        self._published_size = self._size
+
+    @contextmanager
+    def batched(self) -> Iterator["OHLCVWriter"]:
+        """Publish the records written in this block once, at its end.
+
+        Each :meth:`write` otherwise fsyncs twice — the record bytes, then the header
+        counting them. That is the right granularity for a live bar, and far too fine
+        for a feed being built or fetched in bulk: an ext4/NVMe fsync costs about
+        10.5 ms, so a resampled 11 600-bar feed spends over three minutes in the two
+        per-record barriers alone. APFS hides this entirely, because its fsync is not
+        a device barrier.
+
+        The protocol is unchanged, only its granularity: the block's records are
+        fsynced together and the header then names all of them at once. A crash loses
+        the unpublished tail, which :meth:`open` truncates away — the same repair an
+        interrupted single append already needs. Use it only where that tail can be
+        recomputed or re-fetched, never for live bars.
+
+        :return: This writer, so the block can bind it.
+        """
+        self._batch_depth += 1
+        try:
+            yield self
+        except BaseException:
+            self._batch_depth -= 1
+            if self._batch_depth == 0 and self._file is not None:
+                # The records written before the failure are committed and belong in
+                # the header. A publish that fails too is swallowed: the file stays
+                # valid at the last published count and the original error is the one
+                # worth reporting.
+                try:
+                    self._publish()
+                except OSError:
+                    pass
+            raise
+        self._batch_depth -= 1
+        if self._batch_depth == 0 and self._file is not None:
+            self._publish()
 
     @property
     def start_timestamp(self) -> int | None:
@@ -1116,6 +1209,18 @@ class OHLCVWriter:
                 self._pricescale = layout.pricescale
             self._interval_value = layout.interval_value
             self._interval_unit = layout.interval_unit
+            self._published_size = self._size
+            self._published_header = _build_header(
+                self._columns,
+                layout.flags & _DENSE_FLAG,
+                self._size,
+                layout.first_timestamp,
+                layout.last_timestamp,
+                self._interval_value,
+                self._interval_unit,
+                self._minmove,
+                self._pricescale,
+            )
             # The sidecar is adopted (and realigned when an interrupted append left
             # it short) before anything reads the file back: the strict reader used
             # for the trading-hours scan rejects a misaligned pair outright, so the
@@ -1131,9 +1236,14 @@ class OHLCVWriter:
 
     def close(self) -> None:
         """Flush and close the file; repeated calls are safe."""
+        self._sync_extra_csv()
         self._close_extra_csv()
         if self._file is None:
             return
+        # After the sidecar is on its way out, so its rows are flushed before the
+        # header names the records they describe.
+        if self._size != self._published_size and not self._publish_broken:
+            self._publish()
         self._file.flush()
         os.fsync(self._file.fileno())
         self._file.close()
@@ -1151,11 +1261,16 @@ class OHLCVWriter:
         describes committed record ``N`` and a failed write commits nothing.
 
         :param candle: Logical OHLCV bar with a millisecond timestamp.
-        :raises RuntimeError: If the writer is closed.
+        :raises RuntimeError: If the writer is closed, or a failed publication left a header
+            that could not be restored.
         :raises ValueError: If the bar is malformed or its timestamp is not strictly increasing.
         """
         if self._file is None:
             raise RuntimeError("OHLCV writer is not open")
+        if self._publish_broken:
+            raise RuntimeError(
+                "OHLCV writer cannot publish: the previous header could not be restored"
+            )
         _validate_candle(candle)
         if not -(1 << 63) <= candle.timestamp < (1 << 63):
             raise ValueError("OHLCV timestamp is outside the signed i64 range")
@@ -1179,9 +1294,18 @@ class OHLCVWriter:
                 self._set_columns(_promote_columns(self._columns, promoted_roles))
                 self._write_empty_file()
             else:
+                # The rebuild copies the records the file publishes, so a pending
+                # batch has to be named in the header before it is read back.
+                if self._size != self._published_size:
+                    self._publish()
                 self._commit_extra_row(candle.extra_fields, old_count)
                 self._rebuild_published = False
                 try:
+                    # The rebuild publishes the bar by replacing the whole file, so its
+                    # sidecar row has to be durable before the replacement lands -- the
+                    # replaced file would otherwise commit a record whose extra values
+                    # a crash can still take away.
+                    self._sync_extra_csv()
                     self._rebuild_with_append(candle, promoted_roles)
                 except Exception:
                     # Once the rebuilt file is in place the bar is committed, so its
@@ -1197,57 +1321,39 @@ class OHLCVWriter:
         record_offset = self._header_size + old_count * self._record_size
         if _pwrite(self._file.fileno(), record, record_offset) != len(record):
             raise OSError("Could not write the complete OHLCV record")
-        os.fsync(self._file.fileno())
 
         # The sidecar row is durable before the record is published: the header still
-        # names ``old_count`` records, so a failing sidecar write leaves the bar
-        # uncommitted and the caller can retry it with its extra fields intact. The
+        # names ``self._published_size`` records, so a failing sidecar write leaves the
+        # bar uncommitted and the caller can retry it with its extra fields intact. The
         # other way round the bar would be committed with its extra values lost, and
         # the retry rejected as a duplicate timestamp.
         self._commit_extra_row(candle.extra_fields, old_count)
 
-        first_timestamp = self._start_timestamp if self._start_timestamp is not None else candle.timestamp
-        new_count = old_count + 1
+        # ``_dense_after_append`` reads the pre-append state, so it is answered before
+        # anything moves; the rest is captured to undo a failed publication.
         dense = self._dense_after_append(candle.timestamp)
-        flags = _DENSE_FLAG if dense else 0
-        previous_header = _build_header(
-            self._columns,
-            _DENSE_FLAG if self._dense else 0,
-            old_count,
-            self._start_timestamp if self._start_timestamp is not None else 0,
-            self._last_timestamp if self._last_timestamp is not None else 0,
-            self._interval_value,
-            self._interval_unit,
-            self._minmove,
-            self._pricescale,
-        )
-        header = _build_header(
-            self._columns,
-            flags,
-            new_count,
-            first_timestamp,
-            candle.timestamp,
-            self._interval_value,
-            self._interval_unit,
-            self._minmove,
-            self._pricescale,
-        )
-        if _pwrite(self._file.fileno(), header, 0) != len(header):
-            _pwrite_all(
-                self._file.fileno(),
-                previous_header,
-                0,
-                "Could not restore the previous OHLCV header",
-            )
-            os.fsync(self._file.fileno())
-            self._rollback_extra_row(old_count)
-            raise OSError("Could not publish the complete OHLCV header")
-        os.fsync(self._file.fileno())
-
-        self._size = new_count
-        self._start_timestamp = first_timestamp
+        previous_start = self._start_timestamp
+        previous_last = self._last_timestamp
+        previous_dense = self._dense
+        self._size = old_count + 1
+        self._start_timestamp = previous_start if previous_start is not None else candle.timestamp
         self._last_timestamp = candle.timestamp
         self._dense = dense
+        if self._batch_depth == 0:
+            try:
+                self._publish()
+            except Exception:
+                if self._publish_broken:
+                    # The header still names the bar, so its record and sidecar row
+                    # have to stay with it; disowning it here is what would break the
+                    # pair.
+                    raise
+                self._size = old_count
+                self._start_timestamp = previous_start
+                self._last_timestamp = previous_last
+                self._dense = previous_dense
+                self._rollback_extra_row(old_count)
+                raise
         self._collect_price_data(candle)
         self._collect_volume_data(candle)
         self._collect_trading_hours(candle)
@@ -1378,6 +1484,18 @@ class OHLCVWriter:
         self._extra_headers = None
         self._extra_row_count = 0
 
+    def _sync_extra_csv(self) -> None:
+        """Make the sidecar rows written so far durable; repeated calls are safe.
+
+        Flushing only hands the rows to the kernel. Publication makes the binary
+        durable, and without this the pair would survive a crash with committed
+        records whose sidecar rows are gone -- a row-count mismatch the reader
+        rejects outright and a reopen pads away with empty values.
+        """
+        if self._extra_file is not None:
+            self._extra_file.flush()
+            os.fsync(self._extra_file.fileno())
+
     def _close_extra_csv(self) -> None:
         """Close the sidecar file if it is open; repeated calls are safe."""
         if self._extra_file is not None:
@@ -1406,6 +1524,11 @@ class OHLCVWriter:
             writer.writerow(headers)
             self._extra_headers = headers
             self._extra_row_count = 0
+            # Syncing the rows is pointless while the name they live under can still
+            # vanish, so the fresh directory entry is made durable with them.
+            extra_file.flush()
+            os.fsync(extra_file.fileno())
+            _fsync_directory(self._extra_path.parent)
         for _ in range(position - self._extra_row_count):
             writer.writerow(empty)
         self._extra_row_count = position
@@ -1819,6 +1942,8 @@ class OHLCVWriter:
             raise OSError("Could not write the complete OHLCV header and schema")
         self._file.truncate(self._header_size)
         os.fsync(self._file.fileno())
+        self._published_header = header
+        self._published_size = 0
 
     @staticmethod
     def _validate_writer_schema(columns: tuple[_Column, ...]) -> None:
@@ -2031,6 +2156,8 @@ class OHLCVWriter:
             self._start_timestamp = first_timestamp
             self._last_timestamp = last_timestamp
             self._dense = dense
+            self._published_size = record_total
+            self._published_header = final_header
             _fsync_directory(path.parent)
             self._collect_price_data(candle)
             self._collect_volume_data(candle)

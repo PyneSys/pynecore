@@ -141,7 +141,8 @@ def aggregate_ohlcv(
 
     with OHLCVReader(source_path) as reader:
         with OHLCVWriter(target_path, target_period, truncate=True,
-                         minmove=reader.minmove, pricescale=reader.pricescale) as writer:
+                         minmove=reader.minmove,
+                         pricescale=reader.pricescale) as writer, writer.batched():
             window: list[OHLCV] = []
             current_bar_time: int | None = None
             restore_volume = not reader.lossless_volume
@@ -222,7 +223,8 @@ def _aggregate_observed(
 
     with OHLCVReader(source_path) as reader:
         with OHLCVWriter(target_path, f"{multiplier}{modifier}", truncate=True,
-                         minmove=reader.minmove, pricescale=reader.pricescale) as writer:
+                         minmove=reader.minmove,
+                         pricescale=reader.pricescale) as writer, writer.batched():
             window: list[OHLCV] = []
             window_start: int | None = None
             group_key: tuple | None = None

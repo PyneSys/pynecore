@@ -315,15 +315,20 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         daylight-saving shifts move it). Bars past that boundary must still be
         strictly increasing — the writer rejects them otherwise.
 
+        One call is one publication: a live bar arrives alone and is made durable on
+        its own, while a download page is fsynced once instead of once per bar. A
+        crash between pages costs the page, which the resume logic re-fetches anyway.
+
         :param data: Single OHLCV record or list of records.
         """
         assert self.ohlcv_file is not None
         candles = (data,) if isinstance(data, OHLCV) else data
         boundary = self.resume_timestamp
-        for candle in candles:
-            if boundary is not None and candle.timestamp <= boundary:
-                continue
-            self.ohlcv_file.write(candle)
+        with self.ohlcv_file.batched():
+            for candle in candles:
+                if boundary is not None and candle.timestamp <= boundary:
+                    continue
+                self.ohlcv_file.write(candle)
 
     @abstractmethod
     def download_ohlcv(self, time_from: datetime, time_to: datetime,

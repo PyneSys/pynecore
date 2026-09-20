@@ -196,7 +196,8 @@ def main(
             random.seed(42)
 
             with OHLCVWriter(demo_file, syminfo.period,
-                             minmove=syminfo.minmove, pricescale=syminfo.pricescale) as writer:
+                             minmove=syminfo.minmove,
+                             pricescale=syminfo.pricescale) as writer, writer.batched():
                 close_price = base_price
                 volatility = base_volatility
                 bar_return = 0.0

@@ -676,6 +676,69 @@ def __test_late_promotion_keeps_extra_fields__(tmp_path: Path):
         assert reader.read(1).extra_fields == {"sig": 2.5}
 
 
+def __test_promotion_syncs_extra_rows_before_replacing__(tmp_path: Path, monkeypatch):
+    """A promoting append makes its sidecar row durable before the file is replaced."""
+    path = tmp_path / "promotion_sync.ohlcv"
+    first = OHLCV(0, 5_000_000_000_000.0, 5_000_000_000_000.1,
+                  4_999_999_999_999.9, 5_000_000_000_000.05, 1.0,
+                  extra_fields={"sig": 1.5})
+    second = OHLCV(60_000, 5_000_000_000_000.0, 5_001_000_000_000.0,
+                   4_999_000_000_000.0, 5_000_500_000_000.0, 2.0,
+                   extra_fields={"sig": 2.5})
+    _write_candles(path, [first], minmove=1, pricescale=100)
+
+    events: list[str] = []
+    real_sync_extra = OHLCVWriter._sync_extra_csv  # noqa
+    real_replace = ohlcv.replace_file
+
+    def tracking_sync_extra(self) -> None:
+        events.append("sync-extra")
+        real_sync_extra(self)
+
+    def tracking_replace(source, target) -> None:
+        events.append("replace")
+        real_replace(source, target)
+
+    monkeypatch.setattr(OHLCVWriter, "_sync_extra_csv", tracking_sync_extra)
+    monkeypatch.setattr(ohlcv, "replace_file", tracking_replace)
+    with OHLCVWriter(path, "1", minmove=1, pricescale=100) as writer:
+        writer.write(second)
+    monkeypatch.undo()
+
+    assert "replace" in events
+    assert "sync-extra" in events[: events.index("replace")]
+    with OHLCVReader(path) as reader:
+        assert reader.size == 2
+        assert reader.read(1).extra_fields == {"sig": 2.5}
+
+
+def __test_promotion_sync_failure_keeps_the_old_file__(tmp_path: Path, monkeypatch):
+    """A sidecar sync failure aborts the promoting append before the file is replaced."""
+    path = tmp_path / "promotion_sync_fail.ohlcv"
+    first = OHLCV(0, 5_000_000_000_000.0, 5_000_000_000_000.1,
+                  4_999_999_999_999.9, 5_000_000_000_000.05, 1.0,
+                  extra_fields={"sig": 1.5})
+    second = OHLCV(60_000, 5_000_000_000_000.0, 5_001_000_000_000.0,
+                   4_999_000_000_000.0, 5_000_500_000_000.0, 2.0,
+                   extra_fields={"sig": 2.5})
+    _write_candles(path, [first], minmove=1, pricescale=100)
+
+    def failing_sync_extra(self) -> None:
+        raise OSError("simulated sidecar sync failure")
+
+    with OHLCVWriter(path, "1", minmove=1, pricescale=100) as writer:
+        monkeypatch.setattr(OHLCVWriter, "_sync_extra_csv", failing_sync_extra)
+        with pytest.raises(OSError, match="simulated sidecar sync failure"):
+            writer.write(second)
+        monkeypatch.undo()
+        assert writer.size == 1
+
+    assert _record_size(path) == 36
+    with OHLCVReader(path) as reader:
+        assert reader.size == 1
+        assert reader.read(0).extra_fields == {"sig": 1.5}
+
+
 @pytest.mark.parametrize("target_offset", [0, 64, _HEADER_SIZE, _HEADER_SIZE + 48])
 def __test_promotion_retries_short_replacement_writes__(
     tmp_path: Path, monkeypatch, target_offset: int
@@ -1589,3 +1652,171 @@ def __test_record_count_ignores_uncommitted_v2_tail__(tmp_path: Path):
     assert record_count(path) == 2
     with OHLCVReader(path) as reader:
         assert reader.size == 2
+
+
+def __test_batched_publishes_once_at_the_end__(tmp_path: Path):
+    """Inside the block the file still names the records it named before it."""
+    path = tmp_path / "batched.ohlcv"
+    candles = [OHLCV(i * 60_000, 1.0, 2.0, 0.0, 1.5, 1.0) for i in range(4)]
+    with OHLCVWriter(path, "1", truncate=True) as writer:
+        writer.write(candles[0])
+        assert record_count(path) == 1
+
+        with writer.batched():
+            for candle in candles[1:]:
+                writer.write(candle)
+            # The records are on disk, but the header still counts only the first
+            assert writer.size == 4
+            assert record_count(path) == 1
+
+        assert record_count(path) == 4
+
+    with OHLCVReader(path) as reader:
+        assert reader.size == 4
+        assert [candle.timestamp for candle in reader] == [0, 60_000, 120_000, 180_000]
+
+
+def __test_batched_publishes_what_a_failed_block_wrote__(tmp_path: Path):
+    """A block left through an exception still commits the bars it managed to write."""
+    path = tmp_path / "batched_raise.ohlcv"
+    with OHLCVWriter(path, "1", truncate=True) as writer:
+        with pytest.raises(ValueError):
+            with writer.batched():
+                writer.write(OHLCV(0, 1.0, 2.0, 0.0, 1.5, 1.0))
+                writer.write(OHLCV(60_000, 1.0, 2.0, 0.0, 1.5, 1.0))
+                # Not strictly increasing — rejected before anything is written
+                writer.write(OHLCV(60_000, 1.0, 2.0, 0.0, 1.5, 1.0))
+
+        assert record_count(path) == 2
+
+    with OHLCVReader(path) as reader:
+        assert reader.size == 2
+
+
+def __test_reopen_drops_an_unpublished_batch_tail__(tmp_path: Path, monkeypatch):
+    """A crash mid-batch leaves a tail the next open truncates away."""
+    path = tmp_path / "batch_tail.ohlcv"
+    with OHLCVWriter(path, "1", truncate=True) as writer:
+        writer.write(OHLCV(0, 1.0, 2.0, 0.0, 1.5, 1.0))
+
+    published_size = path.stat().st_size
+
+    writer = OHLCVWriter(path, "1")
+    with writer:
+        # Stands in for the power loss: the records reach the file, the header
+        # naming them never does.
+        monkeypatch.setattr(OHLCVWriter, "_publish", lambda self: None)
+        with writer.batched():
+            writer.write(OHLCV(60_000, 1.0, 2.0, 0.0, 1.5, 1.0))
+            writer.write(OHLCV(120_000, 1.0, 2.0, 0.0, 1.5, 1.0))
+
+    assert path.stat().st_size > published_size
+    assert record_count(path) == 1
+
+    monkeypatch.undo()
+    with OHLCVWriter(path, "1") as reopened:
+        assert reopened.size == 1
+    assert path.stat().st_size == published_size
+
+
+def __test_failed_header_sync_restores_the_published_count__(tmp_path: Path, monkeypatch):
+    """A header that reaches the disk but cannot be synced is rolled back."""
+    path = tmp_path / "header_sync.ohlcv"
+    with OHLCVWriter(path, "1", truncate=True) as writer:
+        writer.write(OHLCV(0, 1.0, 2.0, 0.0, 1.5, 1.0, extra_fields={"tag": "one"}))
+
+    real_pwrite = ohlcv._pwrite  # noqa
+    real_fsync = os.fsync
+    header_written: list[int] = []
+    failed: list[int] = []
+
+    def tracking_pwrite(fd: int, data: bytes, offset: int) -> int:
+        written = real_pwrite(fd, data, offset)
+        if offset == 0:
+            header_written.append(fd)
+        return written
+
+    def failing_fsync(fd: int) -> None:
+        # Only the sync that would make the freshly written header durable fails;
+        # the sidecar, the record bytes and the restoring write all sync normally.
+        if header_written and not failed:
+            failed.append(fd)
+            raise OSError("simulated header sync failure")
+        real_fsync(fd)
+
+    with OHLCVWriter(path, "1") as writer:
+        monkeypatch.setattr(ohlcv, "_pwrite", tracking_pwrite)
+        monkeypatch.setattr(ohlcv.os, "fsync", failing_fsync)
+        with pytest.raises(OSError, match="simulated header sync failure"):
+            writer.write(OHLCV(60_000, 1.0, 2.0, 0.0, 1.5, 1.0, extra_fields={"tag": "two"}))
+        monkeypatch.undo()
+        assert failed
+        assert writer.size == 1
+        assert record_count(path) == 1
+
+    assert record_count(path) == 1
+    with OHLCVReader(path) as reader:
+        assert reader.size == 1
+        assert reader.read(0).extra_fields == {"tag": "one"}
+
+
+def __test_failed_header_restore_keeps_the_committed_pair__(tmp_path: Path, monkeypatch):
+    """When the previous header cannot be restored, nothing is disowned or trimmed."""
+    path = tmp_path / "header_restore.ohlcv"
+    with OHLCVWriter(path, "1", truncate=True) as writer:
+        writer.write(OHLCV(0, 1.0, 2.0, 0.0, 1.5, 1.0, extra_fields={"tag": "one"}))
+
+    real_pwrite = ohlcv._pwrite  # noqa
+    real_fsync = os.fsync
+    header_written: list[int] = []
+
+    def tracking_pwrite(fd: int, data: bytes, offset: int) -> int:
+        written = real_pwrite(fd, data, offset)
+        if offset == 0:
+            header_written.append(fd)
+        return written
+
+    def failing_fsync(fd: int) -> None:
+        # Every sync after the first header write fails, so the restoring write is
+        # not durable either.
+        if header_written:
+            raise OSError("simulated persistent sync failure")
+        real_fsync(fd)
+
+    with OHLCVWriter(path, "1") as writer:
+        monkeypatch.setattr(ohlcv, "_pwrite", tracking_pwrite)
+        monkeypatch.setattr(ohlcv.os, "fsync", failing_fsync)
+        with pytest.raises(OSError, match="simulated persistent sync failure"):
+            writer.write(OHLCV(60_000, 1.0, 2.0, 0.0, 1.5, 1.0, extra_fields={"tag": "two"}))
+        monkeypatch.undo()
+        # The header may still name the second bar, so its sidecar row stays with it.
+        assert writer.size == 2
+        with pytest.raises(RuntimeError, match="could not be restored"):
+            writer.write(OHLCV(120_000, 1.0, 2.0, 0.0, 1.5, 1.0))
+
+    extra_rows = (tmp_path / "header_restore.extra.csv").read_text().splitlines()
+    assert len(extra_rows) == 3
+    assert extra_rows[-1].endswith("two")
+
+
+def __test_extra_rows_are_synced_before_the_header__(tmp_path: Path, monkeypatch):
+    """The sidecar rows are durable before the header names the records they describe."""
+    path = tmp_path / "extra_sync.ohlcv"
+    real_fsync = os.fsync
+    synced: list[int] = []
+
+    def recording_fsync(fd: int) -> None:
+        synced.append(fd)
+        real_fsync(fd)
+
+    with OHLCVWriter(path, "1", truncate=True) as writer:
+        writer.write(OHLCV(0, 1.0, 2.0, 0.0, 1.5, 1.0, extra_fields={"tag": "one"}))
+        monkeypatch.setattr(ohlcv.os, "fsync", recording_fsync)
+        writer.write(OHLCV(60_000, 1.0, 2.0, 0.0, 1.5, 1.0, extra_fields={"tag": "two"}))
+        monkeypatch.undo()
+        binary_fd = writer._file.fileno()  # noqa
+        extra_fd = writer._extra_file.fileno()  # noqa
+
+    assert extra_fd in synced
+    assert binary_fd in synced
+    assert synced.index(extra_fd) < synced.index(binary_fd)
