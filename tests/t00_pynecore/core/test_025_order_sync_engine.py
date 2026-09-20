@@ -45,6 +45,7 @@ from pynecore.core.broker.sync_engine import (
 from pynecore.core.plugin import ProviderError, TransientProviderError
 from pynecore.core.broker.models import (
     CANCEL_REASON_VENUE_REDUCE_ONLY,
+    INTENT_KEY_SEP,
     BrokerEvent,
     CapabilityLevel,
     CloseIntent,
@@ -5325,6 +5326,123 @@ def __test_verify_pending_keeps_pending_when_not_found__():
     engine.sync(BAR_TS)
 
     assert expected_coid in engine.pending_verification
+
+
+def __test_exit_dispatch_waits_for_a_parked_parent_entry__():
+    """An exit is not armed while its parent entry's dispatch is parked."""
+    # A parked entry may never have reached the venue; on a spot venue the
+    # exit legs are plain sells, so arming them would sell inventory the
+    # bot never bought. The exit dispatches once the parent is confirmed.
+    expected_coid = _preview_entry_coid("L", limit=50_000.0)
+
+    b = MockBroker()
+    b.raise_on_next_entry = OrderDispositionUnknownError(
+        "simulated timeout", client_order_id=expected_coid,
+    )
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order(
+        "L", -1.0, "L-X", limit=60_000.0, stop=45_000.0,
+    )
+
+    engine.sync(BAR_TS)
+    assert expected_coid in engine.pending_verification
+    assert b.exit_calls == []
+    assert f"L-X{INTENT_KEY_SEP}L" not in engine.active_intents
+
+    # Still parked on the next sync: the re-emitted exit keeps waiting.
+    engine.sync(BAR_TS + 60_000)
+    assert b.exit_calls == []
+
+    # The entry did land; the exit arms right after the promotion.
+    b.open_orders = [
+        ExchangeOrder(
+            id="xchg-42", symbol=SYMBOL, side="buy",
+            order_type=OrderType.LIMIT, qty=1.0, filled_qty=0.0,
+            remaining_qty=1.0, price=50_000.0, stop_price=None,
+            average_fill_price=None, status=OrderStatus.OPEN,
+            timestamp=0.0, fee=0.0, fee_currency="",
+            client_order_id=expected_coid,
+        ),
+    ]
+    engine.sync(BAR_TS + 120_000)
+    assert expected_coid not in engine.pending_verification
+    assert len(b.exit_calls) == 1
+    assert f"L-X{INTENT_KEY_SEP}L" in engine.active_intents
+
+
+def __test_exit_dispatch_proceeds_for_a_parked_parent_with_a_recorded_fill__():
+    """A fill recorded for the parked parent is proof it landed — no gate."""
+    expected_coid = _preview_entry_coid("L", limit=50_000.0)
+
+    b = MockBroker()
+    b.raise_on_next_entry = OrderDispositionUnknownError(
+        "simulated timeout", client_order_id=expected_coid,
+    )
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    assert expected_coid in engine.pending_verification
+
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    pos.exit_orders[("L-X", "L")] = _exit_order(
+        "L", -1.0, "L-X", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS + 60_000)
+
+    assert len(b.exit_calls) == 1
+
+
+def __test_exit_modify_waits_for_a_parked_parent_entry__():
+    """An exit amend is deferred while the parent's replacement is parked."""
+    # The default modify is cancel + re-execute: with the parent's own
+    # amend parked, fresh exit legs would protect a position that may not
+    # exist. The old exit stays as it is and the amend runs once the parent
+    # resolves.
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order(
+        "L", -1.0, "L-X", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+    assert len(b.exit_calls) == 1
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=51_000.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order(
+        "L", -1.0, "L-X", limit=61_000.0, stop=45_000.0,
+    )
+    b.raise_on_next_modify_entry = OrderDispositionUnknownError(
+        "replacement submit timed out", client_order_id="coid-L-replacement",
+    )
+    engine.sync(BAR_TS + 60_000)
+
+    assert "coid-L-replacement" in engine.pending_verification
+    assert b.modify_exit_calls == []
+    assert len(b.exit_calls) == 1
+    active_exit = engine.active_intents[f"L-X{INTENT_KEY_SEP}L"]
+    assert isinstance(active_exit, ExitIntent)
+    assert active_exit.tp_price == 60_000.0
+
+    # The replacement lands; the deferred exit amend runs on the next diff.
+    b.open_orders = [
+        ExchangeOrder(
+            id="xchg-43", symbol=SYMBOL, side="buy",
+            order_type=OrderType.LIMIT, qty=1.0, filled_qty=0.0,
+            remaining_qty=1.0, price=51_000.0, stop_price=None,
+            average_fill_price=None, status=OrderStatus.OPEN,
+            timestamp=0.0, fee=0.0, fee_currency="",
+            client_order_id="coid-L-replacement",
+        ),
+    ]
+    engine.sync(BAR_TS + 120_000)
+
+    assert "coid-L-replacement" not in engine.pending_verification
+    assert len(b.modify_exit_calls) == 1
+    active_exit = engine.active_intents[f"L-X{INTENT_KEY_SEP}L"]
+    assert isinstance(active_exit, ExitIntent)
+    assert active_exit.tp_price == 61_000.0
 
 
 def __test_verify_pending_connection_error_keeps_pending__():

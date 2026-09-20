@@ -872,6 +872,20 @@ class _QuarantineModifyDeferred(Exception):
     """
 
 
+class _ParentEntryParkedModifyDeferred(Exception):
+    """Internal control-flow signal raised by :meth:`OrderSyncEngine._dispatch_modify`
+    when an exit amend targets a parent entry whose dispatch is still parked
+    with an unknown disposition.
+
+    Nothing was sent to the broker: whatever the exit currently holds (a
+    parked leg or resting legs) is left untouched, so the caller must keep
+    ``_active_intents[key]`` pointing at the OLD intent and re-diff once
+    the parent's disposition resolves.
+
+    Module-private — never propagates outside :mod:`sync_engine`.
+    """
+
+
 @dataclasses.dataclass(frozen=True)
 class _EngineTriggerLegSpec:
     """Per-leg spec produced by :meth:`OrderSyncEngine._enumerate_engine_trigger_legs`.
@@ -8848,6 +8862,8 @@ class OrderSyncEngine:
         new_intent = dataclasses.replace(bracket_intent, qty=target_qty)
         try:
             self._dispatch_modify(bracket_intent, new_intent)
+        except _ParentEntryParkedModifyDeferred:
+            return
         except OrderSkippedByPlugin as e:
             # The qty amend escalated into the bracket-attach-reject
             # recovery inside ``_dispatch_modify`` (defensive close armed,
@@ -13405,6 +13421,12 @@ class OrderSyncEngine:
                     # lifts on an operator restart, so there is nothing to
                     # retry in-process.
                     continue
+                except _ParentEntryParkedModifyDeferred:
+                    # Exit amend deferred behind its parked parent entry —
+                    # no broker call was made. Keep the OLD intent active so
+                    # the next sync re-diffs once the parent's disposition
+                    # resolves.
+                    continue
                 except OrderDispositionUnknownError:
                     # Native-to-engine partial-bracket conversion path
                     # surfaces a timed-out strict cancel here. Leaving the
@@ -14039,6 +14061,24 @@ class OrderSyncEngine:
             retry_seq=0,
             coid_max_len=self._coid_max_len,
         )
+
+    def _parent_entry_dispatch_parked(self, from_entry: str | None) -> str | None:
+        """Return the parked client order id of ``from_entry``'s entry dispatch.
+
+        ``None`` when the parent entry is not parked or has already
+        recorded a fill: a fill is proof the parked order landed, and the
+        park itself is retired only once the store row is pruned at the
+        next sync top, so the fill ledger is consulted first.
+        """
+        if from_entry is None:
+            return None
+        if self._active_entry_filled_qty.get(from_entry, 0.0) > 0.0:
+            return None
+        for coid, envelope in self._pending_verification.items():
+            if (isinstance(envelope.intent, EntryIntent)
+                    and envelope.intent.intent_key == from_entry):
+                return coid
+        return None
 
     def _park_pending(
             self, envelope: DispatchEnvelope, error: OrderDispositionUnknownError,
@@ -15078,6 +15118,30 @@ class OrderSyncEngine:
                     context={
                         'symbol': intent.symbol,
                         'from_entry': intent.from_entry,
+                    },
+                )
+            # An exit is only ever a reduction of the position its parent
+            # entry opened. While the parent's dispatch is parked with an
+            # unknown disposition there may be no such position at all —
+            # on a spot venue the exit legs are plain sells, so arming
+            # them now would sell inventory the bot never bought the
+            # moment the SL or TP level trades. The parent's disposition
+            # resolves through ``get_open_orders`` / the plugin's fill
+            # unpark; the script keeps re-emitting the exit until then.
+            parked_parent = self._parent_entry_dispatch_parked(intent.from_entry)
+            if parked_parent is not None:
+                raise OrderSkippedByPlugin(
+                    f"Exit {format_intent_key(intent.intent_key)} "
+                    f"skipped: parent entry {intent.from_entry!r} dispatch "
+                    f"is parked with an unknown disposition "
+                    f"(client_order_id={parked_parent}); re-evaluating "
+                    f"next sync.",
+                    intent_key=intent.intent_key,
+                    reason='parent_entry_disposition_pending',
+                    context={
+                        'symbol': intent.symbol,
+                        'from_entry': intent.from_entry,
+                        'parent_client_order_id': parked_parent,
                     },
                 )
         # Quarantine gate: new entries are exactly the "new or
@@ -18260,6 +18324,23 @@ class OrderSyncEngine:
             raise _QuarantineModifyDeferred(
                 "entry modify blocked by quarantine"
             )
+        # Exit amends share the parked-parent rule of ``_dispatch_new``:
+        # the default modify is cancel + re-execute, which would arm fresh
+        # legs against a position the parked parent may never have opened.
+        # Leave the exit as it is (parked or resting) and re-diff once the
+        # parent's disposition resolves.
+        if isinstance(new, ExitIntent):
+            parked_parent = self._parent_entry_dispatch_parked(new.from_entry)
+            if parked_parent is not None:
+                _blog_warning(
+                    "exit modify %s -> %s deferred — parent entry %r "
+                    "dispatch is parked with an unknown disposition "
+                    "(client_order_id=%s)",
+                    old, new, new.from_entry, parked_parent,
+                )
+                raise _ParentEntryParkedModifyDeferred(
+                    "exit modify deferred — parent entry dispatch parked"
+                )
         # Short gate for entry amends: a qty raise on a resting sell-side
         # entry can flip the projected position just like a fresh dispatch.
         # The OLD quantity is excluded from the aggregation (it is being
