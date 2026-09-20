@@ -83,17 +83,18 @@ def __test_helper_run(runner, no_merge):
         of served sids per child, and the sids whose child got a planned
         developing sequence.
     """
-    import multiprocessing
     import os
     import sys
     import tempfile
     from pathlib import Path
+    from pynecore.core import security_mp
 
     sys.modules.pop(Path(__file__).stem, None)
 
     spawned: list = []
     batched: list = []
-    original = multiprocessing.Process
+    context = security_mp.mp_context
+    original = context.Process
 
     def _recording_process(*args, **kwargs):
         sec_args = kwargs.get('args') or ()
@@ -104,7 +105,7 @@ def __test_helper_run(runner, no_merge):
         return original(*args, **kwargs)
 
     rows: list[dict] = []
-    multiprocessing.Process = _recording_process
+    context.Process = _recording_process
     if no_merge:
         os.environ['PYNE_NO_SECURITY_MERGE'] = '1'
     try:
@@ -124,7 +125,7 @@ def __test_helper_run(runner, no_merge):
             for _candle, pv in r.run_iter():
                 rows.append(dict(pv))
     finally:
-        multiprocessing.Process = original
+        del context.Process
         if no_merge:
             os.environ.pop('PYNE_NO_SECURITY_MERGE', None)
     return rows, spawned, batched
@@ -138,15 +139,16 @@ def __test_helper_run_strategy(runner, no_merge):
     :return: ``(trades, spawned)`` — one comparable tuple per closed trade and
         one tuple of served sids per child process.
     """
-    import multiprocessing
     import os
     import sys
     import tempfile
     from pathlib import Path
     from pynecore.core.script_runner import ScriptRunner
+    from pynecore.core import security_mp
 
     spawned: list = []
-    original = multiprocessing.Process
+    context = security_mp.mp_context
+    original = context.Process
 
     def _recording_process(*args, **kwargs):
         sec_args = kwargs.get('args') or ()
@@ -155,7 +157,7 @@ def __test_helper_run_strategy(runner, no_merge):
         return original(*args, **kwargs)
 
     trades: list = []
-    multiprocessing.Process = _recording_process
+    context.Process = _recording_process
     if no_merge:
         os.environ['PYNE_NO_SECURITY_MERGE'] = '1'
     try:
@@ -181,7 +183,7 @@ def __test_helper_run_strategy(runner, no_merge):
                 sys.path.remove(str(tmp))
                 sys.modules.pop(path.stem, None)
     finally:
-        multiprocessing.Process = original
+        del context.Process
         if no_merge:
             os.environ.pop('PYNE_NO_SECURITY_MERGE', None)
     return trades, spawned

@@ -2007,7 +2007,12 @@ class ScriptRunner:
                 )
                 from .security_shm import create_ring_conditions
                 from .security_process import security_process_main
-                from multiprocessing import Pipe, Process
+                from .security_mp import mp_context, preload_in_forkserver, child_run_env
+
+                # Before the first ``Process()``, which is what starts the
+                # forkserver. The module name comes off the entry point so it
+                # cannot drift from the import above.
+                preload_in_forkserver(security_process_main.__module__)
 
                 # Detect same-context: symbol+TF identical to chart. Pine names the
                 # chart instrument either bare (``syminfo.ticker``) or exchange
@@ -2405,9 +2410,9 @@ class ScriptRunner:
                         sec_states,  # noqa - non-None inside if sec_contexts
                         _sec_prepared, sec_consumers,
                         _chart_ring_capacity, _chart_ring_arena)
-                    _registry_parent_conn, _registry_child_conn = Pipe()
+                    _registry_parent_conn, _registry_child_conn = mp_context.Pipe()
                     sec_registry_pipes[sid] = _registry_parent_conn
-                    proc = Process(
+                    proc = mp_context.Process(
                         target=security_process_main,
                         args=(
                             served,
@@ -2438,6 +2443,12 @@ class ScriptRunner:
                             self._inputs,
                             _dev_batch_spec,
                         ),
+                        # Read per spawn: the forkserver froze its own copy of
+                        # the environment at the first child and a replay may
+                        # have re-pinned ``timenow`` since. Kept out of ``args``
+                        # because that tuple describes the CONTEXT, and its tail
+                        # is what identifies a planned developing batch.
+                        kwargs={'run_env': child_run_env()},
                         daemon=True,
                     )
                     proc.start()

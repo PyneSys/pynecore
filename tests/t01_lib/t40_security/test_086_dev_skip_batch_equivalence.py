@@ -172,19 +172,20 @@ def __test_helper_run(runner, no_skip):
         ``(first_dev_only, developing records, records, closed_shift)`` tuple per
         plan.
     """
-    import multiprocessing
     import os
     import sys
     import tempfile
     from pathlib import Path
 
+    from pynecore.core import security_mp
     from pynecore.core.script_runner import ScriptRunner
 
     sys.modules.pop(Path(__file__).stem, None)
 
     batched: list[str] = []
     specs: list = []
-    original_process = multiprocessing.Process
+    context = security_mp.mp_context
+    original_process = context.Process
     original_spec = ScriptRunner._dev_batch_spec
 
     def _recording_process(*args, **kwargs):
@@ -202,7 +203,7 @@ def __test_helper_run(runner, no_skip):
         return spec
 
     rows: list[dict] = []
-    multiprocessing.Process = _recording_process
+    context.Process = _recording_process
     ScriptRunner._dev_batch_spec = _recording_spec
     if no_skip:
         os.environ['PYNE_NO_SECURITY_DEV_SKIP'] = '1'
@@ -223,7 +224,7 @@ def __test_helper_run(runner, no_skip):
                 rows.append(dict(pv))
             plans = __test_helper_plans(specs)
     finally:
-        multiprocessing.Process = original_process
+        del context.Process
         ScriptRunner._dev_batch_spec = original_spec
         if no_skip:
             os.environ.pop('PYNE_NO_SECURITY_DEV_SKIP', None)

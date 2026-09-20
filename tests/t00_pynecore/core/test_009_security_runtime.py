@@ -571,3 +571,36 @@ def __test_setup_security_states_ltf__(log):
             rb.unlink()
         sync_block.close()
         sync_block.unlink()
+
+
+def __test_apply_child_run_env_clears_removed_switches__():
+    """apply_child_run_env makes the snapshot authoritative, not additive"""
+    import os
+    from pynecore.core.security_mp import apply_child_run_env, child_run_env
+
+    saved = {k: v for k, v in os.environ.items() if k.startswith("PYNE")}
+    other = os.environ.get("PATH")
+    try:
+        for k in list(saved):
+            del os.environ[k]
+
+        # A forkserver child starts from the server's frozen environment
+        os.environ["PYNE_NO_SECURITY_SLICE"] = "1"
+        os.environ["PYNE_TIMENOW_MS"] = "111"
+
+        # ... and the runner has since cleared both
+        apply_child_run_env({})
+        assert "PYNE_NO_SECURITY_SLICE" not in os.environ
+        assert "PYNE_TIMENOW_MS" not in os.environ
+        assert os.environ.get("PATH") == other
+
+        # A later run re-pins the clock while slicing stays on
+        os.environ["PYNE_NO_SECURITY_SLICE"] = "1"
+        apply_child_run_env({"PYNE_TIMENOW_MS": "222"})
+        assert "PYNE_NO_SECURITY_SLICE" not in os.environ
+        assert os.environ["PYNE_TIMENOW_MS"] == "222"
+        assert child_run_env() == {"PYNE_TIMENOW_MS": "222"}
+    finally:
+        for k in [k for k in os.environ if k.startswith("PYNE")]:
+            del os.environ[k]
+        os.environ.update(saved)

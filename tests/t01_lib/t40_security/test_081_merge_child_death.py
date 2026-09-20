@@ -40,16 +40,17 @@ def __test_helper_run(runner, no_merge):
     :return: ``(raised, spawned)`` — the exception the run ended with (or None)
         and one tuple of served sids per child process.
     """
-    import multiprocessing
     import os
     import sys
     import tempfile
     from pathlib import Path
+    from pynecore.core import security_mp
 
     sys.modules.pop(Path(__file__).stem, None)
 
     spawned: list = []
-    original = multiprocessing.Process
+    context = security_mp.mp_context
+    original = context.Process
 
     def _recording_process(*args, **kwargs):
         sec_args = kwargs.get('args') or ()
@@ -58,7 +59,7 @@ def __test_helper_run(runner, no_merge):
         return original(*args, **kwargs)
 
     raised = None
-    multiprocessing.Process = _recording_process
+    context.Process = _recording_process
     if no_merge:
         os.environ['PYNE_NO_SECURITY_MERGE'] = '1'
     try:
@@ -76,7 +77,7 @@ def __test_helper_run(runner, no_merge):
             except BaseException as exc:  # noqa: BLE001 - the failure IS the result
                 raised = exc
     finally:
-        multiprocessing.Process = original
+        del context.Process
         if no_merge:
             os.environ.pop('PYNE_NO_SECURITY_MERGE', None)
     return raised, spawned
