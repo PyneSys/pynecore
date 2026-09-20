@@ -124,17 +124,18 @@ def __test_helper_run(runner, no_batch):
     :return: ``(rows, batched_sids)`` — the plot values per chart bar, and the
         sids whose child was spawned with a planned developing sequence.
     """
-    import multiprocessing
     import sys
     import tempfile
     from pathlib import Path
 
     import pynecore.core.security as security_module
+    from pynecore.core import security_mp
 
     sys.modules.pop(Path(__file__).stem, None)
 
     batched: list[str] = []
-    original = multiprocessing.Process
+    context = security_mp.mp_context
+    original = context.Process
 
     def _recording_process(*args, **kwargs):
         sec_args = kwargs.get('args') or ()
@@ -145,7 +146,7 @@ def __test_helper_run(runner, no_batch):
     rows: list[dict] = []
     previous = security_module.NO_BATCH
     security_module.NO_BATCH = no_batch
-    multiprocessing.Process = _recording_process
+    context.Process = _recording_process
     try:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -159,7 +160,7 @@ def __test_helper_run(runner, no_batch):
             for _candle, pv in r.run_iter():
                 rows.append(dict(pv))
     finally:
-        multiprocessing.Process = original
+        del context.Process
         security_module.NO_BATCH = previous
     return rows, batched
 

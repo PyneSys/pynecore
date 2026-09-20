@@ -20,7 +20,7 @@ from time import monotonic
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from enum import Enum, auto
-from multiprocessing import Event, Lock, connection
+from multiprocessing import connection
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 from zoneinfo import ZoneInfo
@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 from .datetime import parse_timezone
 from .import_hook import security_dev_skip_disabled
 from .lookahead import ALLOW_LOOKAHEAD
+from .security_mp import mp_context
 from .security_shm import (
     SyncBlock, ResultBlock, ResultReader, INITIAL_RESULT_SIZE,
     FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE, FLAG_DEV_HISTORICAL,
@@ -268,16 +269,16 @@ class SecurityState:
     tz: ZoneInfo
 
     # Multiprocessing events (shared between chart and security processes)
-    data_ready: EventType = field(default_factory=Event)
-    advance_event: EventType = field(default_factory=Event)
-    done_event: EventType = field(default_factory=Event)
-    stop_event: EventType = field(default_factory=Event)
+    data_ready: EventType = field(default_factory=mp_context.Event)
+    advance_event: EventType = field(default_factory=mp_context.Event)
+    done_event: EventType = field(default_factory=mp_context.Event)
+    stop_event: EventType = field(default_factory=mp_context.Event)
 
     # Cross-process mutex protecting this slot's ResultBlock + sync metadata.
     # Held by writers (write_result/write_na) and by cross-context readers in
     # security children. Chart-side reads also acquire it for uniformity, but
     # never contend (data_ready already gates them).
-    result_lock: LockType = field(default_factory=Lock)
+    result_lock: LockType = field(default_factory=mp_context.Lock)
 
     # LTF mode (lower timeframe → array return)
     is_ltf: bool = False

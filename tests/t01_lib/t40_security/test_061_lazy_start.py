@@ -115,8 +115,8 @@ def __test_helper_same(a, b):
 def __test_helper_run(runner, no_merge=False):
     """Run the script once, recording which sids each child process serves.
 
-    ``script_runner`` imports ``Process`` from :mod:`multiprocessing` inside the
-    run, so patching the module attribute up front is what the spawn resolves —
+    ``script_runner`` starts the children on ``security_mp.mp_context``, so
+    patching that context's ``Process`` up front is what the start resolves —
     and the first entry of the spawn's ``args`` is the served sid list, which is
     all the test needs.
 
@@ -125,16 +125,17 @@ def __test_helper_run(runner, no_merge=False):
     :return: ``(rows, spawned)``, rows keyed by chart bar index and ``spawned``
         one tuple of served sids per child process.
     """
-    import multiprocessing
     import os
     import sys
     import tempfile
     from pathlib import Path
+    from pynecore.core import security_mp
 
     sys.modules.pop(Path(__file__).stem, None)
 
     spawned: list = []
-    original = multiprocessing.Process
+    context = security_mp.mp_context
+    original = context.Process
 
     def _recording_process(*args, **kwargs):
         sec_args = kwargs.get('args') or ()
@@ -143,7 +144,7 @@ def __test_helper_run(runner, no_merge=False):
         return original(*args, **kwargs)
 
     rows = {}
-    multiprocessing.Process = _recording_process
+    context.Process = _recording_process
     if no_merge:
         os.environ['PYNE_NO_SECURITY_MERGE'] = '1'
     try:
@@ -153,7 +154,7 @@ def __test_helper_run(runner, no_merge=False):
             for i, (_candle, pv) in enumerate(r.run_iter()):
                 rows[i] = dict(pv)
     finally:
-        multiprocessing.Process = original
+        del context.Process
         if no_merge:
             os.environ.pop('PYNE_NO_SECURITY_MERGE', None)
     return rows, spawned

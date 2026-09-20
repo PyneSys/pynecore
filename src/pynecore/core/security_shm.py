@@ -18,10 +18,11 @@ Three types of shared memory blocks:
 import pickle
 import struct
 from bisect import bisect_right
-from multiprocessing import Condition
 from multiprocessing.shared_memory import SharedMemory
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Callable, Iterable
+
+from .security_mp import mp_context
 
 if TYPE_CHECKING:
     from multiprocessing.synchronize import Condition as ConditionType, Event as EventType
@@ -1308,11 +1309,11 @@ def create_ring_conditions(sec_ids: Iterable[str]) -> dict[str, 'ConditionType']
     """
     Create one ``multiprocessing.Condition`` per security id.
 
-    The conditions are created on the default multiprocessing context, exactly
-    like ``SecurityState``'s events and locks, so they pickle into spawned
-    children through the ``Process`` argument tuple.
+    The conditions are created on ``security_mp.mp_context``, exactly like
+    ``SecurityState``'s events and locks, so they pickle into the children
+    through the ``Process`` argument tuple.
 
     :param sec_ids: Security ids to create conditions for.
     :return: Mapping of security id to condition.
     """
-    return {sid: Condition() for sid in sec_ids}
+    return {sid: mp_context.Condition() for sid in sec_ids}

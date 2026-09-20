@@ -57,7 +57,8 @@ from collections import deque
 from functools import partial
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
-from time import monotonic, sleep
+from multiprocessing import parent_process
+from time import monotonic
 from typing import TYPE_CHECKING, Any, Callable, Iterator, cast
 
 from ..types.na import set_bool_na
@@ -75,6 +76,7 @@ from .security import (
 )
 from .live_ltf_collector import LiveLtfCollector
 from .plugin.live_provider import PluginSymbol
+from .security_mp import apply_child_run_env
 
 logger = logging.getLogger(__name__)
 
@@ -83,10 +85,6 @@ if TYPE_CHECKING:
     from .live_runner import LiveBarStreamer
     from .security import DevBatchSpec
     from ..types.ohlcv import OHLCV
-
-# Seconds between parent-liveness checks in the orphan watchdog.
-_ORPHAN_CHECK_INTERVAL = 2.0
-
 
 # Upper bound of one wait slice while throttled. The chart notifies the ring
 # condition when it parks its watermark, so this only bounds how long a child
@@ -101,28 +99,35 @@ def _start_parent_death_watchdog() -> None:
     A *clean* parent exit tears it down (daemon atexit + the runner's ``finally``
     that sets ``stop_event`` and joins). But a *hard* kill of the parent — a
     ``SIGKILL``, or a ``subprocess`` timeout that kills only the direct child —
-    skips all of that: the child reparents to init, never receives ``stop_event``,
-    and on macOS (where timed Event waits fall back to select() polling) spins at
-    100% CPU while pinning its OHLCV and interpreter memory. macOS has no
-    ``PR_SET_PDEATHSIG``, so the portable safety net is a watchdog thread that
-    notices the reparent and exits.
+    skips all of that: the child never receives ``stop_event``, and on macOS
+    (where timed Event waits fall back to select() polling) spins at 100% CPU
+    while pinning its OHLCV and interpreter memory. macOS has no
+    ``PR_SET_PDEATHSIG``, so the portable safety net is a watchdog thread.
 
-    The captured parent PID is the spawning runner; when ``os.getppid()`` changes,
-    the parent is gone and this orphan exits via ``os._exit`` — skipping
-    atexit/``finally``, which could deadlock on shared memory the dead parent
-    still holds.
+    The liveness signal must be the RUNNER, not ``os.getppid()``. Children are
+    forked by the forkserver (``core/security_mp.py``), so their OS parent is
+    that server — and the server itself outlives the runner: every client owns
+    the write end of its "alive" pipe and ``connect_to_new_process`` passes that
+    very fd on to the child, which never closes it. An orphaned security child
+    therefore keeps the server alive and its ``getppid()`` never changes.
+    :func:`multiprocessing.parent_process` tracks the LOGICAL parent instead:
+    its sentinel is the read end of a pipe only the runner holds open, so it
+    becomes ready the moment the runner dies, under any start method.
+
+    The orphan then exits via ``os._exit`` — skipping atexit/``finally``, which
+    could deadlock on shared memory the dead parent still holds.
     """
-    parent_pid = os.getppid()
+    parent = parent_process()
+    if parent is None:  # not started through multiprocessing
+        return
 
     def _watch() -> None:
-        while True:
-            sleep(_ORPHAN_CHECK_INTERVAL)  # watchdog tick, not a poll-retry
-            if os.getppid() != parent_pid:
-                logger.warning(
-                    "Security process %d orphaned (parent %d gone); exiting.",
-                    os.getpid(), parent_pid,
-                )
-                os._exit(1)
+        parent.join()  # blocks on the parent's sentinel, not a poll loop
+        logger.warning(
+            "Security process %d orphaned (parent %s gone); exiting.",
+            os.getpid(), parent.pid,
+        )
+        os._exit(1)
 
     threading.Thread(target=_watch, daemon=True, name="sec-parent-watchdog").start()
 
@@ -431,6 +436,7 @@ def security_process_main(
         chart_ring_arena: 'dict[str, int] | None' = None,
         script_inputs: 'dict[str, Any] | None' = None,
         dev_batch_spec: 'DevBatchSpec | None' = None,
+        run_env: 'dict[str, str] | None' = None,
 ):
     assert result_locks is not None, "result_locks must be provided by script_runner"
     """
@@ -521,9 +527,21 @@ def security_process_main(
         (``FLAG_DEV_BATCH_ROUND``) and this process produces every record of
         the sequence and replays it as a round of its own, running ahead of the
         chart while it walks its bars.
+    :param run_env: The runner's ``PYNE*`` environment at spawn time
+        (``security_mp.child_run_env``), or ``None`` to leave the inherited one
+        alone. A forkserver child inherits the SERVER's environment, frozen at
+        the first spawn, so every per-run switch has to travel with the process
+        instead; the snapshot replaces the prefix wholesale, an empty one
+        included (``security_mp.apply_child_run_env``).
     """
     # Safety net first: exit if the parent is hard-killed (see the watchdog docstring).
     _start_parent_death_watchdog()
+
+    # Before anything reads a switch — the import hook below already consults
+    # ``PYNE_NO_SECURITY_SLICE``. The child's own later writes still win, which
+    # is what ``PYNE_SAVE_SCRIPT_TOML`` relies on.
+    if run_env is not None:
+        apply_child_run_env(run_env)
 
     # Re-register import hooks (spawn mode starts a fresh Python process)
     from . import import_hook  # noqa
