@@ -274,7 +274,7 @@ class DataConverter:
                 pricescale=writer_pricescale,
                 truncate=True,
                 timezone=timezone,
-            ) as ohlcv_writer:
+            ) as ohlcv_writer, ohlcv_writer.batched():
                 if detected_format == 'csv':
                     load_from_csv(
                         ohlcv_writer,
