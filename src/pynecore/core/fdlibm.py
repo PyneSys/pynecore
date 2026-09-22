@@ -1,4 +1,4 @@
-"""Bit-exact Python port of fdlibm 5.3 sin/cos/exp/asin/acos.
+"""Bit-exact Python port of fdlibm 5.3 sin/cos/exp/asin/acos/atan.
 
 Ported from the SunSoft fdlibm sources (netlib.org/fdlibm), which carry the
 following notice that must be preserved:
@@ -19,7 +19,7 @@ against Java StrictMath (the same fdlibm lineage) over millions of arguments.
 import math as _math
 from struct import pack as _pack, unpack as _unpack
 
-__all__ = ['sin', 'cos', 'exp', 'asin', 'acos']
+__all__ = ['sin', 'cos', 'exp', 'asin', 'acos', 'atan']
 
 _M32 = 0xFFFFFFFF
 
@@ -538,3 +538,70 @@ def acos(x: float) -> float:
     r = p / q
     w = r * s + c
     return 2.0 * (df + w)
+
+
+# --- atan (s_atan.c) ---------------------------------------------------------
+
+_ATAN_HI = (
+    4.63647609000806093515e-01,             # atan(0.5) head
+    7.85398163397448278999e-01,             # atan(1.0) head
+    9.82793723247329054082e-01,             # atan(1.5) head
+    1.57079632679489655800e+00,             # atan(inf) head
+)
+_ATAN_LO = (
+    2.26987774529616870924e-17,
+    3.06161699786838301793e-17,
+    1.39033110312309984516e-17,
+    6.12323399573676603587e-17,
+)
+_AT0 = 3.33333333333329318027e-01
+_AT1 = -1.99999999998764832476e-01
+_AT2 = 1.42857142725034663711e-01
+_AT3 = -1.11111104054623557880e-01
+_AT4 = 9.09088713343650656196e-02
+_AT5 = -7.69187620504482999495e-02
+_AT6 = 6.66107313738753120669e-02
+_AT7 = -5.83357013379057348645e-02
+_AT8 = 4.97687799461593236017e-02
+_AT9 = -3.65315727442169155270e-02
+_AT10 = 1.62858201153657823623e-02
+
+
+def atan(x: float) -> float:
+    hx = _hi(x)
+    ix = hx & 0x7fffffff
+    if ix >= 0x44100000:                    # |x| >= 2**66
+        if ix > 0x7ff00000 or (ix == 0x7ff00000 and _lo(x) != 0):
+            return x + x                    # NaN
+        if hx > 0:
+            return _ATAN_HI[3] + _ATAN_LO[3]
+        return -_ATAN_HI[3] - _ATAN_LO[3]
+    if ix < 0x3fdc0000:                     # |x| < 0.4375
+        if ix < 0x3e200000:                 # |x| < 2**-29
+            return x
+        id_ = -1
+    else:
+        x = _math.fabs(x)
+        if ix < 0x3ff30000:                 # |x| < 1.1875
+            if ix < 0x3fe60000:             # 7/16 <= |x| < 11/16
+                id_ = 0
+                x = (2.0 * x - 1.0) / (2.0 + x)
+            else:                           # 11/16 <= |x| < 19/16
+                id_ = 1
+                x = (x - 1.0) / (x + 1.0)
+        elif ix < 0x40038000:               # |x| < 2.4375
+            id_ = 2
+            x = (x - 1.5) / (1.0 + 1.5 * x)
+        else:                               # 2.4375 <= |x| < 2**66
+            id_ = 3
+            x = -1.0 / x
+
+    # the sum of aT[i] * z**(i+1) broken into its odd and even halves
+    z = x * x
+    w = z * z
+    s1 = z * (_AT0 + w * (_AT2 + w * (_AT4 + w * (_AT6 + w * (_AT8 + w * _AT10)))))
+    s2 = w * (_AT1 + w * (_AT3 + w * (_AT5 + w * (_AT7 + w * _AT9))))
+    if id_ < 0:
+        return x - x * (s1 + s2)
+    z = _ATAN_HI[id_] - ((x * (s1 + s2) - _ATAN_LO[id_]) - x)
+    return -z if hx < 0 else z
