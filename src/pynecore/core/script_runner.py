@@ -2,6 +2,7 @@ from typing import Iterable, Iterator, Callable, TYPE_CHECKING, Any, cast
 from types import ModuleType
 import asyncio
 import concurrent.futures
+import os
 import sys
 import tomllib
 from dataclasses import dataclass, field as dataclasses_field
@@ -1336,9 +1337,9 @@ class ScriptRunner:
             # through the engine's own ``_run_async`` (identical loop + timeout
             # to every other broker call). Only wired when the plugin actually
             # provides the actuator — other plugins simply stay state-only.
-            if hasattr(broker_plugin, 'publish_native_failsafe_sl'):
+            _failsafe_publish = getattr(broker_plugin, 'publish_native_failsafe_sl', None)
+            if _failsafe_publish is not None:
                 _engine = cast('OrderSyncEngine', self._order_sync_engine)
-                _failsafe_publish = broker_plugin.publish_native_failsafe_sl
 
                 # noinspection PyProtectedMember
                 def _native_failsafe_dispatcher(snapshot):
@@ -3095,12 +3096,16 @@ class ScriptRunner:
             htf_prepared = False
 
             # calc_bars_count: Pine restricts calculation to the last N chart
-            # bars. Earlier bars are not calculated at all -- series start fresh
-            # (na warmup) at the first calculated bar, while bar_index keeps its
-            # absolute value and last_bar_index is unchanged. 0 (or a value that
-            # covers the whole history) calculates every bar.
+            # bars. Earlier bars are not calculated at all: the script runs as if
+            # its history BEGAN at the first calculated bar. MEASURED
+            # (BINANCE:BTCUSDT@30, a 30162-bar chart, calc_bars_count 500 and
+            # 1500): bar_index is 0 on the first calculated bar, last_bar_index is
+            # N - 1 on every one, and ``ta.highest(20)`` stays na for its first 19
+            # bars. 0 (or a value that covers the whole history) calculates every
+            # bar.
             calc_bars_count = getattr(self.script, 'calc_bars_count', 0) or 0
             calc_start = self.last_bar_index + 1 - calc_bars_count if calc_bars_count > 0 else 0
+            series_index = -1
 
             if is_live and self._broker_plugin is not None:
                 broker_info("warmup phase started — replaying historical bars")
@@ -3138,14 +3143,15 @@ class ScriptRunner:
                         continue
                     exec_candle = htf_candle
 
+                # Skip bars before the calc_bars_count window: feed no series,
+                # run no main, process no orders and emit no output for
+                # uncalculated history, which bar_index does not count either.
+                series_index += 1
+                if series_index < calc_start:
+                    continue
                 # Pre-increment: bar_index becomes the index of the bar we
                 # are about to process (first bar -> 0).
                 self.bar_index += 1
-                # Skip bars before the calc_bars_count window: advance bar_index
-                # to keep it absolute, but feed no series, run no main, process
-                # no orders and emit no output for uncalculated history.
-                if self.bar_index < calc_start:
-                    continue
                 last_warmup_timestamp = candle.timestamp
                 warmup_bars_processed += 1
 
@@ -3174,9 +3180,12 @@ class ScriptRunner:
                 barstate.isnew = True
 
                 # Update lib properties
+                last_index = self.last_bar_index if stf is None else stf.last_bar_index
+                if last_index is not None and calc_start > 0:
+                    last_index -= calc_start
                 _set_lib_properties(
                     exec_candle, self.bar_index, self.tz, lib, self._round_decimals,
-                    (self.last_bar_index if stf is None else stf.last_bar_index),
+                    last_index,
                     (self.last_bar_time if stf is None else stf.last_bar_time),
                     self._lossless_volume, self._lossless_prices,
                 )
@@ -4403,6 +4412,10 @@ class ScriptRunner:
                  ``ignore_invalid_symbol``.
         :raises ValueError: If no data found and ignore_invalid_symbol is not True
         """
+        from .security import SECURITY_TRACE_ENV
+
+        traced = bool(os.environ.get(SECURITY_TRACE_ENV, "").strip())
+
         from dataclasses import replace as dc_replace
         # noinspection PyProtectedMember
         from ..lib.ticker import _split_chart_type
@@ -4579,11 +4592,13 @@ class ScriptRunner:
                 f"security_data={{'{symbol}': 'path/to/data.ohlcv'}}"
                 f"{map_hint}"
             )
-            if defer_missing:
+            if defer_missing or traced:
                 # A runtime-resolved context signals every bar even when it
                 # stands in a branch that is never taken (a ternary evaluates
                 # both branches in Pine), so resolution alone is no demand for
                 # data. Keep the run going and let the first real read raise.
+                # A traced run defers every context the same way: its reads
+                # log the missing feed and answer na (see ``core/security.py``).
                 logger.warning(
                     f"Unprovisioned security context (symbol={symbol!r}, "
                     f"timeframe={timeframe!r}): no OHLCV data found, so the "

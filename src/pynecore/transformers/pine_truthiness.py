@@ -165,11 +165,17 @@ class PineTruthinessTransformer(ast.NodeTransformer):
 
         A comparison is the only bool-shaped operand the conversion above skips,
         so it is the only one that needs the cast; two ``not``s are the cheapest
-        one and evaluate the operand exactly once.
+        one and evaluate the operand exactly once. The conversion also skips a
+        conditional whose arms are both bool-shaped, so a comparison standing in
+        an arm (``iff(use, x > y, true)``) is cast there.
 
         :param node: An already-converted ``and``/``or`` operand.
         :return: The operand, cast to bool when it could still be na.
         """
+        if isinstance(node, ast.IfExp):
+            node.body = PineTruthinessTransformer._bool_value(node.body)
+            node.orelse = PineTruthinessTransformer._bool_value(node.orelse)
+            return node
         if not isinstance(node, ast.Compare) or getattr(node, 'pine_bool', False):
             return node
         return ast.UnaryOp(op=ast.Not(), operand=ast.UnaryOp(op=ast.Not(), operand=node))

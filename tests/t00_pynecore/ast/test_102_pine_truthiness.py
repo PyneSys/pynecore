@@ -135,6 +135,20 @@ def __test_na_comparison_does_not_leak_out_of_and_or__():
     assert _eval("a > b or c > d", a=NA(float), b=1.0, c=1.0, d=2.0) is False
 
 
+def __test_na_comparison_in_a_conditional_arm_does_not_leak_either__():
+    """ ``iff(use, x > y, true)`` as an operand: the arm's comparison is cast
+
+    MEASURED (BINANCE:BTCUSDT@30, v4): ``true and iff(s == "Y", nf > 1, true)``
+    with an na ``nf`` is false, not na — a marker plot of it exports 0.
+    """
+    assert "(not not a > b if " in _rewrite("t and (a > b if s else True)")
+    for expr in ("t and (a > b if s else True)",
+                 "t and (True if not s else a > b)",
+                 "t and (True if not s else True) and (a > b if s else True)"):
+        assert _eval(expr, t=True, s=True, a=NA(float), b=1.0) is False, expr
+    assert _eval("t and (a > b if s else True)", t=True, s=True, a=2.0, b=1.0) is True
+
+
 def __test_comparison_rewrite_output_is_not_wrapped__():
     """ The ``==``/``!=`` conditional the tolerance rewrite emits is already a bool """
     source = "1 if a == b else 0"

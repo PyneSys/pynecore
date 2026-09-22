@@ -160,7 +160,7 @@ _TRUTHY = frozenset({'1', 'true', 'yes', 'on'})
 def security_slice_disabled() -> bool:
     """Whether ``PYNE_NO_SECURITY_SLICE`` asks for the unsliced child behaviour.
 
-    :return: True when no ``main()`` clone may be emitted.
+    :return: True when no backward slice of ``main()`` may be emitted.
     """
     return os.environ.get(SECURITY_SLICE_ENV, '').strip().lower() in _TRUTHY
 

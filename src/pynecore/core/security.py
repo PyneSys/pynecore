@@ -12,6 +12,7 @@ Architecture:
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -147,6 +148,18 @@ _LIVENESS_POLL_SECONDS = 0.5
 NO_BATCH = os.environ.get("PYNE_NO_SECURITY_BATCH", "").strip().lower() in (
     "1", "true", "yes", "on",
 )
+
+# ``PYNE_SECURITY_TRACE=<path>`` appends one JSON line per security context to
+# ``<path>`` at the context's FIRST chart-side read: its id and the symbol and
+# timeframe its signal resolved to, in the order the script reaches them. The
+# signals are hoisted to the top of their scope, so only the reads stand where
+# the ``request.security()`` calls were written — and that order is what decides
+# how a data vendor serves the contexts of one script. A traced run is a
+# discovery run: a context with no feed behind it is logged with
+# ``"missing": true`` and reads as ``na`` instead of stopping the run, so ONE
+# pass names every feed the script needs. Read when a run builds its protocol
+# functions, so it costs a run without it nothing per bar.
+SECURITY_TRACE_ENV = "PYNE_SECURITY_TRACE"
 
 
 def watch_security_child(
@@ -2649,10 +2662,50 @@ def create_chart_protocol(
     for _sid in consumers_by_sid:
         _ensure_chart_writer(_sid)
 
+    read_fn = __sec_read__
+    trace_path = os.environ.get(SECURITY_TRACE_ENV, "").strip()
+    if trace_path:
+        read_fn = _trace_first_reads(__sec_read__, signal_values, same_context_ids,
+                                     missing_data_ids, trace_path)
     return (
-        __sec_signal__, __sec_write__, __sec_read__, __sec_wait__,
+        __sec_signal__, __sec_write__, read_fn, __sec_wait__,
         cleanup, signal_rate_sources, begin_bar, end_bar,
     )
+
+
+def _trace_first_reads(read, signal_values: dict[str, tuple],
+                       same_context_ids: 'set[str] | frozenset[str]',
+                       missing_data_ids: dict[str, str], path: str):
+    """Wrap the chart-side read so every context's first read is logged.
+
+    :param read: The chart-side ``__sec_read__``.
+    :param signal_values: Per sid, the ``(symbol, timeframe, lookahead)`` its
+        signal resolved to.
+    :param same_context_ids: Sids sharing the chart's symbol and timeframe.
+    :param missing_data_ids: Sids resolved at runtime with no feed behind them;
+        the traced read answers ``default`` for these.
+    :param path: The trace file (see :data:`SECURITY_TRACE_ENV`).
+    :return: The wrapped read.
+    """
+    traced: set[str] = set()
+
+    def __sec_read__(sec_id: str, default=None, _scope_id=None):
+        if sec_id not in traced:
+            traced.add(sec_id)
+            symbol, timeframe, _lookahead = signal_values.get(sec_id) or (None, None, None)
+            with open(path, 'a', encoding='utf-8') as trace:
+                trace.write(json.dumps({
+                    'order': len(traced) - 1, 'sec_id': sec_id,
+                    'symbol': None if symbol is None else str(symbol),
+                    'timeframe': None if timeframe is None else str(timeframe),
+                    'same_context': sec_id in same_context_ids,
+                    'missing': sec_id in missing_data_ids,
+                }) + '\n')
+        if sec_id in missing_data_ids:
+            return default
+        return read(sec_id, default, _scope_id)
+
+    return __sec_read__
 
 
 def __ltf_unzip__(rows, n):

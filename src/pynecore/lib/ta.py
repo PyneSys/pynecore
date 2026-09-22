@@ -447,15 +447,17 @@ def cross(source1: float, source2: float) -> PyneBool:
     # before the plateau still arms the jump after it. Probes U/D/E/F/G/H/I on
     # BINANCE:BTCUSDT 30m, 2026-08.
     armed: Persistent[int] = 0  # 0 unarmed, -1 last strictly below, +1 last strictly above
+    # A bar with an na source is a bool na (false under the two-state bool) and
+    # leaves the state alone: TV compares against the last bar where both sources
+    # were defined, so na gaps must not reset it
+    if not (source1 == source1 and source2 == source2):
+        return NA(bool)
     res = (armed < 0 and source1 > source2) or (armed > 0 and source1 < source2)
-    # Only refreshed on bars where both sources are defined; TV compares against the
-    # last such bar, so na gaps must not reset the state
-    if source1 == source1 and source2 == source2:
-        diff = source1 - source2
-        if diff < -_EPSILON:
-            armed = -1
-        elif diff > _EPSILON:
-            armed = 1
+    diff = source1 - source2
+    if diff < -_EPSILON:
+        armed = -1
+    elif diff > _EPSILON:
+        armed = 1
     return res
 
 
@@ -474,14 +476,16 @@ def crossover(source1: float, source2: float) -> PyneBool:
     # blocks, so the comparison is raw, not tolerant. A from-the-start equality
     # plateau AND an equality run entered from above both arm the jump (probes
     # S1-S9 on BINANCE:BTCUSDT 30m, 2026-08); crossover has no armed direction to
-    # lose, unlike ta.cross. Pine has no na bool: with no previous relation to
-    # compare against there is no cross, so the first defined bar yields false.
+    # lose, unlike ta.cross. With no previous relation to compare against there is
+    # no cross, so the first defined bar yields false.
     was_le: Persistent[bool] = False
+    # A bar with an na source is a bool na (false under the two-state bool) and
+    # leaves the state alone: TV compares against the last bar where both sources
+    # were defined, so na gaps must not reset it
+    if not (source1 == source1 and source2 == source2):
+        return NA(bool)
     res = source1 > source2 and was_le
-    # Only refreshed on bars where both sources are defined; TV compares against the
-    # last such bar, so na gaps must not reset the state
-    if source1 == source1 and source2 == source2:
-        was_le = source1 <= source2
+    was_le = source1 <= source2
     return res
 
 
@@ -497,9 +501,10 @@ def crossunder(source1: float, source2: float) -> PyneBool:
     # Measured EXACT rule, the mirror of crossover: fire when source1 was at or
     # above source2 on the last defined bar and is STRICTLY below now.
     was_ge: Persistent[bool] = False
+    if not (source1 == source1 and source2 == source2):
+        return NA(bool)
     res = source1 < source2 and was_ge
-    if source1 == source1 and source2 == source2:
-        was_ge = source1 >= source2
+    was_ge = source1 >= source2
     return res
 
 

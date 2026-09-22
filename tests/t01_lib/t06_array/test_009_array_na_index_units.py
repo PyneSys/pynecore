@@ -194,6 +194,20 @@ def __test_max_min_na_nth_is_zero__():
     assert array.min([10, 20, 30, 40], 1) == 20
 
 
+def __test_max_min_nth_past_the_non_na_values__():
+    """ A rank the na elements push out of reach repeats the last ranked value """
+    a = [30.0, nan, 10.0, nan]
+    assert [array.min(a, n) for n in range(4)] == [10.0, 30.0, 30.0, 30.0]
+    assert [array.max(a, n) for n in range(4)] == [30.0, 10.0, 10.0, 10.0]
+    b = [nan, 30.0, 20.0, 10.0]
+    assert array.min(b, 2) == 30.0 and array.min(b, 3) == 30.0
+    assert array.max(b, 2) == 10.0 and array.max(b, 3) == 10.0
+    # The array's size still bounds the rank, and an all-na array has no value
+    assert array.min(a, 4) != array.min(a, 4)
+    assert array.max(a, -1) != array.max(a, -1)
+    assert array.min([nan, nan], 1) != array.min([nan, nan], 1)
+
+
 def __test_percentile_na_percentage__():
     """ An na percentage counts as 0 for the nearest rank and yields na for the
     interpolation """

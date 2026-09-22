@@ -31,15 +31,22 @@ slot layout.
 The slice is a conservative over-approximation: every uncertainty KEEPS a
 statement, and a construct the pass cannot classify at all drops the whole
 optimization for the module (the child then runs ``main()`` as before).
-``PYNE_NO_SECURITY_SLICE=1`` switches the emission off; the flag is mixed into
+``PYNE_NO_SECURITY_SLICE=1`` switches the slicing off; the flag is mixed into
 the transform pipeline digest, so chart and child can never load bytecode built
 under the other setting.
+
+A clone is also where a guarded write is made unconditional
+(:func:`_force_conditional_writes`). That is a matter of what the child
+computes, not of how much it may skip, so a context the slice does not serve —
+an LTF one, one of a module the analysis gave up on, any of them while the
+slicing is switched off — still gets a clone whenever its write is guarded: one
+of the whole ``main()``, with nothing dropped.
 """
 import ast
 import copy
 from collections.abc import Callable
 
-from ..core.import_hook import security_slice_disabled
+from ..core.import_hook import PYNE_RESERVED_NAME_CHAR, security_slice_disabled
 from .dynamic_default import is_script_entry
 from .persistent import VARIP_TYPES
 from .pine_type_rules import OBJECT, STR, stamp_lowering
@@ -548,7 +555,7 @@ class SecuritySliceTransformer(ast.NodeTransformer):
     """Emit a backward-sliced ``main()`` clone per security context.
 
     :ivar module_skip: why no context of the module could be sliced, if so
-    :ivar skipped: per sid, why that context got no clone
+    :ivar skipped: per sid, why that context got no clone at all
     """
 
     def __init__(self) -> None:
@@ -566,32 +573,84 @@ class SecuritySliceTransformer(ast.NodeTransformer):
         """Emit the clones and record what each served context's child runs.
 
         :param node: the lowered module
-        :return: per sid, the ``main()`` statements its clone kept (absent for a
-            context that got no clone — its child runs the whole ``main()``)
+        :return: per sid, the statements of the clone its child runs (absent for
+            a context that got no clone — its child runs the whole ``main()``)
         """
-        if security_slice_disabled():
-            self.module_skip = 'disabled'
-            return {}
         contexts = _find_contexts(node)
         main = _find_main(node)
         if contexts is None or main is None:
             self.module_skip = 'no_contexts' if main is not None else 'no_main'
             return {}
+        entries = list(enumerate(_iter_contexts(contexts)))
 
+        # A sliced clone per unit the analysis can serve, then a clone of the
+        # WHOLE ``main()`` for every other unit with a guarded write: forcing
+        # the write is a matter of what the child computes, not of how much of
+        # ``main()`` it may skip, so it cannot depend on the slice succeeding.
+        plans = self._sliced_units(node, main, entries)
+        covered = {sid for unit, _kept in plans for _index, sid, _ctx in unit}
+        whole = list(range(len(main.body)))
+        plans.extend((unit, None) for unit in _whole_units(entries, covered))
+
+        clones: list[ast.stmt] = []
+        sliced: dict[str, list[ast.stmt]] = {}
+        for unit, kept in plans:
+            # The unit's first member names the clone: its index is its own,
+            # so no other unit can pick the same name.
+            name = f'{CLONE_PREFIX}{unit[0][0]}{CLONE_SUFFIX}'
+            clone = _build_clone(node, main, whole if kept is None else kept, name)
+            guarded = {sid for _index, sid, ctx in unit
+                       if _ctx_get(ctx, 'ohlcv_fields') is None
+                       and not _write_reached(clone.body, sid)}
+            forced = bool(guarded) and _force_conditional_writes(node, clone, guarded)
+            if kept is None and not forced:
+                # Nothing to gain: the clone would be ``main()`` itself.
+                continue
+            clones.append(clone)
+            clones.extend(_bind_defaults(main.name, name))
+            for _index, _sid, ctx in unit:
+                sliced[_sid] = clone.body
+                if kept is None:
+                    self.skipped.pop(_sid, None)
+                # The type pass has already run, so the two new literals are
+                # stamped here — an unstamped node inside a stamped subtree
+                # loses the type of everything above it.
+                ctx.keys.append(stamp_lowering(ast.Constant(value='slice_main'), STR))
+                ctx.values.append(stamp_lowering(ast.Constant(value=name), STR))
+
+        if clones:
+            insert_at = node.body.index(main) + 1
+            node.body[insert_at:insert_at] = clones
+        return sliced
+
+    def _sliced_units(self, node: ast.Module, main: ast.FunctionDef,
+                      entries: list[tuple[int, tuple[str, ast.Dict]]],
+                      ) -> list[tuple[list[tuple[int, str, ast.Dict]], list[int] | None]]:
+        """The units a backward slice serves, each with the statements it keeps.
+
+        :param node: the lowered module
+        :param main: the script's ``main()``
+        :param entries: ``(index, (sid, context dict))`` in context order
+        :return: ``(unit, kept indexes)`` per sliced unit; empty when the module
+            cannot be sliced at all (see :attr:`module_skip`)
+        """
+        if security_slice_disabled():
+            self.module_skip = 'disabled'
+            return []
         scopes = _SliceScopes(node)
         main_key = scopes.scope_key_of(main)
         if main_key is None:
             self.module_skip = 'no_main_scope'
-            return {}
+            return []
         reachable = _reachable_scopes(scopes, main_key)
         for key in reachable:
             found = _unmodelled_kind(scopes.scope_node(key))
             if found is not None:
                 self.module_skip = f'unmodelled:{found}:{key or "<module>"}'
-                return {}
+                return []
             if _unresolved_collection(scopes.scope_node(key)):
                 self.module_skip = f'unresolved_collection:{key or "<module>"}'
-                return {}
+                return []
 
         import_names = _module_imports(node)
         aliases = _Aliases()
@@ -606,17 +665,13 @@ class SecuritySliceTransformer(ast.NodeTransformer):
         index_of_stmt = _build_index(main.body, collector, aliases, summaries, main_key)
         if collector.unresolved is not None:
             self.module_skip = collector.unresolved
-            return {}
+            return []
         written_sids: set[str] = set()
         for entry in index_of_stmt:
             written_sids |= entry.write_sids
 
-        entries = list(enumerate(_iter_contexts(contexts)))
-        units = _slice_units(entries, written_sids, self.skipped)
-
-        clones: list[ast.stmt] = []
-        sliced: dict[str, list[ast.stmt]] = {}
-        for unit in units:
+        plans: list[tuple[list[tuple[int, str, ast.Dict]], list[int] | None]] = []
+        for unit in _slice_units(entries, written_sids, self.skipped):
             keep_reads: set[str] = set()
             for _index, sid, ctx in unit:
                 keep_reads |= {sid} | _sid_list(ctx, 'depends') | _sid_list(ctx, 'late_reads')
@@ -626,23 +681,8 @@ class SecuritySliceTransformer(ast.NodeTransformer):
                 for _index, sid, _ctx in unit:
                     self.skipped[sid] = 'nothing_dropped'
                 continue
-            # The unit's first member names the clone: its index is its own,
-            # so no other unit can pick the same name.
-            name = f'{CLONE_PREFIX}{unit[0][0]}{CLONE_SUFFIX}'
-            clones.append(_build_clone(node, main, kept, name))
-            clones.extend(_bind_defaults(main.name, name))
-            for _index, _sid, ctx in unit:
-                sliced[_sid] = [main.body[index] for index in kept]
-                # The type pass has already run, so the two new literals are
-                # stamped here — an unstamped node inside a stamped subtree
-                # loses the type of everything above it.
-                ctx.keys.append(stamp_lowering(ast.Constant(value='slice_main'), STR))
-                ctx.values.append(stamp_lowering(ast.Constant(value=name), STR))
-
-        if clones:
-            insert_at = node.body.index(main) + 1
-            node.body[insert_at:insert_at] = clones
-        return sliced
+            plans.append((unit, kept))
+        return plans
 
 
 # --- module inspection ---
@@ -1084,8 +1124,10 @@ def _expr_unguarded(node: ast.AST, hit: _Hit) -> bool:
     """Whether the target stands under no expression-level branch inside ``node``.
 
     The two expression-level branches are ``IfExp`` and the short-circuit
-    ``BoolOp``: a target in either of them is evaluated only for some values of
-    the test, so it is guarded. A target standing in a call argument or in an
+    ``BoolOp``: a target in a branch of the first or in a later operand of the
+    second is evaluated only for some values of what precedes it, so it is
+    guarded. The ``IfExp``'s test and the ``BoolOp``'s first operand always
+    run. A target standing in a call argument or in an
     operand of a plain operator is not guarded at all. A lambda or a
     comprehension answers False as well: when its body runs is not visible here.
 
@@ -1101,7 +1143,13 @@ def _expr_unguarded(node: ast.AST, hit: _Hit) -> bool:
                 and not any(_contains_write(branch, hit)
                             for branch in (node.body, node.orelse))
                 and _expr_unguarded(node.test, hit))
-    if isinstance(node, (ast.BoolOp, ast.Lambda, ast.ListComp, ast.SetComp,
+    if isinstance(node, ast.BoolOp):
+        # Only the first operand runs whatever the others evaluate to.
+        first = node.values[0]
+        return (_contains_write(first, hit)
+                and not any(_contains_write(value, hit) for value in node.values[1:])
+                and _expr_unguarded(first, hit))
+    if isinstance(node, (ast.Lambda, ast.ListComp, ast.SetComp,
                          ast.DictComp, ast.GeneratorExp)):
         return False
     for child in ast.iter_child_nodes(node):
@@ -1182,7 +1230,8 @@ def _is_dispatch_test(test: ast.expr) -> bool:
 
 def _holds_write(stmt: ast.stmt, hit: _Hit) -> bool:
     """Whether a simple statement holds the target itself."""
-    if not isinstance(stmt, (ast.Expr, ast.Assign, ast.AnnAssign, ast.AugAssign)):
+    if not isinstance(stmt, (ast.Expr, ast.Assign, ast.AnnAssign, ast.AugAssign,
+                             ast.Return)):
         return False
     return any(hit(sub) for sub in _walk_own(stmt))
 
@@ -1437,6 +1486,33 @@ def _slice_units(entries: list[tuple[int, tuple[str, ast.Dict]]],
     return units
 
 
+def _whole_units(entries: list[tuple[int, tuple[str, ast.Dict]]],
+                 covered: set[str]) -> list[list[tuple[int, str, ast.Dict]]]:
+    """The units no sliced clone serves, grouped the way their children are.
+
+    Nothing blocks a unit here: a clone of the whole ``main()`` holds every
+    write block ``main()`` does, whatever kind of context it belongs to.
+
+    :param entries: ``(index, (sid, context dict))`` in context order
+    :param covered: sids a sliced clone already serves
+    :return: the remaining units, each a list of ``(index, sid, context dict)``
+    """
+    units: list[list[tuple[int, str, ast.Dict]]] = []
+    by_group: dict[int, list[tuple[int, str, ast.Dict]]] = {}
+    for index, (sid, ctx) in entries:
+        if sid in covered:
+            continue
+        group = _ctx_group(ctx)
+        if group is None:
+            units.append([(index, sid, ctx)])
+        elif group in by_group:
+            by_group[group].append((index, sid, ctx))
+        else:
+            by_group[group] = [(index, sid, ctx)]
+            units.append(by_group[group])
+    return units
+
+
 def _stmt_nodes(stmt: ast.stmt) -> list[ast.AST]:
     """The nodes of a top-level statement that RUN when the statement runs.
 
@@ -1507,6 +1583,659 @@ def _slice(index: list[_StmtIndex], sids: set[str],
     if len(kept) == len(index):
         return None
     return sorted(kept)
+
+
+def _reaching_defs(defs: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]],
+                   hit: _Hit) -> set[str]:
+    """Names of the ``def``s whose call can perform the target.
+
+    A direct writer holds the target in its own body; an indirect one calls a
+    writer by name. The closure is taken over the call graph the code spells
+    out, so an unresolvable callee (an attribute, a value passed in) simply
+    leaves its caller out — that path is then not forced.
+
+    :param defs: The candidate definitions, by name.
+    :param hit: The target test.
+    :return: The names whose call reaches the target.
+    """
+    reaching = {name for name, nodes in defs.items()
+                if any(_contains_write(stmt, hit)
+                       for node in nodes for stmt in node.body
+                       if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)))}
+    callees = {
+        name: {sub.func.id for node in nodes for sub in _walk_own(node)
+               if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)}
+        for name, nodes in defs.items()
+    }
+    for _ in range(len(defs) + 1):
+        grown = False
+        for name, called in callees.items():
+            if name not in reaching and called & reaching:
+                reaching.add(name)
+                grown = True
+        if not grown:
+            break
+    return reaching
+
+
+def _nested_defs(func: ast.FunctionDef) -> dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]]:
+    """Every ``def`` standing anywhere inside ``func``, by name."""
+    defs: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+    for node in ast.walk(func):
+        if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node is not func):
+            defs.setdefault(node.name, []).append(node)
+    return defs
+
+
+def _stmt_reaches(stmt: ast.stmt, test: _Hit) -> bool:
+    """Whether running ``stmt`` performs the target (nested ``def``s excluded)."""
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    return _contains_write(stmt, test)
+
+
+#: Expression shapes whose body runs at a time the forcing pass does not see.
+_DEFERRED_EXPRS: tuple[type[ast.AST], ...] = (
+    ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+#: Simple statements whose expressions are rewritten in place.
+_FORCED_SIMPLE: tuple[type[ast.AST], ...] = (
+    ast.Expr, ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Return)
+
+
+class _Forcer:
+    """Rewrites a child's code so the targets run on every execution.
+
+    Two kinds of guard can stand between a scope's body and a target: a user
+    ``if`` statement, and an expression-level branch (``IfExp``, short-circuit
+    ``BoolOp``) around the CALL of a helper that performs the target. The
+    ``__sec_write__`` block is a statement of its own and always precedes the
+    statement that held the ``request.security()`` call, so an expression-level
+    guard only ever stands around a helper call.
+
+    A user ``if`` stays where it is: only the statements that reach a target
+    are LIFTED in front of it, each behind copies of the plain assignments of
+    the same branch it reads. Everything else the branch does — drawings, the
+    script's own conditionally advancing state — keeps running under its guard,
+    as it does in the context TradingView compiles: the request is what is
+    unconditional there, not the code around it.
+
+    A loop, a ``with``, a ``try`` and a ``match`` are left as they are, and so
+    is a lambda or a comprehension: how often their body runs is not a guard
+    this pass can remove.
+
+    :ivar changed: whether anything was rewritten
+    """
+
+    def __init__(self, test: _Hit, aliases: _Aliases) -> None:
+        self.test = test
+        self.aliases = aliases
+        self.changed = False
+        self._temps = 0
+        self._locals: set[str] = set()
+        self._certain: set[str] = set()
+
+    def func_body(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.stmt]:
+        """One function's body, forced, with its local bindings tracked.
+
+        A lift moves reads in front of the guard they were written under, so a
+        local the guard itself is what binds — ``if flag: original = close``
+        read from a second ``if flag:`` — would be read unbound on a pass that
+        takes neither branch. Telling such a name from a module-level one needs
+        the function: a name bound nowhere in it is a global, an import or a
+        builtin and is always available, while every name the function binds is
+        a local that has to be proven bound before the guard.
+
+        :param node: The function whose body to force.
+        :return: The forced body.
+        """
+        saved_locals, saved_certain = self._locals, self._certain
+        args = node.args
+        params = {arg.arg for arg in
+                  [*args.posonlyargs, *args.args, *args.kwonlyargs,
+                   *([args.vararg] if args.vararg else []),
+                   *([args.kwarg] if args.kwarg else [])]}
+        self._locals = params.union(*(_bound_names(stmt) for stmt in node.body)) \
+            if node.body else params
+        self._certain = set(params)
+        try:
+            return self.body(node.body)
+        finally:
+            self._locals, self._certain = saved_locals, saved_certain
+
+    def body(self, stmts: list[ast.stmt]) -> list[ast.stmt]:
+        """The statement list with every reaching statement forced."""
+        out: list[ast.stmt] = []
+        for stmt in stmts:
+            if _stmt_reaches(stmt, self.test):
+                out.extend(self.stmt(stmt))
+            else:
+                out.append(stmt)
+            bound, removed = _definite_bindings(stmt)
+            self._certain = (self._certain - removed) | bound
+        return out
+
+    def stmt(self, stmt: ast.stmt) -> list[ast.stmt]:
+        """One reaching statement, as the statements that replace it."""
+        if isinstance(stmt, ast.If):
+            return self._if(stmt)
+        if not isinstance(stmt, _FORCED_SIMPLE):
+            return [stmt]
+        hoisted: list[ast.expr] = []
+        for field, value in ast.iter_fields(stmt):
+            if isinstance(value, ast.expr):
+                setattr(stmt, field, self.expr(value, hoisted))
+        return [*_as_statements(hoisted, stmt), stmt]
+
+    def _if(self, stmt: ast.If) -> list[ast.stmt]:
+        hoisted: list[ast.expr] = []
+        in_test = _contains_write(stmt.test, self.test)
+        if in_test:
+            stmt.test = self.expr(stmt.test, hoisted)
+        out = _as_statements(hoisted, stmt)
+        in_body = any(_stmt_reaches(sub, self.test) for sub in stmt.body)
+        in_else = any(_stmt_reaches(sub, self.test) for sub in stmt.orelse)
+        # What is certainly bound in front of the ``if`` is what a lift out of
+        # either branch may read; a branch's own bindings are undone for the
+        # other branch and for everything after the statement.
+        outer = set(self._certain)
+        if _is_dispatch_test(stmt.test) or not (in_body or in_else):
+            # The protocol's own dispatch stays: the child always has its sid
+            # active. A target in the test alone already runs on every pass.
+            stmt.body = self.body(stmt.body)
+            self._certain = set(outer)
+            stmt.orelse = self.body(stmt.orelse)
+            self._certain = outer
+            return [*out, stmt]
+        # Both branches may hold a target — one context in each. TradingView
+        # computes both series on every bar, so the child lifts both.
+        for branch in (stmt.body, stmt.orelse):
+            self._certain = set(outer)
+            forced = self.body(branch)
+            self._certain = outer
+            kept, lifted = self._lift(forced, outer)
+            if not lifted:
+                continue
+            self.changed = True
+            out.extend(lifted)
+            branch[:] = kept or ([ast.copy_location(ast.Pass(), stmt)] if branch else [])
+        return [*out, stmt]
+
+    def _lift(self, stmts: list[ast.stmt],
+              certain: set[str]) -> tuple[list[ast.stmt], list[ast.stmt]]:
+        """Split a branch into what stays guarded and what runs ahead of the guard.
+
+        A reaching statement is lifted only when everything the branch does
+        before it can run ahead of the guard unchanged: plain assignments of
+        side-effect-free expressions, which the lift copies. A name bound any
+        other way — a nested conditional, an augmented assignment, an
+        assignment whose value calls something — keeps the statement reading
+        it where it is, and so does a script value an earlier effect of the
+        branch may have mutated: a lift would read an unbound name, publish a
+        stale value, or run the effect twice.
+
+        Every local the lifted group reads must also be certainly bound in
+        front of the guard, or bound by a copy of the group itself: a local the
+        branch alone binds is unbound on a pass that never takes it.
+
+        :param stmts: The branch, its own nested guards already handled.
+        :param certain: The locals certainly bound in front of the guard.
+        :return: The statements left in the branch, and the reaching ones in
+                 source order, each preceded by the assignments it reads.
+        """
+        kept: list[ast.stmt] = []
+        lifted: list[ast.stmt] = []
+        touched: set[str] = set()
+        for stmt in stmts:
+            if not _stmt_reaches(stmt, self.test):
+                kept.append(stmt)
+                if not _is_copyable_assignment(stmt):
+                    touched |= _operand_names(stmt)
+                continue
+            feeding = _feeding_copies(stmt, kept)
+            reads = _operand_names(stmt)
+            loaded = _loaded_names(stmt)
+            provided = set(certain)
+            for copied in feeding or ():
+                reads |= _operand_names(copied)
+                loaded |= _loaded_names(copied)
+                provided |= _bound_names(copied)
+            if feeding is not None and (loaded & self._locals) - provided:
+                # A local only the branch binds would be read unbound ahead of
+                # the guard.
+                feeding = None
+            if feeding is not None and self.aliases.classes(touched) & self.aliases.classes(reads):
+                # An earlier effect of the branch — a collection mutation, a
+                # call on a script value — may be what the statement reads.
+                feeding = None
+            if feeding is None:
+                kept.append(stmt)
+                touched |= _operand_names(stmt)
+                continue
+            self._detach(feeding, stmt)
+            lifted.extend(feeding)
+            lifted.append(stmt)
+        return kept, lifted
+
+    def _detach(self, feeding: list[ast.stmt], stmt: ast.stmt) -> None:
+        """Rebind the copied dependencies onto private names.
+
+        The originals stay under the guard, so a copy keeping its own target
+        would write that name ahead of the ``if`` — turning a test that reads
+        it false when it was true, and leaving the branch's value behind on a
+        pass that never took the branch. The copies therefore bind names of
+        their own, and only the lifted statement follows them.
+
+        :param feeding: The copies, in source order; renamed in place.
+        :param stmt: The lifted statement; its reads are rewritten in place.
+        """
+        renamed: dict[str, str] = {}
+        for copied in feeding:
+            for name in sorted(_bound_names(copied)):
+                if name not in renamed:
+                    renamed[name] = (f'__sec_dep{PYNE_RESERVED_NAME_CHAR}'
+                                     f'{self._temps}__')
+                    self._temps += 1
+        if not renamed:
+            return
+        # A namespace root is never bound by a copy, so it is never renamed
+        for copied in feeding:
+            for node in ast.walk(copied):
+                if isinstance(node, ast.Name) and node.id in renamed:
+                    node.id = renamed[node.id]
+        for node in ast.walk(stmt):
+            if (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+                    and node.id in renamed):
+                node.id = renamed[node.id]
+
+    def expr(self, node: ast.expr, hoisted: list[ast.expr]) -> ast.expr:
+        """``node`` with every guard around a reaching call removed.
+
+        An ``IfExp`` becomes the branch that reaches a target, and a guarded
+        ``BoolOp`` operand is taken out of the chain. Whatever reaches a target
+        but cannot stay in the expression — the second branch of an ``IfExp``
+        holding one in each, the operand taken out — is handed to ``hoisted``
+        and runs as a statement of its own ahead of the rewritten one.
+
+        :param node: The expression.
+        :param hoisted: Collects the expressions that must run separately.
+        :return: The expression to put in ``node``'s place.
+        """
+        if isinstance(node, _DEFERRED_EXPRS) or not _contains_write(node, self.test):
+            return node
+        if isinstance(node, ast.IfExp):
+            node.test = self.expr(node.test, hoisted)
+            in_body = _contains_write(node.body, self.test)
+            in_else = _contains_write(node.orelse, self.test)
+            if not (in_body or in_else):
+                return node
+            self.changed = True
+            body = self.expr(node.body, hoisted)
+            orelse = self.expr(node.orelse, hoisted)
+            if in_body and in_else:
+                hoisted.append(orelse)
+            return body if in_body else orelse
+        if isinstance(node, ast.BoolOp):
+            values = [self.expr(value, hoisted) for value in node.values]
+            kept = [values[0]]
+            for value in values[1:]:
+                if _contains_write(value, self.test):
+                    hoisted.append(value)
+                    self.changed = True
+                else:
+                    kept.append(value)
+            if len(kept) == 1:
+                return kept[0]
+            node.values = kept
+            return node
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, ast.expr):
+                setattr(node, field, self.expr(value, hoisted))
+            elif isinstance(value, list):
+                setattr(node, field, [self.expr(item, hoisted) if isinstance(item, ast.expr)
+                                      else item for item in value])
+        for keyword in getattr(node, 'keywords', ()):
+            keyword.value = self.expr(keyword.value, hoisted)
+        return node
+
+
+#: Annotations of a declaration that owns per-call-site state: running a copy of
+#: one would give the script a second, independently advancing variable.
+_STATEFUL_ANNOTATIONS = frozenset({'Persistent', 'Series', *VARIP_TYPES})
+
+
+def _loaded_names(node: ast.AST) -> set[str]:
+    """Every name the node reads."""
+    return {sub.id for sub in ast.walk(node)
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load)}
+
+
+#: Statements whose bindings only happen on some paths through them.
+_CONDITIONAL_STMT = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try,
+                     ast.TryStar, ast.With, ast.AsyncWith, ast.Match)
+
+
+def _definite_bindings(stmt: ast.stmt) -> tuple[set[str], set[str]]:
+    """What the statement certainly gives a value to, and what it may unbind.
+
+    This is deliberately not ``_bound_names``, which answers the other
+    question — which names are locals of the scope at all. A name is local
+    even when the statement that makes it one gives it no value
+    (``original: float``) or takes its value away (``del original``), and
+    neither of those may let a lift read it ahead of a guard.
+
+    What binds is therefore listed by statement kind, and only outside a
+    compound statement: a body may not run, may run zero times, or may leave
+    through an exception halfway. A statement kind that is not listed adds
+    nothing, which also keeps an assignment evaluated inside a short-circuiting
+    expression — ``flag and (original := close)`` — out. Deletions are
+    subtracted wherever they sit, nested ones included, since a compound
+    statement that binds nothing certain can still take a binding away. An
+    ``except E as name`` handler counts as such a deletion: Python unbinds
+    ``name`` when the handler leaves, whatever value it held before.
+
+    :param stmt: The statement.
+    :return: The names certainly bound, and the names possibly unbound.
+    """
+    nodes = [stmt, *_walk_own(stmt)]
+    removed = {sub.id for sub in nodes
+               if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Del)}
+    removed |= {sub.name for sub in nodes
+                if isinstance(sub, ast.ExceptHandler) and sub.name is not None}
+    if isinstance(stmt, _CONDITIONAL_STMT):
+        return set(), removed
+    bound: set[str] = set()
+    targets: list[ast.expr] = []
+    if isinstance(stmt, ast.Assign):
+        targets = list(stmt.targets)
+    elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+        targets = [stmt.target]
+    elif isinstance(stmt, ast.AugAssign):
+        targets = [stmt.target]
+    elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        bound.add(stmt.name)
+    elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        bound |= {(alias.asname or alias.name).split('.')[0] for alias in stmt.names}
+    for target in targets:
+        bound |= {sub.id for sub in [target, *ast.walk(target)]
+                  if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store)}
+    return bound - removed, removed
+
+
+def _bound_names(stmt: ast.stmt) -> set[str]:
+    """Every local name the statement may bind, nested statements included.
+
+    Nested function definitions bind only their own name here: what their body
+    binds is local to them.
+    """
+    names: set[str] = set()
+    for node in [stmt, *_walk_own(stmt)]:
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            names.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.alias):
+            names.add((node.asname or node.name).split('.')[0])
+        elif isinstance(node, ast.ExceptHandler) and node.name is not None:
+            names.add(node.name)
+    for node in ast.iter_child_nodes(stmt):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.add(node.name)
+    return names
+
+
+def _is_repeatable(node: ast.expr) -> bool:
+    """Whether the expression may be evaluated ahead of the guard it sits under.
+
+    This is an allowlist: only expression kinds that provably neither advance
+    state nor raise are accepted, because the copy runs on every pass while the
+    original stays guarded. Accepted are a constant, a bare name and an
+    attribute chain rooted in the compiler-owned ``lib`` binding, which always
+    exists and whose members are the library namespaces.
+
+    Everything else is rejected, and the reason is the same for all of it: the
+    guard is usually what makes the expression valid at all. A call may advance
+    state (``array.pop``) or draw; a subscript needs the index the guard
+    establishes — ``if array.size(store) > 0: x = store[0]``; an attribute of a
+    script value needs the owner the guard establishes — ``if item is not None:
+    x = item.value``. Operators are no different: ``if item != 0: x = 10 //
+    item`` raises ``ZeroDivisionError`` outside the guard, and ``if item is not
+    None: x = item + 1`` raises ``TypeError``. Since neither the operand types
+    nor their values are known here, no operator can be shown safe, so none is
+    accepted.
+    """
+    for sub in [node, *ast.walk(node)]:
+        if isinstance(sub, ast.Attribute):
+            if not _is_lib_attribute(sub):
+                return False
+        elif not isinstance(sub, (ast.Constant, ast.Name, ast.Load)):
+            return False
+    return True
+
+
+def _is_lib_attribute(node: ast.Attribute) -> bool:
+    """Whether the attribute chain is rooted in the compiler's ``lib`` binding."""
+    base: ast.expr = node.value
+    while isinstance(base, ast.Attribute):
+        base = base.value
+    return isinstance(base, ast.Name) and base.id == 'lib'
+
+
+def _plain_aliases(nodes: list[ast.AST]) -> _Aliases:
+    """Union-find over the bare names a scope may make denote one object.
+
+    Only ``b = a`` is read here — annotated (``b: list[float] = a``) as much as
+    plain, since the annotation changes nothing about the object the second
+    name denotes: it is the spelling that hands a collection or an object to a
+    second name, after which a mutation written through either one is a
+    mutation of both. The names are taken unqualified, so two scopes spelling
+    the same name share a class — that only makes the lift more conservative,
+    never less.
+
+    :param nodes: The roots to scan, nested functions included.
+    :return: The alias classes.
+    """
+    aliases = _Aliases()
+    for root in nodes:
+        for node in ast.walk(root):
+            if isinstance(node, ast.Assign):
+                targets: list[ast.expr] = list(node.targets)
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            else:
+                continue
+            if not isinstance(node.value, ast.Name):
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    aliases.union(target.id, node.value.id)
+    return aliases
+
+
+def _operand_names(node: ast.AST) -> set[str]:
+    """The script values the node touches, the compiler namespace left out.
+
+    Only ``lib`` is dropped: it is the compiler-owned binding of the library
+    namespaces — ``lib.array``, ``lib.close`` — and holds nothing a statement
+    of the branch can mutate. Any other attribute owner is a value of the
+    script itself, and a method called on it — ``store.append(3)`` — mutates
+    it, so its root stays an operand and two statements naming it are treated
+    as dependent.
+    """
+    roots: set[int] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Attribute):
+            base = sub.value
+            while isinstance(base, ast.Attribute):
+                base = base.value
+            if isinstance(base, ast.Name) and base.id == 'lib':
+                roots.add(id(base))
+    return {sub.id for sub in ast.walk(node)
+            if isinstance(sub, ast.Name) and id(sub) not in roots}
+
+
+def _is_copyable_assignment(stmt: ast.stmt) -> bool:
+    """Whether the statement may run a second time ahead of its own guard.
+
+    Only a plain assignment of a repeatable expression qualifies. Anything
+    else either binds a name in a way a copy cannot reproduce or performs an
+    effect — a drawing, a collection mutation, an order — that must happen
+    exactly once, in its original place.
+    """
+    targets = _plain_assignment_targets(stmt)
+    value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
+    if not targets or value is None or not _is_repeatable(value):
+        return False
+    return not _bound_names(stmt) - targets
+
+
+def _feeding_copies(stmt: ast.stmt, kept: list[ast.stmt]) -> list[ast.stmt] | None:
+    """Copies of the branch statements the reaching statement reads.
+
+    :param stmt: The reaching statement about to be lifted.
+    :param kept: The branch statements before it that stay guarded.
+    :return: The copies in source order, or ``None`` when a dependency cannot
+             run ahead of the guard and the statement must stay where it is.
+    """
+    needed = _loaded_names(stmt)
+    feeding: list[ast.stmt] = []
+    for earlier in reversed(kept):
+        bound = _bound_names(earlier)
+        if not bound & needed:
+            continue
+        if not _is_copyable_assignment(earlier):
+            return None
+        feeding.append(copy.deepcopy(earlier))
+        needed |= _loaded_names(earlier)
+    feeding.reverse()
+    # The originals stay under the guard and run again after the copies, so a
+    # copy must not read a name the group itself binds at or after it:
+    # ``length = length + 1`` would advance twice, and ``a = b`` followed by
+    # ``b = a + 1`` would re-read the already advanced ``b``.
+    for index, earlier in enumerate(feeding):
+        later_targets: set[str] = set()
+        for other in feeding[index:]:
+            later_targets |= _bound_names(other)
+        if later_targets & _loaded_names(earlier):
+            return None
+    return feeding
+
+
+def _plain_assignment_targets(stmt: ast.stmt) -> set[str]:
+    """The local names a plain assignment binds, or nothing for anything else.
+
+    Only such a statement may be copied ahead of a guard: an augmented
+    assignment or a persistent / series declaration advances state, so a lifted
+    statement reads whatever value that state has under its own guard.
+    """
+    if isinstance(stmt, ast.Assign):
+        targets = stmt.targets
+    elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+        if any(isinstance(node, ast.Name) and node.id in _STATEFUL_ANNOTATIONS
+               for node in ast.walk(stmt.annotation)):
+            return set()
+        targets = [stmt.target]
+    else:
+        return set()
+    names: set[str] = set()
+    for target in targets:
+        # Only a bare name: an attribute or a subscript target writes through
+        # an object, and a tuple / list / starred one unpacks — ``x, y =
+        # items`` raises ``ValueError`` as soon as the guard above it is what
+        # gives ``items`` the matching length.
+        if not isinstance(target, ast.Name):
+            return set()
+        names.add(target.id)
+    return names
+
+
+def _as_statements(exprs: list[ast.expr], where: ast.stmt) -> list[ast.stmt]:
+    """Expression statements running ``exprs``, located at ``where``."""
+    return [ast.copy_location(ast.Expr(value=value), where) for value in exprs]
+
+
+def _any_sid_write(sids: set[str]) -> _Hit:
+    """A target test matching a ``__sec_write__`` call of any of ``sids``."""
+
+    def hit(node: ast.AST) -> bool:
+        return _protocol_sid(node, '__sec_write__') in sids
+
+    return hit
+
+
+def _force_conditional_writes(module: ast.Module, clone: ast.FunctionDef,
+                              sids: set[str]) -> bool:
+    """Make the writes of ``sids`` run on every bar the child computes.
+
+    TradingView HOISTS a ``request.security()`` call to global scope: the branch
+    it is written in decides where its RESULT lands on the chart, never whether
+    the requested context's series is computed. The security split leaves the
+    ``__sec_write__`` block where the call stood, so a call site inside a branch
+    has the CHILD re-evaluate that test against ITS OWN bars and publish on only
+    some of them — the chart then reads the previous period's value.
+    MEASURED on a 90-minute context of a 30-minute chart gated by
+    ``bar_index % 3 != 1``, against an ungated call of the same expression:
+    TradingView delivers the same series on every bar for a call in an ``if``,
+    in either branch of an ``if`` / ``else`` holding one context each, in a
+    ternary, behind ``and``, through a helper in each of those positions, and
+    for ``request.security_lower_tf``.
+
+    The clone is the child's own code, so the path is forced here: every write,
+    and every call of a helper performing one, is lifted in front of the guards
+    standing between it and the clone's body (:class:`_Forcer`), inside the
+    helper functions first and then in the clone's own body. Branches the
+    EXPRESSION depends on are untouched — they are part of the subtree
+    TradingView compiles into the security context.
+
+    A writing helper defined at module level is shared with ``main()``, so the
+    clone gets forced copies of the module-level definitions on the call chain
+    as nested ``def``s, which shadow the originals inside the clone only.
+
+    :param module: The lowered module.
+    :param clone: The emitted clone, modified in place.
+    :param sids: The contexts whose write must become unconditional.
+    :return: Whether anything was rewritten.
+    """
+    hit = _any_sid_write(sids)
+    outer: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+    for node in module.body:
+        if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and not is_script_entry(node) and not node.name.startswith(CLONE_PREFIX)):
+            outer.setdefault(node.name, []).append(node)
+    nested = _nested_defs(clone)
+    shared = {name: nodes for name, nodes in outer.items() if name not in nested}
+    reaching_shared = _reaching_defs(shared, hit)
+    memo: dict[int, object] = {id(module): module}
+    copies = [copy.deepcopy(node, memo)
+              for name in sorted(reaching_shared) for node in shared[name]]
+
+    defs = dict(nested)
+    for node in copies:
+        defs.setdefault(node.name, []).append(node)
+        for name, nodes in _nested_defs(node).items():
+            defs.setdefault(name, []).extend(nodes)
+    reaching = _reaching_defs(defs, hit)
+
+    def test(node: ast.AST) -> bool:
+        if hit(node):
+            return True
+        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in reaching)
+
+    shared_forcer = _Forcer(test, _plain_aliases(list(copies)))
+    for node in copies:
+        for sub in [node, *[n for nodes in _nested_defs(node).values() for n in nodes]]:
+            sub.body = shared_forcer.func_body(sub)
+    forcer = _Forcer(test, _plain_aliases([clone]))
+    for nodes in nested.values():
+        for node in nodes:
+            node.body = forcer.func_body(node)
+    clone.body = forcer.func_body(clone)
+    if shared_forcer.changed:
+        clone.body[0:0] = copies
+    ast.fix_missing_locations(clone)
+    return forcer.changed or shared_forcer.changed
 
 
 def _build_clone(module: ast.Module, main: ast.FunctionDef, kept: list[int],
