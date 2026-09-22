@@ -870,8 +870,8 @@ def main():
     log.info("the series-guarded early return cleared the flag")
 
 
-def __test_a_series_guard_clears_closed_shift__(log):
-    """An ``if`` around the write clears the flag, whatever the test reads"""
+def __test_a_forced_series_guard_keeps_closed_shift__(log):
+    """An ``if`` around the write is forced out of the clone, so the flag stays"""
     source = """
 @lib.script.indicator("t")
 def main():
@@ -881,8 +881,11 @@ def main():
                                        lookahead=lib.barmerge.lookahead_on)
     lib.plot(shifted)
 """
-    assert __test_helper_closed_shift(__test_helper_transform(source)) == [False]
-    log.info("the series guard cleared the flag")
+    tree = __test_helper_transform(source)
+    assert __test_helper_closed_shift(tree) == [True]
+    clone = __test_helper_clones(tree)['__sec_main_0__']
+    assert __test_helper_write_guards(clone) == []
+    log.info("the child runs the write unguarded, and the flag is kept")
 
 
 def __test_a_helper_called_unconditionally_keeps_closed_shift__(log):
@@ -899,8 +902,8 @@ def main():
     log.info("the unconditional call site kept the flag")
 
 
-def __test_a_helper_called_under_a_series_guard_clears_closed_shift__(log):
-    """A call site behind a bar-data guard may skip the write inside a period"""
+def __test_a_helper_called_under_a_forced_series_guard_keeps_closed_shift__(log):
+    """A call site behind a bar-data guard is forced out of the clone too"""
     source = """
 @lib.script.indicator("t")
 def main():
@@ -912,8 +915,8 @@ def main():
         shifted = htf("D")
     lib.plot(shifted)
 """
-    assert __test_helper_closed_shift(__test_helper_transform(source)) == [False]
-    log.info("the guarded call site cleared the flag")
+    assert __test_helper_closed_shift(__test_helper_transform(source)) == [True]
+    log.info("the forced call site kept the flag")
 
 
 def __test_a_helper_called_in_a_loop_clears_closed_shift__(log):
@@ -993,13 +996,13 @@ def main():
     log.info("both isolation copies kept the flag")
 
 
-def __test_only_an_unguarded_top_level_write_keeps_closed_shift__(log):
-    """The flag survives a top-level write only; ANY ``if`` around it clears it
+def __test_only_a_write_run_on_every_round_keeps_closed_shift__(log):
+    """The flag survives a write the child runs on every round, and no other
 
     The write below stands at the top level of a helper that the entry calls at
-    its own top level, so it runs on every round. Putting the very same write
-    behind an ``if`` clears the flag even though the guard reads nothing but an
-    ``input.*`` value, which picks one branch for the whole run.
+    its own top level, so it runs on every round. An ``if`` around the very same
+    write is forced out of the child's clone, so it keeps the flag as well. A
+    loop around it cannot be forced, and clears the flag.
     """
     unguarded = """
 @lib.script.indicator("t")
@@ -1019,6 +1022,695 @@ def main():
                                        lookahead=lib.barmerge.lookahead_on)
     lib.plot(shifted)
 """
+    looped = """
+@lib.script.indicator("t")
+def main():
+    shifted = lib.na
+    for _i in range(2):
+        shifted = lib.request.security(lib.syminfo.tickerid, "D", lib.close[1],
+                                       lookahead=lib.barmerge.lookahead_on)
+    lib.plot(shifted)
+"""
     assert __test_helper_closed_shift(__test_helper_transform(unguarded)) == [True]
-    assert __test_helper_closed_shift(__test_helper_transform(guarded)) == [False]
-    log.info("only the unguarded top-level write kept the flag")
+    assert __test_helper_closed_shift(__test_helper_transform(guarded)) == [True]
+    assert __test_helper_closed_shift(__test_helper_transform(looped)) == [False]
+    log.info("the unguarded and the forced write kept the flag, the looped one lost it")
+
+
+def __test_helper_write_guards(clone: ast.FunctionDef) -> list[str]:
+    """The user guards still standing around a write or a helper call in a clone."""
+    guards: list[str] = []
+    for node in ast.walk(clone):
+        if isinstance(node, ast.If) and '__active_security__' not in ast.unparse(node.test):
+            # The user's ``if`` itself stays; what may not stay under it is a
+            # write or a call of the writing helper.
+            guarded = ast.unparse(ast.Module(body=[*node.body, *node.orelse], type_ignores=[]))
+            if '__sec_write__' in guarded or 'htf(' in guarded:
+                guards.append(ast.unparse(node.test))
+        elif isinstance(node, (ast.IfExp, ast.BoolOp)) and 'htf' in ast.unparse(node):
+            guards.append(ast.unparse(node))
+    return guards
+
+
+def __test_only_the_write_leaves_its_branch__(log):
+    """The branch keeps its guard: the write is lifted with the assignment it reads
+
+    The slicing is switched off so the clone holds the whole ``main()``: the
+    drawing and the conditionally advancing counter must stay under the ``if``.
+    """
+    import os
+    source = """
+@lib.script.indicator("t")
+def main():
+    count: Persistent[int] = 0
+    value = lib.na
+    if lib.bar_index % 3 != 1:
+        count += 1
+        length = 3
+        lib.label.new(lib.bar_index, lib.high, "x")
+        value = lib.request.security(lib.syminfo.tickerid, "D", lib.ta.sma(lib.close, length))
+    lib.plot(value)
+    lib.plot(count)
+"""
+    os.environ['PYNE_NO_SECURITY_SLICE'] = '1'
+    try:
+        clone = __test_helper_only_clone(__test_helper_transform(source))
+    finally:
+        os.environ.pop('PYNE_NO_SECURITY_SLICE', None)
+    assert __test_helper_write_guards(clone) == []
+    guard = next(node for node in clone.body
+                 if isinstance(node, ast.If) and 'bar_index' in ast.unparse(node.test))
+    guarded = ast.unparse(ast.Module(body=guard.body, type_ignores=[]))
+    assert 'count += 1' in guarded and 'label.new' in guarded
+    ahead = ast.unparse(ast.Module(body=clone.body[:clone.body.index(guard)], type_ignores=[]))
+    # The copy binds a private name: the original still runs under the guard,
+    # so a copy writing ``length`` would leave the branch's value behind on a
+    # pass that never took the branch
+    assert '__sec_dep' in ahead and '= 3' in ahead and '__sec_write__' in ahead
+    assert 'length = 3' not in ahead
+    assert 'count += 1' not in ahead and 'label.new' not in ahead
+    assert 'length = 3' in guarded
+    log.info("write and its plain assignment lifted, counter and drawing still guarded")
+
+
+def __test_an_alias_of_a_mutated_collection_keeps_the_write_guarded__(log):
+    """A mutation written through a second name still holds the write back
+
+    ``alias = store`` makes both names denote one array, so ``lib.array.set()``
+    on the alias is a mutation of what the request reads through ``store``.
+    Lifting the write ahead of it would publish what the array held before the
+    branch ran.
+    """
+    import os
+    source = """
+@lib.script.indicator("t")
+def main():
+    store = lib.array.new_float(1, 2.0)
+    alias = store
+    value = lib.na
+    if lib.bar_index % 3 != 1:
+        lib.array.set(alias, 0, 3.0)
+        value = lib.request.security(lib.syminfo.tickerid, "D", lib.array.get(store, 0))
+    lib.plot(value)
+"""
+    os.environ['PYNE_NO_SECURITY_SLICE'] = '1'
+    try:
+        tree = __test_helper_transform(source)
+    finally:
+        os.environ.pop('PYNE_NO_SECURITY_SLICE', None)
+    assert __test_helper_clones(tree) == {}
+    guarded = __test_helper_guarded_write(tree)
+    assert '__sec_write__' in guarded and 'array.set' in guarded
+    log.info("the alias tied the write to the mutation")
+
+
+def __test_an_annotated_alias_of_a_mutated_collection_keeps_the_write_guarded__(log):
+    """An annotation does not turn an alias into a fresh object
+
+    ``alias: list[float] = store`` binds the very same array as ``alias =
+    store`` does, so the mutation written through the alias must hold the
+    write back exactly as the plain spelling does.
+    """
+    import os
+    source = """
+@lib.script.indicator("t")
+def main():
+    store = lib.array.new_float(1, 2.0)
+    alias: list[float] = store
+    value = lib.na
+    if lib.bar_index % 3 != 1:
+        lib.array.set(alias, 0, 3.0)
+        value = lib.request.security(lib.syminfo.tickerid, "D", lib.array.get(store, 0))
+    lib.plot(value)
+"""
+    os.environ['PYNE_NO_SECURITY_SLICE'] = '1'
+    try:
+        tree = __test_helper_transform(source)
+    finally:
+        os.environ.pop('PYNE_NO_SECURITY_SLICE', None)
+    assert __test_helper_clones(tree) == {}
+    guarded = __test_helper_guarded_write(tree)
+    assert '__sec_write__' in guarded and 'array.set' in guarded
+    log.info("the annotated alias tied the write to the mutation")
+
+
+def __test_a_lifted_dependency_does_not_change_its_own_guard__(log):
+    """A copied dependency binds a private name, not the one the test reads
+
+    ``x`` is both the guard's input and the request's: a copy keeping the name
+    would run ``x = lib.open`` before ``x > 100``, turning a true branch false
+    and leaving that value behind on a pass that never took the branch.
+    """
+    import os
+    source = """
+@lib.script.indicator("t")
+def main():
+    x = lib.close
+    value = lib.na
+    if x > 100:
+        x = lib.open
+        value = lib.request.security(lib.syminfo.tickerid, "D", x)
+    lib.plot(value)
+    lib.plot(x)
+"""
+    os.environ['PYNE_NO_SECURITY_SLICE'] = '1'
+    try:
+        clone = __test_helper_only_clone(__test_helper_transform(source))
+    finally:
+        os.environ.pop('PYNE_NO_SECURITY_SLICE', None)
+    assert __test_helper_write_guards(clone) == []
+    guard = next(node for node in clone.body
+                 if isinstance(node, ast.If) and 'x > 100' in ast.unparse(node.test))
+    ahead = ast.unparse(ast.Module(body=clone.body[:clone.body.index(guard)], type_ignores=[]))
+    assert '__sec_dep' in ahead and '__sec_write__' in ahead
+    assert 'x = lib.open' not in ahead
+    assert 'x = lib.open' in ast.unparse(ast.Module(body=guard.body, type_ignores=[]))
+    log.info("the guard still reads the value it read before the lift")
+
+
+def __test_helper_guarded_write(tree: ast.Module) -> str:
+    """The body of ``main()``'s ``bar_index`` guard, as source text."""
+    main = next(node for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == 'main')
+    guard = next(node for node in ast.walk(main)
+                 if isinstance(node, ast.If) and 'bar_index' in ast.unparse(node.test))
+    return ast.unparse(ast.Module(body=guard.body, type_ignores=[]))
+
+
+def __test_a_collection_mutated_before_the_request_keeps_the_write_guarded__(log):
+    """A branch effect the request reads is never overtaken by the lift
+
+    ``lib.array.set()`` binds no name, so only the value it touches ties it to
+    the request: lifting the write ahead of it would publish what the
+    collection held before the branch ran. Nothing can be lifted here, so no
+    forced clone is emitted at all and the write stays under its guard.
+    """
+    import os
+    source = """
+@lib.script.indicator("t")
+def main():
+    store = lib.array.new_float(1, 2.0)
+    value = lib.na
+    if lib.bar_index % 3 != 1:
+        lib.array.set(store, 0, 3.0)
+        value = lib.request.security(lib.syminfo.tickerid, "D", lib.array.get(store, 0))
+    lib.plot(value)
+"""
+    os.environ['PYNE_NO_SECURITY_SLICE'] = '1'
+    try:
+        tree = __test_helper_transform(source)
+    finally:
+        os.environ.pop('PYNE_NO_SECURITY_SLICE', None)
+    assert __test_helper_clones(tree) == {}
+    guarded = __test_helper_guarded_write(tree)
+    assert '__sec_write__' in guarded and 'array.set' in guarded
+    log.info("the write stayed behind the mutation it reads")
+
+
+def __test_a_self_referential_assignment_keeps_the_write_guarded__(log):
+    """A dependency reading what the same branch binds is not copied ahead
+
+    ``length = length + 1`` cannot be copied in front of the guard: the
+    original runs again under it, so the counter would advance twice.
+    """
+    import os
+    source = """
+@lib.script.indicator("t")
+def main():
+    length = 2
+    value = lib.na
+    if lib.bar_index % 3 != 1:
+        length = length + 1
+        value = lib.request.security(lib.syminfo.tickerid, "D", lib.ta.sma(lib.close, length))
+    lib.plot(value)
+    lib.plot(length)
+"""
+    os.environ['PYNE_NO_SECURITY_SLICE'] = '1'
+    try:
+        tree = __test_helper_transform(source)
+    finally:
+        os.environ.pop('PYNE_NO_SECURITY_SLICE', None)
+    assert __test_helper_clones(tree) == {}
+    guarded = __test_helper_guarded_write(tree)
+    assert guarded.count('length = length + 1') == 1 and '__sec_write__' in guarded
+    log.info("the increment runs once, under its own guard")
+
+
+def __test_a_guarded_helper_call_is_forced_in_the_clone__(log):
+    """A ternary or a short circuit around the writing helper's call is removed"""
+    ternary = """
+@lib.script.indicator("t")
+def main():
+    def htf():
+        return lib.request.security(lib.syminfo.tickerid, "D", lib.ta.sma(lib.close, 3))
+    gate = lib.bar_index % 3 != 1
+    lib.plot(htf() if gate else lib.na)
+"""
+    short_circuit = """
+@lib.script.indicator("t")
+def main():
+    def htf():
+        return lib.request.security(lib.syminfo.tickerid, "D", lib.close > lib.open)
+    gate = lib.bar_index % 3 != 1
+    flag = gate and htf()
+    lib.plot(1 if flag else 0)
+"""
+    for name, source in (("ternary", ternary), ("short circuit", short_circuit)):
+        clone = __test_helper_only_clone(__test_helper_transform(source))
+        assert __test_helper_write_guards(clone) == [], name
+        assert 'htf()' in __test_helper_body(clone), name
+    log.info("neither expression-level guard survived in the clone")
+
+
+def __test_a_context_in_each_branch_keeps_both_writes__(log):
+    """``if`` / ``else`` holding a context each: the child runs both branches"""
+    source = """
+@lib.script.indicator("t")
+def main():
+    gate = lib.bar_index % 3 != 1
+    value = 0.0
+    if gate:
+        value = lib.request.security(lib.syminfo.tickerid, "D", lib.ta.sma(lib.high, 3))
+    else:
+        value = lib.request.security(lib.syminfo.tickerid, "D", lib.ta.sma(lib.low, 3))
+    lib.plot(value)
+"""
+    tree = __test_helper_transform(source)
+    names = __test_helper_slice_name_per_context(tree)
+    assert names[0] is not None and names[0] == names[1], names
+    clone = __test_helper_clones(tree)[names[0]]
+    assert __test_helper_write_guards(clone) == []
+    body = __test_helper_body(clone)
+    assert 'lib.high' in body and 'lib.low' in body
+    log.info("the one clone of the group writes both contexts unguarded")
+
+
+def __test_a_guarded_write_gets_a_whole_clone_where_nothing_is_sliced__(log):
+    """An LTF context, or any context while slicing is off, is still forced"""
+    import os
+
+    ltf_guarded = """
+@lib.script.indicator("t")
+def main():
+    vals = lib.array.new_float(0)
+    if lib.bar_index % 3 != 1:
+        vals = lib.request.security_lower_tf(lib.syminfo.tickerid, "1", lib.ta.sma(lib.close, 3))
+    lib.plot(lib.array.sum(vals))
+"""
+    htf_guarded = """
+@lib.script.indicator("t")
+def main():
+    value = 0.0
+    if lib.bar_index % 3 != 1:
+        value = lib.request.security(lib.syminfo.tickerid, "D", lib.ta.sma(lib.close, 3))
+    lib.plot(value)
+"""
+    htf_plain = """
+@lib.script.indicator("t")
+def main():
+    lib.plot(lib.request.security(lib.syminfo.tickerid, "D", lib.ta.sma(lib.close, 3)))
+"""
+    clone = __test_helper_only_clone(__test_helper_transform(ltf_guarded))
+    assert __test_helper_write_guards(clone) == []
+    # Nothing was dropped: the chart-side statements are all still there
+    assert 'lib.plot' in __test_helper_body(clone)
+
+    os.environ['PYNE_NO_SECURITY_SLICE'] = '1'
+    try:
+        clone = __test_helper_only_clone(__test_helper_transform(htf_guarded))
+        assert __test_helper_write_guards(clone) == []
+        assert 'lib.plot' in __test_helper_body(clone)
+        assert __test_helper_clones(__test_helper_transform(htf_plain)) == {}
+    finally:
+        os.environ.pop('PYNE_NO_SECURITY_SLICE', None)
+    log.info("the unsliced contexts got a forced clone of the whole main()")
+
+
+def __test_a_module_level_helper_is_forced_on_a_private_copy__(log):
+    """The guard inside a shared helper goes from the clone's copy only"""
+    source = """
+def htf(flag):
+    value = lib.na
+    if flag:
+        value = lib.request.security(lib.syminfo.tickerid, "D", lib.ta.sma(lib.close, 3))
+    return value
+
+@lib.script.indicator("t")
+def main():
+    lib.plot(htf(lib.bar_index % 3 != 1))
+"""
+    tree = __test_helper_transform(source)
+    clone = __test_helper_only_clone(tree)
+    copies = [node for node in clone.body
+              if isinstance(node, ast.FunctionDef) and node.name == 'htf']
+    assert len(copies) == 1
+    assert __test_helper_write_guards(copies[0]) == []
+    shared = [node for node in tree.body
+              if isinstance(node, ast.FunctionDef) and node.name == 'htf']
+    assert len(shared) == 1
+    assert __test_helper_write_guards(shared[0]) == ['flag']
+    log.info("main() still calls the guarded helper, the clone its forced copy")
+
+
+def __test_a_method_mutation_of_a_script_value_keeps_the_write_guarded__(log):
+    """A method receiver is a script value the branch may mutate
+
+    ``store.append(3.0)`` mutates ``store`` exactly as ``lib.array.push()``
+    does; only the receiver name ties the effect to the request, so the write
+    must stay behind it instead of publishing the collection as it was before
+    the branch ran.
+    """
+    import os
+    source = """
+@lib.script.indicator("t")
+def main():
+    store = lib.array.new_float(1, 2.0)
+    value = lib.na
+    if lib.bar_index % 3 != 1:
+        store.append(3.0)
+        value = lib.request.security(lib.syminfo.tickerid, "D", lib.array.size(store))
+    lib.plot(value)
+"""
+    os.environ['PYNE_NO_SECURITY_SLICE'] = '1'
+    try:
+        tree = __test_helper_transform(source)
+    finally:
+        os.environ.pop('PYNE_NO_SECURITY_SLICE', None)
+    assert __test_helper_clones(tree) == {}
+    guarded = __test_helper_guarded_write(tree)
+    assert '__sec_write__' in guarded and 'store.append' in guarded
+    log.info("the method receiver tied the write to the mutation")
+
+
+def __test_a_subscript_dependency_is_never_copied_ahead_of_its_guard__(log):
+    """The guard is what makes the index valid, so the copy may not run
+
+    ``x = store[0]`` holds no call, but the ``array.size()`` test above it is
+    what establishes that element: evaluating a copy on a pass that never
+    takes the branch would raise where the original never runs.
+    """
+    import os
+    source = """
+@lib.script.indicator("t")
+def main():
+    store = lib.array.new_float(0)
+    value = lib.na
+    if lib.array.size(store) > 0:
+        x = store[0]
+        value = lib.request.security(lib.syminfo.tickerid, "D", x + lib.close)
+    lib.plot(value)
+"""
+    os.environ['PYNE_NO_SECURITY_SLICE'] = '1'
+    try:
+        tree = __test_helper_transform(source)
+    finally:
+        os.environ.pop('PYNE_NO_SECURITY_SLICE', None)
+    assert __test_helper_clones(tree) == {}
+    main = next(node for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == 'main')
+    guard = next(node for node in ast.walk(main)
+                 if isinstance(node, ast.If) and 'array.size' in ast.unparse(node.test))
+    guarded = ast.unparse(ast.Module(body=guard.body, type_ignores=[]))
+    assert '__sec_write__' in guarded and 'store[0]' in guarded
+    # No private copy of the subscript was hoisted ahead of the guard
+    assert '__sec_dep' not in ast.unparse(main)
+    log.info("the subscript dependency stayed under the guard")
+
+
+
+def __test_helper_pipeline(source: str) -> ast.Module:
+    """Run the whole analysis half of the pipeline over a source string.
+
+    The slicer's copy analysis reads the tree the earlier passes produce, so a
+    dependency hoist is only visible end to end.
+
+    :param source: The module source.
+    :return: The analysed module, locations fixed up for unparsing.
+    """
+    import os
+    from pathlib import Path
+    from pynecore.core.import_hook import _analyse_tree, _module_mode
+    os.environ['PYNE_SAVE_SCRIPT_TOML'] = '0'
+    tree = ast.parse(source)
+    path = Path(__file__).parent / 'security_slice_probe.py'
+    tree = _analyse_tree(tree, source, path, _module_mode(tree)[1])
+    ast.fix_missing_locations(tree)
+    return tree
+
+
+def __test_an_attribute_dependency_is_never_copied_ahead_of_its_guard__(log):
+    """The guard is what makes the attribute owner valid, so the copy may not run
+
+    ``x = item.value`` holds no call, but the ``item is not None`` test above it
+    is what establishes the owner: a copy evaluated on a pass that never takes
+    the branch would read the attribute off ``na`` and raise where the original
+    never runs.
+    """
+    source = '''"""
+@pyne
+"""
+from pynecore import lib
+from pynecore.lib import script, request, syminfo, close, na, plot
+
+@script.indicator("t")
+def main(item=None):
+    value = na
+    if item is not None:
+        x = item.value
+        value = request.security(syminfo.tickerid, "D", x + close)
+    plot(value)
+'''
+    tree = __test_helper_pipeline(source)
+    clone = __test_helper_only_clone(tree)
+    body = __test_helper_body(clone)
+    # The attribute read stayed under its own guard, with no copy ahead of it
+    assert '__sec_dep' not in body, body
+    guard = next(node for node in ast.walk(clone)
+                 if isinstance(node, ast.If) and 'is not None' in ast.unparse(node.test)
+                 and '__active_security__' not in ast.unparse(node.test))
+    guarded = ast.unparse(ast.Module(body=guard.body, type_ignores=[]))
+    assert '__sec_write__' in guarded and 'item.value' in guarded, guarded
+    log.info("the attribute dependency stayed under the guard")
+
+
+def __test_an_arithmetic_dependency_is_never_copied_ahead_of_its_guard__(log):
+    """Operators may raise outside their guard, so no operand copy may run early
+
+    ``x = 10 // item`` holds no call, no subscript and no attribute, yet the
+    ``item != 0`` test above it is what makes the division defined: a copy
+    evaluated on a pass that never takes the branch raises ``ZeroDivisionError``
+    where the original never runs.
+    """
+    source = '''"""
+@pyne
+"""
+from pynecore import lib
+from pynecore.lib import script, request, syminfo, close, na, plot
+
+@script.indicator("t")
+def main(item=0):
+    value = na
+    if item != 0:
+        x = 10 // item
+        value = request.security(syminfo.tickerid, "D", x + close)
+    plot(value)
+'''
+    tree = __test_helper_pipeline(source)
+    clone = __test_helper_only_clone(tree)
+    body = __test_helper_body(clone)
+    # The division stayed under its own guard, with no copy ahead of it
+    assert '__sec_dep' not in body, body
+    guard = next(node for node in ast.walk(clone)
+                 if isinstance(node, ast.If) and '!= 0' in ast.unparse(node.test)
+                 and '__active_security__' not in ast.unparse(node.test))
+    guarded = ast.unparse(ast.Module(body=guard.body, type_ignores=[]))
+    assert '__sec_write__' in guarded and '//' in guarded, guarded
+    log.info("the arithmetic dependency stayed under the guard")
+
+
+def __test_an_unpacking_dependency_is_never_copied_ahead_of_its_guard__(log):
+    """Unpacking needs the length the guard establishes, so no copy may run early
+
+    ``x, y = items`` holds no call and no subscript, yet the ``len(items) == 2``
+    test above it is what makes the unpacking match: a copy evaluated on a pass
+    that never takes the branch raises ``ValueError`` where the original never
+    runs.
+    """
+    source = '''"""
+@pyne
+"""
+from pynecore import lib
+from pynecore.lib import script, request, syminfo, close, na, plot
+
+@script.indicator("t")
+def main(items=()):
+    value = na
+    if len(items) == 2:
+        x, y = items
+        value = request.security(syminfo.tickerid, "D", x + close)
+    plot(value)
+'''
+    tree = __test_helper_pipeline(source)
+    clone = __test_helper_only_clone(tree)
+    body = __test_helper_body(clone)
+    # The unpacking stayed under its own guard, with no copy ahead of it
+    assert '__sec_dep' not in body, body
+    guard = next(node for node in ast.walk(clone)
+                 if isinstance(node, ast.If) and 'len(items)' in ast.unparse(node.test))
+    guarded = ast.unparse(ast.Module(body=guard.body, type_ignores=[]))
+    assert '__sec_write__' in guarded, guarded
+    log.info("the unpacking dependency stayed under the guard")
+
+
+def __test_a_conditionally_bound_local_is_never_read_ahead_of_its_guard__(log):
+    """A local only a guard binds may not be read in front of another guard
+
+    ``original`` is bound in the first ``if`` alone, so the second ``if`` may
+    not be lifted: on a pass taking neither branch the lifted read would raise
+    ``UnboundLocalError`` where the original never runs.
+    """
+    source = '''"""
+@pyne
+"""
+from pynecore import lib
+from pynecore.lib import script, request, syminfo, close, na, plot
+
+@script.indicator("t")
+def main(flag=False):
+    value = na
+    if flag:
+        original = close
+    if flag:
+        x = original
+        value = request.security(syminfo.tickerid, "D", x + close)
+    plot(value)
+'''
+    tree = __test_helper_pipeline(source)
+    clone = __test_helper_only_clone(tree)
+    body = __test_helper_body(clone)
+    assert '__sec_dep' not in body, body
+    guard = next(node for node in ast.walk(clone)
+                 if isinstance(node, ast.If) and 'flag' in ast.unparse(node.test)
+                 and 'x = original' in ast.unparse(ast.Module(body=node.body,
+                                                              type_ignores=[])))
+    guarded = ast.unparse(ast.Module(body=guard.body, type_ignores=[]))
+    assert '__sec_write__' in guarded, guarded
+    log.info("the conditionally bound local stayed under the guard")
+
+
+def __test_an_annotation_only_declaration_binds_no_value__(log):
+    """A declared but unassigned local may not be read in front of a guard
+
+    ``original: float`` makes the name a local without giving it a value, so
+    the only binding is the one the first ``if`` writes: lifting the second
+    ``if`` would read it unbound.
+    """
+    source = '''"""
+@pyne
+"""
+from pynecore import lib
+from pynecore.lib import script, request, syminfo, close, na, plot
+
+@script.indicator("t")
+def main(flag=False):
+    value = na
+    original: float
+    if flag:
+        original = close
+    if flag:
+        x = original
+        value = request.security(syminfo.tickerid, "D", x + close)
+    plot(value)
+'''
+    tree = __test_helper_pipeline(source)
+    clone = __test_helper_only_clone(tree)
+    body = __test_helper_body(clone)
+    assert '__sec_dep' not in body, body
+    log.info("the annotation-only declaration did not license the lift")
+
+
+def __test_a_deleted_local_is_not_certainly_bound__(log):
+    """A local a branch may delete may not be read in front of a later guard
+
+    ``original`` is bound unconditionally but ``del`` may take that binding
+    away, so the read must stay under its own guard.
+    """
+    source = '''"""
+@pyne
+"""
+from pynecore import lib
+from pynecore.lib import script, request, syminfo, close, na, plot
+
+@script.indicator("t")
+def main(flag=False):
+    value = na
+    original = close
+    if flag:
+        del original
+    if flag:
+        x = original
+        value = request.security(syminfo.tickerid, "D", x + close)
+    plot(value)
+'''
+    module = ast.unparse(__test_helper_pipeline(source))
+    assert '__sec_dep' not in module, module
+    log.info("the deleted local did not license the lift")
+
+
+def __test_a_short_circuited_walrus_binds_nothing_certain__(log):
+    """An assignment inside a short-circuiting expression is not a binding
+
+    ``flag and (original := close)`` writes ``original`` only when ``flag`` is
+    true, so the later guard's read of it may not run ahead of the guard.
+    """
+    source = '''"""
+@pyne
+"""
+from pynecore import lib
+from pynecore.lib import script, request, syminfo, close, na, plot
+
+@script.indicator("t")
+def main(flag=False):
+    value = na
+    flag and (original := close)
+    if flag:
+        x = original
+        value = request.security(syminfo.tickerid, "D", x + close)
+    plot(value)
+'''
+    tree = __test_helper_pipeline(source)
+    clone = __test_helper_only_clone(tree)
+    body = __test_helper_body(clone)
+    assert '__sec_dep' not in body, body
+    log.info("the short-circuited walrus did not license the lift")
+
+
+def __test_an_except_handler_target_is_not_certainly_bound__(log):
+    """A name an ``except ... as`` handler holds is unbound when it leaves
+
+    Python deletes the handler's target on exit, so the earlier
+    ``original = close`` no longer holds after the ``try``: the later read
+    must stay under its own guard.
+    """
+    source = '''"""
+@pyne
+"""
+from pynecore import lib
+from pynecore.lib import script, request, syminfo, close, na, plot
+
+@script.indicator("t")
+def main(flag=False):
+    value = na
+    original = close
+    try:
+        pass
+    except ValueError as original:
+        pass
+    if flag:
+        x = original
+        value = request.security(syminfo.tickerid, "D", x + close)
+    plot(value)
+'''
+    module = ast.unparse(__test_helper_pipeline(source))
+    assert '__sec_dep' not in module, module
+    log.info("the except-handler target did not license the lift")

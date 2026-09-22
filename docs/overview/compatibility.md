@@ -242,6 +242,43 @@ truncated values. Only the bar's last, definitive execution sees the completed b
 also the only execution a strategy without these flags ever gets, so default strategies are
 unaffected.
 
+## Known TradingView quirks not reproduced
+
+Behaviour that looks like a TradingView defect rather than a rule is documented here instead
+of being copied. Each entry says where to look if a script ever turns out to depend on it.
+
+### Session mask on the day before a fall DST change
+
+On the day BEFORE a timezone's fall clock change — where no offset shifts at all — TradingView
+appends one extra hour to the intraday close of every session run that has an endpoint on the
+changing wall-clock hour (02:00 in `America/New_York` and `Europe/London`, 03:00 in
+`Australia/Sydney`). On the first chart bar of that extra hour `time(tf, session, tz)` returns
+`na` while `time_close(tf, session, tz)` returns a value, so the same bar is out of and in the
+session at once. PyneCore returns `na` from both.
+
+Measured on a 60-minute chart, 2024-01 to 2026-09, identically on BINANCE:BTCUSDT,
+COINBASE:BTCUSD, BITSTAMP:BTCUSD, KRAKEN:XBTUSD and CAPITALCOM:BTCUSD, so it does not depend on
+the data source:
+
+| Session, timezone              | Bars where `time()` is `na` and `time_close()` is not (UTC) |
+|--------------------------------|-------------------------------------------------------------|
+| `"1700-0200"` America/New_York | 2024-11-02 06:00, 2025-11-01 06:00                          |
+| `"0200-1000"` America/New_York | 2024-11-02 14:00, 2025-11-01 14:00                          |
+| `"0900-1600"` America/New_York | none — no endpoint on the changing hour                     |
+| `"1700-0200"` Europe/London    | 2024-10-26 01:00, 2025-10-25 01:00                          |
+| `"0200-1000"` Europe/London    | 2024-10-26 09:00, 2025-10-25 09:00                          |
+| `"1700-0300"` Australia/Sydney | 2024-04-05 16:00, 2025-04-04 16:00, 2026-04-03 16:00        |
+
+It can only show on an instrument that trades on that day (the day before the change is a
+Saturday, or a Friday evening UTC for Sydney), which rules out exchange-traded and FX symbols,
+and only in a script that reads `time_close()` with such a session: the usual
+`na(time(tf, session, tz))` test agrees with TradingView on that bar. It is one bar per
+affected session per year.
+
+Where to look: `_session_occurrences_opening_on` and `_intraday_session_bounds` in
+`pynecore/lib/__init__.py`. Both functions read one session occurrence per bar, so reproducing
+the quirk needs a rule of its own for `time_close()` on that single bar.
+
 ## Precision
 
 PyneCore is precision-tested against TradingView:

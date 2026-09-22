@@ -7,7 +7,7 @@ import queue
 import threading
 from pathlib import Path
 from datetime import datetime, UTC
-from math import copysign as _copysign
+from math import copysign as _copysign, inf as _INF
 
 from pynecore.types.ohlcv import OHLCV
 from pynecore.types.na import NA, na_float
@@ -113,7 +113,9 @@ class CSVWriter:
             # Canonicalize na to Pine's "NaN". A native nan would format lowercase
             # ("nan") via fmt; an NA object formats as "NaN" already but we keep the
             # branch representation-agnostic so both map to the same token.
-            if not (x == x):
+            # An infinity (a division by zero) is na to Pine's ``na()`` and
+            # TradingView exports such a plot value as na as well.
+            if not (x == x) or x == _INF or x == -_INF:
                 return "NaN"
             if fast_repr and type(x) is float:
                 # An integral value prints as the integer, the way TradingView's

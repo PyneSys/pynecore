@@ -572,8 +572,9 @@ def max(id: list[Number], nth: int = 0) -> Number:
 
     na elements are ignored. ``nth`` is 0-based: 0 is the maximum, 1 the second
     largest, and so on. An na ``nth`` is treated as 0 and a float one is
-    truncated to an integer. Returns na if the array holds no non-na values or
-    ``nth`` is out of range.
+    truncated to an integer. A rank that the array's size covers but its non-na
+    values do not yields the last ranked non-na value. Returns na if the array
+    holds no non-na values or ``nth`` is outside the array's size.
 
     :param id: Input array
     :param nth: Rank of the maximum to return (0 = maximum)
@@ -581,6 +582,8 @@ def max(id: list[Number], nth: int = 0) -> Number:
     """
     # Measured on TradingView (FX:EURUSD 240, bar 100, array [10, 20, 30, 40]):
     # max(a, na) -> 40, the same as nth = 0, while nth = 1 gives 30.
+    # With na elements (CAPITALCOM:EURUSD 60, [30, na, 10, na]) every rank from
+    # the non-na count up to the array's size repeats the last ranked value.
     if not (nth == nth):  # is_na_arg
         nth = 0
     nth = int(nth)  # float-carried integer rank, see get()
@@ -589,9 +592,9 @@ def max(id: list[Number], nth: int = 0) -> Number:
         return id[0] if id else NA(None)
     if nth == 0:
         return builtins.max(a)
-    if nth < 0 or nth >= len(a):
+    if nth < 0 or nth >= len(id):
         return cast(Number, NA(builtins.type(a[0])))
-    return sorted(a, reverse=True)[nth]
+    return sorted(a, reverse=True)[nth if nth < len(a) else -1]
 
 
 # noinspection PyShadowingBuiltins
@@ -615,8 +618,9 @@ def min(id: list[Number], nth: int = 0) -> Number:
 
     na elements are ignored. ``nth`` is 0-based: 0 is the minimum, 1 the second
     smallest, and so on. An na ``nth`` is treated as 0 and a float one is
-    truncated to an integer. Returns na if the array holds no non-na values or
-    ``nth`` is out of range.
+    truncated to an integer. A rank that the array's size covers but its non-na
+    values do not yields the last ranked non-na value. Returns na if the array
+    holds no non-na values or ``nth`` is outside the array's size.
 
     :param id: Input array
     :param nth: Rank of the minimum to return (0 = minimum)
@@ -624,6 +628,8 @@ def min(id: list[Number], nth: int = 0) -> Number:
     """
     # Measured on TradingView (FX:EURUSD 240, bar 100, array [10, 20, 30, 40]):
     # min(a, na) -> 10, the same as nth = 0, while nth = 1 gives 20.
+    # With na elements (CAPITALCOM:EURUSD 60, [30, na, 10, na]) every rank from
+    # the non-na count up to the array's size repeats the last ranked value.
     if not (nth == nth):  # is_na_arg
         nth = 0
     nth = int(nth)  # float-carried integer rank, see get()
@@ -632,9 +638,9 @@ def min(id: list[Number], nth: int = 0) -> Number:
         return id[0] if id else NA(None)
     if nth == 0:
         return builtins.min(a)
-    if nth < 0 or nth >= len(a):
+    if nth < 0 or nth >= len(id):
         return cast(Number, NA(builtins.type(a[0])))
-    return sorted(a)[nth]
+    return sorted(a)[nth if nth < len(a) else -1]
 
 
 # noinspection PyShadowingBuiltins

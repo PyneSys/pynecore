@@ -75,6 +75,19 @@ def __test_flush_reaches_the_file__(tmp_path: Path):
         writer.close()
 
 
+def __test_infinite_value_is_written_as_na__(tmp_path: Path):
+    """A division by zero leaves an infinity, which a plot exports as na"""
+    path = tmp_path / "out.csv"
+    writer = CSVWriter(path, idle_time=30.0)
+    writer.open()
+    try:
+        assert writer.write_dict({'a': float("inf"), 'b': float("-inf"), 'c': 1.5})
+        assert writer.flush()
+        assert path.read_text() == "a,b,c\nNaN,NaN,1.5\n"
+    finally:
+        writer.close()
+
+
 def __test_flush_raises_on_write_failure__(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """A failing write must surface on flush() instead of blocking forever"""
     failing = _FailingFile()

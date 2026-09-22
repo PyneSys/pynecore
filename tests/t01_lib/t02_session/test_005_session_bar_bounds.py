@@ -84,6 +84,59 @@ def __test_session_closing_on_the_changing_hour_ends_on_its_last_minute__():
     assert _is_bar_in_session(_ms(2025, 11, 2, 6), infos) is False
 
 
+def __test_intraday_mask_resolves_each_endpoint_on_a_change_night__():
+    """The intraday mask reads a gap endpoint after the change, a repeated one first
+
+    MEASURED on BINANCE:BTCUSDT@30 with ``time(timeframe.period, session, tz)``
+    over the 2025-03-09 and 2025-11-02 New York changes.
+    """
+    def run(session: str, *bar: int) -> tuple[int, int] | None:
+        return _session_occurrence(_ms(*bar), _parse_session_string(session, NY), True)
+
+    # Spring: 02:30 and 03:00 do not exist / are EDT, the 22:00 and 17:00 opens are EST
+    assert run("2200-0230", 2025, 3, 9, 5) == (_ms(2025, 3, 9, 3), _ms(2025, 3, 9, 6, 30))
+    assert run("1700-0300", 2025, 3, 9, 5) == (_ms(2025, 3, 8, 22), _ms(2025, 3, 9, 7))
+    assert run("0230-0500", 2025, 3, 9, 8) == (_ms(2025, 3, 9, 6, 30), _ms(2025, 3, 9, 9))
+    # "0130-0230" opens and closes on the same instant there, so it never runs
+    assert run("0130-0230", 2025, 3, 9, 6, 30) is None
+    # Fall: the close at 01:00 is the first, still-EDT one; 03:00 is EST
+    assert run("1800-0100", 2025, 11, 2, 3) == (_ms(2025, 11, 1, 22), _ms(2025, 11, 2, 5))
+    assert run("1700-0300", 2025, 11, 2, 3) == (_ms(2025, 11, 1, 21), _ms(2025, 11, 2, 8))
+
+
+def __test_intraday_run_closing_on_the_changing_clock_shifts_as_a_whole__():
+    """A run closing at the wall clock the change happens at keeps its nominal length
+
+    MEASURED as above, plus Europe/London over 2025-03-30 (the clock changes at
+    01:00 there) and 2025-10-26 (at 02:00). The daily request keeps the bounds
+    of :func:`__test_session_closing_on_the_changing_hour_ends_on_its_last_minute__`.
+    """
+    def run(session: str, tz: str, *bar: int) -> tuple[int, int] | None:
+        return _session_occurrence(_ms(*bar), _parse_session_string(session, tz), True)
+
+    assert run("1700-0200", NY, 2025, 3, 9, 3) == (_ms(2025, 3, 8, 21), _ms(2025, 3, 9, 6))
+    assert run("1700-0200", NY, 2025, 11, 2, 3) == (_ms(2025, 11, 1, 22), _ms(2025, 11, 2, 7))
+    # The shifted open precedes the run's own local midnight, a day "early"
+    assert run("0000-0200", NY, 2025, 3, 9, 4) == (_ms(2025, 3, 9, 4), _ms(2025, 3, 9, 6))
+    assert run("0000-0200", NY, 2025, 11, 2, 6) == (_ms(2025, 11, 2, 5), _ms(2025, 11, 2, 7))
+    london = "Europe/London"
+    assert run("2000-0100", london, 2025, 3, 29, 23) == \
+           (_ms(2025, 3, 29, 19), _ms(2025, 3, 30, 0))
+    assert run("1700-0200", london, 2025, 10, 26, 1) == \
+           (_ms(2025, 10, 25, 17), _ms(2025, 10, 26, 2))
+    # London's spring change is at 01:00, so a 02:00 close is an ordinary endpoint
+    assert run("1700-0200", london, 2025, 3, 29, 23) == \
+           (_ms(2025, 3, 29, 17), _ms(2025, 3, 30, 1))
+
+
+def __test_empty_session_is_the_all_day_session__():
+    """``time(tf, "", tz)`` is ``time(tf, "0000-0000", tz)``, not na"""
+    assert _parse_session_string("", NY) == _parse_session_string("0000-0000", NY)
+    # 2025-01-01 00:00 UTC is 19:00 on New Year's Eve in New York
+    assert _session_occurrence(_ms(2025, 1, 1), _parse_session_string("", NY)) == \
+           (_ms(2024, 12, 31, 5), _ms(2025, 1, 1, 5))
+
+
 def __test_period_anchor_is_the_first_session_open_of_the_period__():
     """Weekly and monthly session bars open at the period's first session open"""
     infos = _parse_session_string("0300-1200:1234567", NY)
