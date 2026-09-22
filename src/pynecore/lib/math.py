@@ -79,7 +79,7 @@ def atan(angle: TFI | NA[TFI]) -> PyneFloat:
     """
     if not (angle == angle):  # is_na_arg
         return na_float
-    return math.atan(angle)
+    return fdlibm.atan(angle)
 
 
 def avg(*numbers: TFI | NA[TFI]) -> PyneFloat:

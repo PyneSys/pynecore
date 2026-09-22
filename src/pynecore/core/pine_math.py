@@ -1,21 +1,25 @@
 """Runtime-exact transcendental functions for Pine-compatible execution.
 
-Implements the cos/sin/exp algorithm that HotSpot JVMs before JDK 19 use for
-``Math.cos``/``Math.sin``/``Math.exp`` on x86-64 (the Intel LIBM table-driven
-method), so per-bar runtime results are bit-identical to the venue engine.
+Implements the cos/sin/exp/log algorithms that HotSpot JVMs before JDK 19 use
+for ``Math.cos``/``Math.sin``/``Math.exp``/``Math.log`` on x86-64 (the Intel
+LIBM table-driven methods), so per-bar runtime results are bit-identical to the
+venue engine. None of them is correctly rounded, and ``log`` is the one where
+that shows: a correctly rounded logarithm disagrees with the venue whenever the
+argument comes within about 1.2% of 1.
 
 This is an independent implementation written from the published algorithm
 description: argument reduction against a fixed-point table of 2/pi (huge
 arguments) or N = round(x * 32/pi) (normal range), a 64-entry split-precision
 table of cos/sin values at multiples of pi/32, and a shared polynomial
-reconstruction. The numeric tables are the published algorithm constants
+reconstruction; ``log`` reduces instead against a 129-bin table of -ln(B) for
+the bins an approximate hardware reciprocal selects, and finishes with a
+degree-7 ``log1p`` series. The numeric tables are the published algorithm constants
 (mathematical values, reproduced as data). Correctness is established by
 bit-comparison against venue-engine oracles over hundreds of thousands of
 arguments, including huge, tiny, denormal-result and overflow/underflow
 boundary regions.
 """
 import math as _math
-from decimal import Decimal as _Decimal, localcontext as _localcontext
 from struct import pack as _pack, unpack as _unpack
 
 __all__ = ['cos', 'sin', 'exp', 'log']
@@ -454,263 +458,174 @@ def exp(x: float) -> float:
 
 # --- log ---------------------------------------------------------------------
 
-# Reduction table: for each of the 128 bins of the mantissa [1, 2) the double
-# ``inv`` closest to 1 / (bin midpoint) and ``-ln(inv)`` as a head/tail double
-# pair. The logs are taken of the ROUNDED ``inv``, so the table carries no
-# approximation of its own — the only error left in the reduction is the one the
-# series below makes.
+# Reduction table: for each of the 129 bins the reduction can land in, the head
+# and tail halves of ``-ln(B)`` for that bin's reciprocal ``B``. Sixteen bytes
+# per entry, addressed by the BYTE offset the reduction computes directly.
 _LOG_TBL = bytes.fromhex(
-    '20e01fe01fe0ef3fa00bb1a20af06f3f57d3a6d51a82023c12fa01aa1ca1ef3f690a815f'
-    '47dc873f721016bc4449273cb5dba0ac1063ef3f84a54643a4ce933f009d1548ad6528bc'
-    'b50a2344f625ef3f9a91af27c09f9b3f86dc2992e60a39bc028e45f8c7e9ee3f7fd92389'
-    'd9b0a13f4162dd44744d47bceb01ba7a80aeee3fd3e4c8af5b8aa53f406ec56985abfcbb'
-    'e45097a51a74ee3ff2e3c80e835ca93fe917a4001db43e3c731adc79913aee3f560bdb8a'
-    '6b27ad3f53ff954cf178403c1ee0011ee001ee3f71e498359875b03fdc229e99d206503c'
-    'ca1da0dc01caed3f17140a2ff653b23f81d9014ed3f6213c8a7f1e23f292ed3fee46a6be'
-    'dc2eb43f9b345336581155bcb2727580ac5ced3fc45037a95806b63fd336841d8b104fbc'
-    '1a5bfca32c27ed3fd0127b6d76dab73fa27d4d6440224a3cc6bf445c6ef2ec3fae332046'
-    '42abb93f8e4e181c9e094abce7cb01966dbeec3fa0edb02bc878bb3f3cb0f9610eef53bc'
-    '428afb5a268bec3f5db36cd61343bd3ffa901d95dd905b3c86490dd19458ec3fa46211c0'
-    '300abf3f9b75b7b864be483c1ca02e39b526ec3f6f59ca121567c03f679b47819bf352bc'
-    '8b8d86ee83f5eb3fac4267848547c13f3af8d3f10944393c7b3e8865fdc4eb3fcd5a0a19'
-    '6f26c23f77617f0e84ab6dbc23ff182b1e95eb3fd57fe418d703c33f4782651fe75a6bbc'
-    '05eebee3e265eb3f2ac6ecb0c2dfc33ff4f7138c2ba66b3cce06d84a4837eb3fe5559af3'
-    '36bac43faa983c437e766fbca422d9314b09eb3f852098d93893c53f1994baaa6ed1683c'
-    '5e90947fe8dbea3f51ad7242cd6ac63f65513d9c1c2049bcfdeb872f1dafea3fa33740f5'
-    'f840c73f26b3579dbfd9563c59e13051e682ea3fe95743a1c015c83f9efac5f8b741513c'
-    '4a8a68074157ea3f416d88de28e9c83f40626ab99e58423ca01cc5872a2cea3f85fb7d2e'
-    '36bbc93fe783ffc1391455bc1aa0011aa001ea3f192f88fcec8bca3feb398c91378c5abc'
-    '2d686b179fd7e93fa6b58f9e515bcb3f5f1ee623805d6dbcda1055ea24aee93fc2188c55'
-    '6829cc3fac24e03a8e10363cffc08e0d2f85e93fddc5094e35f6cc3f96b6557da039633c'
-    'ae77e30bbb5ce93f7becaba0bcc1cd3ffb6d31338a695c3ce62c9b7fc634e93f605aaa52'
-    '028cce3f35917f7374c03dbcd59001124f0de93f377b4b560a55cf3f3de72f20093a61bc'
-    '3f37f17a52e6e83f1d50ad456c0ed03fadfef68f56b963bc3aff6280cebfe83f0d59cd5f'
-    'b871d03f40efbdfc838b603c9c8901f6c099e83f4bb79a576bd4d03fc95e1e0e641f723c'
-    'b992c0bc2774e83fb0a893028736d13f94a4db31c56c683c140678c2004fe83f6f23d42d'
-    '0d98d13fb92e1b4f2e2c70bca0a482014a2ae83ff3a2489efff8d13f0d961834bf3f69bc'
-    '061860800106e83f3a76df106059d23f3cbd0eaed8ee49bc1d4f5a5125e2e73f259db83a'
-    '30b9d23f51ab14f6d75a58bc7c012e92b3bee73f854154c97118d33f6f36818959a36ebc'
-    '8b39b66baa9be73f5cd8bf622677d33f88a0fb89752a603c0dc69a110879e73f10f7c1a5'
-    '4fd5d33fcdd978e56836553c6d7501c2ca56e73f13e8042aef32d43f0692b5e2623268bc'
-    '8dfe41c5f034e73fd00940800690d43f6ddfc5070dff4bbc097c9c6d7813e73f69026032'
-    '97ecd43f5edc77d987aa71bc1760f21660f2e63f63d2adc3a248d53fee4618bfe78c75bc'
-    '61c88126a6d1e63fe2cff4b02aa4d53f3d9aee7dcb6b7cbc3d1aa30a49b1e63fd493a770'
-    '30ffd53fb7377e7d076370bcc0d0883a4791e63ff2e10373b559d63fc783fb8eafb01d3c'
-    '1a6701369f71e63f3d943522bbb3d63f4d782633a957793ca34a3b854f52e63f369278e2'
-    '420dd73f543914f79be97e3cdec08ab85633e63fcfdb39124e66d73ff8daf5645d6d6dbc'
-    '94ae3168b314e63fbfaf370adebed73f5b1a80b93c7876bcfc2d293464f6e53f95d4a01d'
-    'f416d83fe48fb45fc36d773ca5e2ecc367d8e53fa10b339a916ed83f459002d2c90077bc'
-    '91fa47c6bcbae53f8bb458c8b7c5d83f6cfa05024b757d3caacc23f1619de53f3ea845eb'
-    '671cd93fdfa3963beae3653c600558015680e53f59511341a372d93f278fb42df6a375bc'
-    'e2527cba9763e53f6208dc026bc8d93fdf2b624911e8773cfe82bbe62547e53f95b9d564'
-    'c01dda3fb8a08b6928017a3c4b05a856ff2ae53fe9d96b96a472da3ff1619fc6da29753c'
-    'c5c411e1220fe53fe5b058c218c7da3fe3dee8adc782763c9b4cdd628ff3e43f5afcbd0e'
-    '1e1bdb3fa64ed77d1aee50bc4c2cdcbe43d8e43f5cf33c9db56edb3fc495cd324352713c'
-    'e18fa6dd3ebde43f0aad0d8be0c1db3fa899eae3e38553bc4a0176ad7fa2e43f27f015f1'
-    '9f14dc3ff6397fde6868643c804801220588e43ff96fffe3f466dc3f89688b25472958bc'
-    '66605934ce6de43fca7a4d74e0b8dc3feb5aef32bc5b7c3cca76c7e2d953e43f641e72ae'
-    '630add3ff2402c11ceac643c4deeab30273ae43f84c6e29a7f5bdd3f963fb5071884643c'
-    '51595e26b520e43f55592c3e35acdd3f04f2f2a365bc7abc66650ed18207e43fb5d50699'
-    '85fcdd3f9863f999131e753c07afa5428feee33f047768a8714cde3fb952f0e0364c73bc'
-    'c675aa91d9d5e33ff5619865fa9bde3fcf1e243850e47dbc552923d960bde33ff3dd40c6'
-    '20ebde3f04841b14471e78bc22c87a3824a5e33f5d1e81bce539df3f73981321e200423c'
-    '8e0866d3228de33fc19efe364a88df3f0084004fae18763cee45c9d15b75e33f7115f620'
-    '4fd6df3f49a3d55958611bbcf82a9f5fce5de33f8aff25b1fa11e03f781721503704843c'
-    '4613e0ac7946e33f3c63ceef9e38e03f4aba419ae2aa483cfa1d6aed5c2fe33f9c4526bd'
-    '145fe03ffe9e4feeb835593cb6ebe9587718e33f0e454b885c85e03f18f3496e8285873c'
-    '6002c42ac801e33fd214cebe76abe03f9ac0baca3629703c4bd1fea14eebe23fb8d6b9cc'
-    '63d1e03fc3f3d0959511463ca0502d010ad5e23f7d499b1c24f7e03f9db19d3b44a88b3c'
-    '11375a8ef9bee23ff8cc8717b81ce13f20993f560fc77d3c05c1f3921ca9e23f453d2425'
-    '2042e13fec96a4b6e3e5873ca504b85b7293e23f0ea6abab5c67e13f8e7c47159cb17cbc'
-    '4dcea138fa7de23f07cff50f6e8ce13f37e6f4f4baa679bc2701d67cb368e23f9ea27db5'
-    '54b1e13fb54a125c0a77723cb277917e9d53e23f037067fe10d6e13f3d96473656277d3c'
-    '5b601797b73ee23f4c09874ba3fae13f7632f41ef7428c3c2a12a022012ae23fecbe65fc'
-    '0b1fe23f927c18c9f0246cbce65548807915e23f3439486f4b43e23f116d0fcfb8eb6bbc'
-    '122001122001e23fe03034016267e23f27671c78956a78bc4cb87f3cf4ece13f8307f60d'
-    '508be23fa3a9aaf4f313383cbd4a2e67f5d8e13fac4026f015afe23f5a67252932d87e3c'
-    '59e01cfc22c5e13f9ddc2e01b4d2e23f55e364369dae893ce3baf2677cb1e13f46955099'
-    '2af6e23f330130c6bcdc87bc9e11e019019ee13f6afea70f7a19e33f8f1297fb48636f3c'
-    'db2b9083b08ae13f948932baa23ce33f1009fd66bac6813c84d61b198a77e13fa06ed3ed'
-    'a45fe33f36640968d427773c0132fc508d64e13f7f7958fe8082e33f74b9a9d8f45667bc'
-    'c9d5fda3b951e13ff9bd7e3e37a5e33f24118e1411ce753c2447348d0e3fe13f0632f7ff'
-    'c7c7e33fd1be2570db803ebcacc0ed898b2ce13f5b2f6b9333eae33f529fec75e9664f3c'
-    '2648a719301ae13feadc80487a0ce43f8927ff798b3c513c801001befb07e13fbf80df6d'
-    '9c2ee43ff17ccdc211d484bca225b3faedf5e03f0abb33519a50e43fa584d27a1d7085bc'
-    '1160825506e4e03fadaa333f7472e43f7e6b5ded0f933abc3a9e355644d2e03f07fca283'
-    '2a94e43fb556ca888aa1723c71418b86a7c0e03f73e25669bdb5e43f72a7ee6ba0c782bc'
-    'b5ec2e722fafe03f01fd393a2dd7e43f1b019c829a1a703c6083afa6db9de03fe926503f'
-    '7af8e43f9deabcb1a88c86bce26575b3ab8ce03f4634bac0a419e53f7fa7e42821338a3c'
-    'e2eab8299f7be03f7c9bb905ad3ae53fe294b8142c7267bcfb12799cb56ae03fce0bb454'
-    '935be53f3da641e542f341bc867572a0ee59e03f91f136f3577ce53f6e7e37c4c5ea813c'
-    'c56416cc4949e03f7fe8fa25fb9ce53f57e3ac2248b96bbcfc4782b7c638e03f731ce730'
-    '7dbde53f448e2e354996ccbbe92977fc6428e03f23991457dedde53f85f25ed737fa403c'
-    '377a51362418e03f1989d1da1efee53f83e43cde932e793c800001020408e03f6764a4fd'
-    '3e1ee63f731484043692673c'
+    '0038fafe422ee63f3067c79357f32e3d001824aa82eee53fbe46da0c3802223d0048365c'
+    '40afe53ffbc910ac63fa2d3d008cbb267a70e53fdd0333ff0b98093d007886262e32e53f'
+    '3175255dc4cc053d00505a835af4e43ffbb8936d516c2ebd000c976ffdb6e43f1c544ced'
+    '1571ef3c00a4e827157ae43faa604df96acb22bd0024f9f29f3de43ff75110484f98fdbc'
+    '00cc25219c01e43f4cc7f03079ce26bd00c0360c08c6e33fc213fe7c36b702bd00781917'
+    'e28ae33fa46955bb7a8b21bd008c9dad2850e33face627953fb8103d00083444da15e33f'
+    '9ceda0c5934e27bd00e0b057f5dbe23f11dcb907e5a617bd00c00e6d78a2e23f2d8897e7'
+    '2b6d203d00dc34116269e23f50622205f1610bbd00bcbed8b030e23f7b66486e06fc123d'
+    '0018c65f63f8e13fd381fec942722abd0060ae4978c0e13f67e670eddeaccc3c003cf240'
+    'ee88e13f5046abf84ecc143d0098f2f6c351e13f49ae93a297dd2ebd005cc723f81ae13f'
+    'b2dc9dbb478625bd00cc118689e4e03f4217800798291c3d0054d0e276aee03f277e7e88'
+    '6b481f3d00c43305bf78e03ffdf5ed412281263d000476be6043e03fe03995e75fc404bd'
+    '0008b2e55a0ee03f1c7b72b1a33b05bd00487aaf58b3df3f3549163cfa85003d001803ee'
+    'a74adf3f8b4a016fe5cd123d0010b456a1e2de3f5102475af4272f3d00b0ddc3427bde3f'
+    '08bd7253506524bd0028271a8a14de3f38293207b22613bd00984c4875aedd3f6a61dc60'
+    '2da41ebd00f8de460249dd3fa867a7e9af5b233d004806182fe4dc3fb0a6c73ec39707bd'
+    '005845c7f97fdc3fae4952c1ddb629bd00a03f69601cdc3f80e1e87f80ec2c3d00e0801b'
+    '61b9db3f6d660af45bd8273d00284604fa56db3f9519842d2595103d00d0485229f5da3f'
+    '58447752c57c21bd00d88a3ced93da3f5d7aa7bef2361e3d00f824024433da3ff5799d7f'
+    '45c6233d00f015ea2bd3d93fb0c0d0109e2726bd00581343a373d93ff0d902a5132315bd'
+    '00f85b63a814d93f7d30e62eb56617bd00308ba839b6d83f7004e7e5e15a20bd00c86d77'
+    '5558d83f8a7733336fd52f3d0018d83bfafad73f6a5612c8902027bd00f87c68269ed73f'
+    '7817fd2e7dec293d0078c676d841d73fb360dc49098b2d3d0018afe60ee6d63f872d227c'
+    '6521173d00689c3ec88ad63fa0eb5627d3a0203d00b03a0b0330d63f00ae31e723b62dbd'
+    '006059dfbdd5d53fdc65a4082a0b0abd00d0c853f77bd53fef405deeedad1f3d00a03807'
+    'ae22d53f59c7648170be2e3d0030179ee0c9d43fa4d80a1b89202ebd00c871c28d71d43f'
+    '75d66709ce272fbd00e8d523b419d43f9de090ec36e4083d0030337752c2d33f5cbd06b6'
+    '543b183d0010be76676bd33fc877f1b0cd6e113d0060d3e1f114d33fb83c21d37ae228bd'
+    '0090dc7cf0bed23ff404504afa9c2a3d00d834116269d23fb6b35bdfc1932c3d00b80e6d'
+    '4514d23feaba46bade870a3d00685a6399bfd13fb7bd4751eda62c3d00f8accb5c6bd13f'
+    '8116a5f7cd9a2b3d00e827828e17d13f1cf0a5630e212cbd006061672dc4d03fe9ea3c16'
+    '8b18273d00584d603871d03f914eed16db9cf83c00c82656ae1ed03f4ae985148cf016bd'
+    '00b0b36c1c99cf3f30df0ccaeccb1b3d0000dde4adf5ce3f118ebb651521cabc0010e7ff'
+    '0e53ce3f30f441602712c23c0090d4b03db1cd3f35b015f72aff2abd006065f23710cd3f'
+    'e4f6b6757e4a08bd0010f0c6fb6fcc3fd22b96c572ecf1bc00e03b3887d0cb3fb6125459'
+    'c44b2dbd00d05b57d831cb3faae1ac4e8d350cbd00e08a3ced93ca3f69215650437228bd'
+    '00900807c4f6c93f7a8165684d90293d0000f7dc5a5ac93f6fffa05828f2073d000039eb'
+    'afbec83fd12ce9aa543d07bd00a05165c123c83f831e639adb0d1e3d005044858d89c73f'
+    '0543917010661cbd0070758b12f0c63fe1219ce58d1125bd00108cbe4e57c63f782e3c2c'
+    '8bcf193d0040546b40bfc53f1c9868eb237012bd00b0a1e4e527c53fc77d69e5e833263d'
+    '00b033833d91c43f78b6fd547983253d003099a545fbc33f4d356a7ed8d12cbd009015b0'
+    'fc65c33f89724b23a82fc63c0080860c61d1c23fa1b481cb6c9d033d00c0492a713dc23f'
+    '5cdfd38f230d103d00f0237e2baac13f349938448ea72c3d00e027828e17c13ff2072dce'
+    '78ef213d00409eb59885c03f2c900970dde527bd00e0db3991e8bf3ffd0aa14fd63425bd'
+    '00200a8339c7be3fe045e6af68c02dbd0040846327a7bd3f3317a71f40891a3d0040bc01'
+    '5888bc3fd3ac5ac6d146263d0060ad8dc86abb3fe568f72b809013bd00c0b140764eba3f'
+    'c80744b9b6420ebd0040595d5e33b93fda47bd3a5c11233d00e0402f7e19b83ff7fd6ff9'
+    'dc800f3d00c0ea0ad300b73f32ed9da98d1eec3c00a0974d5ae9b53f1e1d5d3c06692cbd'
+    '0080205d11d3b43fefe1f482253af5bc00e0d1a7f5bdb33fd74edba55ec82c3d002047a4'
+    '04aab23f7d699caee8b620bd006046d13b97b13f9b9e0d565d3225bd00409eb59885b03f'
+    '2c900970dde517bd00c006c031eaae3f7b3bc94f3e110ebd00c0ddcd73cbac3f0728d847'
+    'f2681abd0000fbd0f2aeaa3f2eb43b351afc203d00c09f14aa94a83f7d265ad0957919bd'
+    '00c0d4f2947ca63fa2af19ecfb9e02bd00002ed4ae66a43f28fdbd7573162cbd00008d2f'
+    'f352a23f7bb621e09a3e283d0040e7895d41a03f53d7f15cc011013d008014ecd2639c3f'
+    'f3b29e3fc678253d0000c9282549983f340c5a32baa02abd00009825a932943ffe378692'
+    '3981093d008093585620903fd2f7e2065bdc23bd000089a34824883f40f674da775527bd'
+    '000089751510803fe82b9d996bc710bd000058590508703f7bc631cbaf66213d00000000'
+    '000000000000000000000080'
 )
 
-_L_INV = [_b2f(_u64(_LOG_TBL, j * 24)) for j in range(128)]
-_L_HI = [_b2f(_u64(_LOG_TBL, j * 24 + 8)) for j in range(128)]
-_L_LO = [_b2f(_u64(_LOG_TBL, j * 24 + 16)) for j in range(128)]
-
-_L_LN2_HI = _b2f(0x3fe62e42fefa39ef)
-_L_LN2_LO = _b2f(0x3c7abc9e3b39803f)
-_L_THIRD = _b2f(0x3fd5555555555555)
-_L_THIRD_LO = _b2f(0x3c75555555555555)
-# The head/tail pair below carries the result to ~2**-74 relative (MEASURED over
-# 60k random exponents: worst 2**-74.2). The bound here is that with a margin;
-# a result closer than this to a rounding boundary takes the exact path.
-_L_REL_ERR = 2.0 ** -71
-_L_NEAR_LO = 0.9921875   # 1 - 2**-7: below this the table reduction is used
-_L_NEAR_HI = 1.0078125   # 1 + 2**-7
-_L_SPLIT = 134217729.0   # 2**27 + 1, Dekker's splitter
+_L_LOG2_HI = _b2f(0x3fa62e42fefa3800)  # ln2 / 16, head
+_L_LOG2_LO = _b2f(0x3ceef35793c76730)  # ln2 / 16, tail
+# log1p series coefficients, in the two interleaved chains the algorithm keeps
+_L_C7 = _b2f(0x3fc2492492492492)
+_L_C6 = _b2f(0xbfc5555e3d6fb175)
+_L_C5 = _b2f(0x3fc999999999999a)
+_L_C4 = _b2f(0xbfd0000000000000)
+_L_C3 = _b2f(0x3fd5555555555555)
+_L_C2 = _b2f(0xbfe0000000000000)
 _L_INF = _b2f(0x7ff0000000000000)
 _L_NAN = _b2f(0x7ff8000000000000)
+# The reduction carries the mantissa at 2**896 and meets a reciprocal near
+# 2**-896, so their product lands next to 1 with the cancellation exposed.
+_L_MANT_SCALE = _b2f(0x77f0000000000000)
+_L_ULP52 = 2.0 ** -52
+_L_ULP23 = 2.0 ** -23
+# 2**128 lifts a denormal into the normal range; the exponent term pays it back
+# through the larger bias
+_L_DENORM_SCALE = _b2f(0x47f0000000000000)
+_L_BIAS = 16352
+_L_DENORM_BIAS = 18416
 
-
-def _log1p_dd(r: float) -> tuple[float, float]:
-    """``log1p(r)`` as a head/tail double pair, for ``|r| <= 2**-7``."""
-    # r^2 exactly (Dekker), then -r^2/2 (exact: a power-of-two scaling)
-    p = r * r
-    t = _L_SPLIT * r
-    rh = t - (t - r)
-    rl = r - rh
-    pl = ((rh * rh - p) + 2.0 * rh * rl) + rl * rl
-    hh = -0.5 * p
-    hl = -0.5 * pl
-    # r - r^2/2
-    s = r + hh
-    b = s - r
-    e = (r - (s - b)) + (hh - b) + hl
-    sh = s + e
-    sl = e - (sh - s)
-    # + r^3/3 — still 2**-24 of the result, so it needs the extra precision too
-    c3 = p * r
-    t = _L_SPLIT * p
-    ph = t - (t - p)
-    plo = p - ph
-    c3l = ((ph * rh - c3) + ph * rl + plo * rh) + plo * rl + pl * r
-    th = c3 * _L_THIRD
-    t = _L_SPLIT * c3
-    ch = t - (t - c3)
-    cl = c3 - ch
-    t2 = _L_SPLIT * _L_THIRD
-    dh = t2 - (t2 - _L_THIRD)
-    dl = _L_THIRD - dh
-    tl = ((ch * dh - th) + ch * dl + cl * dh) + cl * dl + c3l * _L_THIRD + c3 * _L_THIRD_LO
-    s = sh + th
-    b = s - sh
-    e = (sh - (s - b)) + (th - b) + sl + tl
-    sh = s + e
-    sl = e - (sh - s)
-    # the remaining terms stay below 2**-30 and fit a plain double
-    tail = c3 * r * (-0.25 + r * (0.2 + r * (-1.0 / 6.0 + r * (
-        1.0 / 7.0 + r * (-0.125 + r * (1.0 / 9.0 + r * (-0.1)))))))
-    s = sh + tail
-    b = s - sh
-    e = (sh - (s - b)) + (tail - b) + sl
-    sh = s + e
-    return sh, e - (sh - s)
-
-
-def _log_exact(x: float) -> float:
-    """Correctly rounded ``ln(x)`` the slow way, for the rare boundary case."""
-    with _localcontext() as ctx:
-        ctx.prec = 40
-        return float(_Decimal(x).ln())
+_L_THI = [_b2f(_u64(_LOG_TBL, j * 16)) for j in range(129)]
+_L_TLO = [_b2f(_u64(_LOG_TBL, j * 16 + 8)) for j in range(129)]
 
 
 def log(x: float) -> float:
-    """Correctly rounded natural logarithm.
+    """``ln(x)`` as the venue's engine computes it.
 
-    The venue's ``Math.log`` is correctly rounded on every argument measured
-    (probe logpow, BINANCE:BTCUSDT 30m: the 8 of 86241 values where the platform
-    ``math.log`` differs are all cases where the platform, not the venue, is the
-    one off by an ulp), while the platform's is only within an ulp — so a
-    recursive script carries that ulp into its output. This computes ln in a
-    head/tail double pair and falls back to exact decimal arithmetic on the rare
-    argument whose pair lands too close to a rounding boundary to decide.
+    The venue evaluates ``math.log`` with the JVM's x86 ``Math.log`` intrinsic,
+    the Intel LIBM stub, and that stub is NOT correctly rounded: it reduces the
+    argument against a 129-bin reciprocal table and finishes with a degree-7
+    ``log1p`` series in plain doubles, so its last bit is its own. This ports the
+    algorithm operation for operation, including the order its four partial sums
+    are folded together, which is what decides that bit.
+
+    MEASURED (BINANCE:BTCUSDT 30m, 120856 arguments — ``log`` of every ratio of
+    two prices of the same bar over 30213 bars): exact on every one. A correctly
+    rounded ``ln`` misses 6 of them and an exact reciprocal in the bin reduction
+    misses another, all seven with the argument inside ``[0.988, 1.0021]``, where
+    the reduction is at its weakest; a script that divides one nearly cancelling
+    difference of logs by another turns that single ulp into a visible divergence.
+
+    The reciprocal instruction fills a second lane from a denormal, whose
+    reciprocal is an infinity that contributes nothing, and its own lane can never
+    overflow because the mantissa it reads is a float32 in ``[1, 2)`` — both are
+    folded into the closed forms below.
+
+    :param x: The argument.
+    :return: Its natural logarithm, bit-identical to the venue's.
     """
-    if x != x:
-        return x
-    if x <= 0.0:
-        return -_L_INF if x == 0.0 else _L_NAN
-    if x == 1.0:
-        return 0.0
-    if x == _L_INF:
-        return x
-
-    if _L_NEAR_LO <= x <= _L_NEAR_HI:
-        # ``x - 1`` is exact here (Sterbenz) and the series needs no reduction,
-        # which also avoids the cancellation a table term would introduce.
-        sh, sl = _log1p_dd(x - 1.0)
+    bits = _f2b(x)
+    head = (bits >> 48) & 0xFFFF
+    biased = (head - 16) & _M32
+    if biased >= 32736:
+        # zero, denormal, infinity, NaN or negative — everything the reduction
+        # below cannot take. Only a positive denormal comes back out of here.
+        if head < 16:
+            if bits == 0:
+                return -_L_INF
+            bits = _f2b(x * _L_DENORM_SCALE)
+            head = (bits >> 48) & 0xFFFF
+            bias = _L_DENORM_BIAS
+        elif head < 32768:
+            return x + x  # +inf, positive NaN
+        elif (bits << 1) & _M64 == 0:
+            return -_L_INF  # -0.0
+        elif head >= 0xFFF0 and bits & 0xFFFFFFFFFFFFF:
+            return x + x  # negative NaN
+        else:
+            return _L_NAN  # -inf and every other negative
     else:
-        m, e = _math.frexp(x)
-        m += m
-        e -= 1
-        j = int((m - 1.0) * 128.0)
-        if j > 127:
-            j = 127
-        inv = _L_INV[j]
-        # m * inv - 1 as a head/tail pair: rounding it to a single double would
-        # cap the whole reduction at 53 bits, which no series precision recovers.
-        p = m * inv
-        t = _L_SPLIT * m
-        mh = t - (t - m)
-        ml = m - mh
-        t = _L_SPLIT * inv
-        ih = t - (t - inv)
-        il = inv - ih
-        pl = ((mh * ih - p) + mh * il + ml * ih) + ml * il
-        rh = p - 1.0  # exact: p is within 2**-8 of 1
-        rl = pl
-        s = rh + rl
-        rl = rl - (s - rh)
-        rh = s
-        sh, sl = _log1p_dd(rh)
-        # the tail of the reduction enters through log1p'(rh) = 1 / (1 + rh)
-        corr = rl / (1.0 + rh)
-        s = sh + corr
-        b = s - sh
-        sl = (sh - (s - b)) + (corr - b) + sl
-        sh = s + sl
-        sl = sl - (sh - s)
-        # + the table's -ln(inv)
-        hi = _L_HI[j]
-        s = sh + hi
-        b = s - sh
-        sl = (sh - (s - b)) + (hi - b) + sl + _L_LO[j]
-        sh = s + sl
-        sl = sl - (sh - s)
-        if e:
-            ef = float(e)
-            eh = ef * _L_LN2_HI
-            t = _L_SPLIT * ef
-            fh = t - (t - ef)
-            fl = ef - fh
-            t = _L_SPLIT * _L_LN2_HI
-            lh = t - (t - _L_LN2_HI)
-            ll = _L_LN2_HI - lh
-            el = ((fh * lh - eh) + fh * ll + fl * lh) + fl * ll + ef * _L_LN2_LO
-            s = sh + eh
-            b = s - sh
-            sl = (sh - (s - b)) + (eh - b) + sl + el
-            sh = s + sl
-            sl = sl - (sh - s)
+        head = biased
+        bias = _L_BIAS
 
-    y = sh + sl
-    if y == 0.0:
-        return _log_exact(x)
-    resid = (sh - y) + sl
-    if resid == 0.0:
-        return y
-    # The pair decides ``y`` unless it sits within its own error of the rounding
-    # boundary. That boundary is half the gap on the SIDE the remainder points
-    # to, which at a power of two is half the size of the other side's.
-    if resid > 0.0:
-        d = resid - (_math.nextafter(y, _L_INF) - y) * 0.5
-    else:
-        d = -resid - (y - _math.nextafter(y, -_L_INF)) * 0.5
-    a = y if y > 0.0 else -y
-    if (d if d > 0.0 else -d) > a * _L_REL_ERR + 5e-324:
-        return y
-    return _log_exact(x)
+    # B, the bin's reciprocal. The instruction that answers here is an
+    # APPROXIMATE reciprocal: it indexes an 11-bit mantissa table and returns the
+    # reciprocal of that interval's midpoint at 12 significant bits, so it leans
+    # off 1/mantissa by up to 1.5 * 2**-12 -- exactly the error the instruction is
+    # specified to. The added half-bin then rounds the answer onto the table's
+    # grid, and a lean that carries across that boundary picks the neighbouring
+    # bin. Dividing here instead costs the last bit on roughly one argument in
+    # 20000.
+    mantissa = (bits >> 29) & 0x7FFFFF
+    midpoint = 1.0 + (((mantissa >> 12) << 12) + 0x800) * _L_ULP23
+    rcp = _unpack('<I', _pack('<f', 1.0 / midpoint))[0]
+    lane = ((((rcp + 0x800) >> 12) << 12) + 32768) & _M32
+    b = _b2f((lane << 29) & 0xffffe00000000000)
+
+    # r = B * mantissa - 1, the mantissa split in two so the product's own
+    # rounding cannot eat the cancellation
+    fraction = bits & 0xFFFFFFFFFFFFF
+    mant_hi = (1.0 + (fraction & 0x000FE00000000000) * _L_ULP52) * _L_MANT_SCALE
+    r = ((1.0 + fraction * _L_ULP52) * _L_MANT_SCALE - mant_hi) * b \
+        + (mant_hi * b - 1.0)
+
+    bin_index = (lane >> 16) & 0xFF
+    k = float((head & 32752) - bias)
+    head_term = _L_THI[bin_index] + k * _L_LOG2_HI
+    result = head_term + r
+
+    r2 = r * r
+    tail = r + (head_term - result)
+    tail = tail + (k * _L_LOG2_LO + _L_TLO[bin_index])
+    tail = tail + ((_L_C6 * r + _L_C5) * r + (_L_C7 * r) * r2) * (r2 * r2)
+    tail = tail + ((_L_C3 * r + _L_C2) + _L_C4 * r2) * r2
+    return result + tail

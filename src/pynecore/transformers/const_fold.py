@@ -18,7 +18,7 @@ _BAIL = object()
 # TradingView's parser folds constant expressions with StrictMath; at runtime
 # sin/cos/exp go through the JIT's Intel-LIBM intrinsics instead (see
 # ``core.pine_math``), which disagree with fdlibm in the last ulp, so their
-# fold must NOT go through the runtime implementations. asin/acos have no
+# fold must NOT go through the runtime implementations. asin/acos/atan have no
 # intrinsic -- their runtime is fdlibm too -- but they fold all the same.
 _FOLD_FDLIBM = {
     'sin': fdlibm.sin,
@@ -26,6 +26,7 @@ _FOLD_FDLIBM = {
     'exp': fdlibm.exp,
     'asin': fdlibm.asin,
     'acos': fdlibm.acos,
+    'atan': fdlibm.atan,
 }
 
 # lib.math functions with no fold/runtime split: they are plain IEEE-754
