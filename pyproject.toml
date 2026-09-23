@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+# Cython compiles the optional native math extension (see setup.py); without it, or
+# without a C compiler, the package still builds and runs on its pure-Python math.
+requires = ["setuptools>=61.0", "Cython>=3.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -10,6 +12,10 @@ zip-safe = false  # Critical for import hooks
 
 [tool.setuptools.package-data]
 "pynecore" = ["*.pyi", "*.json"]
+
+# The native extension's source ships in the sdist only; a wheel carries the build.
+[tool.setuptools.exclude-package-data]
+"pynecore.core" = ["_native_math.pyx", "_native_math.c"]
 
 [tool.distutils]
 egg_info.egg_base = "build"
@@ -84,3 +90,23 @@ replay = "pynecore.providers.replay:ReplayProvider"
 "X" = "https://x.com/pynesys"
 "Discord" = "https://discord.pynesys.io"
 "Discussions" = "https://github.com/PyneSys/pynecore/discussions"
+
+
+#
+# Wheels
+#
+
+# Platform wheels carry the compiled ``pynecore.core._native_math``. Every one is tested
+# against the pure-Python math it replaces, and must actually contain the extension.
+[tool.cibuildwheel]
+build = "cp311-* cp312-* cp313-* cp314-*"
+skip = "*-win32 *-manylinux_i686 *-musllinux_i686"
+test-requires = ["pytest", "pytest-spec"]
+test-command = """pytest -p no:cacheprovider \
+  {project}/tests/t01_lib/t04_math/test_016_native_math_matches_python.py \
+  {project}/tests/t01_lib/t04_math/test_009_math_log_matches_the_venue.py \
+  {project}/tests/t01_lib/t04_math/test_015_math_atan_matches_the_venue.py \
+  {project}/tests/t01_lib/t04_math/test_017_math_log10_matches_the_venue.py \
+  {project}/tests/t01_lib/t04_math/test_018_math_pow_matches_the_venue.py \
+  {project}/tests/t01_lib/t04_math/test_008_math_pow_shortcuts.py"""
+test-environment = { PYNE_REQUIRE_NATIVE_MATH = "1" }

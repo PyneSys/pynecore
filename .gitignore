@@ -45,8 +45,12 @@ dist/
 .windsurf/
 .claude/
 .mcp.json
-CLAUDE.md
-MEMORY.md
 
 # Others
 uv.lock
+
+# Native math extension build products (source is _native_math.pyx)
+src/pynecore/core/_native_math.c
+*.so
+*.pyd
+wheelhouse/

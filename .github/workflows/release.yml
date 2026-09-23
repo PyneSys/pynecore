@@ -3,17 +3,51 @@ name: Upload Python Package
 on:
   release:
     types: [published]
+  # A manual run builds and tests every wheel without publishing anything
+  workflow_dispatch:
 
 permissions:
   contents: write
   id-token: write  # Required for trusted publishing
 
 jobs:
-  build-and-publish:
+  # Platform wheels with the compiled native math extension. cibuildwheel runs the
+  # native-vs-Python bit-identity test inside every wheel it builds (see
+  # [tool.cibuildwheel] in pyproject.toml), so a platform whose compiler changes a
+  # single last bit fails the release instead of shipping.
+  build-wheels:
+    name: Wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-15-intel, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Build and test wheels
+        uses: pypa/cibuildwheel@v4.2.0
+        with:
+          output-dir: wheelhouse
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dist-wheels-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
+
+  # The sdist, plus the pure-Python wheel every platform without a matching binary wheel
+  # installs (WebAssembly runtimes among them). It runs the Python math only.
+  build-pure:
+    name: Sdist and pure wheel
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v6
         with:
@@ -22,8 +56,32 @@ jobs:
       - name: Install build tool
         run: python -m pip install build
 
-      - name: Build distributions
-        run: python -m build
+      - name: Build sdist
+        run: python -m build --sdist
+
+      - name: Build pure wheel
+        run: python -m build --wheel
+        env:
+          PYNE_BUILD_PURE: "1"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dist-pure
+          path: dist/*
+
+  publish:
+    needs: [build-wheels, build-pure]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
