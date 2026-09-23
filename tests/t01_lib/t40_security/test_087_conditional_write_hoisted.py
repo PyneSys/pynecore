@@ -2,7 +2,7 @@
 @pyne
 """
 from pynecore.lib import (
-    array, bar_index, close, high, low, na, open, plot, request, script, syminfo,
+    array, bar_index, close, high, input, low, na, open, plot, request, script, syminfo,
 )
 from pynecore.types import Series
 
@@ -30,8 +30,15 @@ def guarded_inside(flag):
     return value
 
 
+def forwarded_read(exp, use, res):
+    """A security call on an argument, in a helper each branch statement calls."""
+    value = request.security(syminfo.tickerid, res, exp)
+    return value if use else exp
+
+
 @script.indicator(title="Conditional Security Write", shorttitle="CSW")
-def main():
+def main(use_res=input.bool(True, "Use Alt Res"), res=input.timeframe("60", "Alt Res"),
+         res_first=input.timeframe("120", "First Res")):
     # TradingView hoists a ``request.security()`` call to global scope: the
     # branch it is written in decides where its RESULT lands, never whether the
     # requested series is computed. The gate below is a function of
@@ -73,6 +80,19 @@ def main():
     if gate:
         in_ltf = request.security_lower_tf("EXCH:LTFSYM", "1", close * 2.0)
 
+    # Two writing statements in one branch, both handing input values to the
+    # helper, on two feeds so each context gets a clone of its own: the first
+    # statement's call must not pin the second one under the guard in the
+    # clone serving the second context.
+    first_of_two: Series[float] = 0.0
+    second_of_two: Series[float] = 0.0
+    if gate:
+        first_of_two = forwarded_read(close * 64.0, use_res, res_first)
+        second_of_two = forwarded_read(close * 128.0, use_res, res)
+    else:
+        first_of_two = first_of_two[1]
+        second_of_two = second_of_two[1]
+
     plot(gate, "gate")
     plot(ref_close, "ref_close")
     plot(ref_high, "ref_high")
@@ -86,6 +106,8 @@ def main():
     plot(in_helper / 32.0, "in_helper")
     plot(1.0 if in_bool else 0.0, "in_bool")
     plot(array.sum(in_ltf) / 2.0, "in_ltf")
+    plot(first_of_two / 64.0, "first_of_two")
+    plot(second_of_two / 128.0, "second_of_two")
 
 
 # Every timestamp here is Unix MILLISECONDS.
@@ -115,7 +137,7 @@ def __test_helper_write_syminfo(path, prefix, ticker, period):
 
 
 def __test_helper_write_feeds(tmp_dir):
-    """Write the ``60`` feed and the 1-minute feed the two context kinds read.
+    """Write the ``60`` and ``120`` feeds and the 1-minute feed the contexts read.
 
     :param tmp_dir: Directory to write into.
     :return: The ``security_data`` mapping for the runner.
@@ -133,6 +155,14 @@ def __test_helper_write_feeds(tmp_dir):
                           close=c, volume=1.0))
     __test_helper_write_syminfo(htf, "PYTEST", "TEST", "60")
 
+    htf2 = tmp_dir / "CSW120.ohlcv"
+    with OHLCVWriter(htf2, "120") as w:
+        for block in range(__test_helper_hours // 2):
+            c = 200.0 + (block % 7) * 2.5
+            w.write(OHLCV(timestamp=__test_helper_t0 + block * 2 * __test_helper_hour,
+                          open=c, high=c + 1.0, low=c - 1.0, close=c, volume=1.0))
+    __test_helper_write_syminfo(htf2, "PYTEST", "TEST", "120")
+
     ltf = tmp_dir / "EXCH_LTFSYM_1.ohlcv"
     with OHLCVWriter(ltf, "1") as w:
         for minute in range(__test_helper_bars * 5):
@@ -140,7 +170,7 @@ def __test_helper_write_feeds(tmp_dir):
             w.write(OHLCV(timestamp=__test_helper_t0 + minute * __test_helper_minute,
                           open=c, high=c, low=c, close=c, volume=1.0))
     __test_helper_write_syminfo(ltf, "EXCH", "LTFSYM", "1")
-    return {"60": str(htf), "EXCH:LTFSYM:1": str(ltf)}
+    return {"60": str(htf), "120": str(htf2), "EXCH:LTFSYM:1": str(ltf)}
 
 
 def __test_helper_chart_bars():
@@ -251,6 +281,7 @@ __test_helper_open_pairs = (
     ("in_if", "ref_close"), ("in_if_fn", "ref_close"), ("either", "ref_high"),
     ("in_ternary", "ref_close"), ("in_helper", "ref_close"),
     ("in_bool", "ref_up"), ("in_ltf", "ref_ltf"),
+    ("second_of_two", "ref_close"),
 )
 
 
@@ -286,7 +317,8 @@ def __test_conditional_call_reads_the_current_period__(runner, log):
     same instant, so they must be the same value — for a call in an ``if``, in
     either branch of an ``if`` / ``else`` holding a context each, through a
     helper called from a branch, from one side of a ternary or behind ``and``,
-    through a helper holding the guard itself, and for
+    through a helper holding the guard itself, for two helper calls in one
+    branch that each write their own context, and for
     ``request.security_lower_tf``. A child that carried the chart's
     guard into its own bar loop would answer with the previous security period
     on a third of them.

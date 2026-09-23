@@ -49,7 +49,7 @@ from collections.abc import Callable
 from ..core.import_hook import PYNE_RESERVED_NAME_CHAR, security_slice_disabled
 from .dynamic_default import is_script_entry
 from .persistent import VARIP_TYPES
-from .pine_type_rules import OBJECT, STR, stamp_lowering
+from .pine_type_rules import OBJECT, SCALARS, STR, get_ty, stamp_lowering
 from .security import (
     _COLLECTION_NAMESPACES, _COLLECTION_READERS, _DependencyAnalyzer, _UNMODELLED_NODES,
 )
@@ -1779,6 +1779,11 @@ class _Forcer:
         front of the guard, or bound by a copy of the group itself: a local the
         branch alone binds is unbound on a pass that never takes it.
 
+        A statement binding a name the branch reads or binds before it stays
+        guarded too: lifted ahead, its value would reach an earlier read of the
+        name — ``lib.array.push(store, x)`` would push the new ``x`` — or be
+        overwritten by an earlier assignment running after it.
+
         :param stmts: The branch, its own nested guards already handled.
         :param certain: The locals certainly bound in front of the guard.
         :return: The statements left in the branch, and the reaching ones in
@@ -1787,13 +1792,19 @@ class _Forcer:
         kept: list[ast.stmt] = []
         lifted: list[ast.stmt] = []
         touched: set[str] = set()
+        used: set[str] = set()
         for stmt in stmts:
             if not _stmt_reaches(stmt, self.test):
                 kept.append(stmt)
+                used |= _loaded_names(stmt) | _bound_names(stmt)
                 if not _is_copyable_assignment(stmt):
                     touched |= _operand_names(stmt)
                 continue
             feeding = _feeding_copies(stmt, kept)
+            if feeding is not None and _bound_names(stmt) & used:
+                # The statement would overtake an earlier read or write of a
+                # name it binds.
+                feeding = None
             reads = _operand_names(stmt)
             loaded = _loaded_names(stmt)
             provided = set(certain)
@@ -1811,6 +1822,7 @@ class _Forcer:
                 feeding = None
             if feeding is None:
                 kept.append(stmt)
+                used |= _loaded_names(stmt) | _bound_names(stmt)
                 touched |= _operand_names(stmt)
                 continue
             self._detach(feeding, stmt)
@@ -2062,6 +2074,12 @@ def _operand_names(node: ast.AST) -> set[str]:
     script itself, and a method called on it — ``store.append(3)`` — mutates
     it, so its root stays an operand and two statements naming it are treated
     as dependent.
+
+    A name stamped with a scalar Pine type is dropped as well: it holds an
+    immutable value no call can change in place, so handing it to a call —
+    ``fn(close, use_alt, "60")`` — makes no later statement reading it
+    dependent. Whether a guarded statement REBINDS it is
+    :func:`_feeding_copies`' question, not this one.
     """
     roots: set[int] = set()
     for sub in ast.walk(node):
@@ -2072,7 +2090,8 @@ def _operand_names(node: ast.AST) -> set[str]:
             if isinstance(base, ast.Name) and base.id == 'lib':
                 roots.add(id(base))
     return {sub.id for sub in ast.walk(node)
-            if isinstance(sub, ast.Name) and id(sub) not in roots}
+            if isinstance(sub, ast.Name) and id(sub) not in roots
+            and get_ty(sub) not in SCALARS}
 
 
 def _is_copyable_assignment(stmt: ast.stmt) -> bool:
