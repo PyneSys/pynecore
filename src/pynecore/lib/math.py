@@ -196,7 +196,7 @@ def log10(number: TFI | NA[TFI]) -> PyneFloat:
     """
     if not (number == number):  # is_na_arg
         return na_float
-    return math.log10(number)
+    return pine_math.log10(number)
 
 
 def _na_of_operands(numbers: tuple[TFI | NA[TFI], ...]) -> PyneFloat:
@@ -284,25 +284,15 @@ def pow(base: TFI | NA[TFI], exponent: TFI | NA[TFI]) -> PyneFloat:
     if base != base or exponent != exponent:
         return na_float
 
+    # A runtime pow on TradingView is the JVM's x86 Math.pow intrinsic, which
+    # pine_math ports bit-exactly. Its first shortcut is repeated here so that
+    # an inlined ``math.pow(x, 2)`` stays a bare ``x * x``; pine_math keeps the
+    # rest (``pow(x, 0.5)`` is ``sqrt(x)``, but ``pow(x, -1)`` is not ``1 / x``
+    # and ``pow(x, 3)`` is not ``x * x * x``).
     b = cast(float, base)
-    # MEASURED (BINANCE:BTCUSDT@30, 8000 bars, base in [0.3, 1.3]): TradingView
-    # answers these four exponents with the shortcut result exactly -- every bar
-    # of ``pow(x, 2) - x * x``, ``pow(x, 0.5) - sqrt(x)``, ``pow(x, 1) - x`` and
-    # ``pow(x, 0) - 1`` was zero. The platform ``pow()`` is not: it disagrees
-    # with ``x * x`` on 8 of those bars and with ``sqrt(x)`` on 5, which a
-    # recursive script carries into its output (Signal Moving Average [LuxAlgo]).
-    # Only these hold -- ``pow(x, -1)`` is NOT ``1 / x`` on TradingView (3 bars),
-    # and ``pow(x, 3)`` is not ``x * x * x`` on 2149 of them.
     if exponent == 2:
         return b * b
-    if exponent == 1:
-        return b
-    if exponent == 0:
-        return 1.0
-    if exponent == 0.5 and b >= 0.0:
-        return math.sqrt(b)
-
-    return b ** cast(float, exponent)
+    return pine_math.pow(b, exponent)
 
 
 # noinspection PyShadowingBuiltins

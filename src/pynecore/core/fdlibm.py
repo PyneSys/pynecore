@@ -17,6 +17,7 @@ double operations, so the port is bit-exact by construction; it is verified
 against Java StrictMath (the same fdlibm lineage) over millions of arguments.
 """
 import math as _math
+import os as _os
 from struct import pack as _pack, unpack as _unpack
 
 __all__ = ['sin', 'cos', 'exp', 'asin', 'acos', 'atan']
@@ -605,3 +606,15 @@ def atan(x: float) -> float:
         return x - x * (s1 + s2)
     z = _ATAN_HI[id_] - ((x * (s1 + s2) - _ATAN_LO[id_]) - x)
     return -z if hx < 0 else z
+
+
+#: The pure-Python implementations. ``_native_math``, when built, rebinds the public
+#: names above to compiled twins of these (bit-identical, see that module); this keeps
+#: the originals reachable for the tests that hold the two paths against each other.
+PYTHON_IMPLEMENTATIONS = {'sin': sin, 'cos': cos, 'exp': exp, 'asin': asin, 'acos': acos, 'atan': atan}
+
+if not _os.environ.get('PYNE_NO_NATIVE_MATH'):
+    try:
+        from . import _native_math  # noqa: F401 -- importing it installs the twins
+    except ImportError:
+        pass
