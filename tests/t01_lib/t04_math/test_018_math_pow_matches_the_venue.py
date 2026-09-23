@@ -5,7 +5,7 @@ The venue evaluates a runtime ``math.pow`` with the JVM's x86 ``Math.pow`` intri
 (the Intel LIBM stub): ``log2(x)`` in head and tail halves from a 513-bin reciprocal
 reduction, then ``2**(y * log2(x))`` from a 256-entry table, with separate paths for
 a base near 1 against a large exponent, for results near the range limits and for
-negative bases. The platform's ``pow()`` behind Python's ``**`` is a different
+negative bases. macOS's ``pow()`` behind Python's ``**`` is a different
 algorithm and misses the venue's last bit on roughly one argument in 700.
 
 MEASURED on TradingView: 423906 arguments on BINANCE:BTCUSDT@30 (14 exponent
@@ -14,10 +14,11 @@ for every reciprocal bin (probes ``rcp2``/``rcp3``), and an independent holdout 
 244486 arguments on CAPITALCOM:BTCUSD@15 -- exact on all of them.
 """
 import math as _math
+from decimal import Decimal, localcontext
 
 from pynecore.lib import math
 
-# (base, exponent, venue) where CPython's ``**`` differs from the venue, over the
+# (base, exponent, venue) where macOS's ``**`` differs from the venue, over the
 # measured exponent patterns: fractional and integer, positive and negative, a
 # variable exponent, a constant base of 10 and 2
 __test_helper_PLATFORM_DISAGREES = (
@@ -39,7 +40,7 @@ __test_helper_PLATFORM_DISAGREES = (
     (0.9942017631430812, 18.093813253542894, 0.9001286794949037),
 )
 
-# ``pow(x, 0.5)`` is ``sqrt(x)`` on the venue; the platform ``pow()`` is not
+# ``pow(x, 0.5)`` is ``sqrt(x)`` on the venue; macOS's ``pow()`` is not
 __test_helper_HALF_IS_SQRT = (
     (67958.52, 260.6885498060857),
     (102120.01, 319.56221616455224),
@@ -78,35 +79,48 @@ __test_helper_MEASURED_RECIPROCAL = (
 )
 
 
-def __test_pow_matches_the_venue_where_the_platform_does_not__():
+def __test_helper_exact(x: float, y: float) -> float:
+    """``x ** y`` correctly rounded (an odd integer ``y`` for a negative ``x``)."""
+    with localcontext() as ctx:
+        ctx.prec = 80
+        magnitude = float(Decimal(abs(x)) ** Decimal(y))
+    return -magnitude if x < 0 else magnitude
+
+
+def __test_helper_not_correctly_rounded(cases) -> int:
+    return sum(1 for x, y, e in cases if __test_helper_exact(x, y) != e)
+
+
+def __test_pow_matches_the_venue_where_macos_does_not__():
     for x, y, expected in __test_helper_PLATFORM_DISAGREES:
         assert math.pow(x, y) == expected, (x, y)
 
-    # The platform is what differs -- otherwise the test proves nothing
-    assert all(x ** y != e for x, y, e in __test_helper_PLATFORM_DISAGREES)
+    # Some are not the correctly rounded power either, which holds whatever the
+    # host's libm is
+    assert __test_helper_not_correctly_rounded(__test_helper_PLATFORM_DISAGREES) == 4
 
 
 def __test_pow_half_is_sqrt__():
     for x, expected in __test_helper_HALF_IS_SQRT:
         assert math.pow(x, 0.5) == expected == _math.sqrt(x)
-        assert x ** 0.5 != expected
 
 
 def __test_pow_matches_the_venue_near_one__():
     for x, y, expected in __test_helper_NEAR_ONE:
         assert math.pow(x, y) == expected, (x, y)
-    assert all(x ** y != e for x, y, e in __test_helper_NEAR_ONE)
+    assert __test_helper_not_correctly_rounded(__test_helper_NEAR_ONE) == 2
 
 
 def __test_pow_matches_the_venue_on_a_negative_base__():
     for x, y, expected in __test_helper_NEGATIVE_BASE:
         assert math.pow(x, y) == expected, (x, y)
-    assert all(x ** y != e for x, y, e in __test_helper_NEGATIVE_BASE)
+    assert __test_helper_not_correctly_rounded(__test_helper_NEGATIVE_BASE) == 2
 
 
 def __test_pow_matches_the_venue_where_the_reciprocal_decides__():
     for x, y, expected in __test_helper_MEASURED_RECIPROCAL:
         assert math.pow(x, y) == expected, (x, y)
+    assert __test_helper_not_correctly_rounded(__test_helper_MEASURED_RECIPROCAL) == 4
 
 
 def __test_pow_edge_values__():

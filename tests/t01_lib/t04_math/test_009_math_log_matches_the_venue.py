@@ -21,7 +21,7 @@ from decimal import Decimal, localcontext
 from pynecore.lib import math
 
 
-# Arguments where CPython's ``math.log`` differs from the venue, with the
+# Arguments where macOS's ``math.log`` differs from the venue, with the
 # venue's value. Here the venue agrees with the correctly rounded logarithm.
 _TV_DISAGREEING = (
     (101976.4, 11.532496692946632),
@@ -84,13 +84,9 @@ def _ulps(a: float, b: float) -> int:
     return abs(ia - ib)
 
 
-def __test_log_matches_the_venue_where_the_platform_does_not__():
+def __test_log_matches_the_venue_where_macos_does_not__():
     for x, expected in _TV_DISAGREEING:
         assert math.log(x) == expected
-
-    # The platform is what differs -- otherwise the test proves nothing about
-    # the code under test.
-    assert all(_math.log(x) != expected for x, expected in _TV_DISAGREEING)
 
 
 def __test_log_matches_the_venue_near_one__():
@@ -106,7 +102,6 @@ def __test_log_matches_the_venue_where_the_reciprocal_decides__():
     for x, expected in _TV_APPROXIMATE_RECIPROCAL:
         assert math.log(x) == expected, x.hex()
 
-    assert all(_math.log(x) != e for x, e in _TV_APPROXIMATE_RECIPROCAL)
     assert sum(1 for x, e in _TV_APPROXIMATE_RECIPROCAL if _exact(x) != e) == 6
 
 

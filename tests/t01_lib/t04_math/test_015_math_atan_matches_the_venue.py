@@ -4,18 +4,18 @@
 The venue's JVM has no JIT intrinsic for ``atan``: ``Math.atan`` delegates to
 ``StrictMath.atan``, the fdlibm algorithm, which reduces the argument into one of
 five ranges and finishes with a degree-11 odd/even split polynomial. It is not
-correctly rounded, and the platform's ``math.atan`` is not it.
+correctly rounded, and a platform ``math.atan`` need not be it (macOS's is not).
 
 MEASURED on TradingView, BINANCE:BTCUSDT@30 with byte-identical bar data (probe
 ``atan_probe``, 47116 values covering every reduction branch): the fdlibm port is
-exact on all of them, the platform's ``atan`` misses 3216 -- 6.8%, by an ulp each.
+exact on all of them, macOS's ``atan`` misses 3216 -- 6.8%, by an ulp each.
 """
 import math as _pymath
 
 from pynecore.lib import math
 
 
-# Arguments where the platform's ``atan`` differs from the venue, with the
+# Arguments where macOS's ``atan`` differs from the venue, with the
 # venue's value: two per reduction branch where the run offers two.
 _TV_DISAGREEING = (
     # |x| < 0.4375, no reduction
@@ -34,13 +34,9 @@ _TV_DISAGREEING = (
 )
 
 
-def __test_atan_matches_the_venue_where_the_platform_does_not__():
+def __test_atan_matches_the_venue_where_macos_does_not__():
     for x, expected in _TV_DISAGREEING:
         assert math.atan(x) == expected, x.hex()
-
-    # The platform is what differs -- otherwise the test proves nothing about
-    # the code under test.
-    assert all(_pymath.atan(x) != expected for x, expected in _TV_DISAGREEING)
 
 
 def __test_atan_is_odd__():
