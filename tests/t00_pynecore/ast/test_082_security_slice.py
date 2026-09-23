@@ -1256,6 +1256,64 @@ def main():
     log.info("the increment runs once, under its own guard")
 
 
+def __test_a_write_rebinding_an_earlier_read_keeps_its_guard__(log):
+    """A write binding a name the branch read before it is not lifted ahead
+
+    ``x`` is stamped a scalar, so the push is no mutation the write could
+    depend on, but it still reads ``x`` before the write rebinds it: lifted
+    ahead of the guard, the write would hand the push its new value, and the
+    second request would read a store holding the wrong ``x``. The same holds
+    for a plain copy of ``x`` taken before the write.
+    """
+    import os
+    from pynecore.transformers.pine_type_rules import FLOAT, set_ty
+
+    pushed = """
+@lib.script.indicator("t")
+def main():
+    def htf(src):
+        return lib.request.security(lib.syminfo.tickerid, "D", src)
+    store = lib.array.new_float(0)
+    x = lib.close * 2.0
+    total = lib.na
+    if lib.bar_index % 3 != 1:
+        lib.array.push(store, x)
+        x = htf(lib.close * 3.0)
+    total = lib.request.security(lib.syminfo.tickerid, "W", lib.array.sum(store))
+    lib.plot(total)
+    lib.plot(x)
+"""
+    copied = """
+@lib.script.indicator("t")
+def main():
+    def htf(src):
+        return lib.request.security(lib.syminfo.tickerid, "D", src)
+    x = lib.close * 2.0
+    y = lib.na
+    if lib.bar_index % 3 != 1:
+        y = x
+        x = htf(lib.close * 3.0)
+    lib.plot(y)
+    lib.plot(x)
+"""
+    for name, source in (("pushed", pushed), ("copied", copied)):
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == 'x':
+                set_ty(node, FLOAT)
+        tree = SecurityTransformer().visit(tree)
+        os.environ['PYNE_NO_SECURITY_SLICE'] = '1'
+        try:
+            tree = SecuritySliceTransformer().visit(tree)
+        finally:
+            os.environ.pop('PYNE_NO_SECURITY_SLICE', None)
+        ast.fix_missing_locations(tree)
+        clones = __test_helper_clones(tree)
+        assert clones == {}, (name, [ast.unparse(clone) for clone in clones.values()])
+        assert 'htf(' in __test_helper_guarded_write(tree), name
+    log.info("the write stayed behind the earlier read of the name it binds")
+
+
 def __test_a_guarded_helper_call_is_forced_in_the_clone__(log):
     """A ternary or a short circuit around the writing helper's call is removed"""
     ternary = """

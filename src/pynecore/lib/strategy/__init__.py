@@ -1500,13 +1500,17 @@ class SimPosition(PositionBase):
         """Entries counted against ``pyramiding`` — the binding book, not the FIFO one."""
         return len(self._entry_book)
 
-    def _drop_binding(self, binding: '_EntryBinding', carry_pending: bool = False) -> None:
+    def _drop_binding(self, binding: '_EntryBinding', carry_pending: bool = False,
+                      reversing_id: str | None = None) -> None:
         """Retire a spent binding and cancel the exit legs that were bound to it.
 
         :param carry_pending: The binding was spent by a closer that is not one of
             its own exit legs, so a leg whose id still has a LONG order waiting to
             fill survives (see the block below). A leg settling its own binding
             fired, and dies with it however the id is re-entered.
+        :param reversing_id: Id of the entry order whose closing leg spent the
+            binding. That order is the one about to fill, not one still waiting,
+            so it carries nothing over.
         """
         try:
             self._entry_book.remove(binding)
@@ -1539,8 +1543,17 @@ class SimPosition(PositionBase):
             # ``position_size > 0`` guard where ``!= 0`` was meant -- but a bug in
             # the reference engine is still the reference: what TradingView prints
             # is what a backtest has to reproduce.
+            #
+            # A reversal is not such a re-entry: the pending order of the leg's id is
+            # the reversing entry itself, and its opening half gets no leg from the
+            # position it just closed. MEASURED on `3 EMA + Stochastic RSI + ATR`
+            # (BINANCE:BTCUSDT 30m, process_orders_on_close): short "3ESRA" reversed
+            # by long "3ESRA", with the reversal bar's `strategy.exit` bracket reached
+            # on the very next bar -- TradingView fills nothing there in 5/5 events,
+            # the long is first covered by the next bar's re-issued call.
             pending = self.entry_orders.get(exit_order.order_id) if carry_pending else None
-            if pending is not None and pending.sign > 0.0:
+            if (pending is not None and pending.sign > 0.0
+                    and exit_order.order_id != reversing_id):
                 if bound_here:
                     self.exit_orders.pop(_exit_order_key(exit_order), None)
                     exit_order.entry_seq = None
@@ -1549,12 +1562,12 @@ class SimPosition(PositionBase):
             self._remove_order(exit_order)
 
     def _reduce_binding(self, binding: '_EntryBinding', qty: float,
-                        carry_pending: bool = False) -> float:
+                        carry_pending: bool = False, reversing_id: str | None = None) -> float:
         """Take up to ``qty`` off one binding; return what it could not absorb."""
         take = min(binding.bound, qty)
         binding.bound -= take
         if _size_round(binding.bound) <= 0.0:
-            self._drop_binding(binding, carry_pending)
+            self._drop_binding(binding, carry_pending, reversing_id)
         return qty - take
 
     def _settle_entry_book(self, order: Order, qty: float) -> None:
@@ -1576,12 +1589,14 @@ class SimPosition(PositionBase):
             self._reduce_binding(binding, qty)
             return
         bound_id = order.order_id if order.order_type == _order_type_close else None
+        reversing_id = order.exit_id if order.reversal_leg else None
         for candidate in list(self._entry_book):
             if qty <= 0.0:
                 break
             if bound_id is not None and candidate.entry_id != bound_id:
                 continue
-            qty = self._reduce_binding(candidate, qty, carry_pending=True)
+            qty = self._reduce_binding(candidate, qty, carry_pending=True,
+                                       reversing_id=reversing_id)
 
     def _fill_order(self, order: Order, price: PyneFloat,
                     counts_as_filled_order: bool = True):
