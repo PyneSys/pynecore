@@ -17,7 +17,7 @@ from decimal import Decimal, localcontext
 
 from pynecore.lib import math
 
-# Arguments where CPython's ``math.log10`` differs from the venue, with the venue's value
+# Arguments where macOS's ``math.log10`` differs from the venue, with the venue's value
 __test_helper_PLATFORM_DISAGREES = (
     (0.9999999130359312, -3.776801686113221e-08),
     (1.0002773431328527, 0.00012043189248434519),
@@ -71,12 +71,14 @@ def __test_helper_ulps(a: float, b: float) -> int:
     return abs(ia - ib)
 
 
-def __test_log10_matches_the_venue_where_the_platform_does_not__():
+def __test_log10_matches_the_venue_where_macos_does_not__():
     for x, expected in __test_helper_PLATFORM_DISAGREES:
         assert math.log10(x) == expected, x.hex()
 
-    # The platform is what differs -- otherwise the test proves nothing
-    assert all(_math.log10(x) != e for x, e in __test_helper_PLATFORM_DISAGREES)
+    # The venue is not the correctly rounded logarithm on most of them either, which
+    # holds whatever the host's libm is
+    assert sum(1 for x, e in __test_helper_PLATFORM_DISAGREES
+               if __test_helper_exact(x) != e) == 5
 
 
 def __test_log10_matches_the_venue_where_it_is_not_correctly_rounded__():
@@ -89,6 +91,9 @@ def __test_log10_matches_the_venue_where_it_is_not_correctly_rounded__():
 def __test_log10_matches_the_venue_where_the_reciprocal_decides__():
     for x, expected in __test_helper_MEASURED_RECIPROCAL:
         assert math.log10(x) == expected, x.hex()
+
+    assert sum(1 for x, e in __test_helper_MEASURED_RECIPROCAL
+               if __test_helper_exact(x) != e) == 6
 
 
 def __test_log10_stays_within_an_ulp_over_the_price_range__():
