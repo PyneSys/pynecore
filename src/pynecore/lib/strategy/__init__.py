@@ -6737,6 +6737,23 @@ def _exit_leg(position: PositionBase, exit_id: str, from_entry: str,
     if existing is not None and existing.consumed:
         return
 
+    # A call whose price/tick args ALL resolve to na arms no trigger -- e.g.
+    # brackets computed from a flat position_avg_price (na) on a bar before the
+    # entry fills. It is not a level-less market close that fires at the next
+    # open: it replaces the resting leg of the same id with an order that can
+    # never fill, which cancels that leg and leaves nothing in its place --
+    # whatever slice the call asks for, so this comes before the reservation.
+    # MEASURED on TradingView (CAPITALCOM:EURUSD 60): after a trailing exit, a
+    # same-id ``strategy.exit(id, from_entry, stop = na)`` yields the trade list
+    # of ``strategy.cancel(id)`` byte for byte (33 trades where keeping the leg
+    # gives 34), with or without ``qty_percent``, while an entry order of the
+    # same id stays pending.
+    if not (limit == limit or stop == stop or profit == profit or loss == loss
+            or trail_price == trail_price or trail_points == trail_points):  # is_na_arg
+        if existing is not None:
+            position._remove_order(existing)
+        return
+
     is_rest_leg = not (qty == qty) and not (qty_percent == qty_percent)  # is_na_arg
     # Sibling legs reserve slices of the SAME entry first-come-first-served
     # (consumed siblings keep their reservation until the entry fully
@@ -6815,14 +6832,6 @@ def _exit_leg(position: PositionBase, exit_id: str, from_entry: str,
     # TV reference exports (pynecomp bracket trail probes 88-91) prove the trailing
     # stop arms with an offset of 0 ticks. The offset-0 default is applied at
     # ``Order`` construction.
-
-    # An exit must arm at least one trigger. TradingView treats a call whose
-    # price/tick args ALL resolve to na as a no-op -- e.g. brackets computed
-    # from a flat position_avg_price (na) on a bar before the entry fills --
-    # not a level-less market close that fires at the next open.
-    if (not (limit == limit or stop == stop or profit == profit or loss == loss)
-            and _trail_price is None and trail_points_ticks is None):
-        return
 
     _limit = limit if limit == limit else None  # is_na_arg
     if _limit is not None:
