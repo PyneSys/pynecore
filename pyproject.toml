@@ -97,16 +97,11 @@ replay = "pynecore.providers.replay:ReplayProvider"
 #
 
 # Platform wheels carry the compiled ``pynecore.core._native_math``. Every one is tested
-# against the pure-Python math it replaces, and must actually contain the extension.
+# against the pure-Python math it replaces, and must actually contain the extension; the
+# venue tests pin the pure-Python math itself, which is the same on every platform.
 [tool.cibuildwheel]
 build = "cp311-* cp312-* cp313-* cp314-*"
 skip = "*-win32 *-manylinux_i686 *-musllinux_i686"
 test-requires = ["pytest", "pytest-spec"]
-test-command = """pytest -p no:cacheprovider \
-  {project}/tests/t01_lib/t04_math/test_016_native_math_matches_python.py \
-  {project}/tests/t01_lib/t04_math/test_009_math_log_matches_the_venue.py \
-  {project}/tests/t01_lib/t04_math/test_015_math_atan_matches_the_venue.py \
-  {project}/tests/t01_lib/t04_math/test_017_math_log10_matches_the_venue.py \
-  {project}/tests/t01_lib/t04_math/test_018_math_pow_matches_the_venue.py \
-  {project}/tests/t01_lib/t04_math/test_008_math_pow_shortcuts.py"""
+test-command = "pytest -p no:cacheprovider {project}/tests/t01_lib/t04_math/test_016_native_math_matches_python.py"
 test-environment = { PYNE_REQUIRE_NATIVE_MATH = "1" }
