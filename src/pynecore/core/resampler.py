@@ -282,6 +282,49 @@ def trading_day(ts_sec: float, tz: ZoneInfo | dt_timezone | None,
     return d
 
 
+def trading_day_span_sec(d: date, tz: ZoneInfo | dt_timezone | None,
+                         overnight: dict[int, dt_time]) -> tuple[int, int] | None:
+    """
+    Instants :func:`trading_day` assigns to ``d``, as one epoch-second interval.
+
+    In wall-clock terms trading day ``d`` runs from the overnight open of the calendar
+    day before ``d`` (``d``'s own midnight when that day has none) to ``d``'s overnight
+    open (the next midnight when it has none). Both boundaries are converted to instants,
+    and the instants between them belong to ``d`` as long as the zone changes its UTC
+    offset at most once inside that span of at most two days.
+
+    :param d: Trading day date
+    :param tz: Exchange timezone (``None`` uses the system's local timezone)
+    :param overnight: Per-weekday rolling opens from :func:`overnight_opens`
+    :return: ``(start, end)`` in epoch seconds, end exclusive. ``None`` when a boundary
+             wall time is repeated or skipped by a DST change, or is not a whole
+             second: the boundary then has no single instant.
+    """
+    prev = d - timedelta(days=1)
+    t0 = overnight.get(prev.weekday())
+    if t0 is None:
+        start = datetime(d.year, d.month, d.day, tzinfo=tz)
+    else:
+        start = datetime(prev.year, prev.month, prev.day,
+                         t0.hour, t0.minute, t0.second, t0.microsecond, tzinfo=tz)
+    t1 = overnight.get(d.weekday())
+    if t1 is None:
+        nxt = d + timedelta(days=1)
+        end = datetime(nxt.year, nxt.month, nxt.day, tzinfo=tz)
+    else:
+        end = datetime(d.year, d.month, d.day,
+                       t1.hour, t1.minute, t1.second, t1.microsecond, tzinfo=tz)
+    if start.microsecond or end.microsecond:
+        return None
+    start_sec = start.timestamp()
+    end_sec = end.timestamp()
+    # A wall time maps to one instant exactly when both folds agree on it
+    if (start.replace(fold=1).timestamp() != start_sec
+            or end.replace(fold=1).timestamp() != end_sec):
+        return None
+    return int(start_sec), int(end_sec)
+
+
 def weekday_ordinal(d: date) -> int:
     """
     Index of ``d`` among its year's Mon-Fri weekdays (Jan 1 weekday = 0).
@@ -610,6 +653,13 @@ class ObservedDayCounter:
         return cur.year, (cur.month - 1) // multiplier
 
 
+# A validity window of a resolved single-period D/W/M bar open:
+# (start ms, end ms exclusive, bar open ms, session_starts, tz, opening_hours)
+_Window = tuple[int, int, int, object, object, object]
+# No instant satisfies ``0 <= t < 0``
+_NO_WINDOW: _Window = (0, 0, 0, None, None, None)
+
+
 class Resampler:
     """
     Resampler class for handling different timeframes and calculating bar times.
@@ -628,10 +678,19 @@ class Resampler:
         """
         self.timeframe = timeframe
         self._validate_timeframe()
+        # noinspection PyProtectedMember
+        self._modifier, self._multiplier = tf_module._process_tf(timeframe)
+        # noinspection PyProtectedMember
+        self._tf_seconds = tf_module._in_seconds(timeframe)
+        # Single-period D/W/M bars on a session template remember the windows of their
+        # latest results, newest first (see the session branch of get_bar_time)
+        self._windowed = self._multiplier == 1 and self._modifier in ('D', 'W', 'M')
+        self._windows: tuple[_Window, _Window, _Window] = (_NO_WINDOW, _NO_WINDOW, _NO_WINDOW)
 
     def _validate_timeframe(self) -> None:
         """Validate that the timeframe is supported."""
         try:
+            # noinspection PyProtectedMember
             tf_module._in_seconds(self.timeframe)
         except (ValueError, AssertionError) as e:
             raise ValueError(f"Invalid timeframe: {self.timeframe}") from e
@@ -682,6 +741,12 @@ class Resampler:
         symbols (exchange-listed) this arithmetic is only the dataless fallback
         on the weekday grid — data-driven callers count actual trading days.
 
+        A single-period D/W/M result on a session template is remembered together
+        with the interval of instants it holds for, so the other bars of that trading
+        day resolve with a range check. The template lists and the timezone are
+        matched by identity: a changed template must be a new list, not one edited in
+        place.
+
         :param current_time_ms: Current time in milliseconds (UNIX timestamp)
         :param tz: Timezone for day/week/month boundary calculation, and for
                    locating session opens when ``session_starts`` is given.
@@ -697,15 +762,28 @@ class Resampler:
                    'weekday' otherwise. Only multi-period timeframes use it.
         :return: Bar opening time in milliseconds
         """
+        if self._windowed:
+            # An instant inside the window of an earlier single-period D/W/M result on the
+            # same template gets that result (see the session branch below)
+            windows = self._windows
+            w = windows[0]
+            if (w[0] <= current_time_ms < w[1] and w[3] is session_starts and w[4] is tz
+                    and w[5] is opening_hours):
+                return w[2]
+            w = windows[1]
+            if (w[0] <= current_time_ms < w[1] and w[3] is session_starts and w[4] is tz
+                    and w[5] is opening_hours):
+                return w[2]
+            w = windows[2]
+            if (w[0] <= current_time_ms < w[1] and w[3] is session_starts and w[4] is tz
+                    and w[5] is opening_hours):
+                return w[2]
+
         # Convert to seconds for calculations
         current_time_sec = current_time_ms // 1000
-
-        # Get timeframe in seconds
-        tf_seconds = tf_module._in_seconds(self.timeframe)
-
-        # Calculate bar opening time based on timeframe type
-        # noinspection PyProtectedMember
-        modifier, multiplier = tf_module._process_tf(self.timeframe)
+        tf_seconds = self._tf_seconds
+        modifier = self._modifier
+        multiplier = self._multiplier
 
         if modifier in ('S', ''):  # Seconds / minutes (intraday)
             if session_starts is None:
@@ -760,6 +838,11 @@ class Resampler:
             # 24/7 and midnight-opening markets are unaffected.
             on = overnight_opens(opening_hours, session_starts)
             td = trading_day(current_time_sec, tz, on)
+            first_td = td
+            # Of the thresholds the instant is compared against below, the latest one it
+            # has reached and the earliest one it has not (bounds of the validity window)
+            reached: int | None = None
+            ahead: int | None = None
 
             # A session-anchored period runs from its own open to the next one,
             # so ``trading_day`` — which answers with a calendar date — has to be
@@ -771,8 +854,10 @@ class Resampler:
                 # what rolls it, and that may be days away, or never within the
                 # week). Step past it, otherwise the closing chart bar would
                 # resolve to the very period it completes.
+                reached = day_end
                 td += timedelta(days=1)
             else:
+                ahead = day_end
                 # Before the day's own open (a pre-market bar, or the overnight
                 # gap of a market that closes and reopens) the containing period
                 # is the previous SCHEDULED day's — skipping weekend days the
@@ -780,7 +865,10 @@ class Resampler:
                 for _ in range(8):
                     day_open = scheduled_day_open_sec(td, tz, session_starts, on)
                     if day_open is not None and current_time_sec >= day_open:
+                        reached = day_open
                         break
+                    if day_open is not None and (ahead is None or day_open < ahead):
+                        ahead = day_open
                     td -= timedelta(days=1)
 
             if modifier == 'D':
@@ -799,6 +887,23 @@ class Resampler:
                         slot += timedelta(days=7 - slot.weekday())
 
             bar_start_sec = trading_day_open_sec(slot, tz, session_starts, on)
+
+            # Validity window. The instant enters the computation above in two ways only:
+            # through its trading day, and through which side of each compared threshold
+            # (the day's end, the scheduled opens walked back through) it lies on.
+            # Everything else is a function of that trading day's date and the template.
+            # So every instant whose trading day is the same and that lies between
+            # ``reached`` and ``ahead`` takes the same path to the same result. The
+            # instants of one trading day form a single interval when the zone changes
+            # its UTC offset at most once within that day's span of at most two days
+            # (the closest two offset changes of any IANA zone are 6.96 days apart in
+            # tzdata 2025b and 2026c) and the span's boundary wall times are neither
+            # repeated nor skipped, which ``trading_day_span_sec`` checks. A local-time
+            # (``None``) or a foreign tzinfo is not cached.
+            if isinstance(tz, (ZoneInfo, dt_timezone)):
+                self._remember_window(current_time_sec, first_td, on, reached, ahead,
+                                      bar_start_sec * 1000, tz, session_starts,
+                                      opening_hours)
 
         elif modifier in ('D', 'W', 'M'):
             # Daily/Weekly/Monthly — timezone matters for calendar alignment
@@ -826,3 +931,56 @@ class Resampler:
 
         # Convert back to milliseconds
         return bar_start_sec * 1000
+
+    def _remember_window(self, time_sec: int, day: date, overnight: dict[int, dt_time],
+                         reached: int | None, ahead: int | None, bar_ms: int,
+                         tz: ZoneInfo | dt_timezone,
+                         session_starts: 'list[SymInfoSession]',
+                         opening_hours: 'list[SymInfoInterval] | None') -> None:
+        """
+        Store the validity window of a single-period D/W/M result as the newest window.
+
+        The window is the part of trading day ``day``'s span between ``reached`` and
+        ``ahead``. Held windows with the same result on the same template that overlap or
+        touch it are merged into it, and the oldest window beyond three is dropped.
+
+        :param time_sec: The resolved instant in epoch seconds
+        :param day: The instant's trading day (before any period correction)
+        :param overnight: Per-weekday rolling opens the trading day was derived with
+        :param reached: Latest compared threshold at or before the instant (epoch seconds)
+        :param ahead: Earliest compared threshold after the instant (epoch seconds)
+        :param bar_ms: The resolved bar open in milliseconds
+        :param tz: Exchange timezone
+        :param session_starts: Session template the result was resolved with
+        :param opening_hours: Opening hours the result was resolved with
+        """
+        try:
+            span = trading_day_span_sec(day, tz, overnight)
+        except (OverflowError, ValueError, OSError):
+            return
+        if span is None:
+            return
+        lo, hi = span
+        if reached is not None and reached > lo:
+            lo = reached
+        if ahead is not None and ahead < hi:
+            hi = ahead
+        if not lo <= time_sec < hi:
+            return
+        lo_ms = lo * 1000
+        hi_ms = hi * 1000
+        kept: list[_Window] = []
+        for w in self._windows:
+            if (w[2] == bar_ms and w[3] is session_starts and w[4] is tz
+                    and w[5] is opening_hours and w[0] <= hi_ms and lo_ms <= w[1]):
+                # The same result holds on both windows, so it holds on their union
+                if w[0] < lo_ms:
+                    lo_ms = w[0]
+                if w[1] > hi_ms:
+                    hi_ms = w[1]
+            elif w[0] < w[1]:
+                kept.append(w)
+        kept.append(_NO_WINDOW)
+        kept.append(_NO_WINDOW)
+        self._windows = ((lo_ms, hi_ms, bar_ms, session_starts, tz, opening_hours),
+                         kept[0], kept[1])

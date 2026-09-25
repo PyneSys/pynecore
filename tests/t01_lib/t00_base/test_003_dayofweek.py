@@ -11,6 +11,7 @@ thursday=5, friday=6, saturday=7.
 from datetime import datetime, timezone
 
 from pynecore.lib import dayofweek
+from pynecore.lib.dayofweek import dayofweek as dayofweek_of
 
 
 def __test_dayofweek_constants_match_pine_spec__():
@@ -37,15 +38,15 @@ def __test_dayofweek_function_matches_named_constant_for_every_weekday__():
     ]
     for iso_date, expected_const, label in cases:
         ts_ms = int(datetime.fromisoformat(iso_date).replace(tzinfo=timezone.utc).timestamp() * 1000)
-        assert dayofweek.dayofweek(ts_ms) == expected_const, f"{label} ({iso_date}) failed"
+        assert dayofweek_of(ts_ms) == expected_const, f"{label} ({iso_date}) failed"
 
 
 def __test_issue_56_friday_and_saturday_not_swapped__():
     """Reporter's bars: Friday matches dayofweek.friday, Saturday matches dayofweek.saturday."""
     ts_fri = int(datetime(2024, 6, 14, 23, 30, tzinfo=timezone.utc).timestamp() * 1000)
-    assert dayofweek.dayofweek(ts_fri) == dayofweek.friday
-    assert dayofweek.dayofweek(ts_fri) != dayofweek.saturday
+    assert dayofweek_of(ts_fri) == dayofweek.friday
+    assert dayofweek_of(ts_fri) != dayofweek.saturday
 
     ts_sat = int(datetime(2024, 9, 14, 23, 30, tzinfo=timezone.utc).timestamp() * 1000)
-    assert dayofweek.dayofweek(ts_sat) == dayofweek.saturday
-    assert dayofweek.dayofweek(ts_sat) != dayofweek.friday
+    assert dayofweek_of(ts_sat) == dayofweek.saturday
+    assert dayofweek_of(ts_sat) != dayofweek.friday

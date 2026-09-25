@@ -285,6 +285,8 @@ class _MockBroker:
 
     def watch_orders(self):
         async def _gen():
+            # The dead yield only makes _gen an async generator
+            # noinspection PyUnreachableCode
             if False:
                 yield  # pragma: no cover — empty stream
         return _gen()

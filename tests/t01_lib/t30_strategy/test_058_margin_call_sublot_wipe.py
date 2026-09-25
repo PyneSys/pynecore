@@ -22,6 +22,8 @@ from pynecore.lib import script, strategy, bar_index
     pyramiding=1,
 )
 def main():
+    # PyCharm narrows a Pine float compared with an int literal to Never
+    # noinspection PyUnreachableCode
     if bar_index == 0 and strategy.position_size == 0:
         strategy.entry('S', strategy.short)
 

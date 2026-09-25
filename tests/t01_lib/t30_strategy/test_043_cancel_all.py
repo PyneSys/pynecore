@@ -78,4 +78,5 @@ def __test_cancel_all_removes_every_pending_entry__(script_path, module_key):
         f"Expected no entries to fill after cancel_all(), got {opened_entries} — "
         "strategy.cancel_all() regression."
     )
+    position = runner.script.position
     assert position.size == 0.0, f"Expected flat position, got size={position.size}"

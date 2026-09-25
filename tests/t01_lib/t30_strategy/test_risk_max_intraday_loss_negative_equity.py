@@ -27,6 +27,8 @@ from pynecore.lib import script, strategy
 )
 def main():
     strategy.risk.max_intraday_loss(100, strategy.cash)
+    # PyCharm narrows a Pine float compared with an int literal to Never
+    # noinspection PyUnreachableCode
     if strategy.position_size == 0:
         strategy.entry('Short', strategy.short)
 

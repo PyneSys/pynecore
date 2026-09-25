@@ -112,6 +112,7 @@ The wrapper bodies compare RAW (``x == x`` is their na test, ``exponent == 2``
 a measured shortcut), which is why the pass marks its own comparisons exact
 for ``FloatToleranceTransformer`` -- and only its own.
 """
+from collections.abc import Callable
 from typing import Any, cast
 import ast
 import builtins
@@ -436,8 +437,9 @@ def derive_template(module_name: str, func_name: str) -> _Template:
     supported = SUPPORT_NAMES.get(module_name, {})
 
     body = list(node.body)
-    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
-            and isinstance(body[0].value.value, str):
+    first = body[0] if body else None
+    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) \
+            and isinstance(first.value.value, str):
         body = body[1:]
     if not body:
         raise NotDerivable("empty body")
@@ -507,7 +509,8 @@ def _varargs_shape(module_name: str, func_name: str) -> str:
         raise NotDerivable("expected a pure varargs signature")
     vararg = args.vararg.arg
     body = list(node.body)
-    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+    first = body[0] if body else None
+    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
         body = body[1:]
     if len(body) != 3 or not isinstance(body[0], ast.Assert):
         raise NotDerivable("expected `assert`, the na loop and the final return")
@@ -607,10 +610,12 @@ def _varargs_template(module_name: str, func_name: str) -> _Template:
 #: Anchors whose one-argument form may be evaluated at transform time over a
 #: numeric literal. The fold RUNS the very same callable the emission would
 #: have run, so it cannot reason its way to a different int-vs-float result.
-_FOLDABLE_UNARY: dict[str, Any] = {'py_int': builtins.int, 'py_float': builtins.float}
+_FOLDABLE_UNARY: dict[str, Callable[[Any], Any]] = {
+    'py_int': builtins.int, 'py_float': builtins.float,
+}
 
 #: Comparison operators a fold may evaluate over two numeric literals
-_FOLDABLE_COMPARE: dict[type[ast.cmpop], Any] = {
+_FOLDABLE_COMPARE: dict[type[ast.cmpop], Callable[[Any, Any], Any]] = {
     ast.Eq: operator.eq, ast.NotEq: operator.ne,
     ast.Lt: operator.lt, ast.LtE: operator.le,
     ast.Gt: operator.gt, ast.GtE: operator.ge,

@@ -30,6 +30,8 @@ from pynecore.lib import script, strategy
     pyramiding=1,
 )
 def main():
+    # PyCharm narrows a Pine float compared with an int literal to Never
+    # noinspection PyUnreachableCode
     if strategy.position_size == 0:
         strategy.entry('L', strategy.long)
 

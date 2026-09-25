@@ -280,7 +280,7 @@ def __test_fold_flat_resets_basis_and_oversell_flags_violation__(tmp_path: Path)
     fold = fold_inventory([
         row("a", '1', '-100', 1), row("b", '-1', '105', 2),
     ])
-    assert fold.net_base == 0 and fold.cost_quote == 0 and fold.vwap is None
+    assert fold.net_base == Decimal(0) and fold.cost_quote == Decimal(0) and fold.vwap is None
     assert fold.violation is None
 
     # Oversell: spot cannot go short — corruption flag.
@@ -1187,7 +1187,7 @@ def __test_same_ms_buy_sell_orders_by_venue_seq__(tmp_path: Path):
     rows = ctx.iter_spot_executions(ACCOUNT, "BTC-USD")
     assert [r.fill_id for r in rows] == ["z-buy", "a-sell"]
     fold = fold_inventory(rows)
-    assert fold.net_base == 0 and fold.violation is None
+    assert fold.net_base == Decimal(0) and fold.violation is None
     store.close()
 
 
@@ -1299,7 +1299,7 @@ def __test_reconcile_compacts_unsellable_dust_into_the_baseline__(tmp_path: Path
     port.min_sellable = Decimal('0.00125')
     assert _run(mgr.reconcile(T0_MS + 10_000)) == []
 
-    assert mgr.fold.net_base == 0
+    assert mgr.fold.net_base == Decimal(0)
     epoch = ctx.get_latest_spot_epoch(port.product_id)
     assert epoch is not None and epoch.state == 'active'
     assert epoch.epoch_seq == 2

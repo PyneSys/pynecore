@@ -29,6 +29,10 @@ class PineLoop(Generic[_TNum]):
     Counter of a Pine ``for`` loop whose ``to`` bound is not loop-invariant.
     """
     value: _TNum
+    _by: int | float | None
+    _step: int | float
+    _ascending: bool
+    _started: bool
 
     def __init__(self, from_num: _TNum, step_num: _TNum | None = None) -> None: ...
 

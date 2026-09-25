@@ -37,9 +37,9 @@ from pynecore.transformers.pine_type_artifact import (
 )
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
-    BOOL, COLOR, FLOAT, INT, OBJECT, PIN_ANY, STR, TYPELESS, UNKNOWN, VOID,
-    annotation_type, arity, array_of, builtin_class_id, class_id, elements_of, get_pin,
-    get_ty, head, is_shaped, is_tuple, join, map_of, matrix_of, object_ty, render_ty,
+    BOOL, COLOR, FLOAT, INT, OBJECT, PIN_ANY, STR, TYPELESS, UNKNOWN,
+    annotation_type, arity, array_of, class_id, elements_of, get_pin,
+    head, is_shaped, is_tuple, join, map_of, matrix_of, object_ty, render_ty,
     shape_mismatch, tuple_of,
 )
 from pynecore.transformers.pine_type_table import PineTypeTable

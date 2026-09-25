@@ -4,6 +4,9 @@
 from pynecore.lib import script, timeframe, syminfo
 
 
+# PyCharm keeps each asserted timeframe.* value narrowed across the syminfo.period changes,
+# so a later block asserting another value reads as unreachable
+# noinspection PyUnreachableCode
 @script.indicator(title="Timeframe Basic", shorttitle="tf_basic")
 def main():
     import pytest

@@ -45,6 +45,8 @@ def main():
         first_close = close
         first_volume = volume
 
+    # PyCharm narrows a Pine float compared with an int literal to Never
+    # noinspection PyUnreachableCode
     if strategy.position_size == 0:
         strategy.entry('Long', strategy.long)
 

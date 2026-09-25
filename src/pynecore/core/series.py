@@ -3,8 +3,7 @@ from typing import Any, TypeVar, Generic, Iterator, Callable, cast, overload
 
 from types import ModuleType
 
-# noinspection PyProtectedMember
-from ..types.na import NA, na_float as _NAN
+from ..types.na import NA, na_float
 
 __all__ = ['SeriesImpl', 'inline_series']
 
@@ -168,7 +167,7 @@ class SeriesImpl(Generic[T]):
         :return: The same value that was added (for chaining or inline usage).
         """
         if self._as_float:
-            value = float(value) if value == value else _NAN  # type: ignore[assignment]
+            value = float(value) if value == value else na_float  # type: ignore[assignment]
 
         # Read the module attribute once: this runs for every series assignment
         # on every bar, and the three reads it replaces cannot see a different
@@ -249,7 +248,7 @@ class SeriesImpl(Generic[T]):
         if self._size == 0:
             return self._na
         if self._as_float:
-            value = float(value) if value == value else _NAN  # type: ignore[assignment]
+            value = float(value) if value == value else na_float  # type: ignore[assignment]
 
         pos = self._write_pos - 1
         if pos < 0:

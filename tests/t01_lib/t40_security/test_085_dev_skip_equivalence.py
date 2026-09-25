@@ -54,6 +54,8 @@ def main():
     # the group of (1) and (2) does not start it along with them.
     late: Series[float] = request.security(
         syminfo.tickerid, "240", close[2], lookahead=barmerge.lookahead_on)
+    # A series reads its own history: gated[1] becomes a slot read in the transform
+    # noinspection PyUnboundLocalVariable,PyUnresolvedReferences
     gated: Series[float] = late if bar_index > 100 else nz(gated[1])
     # (6) NOT skippable: the second term reads the developing bar.
     mixed: Series[float] = request.security(

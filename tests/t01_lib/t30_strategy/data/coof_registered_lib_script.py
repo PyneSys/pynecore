@@ -24,6 +24,8 @@ def main():
     var_exec: Persistent[int] = 0
     var_exec += 1
 
+    # PyCharm narrows a Pine float compared with an int literal to Never
+    # noinspection PyUnreachableCode
     if strategy.position_size == 0:
         strategy.entry('Long', strategy.long)
 
