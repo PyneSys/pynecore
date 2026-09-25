@@ -15,6 +15,9 @@ Convention::
 import ast
 import dataclasses
 import inspect
+import os
+import stat
+import tempfile
 import textwrap
 import tomllib
 from pathlib import Path
@@ -257,7 +260,9 @@ def ensure_config(config_cls: type, config_path: Path) -> object:
     Main entry point.  Call on every application run.
 
     1. If the file does not exist, generate it with all defaults (commented).
-    2. If it exists, read user values, regenerate from the dataclass, write back.
+    2. If it exists, read user values and regenerate it from the dataclass. The
+       file is written only when that changes it, and then replaced in one step
+       wherever the file allows it (see :func:`_replace_file`).
     3. Return a populated dataclass instance with user values over defaults.
 
     The result is cached on ``config_cls._ensured``, so repeated calls
@@ -273,11 +278,13 @@ def ensure_config(config_cls: type, config_path: Path) -> object:
     if hasattr(config_cls, '_ensured'):
         return config_cls._ensured
 
+    existing = None
     user_values = None
     extra_content = ""
 
     if config_path.exists():
-        user_values, extra_content = _parse_existing(config_path, config_cls)
+        existing = config_path.read_text(encoding='utf-8')
+        user_values, extra_content = _parse_existing(existing, config_cls)
 
     toml_content = generate_toml(config_cls, user_values)
 
@@ -286,24 +293,86 @@ def ensure_config(config_cls: type, config_path: Path) -> object:
         if not extra_content.endswith('\n'):
             toml_content += '\n'
 
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(toml_content, encoding='utf-8')
+    # Several processes may run at once and each reads the file here. A reader that
+    # met a truncated file mid-write would find no user values in it and write the
+    # bare template back over them, so an existing file is replaced atomically
+    # wherever it can be.
+    if existing is None:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(toml_content, encoding='utf-8')
+    elif toml_content != existing:
+        _replace_file(config_path, toml_content)
 
     instance = _create_instance(config_cls, user_values)
     config_cls._ensured = instance
     return instance
 
 
-def _parse_existing(config_path: Path, config_cls: type) -> tuple[dict, str]:
+def _replace_file(path: Path, content: str) -> None:
+    """
+    Replace an existing file's content, in one step wherever the file allows it.
+
+    The new content goes to a new file that is renamed over the old one, so a reader
+    sees either the old or the new content, never a partly written file. The new file
+    takes the old one's permission bits and owner, and a symlinked path keeps its link.
+    A file the new one cannot stand in for is written in place instead: one with other
+    hard links or without write permission, one whose owner the running user cannot
+    hand the new file to, and one the system does not let be renamed over (a
+    single-file bind mount, a directory without write permission, a file another
+    process holds open on Windows).
+
+    :param path: Path to the existing file.
+    :param content: The new file content.
+    """
+    target = path.resolve()
+    target_stat = target.stat()
+    if (target_stat.st_nlink == 1 and target_stat.st_mode & stat.S_IWUSR
+            and _swap_file(target, target_stat, content)):
+        return
+    target.write_text(content, encoding='utf-8')
+
+
+def _swap_file(target: Path, target_stat: os.stat_result, content: str) -> bool:
+    """
+    Write content to a new file and rename it over an existing one.
+
+    :param target: The existing file, symlinks resolved.
+    :param target_stat: The existing file's stat.
+    :param content: The new file content.
+    :return: Whether the rename happened; when it did not, the new file is removed.
+    """
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix=f'.{target.name}.', suffix='.tmp',
+                                        dir=target.parent)
+    except OSError:
+        return False
+    swapped = False
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(content)
+        os.chmod(tmp_name, stat.S_IMODE(target_stat.st_mode))
+        tmp_stat = os.stat(tmp_name)
+        if (tmp_stat.st_uid, tmp_stat.st_gid) != (target_stat.st_uid, target_stat.st_gid):
+            os.chown(tmp_name, target_stat.st_uid, target_stat.st_gid)
+        os.replace(tmp_name, target)
+        swapped = True
+    except OSError:
+        # The caller writes the file in place instead
+        pass
+    finally:
+        if not swapped:
+            os.unlink(tmp_name)
+    return swapped
+
+
+def _parse_existing(content: str, config_cls: type) -> tuple[dict, str]:
     """
     Parse an existing config file to extract user values and extra sections.
 
-    :param config_path: Path to the TOML file.
+    :param content: Content of the TOML file.
     :param config_cls: The config dataclass type.
     :return: ``(user_values, extra_sections_raw_text)``.
     """
-    content = config_path.read_text(encoding='utf-8')
-
     parsed = tomllib.loads(content)
 
     field_names = {f.name for f in dataclasses.fields(cast(Any, config_cls))}

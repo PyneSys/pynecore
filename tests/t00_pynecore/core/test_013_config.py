@@ -1,5 +1,7 @@
 """Tests for the general-purpose dataclass config system."""
 
+import stat
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -426,3 +428,59 @@ def __test_idempotent_regeneration__(tmp_path: Path):
     content2 = cfg_path.read_text()
 
     assert content1 == content2
+
+
+def __test_unchanged_file_is_not_rewritten__(tmp_path: Path):
+    """A file regeneration would leave unchanged is not written again."""
+    cfg_path = tmp_path / "config.toml"
+    ensure_config(SampleConfig, cfg_path)
+    content = cfg_path.read_text().replace('#api_key = ""', 'api_key = "secret"')
+    cfg_path.write_text(content)
+    before = cfg_path.stat()
+    del SampleConfig._ensured
+
+    ensure_config(SampleConfig, cfg_path)
+
+    after = cfg_path.stat()
+    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+    assert cfg_path.read_text() == content
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="creating a symlink needs privileges on Windows")
+def __test_changed_file_is_replaced_through_its_symlink__(tmp_path: Path):
+    """A regenerated file replaces the symlink's target: the link and the file mode stay."""
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    real_path = real_dir / "config.toml"
+    real_path.write_text('api_key = "secret"\n')
+    # Not the 0o600 a fresh temporary file is created with
+    real_path.chmod(0o640)
+    link_path = tmp_path / "config.toml"
+    link_path.symlink_to(real_path)
+
+    result = ensure_config(SampleConfig, link_path)
+
+    assert link_path.is_symlink()
+    content = real_path.read_text()
+    assert 'api_key = "secret"' in content
+    assert "#timeout = 30" in content
+    assert stat.S_IMODE(real_path.stat().st_mode) == 0o640
+    assert [p.name for p in real_dir.iterdir()] == ["config.toml"]
+    assert isinstance(result, SampleConfig)
+    assert result.api_key == "secret"
+
+
+def __test_hard_linked_file_is_written_in_place__(tmp_path: Path):
+    """A file with another hard link is rewritten in place, so both links see the change."""
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text('api_key = "secret"\n')
+    other_path = tmp_path / "other.toml"
+    other_path.hardlink_to(cfg_path)
+    inode = cfg_path.stat().st_ino
+
+    ensure_config(SampleConfig, cfg_path)
+
+    assert cfg_path.stat().st_ino == inode
+    content = other_path.read_text()
+    assert 'api_key = "secret"' in content
+    assert "#timeout = 30" in content

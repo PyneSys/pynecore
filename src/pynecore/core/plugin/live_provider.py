@@ -66,8 +66,8 @@ class PluginSymbol:
     :ivar config: Pre-loaded plugin config dataclass instance. The chart
                   process runs :func:`ensure_config` once and hands the
                   resulting instance to every subprocess via spawn args —
-                  subprocesses must not touch the TOML file themselves
-                  because :func:`ensure_config` is not process-safe.
+                  subprocesses must not touch the TOML file themselves, so
+                  every context runs with the configuration the chart read.
     :ivar time_from: Optional warmup-window start. Defaults to ``None``,
                   which lets the subprocess fall back to its built-in
                   ``_DEFAULT_WARMUP_BARS`` heuristic; the chart passes
