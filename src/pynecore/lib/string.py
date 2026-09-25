@@ -9,7 +9,7 @@ from decimal import Decimal, ROUND_HALF_UP, ROUND_HALF_EVEN, localcontext
 
 from ..core.safe_convert import native_int_or as _native_int_or
 from ..types.na import NA, na_float, na_int
-from ..types.pine_types import PyneFloat, PyneInt, PyneStr, PyneBool
+from ..types.pine_types import PyneFloat, PyneInt, PyneStr, PyneBool, pine_int
 
 from ..types.format import Format
 from . import format as _format
@@ -841,8 +841,7 @@ def length(string: str) -> PyneInt:
     :param string: String to get the length of
     :return: Amount of chars in the string
     """
-    # A Pine int is a double at runtime
-    return float(len(string))
+    return pine_int(len(string))
 
 
 def lower(source: str) -> str:
@@ -902,7 +901,7 @@ def pos(source: str, str: str) -> PyneInt:
     res = source.find(str)
     if res == -1:
         return na_int
-    return float(res)
+    return pine_int(res)
 
 
 # noinspection PyShadowingNames

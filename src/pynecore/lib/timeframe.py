@@ -7,7 +7,7 @@ from functools import lru_cache
 from datetime import datetime, timedelta
 
 from ..core.module_property import module_property
-from ..types.pine_types import PyneInt
+from ..types.pine_types import PyneInt, pine_int
 
 from .. import lib
 from . import syminfo as _syminfo
@@ -196,8 +196,8 @@ def in_seconds(timeframe: str | None = None) -> PyneInt:
     :param timeframe: The timeframe string, if None the current timeframe is used
     :return: The timeframe in seconds
     """
-    # A Pine int is a double at runtime; the core keeps the int form (:func:`_in_seconds`)
-    return float(_in_seconds(timeframe))
+    # The core keeps the native int form (:func:`_in_seconds`)
+    return pine_int(_in_seconds(timeframe))
 
 
 @module_property
@@ -313,8 +313,7 @@ def multiplier() -> PyneInt:
     :return: The current timeframe multiplier
     """
     _, _multiplier = _process_tf(_current_period())
-    # A Pine int is a double at runtime
-    return float(_multiplier)
+    return pine_int(_multiplier)
 
 
 @module_property

@@ -18,7 +18,7 @@ class Matrix(Generic[T]):
         self.cols = cols
         self.data = [[initial_value for _ in range(cols)] for _ in range(rows)]
 
-    def __iter__(self) -> Iterator[list[Any]]:
+    def __iter__(self) -> Iterator[list[T]]:
         """
         Iterate over the rows of the matrix.
 

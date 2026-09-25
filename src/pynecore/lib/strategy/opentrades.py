@@ -1,5 +1,6 @@
 from ...types.na import NA, na_float, na_int
 from ...types import PyneFloat, PyneInt, PyneStr
+from ...types.pine_types import pine_int
 from ... import lib
 
 from ...core.module_property import module_property
@@ -60,7 +61,7 @@ def entry_bar_index(trade_num: int) -> PyneInt:
     try:
         assert lib._script is not None
         assert lib._script.position is not None
-        return float(lib._script.position.open_trades[trade_num].entry_bar_index)
+        return pine_int(lib._script.position.open_trades[trade_num].entry_bar_index)
     except (IndexError, AssertionError):
         return na_int
 
@@ -138,7 +139,7 @@ def entry_time(trade_num: int) -> PyneInt:
     try:
         assert lib._script is not None
         assert lib._script.position is not None
-        return float(lib._script.position.open_trades[trade_num].entry_time)
+        return pine_int(lib._script.position.open_trades[trade_num].entry_time)
     except (IndexError, AssertionError):
         return na_int
 
@@ -286,11 +287,10 @@ def opentrades() -> PyneInt:
 
     :return: The number of open trades
     """
-    if lib._script is None or lib._script.position is None:
-        return 0.0
+    if not lib._script or not lib._script.position:
+        return pine_int(0)
     position = lib._script.position
-    # A Pine int is a double at runtime
-    return float(len(position.open_trades))
+    return pine_int(len(position.open_trades))
 
 
 # noinspection PyProtectedMember
@@ -313,7 +313,7 @@ def capital_held() -> PyneFloat:
     # TradingView reports na on every bar, flat ones included.
     # The pointvalue factor is not separately measured -- the probe symbol has
     # pointvalue 1 -- it follows how the engine scales its other monetary values.
-    if lib._script is None or lib._script.position is None:
+    if not lib._script or not lib._script.position:
         return 0.0
     if lib._script.margin_long <= 0.0 and lib._script.margin_short <= 0.0:
         return na_float

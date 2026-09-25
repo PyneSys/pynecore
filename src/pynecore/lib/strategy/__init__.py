@@ -21,6 +21,7 @@ from ...types.strategy import QtyType, ADOPTED_STARTUP_ENTRY_ID
 from ...types.base import IntEnum
 from ...types.na import NA, na_float, na_str
 from ...types import PyneFloat, PyneInt, PyneStr
+from ...types.pine_types import pine_int
 
 from . import direction as direction
 from . import commission as _commission
@@ -7446,14 +7447,13 @@ def equity() -> PyneFloat:
 @module_property
 def eventrades() -> PyneInt:
     if not lib._script:
-        return 0.0
-    # A Pine int is a double at runtime
-    return float(lib._script.position.eventrades)
+        return pine_int(0)
+    return pine_int(lib._script.position.eventrades)
 
 
 # noinspection PyProtectedMember
 @module_property
-def initial_capital() -> float:
+def initial_capital() -> PyneFloat:
     if not lib._script:
         return 0.0
     return lib._script.initial_capital
@@ -7506,9 +7506,8 @@ def grossprofit_percent() -> PyneFloat:
 @module_property
 def losstrades() -> PyneInt:
     if not lib._script:
-        return 0.0
-    # A Pine int is a double at runtime
-    return float(lib._script.position.losstrades)
+        return pine_int(0)
+    return pine_int(lib._script.position.losstrades)
 
 
 # noinspection PyProtectedMember
@@ -7702,6 +7701,5 @@ def position_entry_name() -> PyneStr:
 @module_property
 def wintrades() -> PyneInt:
     if not lib._script:
-        return 0.0
-    # A Pine int is a double at runtime
-    return float(lib._script.position.wintrades)
+        return pine_int(0)
+    return pine_int(lib._script.position.wintrades)

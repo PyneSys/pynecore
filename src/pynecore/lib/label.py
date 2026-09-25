@@ -408,7 +408,7 @@ def get_x(id: Label) -> PyneInt:
 
 
 # noinspection PyShadowingBuiltins
-def get_y(id: Label) -> PyneInt | PyneFloat:
+def get_y(id: Label) -> PyneFloat:
     """
     Returns price of the label.
 

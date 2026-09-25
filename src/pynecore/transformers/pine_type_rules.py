@@ -1657,9 +1657,12 @@ LIB_TYPE_OVERRIDES: Final[dict[str, object]] = {
     'math.max': 'all_int',
     'math.min': 'all_int',
     'math.abs': 'arg0',
-    'math.sum': 'arg0',
-    'math.avg': 'all_int',
-    'math.sign': 'arg0',
+    # MEASURED (2026-09-25, compile-only ``int a = <expr>``): ``math.sum(bar_index, 3)``,
+    # ``math.avg(bar_index, 2)``, ``math.avg(1, 2)`` and ``math.sign(bar_index)`` are all
+    # rejected as float -- none of them follows its int arguments
+    'math.sum': FLOAT,
+    'math.avg': FLOAT,
+    'math.sign': FLOAT,
     # The arity split is the whole reason ``math.round`` needed a fix: with no
     # precision it is the int overload, with one it is the float overload
     'math.round': {1: INT, 2: FLOAT},
@@ -1704,6 +1707,14 @@ LIB_TYPE_OVERRIDES: Final[dict[str, object]] = {
     # source's own type
     'ta.change': 'arg0',
     'fixnan': 'arg0',
+    # MEASURED (2026-09-25, compile-only ``int a = <expr>``): ``ta.valuewhen(c, bar_index,
+    # 0)``, ``ta.median(bar_index, 4)``, ``ta.range(bar_index, 4)`` and ``ta.mode(bar_index,
+    # 4)`` compile, while the same calls over ``close`` are rejected as float, so each result
+    # is its source's own type
+    'ta.valuewhen': 'arg1',
+    'ta.median': 'arg0',
+    'ta.range': 'arg0',
+    'ta.mode': 'arg0',
     # The casts are the only place the TYPE and the VALUE move together
     'int': INT,
     'float': FLOAT,

@@ -1,6 +1,7 @@
 from typing import Literal
 from ..types.session import Session
 from ..types.na import NA, na_float, na_int
+from ..types.pine_types import PyneFloat, PyneInt
 from .session import regular
 
 from ..core.syminfo import SymInfoSession, SymInfoInterval
@@ -61,7 +62,7 @@ current_contract: str = ""
 # Fundamentals (na when no data available, like in TradingView)
 employees: int | NA = na_int
 shareholders: int | NA = na_int
-shares_outstanding_total: float | NA = na_float
+shares_outstanding_total: PyneInt = na_int
 shares_outstanding_float: float | NA = na_float
 
 # Analyst recommendation counts (na when no data available, like in TradingView)
@@ -79,6 +80,6 @@ target_price_high: float | NA = na_float
 target_price_low: float | NA = na_float
 target_price_median: float | NA = na_float
 target_price_date: int | NA = na_int
-target_price_estimates: int | NA = na_int
+target_price_estimates: PyneFloat = na_float
 
 _size_round_factor: float

@@ -2,7 +2,7 @@ from typing import Any
 
 from ..types.datetime import DayOfWeek
 from ..types.na import na_int
-from ..types.pine_types import PyneInt
+from ..types.pine_types import PyneInt, pine_int
 from ..core.module_property import module_function_property
 
 
@@ -49,4 +49,4 @@ def dayofweek(time: int | float | None = None, timezone: str | None = None) -> P
     res = dt.weekday() + 2
     if res == 8:
         res = 1
-    return float(res)
+    return pine_int(res)

@@ -17,7 +17,8 @@ from pynecore.core.broker.models import ScriptRequirements
 from pynecore.types import script_type as _script_type
 from pynecore.types.color import Color
 from pynecore.types import PyneFloat, PyneInt
-from pynecore.types.na import na_float
+from pynecore.types.pine_types import pine_int
+from pynecore.types.na import na_int
 
 __all__ = ['script', 'input']
 
@@ -29,6 +30,8 @@ _registered_libraries: list[tuple[str, Callable]] = []
 
 # TypeVar for enum type preservation
 TEnum = TypeVar('TEnum', bound=StrEnum)
+# The generic input() is typed by its default value
+TInput = TypeVar('TInput')
 
 # MEASURED on TradingView: ``commission_type`` accepts the undocumented value ``"cash"``
 # (reachable by passing ``strategy.cash``, which is a QtyType constant of the same string).
@@ -571,6 +574,15 @@ class _Input:
     Input functions
     """
 
+    @overload
+    def __call__(self, defval: TInput, /, **__) -> TInput: ...
+
+    @overload
+    def __call__(self, defval: TInput, title: str | None = None,
+                 tooltip: str | None = None, inline: str | None = None, group: str | None = None,
+                 display: _display.Display | None = None, active: bool | None = None,
+                 *, _id: str = "", **__) -> TInput: ...
+
     def __call__(self, defval: Any, title: str | None = None,
                  tooltip: str | None = None, inline: str | None = None, group: str | None = None,
                  display: _display.Display | None = None, active: bool | None = None,
@@ -691,8 +703,7 @@ class _Input:
         )
         if _id in _old_input_values:
             return safe_convert.safe_int(_old_input_values[_id])
-        # A Pine int is a double at runtime
-        return float(defval) if defval == defval else na_float
+        return pine_int(defval) if defval == defval else na_int
 
     # noinspection PyUnusedLocal
     @classmethod

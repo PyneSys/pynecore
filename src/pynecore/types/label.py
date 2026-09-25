@@ -15,7 +15,7 @@ class Label(Drawing):
     # Required parameters (``na`` when set from a chart.point that lacks the corresponding
     # coordinate for the active xloc)
     x: PyneInt  # Bar index or UNIX time
-    y: PyneInt | PyneFloat  # Price of the label position
+    y: PyneFloat  # Price of the label position
     text: str = ""  # Label text
 
     # Optional parameters with defaults

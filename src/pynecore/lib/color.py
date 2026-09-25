@@ -2,7 +2,7 @@ from typing import cast
 
 from ..types.color import Color
 from ..types.na import NA
-from ..types.pine_types import PyneInt
+from ..types.pine_types import PyneFloat
 
 #
 # Constants
@@ -27,40 +27,40 @@ white = Color('#FFFFFF')
 yellow = Color('#FDD835')
 
 
-def r(color: Color) -> PyneInt:
+def r(color: Color) -> PyneFloat:
     """
     Return the red component of a color
 
     :param color: Color
     :return: The red component of the color
     """
-    # A Pine int is a double at runtime; the component of a na color is 0
-    return 0.0 if isinstance(color, NA) else float(color.r)
+    # The component of a na color is 0
+    return float(0 if isinstance(color, NA) else color.r)
 
 
-def g(color: Color) -> PyneInt:
+def g(color: Color) -> PyneFloat:
     """
     Return the green component of a color
 
     :param color: Color
     :return: The green component of the color
     """
-    # A Pine int is a double at runtime; the component of a na color is 0
-    return 0.0 if isinstance(color, NA) else float(color.g)
+    # The component of a na color is 0
+    return float(0 if isinstance(color, NA) else color.g)
 
 
-def b(color: Color) -> PyneInt:
+def b(color: Color) -> PyneFloat:
     """
     Return the blue component of a color
 
     :param color: Color
     :return: The blue component of the color
     """
-    # A Pine int is a double at runtime; the component of a na color is 0
-    return 0.0 if isinstance(color, NA) else float(color.b)
+    # The component of a na color is 0
+    return float(0 if isinstance(color, NA) else color.b)
 
 
-def t(color: Color) -> float:
+def t(color: Color) -> PyneFloat:
     """
     Return the transparency of a color
 

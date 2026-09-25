@@ -1,9 +1,10 @@
-from math import inf as _INF
+from math import inf
 
 from ..types import NA, PyneFloat, PyneInt
-from ..types.na import na_float as _NAN
+from ..types.na import na_float, na_int
+from ..types.pine_types import pine_int
 
-_NEG_INF = -_INF
+_NEG_INF = -inf
 
 
 def safe_div(a: PyneFloat, b: PyneFloat):
@@ -21,17 +22,17 @@ def safe_div(a: PyneFloat, b: PyneFloat):
     @return: a/b, raw inf/-inf/nan on zero denominator, or nan for na inputs.
     """
     if not (a == a) or not (b == b):  # is_na_arg
-        return _NAN
+        return na_float
     try:
         return a / b
     except ZeroDivisionError:
         if a > 0:
-            return _INF
+            return inf
         if a < 0:
             return _NEG_INF
-        return _NAN
+        return na_float
     except TypeError:
-        return _NAN
+        return na_float
 
 
 def safe_float(value: PyneFloat) -> float:
@@ -40,13 +41,13 @@ def safe_float(value: PyneFloat) -> float:
     Catches TypeError (thrown by NA values) but allows ValueError to propagate normally.
 
     @param value: The value to convert to float.
-    @return: The float value, or _NAN if TypeError occurs.
+    @return: The float value, or na when the input is na.
     """
     try:
         return float(value)
     except TypeError:
         # NA values throw TypeError, convert these to NA
-        return _NAN
+        return na_float
 
 
 def native_int(value: PyneInt) -> int | NA:
@@ -88,17 +89,15 @@ def native_int_or(value: PyneInt, default: int) -> int:
         return default
 
 
-def safe_int(value: PyneInt) -> float:
+def safe_int(value: PyneInt) -> PyneInt:
     """
     Safe int conversion that returns na for na inputs.
-
-    A Pine int is a double at runtime, so the truncated value travels as a float.
 
     @param value: The value to convert to int.
     @return: The truncated value, or na when the input is na.
     """
     try:
-        return float(int(value))
+        return pine_int(int(value))
     except (TypeError, ValueError, OverflowError):
         # NA objects throw TypeError; int(nan) throws ValueError; int(inf) OverflowError
-        return _NAN
+        return na_int

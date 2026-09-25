@@ -12,3 +12,8 @@ PyneFloat: TypeAlias = float | NA[float] | Series[float]
 PyneInt: TypeAlias = float | int | Series[int]
 PyneStr: TypeAlias = str | NA[str] | Series[str]
 PyneBool: TypeAlias = bool | NA[bool] | Series[bool]
+
+# A native number handed back to a script as a Pine int. The runtime form of a
+# Pine int is a double, so this is ``float`` itself; the stub types the result
+# as the Pine int it stands for
+pine_int = float

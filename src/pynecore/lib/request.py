@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from math import nan
-from typing import TYPE_CHECKING, Any, TypeVar, overload
+from typing import TYPE_CHECKING, Any, TypeVar, overload, overload as _typing_overload
 
 from ..types.footprint import Footprint
 from ..types.na import NA
@@ -255,9 +255,24 @@ def quandl(*args, **kwargs) -> float:
     raise NotImplementedError("request.quandl() is not yet implemented in PyneCore")
 
 
+# The static face of seed: the result is the expression's own type. Spelled through the
+# typing alias on purpose: a decorator named ``overload`` would make the lib type registry
+# read these as a runtime overload group
+# noinspection PyUnusedLocal
+@_typing_overload
+def seed(source: str, symbol: str, expression: T,
+         ignore_invalid_symbol: bool = False, calc_bars_count: int | None = None) -> T: ...
+
+
+# noinspection PyUnusedLocal
+@_typing_overload
+def seed(source: str | None = None, symbol: str | None = None, expression: None = None,
+         ignore_invalid_symbol: bool = False, calc_bars_count: int | None = None) -> Any: ...
+
+
 # noinspection PyUnusedLocal
 def seed(source=None, symbol=None, expression=None,
-         ignore_invalid_symbol=False, calc_bars_count=None):
+         ignore_invalid_symbol=False, calc_bars_count=None) -> Any:
     """
     Request data from user-maintained GitHub repositories.
 

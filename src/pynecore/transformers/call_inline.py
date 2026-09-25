@@ -184,12 +184,14 @@ SUPPORT_NAMES: dict[str, dict[str, str]] = {
         'builtins': 'py_builtins', 'math': 'py_math',
         'pine_math': 'pine_math', 'fdlibm': 'fdlibm',
         'float': 'py_float', 'int': 'py_int', 'isinstance': 'py_isinstance',
+        'pine_int': 'py_float',
         '_na_of_operands': 'math_na_of_operands',
     },
     'pynecore.lib.array': {
         'NA': 'NA', 'na_float': 'na_float', 'na_int': 'na_int',
         'builtins': 'py_builtins',
         'float': 'py_float', 'int': 'py_int', 'len': 'py_len',
+        'pine_int': 'py_float',
         '_na_element': 'array_na_element',
     },
 }

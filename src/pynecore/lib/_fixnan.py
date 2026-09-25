@@ -8,14 +8,16 @@ function, and the layout travels on the function object.
 """
 # Absolute imports on purpose: the call-site classifier resolves absolute
 # imports at transform time, so NA() calls stay direct instead of anchored
-from typing import Any
+from typing import Any, TypeVar
 
 from pynecore.types import NA, Persistent
 
 __all__ = ['fixnan']
 
+_T = TypeVar('_T')
 
-def fixnan(source: Any) -> Any:
+
+def fixnan(source: NA[_T] | _T) -> _T:
     """
     Fix NA values by replacing them with the last non-NA value
 

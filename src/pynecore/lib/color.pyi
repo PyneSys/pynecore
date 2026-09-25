@@ -6,7 +6,7 @@ Parameters stay permissive (accept NA), runtime (color.py) is unchanged.
 """
 from ..types.color import Color as Color
 from ..types.na import NA
-from ..types.pine_types import PyneInt
+from ..types.pine_types import PyneFloat
 
 aqua: Color
 black: Color
@@ -27,16 +27,16 @@ white: Color
 yellow: Color
 
 
-def r(color: Color | NA[Color]) -> PyneInt: ...
+def r(color: Color | NA[Color]) -> PyneFloat: ...
 
 
-def g(color: Color | NA[Color]) -> PyneInt: ...
+def g(color: Color | NA[Color]) -> PyneFloat: ...
 
 
-def b(color: Color | NA[Color]) -> PyneInt: ...
+def b(color: Color | NA[Color]) -> PyneFloat: ...
 
 
-def t(color: Color | NA[Color]) -> float: ...
+def t(color: Color | NA[Color]) -> PyneFloat: ...
 
 
 def new(color: Color | str | NA[Color], transp: float | NA[float] = 0) -> Color: ...

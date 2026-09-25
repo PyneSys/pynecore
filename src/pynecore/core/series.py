@@ -533,7 +533,7 @@ class ReadOnlySeriesView(Generic[T]):
         return f"ReadOnlySeriesView({list(self)})"
 
 
-def _inline_series_instance(_pin: str | None = None) -> Callable[..., SeriesImpl]:
+def _inline_series_instance(_pin: str | None = None) -> Callable[..., Any]:
     """One ``inline_series`` instance: a closure over its own series buffer.
 
     The slot transform routes ``inline_series`` call sites on the uniform
@@ -547,9 +547,11 @@ def _inline_series_instance(_pin: str | None = None) -> Callable[..., SeriesImpl
     """
     series: SeriesImpl = SeriesImpl()
 
-    def bound(value: T, idx: int) -> SeriesImpl[T]:
+    def bound(value: T, idx: int) -> T:
         series.add(value)
-        return cast(SeriesImpl[T], series[idx])
+        # The read is typed with the na the plain-T view drops; pyright needs the cast
+        # noinspection PyUnnecessaryCast
+        return cast(T, series[idx])
 
     # The whole instance state is this one buffer, and it lives in a closure
     # cell that the generic child-slot walker cannot reach. Publishing it lets
@@ -563,7 +565,7 @@ def _inline_series_instance(_pin: str | None = None) -> Callable[..., SeriesImpl
 _inline_series_shared: SeriesImpl = SeriesImpl()
 
 
-def inline_series(value: T, idx: int) -> SeriesImpl[T]:
+def inline_series(value: T, idx: int) -> T:
     """
     Inline series creation
     It is mainly for compiled codes
@@ -578,7 +580,9 @@ def inline_series(value: T, idx: int) -> SeriesImpl[T]:
     :return:
     """
     _inline_series_shared.add(value)
-    return cast(SeriesImpl[T], _inline_series_shared[idx])
+    # See the bound instance above: pyright needs the cast
+    # noinspection PyUnnecessaryCast
+    return cast(T, _inline_series_shared[idx])
 
 
 setattr(inline_series, '__pyne_bind__', _inline_series_instance)

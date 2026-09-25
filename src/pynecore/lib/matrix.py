@@ -1,11 +1,15 @@
 from __future__ import annotations
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 from ..core.module_property import module_property
 from ..types.matrix import Matrix
 from ..types.na import NA, na_float, na_int
-from ..types.pine_types import PyneInt
+from ..types.pine_types import PyneInt, pine_int
+if TYPE_CHECKING:
+    from ..types.pine_types import PyneFloat
 from . import array as _array
+
+T = TypeVar('T')
 
 _registry: list[Matrix] = []
 
@@ -54,7 +58,7 @@ def all() -> list[Matrix]:
 
 
 # noinspection PyShadowingBuiltins
-def copy(id: Matrix | NA) -> Matrix | NA:
+def copy(id: Matrix[T] | NA) -> Matrix[T]:
     """
     Create a new matrix which is a copy of the original.
 
@@ -109,6 +113,16 @@ def add_col(id: Matrix | NA, column: int | None = None, array_id: list[Any] | No
     id.add_col(column if column is None else int(column), array_id)
 
 
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def avg(id: Matrix[int]) -> PyneInt: ...
+
+    # noinspection PyShadowingBuiltins
+    @overload
+    def avg(id: Matrix[float] | NA) -> PyneFloat: ...
+
+
 # noinspection PyShadowingBuiltins
 def avg(id: Matrix | NA) -> float | int | NA:
     """
@@ -123,7 +137,7 @@ def avg(id: Matrix | NA) -> float | int | NA:
 
 
 # noinspection PyShadowingBuiltins
-def col(id: Matrix | NA, column: int) -> list[Any] | NA:
+def col(id: Matrix[T] | NA, column: int) -> list[T]:
     """
     Create a one-dimensional array from the elements of a matrix column.
 
@@ -151,12 +165,11 @@ def columns(id: Matrix | NA) -> PyneInt:
     """
     if isinstance(id, NA):
         return na_int
-    # A Pine int is a double at runtime
-    return float(id.cols)
+    return pine_int(id.cols)
 
 
 # noinspection PyShadowingBuiltins
-def concat(id1: Matrix | NA, id2: Matrix | NA) -> Matrix | NA:
+def concat(id1: Matrix[T] | NA, id2: Matrix[Any] | NA) -> Matrix[T]:
     """
     Append the second matrix to the first matrix.
 
@@ -167,6 +180,16 @@ def concat(id1: Matrix | NA, id2: Matrix | NA) -> Matrix | NA:
     if isinstance(id1, NA) or isinstance(id2, NA):
         return NA(Matrix)
     return id1.concat(id2)
+
+
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def det(id: Matrix[int]) -> PyneInt: ...
+
+    # noinspection PyShadowingBuiltins
+    @overload
+    def det(id: Matrix[float] | NA) -> PyneFloat: ...
 
 
 # noinspection PyShadowingBuiltins
@@ -183,7 +206,7 @@ def det(id: Matrix | NA) -> float | int | NA:
 
 
 # noinspection PyShadowingBuiltins
-def diff(id1: Matrix | NA, id2: Matrix | int | float | NA) -> Matrix | NA:
+def diff(id1: Matrix[T] | NA, id2: Matrix[Any] | int | float | NA) -> Matrix[T]:
     """
     Return a new matrix resulting from subtraction.
 
@@ -196,8 +219,18 @@ def diff(id1: Matrix | NA, id2: Matrix | int | float | NA) -> Matrix | NA:
     return id1.diff(id2)
 
 
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def eigenvalues(id: Matrix[int]) -> list[int]: ...
+
+    # noinspection PyShadowingBuiltins
+    @overload
+    def eigenvalues(id: Matrix[float] | NA) -> list[float]: ...
+
+
 # noinspection PyShadowingBuiltins
-def eigenvalues(id: Matrix | NA) -> list[float | int] | NA:
+def eigenvalues(id: Matrix | NA) -> list[Any]:
     """
     Return an array containing the eigenvalues of a square matrix.
 
@@ -210,7 +243,7 @@ def eigenvalues(id: Matrix | NA) -> list[float | int] | NA:
 
 
 # noinspection PyShadowingBuiltins
-def eigenvectors(id: Matrix | NA) -> Matrix | NA:
+def eigenvectors(id: Matrix[T] | NA) -> Matrix[T]:
     """
     Return a matrix of eigenvectors.
 
@@ -232,8 +265,7 @@ def elements_count(id: Matrix | NA) -> PyneInt:
     """
     if isinstance(id, NA):
         return na_int
-    # A Pine int is a double at runtime
-    return float(id.elements_count())
+    return pine_int(id.elements_count())
 
 
 # noinspection PyShadowingBuiltins
@@ -253,6 +285,16 @@ def fill(id: Matrix | NA, value: Any, from_row: int = 0, to_row: int | None = No
         return
     id.fill(value, int(from_row), to_row if to_row is None else int(to_row),
             int(from_column), to_column if to_column is None else int(to_column))
+
+
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins,PyShadowingNames
+    @overload
+    def get(id: Matrix[T], row: int, column: int) -> T: ...
+
+    # noinspection PyShadowingBuiltins,PyShadowingNames
+    @overload
+    def get(id: NA[Any], row: int, column: int) -> Any: ...
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
@@ -281,7 +323,7 @@ def get(id: Matrix | NA, row: int, column: int) -> Any | NA:
 
 
 # noinspection PyShadowingBuiltins
-def inv(id: Matrix | NA) -> Matrix | NA:
+def inv(id: Matrix[T] | NA) -> Matrix[T]:
     """
     Return the inverse of a square matrix.
 
@@ -424,7 +466,7 @@ def is_zero(id: Matrix | NA) -> bool | NA:
 
 
 # noinspection PyShadowingBuiltins
-def kron(id1: Matrix | NA, id2: Matrix | NA) -> Matrix | NA:
+def kron(id1: Matrix[T] | NA, id2: Matrix[Any] | NA) -> Matrix[T]:
     """
     Return the Kronecker product for two matrices.
 
@@ -435,6 +477,16 @@ def kron(id1: Matrix | NA, id2: Matrix | NA) -> Matrix | NA:
     if isinstance(id1, NA) or isinstance(id2, NA):
         return NA(Matrix)
     return id1.kron(id2)
+
+
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def max(id: Matrix[int]) -> PyneInt: ...
+
+    # noinspection PyShadowingBuiltins
+    @overload
+    def max(id: Matrix[float] | NA) -> PyneFloat: ...
 
 
 # noinspection PyShadowingBuiltins
@@ -450,6 +502,16 @@ def max(id: Matrix | NA) -> float | int | NA:
     return id.max()
 
 
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def median(id: Matrix[int]) -> PyneInt: ...
+
+    # noinspection PyShadowingBuiltins
+    @overload
+    def median(id: Matrix[float] | NA) -> PyneFloat: ...
+
+
 # noinspection PyShadowingBuiltins
 def median(id: Matrix | NA) -> float | int | NA:
     """
@@ -461,6 +523,16 @@ def median(id: Matrix | NA) -> float | int | NA:
     if isinstance(id, NA):
         return na_float
     return id.median()
+
+
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def min(id: Matrix[int]) -> PyneInt: ...
+
+    # noinspection PyShadowingBuiltins
+    @overload
+    def min(id: Matrix[float] | NA) -> PyneFloat: ...
 
 
 # noinspection PyShadowingBuiltins
@@ -476,6 +548,16 @@ def min(id: Matrix | NA) -> float | int | NA:
     return id.min()
 
 
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def mode(id: Matrix[int]) -> PyneInt: ...
+
+    # noinspection PyShadowingBuiltins
+    @overload
+    def mode(id: Matrix[float] | NA) -> PyneFloat: ...
+
+
 # noinspection PyShadowingBuiltins
 def mode(id: Matrix | NA) -> float | int | NA:
     """
@@ -487,6 +569,16 @@ def mode(id: Matrix | NA) -> float | int | NA:
     if isinstance(id, NA):
         return na_float
     return id.mode()
+
+
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def mult(id1: Matrix[T] | NA, id2: list[Any]) -> list[T]: ...
+
+    # noinspection PyShadowingBuiltins
+    @overload
+    def mult(id1: Matrix[T] | NA, id2: Matrix[Any] | int | float | NA) -> Matrix[T]: ...
 
 
 # noinspection PyShadowingBuiltins
@@ -504,7 +596,7 @@ def mult(id1: Matrix | NA, id2: Matrix | list[Any] | int | float | NA) -> Matrix
 
 
 # noinspection PyShadowingBuiltins
-def pinv(id: Matrix | NA) -> Matrix | NA:
+def pinv(id: Matrix[T] | NA) -> Matrix[T]:
     """
     Return the pseudoinverse of a matrix.
 
@@ -517,7 +609,7 @@ def pinv(id: Matrix | NA) -> Matrix | NA:
 
 
 # noinspection PyShadowingBuiltins
-def pow(id: Matrix | NA, power: int) -> Matrix | NA:
+def pow(id: Matrix[T] | NA, power: int) -> Matrix[T]:
     """
     Calculate the product of the matrix by itself power times.
 
@@ -540,12 +632,11 @@ def rank(id: Matrix | NA) -> PyneInt:
     """
     if isinstance(id, NA):
         return na_int
-    # A Pine int is a double at runtime
-    return float(id.rank())
+    return pine_int(id.rank())
 
 
 # noinspection PyShadowingBuiltins
-def remove_col(id: Matrix | NA, column: int | None = None) -> list[Any] | NA:
+def remove_col(id: Matrix[T] | NA, column: int | None = None) -> list[T]:
     """
     Remove the column at the specified index and return its values.
 
@@ -559,7 +650,7 @@ def remove_col(id: Matrix | NA, column: int | None = None) -> list[Any] | NA:
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
-def remove_row(id: Matrix | NA, row: int | None = None) -> list[Any] | NA:
+def remove_row(id: Matrix[T] | NA, row: int | None = None) -> list[T]:
     """
     Remove the row at the specified index and return its values.
 
@@ -599,7 +690,7 @@ def reverse(id: Matrix | NA) -> None:
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
-def row(id: Matrix | NA, row: int) -> list[Any] | NA:
+def row(id: Matrix[T] | NA, row: int) -> list[T]:
     """
     Create a one-dimensional array from the elements of a matrix row.
 
@@ -628,8 +719,7 @@ def rows(id: Matrix | NA) -> PyneInt:
     """
     if isinstance(id, NA):
         return na_int
-    # A Pine int is a double at runtime
-    return float(id.rows)
+    return pine_int(id.rows)
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
@@ -668,8 +758,8 @@ def sort(id: Matrix | NA, column: int = 0, order: str = 'ascending') -> None:
 
 
 # noinspection PyShadowingBuiltins
-def submatrix(id: Matrix | NA, from_row: int = 0, to_row: int | None = None,
-              from_column: int = 0, to_column: int | None = None) -> Matrix | NA:
+def submatrix(id: Matrix[T] | NA, from_row: int = 0, to_row: int | None = None,
+              from_column: int = 0, to_column: int | None = None) -> Matrix[T]:
     """
     Extract a submatrix within the specified indices.
 
@@ -687,7 +777,7 @@ def submatrix(id: Matrix | NA, from_row: int = 0, to_row: int | None = None,
 
 
 # noinspection PyShadowingBuiltins
-def sum(id1: Matrix | NA, id2: Matrix | int | float | NA) -> Matrix | NA:
+def sum(id1: Matrix[T] | NA, id2: Matrix[Any] | int | float | NA) -> Matrix[T]:
     """
     Return a new matrix resulting from addition.
 
@@ -728,6 +818,16 @@ def swap_rows(id: Matrix | NA, row1: int, row2: int) -> None:
     id.swap_rows(int(row1), int(row2))
 
 
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def trace(id: Matrix[int]) -> PyneInt: ...
+
+    # noinspection PyShadowingBuiltins
+    @overload
+    def trace(id: Matrix[float] | NA) -> PyneFloat: ...
+
+
 # noinspection PyShadowingBuiltins
 def trace(id: Matrix | NA) -> float | int | NA:
     """
@@ -742,7 +842,7 @@ def trace(id: Matrix | NA) -> float | int | NA:
 
 
 # noinspection PyShadowingBuiltins
-def transpose(id: Matrix | NA) -> Matrix | NA:
+def transpose(id: Matrix[T] | NA) -> Matrix[T]:
     """
     Create a new transposed version of the matrix.
 
