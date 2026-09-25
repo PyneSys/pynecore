@@ -63,17 +63,22 @@ _POINT_PARAMS = ('point', 'text') + _COMMON_PARAMS
 _COORD_PARAMS = ('x', 'y', 'text') + _COMMON_PARAMS
 
 
-# noinspection PyProtectedMember
+# The documented parameters are the call-shape names ``*args``/``**kwargs`` bind to; they
+# stay ``:param`` fields because builtin documentation harvesting reads only those
+# noinspection PyProtectedMember,PyIncorrectDocstring
 def new(*args: Any, **kwargs: Any) -> Label:
     """
     Creates a new label object.
 
     Two call shapes are accepted:
+
     - ``label.new(point, text="", ...)`` where ``point`` is a ``chart.point`` object. In this
       form the second positional argument is the label ``text``.
     - ``label.new(x, y, text="", ...)`` where ``x`` is bar index (``xloc.bar_index``) or
       bar UNIX time in milliseconds (``xloc.bar_time``), and ``y`` is the price.
       A float ``x`` is truncated to int.
+
+    Positional arguments bind to the parameter names below in the order of their call shape.
 
     :param x: Bar index / bar time of the label position (coordinate form)
     :param y: Price of the label position (coordinate form)

@@ -37,13 +37,15 @@ from pynecore.core.safe_convert import native_int_or as _native_int_or
 from pynecore.core.datetime import parse_datestring as _parse_datestring, parse_timezone as _parse_timezone, \
     TimezoneNotFoundError, civil_days as _civil_days, julian_civil_days as _julian_civil_days, \
     GREGORIAN_CUTOVER_DAY as _GREGORIAN_CUTOVER_DAY, GREGORIAN_CYCLE_DAYS as _GREGORIAN_CYCLE_DAYS
-from ..core.security import BarCalendar as _BarCalendar, actual_bar_close as _actual_bar_close
+from ..core.security import BarCalendar as _BarCalendar, actual_bar_close as _actual_bar_close, \
+    dwm_period_end as _dwm_period_end
 from ..core.resampler import (
     Resampler, ObservedDayCounter as _ObservedDayCounter,
     grid_mode as _grid_mode, overnight_opens as _overnight_opens,
     overnight_starts_by_weekday as _overnight_starts_by_weekday,
     close_table_by_weekday as _close_table_by_weekday,
     trading_day as _trading_day, trading_day_open_sec as _trading_day_open_sec,
+    scheduled_day_open_sec as _scheduled_day_open_sec,
     observed_week_key as _observed_week_key,
 )
 
@@ -1054,20 +1056,32 @@ def second(time: int | float | None = None, timezone: str | None = None) -> Pyne
 ### Session parsing and validation helpers ###
 
 _MINUTES_PER_DAY = 24 * 60
+# Session day numbers run 1 = Sunday ... 7 = Saturday
+_ALL_SESSION_DAYS = frozenset(range(1, 8))
+_WEEKDAY_SESSION_DAYS = frozenset(range(2, 7))
+_SESSION_DIGITS = frozenset('0123456789')
+_SESSION_DAY_DIGITS = frozenset('1234567')
 
 
 def _parse_session_string(session: str, timezone: str | None = None) -> tuple['SessionInfo', ...]:
     """
     Parse a session string into one SessionInfo per time range.
 
-    A session may list several comma-separated ranges ("0400-0700,0900-1300"); the
-    optional ``:days`` suffix applies to the whole specification, so every range
-    shares the same day set and timezone.
+    Grammar: ``range[,range...][:days]``, several such sections joined by ``|``. A
+    range is ``HHMM-HHMM``; days are digits 1 (Sunday) .. 7 (Saturday) naming the day
+    each run's last minute falls on. A lone range without days runs every day; in any
+    other form a section without days is the default section, which runs on the
+    weekdays (2..6) no other section names, and a section naming a day replaces the
+    earlier ones on that day. Surrounding whitespace is ignored.
+
+    A string that is empty, blank or does not start with a digit -- a session name
+    such as "regular" -- is the symbol's own session: its opening hours read in the
+    given timezone (see :func:`_symbol_session_infos`). "24x7" is the all-day session.
 
     :param session: Session string (e.g., "0930-1600", "0930-1600:23456",
-                    "0400-0700,0900-1300:23456", "0000-0000:1234567")
+                    "0400-0700,0900-1300:23456", "0930-1600|1000-1300:7")
     :param timezone: Timezone string, defaults to exchange timezone if None
-    :return: One SessionInfo per time range, in the order they were written
+    :return: One SessionInfo per time range and section, in the order they were written
     :raises ValueError: If session string is invalid
     """
     # The exchange fallback is resolved here rather than inside the cached parse so
@@ -1079,11 +1093,14 @@ def _parse_session_string(session: str, timezone: str | None = None) -> tuple['S
         # Handle NA values
         if hasattr(timezone, '__class__') and 'NA' in timezone.__class__.__name__:
             timezone = 'UTC'
-    return _parse_session_string_cached(session, timezone)
+    session_infos = _parse_session_string_cached(session, timezone)
+    if session_infos is None:
+        return _symbol_session_infos(timezone)
+    return session_infos
 
 
 @_lru_cache(maxsize=128)
-def _parse_session_string_cached(session: str, timezone: str) -> tuple['SessionInfo', ...]:
+def _parse_session_string_cached(session: str, timezone: str) -> 'tuple[SessionInfo, ...] | None':
     """
     Parse a fully resolved session specification, memoized on its arguments.
 
@@ -1092,88 +1109,201 @@ def _parse_session_string_cached(session: str, timezone: str) -> tuple['SessionI
     multi-context strategy. The result is a tuple of frozen ``SessionInfo`` and
     callers only read it, so one instance can be shared by every caller.
 
-    :param session: Session string; an empty one is the all-day session
+    :param session: Session string (grammar in :func:`_parse_session_string`)
     :param timezone: Timezone string, already resolved to a concrete zone
-    :return: One SessionInfo per time range, in the order they were written
+    :return: One SessionInfo per time range, in the order they were written, or
+             ``None`` when the string selects the symbol's own session
     :raises ValueError: If session string is invalid
     """
     from ..types.session import SessionInfo
 
-    # MEASURED (BINANCE:BTCUSDT@30, New York, requested "D", "W", "240" and the
-    # chart's own period, ``time`` and ``time_close``): an empty session string is
-    # "0000-0000" on every one of 30162 bars -- the all-day session of the given
-    # timezone, not a missing argument.
-    if not session or session.strip() == "":
-        session = "0000-0000"
+    spec = session.strip()
+    # MEASURED (TradingView, CAPITALCOM:AAPL and BTCUSD 10-minute charts, 2026-09-25):
+    # "", " ", "invalid", "regular", "abc-def", "invalid:23456", "abc:23456",
+    # "a0930-1600", ",1100-1400", "|1100-1400", "-1400", ":23456" and "x" all ran on the
+    # symbol's session, read in the timezone argument when one was given. A leading
+    # digit starts a specification, which halts the script when it is malformed ("0930",
+    # "0930-16", "1100-", "0930-1600:8", ...); the script is kept running with na here.
+    # "extended" is the symbol's extended-hours session, which the symbol data does not
+    # carry, so it resolves to the regular one.
+    if not spec or spec[0] not in _SESSION_DIGITS:
+        return None
+    if spec == '24x7':
+        # MEASURED (same charts): "24x7" is "0000-0000" on every bar, AAPL included
+        return (SessionInfo(start_time=dt_time(0), end_time=dt_time(0),
+                            days=_ALL_SESSION_DAYS, timezone=timezone),)
 
-    # Split session and days if present
-    if ':' in session:
-        time_part, days_part = session.split(':', 1)
-    else:
-        time_part = session
-        # Default days in Pine Script v5 is all days (1234567)
-        days_part = "1234567"
+    if ':' not in spec and ',' not in spec and '|' not in spec:
+        # MEASURED (CAPITALCOM:BTCUSD, "UTC"): a lone range such as "1100-1400", also
+        # with surrounding whitespace, runs on all seven days, while "1100-1400,",
+        # "1100-1400:", "1100-1400|" and "1100-1400,1500-1600" run Monday to Friday.
+        return tuple(
+            SessionInfo(start_time=start_time, end_time=end_time,
+                        days=_ALL_SESSION_DAYS, timezone=timezone)
+            for start_time, end_time in _parse_session_ranges(spec, session)
+        )
 
-    # Parse time part (one or more comma-separated HHMM-HHMM ranges)
-    ranges: list[tuple[dt_time, dt_time]] = []
-    for range_part in time_part.split(','):
-        if '-' not in range_part:
-            raise ValueError(f"Invalid session format: {session}. Expected HHMM-HHMM format")
+    sections = spec.split('|')
+    if not sections[-1]:
+        # A trailing separator ends the list ("1100-1400|" is "1100-1400")
+        sections.pop()
+    parsed: list[tuple[tuple[tuple[dt_time, dt_time], ...], frozenset[int] | None]] = []
+    has_default = False
+    for section in sections:
+        parts = section.split(':')
+        if len(parts) > 2:
+            raise ValueError(f"Invalid session section {section!r} in session: {session}")
+        ranges = _parse_session_ranges(parts[0], session)
+        if len(parts) == 1 or not parts[1]:
+            # MEASURED: "0930-1600|1700-1800" and "1100-1400:|1200-1300" halt with
+            # "duplicated default section"
+            if has_default:
+                raise ValueError(f"Duplicated default section in session: {session}")
+            has_default = True
+            parsed.append((ranges, None))
+        else:
+            parsed.append((ranges, _parse_session_days(parts[1], session)))
 
-        start_str, end_str = range_part.split('-', 1)
-
-        if len(start_str) != 4 or len(end_str) != 4:
-            raise ValueError(f"Invalid time format in session: {session}. Expected HHMM-HHMM")
-
-        try:
-            start_hour = int(start_str[:2])
-            start_minute = int(start_str[2:])
-            end_hour = int(end_str[:2])
-            end_minute = int(end_str[2:])
-
-            # Validate time values -- hour 24 is a legal "end of day" hour ("0000-2400"
-            # is the usual all-day session), hour 25 and above is rejected.
-            if not (0 <= start_hour <= 24 and 0 <= start_minute <= 59):
-                raise ValueError(f"Invalid start time: {start_str}")
-            if not (0 <= end_hour <= 24 and 0 <= end_minute <= 59):
-                raise ValueError(f"Invalid end time: {end_str}")
-
-            # The start is wrapped into the day, the end is not: measured on
-            # TradingView, "2430-1200" runs 00:30-12:00 while "0930-2430" runs to 00:30
-            # of the NEXT day. An end at or before the start is the next day's, and a
-            # range covering 24 hours or more is the whole day -- encoded as equal
-            # endpoints, which :func:`_is_bar_in_session` reads as the all-day session.
-            start_minutes = (start_hour * 60 + start_minute) % _MINUTES_PER_DAY
-            end_minutes = end_hour * 60 + end_minute
-            if end_minutes <= start_minutes:
-                end_minutes += _MINUTES_PER_DAY
-            if end_minutes - start_minutes >= _MINUTES_PER_DAY:
-                end_minutes = start_minutes
-            else:
-                end_minutes %= _MINUTES_PER_DAY
-
-            ranges.append((dt_time(*divmod(start_minutes, 60)),
-                           dt_time(*divmod(end_minutes, 60))))
-
-        except ValueError as e:
-            raise ValueError(f"Invalid time values in session: {session}") from e
-
-    # Parse days (1=Sunday, 2=Monday, ..., 7=Saturday)
-    try:
-        day_nums = set()
-        for day_char in days_part:
-            day_num = int(day_char)
-            if not 1 <= day_num <= 7:
-                raise ValueError(f"Invalid day: {day_num}")
-            day_nums.add(day_num)
-    except ValueError as e:
-        raise ValueError(f"Invalid days specification: {days_part}") from e
-    days = frozenset(day_nums)
+    # MEASURED (CAPITALCOM:BTCUSD, "UTC"): a later section naming a day replaces the
+    # earlier ones on that day ("1100-1400:2|1200-1300:2" ran 12:00-13:00 on Mondays
+    # only), and the default section takes the weekdays nobody named -- "1100-1400|
+    # 1200-1300:7" ran 11:00-14:00 Monday to Friday, 12:00-13:00 on Saturday and
+    # nothing on Sunday.
+    own_days: list[frozenset[int]] = [_WEEKDAY_SESSION_DAYS] * len(parsed)
+    claimed: frozenset[int] = frozenset()
+    for index in range(len(parsed) - 1, -1, -1):
+        days = parsed[index][1]
+        if days is not None:
+            own_days[index] = days - claimed
+            claimed |= days
+    for index, (_, days) in enumerate(parsed):
+        if days is None:
+            own_days[index] = _WEEKDAY_SESSION_DAYS - claimed
 
     return tuple(
-        SessionInfo(start_time=start_time, end_time=end_time, days=days, timezone=timezone)
+        SessionInfo(start_time=start_time, end_time=end_time, days=own_days[index],
+                    timezone=timezone)
+        for index, (ranges, _) in enumerate(parsed) if own_days[index]
         for start_time, end_time in ranges
     )
+
+
+def _parse_session_ranges(text: str, session: str) -> tuple[tuple[dt_time, dt_time], ...]:
+    """
+    Parse the comma-separated ranges of one session section.
+
+    :param text: The ranges part of the section; empty in an empty section
+    :param session: The whole session string, for error messages
+    :return: ``(start, end)`` time-of-day pairs; an end at or before the start is on
+             the next day, equal endpoints span the whole day
+    :raises ValueError: If a range is malformed or out of range
+    """
+    if not text:
+        return ()
+    entries = text.split(',')
+    if not entries[-1]:
+        # A trailing comma ends the list; an empty entry anywhere else is malformed
+        entries.pop()
+    ranges: list[tuple[dt_time, dt_time]] = []
+    for entry in entries:
+        # MEASURED: "0930-16", "930-1600", "09300-1600", "0930-1600a", "0930-abcd",
+        # "1100 -1400" and an empty entry all halt the script
+        if (len(entry) != 9 or entry[4] != '-'
+                or not _SESSION_DIGITS.issuperset(entry[:4] + entry[5:])):
+            raise ValueError(f"Invalid session range {entry!r} in session: {session}")
+        start_minutes = int(entry[:2]) * 60 + int(entry[2:4])
+        end_minutes = int(entry[5:7]) * 60 + int(entry[7:])
+        # MEASURED (CAPITALCOM:BTCUSD, "UTC", start and end hours up to 99, minutes up
+        # to 99): both endpoints are plain minute counts taken modulo one day --
+        # "0930-2500" ran 09:30 -> 01:00, "0930-3400" 09:30 -> 10:00 of the same day,
+        # "0960-1600" 10:00-16:00, "2500-1200" 01:00-12:00. Any end is accepted after a
+        # start before 24:00. A start at 24:00 or later is accepted only when, moved
+        # back one day, it opens a run of at most a day ending at the given end (00:00
+        # read as 24:00): "2500-2500", "2500-0101", "4759-4759" and "2400-0000" run,
+        # "2500-0100", "2500-2600", "2400-2500", "4700-2300" and "4800-4800" halt.
+        if start_minutes >= _MINUTES_PER_DAY:
+            end_of_run = end_minutes or _MINUTES_PER_DAY
+            if not (start_minutes - _MINUTES_PER_DAY < end_of_run <= start_minutes
+                    < 2 * _MINUTES_PER_DAY):
+                raise ValueError(f"Invalid session range {entry!r} in session: {session}")
+        start_minutes %= _MINUTES_PER_DAY
+        end_minutes %= _MINUTES_PER_DAY
+        ranges.append((dt_time(*divmod(start_minutes, 60)), dt_time(*divmod(end_minutes, 60))))
+    return tuple(ranges)
+
+
+def _parse_session_days(text: str, session: str) -> frozenset[int]:
+    """
+    Parse the days of one session section.
+
+    :param text: Day digits, 1 (Sunday) .. 7 (Saturday), in any order
+    :param session: The whole session string, for error messages
+    :return: The day numbers
+    :raises ValueError: If a character is not a day digit
+    """
+    # MEASURED: ":0", ":8", ":9", ":abc", ":23456a", ":23456," and ":2345 6" halt the
+    # script with "Invalid days specification"; a repeated digit is accepted
+    if not _SESSION_DAY_DIGITS.issuperset(text):
+        raise ValueError(f"Invalid days specification {text!r} in session: {session}")
+    return frozenset(int(day_char) for day_char in text)
+
+
+# The symbol's own session per timezone, rebuilt when ``syminfo._opening_hours`` is
+# replaced (identity guard, like the ``_ttd``/``_tdc`` machinery).
+_ssi_hours: list | None = None
+_ssi_by_tz: dict[str, 'tuple[SessionInfo, ...]'] = {}
+
+
+# The schedule is lib's own ``syminfo`` module state, installed by the script runner
+# noinspection PyProtectedMember
+def _symbol_session_infos(timezone: str) -> tuple['SessionInfo', ...]:
+    """
+    The symbol's own session: its opening hours as a session specification.
+
+    Each opening-hours interval is one run opening on its weekday, closing on the next
+    day when its end is at or before its start, named by the day its last minute falls
+    on. An end with seconds is the last instant inside the session, so a ``23:59:59``
+    end is midnight. The wall-clock times are read in ``timezone``, which may differ
+    from the exchange timezone. A symbol without opening hours is a continuous market.
+
+    :param timezone: Timezone to read the session in
+    :return: One SessionInfo per distinct range
+    """
+    global _ssi_hours
+    opening_hours = syminfo._opening_hours
+    if opening_hours is not _ssi_hours:
+        _ssi_by_tz.clear()
+        _ssi_hours = opening_hours
+    session_infos = _ssi_by_tz.get(timezone)
+    if session_infos is not None:
+        return session_infos
+
+    from ..types.session import SessionInfo
+
+    # MEASURED (TradingView, 10-minute charts, 2026-09-25): time(tf, "") and time(tf,
+    # "invalid") equal the plain time(tf) and time_close(tf) on every bar for "45", "60",
+    # "240" and timeframe_bars_back 3 on CAPITALCOM:AAPL (20058 bars), BTCUSD (20501) and
+    # GOLD (20429). "D" reports the symbol's runs -- AAPL 09:30-16:00, BTCUSD 17:00 ->
+    # 17:00, GOLD 18:00 -> 17:00 New York -- and with the "UTC" argument the same wall
+    # clocks read in UTC (AAPL 09:30-16:00 UTC).
+    days_by_range: dict[tuple[int, int], set[int]] = {}
+    for day, start, end in opening_hours or ():
+        start_minutes = start.hour * 60 + start.minute
+        end_minutes = (end.hour * 60 + end.minute
+                       + (1 if end.second or end.microsecond else 0)) % _MINUTES_PER_DAY
+        last_day = day if end_minutes == 0 or end_minutes > start_minutes else day + 1
+        days_by_range.setdefault((start_minutes, end_minutes), set()).add(
+            (last_day + 2) % 7 or 7)
+    if not days_by_range:
+        days_by_range[(0, 0)] = set(_ALL_SESSION_DAYS)
+    session_infos = tuple(
+        SessionInfo(start_time=dt_time(*divmod(start_minutes, 60)),
+                    end_time=dt_time(*divmod(end_minutes, 60)),
+                    days=frozenset(days), timezone=timezone)
+        for (start_minutes, end_minutes), days in sorted(days_by_range.items())
+    )
+    _ssi_by_tz[timezone] = session_infos
+    return session_infos
 
 
 def _is_bar_in_session(bar_time_ms: int, session_infos: 'tuple[SessionInfo, ...]') -> bool:
@@ -1415,6 +1545,88 @@ def _previous_session_occurrence(before_ms: int,
     return None
 
 
+@_lru_cache(maxsize=512)
+def _session_day_bounds(day: date,
+                        session_infos: 'tuple[SessionInfo, ...]') -> tuple[int, int] | None:
+    """
+    Bounds of the daily session bar of one trading day.
+
+    A trading day is every run whose last minute falls on its date -- the day the day
+    mask names -- and its daily bar spans from the first of them to the last, so the
+    gaps between the ranges of a multi-range session lie inside it.
+
+    :param day: Date of the trading day, in the session's timezone
+    :param session_infos: Session ranges of one session specification
+    :return: ``(open_ms, close_ms)``, or ``None`` when the session does not run that day
+    """
+    # MEASURED (TradingView, CAPITALCOM:BTCUSD 10-minute chart, "UTC", 2026-09-25):
+    # time("D", s) and time_close("D", s) of "1100-1400,1500-1600" ran 11:00 -> 16:00 on
+    # every bar of that span, 14:xx included, "2200-0200,1100-1400" Sunday 22:00 -> Monday
+    # 14:00 and "2500-1200,1300-1400" 01:00 -> 14:00, while their "60" buckets stayed na
+    # in the gaps.
+    tz = _parse_timezone(session_infos[0].timezone)
+    bounds: tuple[int, int] | None = None
+    for opening_day in (day - timedelta(days=1), day):
+        for start_ms, end_ms in _session_occurrences_opening_on(opening_day, session_infos):
+            if datetime.fromtimestamp((end_ms - 60_000) / 1000, tz).date() != day:
+                continue
+            if bounds is None:
+                bounds = (start_ms, end_ms)
+            else:
+                bounds = (min(bounds[0], start_ms), max(bounds[1], end_ms))
+    return bounds
+
+
+@_lru_cache(maxsize=256)
+def _session_day_occurrence(bar_time_ms: int,
+                            session_infos: 'tuple[SessionInfo, ...]') -> tuple[int, int] | None:
+    """
+    Bounds of the daily session bar a chart bar falls into.
+
+    The bar belongs to a trading day when its opening time lies in the day's
+    ``[open, close)`` (see :func:`_session_day_bounds`); the latest opening day wins
+    when two overlap.
+
+    :param bar_time_ms: Chart bar open in milliseconds
+    :param session_infos: Session ranges of one session specification
+    :return: ``(open_ms, close_ms)``, or ``None`` when the bar is outside every day
+    """
+    if not session_infos:
+        return None
+    tz = _parse_timezone(session_infos[0].timezone)
+    bar_day = datetime.fromtimestamp(bar_time_ms / 1000, tz).date()
+    best: tuple[int, int] | None = None
+    # A trading day closing tomorrow can open today (an overnight range)
+    for day in (bar_day, bar_day + timedelta(days=1)):
+        bounds = _session_day_bounds(day, session_infos)
+        if (bounds is not None and bounds[0] <= bar_time_ms < bounds[1]
+                and (best is None or bounds[0] > best[0])):
+            best = bounds
+    return best
+
+
+@_lru_cache(maxsize=256)
+def _previous_session_day(before_ms: int,
+                          session_infos: 'tuple[SessionInfo, ...]') -> tuple[int, int] | None:
+    """
+    The latest daily session bar opening strictly before an instant.
+
+    :param before_ms: Instant the day has to open before, in milliseconds
+    :param session_infos: Session ranges of one session specification
+    :return: ``(open_ms, close_ms)``, or ``None`` when no day in the previous two
+             months runs the session
+    """
+    if not session_infos:
+        return None
+    tz = _parse_timezone(session_infos[0].timezone)
+    day = datetime.fromtimestamp(before_ms / 1000, tz).date() + timedelta(days=1)
+    for day_offset in range(62):
+        bounds = _session_day_bounds(day - timedelta(days=day_offset), session_infos)
+        if bounds is not None and bounds[0] < before_ms:
+            return bounds
+    return None
+
+
 @_lru_cache(maxsize=64)
 def _session_period_anchor(period_date: date,
                            session_infos: 'tuple[SessionInfo, ...]') -> int | None:
@@ -1472,8 +1684,6 @@ def _period_start_date(period_date: date, modifier: str, steps: int) -> date:
     :param steps: Periods to move, negative walks back
     :return: First calendar date of the requested period
     """
-    from datetime import timedelta
-
     if modifier == 'W':
         return period_date + timedelta(days=7 * steps)
     month_index = period_date.month - 1 + steps
@@ -1508,14 +1718,18 @@ def _session_bar_bounds(chart_time_ms: int, session_infos: 'tuple[SessionInfo, .
       timeframe is: ``"D"``, ``"60"`` and the chart's own period each left
       exactly the same 10647 of 28391 bars defined.
     - A daily request reports the session's own bounds -- 08:00 open and 17:00
-      close for that day's occurrence -- not the calendar day's.
+      close for that day's occurrence -- not the calendar day's. A multi-range
+      session's trading day runs from its first range's open to its last range's
+      close (:func:`_session_day_bounds`).
     - An intraday request tiles the occurrence: buckets are counted from the
       session open, so an off-grid session shifts the whole series, and the
       final bucket is truncated at the session close.
-    - Weekly and monthly requests are never na: their session bars run from the
-      period's first session open to the NEXT period's first session open
-      (weekly close landed on the following Monday's open, not on Friday's
-      close), so consecutive bars tile the whole timeline.
+    - Weekly and monthly requests are never na: their session bars open at the
+      period's first session open. On an intraday chart they close at the NEXT
+      period's first session open (weekly close landed on the following Monday's
+      open, not on Friday's close), so consecutive bars tile the whole timeline;
+      on a daily, weekly or monthly chart they close at the end of the period's
+      last session run.
 
     Multi-period daily/weekly/monthly requests ("3D", "2W") keep the plain grid:
     their session anchoring is unmeasured.
@@ -1529,17 +1743,18 @@ def _session_bar_bounds(chart_time_ms: int, session_infos: 'tuple[SessionInfo, .
     :param steps: Session bars to walk back, the positive ``timeframe_bars_back``
     :return: ``(open_ms, close_ms)``, or ``None`` when the bar is out of session
     """
-    from datetime import datetime
-
     if modifier in ('W', 'M'):
         if multiplier == 1:
             exchange_tz = _parse_timezone(getattr(syminfo, 'timezone', None) or 'UTC')
-            # ``bar_start_ms`` has already walked ``steps`` periods back, so the
-            # period the CHART bar sits in is recovered before the walk below and
-            # the offset is re-applied to its result.
-            period_date = _period_start_date(
-                datetime.fromtimestamp(bar_start_ms / 1000, exchange_tz).date(),
-                modifier, steps)
+            # The walk starts from the calendar period of the CHART bar's date and the
+            # offset is applied to its result: the requested grid's bar opens at the
+            # session open of the period's first trading day, which can fall on the
+            # calendar day before the period. MEASURED (TradingView, CAPITALCOM:BTCUSD
+            # 10-minute chart, 2026-09-25): time("W", "") opens Sunday 17:00, with the
+            # run closing on the week's Monday.
+            chart_date = datetime.fromtimestamp(chart_time_ms / 1000, exchange_tz).date()
+            period_date = (chart_date - timedelta(days=chart_date.weekday()) if modifier == 'W'
+                           else chart_date.replace(day=1))
             # A session anchor can fall on either side of its calendar period's
             # first date -- an overnight session opens the evening BEFORE its
             # first session day -- so the period holding the chart bar is walked
@@ -1562,29 +1777,42 @@ def _session_bar_bounds(chart_time_ms: int, session_infos: 'tuple[SessionInfo, .
             close_ms = _session_period_anchor(_period_start_date(period_date, modifier, 1),
                                               session_infos)
             if open_ms is not None and close_ms is not None:
+                if _chart_modifier() not in ('', 'S'):
+                    # MEASURED (TradingView, 2026-09-25, CAPITALCOM:EURUSD on D, 2D, W and
+                    # M, GOLD, AAPL and BTCUSD on D): on a daily, weekly or monthly chart
+                    # time_close("W"/"M", session) is the end of the period's last run --
+                    # Friday 17:00 for "" on EURUSD, Sunday 23:59 for "0000-2359" -- while
+                    # the 10- and 60-minute charts report the next period's first session
+                    # open.
+                    last_run = _previous_session_occurrence(close_ms, session_infos)
+                    if last_run is not None and last_run[0] >= open_ms:
+                        close_ms = last_run[1]
                 return open_ms, close_ms
         return bar_start_ms, bar_close_ms
 
     if modifier not in ('', 'S', 'D') or (modifier == 'D' and multiplier != 1):
         return bar_start_ms, bar_close_ms
 
-    intraday = modifier != 'D'
-    occurrence = _session_occurrence(chart_time_ms, session_infos, intraday)
-    if occurrence is None and steps <= 0:
-        return None
-
     if modifier == 'D':
+        # A daily request reports whole trading days, gaps between ranges included
+        occurrence = _session_day_occurrence(chart_time_ms, session_infos)
         if occurrence is None:
+            if steps <= 0:
+                return None
             # MEASURED: out of session a daily request is NOT na once an offset
             # is given, it reports the occurrence the offset lands on counted
             # from the one the chart bar is heading into -- which is one step
             # further than the last one that ran.
-            occurrence = _previous_session_occurrence(chart_time_ms + 1, session_infos)
+            occurrence = _previous_session_day(chart_time_ms + 1, session_infos)
             steps -= 1
         while occurrence is not None and steps > 0:
-            occurrence = _previous_session_occurrence(occurrence[0], session_infos)
+            occurrence = _previous_session_day(occurrence[0], session_infos)
             steps -= 1
         return occurrence
+
+    occurrence = _session_occurrence(chart_time_ms, session_infos, True)
+    if occurrence is None and steps <= 0:
+        return None
 
     # An intraday request tiles the occurrence itself instead of filtering the
     # plain grid: the first bucket opens at the session open even when that is
@@ -1593,15 +1821,16 @@ def _session_bar_bounds(chart_time_ms: int, session_infos: 'tuple[SessionInfo, .
     # 10:30-11:30, ... and closed 15:30-16:00, while "0900-1130" closed its
     # 11:00 bucket at 11:30, not at 12:00.
     step_ms = (multiplier if modifier == 'S' else multiplier * 60) * 1000
-    in_session = occurrence is not None
     if occurrence is not None:
         index = (chart_time_ms - occurrence[0]) // step_ms - steps
     else:
-        # MEASURED (both "0930-1600" with seven buckets and "0900-1130" with
-        # three, requested "60", offsets 1..8): out of session the walk starts
-        # from the LAST bucket of the run that has already closed, and whichever
-        # run it lands in is reported by its OPENING bucket -- the within-run
-        # position of a bar that is not in the run does not carry over.
+        # MEASURED (TradingView, 2026-09-25, "UTC" sessions, requested "60"):
+        # out of session the value of the run's LAST bucket holds -- the walk
+        # starts from the last bucket of the run that has already closed and
+        # reports the bucket it lands on. CAPITALCOM:BTCUSD@30 "0900-1130" gave
+        # 10:00 for offset 1 and the previous day's 11:00 for offset 3 on every
+        # bar from 11:30 to the next 09:00; "0930-1600" offset 2 gave 13:30 from
+        # 16:00 on, on BTCUSD@30 and on every out-of-session bar of AAPL@10.
         occurrence = _previous_session_occurrence(chart_time_ms + 1, session_infos, True)
         if occurrence is None:
             return None
@@ -1613,38 +1842,34 @@ def _session_bar_bounds(chart_time_ms: int, session_infos: 'tuple[SessionInfo, .
             break
         occurrence = previous
         index += _session_bucket_count(occurrence, step_ms)
-    if not in_session:
-        index = 0
     start_ms = occurrence[0] + index * step_ms
     return start_ms, min(start_ms + step_ms, occurrence[1])
 
 
-def _intraday_session_args(timeframe: str) -> tuple:
+def _session_grid_args() -> tuple:
     """
-    Build the ``(tz, session_starts)`` arguments for :meth:`Resampler.get_bar_time`
-    that anchor an intraday ``timeframe`` to the exchange session open, the way
-    TradingView aligns intraday HTF bars. Anchoring is a no-op for on-hour / 24-7
-    markets, so it is always safe to pass for intraday.
+    Build the session arguments of :meth:`Resampler.get_bar_time` for an intraday or a
+    single-period weekly/monthly timeframe.
 
-    Daily/weekly/monthly timeframes get ``(tz,)`` instead: their calendar floor
-    must run in the exchange timezone (TradingView day/week/month boundaries are
-    exchange-local), not in the machine's local time.
+    An intraday grid is anchored to the exchange session open, the way TradingView
+    aligns intraday HTF bars; anchoring is a no-op for on-hour / 24-7 markets. A weekly
+    or monthly bar is the trading week (month) and opens at the session open of its
+    first trading day -- for an overnight market the previous evening (an FX week opens
+    Sunday 17:00 New York), not at local midnight.
 
-    :param timeframe: The requested timeframe string (already validated).
-    :return: ``(tz, session_starts)`` for intraday with a session, ``(tz,)`` for
-             daily/weekly/monthly, else ``()``.
+    Without a session template the calendar floor still runs in the exchange timezone
+    (TradingView week/month boundaries are exchange-local), not in the machine's local
+    time.
+
+    :return: ``(tz, session_starts, opening_hours)`` with a session template,
+             ``(tz,)`` without one, ``()`` when the timezone is unknown too.
     """
     tz_name = getattr(syminfo, 'timezone', None)
     tz = _parse_timezone(tz_name) if tz_name else None
-    # noinspection PyProtectedMember
-    modifier, _ = timeframe_module._process_tf(timeframe)
-    if modifier not in ('S', ''):
-        return (tz,) if tz is not None else ()
-    # noinspection PyProtectedMember
     session_starts = getattr(syminfo, '_session_starts', None)
     if not session_starts:
         return (tz,) if tz is not None else ()
-    return tz, session_starts
+    return tz, session_starts, getattr(syminfo, '_opening_hours', None) or None
 
 
 # Multi-period (nD/nW/nM) scheduled-grid tracker. TradingView counts scheduled
@@ -1795,6 +2020,7 @@ def _dwm_change_key(timeframe: str, modifier: str, multiplier: int) -> int:
         Resampler.get_resampler(timeframe), modifier, multiplier, _time)
 
 
+# noinspection PyProtectedMember
 def _chart_span_off_ms() -> int:
     """
     Offset from a chart bar's open to its last instant, in milliseconds.
@@ -1808,15 +2034,26 @@ def _chart_span_off_ms() -> int:
     :return: ``chart bar span - 1`` for intraday chart periods, else 0
     """
     try:
-        # noinspection PyProtectedMember
         run_tf = timeframe_module._current_period()
         chart_mod, _ = timeframe_module._process_tf(run_tf)
         if chart_mod in ('', 'S'):
-            # noinspection PyProtectedMember
             return timeframe_module._in_seconds(run_tf) * 1000 - 1
     except (ValueError, AssertionError):
         pass
     return 0
+
+
+# noinspection PyProtectedMember
+def _chart_modifier() -> str | None:
+    """
+    Timeframe modifier of the bars the script runs on.
+
+    :return: '', 'S', 'D', 'W' or 'M'; ``None`` when the period cannot be parsed
+    """
+    try:
+        return timeframe_module._process_tf(timeframe_module._current_period())[0]
+    except (ValueError, AssertionError):
+        return None
 
 
 def _dg_trading_day():
@@ -1918,6 +2155,9 @@ _dbt_guard: tuple | None = None  # (opening_hours, session_starts) identities
 _dbt_tz = None
 _dbt_on: dict = {}
 _dbt_starts: list | None = None
+# (bar open, span offset) -> the previous scheduled trading day's open, which a
+# ``timeframe_bars_back`` walk asks for on every chart bar of the same period
+_ptd_cache: dict[tuple[int, int], int] = {}
 
 
 # noinspection PyProtectedMember
@@ -1933,27 +2173,74 @@ def _d_bar_time(current_time_ms: int) -> int:
     :param current_time_ms: Chart bar open to resolve, in milliseconds
     :return: Bar opening time in milliseconds
     """
-    global _dbt_guard, _dbt_tz, _dbt_on, _dbt_starts
     oh = syminfo._opening_hours
     ss = syminfo._session_starts
     if _dbt_guard is None or _dbt_guard[0] is not oh or _dbt_guard[1] is not ss:
-        tz_name = getattr(syminfo, 'timezone', None)
-        _dbt_tz = _parse_timezone(tz_name) if tz_name else None
-        _dbt_on = _overnight_opens(oh or None, ss or None)
-        _dbt_starts = ss or None
-        _dbt_guard = (oh, ss)
+        _dbt_rebuild(oh, ss)
     eff_sec = (current_time_ms + _chart_span_off_ms()) // 1000
     td = _trading_day(eff_sec, _dbt_tz, _dbt_on)
     return _trading_day_open_sec(td, _dbt_tz, _dbt_starts, _dbt_on) * 1000
 
 
-def _requested_bar_time(resampler: Resampler, timeframe: str, modifier: str, multiplier: int,
+def _dbt_rebuild(opening_hours: list | None, session_starts: list | None) -> None:
+    """
+    Rebuild the daily-open cache from the session template.
+
+    :param opening_hours: ``syminfo._opening_hours``
+    :param session_starts: ``syminfo._session_starts``
+    """
+    global _dbt_guard, _dbt_tz, _dbt_on, _dbt_starts
+    tz_name = getattr(syminfo, 'timezone', None)
+    _dbt_tz = _parse_timezone(tz_name) if tz_name else None
+    _dbt_on = _overnight_opens(opening_hours or None, session_starts or None)
+    _dbt_starts = session_starts or None
+    _dbt_guard = (opening_hours, session_starts)
+    _ptd_cache.clear()
+
+
+# noinspection PyProtectedMember
+def _previous_trading_day_open_ms(open_ms: int, span_off_ms: int) -> int:
+    """
+    Session open of the scheduled trading day before the one a bar belongs to.
+
+    Days the session template schedules no open for (the weekend of a Monday to Friday
+    market) are skipped; holidays are not, the template does not know them. Without a
+    template the instant before ``open_ms`` is returned.
+
+    :param open_ms: Open of the bar, in milliseconds
+    :param span_off_ms: Offset from the bar's open to its last instant, which decides its
+                        trading day (:func:`_chart_span_off_ms`)
+    :return: The previous scheduled trading day's session open, in milliseconds
+    """
+    oh = syminfo._opening_hours
+    ss = syminfo._session_starts
+    if _dbt_guard is None or _dbt_guard[0] is not oh or _dbt_guard[1] is not ss:
+        _dbt_rebuild(oh, ss)
+    key = (open_ms, span_off_ms)
+    previous_open_ms = _ptd_cache.get(key)
+    if previous_open_ms is not None:
+        return previous_open_ms
+    previous_open_ms = open_ms - 1
+    if _dbt_starts:
+        day = _trading_day((open_ms + span_off_ms) // 1000, _dbt_tz, _dbt_on)
+        for _ in range(7):
+            day -= timedelta(days=1)
+            open_sec = _scheduled_day_open_sec(day, _dbt_tz, _dbt_starts, _dbt_on)
+            if open_sec is not None:
+                previous_open_ms = open_sec * 1000
+                break
+    if len(_ptd_cache) >= 1024:
+        _ptd_cache.clear()
+    _ptd_cache[key] = previous_open_ms
+    return previous_open_ms
+
+
+def _requested_bar_time(resampler: Resampler, modifier: str, multiplier: int,
                         current_time_ms: int, steps: int) -> int:
     """
     Bar open time on a requested timeframe's grid, stepped back by whole grid bars.
 
     :param resampler: Resampler of the requested timeframe
-    :param timeframe: The requested timeframe
     :param modifier: Timeframe modifier ('', 'S', 'D', 'W' or 'M')
     :param multiplier: Timeframe multiplier
     :param current_time_ms: Chart bar open to resolve, in milliseconds
@@ -1962,7 +2249,7 @@ def _requested_bar_time(resampler: Resampler, timeframe: str, modifier: str, mul
     """
     dwm = multiplier > 1 and modifier in ('D', 'W', 'M')
     daily = multiplier == 1 and modifier == 'D'
-    if (dwm or daily) and steps <= 0:
+    if steps <= 0 and modifier in ('D', 'W', 'M'):
         # noinspection PyProtectedMember
         if (modifier, multiplier) == timeframe_module._process_tf(
                 timeframe_module._current_period()):
@@ -1976,18 +2263,39 @@ def _requested_bar_time(resampler: Resampler, timeframe: str, modifier: str, mul
             # (the previous evening for overnight markets), not at midnight
             bar_time = _d_bar_time(current_time_ms)
         else:
-            bar_time = resampler.get_bar_time(current_time_ms, *_intraday_session_args(timeframe))
+            # Intraday bars on the session-anchored grid; weekly and monthly bars at their
+            # first trading day's session open. MEASURED (TradingView, 2026-09-25,
+            # CAPITALCOM:EURUSD on 60/240/D/W/M, BTCUSD@60, GOLD@60/D, AAPL@60/D/W): a
+            # week opens at its Monday trading day's open (EURUSD Sunday 17:00, AAPL Monday
+            # 09:30 even on a holiday Monday), a month at its first scheduled day's open
+            # (EURUSD January 2016: Thursday 2015-12-31 17:00, BTCUSD February 2026:
+            # Saturday 01-31 17:00).
+            bar_time = resampler.get_bar_time(current_time_ms, *_session_grid_args())
         if steps <= 0:
             return bar_time
         steps -= 1
-        # The walk lands one instant before a resolved bar open rather than subtracting a
+        # The walk resolves a probe inside the previous bar rather than subtracting a
         # nominal bar length, because a month is not a fixed span: taking _in_seconds('M')
         # (30.4375 days) off a bar early in the month reaches the month BEFORE the intended
-        # one. ``_dwm_bar_time`` and ``_d_bar_time`` resolve a chart bar by its own last
-        # instant, so the probe carries the same span back.
-        current_time_ms = bar_time - 1 - (_chart_span_off_ms() if dwm or daily else 0)
+        # one. An intraday bar is left one instant before its open. A D, W or M bar is left
+        # through the scheduled trading day before its first one, because the instant
+        # before its open can lie in a gap that resolves forward again: AAPL's 09:29 is
+        # still the Monday that opens at 09:30, GOLD's 17:59 after the 17:00 close is
+        # already the next trading day, and the FX Sunday before the 17:00 open has no
+        # trading day at all. MEASURED (TradingView, 2026-09-25, CAPITALCOM:AAPL, EURUSD,
+        # GOLD and BTCUSD on 60 and D charts): time("D", timeframe_bars_back=1) is the
+        # previous trading day of the session template, a template day without data (a
+        # holiday) included -- AAPL's Tuesday 2017-05-30 steps to Memorial Day 09:30.
+        if modifier in ('', 'S'):
+            current_time_ms = bar_time - 1
+        else:
+            # ``_dwm_bar_time`` and ``_d_bar_time`` resolve a chart bar by its own last
+            # instant, so the probe carries the same span back
+            span_off_ms = _chart_span_off_ms() if dwm or daily else 0
+            current_time_ms = _previous_trading_day_open_ms(bar_time, span_off_ms) - span_off_ms
 
 
+# noinspection PyProtectedMember
 @module_function_property
 def time(timeframe: str | None = None, session: str | int | None = None,
          timezone: str | None = None, bars_back: int = 0,
@@ -2004,10 +2312,15 @@ def time(timeframe: str | None = None, session: str | int | None = None,
     - time("60", -1) - Expected start time of the next 1-hour bar
 
     :param timeframe: The timeframe to get the time for (e.g., "D", "60", "240").
-                     An empty string selects the chart's timeframe.
-                     If None, returns current bar time.
+                     An empty string or ``na`` selects the chart's timeframe; an intraday
+                     timeframe on a daily, weekly or monthly chart resolves as "D".
+                     Weekly and monthly bars open at the session open of their first
+                     trading day. If None, returns current bar time.
     :param session: Session specification string (e.g., "0930-1600", "0000-0000:23456").
-                   Format: "HHMM-HHMM" or "HHMM-HHMM:days" where days are 1234567 (1=Sun, 7=Sat).
+                   Format: "HHMM-HHMM" or "HHMM-HHMM:days" where days are 1234567 (1=Sun, 7=Sat);
+                   hours past 24 run into the next day ("0930-2500" ends at 01:00). An
+                   empty string or one not starting with a digit (e.g. "regular") selects
+                   the symbol's own session; a malformed specification gives na.
                    An int value here is treated as ``bars_back`` (Pine's
                    ``time(timeframe, bars_back)`` overload).
     :param timezone: Timezone for the session (e.g., "GMT+2", "America/New_York").
@@ -2018,7 +2331,9 @@ def time(timeframe: str | None = None, session: str | int | None = None,
     :param timeframe_bars_back: Bar offset on the requested ``timeframe`` instead of the
                      chart's, applied on top of ``bars_back``. Positive values walk the
                      requested grid one bar at a time, so an uneven grid such as a monthly
-                     one steps exactly; negative values refer to bars that do not exist yet
+                     one steps exactly, an intraday one skips the time between the
+                     symbol's sessions and a daily one the days its session template does
+                     not schedule; negative values refer to bars that do not exist yet
                      and use the nominal bar length.
     :return: UNIX time in milliseconds or NA if bar is outside session or invalid parameters
     """
@@ -2031,8 +2346,9 @@ def time(timeframe: str | None = None, session: str | int | None = None,
     if timeframe is None:
         return pine_int(_time)
 
-    # An empty string selects the timeframe the script runs on
-    if timeframe == '':
+    # An empty or na timeframe selects the timeframe the script runs on. MEASURED
+    # (TradingView, CAPITALCOM:EURUSD@60, 2026-09-25): time(na) == time("") on every bar.
+    if not timeframe:
         timeframe = timeframe_module._current_period()
 
     # Get resampler for the requested timeframe
@@ -2042,23 +2358,35 @@ def time(timeframe: str | None = None, session: str | int | None = None,
         # Invalid timeframe
         return na_int
 
+    modifier, multiplier = timeframe_module._process_tf(timeframe)
+    if modifier in ('', 'S') and _chart_modifier() in ('D', 'W', 'M'):
+        # A daily, weekly or monthly chart resolves an intraday request as "D". MEASURED
+        # (TradingView, CAPITALCOM:EURUSD on D/W/M, 2026-09-25): time() and time_close()
+        # of "1", "30", "60" and "240", and of "60" with a session, equal those of "D" on
+        # every bar -- on a W or M chart the trading day the chart bar opens with.
+        timeframe, modifier, multiplier = 'D', 'D', 1
+        resampler = Resampler.get_resampler(timeframe)
+
     # Get the current bar time for the requested timeframe
     current_time_ms = _time
-    # noinspection PyProtectedMember
-    modifier, multiplier = timeframe_module._process_tf(timeframe)
     if bars_back or timeframe_bars_back < 0:
         try:
             if bars_back:
-                # noinspection PyProtectedMember
                 current_time_ms -= bars_back * timeframe_module._in_seconds(
                     timeframe_module._current_period()) * 1000
             if timeframe_bars_back < 0:
                 # A future bar has no grid to walk yet, so its nominal length is used
-                # noinspection PyProtectedMember
                 current_time_ms -= timeframe_bars_back * timeframe_module._in_seconds(timeframe) * 1000
         except (ValueError, AssertionError):
             return na_int
-    bar_time = _requested_bar_time(resampler, timeframe, modifier, multiplier,
+    if session is None and timeframe_bars_back > 0 and modifier in ('', 'S'):
+        # An offset walks the intraday grid over the symbol's session runs, skipping the
+        # time between them. MEASURED (TradingView, 2026-09-25): time("60",
+        # timeframe_bars_back=3) equals time("60", "", timeframe_bars_back=3) on every bar
+        # of CAPITALCOM:AAPL, BTCUSD and GOLD at 10 minutes, and on EURUSD@60 the offset 1
+        # steps from the Sunday 17:00 bar back to Friday 16:00.
+        session = ''
+    bar_time = _requested_bar_time(resampler, modifier, multiplier,
                                    current_time_ms, timeframe_bars_back)
 
     if session is None:
@@ -2262,32 +2590,50 @@ def _tdc_cap_ms(bar_open_ms: int, bar_close_ms: int) -> int:
     dt_local = _datetime if bar_open_ms == _time \
         else datetime.fromtimestamp(bar_open_ms / 1000, tz=_tdc_tz)
     trade_date = dt_local.date()
+    day_end_ms = _tdc_day_end_ms(trade_date)
 
-    # Overnight roll: a bar whose window reaches into a session opening this
-    # calendar day and crossing midnight belongs to the next trading day
-    # (same rule as ``time_tradingday``).
-    opens = _tdc_overnight_by_wd.get(dt_local.weekday())
-    if opens:
-        for o in opens:
-            session_open = dt_local.replace(
-                hour=o.hour, minute=o.minute, second=o.second, microsecond=0)
-            if bar_close_ms > session_open.timestamp() * 1000:
-                trade_date += timedelta(days=1)
-                break
+    if day_end_ms is None or day_end_ms <= bar_open_ms:
+        # Overnight roll: once the calendar date's own trading day is over (or the
+        # date has none), a bar whose window reaches into a session opening this
+        # calendar day and crossing midnight belongs to the next trading day (same
+        # rule as ``time_tradingday``). A bar opening while the day still runs stays
+        # in it and is cut at its end, even when the uncapped close reaches past the
+        # overnight open. MEASURED (TradingView, CAPITALCOM:BTCUSD@60, 2026-09-25): on
+        # the 2026-03-08 DST change the "240" bar opening 14:00 closes at the 17:00
+        # roll, not at 18:00.
+        opens = _tdc_overnight_by_wd.get(dt_local.weekday())
+        if opens:
+            for o in opens:
+                session_open = dt_local.replace(
+                    hour=o.hour, minute=o.minute, second=o.second, microsecond=0)
+                if bar_close_ms > session_open.timestamp() * 1000:
+                    day_end_ms = _tdc_day_end_ms(trade_date + timedelta(days=1))
+                    break
 
+    if day_end_ms is None or day_end_ms <= bar_open_ms:
+        # No session ends the bar's trading day, or a degenerate template — never
+        # close before the open
+        return bar_close_ms
+    return min(bar_close_ms, day_end_ms)
+
+
+def _tdc_day_end_ms(trade_date: date) -> int | None:
+    """
+    Scheduled end of trading day ``trade_date`` from the close table.
+
+    :param trade_date: The trading day's date
+    :return: The day's end (UNIX ms), ``None`` when no session ends that day
+    """
     entry = _tdc_by_wd.get(trade_date.weekday())
     if entry is None:
-        return bar_close_ms
+        return None
     end_tod, offset = entry
     end_date = trade_date + timedelta(days=offset)
-    day_end_ms = int(datetime(
+    return int(datetime(
         end_date.year, end_date.month, end_date.day,
         end_tod.hour, end_tod.minute, end_tod.second,
         tzinfo=_tdc_tz,
     ).timestamp() * 1000)
-    if day_end_ms <= bar_open_ms:  # degenerate template — never close before the open
-        return bar_close_ms
-    return min(bar_close_ms, day_end_ms)
 
 
 # Scheduled calendar of the chart symbol, used for D/W/M bar closes. Rebuilt
@@ -2296,11 +2642,11 @@ def _tdc_cap_ms(bar_open_ms: int, bar_close_ms: int) -> int:
 # because ``time_close`` is called on every bar with the same arguments.
 _dwc_guard: tuple | None = None
 _dwc_cal: '_BarCalendar | None' = None
-_dwc_cache: dict[tuple[int, str], int] = {}
+_dwc_cache: dict[tuple[int, str, bool], int] = {}
 
 
 # noinspection PyProtectedMember
-def _dwm_close_ms(bar_open_ms: int, timeframe: str) -> int:
+def _dwm_close_ms(bar_open_ms: int, timeframe: str, to_next_open: bool = False) -> int:
     """
     Scheduled close of the D/W/M bar opening at ``bar_open_ms``.
 
@@ -2311,8 +2657,14 @@ def _dwm_close_ms(bar_open_ms: int, timeframe: str) -> int:
     a monthly bar's ``time_close - time`` varies per month and a weekly one is a
     constant 4d23h, both landing on the last trading day's session end.
 
+    With ``to_next_open`` the bar closes when the next period of its grid opens
+    instead: that is where a period longer than one trading day ends when it is
+    requested from an intraday chart.
+
     :param bar_open_ms: Bar opening time (UNIX ms)
     :param timeframe: The bar's timeframe string ('D', 'W' or 'M' modifier)
+    :param to_next_open: Close at the next period's open instead of at the last
+                         scheduled session end inside the period
     :return: The bar's close instant (UNIX ms)
     """
     global _dwc_guard, _dwc_cal
@@ -2334,18 +2686,29 @@ def _dwm_close_ms(bar_open_ms: int, timeframe: str) -> int:
         _dwc_guard = (oh, ss, corr, tz_name)
         _dwc_cache.clear()
 
-    key = (bar_open_ms, timeframe)
+    key = (bar_open_ms, timeframe, to_next_open)
     cached = _dwc_cache.get(key)
     if cached is not None:
         return cached
     if len(_dwc_cache) >= 1024:
         _dwc_cache.clear()
     assert _dwc_cal is not None
-    close_ms = _actual_bar_close(bar_open_ms, 0, _dwc_cal, timeframe)
+    if to_next_open:
+        # MEASURED (TradingView, 2026-09-25, 60 charts of CAPITALCOM:EURUSD, BTCUSD,
+        # GOLD and AAPL): time_close() of "2D", "3D", "W", "2W", "M", "3M" and "12M" is
+        # the next period's time() on every bar -- the EURUSD week of Sunday 2025-11-16
+        # 17:00 closes Sunday 11-23 17:00, a GOLD week Sunday 18:00, an AAPL week
+        # Monday 09:30 even when that Monday is a holiday -- while "D" closes at its
+        # own session end (Friday 17:00 / 16:00). On EURUSD D, 2D, W and M charts
+        # every period closes at its last session end instead.
+        close_ms = _dwm_period_end(bar_open_ms, _dwc_cal, timeframe)
+    else:
+        close_ms = _actual_bar_close(bar_open_ms, 0, _dwc_cal, timeframe)
     _dwc_cache[key] = close_ms
     return close_ms
 
 
+# noinspection PyProtectedMember
 @module_function_property
 def time_close(timeframe: str | None = None, session: str | int | None = None,
                timezone: str | None = None, bars_back: int = 0,
@@ -2362,10 +2725,17 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
     - time_close("60", -1) - Expected close time of the next 1-hour bar
 
     :param timeframe: The timeframe to get the close time for (e.g., "D", "60", "240").
-                     An empty string selects the chart's timeframe.
-                     If None, returns current bar close time.
+                     An empty string or ``na`` selects the chart's timeframe; an intraday
+                     timeframe on a daily, weekly or monthly chart resolves as "D".
+                     A daily bar closes at the end of its trading day; a longer period
+                     (nD, W, M) closes at the end of its last trading day on a daily,
+                     weekly or monthly chart, and when the next period opens on an
+                     intraday chart. If None, returns current bar close time.
     :param session: Session specification string (e.g., "0930-1600", "0000-0000:23456").
-                   Format: "HHMM-HHMM" or "HHMM-HHMM:days" where days are 1234567 (1=Sun, 7=Sat).
+                   Format: "HHMM-HHMM" or "HHMM-HHMM:days" where days are 1234567 (1=Sun, 7=Sat);
+                   hours past 24 run into the next day ("0930-2500" ends at 01:00). An
+                   empty string or one not starting with a digit (e.g. "regular") selects
+                   the symbol's own session; a malformed specification gives na.
                    An int value here is treated as ``bars_back`` (Pine's
                    ``time_close(timeframe, bars_back)`` overload).
     :param timezone: Timezone for the session (e.g., "GMT+2", "America/New_York").
@@ -2376,7 +2746,9 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
     :param timeframe_bars_back: Bar offset on the requested ``timeframe`` instead of the
                      chart's, applied on top of ``bars_back``. Positive values walk the
                      requested grid one bar at a time, so an uneven grid such as a monthly
-                     one steps exactly; negative values refer to bars that do not exist yet
+                     one steps exactly, an intraday one skips the time between the
+                     symbol's sessions and a daily one the days its session template does
+                     not schedule; negative values refer to bars that do not exist yet
                      and use the nominal bar length.
     :return: UNIX time in milliseconds of bar close or NA if bar is outside session or invalid parameters
     """
@@ -2390,22 +2762,21 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
         # Close time of the current chart bar — capped at the trading-day end,
         # because the last bar of a session may be shortened
         try:
-            # noinspection PyProtectedMember
             run_tf = timeframe_module._current_period()
-            # noinspection PyProtectedMember
             chart_mod, _chart_mult = timeframe_module._process_tf(run_tf)
             if chart_mod in ('D', 'W', 'M'):
                 close_ms = _dwm_close_ms(_time, run_tf)
             else:
-                # noinspection PyProtectedMember
                 close_ms = _time + timeframe_module._in_seconds(run_tf) * 1000
                 close_ms = _tdc_cap_ms(_time, close_ms)
         except (ValueError, AssertionError):
             return na_int
         return pine_int(close_ms)
 
-    # An empty string selects the timeframe the script runs on
-    if timeframe == '':
+    # An empty or na timeframe selects the timeframe the script runs on. MEASURED
+    # (TradingView, CAPITALCOM:EURUSD@60, 2026-09-25): time_close(na) == time_close("") on
+    # every bar.
+    if not timeframe:
         timeframe = timeframe_module._current_period()
 
     # Get resampler for the requested timeframe
@@ -2415,32 +2786,41 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
         # Invalid timeframe
         return na_int
 
+    modifier, multiplier = timeframe_module._process_tf(timeframe)
+    chart_modifier = _chart_modifier()
+    if modifier in ('', 'S') and chart_modifier in ('D', 'W', 'M'):
+        # A daily, weekly or monthly chart resolves an intraday request as "D" (see time())
+        timeframe, modifier, multiplier = 'D', 'D', 1
+        resampler = Resampler.get_resampler(timeframe)
+
     # Get the current bar time for the requested timeframe
     current_time_ms = _time
-    # noinspection PyProtectedMember
-    modifier, multiplier = timeframe_module._process_tf(timeframe)
     if bars_back or timeframe_bars_back < 0:
         try:
             if bars_back:
-                # noinspection PyProtectedMember
                 current_time_ms -= bars_back * timeframe_module._in_seconds(
                     timeframe_module._current_period()) * 1000
             if timeframe_bars_back < 0:
                 # A future bar has no grid to walk yet, so its nominal length is used
-                # noinspection PyProtectedMember
                 current_time_ms -= timeframe_bars_back * timeframe_module._in_seconds(timeframe) * 1000
         except (ValueError, AssertionError):
             return na_int
-    bar_start_time = _requested_bar_time(resampler, timeframe, modifier, multiplier,
+    if session is None and timeframe_bars_back > 0 and modifier in ('', 'S'):
+        # An offset walks the symbol's session runs (see time())
+        session = ''
+    bar_start_time = _requested_bar_time(resampler, modifier, multiplier,
                                          current_time_ms, timeframe_bars_back)
 
     # Calculate the bar close time: D/W/M periods close at the end of their last
-    # scheduled trading day, intraday bars at the (possibly shortened) day end.
+    # scheduled trading day -- except on an intraday chart, where a period longer than
+    # one trading day closes when the next period opens -- and intraday bars at the
+    # (possibly shortened) day end.
     try:
         if modifier in ('D', 'W', 'M'):
-            bar_close_time = _dwm_close_ms(bar_start_time, timeframe)
+            bar_close_time = _dwm_close_ms(
+                bar_start_time, timeframe,
+                chart_modifier in ('', 'S') and (modifier != 'D' or multiplier > 1))
         else:
-            # noinspection PyProtectedMember
             tf_seconds = timeframe_module._in_seconds(timeframe)
             bar_close_time = _tdc_cap_ms(bar_start_time,
                                          bar_start_time + (tf_seconds * 1000))

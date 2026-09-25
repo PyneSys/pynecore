@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from .pine_type_rules import OBJECT, stamp_lowering
 
 __all__ = ['ModuleLayout', 'ScopeLayout', 'apply_layout', 'scope_for_function',
-           'collect_scope_segments']
+           'collect_scope_segments', 'DEFAULT_STATE_PARAM']
 
 DEFAULT_STATE_PARAM = '__state__'
 

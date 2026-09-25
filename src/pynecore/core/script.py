@@ -705,7 +705,8 @@ class _Input:
             return safe_convert.safe_int(_old_input_values[_id])
         return pine_int(defval) if defval == defval else na_int
 
-    # noinspection PyUnusedLocal
+    # ``active`` is UI-only in Pine: accepted for signature parity, never read
+    # noinspection PyUnusedParameter
     @classmethod
     def _bool(cls, defval: bool, title: str | None = None,
               tooltip: str | None = None, inline: str | None = None, group: str | None = None,
@@ -793,7 +794,8 @@ class _Input:
         )
         return defval if _id not in _old_input_values else safe_convert.safe_float(_old_input_values[_id])
 
-    # noinspection PyUnusedLocal
+    # ``active`` is UI-only in Pine: accepted for signature parity, never read
+    # noinspection PyUnusedParameter
     @classmethod
     def string(cls, defval: str, title: str | None = None,
                options: tuple[str, ...] | None = None,
@@ -831,7 +833,8 @@ class _Input:
         )
         return defval if _id not in _old_input_values else str(_old_input_values[_id])
 
-    # noinspection PyUnusedLocal
+    # ``active`` is UI-only in Pine: accepted for signature parity, never read
+    # noinspection PyUnusedParameter
     @classmethod
     def color(cls, defval: Color, title: str | None = None,
               tooltip: str | None = None, inline: str | None = None, group: str | None = None,
@@ -866,7 +869,8 @@ class _Input:
         )
         return defval if _id not in _old_input_values else Color(_old_input_values[_id])
 
-    # noinspection PyUnusedLocal
+    # ``active`` is UI-only in Pine: accepted for signature parity, never read
+    # noinspection PyUnusedParameter
     @classmethod
     def source(cls, defval: str | Source | float, title: str | None = None,
                tooltip: str | None = None, inline: str | None = None, group: str | None = None,
@@ -907,7 +911,8 @@ class _Input:
         # We actually return a string here, but the InputTransformer will add a `getattr()` call to get the
         return defval if _id not in _old_input_values else _old_input_values[_id]  # type: ignore[return-value]
 
-    # noinspection PyUnusedLocal
+    # ``active`` is UI-only in Pine: accepted for signature parity, never read
+    # noinspection PyUnusedParameter
     @classmethod
     def enum(cls, defval: TEnum, title: str | None = None,
              options: tuple[str, ...] | None = None,
@@ -957,7 +962,8 @@ class _Input:
 
     # We don't have interactive inputs, so price is stored as a float input; its
     # Pine positional order has no minval/maxval/step, so it cannot alias _float
-    # noinspection PyUnusedLocal
+    # ``active`` is UI-only in Pine: accepted for signature parity, never read
+    # noinspection PyUnusedParameter
     @classmethod
     def price(cls, defval: float, title: str | None = None,
               tooltip: str | None = None, inline: str | None = None, group: str | None = None,
@@ -984,7 +990,8 @@ class _Input:
 
     # Pine's input.symbol has NO options: its third positional is tooltip, so it
     # cannot alias string (whose third positional is options)
-    # noinspection PyUnusedLocal
+    # ``active`` is UI-only in Pine: accepted for signature parity, never read
+    # noinspection PyUnusedParameter
     @classmethod
     def symbol(cls, defval: str, title: str | None = None,
                tooltip: str | None = None, inline: str | None = None, group: str | None = None,
@@ -1011,7 +1018,8 @@ class _Input:
 
     # Pine's input.text_area has neither options nor inline: its positional
     # order is defval, title, tooltip, group, confirm, display, active
-    # noinspection PyUnusedLocal
+    # ``active`` is UI-only in Pine: accepted for signature parity, never read
+    # noinspection PyUnusedParameter
     @classmethod
     def text_area(cls, defval: str, title: str | None = None,
                   tooltip: str | None = None, group: str | None = None,
@@ -1037,7 +1045,8 @@ class _Input:
 
     # time() returns UNIX timestamp in milliseconds (int); its Pine positional
     # order has no minval/maxval/step, so it cannot alias _int
-    # noinspection PyUnusedLocal
+    # ``active`` is UI-only in Pine: accepted for signature parity, never read
+    # noinspection PyUnusedParameter
     @classmethod
     def time(cls, defval: int, title: str | None = None,
              tooltip: str | None = None, inline: str | None = None, group: str | None = None,

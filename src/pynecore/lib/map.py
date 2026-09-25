@@ -5,7 +5,7 @@ from typing import TypeVar, Any
 # nan key to this interned constant makes an na key storable and retrievable
 # (TV-verified: map.get / contains find a float(na) key after map.put with one).
 # Imported underscored so it stays out of the lib module-property registry.
-from pynecore.types.na import NA, na_float as _NAN_KEY
+from pynecore.types.na import NA, na_float as _nan_key
 from pynecore.types.pine_types import PyneInt, pine_int
 
 TKey = TypeVar('TKey')
@@ -31,7 +31,7 @@ def contains(id: dict, key: Any) -> bool:
     :param key: The key to check for.
     """
     if key != key:
-        key = _NAN_KEY
+        key = _nan_key
     return key in id
 
 
@@ -55,7 +55,7 @@ def get(id: dict[TKey, TValue], key: TKey) -> TValue:
     :return: The value associated with the key, or na when the key is absent.
     """
     if key != key:
-        key = _NAN_KEY
+        key = _nan_key
     try:
         return id[key]
     except KeyError:
@@ -92,7 +92,7 @@ def put(id: dict[Any, TValue], key: Any, value: TValue | Any) -> TValue:
     :return: The value that was previously in the map.
     """
     if key != key:
-        key = _NAN_KEY
+        key = _nan_key
     try:
         old_value = id[key]
     except KeyError:
@@ -122,7 +122,7 @@ def remove(id: dict[TKey, TValue], key: TKey) -> TValue:
     :return: The value that was removed from the map.
     """
     if key != key:
-        key = _NAN_KEY
+        key = _nan_key
     try:
         return id.pop(key)
     except KeyError:

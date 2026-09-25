@@ -7,8 +7,9 @@ close, and weekly/monthly requests run from one period's first session open to
 the next one's. Measured against TradingView on BINANCE:BTCUSDT@30 with the
 "0300-1200", "1700-0200" and "0930-1600:23456" New York sessions.
 """
-from datetime import date, datetime, UTC
+from datetime import date, datetime, UTC, time as dt_time
 
+from pynecore.core.syminfo import SymInfoInterval
 from pynecore.lib import (_parse_session_string, _is_bar_in_session, _session_occurrence,
                           _session_period_anchor, _session_bar_bounds, syminfo)
 
@@ -129,8 +130,19 @@ def __test_intraday_run_closing_on_the_changing_clock_shifts_as_a_whole__():
            (_ms(2025, 3, 29, 17), _ms(2025, 3, 30, 1))
 
 
-def __test_empty_session_is_the_all_day_session__():
-    """``time(tf, "", tz)`` is ``time(tf, "0000-0000", tz)``, not na"""
+def __test_empty_session_is_the_symbol_session__(monkeypatch):
+    """``time(tf, "", tz)`` runs on the symbol's own session read in ``tz``, not na
+
+    MEASURED on CAPITALCOM:AAPL (09:30-16:00 New York): ``""`` equals ``"0930-1600"``
+    on every bar, read in UTC when the timezone argument is "UTC". On a round-the-clock
+    symbol (BINANCE:BTCUSDT@30) it is the all-day session.
+    """
+    monkeypatch.setattr(syminfo, "_opening_hours", [
+        SymInfoInterval(day=d, start=dt_time(9, 30), end=dt_time(16)) for d in range(5)])
+    assert _parse_session_string("", NY) == _parse_session_string("0930-1600:23456", NY)
+    assert _parse_session_string("", "UTC") == _parse_session_string("0930-1600:23456", "UTC")
+    monkeypatch.setattr(syminfo, "_opening_hours", [
+        SymInfoInterval(day=d, start=dt_time(0), end=dt_time(0)) for d in range(7)])
     assert _parse_session_string("", NY) == _parse_session_string("0000-0000", NY)
     # 2025-01-01 00:00 UTC is 19:00 on New Year's Eve in New York
     assert _session_occurrence(_ms(2025, 1, 1), _parse_session_string("", NY)) == \
@@ -258,12 +270,13 @@ def __test_period_anchor_of_a_midnight_closing_session_stays_on_its_day__():
 def __test_timeframe_bars_back_walks_the_session_bar_series__():
     """A positive offset steps session bars, crossing into the previous run
 
-    MEASURED (BINANCE:BTCUSDT@30, requested "60"): with "0900-1130" -- three
-    buckets a run -- the offsets 1 and 3 taken on the 09:00 bucket reported the
-    previous day's 11:00 and 09:00 buckets. Out of session the walk starts from
-    the last bucket of the run that has already closed and reports whichever run
-    it lands in by that run's OPENING bucket: offsets 1 and 3 gave the current
-    day's and the previous day's 09:00 bucket.
+    MEASURED (BINANCE:BTCUSDT@30 and CAPITALCOM:BTCUSD@30, requested "60"): with
+    "0900-1130" -- three buckets a run -- the offsets 1 and 3 taken on the 09:00
+    bucket reported the previous day's 11:00 and 09:00 buckets. Out of session the
+    value of the run's last bucket holds (CAPITALCOM:BTCUSD@30, 2026-09-25): the walk
+    starts from the last bucket of the run that has already closed and reports the
+    bucket it lands on -- offsets 1 and 3 gave the current day's 10:00 and the
+    previous day's 11:00 bucket on every bar from 11:30 to the next 09:00.
     """
     period = syminfo.period
     timezone = syminfo.timezone
@@ -277,12 +290,14 @@ def __test_timeframe_bars_back_walks_the_session_bar_series__():
                (_ms(2025, 1, 5, 9), _ms(2025, 1, 5, 10))
         assert _session_bar_bounds(_ms(2025, 1, 6, 9), infos, '', 60, 0, 0, 4) == \
                (_ms(2025, 1, 4, 11), _ms(2025, 1, 4, 11, 30))
-        # Out of session the offset is answered, and always by an opening bucket.
+        # Out of session the offset is answered from the closed run's last bucket.
         assert _session_bar_bounds(_ms(2025, 1, 6, 13), infos, '', 60, 0, 0) is None
         assert _session_bar_bounds(_ms(2025, 1, 6, 13), infos, '', 60, 0, 0, 1) == \
-               (_ms(2025, 1, 6, 9), _ms(2025, 1, 6, 10))
+               (_ms(2025, 1, 6, 10), _ms(2025, 1, 6, 11))
         assert _session_bar_bounds(_ms(2025, 1, 6, 13), infos, '', 60, 0, 0, 3) == \
-               (_ms(2025, 1, 5, 9), _ms(2025, 1, 5, 10))
+               (_ms(2025, 1, 5, 11), _ms(2025, 1, 5, 11, 30))
+        assert _session_bar_bounds(_ms(2025, 1, 7, 8), infos, '', 60, 0, 0, 1) == \
+               (_ms(2025, 1, 6, 10), _ms(2025, 1, 6, 11))
         # A daily request walks whole occurrences, and out of session it counts
         # from the run the chart bar is heading into.
         assert _session_bar_bounds(_ms(2025, 1, 6, 10), infos, 'D', 1, 0, 0, 1) == \

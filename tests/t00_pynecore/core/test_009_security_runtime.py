@@ -387,14 +387,14 @@ def __test_chart_protocol_currency_conversion__(log):
         from datetime import datetime, timezone
         lib._datetime = datetime.fromtimestamp(200_000, timezone.utc)
 
+        # Conversion: security result is in EUR, convert to USD
+        currency_conversions = {"sec_cur": ("EUR", "USD")}
+
+        signal_fn, write_fn, read_fn, wait_fn, cleanup, _, _begin_bar, _ = create_chart_protocol(
+            states, sb, currency_conversions=currency_conversions,
+        )
+
         try:
-            # Conversion: security result is in EUR, convert to USD
-            currency_conversions = {"sec_cur": ("EUR", "USD")}
-
-            signal_fn, write_fn, read_fn, wait_fn, cleanup, _, _begin_bar, _ = create_chart_protocol(
-                states, sb, currency_conversions=currency_conversions,
-            )
-
             # Write a value in EUR
             write_result(rb, sb, 100.0)
 
@@ -435,13 +435,13 @@ def __test_chart_protocol_currency_no_data__(log):
     from datetime import datetime, timezone
     lib._datetime = datetime.fromtimestamp(1000, timezone.utc)
 
+    currency_conversions = {"sec_nodata": ("EUR", "USD")}
+
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, _, _begin_bar, _ = create_chart_protocol(
+        states, sb, currency_conversions=currency_conversions,
+    )
+
     try:
-        currency_conversions = {"sec_nodata": ("EUR", "USD")}
-
-        signal_fn, write_fn, read_fn, wait_fn, cleanup, _, _begin_bar, _ = create_chart_protocol(
-            states, sb, currency_conversions=currency_conversions,
-        )
-
         write_result(rb, sb, 100.0)
 
         # No provider → rate is nan → result should stay unconverted

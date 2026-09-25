@@ -3879,7 +3879,7 @@ def _exclusive_session_end(ms: int, tz: ZoneInfo | None) -> int:
     return ms
 
 
-def _dwm_period_end(open_ms: int, cal: BarCalendar, timeframe: str) -> int:
+def dwm_period_end(open_ms: int, cal: BarCalendar, timeframe: str) -> int:
     """
     Exclusive end of the session-anchored D/W/M period opening at ``open_ms``.
 
@@ -3954,7 +3954,7 @@ def actual_bar_close(open_ms: int, next_open_ms: int, cal: BarCalendar,
                     close = session_end
         return close
 
-    return dwm_session_close(open_ms, _dwm_period_end(open_ms, cal, timeframe), cal)
+    return dwm_session_close(open_ms, dwm_period_end(open_ms, cal, timeframe), cal)
 
 
 def dwm_session_close(open_ms: int, period_end: int, cal: BarCalendar) -> int:

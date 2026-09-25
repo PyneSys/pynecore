@@ -429,10 +429,14 @@ def _folded_types(source: str, names: set[str]) -> dict[str, str]:
     """Const-fold a snippet and return the type stamped on each named value."""
     tree = ast.parse(source)
     ConstFoldTransformer().visit(tree)
-    return {stmt.targets[0].id: get_ty(stmt.value)
-            for stmt in tree.body
-            if isinstance(stmt, ast.Assign) and isinstance(stmt.targets[0], ast.Name)
-            and stmt.targets[0].id in names}
+    types: dict[str, str] = {}
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        target = stmt.targets[0]
+        if isinstance(target, ast.Name) and target.id in names:
+            types[target.id] = get_ty(stmt.value)
+    return types
 
 
 def __test_folded_types_are_scoped_like_their_values__():

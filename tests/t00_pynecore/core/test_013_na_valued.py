@@ -106,6 +106,8 @@ def __test_na_object_comparisons_always_false__():
     assert (x < 40) is False
     assert (x == 40) is False
     assert (x != 40) is False
+    # PyCharm narrows the na string compared with an int literal to Never
+    # noinspection PyUnreachableCode
     assert (x != x) is False
 
 

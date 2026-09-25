@@ -26,6 +26,8 @@ def main(tf=input.string(defval="60", title="HTF")):
     # unconditional — a ``request.security()`` sitting in a branch signals
     # inline instead of in the hoisted top block, and an inline signal never
     # joins a group.
+    # A series reads its own history: gated[1] becomes a slot read in the transform
+    # noinspection PyUnboundLocalVariable,PyUnresolvedReferences
     gated: Series[float] = accSec if bar_index % 2 == 0 else nz(gated[1])
     plot(rsi, "rsi")
     plot(smoothed, "smoothed")

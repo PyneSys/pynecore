@@ -5078,6 +5078,8 @@ def __test_run_event_stream_handles_async_gen_not_implemented__():
     def _raise_in_body():
         async def _gen():
             raise NotImplementedError
+            # The dead yield only makes _gen an async generator
+            # noinspection PyUnreachableCode
             yield  # pragma: no cover — unreachable
 
         return _gen()
@@ -5137,6 +5139,8 @@ def __test_run_event_stream_reopens_after_an_unexpected_error__(monkeypatch, cap
     def _halting():
         async def _gen():
             raise BrokerManualInterventionError("venue says stop")
+            # The dead yield only makes _gen an async generator
+            # noinspection PyUnreachableCode
             yield  # pragma: no cover — unreachable
 
         return _gen()

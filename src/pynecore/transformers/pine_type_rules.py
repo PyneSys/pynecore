@@ -1377,9 +1377,9 @@ def annotation_takes_none(node: ast.expr | None) -> bool:
         return annotation_takes_none(node.left) or annotation_takes_none(node.right)
 
     if isinstance(node, ast.Subscript):
-        head = node.value
-        name = head.id if isinstance(head, ast.Name) else \
-            (head.attr if isinstance(head, ast.Attribute) else '')
+        origin = node.value
+        name = origin.id if isinstance(origin, ast.Name) else \
+            (origin.attr if isinstance(origin, ast.Attribute) else '')
         if name in _OPTIONAL_SUBSCRIPTS:
             return True
         if name == 'Union':

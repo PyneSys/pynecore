@@ -21,7 +21,9 @@ _lib: Any = None
 T = TypeVar('T')
 
 
-# noinspection PyUnusedLocal
+# IDE-facing stub: the SecurityTransformer rewrites every call, so the parameters only
+# carry the Pine signature
+# noinspection PyUnusedParameter
 def security(symbol, timeframe, expression: T, *args, **kwargs) -> T:
     """
     Request data from another symbol/timeframe.
@@ -65,7 +67,6 @@ def security(symbol, timeframe, expression: T, *args, **kwargs) -> T:
     )
 
 
-# noinspection PyUnusedLocal
 @overload
 def security_lower_tf(
         symbol, timeframe, expression: tuple,
@@ -74,7 +75,9 @@ def security_lower_tf(
 ) -> tuple[list, ...]: ...
 
 
-# noinspection PyUnusedLocal
+# PyCharm reads the TypeVar parameter as matched by overload 1's ``tuple``, yet every
+# non-tuple expression resolves here
+# noinspection PyOverloads
 @overload
 def security_lower_tf(
         symbol, timeframe, expression: T,
@@ -83,7 +86,9 @@ def security_lower_tf(
 ) -> list[T]: ...
 
 
-# noinspection PyUnusedLocal
+# IDE-facing stub: the SecurityTransformer rewrites every call, so the parameters only
+# carry the Pine signature
+# noinspection PyUnusedParameter
 def security_lower_tf(
         symbol, timeframe, expression,
         ignore_invalid_symbol=False, currency=None,
@@ -145,7 +150,8 @@ def currency_rate(from_currency: str, to_currency: str) -> float:
     return _currency_provider.get_rate(_from, _to, timestamp)
 
 
-# noinspection PyUnusedLocal
+# Pine signature parity: the data source is not implemented, so most parameters go unread
+# noinspection PyUnusedParameter
 def dividends(
         ticker=None, field=None, gaps=None, lookahead=None,
         ignore_invalid_symbol=False, currency=None,
@@ -168,7 +174,8 @@ def dividends(
     raise NotImplementedError("request.dividends() is not yet implemented in PyneCore")
 
 
-# noinspection PyUnusedLocal
+# Pine signature parity: the data source is not implemented, so most parameters go unread
+# noinspection PyUnusedParameter
 def splits(
         ticker=None, field=None, gaps=None, lookahead=None,
         ignore_invalid_symbol=False,
@@ -190,7 +197,8 @@ def splits(
     raise NotImplementedError("request.splits() is not yet implemented in PyneCore")
 
 
-# noinspection PyUnusedLocal
+# Pine signature parity: the data source is not implemented, so most parameters go unread
+# noinspection PyUnusedParameter
 def earnings(
         ticker=None, field=None, gaps=None, lookahead=None,
         ignore_invalid_symbol=False, currency=None,
@@ -213,7 +221,8 @@ def earnings(
     raise NotImplementedError("request.earnings() is not yet implemented in PyneCore")
 
 
-# noinspection PyUnusedLocal
+# Pine signature parity: the data source is not implemented, so most parameters go unread
+# noinspection PyUnusedParameter
 def financial(
         symbol=None, financial_id=None, period=None, gaps=None,
         ignore_invalid_symbol=False, currency=None,
@@ -235,8 +244,7 @@ def financial(
     raise NotImplementedError("request.financial() is not yet implemented in PyneCore")
 
 
-# noinspection PyUnusedLocal
-def economic(*args, **kwargs) -> float:
+def economic(*_, **__) -> float:
     """
     Request economic data.
 
@@ -245,8 +253,7 @@ def economic(*args, **kwargs) -> float:
     raise NotImplementedError("request.economic() is not yet implemented in PyneCore")
 
 
-# noinspection PyUnusedLocal
-def quandl(*args, **kwargs) -> float:
+def quandl(*_, **__) -> float:
     """
     Request data from Quandl/Nasdaq.
 
@@ -258,19 +265,19 @@ def quandl(*args, **kwargs) -> float:
 # The static face of seed: the result is the expression's own type. Spelled through the
 # typing alias on purpose: a decorator named ``overload`` would make the lib type registry
 # read these as a runtime overload group
-# noinspection PyUnusedLocal
 @_typing_overload
 def seed(source: str, symbol: str, expression: T,
          ignore_invalid_symbol: bool = False, calc_bars_count: int | None = None) -> T: ...
 
 
-# noinspection PyUnusedLocal
 @_typing_overload
 def seed(source: str | None = None, symbol: str | None = None, expression: None = None,
          ignore_invalid_symbol: bool = False, calc_bars_count: int | None = None) -> Any: ...
 
 
-# noinspection PyUnusedLocal
+# Seed data is unavailable: only ``expression`` shapes the na result, the other parameters
+# are Pine signature parity
+# noinspection PyUnusedParameter
 def seed(source=None, symbol=None, expression=None,
          ignore_invalid_symbol=False, calc_bars_count=None) -> Any:
     """
@@ -300,7 +307,8 @@ def seed(source=None, symbol=None, expression=None,
     return NA(None)
 
 
-# noinspection PyUnusedLocal
+# Order-flow data is unavailable: the parameters are Pine signature parity only
+# noinspection PyUnusedParameter
 def footprint(ticks_per_row: int, va_percent: int = 70,
               imbalance_percent: int = 300) -> Footprint | NA[Footprint]:
     """
