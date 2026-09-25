@@ -369,6 +369,8 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
     # instant as a UTC roundtrip), and the epoch milliseconds are the raw
     # timestamp itself — no astimezone/timestamp C calls per bar.
     props['_time'] = t = ohlcv.timestamp  # PineScript representation of time
+    bar_opens = props['_bar_opens']
+    bar_opens[bar_index % len(bar_opens)] = t
     props['_datetime'] = datetime.fromtimestamp(t / 1000, tz)
     # Historical runs anchor ``last_bar_time`` to the chart's final bar (Pine
     # semantics — the whole history is known up front); live updates pass

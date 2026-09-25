@@ -3,8 +3,9 @@
 
 Covers the chart bar's close; the bar of a requested timeframe (intraday, D, nD, W, nW, M,
 nM) and how its close depends on the chart's timeframe; an intraday request on a D, W or M
-chart; an na, empty or unparsable timeframe; Pine's keyword names; ``timeframe_bars_back``
-on an intraday, daily and monthly grid; and the session argument: gating and hourly buckets
+chart; an na, empty or unparsable timeframe; Pine's keyword names; ``bars_back`` over the
+chart's bar history and into future bars; ``timeframe_bars_back`` on an intraday, daily and
+monthly grid, forward on an intraday one; and the session argument: gating and hourly buckets
 in the exchange timezone or in the ``timezone`` argument, the day digits, an overnight
 session, the symbol's own session for an empty or non-numeric string, hours past 24 and
 malformed specifications.
@@ -56,6 +57,12 @@ def __test_helper_bar(monkeypatch, period: str, bar_ms: int, sym_type: str,
         SymInfoInterval(day=d, start=start, end=end) for d in session_days])
     monkeypatch.setattr(syminfo, "_session_starts", [
         SymInfoSession(day=d, time=start) for d in session_days])
+
+
+def __test_helper_history(monkeypatch, *opens: int) -> None:
+    """Install the chart bar history the script runner records, the current bar last"""
+    monkeypatch.setattr(lib, "_bar_opens", list(opens))
+    monkeypatch.setattr(lib, "bar_index", float(len(opens) - 1))
 
 
 def __test_helper_eurusd(monkeypatch, period: str, bar_ms: int) -> None:
@@ -335,6 +342,69 @@ def __test_intraday_offset_skips_the_session_break__(monkeypatch):
     __test_helper_eurusd(monkeypatch, "60", ny(2025, 11, 16, 18))
     assert time("60", timeframe_bars_back=1) == ny(2025, 11, 16, 17)
     assert time_close("60", timeframe_bars_back=1) == ny(2025, 11, 16, 18)
+
+
+def __test_negative_intraday_offset_walks_the_session_schedule__(monkeypatch):
+    """ A negative ``timeframe_bars_back`` on an intraday grid steps over the session break """
+    ny = __test_helper_ny
+    # MEASURED (TradingView 2026-09-25, CAPITALCOM:EURUSD@60): on the week's first bar,
+    # Sunday 2023-01-08 17:00, bars_back 1 is Friday's 16:00 bar, and the hourly bar after
+    # that one is the Sunday 17:00 open
+    __test_helper_eurusd(monkeypatch, "60", ny(2023, 1, 8, 17))
+    __test_helper_history(monkeypatch, ny(2023, 1, 6, 16), ny(2023, 1, 8, 17))
+    assert time("60", bars_back=1, timeframe_bars_back=-1) == ny(2023, 1, 8, 17)
+    assert time_close("60", bars_back=1, timeframe_bars_back=-1) == ny(2023, 1, 8, 18)
+
+
+def __test_bars_back_evaluates_on_an_earlier_chart_bar__(monkeypatch):
+    """ ``bars_back`` evaluates the call on the chart bar that many bars back """
+    ny = __test_helper_ny
+    # MEASURED (TradingView 2026-09-25, CAPITALCOM:EURUSD@60): the week's first bar, Sunday
+    # 2023-01-08 17:00, looks back over the weekend to Friday's last bars
+    __test_helper_eurusd(monkeypatch, "60", ny(2023, 1, 8, 17))
+    __test_helper_history(monkeypatch, ny(2023, 1, 6, 14), ny(2023, 1, 6, 15),
+                          ny(2023, 1, 6, 16), ny(2023, 1, 8, 17))
+    assert time("", 1) == ny(2023, 1, 6, 16)
+    assert time_close("", 1) == ny(2023, 1, 6, 17)
+    assert time("", 3) == ny(2023, 1, 6, 14)
+    assert time("60", 1) == ny(2023, 1, 6, 16)
+    assert time("D", 1) == ny(2023, 1, 5, 17)
+    assert time_close("D", 1) == ny(2023, 1, 6, 17)
+    assert time("D", bars_back=1, timeframe_bars_back=1) == ny(2023, 1, 4, 17)
+    assert time("60", bars_back=2, timeframe_bars_back=1) == ny(2023, 1, 6, 14)
+    # MEASURED (EURUSD@60): the data has no 18:00 bar on its first Sunday, 2023-01-01, so
+    # the 19:00 bar's previous one is 17:00, and no bar lies three back
+    __test_helper_eurusd(monkeypatch, "60", ny(2023, 1, 1, 19))
+    __test_helper_history(monkeypatch, ny(2023, 1, 1, 17), ny(2023, 1, 1, 19))
+    assert time("", 1) == ny(2023, 1, 1, 17)
+    assert time_close("", 1) == ny(2023, 1, 1, 18)
+    assert na(time("", 3))
+    # MEASURED (EURUSD@60): the first bar has no previous one
+    __test_helper_eurusd(monkeypatch, "60", ny(2023, 1, 1, 17))
+    __test_helper_history(monkeypatch, ny(2023, 1, 1, 17))
+    assert na(time("", 1))
+    assert na(time_close("", 1))
+
+
+def __test_negative_bars_back_is_the_next_scheduled_chart_bar__(monkeypatch):
+    """ A negative ``bars_back`` walks the session schedule, blind to holidays and gaps """
+    ny = __test_helper_ny
+    # MEASURED (TradingView 2026-09-25, CAPITALCOM:EURUSD@60): the week's last bar, Friday
+    # 2023-01-06 16:00, is followed by the Sunday 17:00 open
+    __test_helper_eurusd(monkeypatch, "60", ny(2023, 1, 6, 16))
+    assert time("", -1) == ny(2023, 1, 8, 17)
+    assert time_close("", -1) == ny(2023, 1, 8, 18)
+    assert time("60", -3) == ny(2023, 1, 8, 19)
+    assert time("D", -1) == ny(2023, 1, 8, 17)
+    assert time_close("D", -1) == ny(2023, 1, 9, 17)
+    # MEASURED (EURUSD@60): the data's first Sunday has no 18:00 bar, the schedule has one
+    __test_helper_eurusd(monkeypatch, "60", ny(2023, 1, 1, 17))
+    assert time("", -1) == ny(2023, 1, 1, 18)
+    # MEASURED (EURUSD@60): Christmas Day has no bars, yet the schedule opens its trading
+    # day on Christmas Eve at 17:00
+    __test_helper_eurusd(monkeypatch, "60", ny(2024, 12, 24, 16))
+    assert time("", -1) == ny(2024, 12, 24, 17)
+    assert time_close("D", -1) == ny(2024, 12, 25, 17)
 
 
 def __test_daily_and_monthly_offset_steps_to_the_previous_trading_day__(monkeypatch):

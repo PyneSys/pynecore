@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, time as dt_time, date, UTC, \
 from pynecore.types.source import Source
 
 from ..core.module_property import module_property, module_function_property
+from ..core.series import SeriesImpl as _SeriesImpl
 from ..core.script import script, input
 
 from ..types.na import NA, na_int
@@ -142,6 +143,13 @@ _time: int = 0
 # carries (see ``core/security.py::_get_confirmed_time``).
 _next_time: int = 0
 last_bar_time: PyneInt = 0.0
+
+# Open times (ms) of the chart's recent bars, bar ``i`` in slot ``i % _BAR_OPENS_SIZE``.
+# ``time(tf, bars_back)`` is evaluated on the chart bar ``bars_back`` bars back, whose
+# open a gap in the data or between sessions keeps off the nominal grid. The runner
+# fills the slot of every bar it publishes, so no slot within reach is stale.
+_BAR_OPENS_SIZE = _SeriesImpl.MAXIMUM_MAX_BARS_BACK + 1
+_bar_opens: list[int] = [0] * _BAR_OPENS_SIZE
 
 # Datetime object in the exchange timezone
 _datetime: datetime = datetime.fromtimestamp(0, UTC)
@@ -1545,6 +1553,37 @@ def _previous_session_occurrence(before_ms: int,
     return None
 
 
+@_lru_cache(maxsize=256)
+def _next_session_occurrence(after_ms: int,
+                             session_infos: 'tuple[SessionInfo, ...]',
+                             intraday: bool = False) -> tuple[int, int] | None:
+    """
+    The earliest session occurrence opening strictly after an instant.
+
+    :param after_ms: Instant the occurrence has to open after, in milliseconds
+    :param session_infos: Session ranges of one session specification
+    :param intraday: Whether the runs are drawn by the intraday session mask
+    :return: ``(open_ms, close_ms)``, or ``None`` when no day in the next two
+             months runs the session
+    """
+    if not session_infos:
+        return None
+    tz = _parse_timezone(session_infos[0].timezone)
+    day = datetime.fromtimestamp(after_ms / 1000, tz).date()
+    best: tuple[int, int] | None = None
+    for day_offset in range(61):
+        # The intraday mask can pull a run an hour ahead of its own midnight, so the
+        # date after the first one with a match may still hold an earlier run
+        found = best is not None
+        for occurrence in _session_occurrences_opening_on(day + timedelta(days=day_offset),
+                                                          session_infos, intraday):
+            if occurrence[0] > after_ms and (best is None or occurrence[0] < best[0]):
+                best = occurrence
+        if found:
+            return best
+    return best
+
+
 @_lru_cache(maxsize=512)
 def _session_day_bounds(day: date,
                         session_infos: 'tuple[SessionInfo, ...]') -> tuple[int, int] | None:
@@ -1623,6 +1662,28 @@ def _previous_session_day(before_ms: int,
     for day_offset in range(62):
         bounds = _session_day_bounds(day - timedelta(days=day_offset), session_infos)
         if bounds is not None and bounds[0] < before_ms:
+            return bounds
+    return None
+
+
+@_lru_cache(maxsize=256)
+def _next_session_day(after_ms: int,
+                      session_infos: 'tuple[SessionInfo, ...]') -> tuple[int, int] | None:
+    """
+    The earliest daily session bar opening strictly after an instant.
+
+    :param after_ms: Instant the day has to open after, in milliseconds
+    :param session_infos: Session ranges of one session specification
+    :return: ``(open_ms, close_ms)``, or ``None`` when no day in the next two
+             months runs the session
+    """
+    if not session_infos:
+        return None
+    tz = _parse_timezone(session_infos[0].timezone)
+    day = datetime.fromtimestamp(after_ms / 1000, tz).date()
+    for day_offset in range(62):
+        bounds = _session_day_bounds(day + timedelta(days=day_offset), session_infos)
+        if bounds is not None and bounds[0] > after_ms:
             return bounds
     return None
 
@@ -1740,7 +1801,8 @@ def _session_bar_bounds(chart_time_ms: int, session_infos: 'tuple[SessionInfo, .
     :param multiplier: Requested timeframe multiplier
     :param bar_start_ms: Plain grid bar open of the requested timeframe
     :param bar_close_ms: Plain grid bar close of the requested timeframe
-    :param steps: Session bars to walk back, the positive ``timeframe_bars_back``
+    :param steps: Session bars to walk back, the positive ``timeframe_bars_back``; a
+                  negative count walks forward to a bar that has not opened yet
     :return: ``(open_ms, close_ms)``, or ``None`` when the bar is out of session
     """
     if modifier in ('W', 'M'):
@@ -1797,21 +1859,30 @@ def _session_bar_bounds(chart_time_ms: int, session_infos: 'tuple[SessionInfo, .
         # A daily request reports whole trading days, gaps between ranges included
         occurrence = _session_day_occurrence(chart_time_ms, session_infos)
         if occurrence is None:
-            if steps <= 0:
+            if steps == 0:
                 return None
-            # MEASURED: out of session a daily request is NOT na once an offset
-            # is given, it reports the occurrence the offset lands on counted
-            # from the one the chart bar is heading into -- which is one step
-            # further than the last one that ran.
-            occurrence = _previous_session_day(chart_time_ms + 1, session_infos)
-            steps -= 1
+            if steps > 0:
+                # MEASURED: out of session a daily request is NOT na once an offset
+                # is given, it reports the occurrence the offset lands on counted
+                # from the one the chart bar is heading into -- which is one step
+                # further than the last one that ran.
+                occurrence = _previous_session_day(chart_time_ms + 1, session_infos)
+                steps -= 1
+            else:
+                # A day that has not opened yet is counted from the one the chart
+                # bar is heading into
+                occurrence = _next_session_day(chart_time_ms, session_infos)
+                steps += 1
         while occurrence is not None and steps > 0:
             occurrence = _previous_session_day(occurrence[0], session_infos)
             steps -= 1
+        while occurrence is not None and steps < 0:
+            occurrence = _next_session_day(occurrence[0], session_infos)
+            steps += 1
         return occurrence
 
     occurrence = _session_occurrence(chart_time_ms, session_infos, True)
-    if occurrence is None and steps <= 0:
+    if occurrence is None and steps == 0:
         return None
 
     # An intraday request tiles the occurrence itself instead of filtering the
@@ -1823,6 +1894,13 @@ def _session_bar_bounds(chart_time_ms: int, session_infos: 'tuple[SessionInfo, .
     step_ms = (multiplier if modifier == 'S' else multiplier * 60) * 1000
     if occurrence is not None:
         index = (chart_time_ms - occurrence[0]) // step_ms - steps
+    elif steps < 0:
+        # A bar that has not opened yet is counted from the run the chart bar is
+        # heading into
+        occurrence = _next_session_occurrence(chart_time_ms, session_infos, True)
+        if occurrence is None:
+            return None
+        index = -steps - 1
     else:
         # MEASURED (TradingView, 2026-09-25, "UTC" sessions, requested "60"):
         # out of session the value of the run's LAST bucket holds -- the walk
@@ -1842,6 +1920,13 @@ def _session_bar_bounds(chart_time_ms: int, session_infos: 'tuple[SessionInfo, .
             break
         occurrence = previous
         index += _session_bucket_count(occurrence, step_ms)
+    while index >= (count := _session_bucket_count(occurrence, step_ms)):
+        following = _next_session_occurrence(occurrence[0], session_infos, True)
+        if following is None:
+            index = count - 1
+            break
+        occurrence = following
+        index -= count
     start_ms = occurrence[0] + index * step_ms
     return start_ms, min(start_ms + step_ms, occurrence[1])
 
@@ -2296,6 +2381,42 @@ def _requested_bar_time(resampler: Resampler, modifier: str, multiplier: int,
 
 
 # noinspection PyProtectedMember
+def _chart_bar_open(bars_back: int | float) -> int | None:
+    """
+    Open of the chart bar a ``bars_back`` offset of ``time()`` or ``time_close()`` names.
+
+    A positive offset names a bar the chart already has. A negative one names a bar that
+    has not opened yet, whose expected open walks the chart's timeframe over the symbol's
+    session schedule.
+
+    :param bars_back: Chart bars back, negative for a future bar
+    :return: Open time in milliseconds, or ``None`` when the chart has no bar that far back
+    """
+    # MEASURED (TradingView, CAPITALCOM:EURUSD@60, 2026-09-25): time(tf, bars_back) is
+    # time(tf) evaluated on the chart bar ``bars_back`` bars back -- time("", 1) equals
+    # time[1] on all 23246 bars, across weekends and missing bars, and is na while the
+    # chart has fewer bars behind it. A future bar's open follows the schedule alone: it
+    # skips the weekend but knows neither holidays nor the bars the feed leaves out.
+    # time("", -1) was Sunday 17:00 on the Friday 16:00 bar, 18:00 on a Sunday 17:00 bar
+    # followed by 19:00, and 17:00 on the 16:00 bar before Christmas Day.
+    offset = int(bars_back)
+    if offset < 0:
+        run_tf = timeframe_module._current_period()
+        modifier, multiplier = timeframe_module._process_tf(run_tf)
+        nominal_ms = _time - offset * timeframe_module._in_seconds(run_tf) * 1000
+        bounds = _session_bar_bounds(
+            _time, _symbol_session_infos(getattr(syminfo, 'timezone', None) or 'UTC'),
+            modifier, multiplier, nominal_ms, nominal_ms, offset)
+        # A grid the session walk does not tile (nD, nW, nM) steps the nominal bar
+        # length, and so does a schedule with no run in reach
+        return nominal_ms if bounds is None else bounds[0]
+    index = int(bar_index) - offset
+    if index < 0 or offset >= _BAR_OPENS_SIZE:
+        return None
+    return _bar_opens[index % _BAR_OPENS_SIZE]
+
+
+# noinspection PyProtectedMember
 @module_function_property
 def time(timeframe: str | None = None, session: str | int | None = None,
          timezone: str | None = None, bars_back: int = 0,
@@ -2325,16 +2446,18 @@ def time(timeframe: str | None = None, session: str | int | None = None,
                    ``time(timeframe, bars_back)`` overload).
     :param timezone: Timezone for the session (e.g., "GMT+2", "America/New_York").
                     If None, uses exchange timezone.
-    :param bars_back: Bar offset on the chart's timeframe: positive values refer to past
-                     bars, negative values to the expected times of future bars. The offset
-                     is computed on a continuous time grid (exact for 24/7 markets).
+    :param bars_back: Bar offset on the chart's timeframe: the call is evaluated on the
+                     chart bar this many bars back, and is na while the chart has no bar
+                     that far back. A negative value evaluates it on the expected open of a
+                     future chart bar, walked over the symbol's session schedule.
     :param timeframe_bars_back: Bar offset on the requested ``timeframe`` instead of the
                      chart's, applied on top of ``bars_back``. Positive values walk the
                      requested grid one bar at a time, so an uneven grid such as a monthly
                      one steps exactly, an intraday one skips the time between the
                      symbol's sessions and a daily one the days its session template does
-                     not schedule; negative values refer to bars that do not exist yet
-                     and use the nominal bar length.
+                     not schedule. Negative values refer to bars that have not opened yet:
+                     an intraday grid is walked forward over the symbol's sessions, a
+                     daily, weekly or monthly one steps its nominal bar length.
     :return: UNIX time in milliseconds or NA if bar is outside session or invalid parameters
     """
     # Pine overload: time(timeframe, bars_back) -- a numeric second argument is a bar
@@ -2367,24 +2490,30 @@ def time(timeframe: str | None = None, session: str | int | None = None,
         timeframe, modifier, multiplier = 'D', 'D', 1
         resampler = Resampler.get_resampler(timeframe)
 
-    # Get the current bar time for the requested timeframe
+    # The chart bar the call is evaluated on
     current_time_ms = _time
-    if bars_back or timeframe_bars_back < 0:
+    intraday = modifier in ('', 'S')
+    if bars_back or (timeframe_bars_back < 0 and not intraday):
         try:
             if bars_back:
-                current_time_ms -= bars_back * timeframe_module._in_seconds(
-                    timeframe_module._current_period()) * 1000
-            if timeframe_bars_back < 0:
-                # A future bar has no grid to walk yet, so its nominal length is used
+                chart_bar_ms = _chart_bar_open(bars_back)
+                if chart_bar_ms is None:
+                    return na_int
+                current_time_ms = chart_bar_ms
+            if timeframe_bars_back < 0 and not intraday:
+                # A daily, weekly or monthly bar that has not opened yet steps its nominal
+                # length
                 current_time_ms -= timeframe_bars_back * timeframe_module._in_seconds(timeframe) * 1000
         except (ValueError, AssertionError):
             return na_int
-    if session is None and timeframe_bars_back > 0 and modifier in ('', 'S'):
+    if session is None and timeframe_bars_back and intraday:
         # An offset walks the intraday grid over the symbol's session runs, skipping the
-        # time between them. MEASURED (TradingView, 2026-09-25): time("60",
-        # timeframe_bars_back=3) equals time("60", "", timeframe_bars_back=3) on every bar
-        # of CAPITALCOM:AAPL, BTCUSD and GOLD at 10 minutes, and on EURUSD@60 the offset 1
-        # steps from the Sunday 17:00 bar back to Friday 16:00.
+        # time between them in both directions. MEASURED (TradingView, 2026-09-25):
+        # time("60", timeframe_bars_back=3) equals time("60", "", timeframe_bars_back=3) on
+        # every bar of CAPITALCOM:AAPL, BTCUSD and GOLD at 10 minutes, and on EURUSD@60 the
+        # offset 1 steps from the Sunday 17:00 bar back to Friday 16:00, while
+        # time("60", bars_back=1, timeframe_bars_back=-1) steps from the Friday 16:00 bar
+        # forward to Sunday 17:00.
         session = ''
     bar_time = _requested_bar_time(resampler, modifier, multiplier,
                                    current_time_ms, timeframe_bars_back)
@@ -2406,8 +2535,9 @@ def time(timeframe: str | None = None, session: str | int | None = None,
 
     # Resolve the session bar this call reports (see _session_bar_bounds)
     try:
+        steps = timeframe_bars_back if intraday else max(timeframe_bars_back, 0)
         bounds = _session_bar_bounds(current_time_ms, session_infos, modifier, multiplier,
-                                     bar_time, bar_time, max(timeframe_bars_back, 0))
+                                     bar_time, bar_time, steps)
         if bounds is None:
             return na_int
         return pine_int(bounds[0])
@@ -2740,16 +2870,18 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
                    ``time_close(timeframe, bars_back)`` overload).
     :param timezone: Timezone for the session (e.g., "GMT+2", "America/New_York").
                     If None, uses exchange timezone.
-    :param bars_back: Bar offset on the chart's timeframe: positive values refer to past
-                     bars, negative values to the expected times of future bars. The offset
-                     is computed on a continuous time grid (exact for 24/7 markets).
+    :param bars_back: Bar offset on the chart's timeframe: the call is evaluated on the
+                     chart bar this many bars back, and is na while the chart has no bar
+                     that far back. A negative value evaluates it on the expected open of a
+                     future chart bar, walked over the symbol's session schedule.
     :param timeframe_bars_back: Bar offset on the requested ``timeframe`` instead of the
                      chart's, applied on top of ``bars_back``. Positive values walk the
                      requested grid one bar at a time, so an uneven grid such as a monthly
                      one steps exactly, an intraday one skips the time between the
                      symbol's sessions and a daily one the days its session template does
-                     not schedule; negative values refer to bars that do not exist yet
-                     and use the nominal bar length.
+                     not schedule. Negative values refer to bars that have not opened yet:
+                     an intraday grid is walked forward over the symbol's sessions, a
+                     daily, weekly or monthly one steps its nominal bar length.
     :return: UNIX time in milliseconds of bar close or NA if bar is outside session or invalid parameters
     """
     # Pine overload: time_close(timeframe, bars_back) -- a numeric second argument is a
@@ -2793,19 +2925,23 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
         timeframe, modifier, multiplier = 'D', 'D', 1
         resampler = Resampler.get_resampler(timeframe)
 
-    # Get the current bar time for the requested timeframe
+    # The chart bar the call is evaluated on
     current_time_ms = _time
-    if bars_back or timeframe_bars_back < 0:
+    intraday = modifier in ('', 'S')
+    if bars_back or (timeframe_bars_back < 0 and not intraday):
         try:
             if bars_back:
-                current_time_ms -= bars_back * timeframe_module._in_seconds(
-                    timeframe_module._current_period()) * 1000
-            if timeframe_bars_back < 0:
-                # A future bar has no grid to walk yet, so its nominal length is used
+                chart_bar_ms = _chart_bar_open(bars_back)
+                if chart_bar_ms is None:
+                    return na_int
+                current_time_ms = chart_bar_ms
+            if timeframe_bars_back < 0 and not intraday:
+                # A daily, weekly or monthly bar that has not opened yet steps its nominal
+                # length
                 current_time_ms -= timeframe_bars_back * timeframe_module._in_seconds(timeframe) * 1000
         except (ValueError, AssertionError):
             return na_int
-    if session is None and timeframe_bars_back > 0 and modifier in ('', 'S'):
+    if session is None and timeframe_bars_back and intraday:
         # An offset walks the symbol's session runs (see time())
         session = ''
     bar_start_time = _requested_bar_time(resampler, modifier, multiplier,
@@ -2844,9 +2980,9 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
 
     # Resolve the session bar this call reports (see _session_bar_bounds)
     try:
+        steps = timeframe_bars_back if intraday else max(timeframe_bars_back, 0)
         bounds = _session_bar_bounds(current_time_ms, session_infos, modifier, multiplier,
-                                     bar_start_time, bar_close_time,
-                                     max(timeframe_bars_back, 0))
+                                     bar_start_time, bar_close_time, steps)
         if bounds is None:
             return na_int
         return pine_int(bounds[1])
