@@ -247,9 +247,9 @@
     "id"
    ],
    "params": [
-    "a:f"
+    "o"
    ],
-   "ret": "a:f"
+   "ret": "o"
   },
   "array.avg": {
    "defaults": 0,
@@ -752,7 +752,7 @@
     "percentage"
    ],
    "params": [
-    "a:f",
+    "o",
     "f"
    ],
    "ret": "f"
@@ -765,7 +765,7 @@
     "percentage"
    ],
    "params": [
-    "a:f",
+    "o",
     "f"
    ],
    "ret": "f"
@@ -958,9 +958,9 @@
     "id"
    ],
    "params": [
-    "a:f"
+    "o"
    ],
-   "ret": "a:f"
+   "ret": "o"
   },
   "array.stdev": {
    "default_ty": [
@@ -985,7 +985,7 @@
     "id"
    ],
    "params": [
-    "a:f"
+    "o"
    ],
    "ret": "f"
   },
@@ -1784,7 +1784,7 @@
    "params": [
     "c"
    ],
-   "ret": "i"
+   "ret": "f"
   },
   "color.black": {
    "kind": "value",
@@ -1826,7 +1826,7 @@
    "params": [
     "c"
    ],
-   "ret": "i"
+   "ret": "f"
   },
   "color.gray": {
    "kind": "value",
@@ -1885,7 +1885,7 @@
    "params": [
     "c"
    ],
-   "ret": "i"
+   "ret": "f"
   },
   "color.red": {
    "kind": "value",
@@ -2229,6 +2229,18 @@
    "kind": "value",
    "ty": "o:lib#Display"
   },
+  "dividends.future_amount": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "dividends.future_ex_date": {
+   "kind": "value",
+   "ty": "i"
+  },
+  "dividends.future_pay_date": {
+   "kind": "value",
+   "ty": "i"
+  },
   "dividends.gross": {
    "kind": "value",
    "ty": "o:lib#Dividends"
@@ -2245,9 +2257,17 @@
    "kind": "value",
    "ty": "o:lib#Earnings"
   },
+  "earnings.future_eps": {
+   "kind": "value",
+   "ty": "f"
+  },
   "earnings.future_period_end_time": {
    "kind": "value",
    "ty": "i"
+  },
+  "earnings.future_revenue": {
+   "kind": "value",
+   "ty": "f"
   },
   "earnings.future_time": {
    "kind": "value",
@@ -3686,7 +3706,7 @@
    "params": [
     "?"
    ],
-   "ret": "f"
+   "ret": "?"
   },
   "math.acos": {
    "defaults": 0,
@@ -3751,6 +3771,10 @@
    ],
    "ret": "f"
   },
+  "math.e": {
+   "kind": "value",
+   "ty": "f"
+  },
   "math.exp": {
    "defaults": 0,
    "kind": "function",
@@ -3808,7 +3832,7 @@
      "defaults": 0,
      "names": [],
      "params": [],
-     "ret": "f",
+     "ret": "?",
      "vararg": "?"
     }
    ],
@@ -3827,11 +3851,19 @@
      "defaults": 0,
      "names": [],
      "params": [],
-     "ret": "f",
+     "ret": "?",
      "vararg": "?"
     }
    ],
    "kind": "overloads"
+  },
+  "math.phi": {
+   "kind": "value",
+   "ty": "f"
+  },
+  "math.pi": {
+   "kind": "value",
+   "ty": "f"
   },
   "math.pow": {
    "defaults": 0,
@@ -3918,6 +3950,10 @@
    ],
    "kind": "overloads"
   },
+  "math.rphi": {
+   "kind": "value",
+   "ty": "f"
+  },
   "math.sign": {
    "defaults": 0,
    "kind": "function",
@@ -3962,7 +3998,7 @@
     "?",
     "i"
    ],
-   "ret": "?"
+   "ret": "f"
   },
   "math.tan": {
    "defaults": 0,
@@ -4151,7 +4187,7 @@
    "params": [
     "o"
    ],
-   "ret": "a:f"
+   "ret": "o"
   },
   "matrix.eigenvectors": {
    "defaults": 0,
@@ -7252,7 +7288,7 @@
   },
   "syminfo.shares_outstanding_total": {
    "kind": "value",
-   "ty": "f"
+   "ty": "i"
   },
   "syminfo.taker_fee": {
    "kind": "value",
@@ -7268,7 +7304,7 @@
   },
   "syminfo.target_price_estimates": {
    "kind": "value",
-   "ty": "i"
+   "ty": "f"
   },
   "syminfo.target_price_high": {
    "kind": "value",
@@ -7805,7 +7841,7 @@
     "?",
     "i"
    ],
-   "ret": "f"
+   "ret": "?"
   },
   "ta.mfi": {
    "defaults": 0,
@@ -8008,10 +8044,10 @@
     "length"
    ],
    "params": [
-    "f",
+    "?",
     "i"
    ],
-   "ret": "f"
+   "ret": "?"
   },
   "ta.rci": {
    "defaults": 0,
@@ -8157,7 +8193,7 @@
     "f",
     "i"
    ],
-   "ret": "T:1:f1:i"
+   "ret": "T:1:f1:f"
   },
   "ta.swma": {
    "defaults": 0,
@@ -8200,10 +8236,10 @@
    ],
    "params": [
     "b",
-    "f",
+    "?",
     "i"
    ],
-   "ret": "f"
+   "ret": "?"
   },
   "ta.variance": {
    "default_ty": [
@@ -9053,7 +9089,7 @@
   "timenow": {
    "callable": true,
    "kind": "value",
-   "ty": "?"
+   "ty": "i"
   },
   "timestamp": {
    "impls": [

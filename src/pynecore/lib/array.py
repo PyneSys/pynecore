@@ -1,4 +1,4 @@
-from typing import TypeVar, Any, cast
+from typing import TYPE_CHECKING, TypeVar, Any, cast, overload
 
 import builtins
 
@@ -17,7 +17,9 @@ from ..utils.sequence_view import SequenceView
 from ..core.pine_compare import EPSILON as _EPSILON, equal as _equal
 
 from ..types.na import NA, na_float, na_int
-from ..types.pine_types import PyneInt
+from ..types.pine_types import PyneInt, pine_int
+if TYPE_CHECKING:
+    from ..types.pine_types import PyneFloat
 from ..types.color import Color
 from ..types.box import Box
 from ..types.line import Line
@@ -167,8 +169,21 @@ def _na_element(id: list[Any] | SequenceView[Any]) -> Any:
     return NA(builtins.type(head))
 
 
+if TYPE_CHECKING:
+    # The container reductions answer with the element type (int array -> int). PyCharm's
+    # numeric tower cannot tell list[int] from list[float], so it calls the second overload
+    # of each pair unreachable; pyright and Pine both tell them apart
+    # noinspection PyShadowingBuiltins
+    @overload
+    def abs(id: list[int]) -> list[int]: ...
+
+    # noinspection PyShadowingBuiltins,PyOverloads
+    @overload
+    def abs(id: list[float]) -> list[float]: ...
+
+
 # noinspection PyShadowingBuiltins
-def abs(id: list[int | float]) -> list[int | float]:
+def abs(id: list[Number]) -> list[Any]:
     """
     Returns an array containing the absolute value of each element in the original array.
 
@@ -176,6 +191,16 @@ def abs(id: list[int | float]) -> list[int | float]:
     :return: Array containing the absolute value of each element in the original array
     """
     return [builtins.abs(v) for v in id]
+
+
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def avg(id: list[int]) -> PyneInt: ...
+
+    # noinspection PyShadowingBuiltins,PyOverloads
+    @overload
+    def avg(id: list[float]) -> PyneFloat: ...
 
 
 # noinspection PyShadowingBuiltins
@@ -208,13 +233,13 @@ def binary_search(id: list[Any], val: Any) -> PyneInt:
     while low <= high:
         mid = (low + high) // 2
         if id[mid] == val:
-            return float(mid)
+            return pine_int(mid)
         else:
             if val < id[mid]:
                 high = mid - 1
             else:
                 low = mid + 1
-    return -1.0
+    return pine_int(-1)
 
 
 # noinspection PyShadowingBuiltins
@@ -235,8 +260,8 @@ def binary_search_leftmost(id: list[Any], val: Any) -> PyneInt:
     # and a value below the whole array is clamped to 0 rather than returning -1.
     index = _bisect_left(id, val)
     if index < len(id) and id[index] == val:
-        return float(index)
-    return float(index - 1 if index > 0 else 0)
+        return pine_int(index)
+    return pine_int(index - 1 if index > 0 else 0)
 
 
 # noinspection PyShadowingBuiltins
@@ -257,8 +282,8 @@ def binary_search_rightmost(id: list[Any], val: Any) -> PyneInt:
     # greater element -- past the end for a value above the whole array.
     index = _bisect_right(id, val)
     if index > 0 and id[index - 1] == val:
-        return float(index - 1)
-    return float(index)
+        return pine_int(index - 1)
+    return pine_int(index)
 
 
 # noinspection PyShadowingBuiltins
@@ -412,6 +437,18 @@ def from_items(*items: T) -> list[T]:
     return list(items)
 
 
+if TYPE_CHECKING:
+    # One overload per container kind, so a checker splits a union of two arrays (the
+    # result of ``cond ? floats : ints``, which Pine accepts) instead of rejecting it
+    # noinspection PyShadowingBuiltins
+    @overload
+    def get(id: list[T], index: int) -> T: ...
+
+    # noinspection PyShadowingBuiltins
+    @overload
+    def get(id: SequenceView[T], index: int) -> T: ...
+
+
 # noinspection PyShadowingBuiltins
 def get(id: list[T] | SequenceView[T], index: int) -> T:
     """
@@ -482,8 +519,8 @@ def indexof(id: list[T], value: T) -> PyneInt:
     # Tolerance measured on TradingView (probes m548/m551)
     for i, item in enumerate(id):
         if _equal(item, value):
-            return float(i)
-    return -1.0
+            return pine_int(i)
+    return pine_int(-1)
 
 
 # noinspection PyShadowingBuiltins
@@ -561,8 +598,8 @@ def lastindexof(id: list[T], value: T) -> PyneInt:
     # Tolerance measured on TradingView (probe m551)
     for i in builtins.range(len(id) - 1, -1, -1):
         if _equal(id[i], value):
-            return float(i)
-    return -1.0
+            return pine_int(i)
+    return pine_int(-1)
 
 
 # noinspection PyShadowingBuiltins
@@ -595,6 +632,16 @@ def max(id: list[Number], nth: int = 0) -> Number:
     if nth < 0 or nth >= len(id):
         return cast(Number, NA(builtins.type(a[0])))
     return sorted(a, reverse=True)[nth if nth < len(a) else -1]
+
+
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def median(id: list[int]) -> PyneInt: ...
+
+    # noinspection PyShadowingBuiltins,PyOverloads
+    @overload
+    def median(id: list[float]) -> PyneFloat: ...
 
 
 # noinspection PyShadowingBuiltins
@@ -893,8 +940,18 @@ def _select_linear_interpolation(non_na: list[float], n: int, percentage: float)
     return non_na[lower - 1] * (1 - frac) + non_na[lower] * frac
 
 
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def percentile_linear_interpolation(id: list[int], percentage: float) -> PyneInt: ...
+
+    # noinspection PyShadowingBuiltins,PyOverloads
+    @overload
+    def percentile_linear_interpolation(id: list[float], percentage: float) -> PyneFloat: ...
+
+
 # noinspection PyShadowingBuiltins,PyShadowingNames
-def percentile_linear_interpolation(id: list[float], percentage: float) -> float:
+def percentile_linear_interpolation(id: list[Any], percentage: float) -> float:
     """
     Calculate the percentile value using linear interpolation.
 
@@ -963,8 +1020,18 @@ def _select_nearest_rank(non_na: list[float], n: int, percentage: float) -> floa
     return non_na[rank - 1] if rank <= m else na_float
 
 
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def percentile_nearest_rank(id: list[int], percentage: float) -> PyneInt: ...
+
+    # noinspection PyShadowingBuiltins,PyOverloads
+    @overload
+    def percentile_nearest_rank(id: list[float], percentage: float) -> PyneFloat: ...
+
+
 # noinspection PyShadowingBuiltins,PyShadowingNames
-def percentile_nearest_rank(id: list[float], percentage: float) -> float:
+def percentile_nearest_rank(id: list[Any], percentage: float) -> float:
     """
     Calculate the nearest rank percentile without interpolation.
 
@@ -986,6 +1053,16 @@ def percentile_nearest_rank(id: list[float], percentage: float) -> float:
 
     non_na = sorted(v for v in id if v == v)  # non-na: na never equals itself
     return _select_nearest_rank(non_na, len(id), percentage)
+
+
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def percentrank(id: list[int], index: int) -> PyneInt: ...
+
+    # noinspection PyShadowingBuiltins,PyOverloads
+    @overload
+    def percentrank(id: list[float], index: int) -> PyneFloat: ...
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames
@@ -1161,8 +1238,7 @@ def size(id: list[Any] | SequenceView[Any]) -> PyneInt:
     :param id: Input array
     :return: Number of elements in the array
     """
-    # A Pine int is a double at runtime
-    return float(len(id))
+    return pine_int(len(id))
 
 
 # noinspection PyShadowingBuiltins
@@ -1308,8 +1384,18 @@ def sort_indices(id: list[T], order: _order.Order = _order.ascending,
     return _sorted_positions(id, order, sort_field)
 
 
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def standardize(id: list[int]) -> list[int]: ...
+
+    # noinspection PyShadowingBuiltins,PyOverloads
+    @overload
+    def standardize(id: list[float]) -> list[float]: ...
+
+
 # noinspection PyShadowingBuiltins,PyShadowingNames
-def standardize(id: list[float | int]) -> list[float | int]:
+def standardize(id: list[Number]) -> list[Any]:
     """
     Standardizes the input array: every element becomes its z-score against the
     population mean and standard deviation.
@@ -1340,8 +1426,18 @@ def standardize(id: list[float | int]) -> list[float | int]:
     return [(v - mean) / stdev if v == v else na_float for v in id]
 
 
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def stdev(id: list[int], biased: bool = True) -> PyneInt: ...
+
+    # noinspection PyShadowingBuiltins,PyOverloads
+    @overload
+    def stdev(id: list[float], biased: bool = True) -> PyneFloat: ...
+
+
 # noinspection PyShadowingBuiltins
-def stdev(id: list[Number], biased: bool = True) -> float:
+def stdev(id: list[Any], biased: bool = True) -> float:
     """
     Returns the standard deviation of the elements in the array.
 
@@ -1358,8 +1454,18 @@ def stdev(id: list[Number], biased: bool = True) -> float:
     return math.sqrt(var)
 
 
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def sum(id: list[int]) -> PyneInt: ...
+
+    # noinspection PyShadowingBuiltins,PyOverloads
+    @overload
+    def sum(id: list[float]) -> PyneFloat: ...
+
+
 # noinspection PyShadowingBuiltins
-def sum(id: list[float | int]) -> float | int:
+def sum(id: list[Any]) -> float | int:
     """
     Returns the sum of the elements in the array.
 
@@ -1381,6 +1487,16 @@ def unshift(id: list[T] | SequenceView[T], value: T) -> None:
     :param value: Value to prepend
     """
     id.insert(0, value)
+
+
+if TYPE_CHECKING:
+    # noinspection PyShadowingBuiltins
+    @overload
+    def variance(id: list[int], biased: bool = True) -> PyneInt: ...
+
+    # noinspection PyShadowingBuiltins,PyOverloads
+    @overload
+    def variance(id: list[float], biased: bool = True) -> PyneFloat: ...
 
 
 # noinspection PyShadowingBuiltins

@@ -5,7 +5,7 @@ from ...types import PyneFloat, PyneInt, PyneStr
 # is an int value, ``strategy.closedtrades.commission(...)`` a namespaced function;
 # the AST transformer resolves both at runtime. The ``int`` base keeps arithmetic
 # on the bare name type-checking.
-class ClosedTradesModule(int):
+class ClosedTradesModule(PyneInt):
 
     def __call__(self) -> PyneInt: ...
 

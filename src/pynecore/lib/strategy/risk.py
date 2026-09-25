@@ -4,8 +4,11 @@ from .. import strategy
 
 from ... import lib
 
+# The risk_* attributes are slotted by every concrete position class, not by PositionBase
+# itself, and PyCharm checks an assignment against the declared type's own __slots__
 
-# noinspection PyShadowingBuiltins,PyProtectedMember
+
+# noinspection PyShadowingBuiltins,PyProtectedMember,PyDunderSlots,PyUnresolvedReferences
 def max_drawdown(
         value: float | int,
         type: strategy.QtyType = strategy.percent_of_equity,
@@ -20,7 +23,7 @@ def max_drawdown(
     :param type: The type of the value
     :param alert_message: The alert message
     """
-    if lib._script is None or lib._script.position is None:
+    if not lib._script or not lib._script.position:
         return
 
     lib._script.position.risk_max_drawdown_value = value
@@ -28,7 +31,7 @@ def max_drawdown(
     lib._script.position.risk_max_drawdown_alert = None if isinstance(alert_message, NA) else str(alert_message)
 
 
-# noinspection PyProtectedMember
+# noinspection PyProtectedMember,PyDunderSlots,PyUnresolvedReferences
 def allow_entry_in(value: strategy.direction.Direction) -> None:
     """
     This function can be used to specify in which market direction the strategy.entry function is
@@ -36,13 +39,13 @@ def allow_entry_in(value: strategy.direction.Direction) -> None:
 
     :param value: The allowed direction
     """
-    if lib._script is None or lib._script.position is None:
+    if not lib._script or not lib._script.position:
         return
 
     lib._script.position.risk_allowed_direction = value
 
 
-# noinspection PyProtectedMember
+# noinspection PyProtectedMember,PyDunderSlots,PyUnresolvedReferences
 def max_cons_loss_days(count: int, alert_message: PyneStr = NA(str)) -> None:
     """
     The purpose of this rule is to determine the maximum number of consecutive losing days.
@@ -52,14 +55,14 @@ def max_cons_loss_days(count: int, alert_message: PyneStr = NA(str)) -> None:
     :param count: The maximum number of consecutive losing days
     :param alert_message: The alert message
     """
-    if lib._script is None or lib._script.position is None:
+    if not lib._script or not lib._script.position:
         return
 
     lib._script.position.risk_max_cons_loss_days = count
     lib._script.position.risk_max_cons_loss_days_alert = None if isinstance(alert_message, NA) else str(alert_message)
 
 
-# noinspection PyProtectedMember
+# noinspection PyProtectedMember,PyDunderSlots,PyUnresolvedReferences
 def max_intraday_filled_orders(count: int, alert_message: PyneStr = NA(str)) -> None:
     """
     The purpose of this rule is to determine the maximum number of intraday filled orders
@@ -67,7 +70,7 @@ def max_intraday_filled_orders(count: int, alert_message: PyneStr = NA(str)) -> 
     :param count: The maximum number of intraday filled orders
     :param alert_message: The alert message
     """
-    if lib._script is None or lib._script.position is None:
+    if not lib._script or not lib._script.position:
         return
 
     lib._script.position.risk_max_intraday_filled_orders = count
@@ -76,7 +79,7 @@ def max_intraday_filled_orders(count: int, alert_message: PyneStr = NA(str)) -> 
     )
 
 
-# noinspection PyShadowingBuiltins,PyProtectedMember
+# noinspection PyShadowingBuiltins,PyProtectedMember,PyDunderSlots,PyUnresolvedReferences
 def max_intraday_loss(value: float | int, type: strategy.QtyType = strategy.percent_of_equity,
                       alert_message: PyneStr = NA(str)) -> None:
     """
@@ -88,7 +91,7 @@ def max_intraday_loss(value: float | int, type: strategy.QtyType = strategy.perc
     :param type: The type of the value
     :param alert_message: The alert message
     """
-    if lib._script is None or lib._script.position is None:
+    if not lib._script or not lib._script.position:
         return
 
     lib._script.position.risk_max_intraday_loss_value = value
@@ -96,14 +99,14 @@ def max_intraday_loss(value: float | int, type: strategy.QtyType = strategy.perc
     lib._script.position.risk_max_intraday_loss_alert = None if isinstance(alert_message, NA) else str(alert_message)
 
 
-# noinspection PyProtectedMember
+# noinspection PyProtectedMember,PyDunderSlots,PyUnresolvedReferences
 def max_position_size(contracts: int | float):
     """
     The purpose of this rule is to determine maximum size of a market position
 
     :param contracts: The maximum size of a market position
     """
-    if lib._script is None or lib._script.position is None:
+    if not lib._script or not lib._script.position:
         return
 
     lib._script.position.risk_max_position_size = abs(contracts)

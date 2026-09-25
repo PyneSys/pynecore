@@ -455,20 +455,20 @@ middle, upper, lower = ta.bb(close, 20, 2.0)
 trend, direction = ta.supertrend(3.0, 10)
 ''')
     assert (types['middle'], types['upper'], types['lower']) == (FLOAT, FLOAT, FLOAT)
-    # ... and the int half of a mixed pair is an INT-typed value, which is what
-    # the whole pass exists for
-    assert (types['trend'], types['direction']) == (FLOAT, INT)
+    # MEASURED (2026-09-25): ``[s, d] = ta.supertrend(3, 10)`` then ``int x = d`` is
+    # rejected, the direction is a float like the line itself
+    assert (types['trend'], types['direction']) == (FLOAT, FLOAT)
 
 
 def __test_a_lib_tuple_half_pins_what_it_feeds__():
-    """An unpacked int reaches an overload site as an int"""
+    """An unpacked half reaches an overload site with its own type"""
     tree, _ = _infer(SETUP + '''
 trend, direction = ta.supertrend(3.0, 10)
 picked = math.max(direction, 1)
 ''')
     pins = [get_pin(node) for node in ast.walk(tree)
             if isinstance(node, ast.Call) and ast.unparse(node.func) == 'lib.math.max']
-    assert pins == ['ii']
+    assert pins == ['fi']
 
 
 # --- 4. request.security ---------------------------------------------------

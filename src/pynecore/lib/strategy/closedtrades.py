@@ -1,5 +1,6 @@
 from ...types.na import NA, na_float, na_int
 from ...types import PyneFloat, PyneInt, PyneStr
+from ...types.pine_types import pine_int
 from ... import lib
 
 from ...core.module_property import module_property
@@ -66,7 +67,7 @@ def entry_bar_index(trade_num: int) -> PyneInt:
     try:
         assert lib._script is not None
         assert lib._script.position is not None
-        return float(lib._script.position.closed_trades[trade_num].entry_bar_index)
+        return pine_int(lib._script.position.closed_trades[trade_num].entry_bar_index)
     except (IndexError, AssertionError):
         return na_int
 
@@ -144,7 +145,7 @@ def entry_time(trade_num: int) -> PyneInt:
     try:
         assert lib._script is not None
         assert lib._script.position is not None
-        return float(lib._script.position.closed_trades[trade_num].entry_time)
+        return pine_int(lib._script.position.closed_trades[trade_num].entry_time)
     except (IndexError, AssertionError):
         return na_int
 
@@ -163,7 +164,7 @@ def exit_bar_index(trade_num: int) -> PyneInt:
     try:
         assert lib._script is not None
         assert lib._script.position is not None
-        return float(lib._script.position.closed_trades[trade_num].exit_bar_index)
+        return pine_int(lib._script.position.closed_trades[trade_num].exit_bar_index)
     except (IndexError, AssertionError):
         return na_int
 
@@ -239,7 +240,7 @@ def exit_time(trade_num: int) -> PyneInt:
     try:
         assert lib._script is not None
         assert lib._script.position is not None
-        return float(lib._script.position.closed_trades[trade_num].exit_time)
+        return pine_int(lib._script.position.closed_trades[trade_num].exit_time)
     except (IndexError, AssertionError):
         return na_int
 
@@ -383,11 +384,10 @@ def closedtrades() -> PyneInt:
 
     :return: The number of closed trades
     """
-    if lib._script is None or lib._script.position is None:
-        return 0.0
+    if not lib._script or not lib._script.position:
+        return pine_int(0)
     position = lib._script.position
-    # A Pine int is a double at runtime
-    return float(position.closed_trades_count)
+    return pine_int(position.closed_trades_count)
 
 
 # noinspection PyProtectedMember
@@ -398,7 +398,7 @@ def first_index() -> PyneInt:
 
     :return: The index of the oldest retained closed trade
     """
-    if lib._script is None or lib._script.position is None:
-        return 0.0
+    if not lib._script or not lib._script.position:
+        return pine_int(0)
     position = lib._script.position
-    return float(position.closed_trades_count - len(position.closed_trades))
+    return pine_int(position.closed_trades_count - len(position.closed_trades))

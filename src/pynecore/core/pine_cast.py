@@ -1,4 +1,5 @@
-from ..types.na import NA, na_float
+from ..types.na import NA, na_float, na_int
+from ..types.pine_types import PyneInt, pine_int
 from ..types.color import Color
 from ..types.label import Label
 from ..types.table import Table
@@ -69,7 +70,7 @@ def cast_box(x: Box | NA) -> Box:
     return NA(Box) if isinstance(x, NA) else x
 
 
-def cast_int(x: int | float | NA) -> float:
+def cast_int(x: int | float | NA) -> PyneInt:
     """
     Casts na or truncates float value to int
 
@@ -77,9 +78,8 @@ def cast_int(x: int | float | NA) -> float:
     :return: The casted value
     """
     if not (x == x):  # NA object or native nan
-        return na_float
-    # A Pine int is a double at runtime: the truncated value travels as a float
-    return float(int(x))
+        return na_int
+    return pine_int(int(x))
 
 
 def cast_line(x: Line | NA) -> Line:

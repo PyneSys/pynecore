@@ -81,9 +81,10 @@ class NA(Generic[T]):
 # The singleton constants wear the same "plain T" face as __new__ above:
 # na_float must be assignable wherever a float is, or every hot-path use of the
 # interned constants (instead of an NA(float) call) would false-positive.
-# (na_float genuinely IS a float now — the interned native nan.)
+# (na_float genuinely IS a float now — the interned native nan.) na_int is the
+# same nan at runtime, but it is the na of a Pine int, so it types as one.
 na_float: float
-na_int: float
+na_int: int
 na_str: str
 na_bool: bool
 

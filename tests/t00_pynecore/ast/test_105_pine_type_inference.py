@@ -329,7 +329,9 @@ def __test_keyword_spelling_keeps_a_type_preserving_call__():
     assert types['a'] == 'i'
     assert types['b'] == 'i'
     assert types['c'] == 'i'
-    assert types['d'] == 'i'
+    # MEASURED (2026-09-25): ``int a = math.sign(bar_index)`` is rejected, the sign is a
+    # float whatever the argument
+    assert types['d'] == 'f'
     assert types['e'] == 'i'
     assert types['f'] == 'f'
     assert types['g'] == '?'

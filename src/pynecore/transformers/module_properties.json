@@ -135,6 +135,9 @@
     "open": {
       "type": "variable"
     },
+    "pine_int": {
+      "type": "variable"
+    },
     "plotarrow": {
       "type": "variable"
     },
@@ -373,6 +376,9 @@
       "type": "variable"
     },
     "percentrank": {
+      "type": "variable"
+    },
+    "pine_int": {
       "type": "variable"
     },
     "pop": {
@@ -655,7 +661,7 @@
     "NA": {
       "type": "variable"
     },
-    "PyneInt": {
+    "PyneFloat": {
       "type": "variable"
     },
     "aqua": {
@@ -923,6 +929,9 @@
     "na_int": {
       "type": "variable"
     },
+    "pine_int": {
+      "type": "variable"
+    },
     "saturday": {
       "type": "variable"
     },
@@ -966,6 +975,12 @@
     "Dividends": {
       "type": "variable"
     },
+    "PyneFloat": {
+      "type": "variable"
+    },
+    "PyneInt": {
+      "type": "variable"
+    },
     "future_amount": {
       "type": "variable"
     },
@@ -981,6 +996,9 @@
     "na_float": {
       "type": "variable"
     },
+    "na_int": {
+      "type": "variable"
+    },
     "net": {
       "type": "variable"
     }
@@ -989,7 +1007,7 @@
     "Earnings": {
       "type": "variable"
     },
-    "NA": {
+    "PyneFloat": {
       "type": "variable"
     },
     "PyneInt": {
@@ -1557,6 +1575,9 @@
     "new": {
       "type": "variable"
     },
+    "pine_int": {
+      "type": "variable"
+    },
     "put": {
       "type": "variable"
     },
@@ -1644,6 +1665,9 @@
       "type": "variable"
     },
     "pi": {
+      "type": "variable"
+    },
+    "pine_int": {
       "type": "variable"
     },
     "pine_math": {
@@ -1808,6 +1832,9 @@
       "type": "variable"
     },
     "new": {
+      "type": "variable"
+    },
+    "pine_int": {
       "type": "variable"
     },
     "pinv": {
@@ -2451,6 +2478,9 @@
     "percent_of_equity": {
       "type": "variable"
     },
+    "pine_int": {
+      "type": "variable"
+    },
     "position_avg_price": {
       "type": "property"
     },
@@ -2547,6 +2577,9 @@
       "type": "variable"
     },
     "na_int": {
+      "type": "variable"
+    },
+    "pine_int": {
       "type": "variable"
     },
     "profit": {
@@ -2658,6 +2691,9 @@
     },
     "opentrades": {
       "type": "property"
+    },
+    "pine_int": {
+      "type": "variable"
     },
     "profit": {
       "type": "variable"
@@ -2774,6 +2810,9 @@
     "na_int": {
       "type": "variable"
     },
+    "pine_int": {
+      "type": "variable"
+    },
     "pos": {
       "type": "variable"
     },
@@ -2816,6 +2855,12 @@
   },
   "lib.syminfo": {
     "NA": {
+      "type": "variable"
+    },
+    "PyneFloat": {
+      "type": "variable"
+    },
+    "PyneInt": {
       "type": "variable"
     },
     "Session": {
@@ -3466,6 +3511,9 @@
     },
     "period": {
       "type": "property"
+    },
+    "pine_int": {
+      "type": "variable"
     },
     "timedelta": {
       "type": "variable"

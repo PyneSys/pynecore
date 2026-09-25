@@ -1,7 +1,7 @@
 """
 Builtin library of Pyne
 """
-from typing import TYPE_CHECKING, TypeAlias, Any
+from typing import TYPE_CHECKING, TypeAlias, Any, TypeVar, overload as _typing_overload
 
 if TYPE_CHECKING:
     from pynecore.types.type_checker import *
@@ -21,6 +21,7 @@ from ..core.script import script, input
 
 from ..types.na import NA, na_int
 from ..types import Series, PyneInt
+from ..types.pine_types import pine_int
 from ..types.plot_meta import PlotMeta
 from . import syminfo  # This should be imported before core.datetime to avoid circular import!
 from . import barstate, string, log, math, plot, hline, linefill, alert, dayofweek
@@ -194,6 +195,7 @@ if TYPE_CHECKING:
     from .hline import hline
     from .plot import plot
     from .alert import alert
+    from .dayofweek import dayofweek
 
 
 #
@@ -238,7 +240,7 @@ def timestamp(date_string: DateStr) -> PyneInt:  # It is more pythonic, but not 
     :return: UNIX timestamp in milliseconds
     """
     dt = _parse_datestring(date_string)
-    return float(int(dt.timestamp() * 1000))
+    return pine_int(int(dt.timestamp() * 1000))
 
 
 # noinspection PyPep8Naming
@@ -332,7 +334,7 @@ def timestamp(timezone: TimezoneStr | None, year: int | float, month: int | floa
     dt = datetime(y, m, 1, tzinfo=tz) + timedelta(
         days=d - 1 + calendar_shift, seconds=second_of_day
     )
-    return float(int(dt.timestamp() * 1000) + cycles * _GREGORIAN_CYCLE_MS)
+    return pine_int(int(dt.timestamp() * 1000) + cycles * _GREGORIAN_CYCLE_MS)
 
 
 # noinspection PyShadowingNames
@@ -887,6 +889,19 @@ def is_na(x: Any = None) -> bool | NA:
 # the @pyne transform) is therefore NOT a supported na-value spelling.
 na: Any = is_na
 
+_T = TypeVar('_T')
+
+
+# The static face of nz: the result is the source's own type with its na stripped.
+# Spelled through the typing alias on purpose: a decorator named ``overload`` would make
+# the lib type registry read these as a runtime overload group
+@_typing_overload
+def nz(source: NA[_T] | _T) -> _T: ...
+
+
+@_typing_overload
+def nz(source: NA[_T] | _T, replacement: _T) -> _T: ...
+
 
 def nz(source: Any, replacement: Any = 0) -> Any:
     """
@@ -977,7 +992,7 @@ def dayofmonth(time: int | float | None = None, timezone: str | None = None) -> 
     :return: The day of the month
     """
     dt = _get_dt(time, timezone)
-    return na_int if dt is None else float(dt.day)
+    return na_int if dt is None else pine_int(dt.day)
 
 
 # noinspection PyShadowingNames
@@ -991,7 +1006,7 @@ def hour(time: int | float | None = None, timezone: str | None = None) -> PyneIn
     :return: The hour of the day
     """
     dt = _get_dt(time, timezone)
-    return na_int if dt is None else float(dt.hour)
+    return na_int if dt is None else pine_int(dt.hour)
 
 
 # noinspection PyShadowingNames
@@ -1005,7 +1020,7 @@ def minute(time: int | float | None = None, timezone: str | None = None) -> Pyne
     :return: The minute of the hour
     """
     dt = _get_dt(time, timezone)
-    return na_int if dt is None else float(dt.minute)
+    return na_int if dt is None else pine_int(dt.minute)
 
 
 # noinspection PyShadowingNames
@@ -1019,7 +1034,7 @@ def month(time: int | float | None = None, timezone: str | None = None) -> PyneI
     :return: The month of the year
     """
     dt = _get_dt(time, timezone)
-    return na_int if dt is None else float(dt.month)
+    return na_int if dt is None else pine_int(dt.month)
 
 
 # noinspection PyShadowingNames
@@ -1033,7 +1048,7 @@ def second(time: int | float | None = None, timezone: str | None = None) -> Pyne
     :return: The second of the minute
     """
     dt = _get_dt(time, timezone)
-    return na_int if dt is None else float(dt.second)
+    return na_int if dt is None else pine_int(dt.second)
 
 
 ### Session parsing and validation helpers ###
@@ -2014,7 +2029,7 @@ def time(timeframe: str | None = None, session: str | int | None = None,
         session = None
 
     if timeframe is None:
-        return float(_time)
+        return pine_int(_time)
 
     # An empty string selects the timeframe the script runs on
     if timeframe == '':
@@ -2048,7 +2063,7 @@ def time(timeframe: str | None = None, session: str | int | None = None,
 
     if session is None:
         # No session specified, return the bar time
-        return float(bar_time)
+        return pine_int(bar_time)
     if not isinstance(session, str):
         # A bool slips past the int(bars_back) overload guard (bool is an int):
         # it is not a valid session specification.
@@ -2067,7 +2082,7 @@ def time(timeframe: str | None = None, session: str | int | None = None,
                                      bar_time, bar_time, max(timeframe_bars_back, 0))
         if bounds is None:
             return na_int
-        return float(bounds[0])
+        return pine_int(bounds[0])
     except TimezoneNotFoundError:
         # A missing/unresolvable timezone is a configuration error: surface it with
         # the actionable message instead of silently treating every bar as closed.
@@ -2093,7 +2108,7 @@ _timenow_ms: int = 0
 
 
 @module_property
-def timenow():
+def timenow() -> PyneInt:
     """
     Current time in UNIX format. It is the number of milliseconds that have elapsed since 00:00:00 UTC, 1 January 1970.
 
@@ -2103,9 +2118,9 @@ def timenow():
     :return: Current time in milliseconds
     """
     if _timenow_ms:
-        return float(_timenow_ms)
+        return pine_int(_timenow_ms)
     # Get current UTC time and convert to milliseconds since Unix epoch
-    return float(int(datetime.now(UTC).timestamp() * 1000))
+    return pine_int(int(datetime.now(UTC).timestamp() * 1000))
 
 
 # ``time_tradingday`` cache. The strategy engine calls the property on every bar
@@ -2160,7 +2175,7 @@ def time_tradingday() -> PyneInt:
         _ttd_memo_dt = None
 
     if _datetime is _ttd_memo_dt:
-        return float(_ttd_memo_result)
+        return pine_int(_ttd_memo_result)
 
     local_dt = _datetime  # already expressed in the exchange timezone
     trade_date = local_dt.date()
@@ -2187,7 +2202,7 @@ def time_tradingday() -> PyneInt:
     result = (trade_date.toordinal() - _EPOCH_ORDINAL) * 86_400_000
     _ttd_memo_dt = local_dt
     _ttd_memo_result = result
-    return float(result)
+    return pine_int(result)
 
 
 # Trading-day close cap for ``time_close``. TradingView closes a bar at
@@ -2387,7 +2402,7 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
                 close_ms = _tdc_cap_ms(_time, close_ms)
         except (ValueError, AssertionError):
             return na_int
-        return float(close_ms)
+        return pine_int(close_ms)
 
     # An empty string selects the timeframe the script runs on
     if timeframe == '':
@@ -2434,7 +2449,7 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
 
     if session is None:
         # No session specified, return the bar close time
-        return float(bar_close_time)
+        return pine_int(bar_close_time)
     if not isinstance(session, str):
         # A bool slips past the int(bars_back) overload guard (bool is an int):
         # it is not a valid session specification.
@@ -2454,7 +2469,7 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
                                      max(timeframe_bars_back, 0))
         if bounds is None:
             return na_int
-        return float(bounds[1])
+        return pine_int(bounds[1])
     except TimezoneNotFoundError:
         # A missing/unresolvable timezone is a configuration error: surface it with
         # the actionable message instead of silently treating every bar as closed.
@@ -2475,7 +2490,7 @@ def weekofyear(time: int | float | None = None, timezone: str | None = None) -> 
     :return: The week of the year
     """
     dt = _get_dt(time, timezone)
-    return na_int if dt is None else float(dt.isocalendar()[1])
+    return na_int if dt is None else pine_int(dt.isocalendar()[1])
 
 
 # noinspection PyShadowingNames
@@ -2489,4 +2504,4 @@ def year(time: int | float | None = None, timezone: str | None = None) -> PyneIn
     :return: The year
     """
     dt = _get_dt(time, timezone)
-    return na_int if dt is None else float(dt.year)
+    return na_int if dt is None else pine_int(dt.year)

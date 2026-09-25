@@ -63,7 +63,7 @@ getattr(random, '__pyne_layout__')['per_call'] = True
 # looks type-unsafe because the ``source_na`` guard above it is a value test the
 # IDE cannot narrow by.
 # noinspection PyShadowingBuiltins,PyUnusedLocal,PyUnboundLocalVariable,PyUnresolvedReferences,PyTypeChecker
-def sum(source: TFI | NA[TFI], length: int) -> PyneFloat | TFI | NA[TFI]:
+def sum(source: TFI | NA[TFI], length: int) -> PyneFloat:
     """
     Returns the sum of a series over a specified length.
 

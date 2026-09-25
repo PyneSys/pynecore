@@ -1,15 +1,20 @@
-from typing import TypeVar, cast, overload
+from typing import Any, TypeVar, cast, overload
 import builtins
 import math
 
 from ..core import fdlibm, pine_math
 from ..types.na import NA, na_float, na_int
 from ..types import PyneFloat, PyneInt
+from ..types.pine_types import pine_int
 
 from . import syminfo
 from ._math_stateful import random, sum
 
 TFI = TypeVar('TFI', float, int)
+# Result-side twin of TFI: int FIRST, so an argument of unknown type keeps the
+# Pine int, and spelled with the Pyne aliases, which PyCharm resolves to its
+# indexable int/float
+TIF = TypeVar('TIF', PyneInt, PyneFloat)
 
 __all__ = [
     'e', 'pi', 'phi', 'rphi',
@@ -19,10 +24,10 @@ __all__ = [
 ]
 
 # Constants
-e = math.e
-pi = math.pi
-phi = (1 + math.sqrt(5)) / 2
-rphi = 1 / phi
+e: PyneFloat = math.e
+pi: PyneFloat = math.pi
+phi: PyneFloat = (1 + math.sqrt(5)) / 2
+rphi: PyneFloat = 1 / phi
 
 # `0.5 - 1e-10` as an exact fraction, the tie threshold round() compares against
 _ROUND_TIE_SCALE = 10 ** 10
@@ -33,16 +38,18 @@ _ROUND_MAX_PRECISION = 16.0
 _ROUND_INT_LIMIT = 2.0 ** 52
 
 # noinspection PyShadowingBuiltins
-def abs(number: TFI | NA[TFI]) -> PyneFloat:
+def abs(number: TIF | NA[TIF]) -> TIF:
     """
     Returns the absolute value of a number.
 
     :param number: A number.
-    :return: The absolute value of the number.
+    :return: The absolute value of the number, of the number's own type.
     """
     if not (number == number):  # is_na_arg
-        return na_float
-    return builtins.abs(number)
+        # The numeric na is the na of both int and float; pyright needs the cast
+        # noinspection PyUnnecessaryCast
+        return cast(TIF, na_float)
+    return cast(TIF, builtins.abs(number))
 
 
 def acos(angle: TFI | NA[TFI]) -> PyneFloat:
@@ -130,8 +137,7 @@ def ceil(number: TFI | NA[TFI]) -> PyneInt:
     """
     if not (number == number):  # is_na_arg
         return na_int
-    # A Pine int is a double at runtime: the integral result travels as a float
-    return float(math.ceil(number))
+    return pine_int(math.ceil(number))
 
 
 def cos(angle: TFI | NA[TFI]) -> PyneFloat:
@@ -171,8 +177,7 @@ def floor(number: TFI | NA[TFI]) -> PyneInt:
     if not (number == number):  # is_na_arg
         return na_int
     # int() truncates toward zero; Pine's floor is a true floor (floor(-1.2) == -2).
-    # A Pine int is a double at runtime: the integral result travels as a float
-    return float(math.floor(number))
+    return pine_int(math.floor(number))
 
 
 def log(number: TFI | NA[TFI]) -> PyneFloat:
@@ -199,7 +204,7 @@ def log10(number: TFI | NA[TFI]) -> PyneFloat:
     return pine_math.log10(number)
 
 
-def _na_of_operands(numbers: tuple[TFI | NA[TFI], ...]) -> PyneFloat:
+def _na_of_operands(numbers: tuple[Any, ...]) -> Any:
     """
     Return the na matching the operands' numeric contract: the typeless na when
     no operand carries a type at all, the numeric na otherwise.
@@ -218,13 +223,15 @@ def _na_of_operands(numbers: tuple[TFI | NA[TFI], ...]) -> PyneFloat:
 # noinspection PyShadowingBuiltins
 @overload
 def max(*numbers: int) -> PyneInt: ...
-# noinspection PyShadowingBuiltins
+# PyCharm cannot match a TypeVar-constrained overload against the implementation;
+# pyright checks this set and finds it consistent
+# noinspection PyShadowingBuiltins,PyOverloads
 @overload
-def max(*numbers: TFI | NA[TFI]) -> PyneFloat: ...
+def max(*numbers: TIF | NA[TIF]) -> TIF: ...
 
 
 # noinspection PyShadowingBuiltins
-def max(*numbers: TFI | NA[TFI]) -> PyneFloat:
+def max(*numbers: TIF | NA[TIF]) -> TIF:
     """
     Returns the largest number.
 
@@ -241,19 +248,20 @@ def max(*numbers: TFI | NA[TFI]) -> PyneFloat:
         if not (n == n):  # is_na_arg
             return _na_of_operands(numbers)
 
-    return builtins.max(cast(list[TFI], numbers))
+    return builtins.max(cast(list[TIF], numbers))
 
 
 # noinspection PyShadowingBuiltins
 @overload
 def min(*numbers: int) -> PyneInt: ...
-# noinspection PyShadowingBuiltins
+# See max: a PyCharm limitation, not an inconsistency
+# noinspection PyShadowingBuiltins,PyOverloads
 @overload
-def min(*numbers: TFI | NA[TFI]) -> PyneFloat: ...
+def min(*numbers: TIF | NA[TIF]) -> TIF: ...
 
 
 # noinspection PyShadowingBuiltins
-def min(*numbers: TFI | NA[TFI]) -> PyneFloat:
+def min(*numbers: TIF | NA[TIF]) -> TIF:
     """
     Returns the smallest number.
 
@@ -267,7 +275,7 @@ def min(*numbers: TFI | NA[TFI]) -> PyneFloat:
         if not (n == n):  # is_na_arg
             return _na_of_operands(numbers)
 
-    return builtins.min(cast(list[TFI], numbers))
+    return builtins.min(cast(list[TIF], numbers))
 
 
 # noinspection PyShadowingBuiltins
@@ -295,16 +303,18 @@ def pow(base: TFI | NA[TFI], exponent: TFI | NA[TFI]) -> PyneFloat:
     return pine_math.pow(b, exponent)
 
 
-# noinspection PyShadowingBuiltins
+# PyCharm cannot match a TypeVar-constrained overload against the implementation, nor
+# see an int result as a float one; pyright checks this set and finds it consistent
+# noinspection PyShadowingBuiltins,PyOverloads
 @overload
 def round(number: TFI | NA[TFI]) -> PyneInt: ...
-# noinspection PyShadowingBuiltins
+# noinspection PyShadowingBuiltins,PyOverloads
 @overload
 def round(number: TFI | NA[TFI], precision: PyneInt) -> PyneFloat: ...
 
 
 # noinspection PyShadowingBuiltins
-def round(number: TFI | NA[TFI], precision: PyneInt = na_int) -> PyneFloat:
+def round(number: TFI | NA[TFI], precision: PyneInt = na_int) -> PyneFloat | PyneInt:
     """
     Returns a number rounded to a specified number of decimal places, ties going
     away from zero.
@@ -394,6 +404,9 @@ def round(number: TFI | NA[TFI], precision: PyneInt = na_int) -> PyneFloat:
 
 @overload
 def round_to_mintick(number: float | int) -> float: ...
+# The Pyne-typed face for PyCharm, whose indexable Pyne classes the builtin overload
+# above does not return; PyCharm then calls it unreachable behind that one
+# noinspection PyOverloads
 @overload
 def round_to_mintick(number: PyneFloat | PyneInt) -> PyneFloat: ...
 

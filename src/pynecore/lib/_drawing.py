@@ -15,20 +15,21 @@ that is not a number is ``na``.
 from typing import Any
 
 from ..types.na import na_int, na_float
+from ..types.pine_types import PyneFloat, PyneInt, pine_int
 
 __all__ = ['bar_coord', 'price']
 
 
-def bar_coord(value: Any) -> float:
+def bar_coord(value: Any) -> PyneInt:
     """Normalize a drawing's x coordinate (bar index or bar time).
 
     :param value: The coordinate the script passed.
     :return: The truncated coordinate, or ``na`` when it is not a number.
     """
-    return float(int(value)) if isinstance(value, (int, float)) and value == value else na_int
+    return pine_int(int(value)) if isinstance(value, (int, float)) and value == value else na_int
 
 
-def price(value: Any) -> float:
+def price(value: Any) -> PyneFloat:
     """Normalize a drawing's y coordinate (a price).
 
     :param value: The coordinate the script passed.

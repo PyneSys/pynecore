@@ -204,7 +204,7 @@ def barssince(condition: bool) -> PyneInt:
     else:
         counter += 1
     # A Pine int is a double at runtime
-    return float(counter)
+    return cast(PyneInt, float(counter))
 
 
 def bb(series: float, length: int, mult: float | int) -> tuple[PyneFloat, PyneFloat, PyneFloat]:
@@ -1205,7 +1205,7 @@ def max(source: Series[float]) -> PyneFloat:
 # looks possibly-unbound because it is a series whose storage outlives the ``if``
 # that feeds it.
 # noinspection PyUnusedLocal,PyUnboundLocalVariable
-def median(source: Series[TFI], length: int) -> PyneFloat:
+def median(source: Series[TFI], length: int) -> TFI:
     """
     Calculate the median of the source series over a given period.
 
@@ -1263,7 +1263,10 @@ def median(source: Series[TFI], length: int) -> PyneFloat:
             return source
         if len(heap_low) > len(heap_high):
             return -heap_low[0]
-        return (-heap_low[0] + heap_high[0]) / 2
+        # An int-typed median keeps the .5 of an even window (a Pine int is a double);
+        # pyright needs the cast to the source type
+        # noinspection PyUnnecessaryCast
+        return cast(TFI, (-heap_low[0] + heap_high[0]) / 2)
 
     if length != prev_length and prev_length != 0:
         # ``length`` is a series value and changed: rebuild the window and both
@@ -1323,7 +1326,8 @@ def median(source: Series[TFI], length: int) -> PyneFloat:
     if len(heap_low) > len(heap_high):
         return -heap_low[0]  # Max heap root
     # MEASURED: an int source gets the mean of the two middle values too (1.5 for 0,1,2,3)
-    return (-heap_low[0] + heap_high[0]) / 2
+    # noinspection PyUnnecessaryCast
+    return cast(TFI, (-heap_low[0] + heap_high[0]) / 2)
 
 
 def mfi(series: float, length: int) -> PyneFloat:
@@ -2194,7 +2198,7 @@ def pvt() -> PyneFloat:
 
 
 # noinspection PyShadowingBuiltins
-def range(source: Series[float], length: int) -> PyneFloat:
+def range(source: Series[TFI], length: int) -> TFI:
     """
     Returns the difference between the max and min values in a series.
 
@@ -2203,11 +2207,14 @@ def range(source: Series[float], length: int) -> PyneFloat:
     :return: The range of the source series
     """
     assert length > 0, "Invalid length, length must be greater than 0!"
+    # The result has the source's type; pyright needs the casts, PyCharm does not
     if not (source == source):  # is_na_arg
-        return na_float
+        # noinspection PyUnnecessaryCast
+        return cast(TFI, na_float)
     length = int(length)
 
-    return highest(source, length) - lowest(source, length)
+    # noinspection PyUnnecessaryCast
+    return cast(TFI, highest(source, length) - lowest(source, length))
 
 
 def rci(source: Series[float], length: int) -> PyneFloat:
@@ -2618,7 +2625,7 @@ def stoch(source: float | Series[float], high: float | Series[float], low: float
 
 
 # noinspection PyUnusedLocal,PyShadowingNames,PyPep8Naming
-def supertrend(factor: float | int, atrPeriod: int) -> tuple[PyneFloat, PyneInt]:
+def supertrend(factor: float | int, atrPeriod: int) -> tuple[PyneFloat, PyneFloat]:
     """
     Calculate Supertrend indicator.
 
@@ -2813,7 +2820,7 @@ def variance(source: Series[float],
     return builtins.max(0.0, var)
 
 
-def valuewhen(condition: bool, source: float, occurrence: int) -> PyneFloat:
+def valuewhen(condition: bool, source: TFIB, occurrence: int) -> TFIB:
     """
     Returns the value of the source series when the condition is true for the given occurrence.
 
@@ -2850,14 +2857,16 @@ def valuewhen(condition: bool, source: float, occurrence: int) -> PyneFloat:
     # duplicate ages out of the ring like any other occurrence. ``var``
     # assignments and ``ta.cum`` are rolled back on the same bars, so this is
     # the ring itself living outside the rollback, which is ``varip``.
-    values: IBPersistent[deque[PyneFloat]] = deque(maxlen=occurrence + 1)
+    values: IBPersistent[deque[TFIB]] = deque(maxlen=occurrence + 1)
 
     if condition:
         values.append(source)
 
     if len(values) == occurrence + 1:
         return values[0]
-    return na_float
+    # The numeric na stands in for the source's own type; pyright needs the cast
+    # noinspection PyUnnecessaryCast
+    return cast(TFIB, na_float)
 
 
 # noinspection PyUnusedLocal
