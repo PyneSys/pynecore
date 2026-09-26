@@ -5,7 +5,7 @@ title: "What is PyneCore"
 description: "Introduction to PyneCore and its core concepts"
 icon: "code"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-09-26"
 draft: false
 toc: true
 categories: ["Overview"]
@@ -17,7 +17,13 @@ tags: ["introduction", "pine-script", "python"]
 
 ## The Python-Powered Trading Framework
 
-PyneCore is an innovative, open-source framework that brings the power of TradingView's Pine Script paradigm to the Python ecosystem. It's not just a tool that runs Pine Script code — it's a complete reimagining of the Pine Script concept, natively implemented in Python, while trying to be as compatible with Pine Script as possible.
+PyneCore is an innovative, open-source framework that brings the power of TradingView's Pine Script paradigm to the Python ecosystem. It's not just a tool that runs Pine Script code — it's a complete reimagining of the Pine Script concept, natively implemented in Python, with results that match TradingView.
+
+PyneCore is validated continuously against TradingView on 809 published Pine Script v6 scripts:
+all 1,090 comparable outputs match, 99.714% of 99 million plotted values are bit-identical, and
+289,074 strategy trades match TradingView's timing (snapshot 2026-09-23,
+[Pyne in the Wild](https://wild.pynesys.io/)). See [Compatibility](./compatibility.md) for
+details.
 
 ## The PyneCore Vision
 
@@ -32,7 +38,8 @@ Trading strategies and technical indicators are usually implemented in one of tw
 
 PyneCore was built with several ambitious goals in mind:
 
-- **100% compatibility with TradingView Pine Script**: The system aims to replicate Pine Script functionality with high precision (0.001% tolerance)
+- **Results that match TradingView**: Indicator values and strategy trades match TradingView,
+  measured on a public corpus of 809 published Pine Script v6 scripts
 - **Zero mandatory dependencies**: The core system operates without external libraries, ensuring portability and reliability
 - **Maximum performance**: Designed from the ground up for speed and efficiency
 - **Clean, well-documented code**: The source code prioritizes readability and proper documentation
@@ -132,7 +139,9 @@ Learn more about the NA system in the [Core Concepts](./core-concepts.md#5-na-no
 - **Extensible**: Leverage Python's vast ecosystem alongside PyneCore's capabilities
 - **Open Source**: Core functionality is open source and free to use (Apache 2.0 license)
 - **Modern**: Type hints, error handling, and comprehensive documentation (always improving)
-- **Precise**: Calculations match TradingView's results with high precision (the goal is to be 100% compatible)
+- **Precise**: All 1,090 comparable outputs of 809 published Pine Script v6 scripts match
+  TradingView; 99.714% of 99 million plotted values are bit-identical, and the largest relative
+  gap anywhere is 1.2e-10
 
 ## Who Is PyneCore For?
 

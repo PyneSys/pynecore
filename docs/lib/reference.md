@@ -5,7 +5,7 @@ title: "Library Reference"
 description: "PyneCore library modules, types, and usage patterns"
 icon: "menu_book"
 date: "2025-03-31"
-lastmod: "2026-03-28"
+lastmod: "2026-09-26"
 draft: false
 toc: true
 categories: ["API Reference", "Library"]
@@ -105,9 +105,11 @@ can also be used, keeping code readability and personal preferences in mind.
 
 ## Pine Script Compatibility
 
-The goal of the PyneCore library is to provide full compatibility with the Pine Script API while leveraging Python's
-strengths. Technical indicators and other calculations are performed with high precision (0.001% tolerance), just like
-Pine Script.
+The PyneCore library implements the Pine Script API while leveraging Python's strengths. PyneCore is validated
+continuously against TradingView on 809 published Pine Script v6 scripts: all 1,090 comparable outputs match, 99.714%
+of 99 million plotted values are bit-identical, and 289,074 strategy trades match TradingView's timing (snapshot
+2026-09-23, [Pyne in the Wild](https://wild.pynesys.io/)). See
+[Compatibility](/docs/overview/compatibility/) for details.
 
 ### Documentation
 
