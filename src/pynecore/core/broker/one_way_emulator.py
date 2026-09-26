@@ -996,25 +996,34 @@ class OneWayEmulator:
 
     # === Restart replay ===================================================
 
-    async def restart_replay(self, port: 'PositionPort') -> None:
+    async def restart_replay(self, port: 'PositionPort') -> bool:
         """Resume any close-leg fan-out or bracket replication a crash interrupted.
 
-        Called once at startup. Three ordered passes: pending close-leg rows
-        are reconciled against the live legs and the residual re-dispatched (an
-        already-settled leg is never re-closed); THEN reversal residual-open
-        breadcrumbs are reconciled (the closes are now resolved, so a still-owed
-        residual is safely re-opened) and the open re-dispatched only when its
-        own entry row never landed; THEN active bracket-ownership rows are
-        re-asserted on still-open legs (idempotent on the per-leg coid) and
-        released when their leg has vanished.
+        Called at startup until it reports completion. Three ordered passes:
+        pending close-leg rows are reconciled against the live legs and the
+        residual re-dispatched (an already-settled leg is never re-closed); THEN
+        reversal residual-open breadcrumbs are reconciled (the closes are now
+        resolved, so a still-owed residual is safely re-opened) and the open
+        re-dispatched only when its own entry row never landed; THEN active
+        bracket-ownership rows are re-asserted on still-open legs (idempotent on
+        the per-leg coid) and released when their leg has vanished.
+
+        :return: ``True`` when every pass ran to completion. ``False`` when a
+            re-dispatched close leg was definitively refused by the exchange
+            (a closed market, a symbol holiday): its row stays pending, the
+            residual-open pass — which must not re-open before the closes are
+            resolved — is not reached, and the caller runs the replay again on
+            its next sync.
         """
         if self._store_ctx is None:
-            return
-        await self._replay_close_legs(port)
+            return True
+        if not await self._replay_close_legs(port):
+            return False
         await self._replay_residual_opens(port)
         await self._replay_bracket_ownership(port)
+        return True
 
-    async def _replay_close_legs(self, port: 'PositionPort') -> None:
+    async def _replay_close_legs(self, port: 'PositionPort') -> bool:
         """Reconcile + re-dispatch any pending close-leg rows (first replay pass).
 
         For every persisted ``pending`` close-leg row, reconcile against the live
@@ -1023,28 +1032,42 @@ class OneWayEmulator:
         re-dispatch only the residual (capped at the live leg size, re-snapped to
         the grid) so an already-partly-closed leg is never over-reduced. The
         natural-close fill dedup guards the fill side.
+
+        :return: ``True`` when every pending row was settled, ``False`` when the
+            exchange refused at least one re-dispatch (that row stays pending
+            for the next replay).
         """
         if self._store_ctx is None:
-            return
+            return True
         pending = list(iter_active_close_legs(self._store_ctx))
         if not pending:
-            return
+            return True
         by_symbol: dict[str, list] = {}
         for row in pending:
             by_symbol.setdefault(row.symbol, []).append(row)
+        settled = True
         for symbol, rows in by_symbol.items():
             legs = await port.fetch_raw_positions(symbol)
             live_by_id = {leg.leg_id: leg for leg in legs}
             quantize = await port.get_volume_quantizer(symbol)
             for row in rows:
-                await self._replay_one(row, symbol, live_by_id, quantize, port)
+                if not await self._replay_one(row, symbol, live_by_id, quantize, port):
+                    settled = False
+        return settled
 
     async def _replay_one(
             self, row, symbol: str, live_by_id: dict[str, PositionLeg], quantize, port: 'PositionPort',
-    ) -> None:
-        """Reconcile + (if needed) re-dispatch one pending close-leg row."""
+    ) -> bool:
+        """Reconcile + (if needed) re-dispatch one pending close-leg row.
+
+        :return: ``True`` when the row was settled (finalised, or re-dispatched
+            and finalised), ``False`` when the exchange definitively refused the
+            re-dispatch — the leg is still open and the row stays pending so the
+            next replay retries it (a bot restarted into a closed market must not
+            halt on the refusal; the close is still owed once trading resumes).
+        """
         if self._store_ctx is None:
-            return
+            return True
         extras = row.extras or {}
         leg_id: str | None = extras.get(EXTRAS_KEY_CLOSE_LEG_ID)
         live_leg = live_by_id.get(leg_id) if leg_id is not None else None
@@ -1054,15 +1077,24 @@ class OneWayEmulator:
                 self._store_ctx, coid=row.client_order_id,
                 new_state=CLOSE_LEG_STATE_DISPATCHED, close_row=True,
             )
-            return
+            return True
         persisted = extras.get(EXTRAS_KEY_CLOSE_LEG_VOLUME) or 0
         residual = min(int(persisted), quantize(live_leg.qty))
         if residual > 0:
-            await port.close_leg(symbol, leg_id, residual, row.client_order_id)
+            try:
+                await port.close_leg(symbol, leg_id, residual, row.client_order_id)
+            except ExchangeOrderRejectedError as exc:
+                _blog_warning(
+                    "restart replay: close of leg %s (%s x%d) refused by the "
+                    "exchange, kept pending for the next sync: %s",
+                    leg_id, symbol, residual, exc,
+                )
+                return False
         update_close_leg_state(
             self._store_ctx, coid=row.client_order_id,
             new_state=CLOSE_LEG_STATE_DISPATCHED, close_row=True,
         )
+        return True
 
     async def _replay_residual_opens(self, port: 'PositionPort') -> None:
         """Re-dispatch any reversal residual-open a crash left un-persisted.

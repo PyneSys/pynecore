@@ -11211,6 +11211,7 @@ def __test_first_sync_skips_one_way_replay_when_not_emulating__():
 
     async def _spy(port):
         called.append(port)
+        return True
 
     engine._one_way_emulator.restart_replay = _spy
     engine.sync(BAR_TS)
@@ -11229,6 +11230,7 @@ def __test_one_way_replay_connection_error_retries_next_sync__():
         calls.append(port)
         if len(calls) == 1:
             raise ExchangeConnectionError("transient broker read failure")
+        return True
 
     engine._one_way_emulator.restart_replay = _spy
     engine.sync(BAR_TS)  # first sync: replay errors -> sync bails, flag unset
@@ -11237,6 +11239,33 @@ def __test_one_way_replay_connection_error_retries_next_sync__():
     engine.sync(BAR_TS + 60_000)  # retried on the next sync
     assert len(calls) == 2
     assert engine._one_way_replay_done is True
+
+
+def __test_one_way_replay_refused_close_retries_next_sync__():
+    """A replayed close the exchange refuses leaves the replay pending for the next sync.
+
+    (Live incident: a bot restarted into a symbol holiday; the venue rejected
+    the replayed reversal close and the reject escaped the startup sync, so
+    the run died although the close was merely owed until trading resumed.)
+    """
+    b = MockBroker()
+    b.position_port = b
+    engine, _pos = _mk_engine(b)
+    calls: list = []
+
+    async def _spy(port):
+        calls.append(port)
+        return len(calls) > 1
+
+    engine._one_way_emulator.restart_replay = _spy
+    engine.sync(BAR_TS)  # first sync: a close was refused -> sync bails, flag unset
+    assert engine._one_way_replay_done is False
+    assert len(calls) == 1
+    engine.sync(BAR_TS + 60_000)  # retried on the next sync, now complete
+    assert len(calls) == 2
+    assert engine._one_way_replay_done is True
+    engine.sync(BAR_TS + 120_000)
+    assert len(calls) == 2  # settled: not re-driven again
 
 
 def _persist_bracket_ownership(ctx, *, leg_id="1", intent_key="X\0L",
