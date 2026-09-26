@@ -42,7 +42,8 @@ def _check_session(dt: datetime, tf_sec: int) -> bool:
     :param tf_sec: Timeframe in seconds
     :return: True if candle overlaps with any session
     """
-    return is_in_session(syminfo._opening_hours, dt, tf_sec)
+    return is_in_session(syminfo._opening_hours, dt, tf_sec,
+                         getattr(syminfo, 'session_corrections', None) or None)
 
 
 #

@@ -533,7 +533,8 @@ def _classify_missing_slots(missing: list[int], syminfo: 'SymInfo',
     closed: list[int] = []
     for ts in missing:
         local_dt = datetime.fromtimestamp(ts, tz)
-        if is_in_session(opening_hours, local_dt, tf_seconds):
+        if is_in_session(opening_hours, local_dt, tf_seconds,
+                         syminfo.session_corrections):
             in_session.append(ts)
         else:
             closed.append(ts)

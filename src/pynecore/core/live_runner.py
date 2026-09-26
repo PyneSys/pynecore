@@ -757,7 +757,8 @@ def live_ohlcv_generator(
             return True
         assert syminfo is not None and _sym_tz is not None
         local_dt = datetime.fromtimestamp(epoch_ms / 1000.0, tz=_sym_tz)
-        return is_in_session(syminfo.opening_hours, local_dt, tf_seconds)
+        return is_in_session(syminfo.opening_hours, local_dt, tf_seconds,
+                             syminfo.session_corrections)
 
     def _market_open_now() -> bool:
         """Point-in-time "is the market open right now?" check.
@@ -772,7 +773,8 @@ def live_ohlcv_generator(
             return True
         assert syminfo is not None and _sym_tz is not None
         local_dt = datetime.fromtimestamp(time.time(), tz=_sym_tz)
-        return is_point_in_session(syminfo.opening_hours, local_dt)
+        return is_point_in_session(syminfo.opening_hours, local_dt,
+                                   syminfo.session_corrections)
 
     async def _async_loop():
         nonlocal shutdown_loop, shutdown_event

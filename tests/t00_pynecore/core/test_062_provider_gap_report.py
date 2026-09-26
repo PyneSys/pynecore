@@ -6,7 +6,7 @@ must localize the shortfall precisely: distinguish a venue history-horizon
 limit from in-session holes (incomplete pagination / omitted ticks) and list
 the exact missing intervals, instead of a vague sparse-coverage count.
 """
-from datetime import datetime, time, UTC
+from datetime import date, datetime, time, UTC
 from types import SimpleNamespace
 
 from pynecore.cli.commands.run import (
@@ -40,7 +40,7 @@ def __test_missing_slots_empty_without_real_bars__():
 
 def __test_classify_24x7_all_in_session__():
     """A symbol with no opening_hours treats every hole as an anomaly."""
-    syminfo = SimpleNamespace(opening_hours=[], timezone="UTC")
+    syminfo = SimpleNamespace(opening_hours=[], timezone="UTC", session_corrections={})
     slots = [_ts(2025, 1, 6, 3, 0), _ts(2025, 1, 6, 10, 0)]
     in_session, closed = _classify_missing_slots(slots, syminfo, TF)
     assert in_session == slots
@@ -53,6 +53,7 @@ def __test_classify_splits_by_session__():
     syminfo = SimpleNamespace(
         opening_hours=[SymInfoInterval(day=0, start=time(9, 0), end=time(17, 0))],
         timezone="UTC",
+        session_corrections={},
     )
     in_slot = _ts(2025, 1, 6, 10, 0)   # Monday 10:00 — open
     out_slot = _ts(2025, 1, 6, 3, 0)   # Monday 03:00 — closed
@@ -66,6 +67,7 @@ def __test_classify_session_boundaries_use_half_open_slots__():
     syminfo = SimpleNamespace(
         opening_hours=[SymInfoInterval(day=0, start=time(9, 0), end=time(17, 0))],
         timezone="UTC",
+        session_corrections={},
     )
     pre_open = _ts(2025, 1, 6, 8, 59)
     first_open = _ts(2025, 1, 6, 9, 0)
@@ -111,3 +113,20 @@ def __test_format_reports_in_session_gap__():
     )
     assert "in-session" in msg.lower()
     assert "2025-01-06 10:00" in msg
+
+
+def __test_classify_honours_session_corrections__():
+    """A holiday correction turns an in-session hole into an expected closed gap."""
+    syminfo = SimpleNamespace(
+        opening_hours=[SymInfoInterval(day=0, start=time(9, 0), end=time(17, 0))],
+        timezone="UTC",
+        # Monday 2025-01-06 closes early at 12:00.
+        session_corrections={
+            date(2025, 1, 6): (SymInfoInterval(day=0, start=time(9, 0), end=time(12, 0)),),
+        },
+    )
+    morning = _ts(2025, 1, 6, 10, 0)
+    afternoon = _ts(2025, 1, 6, 14, 0)
+    in_session, closed = _classify_missing_slots([morning, afternoon], syminfo, TF)
+    assert in_session == [morning]
+    assert closed == [afternoon]
