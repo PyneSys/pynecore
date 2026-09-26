@@ -2340,13 +2340,20 @@ class OrderSyncEngine:
         one_way_port: PositionPort | None = getattr(self._broker, 'position_port', None)
         if not self._one_way_replay_done and one_way_port is not None:
             try:
-                self._run_async(
+                replayed = self._run_async(
                     self._one_way_emulator.restart_replay(one_way_port),
                 )
             except ExchangeConnectionError as e:
                 _blog_warning(
                     "restart settle skipped before one-way emulation replay "
                     "could complete (connection error: %s) — retrying next bar", e,
+                )
+                return
+            if not replayed:
+                _blog_warning(
+                    "restart settle skipped: one-way emulation replay could not "
+                    "complete (the exchange refused a replayed close) — retrying "
+                    "next bar",
                 )
                 return
             self._one_way_replay_done = True
@@ -2519,13 +2526,19 @@ class OrderSyncEngine:
         one_way_port: PositionPort | None = getattr(self._broker, 'position_port', None)
         if not self._one_way_replay_done and one_way_port is not None:
             try:
-                self._run_async(
+                replayed = self._run_async(
                     self._one_way_emulator.restart_replay(one_way_port),
                 )
             except ExchangeConnectionError as e:
                 _blog_warning(
                     "sync skipped before one-way emulation replay could "
                     "complete (connection error: %s) — retrying next sync", e,
+                )
+                return
+            if not replayed:
+                _blog_warning(
+                    "sync skipped: one-way emulation replay could not complete "
+                    "(the exchange refused a replayed close) — retrying next sync",
                 )
                 return
             self._one_way_replay_done = True

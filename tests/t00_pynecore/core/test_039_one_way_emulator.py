@@ -367,6 +367,35 @@ def __test_restart_replay_is_idempotent__(tmp_path):
     store.close()
 
 
+def __test_restart_replay_keeps_refused_close_leg_pending__(tmp_path):
+    """A replayed close the exchange refuses stays pending and is retried by the next replay.
+
+    A bot restarted into a closed market (symbol holiday) gets its owed close
+    refused; the refusal must not settle the row (the leg is still open) and
+    must not halt the startup — the next replay, once trading resumes, closes
+    the leg exactly once.
+    """
+    store, ctx = _make_store(tmp_path)
+    _pending_leg_row(ctx, leg_id="10", volume=2, qty=2.0)
+    port = _FakePort(
+        [_leg("10", "buy", 2.0, open_time=0.0)],
+        fail_close_leg=ExchangeOrderRejectedError("SYMBOL_HAS_HOLIDAY"),
+    )
+    eng = OneWayEmulator(store_ctx=ctx)
+    assert _run(eng.restart_replay(port)) is False
+    assert port.closed == []
+    assert [row.client_order_id for row in iter_active_close_legs(ctx)] == ["t000-x-y-c:10"]
+    # Trading resumed: the same row is replayed and settled.
+    port._fail_close_leg = None
+    assert _run(eng.restart_replay(port)) is True
+    assert _dispatched(port) == [("10", 2)]
+    assert list(iter_active_close_legs(ctx)) == []
+    # A settled replay reports completion on every later pass.
+    assert _run(eng.restart_replay(port)) is True
+    assert _dispatched(port) == [("10", 2)]
+    store.close()
+
+
 # === run_reversal — decomposition =======================================
 
 def _entry_env(side, qty, *, symbol="EURUSD", pine_id="Long",
