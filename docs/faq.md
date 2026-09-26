@@ -5,7 +5,7 @@ title: "FAQ"
 description: "Frequently asked questions about PyneCore"
 icon: "psychology"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-09-26"
 draft: false
 toc: true
 categories: ["Support"]
@@ -25,7 +25,11 @@ PyneCore is an open-source framework that implements TradingView's Pine Script p
 
 ### How does PyneCore relate to TradingView?
 
-PyneCore is not affiliated with or endorsed by TradingView. It is an independent project that aims to be compatible with Pine Script functionality while offering the advantages of Python. PyneCore strives to match TradingView's Pine Script calculations with precision testing with tolerances of 0.001% (relative) and 0.00000001 (absolute).
+PyneCore is not affiliated with or endorsed by TradingView. It is an independent project that
+implements Pine Script's functionality and execution model in Python. PyneCore is validated
+continuously against TradingView on 809 published Pine Script v6 scripts: all 1,090 comparable
+outputs match, 99.714% of 99 million plotted values are bit-identical, and 289,074 strategy trades
+match TradingView's timing (snapshot 2026-09-23, [Pyne in the Wild](https://wild.pynesys.io/)).
 
 ### Is PyneCore free to use?
 
@@ -168,9 +172,30 @@ You can use either or both methods (even in the same script) based on your prefe
 
 ## Compatibility and Technical Details
 
+### How reliable is PyneCore compared to TradingView?
+
+PyneCore's results are measured against TradingView on a public validation corpus,
+[Pyne in the Wild](https://wild.pynesys.io/). The snapshot of 2026-09-23 covers 809 published
+open-source Pine Script v6 scripts (407 indicators, 402 strategies), tested on BINANCE:BTCUSDT
+30-minute bars:
+
+- All 809 scripts run.
+- All 1,090 outputs that can be compared with TradingView are verified (712 plot outputs and 378
+  strategy trade lists).
+- Of 99,018,068 plotted values, 99.714% are identical to TradingView to the bit; the rest are
+  within the published band. The largest relative gap anywhere is 1.2e-10 (about 9 significant
+  figures).
+- In all 378 strategies with trades, the 289,074 trades match TradingView's entry and exit timing,
+  and the trade counts are identical.
+
+See [Compatibility](./overview/compatibility.md) for details.
+
 ### Is PyneCore 100% compatible with Pine Script?
 
-PyneCore aims for high compatibility with Pine Script functionality and calculations, with high precision (0.001% tolerance). However, there are some intentional differences to make the experience more Pythonic and to leverage Python's strengths. These differences are documented in the [Differences from Pine Script](./overview/differences.md) page.
+The calculations and strategy results match TradingView, as measured above. There are some
+intentional differences in the programming model to make the experience more Pythonic and to
+leverage Python's strengths. These differences are documented in the
+[Differences from Pine Script](./overview/differences.md) page.
 
 ### How does PyneCore handle NA values?
 
@@ -254,6 +279,13 @@ See the [Programmatic Usage](./programmatic/README.md) guide for full documentat
 [pynecore-examples](https://github.com/PyneSys/pynecore-examples) repository for runnable examples
 covering CSV data, custom data sources, live exchange feeds, and FreqTrade integration.
 
+### Can PyneCore run scripts on live market data?
+
+Yes. `pyne run --live` streams real-time data from a provider plugin after the historical phase;
+strategies run in paper-trading mode with simulated fills. `pyne run --broker` (which implies
+`--live`) sends real orders to the exchange through a broker plugin. See
+[Live Mode](./advanced/live-mode.md).
+
 ## Troubleshooting
 
 ### My script isn't being recognized as a PyneCore script
@@ -270,13 +302,21 @@ NA values can propagate through calculations just like in Pine Script. If any in
 
 ### My script runs differently than the Pine Script version
 
-While PyneCore aims for high compatibility, there might be subtle differences in behavior. Common issues include:
+PyneCore's results match TradingView on the public validation corpus (see
+[How reliable is PyneCore compared to TradingView?](#how-reliable-is-pynecore-compared-to-tradingview)).
+When a result differs, the most common causes are:
 
-1. Different handling of edge cases
-2. Differences in function implementation details
-3. Missing Pine Script features (check the documentation for supported features)
+1. Different input data: TradingView and your data source may have different bars, and a
+   comparison is only meaningful on identical OHLCV data
+2. Data feeds PyneCore has no source for: `request.dividends()`, `request.splits()`,
+   `request.earnings()` and `request.financial()` return `na` when called with
+   `ignore_invalid_symbol=True` and raise an error otherwise; `request.economic()` and
+   `request.quandl()` always raise an error
+3. An intentional difference from Pine Script (see
+   [Differences from Pine Script](./overview/differences.md))
 
-If you encounter significant discrepancies, please report them as issues in the GitHub repository.
+If you find a discrepancy on identical data, please report it as an issue in the GitHub
+repository.
 
 ### How do I debug my PyneCore script?
 

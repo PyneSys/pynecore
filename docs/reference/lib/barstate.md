@@ -5,7 +5,7 @@ title: "barstate"
 description: "Bar state flags — first bar, last bar, new bar, etc."
 icon: "toggle_on"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-09-26"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -129,12 +129,17 @@ if barstate.isrealtime:
 
 ## Compatibility Notes
 
-**Current Limitations:**
+**Backtesting** (historical data only): every bar is a closed historical bar.
 
-- `barstate.isconfirmed` — Always returns `true`; bar magnifier support not yet implemented.
-- `barstate.ishistory` — Always returns `true`; live trading not yet supported.
-- `barstate.islastconfirmedhistory` — Always returns `false`; live trading not yet supported.
-- `barstate.isnew` — Always returns `false`; bar magnifier support not yet implemented.
-- `barstate.isrealtime` — Always returns `false`; live trading not yet supported.
+- `barstate.ishistory` and `barstate.isconfirmed` are `true` on every bar.
+- `barstate.isnew` is `true` on every bar: each historical bar is calculated once.
+- `barstate.isrealtime` is `false` on every bar.
+- `barstate.islastconfirmedhistory` is `false` on every bar, including the dataset's last bar.
 
-For backtesting on historical datasets, `isfirst`, `islast`, and `isconfirmed` work as documented. Live market support is planned for a future release.
+**Live mode** (`pyne run --live`, or `pyne run --broker`): the historical phase behaves like a
+backtest, except that `barstate.islast` is `false` on the historical bars and
+`barstate.islastconfirmedhistory` is `true` on the final historical bar. On the streamed bars
+`barstate.ishistory` is `false`, `barstate.isrealtime` and `barstate.islast` are `true`,
+`barstate.isconfirmed` is `true` only on the bar-closing update, and `barstate.isnew` marks the
+first execution of a new bar. See [Live Mode](../../advanced/live-mode.md#barstate-values) for the
+per-tick values.
