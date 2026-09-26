@@ -47,7 +47,7 @@ from ..core.resampler import (
     close_table_by_weekday as _close_table_by_weekday,
     trading_day as _trading_day, trading_day_open_sec as _trading_day_open_sec,
     scheduled_day_open_sec as _scheduled_day_open_sec,
-    observed_week_key as _observed_week_key,
+    observed_week_key as _observed_week_key, first_monday as _first_monday,
 )
 
 # The interned typeless na: bare ``na`` in compiled scripts evaluates through
@@ -1834,7 +1834,11 @@ def _session_bar_bounds(chart_time_ms: int, session_infos: 'tuple[SessionInfo, .
                     period_date = _period_start_date(period_date, modifier, 1)
                     continue
                 break
-            period_date = _period_start_date(period_date, modifier, -steps)
+            if modifier == 'W' and steps > 0:
+                period_date = _tv_week_walk(period_date, max(period_date.year, chart_date.year),
+                                            1, steps)
+            else:
+                period_date = _period_start_date(period_date, modifier, -steps)
             open_ms = _session_period_anchor(period_date, session_infos)
             close_ms = _session_period_anchor(_period_start_date(period_date, modifier, 1),
                                               session_infos)
@@ -2320,26 +2324,171 @@ def _previous_trading_day_open_ms(open_ms: int, span_off_ms: int) -> int:
     return previous_open_ms
 
 
+def _weeks_in_year(calendar_year: int) -> int:
+    """
+    Number of weeks on the year's weekly grid: the Mondays of ``calendar_year``.
+
+    :param calendar_year: Calendar year
+    :return: 52, or 53 when the year starts on a Monday or is a leap year starting on
+             a Sunday
+    """
+    return (_first_monday(calendar_year + 1) - _first_monday(calendar_year)).days // 7
+
+
+def _week_group_monday(monday: date, multiplier: int) -> date:
+    """
+    Monday of the nW bar holding the week that starts on ``monday``.
+
+    :param monday: Monday of a week
+    :param multiplier: Weekly timeframe multiplier
+    :return: Monday of the bar's first week (weeks count from the year's first Monday)
+    """
+    fm = _first_monday(monday.year)
+    return fm + timedelta(weeks=(monday - fm).days // 7 // multiplier * multiplier)
+
+
+def _tv_week_walk(day: date, chart_year: int, multiplier: int, steps: int) -> date:
+    """
+    Monday of the nW bar ``steps`` bars before the one holding ``day``.
+
+    :param day: Trading day of the chart bar (or a Monday of its week)
+    :param chart_year: Calendar year of the chart bar's trading day -- differs from the
+                 week's Monday's year on the days before the year's first Monday
+    :param multiplier: Weekly timeframe multiplier
+    :param steps: Bars to walk back, positive
+    :return: Monday of the bar's first week
+    """
+    # MEASURED (TradingView, 2026-09-26, CAPITALCOM:US500 1999-2026, BTCUSD, EURUSD,
+    # AAPL and GOLD daily charts, every multiplier 1..18, 20, 25, 26, 30, 40 and 52,
+    # offsets 1..20: 1.48 million values, no mismatch). A step subtracts the bar length
+    # from the chart bar's time and reports the bar holding the result -- exact inside a
+    # year, where the grid is regular. When the result falls before the year's first
+    # Monday, D weeks before it, TradingView does not count D weeks back from there: it
+    # tiles the previous year with D-week tiles from ITS first Monday and lands on the
+    # last tile that starts inside that year. The two agree when D divides the previous
+    # year's week count (52 or 53) and differ by up to D - 1 weeks otherwise -- from the
+    # year's first week (D = n) the walk then reaches the previous year's short last bar,
+    # while from a later week of the same bar it may skip it. The walk continues from
+    # the landing week, so later steps stay inside the previous year until they cross
+    # again.
+    for _ in range(steps):
+        target: date = day - timedelta(weeks=multiplier)
+        fm = _first_monday(chart_year)
+        if target >= fm:
+            day = target
+            continue
+        target_monday = target - timedelta(days=target.weekday())
+        distance = (fm - target_monday).days // 7
+        previous = _weeks_in_year(chart_year - 1)
+        day = fm - timedelta(weeks=(previous - 1) % distance + 1)
+        chart_year -= 1
+    return _week_group_monday(day - timedelta(days=day.weekday()), multiplier)
+
+
+# noinspection PyProtectedMember
+def _scheduled_day_shift(day: date, count: int) -> date:
+    """
+    Trading day ``count`` scheduled days away from ``day`` on the session template.
+
+    Days the template schedules no open for (the weekend of a Monday to Friday market)
+    are skipped; holidays are not, the template does not know them.
+
+    :param day: Trading day date
+    :param count: Scheduled days to move, negative walks back
+    :return: The target trading day
+    """
+    oh = syminfo._opening_hours
+    ss = syminfo._session_starts
+    if _dbt_guard is None or _dbt_guard[0] is not oh or _dbt_guard[1] is not ss:
+        _dbt_rebuild(oh, ss)
+    step = timedelta(days=1 if count > 0 else -1)
+    remaining = abs(count)
+    while remaining:
+        day += step
+        if not _dbt_starts or _scheduled_day_open_sec(day, _dbt_tz, _dbt_starts, _dbt_on) is not None:
+            remaining -= 1
+    return day
+
+
+# noinspection PyProtectedMember
+def _dwm_walk_probe_ms(modifier: str, multiplier: int, current_time_ms: int,
+                       steps: int) -> int:
+    """
+    Session open of the first trading day of the D/W/M bar ``steps`` bars away from the
+    one holding the chart bar at ``current_time_ms``.
+
+    :param modifier: 'D', 'W' or 'M'
+    :param multiplier: Timeframe multiplier
+    :param current_time_ms: Chart bar open, in milliseconds
+    :param steps: Bars to walk, positive back, negative forward
+    :return: Open of the target bar's first scheduled trading day, in milliseconds
+    """
+    oh = syminfo._opening_hours
+    ss = syminfo._session_starts
+    if _dbt_guard is None or _dbt_guard[0] is not oh or _dbt_guard[1] is not ss:
+        _dbt_rebuild(oh, ss)
+    day = _trading_day((current_time_ms + _chart_span_off_ms()) // 1000, _dbt_tz, _dbt_on)
+    if modifier == 'W':
+        if steps > 0:
+            day = _tv_week_walk(day, day.year, multiplier, steps)
+        else:
+            # A bar that has not opened yet: the bar holding the chart bar's time moved
+            # forward by whole bar lengths. MEASURED (TradingView, 2026-09-26, US500 and
+            # BTCUSD daily charts, 1W..26W, offsets -1 and -2): a move landing in the
+            # next year reports that year's first bar even from the last full bar of the
+            # current one, so its short last bar is skipped.
+            monday = day - timedelta(days=day.weekday()) - timedelta(weeks=steps * multiplier)
+            day = _week_group_monday(monday, multiplier)
+    elif modifier == 'M':
+        # MEASURED (TradingView, 2026-09-26, US500 and BTCUSD daily charts, 5M..11M,
+        # offsets -1, 1 and 2): the bar holding the chart bar's month moved by whole bar
+        # lengths, so a move across the year skips the year's short last bar.
+        months = day.year * 12 + day.month - 1 - steps * multiplier
+        target_year, target_month = divmod(months, 12)
+        day = date(target_year, target_month // multiplier * multiplier + 1, 1)
+    else:
+        # MEASURED (TradingView, 2026-09-26, US500 and BTCUSD daily charts, 2D..10D):
+        # the bar holding the trading day the template schedules that many days away.
+        # Around the turn of the year TradingView's daily walk on a Monday to Friday
+        # template deviates from this on some of the first days of January (see the
+        # nD notes in docs/development/tradingview-time-bars-back.md).
+        day = _scheduled_day_shift(day, -steps * multiplier)
+    # The probe is the session open of the target bar's first scheduled day: the day
+    # before it may lie in a gap of the template (a month starting on a Sunday), and an
+    # instant in a gap resolves to the trading day before it.
+    day = _scheduled_day_shift(day - timedelta(days=1), 1)
+    return _trading_day_open_sec(day, _dbt_tz, _dbt_starts, _dbt_on) * 1000
+
+
 def _requested_bar_time(resampler: Resampler, modifier: str, multiplier: int,
                         current_time_ms: int, steps: int) -> int:
     """
-    Bar open time on a requested timeframe's grid, stepped back by whole grid bars.
+    Bar open time on a requested timeframe's grid, stepped by whole grid bars.
 
     :param resampler: Resampler of the requested timeframe
     :param modifier: Timeframe modifier ('', 'S', 'D', 'W' or 'M')
     :param multiplier: Timeframe multiplier
     :param current_time_ms: Chart bar open to resolve, in milliseconds
-    :param steps: Whole grid bars to step back; zero or less resolves without stepping
+    :param steps: Whole grid bars to step, positive back, negative forward (a bar that
+                  has not opened yet); zero resolves the chart bar's own grid bar
     :return: Bar opening time in milliseconds
     """
     dwm = multiplier > 1 and modifier in ('D', 'W', 'M')
     daily = multiplier == 1 and modifier == 'D'
-    if steps <= 0 and modifier in ('D', 'W', 'M'):
+    if steps == 0 and modifier in ('D', 'W', 'M'):
         # noinspection PyProtectedMember
         if (modifier, multiplier) == timeframe_module._process_tf(
                 timeframe_module._current_period()):
             # The script's own bars are the requested grid
             return current_time_ms
+    if steps and (dwm or modifier in ('W', 'M')):
+        # Weekly, monthly and multi-day bars are walked on their calendar grids; the
+        # probe lands on the target bar's first trading day and resolves without
+        # stepping. ``_dwm_bar_time`` resolves a chart bar by its own last instant, so
+        # the probe carries the chart span back.
+        span_off_ms = _chart_span_off_ms() if dwm else 0
+        current_time_ms = _dwm_walk_probe_ms(modifier, multiplier, current_time_ms, steps) - span_off_ms
+        steps = 0
     while True:
         if dwm:
             bar_time = _dwm_bar_time(resampler, modifier, multiplier, current_time_ms)
@@ -2356,27 +2505,35 @@ def _requested_bar_time(resampler: Resampler, modifier: str, multiplier: int,
             # (EURUSD January 2016: Thursday 2015-12-31 17:00, BTCUSD February 2026:
             # Saturday 01-31 17:00).
             bar_time = resampler.get_bar_time(current_time_ms, *_session_grid_args())
-        if steps <= 0:
+        if steps == 0:
             return bar_time
+        if steps < 0:
+            # A daily bar that has not opened yet: the next scheduled trading day of the
+            # session template
+            span_off_ms = _chart_span_off_ms()
+            day = _trading_day((bar_time + span_off_ms) // 1000, _dbt_tz, _dbt_on)
+            day = _scheduled_day_shift(day, -steps)
+            current_time_ms = _trading_day_open_sec(day, _dbt_tz, _dbt_starts, _dbt_on) * 1000 - span_off_ms
+            steps = 0
+            continue
         steps -= 1
         # The walk resolves a probe inside the previous bar rather than subtracting a
-        # nominal bar length, because a month is not a fixed span: taking _in_seconds('M')
-        # (30.4375 days) off a bar early in the month reaches the month BEFORE the intended
-        # one. An intraday bar is left one instant before its open. A D, W or M bar is left
-        # through the scheduled trading day before its first one, because the instant
-        # before its open can lie in a gap that resolves forward again: AAPL's 09:29 is
-        # still the Monday that opens at 09:30, GOLD's 17:59 after the 17:00 close is
-        # already the next trading day, and the FX Sunday before the 17:00 open has no
-        # trading day at all. MEASURED (TradingView, 2026-09-25, CAPITALCOM:AAPL, EURUSD,
-        # GOLD and BTCUSD on 60 and D charts): time("D", timeframe_bars_back=1) is the
-        # previous trading day of the session template, a template day without data (a
-        # holiday) included -- AAPL's Tuesday 2017-05-30 steps to Memorial Day 09:30.
+        # nominal bar length. An intraday bar is left one instant before its open. A
+        # daily bar is left through the scheduled trading day before its first one,
+        # because the instant before its open can lie in a gap that resolves forward
+        # again: AAPL's 09:29 is still the Monday that opens at 09:30, GOLD's 17:59 after
+        # the 17:00 close is already the next trading day, and the FX Sunday before the
+        # 17:00 open has no trading day at all. MEASURED (TradingView, 2026-09-25,
+        # CAPITALCOM:AAPL, EURUSD, GOLD and BTCUSD on 60 and D charts): time("D",
+        # timeframe_bars_back=1) is the previous trading day of the session template, a
+        # template day without data (a holiday) included -- AAPL's Tuesday 2017-05-30
+        # steps to Memorial Day 09:30.
         if modifier in ('', 'S'):
             current_time_ms = bar_time - 1
         else:
-            # ``_dwm_bar_time`` and ``_d_bar_time`` resolve a chart bar by its own last
-            # instant, so the probe carries the same span back
-            span_off_ms = _chart_span_off_ms() if dwm or daily else 0
+            # ``_d_bar_time`` resolves a chart bar by its own last instant, so the probe
+            # carries the same span back
+            span_off_ms = _chart_span_off_ms()
             current_time_ms = _previous_trading_day_open_ms(bar_time, span_off_ms) - span_off_ms
 
 
@@ -2451,13 +2608,14 @@ def time(timeframe: str | None = None, session: str | int | None = None,
                      that far back. A negative value evaluates it on the expected open of a
                      future chart bar, walked over the symbol's session schedule.
     :param timeframe_bars_back: Bar offset on the requested ``timeframe`` instead of the
-                     chart's, applied on top of ``bars_back``. Positive values walk the
-                     requested grid one bar at a time, so an uneven grid such as a monthly
-                     one steps exactly, an intraday one skips the time between the
-                     symbol's sessions and a daily one the days its session template does
-                     not schedule. Negative values refer to bars that have not opened yet:
-                     an intraday grid is walked forward over the symbol's sessions, a
-                     daily, weekly or monthly one steps its nominal bar length.
+                     chart's, applied on top of ``bars_back``. An intraday grid is walked
+                     one bar at a time over the symbol's sessions, in both directions.
+                     A daily one steps the days its session template schedules. Weekly
+                     and monthly bars are found by moving the chart bar's time by whole
+                     bar lengths, the way TradingView does: a move that crosses the
+                     turn of the year can skip the year's short last bar, and a backward
+                     weekly move that crosses it lands where TradingView's year tiling
+                     puts it (see :func:`_tv_week_walk`).
     :return: UNIX time in milliseconds or NA if bar is outside session or invalid parameters
     """
     # Pine overload: time(timeframe, bars_back) -- a numeric second argument is a bar
@@ -2493,19 +2651,14 @@ def time(timeframe: str | None = None, session: str | int | None = None,
     # The chart bar the call is evaluated on
     current_time_ms = _time
     intraday = modifier in ('', 'S')
-    if bars_back or (timeframe_bars_back < 0 and not intraday):
+    if bars_back:
         try:
-            if bars_back:
-                chart_bar_ms = _chart_bar_open(bars_back)
-                if chart_bar_ms is None:
-                    return na_int
-                current_time_ms = chart_bar_ms
-            if timeframe_bars_back < 0 and not intraday:
-                # A daily, weekly or monthly bar that has not opened yet steps its nominal
-                # length
-                current_time_ms -= timeframe_bars_back * timeframe_module._in_seconds(timeframe) * 1000
+            chart_bar_ms = _chart_bar_open(bars_back)
         except (ValueError, AssertionError):
             return na_int
+        if chart_bar_ms is None:
+            return na_int
+        current_time_ms = chart_bar_ms
     if session is None and timeframe_bars_back and intraday:
         # An offset walks the intraday grid over the symbol's session runs, skipping the
         # time between them in both directions. MEASURED (TradingView, 2026-09-25):
@@ -2535,9 +2688,8 @@ def time(timeframe: str | None = None, session: str | int | None = None,
 
     # Resolve the session bar this call reports (see _session_bar_bounds)
     try:
-        steps = timeframe_bars_back if intraday else max(timeframe_bars_back, 0)
         bounds = _session_bar_bounds(current_time_ms, session_infos, modifier, multiplier,
-                                     bar_time, bar_time, steps)
+                                     bar_time, bar_time, timeframe_bars_back)
         if bounds is None:
             return na_int
         return pine_int(bounds[0])
@@ -2875,13 +3027,14 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
                      that far back. A negative value evaluates it on the expected open of a
                      future chart bar, walked over the symbol's session schedule.
     :param timeframe_bars_back: Bar offset on the requested ``timeframe`` instead of the
-                     chart's, applied on top of ``bars_back``. Positive values walk the
-                     requested grid one bar at a time, so an uneven grid such as a monthly
-                     one steps exactly, an intraday one skips the time between the
-                     symbol's sessions and a daily one the days its session template does
-                     not schedule. Negative values refer to bars that have not opened yet:
-                     an intraday grid is walked forward over the symbol's sessions, a
-                     daily, weekly or monthly one steps its nominal bar length.
+                     chart's, applied on top of ``bars_back``. An intraday grid is walked
+                     one bar at a time over the symbol's sessions, in both directions.
+                     A daily one steps the days its session template schedules. Weekly
+                     and monthly bars are found by moving the chart bar's time by whole
+                     bar lengths, the way TradingView does: a move that crosses the
+                     turn of the year can skip the year's short last bar, and a backward
+                     weekly move that crosses it lands where TradingView's year tiling
+                     puts it (see :func:`_tv_week_walk`).
     :return: UNIX time in milliseconds of bar close or NA if bar is outside session or invalid parameters
     """
     # Pine overload: time_close(timeframe, bars_back) -- a numeric second argument is a
@@ -2928,19 +3081,14 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
     # The chart bar the call is evaluated on
     current_time_ms = _time
     intraday = modifier in ('', 'S')
-    if bars_back or (timeframe_bars_back < 0 and not intraday):
+    if bars_back:
         try:
-            if bars_back:
-                chart_bar_ms = _chart_bar_open(bars_back)
-                if chart_bar_ms is None:
-                    return na_int
-                current_time_ms = chart_bar_ms
-            if timeframe_bars_back < 0 and not intraday:
-                # A daily, weekly or monthly bar that has not opened yet steps its nominal
-                # length
-                current_time_ms -= timeframe_bars_back * timeframe_module._in_seconds(timeframe) * 1000
+            chart_bar_ms = _chart_bar_open(bars_back)
         except (ValueError, AssertionError):
             return na_int
+        if chart_bar_ms is None:
+            return na_int
+        current_time_ms = chart_bar_ms
     if session is None and timeframe_bars_back and intraday:
         # An offset walks the symbol's session runs (see time())
         session = ''
@@ -2980,9 +3128,8 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
 
     # Resolve the session bar this call reports (see _session_bar_bounds)
     try:
-        steps = timeframe_bars_back if intraday else max(timeframe_bars_back, 0)
         bounds = _session_bar_bounds(current_time_ms, session_infos, modifier, multiplier,
-                                     bar_start_time, bar_close_time, steps)
+                                     bar_start_time, bar_close_time, timeframe_bars_back)
         if bounds is None:
             return na_int
         return pine_int(bounds[1])

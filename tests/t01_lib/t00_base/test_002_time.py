@@ -624,3 +624,81 @@ def __test_malformed_numeric_session_is_na__(monkeypatch):
         assert na(time_close("60", session)), session
         assert na(time("60", session, "UTC")), session
         assert na(time_close("60", session, "UTC")), session
+
+
+def __test_weekly_offset_across_the_year_follows_the_year_tiling__(monkeypatch):
+    """ A backward nW offset that crosses the turn of the year lands on TradingView's tile """
+    ny = __test_helper_ny
+    # MEASURED (TradingView, 2026-09-26, CAPITALCOM:US500, EURUSD, BTCUSD, AAPL and GOLD
+    # daily charts, every multiplier 1..18, 20, 25, 26, 30, 40 and 52, offsets 1..20, 27
+    # year boundaries): 2019 has 52 weeks, its last 3W bar is the lone week of December 30.
+    # From the first week of 2020 the offset reaches it, from the second week it skips to
+    # the bar of December 9 -- the bar length taken off the chart bar's time falls 2 weeks
+    # before the year's first Monday, and 52 weeks tile into 2-week tiles with none left
+    # over -- and from the third week it reaches it again.
+    __test_helper_eurusd(monkeypatch, "D", ny(2020, 1, 5, 17))
+    assert time("3W", timeframe_bars_back=1) == ny(2019, 12, 29, 17)
+    __test_helper_eurusd(monkeypatch, "D", ny(2020, 1, 12, 17))
+    assert time("3W", timeframe_bars_back=1) == ny(2019, 12, 8, 17)
+    assert time("3W", timeframe_bars_back=2) == ny(2019, 11, 17, 17)
+    __test_helper_eurusd(monkeypatch, "D", ny(2020, 1, 19, 17))
+    assert time("3W", timeframe_bars_back=1) == ny(2019, 12, 29, 17)
+    # The days of January before the year's first Monday belong to the previous year's
+    # last week; after a 53-week year (2018) one bar back is that same week, after a
+    # 52-week year (2019) it is the week before
+    __test_helper_eurusd(monkeypatch, "D", ny(2018, 12, 31, 17))
+    assert time("W", timeframe_bars_back=1) == ny(2018, 12, 30, 17)
+    assert time("W", timeframe_bars_back=2) == ny(2018, 12, 23, 17)
+    __test_helper_eurusd(monkeypatch, "D", ny(2019, 12, 31, 17))
+    assert time("W", timeframe_bars_back=1) == ny(2019, 12, 22, 17)
+    # A yearly bar: 2018 has 53 weeks, its second 52W bar is the lone week of December 31.
+    # From week 48 of 2019 one bar back is that week and two bars back the 2018 bar; from
+    # week 49 the lone week is skipped and the walk continues from where it landed
+    __test_helper_eurusd(monkeypatch, "D", ny(2019, 12, 8, 17))
+    assert time("52W", timeframe_bars_back=1) == ny(2018, 12, 30, 17)
+    assert time("52W", timeframe_bars_back=2) == ny(2017, 12, 31, 17)
+    __test_helper_eurusd(monkeypatch, "D", ny(2019, 12, 15, 17))
+    assert time("52W", timeframe_bars_back=1) == ny(2017, 12, 31, 17)
+    assert time("52W", timeframe_bars_back=2) == ny(2017, 1, 1, 17)
+
+
+def __test_forward_and_monthly_offsets_move_by_whole_bar_lengths__(monkeypatch):
+    """ Forward weekly and any monthly offset take the bar holding the moved chart time """
+    ny = __test_helper_ny
+    # MEASURED (TradingView, 2026-09-26, CAPITALCOM:US500 and BTCUSD daily charts, 1W..26W
+    # offsets -1 and -2, 5M..11M offsets -1, 1 and 2): from the second week of the last
+    # full 3W bar of 2019 the next bar is the first bar of 2020 -- 3 weeks on is already
+    # January -- while from its first week it is the lone week of December 30
+    __test_helper_eurusd(monkeypatch, "D", ny(2019, 12, 15, 17))
+    assert time("3W", timeframe_bars_back=-1) == ny(2020, 1, 5, 17)
+    __test_helper_eurusd(monkeypatch, "D", ny(2019, 12, 8, 17))
+    assert time("3W", timeframe_bars_back=-1) == ny(2019, 12, 29, 17)
+    # 5M bars: January-May, June-October, November-December. From March 2020 one bar back
+    # is October 2019 minus nothing -- 5 months before March is October, the June bar --
+    # while from April it is November, the two-month bar. Forward from September 2019 the
+    # next bar is February 2020, the January bar
+    __test_helper_eurusd(monkeypatch, "D", ny(2020, 3, 1, 17))
+    assert time("5M", timeframe_bars_back=1) == ny(2019, 6, 2, 17)
+    __test_helper_eurusd(monkeypatch, "D", ny(2020, 3, 31, 17))
+    assert time("5M", timeframe_bars_back=1) == ny(2019, 10, 31, 17)
+    __test_helper_eurusd(monkeypatch, "D", ny(2019, 9, 1, 17))
+    assert time("5M", timeframe_bars_back=-1) == ny(2019, 12, 31, 17)
+    # A month that opens on a weekend opens at its first session: one bar back from
+    # June 2016 is May, opening Sunday May 1 17:00
+    __test_helper_eurusd(monkeypatch, "D", ny(2016, 5, 31, 17))
+    assert time("M", timeframe_bars_back=1) == ny(2016, 5, 1, 17)
+
+
+def __test_multi_day_offsets_step_the_scheduled_days__(monkeypatch):
+    """ An nD offset moves the chart bar's trading day by scheduled days, holidays included """
+    ny = __test_helper_ny
+    # MEASURED (TradingView, 2026-09-26, CAPITALCOM:US500 daily chart, 2D..10D): 2D bars
+    # pair the weekdays counted from January 1; Christmas 2019 is a scheduled Wednesday
+    # without data, so from Friday December 27 one bar back opens Tuesday 17:00 for the
+    # Wednesday-Thursday bar, and one bar forward is the lone Tuesday December 31
+    __test_helper_eurusd(monkeypatch, "D", ny(2019, 12, 26, 17))
+    assert time("2D", timeframe_bars_back=1) == ny(2019, 12, 24, 17)
+    assert time("2D", timeframe_bars_back=-1) == ny(2019, 12, 30, 17)
+    __test_helper_eurusd(monkeypatch, "D", ny(2020, 1, 2, 17))
+    assert time("2D", timeframe_bars_back=1) == ny(2019, 12, 31, 17)
+    assert time("3D", timeframe_bars_back=2) == ny(2019, 12, 23, 17)
