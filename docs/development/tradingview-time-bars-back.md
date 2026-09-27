@@ -142,11 +142,13 @@ Sunday 17:00 as its day, while the 16:00 bar starts Tuesday's trading day; a bar
 nominal span reaches into a session that opens later than the bar (a 17:05 open on a
 17:00 bar) starts the new day. PyneCore: `_chart_span_off_ms` in `lib/__init__.py`.
 
-For symbols whose grid mode is `observed` (exchange-listed types), the nD/nW/nM bar
-stamps come from the observed day counter, which counts the days present in the data.
-TradingView's CAPITALCOM feeds count scheduled weekdays regardless of data, so AAPL,
-GOLD and US500 stamp their 2D/3D bars differently from TradingView after a holiday
-(the counter is one behind until the year resets) and their nW/nM bars one session late
-when the period's first scheduled day has no data. This is the grid stamp, independent
-of `timeframe_bars_back`; the walks above are consistent with whatever stamp the grid
-gives.
+The nD/nW/nM grid of an exchange-listed symbol (`observed` mode) counts the trading
+days present in the data, which is TradingView's exchange calendar realized:
+NASDAQ:AAPL 2D-7D bars match from 2000 on, when that calendar starts (before it the
+grid is the weekday one), except on the unscheduled closures the calendar does not
+list before 2019 (2001-09-11, 2012-10-29, 2018-12-05 keep their grid slot on
+TradingView). A CFD feed has no exchange calendar: TradingView's CAPITALCOM AAPL,
+GOLD and US500 count every weekday, Christmas and New Year included, so `grid_mode`
+puts that feed on the `weekday` grid whatever the symbol's type. The grid stamp is
+independent of `timeframe_bars_back`; the walks above are consistent with whatever
+stamp the grid gives.

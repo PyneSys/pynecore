@@ -82,6 +82,7 @@ def aggregate_ohlcv(
         opening_hours: list | None = None,
         sym_type: str | None = None,
         source_tf: str | None = None,
+        prefix: str | None = None,
 ) -> tuple[int, int]:
     """
     Aggregate OHLCV data from a lower timeframe file to a higher timeframe file.
@@ -109,13 +110,15 @@ def aggregate_ohlcv(
                *last* instant falls into — the bar containing a session open
                starts the new day even when its timestamp precedes the open
                (see the ``resampler`` module docs).
+    :param prefix: ``SymInfo.prefix``, the feed the data comes from; a CFD feed
+               has no exchange calendar and stays on the weekday grid.
     :return: Tuple of (source_candles_read, target_candles_written)
     """
     # noinspection PyProtectedMember
     modifier, multiplier = _process_tf(target_tf)
     # The written file declares its period with an explicit multiplier ('D' -> '1D').
     target_period = f"{multiplier}{modifier}" if modifier else str(multiplier)
-    mode = grid_mode(sym_type, opening_hours)
+    mode = grid_mode(sym_type, opening_hours, prefix)
 
     src_off = 0
     fold = False

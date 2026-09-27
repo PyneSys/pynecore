@@ -335,6 +335,51 @@ syminfo = SymInfo(
 `SymInfo` exposes `has_schedule_history`, `schedule_index_for(date)` and
 `schedule_for(date)` to inspect which variant applies on a given date.
 
+### Extended Trading Hours
+
+An exchange-listed stock or fund trades beyond its regular session: a US stock's
+09:30-16:00 New York session sits inside 04:00-20:00 extended hours (pre-market and
+post-market). `SymInfo` keeps that template in `extended_hours`, with the dates whose
+extended hours differ in `extended_session_corrections` (an early close ends the
+extended hours at 17:00). Both follow the layout of `opening_hours` and
+`session_corrections`; the TradingView provider fills them from the symbol's
+`extended` subsession, other providers leave them empty, which is also right for
+every market without an extended session (forex, crypto, futures, CFDs).
+
+`session` says which hours the **bars** follow: `"regular"` (the default) or
+`"extended"`. Bars of the extended hours make the extended template the symbol's own
+session, so `time("D")`, `timeframe.change("D")` and the intraday bar grid start at
+04:00, `syminfo.session` is `session.extended`, and the `session.*` properties tell
+the pre-market, market and post-market bars apart (see
+[session](../reference/lib/session.md)). The regular template stays available to
+`time(tf, "regular")` and the `_regular` properties. A TOML loaded as `"extended"`
+exposes the extended template in `opening_hours` / `session_starts` / `session_ends` /
+`session_corrections` and the regular one in `regular_hours` /
+`regular_session_corrections`; saving writes both back where they came from. A dated
+schedule history describes the regular hours only.
+
+```toml
+[symbol]
+session = "extended"
+# ...
+
+# Extended trading hours (pre-market through post-market)
+[[extended_hours]]
+day = 0
+start = "04:00:00"
+end = "20:00:00"
+
+# Single-day exceptions of the extended hours: dates whose hours
+# differ from the weekly schedule. Empty opening_hours = closed.
+[[extended_session_corrections]]
+opening_hours = [{ start = "04:00:00", end = "17:00:00" }]
+dates = [2024-11-29, 2024-12-24]
+```
+
+`time(tf, "extended")` reads the extended template on any chart and
+`time(tf, "regular")` the regular one; every other session name is the chart's own
+hours. Without an extended template `"extended"` is the symbol's own session too.
+
 ### Period Values
 
 The `period` field uses the same values as TradingView's Pine Script `timeframe.period`:

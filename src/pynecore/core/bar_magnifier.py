@@ -55,6 +55,7 @@ class BarMagnifier:
             opening_hours: 'list | None' = None,
             sym_type: str | None = None,
             source_tf: str | None = None,
+            prefix: str | None = None,
     ):
         """
         :param ohlcv_iter: Iterator of sub-timeframe OHLCV candles
@@ -71,6 +72,8 @@ class BarMagnifier:
             timeframes an intraday sub-bar belongs to the trading day its *last*
             instant falls into — the bar containing a session open starts the
             new day even when its timestamp precedes the open.
+        :param prefix: ``SymInfo.prefix``, the feed the sub-bars come from; a CFD
+            feed has no exchange calendar and stays on the weekday grid.
         """
         self._ohlcv_iter = ohlcv_iter
         self._resampler = Resampler.get_resampler(chart_tf)
@@ -83,7 +86,7 @@ class BarMagnifier:
         self._modifier = modifier
         self._multiplier = multiplier
         multi = modifier in ('D', 'W', 'M') and multiplier > 1
-        self._mode = grid_mode(sym_type, opening_hours) if multi else None
+        self._mode = grid_mode(sym_type, opening_hours, prefix) if multi else None
 
         self._src_off = 0
         self._fold = False

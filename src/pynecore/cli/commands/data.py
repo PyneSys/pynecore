@@ -756,7 +756,7 @@ def aggregate(
                 source, out_path, timeframe, tz=data_tz,
                 session_starts=syminfo.session_starts,
                 opening_hours=syminfo.opening_hours,
-                sym_type=syminfo.type, source_tf=source_tf)
+                sym_type=syminfo.type, source_tf=source_tf, prefix=syminfo.prefix)
         except Exception as e:
             secho(f"Error during aggregation: {e}", err=True, fg=colors.RED)
             raise Exit(1)

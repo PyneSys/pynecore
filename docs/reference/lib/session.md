@@ -54,11 +54,9 @@ is_first: bool = session.isfirstbar_regular  # True on first regular bar of day
 
 ### isfirstbar
 
-Returns `True` if the current bar is the first bar of the trading day, `False` otherwise. When extended session data is enabled, only returns `True` for the first bar of pre-market hours.
+Returns `True` if the current bar is the first bar of the trading day, `False` otherwise. On bars of the extended hours (`syminfo.session == session.extended`) only the first bar of the pre-market is the first bar.
 
 **Type:** `bool`
-
-**Note:** Extended session support is not yet fully implemented; behaves like `isfirstbar_regular`.
 
 **Example:**
 ```python
@@ -78,11 +76,9 @@ is_last: bool = session.islastbar_regular  # True on last regular bar of day
 
 ### islastbar
 
-Returns `True` if the current bar is the last bar of the trading day, `False` otherwise. When extended session data is enabled, only returns `True` for the last bar of post-market hours.
+Returns `True` if the current bar is the last bar of the trading day, `False` otherwise. On bars of the extended hours only the last bar of the post-market is the last bar.
 
 **Type:** `bool`
-
-**Note:** Extended session support is not yet fully implemented; behaves like `islastbar_regular`.
 
 **Example:**
 ```python
@@ -91,7 +87,7 @@ is_session_end: bool = session.islastbar  # True at session close
 
 ### ismarket
 
-Returns `True` if the current bar is within regular market hours, `False` otherwise. On daily or longer timeframes, the result depends on whether the bar's time range overlaps with session hours — typically `True` for trading days.
+Returns `True` if the current bar is within regular market hours, `False` otherwise. Every bar of a regular-hours chart is; on bars of the extended hours the bar has to open inside the regular hours.
 
 **Type:** `bool`
 
@@ -102,28 +98,24 @@ trading_hours: bool = session.ismarket  # True during market hours
 
 ### ispremarket
 
-Returns `True` if the current bar is within pre-market hours, `False` otherwise. Always `False` on non-intraday charts.
+Returns `True` if the current bar is within pre-market hours, `False` otherwise: a bar of the extended hours opening before the day's regular open. Always `False` on a regular-hours chart.
 
 **Type:** `bool`
 
-**Note:** Not yet implemented. Always returns `False`.
-
 **Example:**
 ```python
-early_hours: bool = session.ispremarket  # Always False
+early_hours: bool = session.ispremarket  # True on the 04:00-09:00 bars of a US stock
 ```
 
 ### ispostmarket
 
-Returns `True` if the current bar is within post-market hours, `False` otherwise. Always `False` on non-intraday charts.
+Returns `True` if the current bar is within post-market hours, `False` otherwise: a bar of the extended hours opening at or after the day's regular close (13:00 on an early-close day). Always `False` on a regular-hours chart.
 
 **Type:** `bool`
 
-**Note:** Not yet implemented. Always returns `False`.
-
 **Example:**
 ```python
-after_hours: bool = session.ispostmarket  # Always False
+after_hours: bool = session.ispostmarket  # True on the 16:00-19:00 bars of a US stock
 ```
 
 ## Constants
@@ -135,6 +127,5 @@ after_hours: bool = session.ispostmarket  # Always False
 
 ## Compatibility Notes
 
-- **Extended session modes**: The `session.extended` constant is defined but extended session detection is not fully implemented. `isfirstbar` and `islastbar` currently behave identically to `isfirstbar_regular` and `islastbar_regular`.
-- **Pre/post-market detection**: `ispremarket` and `ispostmarket` are not yet implemented and always return `False`.
+- **Extended hours**: the properties follow the symbol's `extended_hours` template and the `session` flag of its TOML (see [Extended Trading Hours](../../programmatic/data-and-syminfo.md#extended-trading-hours)). The bars of an extended-hours chart are cut from the extended open, so the regular open never falls on a bar edge: the regular hours are read by the bar's open (the first regular bar of a 60-minute US stock chart is the 10:00 bar, not the 09:00 bar that contains 09:30), while the chart's own open and close are the bars that contain them. Measured on the NASDAQ:AAPL 60-minute chart on both hours.
 - **Daily+ charts**: On daily or longer timeframes, session variables still evaluate using normal session overlap logic. Results depend on whether the bar's time range overlaps with configured session hours. This may differ from TradingView, which returns `False` for all session variables on daily+ charts.

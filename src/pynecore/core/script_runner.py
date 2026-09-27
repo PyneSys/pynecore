@@ -19,6 +19,7 @@ from pynecore.core.broker.exceptions import ExchangeConnectionError
 from pynecore.types.ohlcv import OHLCV
 from pynecore.types.na import na_float, set_bool_na
 from pynecore.core.syminfo import SymInfo, mintick_decimals
+from pynecore.types.session import Session
 from pynecore.core.csv_file import CSVWriter
 from pynecore.core.drawing_snapshot import DrawingSnapshot
 from pynecore.core.lookahead import ALLOW_LOOKAHEAD
@@ -411,6 +412,14 @@ def _set_lib_syminfo_properties(syminfo: SymInfo):
     lib.syminfo._opening_hours = syminfo.opening_hours
     lib.syminfo._session_starts = syminfo.session_starts
     lib.syminfo._session_ends = syminfo.session_ends
+    lib.syminfo._extended_hours = syminfo.extended_hours
+    lib.syminfo.session = Session(syminfo.session)
+    if syminfo.regular_hours is None:
+        lib.syminfo._regular_hours = syminfo.opening_hours
+        lib.syminfo._regular_corrections = syminfo.session_corrections or None
+    else:
+        lib.syminfo._regular_hours = syminfo.regular_hours
+        lib.syminfo._regular_corrections = syminfo.regular_session_corrections or None
 
     # Order sizes are truncated to the symbol's quantity grid, exactly like TV
     # floors sizes to syminfo.mincontract. SymInfo guarantees a positive value
@@ -623,7 +632,7 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
         src, out, target_tf, tz=tz,
         session_starts=si.session_starts or None,
         opening_hours=si.opening_hours or None,
-        sym_type=si.type, source_tf=si.period,
+        sym_type=si.type, source_tf=si.period, prefix=si.prefix,
     )
     if target_count == 0:
         # An empty source (no bars) resamples to an empty file; swapping the child
@@ -2804,7 +2813,8 @@ class ScriptRunner:
                                              session_starts=self.syminfo.session_starts,
                                              opening_hours=self.syminfo.opening_hours,
                                              sym_type=self.syminfo.type,
-                                             source_tf=self._magnifier_source_tf)
+                                             source_tf=self._magnifier_source_tf,
+                                             prefix=self.syminfo.prefix)
                     self.ohlcv_iter = (w.aggregated for w in magnifier)
 
             # --- Helper closures for DRY ---
@@ -3953,7 +3963,8 @@ class ScriptRunner:
                                  session_starts=self.syminfo.session_starts,
                                  opening_hours=self.syminfo.opening_hours,
                                  sym_type=self.syminfo.type,
-                                 source_tf=self._magnifier_source_tf)
+                                 source_tf=self._magnifier_source_tf,
+                                 prefix=self.syminfo.prefix)
 
         for window in magnifier:
             # Pre-increment: bar_index becomes the index of the current

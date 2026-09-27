@@ -117,6 +117,10 @@ def __test_grid_mode_classification__():
     assert grid_mode('stock', hours) == 'observed'
     assert grid_mode('forex', hours) == 'weekday'
     assert grid_mode('crypto', hours) == 'calendar'
+    # A CFD feed carries no exchange calendar whatever the symbol's type
+    assert grid_mode('stock', hours, 'CAPITALCOM') == 'weekday'
+    assert grid_mode('index', hours, 'CAPITALCOM') == 'weekday'
+    assert grid_mode('stock', hours, 'NASDAQ') == 'observed'
     full_week = [SymInfoInterval(day=d, start=time(0, 0), end=time(0, 0))
                  for d in range(7)]
     assert grid_mode('futures', full_week) == 'calendar'

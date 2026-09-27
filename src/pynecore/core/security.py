@@ -4110,7 +4110,7 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
             sec_tz = state.tz
         sec_starts = si.session_starts or None
         sec_hours = si.opening_hours or None
-        mode = grid_mode(si.type, si.opening_hours)
+        mode = grid_mode(si.type, si.opening_hours, si.prefix)
 
         # Session-bounded intraday feed (e.g. a futures contract's day/night
         # sessions, or an equity whose 09:30 open puts its bars off the chart's
@@ -4306,7 +4306,8 @@ def setup_security_states(
             opening_hours=tuple(chart_syminfo.opening_hours or ()),
             session_starts=tuple(chart_syminfo.session_starts or ()),
             corrections=chart_syminfo.session_corrections or None,
-            grid_mode=grid_mode(chart_syminfo.type, chart_syminfo.opening_hours),
+            grid_mode=grid_mode(chart_syminfo.type, chart_syminfo.opening_hours,
+                                chart_syminfo.prefix),
         )
 
     sec_ids = list(contexts.keys())

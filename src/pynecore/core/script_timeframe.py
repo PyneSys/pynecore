@@ -153,7 +153,7 @@ class ScriptTimeframe:
         # Passed explicitly: without it the resampler infers it from the session
         # template, which a 24/7 market that needs no anchoring does not supply,
         # and the period grid would silently fall back to weekdays.
-        self._grid_mode = grid_mode(syminfo.type, syminfo.opening_hours)
+        self._grid_mode = grid_mode(syminfo.type, syminfo.opening_hours, syminfo.prefix)
         self._calendar = BarCalendar(
             tz=tz,
             opening_hours=tuple(syminfo.opening_hours or ()),

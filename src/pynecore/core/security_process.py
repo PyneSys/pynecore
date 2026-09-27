@@ -774,7 +774,7 @@ def security_process_main(
         opening_hours=tuple(syminfo.opening_hours or ()),
         session_starts=tuple(syminfo.session_starts or ()),
         corrections=syminfo.session_corrections or None,
-        grid_mode=_grid_mode(syminfo.type, syminfo.opening_hours),
+        grid_mode=_grid_mode(syminfo.type, syminfo.opening_hours, syminfo.prefix),
     )
     own_timeframe = str(syminfo.period)
     registry = dict(registry or {})

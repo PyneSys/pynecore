@@ -136,6 +136,28 @@ class SymInfo:
     the early close, not at the regular one. That is not derivable from the bar
     data (the day's last bar is a stub with no marker), so it comes from the
     exchange calendar the data source publishes."""
+    extended_hours: list[SymInfoInterval] = field(default_factory=list)
+    """The symbol's extended trading hours (pre-market through post-market) as a
+    weekly template, in the exchange timezone: a US stock's 04:00-20:00 New York
+    around its 09:30-16:00 regular session. Empty when the symbol has no session
+    beyond the regular one, which is every market that is not an exchange-listed
+    stock or fund."""
+    extended_session_corrections: dict[date, tuple[SymInfoInterval, ...]] = field(
+        default_factory=dict)
+    """Single-day exceptions of the extended hours, like :attr:`session_corrections`
+    (a US stock's early close ends its extended hours at 17:00)."""
+    session: Literal["regular", "extended"] = 'regular'
+    """Which hours the data follows (Pine ``syminfo.session``). ``"extended"`` bars
+    cover the extended hours, and the symbol's own session -- ``opening_hours``,
+    ``session_starts``, ``session_ends``, ``session_corrections`` as loaded -- is
+    the extended one, the regular hours being kept in :attr:`regular_hours` and
+    :attr:`regular_session_corrections`. A dated schedule history describes the
+    regular hours only."""
+    regular_hours: list[SymInfoInterval] | None = None
+    """The regular hours of an ``"extended"`` symbol; ``None`` on a regular one,
+    whose regular hours are :attr:`opening_hours`."""
+    regular_session_corrections: dict[date, tuple[SymInfoInterval, ...]] | None = None
+    """The regular hours' single-day exceptions of an ``"extended"`` symbol."""
     timezone: str = 'UTC'
 
     avg_spread: float | None = None
@@ -273,17 +295,42 @@ class SymInfo:
         # same corrected hours, so a decade of early closes stays a few lines. The
         # interval's weekday is the date's own -- it is not written out, and a
         # value contradicting the date could only be wrong.
-        session_corrections: dict[date, tuple[SymInfoInterval, ...]] = {}
-        for corr in data.get('session_corrections', []):
-            hours = [(parse_time(iv['start']), parse_time(iv['end']))
-                     for iv in corr.get('opening_hours', [])]
-            for raw_date in corr.get('dates', []):
-                corrected = parse_local_date(raw_date, "session_corrections date")
-                if corrected in session_corrections:
-                    raise ValueError(f"Duplicate session_corrections date: {corrected}")
-                session_corrections[corrected] = tuple(
-                    SymInfoInterval(day=corrected.weekday(), start=start, end=end)
-                    for start, end in hours)
+        def parse_corrections(key: str) -> dict[date, tuple[SymInfoInterval, ...]]:
+            """Parse the ``[[<key>]]`` blocks of dated exceptions to a weekly template"""
+            corrections: dict[date, tuple[SymInfoInterval, ...]] = {}
+            for corr in data.get(key, []):
+                hours = [(parse_time(iv['start']), parse_time(iv['end']))
+                         for iv in corr.get('opening_hours', [])]
+                for raw_date in corr.get('dates', []):
+                    corrected = parse_local_date(raw_date, f"{key} date")
+                    if corrected in corrections:
+                        raise ValueError(f"Duplicate {key} date: {corrected}")
+                    corrections[corrected] = tuple(
+                        SymInfoInterval(day=corrected.weekday(), start=start, end=end)
+                        for start, end in hours)
+            return corrections
+
+        session_corrections = parse_corrections('session_corrections')
+
+        extended_hours = [
+            SymInfoInterval(day=oh['day'], start=parse_time(oh['start']), end=parse_time(oh['end']))
+            for oh in data.get('extended_hours', [])]
+        extended_session_corrections = parse_corrections('extended_session_corrections')
+
+        # Bars of the extended hours: the symbol's own session is the extended
+        # template, the regular one is kept aside for the session.* properties
+        session = symbol.get('session', 'regular')
+        if session not in ('regular', 'extended'):
+            raise ValueError(f"Invalid session {session!r}: expected 'regular' or 'extended'")
+        regular_hours = None
+        regular_session_corrections = None
+        if session == 'extended' and extended_hours:
+            regular_hours = opening_hours
+            regular_session_corrections = session_corrections
+            opening_hours = extended_hours
+            session_starts = [SymInfoSession(day=oh.day, time=oh.start) for oh in extended_hours]
+            session_ends = [SymInfoSession(day=oh.day, time=oh.end) for oh in extended_hours]
+            session_corrections = extended_session_corrections
 
         # Create instance with all fields
         return cls(
@@ -306,6 +353,11 @@ class SymInfo:
             session_ends=session_ends,
             session_schedules=session_schedules,
             session_corrections=session_corrections,
+            extended_hours=extended_hours,
+            extended_session_corrections=extended_session_corrections,
+            session=session,
+            regular_hours=regular_hours,
+            regular_session_corrections=regular_session_corrections,
             timezone=symbol.get('timezone', 'UTC'),
             volumetype=symbol.get('volumetype', 'base'),
             avg_spread=symbol.get('avg_spread'),
@@ -378,7 +430,8 @@ class SymInfo:
         # Basic fields
         for key in ['prefix', 'description', 'ticker', 'currency', 'basecurrency',
                     'period', 'type', 'mintick', 'pricescale', 'minmove', 'pointvalue',
-                    'mincontract', 'timezone', 'volumetype', 'avg_spread', 'taker_fee', 'maker_fee',
+                    'mincontract', 'timezone', 'session', 'volumetype', 'avg_spread',
+                    'taker_fee', 'maker_fee',
                     'country', 'sector', 'industry', 'isin',
                     'expiration_date', 'current_contract',
                     'employees', 'shareholders',
@@ -399,10 +452,19 @@ class SymInfo:
             flat_opening_hours = newest.opening_hours
             flat_session_starts = newest.session_starts
             flat_session_ends = newest.session_ends
+        elif self.regular_hours is not None:
+            # Loaded as extended: the regular template is the one written back
+            flat_opening_hours = self.regular_hours
+            flat_session_starts = [SymInfoSession(day=oh.day, time=oh.start)
+                                   for oh in self.regular_hours]
+            flat_session_ends = [SymInfoSession(day=oh.day, time=oh.end)
+                                 for oh in self.regular_hours]
         else:
             flat_opening_hours = self.opening_hours
             flat_session_starts = self.session_starts
             flat_session_ends = self.session_ends
+        regular_corrections = (self.session_corrections if self.regular_session_corrections is None
+                               else self.regular_session_corrections)
 
         lines.append("\n# Opening hours")
         for oh in flat_opening_hours:
@@ -452,23 +514,41 @@ class SymInfo:
             lines.append(_SESSION_SCHEDULE_EXAMPLE_COMMENT)
             lines.append("")
 
-        # Single-day calendar exceptions, grouped by identical hours so one block
-        # covers every date that shares them.
-        if self.session_corrections:
+        # noinspection PyShadowingNames
+        def write_corrections(key: str, corrections: dict[date, tuple[SymInfoInterval, ...]],
+                              heading: str) -> None:
+            """Single-day calendar exceptions, grouped by identical hours so one block
+            covers every date that shares them."""
+            if not corrections:
+                return
             groups: dict[tuple[tuple[time, time], ...], list[date]] = {}
-            for corrected in sorted(self.session_corrections):
-                key = tuple((iv.start, iv.end) for iv in self.session_corrections[corrected])
-                groups.setdefault(key, []).append(corrected)
-            lines.append("# Single-day calendar exceptions: dates whose trading hours")
+            for corrected in sorted(corrections):
+                groups.setdefault(tuple((iv.start, iv.end) for iv in corrections[corrected]),
+                                  []).append(corrected)
+            lines.append(heading)
             lines.append("# differ from the weekly schedule. Empty opening_hours = closed.")
             for hours, dates in groups.items():
-                lines.append("[[session_corrections]]")
+                lines.append(f"[[{key}]]")
                 intervals = ", ".join(
                     f'{{ start = "{time_to_str(start)}", end = "{time_to_str(end)}" }}'
                     for start, end in hours)
                 lines.append(f"opening_hours = [{intervals}]")
                 lines.append("dates = [" + ", ".join(d.isoformat() for d in dates) + "]")
                 lines.append("")
+
+        write_corrections('session_corrections', regular_corrections,
+                          "# Single-day calendar exceptions: dates whose trading hours")
+
+        if self.extended_hours:
+            lines.append("# Extended trading hours (pre-market through post-market)")
+            for oh in self.extended_hours:
+                lines.append("[[extended_hours]]")
+                lines.append(f"day = {oh.day}")
+                lines.append(f'start = "{time_to_str(oh.start)}"')
+                lines.append(f'end = "{time_to_str(oh.end)}"')
+                lines.append("")
+            write_corrections('extended_session_corrections', self.extended_session_corrections,
+                              "# Single-day exceptions of the extended hours: dates whose hours")
 
         if preserved_download:
             lines.append(preserved_download)

@@ -88,18 +88,26 @@ def _session_anchor_sec(
 #
 #   'calendar' — 24/7 markets (crypto): every calendar day. Pure arithmetic,
 #                exact for any data window.
-#   'weekday'  — FX/CFD feeds: every Mon-Fri weekday. TradingView has no FX
-#                holiday calendar, so Dec 25 / Jan 1 consume a grid slot even
-#                with no data. Pure arithmetic, exact for any data window.
+#   'weekday'  — FX and CFD feeds: every Mon-Fri weekday. TradingView has no
+#                holiday calendar for them, so Dec 25 / Jan 1 consume a grid
+#                slot even with no data. A CFD broker's stock and index feeds
+#                (CAPITALCOM:AAPL, US500, GOLD) are typed as the underlying but
+#                carry no exchange calendar either, so the feed decides, not the
+#                type. Pure arithmetic, exact for any data window.
 #   'observed' — exchange-listed symbols (futures, stocks): TradingView's real
 #                holiday calendar, which we don't have — but the daily data is
 #                its realization, so counting actual trading days reproduces it
-#                (verified 100% on CME 2022+). Needs the data stream; the
-#                arithmetic here serves only as the dataless fallback.
+#                (verified 100% on CME 2022+, NASDAQ:AAPL 2000-2026). Needs the
+#                data stream; the arithmetic here serves only as the dataless
+#                fallback.
 #
 # Verified against TradingView: OANDA/CAPITALCOM EURUSD 5D 2002-2026 (weekday,
 # 100%), BINANCE:BTCUSDT 5D 2017-2026 (calendar, 100%), CME_MINI:RTY1! 5D/2D/6D
-# 2022-2026 (observed, 100%) and RTY 3W/3M (week/month grids).
+# 2022-2026 (observed, 100%), RTY 3W/3M (week/month grids) and NASDAQ:AAPL
+# 2D-7D 1980-2026 (observed; TradingView's exchange calendar starts in 2000 --
+# before it the grid is the weekday one -- and it lists no unscheduled closure
+# before 2019, so the days of 2001-09-11, 2012-10-29 and 2018-12-05 keep their
+# grid slot there while the observed count skips them).
 #
 # On intraday charts a chart bar belongs to the period its *last* instant falls
 # into: the bar containing a session open is the new trading day's first bar
@@ -111,13 +119,22 @@ def _session_anchor_sec(
 #
 
 
+# Feeds without an exchange holiday calendar: every weekday is a scheduled
+# trading day whatever the symbol's type. MEASURED (TradingView, 2026-09-26):
+# CAPITALCOM:AAPL, GOLD and US500 2D/3D bars count Dec 25 and Jan 1 as grid
+# slots, NASDAQ:AAPL's skip them.
+_CALENDARLESS_FEEDS = frozenset({'CAPITALCOM'})
+
+
 def grid_mode(sym_type: str | None,
-              opening_hours: 'list[SymInfoInterval] | None') -> str:
+              opening_hours: 'list[SymInfoInterval] | None',
+              prefix: str | None = None) -> str:
     """
     Classify the symbol's scheduled-trading-day calendar.
 
     :param sym_type: ``SymInfo.type`` (e.g. "forex", "futures", "crypto")
     :param opening_hours: ``SymInfo.opening_hours`` intervals
+    :param prefix: ``SymInfo.prefix``, the feed the symbol comes from
     :return: ``'calendar'``, ``'weekday'`` or ``'observed'``
     """
     if opening_hours:
@@ -126,7 +143,7 @@ def grid_mode(sym_type: str | None,
             return 'calendar'
     if sym_type in ('crypto', 'spot', 'swap'):
         return 'calendar'
-    if sym_type == 'forex':
+    if sym_type == 'forex' or prefix in _CALENDARLESS_FEEDS:
         return 'weekday'
     return 'observed'
 

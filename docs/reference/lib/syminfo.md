@@ -131,7 +131,7 @@ market: str = syminfo.type  # "stock", "future", etc.
 #### session
 Type: `Session`
 
-The session type of the chart's main series. Possible values are `session.regular` or `session.extended`.
+The session type of the chart's main series. Possible values are `session.regular` or `session.extended`, from the `session` field of the symbol's TOML (see [Extended Trading Hours](../../programmatic/data-and-syminfo.md#extended-trading-hours)).
 
 ```python
 sess: Session = syminfo.session  # session.regular

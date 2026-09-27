@@ -22,12 +22,18 @@ __all__ = [
 _opening_hours: list[SymInfoInterval] = []
 _session_starts: list[SymInfoSession] = []
 _session_ends: list[SymInfoSession] = []
+_extended_hours: list[SymInfoInterval] = []
+# The regular hours and their dated exceptions; the same as the symbol's own session
+# unless the bars follow the extended hours
+_regular_hours: list[SymInfoInterval] = []
+_regular_corrections: dict | None = None
 
 # Provider-supplied symbol details — annotation-only: the runner injects the values
 # per run (the fee/spread fields only when the data provider supplies them)
 opening_hours: list[SymInfoInterval]
 session_starts: list[SymInfoSession]
 session_ends: list[SymInfoSession]
+extended_hours: list[SymInfoInterval]
 avg_spread: float
 taker_fee: float
 maker_fee: float

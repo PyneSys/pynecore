@@ -1083,9 +1083,11 @@ def _parse_session_string(session: str, timezone: str | None = None) -> tuple['S
     weekdays (2..6) no other section names, and a section naming a day replaces the
     earlier ones on that day. Surrounding whitespace is ignored.
 
-    A string that is empty, blank or does not start with a digit -- a session name
-    such as "regular" -- is the symbol's own session: its opening hours read in the
-    given timezone (see :func:`_symbol_session_infos`). "24x7" is the all-day session.
+    A string that is empty, blank or does not start with a digit is the symbol's own
+    session: its opening hours read in the given timezone (see
+    :func:`_symbol_session_infos`). "regular" names the regular hours and "extended"
+    the extended ones, which differ from the symbol's own session only on bars of
+    the extended hours. "24x7" is the all-day session.
 
     :param session: Session string (e.g., "0930-1600", "0930-1600:23456",
                     "0400-0700,0900-1300:23456", "0930-1600|1000-1300:7")
@@ -1104,6 +1106,15 @@ def _parse_session_string(session: str, timezone: str | None = None) -> tuple['S
             timezone = 'UTC'
     session_infos = _parse_session_string_cached(session, timezone)
     if session_infos is None:
+        # MEASURED (TradingView, NASDAQ:AAPL 60-minute charts on the regular and the
+        # extended hours, 2026-09-27): time(tf, "extended") is time(tf, "0400-2000") and
+        # time(tf, "regular") is time(tf, "0930-1600") on both charts, while every
+        # other name is the chart's own hours (04:00 on the extended chart)
+        name = session.strip()
+        if name == 'extended' and syminfo._extended_hours:
+            return _symbol_session_infos(timezone, syminfo._extended_hours)
+        if name == 'regular' and syminfo.session == 'extended':
+            return _symbol_session_infos(timezone, syminfo._regular_hours)
         return _symbol_session_infos(timezone)
     return session_infos
 
@@ -1133,8 +1144,6 @@ def _parse_session_string_cached(session: str, timezone: str) -> 'tuple[SessionI
     # symbol's session, read in the timezone argument when one was given. A leading
     # digit starts a specification, which halts the script when it is malformed ("0930",
     # "0930-16", "1100-", "0930-1600:8", ...); the script is kept running with na here.
-    # "extended" is the symbol's extended-hours session, which the symbol data does not
-    # carry, so it resolves to the regular one.
     if not spec or spec[0] not in _SESSION_DIGITS:
         return None
     if spec == '24x7':
@@ -1259,13 +1268,16 @@ def _parse_session_days(text: str, session: str) -> frozenset[int]:
 
 # The symbol's own session per timezone, rebuilt when ``syminfo._opening_hours`` is
 # replaced (identity guard, like the ``_ttd``/``_tdc`` machinery).
-_ssi_hours: list | None = None
-_ssi_by_tz: dict[str, 'tuple[SessionInfo, ...]'] = {}
+# Session specifications built from the weekly templates, by template identity and
+# timezone; the templates are kept so an identity cannot be reused by a later list
+_ssi_templates: dict[int, list] = {}
+_ssi_by_key: dict[tuple[int, str], 'tuple[SessionInfo, ...]'] = {}
 
 
 # The schedule is lib's own ``syminfo`` module state, installed by the script runner
 # noinspection PyProtectedMember
-def _symbol_session_infos(timezone: str) -> tuple['SessionInfo', ...]:
+def _symbol_session_infos(timezone: str,
+                          opening_hours: list | None = None) -> tuple['SessionInfo', ...]:
     """
     The symbol's own session: its opening hours as a session specification.
 
@@ -1276,16 +1288,20 @@ def _symbol_session_infos(timezone: str) -> tuple['SessionInfo', ...]:
     from the exchange timezone. A symbol without opening hours is a continuous market.
 
     :param timezone: Timezone to read the session in
+    :param opening_hours: The weekly template to read, the symbol's own hours by default
     :return: One SessionInfo per distinct range
     """
-    global _ssi_hours
-    opening_hours = syminfo._opening_hours
-    if opening_hours is not _ssi_hours:
-        _ssi_by_tz.clear()
-        _ssi_hours = opening_hours
-    session_infos = _ssi_by_tz.get(timezone)
-    if session_infos is not None:
+    if opening_hours is None:
+        opening_hours = syminfo._opening_hours
+    key = (id(opening_hours), timezone)
+    session_infos = _ssi_by_key.get(key)
+    if session_infos is not None and _ssi_templates.get(key[0]) is opening_hours:
         return session_infos
+    if _ssi_templates.get(key[0]) is not opening_hours:
+        # A new template: drop what an earlier list of the same identity cached
+        for stale in [k for k in _ssi_by_key if k[0] == key[0]]:
+            del _ssi_by_key[stale]
+        _ssi_templates[key[0]] = opening_hours
 
     from ..types.session import SessionInfo
 
@@ -1311,7 +1327,7 @@ def _symbol_session_infos(timezone: str) -> tuple['SessionInfo', ...]:
                     days=frozenset(days), timezone=timezone)
         for (start_minutes, end_minutes), days in sorted(days_by_range.items())
     )
-    _ssi_by_tz[timezone] = session_infos
+    _ssi_by_key[key] = session_infos
     return session_infos
 
 
@@ -2023,7 +2039,8 @@ def _dg_on_roll(ts: float) -> None:
     if opening_hours is not _dg_template:
         # (Re)configure from the symbol template
         _dg_template = opening_hours
-        _dg_mode = _grid_mode(getattr(syminfo, 'type', None), opening_hours)
+        _dg_mode = _grid_mode(getattr(syminfo, 'type', None), opening_hours,
+                              getattr(syminfo, 'prefix', None))
         tz_name = getattr(syminfo, 'timezone', None)
         _dg_tz = _parse_timezone(tz_name) if tz_name else None
         _dg_overnight = _overnight_opens(opening_hours, syminfo._session_starts)
@@ -2302,6 +2319,7 @@ def _scheduled_year_days(calendar_year: int) -> list[date]:
     :return: The scheduled days; index ``i`` is the day of ordinal ``i`` on the year's
              daily grid (holidays included, the template does not know them)
     """
+    calendar_year = int(calendar_year)
     days = _dbt_years.get(calendar_year)
     if days is None:
         days = []
@@ -2361,7 +2379,7 @@ def _tv_week_walk(day: date, chart_year: int, multiplier: int, steps: int) -> da
     # while from a later week of the same bar it may skip it. The walk continues from
     # the landing week, so later steps stay inside the previous year until they cross
     # again.
-    for _ in range(steps):
+    for _ in range(int(steps)):
         target: date = day - timedelta(weeks=multiplier)
         fm = _first_monday(chart_year)
         if target >= fm:
@@ -3037,7 +3055,7 @@ def _dwm_close_ms(bar_open_ms: int, timeframe: str, to_next_open: bool = False) 
             opening_hours=tuple(oh or ()),
             session_starts=tuple(ss or ()),
             corrections=corr,
-            grid_mode=_grid_mode(syminfo.type, oh or None),
+            grid_mode=_grid_mode(syminfo.type, oh or None, syminfo.prefix),
         )
         _dwc_guard = (oh, ss, corr, tz_name)
         _dwc_cache.clear()
