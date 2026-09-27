@@ -414,3 +414,88 @@ def test_symbol_provider_detection_from_csv_content_no_hints(tmp_path):
 
 def test_convert_to_ohlcv_databento_uses_csv_symbol(tmp_path):
     __test_convert_to_ohlcv_databento_uses_csv_symbol__(tmp_path)
+
+
+def __test_helper_convert_csv(tmp_path, name: str, timestamps: list[int]):
+    """Convert a flat-price CSV at ``timestamps`` (epoch seconds) and load its TOML"""
+    from pynecore.core.syminfo import SymInfo
+    csv_path = tmp_path / name
+    with open(csv_path, 'w') as f:
+        f.write("timestamp,open,high,low,close,volume\n")
+        for ts in timestamps:
+            f.write(f"{ts},100,101,99,100.5,10\n")
+    DataConverter().convert_to_ohlcv(csv_path, force=True)
+    return SymInfo.load_toml(csv_path.with_suffix('.toml'))
+
+
+def __test_convert_to_ohlcv_247_schedule_uses_python_weekdays__(tmp_path):
+    """A round-the-clock feed gets one 00:00-23:59:59 session on every day 0 (Monday) ... 6.
+
+    Schedule days are Python weekdays. ISO numbering (1 ... 7) left Monday out of the
+    schedule, and the only session start/end pair made the whole week one session, so
+    ``request.security("D")`` paired every Monday chart bar with that day's close.
+    """
+    from datetime import time
+    start = 1704067200  # 2024-01-01 00:00 UTC, a Monday
+    syminfo = __test_helper_convert_csv(
+        tmp_path, "BINANCE_BTCUSDT_30.csv", [start + i * 1800 for i in range(48 * 21)])
+
+    assert sorted(oh.day for oh in syminfo.opening_hours) == list(range(7))
+    assert all(oh.start == time(0, 0) and oh.end == time(23, 59, 59)
+               for oh in syminfo.opening_hours)
+    assert sorted((s.day, s.time) for s in syminfo.session_starts) == \
+           [(d, time(0, 0)) for d in range(7)]
+    assert sorted((s.day, s.time) for s in syminfo.session_ends) == \
+           [(d, time(23, 59, 59)) for d in range(7)]
+
+
+def __test_convert_to_ohlcv_weekday_daily_schedule_includes_monday__(tmp_path):
+    """Monday-Friday daily bars are scheduled on days 0 ... 4, not Tuesday-Saturday"""
+    start = 1704067200  # 2024-01-01, a Monday
+    stamps = [start + d * 86400 for d in range(28) if d % 7 < 5]
+    syminfo = __test_helper_convert_csv(tmp_path, "CAPITALCOM_EURUSD_1D.csv", stamps)
+
+    assert sorted({oh.day for oh in syminfo.opening_hours}) == [0, 1, 2, 3, 4]
+    assert sorted(s.day for s in syminfo.session_starts) == [0, 1, 2, 3, 4]
+    assert sorted(s.day for s in syminfo.session_ends) == [0, 1, 2, 3, 4]
+
+
+def __test_syminfo_rejects_schedule_day_outside_python_weekdays__(tmp_path):
+    """``day = 7`` has no weekday: loading it fails instead of silently dropping the day"""
+    from pynecore.core.syminfo import SymInfo
+    syminfo = __test_helper_convert_csv(
+        tmp_path, "BINANCE_ETHUSDT_60.csv", [1704067200 + i * 3600 for i in range(24 * 14)])
+    toml_path = tmp_path / "BINANCE_ETHUSDT_60.toml"
+    assert syminfo.opening_hours
+    text = toml_path.read_text()
+    toml_path.write_text(text.replace("day = 6\n", "day = 7\n", 1))
+
+    with pytest.raises(ValueError, match="Invalid schedule day 7"):
+        SymInfo.load_toml(toml_path)
+
+
+def __test_convert_to_ohlcv_hourly_24x5_schedule_excludes_weekend__(tmp_path):
+    """An even round-the-clock Monday-Friday feed is not mistaken for a 24/7 market"""
+    from datetime import time
+    start = 1704067200  # 2024-01-01 00:00 UTC, a Monday
+    stamps = [start + h * 3600 for h in range(24 * 7 * 4) if (h // 24) % 7 < 5]
+    syminfo = __test_helper_convert_csv(tmp_path, "CAPITALCOM_EURUSD_60.csv", stamps)
+
+    assert sorted((oh.day, oh.start, oh.end) for oh in syminfo.opening_hours) == \
+           [(d, time(0, 0), time(23, 59, 59)) for d in range(5)]
+    assert sorted(s.day for s in syminfo.session_starts) == [0, 1, 2, 3, 4]
+    assert sorted(s.day for s in syminfo.session_ends) == [0, 1, 2, 3, 4]
+
+
+def __test_convert_to_ohlcv_keeps_unloadable_toml__(tmp_path):
+    """A TOML that fails to load stops the conversion instead of being overwritten"""
+    from pynecore.core.data_converter import ConversionError
+    stamps = [1704067200 + i * 3600 for i in range(24 * 14)]
+    __test_helper_convert_csv(tmp_path, "BINANCE_SOLUSDT_60.csv", stamps)
+    toml_path = tmp_path / "BINANCE_SOLUSDT_60.toml"
+    legacy_text = toml_path.read_text().replace("day = 6\n", "day = 7\n", 1)
+    toml_path.write_text(legacy_text)
+
+    with pytest.raises(ConversionError, match="Invalid schedule day 7"):
+        DataConverter().convert_to_ohlcv(tmp_path / "BINANCE_SOLUSDT_60.csv", force=True)
+    assert toml_path.read_text() == legacy_text

@@ -1805,7 +1805,7 @@ class OHLCVWriter:
             )
         except (OverflowError, OSError, ValueError):
             return
-        key = (bar_datetime.isoweekday(), bar_datetime.hour)
+        key = (bar_datetime.weekday(), bar_datetime.hour)
         self._trading_hours[key] = self._trading_hours.get(key, 0) + 1
 
     def _collect_existing_trading_hours(self) -> None:
@@ -1841,12 +1841,12 @@ class OHLCVWriter:
             hours: list[SymInfoInterval] = []
             days_with_trading = {day for day, _hour in self._trading_hours}
             if len(days_with_trading) == 7:
-                for day in range(1, 8):
+                for day in range(7):
                     hours.append(
                         SymInfoInterval(day=day, start=time(0, 0, 0), end=time(23, 59, 59))
                     )
-            elif days_with_trading <= {1, 2, 3, 4, 5}:
-                for day in range(1, 6):
+            elif days_with_trading <= {0, 1, 2, 3, 4}:
+                for day in range(5):
                     hours.append(
                         SymInfoInterval(day=day, start=time(9, 30, 0), end=time(16, 0, 0))
                     )
@@ -1858,19 +1858,22 @@ class OHLCVWriter:
             self._analyzed_opening_hours = hours
             return
 
-        if len(self._trading_hours) >= 168 * 0.7:
+        # The round-the-clock shortcut needs activity on every weekday: a complete
+        # Monday-Friday feed fills 120 of the 168 buckets evenly as well
+        days_with_trading = {day for day, _hour in self._trading_hours}
+        if len(self._trading_hours) >= 168 * 0.7 and len(days_with_trading) == 7:
             counts = list(self._trading_hours.values())
             average_count = sum(counts) / len(counts)
             variance = sum((count - average_count) ** 2 for count in counts) / len(counts)
             if variance < average_count * 0.5:
                 self._analyzed_opening_hours = [
                     SymInfoInterval(day=day, start=time(0, 0, 0), end=time(23, 59, 59))
-                    for day in range(1, 8)
+                    for day in range(7)
                 ]
                 return
 
         hours = []
-        for day in range(1, 8):
+        for day in range(7):
             day_hours = [
                 (hour, count)
                 for (activity_day, hour), count in self._trading_hours.items()
@@ -1912,7 +1915,7 @@ class OHLCVWriter:
         if not hours:
             hours = [
                 SymInfoInterval(day=day, start=time(9, 30, 0), end=time(16, 0, 0))
-                for day in range(1, 6)
+                for day in range(5)
             ]
         self._analyzed_opening_hours = hours
 

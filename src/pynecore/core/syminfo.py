@@ -223,11 +223,18 @@ class SymInfo:
             h, m, s = map(int, time_str.split(':'))
             return time(h, m, s)
 
+        def parse_day(value: object) -> int:
+            """Validate a schedule weekday: ``0`` = Monday ... ``6`` = Sunday"""
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 6:
+                raise ValueError(f"Invalid schedule day {value!r} in {path}: expected "
+                                 f"0 (Monday) ... 6 (Sunday)")
+            return value
+
         # Convert opening hours
         opening_hours = []
         for oh in data.get('opening_hours', []):
             opening_hours.append(SymInfoInterval(
-                day=oh['day'],
+                day=parse_day(oh['day']),
                 start=parse_time(oh['start']),
                 end=parse_time(oh['end'])
             ))
@@ -236,14 +243,14 @@ class SymInfo:
         session_starts = []
         for s in data.get('session_starts', []):
             session_starts.append(SymInfoSession(
-                day=s['day'],
+                day=parse_day(s['day']),
                 time=parse_time(s['time'])
             ))
 
         session_ends = []
         for s in data.get('session_ends', []):
             session_ends.append(SymInfoSession(
-                day=s['day'],
+                day=parse_day(s['day']),
                 time=parse_time(s['time'])
             ))
 
@@ -275,12 +282,15 @@ class SymInfo:
             seen_effective.add(eff)
             session_schedules.append(SymInfoScheduleVariant(
                 effective_from=eff,
-                opening_hours=[SymInfoInterval(day=oh['day'], start=parse_time(oh['start']),
+                opening_hours=[SymInfoInterval(day=parse_day(oh['day']),
+                                               start=parse_time(oh['start']),
                                                end=parse_time(oh['end']))
                               for oh in sched.get('opening_hours', [])],
-                session_starts=[SymInfoSession(day=s['day'], time=parse_time(s['time']))
+                session_starts=[SymInfoSession(day=parse_day(s['day']),
+                                               time=parse_time(s['time']))
                                 for s in sched.get('session_starts', [])],
-                session_ends=[SymInfoSession(day=s['day'], time=parse_time(s['time']))
+                session_ends=[SymInfoSession(day=parse_day(s['day']),
+                                             time=parse_time(s['time']))
                              for s in sched.get('session_ends', [])],
             ))
         session_schedules.sort(key=lambda v: v.effective_from)
@@ -313,7 +323,8 @@ class SymInfo:
         session_corrections = parse_corrections('session_corrections')
 
         extended_hours = [
-            SymInfoInterval(day=oh['day'], start=parse_time(oh['start']), end=parse_time(oh['end']))
+            SymInfoInterval(day=parse_day(oh['day']), start=parse_time(oh['start']),
+                            end=parse_time(oh['end']))
             for oh in data.get('extended_hours', [])]
         extended_session_corrections = parse_corrections('extended_session_corrections')
 

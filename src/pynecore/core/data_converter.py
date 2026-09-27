@@ -233,17 +233,21 @@ class DataConverter:
         writer_pricescale: int | None = None
 
         if toml_path.exists():
-            # noinspection PyBroadException
+            # An unreadable TOML stops the conversion: converting without it would read
+            # the data in the wrong timezone and tick grid, and would overwrite the
+            # user's symbol metadata with inferred defaults.
             try:
                 existing_syminfo = SymInfo.load_toml(toml_path)
-                timezone = existing_syminfo.timezone
-                existing_period = existing_syminfo.period
-                writer_minmove = existing_syminfo.minmove
-                writer_pricescale = existing_syminfo.pricescale
-                skip_toml_generation = True
-            except Exception:
-                # If TOML is corrupted, continue with provided/default values.
-                pass
+            except (ValueError, KeyError, TypeError, OSError) as e:
+                raise ConversionError(
+                    f"Cannot load symbol info {toml_path}: {e}. Fix or delete the file, "
+                    f"then convert again."
+                ) from e
+            timezone = existing_syminfo.timezone
+            existing_period = existing_syminfo.period
+            writer_minmove = existing_syminfo.minmove
+            writer_pricescale = existing_syminfo.pricescale
+            skip_toml_generation = True
         elif timezone == "UTC" and detected_format == 'csv':
             detected_tz = self._detect_timezone_from_csv(file_path)
             if detected_tz:
@@ -349,9 +353,11 @@ class DataConverter:
                     # Fallback to default based on symbol type (insufficient data or analysis failed)
                     opening_hours = self.get_default_opening_hours(symbol_type)
 
-                # Create session starts and ends
-                session_starts = [SymInfoSession(day=1, time=time(0, 0, 0))]
-                session_ends = [SymInfoSession(day=7, time=time(23, 59, 59))]
+                # Every opening-hours interval is one session
+                session_starts = [SymInfoSession(day=oh.day, time=oh.start)
+                                  for oh in opening_hours]
+                session_ends = [SymInfoSession(day=oh.day, time=oh.end)
+                                for oh in opening_hours]
 
                 # Create SymInfo instance
                 # Use provider as prefix (uppercase), default to "CUSTOM" if not provided
@@ -465,7 +471,7 @@ class DataConverter:
 
         if symbol_type == 'crypto':
             # 24/7 trading for crypto
-            for day in range(1, 8):
+            for day in range(7):
                 opening_hours.append(SymInfoInterval(
                     day=day,
                     start=time(0, 0, 0),
@@ -474,7 +480,7 @@ class DataConverter:
         elif symbol_type == 'forex':
             # Forex markets: Sunday 5 PM ET to Friday 5 PM ET (roughly)
             # Using Monday-Friday 00:00-23:59 as approximation
-            for day in range(1, 6):
+            for day in range(5):
                 opening_hours.append(SymInfoInterval(
                     day=day,
                     start=time(0, 0, 0),
@@ -482,7 +488,7 @@ class DataConverter:
                 ))
         else:
             # Stock markets and others: typical business hours (Mon-Fri 9:30 AM - 4:00 PM)
-            for day in range(1, 6):
+            for day in range(5):
                 opening_hours.append(SymInfoInterval(
                     day=day,
                     start=time(9, 30, 0),
