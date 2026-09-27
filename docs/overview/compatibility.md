@@ -2,7 +2,8 @@
 ---
 weight: 105
 title: "Pine Script Compatibility"
-description: "PyneCore vs TradingView: validated on 809 published Pine Script v6 scripts, 99.714% of 99 million values bit-identical, 289,074 trades matched. Feature status of every Pine Script v6 module."
+description: "PyneCore vs TradingView: 809 published TradingView scripts (Pine Script v4-v6, converted to Pyne code with PyneComp) validated, 99.714% of 99 million values bit-identical, 289,074 trades matched. Feature status of the Pine Script API in PyneCore."
+wildDescription: "PyneCore vs TradingView: {{scripts_total}} published TradingView scripts (Pine Script v4-v6, converted to Pyne code with PyneComp) validated, {{bars_exact_pct_precise}}% of {{bars_compared_millions}} million values bit-identical, {{strategy_trades_display}} trades matched. Feature status of the Pine Script API in PyneCore."
 icon: "checklist"
 date: "2026-03-28"
 lastmod: "2026-09-26"
@@ -15,25 +16,35 @@ tags: ["pine-script", "compatibility", "features", "status", "tradingview", "val
 
 # Pine Script Compatibility
 
-PyneCore runs Pine Script v6 with results that match TradingView. The match is measured, not
-assumed: PyneCore is run on a public corpus of real, published TradingView scripts and every
-comparable output is compared with TradingView's own.
+PyneCore runs **Pyne code**: Python whose API and bar-by-bar semantics follow TradingView's Pine
+Script, with results that match TradingView. This page lists how completely the Pine Script API is
+covered, how closely the results match, and where PyneCore differs on purpose.
 
-> **Validation status** — snapshot 2026-09-23, [Pyne in the Wild](https://wild.pynesys.io/)
+> **Running existing Pine Script:** PyneCore does not read Pine Script source itself. Existing
+> scripts are converted to Pyne code by [PyneComp](https://pynesys.io), the PyneSys compiler for
+> Pine Script v4, v5 and v6 (v1–v3 sources are converted too, on a best-effort basis). PyneComp is
+> a separate service that needs a PyneSys API key; with the key configured, `pyne compile
+> script.pine` converts a script, and `pyne run script.pine` converts it before running — see
+> [Compiling Pine Scripts](../cli/compile.md).
+
+The match with TradingView is measured, not assumed: published TradingView scripts are converted
+with PyneComp, run by PyneCore, and every comparable output is compared with TradingView's own.
+
+> **Validation status** — snapshot <!--wild:generated_at-->2026-09-23<!--/wild-->, [Pyne in the Wild](https://wild.pynesys.io/)
 >
-> - **809** published open-source Pine Script v6 scripts (407 indicators, 402 strategies), all run
-> - **1,090 / 1,090** outputs comparable with TradingView verified (712 plot outputs, 378
->   strategy trade lists)
-> - **99.714%** of 99,018,068 plotted values identical to TradingView to the bit; the largest
->   relative gap anywhere is 1.2 × 10⁻¹⁰ (about 9 significant figures)
-> - **289,074** strategy trades in 378 strategies: entry and exit timing and trade counts match
-> - Chart: BINANCE:BTCUSDT, 30-minute bars; per-script results and methodology are public
-
-The rest of this page lists the status of every Pine Script v6 feature area, the places where
-PyneCore differs from TradingView on purpose, and where the remaining 0.3% of values come from.
-
-> **Note:** PyneCore only supports Pine Script **v6**. Scripts written in v5 or earlier must be
-> updated to v6 syntax (PyneComp handles this automatically during compilation).
+> - **<!--wild:scripts_total-->809<!--/wild-->** published open-source TradingView scripts (<!--wild:indicators-->407<!--/wild--> indicators,
+>   <!--wild:strategies-->402<!--/wild--> strategies; Pine Script v4: <!--wild:pine_v4-->294<!--/wild-->, v5: <!--wild:pine_v5-->314<!--/wild-->,
+>   v6: <!--wild:pine_v6-->201<!--/wild-->), all converted and run
+> - **<!--wild:tv_verified_display-->1,090<!--/wild--> / <!--wild:tv_comparable_display-->1,090<!--/wild-->** outputs comparable with
+>   TradingView verified (<!--wild:plot_outputs-->712<!--/wild--> plot outputs, <!--wild:trade_outputs-->378<!--/wild--> strategy trade
+>   lists)
+> - **<!--wild:bars_exact_pct_precise-->99.714<!--/wild-->%** of <!--wild:bars_compared_full-->99,018,068<!--/wild--> plotted values identical to
+>   TradingView to the bit; the largest relative gap anywhere is <!--wild:max_rel_display-->1.2 × 10⁻¹⁰<!--/wild--> (about
+>   <!--wild:max_rel_sig_figures-->9<!--/wild--> significant figures)
+> - **<!--wild:strategy_trades_display-->289,074<!--/wild-->** strategy trades in <!--wild:strategies_compared-->378<!--/wild--> strategies:
+>   entry and exit timing and trade counts match
+> - Chart: <!--wild:symbol-->BINANCE:BTCUSDT<!--/wild-->, <!--wild:timeframe_min-->30<!--/wild-->-minute bars; per-script results and methodology are
+>   public
 
 ## Status Legend
 
@@ -56,7 +67,7 @@ PyneCore differs from TradingView on purpose, and where the remaining 0.3% of va
 | Pivot points            | full   | All 6 pivot types                            |
 | Statistical functions   | full   | Correlation, percentile, variance, etc.      |
 | Pattern detection       | full   | Crossover, crossunder, rising, falling, etc. |
-| **Total: 67 functions** | full   | Every `ta.*` function of Pine Script v6      |
+| **Total: 67 functions** | full   | The complete `ta` namespace of Pine Script   |
 
 ## Strategy Simulator
 
@@ -167,7 +178,7 @@ create/update/delete event log) for any charting front end — see
 
 ## Enum Constants
 
-All Pine Script v6 enum constants are implemented:
+All Pine Script enum constants are available:
 
 | Module          | Constants                                                 |
 |-----------------|-----------------------------------------------------------|
@@ -296,24 +307,26 @@ the quirk needs a rule of its own for `time_close()` on that single bar.
 
 ## Precision
 
-What "matches TradingView" means, measured on the validation corpus (snapshot 2026-09-23):
+What "matches TradingView" means, measured on the validation corpus (snapshot
+<!--wild:generated_at-->2026-09-23<!--/wild-->):
 
-- **Plotted values**: 99.714% of 99,018,068 values are identical to TradingView to the bit. In 687
-  of the 712 compared plot outputs every single value is bit-identical. The largest relative gap
-  anywhere is 1.2 × 10⁻¹⁰ (about 9 significant figures).
-- **Strategy trades**: 289,074 trades in 378 strategies; entry and exit timing and trade counts
-  match TradingView in every one of them.
+- **Plotted values**: <!--wild:bars_exact_pct_precise-->99.714<!--/wild-->% of <!--wild:bars_compared_full-->99,018,068<!--/wild--> values are identical to
+  TradingView to the bit. In <!--wild:scripts_bit_exact-->687<!--/wild--> of the <!--wild:scripts_fidelity_compared-->712<!--/wild--> compared plot
+  outputs every single value is bit-identical. The largest relative gap anywhere is
+  <!--wild:max_rel_display-->1.2 × 10⁻¹⁰<!--/wild--> (about <!--wild:max_rel_sig_figures-->9<!--/wild--> significant figures).
+- **Strategy trades**: <!--wild:strategy_trades_display-->289,074<!--/wild--> trades in <!--wild:strategies_compared-->378<!--/wild--> strategies;
+  entry and exit timing and trade counts match TradingView in every one of them.
 - **OHLCV data**: the v2 `.ohlcv` format stores int64 millisecond timestamps, float64 open and
   volume, and high/low/close as float32 deltas from the open — promoted to float64 whenever a
   delta cannot hold the symbol's tick grid exactly — and snaps prices back to the tick grid on
   read.
 
-### Where the remaining 0.3% comes from
+### Where the non-identical values come from
 
 IEEE-754 leaves implementations free to differ on operation ordering and internal precision, so
 two correct implementations of the same formula can produce results that differ by a few ULPs.
-The values that are not bit-identical differ in their last bits: the largest relative gap in the
-whole corpus is 1.2 × 10⁻¹⁰, and typical disagreements are 1e-15 to 1e-12 absolute, adding up to
+The values that are not bit-identical differ far below any price tick: the largest relative gap
+in the whole corpus is <!--wild:max_rel_display-->1.2 × 10⁻¹⁰<!--/wild-->, and typical disagreements are 1e-15 to 1e-12 absolute, adding up to
 at most a fraction of a percent equity drift over thousands of trades.
 
 The disagreement is invisible in arithmetic but matters at **exact-equality comparisons**, where

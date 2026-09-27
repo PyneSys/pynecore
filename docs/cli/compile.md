@@ -5,7 +5,7 @@ title: "Compiling Pine Scripts"
 description: "Compiling Pine Script to Python using PyneSys API"
 icon: "code"
 date: "2025-08-03"
-lastmod: "2025-08-03"
+lastmod: "2026-09-26"
 draft: false
 toc: true
 categories: ["Usage", "CLI", "Compilation"]
@@ -98,12 +98,10 @@ pyne compile my_strategy.pine --usage
 
 ## Pine Script Version Support
 
-**Important**: Only Pine Script version 6 is supported. Version 4 and 5 scripts are not supported.
-
-Make sure your Pine Script starts with:
-```pine
-//@version=6
-```
+PyneComp compiles Pine Script v4, v5 and v6. Sources written for v1–v3, or without a
+`//@version` line, are converted too, on a best-effort basis. Older sources are migrated to v6
+automatically before compilation, so a script can be compiled exactly as it was published on
+TradingView.
 
 ## Usage Statistics
 
@@ -196,7 +194,8 @@ This error occurs when the API key is invalid or expired. Check:
 Error: Unsupported Pine Script version
 ```
 
-This error occurs when trying to compile Pine Script v4 or v5. Only version 6 is supported.
+This error means the script's `//@version` could not be handled. PyneComp supports Pine Script v4,
+v5 and v6; v1–v3 sources are converted on a best-effort basis.
 
 ### File Not Found
 

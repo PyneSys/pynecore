@@ -5,7 +5,7 @@ title: "Overview"
 description: "PyneCore overview and main concepts"
 icon: "article"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-09-26"
 draft: false
 toc: true
 categories: ["Overview"]
@@ -23,7 +23,7 @@ PyneCore overview and main concepts
 - [Ecosystem](./ecosystem.md) - Pyne ecosystem components
 - [Core Concepts](./core-concepts.md) - Fundamental concepts and mechanisms
 - [Differences](./differences.md) - Key differences from Pine Script and compatibility notes
-- [Compatibility](./compatibility.md) - Pine Script v6 feature implementation status
+- [Compatibility](./compatibility.md) - Pine Script API coverage and measured match with TradingView
 - [Project Structure](./project-structure.md) - Project structure overview
 - [Configuration](./configuration.md) - System configuration
 - [Symbol Map](./symbol-map.md) - Translate TradingView symbols to provider-native data

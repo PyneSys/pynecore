@@ -150,12 +150,8 @@ class APIErrorHandler:
 
         elif "unsupported pinescript version" in error_msg:
             self.console.print("[red]Version Issue:[/red] Your Pine Script version isn't supported")
-            if "version 5" in error_msg:
-                self.console.print("[yellow]Pine Script v5 → v6 Migration:[/yellow]")
-                self.console.print("  • Update your script to Pine Script version 6")
-                self.console.print("  • Most v5 scripts need minimal changes")
-            else:
-                self.console.print("[yellow]Only Pine Script version 6 is currently supported[/yellow]")
+            self.console.print("[yellow]PyneComp supports Pine Script v4, v5 and v6; v1-v3 sources "
+                               "are converted on a best-effort basis[/yellow]")
 
         elif "api key" in error_msg:
             self.console.print("[red]API Key Issue:[/red] There's a problem with your API key")

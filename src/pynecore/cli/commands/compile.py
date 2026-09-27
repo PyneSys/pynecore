@@ -124,7 +124,8 @@ def compile(
     The system automatically searches for the workdir folder in the current and parent directories.
     If not found, it creates or uses a workdir folder in the current directory.
 
-    Only version 6 is supported (no v4 or v5 support).
+    Pine Script v4, v5 and v6 are supported; v1-v3 sources are converted too, on a best-effort
+    basis.
     API key can be provided via --api-key or via config file: [cyan]workdir/config/api.toml[/cyan].
 
     If no script is provided, will print usage statistics and exit.
