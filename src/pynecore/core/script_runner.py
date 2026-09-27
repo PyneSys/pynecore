@@ -609,10 +609,12 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
         # reads the period bar directly, no aggregation needed.
         return data_path
 
+    # Same resolution as the runner's own ``syminfo.timezone`` (empty -> UTC), so the
+    # resampled grid and the security child agree on the exchange day.
     try:
-        tz = parse_timezone(si.timezone) if si.timezone else None
-    except (ValueError, KeyError):
-        tz = None
+        tz = parse_timezone(si.timezone or 'UTC')
+    except ValueError as e:
+        raise ValueError(f"{toml_path}: {e}") from e
 
     if not tmp_dir_holder:
         tmp_dir_holder.append(tempfile.mkdtemp(prefix='pyne_sec_resample_'))

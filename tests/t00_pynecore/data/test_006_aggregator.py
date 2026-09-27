@@ -3,6 +3,7 @@
 """
 import pytest
 import tempfile
+import time
 from pathlib import Path
 
 from pynecore.core.aggregator import validate_aggregation, aggregate_ohlcv, _merge_candles
@@ -278,6 +279,74 @@ def __test_aggregate_observed_holiday_grouping__():
     assert [c.timestamp for c in result] == [open_ts(g[0]) for g in expected_groups]
     expected_vols = [sum(float(days.index(d) + 1) for d in g) for g in expected_groups]
     assert [c.volume for c in result] == pytest.approx(expected_vols)
+
+
+def __test_aggregate_observed_without_sessions_warns__(tmp_path, caplog):
+    """An observed multi-period grid without session metadata says it groups by date."""
+    day_ms = 86_400_000
+    candles = [
+        OHLCV(timestamp=1_736_121_600_000 + i * day_ms, open=10.0, high=11.0, low=9.0,
+              close=10.5, volume=1.0)
+        for i in range(4)
+    ]
+    source = tmp_path / "src.ohlcv"
+    _create_ohlcv_file(source, candles, "1D")
+
+    with caplog.at_level("WARNING", logger="pynecore.core.aggregator"):
+        aggregate_ohlcv(source, tmp_path / "tgt.ohlcv", "2D", sym_type='futures',
+                        source_tf='1D')
+    assert "grouped by calendar date" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="pynecore.core.aggregator"):
+        aggregate_ohlcv(source, tmp_path / "tgt.ohlcv", "2D", sym_type='crypto',
+                        source_tf='1D')
+    assert "grouped by calendar date" not in caplog.text
+
+
+@pytest.mark.skipif(not hasattr(time, 'tzset'), reason="time.tzset() is not available on Windows")
+def __test_aggregate_default_tz_is_utc_not_host__(tmp_path, monkeypatch):
+    """Without an explicit tz the day boundaries are UTC, whatever the host zone is."""
+    hour_ms = 3_600_000
+    # 2025-01-06 00:00 UTC onwards, 48 hourly bars
+    candles = [
+        OHLCV(timestamp=1_736_121_600_000 + i * hour_ms, open=10.0, high=11.0, low=9.0,
+              close=10.5, volume=1.0)
+        for i in range(48)
+    ]
+    source = tmp_path / "src.ohlcv"
+    _create_ohlcv_file(source, candles, "60")
+
+    monkeypatch.setenv("TZ", "Asia/Tokyo")
+    time.tzset()
+    try:
+        aggregate_ohlcv(source, tmp_path / "tgt.ohlcv", "1D", source_tf='60')
+        result = _read_all(tmp_path / "tgt.ohlcv")
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+    assert [c.timestamp for c in result] == [1_736_121_600_000, 1_736_208_000_000]
+    assert [c.volume for c in result] == pytest.approx([24.0, 24.0])
+
+
+def __test_aggregate_rejects_source_as_target__(tmp_path):
+    """Aggregating onto the source file (directly or via a hard link) fails and keeps it."""
+    candles = [
+        OHLCV(timestamp=1_736_121_600_000 + i * 3_600_000, open=10.0, high=11.0, low=9.0,
+              close=10.5, volume=1.0)
+        for i in range(48)
+    ]
+    source = tmp_path / "src.ohlcv"
+    _create_ohlcv_file(source, candles, "60")
+    before = source.read_bytes()
+    alias = tmp_path / "alias.ohlcv"
+    alias.hardlink_to(source)
+
+    for target in (source, alias):
+        with pytest.raises(ValueError, match="is the source file"):
+            aggregate_ohlcv(source, target, "1D", source_tf='60')
+    assert source.read_bytes() == before
 
 
 # --- Single-record / empty-source edge cases (issue #70) ---

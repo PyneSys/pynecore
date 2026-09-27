@@ -21,6 +21,7 @@ from ...core.download_runner import (download_to_file, ConflictAction, DownloadC
                                      DownloadPlan, DownloadProgress, DownloadError)
 from ...core.ohlcv import OHLCVReader
 from ...core.aggregator import validate_aggregation, aggregate_ohlcv
+from ...core.datetime import parse_timezone
 from ...core.syminfo import SymInfo
 
 from ...utils.rich.date_column import DateColumn
@@ -729,6 +730,10 @@ def aggregate(
     if out_path.suffix == "":
         out_path = out_path.with_suffix(".ohlcv")
 
+    if out_path.exists() and out_path.samefile(source):
+        secho(f"Error: Output is the source file: {out_path}", err=True, fg=colors.RED)
+        raise Exit(1)
+
     # Confirm before overwriting existing file
     if out_path.exists():
         secho(f"Target file already exists: {out_path.name}", fg=colors.YELLOW)
@@ -750,8 +755,7 @@ def aggregate(
             # way TradingView does (no-op for on-hour / 24-7 markets). The
             # symbol type and opening hours drive the multi-period (nD/nW/nM)
             # scheduled grid (see the resampler module docs).
-            from zoneinfo import ZoneInfo
-            data_tz = ZoneInfo(syminfo.timezone) if syminfo.timezone else None
+            data_tz = parse_timezone(syminfo.timezone or 'UTC')
             source_count, target_count = aggregate_ohlcv(
                 source, out_path, timeframe, tz=data_tz,
                 session_starts=syminfo.session_starts,

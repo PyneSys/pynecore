@@ -7,6 +7,7 @@ n > 1) live on the year-reset scheduled grid (see ``resampler`` module docs);
 'observed' symbols (exchange-listed) count the actual trading days seen in the
 source stream, which reproduces TradingView's holiday-aware grid.
 """
+import logging
 from datetime import timezone as dt_timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -20,6 +21,8 @@ from .resampler import (
 # noinspection PyProtectedMember
 from ..lib.timeframe import _in_seconds, _process_tf
 from ..types.ohlcv import OHLCV
+
+logger = logging.getLogger(__name__)
 
 
 def validate_aggregation(source_tf: str, target_tf: str) -> None:
@@ -77,7 +80,7 @@ def aggregate_ohlcv(
         source_path: Path,
         target_path: Path,
         target_tf: str,
-        tz: ZoneInfo | dt_timezone | None = None,
+        tz: ZoneInfo | dt_timezone = dt_timezone.utc,
         session_starts: list | None = None,
         opening_hours: list | None = None,
         sym_type: str | None = None,
@@ -92,6 +95,8 @@ def aggregate_ohlcv(
     :param target_tf: Target timeframe string (e.g., '60', '1W')
     :param tz: Timezone for day/week/month boundary alignment.
                Should match the data's timezone (from TOML metadata).
+               Defaults to UTC, never the host's local zone, so the same
+               files aggregate identically on every machine.
     :param session_starts: Per-trading-day primary opens for intraday session
                anchoring and multi-period grids. When given, intraday bars align
                to the session open (TradingView behaviour) instead of the UTC
@@ -113,7 +118,12 @@ def aggregate_ohlcv(
     :param prefix: ``SymInfo.prefix``, the feed the data comes from; a CFD feed
                has no exchange calendar and stays on the weekday grid.
     :return: Tuple of (source_candles_read, target_candles_written)
+    :raises ValueError: If ``target_path`` is the source file (also via a symlink
+               or hard link) — truncating it would destroy the input before it is read
     """
+    if target_path.exists() and source_path.samefile(target_path):
+        raise ValueError(f"Target {target_path} is the source file; aggregate to another path")
+
     # noinspection PyProtectedMember
     modifier, multiplier = _process_tf(target_tf)
     # The written file declares its period with an explicit multiplier ('D' -> '1D').
@@ -132,6 +142,12 @@ def aggregate_ohlcv(
             fold = True
 
     if modifier in ('D', 'W', 'M') and multiplier > 1 and mode == 'observed':
+        if not opening_hours and not session_starts:
+            logger.warning(
+                "%s: no opening_hours or session_starts in the symbol info; %s%s periods "
+                "are grouped by calendar date, so overnight sessions (e.g. a Sunday "
+                "evening futures open) count as their own trading day",
+                source_path.name, multiplier, modifier)
         return _aggregate_observed(
             source_path, target_path, modifier, multiplier, tz,
             session_starts, opening_hours, src_off, fold)
@@ -185,7 +201,7 @@ def _aggregate_observed(
         target_path: Path,
         modifier: str,
         multiplier: int,
-        tz: ZoneInfo | dt_timezone | None,
+        tz: ZoneInfo | dt_timezone,
         session_starts: list | None,
         opening_hours: list | None,
         src_off: int = 0,
