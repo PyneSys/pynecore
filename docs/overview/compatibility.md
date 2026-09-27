@@ -340,3 +340,10 @@ closed them:
   futures ([#71](https://github.com/PyneSys/pynecore/issues/71)).
 - **v6.6.0** — live data (`pyne run --live`), broker trading (`pyne run --broker`) and realtime
   `barstate` flags; plot and drawing export (`pyne run --viz`).
+- **v6.10.3** — extended trading hours: `SymInfo` keeps the symbol's pre-market and
+  post-market template, `time(tf, "extended")` / `time(tf, "regular")` read it, and on bars of the
+  extended hours `session.ispremarket`, `session.ispostmarket`, `session.ismarket`,
+  `session.isfirstbar` / `session.islastbar` and `syminfo.session` behave as on TradingView (see
+  [Extended Trading Hours](../programmatic/data-and-syminfo.md#extended-trading-hours)). CFD
+  feeds without an exchange calendar (Capital.com) count every weekday on the nD/nW/nM grid,
+  as TradingView does.
