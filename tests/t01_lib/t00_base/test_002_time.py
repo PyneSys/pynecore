@@ -702,3 +702,140 @@ def __test_multi_day_offsets_step_the_scheduled_days__(monkeypatch):
     __test_helper_eurusd(monkeypatch, "D", ny(2020, 1, 2, 17))
     assert time("2D", timeframe_bars_back=1) == ny(2019, 12, 31, 17)
     assert time("3D", timeframe_bars_back=2) == ny(2019, 12, 23, 17)
+
+
+def __test_daily_offsets_cross_the_year_the_way_tradingview_does__(monkeypatch):
+    """ A daily offset across the turn of the year mirrors the year's first scheduled day """
+    ny = __test_helper_ny
+    # MEASURED (TradingView, 2026-09-26, CAPITALCOM:US500 daily chart 1999-2026, offsets
+    # -4..6): stepping back from the year's first scheduled day lands as many days before
+    # the year end as that day lies after January 1. 2000 starts on Saturday: from Monday
+    # January 3 one bar back is Wednesday December 29, not Friday the 31st, and the walk
+    # continues from there. 2001 starts on Monday: from Tuesday January 2 one bar back is
+    # January 1, two bars back is January 1 again (the mirror of the first day is Sunday
+    # the 31st, which reports as the next scheduled day) and three is Friday December 29.
+    __test_helper_eurusd(monkeypatch, "D", ny(2000, 1, 2, 17))
+    assert time("D", timeframe_bars_back=1) == ny(1999, 12, 28, 17)
+    assert time("D", timeframe_bars_back=2) == ny(1999, 12, 27, 17)
+    assert time("D", timeframe_bars_back=4) == ny(1999, 12, 23, 17)
+    __test_helper_eurusd(monkeypatch, "D", ny(2001, 1, 1, 17))
+    assert time("D", timeframe_bars_back=1) == ny(2000, 12, 31, 17)
+    assert time("D", timeframe_bars_back=2) == ny(2000, 12, 31, 17)
+    assert time("D", timeframe_bars_back=3) == ny(2000, 12, 28, 17)
+    assert time("D", timeframe_bars_back=4) == ny(2000, 12, 27, 17)
+    # Stepping forward from the year's last scheduled day stops on an unscheduled
+    # December 31, which reports as the next year's first day: from Friday 2000-12-29
+    # one and two bars forward are both Monday 2001-01-01, three is Tuesday January 2.
+    # A year ending on a scheduled day walks straight on.
+    __test_helper_eurusd(monkeypatch, "D", ny(2000, 12, 28, 17))
+    assert time("D", timeframe_bars_back=-1) == ny(2000, 12, 31, 17)
+    assert time("D", timeframe_bars_back=-2) == ny(2000, 12, 31, 17)
+    assert time("D", timeframe_bars_back=-3) == ny(2001, 1, 1, 17)
+    __test_helper_eurusd(monkeypatch, "D", ny(1999, 12, 30, 17))
+    assert time("D", timeframe_bars_back=-1) == ny(2000, 1, 2, 17)
+    assert time("D", timeframe_bars_back=-2) == ny(2000, 1, 3, 17)
+
+
+def __test_multi_day_offsets_cross_the_year_the_way_tradingview_does__(monkeypatch):
+    """ An nD offset across the turn of the year is placed from the chart bar's own bar """
+    ny = __test_helper_ny
+    # MEASURED (TradingView, 2026-09-26, CAPITALCOM:US500 daily chart 1999-2026, 2D..60D,
+    # offsets 1..4 and offsets across two and three turns of the year). Inside a year the
+    # bars are regular. Across the turn of the year the landing depends on how many
+    # scheduled days remain of the chart bar's own nD bar: that many days counted from
+    # the year's first scheduled day is mirrored across the boundary (a weekend day rounds
+    # up), and every whole week of them beyond the first moves the landing two more weeks
+    # back. So 60D one bar back on 2003-01-02 (59 days remain of the first bar) is the
+    # bar of 2002-03-26, the fourth bar from the end of 2002, and on 2003-01-14 (49 days
+    # remain) the bar of 2002-06-18; the walk continues from the landing a bar length at
+    # a time.
+    __test_helper_eurusd(monkeypatch, "D", ny(2003, 1, 1, 17))
+    assert time("60D", timeframe_bars_back=1) == ny(2002, 3, 25, 17)
+    __test_helper_eurusd(monkeypatch, "D", ny(2003, 1, 12, 17))
+    assert time("60D", timeframe_bars_back=1) == ny(2002, 3, 25, 17)
+    assert time("20D", timeframe_bars_back=1) == ny(2002, 11, 4, 17)
+    __test_helper_eurusd(monkeypatch, "D", ny(2003, 1, 13, 17))
+    assert time("60D", timeframe_bars_back=1) == ny(2002, 6, 17, 17)
+    assert time("20D", timeframe_bars_back=1) == ny(2002, 12, 2, 17)
+    __test_helper_eurusd(monkeypatch, "D", ny(2003, 1, 27, 17))
+    assert time("20D", timeframe_bars_back=1) == ny(2002, 12, 30, 17)
+    # The mirror: 2002 starts on Tuesday, so from Monday 2002-01-07 (three days remain of
+    # the 7D bar) the third scheduled day, Thursday January 3, mirrors to Saturday
+    # December 29, which rounds up to Monday the 31st -- the bar of Friday 2001-12-28.
+    # 2003 starts on Wednesday: from Tuesday 2003-01-07 the mirror is Sunday December 29,
+    # rounding up to Monday the 30th, the last 7D bar of 2002.
+    __test_helper_eurusd(monkeypatch, "D", ny(2002, 1, 6, 17))
+    assert time("7D", timeframe_bars_back=1) == ny(2001, 12, 27, 17)
+    __test_helper_eurusd(monkeypatch, "D", ny(2003, 1, 6, 17))
+    assert time("7D", timeframe_bars_back=1) == ny(2002, 12, 29, 17)
+    # Before a year starting on Monday the mirror of its first days is the weekend, which
+    # rounds up to January 1 itself: 7D one bar back on Monday 2007-01-08 is the current
+    # bar, and the walk continues from the day after 2006's last scheduled day, so two
+    # bars back is the bar of 2006-12-20, skipping the one-day bar of December 29.
+    __test_helper_eurusd(monkeypatch, "D", ny(2007, 1, 7, 17))
+    assert time("7D", timeframe_bars_back=1) == ny(2006, 12, 31, 17)
+    assert time("7D", timeframe_bars_back=2) == ny(2006, 12, 19, 17)
+    __test_helper_eurusd(monkeypatch, "D", ny(2018, 1, 1, 17))
+    assert time("3D", timeframe_bars_back=1) == ny(2017, 12, 31, 17)
+    assert time("3D", timeframe_bars_back=2) == ny(2017, 12, 24, 17)
+    # Before a year starting on Saturday the mirror lands two days early: 2D one bar
+    # back on Monday 2011-01-03 is the bar of 2010-12-27, on Tuesday the 4th the bar of
+    # December 29.
+    __test_helper_eurusd(monkeypatch, "D", ny(2011, 1, 2, 17))
+    assert time("2D", timeframe_bars_back=1) == ny(2010, 12, 26, 17)
+    __test_helper_eurusd(monkeypatch, "D", ny(2011, 1, 3, 17))
+    assert time("2D", timeframe_bars_back=1) == ny(2010, 12, 28, 17)
+    # A walk that reaches the start of the previous year crosses again by the same rule:
+    # 60D five bars back on 2001-01-11 is the first bar of 1999, six bars back the bar of
+    # 1998-09-10.
+    __test_helper_eurusd(monkeypatch, "D", ny(2001, 1, 10, 17))
+    assert time("60D", timeframe_bars_back=5) == ny(1998, 12, 31, 17)
+    assert time("60D", timeframe_bars_back=6) == ny(1998, 9, 9, 17)
+    # The chart bar's position inside its own bar decides the landing, not the distance
+    # walked: 14D three bars back from the second bar of 2010 (2010-02-01) lands where one
+    # bar back from the first does, two bars further on.
+    __test_helper_eurusd(monkeypatch, "D", ny(2010, 1, 3, 17))
+    assert time("14D", timeframe_bars_back=1) == ny(2009, 11, 10, 17)
+    __test_helper_eurusd(monkeypatch, "D", ny(2010, 1, 31, 17))
+    assert time("14D", timeframe_bars_back=3) == ny(2009, 11, 30, 17)
+    # A seven-day template has no weekend to mirror and no weeks to pay for: 10D one bar
+    # back on 2019-01-01 is the bar of 2018-12-17.
+    __test_helper_btcusd(monkeypatch, "D", ny(2018, 12, 31, 17))
+    assert time("10D", timeframe_bars_back=1) == ny(2018, 12, 16, 17)
+
+
+def __test_helper_us500(monkeypatch, period: str, bar_ms: int) -> None:
+    """CAPITALCOM:US500 in Chicago: Sunday 17:00 -> Monday 16:00, then 16:00 -> 16:00"""
+    chicago = ZoneInfo("America/Chicago")
+    monkeypatch.setattr(lib, "_script_timeframe", None)
+    monkeypatch.setattr(lib, "_main_timeframe", None)
+    monkeypatch.setattr(lib, "_time", bar_ms)
+    monkeypatch.setattr(lib, "_datetime", datetime.fromtimestamp(bar_ms / 1000, chicago))
+    monkeypatch.setattr(lib, "_dg_mode", "")
+    monkeypatch.setattr(lib, "_dg_tz", chicago)
+    monkeypatch.setattr(lib, "_dg_day", None)
+    monkeypatch.setattr(syminfo, "period", period)
+    monkeypatch.setattr(syminfo, "type", "forex")
+    monkeypatch.setattr(syminfo, "timezone", "America/Chicago")
+    monkeypatch.setattr(syminfo, "session_corrections", None, raising=False)
+    starts = {6: dt_time(17), 0: dt_time(16), 1: dt_time(16), 2: dt_time(16), 3: dt_time(16)}
+    monkeypatch.setattr(syminfo, "_opening_hours", [
+        SymInfoInterval(day=d, start=t, end=dt_time(16)) for d, t in starts.items()])
+    monkeypatch.setattr(syminfo, "_session_starts", [
+        SymInfoSession(day=d, time=t) for d, t in starts.items()])
+
+
+def __test_intraday_chart_bar_belongs_to_the_day_of_its_scheduled_close__(monkeypatch):
+    """ A chart bar cut short by a session end belongs to the day that end closes """
+    def chi(y: int, mo: int, d: int, h: int) -> int:
+        return int(datetime(y, mo, d, h, tzinfo=ZoneInfo("America/Chicago")).timestamp() * 1000)
+    # MEASURED (TradingView, 2026-09-26, CAPITALCOM:US500 240-minute chart, 2017-2026):
+    # the Monday session ends at 16:00 and the next one opens at once, so the 13:00 bar
+    # runs only to 16:00 and is Monday's last bar -- time("D") on it is Sunday 17:00,
+    # one bar back Thursday 16:00 -- while the 16:00 bar starts Tuesday's trading day.
+    __test_helper_us500(monkeypatch, "240", chi(2017, 5, 1, 13))
+    assert time("D") == chi(2017, 4, 30, 17)
+    assert time("D", timeframe_bars_back=1) == chi(2017, 4, 27, 16)
+    __test_helper_us500(monkeypatch, "240", chi(2017, 5, 1, 16))
+    assert time("D") == chi(2017, 5, 1, 16)
+    assert time("D", timeframe_bars_back=1) == chi(2017, 4, 30, 17)

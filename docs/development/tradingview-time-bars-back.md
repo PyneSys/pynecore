@@ -7,14 +7,15 @@ is not zero, and what was measured on TradingView to arrive at it. The intraday 
 
 ## What was measured
 
-Probes on CAPITALCOM:US500 (daily, 1999-2026, 27 turns of the year), BTCUSD (daily
-and 60-minute), EURUSD, AAPL and GOLD (daily), 2026-09-26:
+Probes on CAPITALCOM:US500 (daily, 240- and 60-minute charts, 1999-2026, 27 turns of
+the year), BTCUSD (daily and 60-minute), EURUSD, AAPL and GOLD (daily), 2026-09-26:
 
 | Grid | Multipliers | Offsets | Values compared | Mismatches |
 |------|-------------|---------|-----------------|------------|
 | nW   | 1-18, 20, 25, 26, 30, 40, 52 | -2 .. 20 | 1 482 278 | 0 |
 | nM   | 5-11 | -1, 1, 2 | 180 202 | 0 |
-| nD   | 2-6, 10 | -2 .. 4 | 126 217 (daily symbols) | see below |
+| D    | 1 | -4 .. 6 | 70 180 | 0 |
+| nD   | 2-60 | -2 .. 8, and 5 .. 132 across two and three turns of the year | 1 900 000 | 0 |
 
 Inside a year every grid is regular, and a walk of any length is exact there. The
 differences appear only when the walk crosses the turn of the year, where the yearly
@@ -67,26 +68,79 @@ while from March it is the June bar.
 
 PyneCore: `_dwm_walk_probe_ms` in `lib/__init__.py`.
 
-## Multi-day grid
+## Daily and multi-day grid, backward
 
-The grid pairs the trading days the session template schedules, counted from
+The grid is the trading days the session template schedules, counted from
 January 1, holidays included (Christmas 2019 is a scheduled Wednesday without data on
-CAPITALCOM symbols; the bar starting on it opens Tuesday evening). A walk moves the
-chart bar's trading day by n scheduled days per bar and reports the bar holding the
-result. This reproduces every value on a seven-day template (BTCUSD) and every value
-inside a year on a Monday to Friday template.
+CAPITALCOM symbols; the bar starting on it opens Tuesday evening); an nD bar groups n
+of them, the year's last bar keeps the remainder. Inside a year a walk is plain
+arithmetic on the day ordinals. The bar that crosses the turn of the year is placed
+from the chart bar's own bar, and the rest of the walk continues from where it lands:
 
-Not reproduced: on a Monday to Friday template, walks that cross the turn of the year
-deviate on some of the first days of January. The deviation depends on the weekday of
-January 1 and on the position of the target inside the last week of the previous year
-(0.2-1% of the daily bars for offset 1 on 2D..10D, more for larger offsets). The
-measured pattern by the weekday of January 1: Saturday -- the target lands two calendar
-days earlier; Monday and Tuesday -- two calendar days later (Monday-start years then
-report the current bar itself once); Wednesday, Thursday and Sunday -- no deviation;
-Friday -- two days earlier except from the last day of the year. The probe data lives in
-the measurement session; the rule behind it is not understood, so it is not implemented.
+```
+remaining = scheduled days from the chart day to the end of its nD bar (n - position)
+mirror    = Dec 31 of the previous year - (day[remaining - 1] - Jan 1)
+            (day[i] = the i-th scheduled day of the chart year, counted from 0;
+             a mirror the template does not schedule rounds up to the next scheduled day)
+landing   = mirror - (weeks of remaining beyond the first) x 2 weeks   (in scheduled days)
+```
+
+The reported bar is the previous year's bar holding the landing day; a landing that
+rounded up into the chart year is the chart year's first bar. Further bars back continue
+from the landing a bar length at a time, a landing in the chart year continuing from
+the day after the previous year's last one, and a walk that reaches the start of the
+previous year crosses again by the same rule.
+
+What this looks like:
+
+- A single day (`remaining` = 1) mirrors the year's first scheduled day: `Dec 31 -
+  (F - Jan 1)`. Before a year that starts on Saturday (`F` = January 3) that is
+  Wednesday December 29, two scheduled days short of Friday the 31st. Before a year that
+  starts on Monday it is Sunday December 31, which rounds up to January 1 itself, so
+  `time("D", timeframe_bars_back=1)` and `=2` on Tuesday 2001-01-02 are both Monday
+  2001-01-01, and `=3` is Friday 2000-12-29. Every other weekday of January 1 gives the
+  previous year's last scheduled day.
+- The mirror reproduces the weekends of the chart year, not of the previous one. 2002
+  starts on Tuesday: from Monday 2002-01-07 three days remain of the 7D bar, the third
+  scheduled day (Thursday January 3) mirrors to Saturday December 29, which rounds up
+  to Monday the 31st, so the walk lands in the bar of Friday 2001-12-28 rather than in
+  the one holding Wednesday the 26th. The shift is at most two calendar days and
+  depends on the weekday of January 1 and of the landing.
+- Every whole week of `remaining` beyond the first costs two more weeks. 60D one bar
+  back on 2003-01-02 (59 days remain: eleven weeks) lands ten weeks earlier than the
+  mirror, in the bar of 2002-03-26, the fourth bar from the end of 2002; on 2003-01-14
+  (49 days, nine weeks) in the bar of 2002-06-18. Across the first bar of the year the
+  reported bar moves one bar per n/3 chart days, which is what made the crossing look
+  non-linear before the rule was found. A seven-day template (BTCUSD) has no weekend
+  to mirror and no weeks to pay for: its walk is plain arithmetic.
+- The position inside the chart bar decides, not the distance walked: 14D three bars
+  back from the second bar of 2010 lands where one bar back from the first bar does,
+  two bar lengths further on.
+
+The rule reproduces every measured value (1.9 million, see the table), including
+offsets that cross two and three turns of the year.
+
+## Daily and multi-day grid, forward
+
+A bar that has not opened yet holds the trading day the template schedules n bars of
+days ahead. Forward from the year's last scheduled day, the walk stops on December 31
+when the template does not schedule it (a year ending on Saturday or Sunday) and
+reports it as the next year's first scheduled day; the next step is that first day
+itself. A year ending on a scheduled day walks straight on. Measured for D..5D,
+offsets -1 and -2, no mismatch.
+
+PyneCore: `_tv_day_walk` (backward) and `_scheduled_day_step` (forward) in
+`lib/__init__.py`.
 
 ## Chart bars versus templates
+
+An intraday chart bar belongs to the D/W/M period its scheduled close falls into, and
+that close is the session end when the end cuts the bar short of its nominal span.
+Measured on CAPITALCOM:US500 (240-minute chart, 2017-2026): the Monday session ends at
+16:00 and the next one opens at once, so the 13:00 bar runs only to 16:00 and reports
+Sunday 17:00 as its day, while the 16:00 bar starts Tuesday's trading day; a bar whose
+nominal span reaches into a session that opens later than the bar (a 17:05 open on a
+17:00 bar) starts the new day. PyneCore: `_chart_span_off_ms` in `lib/__init__.py`.
 
 For symbols whose grid mode is `observed` (exchange-listed types), the nD/nW/nM bar
 stamps come from the observed day counter, which counts the days present in the data.
