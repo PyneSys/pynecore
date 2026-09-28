@@ -35,7 +35,8 @@ def setup(
         recreate_provider_config: bool = typer.Option(
             False,
             "--recreate-provider-config",
-            help="Recreate provider.toml file even if workdir exists",
+            help="Regenerate the config/plugins/*.toml files of the installed plugins "
+                 "(user values are kept)",
         ),
         recreate_api_config: bool = typer.Option(
             False,

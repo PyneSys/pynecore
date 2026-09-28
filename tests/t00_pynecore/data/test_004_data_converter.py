@@ -355,67 +355,6 @@ def __test_convert_to_ohlcv_restores_originals_when_backup_fails__(tmp_path, mon
     assert list(tmp_path.glob("*.converting.*")) == []
 
 
-# Test runner functions that pytest will find
-def test_symbol_provider_detection_ccxt():
-    __test_symbol_provider_detection_ccxt__()
-
-
-def test_symbol_provider_detection_capitalcom():
-    __test_symbol_provider_detection_capitalcom__()
-
-
-def test_symbol_provider_detection_tradingview():
-    __test_symbol_provider_detection_tradingview__()
-
-
-def test_symbol_provider_detection_metatrader():
-    __test_symbol_provider_detection_metatrader__()
-
-
-def test_symbol_provider_detection_crypto_exchanges():
-    __test_symbol_provider_detection_crypto_exchanges__()
-
-
-def test_symbol_provider_detection_generic_crypto():
-    __test_symbol_provider_detection_generic_crypto__()
-
-
-def test_symbol_provider_detection_stock_symbols():
-    __test_symbol_provider_detection_stock_symbols__()
-
-
-def test_symbol_provider_detection_complex_filenames():
-    __test_symbol_provider_detection_complex_filenames__()
-
-
-def test_symbol_provider_detection_edge_cases():
-    __test_symbol_provider_detection_edge_cases__()
-
-
-def test_symbol_provider_detection_forex_pairs():
-    __test_symbol_provider_detection_forex_pairs__()
-
-
-def test_symbol_provider_detection_our_format():
-    __test_symbol_provider_detection_our_format__()
-
-
-def test_symbol_provider_detection_from_csv_content_databento(tmp_path):
-    __test_symbol_provider_detection_from_csv_content_databento__(tmp_path)
-
-
-def test_symbol_provider_detection_from_csv_content_ticker_column(tmp_path):
-    __test_symbol_provider_detection_from_csv_content_ticker_column__(tmp_path)
-
-
-def test_symbol_provider_detection_from_csv_content_no_hints(tmp_path):
-    __test_symbol_provider_detection_from_csv_content_no_hints__(tmp_path)
-
-
-def test_convert_to_ohlcv_databento_uses_csv_symbol(tmp_path):
-    __test_convert_to_ohlcv_databento_uses_csv_symbol__(tmp_path)
-
-
 def __test_helper_convert_csv(tmp_path, name: str, timestamps: list[int]):
     """Convert a flat-price CSV at ``timestamps`` (epoch seconds) and load its TOML"""
     from pynecore.core.syminfo import SymInfo

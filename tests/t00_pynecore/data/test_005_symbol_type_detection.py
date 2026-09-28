@@ -244,32 +244,3 @@ def __test_detect_symbol_type_special_cases__():
     assert symbol_type == "forex"  # Both JPY and EUR are forex currencies
     assert currency == "EUR"
     assert base == "JPY"
-
-
-# Test runner functions that pytest will find
-def test_detect_symbol_type_forex():
-    __test_detect_symbol_type_forex__()
-
-
-def test_detect_symbol_type_crypto():
-    __test_detect_symbol_type_crypto__()
-
-
-def test_detect_symbol_type_other():
-    __test_detect_symbol_type_other__()
-
-
-def test_detect_symbol_type_edge_cases():
-    __test_detect_symbol_type_edge_cases__()
-
-
-def test_detect_symbol_type_forex_with_slash():
-    __test_detect_symbol_type_forex_with_slash__()
-
-
-def test_detect_symbol_type_special_cases():
-    __test_detect_symbol_type_special_cases__()
-
-
-def test_detect_symbol_type_provider_prefix_and_suffix():
-    __test_detect_symbol_type_provider_prefix_and_suffix__()

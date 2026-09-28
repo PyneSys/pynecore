@@ -48,21 +48,18 @@ dependencies = []
 optional-dependencies.cli = ["typer>=0.16", "rich", "tzdata"]
 
 # All optional dependencies for cli and all built-in providers
-optional-dependencies.all = ["typer>=0.16", "rich", "httpx", "ccxt", "pycryptodome", "tzdata"]
+optional-dependencies.all = ["typer>=0.16", "rich", "ccxt", "tzdata"]
 
 #Optional dependencies for development
 optional-dependencies.dev = ["pytest", "pytest-spec"]
 
 ### Providers
 
-# For all providers to work (CCXT, Capital.com)
-optional-dependencies.providers = ["httpx", "ccxt", "pycryptodome"]
+# For all built-in providers to work (CCXT)
+optional-dependencies.providers = ["ccxt"]
 
 # For CCXT provider to work
 optional-dependencies.ccxt = ["ccxt"]
-
-# For Capital.com provider to work
-optional-dependencies.capitalcom = ["httpx", "pycryptodome"]
 
 
 #

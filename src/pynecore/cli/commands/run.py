@@ -425,9 +425,11 @@ def _parse_time_value(value: str | None, *, allow_bars: bool = False) -> datetim
     """
     Parse a --from or --to parameter value.
 
+    A date without an explicit UTC offset is taken as UTC, never as the host's local time.
+
     :param value: The raw string value.
     :param allow_bars: If True, allow negative numbers as bar counts.
-    :return: A datetime, a negative int (bar count), or None.
+    :return: A timezone-aware datetime, a negative int (bar count), or None.
     """
     if value is None:
         return None
@@ -454,10 +456,13 @@ def _parse_time_value(value: str | None, *, allow_bars: bool = False) -> datetim
 
     # Date string
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         secho(f"Error: Invalid date or number: '{value}'", err=True, fg=colors.RED)
         raise Exit(1)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 class _ProviderData:
@@ -784,8 +789,9 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
                 with provider_instance as ohlcv_writer:
                     ohlcv_writer.truncate()
 
-                    time_from_dl = time_from_dt.replace(tzinfo=None) if time_from_dt.tzinfo else time_from_dt
-                    time_to_dl = time_to_dt.replace(tzinfo=None) if time_to_dt.tzinfo else time_to_dt
+                    # Providers take naive UTC datetimes.
+                    time_from_dl = time_from_dt.astimezone(UTC).replace(tzinfo=None)
+                    time_to_dl = time_to_dt.astimezone(UTC).replace(tzinfo=None)
 
                     total_seconds = int((time_to_dl - time_from_dl).total_seconds())
 
@@ -862,12 +868,10 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
                 anchor_ts = oldest_ts if oldest_ts is not None else window_from_ts
                 missing = bar_count - real_bars
                 candidate = (
-                    datetime.fromtimestamp(anchor_ts / 1000, UTC).replace(tzinfo=None)
+                    datetime.fromtimestamp(anchor_ts / 1000, UTC)
                     - timedelta(seconds=tf_seconds * (missing + 10))
                     - timedelta(days=3)
                 )
-                if time_from_dt.tzinfo is not None:
-                    candidate = candidate.replace(tzinfo=UTC)
                 # Only ever move the window start earlier.
                 time_from_dt = min(time_from_dt, candidate)
 
@@ -1077,11 +1081,12 @@ def run(
                                   "(e.g. ccxt:BYBIT:BTC/USDT:USDT@1D)"),
         time_from: str | None = Option(None, '--from', '-f',
                                        metavar="[DATE|DAYS|-BARS]",
-                                       help="Start: date (2025-01-01), days back (30), "
+                                       help="Start: date in UTC (2025-01-01), days back from now (30), "
                                             "or -N bars back (-500). Default: -500 bars in provider mode."),
         time_to: str | None = Option(None, '--to', '-t',
                                      metavar="[DATE|DAYS]",
-                                     help="End: date or days from start (default: end of data or now)"),
+                                     help="End: date in UTC or days back from now "
+                                          "(default: end of data or now)"),
         plot_path: Path | None = Option(None, "--plot", "-pp",
                                         help="Path to save the plot data",
                                         rich_help_panel="Out Path Options"),
@@ -1153,8 +1158,8 @@ def run(
 
     If [bold]script[/] path is a name without full path, it will be searched in the [italic]"workdir/scripts"[/] directory.
     Similarly, if [bold]data[/] path is a name without full path, it will be searched in the [italic]"workdir/data"[/] directory.
-    The [bold]plot_path[/], [bold]strat_path[/], and [bold]trade_path[/] work the same way - if they are names without full paths,
-    they will be saved in the [italic]"workdir/output"[/] directory.
+    The [bold]plot_path[/], [bold]strat_path[/], and [bold]trade_path[/] outputs are saved in the [italic]"workdir/output"[/]
+    directory by default. An explicit path is used as given, so a bare file name is written to the current directory.
 
     [bold]Data Source:[/bold]
     The [bold]data[/] argument accepts either a file path or a provider string:
@@ -1163,7 +1168,7 @@ def run(
       Provider mode: pyne run script.py ccxt:BYBIT:BTC/USDT:USDT@1D -f -500
 
     In provider mode, historical data is downloaded automatically. The --from/-f parameter
-    accepts: date (2025-01-01), days back (30), or -N bars back (-500). Default: -500 bars.
+    accepts: date in UTC (2025-01-01), days back (30), or -N bars back (-500). Default: -500 bars.
 
     [bold]Pine Script Support:[/bold]
     Pine Script (.pine) files are automatically compiled to Python (.py) before execution.
@@ -1408,9 +1413,9 @@ def run(
         time_from_ts = int(time_from_dt.timestamp() * 1000)
         time_to_ts = int(time_to_dt.timestamp() * 1000)
 
-        # Remove timezone for display purposes
-        time_from_display = time_from_dt.replace(tzinfo=None)
-        time_to_display = time_to_dt.replace(tzinfo=None)
+        # Naive UTC for display purposes
+        time_from_display = time_from_dt.astimezone(UTC).replace(tzinfo=None)
+        time_to_display = time_to_dt.astimezone(UTC).replace(tzinfo=None)
 
         total_seconds = int((time_to_display - time_from_display).total_seconds())
 
