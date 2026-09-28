@@ -25,7 +25,7 @@ PyneCore is tested against TradingView on <!--wild:scripts_total-->809<!--/wild-
 - `Series` variables with bar history and `Persistent` variables that keep state between bars
 - Function isolation: every call of a function keeps its own persistent state
 - `na` handling that follows Pine Script
-- The complete `ta` namespace of Pine Script
+- Every `ta.*` function of Pine Script v6
 - Pine Script-compatible strategy backtesting
 
 ## Quick example

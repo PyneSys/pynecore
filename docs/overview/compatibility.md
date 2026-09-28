@@ -2,8 +2,8 @@
 ---
 weight: 105
 title: "Pine Script Compatibility"
-description: "PyneCore vs TradingView: 809 published TradingView scripts (Pine Script v4-v6, converted to Pyne code with PyneComp) validated, 99.714% of 99 million values bit-identical, 289,074 trades matched. Feature status of the Pine Script API in PyneCore."
-wildDescription: "PyneCore vs TradingView: {{scripts_total}} published TradingView scripts (Pine Script v4-v6, converted to Pyne code with PyneComp) validated, {{bars_exact_pct}}% of {{bars_compared_millions}} million values bit-identical, {{strategy_trades}} trades matched. Feature status of the Pine Script API in PyneCore."
+description: "PyneCore vs TradingView: 809 published TradingView scripts (Pine Script v4-v6, converted to Pyne code with PyneComp) validated, 99.714% of 99 million values bit-identical, 289,074 trades matched. Feature status of every Pine Script v6 module."
+wildDescription: "PyneCore vs TradingView: {{scripts_total}} published TradingView scripts (Pine Script v4-v6, converted to Pyne code with PyneComp) validated, {{bars_exact_pct}}% of {{bars_compared_millions}} million values bit-identical, {{strategy_trades}} trades matched. Feature status of every Pine Script v6 module."
 icon: "checklist"
 date: "2026-03-28"
 lastmod: "2026-09-26"
@@ -17,8 +17,8 @@ tags: ["pine-script", "compatibility", "features", "status", "tradingview", "val
 # Pine Script Compatibility
 
 PyneCore runs **Pyne code**: Python whose API and bar-by-bar semantics follow TradingView's Pine
-Script, with results that match TradingView. This page lists how completely the Pine Script API is
-covered, how closely the results match, and where PyneCore differs on purpose.
+Script v6, with results that match TradingView. This page lists how completely the Pine Script v6
+API is covered, how closely the results match, and where PyneCore differs on purpose.
 
 > **Running existing Pine Script:** PyneCore does not read Pine Script source itself. Existing
 > scripts are converted to Pyne code by [PyneComp](https://pynesys.io), the PyneSys compiler for
@@ -67,7 +67,7 @@ with PyneComp, run by PyneCore, and every comparable output is compared with Tra
 | Pivot points            | full   | All 6 pivot types                            |
 | Statistical functions   | full   | Correlation, percentile, variance, etc.      |
 | Pattern detection       | full   | Crossover, crossunder, rising, falling, etc. |
-| **Total: 67 functions** | full   | The complete `ta` namespace of Pine Script   |
+| **Total: 67 functions** | full   | Every `ta.*` function of Pine Script v6      |
 
 ## Strategy Simulator
 
@@ -178,7 +178,7 @@ create/update/delete event log) for any charting front end — see
 
 ## Enum Constants
 
-All Pine Script enum constants are available:
+All Pine Script v6 enum constants are implemented:
 
 | Module          | Constants                                                 |
 |-----------------|-----------------------------------------------------------|
