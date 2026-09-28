@@ -502,6 +502,45 @@ def __test_reconcile_stale_grace_promotes_to_degraded_halt__():
     assert mire[0].reason == 'partial_bracket_cancel_disposition_unresolved'
 
 
+def __test_stale_grace_waits_while_broker_reads_unconfirmed__():
+    """A REST outage must not turn cancel-tentative into a halt.
+
+    With the broker view unconfirmed every probe answers ``UNKNOWN``
+    because the venue is unreachable, not because it is ambiguous: the
+    loop keeps probing, never promotes, and drops the retry count so the
+    halt needs one fresh in-session ``UNKNOWN`` once reads recover.
+    """
+    events: list[BrokerEvent] = []
+    broker = _MockBroker()
+    engine = _mk_engine(broker, events=events,
+                        cancel_tentative_stale_grace_s=1.0)
+    intent = _seed_parent_intent_and_leg(engine)
+    engine._cancel_disposition_pending[intent.intent_key] = _CancelTentativeMeta(
+        since_ts_ms=BAR_TS - 5_000, reason='broker_timeout', retry_count=1,
+    )
+    engine._mark_reads_unconfirmed()
+    engine._drive_cancel_tentative(now_ms=BAR_TS)
+    engine._drive_cancel_tentative(now_ms=BAR_TS + 1_000)
+    # Grace expired with an in-session retry, yet no halt: the venue is down.
+    assert engine.halted is False
+    assert len(broker.cancel_with_outcome_calls) == 2
+    meta = engine._cancel_disposition_pending[intent.intent_key]
+    assert meta.retry_count == 0
+    assert not [e for e in events
+                if isinstance(e, PartialBracketCancelTentativeDegradedEvent)]
+    # Reads recover: the first pass probes again (fresh evidence), the
+    # second pass halts on the persistent UNKNOWN.
+    engine._mark_reads_confirmed()
+    engine._drive_cancel_tentative(now_ms=BAR_TS + 2_000)
+    assert engine.halted is False
+    assert len(broker.cancel_with_outcome_calls) == 3
+    assert meta.retry_count == 1
+    engine._drive_cancel_tentative(now_ms=BAR_TS + 3_000)
+    assert engine.halted is True
+    assert engine._halted_reason == 'partial_bracket_cancel_disposition_unresolved'
+    assert len(broker.cancel_with_outcome_calls) == 3
+
+
 def __test_dispatch_cancel_unknown_preserves_entry_envelope__():
     """Cancel-tentative entry keeps the original ``EntryIntent`` envelope in ``_envelopes``.
 

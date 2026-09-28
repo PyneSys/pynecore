@@ -9829,7 +9829,8 @@ class OrderSyncEngine:
         For each tentative entry, either:
 
         - the stale-grace deadline has passed AND at least one retry
-          already ran in this session → promote to ``DEGRADED_HALT`` via
+          already ran in this session with a confirmed broker view →
+          promote to ``DEGRADED_HALT`` via
           :meth:`_handle_cancel_tentative_stale_grace_expiry`, OR
         - re-invoke :meth:`BrokerPlugin.execute_cancel_with_outcome`
           with the retained envelope and act on the outcome via
@@ -9852,18 +9853,24 @@ class OrderSyncEngine:
             meta = self._cancel_disposition_pending.get(intent_key)
             if meta is None:
                 continue
-            if now_ms - meta.since_ts_ms >= stale_grace_ms and meta.retry_count > 0:
+            reads_confirmed = self._read_view_confirmed
+            if (now_ms - meta.since_ts_ms >= stale_grace_ms
+                    and meta.retry_count > 0 and reads_confirmed):
                 # Halting is a last resort: it requires at least one actual
-                # ``execute_cancel_with_outcome`` attempt IN THIS SESSION.
-                # A restart re-arm (journal / leg-extras) carries the
-                # ORIGINAL mark-time anchor, so a run that starts minutes
-                # later sees the grace long expired with ``retry_count == 0``
-                # — promoting straight to ``DEGRADED_HALT`` would skip the
-                # authoritative venue probe entirely and every restart would
-                # re-halt in a loop even though the venue can answer. Fall
-                # through to the retry below instead; a definite outcome
-                # resolves the entry, an ``UNKNOWN`` bumps ``retry_count``
-                # and the next pass (grace still expired) halts here.
+                # ``execute_cancel_with_outcome`` attempt IN THIS SESSION
+                # that the venue could answer. A restart re-arm (journal /
+                # leg-extras) carries the ORIGINAL mark-time anchor, so a
+                # run that starts minutes later sees the grace long expired
+                # with ``retry_count == 0`` — promoting straight to
+                # ``DEGRADED_HALT`` would skip the authoritative venue probe
+                # entirely and every restart would re-halt in a loop even
+                # though the venue can answer. Fall through to the retry
+                # below instead; a definite outcome resolves the entry, an
+                # ``UNKNOWN`` bumps ``retry_count`` and the next pass (grace
+                # still expired) halts here. While the broker view is
+                # unconfirmed (reads failing — a REST outage) an ``UNKNOWN``
+                # says nothing about the disposition, so the halt waits for
+                # the venue to come back the same way deferred exposure does.
                 self._handle_cancel_tentative_stale_grace_expiry(
                     intent_key, meta, now_ms=now_ms,
                 )
@@ -9887,7 +9894,10 @@ class OrderSyncEngine:
             if envelope is None or not isinstance(envelope.intent, CancelIntent):
                 cancel = CancelIntent(pine_id=intent_key, symbol=self._symbol)
                 envelope = self._build_cancel_envelope(cancel)
-            meta.retry_count += 1
+            # Only a probe made against a reachable venue counts as evidence;
+            # an outage invalidates the earlier count so the halt needs one
+            # fresh in-session ``UNKNOWN`` after reads recover.
+            meta.retry_count = meta.retry_count + 1 if reads_confirmed else 0
             meta.last_retry_ts_ms = now_ms
             try:
                 outcome = self._run_async(
