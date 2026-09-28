@@ -2137,13 +2137,13 @@
     "Session": {
       "type": "variable"
     },
+    "SymInfoInterval": {
+      "type": "variable"
+    },
     "datetime": {
       "type": "variable"
     },
     "extended": {
-      "type": "variable"
-    },
-    "is_in_session": {
       "type": "variable"
     },
     "isfirstbar": {
@@ -2894,6 +2894,9 @@
       "type": "variable"
     },
     "expiration_date": {
+      "type": "variable"
+    },
+    "extended_hours": {
       "type": "variable"
     },
     "industry": {

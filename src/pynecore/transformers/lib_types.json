@@ -7178,6 +7178,10 @@
    "kind": "value",
    "ty": "i"
   },
+  "syminfo.extended_hours": {
+   "kind": "value",
+   "ty": "o"
+  },
   "syminfo.industry": {
    "kind": "value",
    "ty": "s"
