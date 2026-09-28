@@ -2,131 +2,77 @@
 ---
 weight: 102
 title: "Pyne Ecosystem"
-description: "Overview of the complete Pyne ecosystem and how its components work together"
+description: "The Pyne ecosystem: PyneCore, the PyneComp Pine Script compiler, Pyne Edge and the Pyne in the Wild validation report, and how they work together"
 icon: "lan"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-09-28"
 draft: false
 toc: true
 categories: ["Overview", "Ecosystem"]
-tags: ["ecosystem", "pynecomp", "pynecore", "services", "business-model", "community"]
+tags: ["ecosystem", "pynecomp", "pynecore", "pyne-edge", "validation", "community"]
 ---
 -->
 
 # Pyne Ecosystem
 
-The Pyne ecosystem consists of multiple interconnected components that together form a complete solution for TradingView
-Pine Script compatibility in Python. This page provides an overview of these components and how they work together.
+The Pyne ecosystem lets you run TradingView-style indicators and strategies in Python. PyneCore is the open-source
+runtime; the other components convert existing Pine Script to it and measure how closely its results match
+TradingView.
 
-## Core Components
+## How the Components Fit Together
 
-The Pyne ecosystem is built around two main components:
+1. You write **Pyne code** directly, or convert an existing Pine Script with **PyneComp**.
+2. **PyneCore** runs the Pyne code bar by bar, with Pine Script's semantics.
+3. **Pyne in the Wild** runs the same pipeline on hundreds of published TradingView scripts and compares every result
+   with TradingView's own.
 
-### PyneCore (Open Source)
+## PyneCore (Open Source)
 
-PyneCore is the foundation of the ecosystem - an open-source Python implementation of a Pine Script-like environment. It
+PyneCore is the foundation of the ecosystem: a Python runtime whose API follows TradingView's Pine Script v6. It
 provides:
 
-- A Pine Script compatible runtime in Python
-- AST transformations that enable Pine Script-like syntax and features
-- A complete library of technical indicators and functions, comparable to Pine Script's library
-- Persistent variables, which store their values between runs (every candle)
-- Series data structures, which work the same way as Pine Script's series
-- NA class, which works the same way as Pine Script's NA
-- Strategy backtesting capabilities, compatible with Pine Script's strategy tester
+- Import-time AST transformations that give ordinary Python Pine Script's bar-by-bar execution model
+- Series variables with bar history and persistent variables that keep their value from one bar to the next
+- `na` handling that follows Pine Script
+- The Pine Script v6 library, including every `ta.*` function
+- Strategy backtesting that follows TradingView's strategy engine
 
-PyneCore allows you to write Pine Script-like code directly in Python, leveraging Python's ecosystem while maintaining
-the advantages of Pine Script's execution model.
+PyneCore is free and open source under the Apache 2.0 license. Learn more on the
+[What is PyneCore](/docs/overview/what-is-pynecore/) page.
 
-Learn more about PyneCore in the [What is PyneCore](/docs/overview/what-is-pynecore/) page.
+## PyneComp (Pine Script Compiler)
 
-### PyneComp - Pine Script to PyneCore Compiler/Transpiler (SaaS Service)
+PyneComp converts Pine Script to Pyne code. It compiles Pine Script v4, v5 and v6, and converts v1 to v3 sources on
+a best-effort basis. It is a separate PyneSys service that needs an API key, available through:
 
-PyneComp is a compiler service that translates existing Pine Script code into PyneCore-compatible Python code. It
-offers:
-
-- Clean, readable Python code generation (PyneCore)
-- Strict mode with full scope isolation (it is not needed most of the time)
-- 100% Pine Script compatibility
-
-This service is available through:
-
-- The PyneSys API
 - The [pynesys.io](https://pynesys.io) web interface
-- Direct integration with PyneCore CLI (if you have API key)
+- The PyneCore CLI (`pyne compile`, or `pyne run` on a `.pine` file) with an API key
+- The [PyneSys Discord bot](https://discord.pynesys.io): `/pyne-help` shows how it works, `/pyne-convert` converts a
+  script, and every Discord user gets 3 free conversions
+- The PyneSys API
 
-PyneComp enables a smooth migration path from TradingView Pine Script to Python with minimal effort. PyneCore has all
-the tools to run the compiled python code.
+See [Compiling Pine Scripts](/docs/cli/compile/) for the CLI workflow.
 
-## Planned Services
+## Pyne Edge
 
-The following services are planned and/or already being developed:
+PyneComp always generates **Pyne Edge** code, marked with `"""@pyne edge"""`: a strict, Pine-equivalent subset of
+Pyne code. PyneCore runs it exactly like any other Pyne code; the marker guarantees that the script stays within the
+subset, so tooling can rely on it. See [The `edge` Variant](/docs/reference/script-format/#the-edge-variant) for details.
 
-### MetaTrader 4/5 Compiler (Transpiler)
+## Pyne in the Wild (Validation Report)
 
-We are planning a compiler which can convert Pine Scripts to MetaTrader 4/5 expert advisors. We have the knowledge and
-experience to do this.
+[Pyne in the Wild](https://wild.pynesys.io/) is a public, reproducible comparison with TradingView. It converts
+<!--wild:scripts_total-->809<!--/wild--> published TradingView scripts with PyneComp, runs them with PyneCore and
+compares every comparable output with TradingView's: all <!--wild:tv_verified-->1,090<!--/wild--> comparable outputs
+match, <!--wild:bars_exact_pct-->99.714<!--/wild-->% of <!--wild:bars_compared_millions-->99<!--/wild--> million plotted
+values are bit-identical, and <!--wild:strategy_trades-->289,074<!--/wild--> strategy trades match TradingView's timing
+(snapshot <!--wild:generated_at-->2026-09-27<!--/wild-->). Each script's source is pinned by a SHA-256 hash, and its
+result is published individually. See [Compatibility](/docs/overview/compatibility/) for the feature status.
 
-### Strategy Leaderboard
+## What Comes Next
 
-An online automatic strategy ranking system where:
-
-- Users can upload their (own) trading strategies
-- The system runs backtests regularly across multiple markets and timeframes
-- Strategies are ranked based on performance
-- Users can select strategies based on recent performance indicators
-- Weekly performance metrics help identify situational strengths
-
-### Cloud Robot (PyneBot)
-
-A cloud-based execution environment for trading algorithms that:
-
-- Runs your PyneCore scripts in the cloud
-- Connects to various brokers and exchanges
-- Provides 24/7 monitoring and execution
-- Offers detailed performance analytics
-
-### Strategy Marketplace
-
-A platform for buying and selling trading strategies:
-
-- Vetted, high-quality strategies
-- Performance statistics and validation
-- Secure licensing and delivery
-- Revenue sharing with strategy creators
-- Developers can sell their strategies on the marketplace with or without source code
-
-## Use Cases
-
-The Pyne ecosystem serves multiple use cases:
-
-### For TradingView Users
-
-- Migrate existing Pine Script strategies to Python
-- Overcome TradingView limitations (data access, execution)
-- Enhance strategies with Python libraries (ML, optimization)
-
-### For Python Developers
-
-- Use familiar Python syntax for trading strategies
-- Access Pine Script's powerful technical analysis functions
-- Leverage Python's rich ecosystem for trading
-
-### For Institutional Traders
-
-- Standardize trading algorithm codebase
-- Improve backtesting capabilities
-- Integrate with existing Python infrastructure
-- Optimize execution performance
-
-## Business Model
-
-The Pyne ecosystem combines open-source and commercial components:
-
-- **PyneCore**: Free and open-source (Apache 2.0 license)
-- **PyneComp**: Subscription-based service with multiple tiers
-- **Cloud Robot**: Subscription with usage-based pricing
-- **Strategy Marketplace**: Commission-based platform
+As of September 2026, development is focused on a hosted bot platform for running PyneCore strategies; a strategy
+marketplace is planned later.
 
 ## Community and Support
 
