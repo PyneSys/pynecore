@@ -5,7 +5,7 @@ title: "Development"
 description: "Documentation for PyneCore developers"
 icon: "engineering"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-09-28"
 draft: false
 toc: true
 categories: ["Development"]
@@ -20,6 +20,7 @@ Documentation for PyneCore developers
 ## In this section
 
 - [Plugin System](./plugin-system.md) - How to create plugins for PyneCore
+- [Broker Plugin Authoring](./broker-plugin-authoring.md) - The full contract a live broker plugin must uphold
 - [Testing System](./testing-system.md) - Overview of the comprehensive testing system
 - [Contributing](./contributing.md) - Guide for contributing to PyneCore
 - [time() offsets on D/W/M grids](./tradingview-time-bars-back.md) - How `timeframe_bars_back` walks the calendar grids and what TradingView was measured to do

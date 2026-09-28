@@ -5,7 +5,7 @@ title: "Contributing"
 description: "Guide for contributing to PyneCore"
 icon: "handyman"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-09-28"
 draft: false
 toc: true
 categories: ["Development", "Community"]
@@ -60,6 +60,8 @@ PyneCore is designed with a focus on high performance, minimal external dependen
    python -m pytest
    ```
 
+   `pytest.ini` adds `-x` (stop at the first failure) and deselects `live`-marked tests; run those with `-m live`.
+
 ## Project Structure
 
 PyneCore is organized as follows:
@@ -69,13 +71,18 @@ pynecore/
 ├── src/                  # Source code
 │   └── pynecore/         # Main package
 │       ├── core/         # Core functionality and runtime components
-│       ├── lib/          # Pine Script compatible function library
-│       ├── transformers/ # AST transformers for Pine Script syntax
+│       │   ├── broker/   # Broker plugin runtime support
+│       │   └── plugin/   # Plugin base classes, discovery and loading
+│       ├── lib/          # Pine Script v6 function library
+│       ├── transformers/ # AST transformers that give Pyne code its Pine Script semantics
 │       ├── types/        # Type definitions and interfaces
 │       ├── utils/        # Utility functions and helpers
 │       ├── cli/          # Command-line interface
-│       └── providers/    # Data providers and integrations
+│       ├── providers/    # Built-in data providers
+│       ├── pynesys/      # PyneSys API client (PyneComp compilation)
+│       └── testing/      # Offline broker conformance testing (broker_lab)
 ├── tests/                # Test suite
+├── broker_lab/           # Broker lab suites
 ├── docs/                 # Component-specific documentation
 └── scripts/              # Utility scripts
 ```
@@ -88,7 +95,7 @@ Understanding this structure is essential for effective contribution.
 
 PyneCore follows these coding standards:
 
-1. **PEP 8 compliance**: Try to keep line length around 100 characters, with a hard limit of 120 characters as specified in the `pyproject.toml`
+1. **PEP 8 compliance**: Try to keep line length around 100 characters, with a hard limit of 120 characters
 2. **Type hints**: Use for all function arguments and return values
 3. **Docstrings**: Use PyCharm's default "Sphinx-style" reStructuredText format (`:param:`, `:return:`, etc.) for docstrings
 4. **Naming conventions**:
@@ -111,9 +118,7 @@ def calculate_moving_average(values: Series[float], length: int) -> Series[float
     if length <= 0:
         raise ValueError("Length must be positive")
 
-    # Implementation logic
-    result = values.rolling_sum(length) / length
-    return result
+    return ta.sma(values, length)
 ```
 
 ### Clean Code Principles
@@ -136,13 +141,16 @@ python -m pytest
 # Run specific test files
 python -m pytest tests/path/to/test_file.py
 
-# Run tests with coverage report
+# Run tests with coverage report (requires `pip install pytest-cov`)
 python -m pytest --cov=pynecore
 ```
 
 ### Writing Tests
 
-Tests in PyneCore follow a unique pattern where test files are also valid Pyne code:
+Tests in PyneCore follow a unique pattern where test files are also valid Pyne code. Test functions must be named
+`__test_<name>__`: pytest is configured with `python_functions = __test_*__`, so plain `test_*` functions are not
+collected. Test files are `test_NNN_<topic>.py` inside numbered category folders (e.g. `tests/t01_lib/t20_ta/`), with
+reference data in a `data/` subfolder. Helper functions used only by tests are named `__test_helper_<name>`.
 
 ```python
 """

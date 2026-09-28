@@ -5,7 +5,7 @@ title: "Running Scripts"
 description: "Running PyneCore scripts from the command line"
 icon: "play_circle"
 date: "2025-03-31"
-lastmod: "2025-07-24"
+lastmod: "2026-09-28"
 draft: false
 toc: true
 categories: ["Usage", "CLI", "Scripting"]
@@ -15,7 +15,7 @@ tags: ["run", "scripts", "execution", "backtesting", "command-line"]
 
 # Running Scripts
 
-The `run` command is used to execute PyneCore scripts with historical OHLCV data. This page covers the details of how to use this command effectively.
+The `run` command executes Pyne code on OHLCV data from a file or from a data provider plugin, optionally continuing with live data. This page covers the details of how to use this command effectively.
 
 ## Basic Usage
 
@@ -26,8 +26,8 @@ pyne run SCRIPT DATA [OPTIONS]
 ```
 
 Where:
-- `SCRIPT`: Path to the PyneCore script (.py) or Pine Script (.pine) file
-- `DATA`: Path to the data file (.ohlcv, .csv, .json, or .txt)
+- `SCRIPT`: Path to the Pyne code (.py) or to a Pine Script (.pine) file that is converted to Pyne code first
+- `DATA`: Path to the data file (.ohlcv, .csv, .json, or .txt), or a provider string (see [Provider Mode](#provider-mode))
 - `OPTIONS`: Additional options to customize the execution
 
 ## Simple Example
@@ -45,27 +45,27 @@ This command will:
 
 ## Pine Script Support
 
-The `run` command now supports Pine Script (.pine) files in addition to Python (.py) files. When you specify a `.pine` file:
+You can also pass a Pine Script (`.pine`) file: PyneCore sends it to PyneComp, the PyneSys conversion service, which converts it to Pyne code (`.py`), and then runs that code. When you specify a `.pine` file:
 
-1. **Automatic Compilation**: The system automatically compiles the Pine Script to Python if:
+1. **Automatic Compilation**: The `.pine` file is compiled to Pyne code if:
    - The `.py` file doesn't exist, or
    - The `.pine` file is newer than the existing `.py` file
 
-2. **API Key Required**: A valid PyneSys API key is required for Pine Script compilation. You can get one at [https://pynesys.io](https://pynesys.io).
+2. **API Key Required**: A valid PyneSys API key is required for Pine Script compilation. You can get one at [https://pynesys.io](https://pynesys.io). Without an API key, `run` uses an existing `.py` file next to the `.pine` file and does not recompile.
 
 3. **Output Location**: The compiled `.py` file is saved in the same folder as the original `.pine` file.
 
 ### Pine Script Example
 
 ```bash
-# Run a Pine Script directly
+# Convert a Pine Script with PyneComp, then run the resulting Pyne code
 pyne run my_strategy.pine eurusd_data.ohlcv
 ```
 
 This command will:
 1. Check if `my_strategy.py` exists and is up-to-date
 2. If not, compile `my_strategy.pine` to `my_strategy.py` using the PyneSys API
-3. Run the compiled Python script with the provided data
+3. Run the resulting Pyne code with the provided data
 
 ### API Key Configuration
 
@@ -102,7 +102,7 @@ The automatic conversion supports:
 
 The system recognizes common filename patterns:
 - `BTCUSDT.csv` → Symbol: BTC/USDT
-- `EUR_USD.json` → Symbol: EUR/USD
+- `EUR_USD.json` → Symbol: EURUSD
 - `ccxt_BYBIT_BTC_USDT.csv` → Symbol: BTC/USDT, Provider: bybit
 - `BINANCE_ETHUSDT_1h.csv` → Symbol: ETH/USDT, Provider: binance
 
@@ -115,7 +115,8 @@ pyne run my_strategy.py BTCUSDT.csv
 # The system will:
 # 1. Detect BTC/USDT as the symbol
 # 2. Convert CSV to OHLCV format
-# 3. Generate BTCUSDT.toml with symbol info
+# 3. Generate BTCUSDT.toml with symbol info (an existing .toml is kept
+#    and must match the data's timeframe)
 # 4. Run the script with converted data
 ```
 
@@ -124,7 +125,7 @@ pyne run my_strategy.py BTCUSDT.csv
 When converting data, the system performs advanced analysis:
 - **Tick Size Detection**: Analyzes price movements to determine minimum price increment
 - **Trading Hours Detection**: Identifies when the market is actively trading
-- **Interval Auto-Correction**: Detects and fixes incorrect timeframe settings
+- **Timeframe Detection**: Infers the bar period from the timestamps; an existing `.toml` with a different period stops the conversion
 - **Symbol Type Detection**: Identifies forex, crypto, or other asset types
 
 ## Command Arguments
@@ -132,10 +133,10 @@ When converting data, the system performs advanced analysis:
 The `run` command has two required arguments:
 
 - `SCRIPT`: The script file to run. If only a filename is provided, it will be searched in the `workdir/scripts/` directory.
-- `DATA`: The data file to use. Supports .ohlcv, .csv, .json formats. If only a filename is provided, it will be searched in the `workdir/data/` directory.
+- `DATA`: The data file to use. Supports .ohlcv, .csv, .json and .txt files, or a provider string (see Provider Mode). If only a filename is provided, it will be searched in the `workdir/data/` directory.
 
 <small>
-Note: you don't need to write the file extensions in the command.
+Note: file extensions are optional. A script name tries `.pine` first, then `.py`; a data name tries `.ohlcv`, then `.csv`.
 </small>
 
 ## Provider Mode
@@ -151,6 +152,12 @@ pyne run my_strategy.py ccxt:BYBIT:BTC/USDT:USDT@1
 pyne run my_strategy.py ccxt:BYBIT:BTC/USDT:USDT@1 --live -f -500
 ```
 
+The built-in `ccxt` provider needs the `ccxt` extra:
+
+```bash
+pip install "pynesys-pynecore[ccxt]"
+```
+
 Provider string format: `provider:EXCHANGE:SYMBOL:SETTLE@TIMEFRAME`
 
 | Part        | Example      | Description                    |
@@ -161,7 +168,7 @@ Provider string format: `provider:EXCHANGE:SYMBOL:SETTLE@TIMEFRAME`
 | `SETTLE`    | `USDT`      | Settlement currency (optional) |
 | `TIMEFRAME` | `1`         | TradingView timeframe format   |
 
-The `EXCHANGE` segment is the **broker** selector for multi-broker providers (CCXT covers 100+ exchanges); single-broker providers such as Capital.com omit it (`capitalcom:EURUSD@60`). The same provider string works with [`pyne data download`](./data.md), which can also list a provider's brokers via `--list-brokers`.
+The `EXCHANGE` segment is the **broker** selector for multi-broker providers (CCXT covers 100+ exchanges); a single-broker provider plugin omits it (`provider:SYMBOL@TIMEFRAME`). The same provider string works with [`pyne data download`](./data.md), which can also list a provider's brokers via `--list-brokers`.
 
 The `-f` / `--from` option accepts a **negative integer** for relative bar count when using
 a provider string:
@@ -184,8 +191,8 @@ The `run` command supports several options to customize the execution:
 
 ### Date Range Options
 
-- `--from`, `-f`: Start date (UTC) in 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS' format. If not specified, it will use the first date in the data. In provider mode, also accepts a negative integer for relative bar count (e.g. `-f -500`); defaults to `-500` bars if omitted.
-- `--to`, `-t`: End date (UTC) in 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS' format. If not specified, it will use the last date in the data.
+- `--from`, `-f`: Start date (UTC) in 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS' format, or a positive number of days back from now (e.g. `-f 30`). If not specified, it will use the first date in the data. In provider mode, also accepts a negative integer for relative bar count (e.g. `-f -500`); defaults to `-500` bars if omitted.
+- `--to`, `-t`: End date (UTC) in 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS' format, or a positive number of days back from now (e.g. `-t 7`). If not specified, it will use the last date in the data.
 
 Example:
 ```bash
@@ -196,7 +203,10 @@ pyne run my_strategy.py eurusd_data.ohlcv --from "2023-01-01" --to "2023-12-31"
 ### Live Mode Options
 
 - `--live`, `-l`: Continue with real-time data streaming after the historical phase. Only available in provider mode (provider string as data source). See [Live Mode](../advanced/live-mode.md).
-- `--shutdown-timeout`: Maximum seconds to wait for graceful provider shutdown when stopping (default: 120).
+- `--broker`: Enable live broker trading. Requires a provider plugin that supports broker trading (subclasses `BrokerPlugin`). Implies `--live`.
+- `--run-label`: Optional label to distinguish parallel instances of the same strategy, account, symbol and timeframe. Stored in the broker run ID as `...#<label>`.
+- `--shutdown-timeout`: Maximum seconds to wait for graceful provider shutdown when stopping (default: 120; `0` waits forever).
+- `--no-log-ohlcv`: Disable the per-bar OHLCV log lines in live mode (enabled by default).
 
 Example:
 ```bash
@@ -209,6 +219,13 @@ pyne run my_strategy.py ccxt:BYBIT:BTC/USDT:USDT@1 --live -f -500
 - `--plot`, `-pp`: Path to save the plot data (CSV format). If not specified, it will be saved as `<script_name>.csv` in the `workdir/output/` directory.
 - `--strat`, `-sp`: Path to save the strategy statistics (CSV format). If not specified, it will be saved as `<script_name>_strat.csv` in the `workdir/output/` directory.
 - `--trade`, `-tp`: Path to save the trade data (CSV format). If not specified, it will be saved as `<script_name>_trade.csv` in the `workdir/output/` directory.
+- `--no-plot`: Do not write the plot CSV at all. Useful in live mode, where the file grows without bound. Cannot be combined with `--plot`.
+- `--viz`, `-vz`: Write plot and drawing visual data (NDJSON). Saved as `<script_name>_viz.ndjson` in the `workdir/output/` directory unless `--viz-path` is given.
+- `--viz-path`: Path of the visual data NDJSON file (implies `--viz`).
+- `--viz-journal`: Record per-bar drawing create/update/delete events (implies `--viz`).
+
+An explicit output path is used as given: a bare file name is written to the current directory,
+not to `workdir/output/`.
 
 Example:
 ```bash
@@ -219,7 +236,8 @@ pyne run my_strategy.py eurusd_data.ohlcv --plot custom_plot.csv --strat custom_
 ### Timeframe Option
 
 - `--timeframe`, `-tf`: Chart timeframe in TradingView format (e.g. `5`, `60`, `1D`, `1W`). Must
-  be larger than or equal to the data file's timeframe.
+  be larger than or equal to the data file's timeframe, and an exact multiple of it (e.g. 10 → 60,
+  not 7 → 60).
 
 When the data timeframe is smaller than the chart timeframe:
 - **Strategy with `use_bar_magnifier=True`**: activates bar magnifier mode — the script sees
@@ -241,9 +259,13 @@ pyne run my_indicator.py BTCUSDT_1m.ohlcv --timeframe 5
 If your script uses `request.security()` to access data from other symbols or timeframes,
 provide the OHLCV data for each context using `--security`:
 
-- `--security`, `-sec`: Security data mapping in `"KEY=data_name"` format. Can be specified
-  multiple times. **KEY** is `"TIMEFRAME"` (e.g., `"1D"`) or `"SYMBOL:TIMEFRAME"` (e.g.,
-  `"AAPL:1H"`). **data_name** is the OHLCV data name in `workdir/data/` (without extension).
+- `--security`, `-sec`: Security data mapping in `"KEY=value"` format. Can be specified
+  multiple times. **KEY** is `"TIMEFRAME"` (e.g., `"1D"`), `"SYMBOL"` (e.g., `"USI:ADVN.NY"`) or
+  `"SYMBOL:TIMEFRAME"` (e.g., `"AAPL:60"`). In backtests the **value** is a data name in
+  `workdir/data/` (with or without the `.ohlcv` extension) or a path to an `.ohlcv` file; with
+  `--live` it is a plugin-native symbol (e.g. `binance:ETH/USDT`).
+- `--list-data`: List the OHLCV data the script needs (from its `request.security()` calls) and
+  exit without running.
 
 Example:
 ```bash
@@ -258,6 +280,9 @@ pyne run advance_decline.py SPX_1D \
 
 Each security data name must have a corresponding `.ohlcv` and `.toml` file pair in the data
 directory.
+
+To avoid passing `--security` on every run, map the symbols your script uses to your data in
+`config/symbol_map.toml`; see [Symbol Map](../overview/symbol-map.md).
 
 ## Symbol Information
 
@@ -327,6 +352,13 @@ If your script is a strategy, this file contains detailed trade-by-trade data wi
 
 **Note**: This file exports individual trade records (entry/exit pairs), not the equity curve. The equity curve is tracked internally for statistics calculation.
 
+### Visual Data (NDJSON)
+
+Only written with `--viz`, `--viz-path` or `--viz-journal`. Contains the plot and drawing visual
+data of the script.
+
+**Default filename**: `<script_name>_viz.ndjson`
+
 ## Examples
 
 ### Basic Usage
@@ -358,7 +390,7 @@ pyne run my_strategy.py eurusd_data.ohlcv \
 ### Script File Not Found
 
 ```
-Script file 'my_strategy.py' not found!
+Script file '/path/to/workdir/scripts/my_strategy.py' not found!
 ```
 
 This error occurs when the script file cannot be found. Make sure:
@@ -369,7 +401,7 @@ This error occurs when the script file cannot be found. Make sure:
 ### Data File Not Found
 
 ```
-Data file 'eurusd_data.ohlcv' not found!
+Data file not found: eurusd_data.ohlcv
 ```
 
 This error occurs when the data file cannot be found. Make sure:
@@ -380,7 +412,7 @@ This error occurs when the data file cannot be found. Make sure:
 ### Symbol Info File Not Found
 
 ```
-Symbol info file 'eurusd_data.toml' not found!
+Symbol info file '/path/to/workdir/data/eurusd_data.toml' not found!
 ```
 
 This error occurs when the symbol information file cannot be found. Make sure:

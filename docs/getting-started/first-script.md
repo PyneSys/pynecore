@@ -5,7 +5,7 @@ title: "Your First PyneCore Script"
 description: "Learn how to write and run your first PyneCore script"
 icon: "code"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-09-28"
 draft: false
 toc: true
 categories: ["Getting Started"]
@@ -112,7 +112,7 @@ your working directory. This mechanism is the heart of PyneCore. You actually wr
 If you have a compiled script (from [PyneSys](https://pynesys.io) or [converted from Pine Script](./converting-from-pine.md)), you can run it directly with Python — no CLI or workdir needed:
 
 ```bash
-python simple_ma.py my_data.csv
+python my_compiled_script.py my_data.csv
 ```
 
 This works because compiled scripts include a built-in bootstrap that:
@@ -120,8 +120,16 @@ This works because compiled scripts include a built-in bootstrap that:
 - Auto-detects the symbol and timeframe from the filename and data
 - Outputs CSV files next to your script (plots, trades, strategy stats)
 
-> **Note:** Direct execution requires PyneCore to be installed (`pip install pynecore`).
-> For more control over execution (date ranges, custom output paths), use the `pyne run` CLI.
+To make your own script directly runnable, append the same bootstrap to it:
+
+```python
+if __name__ == "__main__":
+    from pynecore.standalone import run
+    run(__file__)
+```
+
+> **Note:** Direct execution requires PyneCore to be installed (`pip install pynesys-pynecore`; the `[cli]` extra is
+> not needed). For more control over execution (date ranges, custom output paths), use the `pyne run` CLI.
 
 ## Adding Parameters
 
@@ -135,12 +143,12 @@ from pynecore import Series
 from pynecore.lib import script, close, ta, plot, color, input
 
 @script.indicator("Customizable Moving Average", overlay=True)
-def main():
-    # Input parameters
-    length = input.int(20, "Period", minval=1)
-    ma_type = input.string("SMA", "Type", options=["SMA", "EMA", "WMA"])
-    line_color = input.color(color.blue, "Line Color")
-
+def main(
+        # Input parameters
+        length: int = input.int(20, "Period", minval=1),
+        ma_type: str = input.string("SMA", "Type", options=("SMA", "EMA", "WMA")),
+        line_color: color.Color = input.color(color.blue, "Line Color"),
+):
     # Calculate the selected moving average
     ma: Series[float] = None
     if ma_type == "SMA":
@@ -154,7 +162,9 @@ def main():
     plot(ma, f"{ma_type} ({length})", color=line_color, linewidth=2)
 ```
 
-PyneCore will save a [toml](https://toml.io/en/) file in the output folder which contains the parameters of your script. If you would like to change a parameter, you can do so by removing the comment from the line and changing the default value.
+Inputs are declared as parameters of `main()` with an `input.*()` call as the default value. An `input.*()` call inside the body of `main()` always returns its default and is not listed in the settings file.
+
+PyneCore saves a [toml](https://toml.io/en/) file next to your script (e.g. `scripts/simple_ma.toml`) listing the script settings and every input declared as a `main()` parameter. To change an input, uncomment its `value =` line under `[inputs.<name>]` and set the value; the default is shown as a comment and is not edited. Set the `PYNE_SAVE_SCRIPT_TOML=0` environment variable to disable writing this file.
 
 ## Understanding Series and Persistence
 
@@ -269,7 +279,7 @@ from pynecore.lib import script, close, plot, color, math
 def average(a, b):
     return (a + b) / 2
 
-def custom_ma(src, length):
+def custom_ma(src: Series[float], length: int):
     """A simple moving average implementation"""
     sum = 0.0
     for i in range(length):

@@ -5,7 +5,7 @@ title: "Installing PyneCore"
 description: "Step-by-step guide to installing PyneCore on different platforms"
 icon: "download"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-09-28"
 draft: false
 toc: true
 categories: ["Getting Started"]
@@ -40,7 +40,7 @@ The simplest way to install PyneCore is using pip:
 pip install pynesys-pynecore
 ```
 
-This will use no dependencies at all. It only has a dumb CLI.
+This installs the library with no dependencies at all. It is enough to run Pyne code from Python (for example a compiled script with `python script.py data.csv`), but the `pyne` command needs the `[cli]` extra.
 
 To install with a user-friendly CLI (recommended):
 
@@ -51,16 +51,19 @@ pip install "pynesys-pynecore[cli]"
 To install with additional features, you can specify optional dependencies:
 
 ```bash
-# Install with built-in data provider capabilities
+# Install with the built-in CCXT data provider
 pip install "pynesys-pynecore[providers]"
 
-# Install with specific provider support
+# Install only the CCXT library for the built-in CCXT data provider
 pip install "pynesys-pynecore[ccxt]"
-pip install "pynesys-pynecore[capitalcom]"
 
 # Install for development
 pip install "pynesys-pynecore[dev]"
 ```
+
+Other data sources and brokers are separate plugins.
+
+These extras do not include the CLI. Combine them with `cli` (for example `"pynesys-pynecore[cli,providers]"`) or use `[all]`.
 
 To install with all features without development dependencies:
 
@@ -100,19 +103,21 @@ pip install -e ".[all,dev]"
 
 ## Setting Up the Working Directory
 
-PyneCore uses a "workdir" directory structure that contains your scripts, data, and configuration. When you run PyneCore, it automatically searches for a "workdir" directory in the current or parent directories.
+PyneCore uses a "workdir" directory structure that contains your scripts, data, and configuration. When you run PyneCore, it automatically searches the current and parent directories for a `workdir` folder (or a directory containing a `.pyne` marker file). You can also set it explicitly with the `--workdir` (`-w`) option or the `PYNE_WORK_DIR` environment variable.
 
 The working directory structure is organized as follows:
 
 ```
 workdir/
-├── scripts/     # Your Pyne code
-├── data/        # OHLCV data files
-├── output/      # Output files (plots, strategy results)
-└── config/      # Configuration files
+├── .pyne        # Workdir marker
+├── scripts/     # Your Pyne code (lib/ for your own libraries, demo.py)
+├── data/        # OHLCV data files with their .toml symbol info (demo.ohlcv)
+├── output/      # Output files (plots, strategy results, trades), logs/
+├── cache/       # Runtime state (e.g. auth sessions)
+└── config/      # api.toml, plugins/*.toml
 ```
 
-PyneCore CLI will automatically create the working directory structure if it doesn't exist.
+If no workdir exists, the PyneCore CLI offers to create `./workdir` with the full structure, including a demo script and demo data.
 
 ## Verifying Installation
 
@@ -142,17 +147,17 @@ def main():
 
 ## Downloading Sample Data
 
-PyneCore includes a data command for downloading historical OHLCV data from various providers. You'll need to install the provider dependencies first:
+PyneCore includes a data command for downloading historical OHLCV data from various providers. You'll need to install the CLI and the provider dependencies first:
 
 ```bash
-pip install "pynesys-pynecore[providers]"
+pip install "pynesys-pynecore[all]"
 ```
 
 To download sample data:
 
 ```bash
-# List available providers
-pyne data download --help
+# List installed providers (or run `pyne data download` without arguments to pick one interactively)
+pyne plugin list
 
 # Example: Download Bybit data (if supported)
 pyne data download ccxt:BYBIT:BTC/USDT:USDT@1D
@@ -178,8 +183,10 @@ pyne data convert-from path/to/your/data.csv --symbol "BTCUSDT"
 After installing PyneCore and setting up data, you can run a simple script:
 
 ```bash
-pyne run test.py data/your-downloaded-data.ohlcv
+pyne run test your-downloaded-data
 ```
+
+Bare names are looked up in `workdir/scripts` and `workdir/data`, and the extensions are optional.
 
 ## Next Steps
 

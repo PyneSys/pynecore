@@ -5,7 +5,7 @@ title: "Strategy Development"
 description: "Creating and testing trading strategies with PyneCore"
 icon: "trending_up"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-09-28"
 draft: false
 toc: true
 categories: ["Usage", "Strategy"]
@@ -15,9 +15,10 @@ tags: ["strategies", "backtesting", "trading", "examples", "position-sizing", "b
 
 # Strategy Development with PyneCore
 
-This guide introduces you to creating and testing trading strategies using PyneCore. As PyneCore maintains full
-compatibility with Pine Script's strategy functionality, this document focuses on the basics with links to TradingView's
-official documentation for detailed reference.
+This guide introduces you to creating and testing trading strategies using PyneCore. PyneCore's strategy API follows
+Pine Script v6, and its broker emulator is validated trade by trade against TradingView (see
+[Compatibility](/docs/overview/compatibility/)). This document covers the basics and links to the PyneCore reference for
+details.
 
 ## Creating a Strategy
 
@@ -54,7 +55,7 @@ The `@script.strategy` decorator accepts numerous parameters to configure backte
     commission_type=strategy.commission.percent,  # Commission type
     commission_value=0.1,  # Commission value (0.1%)
     pyramiding=1,  # Max number of entries in same direction
-    default_qty_type=strategy.percent,  # Position sizing method
+    default_qty_type=strategy.percent_of_equity,  # Position sizing method
     default_qty_value=10,  # Size value (10% of equity)
 )
 ```
@@ -77,10 +78,10 @@ Example TOML file structure:
 # Indicator / Strategy / Library Settings
 
 [script]
-initial_capital = 10000
-commission_value = 0.1
-pyramiding = 1
-# Add more settings here...
+#initial_capital = 10000
+#commission_value = 0.1
+#pyramiding = 1
+# ... every other setting, commented out
 
 # Input Settings
 
@@ -94,7 +95,8 @@ pyramiding = 1
 value = 12
 ```
 
-Simply edit this file and run your strategy again - PyneCore will use the updated values without requiring any code
+Settings are written commented out; uncomment a line and change its value to override it. An input is overridden by
+its `value` line. Simply edit this file and run your strategy again - PyneCore will use the updated values without requiring any code
 changes. This is extremely useful for:
 
 - Testing different parameter combinations
@@ -140,7 +142,7 @@ PyneCore supports various position sizing methods:
 # Fixed size (specific quantity)
 @script.strategy("Fixed Size", default_qty_type=strategy.fixed, default_qty_value=1)
 # Percentage of equity
-@script.strategy("Percent of Equity", default_qty_type=strategy.percent, default_qty_value=10)
+@script.strategy("Percent of Equity", default_qty_type=strategy.percent_of_equity, default_qty_value=10)
 # Cash amount
 @script.strategy("Cash Amount", default_qty_type=strategy.cash, default_qty_value=1000)
 ```
@@ -240,7 +242,7 @@ def main(
     elif sell_signal:
         strategy.close("Long")
 
-    # Return RSI plot (shown in separate pane)
+    # Return RSI values as plot outputs
     return {
         "RSI": rsi_value,
         "Overbought": overbought,
@@ -261,7 +263,7 @@ PyneCore's strategy backtesting functionality mirrors Pine Script's, providing:
 To run a backtest using PyneCore's CLI:
 
 ```bash
-pyne run mystrategy.py data/eurusd_daily.ohlcv
+pyne run mystrategy.py eurusd_daily.ohlcv
 ```
 
 This executes your strategy on the provided price data and generates the following output files in the `workdir/output/` directory:
@@ -272,8 +274,8 @@ This executes your strategy on the provided price data and generates the followi
 
 For more details on output files and CLI options, see [Running Scripts](./cli/run.md).
 
-While PyneCore's backtesting capabilities are already powerful and Pine Script-compatible, future versions will offer
-enhanced analysis and visualization tools designed specifically for Python users.
+Plot and drawing data can also be exported as NDJSON with `--viz`, for your own visualization (see
+[Visual Output](/docs/programmatic/visual-output/)).
 
 ## Best Practices
 
@@ -288,8 +290,8 @@ previous = close[1]  # One bar ago
 older = close[10]  # Ten bars ago
 ```
 
-Note that PyneCore does not support negative indices - attempting to use them (like `close[-1]`) will raise an
-`IndexError` as there's no way to reference future data in the backtest.
+Negative offsets never reach into the future: `close[-1]`, like any offset outside the available history, returns
+`na`, as in Pine Script. Slices with negative bounds (`close[-1:5]`) raise an `IndexError`.
 
 ### 2. Test Strategy Robustness
 
@@ -312,6 +314,5 @@ Begin with simpler strategies before adding complexity:
 - [Strategy Reference](/docs/reference/lib/strategy/) - Complete strategy function reference
 - [Strategy Risk Management](/docs/reference/lib/strategy_risk/) - Risk management functions
 
-As PyneCore continues to evolve, additional strategy development features and backtesting capabilities will be added.
-The project welcomes community contributions to enhance these capabilities further while maintaining full compatibility
-with Pine Script.
+Beyond plain backtests, PyneCore supports `calc_on_order_fills`, the [bar magnifier](/docs/advanced/bar-magnifier/)
+for intrabar fill accuracy, and [live and broker trading](/docs/advanced/live-mode/) with the same strategy code.

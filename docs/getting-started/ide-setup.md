@@ -5,7 +5,7 @@ title: "IDE Setup"
 description: "Setting up your IDE for PyneCore scripts"
 icon: "code"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-09-28"
 draft: false
 toc: true
 categories: ["Getting Started", "Development Environment"]
@@ -58,12 +58,12 @@ The main challenge is that the **Series type** in PyneCore needs to function in 
 1. As a container that can be indexed (e.g., `price[1]` to get the previous bar's value)
 2. As a direct value that can be used in calculations (e.g., `(high + low) / 2`)
 
-The different IDE type checkers handle this dual nature differently:
+Python typing has no intersection type, so this dual nature cannot be expressed directly. Type checkers see `Series[float]` as plain `float` (`Series` is a transparent alias), which makes the scalar side fully type-correct. The indexing side is handled differently per type checker:
 
-- **PyCharm**: Uses a heuristic approach that interprets `Union[T, SeriesType[T]]` as "this can be either type," allowing both behaviors without errors
-- **Pylance**: Has a more strict implementation that treats Union types as exclusive, causing conflicts when the same variable is used both ways
+- **PyCharm**: Gets `[n]` indexing from indexable `float`/`int`/`bool` stand-ins in PyneCore's stubs
+- **Pylance / Pyright**: Needs `reportIndexIssue` switched off, which is part of the configuration below
 
-PyneCore includes different type stub implementations optimized for each IDE, but you'll still need additional configuration for VS Code.
+PyneCore ships one set of stubs whose Series-indexing support is switched by a `TYPECHECKER` constant, so you'll still need additional configuration for VS Code.
 
 ### Creating the PyRight Configuration File
 
@@ -73,10 +73,12 @@ Create a file named `pyrightconfig.json` in the root directory of your project w
 {
    "reportIndexIssue": "none",
    "typeCheckingMode": "basic",
-   "reportUnknownMemberType": "none",
    "reportAssignmentType": "none",
    "reportRedeclaration": "none",
-   "reportArgumentType": "none"
+   "reportArgumentType": "none",
+   "defineConstant": {
+      "TYPECHECKER": "pyright"
+   }
 }
 ```
 
@@ -92,19 +94,19 @@ Each setting in the configuration addresses a specific issue:
 
 - `reportIndexIssue`: Disables errors when using Series as an indexable object (e.g., `close[1]`)
 - `typeCheckingMode`: Relaxes type checking to accommodate PyneCore's dynamic behavior
-- `reportUnknownMemberType`: Prevents errors with dynamically created properties
 - `reportAssignmentType`: Avoids errors when a Series is treated as both a value and a container
 - `reportRedeclaration`: Prevents errors from AST transformations that modify variable declarations
 - `reportArgumentType`: Prevents errors with functions that accept Series arguments
+- `defineConstant`: Sets the `TYPECHECKER` constant that selects the pyright variant of PyneCore's stubs
 
 ### Type Stubs
 
-PyneCore includes specialized type hint stubs for different IDEs:
+PyneCore ships one set of type hint stubs. `Series[T]` is a transparent alias of `T`, and a `TYPECHECKER` constant selects how history indexing is typed:
 
-- **PyCharm stubs**: Use a Union type that PyCharm interprets correctly for Series dual behaviors
-- **Pylance stubs**: Implement a more complex approach, but still require configuration to work well
+- **PyCharm**: `float`, `int` and `bool` are replaced by indexable stand-ins, so `x[1]` type-checks
+- **Pyright / Pylance**: The builtins stay unchanged, and `reportIndexIssue` is switched off in `pyrightconfig.json`
 
-The system automatically selects the appropriate stubs based on the detected environment, but the fundamental limitations of static type checking still apply to Pylance.
+The IDE is not detected automatically: for Pylance, `TYPECHECKER` is set by the `defineConstant` entry above. The fundamental limitations of static type checking still apply to Pylance.
 
 ## Recommended IDE Extensions
 

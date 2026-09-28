@@ -2,10 +2,10 @@
 ---
 weight: 203
 title: "Converting from Pine Script"
-description: "Learn how to convert your TradingView Pine Script code to PyneCore"
+description: "Learn how to convert your TradingView Pine Script code to Pyne code"
 icon: "swap_horiz"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-09-28"
 draft: false
 toc: true
 categories: ["Getting Started", "Migration"]
@@ -18,7 +18,7 @@ tags: ["conversion", "pine-script", "migration", "examples", "syntax", "translat
 If you have existing Pine Script that you want to use with PyneCore, you have two options:
 
 1. **Manual conversion**: Convert your Pine Script code to Pyne code by hand
-2. **Automatic conversion**: Use the PyneComp compiler (closed source SaaS service) to automatically convert your code. This will be integrated in to the pynecore CLI through API keys.
+2. **Automatic conversion**: PyneComp, a separate PyneSys service (API key required), converts Pine Script v4, v5 and v6 (v1-v3 on a best-effort basis) to Pyne code. Use `pyne compile script.pine`, or just `pyne run script.pine data`, which compiles it first.
 
 This guide explains both approaches and highlights the key differences you need to be aware of.
 
@@ -55,7 +55,7 @@ def main():
 ```
 
 Key differences:
-1. PyneCore uses a magic comment `@pyne` instead of `//@version=6` (though you could put any metadata after the `@pyne` comment)
+1. Pyne code starts with a module docstring beginning with `@pyne` instead of `//@version=6`; a description can follow on the next lines of the docstring (`edge` and `lib` directly after `@pyne` are reserved mode words)
 2. You need to import the required components from the `pynecore.lib` module
 3. The script declaration is a decorator on the `main()` function
 4. The main code goes inside the `main()` function
@@ -96,13 +96,14 @@ def main():
 ```
 
 Key differences:
-1. `var` in Pine Script becomes `Persistent` in PyneCore
-2. PyneCore uses Python's type hints system (`variable: Type = value`)
-3. Arrays are handled similarly, but with Python's syntax
+1. `var` in Pine Script corresponds to `Persistent` in PyneCore
+2. `varip` corresponds to `IBPersistent[T]` (`from pynecore.types import IBPersistent`)
+3. PyneCore uses Python's type hints system (`variable: Type = value`)
+4. Arrays are handled similarly, but with Python's syntax
 
 ## Series Variables
 
-In Pine Script, all variables are series by default. In PyneCore, you need to be explicit:
+In Pine Script, all variables are series by default. In PyneCore, a variable keeps its history only if you annotate it with `Series[T]`. You need this only when you index its past values (`x[1]`). Built-in series (`close[1]`) and `ta.*` functions keep their own history:
 
 **Pine Script**:
 ```javascript
@@ -112,6 +113,7 @@ indicator("Series Example")
 // All these are series
 price = close
 avgPrice = ta.sma(price, 20)
+change = price - price[1]
 ```
 
 **PyneCore**:
@@ -124,9 +126,11 @@ from pynecore.lib import script, close, ta
 
 @script.indicator("Series Example")
 def main():
-    # Need to be explicit about Series types
+    # Series annotation: needed because the past value of price is read below
     price: Series[float] = close
-    avgPrice: Series[float] = ta.sma(price, 20)
+    # No annotation needed: ta.sma keeps its own history
+    avgPrice = ta.sma(price, 20)
+    change = price - price[1]
 ```
 
 ## Function Definitions
@@ -203,7 +207,7 @@ def main():
     # Condition
     condition = close > open
 
-    # Conditional logic (ternary operator becomes if-else)
+    # Conditional logic (ternary operator becomes a conditional expression)
     barColor = color.green if condition else color.red
 
     # If statement
@@ -248,7 +252,7 @@ def main():
 
 ## NA Value Handling
 
-In Pine Script, operations with `na` values propagate `na`. In PyneCore, you can use the `na()` function to check for NA values:
+As in Pine Script, operations with `na` values propagate `na` in PyneCore. Use the `na()` function to check for NA values and `nz()` to replace them:
 
 **Pine Script**:
 ```javascript
@@ -256,8 +260,7 @@ In Pine Script, operations with `na` values propagate `na`. In PyneCore, you can
 indicator("NA Example")
 
 // NA handling
-if na(close)
-    close := open
+closeValue = na(close) ? open : close
 value = nz(close, 0)
 ```
 
@@ -282,7 +285,17 @@ def main():
 
 ## Automatic Conversion with PyneComp
 
-For complex scripts, you can use the PyneComp compiler (a closed source SaaS service). This service automatically converts Pine Script code to PyneCore Python code.
+For complex scripts, you can use the PyneComp compiler, a separate, closed source PyneSys service that needs an API key. It automatically converts Pine Script v4, v5 and v6 code to Pyne code; v1-v3 sources are converted on a best-effort basis.
+
+```bash
+# Compile a Pine Script file to Pyne code (writes script.py next to it)
+pyne compile script.pine
+
+# Or run the .pine file directly: it is compiled first
+pyne run script.pine data
+```
+
+The API key goes in `workdir/config/api.toml`, or can be given with `--api-key` or the `PYNESYS_API_KEY` environment variable. PyneComp output is marked with `"""@pyne edge"""`, a strict, Pine-equivalent subset of Pyne code that PyneCore runs like any other Pyne code. See [Compiling Pine Scripts](../cli/compile.md) for details.
 
 Benefits of using PyneComp:
 - Saves time on manual conversion
@@ -332,12 +345,12 @@ from pynecore import Series
 from pynecore.lib import script, close, ta, strategy, input, hline, color
 
 @script.strategy("RSI Strategy", overlay=True)
-def main():
-    # Input parameters
-    length = input.int(14, "RSI Length")
-    overbought = input.int(70, "Overbought")
-    oversold = input.int(30, "Oversold")
-
+def main(
+        # Input parameters are declared as main() parameters
+        length: int = input.int(14, "RSI Length"),
+        overbought: int = input.int(70, "Overbought"),
+        oversold: int = input.int(30, "Oversold"),
+):
     # Calculate RSI
     rsiValue: Series[float] = ta.rsi(close, length)
 
@@ -374,7 +387,7 @@ Both Pine Script and Python use lexical scoping, but with important differences:
 
 **Series behavior:**
 - **Pine Script**: Every variable is a Series by default
-- **PyneCore**: Series variables must be explicitly marked with `Series[T]` type annotation
+- **PyneCore**: A variable keeps its history only when marked with the `Series[T]` type annotation, which is needed only if you index its past values
 
 **Pine Script example:**
 ```javascript
@@ -437,7 +450,7 @@ The most important difference is that compared to Pine Script's block-level scop
 
 ### 2. Type Handling
 
-PyneCore requires explicit type annotations for Series and Persistent variables.
+PyneCore requires an explicit `Persistent[T]` annotation for variables that persist between bars, and a `Series[T]` annotation for variables whose past values you index.
 
 ### 3. Return Values
 
@@ -445,7 +458,7 @@ In Pine Script, the last expression is automatically the return value. In PyneCo
 
 ### 4. Ternary Operators
 
-Pine Script's ternary operator (`condition ? value1 : value2`) must be converted to Python's if-else statements.
+Pine Script's ternary operator (`condition ? value1 : value2`) becomes Python's conditional expression `value1 if condition else value2`.
 
 ### 5. Reassignment Operator
 

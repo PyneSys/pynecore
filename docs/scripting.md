@@ -5,7 +5,7 @@ title: "Scripting with PyneCore"
 description: "Writing effective and idiomatic Pyne code"
 icon: "code"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-09-28"
 draft: false
 toc: true
 categories: ["Usage", "Scripting"]
@@ -115,6 +115,10 @@ Available input types:
 - `input.color()` - Color picker
 - `input.source()` - Data source selector
 
+The other Pine Script input functions are available too: `input()`, `input.enum()`, `input.price()`,
+`input.symbol()`, `input.session()`, `input.timeframe()`, `input.time()` and `input.text_area()`. See
+[Input Functions](/docs/reference/inputs/).
+
 ### 4. Series and Persistent Variables
 
 Two special types unique to PyneCore:
@@ -195,6 +199,8 @@ back with the bar) or an `IBPersistent` (Pine's `varip`, deliberately *not* roll
 inside the function that uses it:
 
 ```python
+from pynecore.types import IBPersistent
+
 @script.indicator("Correct")
 def main():
     total: Persistent[float] = 0.0
@@ -234,8 +240,7 @@ from pynecore.lib import plot, color
 plot(my_series, "My Indicator", color=color.blue)
 
 # Additional plot styles are available
-from pynecore.lib import plot_style
-plot(my_series, "Columns", style=plot_style.style_columns)
+plot(my_series, "Columns", style=plot.style_columns)
 ```
 
 ### 2. Return Dictionary
@@ -346,20 +351,25 @@ elif sell_signal:
 
 ### Handling Multiple Timeframes
 
-While PyneCore doesn't currently implement the `security()` function from Pine Script, you can work with data from different timeframes by using the `timeframe.change()` function:
+To read data from another timeframe or symbol, use `request.security()` (see
+[request.security](/docs/lib/request-security/)). To detect the start of a new higher-timeframe period on the chart,
+use `timeframe.change()`:
 
 ```python
-from pynecore.lib import timeframe
+from pynecore.lib import timeframe, high, low, math, na
+
+daily_high: Persistent[float] = na
+daily_low: Persistent[float] = na
 
 # Check if we're at the beginning of a new day
 if timeframe.change("D"):
-    # Execute logic at the start of a new daily candle
-    daily_high: Persistent[float] = high
-    daily_low: Persistent[float] = low
+    # Start the new day's range
+    daily_high = high
+    daily_low = low
 else:
     # Update daily high/low on intraday candles
-    daily_high = max(daily_high, high)
-    daily_low = min(daily_low, low)
+    daily_high = math.max(daily_high, high)
+    daily_low = math.min(daily_low, low)
 ```
 
 ## Debugging Techniques
@@ -369,8 +379,7 @@ Debug PyneCore scripts using:
 ```python
 from pynecore.lib import log
 
-# Debug logging
-log.debug(f"Debug: close={close}, sma={sma_value}")
+log.info(f"close={close}, sma={sma_value}")
 log.info("Information message")
 log.warning("Warning message")
 log.error("Error message")

@@ -5,7 +5,7 @@ title: "Bar Magnifier"
 description: "Accurate intrabar order fills using lower-timeframe data"
 icon: "zoom_in"
 date: "2025-07-24"
-lastmod: "2025-07-24"
+lastmod: "2026-09-28"
 draft: false
 toc: true
 categories: ["Advanced", "Strategy"]
@@ -56,7 +56,8 @@ chart bar. The key principle:
 
 - **The script still runs once per chart bar** — it sees aggregated OHLCV values
 - **Order fills are checked against each sub-bar** — sequentially, in chronological order
-- **No script re-execution** — only the broker emulator uses the sub-bar data
+- **No extra script executions by default**: unless `calc_on_order_fills` or
+  `calc_on_every_history_tick` is set (see below), only the broker emulator uses the sub-bar data
 
 ### Three-Phase Processing
 
@@ -159,8 +160,8 @@ pyne run my_strategy.py EURUSD_10m.ohlcv --timeframe 60
 
 ## On-the-Fly Aggregation
 
-When `--timeframe` is used with a strategy that does **not** have `use_bar_magnifier=True`, the
-data is aggregated on-the-fly to the chart timeframe. This is equivalent to running
+When `--timeframe` is used with an indicator, or with a strategy that sets
+`use_bar_magnifier=False`, the data is aggregated on-the-fly to the chart timeframe. This is equivalent to running
 `pyne data aggregate` but without creating an intermediate file:
 
 ```bash
@@ -201,7 +202,8 @@ Without the magnifier the tick source is the chart bar's own assumed OHLC path �
 extreme nearest it, the other extreme, close. A re-execution stands on one of those points:
 on the one its triggering fill happened at, and at least one point further along than the
 previous pass. The closing point belongs to the definitive execution, so reaching it ends the
-loop by itself — which is exactly the three fill-driven re-executions per chart bar.
+loop by itself — which is exactly the three fill-driven re-executions per chart bar. Each
+re-execution sees the bar as built up to the node it stands on.
 
 With the magnifier every lower-timeframe bar contributes its own four ticks, so the bound
 scales with the number of sub-bars and the body can run **more than four times on a single

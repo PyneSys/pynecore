@@ -5,7 +5,7 @@ title: "Basic Usage"
 description: "Basic usage of the PyneCore Command Line Interface"
 icon: "terminal"
 date: "2025-03-31"
-lastmod: "2025-03-31"
+lastmod: "2026-09-28"
 draft: false
 toc: true
 categories: ["Usage", "CLI"]
@@ -66,6 +66,18 @@ The PyneCore CLI supports the following global options that can be used with any
   pyne --show-completion
   ```
 
+- `--recreate-demo`: Recreate `scripts/demo.py` and `data/demo.ohlcv` (with its `.toml`) even if the working directory already exists.
+
+- `--recreate-provider-config`: Regenerate every `config/plugins/<plugin>.toml` file for the installed plugins.
+
+- `--recreate-api-config`: Regenerate the `config/api.toml` file.
+
+Global options belong to `pyne` itself, so they go before the command:
+
+```bash
+pyne --workdir /path/to/custom/workdir run my_script.py my_data.ohlcv
+```
+
 You can also set the working directory using the `PYNE_WORK_DIR` environment variable:
 
 ```bash
@@ -102,7 +114,7 @@ When specifying file paths in CLI commands:
 - **Filenames only**: If you provide just a filename:
   - For scripts: It looks in `workdir/scripts/`
   - For data files: It looks in `workdir/data/`
-  - For output files: It saves in `workdir/output/`
+  - For output files: If you don't give an output path, the default file is written to `workdir/output/`. An explicit output path is used as given, relative to the current directory.
 
 Example:
 ```bash
@@ -139,8 +151,9 @@ Example output when running a script:
 The PyneCore CLI behavior can be modified using environment variables:
 
 - `PYNE_WORK_DIR`: Set the working directory path
+- `PYNE_DATA_DIR`: Use this directory for OHLCV data instead of `workdir/data` (configuration and credentials still come from `workdir/config`)
 - `PYNE_NO_LOGO`: Set to any value to disable the logo display
-- `PYNE_QUIET`: Set to any value for quieter output (disables the logo and reduces verbosity)
+- `PYNE_QUIET`: Set to any value to disable the logo display (same effect as `PYNE_NO_LOGO`)
 - `NO_COLOR`: Set to any value to disable colored output
 
 Example:
@@ -156,14 +169,19 @@ PYNE_WORK_DIR=/path/to/my/workdir pyne run my_script.py my_data.ohlcv
 
 The PyneCore CLI provides the following main commands:
 
-- `run`: Run a PyneCore script (.py or .pine)
-- `compile`: Compile Pine Script to Python using PyneSys API
-- `data`: OHLCV related commands
+- `run`: Run Pyne code (.py). A `.pine` file is first converted to Pyne code by PyneComp (PyneSys API key required)
+- `compile`: Convert Pine Script to Pyne code with PyneComp (PyneSys API key required)
+- `data`: OHLCV data commands (`download`, `convert-to`, `convert-from`, `aggregate`, `map`)
+- `benchmark`: Measure script execution performance
+- `debug`: Debug tools (`debug ast`)
+- `plugin`: List and inspect installed plugins (`plugin list`, `plugin info`)
+
+Installed plugins can register additional commands; `pyne --help` lists everything available.
 
 ## Next Steps
 
 Now that you understand the basic concepts, you can learn about specific commands:
 
 - [Running Scripts](run.md): How to run PyneCore scripts
-- [Compiling Pine Scripts](compile.md): How to compile Pine Scripts to Python
+- [Compiling Pine Scripts](compile.md): How to convert Pine Script to Pyne code with PyneComp
 - [Data Management](data.md): Data download and conversion commands
