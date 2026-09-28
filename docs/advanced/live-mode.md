@@ -5,7 +5,7 @@ title: "Live Mode"
 description: "Real-time data streaming with intra-bar updates, varip support, and paper trading"
 icon: "stream"
 date: "2026-04-08"
-lastmod: "2026-07-19"
+lastmod: "2026-09-28"
 draft: false
 toc: true
 categories: ["Advanced", "Strategy", "Live"]
@@ -229,5 +229,9 @@ only cares whether it receives `OHLCV` or `BarUpdate` objects.
   `--live`); shipped broker plugins are `pynesys-pynecore-bybit`,
   `pynesys-pynecore-capitalcom` and `pynesys-pynecore-ctrader`.
 - **Provider required** — `--live` only works with provider strings, not local data files.
-- **No replay** — there is no mechanism to replay missed ticks if the connection drops mid-bar.
-  The provider reconnects and resumes from the next available update.
+- **Outage recovery covers closed bars, not ticks** — after a reconnect, the shipped plugins fetch
+  every bar that closed during the outage from the venue's REST history and feed it to the script
+  as a closed bar before the live stream resumes, so the series continues without a hole. At
+  startup PyneCore likewise recovers the bars that closed while the subscription was being
+  established. What is not replayed is the stream of ticks inside a bar that was still forming
+  during the outage.

@@ -27,3 +27,4 @@ Advanced topics and features of PyneCore
 - [request.security() Internals](./request-security-internals.md) - Multiprocessing architecture, AST transformation, shared memory
 - [Bar Magnifier](./bar-magnifier.md) - Accurate intrabar order fills using lower-timeframe data
 - [Live Mode](./live-mode.md) - Real-time streaming with intra-bar updates and paper trading
+- [How Broker Plugins Are Tested](./broker-plugin-testing.md) - Offline conformance lab, live demo-account runs, fault injection and venue reconciliation
