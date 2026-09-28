@@ -2952,7 +2952,7 @@ class ScriptRunner:
                 sim = sim_position
                 old_fills = sim._fill_counter
                 sim._coof_cursor = -1
-                sim.process_orders()
+                sim.process_orders(coof=True)
                 new_fills = sim._fill_counter
                 if new_fills <= old_fills:
                     return
@@ -2998,7 +2998,7 @@ class ScriptRunner:
                     # hide the rest of the path from the emulator.
                     _set_path_bar(lib, 3, bar_prices, near_is_high)
                     old_fills = new_fills
-                    sim.process_orders()
+                    sim.process_orders(coof=True)
                     bar_closed_trades.extend(sim.new_closed_trades)
                     new_fills = sim._fill_counter
                     cursor = max(cursor + 1, sim._path_node)
