@@ -7,41 +7,40 @@
 <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.11%2B-blue" alt="Python"></a>
 <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
 
-**🚀 Have Pine Script code? [Get automatic Python translation →](#pine-script-migration-made-easy)**
+**Have Pine Script code? [Convert it to Python](#converting-pine-script)**
 
 </div>
 
 ## What is PyneCore?
 
-PyneCore brings TradingView's Pine Script capabilities to Python through a revolutionary approach - it transforms regular Python code to behave like Pine Script through AST transformations, while maintaining the full power of the Python ecosystem.
+PyneCore runs Pine Script-style trading code in Python. You write ordinary Python, and PyneCore rewrites it at import time with AST transformations, so it executes bar by bar with Pine Script's semantics: series with history, variables that keep their value between bars, and `na` for missing data. The rest of the Python ecosystem stays available to the same code.
 
-Instead of creating another object-oriented wrapper or a new language, PyneCore modifies your Python code at import time, giving you the intuitive bar-by-bar execution model of Pine Script without leaving Python's rich environment.
+PyneCore is tested against TradingView on <!--wild:scripts_total-->809<!--/wild--> published TradingView scripts (Pine Script v4 to v6, converted to Pyne code with [PyneComp](https://pynesys.io)). All <!--wild:tv_verified-->1,090<!--/wild--> comparable outputs match, <!--wild:bars_exact_pct-->99.714<!--/wild-->% of <!--wild:bars_compared_millions-->99<!--/wild--> million plotted values are bit-identical, and <!--wild:strategy_trades-->289,074<!--/wild--> strategy trades match TradingView's timing (snapshot <!--wild:generated_at-->2026-09-27<!--/wild-->). Every script and every result is public at [Pyne in the Wild](https://wild.pynesys.io/), and the [Compatibility](https://pynecore.org/docs/overview/compatibility/) page lists the status of each Pine Script feature.
 
-## Key Features
+## Key features
 
-- **Native Pine Script Semantics in Python**: Write familiar Python code that runs with Pine Script's bar-by-bar execution model
-- **AST Transformation Magic**: Your code is transformed at import time to implement Pine Script behavior
-- **High Performance**: Zero mandatory external dependencies with highly optimized implementation
-- **Series & Persistent Variables**: Full support for Pine Script's time series and state persistence
-- **Function Isolation**: Each function call gets its own isolated persistent state
-- **NA Handling**: Graceful handling of missing data with Pine Script's NA system
-- **Technical Analysis Library**: Comprehensive set of Pine Script-compatible indicators and functions
-- **Strategy Backtesting**: Pine Script compatible framework for developing and testing trading strategies
+- Pine Script's bar-by-bar execution model in plain Python
+- Scripts marked with `@pyne` are transformed when they are imported
+- No mandatory dependencies outside the Python standard library
+- `Series` variables with bar history and `Persistent` variables that keep state between bars
+- Function isolation: every call of a function keeps its own persistent state
+- `na` handling that follows Pine Script
+- The complete `ta` namespace of Pine Script
+- Pine Script-compatible strategy backtesting
 
-## Quick Example
+## Quick example
 
 ```python
 """
 @pyne
 """
-from pynecore import Series
 from pynecore.lib import script, close, ta, plot, color, input
 
 @script.indicator(title="Bollinger Bands")
 def main(
-    length=input.int("Length", 20, minval=1),
-    mult=input.float("Multiplier", 2.0, minval=0.1, step=0.1),
-    src=input.source("Source", close)
+    length=input.int(20, "Length", minval=1),
+    mult=input.float(2.0, "Multiplier", minval=0.1, step=0.1),
+    src=input.source(close, "Source")
 ):
     # Calculate Bollinger Bands
     basis = ta.sma(src, length)
@@ -56,13 +55,11 @@ def main(
     plot(lower, "Lower", color=color.blue)
 ```
 
-## Innovative Concepts
+## Core concepts
 
-PyneCore introduces several revolutionary concepts:
+### The `@pyne` magic comment
 
-### 1. Magic Comment & Import Hook
-
-Identify your scripts with a simple magic comment:
+A script is marked with a magic comment in its docstring:
 
 ```python
 """
@@ -70,11 +67,11 @@ Identify your scripts with a simple magic comment:
 """
 ```
 
-This activates PyneCore's import hook system which intercepts Python imports and applies AST transformations to recognized scripts.
+PyneCore's import hook recognizes the marker and applies its AST transformations to the module when it is imported.
 
-### 2. Series Variables
+### Series variables
 
-Track historical data across bars, just like in Pine Script:
+A series variable keeps its history across bars, as in Pine Script:
 
 ```python
 from pynecore import Series
@@ -83,9 +80,9 @@ price: Series[float] = close
 previous_price = price[1]  # Access previous bar's price
 ```
 
-### 3. Persistent Variables
+### Persistent variables
 
-Maintain state between bars with simple type annotations:
+A `Persistent` annotation keeps a variable's value from one bar to the next:
 
 ```python
 from pynecore import Persistent
@@ -94,16 +91,16 @@ counter: Persistent[int] = 0
 counter += 1  # Increments with each bar
 ```
 
-### 4. Function Isolation
+### Function isolation
 
-Each call to a function maintains its own isolated state:
+Every call of a function keeps its own persistent state:
 
 ```python
 def my_indicator(src, length):
-    # Each call gets its own instance of sum
-    sum: Persistent[float] = 0
-    sum += src
-    return sum / length
+    # Each call gets its own instance of total
+    total: Persistent[float] = 0
+    total += src
+    return total / length
 ```
 
 ## Installation
@@ -119,11 +116,11 @@ pip install pynesys-pynecore[cli]
 pip install pynesys-pynecore[all]
 ```
 
-> **Note for Windows users**: PyneCore requires timezone data that is not included in Windows by default. The `[cli]` and `[all]` installations automatically include the `tzdata` package. If you're using the basic installation and encounter timezone errors, install it manually with `pip install tzdata`.
+> **Windows:** PyneCore needs timezone data that Windows does not ship. The `[cli]` and `[all]` extras install the `tzdata` package. With the basic installation, run `pip install tzdata` if you get timezone errors.
 
-## Getting Started
+## Getting started
 
-### Create a Simple Script
+### Create a simple script
 
 1. Create a file with the `@pyne` annotation:
 
@@ -142,7 +139,7 @@ def main():
     plot(sma_value, "Simple Moving Average")
 ```
 
-2. Run your script with the PyneCore CLI:
+2. Run it with the PyneCore CLI:
 
 ```bash
 # First, download some price data
@@ -152,9 +149,9 @@ pyne data download ccxt --symbol "BYBIT:BTC/USDT:USDT"
 pyne run my_script.py ccxt_BYBIT_BTC_USDT_USDT_1D.ohlcv
 ```
 
-### Working with Pine Script Files
+### Running Pine Script files
 
-PyneCore also supports running Pine Script files directly with automatic compilation:
+PyneCore runs Pyne code. Existing Pine Script (v4, v5 and v6, and v1 to v3 on a best-effort basis) is converted to Pyne code by [PyneComp](https://pynesys.io), a separate PyneSys service that needs an API key. With the key, the `pyne` CLI compiles `.pine` files for you:
 
 ```bash
 # Run a Pine Script file directly (requires PyneSys API key)
@@ -167,44 +164,32 @@ pyne compile my_indicator.pine --api-key YOUR_API_KEY
 pyne run my_indicator.py ccxt_BYBIT_BTC_USDT_USDT_1D.ohlcv
 ```
 
-> **Note**: Pine Script compilation requires a PyneSys API key. Get yours at [pynesys.io](https://pynesys.io).
+You can get an API key at [pynesys.io](https://pynesys.io).
 
-## Why Choose PyneCore?
+## Why PyneCore?
 
-- **Beyond TradingView Limitations**: No more platform restrictions, code size limits, or subscription fees
-- **Python Ecosystem Access**: Use Python's data science, ML, and analysis libraries alongside trading logic
-- **Performance & Precision**: Designed for speed and precision, the same results as Pine Script
-- **Open Source Foundation**: The core library and runtime is open source under Apache 2.0 license
-- **Professional Trading Tools**: Build institutional-grade systems with Pine Script simplicity
-- **Advanced Backtesting**: Run sophisticated strategy tests outside platform constraints
+- Your scripts run outside TradingView, without its platform restrictions or code size limits.
+- Python's data science, machine learning and analysis libraries work in the same code as the trading logic.
+- The match with TradingView is measured on [real published scripts](https://wild.pynesys.io/): <!--wild:bars_exact_pct-->99.714<!--/wild-->% of <!--wild:bars_compared_millions-->99<!--/wild--> million plotted values are identical to the bit.
+- The runtime and its library are open source under the Apache 2.0 license.
 
-## Pine Script Migration Made Easy
+## Converting Pine Script
 
-Have existing Pine Script code you want to run in Python? **PyneSys now offers automatic Pine 
-Script to PyneCore translation** through our [web platform](https://pynesys.io) and [Discord bot](https://discord.pynesys.io).
+If you have Pine Script code you want to run in Python, PyneComp converts it to Pyne code. You can use it on the [web](https://pynesys.io), from the `pyne` CLI with an API key, or through the [PyneSys Discord bot](https://discord.pynesys.io): `/pyne-help` shows how the bot works, `/pyne-convert` converts a script, and every Discord user gets 3 free conversions.
 
-### 🚀 Get Started Instantly
-- **Try for free on Discord**: Use `/pine-help` in our [Discord](https://discord.pynesys.io) for instant conversion - 3 free translations!
-- **Full service**: Visit [pynesys.io](https://pynesys.io) for subscriptions and higher limits
+The subscription plans on [pynesys.io](https://pynesys.io) raise the daily conversion limit and the maximum script size. They also fund the development of PyneCore, which stays free and open source.
 
-### 💡 Support the Ecosystem
-Love PyneCore and want to see it grow? Consider a **Seed subscription or higher** ($5+/mo) to support continued development:
-- **Daily translations** of your Pine Script files (5+ per day)
-- **Larger script support** for complex indicators and strategies
-- **Direct contribution** to keeping PyneCore open source and advancing
+## Documentation and support
 
-*Every subscription helps maintain this free, open-source runtime and drives innovation in algorithmic trading tools.*
-
-## Documentation & Support
-
-- **Documentation**: [pynecore.org](https://pynecore.org/docs)
+- Documentation: [pynecore.org](https://pynecore.org/docs)
+- Validation report: [Pyne in the Wild](https://wild.pynesys.io/), where every corpus script is compared with TradingView
 
 ### Community
 
-- **Discussions**: [GitHub Discussions](https://github.com/pynesys/pynecore/discussions)
-- **Discord**: [discord.pynesys.io](https://discord.pynesys.io)
-- **X**: [x.com/pynesys](https://x.com/pynesys)
-- **Website**: [pynecore.org](https://pynecore.org)
+- Discussions: [GitHub Discussions](https://github.com/pynesys/pynecore/discussions)
+- Discord: [discord.pynesys.io](https://discord.pynesys.io)
+- X: [x.com/pynesys](https://x.com/pynesys)
+- Website: [pynecore.org](https://pynecore.org)
 
 ## License
 
@@ -212,9 +197,9 @@ PyneCore is licensed under the [Apache License 2.0](LICENSE).
 
 ## Disclaimer
 
-Pine Script™ is a trademark of TradingView, Inc. PyneCore is not affiliated with, endorsed by, or sponsored by TradingView. This project is an independent implementation that aims to provide compatibility with the Pine Script language concept in the Python ecosystem.
+Pine Script™ is a trademark of TradingView, Inc. PyneCore is not affiliated with, endorsed by, or sponsored by TradingView. This project is an independent implementation of the Pine Script language concept in Python; its results are measured against TradingView on [Pyne in the Wild](https://wild.pynesys.io/).
 
-### Risk Warning
+### Risk warning
 
 Trading involves significant risk of loss and is not suitable for all investors. The use of PyneCore does not guarantee any specific results. Past performance is not indicative of future results.
 
@@ -226,11 +211,6 @@ Trading involves significant risk of loss and is not suitable for all investors.
 
 By using PyneCore, you acknowledge that you are using the software at your own risk. The creators and contributors of PyneCore shall not be held liable for any financial loss or damage resulting from the use of this software.
 
-## Commercial Support
+## Commercial support
 
-PyneCore is part of the PyneSys ecosystem. For commercial support, custom development, or enterprise solutions:
-
-- **Website**: [pynesys.com/contact](https://pynesys.com/contact)
-
----
-<strong>Elevate Your Trading with the Power of Python & Pine Script</strong>
+PyneCore is part of the PyneSys ecosystem. For commercial support, custom development or enterprise solutions, contact us at [pynesys.com/contact](https://pynesys.com/contact).
