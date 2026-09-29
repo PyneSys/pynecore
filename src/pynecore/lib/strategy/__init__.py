@@ -4461,6 +4461,12 @@ class SimPosition(PositionBase):
                 # from that entry — when the entry is gone it stays dormant.
                 if not order.from_entry_na:
                     continue
+                # A leg left by an all-na call holds a slice but has no trigger:
+                # rebuilt for the new position it would become a market close.
+                if (order.limit is None and order.stop is None and order.trail_price is None
+                        and order.profit_ticks is None and order.loss_ticks is None
+                        and order.trail_points_ticks is None):
+                    continue
                 new_sign = -self.sign
                 self._remove_order(order)
                 adapted = Order(
@@ -6553,8 +6559,17 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
         # the reversal flip below for a price-based order, and through the
         # zero-size closing leg the market path already builds; an order with
         # nothing to close is dropped outright.
+        # Dropping it still MODIFIES the pending order of the same id: that order
+        # is gone, not left resting at its old qty and price. Measured on
+        # CAPITALCOM:EURUSD 30m (mincontract 0.1): a resting 0.1 buy limit
+        # re-issued with qty 0.05 on a later bar never fills afterwards (0 fills
+        # vs 285 without the re-issue), with the position flat, with a long
+        # already open, on the placing bar itself, and for a default-sized
+        # re-issue that floors to zero lots.
         if size == 0.0 and (skip_flip or position.size == 0.0
                             or position.sign == direction_sign):
+            if existing_entry is not None:
+                position._remove_order(existing_entry)
             return
 
     # Market entries keep their placement-close sizing (price-based orders
@@ -6823,15 +6838,24 @@ def _exit_leg(position: PositionBase, exit_id: str, from_entry: str,
     # brackets computed from a flat position_avg_price (na) on a bar before the
     # entry fills. It is not a level-less market close that fires at the next
     # open: it replaces the resting leg of the same id with an order that can
-    # never fill, which cancels that leg and leaves nothing in its place --
-    # whatever slice the call asks for, so this comes before the reservation.
-    # MEASURED on TradingView (CAPITALCOM:EURUSD 60): after a trailing exit, a
-    # same-id ``strategy.exit(id, from_entry, stop = na)`` yields the trade list
-    # of ``strategy.cancel(id)`` byte for byte (33 trades where keeping the leg
-    # gives 34), with or without ``qty_percent``, while an entry order of the
-    # same id stays pending.
-    if not (limit == limit or stop == stop or profit == profit or loss == loss
-            or trail_price == trail_price or trail_points == trail_points):  # is_na_arg
+    # never fill. MEASURED on TradingView (CAPITALCOM:EURUSD 60): after a
+    # trailing exit, a same-id ``strategy.exit(id, from_entry, stop = na)``
+    # yields the trade list of ``strategy.cancel(id)`` byte for byte (33 trades
+    # where keeping the leg gives 34), with or without ``qty_percent``, while an
+    # entry order of the same id stays pending.
+    # The level-less order still HOLDS its slice of the entry, both against a
+    # filled entry and against a pending one, and a later call with levels
+    # re-arms it. MEASURED on TradingView (CAPITALCOM:EURUSD 30m, 10-lot long,
+    # legs A = 80% and B = 50% on one limit, A issued first each bar): B issued
+    # once with ``limit = na`` beforehand fills 5 + 5 instead of A's 8 + 2, and
+    # with a pending entry the legs issued AFTER the entry call on its bar --
+    # all-na, as a flat position_avg_price makes them -- take the entry before
+    # the legs issued above the call (probes xb/xc, 4 x ~135 cycles each).
+    # A live broker gets no such order: the plugin would dispatch a level-less
+    # exit as a market close, so there the call only cancels the resting leg.
+    dormant = not (limit == limit or stop == stop or profit == profit or loss == loss
+                   or trail_price == trail_price or trail_points == trail_points)  # is_na_arg
+    if dormant and not isinstance(position, SimPosition):
         if existing is not None:
             position._remove_order(existing)
         return
@@ -6888,6 +6912,10 @@ def _exit_leg(position: PositionBase, exit_id: str, from_entry: str,
         else:
             reserved = _size_round(reserved)
     if reserved <= 0.0:
+        # The level-less replacement still cancels the resting leg even when its
+        # own slice rounds to nothing.
+        if dormant and existing is not None:
+            position._remove_order(existing)
         return
     size = -direction * reserved
 
@@ -7019,6 +7047,9 @@ def _exit_leg(position: PositionBase, exit_id: str, from_entry: str,
         alert_loss=_alert_loss,
         alert_trailing=_alert_trailing
     )
+    if dormant:
+        # No level to index it at and no market fill: it only holds its slice.
+        order.is_market_order = False
 
     # Sticky bracket (TV semantics): a re-issued live trailing leg keeps its
     # activated high/low-water mark ONLY when the trailing parameters are
@@ -7379,7 +7410,12 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     if isinstance(position, SimPosition):
         size = _size_floor(size) if deferred_default \
             else direction_sign * _explicit_qty_round(float(qty))
+        # A zero-lot re-issue removes the pending order of the same id, exactly
+        # as for strategy.entry (measured on the same probe with strategy.order).
         if size == 0.0:
+            existing_order = position.entry_orders.get(id)
+            if existing_order is not None:
+                position._remove_order(existing_order)
             return
 
     # Market orders keep their placement-close sizing (price-based orders
