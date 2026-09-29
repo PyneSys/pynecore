@@ -12,9 +12,11 @@ Architecture:
 """
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
+import sys
 import threading
 from bisect import bisect_right
 from time import monotonic
@@ -157,9 +159,20 @@ NO_BATCH = os.environ.get("PYNE_NO_SECURITY_BATCH", "").strip().lower() in (
 # how a data vendor serves the contexts of one script. A traced run is a
 # discovery run: a context with no feed behind it is logged with
 # ``"missing": true`` and reads as ``na`` instead of stopping the run, so ONE
-# pass names every feed the script needs. Read when a run builds its protocol
-# functions, so it costs a run without it nothing per bar.
+# pass names every feed the script needs. Each line also carries the ``stack`` of
+# script-side ``[file, line]`` frames, outermost first, that reached the read: a
+# helper serves several call sites, and only the stack tells them apart. Read
+# when a run builds its protocol functions, so it costs a run without it nothing
+# per bar.
 SECURITY_TRACE_ENV = "PYNE_SECURITY_TRACE"
+
+# Frames under these roots are the runtime's own or the interpreter's, never the
+# script's, so the trace leaves them out of a read's ``stack``.
+_TRACE_SKIP_ROOTS = tuple(sorted({
+    str(Path(__file__).resolve().parent.parent) + os.sep,
+    str(Path(sys.prefix).resolve()) + os.sep,
+    str(Path(sys.base_prefix).resolve()) + os.sep,
+}))
 
 
 def watch_security_child(
@@ -2585,6 +2598,13 @@ def create_chart_protocol(
         with state.result_lock:
             result = readers[sec_id].read(sync_block, default)
 
+        if state.is_ltf and sec_id in same_context_ids and result is not default:
+            # An LTF request at the chart's own symbol and timeframe has exactly
+            # one intrabar, the chart bar itself: TradingView returns a fresh
+            # one-element array of the value the chart just wrote (a tuple row
+            # for a tuple expression, which ``__ltf_unzip__`` transposes).
+            result = [result]
+
         if currency_conversions and sec_id in currency_conversions and result is not default:
             result = _convert_currency(currency_conversions[sec_id], result)
 
@@ -2693,6 +2713,11 @@ def _trace_first_reads(read, signal_values: dict[str, tuple],
         if sec_id not in traced:
             traced.add(sec_id)
             symbol, timeframe, _lookahead = signal_values.get(sec_id) or (None, None, None)
+            stack = []
+            for info in reversed(inspect.stack(0)):
+                filename = os.path.abspath(info.filename)
+                if not filename.startswith(_TRACE_SKIP_ROOTS):
+                    stack.append([filename, info.lineno])
             with open(path, 'a', encoding='utf-8') as trace:
                 trace.write(json.dumps({
                     'order': len(traced) - 1, 'sec_id': sec_id,
@@ -2700,6 +2725,7 @@ def _trace_first_reads(read, signal_values: dict[str, tuple],
                     'timeframe': None if timeframe is None else str(timeframe),
                     'same_context': sec_id in same_context_ids,
                     'missing': sec_id in missing_data_ids,
+                    'stack': stack,
                 }) + '\n')
         if sec_id in missing_data_ids:
             return default

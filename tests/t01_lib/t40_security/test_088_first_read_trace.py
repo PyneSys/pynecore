@@ -100,6 +100,28 @@ def __test_first_reads_are_traced_in_call_site_order__(runner, tmp_path, log):
     assert [row["order"] for row in rows] == [0, 1, 2]
     assert [row["same_context"] for row in rows] == [False, True, False]
     assert len({row["sec_id"] for row in rows}) == 3
+
+    # Each read carries the script frames that reached it, outermost first: a
+    # helper's request is told apart by the line that called the helper.
+    source = Path(__file__).read_text(encoding="utf-8").splitlines()
+
+    def line_of(text):
+        return next(i for i, line in enumerate(source, 1) if line.strip() == text)
+
+    # This module also hosts the test driving the run, so only the script part
+    # above the test helpers counts.
+    here = str(Path(__file__).resolve())
+    script_end = line_of('__test_helper_t0 = 1_735_689_600_000  '
+                         '# 2025-01-01T00:00:00 UTC, Unix MILLISECONDS')
+    stacks = [[(str(Path(f).resolve()), n) for f, n in row["stack"]
+               if str(Path(f).resolve()) == here and n < script_end]
+              for row in rows]
+    assert stacks == [
+        [(here, line_of('first = request.security(syminfo.tickerid, "60", high)'))],
+        [(here, line_of('own = request.security(syminfo.tickerid, "5", close)'))],
+        [(here, line_of('gated = later_read("120")')),
+         (here, line_of('return request.security(syminfo.tickerid, tf, close)'))],
+    ]
     log.info("three contexts traced once each, in the order main() reads them")
 
 
