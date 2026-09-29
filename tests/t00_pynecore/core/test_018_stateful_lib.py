@@ -345,8 +345,11 @@ def __test_math_sum_length_change_walks_one_entry_at_a_time__():
     MEASURED LAW (probes sumlen6/sumlen7, BINANCE:BTCUSDT 30m): a 5->6, 6->7,
     4->10 or 6->5 length step reproduces TradingView bit-for-bit only when every
     admitted/evicted entry runs its own compensated round -- folding the whole
-    change into a single fused ``d0`` lands 1-3 ulp away. The two models are
-    compared here directly, so the test fails if the implementation folds.
+    change into a single fused ``d0`` lands 1-3 ulp away. A grow admits the raw
+    values newest first down to offset ``new_w`` itself, then the fused step
+    evicts that offset's ORIGINAL entry; admitted bars keep their original
+    entries (probes wg/wh/wk: 131 grows bit-exact). The two models are compared
+    here directly, so the test fails if the implementation folds.
     """
     length_before, length_after = 4, 8
     # Magnitudes chosen so the compensated residue is live when the length moves
@@ -366,7 +369,6 @@ def __test_math_sum_length_change_walks_one_entry_at_a_time__():
             length = lengths(i)
             new_w = length if i + 1 >= length else i + 1
             d0 = 0.0
-            admitted = []
             if win + 1 > new_w:
                 for k in range(win, new_w, -1):
                     if sequential:
@@ -378,19 +380,19 @@ def __test_math_sum_length_change_walks_one_entry_at_a_time__():
                     else:
                         d0 += ent[k - 1]
                 d0 = d0 + ent[new_w - 1] if not sequential else ent[new_w - 1]
-            elif new_w > win + 1:
-                for k in range(new_w - 1, win, -1):
+            elif new_w > win + 1 or new_w < i + 1:
+                top = new_w if new_w < i + 1 else i
+                for k in range(win + 1, top + 1):
                     a = values[i - k]
                     if sequential:
-                        y1 = -comp
-                        t = summ + y1
-                        y2 = a - ((t - summ) - y1)
-                        summ = t + y2
-                        comp = (summ - t) - y2
-                        admitted.append((k, y2))
+                        y = a - comp
+                        ns = summ + y
+                        comp = (ns - summ) - y
+                        summ = ns
                     else:
                         d0 -= a
-                        admitted.append((k, a))
+                if new_w < i + 1:
+                    d0 = d0 + ent[new_w - 1] if not sequential else ent[new_w - 1]
             fires = False
             if comp != 0.0 and v != 0.0:
                 b = comp if comp > 0.0 else -comp
@@ -412,9 +414,6 @@ def __test_math_sum_length_change_walks_one_entry_at_a_time__():
                 comp = (ns - t) - y2
                 summ = ns
                 ent = [y2] + ent
-            for k, e in admitted:
-                if k < len(ent):
-                    ent[k] = e
             win = new_w
             got.append(summ if new_w >= length else None)
         return got

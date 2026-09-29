@@ -165,34 +165,43 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat:
         return summ if new_w >= length else na_float
 
     # The realized-entry ring is addressed by position RELATIVE to the newest
-    # entry, its capacity the largest length seen so far. Pine's machine does not
-    # restart when the length moves (MEASURED, probe sumlen2: a length grown
-    # 1..610 reproduces a constant 610 bit-for-bit on all 28746 bars), so the
-    # history already stored has to keep its identity — a ring re-based on the
-    # new length would lose it. Only LEAVING entries are read from the ring and
-    # those sit inside the previous window, so the largest length is enough.
+    # entry. Pine's machine does not restart when the length moves (MEASURED, probe
+    # sumlen2: a length grown 1..610 reproduces a constant 610 bit-for-bit on all
+    # 28746 bars), so the history already stored has to keep its identity — a ring
+    # re-based on the new length would lose it. Every stored bar keeps the entry it
+    # was stored with for as long as ``src`` can still address it: a grown window
+    # re-admits bars that left long ago, and when they leave again it is that
+    # ORIGINAL entry that is evicted (see the admission walk below). The ring grows
+    # with the stored history up to ``capacity`` like the series buffer itself,
+    # doubling so the copy below stays rare.
     ent = entries
     cap = ring
     at = slot
-    if length > cap:
-        grown = [0.0] * length
+    need = n if n < capacity else capacity
+    if need > cap:
+        size = cap + cap
+        if size < need:
+            size = need
+        elif size > capacity:
+            size = capacity
+        grown = [0.0] * size
         j = 0
         if cap:
-            kept = cap if prev_w > cap else prev_w
+            kept = cap if seen > cap else seen
             i = at - kept
             if i < 0:
                 i += cap
-            j = length - kept
+            j = size - kept
             for _ in builtins.range(kept):
                 grown[j] = ent[i]
                 i += 1
                 if i == cap:
                     i = 0
                 j += 1
-                if j == length:
+                if j == size:
                     j = 0
         ent = grown
-        cap = length
+        cap = size
         at = j
         entries = ent
         ring = cap
@@ -259,12 +268,14 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat:
     # ``prev_w - 1 + shift`` LEAVE oldest first, each an eviction-only step, and
     # the newest of them is the one fused with this bar's own value — in the
     # steady state it is the only one, which is exactly the proven single-evict
-    # step. Offsets ``prev_w + shift``..``new_w - 1`` are ADMITTED oldest first
-    # with their raw values, each an addition-only step whose realized residue
-    # becomes that offset's stored entry.
+    # step. A grown window ADMITS offsets ``prev_w + shift``..``new_w`` instead —
+    # one PAST the new window — and the fused step then evicts offset ``new_w``
+    # again, so every bar whose offset ``new_w`` exists ends on the same fused
+    # step, and only a window reaching back to the first stored bar ends on a
+    # plain compensated add.
     # Every ISOLATED change measured this way is bit-exact over the full
     # following tail (probes sumlen3/6/7: 8->1, 100->1, 300->150->50, 610->100,
-    # 5->3, 6->5 and the grow events). Still OPEN: the arithmetic of a RUNNING
+    # 5->3, 6->5; probes wg/wh/wk: 131 grows). Still OPEN: the arithmetic of a RUNNING
     # length (probe sumlen8's per-bar saws) — the dense branch above bounds
     # that case instead of walking it.
     if source_na:
@@ -343,44 +354,33 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat:
                     ws[i] = s
                     wc[i] = c
                     i += 1
+    elif new_w > prev_w + shift or new_w < n:
+        # Newest first with the RAW source values, each one compensated add, down
+        # to offset ``new_w`` itself when it exists (a +1 grow of a full window
+        # admits just that one), and the admitted bars keep the entries they were
+        # ORIGINALLY stored with: the fused step below evicts offset ``new_w``
+        # with its original entry, and so does every later eviction of an
+        # admitted bar (MEASURED, probes wg/wh/wk: 131 isolated grows of
+        # volume-scaled, ratio and raw volume sources, 1..40 wide, every one
+        # bit-exact on every historical bar after it this way; admitting only up to
+        # ``new_w - 1``, oldest first, with the residues stored, matched 9 of them).
+        # Same native window read as the eviction walk above. Unlike that one
+        # this walk cannot be memoized across the iterations of a shared loop
+        # call site: two lengths share the head of the fold but not its input
+        # range, and every length has to be folded from the bar-start state.
+        top = new_w + 1 if new_w < n else n
+        for admitted in builtins.reversed(
+                builtins.list(builtins.map(builtins.float, src[prev_w + shift:top].oldest))):
+            y = admitted - c
+            new_sum = s + y
+            c = (new_sum - s) - y
+            s = new_sum
+    warm = new_w == n
+    if not warm:
         e = base - new_w
         if e < 0:
             e += cap
         d0 = ent[e]
-    elif new_w > prev_w + shift:
-        # Oldest first: the deepest offset enters before the ones above it
-        # Same native window read as the eviction walk above. Unlike that one
-        # this walk cannot be memoized across the iterations of a shared loop
-        # call site: it folds from the DEEPEST offset upwards, so two lengths
-        # share the tail of the input and not the prefix of the fold, and
-        # every length has to be folded from the bar-start state itself.
-        span = new_w - prev_w - shift
-        residues = [0.0] * span
-        i = 0
-        for admitted in builtins.map(builtins.float, src[prev_w + shift:new_w].oldest):
-            y1 = -c
-            t = s + y1
-            e1 = (t - s) - y1
-            y2 = admitted - e1
-            s = t + y2
-            c = (s - t) - y2
-            residues[i] = y2
-            i += 1
-        # The ring mirrors the window, so an admitted entry takes its slot too:
-        # without it a later eviction of that offset would read a slot the ring
-        # never filled (or one a capacity growth dropped). The offsets walked
-        # are contiguous and ascending in ring position, so the residues go in
-        # as native slices, split where the ring wraps.
-        low = base - new_w + 1
-        high = base - prev_w - shift
-        if low >= 0:
-            ent[low:high + 1] = residues
-        elif high < 0:
-            ent[low + cap:high + 1 + cap] = residues
-        else:
-            wrapped = -low
-            ent[low + cap:cap] = residues[:wrapped]
-            ent[:high + 1] = residues[wrapped:]
 
     # ``core.rolling_sum.sum_fires`` inlined: a call here would cost more than
     # the whole compensated step it guards, and the transform wraps every call
@@ -408,19 +408,21 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat:
         compensation = 0.0
         if not source_na:
             ent[at] = value
-    elif new_w == prev_w + shift:
+    elif warm:
         # Warmup: nothing leaves and nothing else enters, so the bar is a single
         # compensated add. The fused step below with ``d0 = 0`` rounds ``s - c`` on its
         # own first, which differs whenever that rounds away from ``s`` (``|c|`` of half
         # an ulp of ``s`` or more): the stored entry then comes out an ulp off and every
         # later eviction of it carries the error (MEASURED, probe ws: 42 warmups of
         # volume-scaled sources, 841k displayed bars bit-exact this way, none with the
-        # fused form).
+        # fused form). A grown window that reaches back to the first stored bar has
+        # no offset ``new_w`` to evict either and ends on the same add.
         y = value - c
         new_sum = s + y
         compensation = (new_sum - s) - y
         s = new_sum
-        ent[at] = y
+        if not source_na:
+            ent[at] = y
     else:
         # Fused two-round evict-and-add, realized store
         y1 = -d0 - c
