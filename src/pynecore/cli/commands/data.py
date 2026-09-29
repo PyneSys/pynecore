@@ -629,7 +629,7 @@ def convert_from(
 
     # Auto-detect file format
     fmt = file_path.suffix[1:].lower()
-    if fmt not in InputFormats:
+    if fmt not in {f.value for f in InputFormats}:
         raise ValueError(f"Unsupported file format: {file_path}")
 
     # Use the enhanced DataConverter for automatic conversion

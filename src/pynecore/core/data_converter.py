@@ -180,7 +180,7 @@ class DataConverter:
             raise ConversionError(f"Source file is already in OHLCV format: {file_path}")
 
         # Check if format is supported
-        if detected_format not in SupportedFormats:
+        if detected_format not in {f.value for f in SupportedFormats}:
             raise DataFormatError(f"Unsupported file format '{detected_format}' for file: {file_path}")
 
         # Determine OHLCV output path
