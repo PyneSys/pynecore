@@ -90,7 +90,15 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat:
     # decision forced), and on real 22k-bar rsi/stoch/sma chains (probes m561/m562).
     summ: Persistent[float] = 0.0
     compensation: Persistent[float] = 0.0
-    entries: Persistent[list[float]] = []
+    # The entry ring grows with the stored history (up to ``capacity``), so it is
+    # ``varip``: a var rollback would copy the whole ring back on every same-bar
+    # re-execution, and a shared loop call site re-executes once per iteration.
+    # A bar writes at most ONE ring slot (or swaps in a grown ring), so
+    # ``ring_undo`` records exactly that write, keyed by the bar-start ``seen``:
+    # a call that starts from the same ``seen`` is a re-execution of that bar
+    # (loop iteration, realtime tick, security re-tick) and undoes it first.
+    entries: IBPersistent[list[float]] = []
+    ring_undo: IBPersistent[tuple | None] = None
     ring: Persistent[int] = 0
     slot: Persistent[int] = 0
     seen: Persistent[int] = 0
@@ -159,7 +167,15 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat:
     # ORIGINAL entry that is evicted (see the admission walk below). The ring grows
     # with the stored history up to ``capacity`` like the series buffer itself,
     # doubling so the copy below stays rare.
-    ent = entries
+    undo = ring_undo
+    if undo is not None and undo[0] == seen:
+        start = undo[1]
+        if undo[2] >= 0:
+            start[undo[2]] = undo[3]
+        entries = start
+    else:
+        start = entries
+    ent = start
     cap = ring
     at = slot
     need = n if n < capacity else capacity
@@ -328,6 +344,12 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat:
     # docstring for the derivation, the binade-edge reason the magnitude and
     # not the signed ``c`` is shifted, and why the ``|c| > |x|`` residue stays
     # deliberately inexact).
+    if not source_na:
+        # Every branch below stores this bar's entry at ``at``: into the
+        # bar-start ring in place, or into a ring grown above, which leaves the
+        # bar-start one untouched and only has to be swapped back
+        ring_undo = (seen, start, at, start[at]) if ent is start else (seen, start, -1, 0.0)
+
     fires = False
     if c != 0.0 and value != 0.0:
         b = c if c > 0.0 else -c
