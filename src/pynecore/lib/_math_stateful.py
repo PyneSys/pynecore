@@ -96,9 +96,6 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat:
     seen: Persistent[int] = 0
     window: Persistent[int] = 0
     capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
-    calls: Persistent[int] = 0
-    prev_len: Persistent[int] = 0
-    chg_at: Persistent[int] = -1 << 60
     # Memo of the eviction walk below, deliberately ``varip`` so the loop-site
     # rollback leaves it alone: it is not machine state, it is a replay of the
     # walk the rolled-back state produces (issue #80). See there for the key.
@@ -121,18 +118,6 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat:
         length = int(length)
 
     assert length > 0, "Invalid length, length must be greater than 0!"
-
-    # A length change on the bar right after another one marks a RUNNING series
-    # length (a ``barssince`` ramp or sawtooth). The dense/isolated distinction
-    # picks the length-change handling below, so record it before any early
-    # return can skip the bar.
-    calls += 1
-    changed = prev_len != 0 and length != prev_len
-    dense = changed and calls - chg_at <= 1
-    if changed:
-        chg_at = calls
-    if length != prev_len:
-        prev_len = length
 
     n = seen
     if not source_na:
@@ -207,53 +192,6 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat:
         ring = cap
         slot = at
 
-    if dense and n > length:
-        # RUNNING length (changed on consecutive bars): TradingView's arithmetic
-        # for repeated changes is still open — its own machine carries a
-        # persistent sub-ulp drift (MEASURED, probe sumlen8: a length-1 window
-        # reports the raw value plus leftover debris, probe sumlen9: window
-        # membership stays exact, so ALL deviation is compensation arithmetic).
-        # The walk below is bit-exact for isolated events but its drift against
-        # TV accumulates without bound when the length moves every bar (the
-        # corpus sawtooth went from 1.5k to 14.5k max ulp on it), while a
-        # re-baseline bounds the divergence at one window's summation error.
-        # Between the two approximations the re-baseline measures better in
-        # this regime (probe columns saw20/50/200), the walk in every other,
-        # so the dense path re-baselines: newest-first raw linear sum, cleared
-        # compensation, raw stored entries — the same shape a fire produces.
-        # The window travels as ONE native list (oldest first) and the sum and
-        # the store are native list operations over it, instead of ``new_w``
-        # ``Series.__getitem__`` calls plus two interpreted loops. A shared
-        # loop call site re-derives this whole re-baseline on EVERY iteration
-        # of the bar, so a length that moves per iteration paid the window
-        # twice per iteration and dominated the run (issue #80).
-        # ``float`` addition is commutative, so the native left fold over the
-        # reversed window is bit-identical to the ``src[i] + rebuilt`` walk.
-        win = builtins.list(builtins.map(builtins.float, src[0:new_w].oldest))
-        rebuilt = _reduce(_add, builtins.reversed(win))
-        base = at if not source_na else at - 1
-        if base < 0:
-            base += cap
-        # ``ent[base - j] = win_newest_first[j]`` for the whole window is the
-        # oldest-first window written into ``base - new_w + 1 .. base``, split
-        # at the ring wrap. Every slot is inside the ring, so both assignments
-        # are same-length replacements and the list keeps its size.
-        low = base - new_w + 1
-        if low >= 0:
-            ent[low:base + 1] = win
-        else:
-            wrapped = -low
-            ent[low + cap:cap] = win[:wrapped]
-            ent[:base + 1] = win[wrapped:]
-        summ = rebuilt
-        compensation = 0.0
-        seen = n
-        window = new_w
-        if not source_na:
-            at += 1
-            slot = 0 if at == cap else at
-        return rebuilt if new_w >= length else na_float
-
     c = compensation
     s = summ
 
@@ -273,11 +211,11 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat:
     # again, so every bar whose offset ``new_w`` exists ends on the same fused
     # step, and only a window reaching back to the first stored bar ends on a
     # plain compensated add.
-    # Every ISOLATED change measured this way is bit-exact over the full
-    # following tail (probes sumlen3/6/7: 8->1, 100->1, 300->150->50, 610->100,
-    # 5->3, 6->5; probes wg/wh/wk: 131 grows). Still OPEN: the arithmetic of a RUNNING
-    # length (probe sumlen8's per-bar saws) — the dense branch above bounds
-    # that case instead of walking it.
+    # Every change measured this way is bit-exact over the full following tail,
+    # isolated or on consecutive bars (probes sumlen3/6/7: 8->1, 100->1,
+    # 300->150->50, 610->100, 5->3, 6->5; probes wg/wh/wk: 131 grows; probe wr:
+    # sawtooth, ramp, alternating and pseudo-random lengths over 21.7k bars on
+    # six sources).
     if source_na:
         shift = 0
         base = at - 1
@@ -291,10 +229,12 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat:
 
     d0 = 0.0
     if prev_w + shift > new_w:
-        # Oldest first with the RAW source values (MEASURED, probes sumlen3/6:
-        # the isolated 8->1, 100->1, 300->150, 610->100 and 5->3 events are all
-        # bit-exact only this way), the newest leaving entry — the realized one,
-        # exactly the steady-state eviction — left for the fused step below.
+        # Oldest first with the RAW source values, each one compensated add of the
+        # negated value (MEASURED, probes sumlen3/6: the isolated 8->1, 100->1,
+        # 300->150, 610->100 and 5->3 events; probe wr: shrinks on consecutive
+        # bars, where the two-round form drifts 1-16 ulp), the newest leaving
+        # entry — the realized one, exactly the steady-state eviction — left for
+        # the fused step below.
         # The offsets that leave are ``new_w + 1``..``top``, and an offset is
         # its own ``src`` index in BOTH regimes: on a stored bar the buffer
         # moved with the window, on an na bar neither moved. Reading one lower
@@ -345,12 +285,10 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat:
                 wc[i:] = tail
                 for v in builtins.map(builtins.float,
                                       src[new_w + 1:top - walked + 1].oldest):
-                    y1 = -v - c
-                    t = s + y1
-                    e1 = (t - s) - y1
-                    y2 = -e1
-                    s = t + y2
-                    c = (s - t) - y2
+                    y = -v - c
+                    new_sum = s + y
+                    c = (new_sum - s) - y
+                    s = new_sum
                     ws[i] = s
                     wc[i] = c
                     i += 1
@@ -399,8 +337,8 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat:
 
     if fires:
         # Re-baseline: newest-first linear sum of the raw window, raw store
-        # Same native window fold as the dense re-baseline above, seeded with
-        # this bar's own raw value: ``win`` is oldest first, so dropping its
+        # The window travels as ONE native list (oldest first), folded natively
+        # and seeded with this bar's own raw value: ``win`` is oldest first, so dropping its
         # last element drops ``src[0]`` and the reversed rest is ``src[1]``..
         # ``src[new_w - 1]``.
         win = builtins.list(builtins.map(builtins.float, src[0:new_w].oldest))

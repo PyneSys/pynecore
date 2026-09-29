@@ -437,8 +437,8 @@ def __test_math_sum_isolated_shrink_evicts_raw_values__():
 
     MEASURED LAW (probes sumlen3/sumlen6, BINANCE:BTCUSDT 30m): the isolated
     8->1, 100->1, 300->150, 610->100 and 5->3 events reproduce TradingView
-    bit-for-bit only when the extra leaving offsets run their own compensated
-    round with the RAW source value — evicting the stored realized entries
+    bit-for-bit only when each extra leaving offset runs its own compensated
+    add with the RAW source value — evicting the stored realized entries
     instead lands away on the event bar. The two models are compared here
     directly, so the test fails if the implementation reads the ring.
     """
@@ -460,11 +460,10 @@ def __test_math_sum_isolated_shrink_evicts_raw_values__():
             if win + 1 > new_w:
                 for k in range(win, new_w, -1):
                     leaving = values[i - k] if raw_extras else ent[k - 1]
-                    y1 = -leaving - comp
-                    t = summ + y1
-                    y2 = -((t - summ) - y1)
-                    summ = t + y2
-                    comp = (summ - t) - y2
+                    y = -leaving - comp
+                    ns = summ + y
+                    comp = (ns - summ) - y
+                    summ = ns
                 d0 = ent[new_w - 1]
             elif win + 1 == new_w and i + 1 > length:
                 d0 = 0.0
@@ -507,48 +506,6 @@ def __test_math_sum_isolated_shrink_evicts_raw_values__():
 
     # The two models must actually disagree, or the assertion above proves nothing
     assert any(a is not None and repr(a) != repr(b) for a, b in zip(raw, realized))
-
-
-def __test_math_sum_running_length_rebaselines__():
-    """ A RUNNING length (changed on consecutive bars) re-baselines every bar
-
-    TradingView's arithmetic for repeated length changes is still open — its
-    own machine carries persistent sub-ulp debris (probe sumlen8) while the
-    window membership stays exact (probe sumlen9). Walking the changes is
-    bit-exact for isolated events but accumulates unbounded drift against TV
-    when the length moves every bar, so the dense regime re-baselines to the
-    newest-first raw linear sum instead: the divergence stays bounded by one
-    window's summation error (measured better on the saw20/50/200 probe
-    columns and the corpus sawtooth script). This pins the regime split: the
-    sawtooth below must equal the plain rebuild, which the walked machine's
-    carried state does not reproduce.
-    """
-    # Real BINANCE:BTCUSDT 30m volumes (probe sumlen8): the walked machine's
-    # carried rounding state visibly differs from the rebuild on these values
-    values = [
-        271.27422, 484.71588, 387.2325, 199.30206, 152.93592,
-        123.84453, 112.48847, 108.50455, 141.00467, 138.46442,
-        141.23578, 67.94362, 94.66068, 177.61778, 72.64035,
-        125.29423, 317.3764, 164.33533, 431.78652, 366.71121,
-        138.8758, 126.67612, 159.94019, 161.78206, 334.71719,
-        164.63894, 162.40121, 177.96266, 406.18562, 345.72135,
-        221.49823, 264.58572, 324.97033, 255.30351, 183.80447,
-        120.06348, 98.05808, 193.73023, 147.69316, 397.43056,
-    ]
-
-    state = _make_state(lib.math.sum.__pyne_layout__)
-    with _bars() as next_bar:
-        for i, v in enumerate(values):
-            length = i % 5 + 1
-            new_w = length if i + 1 >= length else i + 1
-            got = lib.math.sum(state, v, length)
-            if i + 1 > length and i >= 5:
-                # dense regime: expected is the plain newest-first rebuild
-                want = v
-                for k in range(1, new_w):
-                    want = values[i - k] + want
-                assert repr(got) == repr(want), f'bar {i}: {got!r} != {want!r}'
-            next_bar()
 
 
 def __test_math_sum_length_change_on_na_bar_keeps_window__():
