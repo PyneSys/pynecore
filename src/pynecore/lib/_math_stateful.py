@@ -81,8 +81,10 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat:
     # realized ``y2`` for the future eviction. On bars where ``sum_fires`` signals it,
     # the engine re-baselines instead: the display and accumulator become the plain
     # newest-first linear sum of the raw window, the compensation clears, and the raw
-    # value is stored. The same machine runs during warmup with ``d0 = 0`` and the
-    # re-baseline summing the whole available prefix. Validated bit-for-bit against TV
+    # value is stored. While the window fills, a bar evicts nothing and is a plain
+    # one-round compensated add instead (``y = fl(x - c)``; ``s = fl(s + y)``;
+    # ``c = fl(fl(s' - s) - y)``), storing ``y``; the re-baseline then sums the whole
+    # available prefix. Validated bit-for-bit against TV
     # output on dense probes for lengths 2..14 (~330k displayed bars), on zero-gap
     # block probes m562 (5599 independent blocks, lengths 3/4/5/8, every branch
     # decision forced), and on real 22k-bar rsi/stoch/sma chains (probes m561/m562).
@@ -406,6 +408,19 @@ def sum(source: TFI | NA[TFI], length: int) -> PyneFloat:
         compensation = 0.0
         if not source_na:
             ent[at] = value
+    elif new_w == prev_w + shift:
+        # Warmup: nothing leaves and nothing else enters, so the bar is a single
+        # compensated add. The fused step below with ``d0 = 0`` rounds ``s - c`` on its
+        # own first, which differs whenever that rounds away from ``s`` (``|c|`` of half
+        # an ulp of ``s`` or more): the stored entry then comes out an ulp off and every
+        # later eviction of it carries the error (MEASURED, probe ws: 42 warmups of
+        # volume-scaled sources, 841k displayed bars bit-exact this way, none with the
+        # fused form).
+        y = value - c
+        new_sum = s + y
+        compensation = (new_sum - s) - y
+        s = new_sum
+        ent[at] = y
     else:
         # Fused two-round evict-and-add, realized store
         y1 = -d0 - c
