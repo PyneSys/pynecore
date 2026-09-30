@@ -287,9 +287,11 @@ def pow(base: TFI | NA[TFI], exponent: TFI | NA[TFI]) -> PyneFloat:
     :param exponent: The exponent number.
     :return: The base number raised to the power of the exponent number.
     """
-    if isinstance(base, NA) or isinstance(exponent, NA):
-        return na_float
-    if base != base or exponent != exponent:
+    # One self-comparison per operand is the whole na test: a numeric na is a nan,
+    # and no NA object compares equal to itself either (the three-state bool na
+    # answers ``==`` with itself, a falsy NA). An inlined ``math.pow(x, 2)`` is
+    # therefore a single compare in front of ``x * x``.
+    if not (base == base) or not (exponent == exponent):  # is_na_arg
         return na_float
 
     # A runtime pow on TradingView is the JVM's x86 Math.pow intrinsic, which

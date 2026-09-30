@@ -16,6 +16,7 @@ divergence, so the bases below are exactly the ones measured to disagree.
 import math as _math
 
 from pynecore.lib import math
+from pynecore.types.na import NA, na_float, set_bool_na
 
 
 # Bases where macOS's ``pow()`` differs from the shortcut (a correctly rounding
@@ -55,3 +56,21 @@ def __test_pow_keeps_the_general_path__():
         assert math.pow(x, 3) == expected, x.hex()
         assert x * x * x != expected
     assert math.pow(2, 10) == 1024.0
+
+
+def __test_pow_every_na_face_is_na_float__():
+    """Every na face -- nan, the typeless and typed NA objects, and the
+    three-state bool na whose ``==`` answers a falsy NA instead of False --
+    makes ``pow`` return the numeric na itself, as base and as exponent."""
+    set_bool_na(True)
+    try:
+        faces = (float('nan'), NA(None), NA(str), NA(bool))
+        assert isinstance(NA(bool), NA)
+        for face in faces:
+            for exponent in (2, 2.0, 3, 0.5):
+                assert math.pow(face, exponent) is na_float, (face, exponent)
+            for base in (2, 2.0, 0.0, -1.5):
+                assert math.pow(base, face) is na_float, (base, face)
+            assert math.pow(face, face) is na_float, face
+    finally:
+        set_bool_na(False)

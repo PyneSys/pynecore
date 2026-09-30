@@ -30,10 +30,15 @@ second argument untouched, and the pass verifies the wrapper's ``cast`` IS
 
 A guard a LITERAL argument decides is resolved at transform time
 (``math.pow(x, 2)`` keeps only ``x * x``), and so are the operations that
-guard reads: ``isinstance(2, NA)``, ``2 != 2``, ``int(0)``. Each is folded by
-RUNNING the very same operation on that very literal, never by reasoning
-about it, so an int-vs-float result cannot drift. A ``bool`` is not treated as
+guard reads: ``2 == 2``, ``int(0)``. Each is folded by RUNNING the very same
+operation on that very literal, never by reasoning about it, so an
+int-vs-float result cannot drift. A ``bool`` is not treated as
 a numeric literal, so nothing folds on ``math.pow(x, true)``.
+
+One fold is not a literal's: the counter of a ``for`` loop over ``pine_range``
+is never na, so a self-comparison of it (``i == i``, the na guard of
+``array.get(a, i)``) is True. The fact is proven per loop, not assumed -- see
+:meth:`CallInlineTransformer._loop_counter`.
 
 Arguments and evaluation order
 ------------------------------
@@ -121,7 +126,7 @@ import operator
 import types
 from pathlib import Path
 
-from ..types.na import NA
+from ..core.pine_range import pine_range
 from .pine_type_rules import get_ty, stamp_lowering
 from .slot_layout import DEFAULT_STATE_PARAM
 
@@ -184,7 +189,7 @@ SUPPORT_NAMES: dict[str, dict[str, str]] = {
         'NA': 'NA', 'na_float': 'na_float', 'na_int': 'na_int',
         'builtins': 'py_builtins', 'math': 'py_math',
         'pine_math': 'pine_math', 'fdlibm': 'fdlibm',
-        'float': 'py_float', 'int': 'py_int', 'isinstance': 'py_isinstance',
+        'float': 'py_float', 'int': 'py_int',
         'pine_int': 'py_float',
         '_na_of_operands': 'math_na_of_operands',
     },
@@ -660,12 +665,20 @@ def _literal(node: ast.expr) -> tuple[bool, Any]:
 class _LiteralFolder(ast.NodeTransformer):
     """Evaluate the parts of a copied body a literal argument already decides.
 
-    ``math.pow(x, 2)`` copies in ``isinstance(2, NA)`` and ``2 != 2``;
-    ``array.get(a, 0)`` copies in ``int(0)``. Each is replaced by the result of
-    running that exact operation on that exact literal, so the emission cannot
-    drift from what the body would have computed. A literal has no side effect,
-    so nothing is lost by not evaluating it at runtime.
+    ``math.pow(x, 2)`` copies in ``2 == 2``; ``array.get(a, 0)`` copies in
+    ``int(0)``. Each is replaced by the result of running that exact operation
+    on that exact literal, so the emission cannot drift from what the body
+    would have computed. A literal has no side effect, so nothing is lost by
+    not evaluating it at runtime.
+
+    The one fold that is not a literal's: a self-comparison of a ``for`` loop
+    counter (``i == i``, the wrappers' na test) -- see
+    :meth:`CallInlineTransformer._loop_counter` for why it is always true.
     """
+
+    def __init__(self, counters: frozenset[str] = frozenset()):
+        #: Placeholder names standing for a proven loop counter argument
+        self.counters = counters
 
     def visit_Call(self, node: ast.Call) -> ast.expr:
         self.generic_visit(node)
@@ -673,13 +686,6 @@ class _LiteralFolder(ast.NodeTransformer):
             return node
         anchor = _anchor_of(node.func.id)
         if anchor is None:
-            return node
-        if anchor == 'py_isinstance' and len(node.args) == 2 \
-                and isinstance(node.args[1], ast.Name) \
-                and _anchor_of(cast(ast.Name, node.args[1]).id) == 'NA':
-            ok, value = _literal(node.args[0])
-            if ok:
-                return ast.Constant(value=builtins.isinstance(value, NA))
             return node
         callable_ = _FOLDABLE_UNARY.get(anchor)
         if callable_ is not None and len(node.args) == 1:
@@ -694,6 +700,11 @@ class _LiteralFolder(ast.NodeTransformer):
 
     def visit_Compare(self, node: ast.Compare) -> ast.expr:
         self.generic_visit(node)
+        if len(node.ops) == 1 and isinstance(node.ops[0], (ast.Eq, ast.NotEq)) \
+                and isinstance(node.left, ast.Name) and node.left.id in self.counters \
+                and isinstance(node.comparators[0], ast.Name) \
+                and node.comparators[0].id == node.left.id:
+            return ast.Constant(value=isinstance(node.ops[0], ast.Eq))
         values: list[Any] = []
         for operand in [node.left, *node.comparators]:
             ok, value = _literal(operand)
@@ -1025,6 +1036,10 @@ class CallInlineTransformer(ast.NodeTransformer):
         self._targets: dict[str, tuple[str, str] | None] = {}
         self._counter = 0
         self._func_depth = 0
+        #: The enclosing function definitions, innermost last
+        self._functions: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+        #: The loop counters proven never na at the current position
+        self._counters: frozenset[str] = frozenset()
         self._blocked = 0
         #: Number of sites rewritten -- the pass's own tests assert on it
         self.inlined = 0
@@ -1164,10 +1179,13 @@ class CallInlineTransformer(ast.NodeTransformer):
                 placeholders[index] = name
                 render_args.append(ast.Name(id=name, ctx=ast.Load()))
 
+        counters = frozenset(placeholders[index] for index, kind in enumerate(classes)
+                             if kind == _ARG_NAME
+                             and cast(ast.Name, node.args[index]).id in self._counters)
         used: set[str] = set()
         try:
-            expression = _fold_guards(_LiteralFolder().visit(template.render(render_args,
-                                                                            used)))
+            expression = _fold_guards(_LiteralFolder(counters).visit(
+                template.render(render_args, used)))
         except NotDerivable:
             return None
         # Marked BEFORE the arguments go in: what is in the tree now is the
@@ -1284,6 +1302,66 @@ class CallInlineTransformer(ast.NodeTransformer):
             node.body.insert(insert_pos, import_stmt)
         return node
 
+    def _loop_counter(self, node: ast.For) -> str | None:
+        """The counter of a loop whose value is never na anywhere in its body.
+
+        ``pine_range`` only ever yields a value that passed its ``<= to`` /
+        ``>= to`` test (a nan or NA bound fails it and ends the loop), so the
+        counter starts every iteration as a real number. It stays one through
+        the body when nothing can rebind it there: no store to the name
+        anywhere in the body (nested scopes included, to stay simple), and no
+        ``global`` / ``nonlocal`` declaration of it in the enclosing function,
+        which is what would let a called closure or another function rebind
+        it mid-body.
+
+        :param node: The loop.
+        :return: The counter name, or None when the fact is not proven.
+        """
+        if not self._functions or not isinstance(node.target, ast.Name) \
+                or not isinstance(node.iter, ast.Call):
+            return None
+        path = _func_path(node.iter.func)
+        if path is None:
+            return None
+        base = path.split('.')[0]
+        entry = self.index.import_map.get(base)
+        if base in self.index.bound or entry is None \
+                or self._resolve(path, path.split('.'), entry) is not pine_range:
+            return None
+        name = node.target.id
+        for stmt in node.body:
+            for child in ast.walk(stmt):
+                if isinstance(child, ast.Name) and child.id == name \
+                        and not isinstance(child.ctx, ast.Load):
+                    return None
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
+                        and child.name == name:
+                    return None
+                if isinstance(child, ast.ExceptHandler) and child.name == name:
+                    return None
+                if isinstance(child, (ast.Import, ast.ImportFrom)) \
+                        and any((alias.asname or alias.name.split('.')[0]) == name
+                                for alias in child.names):
+                    return None
+                if isinstance(child, (ast.MatchAs, ast.MatchStar)) and child.name == name:
+                    return None
+        for child in ast.walk(self._functions[-1]):
+            if isinstance(child, (ast.Global, ast.Nonlocal)) and name in child.names:
+                return None
+        return name
+
+    def visit_For(self, node: ast.For) -> ast.For:
+        node.target = cast(ast.expr, self.visit(node.target))
+        node.iter = cast(ast.expr, self.visit(node.iter))
+        outer = self._counters
+        counter = self._loop_counter(node)
+        if counter is not None:
+            self._counters = outer | {counter}
+        node.body = [cast(ast.stmt, self.visit(stmt)) for stmt in node.body]
+        self._counters = outer
+        node.orelse = [cast(ast.stmt, self.visit(stmt)) for stmt in node.orelse]
+        return node
+
     def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
         # A temporary bound in a class body would become a class attribute
         self._blocked += 1
@@ -1298,9 +1376,16 @@ class CallInlineTransformer(ast.NodeTransformer):
             self.visit(decorator)
         for default in node.args.defaults + [d for d in node.args.kw_defaults if d]:
             self.visit(default)
+        # A nested function may run after the loop that encloses it rebound
+        # the counter, so no outer counter fact carries into its body
+        outer = self._counters
+        self._counters = frozenset()
+        self._functions.append(node)
         self._func_depth += 1
         node.body = [cast(ast.stmt, self.visit(stmt)) for stmt in node.body]
         self._func_depth -= 1
+        self._functions.pop()
+        self._counters = outer
         return node
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AsyncFunctionDef:

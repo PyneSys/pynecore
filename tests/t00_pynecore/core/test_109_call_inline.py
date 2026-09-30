@@ -20,7 +20,7 @@ from pynecore.transformers.call_inline import (
     varargs_expansion_arities,
 )
 from pynecore.transformers.float_tolerance import FloatToleranceTransformer
-from pynecore.types.na import NA, na_float, na_int
+from pynecore.types.na import NA, na_float, na_int, set_bool_na
 
 
 def main():
@@ -322,6 +322,23 @@ def __test_call_inline_differential_pow__():
                 f'pow({base!r}, {literal}): {plain!r} != {inlined!r}'
 
 
+def __test_call_inline_differential_pow_three_state_bool__():
+    """The three-state bool na answers ``==`` with itself (a falsy NA), not
+    False; ``math.pow`` must still see it as na, inlined or not."""
+    set_bool_na(True)
+    try:
+        bool_na = NA(bool)
+        assert isinstance(bool_na, NA)
+        for expression, args in (('lib.math.pow(a0, 2)', (bool_na,)),
+                                 ('lib.math.pow(a0, a1)', (bool_na, 2.0)),
+                                 ('lib.math.pow(a0, a1)', (2.0, bool_na))):
+            plain = __test_helper_probe(expression, args, inline=False)
+            inlined = __test_helper_probe(expression, args, inline=True)
+            assert plain is na_float and inlined is na_float, (expression, plain, inlined)
+    finally:
+        set_bool_na(False)
+
+
 def __test_call_inline_differential_minmax__():
     """``math.max`` / ``math.min`` answer bit-identically at every expanded
     arity, including which ``na`` object they hand back."""
@@ -529,10 +546,11 @@ def __test_call_inline_branch_dependent_import__():
 
 def __test_call_inline_literal_folding__():
     """A literal argument decides the guards it controls at transform time."""
-    # isinstance(2, NA) and 2 != 2 are gone; the shortcut is all that is left
+    # 2 == 2 is gone; the base's na test and the shortcut are all that is left
     emitted = __test_helper_inline("def f(v):\n    return lib.math.pow(v, 2)\n")
-    assert '__inl·py_isinstance__(2' not in emitted
-    assert '2 != 2' not in emitted
+    assert '2 == 2' not in emitted
+    assert 'isinstance' not in emitted
+    assert 'not v == v' in emitted
     assert 'v * v' in emitted
 
     # not 1.0 == 1.0 is gone from the na scan
@@ -546,7 +564,7 @@ def __test_call_inline_literal_folding__():
 
     # A bool is NOT a numeric literal, so nothing folds on it
     emitted = __test_helper_inline("def f(v):\n    return lib.math.pow(v, True)\n")
-    assert '__inl·py_isinstance__(True' in emitted
+    assert 'True == True' in emitted
 
 
 def __test_call_inline_slot_arguments__():
@@ -580,3 +598,116 @@ def __test_helper_clear_caches() -> None:
     """Drop the pass's process-global memos so a source change is seen."""
     call_inline_module = importlib.import_module('pynecore.transformers.call_inline')
     getattr(call_inline_module, '_module_asts').clear()
+
+
+__test_helper_LOOP_PROLOGUE = __test_helper_PROLOGUE + "from pynecore import pine_range\n"
+
+
+def __test_call_inline_loop_counter_fold__():
+    """A ``pine_range`` counter is never na, so the index guard of
+    ``array.get(a, i)`` inside its loop folds away -- and only there."""
+    def emitted_get(body: str) -> str:
+        return __test_helper_inline(body, prologue=__test_helper_LOOP_PROLOGUE)
+
+    plain = emitted_get("def f(a, n):\n"
+                        "    s = 0.0\n"
+                        "    for i in pine_range(0, n, 1):\n"
+                        "        s += lib.array.get(a, i) + lib.math.pow(lib.array.get(a, i), 2)\n"
+                        "    return s\n")
+    assert 'i == i' not in plain
+    assert 'a[__inl·py_int__(i)]' in plain
+
+    kept = (
+        # the counter is rebound in the body
+        "def f(a, n):\n"
+        "    for i in pine_range(0, n, 1):\n"
+        "        i = n\n"
+        "        x = lib.array.get(a, i)\n",
+        "def f(a, n):\n"
+        "    for i in pine_range(0, n, 1):\n"
+        "        if (i := n) > 0:\n"
+        "            x = lib.array.get(a, i)\n",
+        # a nested loop over the same name rebinds it for the rest of the body
+        "def f(a, n):\n"
+        "    for i in pine_range(0, n, 1):\n"
+        "        for i in range(3):\n"
+        "            pass\n"
+        "        x = lib.array.get(a, i)\n",
+        # a closure elsewhere in the function may rebind it mid-body
+        "def f(a, n):\n"
+        "    def g():\n"
+        "        nonlocal i\n"
+        "        i = n\n"
+        "    i = 0\n"
+        "    for i in pine_range(0, n, 1):\n"
+        "        g()\n"
+        "        x = lib.array.get(a, i)\n",
+        "def f(a, n):\n"
+        "    global i\n"
+        "    for i in pine_range(0, n, 1):\n"
+        "        x = lib.array.get(a, i)\n",
+        # not a pine_range loop
+        "def f(a, n):\n"
+        "    for i in range(n):\n"
+        "        x = lib.array.get(a, i)\n",
+        # after the loop, in its else branch, and in a nested function
+        "def f(a, n):\n"
+        "    for i in pine_range(0, n, 1):\n"
+        "        pass\n"
+        "    x = lib.array.get(a, i)\n",
+        "def f(a, n):\n"
+        "    for i in pine_range(0, n, 1):\n"
+        "        pass\n"
+        "    else:\n"
+        "        x = lib.array.get(a, i)\n",
+        "def f(a, n):\n"
+        "    for i in pine_range(0, n, 1):\n"
+        "        def g():\n"
+        "            return lib.array.get(a, i)\n",
+    )
+    for body in kept:
+        assert 'not i == i' in emitted_get(body), body
+
+    # A user-bound ``pine_range`` is not the library's
+    shadowed = __test_helper_inline("def pine_range(a, b, c):\n"
+                                    "    return [float('nan')]\n"
+                                    "def f(a, n):\n"
+                                    "    for i in pine_range(0, n, 1):\n"
+                                    "        x = lib.array.get(a, i)\n",
+                                    prologue=__test_helper_PROLOGUE)
+    assert 'not i == i' in shadowed
+
+
+def __test_call_inline_loop_counter_results__():
+    """Folded loops answer exactly what the calls answered, including loops
+    whose bounds, steps or direction take the generator path."""
+    source = ("def probe(a, lo, hi, step):\n"
+              "    out = []\n"
+              "    for i in pine_range(lo, hi, step):\n"
+              "        out.append((lib.array.get(a, i), lib.math.pow(lib.array.get(a, i), 2)))\n"
+              "        if len(out) > 50:\n"
+              "            break\n"
+              "    return out\n")
+    probes = []
+    for inline in (False, True):
+        tree = ast.parse(__test_helper_LOOP_PROLOGUE + source)
+        if inline:
+            transformer = CallInlineTransformer()
+            tree = transformer.visit(tree)
+            assert transformer.inlined == 3
+        ast.fix_missing_locations(tree)
+        namespace: dict[str, Any] = {}
+        exec(compile(tree, '<probe>', 'exec'), namespace)  # noqa: the test's own source
+        probes.append(namespace['probe'])
+    array = [1.5, float('nan'), -2.0, 3.25, 0.0, 7.0]
+    nan = float('nan')
+    for bounds in ((0, 5, 1), (5, 0, 1), (0, 5, 2), (0.5, 4.5, 1), (0, 5, 1.5), (0, -3, 1),
+                   (nan, 3, 1), (0, nan, 1), (0, 3, nan), (NA(None), 3, 1), (0, NA(None), 1)):
+        results = []
+        for probe in probes:
+            try:
+                results.append([tuple(__test_helper_bits(v) for v in pair)
+                                for pair in probe(array, *bounds)])
+            except Exception as exc:  # noqa: the exception TYPE is the compared result
+                results.append(type(exc))
+        assert results[0] == results[1], bounds

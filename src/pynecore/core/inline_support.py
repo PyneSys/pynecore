@@ -4,7 +4,7 @@ Name anchors for the call-inlining pass.
 :class:`~pynecore.transformers.call_inline.CallInlineTransformer` copies the
 body of a handful of trivial Pine builtins into the call site as one
 expression. The copied body keeps referring to whatever its own module
-referred to -- ``na_float``, ``builtins``, ``math``, ``isinstance`` -- and
+referred to -- ``na_float``, ``builtins``, ``math``, ``int`` -- and
 those names mean something else in a script: ``math`` is ``pynecore.lib.math``
 there, and ``BuiltinShadowTransformer`` lets a script rebind ``abs`` or
 ``float`` outright.
@@ -28,7 +28,7 @@ from ..types.na import NA, na_float, na_int
 __all__ = [
     'NA', 'na_float', 'na_int',
     'py_builtins', 'py_math', 'pine_math', 'fdlibm',
-    'py_float', 'py_int', 'py_isinstance', 'py_len',
+    'py_float', 'py_int', 'py_len',
     'array_na_element', 'math_na_of_operands',
 ]
 
@@ -42,5 +42,4 @@ py_math = math
 #: the call site's own name for them.
 py_float = builtins.float
 py_int = builtins.int
-py_isinstance = builtins.isinstance
 py_len = builtins.len
