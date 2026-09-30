@@ -7,6 +7,25 @@ from ..types.pine_types import pine_int
 _NEG_INF = -inf
 
 
+class _ZeroDivisor:
+    """
+    Stand-in for a zero divisor on the fast path of an inlined division.
+
+    ``SafeDivisionTransformer`` divides by ``b or zero_divisor``: a falsy ``b``
+    is replaced by this object before the division can raise. Every numeric
+    type defers to the reflected method for an unknown operand, and the nan it
+    answers fails the quotient's self-equality test, so the expression falls
+    back to :func:`safe_div` with the original operands.
+    """
+    __slots__ = ()
+
+    def __rtruediv__(self, _: object) -> float:
+        return na_float
+
+
+zero_divisor = _ZeroDivisor()
+
+
 def safe_div(a: PyneFloat, b: PyneFloat):
     """
     Safe division mimicking Pine Script semantics.
@@ -21,11 +40,11 @@ def safe_div(a: PyneFloat, b: PyneFloat):
     @param b: The denominator.
     @return: a/b, raw inf/-inf/nan on zero denominator, or nan for na inputs.
     """
-    if not (a == a) or not (b == b):  # is_na_arg
-        return na_float
     try:
-        return a / b
+        result = a / b
     except ZeroDivisionError:
+        if not (a == a):
+            return na_float
         if a > 0:
             return inf
         if a < 0:
@@ -33,6 +52,21 @@ def safe_div(a: PyneFloat, b: PyneFloat):
         return na_float
     except TypeError:
         return na_float
+    except Exception:
+        # A na operand answers na before any division error surfaces
+        if not (a == a) or not (b == b):
+            return na_float
+        raise
+    # The quotient is tested instead of the operands: a nan or ``NA`` operand
+    # always yields a quotient that fails ``==``, so one test clears the common
+    # case. Only a failing quotient needs the operand tests, because a na
+    # operand answers the interned ``na_float``, while ``inf / inf`` on two
+    # finite-typed operands keeps its own computed nan.
+    if result == result:
+        return result
+    if not (a == a) or not (b == b):  # is_na_arg
+        return na_float
+    return result
 
 
 def safe_float(value: PyneFloat) -> float:
