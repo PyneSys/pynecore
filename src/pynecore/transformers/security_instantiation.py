@@ -64,10 +64,51 @@ class _FuncInfo:
 
 def _ordered_walk(node: ast.AST):
     """DFS in source order (``ast.walk`` is BFS; clone/call-site numbering
-    must be stable and follow the source)."""
-    yield node
-    for child in ast.iter_child_nodes(node):
-        yield from _ordered_walk(child)
+    must be stable and follow the source).
+
+    Iterative: a recursive generator pays one ``yield from`` hop per tree level
+    for every node it hands out.
+    """
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        yield current
+        stack.extend(reversed(list(ast.iter_child_nodes(current))))
+
+
+class _RegionIndex:
+    """Name references of one scope region, gathered in a single walk.
+
+    ``_analyze`` asks the same two questions — "where is ``name`` called?" and
+    "is ``name`` referenced any other way?" — for every candidate function of
+    the region; answering them from one walk keeps an analysis round linear in
+    the tree size instead of one full-region walk per candidate.
+    """
+
+    __slots__ = ('call_sites', 'non_call_refs')
+
+    def __init__(self, region: ast.AST):
+        # Direct-Name call sites per callee name, in source order. Sites
+        # inside a nested def that redefines the name are not excluded:
+        # the duplicate-name bail-out in ``_analyze`` disqualifies the
+        # whole function instead
+        self.call_sites: dict[str, list[ast.Call]] = {}
+        # Names referenced outside a direct-call func position (alias,
+        # callback argument, store, ...) or declared global / nonlocal
+        self.non_call_refs: set[str] = set()
+        call_funcs: set[int] = set()
+        for n in _ordered_walk(region):
+            if isinstance(n, ast.Call):
+                func = n.func
+                if isinstance(func, ast.Name):
+                    # Pre-order: the call is seen before its func child
+                    call_funcs.add(id(func))
+                    self.call_sites.setdefault(func.id, []).append(n)
+            elif isinstance(n, ast.Name):
+                if id(n) not in call_funcs:
+                    self.non_call_refs.add(n.id)
+            elif isinstance(n, (ast.Global, ast.Nonlocal)):
+                self.non_call_refs.update(n.names)
 
 
 class SecurityInstantiationTransformer:
@@ -76,7 +117,6 @@ class SecurityInstantiationTransformer:
 
     def __init__(self):
         self._clones_made = 0
-        self._module: ast.Module | None = None
 
     # --- collection ---
 
@@ -117,63 +157,35 @@ class SecurityInstantiationTransformer:
         scan_body(module.body, module)
         return result
 
-    @staticmethod
-    def _call_sites(region: ast.AST, name: str) -> list[ast.Call]:
-        """Direct-Name call sites of ``name`` within ``region`` in source
-        order, excluding sites inside a nested def that redefines the name
-        (approximated: shadowing defs disqualify the whole function via
-        duplicate-name bail-out in ``_analyze``)."""
-        return [n for n in _ordered_walk(region)
-                if isinstance(n, ast.Call)
-                and isinstance(n.func, ast.Name) and n.func.id == name]
-
-    @staticmethod
-    def _non_call_refs(region: ast.AST, name: str,
-                       own_def: ast.AST) -> bool:
-        """Whether ``name`` is referenced outside its own def and outside a
-        direct-call func position (alias, callback argument, store, ...)."""
-        call_funcs = {
-            id(n.func) for n in _ordered_walk(region)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-        }
-        for n in _ordered_walk(region):
-            if n is own_def:
-                continue
-            if isinstance(n, ast.Name) and n.id == name and id(n) not in call_funcs:
-                return True
-            if isinstance(n, (ast.Global, ast.Nonlocal)) and name in n.names:
-                return True
-        return False
-
     # --- analysis ---
 
-    def _analyze(self, module: ast.Module,
-                 min_sites: int = 2) -> tuple[list[_FuncInfo], set[str]]:
-        """Return (eligible security-bearing functions with at least
-        ``min_sites`` call sites, bearing name set). Eligibility applies every
-        bail-out."""
+    def _analyze(self, module: ast.Module, min_sites: int = 2
+                 ) -> list[tuple[_FuncInfo, list[ast.Call]]]:
+        """Return the eligible security-bearing functions with at least
+        ``min_sites`` direct-Name call sites, each with its call sites in
+        source order. Eligibility applies every bail-out."""
         infos = self._collect_functions(module)
 
         by_name: dict[str, list[_FuncInfo]] = {}
         for info in infos:
             by_name.setdefault(info.node.name, []).append(info)
 
-        # Direct bearers: subtree contains a security call.
+        # Direct bearers (subtree contains a security call) and name-level
+        # call edges among module functions (for transitivity and cycle
+        # detection), from one walk per function.
         bearing: set[str] = set()
-        for info in infos:
-            if any(self._is_security_call(n) for n in _ordered_walk(info.node)):
-                bearing.add(info.node.name)
-
-        # Name-level call edges among module functions (for transitivity and
-        # cycle detection).
         edges: dict[str, set[str]] = {}
         for info in infos:
-            callees = {
-                n.func.id for n in _ordered_walk(info.node)
-                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                and n.func.id in by_name
-            }
-            edges.setdefault(info.node.name, set()).update(callees)
+            name = info.node.name
+            callees = edges.setdefault(name, set())
+            for n in _ordered_walk(info.node):
+                if not isinstance(n, ast.Call):
+                    continue
+                if self._is_security_call(n):
+                    bearing.add(name)
+                func = n.func
+                if isinstance(func, ast.Name) and func.id in by_name:
+                    callees.add(func.id)
 
         # Transitive closure: calling a bearer makes the caller a bearer.
         changed = True
@@ -203,7 +215,10 @@ class SecurityInstantiationTransformer:
             if reaches(name, name, set()):
                 on_cycle.add(name)
 
-        eligible: list[_FuncInfo] = []
+        # One index per scope region, built only for regions that hold a
+        # candidate, and shared by every candidate of that region.
+        regions: dict[int, _RegionIndex] = {}
+        eligible: list[tuple[_FuncInfo, list[ast.Call]]] = []
         for info in infos:
             name = info.node.name
             if name not in bearing or name in on_cycle:
@@ -212,35 +227,40 @@ class SecurityInstantiationTransformer:
                 continue
             if info.node.decorator_list:
                 continue
-            if self._non_call_refs(info.region, name, info.node):
+            index = regions.get(id(info.region))
+            if index is None:
+                index = regions[id(info.region)] = _RegionIndex(info.region)
+            if name in index.non_call_refs:
                 continue
-            if len(self._call_sites(info.region, name)) >= min_sites:
-                eligible.append(info)
-        return eligible, bearing
+            sites = index.call_sites.get(name, [])
+            if len(sites) >= min_sites:
+                eligible.append((info, sites))
+        return eligible
 
     # --- cloning ---
 
-    def _unique_name(self, base: str) -> str:
-        """Collision-free clone name (module-wide check; the global clone
-        counter keeps names unique even across nested re-instantiation)."""
-        assert self._module is not None
-        existing = {
-            n.name for n in _ordered_walk(self._module)
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
+    def _unique_name(self, base: str, existing: set[str]) -> str:
+        """Collision-free clone name against ``existing`` (every function name
+        of the module); the global clone counter keeps names unique even
+        across nested re-instantiation. The chosen name is added to
+        ``existing``."""
         candidate = f"{base}__pyne_inst{self._clones_made}"
         while candidate in existing:
             candidate += "_"
+        existing.add(candidate)
         return candidate
 
     def _clone_one(self, module: ast.Module) -> bool:
         """Clone the first eligible multi-site bearer; True if work was done."""
-        eligible, _ = self._analyze(module)
+        eligible = self._analyze(module)
         if not eligible:
             return False
-        info = eligible[0]
+        info, sites = eligible[0]
         name = info.node.name
-        sites = self._call_sites(info.region, name)
+        existing = {
+            n.name for n in ast.walk(module)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
         # Re-locate the def index (earlier clones may have shifted the body).
         index = info.owner_body.index(info.node)
         # Call site 1 keeps the original function; each further site gets a
@@ -254,7 +274,7 @@ class SecurityInstantiationTransformer:
                     f"too large to instantiate per call site"
                 )
             clone = copy.deepcopy(info.node)
-            clone.name = self._unique_name(name)
+            clone.name = self._unique_name(name, existing)
             info.owner_body.insert(index + k - 1, clone)
             site_func = site.func
             assert isinstance(site_func, ast.Name)
@@ -330,9 +350,7 @@ class SecurityInstantiationTransformer:
 
     def _specialize_all(self, module: ast.Module) -> None:
         """Pin call-site constants into every single-site security bearer."""
-        eligible, _ = self._analyze(module, min_sites=1)
-        for info in eligible:
-            sites = self._call_sites(info.region, info.node.name)
+        for info, sites in self._analyze(module, min_sites=1):
             if len(sites) != 1:
                 continue
             self._specialize(info, sites[0])
@@ -342,7 +360,6 @@ class SecurityInstantiationTransformer:
     def visit(self, module: ast.Module) -> ast.Module:
         if not any(self._is_security_call(n) for n in ast.walk(module)):
             return module
-        self._module = module
         # Fixpoint: cloning a caller duplicates its callees' call sites, so
         # re-analyze until no eligible multi-site bearer remains. Bounded by
         # the clone cap (each iteration makes at least one clone).

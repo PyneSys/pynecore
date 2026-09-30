@@ -1558,13 +1558,19 @@ class SecurityTransformer(ast.NodeTransformer):
             the contexts whose arguments are stable
         """
         call_sites, load_counts = self._call_sites_by_name(module)
+        # Every context's walk passes through the script entry, and the tree
+        # is only read here, so each function's bindings are computed once.
+        bindings_of: dict[int, tuple[dict[str, ast.Assign], set[str]]] = {}
 
         def resolve(func: ast.FunctionDef | ast.AsyncFunctionDef,
                     args: list[ast.expr], depth: int) -> tuple[str, ...] | None:
             """The stable dumps of ``args`` as evaluated in ``func``, or None."""
             if depth > _MAX_LIFT_ROUNDS:
                 return None
-            hoistable, stable_params = self._hoistable_bindings(func)
+            found = bindings_of.get(id(func))
+            if found is None:
+                found = bindings_of[id(func)] = self._hoistable_bindings(func)
+            hoistable, stable_params = found
             available = set(hoistable) | stable_params
             if not all(self._is_simple_chain(a, available) for a in args):
                 return None

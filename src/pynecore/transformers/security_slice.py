@@ -598,10 +598,17 @@ class SecuritySliceTransformer(ast.NodeTransformer):
             # The unit's first member names the clone: its index is its own,
             # so no other unit can pick the same name.
             name = f'{CLONE_PREFIX}{unit[0][0]}{CLONE_SUFFIX}'
-            clone = _build_clone(node, main, whole if kept is None else kept, name)
-            guarded = {sid for _index, sid, ctx in unit
-                       if _ctx_get(ctx, 'ohlcv_fields') is None
-                       and not _write_reached(clone.body, sid)}
+            if kept is None:
+                # A whole clone is a copy of ``main()``'s body, so the writes it
+                # would reach are judged on ``main()`` itself, and a unit with
+                # nothing to force is dropped before paying for the copy.
+                guarded = _guarded_sids(unit, main.body)
+                if not guarded:
+                    continue
+                clone = _build_clone(main, whole, name)
+            else:
+                clone = _build_clone(main, kept, name)
+                guarded = _guarded_sids(unit, clone.body)
             forced = bool(guarded) and _force_conditional_writes(node, clone, guarded)
             if kept is None and not forced:
                 # Nothing to gain: the clone would be ``main()`` itself.
@@ -878,8 +885,8 @@ def _ctx_group(ctx: ast.Dict) -> int | None:
 #: ``varip`` slot the child's re-tick rollback leaves alone, so a period whose
 #: developing rounds are skipped would reach them a different number of times.
 #: ``ta.valuewhen`` pushes its occurrence ring once per execution (see
-#: ``lib/ta.py``); ``_math_stateful``'s only ``varip`` is a memo of a walk the
-#: rolled-back state reproduces, so its value does not depend on the count.
+#: ``lib/ta.py``); ``math.sum``'s machine is a self-restoring ``var`` slot the
+#: rollback puts back whole, so its value does not depend on the count.
 _PER_EXECUTION_LIB_CALLS = frozenset({'valuewhen'})
 
 #: Pure Python builtins a call may name without a body to read: none of them
@@ -904,7 +911,7 @@ def _is_varip_annotation(annotation: ast.expr) -> bool:
     return False
 
 
-def _pynecore_imported_names(module: ast.Module) -> set[str]:
+def _pynecore_imported_names(nodes: list[ast.AST]) -> set[str]:
     """Names an import of the PYNECORE package binds.
 
     Such a name stands for a library function, and the library's per-execution
@@ -913,11 +920,11 @@ def _pynecore_imported_names(module: ast.Module) -> set[str]:
     An import of any other module binds a body this module does not hold and is
     not in here (:func:`_imported_names`).
 
-    :param module: The lowered module.
+    :param nodes: Every node of the lowered module.
     :return: The bound names.
     """
     names: set[str] = set()
-    for node in ast.walk(module):
+    for node in nodes:
         if isinstance(node, ast.ImportFrom):
             if _is_pynecore_module(node.module):
                 for alias in node.names:
@@ -1020,7 +1027,7 @@ def _chain_root_name(node: ast.expr) -> str | None:
     return root.id if isinstance(root, ast.Name) else None
 
 
-def _imported_names(module: ast.Module) -> set[str]:
+def _imported_names(nodes: list[ast.AST]) -> set[str]:
     """Names an import of a NON-pynecore module binds.
 
     A subset of :func:`_rebound_names` narrow enough to judge an ARGUMENT by:
@@ -1029,11 +1036,11 @@ def _imported_names(module: ast.Module) -> set[str]:
     scan cannot see. An ordinary variable is not in here, so a value argument
     never trips the check.
 
-    :param module: The lowered module.
+    :param nodes: Every node of the lowered module.
     :return: The bound names.
     """
     names: set[str] = set()
-    for node in ast.walk(module):
+    for node in nodes:
         if isinstance(node, ast.ImportFrom):
             if not _is_pynecore_module(node.module):
                 for alias in node.names:
@@ -1045,7 +1052,7 @@ def _imported_names(module: ast.Module) -> set[str]:
     return names
 
 
-def _rebound_names(module: ast.Module) -> set[str]:
+def _rebound_names(nodes: list[ast.AST]) -> set[str]:
     """Names an assignment, a parameter, or a ``for``/``with``/comprehension
     target binds.
 
@@ -1061,9 +1068,12 @@ def _rebound_names(module: ast.Module) -> set[str]:
     helper import abs`` and ``import helper as abs`` both bind an opaque user
     callable to a spelling :data:`_SAFE_BUILTIN_CALLS` would otherwise trust as
     a builtin, and the attribute root of ``helper.counter()`` is the same name.
+
+    :param nodes: Every node of the lowered module.
+    :return: The bound names.
     """
-    names: set[str] = _imported_names(module)
-    for node in ast.walk(module):
+    names: set[str] = _imported_names(nodes)
+    for node in nodes:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             args = node.args
             for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs,
@@ -1362,6 +1372,20 @@ def _write_reached(stmts: list[ast.stmt], sid: str) -> bool:
     return _node_reached(targets[0], stmts, frozenset())
 
 
+def _guarded_sids(unit: list[tuple[int, str, ast.Dict]], stmts: list[ast.stmt]) -> set[str]:
+    """The unit's contexts whose write does not run on every execution of ``stmts``.
+
+    A plain-OHLCV member is never among them: its child does not run the
+    clone at all.
+
+    :param unit: ``(index, sid, context dict)`` per member
+    :param stmts: The statements the child runs, in order.
+    :return: The sids whose write is guarded.
+    """
+    return {sid for _index, sid, ctx in unit
+            if _ctx_get(ctx, 'ohlcv_fields') is None and not _write_reached(stmts, sid)}
+
+
 def _finalize_closed_shift(module: ast.Module, contexts: ast.Dict,
                            sliced: dict[str, list[ast.stmt]]) -> None:
     """Clear ``closed_shift`` wherever the child's rounds are observable.
@@ -1394,12 +1418,14 @@ def _finalize_closed_shift(module: ast.Module, contexts: ast.Dict,
                   if _ctx_closed_shift(ctx) is not None]
     if not candidates:
         return
+    # One walk of the module, clones included, serves all three scans.
+    nodes = list(ast.walk(module))
     funcs: dict[str, list[ast.AST]] = {}
-    for node in ast.walk(module):
+    for node in nodes:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             funcs.setdefault(node.name, []).append(node)
-    rebound = _rebound_names(module)
-    pyne_imported = _pynecore_imported_names(module)
+    rebound = _rebound_names(nodes)
+    pyne_imported = _pynecore_imported_names(nodes)
     main = _find_main(module)
     whole: bool | None = None
     for sid, ctx in candidates:
@@ -2225,7 +2251,7 @@ def _force_conditional_writes(module: ast.Module, clone: ast.FunctionDef,
     nested = _nested_defs(clone)
     shared = {name: nodes for name, nodes in outer.items() if name not in nested}
     reaching_shared = _reaching_defs(shared, hit)
-    memo: dict[int, object] = {id(module): module}
+    memo: dict[int, object] = {}
     copies = [copy.deepcopy(node, memo)
               for name in sorted(reaching_shared) for node in shared[name]]
 
@@ -2257,8 +2283,7 @@ def _force_conditional_writes(module: ast.Module, clone: ast.FunctionDef,
     return forcer.changed or shared_forcer.changed
 
 
-def _build_clone(module: ast.Module, main: ast.FunctionDef, kept: list[int],
-                 name: str) -> ast.FunctionDef:
+def _build_clone(main: ast.FunctionDef, kept: list[int], name: str) -> ast.FunctionDef:
     """Build the clone function from ``main``'s signature and the kept body.
 
     The clone carries no ``@script.*`` decorator — it is not an entry point the
@@ -2268,15 +2293,11 @@ def _build_clone(module: ast.Module, main: ast.FunctionDef, kept: list[int],
     the copied default expressions only stay in the signature so the lowering
     passes see the same ``input`` calls in it that ``main`` has.
 
-    Only the KEPT statements are copied, and the copy stops at the module:
-    ``ModulePropertyTransformer`` leaves a ``parent`` back-reference on every
-    node, so a copy that walked out of the slice would drag the whole module
-    behind it — including the clones emitted before this one, which would make
-    the emission quadratic. Seeding the memo with the module maps that edge
-    onto the module itself, and sharing one memo across the statements of a
-    clone copies the objects hanging off them once.
+    Only the KEPT statements are copied, through one memo shared across the
+    statements of the clone, so an object hanging off several of them is copied
+    once.
     """
-    memo: dict[int, object] = {id(module): module}
+    memo: dict[int, object] = {}
     clone = copy.copy(main)
     clone.name = name
     clone.decorator_list = []

@@ -31,19 +31,26 @@ class ModulePropertyTransformer(ast.NodeTransformer):
         except (IOError, json.JSONDecodeError) as e:
             raise RuntimeError(f"Failed to load module properties config: {e}")
 
+        # Child -> parent links of this pass, kept here rather than on the nodes:
+        # ``ast.parse`` shares one instance of every context and operator node
+        # (``Load``, ``Add``, ``Eq``, ...) across ALL trees of the process, so a
+        # link stored on a node would tie those singletons to this tree, and
+        # every later ``copy.deepcopy`` of a subtree — in this transform or in
+        # the next one — would copy the whole tree it leads back to.
+        self._parents: dict[ast.AST, ast.AST] = {}
+
     def visit(self, node: ast.AST) -> ast.AST:
         """
-        Override the generic visit method to set .parent on each child node
-        for chain detection.
+        Override the generic visit method to record the parent of each child
+        node for chain detection.
         """
-        # Set parent on children
         for field, value in ast.iter_fields(node):
             if isinstance(value, ast.AST):
-                setattr(value, "parent", node)
+                self._parents[value] = node
             elif isinstance(value, list):
                 for item in value:
                     if isinstance(item, ast.AST):
-                        setattr(item, "parent", node)
+                        self._parents[item] = node
 
         return super().visit(node)
 
@@ -56,7 +63,7 @@ class ModulePropertyTransformer(ast.NodeTransformer):
             return node
 
         # Retrieve the AST parent node
-        parent = getattr(node, 'parent', None)
+        parent = self._parents.get(node)
 
         # Intermediate module - if the parent is also an Attribute, this is not the topmost attribute
         if isinstance(parent, ast.Attribute):
@@ -167,8 +174,8 @@ class ModulePropertyTransformer(ast.NodeTransformer):
     def _is_in_type_annotation(self, node: ast.Attribute) -> bool:
         """Check if the node is inside a type annotation."""
         current = node
-        while hasattr(current, 'parent'):
-            parent = getattr(current, 'parent', None)
+        while current in self._parents:
+            parent = self._parents[current]
 
             # Check if we're in an annotated assignment's annotation
             if (isinstance(parent, ast.AnnAssign) and parent.annotation and

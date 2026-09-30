@@ -7,6 +7,7 @@ self-named function, unknown names on known pynecore.lib modules raise at
 transform time, and everything else stays a plain attribute access.
 """
 import ast
+import copy
 
 import pytest
 
@@ -87,3 +88,21 @@ def __test_annotation_untouched__():
 
 def __test_non_lib_rooted_untouched__():
     assert _transform("x = other.ta.tr") == "x = other.ta.tr"
+
+
+def __test_transform_leaves_no_parent_links__():
+    """The pass keeps its parent links to itself.
+
+    ``ast.parse`` shares its context and operator nodes (``Load``, ``Add``)
+    between every tree of the process, so a link stored on one of them would
+    tie a later, unrelated tree to this one, and a ``deepcopy`` of any part of
+    that later tree would copy this whole tree along.
+    """
+    tree = ast.parse("x = lib.close + y\nz = lib.ta.tr\nw: lib.ta.tr = 1")
+    ModulePropertyTransformer().visit(tree)
+    assert not any(hasattr(node, 'parent') for node in ast.walk(tree))
+
+    later = ast.parse("a = b + c")
+    memo: dict[int, object] = {}
+    copy.deepcopy(later.body[0], memo)
+    assert not any(isinstance(obj, ast.Module) for obj in memo.values())
