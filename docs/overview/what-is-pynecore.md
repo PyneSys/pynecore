@@ -22,10 +22,10 @@ PyneCore is an innovative, open-source framework that brings the power of Tradin
 PyneCore is validated against TradingView on <!--wild:scripts_total-->850<!--/wild--> published
 TradingView scripts (Pine Script v4–v6, converted to Pyne code with [PyneComp](https://pynesys.io)):
 all <!--wild:tv_verified-->1,142<!--/wild--> comparable outputs match,
-<!--wild:bars_exact_pct-->99.734<!--/wild-->% of
+<!--wild:bars_exact_pct-->99.744<!--/wild-->% of
 <!--wild:bars_compared_millions-->106<!--/wild--> million plotted values are bit-identical, and
 <!--wild:strategy_trades-->302,523<!--/wild--> strategy trades match TradingView's timing
-(snapshot <!--wild:generated_at-->2026-09-29<!--/wild-->, [Pyne in the
+(snapshot <!--wild:generated_at-->2026-09-30<!--/wild-->, [Pyne in the
 Wild](https://wild.pynesys.io/)). See [Compatibility](./compatibility.md) for details.
 
 ## The PyneCore Vision
@@ -143,7 +143,7 @@ Learn more about the NA system in the [Core Concepts](./core-concepts.md#5-na-no
 - **Open Source**: Core functionality is open source and free to use (Apache 2.0 license)
 - **Modern**: Type hints, error handling, and comprehensive documentation (always improving)
 - **Precise**: All <!--wild:tv_verified-->1,142<!--/wild--> comparable outputs of <!--wild:scripts_total-->850<!--/wild--> published TradingView scripts
-  match TradingView; <!--wild:bars_exact_pct-->99.734<!--/wild-->% of <!--wild:bars_compared_millions-->106<!--/wild--> million plotted values are
+  match TradingView; <!--wild:bars_exact_pct-->99.744<!--/wild-->% of <!--wild:bars_compared_millions-->106<!--/wild--> million plotted values are
   bit-identical, and the largest relative gap anywhere is <!--wild:max_rel-->1.2 × 10⁻¹⁰<!--/wild-->
 
 ## Who Is PyneCore For?
