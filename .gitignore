@@ -49,8 +49,9 @@ dist/
 # Others
 uv.lock
 
-# Native math extension build products (source is _native_math.pyx)
+# Native extension build products (sources are the .pyx files next to them)
 src/pynecore/core/_native_math.c
+src/pynecore/core/_native_rolling_sum.c
 *.so
 *.pyd
 wheelhouse/

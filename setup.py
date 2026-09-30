@@ -1,10 +1,12 @@
-"""Build hook for PyneCore's one optional compiled extension.
+"""Build hook for PyneCore's optional compiled extensions.
 
-All package metadata lives in ``pyproject.toml``; this file only declares
-``pynecore.core._native_math``, the compiled twin of the pure-Python transcendental
-functions in ``core/pine_math.py`` and ``core/fdlibm.py``.
+All package metadata lives in ``pyproject.toml``; this file only declares the two
+extensions: ``pynecore.core._native_math``, the compiled twin of the pure-Python
+transcendental functions in ``core/pine_math.py`` and ``core/fdlibm.py``, and
+``pynecore.core._native_rolling_sum``, the compiled twin of the ``math.sum`` machine in
+``core/rolling_sum.py``.
 
-The extension is optional in every sense: a platform without a C compiler, or a
+The extensions are optional in every sense: a platform without a C compiler, or a
 compile that fails, still installs a working package that runs the pure-Python
 implementations, and ``PYNE_BUILD_PURE=1`` builds the pure wheel on purpose (the one
 WebAssembly runtimes and unlisted platforms install).
@@ -15,7 +17,7 @@ import sys
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 
-# The compiled functions must round every operation exactly as the Python originals
+# The compiled code must round every operation exactly as the Python originals
 # do. clang and gcc may fuse ``a * b + c`` into one FMA instruction unless told not to
 # (clang does by default, and arm64 always has FMA), which changes last bits; fast-math
 # would additionally reorder sums. MSVC contracts only under /fp:fast or /fp:contract.
@@ -46,7 +48,7 @@ class OptionalBuildExt(build_ext):
 
     @staticmethod
     def _warn(exc: Exception) -> None:
-        print(f"WARNING: pynecore native math extension not built ({exc}); "
+        print(f"WARNING: a pynecore native extension was not built ({exc}); "
               f"the pure-Python implementation will be used.", file=sys.stderr)
 
 
@@ -56,11 +58,13 @@ def _extensions() -> list[Extension]:
     try:
         from Cython.Build import cythonize
     except ImportError:
-        print("WARNING: Cython not available; building without the native math extension.",
+        print("WARNING: Cython not available; building without the native extensions.",
               file=sys.stderr)
         return []
     return cythonize(
-        [Extension('pynecore.core._native_math', ['src/pynecore/core/_native_math.pyx'])],
+        [Extension('pynecore.core._native_math', ['src/pynecore/core/_native_math.pyx']),
+         Extension('pynecore.core._native_rolling_sum',
+                   ['src/pynecore/core/_native_rolling_sum.pyx'])],
         compiler_directives={'language_level': 3},
     )
 

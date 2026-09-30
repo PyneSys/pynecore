@@ -237,6 +237,9 @@ NON_TRANSFORMABLE_FUNCTIONS = {
 
     'method_call', 'pine_range',
 
+    # ``lib.math.sum``'s machine step: the state lives in the machine it is handed
+    'rolling_sum_step',
+
     # Line functions
     'lib.line.new', 'lib.line.copy', 'lib.line.delete', 'lib.line.get_price', 'lib.line.get_x1',
     'lib.line.get_x2', 'lib.line.get_y1', 'lib.line.get_y2', 'lib.line.set_color', 'lib.line.set_extend',

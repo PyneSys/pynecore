@@ -56,6 +56,18 @@ as ``func.__pyne_layout__``. An entry is a plain dict with these keys:
     rolling windows of the builtin machines, which skip na bars on purpose,
     so the per-bar forward fill of :meth:`SeriesImpl.add` must stay off.
 
+Self-restoring slot values
+--------------------------
+
+A ``var`` slot may hold an object that rolls itself back: its type defines
+``__pyne_snapshot__()``, returning an opaque token of the object's current
+state, and ``__pyne_restore__(token)``, putting that state back in place.
+Every rollback here (the loop-site one, the var and child-subtree ones)
+snapshots and restores such a value through the pair instead of copying it,
+and the slot keeps naming the same object. ``math.sum`` keeps its whole
+machine in one (``core.rolling_sum.SumMachine``), which makes the per-iteration
+rollback of a loop call site O(1).
+
 Call shapes emitted by the transformer:
 
 - fast path, straight-line site::
@@ -324,16 +336,18 @@ def _snap_collected(vecs: list) -> list:
     loop call site turns that into the run's hottest loop (issue #80).
     Builtin machine persistents hold scalars or FLAT scalar containers by
     construction, so a shallow container copy is a faithful baseline (and the
-    restore may share its elements); anything else falls back to
+    restore may share its elements); a self-restoring value (see the module
+    docstring) is kept with its token; anything else falls back to
     :func:`_copy_value`.
 
     :param vecs: ``(state, layout)`` pairs of the machines to snapshot.
-    :return: One ``(state, direct, copied, series)`` entry per machine.
+    :return: One ``(state, direct, copied, series, native)`` entry per machine.
     """
     snaps: list = []
     for vec, layout_ in vecs:
         direct: list = []
         copied: list = []
+        native: list = []
         for i in _var_slots_of(layout_):
             value = vec[i]
             t = type(value)
@@ -341,20 +355,56 @@ def _snap_collected(vecs: list) -> list:
                 direct.append((i, value))
             elif t is list:
                 copied.append((i, value.copy()))
+            elif getattr(t, '__pyne_snapshot__', None) is not None:
+                native.append((i, value, value.__pyne_snapshot__()))
             else:
                 copied.append((i, _copy_value(value)))
         snaps.append((vec, tuple(direct), tuple(copied),
                       tuple((slot, vec[slot]._snapshot())  # noqa: cooperating core internals
-                            for slot, _max_bars_back, _elem in layout_['series'])))
+                            for slot, _max_bars_back, _elem in layout_['series']),
+                      tuple(native)))
     return snaps
 
 
-def _snap_builtins(state: list, layout: dict[str, Any]) -> tuple[int, list]:
+def _stamp(snaps: list) -> tuple[int, list, tuple | None]:
+    """Stamp a bar-start snapshot with the state epoch it was collected at, and
+    flatten it for the per-iteration restore when it holds nothing but slot
+    values written straight back and self-restoring values.
+
+    The flat form is ``(direct, native)``: ``(vec, slot, value)`` writes and
+    ``(vec, slot, value, restore, token)`` self-restores, over every machine at
+    once. A shared loop call site restores once per ITERATION, and there the
+    per-machine walk over mostly empty groups costs more than the writes —
+    ``math.sum`` restores through a single ``restore(token)`` call.
+
+    :param snaps: The :func:`_snap_collected` entries.
+    :return: ``(epoch, snaps, flat)``, ``flat`` None when a container or a
+        series has to be rolled back.
+    """
+    direct: list = []
+    native: list = []
+    for vec, values, copied, series, restorable in snaps:
+        if copied or series:
+            return _state_epoch, snaps, None
+        for i, value in values:
+            direct.append((vec, i, value))
+        for i, value, token in restorable:
+            native.append((vec, i, value, value.__pyne_restore__, token))
+    return _state_epoch, snaps, (tuple(direct), tuple(native))
+
+
+# The flat form of a snapshot with no machine in it
+_NOTHING_FLAT: tuple = ((), ())
+
+
+def _snap_builtins(state: list, layout: dict[str, Any]) -> tuple[int, list, tuple | None]:
     """Bar-start snapshot of every builtin machine under a loop-site callee,
-    stamped with the state epoch it was collected at."""
+    stamped with the state epoch it was collected at (see :func:`_stamp`)."""
     vecs: list = []
     _collect_builtins(state, layout, vecs)
-    return _state_epoch, _snap_collected(vecs)
+    if not vecs:
+        return _state_epoch, vecs, _NOTHING_FLAT
+    return _stamp(_snap_collected(vecs))
 
 
 def _restore_collected(current: list, snaps: list) -> None:
@@ -371,7 +421,8 @@ def _restore_collected(current: list, snaps: list) -> None:
     O(changed): the values classified as writable by
     :func:`_snap_collected` go back by assignment, lists by an in-place slice
     copy (their elements are scalars), series through the incremental
-    :meth:`SeriesImpl._restore_bar`.
+    :meth:`SeriesImpl._restore_bar`, self-restoring values through their own
+    ``__pyne_restore__``.
     """
     saved: dict[int, tuple] = {}
     at = 0
@@ -407,12 +458,15 @@ def _restore_collected(current: list, snaps: list) -> None:
                 vec[i] = _copy_value(value)
         for slot, series_snap in snap[3]:
             vec[slot]._restore_bar(series_snap)  # noqa: cooperating core internals
+        for i, value, token in snap[4]:
+            vec[i] = value
+            value.__pyne_restore__(token)
 
 
 def _restore_snapshot(snaps: list) -> None:
     """Roll back exactly the machines a bar-start snapshot lists — valid while
     no state vector was created since the snapshot was taken."""
-    for vec, direct, copied, series in snaps:
+    for vec, direct, copied, series, native in snaps:
         for i, value in direct:
             vec[i] = value
         for i, value in copied:
@@ -426,12 +480,30 @@ def _restore_snapshot(snaps: list) -> None:
                 vec[i] = _copy_value(value)
         for slot, series_snap in series:
             vec[slot]._restore_bar(series_snap)  # noqa: cooperating core internals
+        for i, value, token in native:
+            vec[i] = value
+            value.__pyne_restore__(token)
 
 
-def _restore_builtins(state: list, layout: dict[str, Any], stamped: tuple[int, list]) -> None:
+def _restore_stamped(stamped: tuple[int, list, tuple | None]) -> None:
+    """Roll back exactly the machines a stamped snapshot lists — valid while no
+    state vector was created since it was taken (see :func:`_stamp`)."""
+    flat = stamped[2]
+    if flat is None:
+        _restore_snapshot(stamped[1])
+        return
+    for vec, i, value in flat[0]:
+        vec[i] = value
+    for vec, i, value, restore, token in flat[1]:
+        vec[i] = value
+        restore(token)
+
+
+def _restore_builtins(state: list, layout: dict[str, Any],
+                      stamped: tuple[int, list, tuple | None]) -> None:
     """Roll the builtin machines under a loop-site callee back to bar start."""
     if stamped[0] == _state_epoch:
-        _restore_snapshot(stamped[1])
+        _restore_stamped(stamped)
         return
     current: list = []
     _collect_builtins(state, layout, current)
@@ -463,7 +535,9 @@ def __loop_state__(parent: list, slot: int, func: Any, vector: tuple | None = No
     :return: The shared child state vector.
     """
     cell = parent[slot]
-    bar = _current_bar()
+    # ``_current_bar`` inlined for the loaded case: this runs once per iteration
+    lib = SeriesImpl._lib  # noqa: cooperating core internals
+    bar = lib.bar_index if lib else _current_bar()
     if cell is None:
         layout = func.__pyne_layout__
         state = _configure(_make_state(layout), layout, vector)
@@ -473,8 +547,18 @@ def __loop_state__(parent: list, slot: int, func: Any, vector: tuple | None = No
     if cell[1] != bar:
         cell[1] = bar
         cell[2] = _snap_builtins(state, state[-1])
+        return state
+    # ``_restore_builtins`` inlined for its flat case, the per-iteration hot path
+    stamped = cell[2]
+    flat = stamped[2]
+    if flat is not None and stamped[0] == _state_epoch:
+        for vec, i, value in flat[0]:
+            vec[i] = value
+        for vec, i, value, restore, token in flat[1]:
+            vec[i] = value
+            restore(token)
     else:
-        _restore_builtins(state, state[-1], cell[2])
+        _restore_builtins(state, state[-1], stamped)
     return state
 
 
@@ -635,19 +719,23 @@ def __bind_pinned__(func: Any, pin: str) -> Callable:
     return _bind_target(func, None, pin)
 
 
-def _snap_bound_builtins(bound: Any) -> tuple[int, list]:
+def _snap_bound_builtins(bound: Any) -> tuple[int, list, tuple | None]:
     """Bar-start builtin snapshot for a uniform loop site's bound target
     (empty when the binding is opaque and carries no walkable state)."""
     vecs: list = []
     _collect_bound_builtins(bound, vecs)
-    return _state_epoch, _snap_collected(vecs)
+    if not vecs:
+        # A plain callee rebinding on every call (a bound method is a fresh
+        # object each time) lands here once per call, so it skips the stamping
+        return _state_epoch, vecs, _NOTHING_FLAT
+    return _stamp(_snap_collected(vecs))
 
 
-def _restore_bound_builtins(bound: Any, stamped: tuple[int, list]) -> None:
+def _restore_bound_builtins(bound: Any, stamped: tuple[int, list, tuple | None]) -> None:
     """Roll the builtin machines behind a uniform loop site's bound target
     back to bar start."""
     if stamped[0] == _state_epoch:
-        _restore_snapshot(stamped[1])
+        _restore_stamped(stamped)
         return
     vecs: list = []
     _collect_bound_builtins(bound, vecs)
@@ -817,7 +905,7 @@ _ATOMIC_BASES = (int, float, str, NA, Drawing)
 
 # :class:`_Node` kinds. The two trailing ones are replaced on restore instead of
 # being rolled back in place, see :func:`_snap_value`
-_LIST_FLAT, _LIST, _DICT_FLAT, _DICT, _MATRIX, _FIELDS, _SHALLOW, _DEEP = range(8)
+_LIST_FLAT, _LIST, _DICT_FLAT, _DICT, _MATRIX, _FIELDS, _SELF, _SHALLOW, _DEEP = range(9)
 
 # Field names per dataclass type
 _field_names: dict[type, tuple[str, ...]] = {}
@@ -844,7 +932,8 @@ def _snap_value(value: Any, seen: dict[int, _Node], nested: bool = False) -> Any
     :func:`_restore_value` writes the content back into that same object. Every
     reference to it -- from another slot, another function instance, a container
     or a field -- keeps naming one object, and a discarded execution's mutation
-    is undone wherever it reached.
+    is undone wherever it reached. A self-restoring value (see the module
+    docstring) is rolled back in place the same way, through its own token.
 
     An object of any other type keeps the copy semantics it always had (shallow
     in a slot, deep inside a container) and is REPLACED on restore.
@@ -890,6 +979,9 @@ def _snap_value(value: Any, seen: dict[int, _Node], nested: bool = False) -> Any
         node.kind = _FIELDS
         node.content = tuple((name, _snap_value(getattr(value, name), seen, True))
                              for name in names)
+    elif getattr(t, '__pyne_snapshot__', None) is not None:
+        node.kind = _SELF
+        node.content = value.__pyne_snapshot__()
     elif nested:
         node.kind = _DEEP
         node.content = deepcopy(value)
@@ -930,9 +1022,11 @@ def _restore_value(snap: Any, done: dict[int, Any]) -> Any:
     elif kind == _MATRIX:
         obj.rows, obj.cols = content[0], content[1]
         obj.data = _restore_value(content[2], done)
-    else:
+    elif kind == _FIELDS:
         for name, item in content:
             object.__setattr__(obj, name, _restore_value(item, done))
+    else:
+        obj.__pyne_restore__(content)
     return obj
 
 

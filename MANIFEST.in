@@ -2,3 +2,4 @@ recursive-include src/pynecore *.json
 include NOTICE
 include LICENSE
 include src/pynecore/core/_native_math.pyx
+include src/pynecore/core/_native_rolling_sum.pyx

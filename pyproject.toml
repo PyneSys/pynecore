@@ -1,6 +1,6 @@
 [build-system]
-# Cython compiles the optional native math extension (see setup.py); without it, or
-# without a C compiler, the package still builds and runs on its pure-Python math.
+# Cython compiles the optional native extensions (see setup.py); without it, or
+# without a C compiler, the package still builds and runs on its pure-Python code.
 requires = ["setuptools>=61.0", "Cython>=3.0"]
 build-backend = "setuptools.build_meta"
 
@@ -13,9 +13,10 @@ zip-safe = false  # Critical for import hooks
 [tool.setuptools.package-data]
 "pynecore" = ["*.pyi", "*.json"]
 
-# The native extension's source ships in the sdist only; a wheel carries the build.
+# The native extensions' sources ship in the sdist only; a wheel carries the builds.
 [tool.setuptools.exclude-package-data]
-"pynecore.core" = ["_native_math.pyx", "_native_math.c"]
+"pynecore.core" = ["_native_math.pyx", "_native_math.c",
+                   "_native_rolling_sum.pyx", "_native_rolling_sum.c"]
 
 [tool.distutils]
 egg_info.egg_base = "build"
@@ -51,7 +52,7 @@ optional-dependencies.cli = ["typer>=0.16", "rich", "tzdata"]
 optional-dependencies.all = ["typer>=0.16", "rich", "ccxt", "tzdata"]
 
 #Optional dependencies for development
-optional-dependencies.dev = ["pytest", "pytest-spec"]
+optional-dependencies.dev = ["pytest", "pytest-spec", "Cython>=3.0"]
 
 ### Providers
 
@@ -93,12 +94,13 @@ replay = "pynecore.providers.replay:ReplayProvider"
 # Wheels
 #
 
-# Platform wheels carry the compiled ``pynecore.core._native_math``. Every one is tested
-# against the pure-Python math it replaces, and must actually contain the extension; the
-# venue tests pin the pure-Python math itself, which is the same on every platform.
+# Platform wheels carry the compiled ``pynecore.core._native_math`` and
+# ``pynecore.core._native_rolling_sum``. Every one is tested against the pure-Python code
+# it replaces, and must actually contain the extensions; the venue tests pin the
+# pure-Python code itself, which is the same on every platform.
 [tool.cibuildwheel]
 build = "cp311-* cp312-* cp313-* cp314-*"
 skip = "*-win32 *-manylinux_i686 *-musllinux_i686"
 test-requires = ["pytest", "pytest-spec"]
-test-command = "pytest -p no:cacheprovider {project}/tests/t01_lib/t04_math/test_016_native_math_matches_python.py"
+test-command = "pytest -p no:cacheprovider {project}/tests/t01_lib/t04_math/test_016_native_math_matches_python.py {project}/tests/t01_lib/t04_math/test_022_native_rolling_sum_matches_python.py"
 test-environment = { PYNE_REQUIRE_NATIVE_MATH = "1" }

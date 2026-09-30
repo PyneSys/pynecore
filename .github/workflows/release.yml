@@ -11,7 +11,7 @@ permissions:
   id-token: write  # Required for trusted publishing
 
 jobs:
-  # Platform wheels with the compiled native math extension. cibuildwheel runs the
+  # Platform wheels with the compiled native extensions. cibuildwheel runs the
   # native-vs-Python bit-identity test inside every wheel it builds (see
   # [tool.cibuildwheel] in pyproject.toml), so a platform whose compiler changes a
   # single last bit fails the release instead of shipping.

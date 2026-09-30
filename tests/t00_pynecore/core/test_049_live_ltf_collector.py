@@ -795,3 +795,146 @@ def __test_without_series_rollback_buffer_corrupts__():
         assert len(h.series) > 3
     finally:
         h.cleanup()
+
+
+# ── Builtin-machine rollback across a provisional chain ──────────────────────
+# The baseline is the state after the latest CONFIRMED intrabar, and every
+# provisional and developing intrabar run since advances the builtin machines by
+# one step each. A re-tick or a late close therefore rolls a machine back across
+# several steps at once, not only across the one a same-bar re-execution takes.
+# This harness drives the collector with a REAL ``math.sum`` instance under a root
+# vector and the REAL ``RootChildSnapshot`` baseline.
+
+
+class _RealSumHarness:
+    """Collector callbacks backed by a real ``math.sum`` child of a root vector.
+
+    ``run_intrabar`` returns the sum of the intrabar values over a length of 3, or
+    over the one ``lengths`` gives the intrabar's open time, so a machine that was
+    not rolled back to the confirmed baseline publishes a sum that still contains a
+    discarded intrabar.
+    """
+
+    _ROOT = "test_ltf_sum_rollback_root"
+    _LAYOUT = {'init': (None,), 'series': [], 'varip': (),
+               'children': ((0, 'sum', False),), 'names': ('sum',)}
+
+    def __init__(self):
+        from pynecore import lib
+        from pynecore.core import instance_state
+        self._is = instance_state
+        self._lib = lib
+        self._bar_index = lib.bar_index
+        self._state = instance_state.create_root(self._ROOT, dict(self._LAYOUT))
+        self._state[0] = instance_state._make_state(  # noqa: cooperating core internals
+            getattr(lib.math.sum, '__pyne_layout__'))
+        self._snap = instance_state.RootChildSnapshot([self._ROOT])
+        self.lengths: dict[int, int] = {}
+
+    def run_intrabar(self, bar, bar_index, _confirmed, _is_new, _islast):
+        self._lib.bar_index = bar_index
+        return self._lib.math.sum(self._state[0], bar.value, self.lengths.get(bar.timestamp, 3))
+
+    def collector(self) -> LiveLtfCollector:
+        return LiveLtfCollector(self.run_intrabar, self._snap.save, self._snap.restore)
+
+    def cleanup(self):
+        self._lib.bar_index = self._bar_index
+        self._is.discard_root(self._ROOT)
+
+
+def __test_real_sum_rolls_back_across_provisional_chain__():
+    """A re-tick and a late close behind a provisional rollover restore the
+    ``math.sum`` machine across every intrabar run since the confirmed baseline."""
+    h = _RealSumHarness()
+    try:
+        c = h.collector()
+        n_ms = T + 3 * LTF      # intrabar N (idx 3)
+        n1_ms = T + 4 * LTF     # intrabar N+1 (idx 4)
+        closed = [_Bar.at(T, 1.0), _Bar.at(T + LTF, 2.0), _Bar.at(T + 2 * LTF, 3.0)]
+        # N develops on the confirmed prefix 1, 2, 3.
+        row = c.process_round(T, PERIOD_END, closed, _Bar.at(n_ms, 4.0), chart_confirmed=False)
+        assert row[2:] == [6.0, 9.0]
+        # RACE: N+1 forms before N's close -> N promoted, both run past the baseline.
+        row = c.process_round(T, PERIOD_END, [], _Bar.at(n1_ms, 5.0), chart_confirmed=False)
+        assert row[2:] == [6.0, 9.0, 12.0]
+        # Re-tick of N+1: the baseline is two machine steps behind.
+        row = c.process_round(T, PERIOD_END, [], _Bar.at(n1_ms, 5.5), chart_confirmed=False)
+        assert row[2:] == [6.0, 9.0, 12.5]
+        # A stale forming update of the provisional N replays the chain again.
+        row = c.process_round(T, PERIOD_END, [], _Bar.at(n_ms, 4.5), chart_confirmed=False)
+        assert row[2:] == [6.0, 9.5, 13.0]
+        # N's late close finalizes it in place; N+1 re-ticks on the new baseline.
+        row = c.process_round(T, PERIOD_END, [_Bar.at(n_ms, 4.25)], _Bar.at(n1_ms, 5.5),
+                              chart_confirmed=False)
+        assert row[2:] == [6.0, 9.25, 12.75]
+        # N+1 closes in order, and the next intrabar sums the confirmed values only.
+        row = c.process_round(T, PERIOD_END, [_Bar.at(n1_ms, 6.0)], None, chart_confirmed=False)
+        assert row[2:] == [6.0, 9.25, 13.25]
+        row = c.process_round(T, PERIOD_END, [_Bar.at(T + 5 * LTF, 7.0)], None,
+                              chart_confirmed=False)
+        assert row[2:] == [6.0, 9.25, 13.25, 17.25]
+    finally:
+        h.cleanup()
+
+
+def __test_real_sum_late_close_without_developing_tick__():
+    """A late close arriving with no forming tick finalizes the provisional and
+    rebuilds the developing tail, both from a baseline several steps behind."""
+    h = _RealSumHarness()
+    try:
+        c = h.collector()
+        n_ms = T + 3 * LTF
+        n1_ms = T + 4 * LTF
+        closed = [_Bar.at(T, 1.0), _Bar.at(T + LTF, 2.0), _Bar.at(T + 2 * LTF, 3.0)]
+        c.process_round(T, PERIOD_END, closed, _Bar.at(n_ms, 4.0), chart_confirmed=False)
+        c.process_round(T, PERIOD_END, [], _Bar.at(n1_ms, 5.0), chart_confirmed=False)
+        row = c.process_round(T, PERIOD_END, [_Bar.at(n_ms, 4.25)], None, chart_confirmed=False)
+        assert row[2:] == [6.0, 9.25, 12.25]
+    finally:
+        h.cleanup()
+
+
+def __test_real_sum_confirmed_round_drops_unconfirmed_steps__():
+    """A confirmed chart round abandons the provisional chain and the developing
+    tail; the next period's intrabar continues from the confirmed baseline."""
+    h = _RealSumHarness()
+    try:
+        c = h.collector()
+        n_ms = T + 3 * LTF
+        n1_ms = T + 4 * LTF
+        closed = [_Bar.at(T, 1.0), _Bar.at(T + LTF, 2.0), _Bar.at(T + 2 * LTF, 3.0)]
+        c.process_round(T, PERIOD_END, closed, _Bar.at(n_ms, 4.0), chart_confirmed=False)
+        c.process_round(T, PERIOD_END, [], _Bar.at(n1_ms, 5.0), chart_confirmed=False)
+        row = c.process_round(T, PERIOD_END, [], None, chart_confirmed=True)
+        assert row[2:] == [6.0]
+        row = c.process_round(PERIOD_END, PERIOD_END + TF, [_Bar.at(PERIOD_END, 8.0)], None,
+                              chart_confirmed=False)
+        assert row == [13.0]
+    finally:
+        h.cleanup()
+
+
+def __test_real_sum_replays_a_shrink_over_a_revised_chain__():
+    """A window that shrinks behind a provisional chain is walked again when the
+    chain is replayed with other values: the revised chain can carry the very sum
+    and length into the shrinking intrabar that the discarded one did."""
+    h = _RealSumHarness()
+    try:
+        c = h.collector()
+        n_ms = T + 3 * LTF
+        n1_ms = T + 4 * LTF
+        n2_ms = T + 5 * LTF
+        h.lengths[n2_ms] = 1
+        closed = [_Bar.at(T, 1.0), _Bar.at(T + LTF, 2.0), _Bar.at(T + 2 * LTF, 3.0)]
+        c.process_round(T, PERIOD_END, closed, _Bar.at(n_ms, 4.0), chart_confirmed=False)
+        c.process_round(T, PERIOD_END, [], _Bar.at(n1_ms, 5.0), chart_confirmed=False)
+        # N+2 shrinks the window 3 -> 1 over the chain 4, 5 (window sum 12).
+        row = c.process_round(T, PERIOD_END, [], _Bar.at(n2_ms, 6.0), chart_confirmed=False)
+        assert row[2:] == [6.0, 9.0, 12.0, 6.0]
+        # N closes late as 5 while N+1 is revised to 4: the window sum is 12 again.
+        row = c.process_round(T, PERIOD_END, [_Bar.at(n_ms, 5.0)], _Bar.at(n1_ms, 4.0),
+                              chart_confirmed=False)
+        assert row[2:] == [6.0, 10.0, 12.0, 6.0]
+    finally:
+        h.cleanup()
