@@ -3865,9 +3865,14 @@ class ScriptRunner:
                 if callable(sec_cleanup_fn):
                     sec_cleanup_fn: Callable
                     sec_cleanup_fn()
+                from .security import cleanup_shared_memory, remove_protocol
                 if sec_sync_block is not None and sec_result_blocks is not None:
-                    from .security import cleanup_shared_memory
                     cleanup_shared_memory(sec_sync_block, sec_result_blocks)
+                # The protocol closures hold every ``SecurityState`` and with it
+                # the run's OS semaphores; left in the module globals they would
+                # outlive the run until the module's next run rebinds them.
+                for _sec_mod in sec_modules:
+                    remove_protocol(_sec_mod)
 
             # Remove temp dirs created for HTF security-feed resampling.
             if sec_resample_dirs:

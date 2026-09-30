@@ -4514,6 +4514,17 @@ def inject_protocol(module, signal_fn, write_fn, read_fn, wait_fn,
     module.__same_context__ = same_context
 
 
+def remove_protocol(module):
+    """
+    Remove what :func:`inject_protocol` put into a script module's globals.
+
+    :param module: The script module
+    """
+    for name in ('__sec_signal__', '__sec_write__', '__sec_read__', '__sec_wait__',
+                 '__active_security__', '__same_context__'):
+        module.__dict__.pop(name, None)
+
+
 def cleanup_shared_memory(
     sync_block: SyncBlock,
     result_blocks: dict[str, ResultBlock],
