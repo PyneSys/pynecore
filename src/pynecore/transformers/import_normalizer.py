@@ -1,6 +1,8 @@
 import ast
 from typing import Dict, Set, List, Optional, cast
 
+from . import ast_walk
+
 NON_MODULE_ATTRS = {
     'input',  # class
     'script',  # class
@@ -24,7 +26,7 @@ def _dotted(path: list[str], node: ast.AST) -> ast.expr:
         result = ast.copy_location(ast.Attribute(value=result, attr=part, ctx=ast.Load()), node)
     return result
 
-class ImportNormalizerTransformer(ast.NodeTransformer):
+class ImportNormalizerTransformer(ast_walk.NodeTransformer):
     """
     AST transformer that normalizes pynecore.lib imports.
     - Converts all lib-related imports to 'from pynecore import lib'
@@ -366,4 +368,4 @@ def _rebinds(stmt: ast.stmt, name: str) -> bool:
     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         return stmt.name == name
     return any(isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Store)
-               for node in ast.walk(stmt))
+               for node in ast_walk.walk(stmt))

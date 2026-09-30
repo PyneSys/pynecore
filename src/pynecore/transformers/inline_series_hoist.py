@@ -26,6 +26,8 @@ from typing import cast
 
 from pynecore.transformers.locations import fix_locations
 
+from pynecore.transformers import ast_walk
+
 __all__ = ['InlineSeriesHoistTransformer']
 
 
@@ -39,7 +41,7 @@ def _is_inline_series(node: ast.expr) -> bool:
             and node.func.id == 'inline_series')
 
 
-class _ExprHoister(ast.NodeTransformer):
+class _ExprHoister(ast_walk.NodeTransformer):
     """Rewrite one statement's expression tree: every ``inline_series`` call
     in a lazy position is appended to ``hoisted`` as a temp assignment and
     replaced by the temp's name.

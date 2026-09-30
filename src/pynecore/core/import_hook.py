@@ -1051,29 +1051,41 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
                    and cast(ast.ImportFrom, transformed.body[insert_at]).module == '__future__'):
                 insert_at += 1
             transformed.body[insert_at:insert_at] = baked
+            synthetic: list[ast.stmt] = list(baked)
             # The script's bool na choice, re-applied after EVERY top-level import
             # (an imported library's own prologue must not outlive this module's,
             # wherever the import stands) so that no statement of the module
             # builds a bool na under another module's choice (see _script_bool_na)
             if bool_na is not None:
                 insert_at += len(baked)
-                transformed.body.insert(insert_at, ast.ImportFrom(
-                    module='pynecore.types.na',
-                    names=[ast.alias(name='set_bool_na', asname=_PYNE_SET_BOOL_NA)], level=0))
-                transformed.body.insert(insert_at + 1, ast.Assign(
-                    targets=[ast.Name(id=_PYNE_NA_BOOL, ctx=ast.Store())],
-                    value=ast.Constant(value=bool_na)))
+                prologue: list[ast.stmt] = [
+                    ast.ImportFrom(
+                        module='pynecore.types.na',
+                        names=[ast.alias(name='set_bool_na', asname=_PYNE_SET_BOOL_NA)],
+                        level=0),
+                    ast.Assign(
+                        targets=[ast.Name(id=_PYNE_NA_BOOL, ctx=ast.Store())],
+                        value=ast.Constant(value=bool_na))]
+                transformed.body[insert_at:insert_at] = prologue
+                synthetic += prologue
                 body: list[ast.stmt] = []
                 for index, stmt in enumerate(transformed.body):
                     body.append(stmt)
                     if index >= insert_at and isinstance(stmt, (ast.Import, ast.ImportFrom)) \
                             and not (index + 1 < len(transformed.body) and isinstance(
                                 transformed.body[index + 1], (ast.Import, ast.ImportFrom))):
-                        body.append(ast.Expr(value=ast.Call(
+                        reset = ast.Expr(value=ast.Call(
                             func=ast.Name(id=_PYNE_SET_BOOL_NA, ctx=ast.Load()),
-                            args=[ast.Constant(value=bool_na)], keywords=[])))
+                            args=[ast.Constant(value=bool_na)], keywords=[]))
+                        body.append(reset)
+                        synthetic.append(reset)
                 transformed.body = body
-            ast.fix_missing_locations(transformed)
+            # Everything the pipeline emitted was located by ``fix_locations``;
+            # only the loader's own statements above still lack a position. They
+            # stand at module level, so each gets exactly what a whole-module
+            # ``ast.fix_missing_locations`` would give it, without the walk
+            for stmt in synthetic:
+                ast.fix_missing_locations(stmt)
 
             # Let Python handle bytecode caching
             return compile(transformed, path, 'exec', optimize=_optimize)

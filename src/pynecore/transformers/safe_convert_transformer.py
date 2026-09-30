@@ -1,10 +1,11 @@
 from typing import cast
 import ast
 
+from . import ast_walk
 from .pine_type_rules import INT, get_ty, stamp_lowering
 
 
-class SafeConvertTransformer(ast.NodeTransformer):
+class SafeConvertTransformer(ast_walk.NodeTransformer):
     """
     Transformer that converts float(na) and int(na) calls to safe alternatives
     that preserve Pine Script semantics.
@@ -166,7 +167,7 @@ class SafeConvertTransformer(ast.NodeTransformer):
             or (isinstance(child, ast.Name) and child.id == 'range'
                 and isinstance(child.ctx, ast.Store))
             or (isinstance(child, ast.alias) and (child.asname or child.name) == 'range')
-            for child in ast.walk(node))
+            for child in ast_walk.walk(node))
 
         # Process the module first
         node = cast(ast.Module, self.generic_visit(node))

@@ -8,6 +8,8 @@ from collections.abc import Callable
 # forms below test ``> 1e-10`` / ``< -1e-10`` and the non-strict ones
 # ``<= 1e-10`` / ``>= -1e-10``.
 from pynecore.core.pine_compare import EPSILON
+
+from . import ast_walk
 from .pine_type_rules import BOOL, stamp_lowering
 
 # op -> (bound, comparison of the bound against the difference). ``a < b``
@@ -60,7 +62,7 @@ def _unreachable() -> ast.expr:
 
 def _may_rebind(node: ast.expr) -> bool:
     """Whether evaluating this operand can change what another operand reads."""
-    return not all(isinstance(n, _PURE_NODES) for n in ast.walk(node))
+    return not all(isinstance(n, _PURE_NODES) for n in ast_walk.walk(node))
 
 
 def _insert_import(body: list[ast.stmt], stmt: ast.ImportFrom) -> None:
@@ -83,7 +85,7 @@ def _is_skippable_const(node: ast.expr) -> bool:
     return isinstance(node, ast.Constant) and isinstance(node.value, (str, bool))
 
 
-class FloatToleranceTransformer(ast.NodeTransformer):
+class FloatToleranceTransformer(ast_walk.NodeTransformer):
     """
     Give the comparison operators TradingView's tolerant float semantics.
 
@@ -328,7 +330,7 @@ class FloatToleranceTransformer(ast.NodeTransformer):
         # one probes a type or a float difference, never an ``NA``. Marking them
         # keeps the truthiness pass from casting them when it runs after this
         # one (see ``PineTruthinessTransformer._bool_value``).
-        for emitted in ast.walk(rewritten):
+        for emitted in ast_walk.walk(rewritten):
             if isinstance(emitted, ast.Compare):
                 emitted.pine_bool = True  # type: ignore[attr-defined]
         # Whatever shape the rewrite took, it stands where a comparison stood,

@@ -19,6 +19,8 @@ import ast
 from collections.abc import Callable, Mapping, Sequence
 from typing import Final, NamedTuple, TypeVar
 
+from . import ast_walk
+
 #: Any expression node -- ``stamp_lowering`` hands back exactly what it got.
 _E = TypeVar('_E', bound=ast.expr)
 
@@ -910,7 +912,7 @@ def stamp_lowering(root: _E, result: str) -> _E:
     :param result: The Pine type of the whole rewritten expression
     :return: ``root``, stamped
     """
-    for child in ast.iter_child_nodes(root):
+    for child in ast_walk.iter_child_nodes(root):
         if isinstance(child, ast.expr):
             _stamp_emitted(child)
     return set_ty(root, result)
@@ -940,7 +942,7 @@ def _stamp_emitted(node: ast.expr) -> str:
         _stamp_emitted(node.test)
         ty = join(_stamp_emitted(node.body), _stamp_emitted(node.orelse))
     elif isinstance(node, (ast.Compare, ast.BoolOp)):
-        for child in ast.iter_child_nodes(node):
+        for child in ast_walk.iter_child_nodes(node):
             if isinstance(child, ast.expr):
                 _stamp_emitted(child)
         ty = BOOL
@@ -948,7 +950,7 @@ def _stamp_emitted(node: ast.expr) -> str:
         # A Name, an Attribute, a Subscript, a Call: the machinery's own
         # references -- a state tuple, a bound dispatcher, a helper function.
         # Known, and carrying no numeric algebra of their own.
-        for child in ast.iter_child_nodes(node):
+        for child in ast_walk.iter_child_nodes(node):
             if isinstance(child, ast.expr):
                 _stamp_emitted(child)
         ty = OBJECT
@@ -1858,7 +1860,7 @@ class FactoryFields:
         #: Every class's top-level statement index
         self.top_index: dict[int, int] = {}
         for index, stmt in enumerate(tree.body):
-            for node in ast.walk(stmt):
+            for node in ast_walk.walk(stmt):
                 if isinstance(node, ast.ClassDef):
                     self.top_index[id(node)] = index
 
@@ -1879,7 +1881,7 @@ class FactoryFields:
                 if stmt.name == name:
                     binding = 'other'
             else:
-                for node in ast.walk(stmt):
+                for node in ast_walk.walk(stmt):
                     if isinstance(node, ast.Name) and node.id == name \
                             and isinstance(node.ctx, ast.Store):
                         binding = 'other'

@@ -11,6 +11,8 @@ produces the same ids, which is what makes an artifact diffable.
 """
 import ast
 
+from . import ast_walk
+
 __all__ = ['assign_node_ids', 'node_id']
 
 #: Attribute the id is stamped under. Leading underscore keeps it out of
@@ -36,7 +38,7 @@ def assign_node_ids(tree: ast.AST, start: int = 0) -> int:
         setattr(node, _ID_ATTR, nid)
         nid += 1
         # Reversed so the children come off the stack in source order
-        stack.extend(reversed(list(ast.iter_child_nodes(node))))
+        stack.extend(reversed(list(ast_walk.iter_child_nodes(node))))
     return nid
 
 

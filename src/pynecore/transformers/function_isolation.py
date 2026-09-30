@@ -99,6 +99,7 @@ import types
 
 from ..core.pine_export import Exported
 from ..utils.stdlib_checker import is_stdlib
+from . import ast_walk
 from .call_inline import SUPPORT_ALIAS_PREFIX
 from .pine_type_rules import (get_pin, get_pins, get_ty, get_varying, get_vector,
                               stamp_lowering)
@@ -347,7 +348,7 @@ def _get_func_path(func: ast.expr) -> str | None:
     return None
 
 
-class _ScopeIndex(ast.NodeVisitor):
+class _ScopeIndex(ast_walk.NodeVisitor):
     """Pass 1a: per-scope name bindings (defs, classes, everything else
     assigned) and the module-level import map."""
 
@@ -415,7 +416,7 @@ class _ScopeIndex(ast.NodeVisitor):
                 self.import_map[bound] = (node.module, alias.name)
 
 
-class _RouteCollector(ast.NodeVisitor):
+class _RouteCollector(ast_walk.NodeVisitor):
     """Pass 1b: prelim route of every call site per scope, input of the
     carrier fixpoint. Mirrors the transformer's skip rules (decorators,
     defaults, class bodies, test functions are not isolation territory)."""
@@ -468,7 +469,7 @@ def _stamped_call(bound: ast.expr, node: ast.Call) -> ast.Call:
         ast.Call(func=bound, args=node.args, keywords=node.keywords), get_ty(node))
 
 
-class FunctionIsolationTransformer(ast.NodeTransformer):
+class FunctionIsolationTransformer(ast_walk.NodeTransformer):
     """Rewrite call sites to the parent-slot / anchored emission (pass 2)."""
 
     def __init__(self, layout: ModuleLayout):
@@ -682,7 +683,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         lazy-resolve branch emits line-1 line events mid-statement (double
         breakpoint hits and derailed step-over on the first bar)."""
         copy = cast(ast.expr, ast.parse(ast.unparse(func), mode='eval').body)
-        for node in ast.walk(copy):
+        for node in ast_walk.walk(copy):
             ast.copy_location(node, func)
         return copy
 
@@ -777,7 +778,7 @@ class FunctionIsolationTransformer(ast.NodeTransformer):
         callee: ast.expr
         callee_copy: ast.expr
         bind: ast.expr | None = None
-        if any(isinstance(n, ast.Call) for n in ast.walk(node.func)):
+        if any(isinstance(n, ast.Call) for n in ast_walk.walk(node.func)):
             # The callee expression RUNS CODE (a call hides in it), so the two
             # copies below would execute it twice -- side effects included, and
             # with the nested call's own state site duplicated. Bind it to a

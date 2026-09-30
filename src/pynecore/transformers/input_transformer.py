@@ -1,10 +1,11 @@
 from typing import cast
 import ast
 
+from . import ast_walk
 from .lib_series import BUILTIN_PRICE_SERIES
 
 
-class InputTransformer(ast.NodeTransformer):
+class InputTransformer(ast_walk.NodeTransformer):
     """
     Transform input function calls:
     1. Add _id parameter to input calls

@@ -35,8 +35,8 @@ Must run after ImportNormalizerTransformer (security calls are in their
 ``lib.request.security`` form) and before SecurityTransformer.
 """
 import ast
-import copy
 
+from . import ast_walk
 from .security import SecurityTransformer
 
 __all__ = ['SecurityInstantiationTransformer']
@@ -73,7 +73,7 @@ def _ordered_walk(node: ast.AST):
     while stack:
         current = stack.pop()
         yield current
-        stack.extend(reversed(list(ast.iter_child_nodes(current))))
+        stack.extend(reversed(list(ast_walk.iter_child_nodes(current))))
 
 
 class _RegionIndex:
@@ -258,7 +258,7 @@ class SecurityInstantiationTransformer:
         info, sites = eligible[0]
         name = info.node.name
         existing = {
-            n.name for n in ast.walk(module)
+            n.name for n in ast_walk.walk(module)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
         # Re-locate the def index (earlier clones may have shifted the body).
@@ -273,7 +273,7 @@ class SecurityInstantiationTransformer:
                     f"clones — the script's request.security call graph is "
                     f"too large to instantiate per call site"
                 )
-            clone = copy.deepcopy(info.node)
+            clone = ast_walk.clone(info.node)
             clone.name = self._unique_name(name, existing)
             info.owner_body.insert(index + k - 1, clone)
             site_func = site.func
@@ -340,7 +340,7 @@ class SecurityInstantiationTransformer:
                 continue
             assign = ast.Assign(
                 targets=[ast.Name(id=name, ctx=ast.Store())],
-                value=copy.deepcopy(value),
+                value=ast_walk.clone(value),
             )
             ast.copy_location(assign, fn)
             ast.fix_missing_locations(assign)
@@ -358,7 +358,7 @@ class SecurityInstantiationTransformer:
     # --- pipeline API ---
 
     def visit(self, module: ast.Module) -> ast.Module:
-        if not any(self._is_security_call(n) for n in ast.walk(module)):
+        if not any(self._is_security_call(n) for n in ast_walk.walk(module)):
             return module
         # Fixpoint: cloning a caller duplicates its callees' call sites, so
         # re-analyze until no eligible multi-site bearer remains. Bounded by

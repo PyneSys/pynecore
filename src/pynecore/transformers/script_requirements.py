@@ -24,6 +24,8 @@ import ast
 
 from pynecore.transformers.locations import fix_locations
 
+from pynecore.transformers import ast_walk
+
 __all__ = ['ScriptRequirementsTransformer']
 
 # Flag names on ScriptRequirements — kept in sync with the dataclass in
@@ -132,7 +134,7 @@ def _is_script_strategy_decorator(node: ast.expr) -> bool:
     return False
 
 
-class ScriptRequirementsTransformer(ast.NodeTransformer):
+class ScriptRequirementsTransformer(ast_walk.NodeTransformer):
     """
     Compute :class:`ScriptRequirements` for a strategy script and inject it
     into the ``@script.strategy(...)`` decorator as the

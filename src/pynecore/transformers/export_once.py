@@ -42,6 +42,8 @@ other binding is conditional.
 """
 import ast
 
+from . import ast_walk
+
 __all__ = ['ExportOnceTransformer']
 
 #: Per-root latch the definitions run under, a Persistent slot of ``main``
@@ -71,7 +73,7 @@ def _bound_names(nodes: list[ast.stmt]) -> set[str]:
             continue
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
             bound.add(node.id)
-        stack.extend(ast.iter_child_nodes(node))
+        stack.extend(ast_walk.iter_child_nodes(node))
     return bound
 
 
@@ -90,7 +92,7 @@ def _is_export(node: ast.FunctionDef) -> bool:
     return False
 
 
-class ExportOnceTransformer(ast.NodeTransformer):
+class ExportOnceTransformer(ast_walk.NodeTransformer):
     """Run ``main``'s ``@export`` definitions under a per-root latch."""
 
     def visit_Module(self, node: ast.Module) -> ast.Module:

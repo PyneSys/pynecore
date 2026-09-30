@@ -64,6 +64,8 @@ must participate in them like any other body statement).
 
 import ast
 
+from . import ast_walk
+
 __all__ = ['DynamicDefaultTransformer', 'is_script_entry', 'is_dynamic_default_guard']
 
 _SCRIPT_ENTRY_DECORATORS = frozenset({'indicator', 'strategy', 'library'})
@@ -174,7 +176,7 @@ class _NaBindings:
         elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             self.paths.pop(stmt.name, None)
         else:
-            for node in ast.walk(stmt):
+            for node in ast_walk.walk(stmt):
                 if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
                     self.paths.pop(node.id, None)
 
@@ -216,7 +218,7 @@ def is_script_entry(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     return False
 
 
-class DynamicDefaultTransformer(ast.NodeTransformer):
+class DynamicDefaultTransformer(ast_walk.NodeTransformer):
     """Move ``lib.*``-referencing parameter defaults into per-call prologues."""
 
     def __init__(self):
@@ -226,7 +228,7 @@ class DynamicDefaultTransformer(ast.NodeTransformer):
     @staticmethod
     def _is_dynamic(expr: ast.expr) -> bool:
         """Whether the default expression references runtime ``lib`` state."""
-        return any(isinstance(n, ast.Name) and n.id == 'lib' for n in ast.walk(expr))
+        return any(isinstance(n, ast.Name) and n.id == 'lib' for n in ast_walk.walk(expr))
 
     def _prologue_if(self, param_name: str, default: ast.expr) -> ast.If:
         """Build ``if <param> is __dyn_default__: <param> = <default>``."""

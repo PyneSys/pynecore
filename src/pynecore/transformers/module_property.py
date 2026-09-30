@@ -3,8 +3,10 @@ import ast
 import json
 from pathlib import Path
 
+from . import ast_walk
 
-class ModulePropertyTransformer(ast.NodeTransformer):
+
+class ModulePropertyTransformer(ast_walk.NodeTransformer):
     """
     Transform lib.xxx references based on the generated module_properties.json registry.
 
@@ -211,7 +213,7 @@ class ModulePropertyTransformer(ast.NodeTransformer):
             return True
 
         # Recursively check all child nodes
-        for child in ast.walk(subtree):
+        for child in ast_walk.walk(subtree):
             if child is node:
                 return True
 

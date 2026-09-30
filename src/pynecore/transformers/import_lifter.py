@@ -1,8 +1,10 @@
 from typing import List, cast
 import ast
 
+from . import ast_walk
 
-class ImportLifterTransformer(ast.NodeTransformer):
+
+class ImportLifterTransformer(ast_walk.NodeTransformer):
     """
     AST transformer that lifts all pynecore.lib related imports to module level.
     Does not transform the imports, just moves them to global scope.

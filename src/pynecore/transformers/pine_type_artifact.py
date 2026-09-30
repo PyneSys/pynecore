@@ -35,6 +35,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
+from . import ast_walk
 from .node_ids import assign_node_ids, node_id
 from .pine_type_rules import TY_ATTR, UNKNOWN, ImplSig, annotation_type, impl_sig
 from .pine_type_table import (
@@ -267,7 +268,7 @@ def _collect_defs(node: ast.AST, scope: str,
     :param out: Collects (definition, its id, the scope it was declared in), in
                 source order
     """
-    for child in ast.iter_child_nodes(node):
+    for child in ast_walk.iter_child_nodes(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
             key = qualify(scope, child.name)
             out.append((child, key, scope))
@@ -811,7 +812,7 @@ def table_json(tree: ast.Module, table: PineTypeTable, interface: ModuleInterfac
     """
     assign_node_ids(tree)
     exprs = []
-    for node in ast.walk(tree):
+    for node in ast_walk.walk(tree):
         if not isinstance(node, ast.expr):
             continue
         ty = getattr(node, TY_ATTR, None)

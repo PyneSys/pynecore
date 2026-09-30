@@ -23,6 +23,8 @@ its attribute-op line events on the span's end line, re-creating the bug.
 """
 import ast
 
+from . import ast_walk
+
 __all__ = ('fix_locations',)
 
 
@@ -62,9 +64,9 @@ def _fix(node: ast.AST, line: int, col: int) -> None:
             if isinstance(node, ast.stmt):
                 # Hoisted payloads keep their source lines — anchor the new
                 # statement next to them rather than at the function entry
-                inner = [getattr(n, 'lineno') for n in ast.walk(node) if _located(n)]
+                inner = [getattr(n, 'lineno') for n in ast_walk.walk(node) if _located(n)]
                 if inner:
                     line, col = min(inner), 0
             _stamp_point(node, line, col)
-    for child in ast.iter_child_nodes(node):
+    for child in ast_walk.iter_child_nodes(node):
         _fix(child, line, col)

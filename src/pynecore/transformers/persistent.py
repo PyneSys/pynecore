@@ -26,6 +26,7 @@ parent persistent of the same name.
 from typing import cast
 import ast
 
+from . import ast_walk
 from .slot_layout import ModuleLayout, scope_for_function
 
 __all__ = ['PersistentTransformer', 'VARIP_TYPES']
@@ -34,7 +35,7 @@ PERSISTENT_TYPES = ('Persistent', 'IBPersistent', 'IBPersistentSeries')
 VARIP_TYPES = ('IBPersistent', 'IBPersistentSeries')
 
 
-class PersistentTransformer(ast.NodeTransformer):
+class PersistentTransformer(ast_walk.NodeTransformer):
     """Rewrite Persistent declarations and accesses to state-vector slots."""
 
     def __init__(self, layout: ModuleLayout):

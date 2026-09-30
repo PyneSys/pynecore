@@ -5,6 +5,8 @@ import ast
 # that decides ``x == 0`` decides ``x ? a : b`` as well.
 from pynecore.core.pine_compare import EPSILON
 
+from pynecore.transformers import ast_walk
+
 
 def _is_bool_valued(node: ast.expr) -> bool:
     """Whether the expression provably evaluates to a Python bool already.
@@ -27,7 +29,7 @@ def _is_bool_valued(node: ast.expr) -> bool:
     return False
 
 
-class PineTruthinessTransformer(ast.NodeTransformer):
+class PineTruthinessTransformer(ast_walk.NodeTransformer):
     """
     Give the bool contexts TradingView's tolerant float-to-bool conversion.
 

@@ -47,6 +47,7 @@ import copy
 from collections.abc import Callable
 
 from ..core.import_hook import PYNE_RESERVED_NAME_CHAR, security_slice_disabled
+from . import ast_walk
 from .dynamic_default import is_script_entry
 from .persistent import VARIP_TYPES
 from .pine_type_rules import OBJECT, SCALARS, STR, get_ty, stamp_lowering
@@ -106,7 +107,7 @@ class _SliceScopes(_DependencyAnalyzer):
     def __init__(self, module: ast.Module):
         super().__init__(module, [])
         self._funcs = {
-            n.name: n for n in ast.walk(module)
+            n.name: n for n in ast_walk.walk(module)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
         self._build_scopes()
@@ -277,11 +278,7 @@ def _protocol_sid(node: ast.AST, name: str) -> str | None:
 
 def _walk_own(node: ast.AST):
     """Every descendant of ``node``, not entering nested function definitions."""
-    for child in ast.iter_child_nodes(node):
-        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        yield child
-        yield from _walk_own(child)
+    return ast_walk.iter_descendants(node, (ast.FunctionDef, ast.AsyncFunctionDef))
 
 
 class _Collector:
@@ -551,7 +548,7 @@ class _Collector:
             facts.mutates.update(self.alias_roots(arg, scope))
 
 
-class SecuritySliceTransformer(ast.NodeTransformer):
+class SecuritySliceTransformer(ast_walk.NodeTransformer):
     """Emit a backward-sliced ``main()`` clone per security context.
 
     :ivar module_skip: why no context of the module could be sliced, if so
@@ -747,7 +744,7 @@ def _sid_list(ctx: ast.Dict, name: str) -> set[str]:
 def _module_imports(module: ast.Module) -> frozenset[str]:
     """Names bound by the module's imports (every call through one is opaque)."""
     names: set[str] = set()
-    for stmt in ast.walk(module):
+    for stmt in ast_walk.walk(module):
         if isinstance(stmt, (ast.Import, ast.ImportFrom)):
             for alias in stmt.names:
                 names.add(alias.asname or alias.name.split('.')[0])
@@ -1090,7 +1087,7 @@ def _rebound_names(nodes: list[ast.AST]) -> set[str]:
         elif isinstance(node, ast.withitem):
             targets = [node.optional_vars] if node.optional_vars is not None else []
         for target in targets:
-            for sub in ast.walk(target):
+            for sub in ast_walk.walk(target):
                 if isinstance(sub, ast.Name):
                     names.add(sub.id)
     return names
@@ -1162,7 +1159,7 @@ def _expr_unguarded(node: ast.AST, hit: _Hit) -> bool:
     if isinstance(node, (ast.Lambda, ast.ListComp, ast.SetComp,
                          ast.DictComp, ast.GeneratorExp)):
         return False
-    for child in ast.iter_child_nodes(node):
+    for child in ast_walk.iter_child_nodes(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         if _contains_write(child, hit) and not _expr_unguarded(child, hit):
@@ -1235,7 +1232,7 @@ def _stmt_unconditional(stmt: ast.stmt, hit: _Hit) -> bool:
 def _is_dispatch_test(test: ast.expr) -> bool:
     """Whether ``test`` is the protocol's own ``__active_security__`` dispatch."""
     return any(isinstance(sub, ast.Name) and sub.id == '__active_security__'
-               for sub in ast.walk(test))
+               for sub in ast_walk.walk(test))
 
 
 def _holds_write(stmt: ast.stmt, hit: _Hit) -> bool:
@@ -1248,7 +1245,7 @@ def _holds_write(stmt: ast.stmt, hit: _Hit) -> bool:
 
 def _holds_node(stmt: ast.stmt, target: ast.AST) -> bool:
     """Whether ``target`` stands anywhere inside ``stmt``, nested defs included."""
-    return any(sub is target for sub in ast.walk(stmt))
+    return any(sub is target for sub in ast_walk.walk(stmt))
 
 
 def _def_chain(body: list[ast.stmt],
@@ -1302,7 +1299,7 @@ def _def_called_unconditionally(func: ast.FunctionDef | ast.AsyncFunctionDef,
     if name in seen:
         return False
     seen = seen | {name}
-    nodes = [sub for stmt in body for sub in ast.walk(stmt)]
+    nodes = [sub for stmt in body for sub in ast_walk.walk(stmt)]
     for sub in nodes:
         if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) \
                 and sub.name == name and sub is not func:
@@ -1366,7 +1363,7 @@ def _write_reached(stmts: list[ast.stmt], sid: str) -> bool:
     hit = _sid_write(sid)
     if _write_unconditional(stmts, hit):
         return True
-    targets = [sub for stmt in stmts for sub in ast.walk(stmt) if hit(sub)]
+    targets = [sub for stmt in stmts for sub in ast_walk.walk(stmt) if hit(sub)]
     if len(targets) != 1:
         return False
     return _node_reached(targets[0], stmts, frozenset())
@@ -1419,7 +1416,7 @@ def _finalize_closed_shift(module: ast.Module, contexts: ast.Dict,
     if not candidates:
         return
     # One walk of the module, clones included, serves all three scans.
-    nodes = list(ast.walk(module))
+    nodes = list(ast_walk.walk(module))
     funcs: dict[str, list[ast.AST]] = {}
     for node in nodes:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1647,7 +1644,7 @@ def _reaching_defs(defs: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]]
 def _nested_defs(func: ast.FunctionDef) -> dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]]:
     """Every ``def`` standing anywhere inside ``func``, by name."""
     defs: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
-    for node in ast.walk(func):
+    for node in ast_walk.walk(func):
         if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and node is not func):
             defs.setdefault(node.name, []).append(node)
@@ -1879,10 +1876,10 @@ class _Forcer:
             return
         # A namespace root is never bound by a copy, so it is never renamed
         for copied in feeding:
-            for node in ast.walk(copied):
+            for node in ast_walk.walk(copied):
                 if isinstance(node, ast.Name) and node.id in renamed:
                     node.id = renamed[node.id]
-        for node in ast.walk(stmt):
+        for node in ast_walk.walk(stmt):
             if (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
                     and node.id in renamed):
                 node.id = renamed[node.id]
@@ -1945,7 +1942,7 @@ _STATEFUL_ANNOTATIONS = frozenset({'Persistent', 'Series', *VARIP_TYPES})
 
 def _loaded_names(node: ast.AST) -> set[str]:
     """Every name the node reads."""
-    return {sub.id for sub in ast.walk(node)
+    return {sub.id for sub in ast_walk.walk(node)
             if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load)}
 
 
@@ -1996,7 +1993,7 @@ def _definite_bindings(stmt: ast.stmt) -> tuple[set[str], set[str]]:
     elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
         bound |= {(alias.asname or alias.name).split('.')[0] for alias in stmt.names}
     for target in targets:
-        bound |= {sub.id for sub in [target, *ast.walk(target)]
+        bound |= {sub.id for sub in [target, *ast_walk.walk(target)]
                   if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store)}
     return bound - removed, removed
 
@@ -2017,7 +2014,7 @@ def _bound_names(stmt: ast.stmt) -> set[str]:
             names.add((node.asname or node.name).split('.')[0])
         elif isinstance(node, ast.ExceptHandler) and node.name is not None:
             names.add(node.name)
-    for node in ast.iter_child_nodes(stmt):
+    for node in ast_walk.iter_child_nodes(stmt):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             names.add(node.name)
     return names
@@ -2043,7 +2040,7 @@ def _is_repeatable(node: ast.expr) -> bool:
     nor their values are known here, no operator can be shown safe, so none is
     accepted.
     """
-    for sub in [node, *ast.walk(node)]:
+    for sub in [node, *ast_walk.walk(node)]:
         if isinstance(sub, ast.Attribute):
             if not _is_lib_attribute(sub):
                 return False
@@ -2076,7 +2073,7 @@ def _plain_aliases(nodes: list[ast.AST]) -> _Aliases:
     """
     aliases = _Aliases()
     for root in nodes:
-        for node in ast.walk(root):
+        for node in ast_walk.walk(root):
             if isinstance(node, ast.Assign):
                 targets: list[ast.expr] = list(node.targets)
             elif isinstance(node, ast.AnnAssign):
@@ -2108,14 +2105,14 @@ def _operand_names(node: ast.AST) -> set[str]:
     :func:`_feeding_copies`' question, not this one.
     """
     roots: set[int] = set()
-    for sub in ast.walk(node):
+    for sub in ast_walk.walk(node):
         if isinstance(sub, ast.Attribute):
             base = sub.value
             while isinstance(base, ast.Attribute):
                 base = base.value
             if isinstance(base, ast.Name) and base.id == 'lib':
                 roots.add(id(base))
-    return {sub.id for sub in ast.walk(node)
+    return {sub.id for sub in ast_walk.walk(node)
             if isinstance(sub, ast.Name) and id(sub) not in roots
             and get_ty(sub) not in SCALARS}
 
@@ -2151,7 +2148,7 @@ def _feeding_copies(stmt: ast.stmt, kept: list[ast.stmt]) -> list[ast.stmt] | No
             continue
         if not _is_copyable_assignment(earlier):
             return None
-        feeding.append(copy.deepcopy(earlier))
+        feeding.append(ast_walk.clone(earlier))
         needed |= _loaded_names(earlier)
     feeding.reverse()
     # The originals stay under the guard and run again after the copies, so a
@@ -2178,7 +2175,7 @@ def _plain_assignment_targets(stmt: ast.stmt) -> set[str]:
         targets = stmt.targets
     elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
         if any(isinstance(node, ast.Name) and node.id in _STATEFUL_ANNOTATIONS
-               for node in ast.walk(stmt.annotation)):
+               for node in ast_walk.walk(stmt.annotation)):
             return set()
         targets = [stmt.target]
     else:
@@ -2252,7 +2249,7 @@ def _force_conditional_writes(module: ast.Module, clone: ast.FunctionDef,
     shared = {name: nodes for name, nodes in outer.items() if name not in nested}
     reaching_shared = _reaching_defs(shared, hit)
     memo: dict[int, object] = {}
-    copies = [copy.deepcopy(node, memo)
+    copies = [ast_walk.clone(node, memo)
               for name in sorted(reaching_shared) for node in shared[name]]
 
     defs = dict(nested)
@@ -2301,14 +2298,14 @@ def _build_clone(main: ast.FunctionDef, kept: list[int], name: str) -> ast.Funct
     clone = copy.copy(main)
     clone.name = name
     clone.decorator_list = []
-    clone.args = copy.deepcopy(main.args, memo)
-    clone.returns = copy.deepcopy(main.returns, memo)
+    clone.args = ast_walk.clone(main.args, memo)
+    clone.returns = ast_walk.clone(main.returns, memo)
     # PEP 695 type parameters exist from Python 3.12 on; a Pyne script never
     # has any, but the field must not stay shared with ``main`` where it does.
     type_params = getattr(main, 'type_params', None)
     if type_params is not None:
-        clone.type_params = copy.deepcopy(type_params, memo)
-    body = [copy.deepcopy(main.body[index], memo) for index in kept]
+        clone.type_params = ast_walk.clone(type_params, memo)
+    body = [ast_walk.clone(main.body[index], memo) for index in kept]
     clone.body = body or [ast.Pass()]
     ast.copy_location(clone, main)
     ast.fix_missing_locations(clone)

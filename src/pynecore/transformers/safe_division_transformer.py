@@ -1,6 +1,7 @@
 from typing import cast
 import ast
 
+from . import ast_walk
 from .pine_type_rules import BOOL, FLOAT, INT, TYPELESS, get_ty, set_ty, stamp_lowering
 
 #: Operand types whose runtime values are native numbers, bools or na (an ``NA``
@@ -35,7 +36,7 @@ def _reread(node: ast.expr) -> ast.expr:
     return ast.Constant(value=cast(ast.Constant, node).value)
 
 
-class SafeDivisionTransformer(ast.NodeTransformer):
+class SafeDivisionTransformer(ast_walk.NodeTransformer):
     """
     Transformer that converts division operations to safe alternatives
     that preserve Pine Script semantics.

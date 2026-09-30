@@ -1,6 +1,8 @@
 import ast
 from typing import cast
 
+from . import ast_walk
+
 # The stateful ``ta`` builtin variables. Their accumulators live in per-call-site
 # Persistent state, but TradingView keeps ONE engine-level series per builtin
 # variable in the script's global scope: a read inside an ``if`` returns the same
@@ -41,7 +43,7 @@ MAIN_SCOPE_VARIABLES = frozenset({'accdist', 'vwap'})
 HOISTED_TA_VARIABLES = ENGINE_GLOBAL_VARIABLES | MAIN_SCOPE_VARIABLES
 
 
-class TaVariableHoistTransformer(ast.NodeTransformer):
+class TaVariableHoistTransformer(ast_walk.NodeTransformer):
     """
     Evaluate referenced stateful ``ta`` builtin variables once per bar, at the top
     of ``main``.

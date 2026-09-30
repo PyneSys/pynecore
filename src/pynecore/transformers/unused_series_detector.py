@@ -10,6 +10,8 @@ It runs before SeriesTransformer in the AST transformation pipeline.
 import ast
 from typing import Set, Dict
 
+from . import ast_walk
+
 
 def _is_in_annotation_context(node: ast.Subscript) -> bool:
     """Check if a subscript is part of a type annotation"""
@@ -20,7 +22,7 @@ def _is_in_annotation_context(node: ast.Subscript) -> bool:
     return False
 
 
-class UnusedSeriesDetectorTransformer(ast.NodeTransformer):
+class UnusedSeriesDetectorTransformer(ast_walk.NodeTransformer):
     """
     AST transformer that removes unnecessary Series annotations.
 
@@ -177,7 +179,7 @@ class UnusedSeriesDetectorTransformer(ast.NodeTransformer):
         return optimizer.visit(tree)
 
 
-class SeriesOptimizer(ast.NodeTransformer):
+class SeriesOptimizer(ast_walk.NodeTransformer):
     """Second pass transformer that actually removes the unused Series annotations"""
 
     def __init__(self, series_vars: Dict[str, Set[str]], indexed_vars: Dict[str, Set[str]]):

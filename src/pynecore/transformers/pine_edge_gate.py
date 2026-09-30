@@ -31,6 +31,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Final
 
+from . import ast_walk
 from .pine_type_rules import FactoryFields
 from .pine_type_table import Diag, Unknown
 
@@ -216,7 +217,7 @@ class _Gate:
     # --- collection pre-pass ---------------------------------------------
 
     def _collect(self) -> None:
-        for node in ast.walk(self.tree):
+        for node in ast_walk.walk(self.tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 self.def_names.add(node.name)
             elif isinstance(node, ast.ImportFrom):
@@ -243,7 +244,7 @@ class _Gate:
         # there, as the value of a field in a decorated class body (the
         # predicate is the type pass's, so the gate and the typing agree)
         factory = FactoryFields(self.tree)
-        for node in ast.walk(self.tree):
+        for node in ast_walk.walk(self.tree):
             if not isinstance(node, ast.ClassDef) or len(node.decorator_list) != 1 \
                     or not self._decorator_ok(node.decorator_list[0], self.class_decorators):
                 continue
@@ -287,7 +288,7 @@ class _Gate:
             # name knows whether the name is bound yet
             self._locals.append(_scope_bound(node))
             self._local_index.append(-1)
-            for child in ast.iter_child_nodes(node):
+            for child in ast_walk.iter_child_nodes(node):
                 if isinstance(child, ast.stmt):
                     continue
                 self._visit(child)
@@ -348,7 +349,7 @@ class _Gate:
                              'pass the arguments one by one')
             else:
                 self._check_ident(node, node.arg)
-        for child in ast.iter_child_nodes(node):
+        for child in ast_walk.iter_child_nodes(node):
             self._visit(child)
 
     # --- structural rules ------------------------------------------------
@@ -558,7 +559,7 @@ def _stored_names(stmt: ast.stmt) -> set[str]:
             continue
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
             out.add(node.id)
-        pending.extend(ast.iter_child_nodes(node))
+        pending.extend(ast_walk.iter_child_nodes(node))
     return out
 
 

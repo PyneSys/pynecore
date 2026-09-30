@@ -44,6 +44,7 @@ candidate, this is the exact filter behind it.
 """
 import ast
 
+from . import ast_walk
 from .security_slice import _ctx_get, _iter_contexts
 from .slot_layout import DEFAULT_STATE_PARAM, ModuleLayout
 
@@ -114,7 +115,7 @@ def _binds_name(module: ast.Module, name: str) -> bool:
     :param name: The spelling to look for.
     :return: True when the module binds it.
     """
-    for node in ast.walk(module):
+    for node in ast_walk.walk(module):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if node.name == name:
                 return True
@@ -146,7 +147,7 @@ def _binds_name(module: ast.Module, name: str) -> bool:
             targets = ([node.optional_vars]
                        if node.optional_vars is not None else [])
         for target in targets:
-            for sub in ast.walk(target):
+            for sub in ast_walk.walk(target):
                 if isinstance(sub, ast.Name) and sub.id == name:
                     return True
     return False
@@ -174,7 +175,7 @@ def _own_nodes(node: ast.AST) -> list[ast.AST]:
         if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef,
                                 ast.ClassDef, ast.Lambda)):
             continue
-        pending.extend(ast.iter_child_nodes(current))
+        pending.extend(ast_walk.iter_child_nodes(current))
     return out
 
 
@@ -212,7 +213,7 @@ def _name_binding(name: str, scope: _Scope, target: ast.AST) -> ast.expr | None:
                  and len(stmt.targets) == 1
                  and isinstance(stmt.targets[0], ast.Name)
                  and stmt.targets[0].id == name else None)
-        for sub in ast.walk(stmt):
+        for sub in ast_walk.walk(stmt):
             if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
                     and sub.name == name:
                 return None
@@ -298,7 +299,7 @@ def _collect_writes(module: ast.Module) \
         write's value is resolved there, see :func:`_name_binding`).
     """
     scopes: list[_Scope] = [module]
-    for node in ast.walk(module):
+    for node in ast_walk.walk(module):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             scopes.append(node)
     writes: dict[str, list[tuple[ast.expr, _Scope]]] = {}

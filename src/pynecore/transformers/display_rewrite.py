@@ -21,6 +21,7 @@ tests compare against that).
 from typing import cast
 import ast
 
+from . import ast_walk
 from .slot_layout import ModuleLayout, DEFAULT_STATE_PARAM, collect_scope_segments
 
 __all__ = ['display_dump']
@@ -28,7 +29,7 @@ __all__ = ['display_dump']
 _INDEXED_HELPERS = ('__resolve_slot·__', '__bind_any·__')
 
 
-class _IndexNamer(ast.NodeTransformer):
+class _IndexNamer(ast_walk.NodeTransformer):
     """Replace literal state-vector indexes with named constants."""
 
     def __init__(self, layout: ModuleLayout, segments: dict[int, str]):

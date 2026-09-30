@@ -1,10 +1,10 @@
 import ast
-import copy
 import hashlib
 import re
 from collections.abc import Container
 
 from ..core.import_hook import PYNE_RESERVED_NAME_CHAR
+from . import ast_walk
 from .dynamic_default import is_script_entry
 from .lib_series import NON_SERIES_LIB_ATTRS
 from .pine_type_rules import FactoryFields
@@ -183,7 +183,7 @@ _EXIT_STMTS: tuple[type[ast.AST], ...] = (
 _MAX_LIFT_ROUNDS = 16
 
 
-class _SignalArgSubstituter(ast.NodeTransformer):
+class _SignalArgSubstituter(ast_walk.NodeTransformer):
     """Rewrite one lifted ``__sec_signal__`` argument into the caller's scope.
 
     A helper's signal argument is written in the helper's own names: its
@@ -213,18 +213,18 @@ class _SignalArgSubstituter(ast.NodeTransformer):
         if node.id in self.bindings and node.id not in self._active:
             self._active.add(node.id)
             try:
-                return self.visit(copy.deepcopy(self.bindings[node.id]))
+                return self.visit(ast_walk.clone(self.bindings[node.id]))
             finally:
                 self._active.discard(node.id)
         if node.id in self.mapping:
             # The caller's expression is already in the target scope — return
             # it unvisited so its own names are left alone.
-            return copy.deepcopy(self.mapping[node.id])
+            return ast_walk.clone(self.mapping[node.id])
         self.failed = True
         return node
 
 
-class SecurityTransformer(ast.NodeTransformer):
+class SecurityTransformer(ast_walk.NodeTransformer):
     """
     Transform request.security() calls into multiprocessing signal/write/read pattern.
 
@@ -367,20 +367,25 @@ class SecurityTransformer(ast.NodeTransformer):
     def _walk_skip_funcs(node: ast.AST):
         """Walk AST nodes, skipping nested function definitions."""
         yield node
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            yield from SecurityTransformer._walk_skip_funcs(child)
+        yield from ast_walk.iter_descendants(node, (ast.FunctionDef, ast.AsyncFunctionDef))
 
     @staticmethod
     def _walk_skip_funcs_post(node: ast.AST):
         """Walk AST nodes in post-order (children before their parent),
         skipping nested function definitions."""
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            yield from SecurityTransformer._walk_skip_funcs_post(child)
-        yield node
+        # An explicit stack of (node, child iterator): a recursive generator
+        # pays one ``yield from`` hop per tree level for every node
+        stack = [(node, ast_walk.iter_child_nodes(node))]
+        while stack:
+            current, children = stack[-1]
+            for child in children:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                stack.append((child, ast_walk.iter_child_nodes(child)))
+                break
+            else:
+                stack.pop()
+                yield current
 
     @staticmethod
     def _find_forbidden_strategy_state(expr: ast.expr) -> ast.Attribute | None:
@@ -395,7 +400,7 @@ class SecurityTransformer(ast.NodeTransformer):
         catching those would need a def-use chain analyzer; instead the
         runtime fallback in the strategy module returns inert defaults.
         """
-        for sub in ast.walk(expr):
+        for sub in ast_walk.walk(expr):
             if not isinstance(sub, ast.Attribute):
                 continue
             if sub.attr not in _FORBIDDEN_STRATEGY_STATE_ATTRS:
@@ -462,7 +467,7 @@ class SecurityTransformer(ast.NodeTransformer):
         if isinstance(node, (ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare,
                              ast.IfExp, ast.Tuple, ast.List)):
             return all(cls._is_simple_chain(child, hoistable)
-                       for child in ast.iter_child_nodes(node)
+                       for child in ast_walk.iter_child_nodes(node)
                        if isinstance(child, ast.expr))
         return False
 
@@ -500,7 +505,7 @@ class SecurityTransformer(ast.NodeTransformer):
         """
         counts: dict[str, int] = {}
         declared: set[str] = set()
-        for sub in ast.walk(func):
+        for sub in ast_walk.walk(func):
             if isinstance(sub, ast.Name) and isinstance(sub.ctx, (ast.Store, ast.Del)):
                 counts[sub.id] = counts.get(sub.id, 0) + 1
             elif isinstance(sub, (ast.Global, ast.Nonlocal)):
@@ -541,7 +546,7 @@ class SecurityTransformer(ast.NodeTransformer):
     @staticmethod
     def _referenced_names(node: ast.expr) -> set[str]:
         """Names read by ``node`` (``lib`` excluded)."""
-        return {n.id for n in ast.walk(node)
+        return {n.id for n in ast_walk.walk(node)
                 if isinstance(n, ast.Name) and n.id != 'lib'}
 
     @classmethod
@@ -880,15 +885,15 @@ class SecurityTransformer(ast.NodeTransformer):
         for s in sec_ids:
             args: list[ast.expr] = [ast.Constant(value=s)]
             sym_expr, tf_expr, la_expr = self._signal_args[s]
-            args.append(copy.deepcopy(sym_expr) if sym_expr is not None
+            args.append(ast_walk.clone(sym_expr) if sym_expr is not None
                         else ast.Constant(value=None))
-            args.append(copy.deepcopy(tf_expr) if tf_expr is not None
+            args.append(ast_walk.clone(tf_expr) if tf_expr is not None
                         else ast.Constant(value=None))
             # A lookahead that is not module-level evaluable (an input-derived
             # Pine "simple" value) is still passed here when its chain is
             # hoistable — the binding it reads is moved above this block.
             if la_expr is not None:
-                args.append(copy.deepcopy(la_expr))
+                args.append(ast_walk.clone(la_expr))
             body.append(ast.Expr(value=self._func_call('__sec_signal__', *args)))
         return ast.If(
             test=self._is_none_check(),
@@ -901,12 +906,12 @@ class SecurityTransformer(ast.NodeTransformer):
         symbol/timeframe/lookahead."""
         args: list[ast.expr] = [ast.Constant(value=sec_id)]
         sym_expr, tf_expr, la_expr = self._signal_args[sec_id]
-        args.append(copy.deepcopy(sym_expr) if sym_expr is not None
+        args.append(ast_walk.clone(sym_expr) if sym_expr is not None
                     else ast.Constant(value=None))
-        args.append(copy.deepcopy(tf_expr) if tf_expr is not None
+        args.append(ast_walk.clone(tf_expr) if tf_expr is not None
                     else ast.Constant(value=None))
         if la_expr is not None:
-            args.append(copy.deepcopy(la_expr))
+            args.append(ast_walk.clone(la_expr))
         return ast.If(
             test=self._is_none_check(),
             body=[ast.Expr(value=self._func_call('__sec_signal__', *args))],
@@ -1103,7 +1108,7 @@ class SecurityTransformer(ast.NodeTransformer):
                     sid = getattr(call_node, '_sec_id')
                     if sid in runtime_sec_ids:
                         new_body.append(self._inline_signal(sid))
-                    expr = copy.deepcopy(call_exprs[sid])
+                    expr = ast_walk.clone(call_exprs[sid])
                     expr = replacer.visit(expr)
                     new_body.append(self._write_block(sid, expr))
                 new_body.append(replacer.visit(stmt))
@@ -1217,12 +1222,12 @@ class SecurityTransformer(ast.NodeTransformer):
             # runtime through __sec_signal__ like a deferred symbol/timeframe.
             lookahead_rt: ast.expr | None = None
             if lookahead is not None and not self._is_module_level_expr(lookahead):
-                lookahead_rt = copy.deepcopy(lookahead)
+                lookahead_rt = ast_walk.clone(lookahead)
 
             # Store actual expressions for __sec_signal__ args (always passed at runtime)
             self._signal_args[sec_id] = (
-                copy.deepcopy(symbol) if symbol is not None else None,
-                copy.deepcopy(timeframe) if timeframe is not None else None,
+                ast_walk.clone(symbol) if symbol is not None else None,
+                ast_walk.clone(timeframe) if timeframe is not None else None,
                 lookahead_rt,
             )
 
@@ -1231,12 +1236,12 @@ class SecurityTransformer(ast.NodeTransformer):
             ctx: dict[str, ast.expr] = {}
             if symbol is not None:
                 if self._is_module_level_expr(symbol):
-                    ctx['symbol'] = copy.deepcopy(symbol)
+                    ctx['symbol'] = ast_walk.clone(symbol)
                 else:
                     ctx['symbol'] = ast.Constant(value=None)
             if timeframe is not None:
                 if self._is_module_level_expr(timeframe):
-                    ctx['timeframe'] = copy.deepcopy(timeframe)
+                    ctx['timeframe'] = ast_walk.clone(timeframe)
                 else:
                     ctx['timeframe'] = ast.Constant(value=None)
 
@@ -1244,7 +1249,7 @@ class SecurityTransformer(ast.NodeTransformer):
                 ctx['is_ltf'] = ast.Constant(value=True)
             else:
                 gaps_expr = (
-                    copy.deepcopy(gaps) if gaps is not None else self._default_gaps()
+                    ast_walk.clone(gaps) if gaps is not None else self._default_gaps()
                 )
                 ctx['gaps'] = gaps_expr
                 if lookahead is not None:
@@ -1253,7 +1258,7 @@ class SecurityTransformer(ast.NodeTransformer):
                     # input-derived expression would NameError at import time,
                     # so store None as a placeholder — the runtime value passed
                     # to ``__sec_signal__`` resolves the mode on the first bar.
-                    ctx['lookahead'] = (copy.deepcopy(lookahead) if lookahead_rt is None
+                    ctx['lookahead'] = (ast_walk.clone(lookahead) if lookahead_rt is None
                                         else ast.Constant(value=None))
                 # Developing rounds inside one HTF period are skippable when
                 # the whole expression is a ``[k>=1]`` history reference under
@@ -1265,10 +1270,10 @@ class SecurityTransformer(ast.NodeTransformer):
                     value=self._closed_shift(expression, lookahead))
 
             if ignore_invalid is not None:
-                ctx['ignore_invalid_symbol'] = copy.deepcopy(ignore_invalid)
+                ctx['ignore_invalid_symbol'] = ast_walk.clone(ignore_invalid)
 
             if not is_ltf and currency is not None:
-                ctx['currency'] = copy.deepcopy(currency)
+                ctx['currency'] = ast_walk.clone(currency)
 
             # Plain-OHLCV fast path: when the expression is only raw price
             # series, the security child can serve it straight from each bar
@@ -1475,12 +1480,12 @@ class SecurityTransformer(ast.NodeTransformer):
             node)``, and how often each name is READ anywhere in the module
         """
         load_counts: dict[str, int] = {}
-        for sub in ast.walk(module):
+        for sub in ast_walk.walk(module):
             if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
                 load_counts[sub.id] = load_counts.get(sub.id, 0) + 1
         sites: dict[str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef,
                                     ast.Call]]] = {}
-        for caller in ast.walk(module):
+        for caller in ast_walk.walk(module):
             if not isinstance(caller, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             for stmt in caller.body:
@@ -1503,7 +1508,7 @@ class SecurityTransformer(ast.NodeTransformer):
         """
         found: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef,
                                list[ast.expr]]] = {}
-        for func in ast.walk(module):
+        for func in ast_walk.walk(module):
             if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             for stmt in func.body:
@@ -1596,7 +1601,7 @@ class SecurityTransformer(ast.NodeTransformer):
                 substituted: list[ast.expr] = []
                 for arg in args:
                     substituter = _SignalArgSubstituter(mapping, bindings)
-                    new_arg = substituter.visit(copy.deepcopy(arg))
+                    new_arg = substituter.visit(ast_walk.clone(arg))
                     if substituter.failed:
                         return None
                     substituted.append(new_arg)
@@ -1781,7 +1786,7 @@ class SecurityTransformer(ast.NodeTransformer):
         funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
         ambiguous: set[str] = set()
         entry: ast.FunctionDef | ast.AsyncFunctionDef | None = None
-        for node in ast.walk(module):
+        for node in ast_walk.walk(module):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             if node.name in funcs:
@@ -1831,7 +1836,7 @@ class SecurityTransformer(ast.NodeTransformer):
         :param module: the transformed module, after the cross-function lift
         """
         counts: dict[str, int] = {}
-        for node in ast.walk(module):
+        for node in ast_walk.walk(module):
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                     and node.func.id == '__sec_signal__'):
                 sid = self._call_sid(node)
@@ -1839,7 +1844,7 @@ class SecurityTransformer(ast.NodeTransformer):
                     counts[sid] = counts.get(sid, 0) + 1
 
         entry: ast.FunctionDef | ast.AsyncFunctionDef | None = None
-        for node in ast.walk(module):
+        for node in ast_walk.walk(module):
             if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                     and is_script_entry(node)):
                 entry = node
@@ -1950,7 +1955,7 @@ class SecurityTransformer(ast.NodeTransformer):
             return True
         if isinstance(node, _CONDITIONAL_EXPRS):
             return False
-        for child in ast.iter_child_nodes(node):
+        for child in ast_walk.iter_child_nodes(node):
             if isinstance(child, (ast.expr, ast.keyword)):
                 if cls._reached_unconditionally(child, target):
                     return True
@@ -2056,14 +2061,14 @@ class SecurityTransformer(ast.NodeTransformer):
             site so lifted signals keep their source order
         """
         funcs: list[ast.FunctionDef | ast.AsyncFunctionDef] = [
-            n for n in ast.walk(module)
+            n for n in ast_walk.walk(module)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
         # A name read anywhere else (an alias, a callback, a second call) means
         # the helper may run a different number of times than the single site
         # below suggests.
         load_counts: dict[str, int] = {}
-        for sub in ast.walk(module):
+        for sub in ast_walk.walk(module):
             if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
                 load_counts[sub.id] = load_counts.get(sub.id, 0) + 1
 
@@ -2142,7 +2147,7 @@ class SecurityTransformer(ast.NodeTransformer):
             ok = True
             for arg in stmt.value.args[1:]:
                 substituter = _SignalArgSubstituter(mapping, bindings)
-                new_arg = substituter.visit(copy.deepcopy(arg))
+                new_arg = substituter.visit(ast_walk.clone(arg))
                 if substituter.failed or not self._is_simple_chain(new_arg, available):
                     ok = False
                     break
@@ -2221,7 +2226,7 @@ class SecurityTransformer(ast.NodeTransformer):
             trailing = caller.body[-1] if caller.body else None
             if isinstance(trailing, ast.Return):
                 if trailing.value is not None and any(
-                        node is call for node in ast.walk(trailing.value)):
+                        node is call for node in ast_walk.walk(trailing.value)):
                     # The ``return`` itself runs the helper, and with it the
                     # reads. A wait in front of it would settle the round
                     # before the value is read: the chart would sit out the
@@ -2291,8 +2296,8 @@ class SecurityTransformer(ast.NodeTransformer):
         if not self._keep_top and any(
                 isinstance(sub, ast.Call) and (self._is_security_call(sub)
                                                or self._is_security_lower_tf_call(sub))
-                for sub in ast.walk(node)):
-            original = copy.deepcopy(node)
+                for sub in ast_walk.walk(node)):
+            original = ast_walk.clone(node)
         node = self.generic_visit(node)  # type: ignore[assignment]
 
         if self._all_contexts:
@@ -2560,14 +2565,21 @@ class _DependencyAnalyzer:
 
     # --- scopes ---
 
-    @classmethod
-    def _child_funcs(cls, node: ast.AST):
+    @staticmethod
+    def _child_funcs(node: ast.AST):
         """Yield the function definitions directly owned by ``node``'s scope."""
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                yield child
+        # An explicit stack of child iterators: a recursive generator pays one
+        # ``yield from`` hop per tree level for every node it passes through
+        stack = [ast_walk.iter_child_nodes(node)]
+        while stack:
+            for child in stack[-1]:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    yield child
+                else:
+                    stack.append(ast_walk.iter_child_nodes(child))
+                    break
             else:
-                yield from cls._child_funcs(child)
+                stack.pop()
 
     @staticmethod
     def _params(fn: 'ast.FunctionDef | ast.AsyncFunctionDef') -> list[ast.arg]:
@@ -2799,7 +2811,7 @@ class _DependencyAnalyzer:
         factory_calls = {id(call) for call in factories.of(node)}
         for stmt in node.body:
             if isinstance(stmt, ast.AnnAssign):
-                lambdas = [sub for sub in ast.walk(stmt) if isinstance(sub, ast.Lambda)]
+                lambdas = [sub for sub in ast_walk.walk(stmt) if isinstance(sub, ast.Lambda)]
                 if not lambdas:
                     continue
                 value = stmt.value
@@ -2808,7 +2820,7 @@ class _DependencyAnalyzer:
                                and PYNE_RESERVED_NAME_CHAR not in sub.id
                                and sub.id != 'lib'
                                and sub.id not in class_names
-                               for sub in ast.walk(lambdas[0].body))):
+                               for sub in ast_walk.walk(lambdas[0].body))):
                     return False
                 continue
             if isinstance(stmt, ast.Pass):
@@ -2824,28 +2836,32 @@ class _DependencyAnalyzer:
     @staticmethod
     def _iter_stmts_skip_funcs(node: ast.AST):
         """All descendant nodes of ``node``, not entering nested function defs."""
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            yield child
-            yield from _DependencyAnalyzer._iter_stmts_skip_funcs(child)
+        return ast_walk.iter_descendants(node, (ast.FunctionDef, ast.AsyncFunctionDef))
 
-    @classmethod
-    def _walk_loop_depth(cls, node: ast.AST, depth: int):
+    @staticmethod
+    def _walk_loop_depth(node: ast.AST, depth: int):
         """Yield ``(node, loop_depth)`` pairs, not entering nested function defs.
 
         The whole ``for`` / ``while`` subtree counts as one level deeper — the
         iterator expression itself runs once, but treating it as in-loop only
         over-approximates the ``in_loop`` marking.
         """
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            sub_depth = depth + 1 if isinstance(
-                child, (ast.For, ast.AsyncFor, ast.While)
-            ) else depth
-            yield child, sub_depth
-            yield from cls._walk_loop_depth(child, sub_depth)
+        # An explicit stack of (child iterator, depth): a recursive generator
+        # pays one ``yield from`` hop per tree level for every node
+        stack = [(ast_walk.iter_child_nodes(node), depth)]
+        while stack:
+            children, level = stack[-1]
+            for child in children:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                sub_depth = level + 1 if isinstance(
+                    child, (ast.For, ast.AsyncFor, ast.While)
+                ) else level
+                yield child, sub_depth
+                stack.append((ast_walk.iter_child_nodes(child), sub_depth))
+                break
+            else:
+                stack.pop()
 
     # --- program order of the write sites ---
 
@@ -2865,7 +2881,7 @@ class _DependencyAnalyzer:
 
         def walk(node: ast.AST) -> None:
             nonlocal counter
-            for child in ast.iter_child_nodes(node):
+            for child in ast_walk.iter_child_nodes(node):
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
                 # Arguments are evaluated before the call they belong to
@@ -3020,7 +3036,7 @@ class _DependencyAnalyzer:
                 # nothing below it belongs to this scope.
                 inner = self._scopes.get(self._key_of.get(id(node), ''))
                 own = frozenset(inner.locals) if inner is not None else frozenset()
-                for child in ast.iter_child_nodes(node):
+                for child in ast_walk.iter_child_nodes(node):
                     visit(child, stack, shadowed | own, True, cond, after)
                 return
             if isinstance(node, ast.Assign):
@@ -3075,7 +3091,7 @@ class _DependencyAnalyzer:
                     visit(child, stack, shadowed, in_func, else_cond,
                           after | {loop_id})
                 return
-            for child in ast.iter_child_nodes(node):
+            for child in ast_walk.iter_child_nodes(node):
                 visit(child, stack, shadowed, in_func, cond, after)
 
         visit(scope.node, [], frozenset(), False, frozenset(), frozenset())
@@ -3183,7 +3199,7 @@ class _DependencyAnalyzer:
             return taint
         if isinstance(node, _UNION_EXPRS):
             taint: set[str] = set()
-            for child in ast.iter_child_nodes(node):
+            for child in ast_walk.iter_child_nodes(node):
                 if isinstance(child, ast.expr):
                     taint |= self._expr_taint(child)
             return taint
@@ -3671,11 +3687,11 @@ class _DependencyAnalyzer:
 
     def run(self) -> None:
         self._funcs = {
-            n.name: n for n in ast.walk(self._module)
+            n.name: n for n in ast_walk.walk(self._module)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
         self._called_names = {
-            n.func.id for n in ast.walk(self._module)
+            n.func.id for n in ast_walk.walk(self._module)
             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
             and n.func.id in self._funcs
         }
@@ -3694,7 +3710,7 @@ class _DependencyAnalyzer:
         for node in self._module.body:
             if (isinstance(node, ast.ClassDef)
                     and self._is_plain_record(node, factories, class_names)):
-                record_nodes.update(id(sub) for sub in ast.walk(node))
+                record_nodes.update(id(sub) for sub in ast_walk.walk(node))
         for key, scope in self._scopes.items():
             for sub in self._iter_stmts_skip_funcs(scope.node):
                 if id(sub) in record_nodes:
@@ -3750,7 +3766,7 @@ class _DependencyAnalyzer:
             if late:
                 self.late_reads[sid] = late
 
-class _CallReplacer(ast.NodeTransformer):
+class _CallReplacer(ast_walk.NodeTransformer):
     """Replace marked request.security() call nodes with __sec_read__() calls."""
 
     def __init__(self, parent: SecurityTransformer):

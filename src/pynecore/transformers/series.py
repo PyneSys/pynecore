@@ -30,6 +30,7 @@ shadows the parent's series.
 from typing import cast
 import ast
 
+from . import ast_walk
 from .dynamic_default import is_dynamic_default_guard
 from .pine_type_rules import OBJECT, get_ty, set_ty, stamp_lowering
 from .slot_layout import ModuleLayout, scope_for_function
@@ -45,7 +46,7 @@ _BUFFER_SETTERS = {
 }
 
 
-class SeriesTransformer(ast.NodeTransformer):
+class SeriesTransformer(ast_walk.NodeTransformer):
     """Rewrite Series declarations and accesses to state-vector slots."""
 
     def __init__(self, layout: ModuleLayout):

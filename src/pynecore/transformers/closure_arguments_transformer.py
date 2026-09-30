@@ -32,6 +32,8 @@ Example:
 import ast
 from typing import Set, Dict, List, Optional, cast, Any
 
+from . import ast_walk
+
 
 def _is_persistent_annotation(annotation: ast.AST) -> bool:
     """Check if annotation is Persistent[T] or just Persistent."""
@@ -43,7 +45,7 @@ def _is_persistent_annotation(annotation: ast.AST) -> bool:
     return False
 
 
-class ClosureArgumentsTransformer(ast.NodeTransformer):
+class ClosureArgumentsTransformer(ast_walk.NodeTransformer):
     """Transform closure variables in inner functions to function arguments."""
 
     def __init__(self):
@@ -272,7 +274,7 @@ class ClosureArgumentsTransformer(ast.NodeTransformer):
         return annotation
 
 
-class ClosureVariableCollector(ast.NodeVisitor):
+class ClosureVariableCollector(ast_walk.NodeVisitor):
     """Collect closure variables for inner functions."""
 
     def __init__(self):

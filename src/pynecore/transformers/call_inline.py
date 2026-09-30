@@ -127,6 +127,7 @@ import types
 from pathlib import Path
 
 from ..core.pine_range import pine_range
+from . import ast_walk
 from .pine_type_rules import get_ty, stamp_lowering
 from .slot_layout import DEFAULT_STATE_PARAM
 
@@ -255,7 +256,7 @@ def _mark_exact(node: ast.expr) -> ast.expr:
         return node
     if isinstance(node, ast.Compare):
         setattr(node, 'pine_exact', True)
-    for child in ast.iter_child_nodes(node):
+    for child in ast_walk.iter_child_nodes(node):
         if isinstance(child, ast.expr):
             _mark_exact(child)
     return node
@@ -339,7 +340,7 @@ def _is_cast_call(node: ast.expr, module: types.ModuleType) -> bool:
     return getattr(module, 'cast', None) is typing.cast
 
 
-class _BodySubstitutor(ast.NodeTransformer):
+class _BodySubstitutor(ast_walk.NodeTransformer):
     """Rewrite a copied body expression into call-site terms.
 
     Parameters and body-local aliases become the expressions bound for them,
@@ -662,7 +663,7 @@ def _literal(node: ast.expr) -> tuple[bool, Any]:
     return False, None
 
 
-class _LiteralFolder(ast.NodeTransformer):
+class _LiteralFolder(ast_walk.NodeTransformer):
     """Evaluate the parts of a copied body a literal argument already decides.
 
     ``math.pow(x, 2)`` copies in ``2 == 2``; ``array.get(a, 0)`` copies in
@@ -904,7 +905,7 @@ def _replace_node(root: ast.AST, old: ast.AST, new: ast.AST) -> bool:
     return False
 
 
-class _PlaceholderSubstitutor(ast.NodeTransformer):
+class _PlaceholderSubstitutor(ast_walk.NodeTransformer):
     """Replace every read of one placeholder with a freshly built expression."""
 
     def __init__(self, name: str, factory: Any):
@@ -953,7 +954,7 @@ def _chain(probes: list[ast.expr], body: ast.expr) -> ast.expr:
 # --- the pass ----------------------------------------------------------------
 
 
-class _NameIndex(ast.NodeVisitor):
+class _NameIndex(ast_walk.NodeVisitor):
     """Every name the module binds anywhere, plus its module-level import map.
 
     A base name the module binds somewhere is out of the pass: the callee
@@ -1025,7 +1026,7 @@ class _NameIndex(ast.NodeVisitor):
             self.import_map[bound] = (cast(str, node.module), alias.name)
 
 
-class CallInlineTransformer(ast.NodeTransformer):
+class CallInlineTransformer(ast_walk.NodeTransformer):
     """Replace calls to allow-listed Pine builtins with their own body."""
 
     def __init__(self) -> None:
@@ -1040,6 +1041,10 @@ class CallInlineTransformer(ast.NodeTransformer):
         self._functions: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
         #: The loop counters proven never na at the current position
         self._counters: frozenset[str] = frozenset()
+        #: id(function definition) -> the names it declares ``global`` or
+        #: ``nonlocal`` anywhere inside it (the pass adds no such declaration,
+        #: so one scan per function answers for every loop in it)
+        self._declared: dict[int, frozenset[str]] = {}
         self._blocked = 0
         #: Number of sites rewritten -- the pass's own tests assert on it
         self.inlined = 0
@@ -1193,7 +1198,7 @@ class CallInlineTransformer(ast.NodeTransformer):
         _mark_exact(expression)
 
         reads: dict[int, int] = {index: 0 for index in placeholders}
-        for child in ast.walk(expression):
+        for child in ast_walk.walk(expression):
             if isinstance(child, ast.Name):
                 for index, name in placeholders.items():
                     if child.id == name:
@@ -1268,7 +1273,7 @@ class CallInlineTransformer(ast.NodeTransformer):
         # Collected from the FINAL expression: a guard folded away takes its
         # anchors with it, and an import nothing reads is dead weight
         del used
-        for child in ast.walk(expression):
+        for child in ast_walk.walk(expression):
             if isinstance(child, ast.Name) and child.id.startswith(SUPPORT_ALIAS_PREFIX):
                 anchor_name = _anchor_of(child.id)
                 if anchor_name is not None:
@@ -1330,7 +1335,7 @@ class CallInlineTransformer(ast.NodeTransformer):
             return None
         name = node.target.id
         for stmt in node.body:
-            for child in ast.walk(stmt):
+            for child in ast_walk.walk(stmt):
                 if isinstance(child, ast.Name) and child.id == name \
                         and not isinstance(child.ctx, ast.Load):
                     return None
@@ -1345,10 +1350,23 @@ class CallInlineTransformer(ast.NodeTransformer):
                     return None
                 if isinstance(child, (ast.MatchAs, ast.MatchStar)) and child.name == name:
                     return None
-        for child in ast.walk(self._functions[-1]):
-            if isinstance(child, (ast.Global, ast.Nonlocal)) and name in child.names:
-                return None
+        if name in self._declared_names(self._functions[-1]):
+            return None
         return name
+
+    def _declared_names(self, func: ast.FunctionDef | ast.AsyncFunctionDef) -> frozenset[str]:
+        """The names a function declares ``global`` / ``nonlocal``, nested scopes included.
+
+        :param func: The function definition.
+        :return: Every name of every such declaration inside it.
+        """
+        declared = self._declared.get(id(func))
+        if declared is None:
+            declared = frozenset(name for child in ast_walk.walk(func)
+                                 if isinstance(child, (ast.Global, ast.Nonlocal))
+                                 for name in child.names)
+            self._declared[id(func)] = declared
+        return declared
 
     def visit_For(self, node: ast.For) -> ast.For:
         node.target = cast(ast.expr, self.visit(node.target))

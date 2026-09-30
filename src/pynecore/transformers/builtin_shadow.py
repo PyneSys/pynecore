@@ -4,13 +4,15 @@ import importlib
 import json
 from pathlib import Path
 
+from . import ast_walk
+
 # Pine namespaces whose pynecore module has a different name
 _NAMESPACE_RENAMES = {
     'str': 'string',
 }
 
 
-class BuiltinShadowTransformer(ast.NodeTransformer):
+class BuiltinShadowTransformer(ast_walk.NodeTransformer):
     """
     Resolve workdir library imports whose alias shadows a built-in namespace.
 

@@ -1,7 +1,9 @@
 import ast
 
+from . import ast_walk
 
-class TypeCheckingStripperTransformer(ast.NodeTransformer):
+
+class TypeCheckingStripperTransformer(ast_walk.NodeTransformer):
     """
     Remove `if TYPE_CHECKING:` blocks and the TYPE_CHECKING import from @pyne files.
     These blocks contain IDE-only type hints (casts, re-annotations) that are unnecessary at runtime.

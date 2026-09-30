@@ -1,5 +1,7 @@
 import ast
 
+from . import ast_walk
+
 
 #: Series-carrying persistent annotations mapped to their non-series half.
 #: ``IBPersistentSeries`` is the ``varip`` flavour — it must split the same way,
@@ -11,7 +13,7 @@ SERIES_PERSISTENT_TYPES = {
 }
 
 
-class PersistentSeriesTransformer(ast.NodeTransformer):
+class PersistentSeriesTransformer(ast_walk.NodeTransformer):
     """
     Transform PersistentSeries and IBPersistentSeries declarations into a
     Persistent (resp. IBPersistent) + Series combination.

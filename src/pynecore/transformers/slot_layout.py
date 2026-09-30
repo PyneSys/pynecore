@@ -35,6 +35,7 @@ The runtime side of the contract (layout dict format, ``_make_state``,
 import ast
 from dataclasses import dataclass, field
 
+from . import ast_walk
 from .pine_type_rules import OBJECT, stamp_lowering
 
 __all__ = ['ModuleLayout', 'ScopeLayout', 'apply_layout', 'scope_for_function',
@@ -47,11 +48,18 @@ def _scope_defs(scope_node: ast.AST):
     """Yield the function definitions belonging to one scope in source order
     (descends through statements and class bodies, but not into nested
     function definitions — those belong to the inner scope)."""
-    for child in ast.iter_child_nodes(scope_node):
-        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            yield child
-        elif not isinstance(child, ast.Lambda):
-            yield from _scope_defs(child)
+    # An explicit stack of child iterators: a recursive generator pays one
+    # ``yield from`` hop per tree level for every node it passes through
+    stack = [ast_walk.iter_child_nodes(scope_node)]
+    while stack:
+        for child in stack[-1]:
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                yield child
+            elif not isinstance(child, ast.Lambda):
+                stack.append(ast_walk.iter_child_nodes(child))
+                break
+        else:
+            stack.pop()
 
 
 def collect_scope_segments(tree: ast.Module) -> dict[int, str]:
@@ -276,7 +284,7 @@ def scope_for_function(layout: ModuleLayout, scope_id: str, node: ast.FunctionDe
     """
     scope = layout.scope(scope_id)
     if any(isinstance(child, ast.FunctionDef)
-           for child in ast.walk(node) if child is not node):
+           for child in ast_walk.walk(node) if child is not node):
         scope.state_param = f'__state·{scope_id}__'
     return scope
 

@@ -30,6 +30,8 @@ not script code, and the AOT exporter skips them as well.
 """
 import ast
 
+from . import ast_walk
+
 __all__ = ['OuterWriteTransformer']
 
 #: Methods of the Python containers a script can hold that write the receiver.
@@ -107,7 +109,7 @@ def _module_names(module: ast.Module) -> set[str]:
         elif isinstance(stmt, ast.AnnAssign):
             targets = [stmt.target]
         for target in targets:
-            for sub in ast.walk(target):
+            for sub in ast_walk.walk(target):
                 if isinstance(sub, ast.Name) and not sub.id.startswith('__'):
                     names.add(sub.id)
     return names
@@ -137,7 +139,7 @@ def _local_names(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
             elif isinstance(sub, (ast.Import, ast.ImportFrom)):
                 for alias in sub.names:
                     names.add(alias.asname or alias.name.split('.')[0])
-    for stmt in ast.walk(func):
+    for stmt in ast_walk.walk(func):
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
                 and stmt is not func:
             names.add(stmt.name)
@@ -159,8 +161,7 @@ def _walk_own(node: ast.AST):
     if isinstance(node, _SCOPES):
         return
     yield node
-    for child in ast.iter_child_nodes(node):
-        yield from _walk_own(child)
+    yield from ast_walk.iter_descendants(node, _SCOPES)
 
 
 def _nested_defs(node: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
@@ -171,7 +172,7 @@ def _nested_defs(node: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
     first is returned instead of entered, the second runs no statements.
     """
     found: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
-    pending: list[ast.AST] = list(ast.iter_child_nodes(node))
+    pending: list[ast.AST] = list(ast_walk.iter_child_nodes(node))
     while pending:
         child = pending.pop()
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -179,11 +180,11 @@ def _nested_defs(node: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
             continue
         if isinstance(child, ast.Lambda):
             continue
-        pending.extend(ast.iter_child_nodes(child))
+        pending.extend(ast_walk.iter_child_nodes(child))
     return found
 
 
-class OuterWriteTransformer(ast.NodeTransformer):
+class OuterWriteTransformer(ast_walk.NodeTransformer):
     """Reject every direct write of a module-level object from inside a function.
 
     The pass only inspects; it returns the tree unchanged or raises.

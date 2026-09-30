@@ -1,6 +1,8 @@
 import ast
 from typing import cast
 
+from . import ast_walk
+
 # Builtin price series accepted by generic ``input()`` as source names.
 BUILTIN_PRICE_SERIES = frozenset({
     'open', 'high', 'low', 'close', 'volume',
@@ -21,7 +23,7 @@ NON_SERIES_LIB_ATTRS = frozenset({
 })
 
 
-class LibrarySeriesTransformer(ast.NodeTransformer):
+class LibrarySeriesTransformer(ast_walk.NodeTransformer):
     """
     AST transformer that prepares library Series variables for the SeriesTransformer.
     When a library variable is used with indexing, it creates a local Series variable
@@ -88,7 +90,7 @@ class LibrarySeriesTransformer(ast.NodeTransformer):
 
     def _insert_function_declarations(self, node: ast.Module) -> None:
         """Insert collected declarations into their target functions."""
-        for stmt in ast.walk(node):
+        for stmt in ast_walk.walk(node):
             if isinstance(stmt, ast.FunctionDef) and stmt.name in self.declarations_to_insert:
                 decls = self.declarations_to_insert[stmt.name]
                 stmt.body = decls + stmt.body

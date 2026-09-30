@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from ..utils.stdlib_checker import is_stdlib
+from . import ast_walk
 from . import pine_type_artifact
 from .dynamic_default import is_script_entry
 from .node_ids import assign_node_ids, node_id
@@ -353,6 +354,10 @@ class _Inference:
         #: once per definition: the lexically resolved ones and the ones a
         #: ``global`` declaration sends straight to the module scope
         self._free: dict[int, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+        #: id(scope node) -> that scope's ``_scope_free`` answer. An enclosing
+        #: definition's answer is built from its nested scopes' answers, so
+        #: without it every nested scope is rescanned once per enclosing one
+        self._scope_free_memo: dict[int, tuple[_Scope, frozenset[str], frozenset[str]]] = {}
         #: One call site's analysis identity -- everything but the
         #: free-variable types of a memo key, plus the call node -> the memo
         #: key that currently answers it. What makes a re-analysis of the SAME
@@ -709,7 +714,7 @@ class _Inference:
     def run(self, tree: ast.Module) -> None:
         """Walk a module: the lib aliases, the imports, the definitions, the body."""
         self._factory = FactoryFields(tree)
-        for node in ast.walk(tree):
+        for node in ast_walk.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module == 'pynecore':
                 self._lib_aliases.update(a.asname or a.name for a in node.names)
             elif isinstance(node, ast.Import):
@@ -946,7 +951,7 @@ class _Inference:
         :return: class id -> method name -> its definition
         """
         out: dict[str, dict[str, ast.FunctionDef]] = {}
-        for node in ast.walk(tree):
+        for node in ast_walk.walk(tree):
             if not isinstance(node, ast.FunctionDef):
                 continue
             if not _is_method(node):
@@ -975,7 +980,7 @@ class _Inference:
         :return: Class name -> its declaration, the LAST one under that name
         """
         declared: dict[str, list[ast.ClassDef]] = {}
-        for node in ast.walk(tree):
+        for node in ast_walk.walk(tree):
             if isinstance(node, ast.ClassDef):
                 declared.setdefault(node.name, []).append(node)
         out: dict[str, ast.ClassDef] = {}
@@ -1176,7 +1181,7 @@ class _Inference:
             case _:
                 # Import, Pass, Break, Continue, Global, Nonlocal, Delete:
                 # nothing to type
-                for child in ast.iter_child_nodes(stmt):
+                for child in ast_walk.iter_child_nodes(stmt):
                     if isinstance(child, ast.expr):
                         self._expr(child)
 
@@ -1485,7 +1490,7 @@ class _Inference:
             return cached
         # The definition's own name is bound where the definition stands, so a
         # body that calls itself is reading its own scope, not the one above
-        lexical, module_level = _scope_free(node)
+        lexical, module_level = _scope_free(node, self._scope_free_memo)
         free = (tuple(sorted(lexical - {node.name})),
                 tuple(sorted(module_level - {node.name})))
         if nid is not None:
@@ -1737,7 +1742,7 @@ class _Inference:
         """Type one expression, stamping it and everything under it."""
         method = getattr(self, f'_e_{type(node).__name__}', None)
         if method is None:
-            for child in ast.iter_child_nodes(node):
+            for child in ast_walk.iter_child_nodes(node):
                 if isinstance(child, ast.expr):
                     self._expr(child)
             ty = UNKNOWN
@@ -2643,7 +2648,7 @@ class _Inference:
         if self._pins_suppressed is None:
             return
         self.table.pins_suppressed = self._pins_suppressed
-        for node in ast.walk(tree):
+        for node in ast_walk.walk(tree):
             if isinstance(node, ast.Call):
                 set_pin(node, None)
                 set_pins(node, None)
@@ -3996,7 +4001,7 @@ class _Inference:
         for key, sites in varying.items():
             set_varying(targets[key], sites or None)
         per_instance = {id(call) for sites in varying.values() for call in sites}
-        for node in ast.walk(tree):
+        for node in ast_walk.walk(tree):
             if not isinstance(node, ast.Call) or id(node) in per_instance:
                 continue
             nid = node_id(node)
@@ -4045,7 +4050,7 @@ def _security_writes(tree: ast.Module) -> dict[str, list[ast.expr]]:
     :return: security id -> the expressions written under it
     """
     out: dict[str, list[ast.expr]] = {}
-    for node in ast.walk(tree):
+    for node in ast_walk.walk(tree):
         if not isinstance(node, ast.Call) or len(node.args) < 2:
             continue
         if _dotted(node.func) != '__sec_write__':
@@ -4113,7 +4118,7 @@ def _bound_positions(body: Sequence[ast.AST]) -> dict[str, list[tuple[int, int]]
             record(current.name, current)
         elif isinstance(current, ast.MatchMapping) and current.rest is not None:
             record(current.rest, current)
-        stack.extend(ast.iter_child_nodes(current))
+        stack.extend(ast_walk.iter_child_nodes(current))
     # The walk is depth-first over a LIFO stack, which visits the siblings
     # back to front; source order is what the positions are compared in
     return {name: sorted(positions) for name, positions in out.items()}
@@ -4232,11 +4237,12 @@ def _declared_names(body: Sequence[ast.AST]) -> tuple[set[str], set[str]]:
             globals_.update(current.names)
         elif isinstance(current, ast.Nonlocal):
             nonlocals.update(current.names)
-        stack.extend(ast.iter_child_nodes(current))
+        stack.extend(ast_walk.iter_child_nodes(current))
     return globals_, nonlocals
 
 
-def _scope_free(node: _Scope) -> tuple[set[str], set[str]]:
+def _scope_free(node: _Scope, memo: dict[int, tuple[_Scope, frozenset[str], frozenset[str]]]
+                ) -> tuple[frozenset[str], frozenset[str]]:
     """
     The names one lexical scope reads from OUTSIDE itself.
 
@@ -4263,8 +4269,14 @@ def _scope_free(node: _Scope) -> tuple[set[str], set[str]]:
     binding, so an enclosing scope's same-named local must NOT cancel it.
 
     :param node: The scope to scan
+    :param memo: id(scope) -> the scope and its answer; the tree does not change
+                 while it is analysed, so one scope's answer holds for every
+                 enclosing one
     :return: (names resolved lexically, names ``global`` forces to the module)
     """
+    cached = memo.get(id(node))
+    if cached is not None and cached[0] is node:
+        return cached[1], cached[2]
     body: list[ast.AST] = list(node.body) if isinstance(node.body, list) else [node.body]
     declared_global, declared_nonlocal = _declared_names(body)
     bound = _bound_names(body) - declared_global - declared_nonlocal
@@ -4289,15 +4301,17 @@ def _scope_free(node: _Scope) -> tuple[set[str], set[str]]:
             continue
         if isinstance(current, ast.Name) and isinstance(current.ctx, ast.Load):
             loaded.add(current.id)
-        stack.extend(ast.iter_child_nodes(current))
+        stack.extend(ast_walk.iter_child_nodes(current))
 
     free = (loaded - bound) - declared_global
     module_free = loaded & declared_global
     for scope in nested:
-        nested_free, nested_module = _scope_free(scope)
+        nested_free, nested_module = _scope_free(scope, memo)
         free |= nested_free - bound
         module_free |= nested_module
-    return free, module_free
+    answer = frozenset(free), frozenset(module_free)
+    memo[id(node)] = (node, *answer)
+    return answer
 
 
 def _scope_header(node: _Scope) -> list[ast.expr]:
@@ -4333,7 +4347,7 @@ def _called_names(node: ast.AST) -> set[str]:
     :param node: The subtree to scan
     :return: The bare callee names it mentions
     """
-    return {child.func.id for child in ast.walk(node)
+    return {child.func.id for child in ast_walk.walk(node)
             if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)}
 
 
@@ -4551,7 +4565,7 @@ def _annotation_names(tree: ast.Module) -> dict[str, ast.expr]:
     out: dict[str, ast.expr] = {}
 
     def take(node: ast.expr, where: ast.expr) -> None:
-        for child in ast.walk(node):
+        for child in ast_walk.walk(node):
             if isinstance(child, (ast.Name, ast.Attribute)):
                 spelled = _dotted(child)
                 if spelled is not None:
@@ -4562,7 +4576,7 @@ def _annotation_names(tree: ast.Module) -> dict[str, ast.expr]:
                 except SyntaxError:
                     continue
 
-    for node in ast.walk(tree):
+    for node in ast_walk.walk(tree):
         if isinstance(node, (ast.arg, ast.AnnAssign)):
             annotation = node.annotation
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -4639,7 +4653,7 @@ def _spells_series(annotation: ast.expr | None) -> bool:
         return False
     return any((isinstance(sub, ast.Name) and sub.id in _SERIES_HEADS)
                or (isinstance(sub, ast.Attribute) and sub.attr in _SERIES_HEADS)
-               for sub in ast.walk(annotation))
+               for sub in ast_walk.walk(annotation))
 
 
 def _call_arity(node: ast.Call) -> int | None:
@@ -4758,20 +4772,20 @@ def _own_calls(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.Call]:
         if isinstance(current, ast.Call):
             calls.append(current)
         if not isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            stack.extend(ast.iter_child_nodes(current))
+            stack.extend(ast_walk.iter_child_nodes(current))
     calls.sort(key=lambda call: node_id(call) or 0)
     return calls
 
 
 def _walk_own_scope(node: ast.AST):
     """Walk a function body without descending into nested function scopes."""
-    stack = list(ast.iter_child_nodes(node))
+    stack = list(ast_walk.iter_child_nodes(node))
     while stack:
         current = stack.pop()
         yield current
         if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             continue
-        stack.extend(ast.iter_child_nodes(current))
+        stack.extend(ast_walk.iter_child_nodes(current))
 
 
 def _enumerated(node: ast.expr) -> ast.expr | None:

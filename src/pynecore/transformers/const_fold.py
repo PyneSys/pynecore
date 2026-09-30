@@ -8,6 +8,7 @@ from pynecore.transformers.pine_type_rules import (
     INT, FLOAT, BOOL, STR, UNKNOWN, NUMERIC, join, binop_type, unaryop_type,
     annotation_type, set_ty, LIB_TYPE_OVERRIDES,
 )
+from pynecore.transformers import ast_walk
 
 __all__ = ['ConstFoldTransformer', 'quantize_embed']
 
@@ -127,7 +128,7 @@ def _mutated_stateful_names(body: list[ast.stmt]) -> frozenset[str]:
     stateful: set[str] = set()
     stores: dict[str, int] = {}
     for stmt in body:
-        for n in ast.walk(stmt):
+        for n in ast_walk.walk(stmt):
             if (isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)
                     and _is_stateful_annotation(n.annotation)):
                 stateful.add(n.target.id)
@@ -140,7 +141,7 @@ def _mutated_stateful_names(body: list[ast.stmt]) -> frozenset[str]:
 def _assigned_names(node: ast.AST) -> set[str]:
     """Every name a statement (sub)tree can (re)bind."""
     names: set[str] = set()
-    for n in ast.walk(node):
+    for n in ast_walk.walk(node):
         if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
             names.add(n.id)
         elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -154,7 +155,7 @@ def _assigned_names(node: ast.AST) -> set[str]:
     return names
 
 
-class _ExprFolder(ast.NodeTransformer):
+class _ExprFolder(ast_walk.NodeTransformer):
     """
     Replace every maximal constant subtree of one expression with the
     quantized literal. Non-constant nodes are recursed into; a successful
@@ -436,7 +437,7 @@ class ConstFoldTransformer:
         # A walrus rebinding anywhere in the statement makes that name
         # untrackable from here on (evaluation order inside one statement
         # is not modeled)
-        for n in ast.walk(stmt):
+        for n in ast_walk.walk(stmt):
             if isinstance(n, ast.NamedExpr) and isinstance(n.target, ast.Name):
                 env.pop(n.target.id, None)
 

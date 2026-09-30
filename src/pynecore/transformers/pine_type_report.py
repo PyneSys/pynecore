@@ -23,6 +23,7 @@ import ast
 import re
 from collections.abc import Iterator
 
+from . import ast_walk
 from .node_ids import node_id
 from .pine_type_rules import UNKNOWN, FactoryFields, get_ty, render_ty
 from .pine_type_table import Diag, PineTypeTable, Unknown, qualify
@@ -118,47 +119,47 @@ class _Report:
         """Record every node's parent and scope, and what is not a value position."""
         self.scope_of[id(node)] = scope
         if isinstance(node, ast.Call):
-            for sub in ast.walk(node.func):
+            for sub in ast_walk.walk(node.func):
                 self.skip.add(id(sub))
             # ``method_call(delete, box)`` selects a method by its function:
             # the selector is a name of code, not a value
             if _dotted(node.func) in ('method_call', 'lib.method_call') and node.args:
-                for sub in ast.walk(node.args[0]):
+                for sub in ast_walk.walk(node.args[0]):
                     self.skip.add(id(sub))
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             for decorator in node.decorator_list:
-                for sub in ast.walk(decorator):
+                for sub in ast_walk.walk(decorator):
                     self.skip.add(id(sub))
             if isinstance(node, ast.ClassDef):
                 for base in node.bases:
-                    for sub in ast.walk(base):
+                    for sub in ast_walk.walk(base):
                         self.skip.add(id(sub))
                 # ``field(default_factory=...)`` as a UDT field's default: the
                 # dataclass machinery builds it, the annotation types the field
                 for value in self.factory.of(node):
-                    for sub in ast.walk(value):
+                    for sub in ast_walk.walk(value):
                         self.skip.add(id(sub))
             else:
                 for arg in node.args.args + node.args.posonlyargs + node.args.kwonlyargs:
                     if arg.annotation is not None:
-                        for sub in ast.walk(arg.annotation):
+                        for sub in ast_walk.walk(arg.annotation):
                             self.skip.add(id(sub))
                 if node.returns is not None:
-                    for sub in ast.walk(node.returns):
+                    for sub in ast_walk.walk(node.returns):
                         self.skip.add(id(sub))
                 scope = qualify(scope, node.name)
         elif isinstance(node, ast.AnnAssign):
-            for sub in ast.walk(node.annotation):
+            for sub in ast_walk.walk(node.annotation):
                 self.skip.add(id(sub))
         elif isinstance(node, ast.match_case):
             # A pattern matches, it does not evaluate: the ``match`` itself is
             # what is not Pine, and the structural gate says so
-            for sub in ast.walk(node.pattern):
+            for sub in ast_walk.walk(node.pattern):
                 self.skip.add(id(sub))
         elif isinstance(node, ast.ExceptHandler):
             # ``except TypeError:`` names a class to catch, not a value
             if node.type is not None:
-                for sub in ast.walk(node.type):
+                for sub in ast_walk.walk(node.type):
                     self.skip.add(id(sub))
         if isinstance(node, ast.Expr):
             if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
@@ -171,16 +172,16 @@ class _Report:
                 and not isinstance(getattr(node, 'ctx', ast.Load()), ast.Load):
             self.skip.add(id(node))
             if isinstance(node, (ast.Tuple, ast.List)):
-                for sub in ast.walk(node):
+                for sub in ast_walk.walk(node):
                     self.skip.add(id(sub))
         if isinstance(node, ast.expr) and hasattr(node, 'lineno'):
             self.at.setdefault((node.lineno, node.col_offset), []).append(node)
-        for child in ast.iter_child_nodes(node):
+        for child in ast_walk.iter_child_nodes(node):
             self.parent_of[id(child)] = node
             self._index(child, scope)
 
     def _value_exprs(self) -> Iterator[ast.expr]:
-        for parent in ast.walk(self.tree):
+        for parent in ast_walk.walk(self.tree):
             for _, value in ast.iter_fields(parent):
                 for item in value if isinstance(value, list) else [value]:
                     if isinstance(item, ast.expr) and id(item) not in self.skip:
@@ -227,7 +228,7 @@ class _Report:
             return [] if isinstance(value, (ast.Name, ast.Attribute)) else [value]
         if isinstance(node, ast.Lambda):
             return []
-        return [child for child in ast.iter_child_nodes(node) if isinstance(child, ast.expr)]
+        return [child for child in ast_walk.iter_child_nodes(node) if isinstance(child, ast.expr)]
 
     def _binding(self, name: ast.Name):
         """The binding a name reads, in its scope or any enclosing one."""
@@ -260,7 +261,7 @@ class _Report:
         every expression whose own reason is a report somewhere within it.
         """
         return any((getattr(sub, 'lineno', 0), getattr(sub, 'col_offset', 0)) in self.reported_at
-                   for sub in ast.walk(node) if sub is not node and isinstance(sub, ast.expr))
+                   for sub in ast_walk.walk(node) if sub is not node and isinstance(sub, ast.expr))
 
     def _assigned_from(self, origin: Unknown) -> ast.expr | None:
         """The unknown value expression a binding's provenance points at, if it is one."""
@@ -361,7 +362,7 @@ class _Report:
 
 def _is_plumbing(node: ast.AST) -> bool:
     """Whether an expression is something the transforms emitted, not the user."""
-    for sub in ast.walk(node):
+    for sub in ast_walk.walk(node):
         if isinstance(sub, ast.Name) and _SYNTHETIC.match(sub.id):
             return True
         if isinstance(sub, ast.Attribute) and sub.attr == '__class__':
