@@ -118,7 +118,11 @@ def security_lower_tf(
     )
 
 
-def currency_rate(from_currency: str, to_currency: str) -> float:
+# A pair without rate data answers na whatever ``ignore_invalid_currency`` says: PyneCore
+# cannot tell an invalid pair from one whose rate data was simply not provided
+# noinspection PyUnusedParameter
+def currency_rate(from_currency: str, to_currency: str,
+                  ignore_invalid_currency: bool = False) -> float:
     """
     Get the currency conversion rate between two currencies.
 
@@ -131,6 +135,8 @@ def currency_rate(from_currency: str, to_currency: str) -> float:
 
     :param from_currency: Source currency code (e.g. ``"EUR"``, ``currency.EUR``)
     :param to_currency: Target currency code (e.g. ``"USD"``, ``currency.USD``)
+    :param ignore_invalid_currency: Return ``na`` instead of failing when no rate can be
+                                    calculated for the pair
     :return: Exchange rate as float, or ``na`` if no data is available
     """
     # Measured on TradingView (CAPITALCOM:EURUSD 60): ("USD", ""), ("", "USD"),

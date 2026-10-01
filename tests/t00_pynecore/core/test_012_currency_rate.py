@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import struct
 import tempfile
 from math import isnan
 from pathlib import Path
@@ -169,6 +170,45 @@ def __test_no_data_returns_nan__(log):
     """Unknown currency pair returns nan"""
     provider = CurrencyRateProvider({})
     assert isnan(provider.get_rate("EUR", "JPY", 1000000))
+
+
+def __test_legacy_single_bar_never_reads_its_own_close__(log):
+    """A legacy v1 bar is read only once the sibling ``.toml`` period proves it closed"""
+    day = 86400
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dir_path = Path(tmpdir)
+        sources = {}
+        for name, period, base in (("EURUSD", "1D", "EUR"), ("GBPUSD", "", "GBP")):
+            base_path = _create_test_ohlcv(dir_path, name, [], currency="USD",
+                                           basecurrency=base, period=period or "1D")
+            ohlcv_path = Path(base_path).with_suffix('.ohlcv')
+            # A v1 file has no header, so its period comes from nowhere but the .toml
+            ohlcv_path.write_bytes(struct.pack("Ifffff", 1000 * day, 1.25, 1.25, 1.25, 1.25,
+                                               100.0))
+            toml_path = Path(base_path).with_suffix('.toml')
+            toml_path.write_text(toml_path.read_text().replace('period = "1D"',
+                                                                f'period = "{period}"'))
+            sources[name] = base_path
+
+        provider = CurrencyRateProvider(sources)
+        assert isnan(provider.get_rate("EUR", "USD", 1000 * day))
+        assert provider.get_rate("EUR", "USD", 1001 * day) == 1.25
+        # No period anywhere and a single bar: nothing proves the bar closed
+        assert isnan(provider.get_rate("GBP", "USD", 1000 * day))
+        assert isnan(provider.get_rate("GBP", "USD", 1001 * day))
+
+
+def __test_ignore_invalid_currency_unknown_pair_returns_nan__(log):
+    """``ignore_invalid_currency`` is accepted and an unknown pair answers na"""
+    from pynecore.lib import request
+
+    original_provider = request._currency_provider
+    request._currency_provider = CurrencyRateProvider({})
+    try:
+        assert isnan(request.currency_rate("EUR", "JPY", ignore_invalid_currency=True))
+        assert request.currency_rate("USD", "USD", ignore_invalid_currency=True) == 1.0
+    finally:
+        request._currency_provider = original_provider
 
 
 def __test_multiple_pairs__(log):

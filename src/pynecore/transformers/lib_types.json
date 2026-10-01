@@ -5471,15 +5471,20 @@
    "ty": "o:lib#Position"
   },
   "request.currency_rate": {
-   "defaults": 0,
+   "default_ty": [
+    "b"
+   ],
+   "defaults": 1,
    "kind": "function",
    "names": [
     "from_currency",
-    "to_currency"
+    "to_currency",
+    "ignore_invalid_currency"
    ],
    "params": [
     "s",
-    "s"
+    "s",
+    "b"
    ],
    "ret": "f"
   },

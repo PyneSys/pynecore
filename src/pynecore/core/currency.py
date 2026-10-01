@@ -61,7 +61,7 @@ class CurrencyRateProvider:
     __slots__ = (
         '_pair_map', '_chart_pair',
         '_sync_block', '_result_readers',
-        '_file_rate_cache',
+        '_file_rate_cache', '_file_periods',
     )
 
     def __init__(
@@ -96,6 +96,8 @@ class CurrencyRateProvider:
         self._result_readers: dict[str, ResultReader] = {}
         # Bar open times, closes and the series' own bar length in milliseconds.
         self._file_rate_cache: dict[str, tuple[list[int], list[float], int]] = {}
+        # Period of each file source as its sibling ``.toml`` declares it.
+        self._file_periods: dict[str, str] = {}
 
         self._build_pair_map(
             security_data or {},
@@ -151,6 +153,7 @@ class CurrencyRateProvider:
                         self._get_ohlcv_bar_count(existing[1]):
                     continue
             self._pair_map[pair] = ('file', ohlcv_path)
+            self._file_periods[ohlcv_path] = syminfo.period
 
     def get_rate(self, from_cur: str, to_cur: str, timestamp: int) -> float:
         """
@@ -229,7 +232,9 @@ class CurrencyRateProvider:
         if ohlcv_path not in self._file_rate_cache:
             self._load_ohlcv(ohlcv_path)
         timestamps, closes, period_ms = self._file_rate_cache[ohlcv_path]
-        if not timestamps:
+        # Without a bar length no bar can be proven closed, and taking it as 0 would hand
+        # out a bar's close at its own open.
+        if not timestamps or period_ms <= 0:
             return float('nan')
         # Only an already-CLOSED rate bar may be read. The bar covering the chart bar has
         # not finished there, so its close is not knowable yet; reading it would be
@@ -248,11 +253,12 @@ class CurrencyRateProvider:
         """
         Bar length of a rate series, in milliseconds.
 
-        The declared period wins; the median gap between bars is the fallback for legacy
-        v1 files, which declare none. The median is used rather than the smallest gap so
-        the weekend of a five-day fiat feed and a DST-shifted day cannot shrink it.
+        The declared period wins; the median gap between bars is the fallback when neither
+        the file header (legacy v1 files declare none) nor the sibling ``.toml`` gives one.
+        The median is used rather than the smallest gap so the weekend of a five-day fiat
+        feed and a DST-shifted day cannot shrink it.
 
-        :param declared: Canonical period from the file header, or ``None``.
+        :param declared: Period from the file header or the sibling ``.toml``, or ``None``.
         :param timestamps: Bar open times in milliseconds, ascending.
         :return: The bar length, or 0 when neither source can tell.
         """
@@ -284,7 +290,7 @@ class CurrencyRateProvider:
         if Path(ohlcv_path).exists():
             try:
                 with OHLCVReader(ohlcv_path) as reader:
-                    declared = reader.period
+                    declared = reader.period or self._file_periods.get(ohlcv_path)
                     for candle in reader:
                         timestamps.append(candle.timestamp)
                         closes.append(candle.close)
