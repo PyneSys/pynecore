@@ -36,24 +36,25 @@ def main():
     plot(strategy.position_size, "psize")
 
 
-BASE_TS = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
-DAY_MS = 86_400_000
+__test_helper_BASE_TS = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
+__test_helper_DAY_MS = 86_400_000
 
-CHART_BARS = [
+__test_helper_CHART_BARS = [
     #  open,   high,    low,  close
     (100.0, 100.0, 100.0, 100.0),
     (100.0, 100.0, 100.0, 100.0),
     (100.0, 100.0, 100.0, 100.0),
     (100.0, 100.0, 100.0, 100.0),
-    (125.0, 125.0, 125.0, 125.0),   # the stop is marketable: fills at this open
+    (125.0, 125.0, 125.0, 125.0),   # the stop is marketable: fills at this open,
+                                    # sized at its own 120 level
     (125.0, 125.0, 125.0, 125.0),
 ]
 
 # The rate doubles between the placement bar (1) and the fill bar (4)
-RATES = [0.5, 0.5, 0.5, 1.0, 1.0, 1.0]
+__test_helper_RATES = [0.5, 0.5, 0.5, 1.0, 1.0, 1.0]
 
 
-def _make_syminfo():
+def __test_helper_make_syminfo():
     """Chart symbol quoted in USDT, so an USD account has to convert."""
     from pynecore.core.syminfo import SymInfo
     from pynecore.providers.ccxt import CCXTProvider
@@ -69,15 +70,15 @@ def _make_syminfo():
     )
 
 
-def _write_rate_file(dir_path) -> str:
-    """Daily USDT/USD series where ``RATES[i]`` is in force on chart bar ``i``."""
+def __test_helper_write_rate_file(dir_path) -> str:
+    """Daily USDT/USD series where ``__test_helper_RATES[i]`` is in force on chart bar ``i``."""
     from pynecore.core.ohlcv import OHLCVWriter
     from pynecore.types.ohlcv import OHLCV
 
     base_path = dir_path / "USDTUSD"
     with OHLCVWriter(base_path.with_suffix('.ohlcv'), "1D", truncate=True) as writer:
-        for i, rate in enumerate(RATES):
-            ts = BASE_TS + (i - 1) * DAY_MS
+        for i, rate in enumerate(__test_helper_RATES):
+            ts = __test_helper_BASE_TS + (i - 1) * __test_helper_DAY_MS
             writer.write(OHLCV(ts, rate, rate, rate, rate, 100.0))
 
     base_path.with_suffix('.toml').write_text(
@@ -91,7 +92,7 @@ def _write_rate_file(dir_path) -> str:
     return str(base_path)
 
 
-def _run(script_path, module_key, rate_path: str) -> list[dict]:
+def __test_helper_run(script_path, module_key, rate_path: str) -> list[dict]:
     """Run the script with the rate source attached."""
     import sys
     from pathlib import Path
@@ -102,10 +103,11 @@ def _run(script_path, module_key, rate_path: str) -> list[dict]:
     sys.modules.pop(Path(script_path).stem, None)
 
     bars = [
-        OHLCV(timestamp=BASE_TS + i * DAY_MS, open=o, high=h, low=l, close=c, volume=100.0)
-        for i, (o, h, l, c) in enumerate(CHART_BARS)
+        OHLCV(timestamp=__test_helper_BASE_TS + i * __test_helper_DAY_MS,
+              open=o, high=h, low=l, close=c, volume=100.0)
+        for i, (o, h, l, c) in enumerate(__test_helper_CHART_BARS)
     ]
-    runner = ScriptRunner(Path(script_path), iter(bars), _make_syminfo(),
+    runner = ScriptRunner(Path(script_path), iter(bars), __test_helper_make_syminfo(),
                           security_data={"rate_USDTUSD": rate_path})
     rows = []
     for _candle, plot_values, _closed in runner.run_iter():
@@ -120,10 +122,13 @@ def __test_resting_entry_sizes_at_the_placement_rate__(script_path, module_key):
     from pathlib import Path
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        rows = _run(script_path, module_key, _write_rate_file(Path(tmpdir)))
+        rate_path = __test_helper_write_rate_file(Path(tmpdir))
+        rows = __test_helper_run(script_path, module_key, rate_path)
 
-    # 10000 USD of equity buys 10000 / (125 * 0.5) = 160 contracts at the frozen
-    # placement rate; the fill-bar rate would have bought only 80.
-    assert abs(rows[4]['psize'] - 160.0) < 1e-9, (
-        f"expected the placement rate {RATES[1]} to size the fill, got {rows[4]['psize']}"
+    # 10000 USD of equity buys 10000 / (120 * 0.5) = 166.6666 contracts at the
+    # frozen placement rate (a gapped stop is sized at its level, see
+    # test_143); the fill-bar rate would have bought only 83.3333.
+    assert abs(rows[4]['psize'] - 166.6666) < 1e-9, (
+        f"expected the placement rate {__test_helper_RATES[1]} to size the fill, "
+        f"got {rows[4]['psize']}"
     )

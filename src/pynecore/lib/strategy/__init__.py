@@ -230,6 +230,7 @@ class Order:
         "deferred_qty",  # Default-sized entry: quantity re-resolves at the actual fill price
         "budget_money",  # Money budget of a default-sized entry frozen at (last) placement
         "budget_pv",  # Account point value (quote->account rate) frozen with it
+        "budget_price",  # Would-execute price at that placement: the level, or the close past it
         "filled_qty",  # Live: quantity of this entry order already reflected in open_trades
         "flip_extra",  # Reversal flip magnitude frozen at creation (added back on deferred re-size)
         "skip_flip",  # Entry re-placed on the same bar: it keeps its raw qty, no flip augmentation
@@ -340,6 +341,7 @@ class Order:
         self.deferred_qty = False
         self.budget_money: float | None = None
         self.budget_pv: float | None = None
+        self.budget_price: float | None = None
         # Live-only fill accounting: how much of this retained entry order has
         # already been recorded as an open trade. The simulator removes a
         # market entry order on fill, so it stays 0.0 there; the live broker
@@ -3770,7 +3772,9 @@ class SimPosition(PositionBase):
         an order re-placed every bar degenerates to prev-close equity, which
         is what earlier fill-time measurements saw). For those the
         placement-time size was only the margin-check estimate — a marketable
-        limit filling at the open re-sizes here. Market entries never defer:
+        limit filling at the open re-sizes here. A stop the open gapped through
+        is not re-priced: its caller passes the would-execute price frozen at
+        placement (``Order.budget_price``). Market entries never defer:
         they keep the placement-close size computed in ``entry``
         (TV-probe-verified). The reversal flip component stays frozen from
         creation (TV computes the flip quantity at order creation time).
@@ -4362,16 +4366,31 @@ class SimPosition(PositionBase):
                 slippage_amount = syminfo.mintick * script.slippage * order.sign
                 fill_price = self._market_fill_price + slippage_amount
 
+            # Settle a default-sized order's quantity at its fill price first,
+            # so the entry margin check below judges the real fill, not the
+            # estimate. A stop the open gapped through is the exception: it is
+            # sized at the price it would have executed at when placed — its
+            # stop level, or the placement close when that was already past
+            # the level — slipped, not at the open it fills at. MEASURED
+            # (CAPITALCOM:BTCUSD 60, slippage 3, ~7800 trades per probe), the
+            # same for strategy.entry and strategy.order: stop one tick above
+            # close, gapped fills -> stop+slip in every case, 1128 of them fit
+            # nothing else; stop below close -> close+slip in every case,
+            # stop+slip in 2.
+            if order.deferred_qty:
+                sizing_price = fill_price
+                if (gap_trigger == 'stop' and order.limit is None
+                        and order.budget_price is not None):
+                    sizing_price = (order.budget_price
+                                    + syminfo.mintick * script.slippage * order.sign)
+                self._resolve_deferred_qty(order, sizing_price)
+                if order.size == 0.0:
+                    self._remove_order(order)
+                    continue
+
             # Pre-fill margin check for entry orders (TradingView behavior)
             # TV rejects entry orders BEFORE filling if the position would exceed margin
             if order.order_type == _order_type_entry:
-                # Settle a default-sized order's quantity at its fill price first,
-                # so the margin check judges the real fill, not the estimate
-                if order.deferred_qty:
-                    self._resolve_deferred_qty(order, fill_price)
-                    if order.size == 0.0:
-                        self._remove_order(order)
-                        continue
                 # Same-bar opposite entry reversing a position OPENED earlier in
                 # this same bar-open cycle: TV margins BOTH legs at once (the
                 # closing leg's margin is not freed before the opening leg is
@@ -6702,6 +6721,7 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
         if budget is not None:
             order.budget_money = budget[0]
             order.budget_pv = _account_point_value()
+            order.budget_price = float(exec_price)
     # Store in entry_orders dict
     position._add_order(order)
 
@@ -7439,6 +7459,7 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
         if budget is not None:
             order.budget_money = budget[0]
             order.budget_pv = _account_point_value()
+            order.budget_price = float(exec_price)
     position._add_order(order)
 
 
