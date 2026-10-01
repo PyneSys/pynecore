@@ -19,12 +19,12 @@ tags: ["introduction", "pine-script", "python"]
 
 PyneCore is an innovative, open-source framework that brings the power of TradingView's Pine Script paradigm to the Python ecosystem. It's not just a tool that runs Pine Script code — it's a complete reimagining of the Pine Script concept, natively implemented in Python, with results that match TradingView.
 
-PyneCore is validated against TradingView on <!--wild:scripts_total-->920<!--/wild--> published
+PyneCore is validated against TradingView on <!--wild:scripts_total-->930<!--/wild--> published
 TradingView scripts (Pine Script v4–v6, converted to Pyne code with [PyneComp](https://pynesys.io)):
-all <!--wild:tv_verified-->1,241<!--/wild--> comparable outputs match,
-<!--wild:bars_exact_pct-->99.768<!--/wild-->% of
-<!--wild:bars_compared_millions-->118<!--/wild--> million plotted values are bit-identical, and
-<!--wild:strategy_trades-->318,982<!--/wild--> strategy trades match TradingView's timing
+all <!--wild:tv_verified-->1,256<!--/wild--> comparable outputs match,
+<!--wild:bars_exact_pct-->99.748<!--/wild-->% of
+<!--wild:bars_compared_millions-->120<!--/wild--> million plotted values are bit-identical, and
+<!--wild:strategy_trades-->322,325<!--/wild--> strategy trades match TradingView's timing
 (snapshot <!--wild:generated_at-->2026-10-01<!--/wild-->, [Pyne in the
 Wild](https://wild.pynesys.io/)). See [Compatibility](./compatibility.md) for details.
 
@@ -42,7 +42,7 @@ Trading strategies and technical indicators are usually implemented in one of tw
 PyneCore was built with several ambitious goals in mind:
 
 - **Results that match TradingView**: Indicator values and strategy trades match TradingView,
-  measured on a public corpus of <!--wild:scripts_total-->920<!--/wild--> published TradingView scripts
+  measured on a public corpus of <!--wild:scripts_total-->930<!--/wild--> published TradingView scripts
 - **Zero mandatory dependencies**: The core system operates without external libraries, ensuring portability and reliability
 - **Maximum performance**: Designed from the ground up for speed and efficiency
 - **Clean, well-documented code**: The source code prioritizes readability and proper documentation
@@ -142,8 +142,8 @@ Learn more about the NA system in the [Core Concepts](./core-concepts.md#5-na-no
 - **Extensible**: Leverage Python's vast ecosystem alongside PyneCore's capabilities
 - **Open Source**: Core functionality is open source and free to use (Apache 2.0 license)
 - **Modern**: Type hints, error handling, and comprehensive documentation (always improving)
-- **Precise**: All <!--wild:tv_verified-->1,241<!--/wild--> comparable outputs of <!--wild:scripts_total-->920<!--/wild--> published TradingView scripts
-  match TradingView; <!--wild:bars_exact_pct-->99.768<!--/wild-->% of <!--wild:bars_compared_millions-->118<!--/wild--> million plotted values are
+- **Precise**: All <!--wild:tv_verified-->1,256<!--/wild--> comparable outputs of <!--wild:scripts_total-->930<!--/wild--> published TradingView scripts
+  match TradingView; <!--wild:bars_exact_pct-->99.748<!--/wild-->% of <!--wild:bars_compared_millions-->120<!--/wild--> million plotted values are
   bit-identical, and the largest relative gap anywhere is <!--wild:max_rel-->1.2 × 10⁻¹⁰<!--/wild-->
 
 ## Who Is PyneCore For?

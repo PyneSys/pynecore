@@ -19,10 +19,10 @@ PyneCore runs Pine Script-style indicators and strategies in Python. Its API fol
 and existing Pine Script is converted to Pyne code with [PyneComp](https://pynesys.io), a separate service used with an
 API key.
 
-The results are validated against TradingView on <!--wild:scripts_total-->920<!--/wild--> published TradingView scripts:
-all <!--wild:tv_verified-->1,241<!--/wild--> comparable outputs match, <!--wild:bars_exact_pct-->99.768<!--/wild-->% of
-<!--wild:bars_compared_millions-->118<!--/wild--> million plotted values are bit-identical, and
-<!--wild:strategy_trades-->318,982<!--/wild--> strategy trades match TradingView's timing (snapshot
+The results are validated against TradingView on <!--wild:scripts_total-->930<!--/wild--> published TradingView scripts:
+all <!--wild:tv_verified-->1,256<!--/wild--> comparable outputs match, <!--wild:bars_exact_pct-->99.748<!--/wild-->% of
+<!--wild:bars_compared_millions-->120<!--/wild--> million plotted values are bit-identical, and
+<!--wild:strategy_trades-->322,325<!--/wild--> strategy trades match TradingView's timing (snapshot
 <!--wild:generated_at-->2026-10-01<!--/wild-->, [Pyne in the Wild](https://wild.pynesys.io/)). See
 [Compatibility](./overview/compatibility.md) for the status of each feature.
 
