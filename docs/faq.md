@@ -26,7 +26,7 @@ PyneCore is an open-source framework that implements TradingView's Pine Script p
 ### How does PyneCore relate to TradingView?
 
 PyneCore is not affiliated with or endorsed by TradingView. It is an independent project that
-implements Pine Script's functionality and execution model in Python. PyneCore is validated against TradingView on <!--wild:scripts_total-->910<!--/wild--> published TradingView scripts (Pine Script v4–v6, converted to Pyne code with [PyneComp](https://pynesys.io)): all <!--wild:tv_verified-->1,226<!--/wild--> comparable outputs match, <!--wild:bars_exact_pct-->99.764<!--/wild-->% of <!--wild:bars_compared_millions-->116<!--/wild--> million plotted values are bit-identical, and <!--wild:strategy_trades-->315,838<!--/wild--> strategy trades match TradingView's timing (snapshot <!--wild:generated_at-->2026-10-01<!--/wild-->, [Pyne in the Wild](https://wild.pynesys.io/)). See [Compatibility](./overview/compatibility.md) for details.
+implements Pine Script's functionality and execution model in Python. PyneCore is validated against TradingView on <!--wild:scripts_total-->920<!--/wild--> published TradingView scripts (Pine Script v4–v6, converted to Pyne code with [PyneComp](https://pynesys.io)): all <!--wild:tv_verified-->1,241<!--/wild--> comparable outputs match, <!--wild:bars_exact_pct-->99.768<!--/wild-->% of <!--wild:bars_compared_millions-->118<!--/wild--> million plotted values are bit-identical, and <!--wild:strategy_trades-->318,982<!--/wild--> strategy trades match TradingView's timing (snapshot <!--wild:generated_at-->2026-10-01<!--/wild-->, [Pyne in the Wild](https://wild.pynesys.io/)). See [Compatibility](./overview/compatibility.md) for details.
 
 ### Is PyneCore free to use?
 
@@ -173,18 +173,18 @@ You can use either or both methods (even in the same script) based on your prefe
 
 PyneCore's results are measured against TradingView on a public validation corpus,
 [Pyne in the Wild](https://wild.pynesys.io/). The snapshot of <!--wild:generated_at-->2026-10-01<!--/wild--> covers
-<!--wild:scripts_total-->910<!--/wild--> published open-source TradingView scripts (<!--wild:indicators-->457<!--/wild--> indicators,
-<!--wild:strategies-->453<!--/wild--> strategies), written in Pine Script v4 (<!--wild:pine_v4-->320<!--/wild-->), v5 (<!--wild:pine_v5-->341<!--/wild-->) and v6
-(<!--wild:pine_v6-->249<!--/wild-->), converted to Pyne code with [PyneComp](https://pynesys.io) and tested on
+<!--wild:scripts_total-->920<!--/wild--> published open-source TradingView scripts (<!--wild:indicators-->462<!--/wild--> indicators,
+<!--wild:strategies-->458<!--/wild--> strategies), written in Pine Script v4 (<!--wild:pine_v4-->320<!--/wild-->), v5 (<!--wild:pine_v5-->341<!--/wild-->) and v6
+(<!--wild:pine_v6-->259<!--/wild-->), converted to Pyne code with [PyneComp](https://pynesys.io) and tested on
 <!--wild:symbol-->BINANCE:BTCUSDT<!--/wild--> <!--wild:timeframe_min-->30<!--/wild-->-minute bars:
 
-- All <!--wild:scripts_total-->910<!--/wild--> scripts run.
-- All <!--wild:tv_verified-->1,226<!--/wild--> outputs that can be compared with TradingView are verified
-  (<!--wild:plot_outputs-->802<!--/wild--> plot outputs and <!--wild:trade_outputs-->424<!--/wild--> strategy trade lists).
-- Of <!--wild:bars_compared-->115,765,538<!--/wild--> plotted values, <!--wild:bars_exact_pct-->99.764<!--/wild-->% are identical to
+- All <!--wild:scripts_total-->920<!--/wild--> scripts run.
+- All <!--wild:tv_verified-->1,241<!--/wild--> outputs that can be compared with TradingView are verified
+  (<!--wild:plot_outputs-->812<!--/wild--> plot outputs and <!--wild:trade_outputs-->429<!--/wild--> strategy trade lists).
+- Of <!--wild:bars_compared-->117,659,091<!--/wild--> plotted values, <!--wild:bars_exact_pct-->99.768<!--/wild-->% are identical to
   TradingView to the bit; the rest are within the published band. The largest relative gap
   anywhere is <!--wild:max_rel-->1.2 × 10⁻¹⁰<!--/wild--> (about <!--wild:max_rel_sig_figures-->9<!--/wild--> significant figures).
-- In all <!--wild:strategies_compared-->424<!--/wild--> strategies with trades, the <!--wild:strategy_trades-->315,838<!--/wild--> trades
+- In all <!--wild:strategies_compared-->429<!--/wild--> strategies with trades, the <!--wild:strategy_trades-->318,982<!--/wild--> trades
   match TradingView's entry and exit timing, and the trade counts are identical.
 
 See [Compatibility](./overview/compatibility.md) for details.
