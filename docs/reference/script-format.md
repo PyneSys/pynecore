@@ -144,6 +144,7 @@ Key parameters (in addition to indicator parameters):
 | `process_orders_on_close`    | `False`              | Extra order processing after bar close |
 | `close_entries_rule`         | `'FIFO'`             | Trade closing order                    |
 | `risk_free_rate`             | `2.0`                | For Sharpe ratio calculation           |
+| `close_by_id`                | `False`              | One `close()` slot per id (Pine v4/v5) |
 
 ### @script.library
 

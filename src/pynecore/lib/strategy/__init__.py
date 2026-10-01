@@ -120,6 +120,10 @@ if True:
 # alive and an id can never be recycled onto a different statement.
 _close_call_sites: dict[tuple[object, int], int] = {}
 
+# The one ``book_seq`` every ``strategy.close()`` of a ``close_by_id`` script shares.
+# Call-site numbers start at 1, so it never meets a real statement's stamp.
+_CLOSE_BY_ID_SLOT = 0
+
 
 def _close_call_site(frame) -> int:
     """Identify the ``strategy.close()``/``close_all()`` STATEMENT that is running.
@@ -5208,6 +5212,11 @@ class SimPosition(PositionBase):
             return
         self._deferred_immediate_closes = []  # drain-once / re-entrancy guard
         for order in orders:
+            if self.exit_orders.get(_exit_order_key(order)) is not order:
+                # A later close on the same slot replaced this order (or it was
+                # cancelled): only the order the book still holds may fill. The key
+                # now belongs to the replacement, so the order is left as it is.
+                continue
             if self.size == 0.0:
                 # An earlier buffered close already flattened. TV treats a close
                 # against a zero position as a no-op; drop the order so it cannot
@@ -5240,7 +5249,10 @@ class SimPosition(PositionBase):
         if not self._deferred_immediate_closes:
             return
         for order in self._deferred_immediate_closes:
-            self._remove_order(order)
+            # A replaced or cancelled order no longer owns its slot; removing it
+            # would pop the replacement that now holds the same key.
+            if self.exit_orders.get(_exit_order_key(order)) is order:
+                self._remove_order(order)
         self._deferred_immediate_closes = []
 
     def process_orders_magnified(self, sub_bars: list[OHLCV], aggregated: OHLCV,
@@ -5841,6 +5853,21 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
         return
 
     exit_id = f"Close entry(s) order {id}"
+    close_by_id = isinstance(position, SimPosition) and lib._script.close_by_id
+    if close_by_id:
+        # MEASURED (CAPITALCOM:EURUSD 60, v5) — the quantity is sized against what
+        # the id's pending close of this bar leaves open, and only then does the
+        # call replace that order: qty 3 then a full close shed 7, a full close then
+        # qty 3 leaves the full close alone, qty 5 then qty 8 sheds 5.
+        pending = position.exit_orders.get(_exit_key(exit_id, id, None, _CLOSE_BY_ID_SLOT))
+        if (pending is not None and pending.bar_index == lib.bar_index
+                and not pending.consumed):
+            room = _size_round(abs(bound_size) - abs(pending.size))
+            if room <= 0.0:
+                return
+            if abs(size) > room:
+                size = -position.sign * room
+
     order = Order(id, size, exit_id=exit_id, order_type=_order_type_close,
                   comment=None if isinstance(comment, NA) else comment,
                   alert_message=None if isinstance(alert_message, NA) else alert_message)
@@ -5849,8 +5876,13 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
     # when they come from DIFFERENT statements and collapse when they come from
     # the same one (see _close_call_site). Backtest only — the live broker
     # close-dispatch path is handled separately and stays None.
+    # MEASURED (CAPITALCOM:EURUSD 60) — Pine v4/v5 keys the slot by the entry id
+    # alone: three close statements of one id on a bar leave only the last one's
+    # order, while closes of two different ids both fill. One shared stamp
+    # reproduces that, since the key already carries the id.
     if isinstance(position, SimPosition):
-        order.book_seq = _close_call_site(_sys._getframe(1))
+        order.book_seq = (_CLOSE_BY_ID_SLOT if close_by_id
+                          else _close_call_site(_sys._getframe(1)))
 
     # Add order to position (this will handle orderbook and exit_orders)
     position._add_order(order)

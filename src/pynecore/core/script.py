@@ -76,12 +76,15 @@ class Script:
     Script parameters dataclass
     """
     # These fields will be skipped when saving to toml
-    _SKIP_FIELDS = {'script_type', 'inputs', 'title', 'shorttitle', 'position', 'na_bool'}
+    _SKIP_FIELDS = {'script_type', 'inputs', 'title', 'shorttitle', 'position', 'na_bool',
+                    'close_by_id'}
 
     script_type: _script_type.ScriptType | None = None
     inputs: dict[str, InputData] = field(default_factory=dict)
     #: The script keeps Pine v4/v5's three-state bool (``bool b = na`` is a real na)
     na_bool: bool = False
+    #: Same-bar ``strategy.close()`` orders share one order slot per entry id (Pine v4/v5)
+    close_by_id: bool = False
 
     title: str | None = None
     shorttitle: str | None = None
@@ -420,6 +423,7 @@ class Script:
             _broker_requirements: ScriptRequirements | None = None,
 
             na_bool=False,
+            close_by_id=False,
             *_, **__
     ) -> Callable[..., Any]:
         """
@@ -474,6 +478,9 @@ class Script:
         :param na_bool: Keep Pine v4/v5's three-state bool: a bool may be na (a history
                         before warm-up, ``na(bool)``, a fresh array or UDT bool); v6 has
                         no such state
+        :param close_by_id: Keep Pine v4/v5's ``strategy.close()`` order slots: every close
+                            of one entry id on a bar modifies the same pending order, so the
+                            last call wins; v6 gives every close statement its own slot
         :param _broker_requirements: Broker capability requirements of the script, internal use only
         """
         script = cls()
@@ -525,6 +532,7 @@ class Script:
         script._broker_requirements = _broker_requirements
 
         script.na_bool = na_bool
+        script.close_by_id = close_by_id
         return script._decorate()
 
     @classmethod
