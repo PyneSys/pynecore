@@ -15,7 +15,7 @@
 
 PyneCore runs Pine Script-style trading code in Python. You write ordinary Python, and PyneCore rewrites it at import time with AST transformations, so it executes bar by bar with Pine Script's semantics: series with history, variables that keep their value between bars, and `na` for missing data. The rest of the Python ecosystem stays available to the same code.
 
-PyneCore is tested against TradingView on <!--wild:scripts_total-->880<!--/wild--> published TradingView scripts (Pine Script v4 to v6, converted to Pyne code with [PyneComp](https://pynesys.io)). All <!--wild:tv_verified-->1,185<!--/wild--> comparable outputs match, <!--wild:bars_exact_pct-->99.755<!--/wild-->% of <!--wild:bars_compared_millions-->111<!--/wild--> million plotted values are bit-identical, and <!--wild:strategy_trades-->307,773<!--/wild--> strategy trades match TradingView's timing (snapshot <!--wild:generated_at-->2026-10-01<!--/wild-->). Every script and every result is public at [Pyne in the Wild](https://wild.pynesys.io/), and the [Compatibility](https://pynecore.org/docs/overview/compatibility/) page lists the status of each Pine Script feature.
+PyneCore is tested against TradingView on <!--wild:scripts_total-->890<!--/wild--> published TradingView scripts (Pine Script v4 to v6, converted to Pyne code with [PyneComp](https://pynesys.io)). All <!--wild:tv_verified-->1,200<!--/wild--> comparable outputs match, <!--wild:bars_exact_pct-->99.759<!--/wild-->% of <!--wild:bars_compared_millions-->113<!--/wild--> million plotted values are bit-identical, and <!--wild:strategy_trades-->308,927<!--/wild--> strategy trades match TradingView's timing (snapshot <!--wild:generated_at-->2026-10-01<!--/wild-->). Every script and every result is public at [Pyne in the Wild](https://wild.pynesys.io/), and the [Compatibility](https://pynecore.org/docs/overview/compatibility/) page lists the status of each Pine Script feature.
 
 ## Key features
 
@@ -170,7 +170,7 @@ You can get an API key at [pynesys.io](https://pynesys.io).
 
 - Your scripts run outside TradingView, without its platform restrictions or code size limits.
 - Python's data science, machine learning and analysis libraries work in the same code as the trading logic.
-- The match with TradingView is measured on [real published scripts](https://wild.pynesys.io/): <!--wild:bars_exact_pct-->99.755<!--/wild-->% of <!--wild:bars_compared_millions-->111<!--/wild--> million plotted values are identical to the bit.
+- The match with TradingView is measured on [real published scripts](https://wild.pynesys.io/): <!--wild:bars_exact_pct-->99.759<!--/wild-->% of <!--wild:bars_compared_millions-->113<!--/wild--> million plotted values are identical to the bit.
 - The runtime and its library are open source under the Apache 2.0 license.
 
 ## Converting Pine Script
