@@ -3,8 +3,6 @@
 """
 from dataclasses import dataclass
 
-import pytest
-
 from pynecore.lib import color
 from pynecore.types.color import Color
 from pynecore.types.na import NA, na_float
@@ -71,16 +69,10 @@ def __test_color_new_does_not_mutate_input__():
 
 
 #
-# The numeric validation path is unchanged for real transparencies
+# A numeric transparency only adjusts the alpha
 #
 
 def __test_color_new_numeric_path_preserves_rgb__():
     """A valid transparency keeps the base RGB and only adjusts the alpha"""
     result = color.new(Color('#00C3FF'), 0)
     assert result.value == Color('#00C3FF').value
-
-
-def __test_color_new_out_of_range_still_rejected__():
-    """A numeric transparency outside 0..100 is still a ValueError"""
-    with pytest.raises(ValueError):
-        color.new(Color('#00C3FF'), 150)

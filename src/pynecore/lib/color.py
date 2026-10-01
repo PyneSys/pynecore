@@ -67,7 +67,10 @@ def t(color: Color) -> PyneFloat:
     :param color: Color
     :return: The transparency of the color, 0-100 (0: not transparent, 100: invisible)
     """
-    return color.t
+    # A na color is fully transparent. Otherwise the transparency is read back from the
+    # alpha byte and rounded to a whole number: color.new(c, 50.3) gives 50, 0.4 gives 0
+    # (no tie is possible, 100 * alpha / 255 never ends in .5)
+    return 100.0 if isinstance(color, NA) else float(round(color.t))
 
 
 # noinspection PyShadowingNames
@@ -109,10 +112,15 @@ def rgb(red: float | NA[float], green: float | NA[float], blue: float | NA[float
 
 def from_gradient(value: int | float | NA[float], bottom_value: int | float | NA[float],
                   top_value: int | float | NA[float],
-                  bottom_color: Color | NA[Color], top_color: Color | NA[Color]) -> Color | NA[Color]:
+                  bottom_color: Color | NA[Color], top_color: Color | NA[Color]) -> Color:
     """
     Based on the relative position of value in the bottom_value to top_value range,
     the function returns a color from the gradient defined by bottom_color to top_color.
+
+    The colors are mixed with their alpha premultiplied, so a more transparent endpoint
+    contributes less hue. The result is never na: where TradingView has nothing to mix
+    (a na value or bound, equal bounds, or two fully transparent endpoints) it returns
+    the all-zero color, transparent with no hue.
 
     :param value: Value to calculate the position-dependent color
     :param bottom_value: Bottom position value corresponding to bottom_color
@@ -121,41 +129,36 @@ def from_gradient(value: int | float | NA[float], bottom_value: int | float | NA
     :param top_color: Top position color
     :return: A color calculated from the linear gradient between bottom_color to top_color
     """
-    # na value/bounds propagate: TradingView returns a na color for such a bar.
+    # Measured on TradingView (CAPITALCOM:EURUSD 1D, 9844 packed bgcolor exports over
+    # opaque, translucent, fully transparent and na endpoints, bit-exact): the value is
+    # clamped into the range as max(min(value, top), bottom) -- so a reversed range
+    # always lands on the bottom color -- and every step below runs as written, with the
+    # Java (int) cast that turns the NaN of a na operand or of a 0/0 into 0. A na color
+    # mixes in as the all-zero color.
     if not (value == value and bottom_value == bottom_value and top_value == top_value):
-        return NA(Color)
+        return Color('#00000000')
+    span = top_value - bottom_value
+    if span == 0:
+        return Color('#00000000')
+    position = (max(min(value, top_value), bottom_value) - bottom_value) / span
+    rest = 1 - position
 
-    # Handle edge cases
-    if top_value == bottom_value:
-        return bottom_color
-
-    # Calculate the position as a ratio (0.0 to 1.0), clamped to [0, 1]
-    position = (value - bottom_value) / (top_value - bottom_value)
-    position = max(0.0, min(1.0, position))
-
-    # A na endpoint carries no hue (TV-verified: color.r/g/b(na)==0, color.t(na)==100).
-    # TradingView does NOT fade the visible RGB toward transparent-black; it keeps the
-    # solid endpoint's RGB and only fades transparency toward the na side (na transp=100),
-    # returning the literal na color exactly at the na endpoint's position.
-    bottom_na = isinstance(bottom_color, NA)
-    top_na = isinstance(top_color, NA)
-    if bottom_na and top_na:
-        return NA(Color)
-    if bottom_na:
-        if position <= 0.0:
-            return NA(Color)
-        transp = 100.0 + (top_color.t - 100.0) * position
-        return Color.rgb(top_color.r, top_color.g, top_color.b, transp)
-    if top_na:
-        if position >= 1.0:
-            return NA(Color)
-        transp = bottom_color.t + (100.0 - bottom_color.t) * position
-        return Color.rgb(bottom_color.r, bottom_color.g, bottom_color.b, transp)
-
-    # Both endpoints solid: interpolate RGB and transparency
-    red_comp = int(bottom_color.r + (top_color.r - bottom_color.r) * position)
-    green_comp = int(bottom_color.g + (top_color.g - bottom_color.g) * position)
-    blue_comp = int(bottom_color.b + (top_color.b - bottom_color.b) * position)
-    transp = bottom_color.t + (top_color.t - bottom_color.t) * position
-
-    return Color.rgb(red_comp, green_comp, blue_comp, transp)
+    bottom = 0 if isinstance(bottom_color, NA) else bottom_color.value
+    top = 0 if isinstance(top_color, NA) else top_color.value
+    bottom_a = bottom & 0xFF
+    top_a = top & 0xFF
+    # The alpha mixes as a byte, and the premultiplied channels are divided by that
+    # mixed byte scaled back to 0-1 -- not by the mix of the 0-1 alphas, which rounds
+    # differently and moves a channel by one on about a quarter of the bars
+    alpha = bottom_a * rest + top_a * position
+    if alpha == 0:
+        return Color('#00000000')
+    scale = alpha / 255
+    bottom_w = bottom_a / 255
+    top_w = top_a / 255
+    result = 0
+    for shift in (24, 16, 8):
+        mixed = ((bottom_w * ((bottom >> shift) & 0xFF)) * rest
+                 + (top_w * ((top >> shift) & 0xFF)) * position)
+        result |= int(mixed / scale) << shift
+    return Color(f'#{result | int(alpha):08X}')

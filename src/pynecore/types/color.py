@@ -1,3 +1,6 @@
+import math
+
+
 def _channel(value: float) -> int:
     """
     Bring a Pine rgb channel argument into the 0-255 integer range.
@@ -12,6 +15,25 @@ def _channel(value: float) -> int:
     if value >= 255:
         return 255
     return int(value)
+
+
+def _alpha(transp: float) -> int:
+    """
+    Convert a Pine transparency into the 0-255 alpha byte.
+
+    Measured on TradingView (CAPITALCOM:EURUSD 1D, a 0.1-step sweep of -10..110 through
+    both ``color.new`` and ``color.rgb``): an out of range transparency is clipped
+    instead of rejected, and the alpha is ``(1 - transp / 100) * 255`` rounded half up
+    (transp 30 -> 179, 90 -> 25 because that product is 25.4999...).
+
+    :param transp: Transparency percentage, not na
+    :return: The alpha byte (0: invisible, 255: opaque)
+    """
+    if transp <= 0:
+        return 255
+    if transp >= 100:
+        return 0
+    return math.floor((1 - transp / 100.0) * 255 + 0.5)
 
 
 class Color:
@@ -98,11 +120,9 @@ class Color:
         0: not transparent (fully opaque)
         100: invisible
 
-        :param transp: Transparency percentage (0-100)
+        :param transp: Transparency percentage, clipped into 0-100
         """
-        if not (0 <= transp <= 100):
-            raise ValueError("Transparency must be between 0 and 100")
-        self.value = (self.value & 0xFFFFFF00) | int((1 - transp / 100.0) * 255)
+        self.value = (self.value & 0xFFFFFF00) | _alpha(transp)
 
     @classmethod
     def rgb(cls, r: float, g: float, b: float, transp: float = 0) -> 'Color':
@@ -125,9 +145,4 @@ class Color:
         # solid color: an na channel reads back as 0, an na transparency as 100.
         if not (transp == transp):  # is_na_arg
             transp = 100.0
-        elif transp <= 0:
-            transp = 0.0
-        elif transp >= 100:
-            transp = 100.0
-        return cls(f'#{_channel(r):02X}{_channel(g):02X}{_channel(b):02X}'
-                   f'{int((1 - transp / 100.0) * 255):02X}')
+        return cls(f'#{_channel(r):02X}{_channel(g):02X}{_channel(b):02X}{_alpha(transp):02X}')
