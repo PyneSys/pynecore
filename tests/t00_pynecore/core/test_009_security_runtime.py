@@ -7,10 +7,10 @@ from pynecore.core.security import (
     setup_security_states,
 )
 from pynecore.core.security_shm import (
-    SyncBlock, ResultBlock, ResultReader, write_result,
+    SyncBlock, ResultBlock, write_result,
 )
 from pynecore.core.resampler import Resampler
-from multiprocessing import Event, Lock
+from multiprocessing import Lock
 from zoneinfo import ZoneInfo
 
 
@@ -148,6 +148,56 @@ def __test_chart_protocol_gaps_on__(log):
         state.new_period = True
         result = read_fn("sec_gaps", default="NA")
         assert result == 100.0
+    finally:
+        cleanup()
+        rb.close()
+        rb.unlink()
+        sb.close()
+        sb.unlink()
+
+
+def __test_chart_protocol_same_context_inline__(log):
+    """Chart protocol: an unconsumed chart-served context bypasses shared memory.
+
+    The value stays in the chart process, yet the read semantics of the result
+    block hold: the default before the first write, plain values as written, and
+    any other value as a private copy of what was written.
+    """
+    sec_ids = ["sec_same"]
+    sb = SyncBlock(sec_ids)
+    rb = ResultBlock("sec_same", create=True, version=0, prefix=sb.block_prefix("sec_same"))
+
+    state = _make_state(sec_id="sec_same", timeframe="5", same_timeframe=True)
+    states = {"sec_same": state}
+
+    signal_fn, write_fn, read_fn, wait_fn, cleanup, _, begin_bar, end_bar = create_chart_protocol(
+        states, sb, same_context_ids={"sec_same"}, no_process_ids={"sec_same"},
+        result_blocks={"sec_same": rb},
+    )
+
+    try:
+        begin_bar(1000, 2000, True)
+        signal_fn("sec_same")
+        assert read_fn("sec_same", default="NA") == "NA"
+
+        value = (1.5, float('nan'), "x")
+        write_fn("sec_same", value)
+        assert read_fn("sec_same", default="NA") is value
+        assert sb.get_result_meta("sec_same")[1] == 0
+        assert state.data_ready.is_set()
+        wait_fn("sec_same")
+        end_bar()
+
+        begin_bar(2000, 3000, True)
+        signal_fn("sec_same")
+        written = [1.0, 2.0]
+        write_fn("sec_same", written)
+        written.append(3.0)
+        first = read_fn("sec_same", default="NA")
+        assert first == [1.0, 2.0] and first is not written
+        first.append(4.0)
+        assert read_fn("sec_same", default="NA") == [1.0, 2.0]
+        end_bar()
     finally:
         cleanup()
         rb.close()
@@ -463,7 +513,6 @@ def __test_log_suppressed_in_security_context__(log):
     from pynecore.lib import log as pine_log
 
     original = lib._lib_semaphore
-    handler = logging.handlers = []
 
     # Capture console logger output
     captured = []
@@ -491,7 +540,6 @@ def __test_log_suppressed_in_security_context__(log):
 
 def __test_security_file_log__(log):
     """PYNE_SECURITY_LOG redirects security process logs to a file"""
-    import logging
     import tempfile
     from pathlib import Path
     from pynecore import lib

@@ -16,6 +16,7 @@ import inspect
 import json
 import logging
 import os
+import pickle
 import sys
 import threading
 from bisect import bisect_right
@@ -40,6 +41,7 @@ from .security_shm import (
     INITIAL_RING_CAPACITY, INITIAL_RING_ARENA, RING_RUNAHEAD_ENTRIES,
     RingReader, RingWriter, write_result,
 )
+from ..types.na import NA
 
 if TYPE_CHECKING:
     from multiprocessing.process import BaseProcess
@@ -1212,6 +1214,43 @@ def _next_civil_period_open(modifier: str, current_ms: int, tz: ZoneInfo) -> int
     return int(nxt.timestamp()) * 1000
 
 
+# Types a chart-served context may hand back as the very object the chart
+# wrote: immutable, and rebuilt by pickle as an equal value (an ``NA`` pickles
+# to its interned instance).
+_INLINE_PLAIN_TYPES = frozenset((float, int, bool, str, type(None), NA))
+
+
+class _InlineSnapshot:
+    """A chart-served value that is not plain, pickled at write time.
+
+    The read unpickles it, so the script gets a private copy of the value as it
+    was written, exactly as from the shared-memory result block.
+    """
+
+    __slots__ = ('data',)
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+
+def _inline_entry(value) -> object:
+    """Store form of a chart-served value: plain values as-is, others pickled.
+
+    :param value: The value the chart wrote.
+    :return: ``value`` itself, or its :class:`_InlineSnapshot`.
+    """
+    value_type = type(value)
+    if value_type in _INLINE_PLAIN_TYPES:
+        return value
+    if value_type is tuple:
+        for item in value:
+            if type(item) not in _INLINE_PLAIN_TYPES:
+                break
+        else:
+            return value
+    return _InlineSnapshot(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL))
+
+
 def create_chart_protocol(
     states: dict[str, SecurityState],
     sync_block: SyncBlock,
@@ -1374,6 +1413,15 @@ def create_chart_protocol(
     chart_bar_written: set[str] = set()
     chart_bar_value: dict[str, object] = {}
 
+    # A chart-served context no other context consumes never gets a ring, and
+    # its value never leaves this process: it skips the result block, its lock
+    # and ``data_ready``, and keeps its last written value here instead (see
+    # :func:`_inline_entry`). ``depends`` is compile-time, so the consumed set is
+    # final; a context the deferred resolver turns into the chart's own joins
+    # ``same_context_ids`` later and is served inline from then on.
+    consumed_ids = frozenset(_sid for _sid, _c in consumers_by_sid.items() if _c)
+    inline_values: dict[str, object] = {}
+
     def _ensure_chart_writer(_sid: str) -> None:
         """Give a chart-context producer its ring writer, if it has consumers.
 
@@ -1416,6 +1464,10 @@ def create_chart_protocol(
         :param next_chart_time: Open of the following chart bar, 0 when none.
         :param confirmed: Whether the chart bar is closed (historical/confirmed).
         """
+        if not consumed_ids and len(same_context_ids) == len(states):
+            # Every context is served inline by the chart: no child and no
+            # chart ring exists to hand the round's instants to.
+            return
         cal = _chart_calendar()
         round_state['chart_time'] = chart_time
         round_state['next_time'] = next_chart_time
@@ -2028,7 +2080,8 @@ def create_chart_protocol(
             state.started = True
             if sec_id in same_context_ids:
                 state.new_period = True
-                state.data_ready.clear()
+                if sec_id in consumed_ids:
+                    state.data_ready.clear()
             return
 
         # One outstanding round per context. ``__sec_wait__`` normally collects
@@ -2496,6 +2549,9 @@ def create_chart_protocol(
             raise RuntimeError("loop-varying security expression is not supported")
         chart_bar_written.add(sec_id)
         chart_bar_value[sec_id] = value
+        if sec_id not in consumed_ids:
+            inline_values[sec_id] = _inline_entry(value)
+            return
         with state.result_lock:
             write_result(result_blocks[sec_id], sync_block, value)
         state.data_ready.set()
@@ -2536,6 +2592,11 @@ def create_chart_protocol(
                 v * rate if isinstance(v, (int, float)) else v for v in result
             )
         return result
+
+    def _read_result_block(sec_id: str, state: SecurityState, default):
+        """Read a context's latest value from its shared-memory result block."""
+        with state.result_lock:
+            return readers[sec_id].read(sync_block, default)
 
     def __sec_read__(sec_id: str, default=None, _scope_id=None):
         # Resolved at runtime with no feed behind it. Tolerated up to here so
@@ -2584,7 +2645,9 @@ def create_chart_protocol(
         if driver.pending_live:
             _drive_pending(driver.sec_id, driver)
             _mirror_members(driver.sec_id)
-        _wait_with_liveness(state.data_ready, sec_id, sec_processes, failed_children)
+        inline = sec_id in same_context_ids and sec_id not in consumed_ids
+        if not inline:
+            _wait_with_liveness(state.data_ready, sec_id, sec_processes, failed_children)
 
         if not state.is_ltf and not state.new_period:
             # gaps_on emits ``na`` between HTF closes (Pine semantics).
@@ -2595,8 +2658,12 @@ def create_chart_protocol(
             if state.gaps_on or state.na_on_developing:
                 return default
 
-        with state.result_lock:
-            result = readers[sec_id].read(sync_block, default)
+        if inline:
+            result = inline_values.get(sec_id, default)
+            if type(result) is _InlineSnapshot:
+                result = pickle.loads(result.data)
+        else:
+            result = _read_result_block(sec_id, state, default)
 
         if state.is_ltf and sec_id in same_context_ids and result is not default:
             # An LTF request at the chart's own symbol and timeframe has exactly
