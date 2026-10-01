@@ -1516,6 +1516,73 @@ def __test_helper_pipeline(source: str) -> ast.Module:
     return tree
 
 
+def __test_scalars_and_library_helpers_join_no_alias_class__(log):
+    """A scalar handed around does not tie unrelated statements to the expression
+
+    ``length`` feeds both the expression and a helper call the expression never
+    reads, and ``mult`` comes out of ``cast_int``, a function a pynecore import
+    binds. A scalar is a value, so passing it to a call or choosing between two
+    of them aliases nothing, and a library helper touches no global of the
+    script: the helper call and everything feeding only it must be dropped. In
+    a child whose timeframe makes ``mult`` zero, running it would raise.
+    """
+    source = '''"""
+@pyne
+"""
+from pynecore.core.pine_cast import cast_int
+from pynecore.lib import script, request, syminfo, close, input, plot, ta, timeframe
+
+@script.indicator("t")
+def main(length=input.int(7), mode=input.string("a")):
+    rsi = ta.rsi(close, length)
+    sec = request.security(syminfo.tickerid, "5", rsi)
+    mult = cast_int(15 / timeframe.multiplier)
+
+    def manual(time_mult, len):
+        return ta.rma(close, len * time_mult)
+
+    man = manual(mult, length)
+    chosen = sec if mode == "a" else man
+    plot(chosen)
+'''
+    tree = __test_helper_pipeline(source)
+    body = __test_helper_body(__test_helper_only_clone(tree))
+    assert 'lib.ta.rsi' in body, "the expression's own input was dropped"
+    assert 'manual(mult' not in body, "a helper call the expression never reads was kept"
+    assert 'cast_int' not in body, "a scalar feeding only the dropped call was kept"
+    assert 'chosen' not in body, "a choice between two scalars was kept"
+    log.info("the scalar-only helper chain was dropped")
+
+
+def __test_a_color_alias_mutation_stays_in_the_slice__(log):
+    """A color is a scalar type but a mutable object: its alias still counts
+
+    ``alias.t = 50`` changes the very object ``c`` names, so the transparency
+    the expression reads depends on both the alias binding and the mutation.
+    Treating the color like an immutable scalar would drop them and hand the
+    child the untouched color.
+    """
+    source = '''"""
+@pyne
+"""
+from pynecore.lib import script, request, syminfo, color, plot
+
+@script.indicator("t")
+def main():
+    c = color.new(color.red, 0)
+    alias = c
+    alias.t = 50
+    value = c.t
+    sec = request.security(syminfo.tickerid, "5", value)
+    plot(sec)
+'''
+    tree = __test_helper_pipeline(source)
+    body = __test_helper_body(__test_helper_only_clone(tree))
+    assert 'alias = c' in body, "the color alias binding was dropped"
+    assert 'alias.t = 50' in body, "the mutation through the color alias was dropped"
+    log.info("the color alias mutation was kept")
+
+
 def __test_an_attribute_dependency_is_never_copied_ahead_of_its_guard__(log):
     """The guard is what makes the attribute owner valid, so the copy may not run
 

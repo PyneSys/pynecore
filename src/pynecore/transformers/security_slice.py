@@ -50,7 +50,7 @@ from ..core.import_hook import PYNE_RESERVED_NAME_CHAR, security_slice_disabled
 from . import ast_walk
 from .dynamic_default import is_script_entry
 from .persistent import VARIP_TYPES
-from .pine_type_rules import OBJECT, SCALARS, STR, get_ty, stamp_lowering
+from .pine_type_rules import COLOR, OBJECT, SCALARS, STR, get_ty, stamp_lowering
 from .security import (
     _COLLECTION_NAMESPACES, _COLLECTION_READERS, _DependencyAnalyzer, _UNMODELLED_NODES,
 )
@@ -88,6 +88,10 @@ _PROTOCOL_CALLS = frozenset({
 #: Calls the earlier passes emit that stand for a plain expression: they run
 #: no script code of their own, so an unresolved one is not opaque.
 _MARKER_CALLS = frozenset({'inline_series'})
+
+#: The scalar types whose runtime values are immutable. A ``Color`` is not one:
+#: its ``a`` / ``t`` setters change it in place, so it keeps its alias tracking.
+_IMMUTABLE_SCALARS = SCALARS - {COLOR}
 
 #: Fixpoint safety net for the call-graph summaries; the lattice is finite and
 #: monotone, so the loop always converges well below this.
@@ -285,10 +289,11 @@ class _Collector:
     """Builds :class:`_Facts` and alias classes for the statements of a scope."""
 
     def __init__(self, scopes: _SliceScopes, aliases: _Aliases,
-                 import_names: frozenset[str]):
+                 import_names: frozenset[str], library_calls: frozenset[str]):
         self._scopes = scopes
         self._aliases = aliases
         self._imports = import_names
+        self._library_calls = library_calls
         self._returns: dict[str, list[str]] = {}
         self._returning: set[str] = set()
         # Set when a mutation was seen that joins no alias class, so no slice of
@@ -300,6 +305,10 @@ class _Collector:
     def alias_roots(self, expr: ast.expr | None, scope: str) -> list[str]:
         """Qualified names ``expr`` may evaluate to an alias of."""
         if expr is None:
+            return []
+        if get_ty(expr) in _IMMUTABLE_SCALARS:
+            # An immutable scalar is a value, not an object: no later mutation
+            # can reach it through a second name, so it joins no alias class.
             return []
         if isinstance(expr, (ast.Name, ast.Attribute, ast.Subscript)):
             root = self._scopes.root_name(expr)
@@ -510,6 +519,14 @@ class _Collector:
                 if sid is not None:
                     facts.write_sids.add(sid)
                 return
+            if func.id in self._library_calls:
+                # A library function bound by a pynecore import (``cast_int``)
+                # or a marker call of an earlier pass: the trust the ``lib``
+                # chain gets, it touches no global of the script. It may still
+                # keep or change what it is handed.
+                for arg in args:
+                    facts.mutates.update(self.alias_roots(arg, scope))
+                return
             if func.id in self._imports:
                 facts.external()
                 return
@@ -657,8 +674,11 @@ class SecuritySliceTransformer(ast_walk.NodeTransformer):
                 return []
 
         import_names = _module_imports(node)
+        nodes = list(ast_walk.walk(node))
+        library_calls = frozenset(
+            (_pynecore_imported_names(nodes) - _rebound_names(nodes)) | _MARKER_CALLS)
         aliases = _Aliases()
-        collector = _Collector(scopes, aliases, import_names)
+        collector = _Collector(scopes, aliases, import_names, library_calls)
         # Module level binds names too (``store = array.new_float(1)`` followed
         # by ``alias = store``), and both names denote the same object at
         # runtime, so its bindings join the alias classes as well.
