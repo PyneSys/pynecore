@@ -103,6 +103,7 @@ from . import ast_walk
 from .call_inline import SUPPORT_ALIAS_PREFIX
 from .pine_type_rules import (get_pin, get_pins, get_ty, get_varying, get_vector,
                               stamp_lowering)
+from .pine_qualifier import SERIES_LENGTH_KEYWORD, get_series_len, get_series_lens
 # noinspection PyProtectedMember
 from .slot_layout import DEFAULT_STATE_PARAM, ModuleLayout, scope_for_function
 
@@ -943,6 +944,10 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
     def visit_Call(self, node: ast.Call) -> ast.expr:
         node.args = [cast(ast.expr, self.visit(arg)) for arg in node.args]
         node.keywords = [cast(ast.keyword, self.visit(kw)) for kw in node.keywords]
+        if get_series_len(node):
+            # The type pass found the window's length series in every context
+            node.keywords.append(ast.keyword(arg=SERIES_LENGTH_KEYWORD,
+                                             value=ast.Constant(value=True)))
         if not isinstance(node.func, (ast.Name, ast.Attribute)):
             # Immediately-called expressions stay raw (legacy parity), but
             # calls inside the callee expression still get their own sites
@@ -1010,7 +1015,9 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
         entry out of the slot instead: ``__state__[k][j]``, with ``j`` the
         site's index in that vector. A site is one kind or the other — an
         overload group is never instantiated per call site, so it never carries
-        a vector, and a context-analysed callee has no overload to pin.
+        a vector, and a context-analysed callee has no overload to pin. A window
+        call whose machine varies is the third kind: its entry is appended to
+        the call as the machine keyword instead.
 
         :param node: The call node
         :param scope: Scope id of the call site
@@ -1026,7 +1033,11 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
             entry = ast.Subscript(
                 value=self._slot_ref(self._state_param(), self._pin_slots[scope]),
                 slice=ast.Constant(value=position), ctx=ast.Load())
-            if get_pins(node) is not None:
+            if get_series_lens(node) is not None:
+                # A window call whose machine differs per instance takes it as
+                # an argument: true for a series length, None or false for a ring
+                node.keywords.append(ast.keyword(arg=SERIES_LENGTH_KEYWORD, value=entry))
+            elif get_pins(node) is not None:
                 pin = entry
             else:
                 vector = entry

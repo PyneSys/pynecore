@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .pine_type_rules import UNKNOWN, ImplSig
+from .pine_qualifier import NOT_READ, SERIES
 
 __all__ = ['Unknown', 'Binding', 'FuncSig', 'CallSite', 'ContextKey',
            'ContextResult', 'Diag', 'DepRecord', 'ExportSig', 'ClassSig',
@@ -46,8 +47,10 @@ def qualify(scope: str, name: str) -> str:
 #: How a context is addressed: the callee's scope id, the parameter types it
 #: was instantiated with, the context its caller was running in, the node id of
 #: the DEFINITION analysed (an overload group spells several under one scope
-#: id) and the types the enclosing scopes held for the names its body reads.
-ContextKey = tuple[str, tuple[str, ...], int, int | None, tuple[tuple[str, str], ...]]
+#: id), the types and qualifiers the enclosing scopes held for the names its body
+#: reads, and the qualifier of each parameter.
+ContextKey = tuple[str, tuple[str, ...], int, int | None,
+                   tuple[tuple[str, str, int], ...], tuple[int, ...]]
 
 
 @dataclass(slots=True, frozen=True)
@@ -86,6 +89,20 @@ class Binding:
     unknown: Unknown | None = None
     #: Declared as a series (``Series[...]``): its history ``x[n]`` is readable
     series: bool = False
+    #: Pine qualifier (``pine_qualifier``): the strongest over every assignment
+    #: and the conditions of every reassignment
+    qual: int = SERIES
+    #: How many conditions enclosed the first binding; a reassignment under
+    #: more of them is conditional, and their qualifiers join in
+    depth: int = 0
+    #: Declared ``Persistent`` (Pine's ``var``): any reassignment makes it series
+    persistent: bool = False
+    #: Node id of the statement that declared it; a re-walk of that statement
+    #: (the loop fixpoint) is not a reassignment
+    decl: int | None = None
+    #: Lowest qualifier a read of it has seen in the running walk, NOT_READ when
+    #: none has read it: a read below the final qualifier is a stale read
+    min_read: int = NOT_READ
 
 
 @dataclass(slots=True)
@@ -122,6 +139,10 @@ class ContextResult:
     #: Type of each parameter, positional first then keyword-only
     params: tuple[str, ...]
     ret: str = UNKNOWN
+    #: Pine qualifier of each parameter, in the order of ``params``
+    quals: tuple[int, ...] = ()
+    #: Pine qualifier of the value the function returns
+    ret_qual: int = SERIES
     #: Call node id -> the overload pin this context justified there. Where two
     #: contexts disagree, the node itself carries no single pin and a later
     #: pass has to hand each instance its own out of these

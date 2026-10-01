@@ -7614,19 +7614,22 @@
      "default_ty": [
       "b",
       "b",
+      "b",
       "b"
      ],
-     "defaults": 3,
+     "defaults": 4,
      "names": [
       "source",
       "length",
       "_bars",
       "_tuple",
-      "_check_eq"
+      "_check_eq",
+      "_series_length"
      ],
      "params": [
       "f",
       "i",
+      "b",
       "b",
       "b",
       "b"
@@ -7634,12 +7637,17 @@
      "ret": "f"
     },
     {
-     "defaults": 0,
+     "default_ty": [
+      "b"
+     ],
+     "defaults": 1,
      "names": [
-      "length"
+      "length",
+      "_series_length"
      ],
      "params": [
-      "i"
+      "i",
+      "b"
      ],
      "ret": "f"
     }
@@ -7649,24 +7657,34 @@
   "ta.highestbars": {
    "impls": [
     {
-     "defaults": 0,
+     "default_ty": [
+      "b"
+     ],
+     "defaults": 1,
      "names": [
       "source",
-      "length"
+      "length",
+      "_series_length"
      ],
      "params": [
       "f",
-      "i"
+      "i",
+      "b"
      ],
      "ret": "i"
     },
     {
-     "defaults": 0,
+     "default_ty": [
+      "b"
+     ],
+     "defaults": 1,
      "names": [
-      "length"
+      "length",
+      "_series_length"
      ],
      "params": [
-      "i"
+      "i",
+      "b"
      ],
      "ret": "i"
     }
@@ -7732,17 +7750,22 @@
    "ret": "f"
   },
   "ta.linreg": {
-   "defaults": 0,
+   "default_ty": [
+    "b"
+   ],
+   "defaults": 1,
    "kind": "function",
    "names": [
     "source",
     "length",
-    "offset"
+    "offset",
+    "_series_length"
    ],
    "params": [
     "f",
     "i",
-    "i"
+    "i",
+    "b"
    ],
    "ret": "f"
   },
@@ -7752,19 +7775,22 @@
      "default_ty": [
       "b",
       "b",
+      "b",
       "b"
      ],
-     "defaults": 3,
+     "defaults": 4,
      "names": [
       "source",
       "length",
       "_bars",
       "_tuple",
-      "_check_eq"
+      "_check_eq",
+      "_series_length"
      ],
      "params": [
       "f",
       "i",
+      "b",
       "b",
       "b",
       "b"
@@ -7772,12 +7798,17 @@
      "ret": "f"
     },
     {
-     "defaults": 0,
+     "default_ty": [
+      "b"
+     ],
+     "defaults": 1,
      "names": [
-      "length"
+      "length",
+      "_series_length"
      ],
      "params": [
-      "i"
+      "i",
+      "b"
      ],
      "ret": "f"
     }
@@ -7787,24 +7818,34 @@
   "ta.lowestbars": {
    "impls": [
     {
-     "defaults": 0,
+     "default_ty": [
+      "b"
+     ],
+     "defaults": 1,
      "names": [
       "source",
-      "length"
+      "length",
+      "_series_length"
      ],
      "params": [
       "f",
-      "i"
+      "i",
+      "b"
      ],
      "ret": "i"
     },
     {
-     "defaults": 0,
+     "default_ty": [
+      "b"
+     ],
+     "defaults": 1,
      "names": [
-      "length"
+      "length",
+      "_series_length"
      ],
      "params": [
-      "i"
+      "i",
+      "b"
      ],
      "ret": "i"
     }

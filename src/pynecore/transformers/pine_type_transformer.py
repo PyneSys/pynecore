@@ -41,7 +41,7 @@ class PineTypeTransformer:
     """
 
     def __init__(self, pyne_mode: str | None = None, *, analyse: Analyser | None = None,
-                 pipeline_hash: str = ''):
+                 pipeline_hash: str = '', qualify_windows: bool = False):
         #: ``'lib'``, ``'edge'`` or None -- the strict gate keys off this
         self.pyne_mode = pyne_mode
         #: Re-derives an imported module's table from its source path. Injected
@@ -51,6 +51,9 @@ class PineTypeTransformer:
         #: Digest of the pipeline an imported module's cached interface has to
         #: have been produced by
         self.pipeline_hash = pipeline_hash
+        #: Whether the window calls get their machine decided -- for a script,
+        #: never for PyneCore's own lib modules
+        self.qualify_windows = qualify_windows
 
     def visit(self, tree: ast.Module) -> ast.Module:
         """
@@ -61,7 +64,8 @@ class PineTypeTransformer:
         """
         module_path = getattr(tree, '_module_file_path', '')
         table = infer_module(tree, module_path, analyse=self.analyse,
-                             pipeline_hash=self.pipeline_hash)
+                             pipeline_hash=self.pipeline_hash,
+                             qualify_windows=self.qualify_windows)
         setattr(tree, TABLE_ATTR, table)
         return tree
 

@@ -656,9 +656,13 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
     # BinOp (safe division wraps it into a call), and the
     # security-bearing functions are already instantiated per call
     # site. Analysis only -- it stamps, it does not rewrite.
-    transformed = PineTypeTransformer(pyne_mode, analyse=analyse_source,
-                                      pipeline_hash=_get_transform_pipeline_hash()
-                                      ).visit(transformed)
+    # It also decides the machine of every window call (``ta.highest`` and its
+    # kin) from the Pine qualifier of the length -- in a script, not in
+    # pynecore's own lib modules, whose machines ARE those calls
+    transformed = PineTypeTransformer(
+        pyne_mode, analyse=analyse_source, pipeline_hash=_get_transform_pipeline_hash(),
+        qualify_windows=not path.is_relative_to(Path(__file__).parent.parent)
+    ).visit(transformed)
     # Per-context backward slices of main(), emitted as ordinary module-level
     # functions the security children run instead of main(). Last of this half:
     # the clones must see the tree every earlier pass produced (the hoisted ta

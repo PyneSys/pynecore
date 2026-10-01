@@ -682,10 +682,112 @@ def falling(source: float, length: int) -> bool:
     return counter >= length
 
 
+# A window reaching this far back is longer than any chart history TradingView
+# serves, so trimming beyond it never changes a result; it only keeps a live feed
+# from growing the buffer without bound.
+_SERIES_WINDOW_HISTORY = 100_000
+
+
+# The IDE findings here are ``@pyne`` transform artifacts: ``Persistent`` writes
+# look unused because they are read on the NEXT call.
+# noinspection PyUnusedLocal
+def _series_window_extreme(source: float, length: int, is_max: bool, _bars: bool, _tuple: bool,
+                           _check_eq: bool) -> PyneFloat:
+    """
+    The ``ta.highest`` / ``ta.lowest`` machine for a ``series`` length.
+
+    MEASURED LAW (BINANCE:BTCUSDT 30m, probes over 30657 bars, every value matched):
+    TradingView sizes the ``length + 1`` ring of ``highest``/``lowest`` only when the
+    length is known before the first bar -- a const, input or simple value. A
+    ``series`` length takes the generic series path instead: one slot per chart
+    bar, a bar that skips the call FORWARD-FILLS the value of the last call, and the
+    whole history stays readable, so a length growing from 10 to 10000 on bar 25000
+    answers over the true 10000 bars. The qualifier is the switch, not the value: a
+    series length that is 8 on every bar still forward-fills. An na input resets the
+    window exactly like the ring machine does.
+
+    :param source: The value of this call
+    :param length: The window length
+    :param is_max: True for ``highest``, False for ``lowest``
+    :param _bars: Return the bar offset of the extreme instead of its value
+    :param _tuple: Return ``(value, offset)``
+    :param _check_eq: Keep the NEWEST of equal extremes (pivot detection)
+    :return: The extreme, its offset, or both
+    """
+    bi = int(bar_index)
+    history: Persistent[list[float]] = []
+    first_bar: Persistent[int] = 0
+    last_bar: Persistent[int] = -1
+    reset_bar: Persistent[int] = -1
+    kept: Persistent[float] = na_float
+    kept_bar: Persistent[int] = -1
+    prev_length: Persistent[int] = 0
+
+    if last_bar < 0:
+        first_bar = bi
+        history.append(source)
+    elif bi > last_bar:
+        carried = history[-1]
+        for _ in builtins.range(bi - last_bar - 1):
+            history.append(carried)
+        history.append(source)
+        if len(history) > 2 * _SERIES_WINDOW_HISTORY:
+            dropped = len(history) - _SERIES_WINDOW_HISTORY
+            del history[:dropped]
+            first_bar += dropped
+    else:
+        # Another call on the same bar (a loop) rewrites the bar's slot
+        history[-1] = source
+    last_bar = bi
+
+    if not (source == source):
+        reset_bar = bi
+        kept = na_float
+        kept_bar = -1
+        if bi < length - 1:
+            return na_float if not _tuple else (na_float, na_float)  # type: ignore[return-value]
+        if _bars:
+            return 0.0
+        if _tuple:
+            return na_float, 0.0  # type: ignore[return-value]
+        return na_float
+
+    if (not (kept == kept) or (source > kept if is_max else source < kept)
+            or (_check_eq and kept == source)):
+        kept = source
+        kept_bar = bi
+
+    oldest = bi - length + 1
+    if oldest <= reset_bar:
+        oldest = reset_bar + 1
+    if oldest < first_bar:
+        oldest = first_bar
+    grown = length > prev_length
+    prev_length = length
+    if kept_bar < oldest or grown:
+        kept = source
+        kept_bar = bi
+        for b in builtins.range(bi - 1, oldest - 1, -1):
+            s = history[b - first_bar]
+            if s > kept if is_max else s < kept:
+                kept = s
+                kept_bar = b
+            elif not _check_eq and s == kept:
+                kept_bar = b
+
+    if bi < length - 1:
+        return na_float if not _tuple else (na_float, na_float)  # type: ignore[return-value]
+    if _bars:
+        return float(kept_bar - bi)
+    if _tuple:
+        return kept, float(kept_bar - bi)  # type: ignore[return-value]
+    return kept
+
+
 # noinspection PyUnusedLocal,DuplicatedCode
 @overload
-def highest(source: Series[float], length: int, _bars: bool = False, _tuple: bool = False, _check_eq: bool = False) \
-        -> PyneFloat:
+def highest(source: Series[float], length: int, _bars: bool = False, _tuple: bool = False, _check_eq: bool = False,
+            _series_length: bool = False) -> PyneFloat:
     """
     Calculate the highest value of the source series with the given length.
 
@@ -695,11 +797,15 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     :param _tuple: If true, return a tuple of the highest value and the number of bars since the highest value,
                    internal use only
     :param _check_eq: If true, check for equality too, internal use only
+    :param _series_length: True when ``length`` is a ``series`` value (passed by the
+                           type pass from its qualifier), which selects ``_series_window_extreme``
     :return: The highest value of the source series
     """
     # An int-typed Pine value can still carry a fraction (``int / int``); the
     # truncation happens where an integer is required — see ``_check_type``.
     length = int(length)
+    if _series_length:
+        return _series_window_extreme(source, length, True, _bars, _tuple, _check_eq)
     # The bar clock addresses the ring: a Python int inside the machine
     bi = int(bar_index)
     capacity: Persistent[int] = 0
@@ -712,14 +818,20 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     # the wild-corpus script "Twin Range Filter Algo", whose ``ta.lowest(low, 10)``
     # sits behind a position-state ``if``: over 28827 bars (BINANCE:BTCUSDT 30m)
     # this addressing reproduces every value TradingView returns, while reading the
-    # source's own bar history misses 872 of them. The buffer only grows, like
-    # TradingView's own on-demand resize, and a growth remaps each slot onto the bar
-    # it was written on so a stale value keeps its age.
+    # source's own bar history misses 872 of them. This is the machine of a length
+    # known before the first bar (const, input, simple); a ``series`` length runs
+    # ``_series_window_extreme`` instead. A slot no call has written yet holds 0.0,
+    # not na: a ``ta.lowest(low, 6)`` called on 5 bars out of every 37 returns 0.0
+    # on the calls whose window still reaches such a slot (probe ``qual``,
+    # BINANCE:BTCUSDT 30m). The buffer only grows, and a growth remaps each slot
+    # onto the bar it was written on so a stale value keeps its age. The resize
+    # runs before this bar's write, so every slot still holds a bar BEFORE ``bi``
+    # -- the one sharing ``bi``'s slot is ``bi - capacity``.
     if length >= capacity:
         new_capacity = length + 1
-        new_window: list[float] = [na_float] * new_capacity
+        new_window: list[float] = [0.0] * new_capacity
         for j in builtins.range(capacity):
-            b = bi - ((bi - j) % capacity)
+            b = bi - 1 - ((bi - 1 - j) % capacity)
             new_window[b % new_capacity] = window[j]
         window = new_window
         capacity = new_capacity
@@ -761,11 +873,14 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     # TradingView on every bar for loop AND straight-line sites, while skipping na
     # or keeping the window diverges from the first na on). The value form returns
     # na on the na bar; the bars form returns 0 (measured, subject to the same
-    # warmup gate as any other bar).
+    # warmup gate as any other bar). The na call still takes its length: a site
+    # whose first call is na must not read the next call as a growth from 0 and
+    # rescan the never-written slots (probe ``late``, BINANCE:BTCUSDT 30m).
     if not (source == source):
         last_max = na_float
         last_max_index = 0
         avail = 0
+        prev_length = length
         if bi < length - 1:
             return na_float if not _tuple else (na_float, na_float)  # type: ignore[return-value]
         if _bars:
@@ -793,6 +908,14 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
         last_max_index = 0
         for i in builtins.range(1, length if avail >= length else avail + 1):
             s = window[(bi - i) % capacity]
+            # MEASURED LAW — the rescan stops at the slot an na call wrote: that is
+            # where the reset started the window. A skipped bar can leave that slot
+            # INSIDE the bar-counted reach, and walking past it reads values from
+            # before the reset (probe ``qual``, BINANCE:BTCUSDT 30m: a
+            # ``ta.highest(na-or-high, 7)`` called on two bars of every three matches
+            # TradingView on all 20438 calls this way, 818 differ without the stop).
+            if not (s == s):
+                break
             if s > last_max:
                 last_max = s
                 last_max_index = i
@@ -814,8 +937,8 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
 
 
 @overload
-def highest(length: int) -> PyneFloat:
-    return highest(high, length)
+def highest(length: int, _series_length: bool = False) -> PyneFloat:
+    return highest(high, length, _series_length=_series_length)
 
 
 # The kept extreme advances once per CALL on TradingView — a loop iteration
@@ -833,22 +956,23 @@ for _impl in getattr(highest, '__pyne_impls__'):
 
 # noinspection PyUnusedLocal
 @overload
-def highestbars(source: Series[float], length: int) -> PyneInt:
+def highestbars(source: Series[float], length: int, _series_length: bool = False) -> PyneInt:
     """
     Calculate the number of bars since the highest value of the source series with the given length.
 
     :param source: The source series
     :param length: The length of the highest value
+    :param _series_length: True when ``length`` is a ``series`` value, internal use only
     :return: The number of bars since the highest value of the source series
     """
     # The bars form of ``highest`` yields the offset, an int; the annotation
     # of the shared machine says what the VALUE form yields
-    return cast(PyneInt, highest(source, length, _bars=True))
+    return cast(PyneInt, highest(source, length, _bars=True, _series_length=_series_length))
 
 
 @overload
-def highestbars(length: int) -> PyneInt:
-    return cast(PyneInt, highest(high, length, _bars=True))
+def highestbars(length: int, _series_length: bool = False) -> PyneInt:
+    return cast(PyneInt, highest(high, length, _bars=True, _series_length=_series_length))
 
 
 def hma(source: float, length: int) -> PyneFloat:
@@ -924,88 +1048,27 @@ def kcw(series: float, length: int, mult: float | int, useTrueRange: bool = True
     return (h - l) / b
 
 
-# The IDE findings here are ``@pyne`` transform artifacts: ``Persistent`` writes look
-# unused because they are read on the NEXT bar, and the slice + ``oldest`` read
-# on ``src`` look ill-typed because ``Series[T]`` erases to ``T`` for the IDE.
-# noinspection PyUnusedLocal,PyUnresolvedReferences,PyTypeChecker
-def linreg(source: Series[float], length: int, offset: int) -> PyneFloat:
+def _linreg_fit(ys: list[float], length: int, offset: int, sum_x: float, denom: float) -> float:
     """
-    Computes the linear regression value of the source series over a given period.
+    The regression line of one oldest-first window, evaluated at ``length - offset``.
 
-    :param source: Input series
-    :param length: Number of bars to calculate regression
+    :param ys: The window, oldest value first
+    :param length: The window length
     :param offset: Number of bars to shift the result
-    :return: Linear regression value
+    :param sum_x: ``1 + 2 + ... + length``, summed in that order
+    :param denom: ``length * sum(x^2) - sum_x^2`` from the same loop
+    :return: The regression value, na when the window holds an na
     """
     # TradingView recomputes the whole window every bar: its distance from the
     # exact rational result stays flat over 22k bars (probe m567), while a rolling
     # update of the two sums drifts to 1e-11 on the same data. The x-axis runs
-    # 1..length from the oldest bar, and the result is the line evaluated at
-    # ``length - offset``.
-    # An int-typed Pine value can still carry a fraction (``int / int``); the
-    # truncation happens where an integer is required — see ``_check_type``. It
-    # precedes both the domain check and the single-bar shortcut, because the
-    # regression runs on the truncated length: a 1.5 IS a 1, and a 0.5 IS an
-    # invalid 0 rather than a value that passes ``> 0`` and then divides by zero.
-    length = int(length)
-    offset = int(offset)
-    assert length > 0, "Invalid length, must be greater than 0!"
-    if length == 1:
-        return source
-
-    count: Persistent[int] = 0
-    val: Persistent[float] = na_float
-    const_len: Persistent[int] = 0
-    sum_x: Persistent[float] = 0.0
-    denom: Persistent[float] = 0.0
-    capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
-
-    if not (source == source):  # is_na_arg
-        # An NA bar leaves the window unchanged; hold the last full value
-        # (still NA while warming up)
-        return na_float if count < length else val
-
-    # NA values are NOT stored in the buffer, only skipped, so ``src[i]`` is the
-    # i-th most recent non-NA value. Reading the parameter directly would step
-    # back whole *bars* and land inside an NA gap, poisoning the sums.
-    src: Series[float] = source
-    # Grow the na-compacted buffer so the oldest window slot stays addressable for
-    # lengths beyond the per-series default max_bars_back; otherwise the window
-    # read returns na and the whole regression collapses to na. The resize is
-    # monotonic: a series ``length`` that dips low must not shrink the buffer, or
-    # the history a later increase needs would already be gone.
-    if length > capacity:
-        capacity = length
-        max_bars_back(src, capacity)
-
-    if count < length:
-        count += 1
-        if count < length:  # Not enough data yet
-            return na_float
-
-    # The x-side sums depend only on ``length``; they are accumulated with the
-    # same sequential loop TV runs (so the cached floats are bit-identical to a
-    # per-bar recompute) but only when the length changes.
-    if const_len != length:
-        const_len = length
-        sx = 0.0
-        sx2 = 0.0
-        for i in builtins.range(1, length + 1):
-            per = builtins.float(i)
-            sx = sx + per
-            sx2 = sx2 + per * per
-        sum_x = sx
-        denom = length * sx2 - sx * sx
-
-    # The y-side sums are a fresh oldest-first walk every bar. The window is
-    # taken as a raw list instead of per-element ``src[i]`` reads: the two are
-    # bit-identical (the accumulators are independent, so splitting the x and y
-    # sums does not change either sequence), but the list walk is several times
-    # cheaper -- the ``__getitem__`` call, not the arithmetic, dominates here.
+    # 1..length from the oldest bar.
     sum_y = 0.0
     sum_xy = 0.0
     per = 0.0
-    for y in src[0:length].oldest:
+    for y in ys:
+        if not (y == y):
+            return na_float
         per = per + 1.0
         sum_y = sum_y + y
         sum_xy = sum_xy + y * per
@@ -1020,15 +1083,151 @@ def linreg(source: Series[float], length: int, offset: int) -> PyneFloat:
     slope = (length * sum_xy - sum_x * sum_y) / denom
     average = sum_y / length
     intercept = average - slope * sum_x / length + slope
+    return intercept + slope * (length - 1 - offset)
 
-    val = intercept + slope * (length - 1 - offset)
-    return val
+
+def _linreg_x_sums(length: int) -> tuple[float, float]:
+    """
+    The x-side sums of a ``length`` window: ``sum_x`` and the denominator.
+
+    :param length: The window length
+    :return: ``(sum_x, denom)``
+    """
+    # Accumulated with the same sequential loop TV runs, so a cached copy is
+    # bit-identical to a per-bar recompute
+    sx = 0.0
+    sx2 = 0.0
+    for i in builtins.range(1, length + 1):
+        per = builtins.float(i)
+        sx = sx + per
+        sx2 = sx2 + per * per
+    return sx, length * sx2 - sx * sx
+
+
+# The IDE findings here are ``@pyne`` transform artifacts: ``Persistent`` writes
+# look unused because they are read on the NEXT call.
+# noinspection PyUnusedLocal
+def _series_linreg(source: float, length: int, offset: int) -> PyneFloat:
+    """
+    The ``ta.linreg`` machine for a ``series`` length.
+
+    MEASURED LAW (BINANCE:BTCUSDT 30m, probes ``lrna``/``lrnb`` over 30657 bars, every
+    value bit-exact): the same split as ``_series_window_extreme``. A ``series`` length
+    reads one slot per chart bar, a bar that skips the call FORWARD-FILLS the value of
+    the last call, a bar before the first call is na, and the whole history stays
+    readable for a growing length. A window holding an na answers na.
+
+    :param source: The value of this call
+    :param length: The window length
+    :param offset: Number of bars to shift the result
+    :return: The regression value
+    """
+    bi = int(bar_index)
+    history: Persistent[list[float]] = []
+    first_bar: Persistent[int] = 0
+    last_bar: Persistent[int] = -1
+    const_len: Persistent[int] = 0
+    sum_x: Persistent[float] = 0.0
+    denom: Persistent[float] = 0.0
+
+    if last_bar < 0:
+        first_bar = bi
+        history.append(source)
+    elif bi > last_bar:
+        carried = history[-1]
+        for _ in builtins.range(bi - last_bar - 1):
+            history.append(carried)
+        history.append(source)
+        if len(history) > 2 * _SERIES_WINDOW_HISTORY:
+            dropped = len(history) - _SERIES_WINDOW_HISTORY
+            del history[:dropped]
+            first_bar += dropped
+    else:
+        # Another call on the same bar (a loop) rewrites the bar's slot
+        history[-1] = source
+    last_bar = bi
+
+    oldest = bi - length + 1
+    if oldest < first_bar:
+        return na_float
+
+    if const_len != length:
+        const_len = length
+        sum_x, denom = _linreg_x_sums(length)
+    return _linreg_fit(history[oldest - first_bar:], length, offset, sum_x, denom)
+
+
+# The IDE findings here are ``@pyne`` transform artifacts: ``Persistent`` writes look
+# unused because they are read on the NEXT bar.
+# noinspection PyUnusedLocal
+def linreg(source: Series[float], length: int, offset: int, _series_length: bool = False) -> PyneFloat:
+    """
+    Computes the linear regression value of the source series over a given period.
+
+    :param source: Input series
+    :param length: Number of bars to calculate regression
+    :param offset: Number of bars to shift the result
+    :param _series_length: True when ``length`` is a ``series`` value (passed by the
+                           type pass from its qualifier), which selects ``_series_linreg``
+    :return: Linear regression value
+    """
+    # An int-typed Pine value can still carry a fraction (``int / int``); the
+    # truncation happens where an integer is required — see ``_check_type``. It
+    # precedes both the domain check and the single-bar shortcut, because the
+    # regression runs on the truncated length: a 1.5 IS a 1, and a 0.5 IS an
+    # invalid 0 rather than a value that passes ``> 0`` and then divides by zero.
+    length = int(length)
+    offset = int(offset)
+    assert length > 0, "Invalid length, must be greater than 0!"
+    if length == 1:
+        return source
+    if _series_length:
+        return _series_linreg(source, length, offset)
+
+    # MEASURED LAW (BINANCE:BTCUSDT 30m, probes ``lrna``/``lrnb`` over 30657 bars,
+    # every value bit-exact): a const, input or simple length runs the ``ta.highest``
+    # ring -- ``length + 1`` slots addressed by the CHART BAR, written only on the bars
+    # the call runs, a never-written slot holding 0.0. A conditional call therefore
+    # regresses over the stale values a skipped bar left in its slot (``linreg(close,
+    # 8)`` on two bars of every three: the ring matches all 20434 calls, the source's
+    # own bar history none of them). An na is stored like any value, and a window
+    # holding one answers na: the window is bar-counted, so a single na blanks the
+    # next ``length`` bars rather than being skipped. The warmup gate is the chart
+    # bar too. The buffer only grows, remapped like the ``highest`` ring.
+    bi = int(bar_index)
+    capacity: Persistent[int] = 0
+    window: Persistent[list[float]] = []
+    const_len: Persistent[int] = 0
+    sum_x: Persistent[float] = 0.0
+    denom: Persistent[float] = 0.0
+
+    if length >= capacity:
+        new_capacity = length + 1
+        new_window: list[float] = [0.0] * new_capacity
+        for j in builtins.range(capacity):
+            b = bi - 1 - ((bi - 1 - j) % capacity)
+            new_window[b % new_capacity] = window[j]
+        window = new_window
+        capacity = new_capacity
+    window[bi % capacity] = source
+
+    if bi < length - 1:
+        return na_float
+
+    if const_len != length:
+        const_len = length
+        sum_x, denom = _linreg_x_sums(length)
+    start = (bi - length + 1) % capacity
+    end = start + length
+    ys = window[start:end] if end <= capacity else window[start:] + window[:end - capacity]
+    return _linreg_fit(ys, length, offset, sum_x, denom)
 
 
 # noinspection PyUnusedLocal,DuplicatedCode
 @overload
 def lowest(source: Series[float], length: int,
-           _bars: bool = False, _tuple: bool = False, _check_eq: bool = False) \
+           _bars: bool = False, _tuple: bool = False, _check_eq: bool = False,
+           _series_length: bool = False) \
         -> PyneFloat:
     """
     Calculate the lowest value of the source series with the given length.
@@ -1039,11 +1238,15 @@ def lowest(source: Series[float], length: int,
     :param _tuple: If true, return a tuple of the lowest value and the number of bars since the lowest value,
                    Internal use only
     :param _check_eq: If true, check for equality too, internal use only
+    :param _series_length: True when ``length`` is a ``series`` value (passed by the
+                           type pass from its qualifier), which selects ``_series_window_extreme``
     :return: The lowest value of the source series
     """
     # An int-typed Pine value can still carry a fraction (``int / int``); the
     # truncation happens where an integer is required — see ``_check_type``.
     length = int(length)
+    if _series_length:
+        return _series_window_extreme(source, length, False, _bars, _tuple, _check_eq)
     # The bar clock addresses the ring: a Python int inside the machine
     bi = int(bar_index)
     capacity: Persistent[int] = 0
@@ -1053,9 +1256,9 @@ def lowest(source: Series[float], length: int,
     # runs, so a skipped bar serves the value from one capacity back.
     if length >= capacity:
         new_capacity = length + 1
-        new_window: list[float] = [na_float] * new_capacity
+        new_window: list[float] = [0.0] * new_capacity
         for j in builtins.range(capacity):
-            b = bi - ((bi - j) % capacity)
+            b = bi - 1 - ((bi - 1 - j) % capacity)
             new_window[b % new_capacity] = window[j]
         window = new_window
         capacity = new_capacity
@@ -1088,6 +1291,7 @@ def lowest(source: Series[float], length: int,
         last_min = na_float
         last_min_index = 0
         avail = 0
+        prev_length = length
         if bi < length - 1:
             return na_float if not _tuple else (na_float, na_float)  # type: ignore[return-value]
         if _bars:
@@ -1109,6 +1313,9 @@ def lowest(source: Series[float], length: int,
         last_min_index = 0
         for i in builtins.range(1, length if avail >= length else avail + 1):
             s = window[(bi - i) % capacity]
+            # See ``highest``: the rescan stops at the slot an na call wrote
+            if not (s == s):
+                break
             if s < last_min:
                 last_min = s
                 last_min_index = i
@@ -1130,8 +1337,8 @@ def lowest(source: Series[float], length: int,
 
 
 @overload
-def lowest(length: int) -> PyneFloat:
-    return lowest(low, length)
+def lowest(length: int, _series_length: bool = False) -> PyneFloat:
+    return lowest(low, length, _series_length=_series_length)
 
 
 # Per-call machine like ``highest`` (same measured law, opposite extreme).
@@ -1141,20 +1348,21 @@ for _impl in getattr(lowest, '__pyne_impls__'):
 
 # noinspection PyUnusedLocal
 @overload
-def lowestbars(source: Series[float], length: int) -> PyneInt:
+def lowestbars(source: Series[float], length: int, _series_length: bool = False) -> PyneInt:
     """
     Calculate the number of bars since the lowest value of the source series with the given length.
 
     :param source: The source series
     :param length: The length of the lowest value
+    :param _series_length: True when ``length`` is a ``series`` value, internal use only
     :return: The number of bars since the lowest value of the source series
     """
-    return cast(PyneInt, lowest(source, length, _bars=True))
+    return cast(PyneInt, lowest(source, length, _bars=True, _series_length=_series_length))
 
 
 @overload
-def lowestbars(length: int) -> PyneInt:
-    return cast(PyneInt, lowest(low, length, _bars=True))
+def lowestbars(length: int, _series_length: bool = False) -> PyneInt:
+    return cast(PyneInt, lowest(low, length, _bars=True, _series_length=_series_length))
 
 
 def macd(source: float, fastlen: int, slowlen: int, siglen: int) \

@@ -70,14 +70,20 @@ from .pine_type_table import (
     Analyser, Binding, CallSite, ClassSig, ContextKey, ContextResult, Diag, ExportSig,
     FuncSig, ModuleInterface, PineTypeTable, Unknown, qualify,
 )
+from .pine_qualifier import (
+    CONST, SERIES, NOT_READ, WINDOW_CALLS, SERIES_LENGTH_KEYWORD, lib_value_qualifier,
+    lib_call_qualifier, builtin_call_qualifier, window_length, get_series_lens,
+    set_series_len, set_series_lens,
+)
 
 __all__ = ['infer_module', 'lib_types', 'lib_classes', 'lib_namespaces',
            'TY_ATTR', 'get_ty', 'set_ty', 'inherit_ty']
 
 #: How many times a loop body is re-inferred before the types are declared
-#: stable. The lattice is two high (int -> float -> unknown), so a binding can
-#: only move twice; a third pass exists to OBSERVE that nothing moved.
-_MAX_LOOP_PASSES = 3
+#: stable. Both lattices are two high (int -> float -> unknown, const -> simple
+#: -> series), so a binding can only move four times; the last pass exists to
+#: OBSERVE that nothing moved.
+_MAX_LOOP_PASSES = 5
 
 #: Ceiling on how many per-call-site contexts one module may produce. Contexts
 #: follow the call GRAPH, so a module that fans out through many layers of
@@ -205,7 +211,8 @@ def lib_namespaces() -> set[str]:
 
 def infer_module(tree: ast.Module, module_path: str = '', *,
                  analyse: Analyser | None = None,
-                 pipeline_hash: str = '') -> PineTypeTable:
+                 pipeline_hash: str = '',
+                 qualify_windows: bool = False) -> PineTypeTable:
     """
     Infer and stamp the Pine types of a whole module.
 
@@ -221,10 +228,14 @@ def infer_module(tree: ast.Module, module_path: str = '', *,
                     for resolving a call into another module
     :param pipeline_hash: Digest of the transform pipeline, which an imported
                           module's cached interface has to have been built by
+    :param qualify_windows: Whether to decide the machine of every window call
+                            (``pine_qualifier.WINDOW_CALLS``) from the qualifier
+                            of its length -- a script's, never a lib module's
     :return: The derived type table
     """
     assign_node_ids(tree)
-    engine = _Inference(module_path, analyse=analyse, pipeline_hash=pipeline_hash)
+    engine = _Inference(module_path, analyse=analyse, pipeline_hash=pipeline_hash,
+                        qualify_windows=qualify_windows)
     # The module answers None for itself while it is being walked, which is
     # what terminates an import cycle -- and marking it HERE rather than only
     # in ``lookup`` is what makes the cycle visible to the module that has it,
@@ -288,7 +299,7 @@ class _Inference:
     """The walker. One instance per module."""
 
     def __init__(self, module_path: str, *, analyse: Analyser | None = None,
-                 pipeline_hash: str = ''):
+                 pipeline_hash: str = '', qualify_windows: bool = False):
         self.table = PineTypeTable(module_path=module_path)
         #: How an imported module's table is re-derived, when one is needed.
         #: Not ``_analyse`` -- that name is the walker's own body analysis
@@ -432,6 +443,23 @@ class _Inference:
         #: Security id -> the expressions ``__sec_write__`` publishes under it.
         #: What a ``__sec_read__`` of the same id evaluates to
         self._sec_writes: dict[str, list[ast.expr]] = {}
+        #: Node id -> Pine qualifier THIS walk gave it, the qualifier twin of
+        #: ``_ty``: a context reads its own answers back from here
+        self._q: dict[int, int] = {}
+        #: Qualifiers of the conditions (``if`` tests, loop bounds) enclosing the
+        #: running statement, within the body being walked
+        self._conds: list[int] = []
+        #: Call node id -> qualifier of what the user function it called returns,
+        #: in the context this walk instantiated it in
+        self._call_q: dict[int, int] = {}
+        #: Whether window calls get their machine decided here -- see
+        #: ``infer_module``
+        self._qualify_windows = qualify_windows
+        #: Window call node id -> context id -> whether its length is series. What
+        #: ``_pins`` is for an overload site, this is for a window call
+        self._series_len: dict[int, dict[int, bool]] = {}
+        #: Window call node id -> the node, for the stamps written at the end
+        self._window_nodes: dict[int, ast.Call] = {}
 
     # --- scope plumbing --------------------------------------------------
 
@@ -580,13 +608,18 @@ class _Inference:
         return None
 
     def _bind(self, name: str, ty: str, node: ast.AST, unknown: Unknown | None = None,
-              series: bool = False) -> None:
+              series: bool = False, qual: int = SERIES, persistent: bool = False) -> None:
         """
         Record an assignment.
 
         Re-assigning a name JOINS with what it already had: Pine's variables
         are single-typed, and a branch that stores a float into an int-typed
         variable widens it for every later read.
+
+        The qualifier joins the same way, plus the conditions the reassignment
+        stands under that the declaration did not: a variable declared 8 and
+        reassigned 9 under a series ``if`` is series, while one reassigned 8
+        unconditionally stays const. A ``var`` reassigned anywhere is series.
 
         A ``global``/``nonlocal`` name is written where it LIVES, not here --
         otherwise the scope that widens it and the closure that reads it would
@@ -598,11 +631,23 @@ class _Inference:
         existing = bindings.get(name)
         line = getattr(node, 'lineno', 0)
         series = series or name in self._frames[-1].declared_series
+        decl = node_id(node)
         if existing is None:
-            bindings[name] = Binding(name=name, ty=ty, line=line, unknown=unknown, series=series)
+            bindings[name] = Binding(name=name, ty=ty, line=line, unknown=unknown, series=series,
+                                     qual=qual, depth=len(self._conds), persistent=persistent,
+                                     decl=decl)
             return
         # A series declaration holds for the name, whatever is assigned later
         existing.series = existing.series or series
+        existing.persistent = existing.persistent or persistent
+        if decl is not None and decl == existing.decl:
+            # The loop fixpoint walking the declaration again, not a reassignment
+            existing.qual = max(existing.qual, qual)
+        elif existing.persistent:
+            existing.qual = SERIES
+        else:
+            existing.qual = max(existing.qual, qual,
+                                max(self._conds[existing.depth:], default=CONST))
         before = existing.ty
         joined = self._joined(before, ty, node, f"'{name}'")
         existing.ty = joined
@@ -740,6 +785,7 @@ class _Inference:
         self._collect(tree.body, '')
         self._body(tree.body)
         self._flush_pending()
+        self._stamp_window_machines()
         self._stamp_instance_vectors(tree)
         self._suppress_pins(tree)
         # Where the types ran out, once per cause: the coverage meter of a
@@ -1101,8 +1147,9 @@ class _Inference:
                 self._definition(stmt)
             case ast.Assign():
                 ty = self._expr(stmt.value)
+                qual = self._qual(stmt.value)
                 for target in stmt.targets:
-                    self._store(target, ty, stmt.value)
+                    self._store(target, ty, stmt.value, qual=qual)
                     if ty == PINE_LOOP and isinstance(target, ast.Name) \
                             and isinstance(stmt.value, ast.Call):
                         self._frames[-1].loop_counters[target.id] = \
@@ -1133,7 +1180,9 @@ class _Inference:
                 if declared is not None:
                     self._store(stmt.target, declared,
                                 stmt.value if stmt.value is not None else stmt,
-                                _spells_series(stmt.annotation), unknown)
+                                _spells_series(stmt.annotation), unknown,
+                                SERIES if stmt.value is None else self._qual(stmt.value),
+                                _spells_persistent(stmt.annotation))
                 elif isinstance(stmt.target, ast.Name) and _spells_series(stmt.annotation):
                     # ``x: Series`` with no value declares how the name lives
                     # before the assignment that gives it its type
@@ -1141,16 +1190,29 @@ class _Inference:
             case ast.AugAssign():
                 value_ty = self._expr(stmt.value)
                 current = self._target_type(stmt.target)
-                self._store(stmt.target, binop_type(stmt.op, current, value_ty), stmt)
+                self._store(stmt.target, binop_type(stmt.op, current, value_ty), stmt,
+                            qual=max(self._target_qual(stmt.target), self._qual(stmt.value)))
             case ast.Return():
+                qual = CONST
                 if stmt.value is not None:
                     self._expr(stmt.value)
+                    qual = self._qual(stmt.value)
+                nid = node_id(stmt)
+                if nid is not None:
+                    # Which ``return`` runs is decided by the conditions around
+                    # it: one under a series test makes the result series, even
+                    # when every return hands back a constant
+                    self._q[nid] = max(qual, max(self._conds, default=CONST))
             case ast.If():
                 self._expr(stmt.test)
-                self._body(stmt.body)
-                self._body(stmt.orelse)
+                self._conds.append(self._qual(stmt.test))
+                try:
+                    self._body(stmt.body)
+                    self._body(stmt.orelse)
+                finally:
+                    self._conds.pop()
             case ast.While():
-                self._loop(stmt, lambda: (self._expr(stmt.test), self._body(stmt.body)))
+                self._loop(stmt, lambda: self._while_pass(stmt))
             case ast.For() | ast.AsyncFor():
                 iter_ty = self._expr(stmt.iter)
                 if iter_ty in SCALARS:
@@ -1160,7 +1222,11 @@ class _Inference:
                         render_ty(iter_ty), fix='loop over range(...) or an array')
                     iter_ty = UNKNOWN
                 self._store_iteration(stmt, iter_ty)
-                self._loop(stmt, lambda: self._body(stmt.body))
+                self._conds.append(self._qual(stmt.iter))
+                try:
+                    self._loop(stmt, lambda: self._body(stmt.body))
+                finally:
+                    self._conds.pop()
                 self._body(stmt.orelse)
             case ast.Expr():
                 self._expr(stmt.value)
@@ -1177,9 +1243,15 @@ class _Inference:
             case ast.Match():
                 self._expr(stmt.subject)
                 for branch in stmt.cases:
+                    condition = self._qual(stmt.subject)
                     if branch.guard is not None:
                         self._expr(branch.guard)
-                    self._body(branch.body)
+                        condition = max(condition, self._qual(branch.guard))
+                    self._conds.append(condition)
+                    try:
+                        self._body(branch.body)
+                    finally:
+                        self._conds.pop()
             case ast.ClassDef():
                 self._class_body(stmt)
             case _:
@@ -1188,6 +1260,15 @@ class _Inference:
                 for child in ast_walk.iter_child_nodes(stmt):
                     if isinstance(child, ast.expr):
                         self._expr(child)
+
+    def _while_pass(self, stmt: ast.While) -> None:
+        """One pass of a ``while``: the test, then the body under it."""
+        self._expr(stmt.test)
+        self._conds.append(self._qual(stmt.test))
+        try:
+            self._body(stmt.body)
+        finally:
+            self._conds.pop()
 
     def _class_body(self, stmt: ast.ClassDef) -> None:
         """
@@ -1241,9 +1322,10 @@ class _Inference:
         finally:
             self._loop_stack.pop()
 
-    def _snapshot(self) -> list[dict[str, str]]:
-        """The bindings every live scope holds right now."""
-        return [{name: b.ty for name, b in frame.names.items()} for frame in self._frames]
+    def _snapshot(self) -> list[dict[str, tuple[str, int]]]:
+        """The bindings every live scope holds right now, type and qualifier."""
+        return [{name: (b.ty, b.qual) for name, b in frame.names.items()}
+                for frame in self._frames]
 
     # --- definitions and contexts ----------------------------------------
 
@@ -1321,14 +1403,34 @@ class _Inference:
             out.append(ty)
         return tuple(out)
 
+    def _declared_quals(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[int, ...]:
+        """
+        The parameter qualifiers a definition states on its own, with no caller.
+
+        A script entry's parameter IS its default on every bar, an input; a
+        function nothing calls (a library export among them) may be passed
+        anything, which is series.
+
+        :param node: The definition to read
+        :return: One qualifier per parameter, positional first then keyword-only
+        """
+        defaults = _param_defaults(node) if is_script_entry(node) else {}
+        out: list[int] = []
+        for arg in _every_param(node):
+            default = defaults.get(arg.arg)
+            out.append(SERIES if default is None else self._qual(default))
+        return tuple(out)
+
     def _declaration_context(self, key: str,
                              node: ast.FunctionDef | ast.AsyncFunctionDef) -> ContextResult | None:
         """Analyse a body in the only context its own definition describes."""
-        return self._analyse(key, node, self._declared_params(node))
+        return self._analyse(key, node, self._declared_params(node),
+                             quals=self._declared_quals(node))
 
     def _analyse(self, key: str, node: ast.FunctionDef | ast.AsyncFunctionDef,
                  params: tuple[str, ...], parents: list[_Frame] | None = None,
-                 site: ast.Call | None = None) -> ContextResult | None:
+                 site: ast.Call | None = None,
+                 quals: tuple[int, ...] | None = None) -> ContextResult | None:
         """
         Walk one function body under one parameter-type tuple.
 
@@ -1349,7 +1451,9 @@ class _Inference:
           context's id does not move while the loop fixpoint widens a
           loop-carried variable, so a callee closing over one would be analysed
           once, under the type of the first pass, and would keep the pin that
-          pass justified.
+          pass justified. Their qualifiers too, for the same reason.
+        * The parameter qualifiers: TradingView specializes a function per call
+          on them as well, so a const and a series argument are two instances.
 
         :param key: Scope-qualified id of the function
         :param node: Its definition
@@ -1357,6 +1461,7 @@ class _Inference:
         :param parents: The callee's lexical parent frames; the live ones when
                         the definition is being analysed where it stands
         :param site: The call node this analysis was started from, when one was
+        :param quals: Qualifier of each parameter; the definition's own when None
         :return: The context, or None when it is re-entrant or over budget
         """
         # A module-level function's only enclosing scope is the module, and the
@@ -1368,7 +1473,9 @@ class _Inference:
         env = list(outer if parents is None else parents)
         nid = node_id(node)
         origin = self._context if '·' in key else 0
-        memo: ContextKey = (key, params, origin, nid, self._free_env(node, env))
+        if quals is None:
+            quals = self._declared_quals(node)
+        memo: ContextKey = (key, params, origin, nid, self._free_env(node, env), quals)
         found = self.table.contexts.get(memo)
         if found is not None:
             return found
@@ -1376,8 +1483,10 @@ class _Inference:
         if guard in self._in_progress or len(self.table.contexts) >= _MAX_CONTEXTS:
             return None
 
+        # The qualifiers stay out of the anchor: the same site re-analysed under
+        # raised qualifiers is the stale answer being replaced, like a widened type
         cid = self._supersede((key, params, origin, nid, node_id(site)), memo)
-        result = ContextResult(cid=cid, key=key, params=params)
+        result = ContextResult(cid=cid, key=key, params=params, quals=quals)
         self.table.contexts[memo] = result
         self._in_progress.add(guard)
         declared = self._declared_memo.get(id(node))
@@ -1390,14 +1499,17 @@ class _Inference:
         self._contexts.append(cid)
         self._pin_sink.append(result.pins)
         self._pending.append([])
+        conditions, self._conds = self._conds, []
         try:
-            self._bind_params(node, params)
-            self._body(node.body)
+            self._bind_params(node, params, quals)
+            self._function_body(node.body)
             declared = annotation_type(node.returns, self._classes)
             result.ret = declared if declared != UNKNOWN else self._return_type(node)
+            result.ret_qual = self._return_qual(node)
             self._flush_pending()
             bound = self._frames[-1].names
         finally:
+            self._conds = conditions
             self._pending.pop()
             self._pin_sink.pop()
             self._contexts.pop()
@@ -1409,6 +1521,37 @@ class _Inference:
         self._merge_bindings(key, bound)
         self._record_signature(key, node, result)
         return result
+
+    def _function_body(self, body: list[ast.stmt]) -> None:
+        """
+        Walk a function body until no read saw a qualifier below its final one.
+
+        Pine's qualifier belongs to the VARIABLE: a reassignment under a series
+        condition makes every read of it series, the ones above it included --
+        the script runs again from the top on the next bar. A single forward walk
+        gives such a read the qualifier the variable had so far, so the body is
+        walked again while some read was stale. Most bodies need one pass.
+
+        A walk carries a raise back across ONE assignment above it, so a chain
+        ``a = b; b = c; ...`` needs one walk per link -- no fixed budget covers
+        every body. The walks still end: a stale read saw less than the
+        variable ended the walk with, and every read sees at least what the
+        variable started it with, so a walk that leaves a stale read has raised
+        a qualifier, and a binding rises at most twice. A walk that raised
+        nothing is the fixpoint by that same argument.
+
+        :param body: The statements of the function
+        """
+        names = self._frames[-1].names
+        while True:
+            before = {name: binding.qual for name, binding in names.items()}
+            for binding in names.values():
+                binding.min_read = NOT_READ
+            self._body(body)
+            if all(binding.min_read >= binding.qual for binding in names.values()):
+                return
+            if all(before.get(name) == binding.qual for name, binding in names.items()):
+                return
 
     def _supersede(self, anchor: tuple, memo: ContextKey) -> int:
         """
@@ -1451,21 +1594,21 @@ class _Inference:
         return self.table.contexts.pop(previous).cid
 
     def _free_env(self, node: ast.FunctionDef | ast.AsyncFunctionDef,
-                  frames: list[_Frame]) -> tuple[tuple[str, str], ...]:
+                  frames: list[_Frame]) -> tuple[tuple[str, str, int], ...]:
         """
-        The types the enclosing scopes hold for the names a body reads.
+        The types and qualifiers the enclosing scopes hold for the names a body reads.
 
         :param node: The definition about to be analysed
         :param frames: The lexical parent frames its body will see
-        :return: (name, type) for every free name that resolves, sorted
+        :return: (name, type, qualifier) for every free name that resolves, sorted
         """
-        out: list[tuple[str, str]] = []
+        out: list[tuple[str, str, int]] = []
         lexical, module_level = self._free_names(node)
         for name in lexical:
             for frame in reversed(frames):
                 found = frame.names.get(name)
                 if found is not None:
-                    out.append((name, found.ty))
+                    out.append((name, found.ty, found.qual))
                     break
         # A ``global`` name resolves to the MODULE's binding however many
         # scopes with a same-named local stand between, so the search that
@@ -1474,7 +1617,7 @@ class _Inference:
         for name in module_level:
             found = None if module is None else module.names.get(name)
             if found is not None:
-                out.append((name, found.ty))
+                out.append((name, found.ty, found.qual))
         out.sort()
         return tuple(out)
 
@@ -1506,15 +1649,17 @@ class _Inference:
         return free
 
     def _bind_params(self, node: ast.FunctionDef | ast.AsyncFunctionDef,
-                     params: tuple[str, ...]) -> None:
+                     params: tuple[str, ...], quals: tuple[int, ...]) -> None:
         """Bind a context's parameters in the freshly pushed frame."""
         bindings = self._bindings()
-        for arg, ty in zip(_every_param(node), params):
+        for index, (arg, ty) in enumerate(zip(_every_param(node), params)):
             unknown = None
             if ty == UNKNOWN:
                 unknown = self._unknown('unannotated-param', arg, arg.arg)
             bindings[arg.arg] = Binding(name=arg.arg, ty=ty, line=_line(arg), unknown=unknown,
-                                        series=_spells_series(arg.annotation))
+                                        series=_spells_series(arg.annotation),
+                                        qual=quals[index] if index < len(quals) else SERIES,
+                                        decl=node_id(arg))
 
     def _merge_bindings(self, scope: str, names: dict[str, Binding]) -> None:
         """
@@ -1530,9 +1675,11 @@ class _Inference:
             existing = target.get(name)
             if existing is None:
                 target[name] = Binding(name=name, ty=binding.ty, line=binding.line,
-                                       unknown=binding.unknown, series=binding.series)
+                                       unknown=binding.unknown, series=binding.series,
+                                       qual=binding.qual, persistent=binding.persistent)
                 continue
             existing.series = existing.series or binding.series
+            existing.qual = max(existing.qual, binding.qual)
             joined = join(existing.ty, binding.ty)
             existing.ty = joined
             if joined == UNKNOWN and existing.unknown is None:
@@ -1585,7 +1732,8 @@ class _Inference:
         return VOID if result is None else result
 
     def _store(self, target: ast.expr, ty: str, source: ast.AST, series: bool = False,
-               unknown: Unknown | None = None) -> None:
+               unknown: Unknown | None = None, qual: int = SERIES,
+               persistent: bool = False) -> None:
         """
         Bind an assignment target, recursing into tuple/list targets.
 
@@ -1595,15 +1743,17 @@ class _Inference:
         :param series: Whether the declaration spells a series
         :param unknown: The provenance to record for an UNKNOWN store, when
                         the caller has a more precise one than "the value"
+        :param qual: The qualifier stored
+        :param persistent: Whether the declaration spells a ``Persistent``
         """
         if isinstance(target, ast.Name):
             self._stamp(target, ty)
             if ty == UNKNOWN and unknown is None:
                 unknown = self._unknown('unknown-value', source)
-            self._bind(target.id, ty, source, unknown, series)
+            self._bind(target.id, ty, source, unknown, series, qual, persistent)
         elif isinstance(target, (ast.Tuple, ast.List)):
             self._stamp(target, ty if is_tuple(ty) else OBJECT)
-            self._distribute(target, ty, source)
+            self._distribute(target, ty, source, qual)
         elif isinstance(target, ast.Attribute):
             self._field_store(self._expr(target.value), target, ty)
             self._stamp(target, ty)
@@ -1651,7 +1801,8 @@ class _Inference:
                 f"known here, so its field '{node.attr}' cannot be checked", node,
                 'unknown-class', node.attr, fix='annotate the value with the type it holds')
 
-    def _distribute(self, target: ast.Tuple | ast.List, ty: str, source: ast.AST) -> None:
+    def _distribute(self, target: ast.Tuple | ast.List, ty: str, source: ast.AST,
+                    qual: int = SERIES) -> None:
         """
         Bind the names of an unpack, one element type each.
 
@@ -1665,6 +1816,7 @@ class _Inference:
         :param target: The tuple or list target
         :param ty: Type of the value being unpacked
         :param source: The node the binding is attributed to
+        :param qual: Qualifier of the value being unpacked
         """
         names = [element.value if isinstance(element, ast.Starred) else element
                  for element in target.elts]
@@ -1675,7 +1827,7 @@ class _Inference:
                 self._unknown('shape-mismatch', target, render_ty(ty)),
                 fix='unpack exactly as many names as the tuple has elements')
             for name in names:
-                self._store(name, UNKNOWN, source)
+                self._store(name, UNKNOWN, source, qual=qual)
             return
         elements = elements_of(ty)
         if elements and len(elements) != len(names):
@@ -1687,7 +1839,14 @@ class _Inference:
                 fix=f'unpack {len(elements)} names, as many as the tuple has')
             elements = ()
         for index, name in enumerate(names):
-            self._store(name, elements[index] if elements else UNKNOWN, source)
+            self._store(name, elements[index] if elements else UNKNOWN, source, qual=qual)
+
+    def _target_qual(self, target: ast.expr) -> int:
+        """Current qualifier of an augmented-assignment target."""
+        if isinstance(target, ast.Name):
+            found = self._lookup(target.id)
+            return found.qual if found is not None else SERIES
+        return SERIES
 
     def _target_type(self, target: ast.expr) -> str:
         """Current type of an augmented-assignment target."""
@@ -1739,10 +1898,11 @@ class _Inference:
                 and len(target.elts) == 2:
             element = self._element_type(indexed, self._ty_of(indexed))
             self._stamp(target, OBJECT)
-            self._store(target.elts[0], INT, stmt)
-            self._store(target.elts[1], element, stmt)
+            self._store(target.elts[0], INT, stmt, qual=self._qual(stmt.iter))
+            self._store(target.elts[1], element, stmt, qual=self._qual(stmt.iter))
             return
-        self._store(target, self._element_type(stmt.iter, iter_ty), stmt)
+        self._store(target, self._element_type(stmt.iter, iter_ty), stmt,
+                    qual=self._qual(stmt.iter))
 
     # --- expressions -----------------------------------------------------
 
@@ -1756,7 +1916,104 @@ class _Inference:
             ty = UNKNOWN
         else:
             ty = method(node)
+        nid = node_id(node)
+        if nid is not None:
+            self._q[nid] = self._expr_qual(node)
         return self._stamp(node, ty)
+
+    # --- qualifiers --------------------------------------------------------
+
+    def _qual(self, node: ast.AST) -> int:
+        """
+        The qualifier THIS walk gave an expression it has already visited.
+
+        :param node: The expression
+        :return: Its qualifier, series when the walk did not reach it
+        """
+        nid = node_id(node)
+        return SERIES if nid is None else self._q.get(nid, SERIES)
+
+    def _expr_qual(self, node: ast.expr) -> int:
+        """
+        The qualifier of an expression whose children this walk has just visited.
+
+        :param node: The expression
+        :return: Its qualifier
+        """
+        match node:
+            case ast.Constant():
+                return CONST
+            case ast.Name():
+                return self._name_qual(node)
+            case ast.Attribute():
+                return self._attribute_qual(node)
+            case ast.Call():
+                return self._call_qual(node)
+            case ast.Subscript():
+                # A position of a tuple is the tuple's; anything else is the
+                # history operator or a container read, which is series
+                if is_tuple(self._ty_of(node.value)):
+                    return self._qual(node.value)
+                return SERIES
+            case ast.NamedExpr():
+                return self._qual(node.value)
+            case ast.Lambda() | ast.ListComp() | ast.SetComp() | ast.DictComp() \
+                    | ast.GeneratorExp() | ast.Await() | ast.Yield() | ast.YieldFrom():
+                return SERIES
+        return max((self._qual(child) for child in ast_walk.iter_child_nodes(node)
+                    if isinstance(child, ast.expr)), default=CONST)
+
+    def _name_qual(self, node: ast.Name) -> int:
+        """The qualifier of a bare name read, resolved the way ``_e_Name`` types it."""
+        if node.id == _DYN_DEFAULT:
+            return CONST
+        found = self._lookup(node.id)
+        if found is not None:
+            found.min_read = min(found.min_read, found.qual)
+            return found.qual
+        entry = lib_types().get(node.id)
+        if entry is not None and entry['kind'] == 'value':
+            return lib_value_qualifier(node.id, entry['ty'])
+        # A lib function, a builtin constant, a namespace head or a type name
+        return CONST
+
+    def _attribute_qual(self, node: ast.Attribute) -> int:
+        """The qualifier of an attribute read: a lib value, or a field of an object."""
+        name = self._lib_name(node)
+        if name is None:
+            # A field of an object changes with the object; a class named through
+            # its module is a constant
+            return CONST if self._names_class(node) is not None else SERIES
+        entry = lib_types().get(name)
+        if entry is not None and entry['kind'] == 'value':
+            return lib_value_qualifier(name, entry['ty'])
+        return CONST
+
+    def _call_qual(self, node: ast.Call) -> int:
+        """The qualifier of a call's result."""
+        arguments = [self._qual(arg) for arg in node.args]
+        arguments += [self._qual(keyword.value) for keyword in node.keywords]
+        callee = self._lib_name(node.func)
+        if callee is not None:
+            return lib_call_qualifier(callee, arguments, _call_arity(node))
+        nid = node_id(node)
+        if nid is not None and nid in self._call_q:
+            return self._call_q[nid]
+        if isinstance(node.func, ast.Name) and self._lookup(node.func.id) is None:
+            builtin = builtin_call_qualifier(node.func.id, arguments)
+            if builtin is not None:
+                return builtin
+        return SERIES
+
+    def _return_qual(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
+        """
+        The qualifier a function body returns in this walk: its strongest ``return``.
+
+        Each ``return`` carries the conditions it stands under, the bare one of an
+        early exit included -- the value it skips is the one the caller misses.
+        """
+        return max((self._qual(stmt) for stmt in _walk_own_scope(node)
+                    if isinstance(stmt, ast.Return)), default=CONST)
 
     # Each ``_e_*`` returns the type; the caller stamps it.
 
@@ -2082,7 +2339,7 @@ class _Inference:
 
     def _e_NamedExpr(self, node: ast.NamedExpr) -> str:
         ty = self._expr(node.value)
-        self._store(node.target, ty, node)
+        self._store(node.target, ty, node, qual=self._qual(node.value))
         return ty
 
     def _e_Subscript(self, node: ast.Subscript) -> str:
@@ -2196,6 +2453,10 @@ class _Inference:
     _e_DictComp = _e_ListComp
 
     def _e_Call(self, node: ast.Call) -> str:
+        nid = node_id(node)
+        if nid is not None:
+            # Whatever another walk found for this call, this one decides anew
+            self._call_q.pop(nid, None)
         for arg in node.args:
             self._expr(arg)
         for keyword in node.keywords:
@@ -2233,7 +2494,53 @@ class _Inference:
         ty = self._lib_call_type(callee, node.args, node.keywords, argc, pin)
         self.table.calls.append(CallSite(
             callee=callee, line=_line(node), col=_col(node), argc=argc, ty=ty, pin=pin))
+        if self._qualify_windows and callee in WINDOW_CALLS:
+            self._record_window(node, callee)
         return ty
+
+    def _record_window(self, node: ast.Call, callee: str) -> None:
+        """
+        Record whether a window call's length is series in the running context.
+
+        A call that already passes the machine keyword decided it itself. The
+        loop fixpoint and the qualifier fixpoint re-walk a body in the SAME
+        context, and the last walk is the verdict, so it overwrites.
+
+        :param node: The call node, whose arguments this walk has visited
+        :param callee: Its registry key
+        """
+        if any(keyword.arg == SERIES_LENGTH_KEYWORD for keyword in node.keywords):
+            return
+        length = window_length(callee, node)
+        nid = node_id(node)
+        if length is None or nid is None:
+            return
+        self._series_len.setdefault(nid, {})[self._context] = self._qual(length) == SERIES
+        self._window_nodes[nid] = node
+
+    def _stamp_window_machines(self) -> None:
+        """
+        Stamp each window call with the machine its length selects.
+
+        Where every context agrees the node carries one verdict; where they
+        disagree -- a helper called with a const length at one site and a series
+        one at another -- the per-context map takes its place, and the
+        per-instance channel hands each instance its own (``_stamp_instance_vectors``).
+        """
+        for nid, seen in self._series_len.items():
+            node = self._window_nodes[nid]
+            if len(set(seen.values())) == 1:
+                set_series_len(node, next(iter(seen.values())))
+                set_series_lens(node, None)
+            elif get_pins(node) is not None:
+                # A site reads ONE entry of its instance vector, and the varying
+                # overload pin takes it: an instance that reads the length as
+                # series gets the series machine everywhere
+                set_series_len(node, any(seen.values()))
+                set_series_lens(node, None)
+            else:
+                set_series_len(node, None)
+                set_series_lens(node, dict(seen))
 
     def _lib_call_fits(self, callee: str, entry: dict[str, Any], node: ast.Call,
                        args: Sequence[ast.expr] | None = None) -> bool:
@@ -2661,6 +2968,12 @@ class _Inference:
                 set_pin(node, None)
                 set_pins(node, None)
                 set_vector(node, None)
+                lens = get_series_lens(node)
+                if lens is not None:
+                    # The per-instance channel is gone with the pins, so a window
+                    # call some instance reads as series takes the series machine
+                    set_series_len(node, any(lens.values()))
+                    set_series_lens(node, None)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 set_varying(node, None)
         for site in self.table.calls:
@@ -3486,7 +3799,9 @@ class _Inference:
         # A redefined name is the LAST definition, the way Python binds it
         target = definitions[-1]
         parents = self._frames[:frame + 1]
-        params = self._call_params(target, node, node.args if args is None else args)
+        positional = node.args if args is None else args
+        params = self._call_params(target, node, positional)
+        nid = node_id(node)
         if params is None:
             if id(node) in self._bad_calls:
                 # The call was reported: what it would evaluate to is moot
@@ -3496,17 +3811,21 @@ class _Inference:
             # definition states, so the call is typed by whatever the body
             # says with UNKNOWN parameters
             settled = self._analyse(key, target, self._declared_params(target), parents)
+            if settled is not None and nid is not None:
+                self._call_q[nid] = settled.ret_qual
             return UNKNOWN if settled is None else settled.ret
         if (key, params, node_id(target)) in self._in_progress:
             self._diag(f"'{_dotted(node.func)}' is re-entrant, so its result type is unknown",
                        node, self._unknown('recursion', node, key))
             return UNKNOWN
-        result = self._analyse(key, target, params, parents, node)
+        result = self._analyse(key, target, params, parents, node,
+                               self._call_quals(target, node, positional))
         if result is None:
             self._diag(f"'{_dotted(node.func)}' hit the per-module context limit", node,
                        self._unknown('context-budget', node, key))
             return UNKNOWN
-        nid = node_id(node)
+        if nid is not None:
+            self._call_q[nid] = result.ret_qual
         if nid is not None and record:
             # Only the RESOLVED path is recorded. The fallbacks above hand the
             # callee its own declaration context instead of the one this site
@@ -3588,6 +3907,34 @@ class _Inference:
                 out.append(self._ty_of(passed))
             else:
                 out.append(join(self._ty_of(default), self._ty_of(passed)))
+        return tuple(out)
+
+    def _call_quals(self, target: ast.FunctionDef | ast.AsyncFunctionDef, node: ast.Call,
+                    args: Sequence[ast.expr]) -> tuple[int, ...]:
+        """
+        The parameter qualifiers one call site instantiates the callee with.
+
+        A parameter takes the qualifier of the argument passed to it, and an
+        omitted one that of its default -- the value that IS passed. The shape
+        was already checked by ``_call_params``.
+
+        :param target: The callee's definition
+        :param node: The call node
+        :param args: The positional arguments the call binds, in order
+        :return: One qualifier per parameter, positional first then keyword-only
+        """
+        declared = target.args
+        bound: dict[str, ast.expr] = {}
+        for arg, value in zip(list(declared.posonlyargs) + list(declared.args), args):
+            bound[arg.arg] = value
+        for keyword in node.keywords:
+            if keyword.arg is not None:
+                bound[keyword.arg] = keyword.value
+        defaults = _param_defaults(target)
+        out: list[int] = []
+        for arg in _every_param(target):
+            passed = bound.get(arg.arg, defaults.get(arg.arg))
+            out.append(SERIES if passed is None else self._qual(passed))
         return tuple(out)
 
     def _bad_call(self, node: ast.Call, name: str, message: str) -> None:
@@ -3913,15 +4260,17 @@ class _Inference:
         One body is shared by every context it was instantiated in, so a site
         inside it whose answer differs between those contexts cannot be
         emitted as a constant. Such a site is *instance-varying*: an overload
-        site whose pin differs (``get_pins`` is present), or a call to a
-        generic callee whose own instance vector differs. The two are the same
+        site whose pin differs (``get_pins`` is present), a window call whose
+        machine differs (``get_series_lens`` is present), or a call to a
+        generic callee whose own instance vector differs. They are the same
         question one level apart, so the definition is recursive and settled by
         a fixpoint -- making a callee's site vary can make its caller's site
         vary too.
 
         A function's VECTOR under one context is one entry per varying site of
         that function, in source order: the pin character for an overload site,
-        the callee's own vector (nested) for a generic one, and None where this
+        whether the length is series for a window call, the callee's own vector
+        (nested) for a generic one, and None where this
         context reached the site with nothing to say. None means "configure
         nothing" all the way down -- the callee then keeps the all-None default
         its layout carries, which is the value dispatch the site had before
@@ -3958,7 +4307,7 @@ class _Inference:
                 if nid is not None:
                     owner[nid] = key
         varying: dict[str, list[ast.Call]] = {
-            key: [call for call in calls if get_pins(call) is not None]
+            key: [call for call in calls if _per_context(call)]
             for key, calls in own.items()}
         memo: dict[tuple[str, int], tuple] = {}
 
@@ -3982,6 +4331,8 @@ class _Inference:
             nid = node_id(site)
             if nid is None:
                 return None
+            if get_series_lens(site) is not None:
+                return self._series_len.get(nid, {}).get(cid)
             if get_pins(site) is not None:
                 return self._pins.get(nid, {}).get(cid)
             callee = self._callee_key.get(nid)
@@ -3996,7 +4347,7 @@ class _Inference:
             for key, calls in own.items():
                 found: list[ast.Call] = []
                 for call in calls:
-                    if get_pins(call) is not None:
+                    if _per_context(call):
                         found.append(call)
                     elif len({entry_of(call, cid, frozenset())
                               for cid in cids.get(key, ())}) > 1:
@@ -4655,6 +5006,20 @@ def _fits(declared: str, passed: str) -> bool:
 _SERIES_HEADS = frozenset({'Series', 'PersistentSeries', 'IBPersistentSeries'})
 
 
+#: Annotation heads that declare a variable ``var`` (kept across bars)
+_PERSISTENT_HEADS = frozenset({'Persistent', 'PersistentSeries', 'IBPersistent',
+                               'IBPersistentSeries'})
+
+
+def _spells_persistent(annotation: ast.expr | None) -> bool:
+    """Whether an annotation wraps its type in a persistent head."""
+    if annotation is None:
+        return False
+    return any((isinstance(sub, ast.Name) and sub.id in _PERSISTENT_HEADS)
+               or (isinstance(sub, ast.Attribute) and sub.attr in _PERSISTENT_HEADS)
+               for sub in ast_walk.walk(annotation))
+
+
 def _spells_series(annotation: ast.expr | None) -> bool:
     """Whether an annotation wraps its type in a series head."""
     if annotation is None:
@@ -4783,6 +5148,11 @@ def _own_calls(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.Call]:
             stack.extend(ast_walk.iter_child_nodes(current))
     calls.sort(key=lambda call: node_id(call) or 0)
     return calls
+
+
+def _per_context(call: ast.Call) -> bool:
+    """Whether a call site's answer differs between the contexts reaching it."""
+    return get_pins(call) is not None or get_series_lens(call) is not None
 
 
 def _walk_own_scope(node: ast.AST):
