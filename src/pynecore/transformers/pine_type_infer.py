@@ -358,6 +358,10 @@ class _Inference:
         #: definition's answer is built from its nested scopes' answers, so
         #: without it every nested scope is rescanned once per enclosing one
         self._scope_free_memo: dict[int, tuple[_Scope, frozenset[str], frozenset[str]]] = {}
+        #: id(def node) -> the node and its ``global`` / ``nonlocal`` names. A
+        #: definition is analysed once per calling context, but what it declares
+        #: does not depend on the context. The frames only ever read the sets.
+        self._declared_memo: dict[int, tuple[ast.AST, set[str], set[str]]] = {}
         #: One call site's analysis identity -- everything but the
         #: free-variable types of a memo key, plus the call node -> the memo
         #: key that currently answers it. What makes a re-analysis of the SAME
@@ -714,7 +718,7 @@ class _Inference:
     def run(self, tree: ast.Module) -> None:
         """Walk a module: the lib aliases, the imports, the definitions, the body."""
         self._factory = FactoryFields(tree)
-        for node in ast_walk.walk(tree):
+        for node in ast_walk.walk_statements(tree):
             if isinstance(node, ast.ImportFrom) and node.module == 'pynecore':
                 self._lib_aliases.update(a.asname or a.name for a in node.names)
             elif isinstance(node, ast.Import):
@@ -951,7 +955,7 @@ class _Inference:
         :return: class id -> method name -> its definition
         """
         out: dict[str, dict[str, ast.FunctionDef]] = {}
-        for node in ast_walk.walk(tree):
+        for node in ast_walk.walk_statements(tree):
             if not isinstance(node, ast.FunctionDef):
                 continue
             if not _is_method(node):
@@ -980,7 +984,7 @@ class _Inference:
         :return: Class name -> its declaration, the LAST one under that name
         """
         declared: dict[str, list[ast.ClassDef]] = {}
-        for node in ast_walk.walk(tree):
+        for node in ast_walk.walk_statements(tree):
             if isinstance(node, ast.ClassDef):
                 declared.setdefault(node.name, []).append(node)
         out: dict[str, ast.ClassDef] = {}
@@ -1376,7 +1380,11 @@ class _Inference:
         result = ContextResult(cid=cid, key=key, params=params)
         self.table.contexts[memo] = result
         self._in_progress.add(guard)
-        declared_global, declared_nonlocal = _declared_names(node.body)
+        declared = self._declared_memo.get(id(node))
+        if declared is None or declared[0] is not node:
+            declared = (node, *_declared_names(node.body))
+            self._declared_memo[id(node)] = declared
+        _, declared_global, declared_nonlocal = declared
         self._frames = env + [_Frame(key, declared_global=declared_global,
                                      declared_nonlocal=declared_nonlocal)]
         self._contexts.append(cid)

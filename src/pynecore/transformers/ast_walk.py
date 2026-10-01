@@ -16,7 +16,9 @@ The replacements here produce the same trees:
   node that has no child and no visitor method of its own is not entered at
   all -- visiting it would do nothing but hand it back.
 - :func:`walk` and :func:`iter_child_nodes` yield what their ``ast``
-  namesakes yield, in the same order.
+  namesakes yield, in the same order; :func:`walk_statements` yields the
+  statements among them without entering any expression, and
+  :func:`fix_missing_locations` fills what its ``ast`` namesake fills.
 - :func:`clone` is ``copy.deepcopy`` for trees: same memo protocol, same
   result, attributes the passes stamp on nodes included.
 """
@@ -27,7 +29,7 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 __all__ = ['NodeVisitor', 'NodeTransformer', 'walk', 'iter_child_nodes', 'iter_descendants',
-           'clone']
+           'iter_child_statements', 'walk_statements', 'fix_missing_locations', 'clone']
 
 _AST = ast.AST
 
@@ -243,6 +245,110 @@ def iter_descendants(node: ast.AST, stop: type | tuple[type, ...] = ()) -> Itera
             break
         else:
             stack.pop()
+
+
+#: The fields that hold statement lists, or the ``except`` handlers and ``match``
+#: cases standing between a statement and the statements inside them. Only
+#: such fields lead to a statement: no expression ever contains one.
+_STATEMENT_FIELDS = frozenset({'body', 'orelse', 'finalbody', 'handlers', 'cases'})
+
+#: Node class -> its statement-holding fields, in ``_fields`` order
+_statement_fields: dict[type, tuple[str, ...]] = {}
+
+
+def _statement_fields_of(cls: type) -> tuple[str, ...]:
+    fields = _statement_fields.get(cls)
+    if fields is None:
+        fields = tuple(name for name in cls._fields if name in _STATEMENT_FIELDS)
+        _statement_fields[cls] = fields
+    return fields
+
+
+def iter_child_statements(node: ast.AST) -> Iterator[ast.AST]:
+    """The direct children of ``node`` that are or hold statements, in field order.
+
+    These are the statements of its statement lists, plus the ``except``
+    handlers and ``match`` cases, which hold statements of their own. A
+    ``def``, ``class``, ``global`` or ``import`` can only stand there, so a
+    search for one needs no other child.
+    """
+    for name in _statement_fields_of(node.__class__):
+        try:
+            value = getattr(node, name)
+        except AttributeError:
+            continue
+        # ``Lambda`` and ``IfExp`` call an expression their ``body``
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, _AST):
+                    yield item
+
+
+def walk_statements(node: ast.AST) -> Iterator[ast.AST]:
+    """``node``, then every statement, ``except`` handler and ``match`` case under it.
+
+    Breadth first, in exactly the order :func:`walk` yields these same nodes:
+    each one's ancestors are statements, handlers or cases too, so leaving the
+    expressions out removes no level of the walk and reorders nothing. A walk
+    that only looks for statements gets the same answer from this, without
+    entering a single expression.
+    """
+    todo = deque([node])
+    popleft = todo.popleft
+    append = todo.append
+    while todo:
+        node = popleft()
+        for name in _statement_fields_of(node.__class__):
+            try:
+                value = getattr(node, name)
+            except AttributeError:
+                continue
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, _AST):
+                        append(item)
+        yield node
+
+
+def fix_missing_locations(node: ast.AST) -> ast.AST:
+    """:func:`ast.fix_missing_locations` without the recursion.
+
+    Same nodes filled with the same values, in the same pre-order -- a node
+    shared between two parents keeps what the first visit gave it, as there.
+
+    :param node: Tree to fix in place
+    :return: The same tree
+    """
+    stack: list[tuple[ast.AST, Any, Any, Any, Any]] = [(node, 1, 0, 1, 0)]
+    pop = stack.pop
+    push = stack.append
+    while stack:
+        current, lineno, col_offset, end_lineno, end_col_offset = pop()
+        attributes = current._attributes
+        if 'lineno' in attributes:
+            if not hasattr(current, 'lineno'):
+                current.lineno = lineno  # type: ignore[attr-defined]
+            else:
+                lineno = current.lineno  # type: ignore[attr-defined]
+        if 'end_lineno' in attributes:
+            if getattr(current, 'end_lineno', None) is None:
+                current.end_lineno = end_lineno  # type: ignore[attr-defined]
+            else:
+                end_lineno = current.end_lineno  # type: ignore[attr-defined]
+        if 'col_offset' in attributes:
+            if not hasattr(current, 'col_offset'):
+                current.col_offset = col_offset  # type: ignore[attr-defined]
+            else:
+                col_offset = current.col_offset  # type: ignore[attr-defined]
+        if 'end_col_offset' in attributes:
+            if getattr(current, 'end_col_offset', None) is None:
+                current.end_col_offset = end_col_offset  # type: ignore[attr-defined]
+            else:
+                end_col_offset = current.end_col_offset  # type: ignore[attr-defined]
+        children = list(iter_child_nodes(current))
+        for child in reversed(children):
+            push((child, lineno, col_offset, end_lineno, end_col_offset))
+    return node
 
 
 #: Values ``copy.deepcopy`` hands back as they are

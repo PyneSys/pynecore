@@ -1362,7 +1362,7 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
         """
         declared = self._declared.get(id(func))
         if declared is None:
-            declared = frozenset(name for child in ast_walk.walk(func)
+            declared = frozenset(name for child in ast_walk.walk_statements(func)
                                  if isinstance(child, (ast.Global, ast.Nonlocal))
                                  for name in child.names)
             self._declared[id(func)] = declared

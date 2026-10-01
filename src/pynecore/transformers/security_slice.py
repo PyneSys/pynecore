@@ -111,7 +111,7 @@ class _SliceScopes(_DependencyAnalyzer):
     def __init__(self, module: ast.Module):
         super().__init__(module, [])
         self._funcs = {
-            n.name: n for n in ast_walk.walk(module)
+            n.name: n for n in ast_walk.walk_statements(module)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
         self._build_scopes()
@@ -764,7 +764,7 @@ def _sid_list(ctx: ast.Dict, name: str) -> set[str]:
 def _module_imports(module: ast.Module) -> frozenset[str]:
     """Names bound by the module's imports (every call through one is opaque)."""
     names: set[str] = set()
-    for stmt in ast_walk.walk(module):
+    for stmt in ast_walk.walk_statements(module):
         if isinstance(stmt, (ast.Import, ast.ImportFrom)):
             for alias in stmt.names:
                 names.add(alias.asname or alias.name.split('.')[0])
@@ -1664,7 +1664,7 @@ def _reaching_defs(defs: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]]
 def _nested_defs(func: ast.FunctionDef) -> dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]]:
     """Every ``def`` standing anywhere inside ``func``, by name."""
     defs: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
-    for node in ast_walk.walk(func):
+    for node in ast_walk.walk_statements(func):
         if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and node is not func):
             defs.setdefault(node.name, []).append(node)
@@ -2296,7 +2296,7 @@ def _force_conditional_writes(module: ast.Module, clone: ast.FunctionDef,
     clone.body = forcer.func_body(clone)
     if shared_forcer.changed:
         clone.body[0:0] = copies
-    ast.fix_missing_locations(clone)
+    ast_walk.fix_missing_locations(clone)
     return forcer.changed or shared_forcer.changed
 
 
@@ -2328,7 +2328,7 @@ def _build_clone(main: ast.FunctionDef, kept: list[int], name: str) -> ast.Funct
     body = [ast_walk.clone(main.body[index], memo) for index in kept]
     clone.body = body or [ast.Pass()]
     ast.copy_location(clone, main)
-    ast.fix_missing_locations(clone)
+    ast_walk.fix_missing_locations(clone)
     return clone
 
 
@@ -2356,5 +2356,5 @@ def _bind_defaults(main_name: str, clone_name: str) -> list[ast.stmt]:
 
     stmts = [assign('__defaults__'), assign('__kwdefaults__')]
     for stmt in stmts:
-        ast.fix_missing_locations(stmt)
+        ast_walk.fix_missing_locations(stmt)
     return stmts

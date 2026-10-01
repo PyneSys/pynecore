@@ -48,25 +48,30 @@ def fix_locations(tree: ast.AST, line: int = 1, col: int = 0) -> ast.AST:
     :param col: Anchor column for top-level location-less nodes.
     :return: The same tree.
     """
-    _fix(tree, line, col)
+    # Pre-order over an explicit stack, children pushed back to front: the
+    # order the recursive walk had, which decides what a node shared by two
+    # parents is stamped with
+    stack: list[tuple[ast.AST, int, int]] = [(tree, line, col)]
+    pop = stack.pop
+    push = stack.append
+    while stack:
+        node, line, col = pop()
+        if 'lineno' in node._attributes:
+            if _located(node):
+                line, col = node.lineno, node.col_offset  # type: ignore[attr-defined]
+                if getattr(node, 'end_lineno', None) is None:
+                    node.end_lineno = line  # type: ignore[attr-defined]
+                if getattr(node, 'end_col_offset', None) is None:
+                    node.end_col_offset = col  # type: ignore[attr-defined]
+            else:
+                if isinstance(node, ast.stmt):
+                    # Hoisted payloads keep their source lines — anchor the new
+                    # statement next to them rather than at the function entry
+                    inner = [getattr(n, 'lineno') for n in ast_walk.walk(node) if _located(n)]
+                    if inner:
+                        line, col = min(inner), 0
+                _stamp_point(node, line, col)
+        children = list(ast_walk.iter_child_nodes(node))
+        for child in reversed(children):
+            push((child, line, col))
     return tree
-
-
-def _fix(node: ast.AST, line: int, col: int) -> None:
-    if 'lineno' in node._attributes:
-        if _located(node):
-            line, col = node.lineno, node.col_offset  # type: ignore[attr-defined]
-            if getattr(node, 'end_lineno', None) is None:
-                node.end_lineno = line  # type: ignore[attr-defined]
-            if getattr(node, 'end_col_offset', None) is None:
-                node.end_col_offset = col  # type: ignore[attr-defined]
-        else:
-            if isinstance(node, ast.stmt):
-                # Hoisted payloads keep their source lines — anchor the new
-                # statement next to them rather than at the function entry
-                inner = [getattr(n, 'lineno') for n in ast_walk.walk(node) if _located(n)]
-                if inner:
-                    line, col = min(inner), 0
-            _stamp_point(node, line, col)
-    for child in ast_walk.iter_child_nodes(node):
-        _fix(child, line, col)

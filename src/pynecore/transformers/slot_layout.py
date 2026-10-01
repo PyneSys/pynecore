@@ -49,14 +49,16 @@ def _scope_defs(scope_node: ast.AST):
     (descends through statements and class bodies, but not into nested
     function definitions — those belong to the inner scope)."""
     # An explicit stack of child iterators: a recursive generator pays one
-    # ``yield from`` hop per tree level for every node it passes through
-    stack = [ast_walk.iter_child_nodes(scope_node)]
+    # ``yield from`` hop per tree level for every node it passes through. A
+    # definition only ever stands in a statement list, so no expression is
+    # entered (and no lambda body with it)
+    stack = [ast_walk.iter_child_statements(scope_node)]
     while stack:
         for child in stack[-1]:
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 yield child
-            elif not isinstance(child, ast.Lambda):
-                stack.append(ast_walk.iter_child_nodes(child))
+            else:
+                stack.append(ast_walk.iter_child_statements(child))
                 break
         else:
             stack.pop()
@@ -284,7 +286,7 @@ def scope_for_function(layout: ModuleLayout, scope_id: str, node: ast.FunctionDe
     """
     scope = layout.scope(scope_id)
     if any(isinstance(child, ast.FunctionDef)
-           for child in ast_walk.walk(node) if child is not node):
+           for child in ast_walk.walk_statements(node) if child is not node):
         scope.state_param = f'__state·{scope_id}__'
     return scope
 

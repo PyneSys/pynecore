@@ -137,5 +137,5 @@ def display_dump(tree: ast.Module, layout: ModuleLayout) -> str:
                 and isinstance(first.value.value, str)):
             pos = 1
         clean.body[pos:pos] = defs
-        ast.fix_missing_locations(clean)
+        ast_walk.fix_missing_locations(clean)
     return ast.unparse(clean)

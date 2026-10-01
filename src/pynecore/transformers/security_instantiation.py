@@ -258,7 +258,7 @@ class SecurityInstantiationTransformer:
         info, sites = eligible[0]
         name = info.node.name
         existing = {
-            n.name for n in ast_walk.walk(module)
+            n.name for n in ast_walk.walk_statements(module)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
         # Re-locate the def index (earlier clones may have shifted the body).
@@ -343,7 +343,7 @@ class SecurityInstantiationTransformer:
                 value=ast_walk.clone(value),
             )
             ast.copy_location(assign, fn)
-            ast.fix_missing_locations(assign)
+            ast_walk.fix_missing_locations(assign)
             pinned.append(assign)
         if pinned:
             fn.body[0:0] = pinned

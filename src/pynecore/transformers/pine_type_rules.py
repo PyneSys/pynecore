@@ -1860,7 +1860,7 @@ class FactoryFields:
         #: Every class's top-level statement index
         self.top_index: dict[int, int] = {}
         for index, stmt in enumerate(tree.body):
-            for node in ast_walk.walk(stmt):
+            for node in ast_walk.walk_statements(stmt):
                 if isinstance(node, ast.ClassDef):
                     self.top_index[id(node)] = index
 

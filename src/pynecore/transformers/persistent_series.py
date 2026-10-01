@@ -73,7 +73,7 @@ class PersistentSeriesTransformer(ast_walk.NodeTransformer):
         # The split stands where the declaration stood: a diagnostic on either
         # half has to point at the line the user wrote
         ast.copy_location(persistent_decl, node)
-        ast.fix_missing_locations(persistent_decl)
+        ast_walk.fix_missing_locations(persistent_decl)
         setattr(persistent_decl, "_ps_transformed", True)
 
         # 2. Series declaration
@@ -88,7 +88,7 @@ class PersistentSeriesTransformer(ast_walk.NodeTransformer):
             simple=1
         )
         ast.copy_location(series_decl, node)
-        ast.fix_missing_locations(series_decl)
+        ast_walk.fix_missing_locations(series_decl)
         setattr(series_decl, "_ps_transformed", True)
 
         return [persistent_decl, series_decl]
