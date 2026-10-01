@@ -1250,12 +1250,11 @@ class SimPosition(PositionBase):
             previous = self.market_orders.get(market_key)
             if previous is not None and previous.bar_index != order.bar_index:
                 # The key is reused (same close call site, same entry id) but the
-                # order sitting on it is a leftover from an earlier bar — often a
-                # zero-size tombstone re-filled as a no-op. Plain assignment would
-                # hand the fresh order that stale INSERTION SLOT, and the market
-                # book fills in insertion order, so this bar's close would jump
-                # ahead of orders the script placed before it. Drop the key first
-                # to queue the new order where it was actually placed.
+                # order sitting on it is a leftover from an earlier bar. Plain
+                # assignment would hand the fresh order that stale INSERTION SLOT,
+                # and the market book fills in insertion order, so this bar's close
+                # would jump ahead of orders the script placed before it. Drop the
+                # key first to queue the new order where it was actually placed.
                 del self.market_orders[market_key]
             self.market_orders[market_key] = order
 
@@ -1654,10 +1653,9 @@ class SimPosition(PositionBase):
         # Record same-bar partial strategy.close() fills (stamped close carrying an
         # entry id) so a later same-bar close_all clamps to flat instead of
         # overshooting on the size it captured before this partial shed part of it.
-        # Only a fill that actually sheds size arms the marker: a consumed/zero-size
-        # tombstone (a fired partial-exit leg kept alive while its entry stays open)
-        # is re-filled as a no-op every bar and must NOT re-arm it, or it would
-        # wrongly clamp an unrelated deferred-margin-call close_all overshoot.
+        # Only a fill that actually sheds size arms the marker: a zero-size fill
+        # must NOT re-arm it, or it would wrongly clamp an unrelated
+        # deferred-margin-call close_all overshoot.
         if (order.order_type == _order_type_close and order.order_id is not None
                 and order.book_seq is not None
                 and not order.consumed and _size_round(order.size) != 0.0):
@@ -1926,14 +1924,19 @@ class SimPosition(PositionBase):
                 # bound quantity is still open becomes a tombstone: kept in
                 # exit_orders (so its reservation still counts against sibling
                 # "rest" legs and a per-bar strategy.exit() re-call cannot
-                # resurrect it) and only pulled from the order book. It is purged
+                # resurrect it) and only pulled from the order books. It is purged
                 # when the entry's bound quantity is exhausted (_drop_binding).
+                # Left in the market book, it would re-fill every later bar: a
+                # zero-size fill that still counts as one, re-running a
+                # calc_on_order_fills body at the open of a bar with no real fill.
                 if (order.order_type == _order_type_close and order.order_id is not None
                         and _size_round(order.size) == 0.0
                         and (self._binding(order.entry_seq) is not None
                              if order.entry_seq is not None
                              else self._bound_qty(order.order_id) > 0.0)):
                     order.consumed = True
+                    if order.is_market_order:
+                        self.market_orders.pop(_market_order_key(order), None)
                     self.orderbook.remove_order(order)
                 else:
                     self._remove_order(order)
@@ -2017,10 +2020,9 @@ class SimPosition(PositionBase):
                     self.min_equity = entry_mark
 
         # New trade. A gap-committed leg opens under its own exit id only while it
-        # still has size: a consumed tombstone is re-filled as a no-op on every
-        # later bar (see the `_partial_close_bar` note above), and opening that
-        # would leave a 0-size ghost trade holding a pyramiding slot — and divide
-        # by zero the next time a closing fill walks it.
+        # still has size: opening a zero-size leg would leave a 0-size ghost trade
+        # holding a pyramiding slot — and divide by zero the next time a closing
+        # fill walks it.
         elif (order.order_type != _order_type_close
               or (order.gap_committed and _size_round(order.size) != 0.0)):
             # Calculate commission

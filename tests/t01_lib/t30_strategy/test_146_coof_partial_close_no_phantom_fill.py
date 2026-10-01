@@ -1,34 +1,31 @@
 """
 @pyne
 
-A ``calc_on_order_fills`` re-execution that replaces its own ``immediately=True``
-close with a plain close of the same id (``close_by_id=True``) keeps the plain
-close.
+A partial ``strategy.close()`` that fired its whole slice stays in the exit book
+as a zero-size tombstone while its entry is still open, but it no longer fills:
+with ``calc_on_order_fills`` a later bar without a real fill runs no re-execution.
 
-The re-execution after the entry fill enqueues an immediate close of 3 and then
-replaces it with a full close. The immediate close a trial run enqueued is undone
-before the next order-processing pass, but the replacement that now holds its
-order slot is a regular order of that run and fills on the same bar, at the next
-node of the bar's path.
+Measured on TradingView (CAPITALCOM:EURUSD 60, 467 events): the partial close
+placed by the re-execution after the entry fill fills on the entry bar, and a
+``close_all`` issued two bars later fills at the open of the NEXT bar, not on its
+own bar.
 """
 from pynecore.lib import bar_index, script, strategy
 
 
 @script.strategy(
-    "COOF Replaced Immediate Close",
+    "COOF Partial Close No Phantom Fill",
     overlay=True,
     initial_capital=100000,
     default_qty_type=strategy.fixed,
     default_qty_value=10,
     calc_on_order_fills=True,
-    close_by_id=True,
 )
 def main():
     if bar_index == 1:
         strategy.entry('G', strategy.short)
     if bar_index == 2 and strategy.position_size <= -10:
-        strategy.close('G', comment='ipart', qty=3, immediately=True)
-        strategy.close('G', comment='full')
+        strategy.close('G', comment='part', qty=3)
     if bar_index == 4:
         strategy.close_all('flat')
 
@@ -49,8 +46,8 @@ def __test_helper_make_syminfo(period: str = '1'):
 
 
 # noinspection PyShadowingNames,PyProtectedMember
-def __test_coof_replacement_of_immediate_close_fills_same_bar__(script_path, module_key):
-    """The plain close replacing a trial run's immediate close fills on the entry bar."""
+def __test_close_all_after_partial_close_fills_next_open__(script_path, module_key):
+    """The close_all of bar 4 fills at the open of bar 5."""
     import sys
     from pathlib import Path
     from pynecore.core.script_runner import ScriptRunner
@@ -60,9 +57,9 @@ def __test_coof_replacement_of_immediate_close_fills_same_bar__(script_path, mod
 
     base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
     bars = [
-        OHLCV(timestamp=base_ts + i * 60_000, open=100.0, high=101.0, low=98.5,
-              close=100.0, volume=100.0)
-        for i in range(6)
+        OHLCV(timestamp=base_ts + i * 60_000, open=100.0 + i, high=101.5 + i,
+              low=98.5 + i, close=100.5 + i, volume=100.0)
+        for i in range(7)
     ]
 
     runner = ScriptRunner(Path(script_path), iter(bars), __test_helper_make_syminfo())
@@ -70,8 +67,5 @@ def __test_coof_replacement_of_immediate_close_fills_same_bar__(script_path, mod
     for _candle, _plot, new_closed in runner.run_iter():
         trades.extend(new_closed)
 
-    sheds = sorted((t.exit_comment, abs(t.size)) for t in trades if t.entry_id == 'G')
-    assert sheds == [('flat', 3.0), ('full', 7.0)], sheds
-    full = [t for t in trades if t.exit_comment == 'full']
-    # Market close placed by the re-execution at the entry fill: fills at that node.
-    assert [(t.entry_bar_index, t.exit_bar_index) for t in full] == [(2, 2)], full
+    got = sorted((t.exit_comment, abs(t.size), t.exit_bar_index, t.exit_price) for t in trades)
+    assert got == [('flat', 7.0, 5, 105.0), ('part', 3.0, 2, 102.0)], got
