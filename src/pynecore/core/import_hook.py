@@ -1,6 +1,8 @@
-from typing import TYPE_CHECKING, cast
+from collections.abc import Callable
+from typing import TYPE_CHECKING, TypeVar, cast
 import os
 import sys
+import threading
 import hashlib
 import importlib.util
 import importlib.machinery
@@ -49,6 +51,20 @@ _PYNE_SET_BOOL_NA = '__pyne_set_bool_na·__'
 #: boundary (``pine_export.Exported``) so a library's exported function runs
 #: its own script's bool semantics, not its caller's
 _PYNE_NA_BOOL = '__pyne_na_bool__'
+
+# Recursion limit every pipeline stage runs under. The passes need about 3 Python
+# frames per level of AST nesting (1516 measured on a 503-deep ``elif`` chain), so
+# this covers some 3000 levels; a module nested deeper still gets a limit sized
+# to its depth (see ``_with_nesting_headroom``)
+_TRANSFORM_RECURSION_LIMIT = 10_000
+# Python frames a pipeline pass stacks per level of AST nesting, with margin: a
+# visitor's visit -> visit_<Node> -> generic_visit cycle takes 3 to 4, doubled
+# for passes that recurse through helpers of their own
+_FRAMES_PER_NESTING_LEVEL = 8
+#: Serializes the transforms that run under a raised recursion limit
+_deep_transform_lock = threading.RLock()
+
+_T = TypeVar('_T')
 
 # A module is Pyne code only when its docstring STARTS with ``@pyne``. Matching the
 # raw source head mirrors the strict docstring check in ``source_to_code`` without
@@ -453,6 +469,68 @@ def _script_bool_na(tree: "ast.Module", path: Path) -> bool | None:
     return False
 
 
+def _nesting_depth(tree: "ast.AST") -> int:
+    """The deepest node level of a tree, measured without recursion.
+
+    :param tree: The tree to measure.
+    :return: Number of edges on the longest root-to-leaf path.
+    """
+    # Lazy for the same reason the transformers are: the transformers package is
+    # itself loaded through this hook
+    from pynecore.transformers.ast_walk import iter_child_nodes
+
+    deepest = 0
+    stack: list[tuple[ast.AST, int]] = [(tree, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > deepest:
+            deepest = depth
+        depth += 1
+        stack.extend((child, depth) for child in iter_child_nodes(node))
+    return deepest
+
+
+def _with_nesting_headroom(run: Callable[["ast.Module"], _T], tree: "ast.Module",
+                           source: str) -> _T:
+    """Run a pipeline stage over a tree, however deeply its source nests.
+
+    The passes walk the tree recursively, so the Python stack they need grows
+    with the module's nesting depth: a Pine ``switch`` with hundreds of arms
+    compiles to an ``elif`` chain hundreds of levels deep, beyond what the
+    interpreter's default recursion limit admits. The stage therefore runs
+    under :data:`_TRANSFORM_RECURSION_LIMIT`, which fits any realistic module.
+    Measuring every module up front would cost a full extra walk on each
+    transform, so only a module that still overflows is measured, re-parsed
+    (the failed run left its tree half rewritten) and run again under a limit
+    sized to its depth. The raised limits hold for the stage only.
+
+    :param run: The stage; it is handed the tree to transform.
+    :param tree: The parsed module.
+    :param source: Its source, re-parsed for the second run.
+    :return: What the stage returns.
+    """
+    # The limit is process-wide: the lock keeps a concurrent transform from
+    # restoring it under this one. Reentrant, because analysing a dependency
+    # from inside a stage lands here again.
+    with _deep_transform_lock:
+        limit = sys.getrecursionlimit()
+        base = max(limit, _TRANSFORM_RECURSION_LIMIT)
+        sys.setrecursionlimit(base)
+        try:
+            try:
+                return run(tree)
+            except RecursionError:
+                pass
+
+            import ast
+
+            fresh = ast.parse(source)
+            sys.setrecursionlimit(base + _nesting_depth(fresh) * _FRAMES_PER_NESTING_LEVEL)
+            return run(fresh)
+        finally:
+            sys.setrecursionlimit(limit)
+
+
 def _analyse_tree(tree: "ast.Module", source: str, path: Path,
                   pyne_mode: str | None) -> "ast.Module":
     """Run the pipeline up to and including the Pine type pass.
@@ -773,7 +851,8 @@ def analyse_source(path: str) -> \
         return None
 
     try:
-        analysed = _analyse_tree(tree, source, Path(path), pyne_mode)
+        analysed = _with_nesting_headroom(
+            lambda module: _analyse_tree(module, source, Path(path), pyne_mode), tree, source)
     except (SyntaxError, RecursionError):
         # An unanalysable dependency is not a failure to report here: the
         # module that actually imports it raises the real error, with the real
@@ -993,23 +1072,29 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             pipeline_hash = _get_transform_pipeline_hash()
             # Read off the source tree: the analysis rewrites the decorator
             bool_na = _script_bool_na(tree, path)
-            analysed = _analyse_tree(tree, data_str, path, pyne_mode)
-            table = module_table(analysed)
+            module_path = str(path.resolve())
 
-            # What this module publishes, for every module that imports it: in
-            # this process through the registry, across processes through the
-            # artifact beside the .pyc. Read off the ANALYSED tree, before the
-            # lowering: the isolation pass prepends a state parameter to every
-            # script function and the series pass rewrites the annotations, so a
-            # signature taken afterwards is the emission's, not the module's.
-            interface = None
-            if table is not None:
-                interface = build_interface(
-                    analysed, table, str(path.resolve()),
-                    NO_FINGERPRINT if fingerprint is None else fingerprint)
-                register(interface)
+            def transform(module: ast.Module):
+                analysed = _analyse_tree(module, data_str, path, pyne_mode)
+                module_types = module_table(analysed)
 
-            transformed, _ = _lower_tree(analysed, path, pyne_mode, na_bool=bool(bool_na))
+                # What this module publishes, for every module that imports it: in
+                # this process through the registry, across processes through the
+                # artifact beside the .pyc. Read off the ANALYSED tree, before the
+                # lowering: the isolation pass prepends a state parameter to every
+                # script function and the series pass rewrites the annotations, so a
+                # signature taken afterwards is the emission's, not the module's.
+                published = None
+                if module_types is not None:
+                    published = build_interface(
+                        analysed, module_types, module_path,
+                        NO_FINGERPRINT if fingerprint is None else fingerprint)
+                    register(published)
+
+                lowered, _ = _lower_tree(analysed, path, pyne_mode, na_bool=bool(bool_na))
+                return module_types, published, lowered
+
+            table, interface, transformed = _with_nesting_headroom(transform, tree, data_str)
 
             # No fingerprint means no artifact: a reader validates one by
             # digesting the source it now finds, and nothing here knows which
