@@ -5,7 +5,9 @@ import concurrent.futures
 import hashlib
 import importlib.util
 import os
+import shutil
 import sys
+import tempfile
 import tomllib
 from dataclasses import dataclass, field as dataclasses_field
 from functools import partial
@@ -32,7 +34,7 @@ from pynecore.types.session import Session
 from pynecore.core.csv_file import CSVWriter
 from pynecore.core.drawing_snapshot import DrawingSnapshot
 from pynecore.core.lookahead import ALLOW_LOOKAHEAD
-from pynecore.core.ohlcv import ChartBarWindow, OHLCVReader, restore_f32_volume
+from pynecore.core.ohlcv import ChartBarWindow, OHLCVReader, copy_ohlcv_tail, restore_f32_volume
 from pynecore.core.script_timeframe import ScriptTimeframe
 from pynecore.core.strategy_stats import calculate_strategy_statistics, write_strategy_statistics_csv
 from pynecore.core import viz
@@ -615,7 +617,6 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
         metadata to drive the grid). Temp files live in a per-run directory whose
         path is stored in ``tmp_dir_holder`` and removed at run teardown.
     """
-    import tempfile
     from .aggregator import aggregate_ohlcv
     from .datetime import parse_timezone
     from ..lib.timeframe import _in_seconds
@@ -682,6 +683,70 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
     # grid args stay correct.
     si.period = target_tf
     si.save_toml(out.with_suffix('.toml'))
+    return str(out)
+
+
+def _calc_window_security_feed(data_path: str, ctx_tf: str, calc_tf: str,
+                               calc_bars_count: int, chart_last_ms: int,
+                               tmp_dir_holder: 'list[str]') -> str:
+    """Cut a security context's feed to the bars a ``calc_bars_count`` script calculates.
+
+    A script declared with ``calc_bars_count = N`` calculates each of its security
+    contexts only on the last ``max(1, floor(N * calc_tf / ctx_tf))`` bars of the
+    context's OWN feed, ending at the chart's last bar. Nothing before them is
+    calculated, so the context starts cold on its first calculated bar exactly like
+    the chart does. The count is in context bars, not a time span: a session-bound
+    instrument's daily context keeps that many trading days whatever calendar time
+    the chart's bars cover.
+
+    :param data_path: The context's resolved ``.ohlcv`` feed, at its own timeframe.
+    :param ctx_tf: The context's timeframe.
+    :param calc_tf: The timeframe ``calc_bars_count`` counts bars of (the chart's).
+    :param calc_bars_count: The script's ``calc_bars_count``.
+    :param chart_last_ms: Open time (ms) of the chart's last bar; the context's last
+        calculated bar is its last bar opening at or before it.
+    :param tmp_dir_holder: Per-run temp directory holder, shared with
+        :func:`_resample_finer_security_feed` and removed at run teardown.
+    :return: Path to the cut feed (with a copied ``.toml`` sidecar), or ``data_path``
+        when the feed holds no more bars than the context calculates.
+    """
+    # MEASURED (BINANCE:BTCUSDT@30 and NASDAQ:AAPL@30, calc_bars_count 500, each
+    # context plotting its own bar_index and time): "15" holds 1000 bars (it opens
+    # one bar BEFORE the chart's window), "60" 250, "240" 62 (= floor(62.5)), "D" 10,
+    # "W" and "M" 1; another symbol's "30" 500, request.security_lower_tf alike. The
+    # AAPL "D" context holds 10 days while the chart's 500 bars span eight weeks.
+    ctx_sec = _try_in_seconds(ctx_tf)
+    calc_sec = _try_in_seconds(calc_tf)
+    if not ctx_sec or not calc_sec:
+        return data_path
+    keep = max(1, calc_bars_count * calc_sec // ctx_sec)
+
+    src = Path(data_path)
+    with OHLCVReader(src) as reader:
+        # A legacy feed's ``volume == -1`` gap fills are not bars of the context
+        is_legacy_feed = reader.period is None
+        start = reader.size
+        while start > 0 and reader.read(start - 1).timestamp > chart_last_ms:
+            start -= 1
+        counted = 0
+        while start > 0 and counted < keep:
+            start -= 1
+            if not (is_legacy_feed and reader.read(start).volume < 0):
+                counted += 1
+    if start == 0:
+        return data_path
+
+    if not tmp_dir_holder:
+        tmp_dir_holder.append(tempfile.mkdtemp(prefix='pyne_sec_resample_'))
+    src_key = hashlib.sha1(str(src.resolve()).encode()).hexdigest()[:12]
+    out = Path(tmp_dir_holder[0]) / f"{src.stem}__{src_key}__from{start}.ohlcv"
+    if out.exists():
+        # Same reuse rule as the resampled feeds: a sibling child may have mmap'ed it
+        return str(out)
+    copy_ohlcv_tail(src, out, start)
+    toml_path = src.with_suffix('.toml')
+    if toml_path.exists():
+        shutil.copyfile(toml_path, out.with_suffix('.toml'))
     return str(out)
 
 
@@ -2386,6 +2451,17 @@ class ScriptRunner:
                             data_source = _resample_finer_security_feed(
                                 str(data_source), str(sec_state.timeframe),
                                 sec_resample_dirs)
+                        # ``calc_bars_count`` limits every context to its own last
+                        # bars too, so the child, the bar grid and the batch plan
+                        # below all have to see the cut feed. A script timeframe
+                        # counts HTF bars instead, which nothing has measured yet.
+                        _calc_bars_count = getattr(self.script, 'calc_bars_count', 0) or 0
+                        if (_calc_bars_count > 0 and stf is None
+                                and self.last_bar_time is not None):
+                            data_source = _calc_window_security_feed(
+                                str(data_source), str(sec_state.timeframe), chart_tf,
+                                _calc_bars_count, int(self.last_bar_time),
+                                sec_resample_dirs)
                         load_htf_bar_opens(sec_state, str(data_source))
                         load_ltf_first_ms(sec_state, str(data_source))
                         # Historical BATCH round: the chart drives this context
@@ -3908,7 +3984,6 @@ class ScriptRunner:
 
             # Remove temp dirs created for HTF security-feed resampling.
             if sec_resample_dirs:
-                import shutil
                 for _tmp_dir in sec_resample_dirs:
                     shutil.rmtree(_tmp_dir, ignore_errors=True)
 

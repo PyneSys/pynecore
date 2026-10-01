@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 import pynecore.core.ohlcv as ohlcv
-from pynecore.core.ohlcv import OHLCVReader, OHLCVWriter, record_count
+from pynecore.core.ohlcv import OHLCVReader, OHLCVWriter, copy_ohlcv_tail, record_count
 from pynecore.types.ohlcv import OHLCV
 
 _MAGIC = b"\x89PYN\r\n\x1a\n"
@@ -1820,3 +1820,44 @@ def __test_extra_rows_are_synced_before_the_header__(tmp_path: Path, monkeypatch
     assert extra_fd in synced
     assert binary_fd in synced
     assert synced.index(extra_fd) < synced.index(binary_fd)
+
+
+def __test_copy_ohlcv_tail_reads_back_every_kept_bar_exactly__(tmp_path: Path):
+    """A v2 tail copy keeps the stored bytes: every bar, extra field and the tick grid
+    read back as from the source, under a header rebuilt for the kept records."""
+    source = tmp_path / "source.ohlcv"
+    candles = [OHLCV(i * 60_000, 100.0 + i, 100.25 + i, 99.75 + i, 100.1 + i, 0.1 * i,
+                     extra_fields={"tag": f"bar{i}"}) for i in range(6)]
+    _write_candles(source, candles, minmove=1, pricescale=100)
+
+    target = tmp_path / "tail.ohlcv"
+    assert copy_ohlcv_tail(source, target, 4) == 2
+
+    with OHLCVReader(source) as full, OHLCVReader(target) as tail:
+        assert tail.size == 2
+        assert tail.period == full.period
+        assert (tail.minmove, tail.pricescale) == (full.minmove, full.pricescale)
+        assert tail.start_timestamp == 4 * 60_000
+        assert tail.end_timestamp == full.end_timestamp
+        assert [tail.read(i) for i in range(2)] == [full.read(i) for i in range(4, 6)]
+        assert [tail.read(i).extra_fields for i in range(2)] == [{"tag": "bar4"}, {"tag": "bar5"}]
+
+    copy_ohlcv_tail(source, target, 5)
+    with OHLCVReader(target) as tail:
+        assert tail.size == 1
+        assert tail.dense is False
+    with pytest.raises(ValueError, match="outside"):
+        copy_ohlcv_tail(source, target, 6)
+
+
+def __test_copy_ohlcv_tail_slices_a_legacy_v1_file__(tmp_path: Path):
+    """A legacy v1 file is a bare record array, so its tail copy is a plain slice."""
+    source = tmp_path / "legacy_source.ohlcv"
+    records = [struct.pack("Ifffff", 1_700_000_000 + 60 * i, 1.0, 2.0, 0.5, 1.5, float(i))
+               for i in range(3)]
+    source.write_bytes(b"".join(records))
+
+    target = tmp_path / "legacy_tail.ohlcv"
+    assert copy_ohlcv_tail(source, target, 1) == 2
+    assert target.read_bytes() == b"".join(records[1:])
+    assert not target.with_suffix(".extra.csv").exists()

@@ -23,7 +23,7 @@ from pynecore.core.syminfo import SymInfoInterval
 from pynecore.types.ohlcv import OHLCV
 
 __all__ = ["OHLCVWriter", "OHLCVReader", "ChartBarWindow", "parse_timezone_name",
-           "record_count", "restore_f32_volume"]
+           "record_count", "copy_ohlcv_tail", "restore_f32_volume"]
 
 _MAGIC = b"\x89PYN\r\n\x1a\n"
 _VERSION_MAJOR = 2
@@ -741,6 +741,70 @@ def record_count(path: str | Path) -> int:
         return 0
     finally:
         file.close()
+
+
+def copy_ohlcv_tail(source: str | Path, target: str | Path, start: int) -> int:
+    """Copy the records of an OHLCV file from position ``start`` on, byte for byte.
+
+    The stored bytes are copied rather than decoded and re-encoded, so every bar
+    reads back from ``target`` exactly as it reads from ``source``. A v2 record
+    encodes its deltas against base columns of the same record, so any suffix of
+    records is a valid file under a rebuilt header (record count, first timestamp;
+    the DENSE flag is dropped for a single record). A legacy v1 file is a bare
+    record array and is sliced as is. A position-aligned ``.extra.csv`` sidecar is
+    sliced to the same rows.
+
+    :param source: Source OHLCV file path.
+    :param target: Target OHLCV file path; an existing file is replaced.
+    :param start: Zero-based position of the first record to keep.
+    :return: Number of records written.
+    :raises ValueError: If ``start`` is not a record position of ``source``.
+    """
+    file = open_shared_binary(source, "rb")
+    try:
+        file_size = os.fstat(file.fileno()).st_size
+        magic = file.read(len(_MAGIC))
+        if magic == _MAGIC:
+            layout = _read_layout(file, file_size, magic)
+            total = layout.record_count
+            if not 0 <= start < total:
+                raise ValueError(f"Record position {start} is outside {source} ({total} records)")
+            kept = total - start
+            records = _pread(file.fileno(), kept * layout.record_size,
+                             layout.header_size + start * layout.record_size)
+            descriptors = _pread(file.fileno(), layout.header_size - _FIXED_HEADER_SIZE,
+                                 _FIXED_HEADER_SIZE)
+            timestamp_column = next(column for column in layout.columns
+                                    if column.role == _ROLE_TIMESTAMP)
+            first_timestamp = struct.unpack_from("<q", records, timestamp_column.byte_offset)[0]
+            flags = layout.flags if kept > 1 else layout.flags & ~_DENSE_FLAG
+            header = _build_header(
+                layout.columns, flags, kept, first_timestamp, layout.last_timestamp,
+                layout.interval_value, layout.interval_unit, layout.minmove, layout.pricescale)
+            data = header + descriptors + records
+        else:
+            total = file_size // _LEGACY_RECORD_SIZE
+            if file_size % _LEGACY_RECORD_SIZE != 0 or not 0 <= start < total:
+                raise ValueError(f"Record position {start} is outside {source} ({total} records)")
+            kept = total - start
+            data = _pread(file.fileno(), kept * _LEGACY_RECORD_SIZE, start * _LEGACY_RECORD_SIZE)
+    finally:
+        file.close()
+    Path(target).write_bytes(data)
+
+    source_extra = _extra_sidecar_path(source)
+    target_extra = _extra_sidecar_path(target)
+    if source_extra.exists():
+        with open(source_extra, "r", encoding="utf-8-sig", newline="") as extra_file:
+            rows = list(csv.reader(extra_file))
+        with open(target_extra, "w", encoding="utf-8", newline="") as extra_file:
+            writer = csv.writer(extra_file)
+            if rows:
+                writer.writerow(rows[0])
+                writer.writerows(rows[1 + start:])
+    else:
+        target_extra.unlink(missing_ok=True)
+    return kept
 
 
 class OHLCVWriter:
