@@ -2,6 +2,8 @@ from typing import Iterable, Iterator, Callable, TYPE_CHECKING, Any, cast
 from types import ModuleType
 import asyncio
 import concurrent.futures
+import hashlib
+import importlib.util
 import os
 import sys
 import tomllib
@@ -11,6 +13,13 @@ from math import log10, floor
 from pathlib import Path
 from datetime import datetime, UTC
 
+# Before anything that pulls in ``pynecore.lib``: its @pyne submodules must load
+# through the transforming loader. ``pynecore.__init__`` normally installs the
+# hook, but it never runs when ``pynecore`` resolves as a namespace package (the
+# CLI launched from the monorepo root, whose top-level ``pynecore/`` directory
+# shadows the editable ``src/pynecore``), and then only a cached transformed
+# ``.pyc`` would hide it. Importing the module installs the hook.
+from pynecore.core import import_hook
 from pynecore import lib
 from pynecore.lib import timeframe as timeframe_lib
 from pynecore.lib.log import (broker_debug, broker_info, broker_warning, ohlcv_info, sim_info,
@@ -48,6 +57,7 @@ if TYPE_CHECKING:
     from pynecore.core.symbol_map import MappedSymbol
 
 __all__ = [
+    'script_module_name',
     'import_script',
     'ScriptRunner',
     'LIVE_TRANSITION',
@@ -119,20 +129,33 @@ def _close_price_or_none() -> float | None:
     return None
 
 
+def script_module_name(script_path: Path) -> str:
+    """The name :func:`import_script` registers a script's module under.
+
+    Derived from the file's canonical path, so two scripts that share a file name
+    never share a module, and every process that imports the same file -- a
+    security child included -- names it the same.
+
+    :param script_path: Path of the script file
+    :return: The module name, the file stem followed by a digest of the path
+    """
+    digest = hashlib.sha1(str(script_path.resolve()).encode()).hexdigest()[:16]
+    return f"{script_path.stem.replace('.', '_')}__{digest}"
+
+
 def import_script(script_path: Path) -> ModuleType:
     """
-    Import the script
-    """
-    # ``pynecore`` can resolve as a namespace package when the CLI is launched
-    # from the monorepo root (the checkout's top-level ``pynecore/`` directory
-    # shadows the editable ``src/pynecore`` package).  In that case
-    # ``pynecore.__init__`` never runs, so relying on it to install the Pyne
-    # import hook lets a valid foreign ``.pyc`` bypass every AST transform.
-    # Import the hook at the actual script-import boundary as the definitive
-    # installation point; the module import is idempotent in normal installs.
-    from . import import_hook as _import_hook
-    from importlib import import_module
+    Import the script: execute exactly this file as a fresh module.
 
+    The module is registered in ``sys.modules`` under :func:`script_module_name`,
+    replacing what an earlier import of the same file left there, so every call
+    starts the script from its first statement.
+
+    :param script_path: Path of the script file
+    :return: The executed module
+    :raises ImportError: If the file cannot be read, is not Pyne code or has no
+                         ``main`` function
+    """
     # Check for @pyne magic doc comment before importing (prevents import errors)
     # Without this user may get strange errors which are very hard to debug.
     # The import hook's head detector is the single source of truth here: it
@@ -143,7 +166,7 @@ def import_script(script_path: Path) -> ModuleType:
     try:
         with open(script_path, 'rb') as f:
             head = f.read(4096)
-        if not _import_hook.source_starts_with_pyne(head):
+        if not import_hook.source_starts_with_pyne(head):
             raise ImportError(
                 f"Script '{script_path}' must have a magic doc comment containing "
                 f"'@pyne' at the beginning of the file!"
@@ -151,14 +174,24 @@ def import_script(script_path: Path) -> ModuleType:
     except (OSError, IOError) as e:
         raise ImportError(f"Could not read script file '{script_path}': {e}")
 
-    # Add script's directory to Python path temporarily
+    # The file itself, never what its stem resolves to: a cached module of another
+    # script with the same file name, or any other module of that name
+    name = script_module_name(script_path)
+    spec = importlib.util.spec_from_file_location(
+        name, script_path, loader=import_hook.PyneLoader(name, str(script_path)))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    # Registered before it runs, as an import would: the script's own types are
+    # looked up through ``sys.modules`` by their ``__module__``
+    sys.modules[name] = module
+    # The script's directory is on the path while it runs, for the libraries it imports
     sys.path.insert(0, str(script_path.parent))
     try:
-        # Import hook is registered at pynecore package import time (see pynecore/__init__.py),
-        # so any subsequent import goes through PyneLoader and AST transformers.
-        module = import_module(script_path.stem)
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
     finally:
-        # Remove the directory from path
         sys.path.pop(0)
 
     if not hasattr(module, 'main'):
@@ -582,7 +615,6 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
         metadata to drive the grid). Temp files live in a per-run directory whose
         path is stored in ``tmp_dir_holder`` and removed at run teardown.
     """
-    import hashlib
     import tempfile
     from .aggregator import aggregate_ohlcv
     from .datetime import parse_timezone
