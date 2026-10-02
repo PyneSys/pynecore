@@ -106,10 +106,10 @@ can also be used, keeping code readability and personal preferences in mind.
 ## Pine Script Compatibility
 
 The PyneCore library implements the Pine Script API while leveraging Python's strengths. PyneCore is validated against
-TradingView on <!--wild:scripts_total-->950<!--/wild--> published TradingView scripts (Pine Script v4–v6, converted to
-Pyne code with [PyneComp](https://pynesys.io)): all <!--wild:tv_verified-->1,284<!--/wild--> comparable outputs
-match, <!--wild:bars_exact_pct-->99.754<!--/wild-->% of <!--wild:bars_compared_millions-->123<!--/wild--> million
-plotted values are bit-identical, and <!--wild:strategy_trades-->334,835<!--/wild--> strategy trades match
+TradingView on <!--wild:scripts_total-->960<!--/wild--> published TradingView scripts (Pine Script v4–v6, converted to
+Pyne code with [PyneComp](https://pynesys.io)): all <!--wild:tv_verified-->1,298<!--/wild--> comparable outputs
+match, <!--wild:bars_exact_pct-->99.757<!--/wild-->% of <!--wild:bars_compared_millions-->124<!--/wild--> million
+plotted values are bit-identical, and <!--wild:strategy_trades-->338,601<!--/wild--> strategy trades match
 TradingView's timing (snapshot <!--wild:generated_at-->2026-10-02<!--/wild-->, [Pyne in the
 Wild](https://wild.pynesys.io/)). See [Compatibility](/docs/overview/compatibility/) for details.
 
