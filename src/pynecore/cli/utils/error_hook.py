@@ -12,8 +12,7 @@ def setup_global_error_logging(log_path: Path):
     # Creating the log file directory
     log_path.parent.mkdir(parents=True, exist_ok=True)
     # Remove last error file if exists
-    if log_path.exists():
-        log_path.unlink()
+    log_path.unlink(missing_ok=True)
 
     # Save the original excepthook
     original_excepthook = sys.excepthook
