@@ -1,7 +1,7 @@
 import re
 import sys
 from zoneinfo import ZoneInfo
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, timezone as dt_timezone, tzinfo, UTC
 from functools import cache, lru_cache
 
 # Standard formats for non-ISO dates
@@ -54,6 +54,21 @@ PINE_FORMATS = [
     "%m.%d.%Y %H:%M",  # "03.04.2023 10:20"
     "%m.%d.%Y",  # "03.04.2023"
 ]
+
+# Zone names a date string may END with, as their UTC offsets: the RFC 2822 names
+# plus "Z", in any letter case. Any other trailing name ("CET", a military letter
+# like "A", an IANA name) is rejected.
+_ZONE_NAME_OFFSETS = {
+    "UT": "+0000", "UTC": "+0000", "GMT": "+0000", "Z": "+0000",
+    "EST": "-0500", "EDT": "-0400", "CST": "-0600", "CDT": "-0500",
+    "MST": "-0700", "MDT": "-0600", "PST": "-0800", "PDT": "-0700",
+}
+
+_MONTH_NAMES = frozenset((
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    "january", "february", "march", "april", "june", "july", "august", "september",
+    "october", "november", "december",
+))
 
 
 def normalize_timezone(datestring: str) -> str:
@@ -215,7 +230,9 @@ def parse_datestring(datestring: str) -> datetime:
     Parse date string using multiple formats.
     Handles ISO 8601 with microseconds and timezone offsets.
     If no time is supplied, "00:00" is used.
-    If no timezone is supplied, GMT+0 is used.
+    If no timezone is supplied, GMT+0 is used, whatever the exchange timezone is.
+    Words in front of the date (a weekday, a zone name) are skipped; a zone name
+    after the date is honoured.
 
     :param datestring: Date string to parse
     :return: Parsed datetime object
@@ -224,6 +241,29 @@ def parse_datestring(datestring: str) -> datetime:
     datestring = datestring.strip()
     if not datestring:
         return datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Leading words carry no meaning -- measured on NASDAQ:AAPL: "UTC 01 Jan 2022
+    # 00:00", "EST ...", "America/New_York ...", "Sat, ...", "Foo ..." and "hello
+    # world ..." all resolve to 2022-01-01 00:00 UTC, and "UTC 01 Jan 2022 00:00
+    # +0300" to 21:00 UTC the day before. A word is digit-free and unsigned
+    # ("UTC01 Jan 2022" is rejected); a month name starts the date itself. After
+    # such a word the ISO date/time form is rejected ("UTC 2022-01-01T05:00") while
+    # a bare ISO date is not ("UTC 2022-01-01").
+    words = 0
+    while True:
+        lead = re.match(r'([^\s\d+-]\S*)\s+', datestring)
+        if lead is None or lead.group(1).lower() in _MONTH_NAMES:
+            break
+        datestring = datestring[lead.end():]
+        words += 1
+
+    # A trailing zone name is its offset -- measured on NASDAQ:AAPL:
+    # "01 Jan 2022 00:00 EST" / "est" resolves to 05:00 UTC, "PDT" to 07:00 UTC,
+    # "UT" and "Z" to 00:00 UTC, while "CET", "A" and "America/New_York" are
+    # rejected.
+    zone = re.search(r'\s+([A-Za-z]+)$', datestring)
+    if zone is not None and (offset := _ZONE_NAME_OFFSETS.get(zone.group(1).upper())):
+        datestring = f"{datestring[:zone.start()]} UTC{offset}"
 
     # Try parsing ISO 8601 style dates WITH TIME first. The date and the time may
     # be separated by "T", a space or a colon, and the hour needs no zero padding;
@@ -243,7 +283,7 @@ def parse_datestring(datestring: str) -> datetime:
         r'([+-]\d{2}:?\d{2})?$',  # timezone part
         datestring
     )
-    if iso_match:
+    if iso_match and not words:
         date_part, time_part, tz_part = iso_match.groups()
         dt_str = f"{date_part}T{time_part}"
         if tz_part:
@@ -264,10 +304,7 @@ def parse_datestring(datestring: str) -> datetime:
     # This prevents the timezone regex from incorrectly matching date parts like -09 in 2025-01-09
     iso_date_match = re.match(r'^\d{4}-\d{2}-\d{2}$', datestring)
     if iso_date_match:
-        dt = datetime.strptime(datestring, "%Y-%m-%d")
-        # Use exchange timezone (from syminfo) when no timezone is specified
-        default_tz = parse_timezone(None)  # This will return syminfo.timezone
-        return dt.replace(tzinfo=default_tz)
+        return datetime.strptime(datestring, "%Y-%m-%d").replace(tzinfo=UTC)
 
     # Year-only and year-month dates, where TradingView fills the missing components
     # in with the start of the period -- measured: "2025" -> 2025-01-01 00:00 and
@@ -277,23 +314,32 @@ def parse_datestring(datestring: str) -> datetime:
     partial_match = re.match(r'^(\d{4})(?:[-/.](\d{1,2}))?$', datestring)
     if partial_match:
         year, month = partial_match.groups()
-        # Use exchange timezone (from syminfo) when no timezone is specified
-        return datetime(int(year), int(month) if month else 1, 1,
-                        tzinfo=parse_timezone(None))
+        return datetime(int(year), int(month) if month else 1, 1, tzinfo=UTC)
 
     # Extract timezone if present at the end for other formats
     # The regex requires whitespace before timezone to avoid matching date parts
-    tz_match = re.search(r'\s+((?:UTC|GMT)?[+-]\d{1,2}(?::?\d{2})?)\s*$', datestring)
+    tz_match = re.search(r'\s+((UTC|GMT)?([+-])(\d{1,2})(?::?(\d{2}))?)\s*$', datestring)
+    tz: tzinfo | None
     if tz_match:
-        tz = parse_timezone(
-            f"UTC{tz_match.group(1)}" if not tz_match.group(1).startswith(('UTC', 'GMT')) else tz_match.group(1))
+        _, prefix, sign, hours, minutes = tz_match.groups()
         datestring = datestring[:tz_match.start()].strip()
+        offset = timedelta(hours=int(hours), minutes=int(minutes or 0))
+        tz = dt_timezone(-offset if sign == '-' else offset)
+        # A date spelled with a month NAME and no time ignores its zone, and refuses
+        # a bare offset -- measured on NASDAQ:AAPL: "01 Jan 2022 GMT+3", "01 Jan
+        # 2022 PST" and "Jan 01 2022 EST" all resolve to midnight UTC, "01 Jan 2022
+        # +0300" is rejected, while the numeric "2022-01-01 EST" and "01-02-2022
+        # EST" resolve to 05:00 UTC.
+        if ':' not in datestring and re.search(r'[A-Za-z]', datestring):
+            tz = UTC if prefix else None
     else:
-        # Use exchange timezone (from syminfo) when no timezone is specified
-        tz = parse_timezone(None)  # This will return syminfo.timezone
+        # No timezone means UTC, not the exchange timezone -- measured on
+        # NASDAQ:AAPL (America/New_York): "01 Jan 2022 00:00", "2022-01-01",
+        # "2022", "Jan 2022" and "01-02-2022" all resolve to midnight UTC.
+        tz = UTC
 
     # Try standard formats (with timezone)
-    if tz_match:
+    if tz_match and tz is not None:
         normalized = normalize_timezone(f"{datestring} {tz_match.group(1)}")
         for fmt in STANDARD_FORMATS:
             try:
@@ -302,7 +348,7 @@ def parse_datestring(datestring: str) -> datetime:
                 continue
 
     # Try Pine formats (without timezone)
-    for fmt in PINE_FORMATS:
+    for fmt in PINE_FORMATS if tz is not None else ():
         try:
             dt = datetime.strptime(datestring, fmt)
             return dt.replace(tzinfo=tz)
