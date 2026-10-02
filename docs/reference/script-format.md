@@ -125,26 +125,26 @@ def main():
 
 Key parameters (in addition to indicator parameters):
 
-| Parameter                    | Default              | Description                            |
-|------------------------------|----------------------|----------------------------------------|
-| `initial_capital`            | `1000000`            | Starting capital                       |
-| `currency`                   | `currency.NONE`      | Account currency                       |
-| `pyramiding`                 | `0`                  | Max entries in same direction          |
-| `default_qty_type`           | `strategy.fixed`     | Position sizing method                 |
-| `default_qty_value`          | `1`                  | Default quantity                       |
-| `commission_type`            | `commission.percent` | Commission calculation method          |
-| `commission_value`           | `0.0`                | Commission amount                      |
-| `slippage`                   | `0`                  | Slippage in ticks                      |
-| `margin_long`                | `100.0`              | Long margin percentage                 |
-| `margin_short`               | `100.0`              | Short margin percentage                |
-| `calc_on_order_fills`        | `False`              | Re-execute on fills                    |
-| `calc_on_every_tick`         | `False`              | Re-execute on every tick (live only)   |
-| `calc_on_every_history_tick` | `False`              | Re-execute on every historical tick    |
-| `use_bar_magnifier`          | `True`               | Use LTF data for fill accuracy         |
-| `process_orders_on_close`    | `False`              | Extra order processing after bar close |
-| `close_entries_rule`         | `'FIFO'`             | Trade closing order                    |
-| `risk_free_rate`             | `2.0`                | For Sharpe ratio calculation           |
-| `close_by_id`                | `False`              | One `close()` slot per id (Pine v4/v5) |
+| Parameter                    | Default              | Description                                                                             |
+|------------------------------|----------------------|-----------------------------------------------------------------------------------------|
+| `initial_capital`            | `100000`             | Starting capital                                                                        |
+| `currency`                   | `currency.NONE`      | Account currency                                                                        |
+| `pyramiding`                 | `0`                  | Max entries in same direction                                                           |
+| `default_qty_type`           | `percent_of_equity`  | Position sizing method                                                                  |
+| `default_qty_value`          | `100`                | Default quantity                                                                        |
+| `commission_type`            | `commission.percent` | Commission calculation method                                                           |
+| `commission_value`           | `0.0`                | Commission amount                                                                       |
+| `slippage`                   | `0`                  | Slippage in ticks                                                                       |
+| `margin_long`                | `100.0`              | Long margin percentage                                                                  |
+| `margin_short`               | `100.0`              | Short margin percentage                                                                 |
+| `calc_on_order_fills`        | `False`              | Re-execute on fills                                                                     |
+| `calc_on_every_tick`         | `False`              | Re-execute on every tick (live only)                                                    |
+| `calc_on_every_history_tick` | `False`              | Re-execute on every historical tick                                                     |
+| `use_bar_magnifier`          | `True`               | Use LTF data for fill accuracy                                                          |
+| `process_orders_on_close`    | `False`              | Extra order processing after bar close                                                  |
+| `close_entries_rule`         | `'FIFO'`             | Trade closing order                                                                     |
+| `risk_free_rate`             | `2.0`                | For Sharpe ratio calculation                                                            |
+| `close_by_id`                | `False`              | One `close()` order per id ([v4/v5](lib/strategy.md#several-closes-of-one-id-on-a-bar)) |
 
 ### @script.library
 

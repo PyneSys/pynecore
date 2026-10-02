@@ -62,11 +62,11 @@ subset, so tooling can rely on it. See [The `edge` Variant](/docs/reference/scri
 ## Pyne in the Wild (Validation Report)
 
 [Pyne in the Wild](https://wild.pynesys.io/) is a public, reproducible comparison with TradingView. It converts
-<!--wild:scripts_total-->930<!--/wild--> published TradingView scripts with PyneComp, runs them with PyneCore and
-compares every comparable output with TradingView's: all <!--wild:tv_verified-->1,256<!--/wild--> comparable outputs
-match, <!--wild:bars_exact_pct-->99.748<!--/wild-->% of <!--wild:bars_compared_millions-->120<!--/wild--> million plotted
-values are bit-identical, and <!--wild:strategy_trades-->322,325<!--/wild--> strategy trades match TradingView's timing
-(snapshot <!--wild:generated_at-->2026-10-01<!--/wild-->). Each script's source is pinned by a SHA-256 hash, and its
+<!--wild:scripts_total-->940<!--/wild--> published TradingView scripts with PyneComp, runs them with PyneCore and
+compares every comparable output with TradingView's: all <!--wild:tv_verified-->1,271<!--/wild--> comparable outputs
+match, <!--wild:bars_exact_pct-->99.750<!--/wild-->% of <!--wild:bars_compared_millions-->121<!--/wild--> million plotted
+values are bit-identical, and <!--wild:strategy_trades-->332,586<!--/wild--> strategy trades match TradingView's timing
+(snapshot <!--wild:generated_at-->2026-10-02<!--/wild-->). Each script's source is pinned by a SHA-256 hash, and its
 result is published individually. See [Compatibility](/docs/overview/compatibility/) for the feature status.
 
 ## What Comes Next

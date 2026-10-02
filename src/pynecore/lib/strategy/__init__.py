@@ -231,6 +231,7 @@ class Order:
         "is_market_order",  # Flag to check if this is a market order
         "cancelled",  # Flag to mark order as cancelled by OCA
         "gap_committed",  # Exit leg locked into the current bar-open gap batch
+        "detached",  # Exit leg withdrawn by a rejected reversal until the position next changes
         "deferred_qty",  # Default-sized entry: quantity re-resolves at the actual fill price
         "budget_money",  # Money budget of a default-sized entry frozen at (last) placement
         "budget_pv",  # Account point value (quote->account rate) frozen with it
@@ -241,6 +242,7 @@ class Order:
         "bar_index",  # Bar index when the order was placed
         "filled_by_type",  # Type of execution: 'profit', 'loss', 'trailing', or None
         "from_entry_na",  # True if exit was created without explicit from_entry (applies to any position)
+        "named_entry",  # True if the strategy.exit call named its entry (explicit from_entry)
         "reserved_size",  # Exit-leg slice of the entry's original size (frozen at creation)
         "bound_size",  # Size of everything bound to the entry when this leg reserved its slice
         "rest_leg",  # Exit leg with no explicit qty/qty_percent: closes the WHOLE bound entry
@@ -342,6 +344,7 @@ class Order:
         # first reached inside the bar after a reversal at ANOTHER level (18/18
         # events) and one outlived by a MARKET reversal (6/6) are cancelled unfilled.
         self.gap_committed = False
+        self.detached = False
         self.deferred_qty = False
         self.budget_money: float | None = None
         self.budget_pv: float | None = None
@@ -357,6 +360,7 @@ class Order:
         self.bar_index = -1  # Will be set when order is added to position
         self.filled_by_type: Literal['profit', 'loss', 'trailing'] | None = None  # Will be set when order fills
         self.from_entry_na = False
+        self.named_entry = False
         self.reserved_size = abs(size)
         self.bound_size = 0.0
         self.rest_leg = False
@@ -1500,6 +1504,7 @@ class SimPosition(PositionBase):
             leg.bound_size = bound
             leg.entry_seq = binding.seq
             leg.from_entry_na = source.from_entry_na
+            leg.named_entry = source.named_entry
             self._add_order(leg)
             if leg.trail_price is not None or leg.trail_points_ticks is not None:
                 self._spawned_trail_legs.append(leg)
@@ -1523,6 +1528,17 @@ class SimPosition(PositionBase):
             if binding.entry_id == entry_id:
                 return True
         return False
+
+    def _exit_has_target(self, order: Order) -> bool:
+        """True while an exit leg has open quantity it can close.
+
+        A leg without an id is a ``strategy.exit`` re-aimed at the position that
+        opened after its entry was rejected: it covers that whole position, not
+        one entry's binding.
+        """
+        if order.order_id is None:
+            return bool(self.open_trades)
+        return self._has_bound(order.order_id)
 
     def _pyramid_count(self) -> int:
         """Entries counted against ``pyramiding`` — the binding book, not the FIFO one."""
@@ -2180,8 +2196,20 @@ class SimPosition(PositionBase):
                             self._remove_order(order)
                             return False
 
-        # For normal orders (_order_type_normal), no special risk management or pyramiding limits apply
-        # They simply add to or subtract from the position as requested
+            # A ``strategy.order`` knows no pyramiding limit, but it is margined
+            # like any other order: TV rejects it whole when the position it would
+            # leave behind cannot be margined -- from flat, stacked on a position,
+            # and as a net flip alike, with no closing leg carried out (unlike a
+            # ``strategy.entry`` reversal). MEASURED (BINANCE:BTCUSDT 30m, 512
+            # cycles each): a 5x-equity buy from flat never fills, a 0.7x buy on
+            # a 0.5x long never fills, a 1.2x sell against a 0.5x long flips to
+            # 0.7x short every time while a 1.6x sell leaves the long untouched,
+            # market and limit alike. An order that only reduces is not judged.
+            elif self._order_opens_exposure(order) and \
+                    self._entry_exceeds_margin_after_fill(order, price):
+                self._remove_order(order)
+                return False
+
 
         # If position direction is about to change, we split it into two separate orders
         # This is necessary to create a new average entry price
@@ -2203,8 +2231,12 @@ class SimPosition(PositionBase):
             # overshoot as an opposite trade. But when the shrink came from a
             # same-bar partial strategy.close() (which stamps book_seq), TV
             # closes only what remains, so clamp to flat instead of reversing.
+            # A priced leg without an id is a ``strategy.exit`` re-aimed at the
+            # position (see the adoption pass in _process_at_bar_open): its size
+            # was frozen when it was re-aimed, so it too closes only what remains.
             if (order.order_type == _order_type_close or close_only) and (
                     order.order_id is not None
+                    or order.stop is not None or order.limit is not None
                     or self._partial_close_bar == int(lib.bar_index)):
                 if order.gap_committed and order.exit_id is not None:
                     # A leg locked into a simultaneous-trigger batch runs its
@@ -2503,6 +2535,8 @@ class SimPosition(PositionBase):
         must not trigger: a fill would cancel its sibling OCA legs and count
         toward the filled-order caps even though there is nothing it can close.
         """
+        if order.detached:
+            return True
         if order.order_type != _order_type_close or order.order_id is None or order.from_entry_na:
             return False
         # A leg locked into the current simultaneous-trigger batch was active when
@@ -3555,17 +3589,13 @@ class SimPosition(PositionBase):
         else:
             loss = available_funds / margin_ratio
             raw_cover_lots = abs(loss) / (check_price * pv) * rfactor
-            # TV truncates the fractional cover amount, but snaps a raw value
-            # that lands within ~2^-26 (relative) of an integer to that
-            # integer. Measured on BINANCE:BTCUSDT 30m corpus margin calls:
-            # 21840.99976 (rel dist 1.10e-8) covered 21841 lots on TV, while
-            # 26510.99945 (rel dist 2.08e-8) truncated to 26510; 2^-26 =
-            # 1.49e-8 lies between them.
-            nearest_cover = round(raw_cover_lots)
-            if abs(raw_cover_lots - nearest_cover) <= raw_cover_lots * 2.0 ** -26 + 1e-9:
-                cover_lots = nearest_cover
-            else:
-                cover_lots = int(raw_cover_lots)
+            # TV truncates the fractional cover amount, however close it lands
+            # to the next lot. MEASURED on the wild corpus (26 strategies with
+            # margin calls, BINANCE:BTCUSDT): `RCI Strategy [PineIndicators]`
+            # 2018-01-04 20:00 covers 15863 lots from 15863.99994, and
+            # `Hybrid: RSI + Breakout + Dashboard` 2025-11-14 06:30 covers
+            # 103482 lots from 103482.99931.
+            cover_lots = int(raw_cover_lots)
         if cover_lots == 0 and rfactor > 1:
             # Fractional-lot symbol with a sub-lot shortfall: TradingView closes
             # one whole contract, capped by the current position size. This holds
@@ -3624,6 +3654,7 @@ class SimPosition(PositionBase):
                            tuple((abs(t.size), t.entry_price) for t in self.open_trades))
 
         self._fill_order(margin_call_order, fill_price)
+        self._reattach_exits(check_price)
         return False
 
     def _margin_call_stage2(self, st2: tuple[int, float, float, bool,
@@ -3695,12 +3726,8 @@ class SimPosition(PositionBase):
         loss = d2 / margin_ratio
         rfactor = syminfo._size_round_factor  # noqa
         raw_cover_lots = loss / (c1 * pv) * rfactor
-        # Same truncation-with-float-snap as the first stage.
-        nearest_cover = round(raw_cover_lots)
-        if abs(raw_cover_lots - nearest_cover) <= raw_cover_lots * 2.0 ** -26 + 1e-9:
-            cover_lots = int(nearest_cover)
-        else:
-            cover_lots = int(raw_cover_lots)
+        # Same plain truncation as the first stage.
+        cover_lots = int(raw_cover_lots)
         if cover_lots <= 0:
             return False
         margin_call_size = min(cover_lots * 4 / rfactor, abs(self.size))
@@ -3723,6 +3750,7 @@ class SimPosition(PositionBase):
         margin_call_order.bar_index = int(lib.bar_index)
 
         self._fill_order(margin_call_order, fill_price)
+        self._reattach_exits(check_price)
         return True
 
     def process_deferred_margin_call(self):
@@ -3964,6 +3992,84 @@ class SimPosition(PositionBase):
                 continue
             if close_order.order_id is None or close_order.order_id in open_entry_ids:
                 self._remove_order(close_order)
+
+    def _order_opens_exposure(self, order: Order) -> bool:
+        """
+        Tell whether filling ``order`` leaves a position that needs new margin.
+
+        :param order: The order about to fill
+        :return: True if the fill opens, grows or flips the position
+        """
+        new_size = self.size + order.size
+        if new_size == 0.0:
+            return False
+        if self.size == 0.0 or (new_size > 0.0) != (self.size > 0.0):
+            return True
+        return abs(new_size) > abs(self.size)
+
+    def _detach_reversed_position_exits(self, entry_order: Order,
+                                        gap_batch: list[Order]) -> None:
+        """
+        Withdraw the exit orders of a position whose reversal was rejected at its fill.
+
+        A reversing market entry that was affordable when placed but can no longer
+        be margined at its fill price is rejected whole: the old position stays
+        open, yet TV has already withdrawn that position's ``strategy.exit``
+        orders. They come back with the position's next margin call (see
+        :meth:`_reattach_exits`) or when the script issues them again. MEASURED
+        (BINANCE:BTCUSDT 30m, 100 % percent_of_equity, a long with a stop/limit
+        bracket and a short entry three bars later): in 4 of 497 cycles the next
+        open sits above the placement close by more than the lot-floor slack, the
+        short never opens, and the long then rides through its own take-profit
+        level to the cycle's ``strategy.close_all`` -- with and without
+        ``from_entry`` on the bracket. The wild `VWAP Breakout Strategy + EMAs`
+        long of 2025-03-04 05:30 likewise survives a bar whose low is below its
+        stop and leaves at the levels the next signal sets.
+
+        A bracket the same open gapped through is withdrawn too: it was queued
+        behind the reversal as a market order, so it goes back to resting.
+
+        :param entry_order: The rejected reversing entry
+        :param gap_batch: The exit and entry orders this bar's open gapped through
+        """
+        if self.size == 0.0 or self.sign == entry_order.sign:
+            return
+        for exit_order in self.exit_orders.values():
+            if not (exit_order.from_entry_na or self._exit_has_target(exit_order)):
+                continue
+            if exit_order.is_market_order:
+                if exit_order not in gap_batch:
+                    continue
+                self.market_orders.pop(_market_order_key(exit_order), None)
+                exit_order.is_market_order = False
+            exit_order.detached = True
+
+    def _reattach_exits(self, price: float) -> None:
+        """
+        Bring withdrawn exit orders back after a margin call changed the position.
+
+        A stop the price has already passed fills on the spot, at the margin
+        call's own price. MEASURED on the wild `VWAP Breakout Strategy + EMAs`
+        (BINANCE:BTCUSDT 30m, 2025-04-09 13:30): a short whose reversal was
+        rejected two bars earlier walks through its 77235.97 stop untouched, is
+        margin-called for 0.02688 at the bar high 77875.46, and "Exit Short"
+        closes the remaining 1.39667 at that same 77875.46.
+
+        :param price: The price the margin call was checked at
+        """
+        if not self.exit_orders:
+            return
+        slippage_amount = syminfo.mintick * lib._script.slippage
+        for exit_order in list(self.exit_orders.values()):
+            if not exit_order.detached:
+                continue
+            exit_order.detached = False
+            stop = exit_order.stop
+            if stop is None or self.size == 0.0 or exit_order.sign == self.sign:
+                continue
+            if (price >= stop) if self.sign < 0 else (price <= stop):
+                exit_order.filled_by_type = 'loss'
+                self.fill_order(exit_order, price - self.sign * slippage_amount)
 
     def _check_low_stop(self, order: Order) -> bool:
         """ Check low stop """
@@ -4214,12 +4320,15 @@ class SimPosition(PositionBase):
         # PineScript` reference (BINANCE:BTCUSDT 30m, 2025-04-02 08:30): TV closes
         # the single open trade in ONE fill while the orphan leg split it in two.
         # A ``from_entry``-less leg is exempt -- TV deliberately re-aims that one at
-        # whatever position opens next (see the adoption pass after the open fills).
+        # whatever position opens next (see the adoption pass after the open fills),
+        # and the re-aimed leg (no id) lives as long as that position does.
         if self.exit_orders:
+            in_position = bool(self.open_trades)
             for order in list(self.exit_orders.values()):
                 if (order.is_market_order or order.from_entry_na
                         or order.entry_seq is not None
-                        or order.order_id in self.entry_orders):
+                        or order.order_id in self.entry_orders
+                        or (order.order_id is None and in_position)):
                     continue
                 self._remove_order(order)
 
@@ -4257,11 +4366,13 @@ class SimPosition(PositionBase):
             # Check if the order would be filled immediately (e.g. due to a gap)
             gap_trigger = self._check_already_filled(order)
             if gap_trigger is not None:
+                if order.detached:
+                    continue
                 if order.exit_id is not None:
                     # Exit order gaps through — check if its bound entry still
                     # has open quantity on the ledger (the FIFO fill may have
                     # consumed its trade rows while the binding stays live)
-                    has_open_trade = self._has_bound(order.order_id)
+                    has_open_trade = self._exit_has_target(order)
                     if not has_open_trade:
                         associated_entry = self.entry_orders.get(order.order_id)
                         if associated_entry is not None:
@@ -4322,11 +4433,14 @@ class SimPosition(PositionBase):
                 # order queued on an earlier bar still cancels an exit leg
                 # outright (MEASURED, 6/6 events -- a market reversal leaves the
                 # gapped exit unfilled), while a fill from inside the batch no
-                # longer does (see Order.gap_committed).
+                # longer does (see Order.gap_committed). A leg without an id is
+                # re-aimed at the whole position and closes only what is left
+                # of it (see fill_order), so it is never locked in.
                 for leg in gap_batch:
-                    if leg.exit_id is not None:
+                    if (leg.exit_id is not None and leg.order_id is not None
+                            and not leg.detached):
                         self._commit_leg(leg)
-            if order.cancelled:
+            if order.cancelled or order.detached:
                 continue
             if order.order_type == _order_type_entry:
                 if order.limit is None and order.stop is None:
@@ -4438,6 +4552,7 @@ class SimPosition(PositionBase):
                             base_equity=bar_start_equity))
                     if not is_reversal_leg and not stacks_on_same_bar_fill:
                         self._cancel_same_bar_reversal_closes(order)
+                        self._detach_reversed_position_exits(order, gap_batch)
                         self._remove_order(order)
                         continue
 
@@ -4470,12 +4585,32 @@ class SimPosition(PositionBase):
         # When strategy.exit() is called without from_entry, TV keeps the exit even after
         # its entry is rejected by margin. The exit adapts to close any new position that opens.
         if self.open_trades and self.exit_orders:
+            # A bracket naming the position's entry outranks an orphan: TV
+            # re-aims a from_entry-less exit of a rejected entry only at a
+            # position no ``from_entry`` exit is bound to. MEASURED
+            # (BINANCE:BTCUSDT 30m, a 100 % long rejected at its fill with a
+            # from_entry-less stop/limit exit, then a half-size entry five bars
+            # later, 3 rejected cycles each): a bare short is closed by the
+            # orphan on its own fill bar at the entry price, a bare long is
+            # exited at the orphan's stop, and both still happen when the new
+            # entry has a from_entry-less exit of its own; issued with a
+            # ``from_entry`` bracket instead, the same entries never see the
+            # orphan, in either direction.
+            has_own_exit = False
+            for order in self.exit_orders.values():
+                if (order.named_entry and not order.is_market_order
+                        and self._has_bound(order.order_id)):
+                    has_own_exit = True
+                    break
             for order in list(self.exit_orders.values()):
                 if order.is_market_order:
                     continue
                 # Skip exits whose bound entry still has open quantity on the
                 # ledger (they belong to the current position)
                 if self._has_bound(order.order_id):
+                    continue
+                # A leg already re-aimed at this position stays as it is
+                if order.order_id is None:
                     continue
                 # Skip exits whose entry is still pending
                 if order.order_id in self.entry_orders:
@@ -4485,6 +4620,9 @@ class SimPosition(PositionBase):
                 # bound to an explicit from_entry can only ever close trades
                 # from that entry — when the entry is gone it stays dormant.
                 if not order.from_entry_na:
+                    continue
+                if has_own_exit:
+                    self._remove_order(order)
                     continue
                 # A leg left by an all-na call holds a slice but has no trigger:
                 # rebuilt for the new position it would become a market close.
@@ -4546,7 +4684,7 @@ class SimPosition(PositionBase):
 
         # Fill gap-through exits whose entries just filled
         for order in (list(self.exit_orders.values()) if self.exit_orders else ()):
-            if order.is_market_order:
+            if order.is_market_order or order.detached:
                 continue
             if not self._has_bound(order.order_id):
                 continue
@@ -6698,6 +6836,14 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
                                               alert_message)
                         return
             elif margin_needed > equity:
+                # Below the gate the refusal to open is the same refusal: a market
+                # reversal still closes the opposite position. MEASURED
+                # (BINANCE:BTCUSDT 30m): a short entry of 1.0002x, 1.02x and 5x the
+                # equity against an open long closes that long at the next open in
+                # 498 of 498 cycles (exit named after the entry) and opens nothing.
+                if limit is None and stop is None:
+                    _suppress_opening_leg(position, id, direction_sign, oca_name,
+                                          oca_type, comment, alert_message)
                 return
 
     # The pyramiding limit is judged when the command RUNS, against the position
@@ -7072,6 +7218,7 @@ def _exit_leg(position: PositionBase, exit_id: str, from_entry: str,
             and existing.alert_profit == _alert_profit
             and existing.alert_loss == _alert_loss
             and existing.alert_trailing == _alert_trailing
+            and not existing.detached
             and existing.filled_by_type is None and existing.comm_booking is None
             and existing.budget_money is None and existing.filled_qty == 0.0
             and existing.flip_extra == 0.0
@@ -7324,6 +7471,9 @@ def exit(id: str, from_entry: str = "",
                       trail_price, trail_points, trail_offset, oca_name,
                       comment, comment_profit, comment_loss, comment_trailing,
                       alert_message, alert_profit, alert_loss, alert_trailing)
+        for exit_order in position.exit_orders.values():
+            if exit_order.exit_id == id and exit_order.order_id == from_entry:
+                exit_order.named_entry = True
 
     else:
         for entry_seq, from_entry, direction, init_size in _exit_filled_targets(position, None):

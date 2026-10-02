@@ -10,7 +10,8 @@ from pynecore.lib import bar_index, bgcolor, color, hline, input, na, plot, scri
 SLIPPAGE_TICKS: int = 15
 
 
-@script.strategy("Slippage Test - Direction Change", overlay=True, initial_capital=10000, slippage=SLIPPAGE_TICKS, commission_type=strategy.commission.percent, commission_value=0.1)
+@script.strategy("Slippage Test - Direction Change", overlay=True, initial_capital=10000, slippage=SLIPPAGE_TICKS, commission_type=strategy.commission.percent, commission_value=0.1,
+                 default_qty_type=strategy.fixed, default_qty_value=1)
 def main(
     flipInterval=input.int(10, "Bars Between Direction Changes", minval=5),
     startBar=input.int(20, "Start Trading at Bar", minval=1)

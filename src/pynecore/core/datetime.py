@@ -231,12 +231,16 @@ def parse_datestring(datestring: str) -> datetime:
     # measured: "2021-01-13:05:00", "2021-01-13:5:00", "2021-01-13:05:00:00" and
     # "2021-01-13T05:00" all resolve to 2021-01-13 05:00 UTC, while a missing
     # separator ("2021-01-1305:00"), a letter one ("2021-01-13x05:00") and a
-    # minute-less time ("2021-01-13:05") are rejected outright.
+    # minute-less time ("2021-01-13:05") are rejected outright. The offset is
+    # four digits with an optional colon, glued to the time -- measured:
+    # "2026-08-01T11:00:00-0500" and "...-05:00" both resolve to 16:00 UTC and
+    # "...+0530" to 05:30 UTC, while an hour-only offset ("-05", "-5") and "Z"
+    # are rejected.
     iso_match = re.match(
         r'(\d{4}-\d{2}-\d{2})'  # date part
         r'[T\s:]'  # date/time separator
         r'(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)'  # time part
-        r'([+-]\d{2}:\d{2})?$',  # timezone part
+        r'([+-]\d{2}:?\d{2})?$',  # timezone part
         datestring
     )
     if iso_match:

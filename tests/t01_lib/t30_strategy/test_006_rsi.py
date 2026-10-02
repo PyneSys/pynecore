@@ -8,7 +8,8 @@ Run with open-source PyneCore: https://pynecore.org
 from pynecore.lib import close, input, na, script, strategy, ta
 
 
-@script.strategy("RSI Strategy", overlay=True)
+@script.strategy("RSI Strategy", overlay=True, initial_capital=1000000,
+                 default_qty_type=strategy.fixed, default_qty_value=1)
 def main(
         length=input(14, "Length"),
         overSold=input(30, "Oversold"),

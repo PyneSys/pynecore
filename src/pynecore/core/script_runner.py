@@ -3364,6 +3364,16 @@ class ScriptRunner:
                         and not lib._strategy_suppressed):
                     sim_position.settle_immediate_closes()
 
+                # Process deferred margin calls. The bar-close margin check judges
+                # the position the bar's price walk left behind, so it runs before
+                # the on-close fills: a position opened AT the close is first
+                # checked at the next bar's open. MEASURED (BINANCE:BTCUSDT 30m,
+                # TP/SL Toolkit [AxeAlgo], 1173 margin calls): an on-close entry
+                # 4.56 USD over its margin is trimmed by 0.00016 at the next open,
+                # never on its own fill bar.
+                if is_strat and position and not lib._strategy_suppressed:
+                    self._process_deferred_margin_call(position)
+
                 # Pine `process_orders_on_close=true` — extra fill attempt at the bar
                 # close for current-bar orders, before the next bar's open arrives.
                 # This is the definitive execution's own pass: a COOF re-run earlier in
@@ -3373,10 +3383,6 @@ class ScriptRunner:
                         and not lib._strategy_suppressed
                         and self.script.process_orders_on_close):
                     sim_position.process_orders_at_close()
-
-                # Process deferred margin calls
-                if is_strat and position and not lib._strategy_suppressed:
-                    self._process_deferred_margin_call(position)
 
                 # Write output — in script-timeframe mode the row stays keyed by
                 # the CHART bar that closed this HTF bar, so the output grid is the
@@ -4212,15 +4218,16 @@ class ScriptRunner:
             if position:
                 position.settle_immediate_closes()
 
+            # Process deferred margin calls (after script runs, before the on-close
+            # fills: a position opened at the close is first checked at the next open)
+            if position:
+                position.process_deferred_margin_call()
+
             # Pine `process_orders_on_close=true` — extra fill attempt at the bar
             # close for current-bar orders, after any COOF re-run has already filled
             # at its own node earlier in the bar.
             if position and self.script.process_orders_on_close:
                 position.process_orders_at_close()
-
-            # Process deferred margin calls (after script runs, before results)
-            if position:
-                position.process_deferred_margin_call()
 
             # Update plot data with the results
             if res is not None:

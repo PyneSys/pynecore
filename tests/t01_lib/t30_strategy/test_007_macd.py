@@ -8,7 +8,8 @@ Run with open-source PyneCore: https://pynecore.org
 from pynecore.lib import close, input, script, strategy, ta
 
 
-@script.strategy("MACD Strategy", overlay=True)
+@script.strategy("MACD Strategy", overlay=True, initial_capital=1000000,
+                 default_qty_type=strategy.fixed, default_qty_value=1)
 def main(
         fastLength=input(12, "Fast length"),
         slowlength=input(26, "Slow length"),

@@ -110,9 +110,9 @@ class Script:
     behind_chart: bool = True
 
     backtest_fill_limits_assumption: int = 0
-    default_qty_type: _strategy.QtyType = _strategy.cash
-    default_qty_value: float = 1
-    initial_capital: float | int = 1000000
+    default_qty_type: _strategy.QtyType = _strategy.percent_of_equity
+    default_qty_value: float = 100
+    initial_capital: float | int = 100000
     currency: _currency.Currency = _currency.NONE
     slippage: int = 0
     commission_type: _strategy.commission.Commission = _strategy.commission.percent  # type: ignore
@@ -393,9 +393,9 @@ class Script:
             max_bars_back=0,
 
             backtest_fill_limits_assumption=0,
-            default_qty_type: _strategy.QtyType = _strategy.fixed,
-            default_qty_value: float = 1,
-            initial_capital: float | int = 1000000,
+            default_qty_type: _strategy.QtyType = _strategy.percent_of_equity,
+            default_qty_value: float = 100,
+            initial_capital: float | int = 100000,
             currency: _currency.Currency = _currency.NONE,
             slippage: int = 0,
             commission_type: _strategy.commission.Commission = _strategy.commission.percent,  # type: ignore

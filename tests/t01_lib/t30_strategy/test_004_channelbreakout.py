@@ -9,7 +9,8 @@ from pynecore.lib import script, strategy, input, ta, high, low, close, na, symi
 
 
 # You can define a strategy or indicator with decorator
-@script.strategy("ChannelBreakOutStrategy", overlay=True)
+@script.strategy("ChannelBreakOutStrategy", overlay=True, initial_capital=1000000,
+                 default_qty_type=strategy.fixed, default_qty_value=1)
 # Every Pyne code must have a main function
 def main(
         # Inputs are defined in main function arguments

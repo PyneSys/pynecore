@@ -10,7 +10,8 @@ from pynecore.lib import bar_index, bgcolor, color, input, na, script, strategy
 SLIPPAGE_TICKS: int = 10
 
 
-@script.strategy("Slippage Test - Basic Market Orders", overlay=True, initial_capital=10000, slippage=SLIPPAGE_TICKS, commission_type=strategy.commission.percent, commission_value=0.1)
+@script.strategy("Slippage Test - Basic Market Orders", overlay=True, initial_capital=10000, slippage=SLIPPAGE_TICKS, commission_type=strategy.commission.percent, commission_value=0.1,
+                 default_qty_type=strategy.fixed, default_qty_value=1)
 def main(
     testMode=input.string("Both", "Test Mode", options=("Long Only", "Short Only", "Both")),
     entryBar=input.int(10, "Entry at Bar", minval=1),

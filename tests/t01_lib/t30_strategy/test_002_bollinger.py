@@ -8,7 +8,8 @@ Run with open-source PyneCore: https://pynecore.org
 from pynecore.lib import close, input, script, strategy, ta
 
 
-@script.strategy("Bollinger Bands Strategy", overlay=True)
+@script.strategy("Bollinger Bands Strategy", overlay=True, initial_capital=1000000,
+                 default_qty_type=strategy.fixed, default_qty_value=1)
 def main(
     length=input.int(20, minval=1),
     mult=input.float(2.0, minval=0.001, maxval=50)

@@ -9,7 +9,8 @@ from pynecore.lib import close, display, high, input, low, nz, script, strategy,
 from pynecore.types import Series
 
 
-@script.strategy(title="Keltner Channels Strategy", overlay=True)
+@script.strategy(title="Keltner Channels Strategy", overlay=True, initial_capital=1000000,
+                 default_qty_type=strategy.fixed, default_qty_value=1)
 def main(
         length=input.int(20, minval=1),
         mult=input.float(2.0, "Multiplier"),
