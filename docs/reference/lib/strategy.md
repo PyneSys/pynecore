@@ -122,6 +122,39 @@ strategy.close("long_1", comment="Exit signal")
 strategy.close("entry_a", qty_percent=50)
 ```
 
+#### Several closes of one id on a bar
+
+By default every `strategy.close()` statement places its own order, as in Pine v6, so
+closes from different statements on the same bar all fill: a 10-unit position closed with
+`qty=4`, `qty=3` and `qty=3` on one bar sheds all 10. The same statement running again on
+the bar, in a loop for example, modifies its own order instead of adding another one.
+
+Pine v4 and v5 key that order by the entry id alone. A strategy asks for this behavior
+with `close_by_id=True` on its decorator, and PyneComp emits it for every v4/v5 source:
+
+```python
+@script.strategy("Scale out", close_by_id=True)
+```
+
+With it every `strategy.close()` of one id on a bar modifies the same pending order, so
+the last call wins:
+
+- Each call is sized against what the id's pending close leaves open, and then replaces
+  that order. A call with nothing left to close does nothing.
+- Closes of different ids keep separate orders and all fill.
+- An `immediately=True` close that a later call of the same id replaced does not fill.
+
+What a 10-unit position sheds on the bar with `close_by_id=True`:
+
+| Calls on one bar                     | Closed |
+|--------------------------------------|--------|
+| `qty=4`, `qty=3`, `qty=3`            | 3      |
+| `qty=3`, then a full close           | 7      |
+| a full close, then `qty=3`           | 10     |
+| `qty=8`, `qty=5`, `qty=1`            | 1      |
+
+The switch only changes the backtest simulator.
+
 ### strategy.close_all()
 
 Close the entire open position immediately at market price, regardless of entry ids.
