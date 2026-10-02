@@ -256,6 +256,7 @@ class Order:
         "act_seq",  # Activation slot: the order's place in a simultaneous-trigger batch
         "issue_spec",  # strategy.exit arguments as issued, for the legs later adds inherit
         "spawn_spent",  # A leg of this strategy.exit call fired: later adds inherit nothing
+        "target_trade",  # The one open trade this close fills against (margin call under ANY)
     )
 
     def __init__(
@@ -294,6 +295,7 @@ class Order:
 
         self.reversal_leg = False
         self.placed_fill_seq = -1
+        self.target_trade: Trade | None = None
         # Where this order stands among the orders triggering at one instant. A
         # fresh order takes the next slot when it reaches the book; a re-issue
         # that leaves the resting order's levels and quantity alone keeps that
@@ -1011,7 +1013,8 @@ class SimPosition(PositionBase):
         'risk_max_position_size',
         'risk_cons_loss_days', 'risk_last_trading_day', 'risk_last_day_equity',
         'risk_intraday_filled_orders', 'risk_intraday_start_equity',
-        '_deferred_margin_call', '_mc_stage2', '_fill_counter', '_last_fill_price', '_partial_close_bar',
+        '_deferred_margin_call', '_mc_stage2', '_mc_ghosts', '_bar_start_size', '_bar_start_equity',
+        '_fill_counter', '_last_fill_price', '_partial_close_bar',
         '_entry_book', '_entry_seq', '_act_counter', '_deferred_immediate_closes', '_coof_cursor', '_market_fill_price',
         '_walk_node', '_path_node', '_leg_start', '_spawned_trail_legs'
     )
@@ -1112,6 +1115,13 @@ class SimPosition(PositionBase):
         # with the legs snapshotted FIFO BEFORE the stage-1 fill.
         self._mc_stage2: tuple[int, float, float, bool,
                                tuple[tuple[float, float], ...]] | None = None
+        # Live margin-call orders under close_entries_rule='ANY': (size, trades
+        # already cut) per fired margin call, cleared when the position goes flat
+        # (see _apply_mc_ghosts).
+        self._mc_ghosts: list[tuple[float, set[Trade]]] = []
+        # Position size and equity before the bar's first fill (see _process_at_bar_open)
+        self._bar_start_size: float = 0.0
+        self._bar_start_equity: float = 0.0
         self._fill_counter: int = 0
         # Price of the most recent fill — the broker emulator's "current price"
         # for a calc_on_order_fills body run (see _mark_to_last_fill).
@@ -1522,6 +1532,10 @@ class SimPosition(PositionBase):
         """Open bound quantity across every live binding of an entry id."""
         return sum(b.bound for b in self._entry_book if b.entry_id == entry_id)
 
+    def _bound_init_qty(self, entry_id: str | None) -> float:
+        """Original quantity of every live binding of an entry id."""
+        return sum(b.init_size for b in self._entry_book if b.entry_id == entry_id)
+
     def _has_bound(self, entry_id: str | None) -> bool:
         """True while any binding of this entry id still holds quantity."""
         for binding in self._entry_book:
@@ -1631,6 +1645,8 @@ class SimPosition(PositionBase):
             self._reduce_binding(binding, qty)
             return
         bound_id = order.order_id if order.order_type == _order_type_close else None
+        if order.target_trade is not None:
+            bound_id = order.target_trade.entry_id
         reversing_id = order.exit_id if order.reversal_leg else None
         for candidate in list(self._entry_book):
             if qty <= 0.0:
@@ -1719,9 +1735,11 @@ class SimPosition(PositionBase):
             # the binding only sizes the order and gates its activation.
             close_any = (order.order_type == _order_type_close and order.order_id is not None
                          and script.close_entries_rule == 'ANY')
+            target_trade = order.target_trade
             new_open_trades = []
             for trade in self.open_trades:
-                if order.size != 0.0 and (not close_any or trade.entry_id == order.order_id):
+                if (order.size != 0.0 and (not close_any or trade.entry_id == order.order_id)
+                        and (target_trade is None or trade is target_trade)):
                     delete = True
 
                     size = order.size if abs(order.size) <= abs(trade.size) else -trade.size
@@ -1863,6 +1881,7 @@ class SimPosition(PositionBase):
                     if position_flat:
                         size -= self.size
                         self.size = 0.0
+                        self._mc_ghosts.clear()
                     self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
                     # Keep the residual open-trade size on the unit grid with
                     # the position: a snapped position with a dirty trade
@@ -2205,8 +2224,17 @@ class SimPosition(PositionBase):
             # a 0.5x long never fills, a 1.2x sell against a 0.5x long flips to
             # 0.7x short every time while a 1.6x sell leaves the long untouched,
             # market and limit alike. An order that only reduces is not judged.
+            # Nor is one that fits against the bar-start position: a stop sell
+            # filling right after a same-bar exit flattened a 0.99x long fills at
+            # 1.02x and 1.8x of equity (246/246 each) and the margin call trims
+            # it, while 2.5x never fills (275/275), nor 1.8x from a flat bar start
+            # (MEASURED, BINANCE:BTCUSDT 30m, 2026-10-02, mc8 probes).
             elif self._order_opens_exposure(order) and \
-                    self._entry_exceeds_margin_after_fill(order, price):
+                    self._entry_exceeds_margin_after_fill(order, price) and \
+                    (self.size == self._bar_start_size
+                     or self._entry_exceeds_margin_after_fill(
+                         order, price, base_size=self._bar_start_size,
+                         base_equity=self._bar_start_equity)):
                 self._remove_order(order)
                 return False
 
@@ -2859,6 +2887,7 @@ class SimPosition(PositionBase):
         """
         book = self.orderbook
         self._leg_start = start
+        close_any = lib._script.close_entries_rule == 'ANY'
         resume = start
         # Orders of the resume level already offered before the walk stopped there
         offered: tuple[Order, ...] = ()
@@ -2908,8 +2937,20 @@ class SimPosition(PositionBase):
                         self._commit_leg(leg)
                 else:
                     committed = ()
+                # Under close_entries_rule='ANY' a locked-in leg whose own trades
+                # the batch already closed runs after the legs that still have
+                # trades to close. MEASURED on the wild `Turtle Trader Strategy`
+                # (BINANCE:BTCUSDT 30m, 6/6 events): a strategy.order buy closes
+                # a short entry and part of a pyramid add; the add's leg closes
+                # the rest of the add and opens the part the order took, then the
+                # spent entry's leg opens its whole quantity.
+                spent = []
                 for i, order in enumerate(orders):
                     if order in offered:
+                        continue
+                    if close_any and order.gap_committed and not any(
+                            t.entry_id == order.order_id for t in self.open_trades):
+                        spent.append(order)
                         continue
                     if rising:
                         filled = self._check_high_stop(order) or self._check_high(order)
@@ -2925,9 +2966,17 @@ class SimPosition(PositionBase):
                         self._activate_trails_on_fill(order.order_id, ohlc, rising,
                                                       trail_awaiting, trail_close_leg)
                         if materialized:
-                            resume, offered = price, tuple(orders[:i + 1])
+                            resume, offered = price, tuple(o for o in orders[:i + 1]
+                                                           if o not in spent)
                             resumed = True
                             break
+                if not resumed:
+                    for order in spent:
+                        if rising:
+                            if not self._check_high_stop(order):
+                                self._check_high(order)
+                        elif not self._check_low_stop(order):
+                            self._check_low(order)
                 for leg in committed:
                     leg.gap_committed = False
                 if resumed:
@@ -3468,7 +3517,49 @@ class SimPosition(PositionBase):
     def _check_margin_call(self, check_price: float, *, for_short: bool,
                            at_open: bool = False,
                            can_defer: bool = True,
-                           whole_contracts: bool = False) -> bool:
+                           fill_mark: float | None = None) -> bool:
+        """
+        Run one margin checkpoint: the margin call itself, then the live
+        margin-call orders of earlier liquidations (``close_entries_rule='ANY'``).
+
+        :param check_price: The price to check margin at
+        :param for_short: If True, check short positions. If False, check long positions.
+        :param at_open: See :meth:`_margin_call_at`
+        :param can_defer: See :meth:`_margin_call_at`
+        :param fill_mark: The price of the last fill of the leg that ends at this
+            checkpoint, None if the leg filled nothing
+        :return: True if MC was deferred (caller should stop OHLC processing)
+        """
+        fills = self._fill_counter
+        deferred = self._margin_call_at(check_price, for_short, at_open, can_defer)
+        if fill_mark is not None and not deferred and self._fill_counter == fills:
+            # The account is also judged at the moment of the leg's fill: when the
+            # position fits at this checkpoint but did not at its fill price, the
+            # liquidation is sized at the fill price and executed here. MEASURED
+            # (BINANCE:BTCUSDT 30m, 2026-10-02, mc8 probe: a sell stop filling on
+            # the descending leg right after a same-bar exit of a long): with the
+            # account short of margin at the low, TV sizes the cut at the low
+            # (230/230); with the low in surplus but the fill price short of
+            # margin, it sizes the cut at the fill price and fills it at L+slip
+            # (16/16). A shortfall below one lot at the fill price liquidates
+            # nothing here (Turtle Trader Strategy 2025-01-19 09:00, 0.85 lot: the
+            # bar-close check trims the position instead).
+            self._margin_call_at(check_price, for_short, True, False, mark_price=fill_mark)
+        if self._mc_ghosts and not deferred and self.sign != 0.0 and (self.sign < 0.0) == for_short:
+            self._apply_mc_ghosts(check_price, for_short)
+        return deferred
+
+    def _leg_fill_mark(self, leg_fills: int) -> float | None:
+        """
+        The price of the last fill of the leg that started at fill count ``leg_fills``.
+
+        :param leg_fills: The fill counter when the leg started
+        :return: The last fill price, None if the leg filled nothing
+        """
+        return self._last_fill_price if self._fill_counter != leg_fills else None
+
+    def _margin_call_at(self, check_price: float, for_short: bool, at_open: bool,
+                        can_defer: bool, mark_price: float | None = None) -> bool:
         """
         Check and execute margin call using TradingView's 10-step algorithm.
 
@@ -3486,10 +3577,9 @@ class SimPosition(PositionBase):
         :param for_short: If True, check short positions. If False, check long positions.
         :param at_open: If True, this is an open check — always fire immediately, never defer.
         :param can_defer: If False, MC fires immediately even when mc_size==1 and AF@C<0.
-        :param whole_contracts: If True, size the liquidation in whole contracts even on
-            fractional-lot symbols. TV's bar-open margin call (the one that fires right
-            after entry fills at the open price) liquidates whole contracts, while its
-            intrabar (H/L) and deferred margin calls work in lot units.
+        :param mark_price: The price the position is marked and the liquidation
+            sized at, when it differs from ``check_price`` (the fill price base);
+            a shortfall below one lot at this price liquidates nothing
         :return: True if MC was deferred (caller should stop OHLC processing)
         """
         if not self.open_trades:
@@ -3526,7 +3616,8 @@ class SimPosition(PositionBase):
               else _account_point_value())
 
         money_spent = quantity * self.avg_price * pv
-        mvs = quantity * check_price * pv
+        mark = check_price if mark_price is None else mark_price
+        mvs = quantity * mark * pv
 
         open_profit = mvs - money_spent
         if self.sign < 0:
@@ -3569,12 +3660,12 @@ class SimPosition(PositionBase):
         elif available_funds >= 0:
             return False
 
-        # One contract is worth `check_price * pv` in account currency. Work in
+        # One contract is worth `mark * pv` in account currency. Work in
         # lot units (1 / _size_round_factor): whole-lot symbols (stocks) keep
         # TV's integer-contract truncation, while fractional-lot symbols
         # (crypto) liquidate fractional amounts the way TV does instead of
         # force-closing a minimum of one whole contract.
-        rfactor = 1 if whole_contracts else syminfo._size_round_factor  # noqa
+        rfactor = syminfo._size_round_factor  # noqa
         if big_margin:
             # Above 1e10 margin ticks the cover comes from the same tick-shadow
             # shortfall as the trigger, then a plain truncation with no float
@@ -3583,12 +3674,12 @@ class SimPosition(PositionBase):
             # rounding would keep down).
             shortfall = (margin_ticks - equity_ticks) * mintick
             loss = shortfall / margin_ratio
-            cover_lots = int(loss / (check_price * pv) * rfactor)
+            cover_lots = int(loss / (mark * pv) * rfactor)
             if cover_lots < 0:
                 cover_lots = 0
         else:
             loss = available_funds / margin_ratio
-            raw_cover_lots = abs(loss) / (check_price * pv) * rfactor
+            raw_cover_lots = abs(loss) / (mark * pv) * rfactor
             # TV truncates the fractional cover amount, however close it lands
             # to the next lot. MEASURED on the wild corpus (26 strategies with
             # margin calls, BINANCE:BTCUSDT): `RCI Strategy [PineIndicators]`
@@ -3596,6 +3687,8 @@ class SimPosition(PositionBase):
             # `Hybrid: RSI + Breakout + Dashboard` 2025-11-14 06:30 covers
             # 103482 lots from 103482.99931.
             cover_lots = int(raw_cover_lots)
+        if cover_lots == 0 and mark_price is not None:
+            return False
         if cover_lots == 0 and rfactor > 1:
             # Fractional-lot symbol with a sub-lot shortfall: TradingView closes
             # one whole contract, capped by the current position size. This holds
@@ -3634,15 +3727,6 @@ class SimPosition(PositionBase):
             else:
                 fill_price = check_price - slippage_amount
 
-        margin_call_order = Order(
-            None,
-            -self.sign * margin_call_size,
-            order_type=_order_type_close,
-            comment='Margin call'
-        )
-        margin_call_order.is_market_order = False
-        margin_call_order.bar_index = int(lib.bar_index)
-
         # Arm the second stage for the bar's next checkpoint. TV does not credit
         # the liquidation proceeds there: it walks the pre-liquidation trades
         # FIFO, crediting each trade's entry cost immediately but its realized
@@ -3650,12 +3734,90 @@ class SimPosition(PositionBase):
         # credit would cover the deficit — see _margin_call_stage2. The snapshot
         # must be taken before the fill mutates the trade list.
         deficit = (margin_ticks - equity_ticks) * mintick if big_margin else -available_funds
-        self._mc_stage2 = (int(lib.bar_index), deficit, check_price, for_short,
+        self._mc_stage2 = (int(lib.bar_index), deficit, mark, for_short,
                            tuple((abs(t.size), t.entry_price) for t in self.open_trades))
 
-        self._fill_order(margin_call_order, fill_price)
+        self._fill_margin_call(margin_call_size, fill_price)
         self._reattach_exits(check_price)
         return False
+
+    def _fill_margin_call(self, margin_call_size: float, fill_price: float) -> None:
+        """
+        Book a margin-call liquidation of ``margin_call_size`` contracts.
+
+        Under the default FIFO ``close_entries_rule`` one order closes the position
+        oldest-first. Under ``'ANY'`` the margin-call size comes off EVERY open
+        trade, each capped at the trade's own size, as one order per trade.
+
+        :param margin_call_size: The liquidation size, in contracts
+        :param fill_price: The liquidation price, slippage included
+        """
+        sign = self.sign
+        if lib._script.close_entries_rule == 'ANY':
+            # MEASURED (BINANCE:BTCUSDT 30m, 2026-10-02, two-entry long pyramid at
+            # 2x leverage): with FIFO a margin call cutting 8 lots closes them from
+            # the oldest trade only, with ANY the same bar cuts 8 lots from EACH
+            # trade (579/579 events); two trades of one entry id are cut separately
+            # (460/460), and a trade smaller than the cut closes whole.
+            orders = []
+            for trade in self.open_trades:
+                order = Order(None, -sign * min(margin_call_size, abs(trade.size)),
+                              order_type=_order_type_close, comment='Margin call')
+                order.target_trade = trade
+                orders.append(order)
+            self._mc_ghosts.append((margin_call_size, set(self.open_trades)))
+        else:
+            orders = [Order(None, -sign * margin_call_size,
+                            order_type=_order_type_close, comment='Margin call')]
+        bar_index = int(lib.bar_index)
+        for order in orders:
+            order.is_market_order = False
+            order.bar_index = bar_index
+            self._fill_order(order, fill_price)
+
+    def _apply_mc_ghosts(self, check_price: float, for_short: bool) -> None:
+        """
+        Cut the trades opened since each live margin-call order fired.
+
+        Under ``close_entries_rule='ANY'`` a margin call stays a live order until
+        the position goes flat: every trade opened after it loses the margin-call
+        size (capped at the trade's own size) at the first margin checkpoint that
+        sees it, at that checkpoint's price plus slippage — whatever the account's
+        margin state. Each live order cuts a trade once, and runs after the margin
+        call of the same checkpoint.
+
+        :param check_price: The checkpoint price
+        :param for_short: True when the position is short
+        """
+        # MEASURED (BINANCE:BTCUSDT 30m, 2026-10-02, mc6 probe: long pyramid A+B
+        # liquidated, then C, D, a second C, a partial close of A and E): each
+        # later entry is cut by the margin-call size at its first checkpoint (the
+        # bar open for a market entry), across pyramid adds and partial closes,
+        # until a close_all flattens the position.
+        fill_price = check_price
+        slippage = lib._script.slippage
+        if slippage > 0:
+            slippage_amount = syminfo.mintick * slippage
+            fill_price = check_price + slippage_amount if for_short else check_price - slippage_amount
+        sign = self.sign
+        bar_index = int(lib.bar_index)
+        cut = False
+        for size, done in tuple(self._mc_ghosts):
+            for trade in tuple(self.open_trades):
+                if trade in done:
+                    continue
+                done.add(trade)
+                if not self.open_trades:
+                    break
+                order = Order(None, -sign * min(size, abs(trade.size)),
+                              order_type=_order_type_close, comment='Margin call')
+                order.target_trade = trade
+                order.is_market_order = False
+                order.bar_index = bar_index
+                self._fill_order(order, fill_price)
+                cut = True
+        if cut:
+            self._reattach_exits(check_price)
 
     def _margin_call_stage2(self, st2: tuple[int, float, float, bool,
                                              tuple[tuple[float, float], ...]],
@@ -3740,16 +3902,7 @@ class SimPosition(PositionBase):
             else:
                 fill_price = check_price - slippage_amount
 
-        margin_call_order = Order(
-            None,
-            -self.sign * margin_call_size,
-            order_type=_order_type_close,
-            comment='Margin call'
-        )
-        margin_call_order.is_market_order = False
-        margin_call_order.bar_index = int(lib.bar_index)
-
-        self._fill_order(margin_call_order, fill_price)
+        self._fill_margin_call(margin_call_size, fill_price)
         self._reattach_exits(check_price)
         return True
 
@@ -3759,16 +3912,17 @@ class SimPosition(PositionBase):
         re-check margin at the bar close.
 
         Called from script_runner after the user script's main() completes.
-        Liquidation is booked on the current bar at the close price, in whole
-        contracts.
+        Liquidation is booked on the current bar at the close price, sized in lot
+        units like the intrabar checkpoints.
         """
         # Margin is evaluated at every bar close: without this check the same
         # liquidation only fires at the next bar's open — one bar late, and at the
         # open price on gapped data (Hybrid 2026-05-07 02:00: TV trims 1.0 contract
         # at C=80898.0 on the 02:00 bar while the O/H/L walk points all pass the
-        # margin comparison). Sized like the bar-open check in whole contracts;
-        # every observed instance trimmed exactly 1.0 contract, so the
-        # whole-contract choice is untested beyond that.
+        # margin comparison). Sized in lot units like every other checkpoint: a
+        # sub-lot shortfall (the Hybrid case) trims one whole contract, a larger
+        # one 4x its lots (MEASURED, BINANCE:BTCUSDT 30m, 2026-10-02, mc8 probe:
+        # an 11-lot shortfall at C trims 44 lots, not the whole position).
         prev_count = len(self.new_closed_trades)
 
         if self._deferred_margin_call is not None:
@@ -3777,8 +3931,7 @@ class SimPosition(PositionBase):
             self._check_margin_call(check_price, for_short=for_short, at_open=True)
 
         if self.open_trades:
-            self._check_margin_call(self.c, for_short=self.sign < 0, at_open=True,
-                                    whole_contracts=True)
+            self._check_margin_call(self.c, for_short=self.sign < 0, at_open=True)
 
         initial_capital = lib._script.initial_capital
         for closed_trade in self.new_closed_trades[prev_count:]:
@@ -4415,8 +4568,8 @@ class SimPosition(PositionBase):
         # TV fills it and the bar-open margin call trims the aggregate, so it is
         # not rejected. The first fill also shifts self.equity via its open P&L,
         # so the standalone affordability test must use the bar-start equity too.
-        bar_start_size = self.size
-        bar_start_equity = float(self.equity)
+        self._bar_start_size = bar_start_size = self.size
+        self._bar_start_equity = bar_start_equity = float(self.equity)
         # Sign of the position as established by an entry filled earlier in THIS
         # bar-open cycle. A later opposite entry that would reverse such a
         # same-bar position is margin-gated on BOTH legs at once (see the
@@ -4844,6 +4997,7 @@ class SimPosition(PositionBase):
         if ohlc:
             # open -> high
             self._walk_node = 1
+            leg_fills = self._fill_counter
             if self.orderbook.price_levels and first_leg <= 1 <= last_leg:
                 fills = self._fill_counter
                 self._walk_leg(self.o, self.h, rising=True, ohlc=ohlc,
@@ -4866,7 +5020,8 @@ class SimPosition(PositionBase):
                     # Rocket Grid Algorithm 2026-08-25 02:30 (an up-walk bar):
                     # TV liquidates at H-slip right after the rising leg's
                     # fills, then runs the second stage at the low.
-                    self._check_margin_call(self.h, for_short=False, can_defer=False)
+                    self._check_margin_call(self.h, for_short=False, can_defer=False,
+                                            fill_mark=self._leg_fill_mark(leg_fills))
                 # The checkpoint at the position's FAVORABLE extreme runs
                 # before this leg's fills. Under the float trigger it is a
                 # no-op (available funds only improve toward the favorable
@@ -4884,6 +5039,7 @@ class SimPosition(PositionBase):
                     activated.clear()
 
                 # open -> low (descending: the level nearest the open fills first)
+                leg_fills = self._fill_counter
                 if self.orderbook.price_levels and first_leg <= 2 <= last_leg:
                     fills = self._fill_counter
                     self._walk_leg(self.h if coof and first_leg == 2 else self.o, self.l,
@@ -4898,6 +5054,15 @@ class SimPosition(PositionBase):
                     # A long's unfavorable extreme, reached by the descending leg.
                     if self._check_intraday_loss(self.l):
                         return
+                elif self.sign < 0:
+                    # A short the descending leg opened is checked at the low it
+                    # reached, after the leg's fills — the mirror of the long's
+                    # second favorable checkpoint in the OLHC branch. MEASURED
+                    # (BINANCE:BTCUSDT 30m, 2026-10-02, mc8 probes): a sell stop
+                    # filling right after a same-bar exit of a long is liquidated
+                    # at L+slip, not at the close.
+                    self._check_margin_call(self.l, for_short=True, can_defer=False,
+                                            fill_mark=self._leg_fill_mark(leg_fills))
 
             # Trailing fills on the closing leg — chronologically after both
             # margin-call checkpoints, so a partial liquidation at the extreme
@@ -4923,6 +5088,7 @@ class SimPosition(PositionBase):
         else:
             # open -> low (descending: the level nearest the open fills first)
             self._walk_node = 1
+            leg_fills = self._fill_counter
             if self.orderbook.price_levels and first_leg <= 1 <= last_leg:
                 fills = self._fill_counter
                 self._walk_leg(self.o, self.l, rising=False, ohlc=ohlc,
@@ -4937,6 +5103,13 @@ class SimPosition(PositionBase):
                 # reached — the node ``max_intraday_loss`` closes at.
                 if self.sign > 0 and self._check_intraday_loss(self.l):
                     return
+                if self.sign < 0:
+                    # A short is checked at the low after the descending leg's
+                    # fills too (see the OHLC branch): MEASURED on the mc8
+                    # probes, a sell stop filling on this leg is liquidated at
+                    # L+slip, not at the high.
+                    self._check_margin_call(self.l, for_short=True, can_defer=False,
+                                            fill_mark=self._leg_fill_mark(leg_fills))
                 # Favorable-extreme checkpoint before this leg's fills — see
                 # the mirrored comment in the OHLC branch (TV-verified on the
                 # Hybrid 2025-10-02 16:00 long margin call at the high).
@@ -4950,6 +5123,7 @@ class SimPosition(PositionBase):
                     activated.clear()
 
                 # open -> high
+                leg_fills = self._fill_counter
                 if self.orderbook.price_levels and first_leg <= 2 <= last_leg:
                     fills = self._fill_counter
                     self._walk_leg(self.l if coof and first_leg == 2 else self.o, self.h,
@@ -4970,7 +5144,8 @@ class SimPosition(PositionBase):
                     # stop entries fill on the rising leg and TV then liquidates
                     # 0.51464 of the grown 0.79946-contract position at H-slip
                     # (107499.95) -- more than the whole pre-leg position.
-                    self._check_margin_call(self.h, for_short=False, can_defer=False)
+                    self._check_margin_call(self.h, for_short=False, can_defer=False,
+                                            fill_mark=self._leg_fill_mark(leg_fills))
                 # A short's unfavorable extreme, reached by the rising leg.
                 if self.sign < 0 and self._check_intraday_loss(self.h):
                     return
@@ -5973,7 +6148,16 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
 
     if not (qty == qty):  # is_na_arg
         if qty_percent == qty_percent:
-            size = -bound_size * (qty_percent * 0.01)
+            if isinstance(position, SimPosition) and lib._script.close_entries_rule == 'ANY':
+                # MEASURED (BINANCE:BTCUSDT 30m, 2026-10-02, mc7 probes: entry A,
+                # margin calls, then two closes of A at qty_percent=10): under ANY
+                # both closes take 10% of A's ORIGINAL quantity (217/217 each),
+                # under FIFO 10% of what is still open (586/586).
+                # noinspection PyProtectedMember
+                size = -position.sign * min(position._bound_init_qty(id) * (qty_percent * 0.01),
+                                            abs(bound_size))
+            else:
+                size = -bound_size * (qty_percent * 0.01)
         else:
             size = -bound_size
     else:
@@ -7565,14 +7749,17 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # We need a signed size instead of qty, the sign is the direction
     direction_sign: float = (-1.0 if direction == short else 1.0)
 
+    # Rounded like strategy.entry: a buy limit and a sell stop down, a sell limit
+    # and a buy stop up. MEASURED (BINANCE:BTCUSDT 30m, 2026-10-02, off-grid levels
+    # of all four kinds): 2644/2644 fills match TradingView.
     if not (limit == limit):  # is_na_arg
         limit = None
     elif limit is not None:
-        limit = _price_round(limit, direction_sign)  # TODO: test this if the direction here is correct
+        limit = _price_round(limit, -direction_sign)
     if not (stop == stop):  # is_na_arg
         stop = None
     elif stop is not None:
-        stop = _price_round(stop, -direction_sign)  # TODO: test this if the direction here is correct
+        stop = _price_round(stop, direction_sign)
 
     # A default-sized order resolves its quantity at the actual fill price
     # (TradingView sizes percent_of_equity / cash when the order executes).
