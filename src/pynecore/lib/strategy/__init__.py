@@ -221,6 +221,8 @@ class Order:
 
     __slots__ = (
         "order_id", "size", "sign", "order_type", "limit", "stop", "exit_id", "oca_name", "oca_type",
+        "stop_limit",  # Limit price of a stop-limit order whose stop has not triggered yet
+        "triggered_stop",  # Stop price a stop-limit order already triggered at (it now rests as a limit)
         "comment", "alert_message",
         "comment_profit", "comment_loss", "comment_trailing",
         "alert_profit", "alert_loss", "alert_trailing",
@@ -289,6 +291,11 @@ class Order:
         self.sign = 0.0 if size == 0.0 else 1.0 if size > 0.0 else -1.0
         self.limit = limit
         self.stop = stop
+        # A backtest stop-limit order rests as a plain stop order with its limit
+        # held here; the stop's trigger turns it into a plain limit order (see
+        # SimPosition._trigger_stop_limit).
+        self.stop_limit: float | None = None
+        self.triggered_stop: float | None = None
         self.order_type = order_type
 
         self.exit_id = exit_id
@@ -532,6 +539,7 @@ def _same_order_slot(resting: Order, issued: Order) -> bool:
     return (resting.size == issued.size
             and resting.limit == issued.limit
             and resting.stop == issued.stop
+            and resting.stop_limit == issued.stop_limit
             and resting.trail_price == issued.trail_price
             and resting.trail_offset == issued.trail_offset
             and resting.profit_ticks == issued.profit_ticks
@@ -1016,7 +1024,7 @@ class SimPosition(PositionBase):
         '_deferred_margin_call', '_mc_stage2', '_mc_ghosts', '_bar_start_size', '_bar_start_equity',
         '_fill_counter', '_last_fill_price', '_partial_close_bar',
         '_entry_book', '_entry_seq', '_act_counter', '_deferred_immediate_closes', '_coof_cursor', '_market_fill_price',
-        '_walk_node', '_path_node', '_leg_start', '_spawned_trail_legs'
+        '_walk_node', '_path_node', '_leg_start', '_spawned_trail_legs', '_triggered_stop_limits'
     )
 
     def __init__(self):
@@ -1057,6 +1065,10 @@ class SimPosition(PositionBase):
         # bar's awaiting set, so the fill that created them hands them over (see
         # _spawn_legs_for_add / _activate_trails_on_fill).
         self._spawned_trail_legs: list[Order] = []
+        # Stop-limit orders whose stop triggered during this bar's walk without
+        # filling: the first leg's ones still get the stretch back to the open
+        # (see _walk_triggered_stop_limits).
+        self._triggered_stop_limits: list[Order] = []
         self._act_counter: int = 0
 
         # Trade statistics
@@ -1296,6 +1308,18 @@ class SimPosition(PositionBase):
         # (probe 13c) puts it behind the leg.
         if existing_order is not None:
             self.orderbook.remove_order(existing_order)
+            # MEASURED (BINANCE:BTCUSDT 30m, 2026-10-02, probes sl2/sl3): a
+            # stop-limit re-issued every bar with the same prices keeps its
+            # triggered stop -- the trade list is byte-identical to issuing it
+            # once.
+            if (existing_order.triggered_stop is not None
+                    and order.stop_limit is not None
+                    and order.stop == existing_order.triggered_stop
+                    and order.stop_limit == existing_order.limit):
+                order.triggered_stop = order.stop
+                order.limit = order.stop_limit
+                order.stop = None
+                order.stop_limit = None
             if _same_order_slot(existing_order, order):
                 order.act_seq = existing_order.act_seq
         if order.act_seq == 0:
@@ -1488,7 +1512,7 @@ class SimPosition(PositionBase):
                 reserved = min(abs(qty), bound)
                 reserved = _explicit_qty_round(abs(qty)) if abs(qty) < bound else _size_round(reserved)
             elif qty_percent is not None:
-                reserved = _size_round(min(bound * (qty_percent * 0.01), bound))
+                reserved = _qty_percent_round(min(bound * (qty_percent * 0.01), bound), bound)
             else:
                 reserved = _size_round(bound)
             if reserved <= 0.0:
@@ -2186,7 +2210,9 @@ class SimPosition(PositionBase):
         if order.order_type == _order_type_entry or order.order_type == _order_type_normal:
             # A default-sized order settles its quantity at the actual fill price
             if order.deferred_qty:
-                self._resolve_deferred_qty(order, price)
+                self._resolve_deferred_qty(
+                    order, price if order.triggered_stop is None
+                    else _stop_limit_sizing_price(order, price))
                 if order.size == 0.0:
                     self._remove_order(order)
                     return False
@@ -2497,10 +2523,10 @@ class SimPosition(PositionBase):
         # Check stop orders with gaps
         if order.stop is not None:
             # Long stop order (size > 0): triggers if open gaps above stop level
-            if order.size > 0 and ref >= order.stop:
-                return 'stop'
             # Short stop order (size < 0): triggers if open gaps below stop level
-            if order.size < 0 and ref <= order.stop:
+            if (ref >= order.stop) if order.size > 0 else (ref <= order.stop):
+                if order.stop_limit is not None:
+                    return 'limit' if self._trigger_stop_limit(order, ref) else None
                 return 'stop'
 
         # Check limit orders with gaps
@@ -2513,6 +2539,66 @@ class SimPosition(PositionBase):
                 return 'limit'
 
         return None
+
+    def _trigger_stop_limit(self, order: Order, price: float) -> bool:
+        """Trigger the stop of a stop-limit order: from here on it is a plain limit order.
+
+        MEASURED (BINANCE:BTCUSDT 30m, 2026-10-02, probe sl1): ``strategy.entry``
+        and ``strategy.order`` with both ``stop`` and ``limit`` place ONE
+        stop-limit order, not two independent legs. A buy with its stop already
+        passed and the limit below the market waits for the limit (fills there ten
+        bars later, not at the next open); a buy with stop < limit above the
+        market, never reached, never fills; a short and a ``strategy.order`` buy
+        whose limit is marketable when the stop is hit fill at the stop.
+
+        :param order: The stop-limit order whose stop the price reached
+        :param price: The price the stop triggered at (its level, or a gapping open)
+        :return: True if the limit is marketable at ``price``, so the order fills there
+        """
+        limit = order.stop_limit
+        assert limit is not None
+        self.orderbook.remove_order(order)
+        order.triggered_stop = order.stop
+        order.stop = None
+        order.limit = limit
+        order.stop_limit = None
+        self.orderbook.add_order(order)
+        if (limit >= price) if order.size > 0 else (limit <= price):
+            return True
+        self._triggered_stop_limits.append(order)
+        return False
+
+    def _walk_triggered_stop_limits(self, start: float, end: float) -> None:
+        """Walk the stretch from the first extreme back to the open for triggered stop-limits.
+
+        The level walks are anchored at the bar open (see
+        :meth:`_walk_activated_brackets`), so a stop-limit the first leg triggered
+        with its limit between the open and that extreme would otherwise skip the
+        way back. MEASURED (BINANCE:BTCUSDT 30m, 2026-10-02, probe sl2,
+        2025-05-12 13:30, an open -> high -> low -> close bar): a buy stop-limit
+        triggers at its stop on the way up and fills at its limit -- above the
+        open -- on the descent that follows.
+
+        :param start: The extreme the first leg reached
+        :param end: The bar open, where the anchored second-leg walk takes over
+        """
+        falling = start > end
+        hits = [o for o in self._triggered_stop_limits
+                if not o.cancelled and o.limit is not None and (o.size > 0) == falling
+                and ((end < o.limit <= start) if falling else (start <= o.limit < end))]
+        self._triggered_stop_limits.clear()
+        # Chronological: the level nearest the extreme the stretch starts at.
+        hits.sort(key=lambda o: o.limit, reverse=falling)
+        for order in hits:
+            if order.cancelled:
+                continue
+            order.filled_by_type = 'profit'
+            self.fill_order(order, order.limit)
+            activated: list[Order] = []
+            self._resolve_filled_entry_exits()
+            self._activate_brackets_on_fill(order.order_id, activated)
+            if activated:
+                self._walk_activated_brackets(activated, order.limit, end)
 
     def _commit_leg(self, leg: Order) -> None:
         """Lock an exit leg into the simultaneous-trigger batch that is starting.
@@ -2995,6 +3081,12 @@ class SimPosition(PositionBase):
         # Stop order (size > 0) triggers when price rises to stop level
         if order.size > 0 and order.stop <= self.h:
             p = max(order.stop, self._leg_start)
+            if order.stop_limit is not None:
+                if not self._trigger_stop_limit(order, p):
+                    return False
+                order.filled_by_type = 'profit'
+                self.fill_order(order, p)
+                return True
             slippage = lib._script.slippage
             if slippage > 0:
                 p += syminfo.mintick * slippage
@@ -3034,6 +3126,12 @@ class SimPosition(PositionBase):
         # Buy stop triggers when price rises to the stop level
         if order.stop is not None and order.size > 0 and order.stop <= self.c:
             p = order.stop
+            if order.stop_limit is not None:
+                if not self._trigger_stop_limit(order, p):
+                    return False
+                order.filled_by_type = 'profit'
+                self.fill_order(order, p)
+                return True
             slippage = lib._script.slippage
             if slippage > 0:
                 p += syminfo.mintick * slippage
@@ -4233,6 +4331,12 @@ class SimPosition(PositionBase):
         # Stop order (size < 0) triggers when price falls to stop level
         if order.size < 0 and order.stop >= self.l:
             p = min(self._leg_start, order.stop)
+            if order.stop_limit is not None:
+                if not self._trigger_stop_limit(order, p):
+                    return False
+                order.filled_by_type = 'profit'
+                self.fill_order(order, p)
+                return True
             slippage = lib._script.slippage
             if slippage > 0:
                 p -= syminfo.mintick * slippage
@@ -4272,6 +4376,12 @@ class SimPosition(PositionBase):
         # Sell stop triggers when price falls to the stop level
         if order.stop is not None and order.size < 0 and order.stop >= self.c:
             p = order.stop
+            if order.stop_limit is not None:
+                if not self._trigger_stop_limit(order, p):
+                    return False
+                order.filled_by_type = 'profit'
+                self.fill_order(order, p)
+                return True
             slippage = lib._script.slippage
             if slippage > 0:
                 p -= syminfo.mintick * slippage
@@ -4515,7 +4625,13 @@ class SimPosition(PositionBase):
         # An empty book yields nothing, so the generator is skipped rather than
         # created and immediately exhausted — every bar of an open position with
         # no resting order passes here.
+        scanned: set[int] = set()
         for order in (self.orderbook.iter_orders() if self.orderbook.price_levels else ()):
+            # An order resting at two levels is yielded once per level, and a
+            # triggered stop-limit can reappear at its limit level: judge it once.
+            if id(order) in scanned:
+                continue
+            scanned.add(id(order))
             # Check if the order would be filled immediately (e.g. due to a gap)
             gap_trigger = self._check_already_filled(order)
             if gap_trigger is not None:
@@ -4650,9 +4766,13 @@ class SimPosition(PositionBase):
             # close, gapped fills -> stop+slip in every case, 1128 of them fit
             # nothing else; stop below close -> close+slip in every case,
             # stop+slip in 2.
+            # A stop-limit is sized at that frozen price wherever it fills (see
+            # ``_stop_limit_sizing_price``).
             if order.deferred_qty:
                 sizing_price = fill_price
-                if (gap_trigger == 'stop' and order.limit is None
+                if order.triggered_stop is not None:
+                    sizing_price = _stop_limit_sizing_price(order, fill_price)
+                elif (gap_trigger == 'stop' and order.limit is None
                         and order.budget_price is not None):
                     sizing_price = (order.budget_price
                                     + syminfo.mintick * script.slippage * order.sign)
@@ -4953,6 +5073,7 @@ class SimPosition(PositionBase):
         # Anything spawned before the walk (a market entry filling at the open) is
         # already resolved and indexed, so the pre-walk below covers it.
         self._spawned_trail_legs.clear()
+        self._triggered_stop_limits.clear()
         # Exit legs an entry fill activates on the FIRST leg: the walk that
         # follows is anchored at the open, so the stretch between the open and
         # the extreme just reached is theirs alone (see
@@ -5037,6 +5158,8 @@ class SimPosition(PositionBase):
                 if activated:
                     self._walk_activated_brackets(activated, self.h, self.o)
                     activated.clear()
+                if self._triggered_stop_limits:
+                    self._walk_triggered_stop_limits(self.h, self.o)
 
                 # open -> low (descending: the level nearest the open fills first)
                 leg_fills = self._fill_counter
@@ -5121,6 +5244,8 @@ class SimPosition(PositionBase):
                 if activated:
                     self._walk_activated_brackets(activated, self.l, self.o)
                     activated.clear()
+                if self._triggered_stop_limits:
+                    self._walk_triggered_stop_limits(self.l, self.o)
 
                 # open -> high
                 leg_fills = self._fill_counter
@@ -5372,9 +5497,9 @@ class SimPosition(PositionBase):
         def _close_trigger(order: Order) -> str | None:
             """Which price level of `order` the close has already reached, if any."""
             if order.stop is not None:
-                if order.sign > 0 and close >= order.stop:
-                    return 'stop'
-                if order.sign < 0 and close <= order.stop:
+                if (close >= order.stop) if order.sign > 0 else (close <= order.stop):
+                    if order.stop_limit is not None:
+                        return 'limit' if self._trigger_stop_limit(order, close) else None
                     return 'stop'
             if order.limit is not None:
                 if order.sign > 0 and close <= order.limit:
@@ -6039,6 +6164,27 @@ def _size_round(qty: PyneFloat) -> PyneFloat:
     return _size_units(sign * lots * (1.0 / rfactor))
 
 
+def _qty_percent_round(qty: float, cap: float) -> float:
+    """
+    Round a ``qty_percent``-derived close size down to the lot grid, keeping at least one lot.
+
+    :param qty: The signed quantity (a percentage of an open, lot-exact size)
+    :param cap: The size the share is taken from; only a cap of at least one lot
+                yields the one-lot minimum (a sibling-reserved remainder is float
+                dirt, not a lot)
+    :return: The floored quantity, or one signed lot where the floor is zero
+    """
+    # MEASURED (BINANCE:BTCUSDT 30m, 2026-10-02, minlot probes): a qty_percent
+    # share below one lot still closes ONE lot -- strategy.close and
+    # strategy.exit legs alike, long and short (50 lots at 1% -> 1, 19 at 5%
+    # -> 1, 1 at 99% -> 1) -- while larger shares floor as usual (32 at 5% ->
+    # 1, 3 at 40% -> 1, 12 at 20% -> 2).
+    rounded = _size_round(qty)
+    if rounded == 0.0 and qty != 0.0 and _size_round(abs(cap)) != 0.0:
+        return _size_units((1.0 if qty > 0 else -1.0) / syminfo._size_round_factor)  # noqa
+    return rounded
+
+
 # noinspection PyShadowingNames
 def _price_round(price: PyneFloat, direction: int | float) -> PyneFloat:
     """
@@ -6115,11 +6261,22 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
 
     position = lib._script.position
 
-    if qty == qty and qty <= 0.0:
-        return
-
     if position.size == 0.0:
         return
+
+    # MEASURED (BINANCE:BTCUSDT 30m, 2026-10-02, minlot probes): a runtime
+    # negative qty closes its absolute value, and a qty that floors to zero lots
+    # (0, or 0.5 / 0.99 of a lot, long or short) closes like an omitted qty --
+    # the whole entry. The lot floor is backtest-only (see below), so a broker
+    # position only treats an exact zero that way.
+    if qty == qty:
+        qty = abs(qty)
+        if isinstance(position, SimPosition):
+            no_lots = _explicit_qty_round(qty) == 0.0
+        else:
+            no_lots = qty == 0.0
+        if no_lots:
+            qty = na_float
 
     # TV closes only the part of the position opened by entries with this id.
     # Under the default FIFO close_entries_rule the FILL may consume older
@@ -6170,6 +6327,8 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
     if isinstance(position, SimPosition):
         if qty == qty and qty < abs(bound_size):
             size = -position.sign * _explicit_qty_round(qty)
+        elif qty_percent == qty_percent and not (qty == qty):  # is_na_arg
+            size = _qty_percent_round(size, bound_size)
         else:
             size = _size_round(size)
 
@@ -6879,11 +7038,12 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     exec_price = 0.0  # only meaningful when deferred_default
     if deferred_default:
         exec_price = position.c
-        if limit is not None:
-            exec_price = min(limit, exec_price) if direction_sign > 0 else max(limit, exec_price)
-        elif stop is not None:
+        if stop is not None:
             exec_price = max(stop, exec_price) if direction_sign > 0 else min(stop, exec_price)
-        else:
+        if limit is not None:
+            # A stop-limit executes at its stop price capped by its limit
+            exec_price = min(limit, exec_price) if direction_sign > 0 else max(limit, exec_price)
+        if limit is None and stop is None:
             slippage = lib._script.slippage
             if slippage > 0 and isinstance(position, SimPosition):
                 exec_price = float(exec_price) + direction_sign * syminfo.mintick * slippage
@@ -7072,6 +7232,7 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
 
     order = Order(id, size, order_type=_order_type_entry, limit=limit, stop=stop, oca_name=oca_name,
                   oca_type=oca_type, comment=comment, alert_message=alert_message)
+    _rest_as_stop_limit(position, order)
     order.skip_flip = skip_flip
     order.flip_extra = flip_extra
     # Only price-based orders re-size at execution; a market entry keeps its
@@ -7088,6 +7249,42 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
             order.budget_price = float(exec_price)
     # Store in entry_orders dict
     position._add_order(order)
+
+
+def _stop_limit_sizing_price(order: Order, fill_price: float) -> float:
+    """The price a default-sized stop-limit order is sized at when it fills.
+
+    MEASURED: TradingView sizes it at the price it would have executed at when
+    placed -- the stop path capped by the limit, ``min(max(stop, close), limit)``
+    for a buy -- with no slippage, wherever it fills. Probe sl8 (BINANCE:BTCUSDT
+    30m, slippage 5): 2775/2775 entries exact, gapped fills at the open included,
+    while sizing at the fill price, or with slippage either way, leaves 24-87
+    one-lot misses. The wild `Volume Difference Delta Cycle Oscillator`
+    (BINANCE:ETHUSDT 240) separates it from fill-price sizing even without
+    slippage: a buy stop-limit placed at a 608.31 close with its stop passed and
+    its limit at 609.42 rests past a 609.84 open, fills at 609.42 inside the bar,
+    and is sized at 608.31 (2020-12-21 16:00).
+
+    :param order: The triggered stop-limit order
+    :param fill_price: The price it fills at, the fallback without a frozen price
+    :return: The sizing price
+    """
+    return order.budget_price if order.budget_price is not None else fill_price
+
+
+def _rest_as_stop_limit(position: PositionBase, order: Order) -> None:
+    """Make a backtest order placed with both ``stop`` and ``limit`` a stop-limit order.
+
+    It rests as a plain stop order until the stop triggers (see
+    ``SimPosition._trigger_stop_limit``). A broker order keeps both prices: the
+    plugin places the stop-limit order on the venue.
+
+    :param position: The position the order is placed on
+    :param order: The freshly built entry or ``strategy.order`` order
+    """
+    if order.limit is not None and order.stop is not None and isinstance(position, SimPosition):
+        order.stop_limit = order.limit
+        order.limit = None
 
 
 # noinspection PyShadowingBuiltins,PyProtectedMember
@@ -7244,6 +7441,14 @@ def _exit_leg(position: PositionBase, exit_id: str, from_entry: str,
             position._remove_order(existing)
         return
 
+    # MEASURED (BINANCE:BTCUSDT 30m, 2026-10-02, minlot probes): an explicit qty
+    # that floors to zero lots (0, or half a lot) makes the leg a rest leg: beside
+    # a 20-lot sibling of a 50-lot entry it closes the other 30. The lot floor is
+    # backtest-only, so a broker leg only treats an exact zero that way.
+    if qty == qty and (_explicit_qty_round(qty) == 0.0 if isinstance(position, SimPosition)
+                       else qty == 0.0):
+        qty = na_float
+
     is_rest_leg = not (qty == qty) and not (qty_percent == qty_percent)  # is_na_arg
     # Sibling legs reserve slices of the SAME entry first-come-first-served
     # (consumed siblings keep their reservation until the entry fully
@@ -7293,6 +7498,8 @@ def _exit_leg(position: PositionBase, exit_id: str, from_entry: str,
     if isinstance(position, SimPosition):
         if qty == qty and abs(qty) < unreserved:
             reserved = _explicit_qty_round(abs(qty))
+        elif qty_percent == qty_percent and not (qty == qty):  # is_na_arg
+            reserved = _qty_percent_round(reserved, unreserved)
         else:
             reserved = _size_round(reserved)
     if reserved <= 0.0:
@@ -7727,8 +7934,8 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     :param id: The identifier of the order
     :param direction: The direction of the trade (strategy.long or strategy.short)
     :param qty: The number of contracts/shares/lots/units to trade when the order fills
-    :param limit: The limit price of the order. With ``stop`` set too, the order becomes two OCA legs (a limit and a stop), not a single stop-limit order
-    :param stop: The stop price of the order. With ``limit`` set too, the order becomes two OCA legs (a limit and a stop), not a single stop-limit order
+    :param limit: The limit price of the order. With ``stop`` set too, the order is a stop-limit order
+    :param stop: The stop price of the order. With ``limit`` set too, the order is a stop-limit order
     :param oca_name: The name of the One-Cancels-All (OCA) group
     :param oca_type: Specifies how an unfilled order behaves when another order in the same OCA group executes
     :param comment: Additional notes on the filled order
@@ -7772,11 +7979,12 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     exec_price = 0.0  # only meaningful when deferred_default
     if deferred_default:
         exec_price = float(lib.close)
-        if limit is not None:
-            exec_price = min(limit, exec_price) if direction_sign > 0 else max(limit, exec_price)
-        elif stop is not None:
+        if stop is not None:
             exec_price = max(stop, exec_price) if direction_sign > 0 else min(stop, exec_price)
-        else:
+        if limit is not None:
+            # A stop-limit executes at its stop price capped by its limit
+            exec_price = min(limit, exec_price) if direction_sign > 0 else max(limit, exec_price)
+        if limit is None and stop is None:
             slippage = lib._script.slippage
             if slippage > 0 and isinstance(position, SimPosition):
                 exec_price += direction_sign * syminfo.mintick * slippage
@@ -7822,6 +8030,7 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     order = Order(id, size, order_type=_order_type_normal, limit=limit, stop=stop,
                   oca_name=oca_name, oca_type=oca_type, comment=comment,
                   alert_message=alert_message)
+    _rest_as_stop_limit(position, order)
     # Only price-based orders re-size at execution (see strategy.entry);
     # the money budget is frozen at placement (see _resolve_deferred_qty)
     if deferred_default and (limit is not None or stop is not None):
