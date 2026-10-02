@@ -82,6 +82,19 @@ def __test_merge_candles__():
     assert merged.volume == 450.0
 
 
+def __test_merge_candles_volume_is_decimal_exact_sum__():
+    """The merged volume is the exact decimal sum, not a binary float sum."""
+    # BINANCE:BTCUSDT 30m volumes of one 150m period: a float sum gives 1495.4605800000002
+    volumes = [271.27422, 484.71588, 387.2325, 199.30206, 152.93592]
+    candles = [
+        OHLCV(timestamp=i * 60_000, open=1.0, high=1.0, low=1.0, close=1.0, volume=v)
+        for i, v in enumerate(volumes)
+    ]
+    merged = _merge_candles(candles, bar_time=0)
+
+    assert merged.volume == 1495.46058
+
+
 # --- End-to-end aggregation tests ---
 
 def __test_aggregate_5min_to_15min__(tmp_path):

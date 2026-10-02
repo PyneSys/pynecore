@@ -9,6 +9,7 @@ source stream, which reproduces TradingView's holiday-aware grid.
 """
 import logging
 from datetime import timezone as dt_timezone
+from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -66,13 +67,16 @@ def _merge_candles(candles: list[OHLCV], bar_time: int,
     # does before summing), or the sum carries the float32 dust forever.
     volumes = (restore_f32_volume(c.volume) for c in candles) if restore_volume \
         else (c.volume for c in candles)
+    # TradingView aggregates volume server-side as the exact DECIMAL sum of the feed's
+    # volumes. A binary float sum drifts from it by an ulp on many bars, and the drift
+    # carries into every volume-weighted series computed on the aggregated context.
     return OHLCV(
         timestamp=bar_time,
         open=candles[0].open,
         high=max(c.high for c in candles),
         low=min(c.low for c in candles),
         close=candles[-1].close,
-        volume=sum(volumes),
+        volume=float(sum(Decimal(repr(v)) for v in volumes)),
     )
 
 
