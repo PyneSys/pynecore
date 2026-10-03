@@ -5,11 +5,11 @@ title: "ScriptRunner API"
 description: "Running PyneCore scripts programmatically from Python"
 icon: "play_circle"
 date: "2025-03-31"
-lastmod: "2026-07-28"
+lastmod: "2026-10-03"
 draft: false
 toc: true
 categories: ["Programmatic", "API"]
-tags: ["script-runner", "run-iter", "indicators", "strategies", "trades"]
+tags: ["script-runner", "run-iter", "indicators", "strategies", "trades", "inputs", "settings"]
 ---
 -->
 
@@ -31,7 +31,7 @@ from pynecore.types.ohlcv import OHLCV
 syminfo = SymInfo(
     prefix="BINANCE", ticker="BTCUSD", currency="USD", basecurrency="BTC",
     description="Bitcoin", period="60", type="crypto",
-    mintick=0.01, pricescale=100, minmove=1, pointvalue=1.0,
+    mintick=0.01, pricescale=100, minmove=1, pointvalue=1.0, mincontract=0.00001,
     timezone="UTC", volumetype="base",
     opening_hours=[], session_starts=[], session_ends=[],
 )
@@ -69,45 +69,139 @@ ScriptRunner(
     viz_journal: bool = False,
     update_syminfo_every_run: bool = False,
     last_bar_index: int = 0,
+    last_bar_time: int | None = None,
     inputs: dict[str, Any] | None = None,
+    settings: dict[str, Any] | None = None,
     security_data: dict[str, str | Path] | None = None,
     magnifier_iter: Iterable[OHLCV] | None = None,
+    magnifier_source_tf: str | None = None,
+    config_dir: Path | None = None,
+    # ... plus the live / broker parameters, see below
 )
 ```
 
 ### Parameters
 
-| Parameter                  | Type              | Description                                                    |
-|----------------------------|-------------------|----------------------------------------------------------------|
-| `script_path`              | `Path`            | Path to a compiled PyneCore script (`.py` with `@pyne` marker) |
-| `ohlcv_iter`               | `Iterable[OHLCV]` | Any iterable of OHLCV objects — list, generator, reader, etc.  |
-| `syminfo`                  | `SymInfo`         | Symbol information (from TOML or manually created)             |
-| `plot_path`                | `Path \| None`    | Save indicator plot data to CSV                                |
-| `strat_path`               | `Path \| None`    | Save strategy statistics to CSV                                |
-| `trade_path`               | `Path \| None`    | Save trade-by-trade data to CSV                                |
-| `viz_path`                 | `Path \| None`    | Write plot-style + drawing visual data as NDJSON (see below)   |
-| `viz_journal`              | `bool`            | Emit per-bar drawing create/update/delete events              |
-| `update_syminfo_every_run` | `bool`            | Re-apply syminfo before each bar (for parallel runners)        |
-| `last_bar_index`           | `int`             | Override last bar index (for multi-script setups)              |
-| `inputs`                   | `dict \| None`    | Override script `input()` defaults at runtime                  |
-| `security_data`            | `dict \| None`    | OHLCV paths for `request.security()` contexts (see below)      |
+| Parameter                  | Type               | Description                                                    |
+|----------------------------|--------------------|----------------------------------------------------------------|
+| `script_path`              | `Path`             | Path to a compiled PyneCore script (`.py` with `@pyne` marker) |
+| `ohlcv_iter`               | `Iterable[OHLCV]`  | Any iterable of OHLCV objects — list, generator, reader, etc.  |
+| `syminfo`                  | `SymInfo`          | Symbol information (from TOML or manually created)             |
+| `plot_path`                | `Path \| None`     | Save indicator plot data to CSV                                |
+| `strat_path`               | `Path \| None`     | Save strategy statistics to CSV                                |
+| `trade_path`               | `Path \| None`     | Save trade-by-trade data to CSV                                |
+| `viz_path`                 | `Path \| None`     | Write plot-style + drawing visual data as NDJSON (see below)   |
+| `viz_journal`              | `bool`             | Emit per-bar drawing create/update/delete events               |
+| `update_syminfo_every_run` | `bool`             | Re-apply syminfo before each bar (for parallel runners)        |
+| `last_bar_index`           | `int`              | Override last bar index (for multi-script setups)              |
+| `last_bar_time`            | `int \| None`      | Time (ms) of the last historical bar, for `last_bar_time`      |
+| `inputs`                   | `dict \| None`     | Override `input()` values at runtime (see below)               |
+| `settings`                 | `dict \| None`     | Override script settings at runtime (see below)                |
+| `security_data`            | `dict \| None`     | OHLCV paths for `request.security()` contexts (see below)      |
 | `magnifier_iter`           | `Iterable \| None` | LTF OHLCV bars for bar magnifier mode (intrabar simulation)    |
+| `magnifier_source_tf`      | `str \| None`      | Timeframe of the `magnifier_iter` bars                         |
+| `config_dir`               | `Path \| None`     | Workdir `config/` folder, for its `symbol_map.toml`            |
+
+`last_bar_time` matters for scripts that read `last_bar_time` on historical bars: Pine fixes it to
+the chart's final bar, while `None` makes it track the current bar (live semantics).
+
+The remaining keyword parameters (`broker_plugin`, `broker_event_loop`, `broker_store_ctx`,
+`chart_provider_name`, `chart_provider_instance`, `chart_data_path`, `time_from`, `log_ohlcv`,
+`lossless_volume`, `lossless_prices`, `chart_bar_window`) wire up live data providers and broker
+trading for `pyne run`. A plain backtest from Python needs none of them; see
+[Live Mode](../advanced/live-mode.md) for how live runs work.
 
 ### Overriding Inputs
 
 The `inputs` parameter lets you change script parameters without editing the script file:
 
 ```python
+# In the script:
+#   def main(length=input.int(14, "Length"), confirm=input.int(2, "Confirm bars")):
+
 runner = ScriptRunner(
     script_path=Path("sma_crossover.py"),
     ohlcv_iter=candles,
     syminfo=syminfo,
-    inputs={"Length": 20, "Confirm bars": 3},  # override input() defaults
+    inputs={"length": 20, "confirm": 3},  # override input() values
 )
 ```
 
-Keys must match the `title` parameter of `input()` calls in the script. If a key doesn't match
-any input, it's silently ignored.
+Keys are the **parameter names** of `main()` (`length`), not the `title` shown in the settings
+dialog (`"Length"`). This is the same name the input's `[inputs.<name>]` section uses in the
+script's `.toml`. A key that matches no input is silently ignored, so check the spelling when a
+value does not seem to apply.
+
+### Overriding Script Settings
+
+The `settings` parameter overrides the script's own settings: the arguments of its
+`@script.indicator(...)` / `@script.strategy(...)` decorator, the same fields the `[script]`
+section of its `.toml` holds. Use it to backtest a strategy with a different capital, commission
+or sizing without touching the script:
+
+```python
+from pynecore.lib import strategy
+
+runner = ScriptRunner(
+    script_path=Path("sma_crossover.py"),
+    ohlcv_iter=candles,
+    syminfo=syminfo,
+    settings={
+        "initial_capital": 50_000,
+        "commission_type": strategy.commission.cash_per_order,
+        "commission_value": 2,
+        "default_qty_type": strategy.fixed,
+        "default_qty_value": 1,
+        "pyramiding": 3,
+    },
+)
+```
+
+- Keys are the decorator argument names: `initial_capital`, `currency`, `default_qty_type`,
+  `default_qty_value`, `pyramiding`, `commission_type`, `commission_value`, `slippage`,
+  `margin_long`, `margin_short`, `process_orders_on_close`, `close_entries_rule`,
+  `calc_on_order_fills`, `calc_on_every_tick`, `use_bar_magnifier`, `max_bars_back`,
+  `timeframe`, and so on. `runner.script.settable_fields()` lists every one of them.
+- Constant-valued settings take the `strategy.*` constants or their string values
+  (`strategy.fixed` or `"fixed"`). `commission_type` also takes `strategy.cash`, the same as in
+  the decorator.
+- `pyramiding` is at least 1: `0` means 1, as in the decorator.
+- A key that is not a setting raises `ValueError`, so a typo such as `"initial_capitol"` fails
+  loudly instead of being ignored.
+- Title, script type and the script's inputs are not settings; inputs go in `inputs`.
+
+### Precedence and the Script's `.toml` File
+
+A script's settings and inputs come from three places, each overriding the one before:
+
+1. the script itself: the decorator arguments and the `input()` defaults,
+2. the `.toml` file next to the script (`my_strategy.toml` for `my_strategy.py`),
+3. the `inputs` and `settings` you pass to `ScriptRunner`.
+
+Programmatic overrides apply to **that run only**. They are never written into the `.toml`, so
+a parameter sweep leaves the file as it was, and a later run without overrides gets the `.toml`
+values again.
+
+Importing a script (re)writes its `.toml`, though, with every available setting and input
+listed (unchanged ones commented out). That keeps the file a complete, self-documenting
+template, and it is what you get when you run a script for the first time. To keep a read-only
+script folder untouched, set the `PYNE_SAVE_SCRIPT_TOML=0` environment variable before the
+runner is created. Under `pytest` the file is never written.
+
+Overrides are applied to an indicator or strategy script, never to a library it imports. When
+the script uses `request.security()`, every security context runs with the same `inputs` and
+`settings` as the chart.
+
+### Reading the Effective Settings
+
+`runner.script` is the script's settings object, after the `.toml` and your overrides:
+
+```python
+script = runner.script
+print(script.initial_capital)            # the value this run uses
+print(script.default("initial_capital"))  # what the decorator declares
+print(script.settable_fields())          # every setting name settings= accepts
+```
 
 ### Providing Security Data
 
@@ -152,6 +246,33 @@ both `<path>.ohlcv` (binary data) and `<path>.toml` (symbol info) to exist.
 > loads its own OHLCV data, and builds Series history from bar 0. For technical details, see
 > [request.security() Internals](../advanced/request-security-internals.md).
 
+## Importing a Script Without Running It
+
+`import_script()` loads a script the way `ScriptRunner` does, without processing any bars. Tools
+that only need the script's declarations (a settings form, a validator, a `.toml` generator) use
+it directly:
+
+```python
+from pathlib import Path
+from pynecore.core.script_runner import import_script
+
+module = import_script(Path("sma_crossover.py"),
+                       inputs={"length": 20}, settings={"initial_capital": 50_000})
+script = module.main.script
+
+for name, data in script.inputs.items():   # every input(): type, defval, title, ...
+    print(name, data.input_type, data.defval, data.title)
+for key in script.settable_fields():
+    print(key, script.default(key), getattr(script, key))
+```
+
+`inputs` and `settings` work as in `ScriptRunner`. With `save_overrides=True` they are also
+written into the script's `.toml` (a value equal to the script's own declaration is written
+commented out), which is how a settings editor saves what the user entered. The file is only
+written when `PYNE_SAVE_SCRIPT_TOML` is not `0`.
+
+> **Note:** each call executes the script file from its first statement, as a fresh module.
+
 ## run_iter() — Processing Bars
 
 The primary method. Returns an iterator that yields results for each bar processed.
@@ -186,6 +307,30 @@ for candle, plot_data, new_trades in runner.run_iter():
 
 > **Note:** `new_trades` contains only trades that **closed** on the current bar, not open
 > positions. Each trade appears exactly once — on the bar where it exits.
+
+### Keeping Results vs. the Fast Path
+
+Every bar yields its own `plot_data` dict and `new_trades` list, so the results can be kept as
+they are, for example to collect a whole run at once:
+
+```python
+results = list(runner.run_iter())  # each element keeps its own bar's values
+```
+
+Internally the runner fills one dict and one list, and `run_iter()` hands out a copy of them on
+every bar. When the loop body reads each bar's values before asking for the next one, the copy
+is not needed, and `copy_results=False` skips it:
+
+```python
+closes = []
+for candle, plot_data in runner.run_iter(copy_results=False):
+    closes.append(plot_data["Close"])  # read now: plot_data is refilled for the next bar
+```
+
+With `copy_results=False` the yielded `plot_data` and `new_trades` are the runner's own
+containers, emptied and refilled on every bar. Keeping them (rather than the values read out of
+them) leaves you with empty containers. The `Trade` objects themselves stay valid either way.
+The copy costs a fraction of a microsecond per bar, which only shows on very light scripts.
 
 ### NA Values During Warmup
 
@@ -305,7 +450,8 @@ with OHLCVReader(ohlcv_path) as reader:
         script_path=Path("sma_crossover.py"),
         ohlcv_iter=reader.read_from(reader.start_timestamp, reader.end_timestamp),
         syminfo=syminfo,
-        inputs={"Length": 20, "Confirm bars": 2},
+        inputs={"length": 20, "confirm": 2},
+        settings={"initial_capital": 10_000, "commission_value": 0.05},
     )
 
     all_trades = []

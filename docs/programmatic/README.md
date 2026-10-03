@@ -5,7 +5,7 @@ title: "Programmatic Usage"
 description: "Using PyneCore from Python code — embedding indicators and strategies into your applications"
 icon: "integration_instructions"
 date: "2025-03-31"
-lastmod: "2026-03-17"
+lastmod: "2026-10-03"
 draft: false
 toc: true
 categories: ["Programmatic", "Integration"]
@@ -23,8 +23,8 @@ custom backtesting frameworks, data pipelines, and more.
 
 ## In this section
 
-- [ScriptRunner API](./script-runner.md) - Running scripts from Python, accessing indicator and
-  strategy results
+- [ScriptRunner API](./script-runner.md) - Running scripts from Python, overriding their inputs
+  and settings, accessing indicator and strategy results
 - [Visual Output (Viz)](./visual-output.md) - Plot styles and drawing data as an opt-in NDJSON stream
 - [Data & SymInfo](./data-and-syminfo.md) - Loading and creating OHLCV data and symbol information
 - [Integration Patterns](./integration-patterns.md) - Real-world integration examples (FreqTrade,

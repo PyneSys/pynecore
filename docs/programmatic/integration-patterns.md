@@ -5,7 +5,7 @@ title: "Integration Patterns"
 description: "Real-world patterns for integrating PyneCore into trading systems"
 icon: "hub"
 date: "2025-03-31"
-lastmod: "2026-07-28"
+lastmod: "2026-10-03"
 draft: false
 toc: true
 categories: ["Programmatic", "Integration"]
@@ -61,7 +61,35 @@ def run_indicator(df, script_path, syminfo, inputs=None):
         key: pd.Series(values, index=df.index[:len(values)])
         for key, values in results.items()
     }
+
+
+def run_strategy(df, script_path, syminfo, inputs=None, settings=None):
+    """Run a PyneCore strategy, return its plots (dict of pd.Series) and closed trades."""
+    runner = ScriptRunner(
+        script_path=script_path,
+        ohlcv_iter=dataframe_to_ohlcv(df),
+        syminfo=syminfo,
+        inputs=inputs,
+        settings=settings,
+    )
+
+    results = {}
+    trades = []
+    for _candle, plot_data, new_trades in runner.run_iter():
+        for key, value in plot_data.items():
+            results.setdefault(key, []).append(value)
+        trades.extend(new_trades)
+
+    indicators = {
+        key: pd.Series(values, index=df.index[:len(values)])
+        for key, values in results.items()
+    }
+    return indicators, trades
 ```
+
+Both helpers read `plot_data` and `new_trades` inside the loop, so they could also pass
+`copy_results=False` to `run_iter()` and skip the per-bar copy (see
+[Keeping Results vs. the Fast Path](./script-runner.md#keeping-results-vs-the-fast-path)).
 
 Usage:
 
@@ -184,7 +212,8 @@ bb_values = [(plot.get("Upper"), plot.get("Lower")) for _, plot in bb_runner.run
 
 ## Parameter Optimization
 
-Sweep over input combinations to find optimal parameters:
+Sweep over input combinations to find optimal parameters. The `inputs` keys are the `main()`
+parameter names of the script (here `def main(length=input.int(...), confirm=input.int(...))`):
 
 ```python
 from itertools import product
@@ -195,7 +224,7 @@ for length, confirm in product(range(5, 30, 5), range(1, 4)):
         script_path=Path("sma_crossover.py"),
         ohlcv_iter=data,
         syminfo=syminfo,
-        inputs={"Length": length, "Confirm bars": confirm},
+        inputs={"length": length, "confirm": confirm},
     )
 
     trades = []
@@ -210,6 +239,28 @@ for length, confirm in product(range(5, 30, 5), range(1, 4)):
 best = max(results, key=lambda r: r["pnl"])
 print(f"Best: Length={best['length']}, Confirm={best['confirm']} → P&L={best['pnl']:+.2f}")
 ```
+
+The script's strategy settings can be swept the same way with `settings`, for example to see how
+sensitive the result is to trading costs:
+
+```python
+from pynecore.lib import strategy
+
+for commission in (0.0, 0.05, 0.1, 0.2):  # percent per order
+    runner = ScriptRunner(
+        script_path=Path("sma_crossover.py"),
+        ohlcv_iter=data,
+        syminfo=syminfo,
+        inputs={"length": best["length"], "confirm": best["confirm"]},
+        settings={"commission_type": strategy.commission.percent, "commission_value": commission},
+    )
+    pnl = sum(t.profit for _, _, new_trades in runner.run_iter() for t in new_trades)
+    print(f"commission {commission}% → P&L={pnl:+.2f}")
+```
+
+Overrides apply to their own run only and are never written into the script's `.toml`, so a
+sweep leaves the script's configuration as it was (see
+[Precedence and the Script's `.toml` File](./script-runner.md#precedence-and-the-scripts-toml-file)).
 
 ## Performance Tips
 

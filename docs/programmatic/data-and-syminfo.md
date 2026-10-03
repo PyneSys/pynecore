@@ -5,7 +5,7 @@ title: "Data & SymInfo"
 description: "Loading and creating OHLCV data and symbol information for programmatic use"
 icon: "database"
 date: "2025-03-31"
-lastmod: "2026-07-28"
+lastmod: "2026-10-03"
 draft: false
 toc: true
 categories: ["Programmatic", "Data"]
@@ -157,6 +157,7 @@ syminfo = SymInfo(
     pricescale=100,              # 1 / mintick
     minmove=1,                   # minimum price movement in pricescale units
     pointvalue=1.0,              # profit per 1 unit price move per 1 contract
+    mincontract=0.00001,         # smallest tradable quantity step (syminfo.mincontract)
     timezone="UTC",              # IANA timezone (e.g., "America/New_York")
     volumetype="base",           # "base", "quote", "tick", "n/a"
     opening_hours=[],            # trading session hours (empty for 24/7 crypto)
@@ -174,7 +175,7 @@ SymInfo(
     prefix="BINANCE", description="BTC / USDT", ticker="BTCUSDT",
     currency="USDT", basecurrency="BTC", period="60",
     type="crypto", mintick=0.01, pricescale=100, minmove=1, pointvalue=1.0,
-    timezone="UTC", volumetype="base",
+    mincontract=0.00001, timezone="UTC", volumetype="base",
     opening_hours=[], session_starts=[], session_ends=[],
 )
 ```
@@ -186,7 +187,7 @@ SymInfo(
     prefix="FX", description="EUR / USD", ticker="EURUSD",
     currency="USD", basecurrency="EUR", period="60",
     type="forex", mintick=0.0001, pricescale=10000, minmove=1, pointvalue=1.0,
-    timezone="America/New_York", volumetype="tick",
+    mincontract=1.0, timezone="America/New_York", volumetype="tick",
     opening_hours=[], session_starts=[], session_ends=[],
 )
 ```
@@ -198,7 +199,7 @@ SymInfo(
     prefix="NASDAQ", description="Apple Inc.", ticker="AAPL",
     currency="USD", period="D",
     type="stock", mintick=0.01, pricescale=100, minmove=1, pointvalue=1.0,
-    timezone="America/New_York", volumetype="base",
+    mincontract=1.0, timezone="America/New_York", volumetype="base",
     opening_hours=[], session_starts=[], session_ends=[],
 )
 ```

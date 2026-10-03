@@ -5,7 +5,7 @@ title: "Configuring PyneCore"
 description: "Learn how to configure PyneCore for your specific needs"
 icon: "settings"
 date: "2025-03-31"
-lastmod: "2026-09-28"
+lastmod: "2026-10-03"
 draft: false
 toc: true
 categories: ["Overview", "Configuration"]
@@ -139,6 +139,10 @@ The script configuration file has two main sections:
    - Each input declared as a `main()` parameter default (`input.*()` functions) gets its own section
    - The metadata is displayed as comments and cannot be modified
    - You can set the `value` to override the default value
+
+When PyneCore is used from Python, `ScriptRunner(inputs=..., settings=...)` overrides both
+sections for a single run without writing them into this file; see
+[Overriding Script Settings](../programmatic/script-runner.md#overriding-script-settings).
 
 ### Symbol Map (optional)
 

@@ -435,6 +435,7 @@ def security_process_main(
         chart_ring_capacity: 'dict[str, int] | None' = None,
         chart_ring_arena: 'dict[str, int] | None' = None,
         script_inputs: 'dict[str, Any] | None' = None,
+        script_settings: 'dict[str, Any] | None' = None,
         dev_batch_spec: 'DevBatchSpec | None' = None,
         run_env: 'dict[str, str] | None' = None,
 ):
@@ -518,9 +519,11 @@ def security_process_main(
         dependency of a child that was already spawned, so its record cannot
         have been in that child's snapshot.
     :param script_inputs: The runner's programmatic input overrides. They are
-        applied before this process imports the script, so the child computes
+        applied while this process imports the script, so the child computes
         its context with the very values the chart runs with instead of the
         ``.toml`` (or source) defaults.
+    :param script_settings: The runner's programmatic script setting overrides,
+        applied the same way as ``script_inputs``.
     :param dev_batch_spec: What to reproduce a historical DEVELOPING batch's
         round sequence from (see :func:`security.iter_dev_batch_records`), or
         ``None``. The chart launches ONE round for it
@@ -828,16 +831,12 @@ def security_process_main(
     # same user file. Disable the save for this process before importing.
     os.environ['PYNE_SAVE_SCRIPT_TOML'] = '0'
 
-    # The runner's programmatic inputs override the .toml values in the chart
-    # process; this process loads the same script from scratch, so they must be
-    # in place before the import or the child would silently run a differently
+    # The runner's programmatic inputs and settings override the .toml values in
+    # the chart process; this process loads the same script from scratch, so the
+    # import must apply them too or the child would silently run a differently
     # configured script than the chart it feeds.
-    if script_inputs:
-        # noinspection PyProtectedMember
-        script_mod._programmatic_inputs.update(script_inputs)
-
-    # Import the script
-    script_module = import_script(Path(script_path))
+    script_module = import_script(Path(script_path), inputs=script_inputs,
+                                  settings=script_settings)
 
     # Inject security protocol into module globals. Imported library modules can
     # contain request.security() calls too, so their transformed code references

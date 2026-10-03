@@ -2,7 +2,7 @@ from typing import Any, Callable, TypeVar, overload
 import os
 import sys
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import StrEnum
 from pathlib import Path
 
@@ -66,6 +66,10 @@ class InputData:
 
 _old_input_values: dict[str, Any] = {}
 _programmatic_inputs: dict[str, Any] = {}
+#: Script settings (``[script]`` toml fields) to apply over the toml, like ``_programmatic_inputs``
+_programmatic_settings: dict[str, Any] = {}
+#: Whether the toml the decorator saves records the programmatic overrides too
+_save_programmatic_overrides: bool = False
 inputs: dict[str, InputData] = {}
 
 
@@ -130,6 +134,47 @@ class Script:
     _broker_requirements: ScriptRequirements | None = None
 
     _modified: set[str] = field(default_factory=set)
+    #: The settings the script itself declares (decorator arguments), before any toml override
+    _defaults: dict[str, Any] = field(default_factory=dict)
+
+    def settable_fields(self) -> list[str]:
+        """
+        Names of the settings a ``[script]`` toml section may override.
+
+        :return: Field names in declaration order
+        """
+        return [f.name for f in fields(self)
+                if not f.name.startswith('_') and f.name not in self._SKIP_FIELDS]
+
+    def default(self, key: str) -> Any:
+        """
+        The value the script itself declares for a setting, ignoring any toml override.
+
+        :param key: The setting name
+        :return: The declared value
+        """
+        return self._defaults[key] if key in self._defaults else getattr(self, key)
+
+    def set_setting(self, key: str, value: Any) -> None:
+        """
+        Override a setting. A value equal to the script's own declaration is no override:
+        it is not marked modified, so ``save()`` writes it commented out.
+
+        :param key: The setting name, one of ``settable_fields()``
+        :param value: The new value
+        """
+        if key not in self.settable_fields():
+            raise ValueError(f"Not a settable script field: {key}")
+        if key == 'commission_type':
+            value = _COMMISSION_TYPE_ALIASES.get(value, value)
+        elif key == 'pyramiding':
+            # Pyramiding must be at least 1
+            value = max(value, 1)
+        setattr(self, key, value)
+        if value == self.default(key):
+            self._modified.discard(key)
+        else:
+            self._modified.add(key)
 
     def save(self, path: Path):
         """
@@ -162,12 +207,8 @@ class Script:
         ]
 
         # Save general settings
-        from dataclasses import fields
-        for field in fields(self):
-            key = field.name
+        for key in self.settable_fields():
             value = getattr(self, key)
-            if key.startswith('_') or key in self._SKIP_FIELDS:
-                continue
             if value is None:
                 line = f"#{key} ="
             else:
@@ -226,12 +267,10 @@ class Script:
 
         script_data = data['script']
 
+        settable = self.settable_fields()
         for key, value in script_data.items():
-            if key not in self._SKIP_FIELDS and hasattr(self, key):
-                if value != getattr(self, key):
-                    setattr(self, key, value)
-                    # We just save the modified fields
-                    self._modified.add(key)
+            if key in settable:
+                self.set_setting(key, value)
 
         if 'inputs' not in data:
             return
@@ -252,20 +291,33 @@ class Script:
         script_path = Path(sys._getframe(2).f_globals['__file__']).resolve()  # noqa F821
         toml_path = script_path.with_suffix('.toml')
 
+        # Pyramiding must be at least 1
+        if self.pyramiding <= 0:
+            self.pyramiding = 1
+        self._defaults = {key: getattr(self, key) for key in self.settable_fields()}
+
         # Load settings from toml file if exists
         if toml_path.exists():
             self.load(toml_path)
 
+        # The programmatic overrides belong to the script being run. A library it imports
+        # is decorated first, so it must leave them for that script.
+        is_runnable = self.script_type in (_script_type.indicator, _script_type.strategy)
+        save_overrides = _save_programmatic_overrides
+        toml_input_values = dict(_old_input_values)
+
+        # Programmatic settings (override .toml values), applied once the toml is saved
+        settings: dict[str, Any] = {}
+        if is_runnable:
+            settings = dict(_programmatic_settings)
+            _programmatic_settings.clear()
+
         # Apply programmatic inputs (override .toml values)
-        if _programmatic_inputs:
+        if is_runnable and _programmatic_inputs:
             for key, value in _programmatic_inputs.items():
                 _old_input_values[key] = value
                 _old_input_values[key + '__global__'] = value
             _programmatic_inputs.clear()
-
-        # Pyramiding must be at least 1
-        if self.pyramiding <= 0:
-            self.pyramiding = 1
 
         def decorator(func):
             # Save inputs to script instance then clear inputs (for next script)
@@ -275,7 +327,19 @@ class Script:
             # Set script attribute to the main function to be able to access script properties
             setattr(func, 'script', self)
 
-            if self.script_type in (_script_type.indicator, _script_type.strategy):
+            if is_runnable:
+                # Save toml file if not in pytest and not disabled by env var PYNE_SAVE_SCRIPT_TOML = 0
+                save = os.environ.get('PYNE_SAVE_SCRIPT_TOML', '1') == '1' and 'pytest' not in sys.modules
+                if save and not save_overrides:
+                    # The overrides only configure this run: the toml keeps what it held
+                    _old_input_values.clear()
+                    _old_input_values.update(toml_input_values)
+                    self.save(toml_path)
+                for key, value in settings.items():
+                    self.set_setting(key, value)
+                if save and save_overrides:
+                    self.save(toml_path)
+
                 # Publish the script timeframe while the module body is still running:
                 # the security transformer appends ``__security_contexts__`` AFTER this
                 # decorator, and it evaluates ``timeframe.period`` at module level. In a
@@ -287,10 +351,6 @@ class Script:
                 # module level, so a top-level import here is a cycle.
                 from pynecore import lib as _lib
                 _lib._script_timeframe = self.timeframe
-
-                # Save toml file if not in pytest and not disabled by env var PYNE_SAVE_SCRIPT_TOML = 0
-                if os.environ.get('PYNE_SAVE_SCRIPT_TOML', '1') == '1' and 'pytest' not in sys.modules:
-                    self.save(toml_path)
 
             _old_input_values.clear()
             return func

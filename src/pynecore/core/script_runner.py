@@ -1,4 +1,4 @@
-from typing import Iterable, Iterator, Callable, TYPE_CHECKING, Any, cast
+from typing import Iterable, Iterator, Generator, Callable, TYPE_CHECKING, Any, cast
 from types import ModuleType
 import asyncio
 import concurrent.futures
@@ -23,6 +23,7 @@ from datetime import datetime, UTC
 # ``.pyc`` would hide it. Importing the module installs the hook.
 from pynecore.core import import_hook
 from pynecore import lib
+from pynecore.core import script as script_mod
 from pynecore.lib import timeframe as timeframe_lib
 from pynecore.lib.log import (broker_debug, broker_info, broker_warning, ohlcv_info, sim_info,
                               logger)
@@ -145,7 +146,10 @@ def script_module_name(script_path: Path) -> str:
     return f"{script_path.stem.replace('.', '_')}__{digest}"
 
 
-def import_script(script_path: Path) -> ModuleType:
+# noinspection PyProtectedMember
+def import_script(script_path: Path, *, inputs: dict[str, Any] | None = None,
+                  settings: dict[str, Any] | None = None,
+                  save_overrides: bool = False) -> ModuleType:
     """
     Import the script: execute exactly this file as a fresh module.
 
@@ -153,10 +157,24 @@ def import_script(script_path: Path) -> ModuleType:
     replacing what an earlier import of the same file left there, so every call
     starts the script from its first statement.
 
+    The script's ``@script.indicator``/``@script.strategy`` decorator applies the
+    overrides over its sibling ``.toml``, in the order declaration < ``.toml`` <
+    ``settings``/``inputs``. Overrides the import does not consume (a library script)
+    are dropped, so they never reach the next import.
+
+    The decorator also (re)writes that ``.toml`` unless ``PYNE_SAVE_SCRIPT_TOML=0``.
+    By default the overrides only configure this import and the file keeps what it
+    held; ``save_overrides`` records them in it.
+
     :param script_path: Path of the script file
+    :param inputs: Input values keyed by the ``main()`` parameter name
+    :param settings: Script settings keyed by decorator argument name (``initial_capital``,
+                     ``commission_value``, ...); see :meth:`Script.settable_fields`
+    :param save_overrides: Write ``inputs`` and ``settings`` into the script's ``.toml``
     :return: The executed module
     :raises ImportError: If the file cannot be read, is not Pyne code or has no
                          ``main`` function
+    :raises ValueError: If a ``settings`` key is not a settable script field
     """
     # Check for @pyne magic doc comment before importing (prevents import errors)
     # Without this user may get strange errors which are very hard to debug.
@@ -188,6 +206,11 @@ def import_script(script_path: Path) -> ModuleType:
     sys.modules[name] = module
     # The script's directory is on the path while it runs, for the libraries it imports
     sys.path.insert(0, str(script_path.parent))
+    if inputs:
+        script_mod._programmatic_inputs.update(inputs)
+    if settings:
+        script_mod._programmatic_settings.update(settings)
+    script_mod._save_programmatic_overrides = save_overrides
     try:
         spec.loader.exec_module(module)
     except BaseException:
@@ -195,6 +218,12 @@ def import_script(script_path: Path) -> ModuleType:
         raise
     finally:
         sys.path.pop(0)
+        script_mod._programmatic_inputs.clear()
+        script_mod._programmatic_settings.clear()
+        script_mod._save_programmatic_overrides = False
+        # The decorator clears its input values when it completes; a failed import must not
+        # hand them to the next one either
+        script_mod._old_input_values.clear()
 
     if not hasattr(module, 'main'):
         raise ImportError(f"Script '{script_path}' must have a 'main' function to run!")
@@ -1170,7 +1199,7 @@ class ScriptRunner:
                  '_round_decimals', '_lossless_volume', '_lossless_prices',
                  '_config_dir', '_symbol_map', '_script_timeframe',
                  '_chart_bar_window',
-                 'broker_balance', '_sim_logged_open_ids', '_inputs')
+                 'broker_balance', '_sim_logged_open_ids', '_inputs', '_settings')
 
     # noinspection PyProtectedMember
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
@@ -1180,6 +1209,7 @@ class ScriptRunner:
                  update_syminfo_every_run: bool = False, last_bar_index=0,
                  last_bar_time: int | None = None,
                  inputs: dict[str, Any] | None = None,
+                 settings: dict[str, Any] | None = None,
                  security_data: 'dict[str, str | Path | PluginSymbol] | None' = None,
                  magnifier_iter: Iterable[OHLCV] | None = None,
                  magnifier_source_tf: str | None = None,
@@ -1224,8 +1254,10 @@ class ScriptRunner:
         :param last_bar_time: UNIX time (ms) of the last bar of the historical data. Pine fixes
                               ``last_bar_time`` on historical bars to the chart's final bar;
                               ``None`` falls back to tracking the current bar (live semantics)
-        :param inputs: Optional dictionary of input values to pass to the script,
-                       overrides values from .toml files
+        :param inputs: Optional dictionary of input values to pass to the script, keyed by
+                       the ``main()`` parameter name; overrides values from .toml files
+        :param settings: Optional dictionary of script settings (decorator arguments such as
+                         ``initial_capital``); overrides values from .toml files
         :param security_data: Optional dict mapping ``"[SYMBOL:]TIMEFRAME"`` keys to
                               OHLCV file paths for request.security() contexts.
                               Examples: ``{"1D": "path/to/daily.ohlcv"}`` or
@@ -1345,17 +1377,15 @@ class ScriptRunner:
         # This ensures that timestamp() calls in default parameters use the correct timezone
         _set_lib_syminfo_properties(syminfo)
 
-        # Set programmatic inputs before script import so they override .toml values.
-        # The dict is kept: a security child re-imports the script in its own
-        # process, where nothing would apply these overrides otherwise, and it
-        # would compute the context with the .toml (or source) values instead.
+        # The overrides are kept: a security child re-imports the script in its own
+        # process, where nothing would apply them otherwise, and it would compute
+        # the context with the .toml (or source) values instead.
         self._inputs: dict[str, Any] = dict(inputs) if inputs else {}
-        if inputs:
-            from .script import _programmatic_inputs
-            _programmatic_inputs.update(inputs)
+        self._settings: dict[str, Any] = dict(settings) if settings else {}
 
         # Now import the script (default parameters will use correct timezone)
-        self.script_module = import_script(script_path)
+        self.script_module = import_script(script_path, inputs=self._inputs,
+                                           settings=self._settings)
 
         if not hasattr(self.script_module.main, 'script'):
             raise ImportError(f"The 'main' function must be decorated with "
@@ -1845,15 +1875,57 @@ class ScriptRunner:
         )
 
     def run_iter(self, on_progress: Callable[[datetime], None] | None = None,
-                 on_tick: Callable[[OHLCV], None] | None = None) \
+                 on_tick: Callable[[OHLCV], None] | None = None, *, copy_results: bool = True) \
             -> Iterator[tuple[OHLCV, dict[str, Any]] | tuple[OHLCV, dict[str, Any], list['Trade']]]:
         """
-        Run the script on the data
+        Run the script on the data, yielding the results of every bar
+
+        Indicators yield ``(candle, plot_data)``, strategies ``(candle, plot_data, new_trades)``
+        where ``new_trades`` are the trades closed on that bar.
 
         :param on_progress: Callback to call on every iteration
         :param on_tick: Optional per-update live callback (see :meth:`run`).
-        :return: Return a dictionary with all data the sctipt plotted
+        :param copy_results: Yield a fresh ``plot_data`` dict and ``new_trades`` list on every
+                             bar. With ``False`` the runner yields its own containers, which it
+                             refills for the next bar: faster, for a consumer that reads them
+                             before asking for the next bar.
+        :return: Iterator over the per-bar results
         :raises AssertionError: If the 'main' function does not return a dictionary
+        """
+        results = self._run_iter(on_progress, on_tick)
+        if not copy_results:
+            return results
+        return self._copy_results(results)
+
+    @staticmethod
+    def _copy_results(results: Generator) -> Iterator:
+        """
+        Re-yield the per-bar results of :meth:`_run_iter` in containers of their own.
+
+        :param results: The generator of :meth:`_run_iter`
+        :return: Iterator over the copied results
+        """
+        try:
+            for item in results:
+                # A strategy's gap row of a script timeframe is a pair too
+                if len(item) == 3:
+                    yield item[0], dict(item[1]), list(item[2])
+                else:
+                    yield item[0], dict(item[1])
+        finally:
+            # Closing this iterator early (break, close()) must run the runner's cleanup now
+            results.close()
+
+    def _run_iter(self, on_progress: Callable[[datetime], None] | None = None,
+                  on_tick: Callable[[OHLCV], None] | None = None) \
+            -> Generator[tuple[OHLCV, dict[str, Any]] | tuple[OHLCV, dict[str, Any], list['Trade']],
+                         None, None]:
+        """
+        Run the script on the data, see :meth:`run_iter`
+
+        :param on_progress: Callback to call on every iteration
+        :param on_tick: Optional per-update live callback (see :meth:`run`).
+        :return: Iterator over the per-bar results, in the runner's own (reused) containers
         """
         from .. import lib
         from ..lib import _parse_timezone, barstate, string
@@ -2563,6 +2635,7 @@ class ScriptRunner:
                             _capacities,
                             _arenas,
                             self._inputs,
+                            self._settings,
                             _dev_batch_spec,
                         ),
                         # Read per spawn: the forkserver froze its own copy of
@@ -5045,5 +5118,5 @@ class ScriptRunner:
                         bid/ask in the progress spinner.
         :raises AssertionError: If the 'main' function does not return a dictionary
         """
-        for _ in self.run_iter(on_progress=on_progress, on_tick=on_tick):
+        for _ in self.run_iter(on_progress=on_progress, on_tick=on_tick, copy_results=False):
             pass
