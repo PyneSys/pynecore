@@ -23,7 +23,7 @@ egg_info.egg_base = "build"
 
 [project]
 name = "pynesys-pynecore"
-version = "6.10.6" # PineVersion.Major.Minor
+version = "6.10.7" # PineVersion.Major.Minor
 description = "Pine Script-compatible Python runtime for indicators and strategies, validated against TradingView"
 authors = [{ name = "PYNESYS LLC", email = "hello@pynesys.com" }]
 readme = "README.md"
