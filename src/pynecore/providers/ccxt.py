@@ -1,6 +1,7 @@
 from typing import Any, Callable, TYPE_CHECKING
 from dataclasses import dataclass
 import re
+from time import sleep
 from datetime import datetime, UTC, timedelta, time
 from pathlib import Path
 import tomllib
@@ -49,6 +50,13 @@ _PYNECORE_ONLY_CONFIG_KEYS: frozenset[str] = frozenset({
     'default_type',
     'symbol_map',
 })
+
+# Retry policy of a single candle-download request. A long download issues
+# thousands of requests, so one transient server fault (network error, rate
+# limit, or a bare ``ExchangeError`` like Bybit's ``retCode 10016`` "internal
+# error") must not abort it. Delays double from the base: 1, 2, 4, 8 seconds.
+_DOWNLOAD_MAX_ATTEMPTS: int = 5
+_DOWNLOAD_RETRY_BASE_DELAY: float = 1.0
 
 # Fallback tick size when an exchange exposes no usable price precision at all.
 # Eight decimals is the common crypto default; an over-fine tick only adds
@@ -517,15 +525,28 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
                 if on_progress:
                     on_progress(tf)
 
-                try:
-                    res: list = self._client.fetch_ohlcv(
-                        symbol=self.symbol,
-                        limit=limit,
-                        timeframe=self.xchg_timeframe,
-                        since=self._client.parse8601(tf.isoformat())
-                    )
-                except ccxt.BaseError as exc:
-                    raise CCXTError(f"{self._client.id}: {exc}") from exc
+                since = self._client.parse8601(tf.isoformat())
+                attempt = 1
+                while True:
+                    try:
+                        res: list = self._client.fetch_ohlcv(
+                            symbol=self.symbol,
+                            limit=limit,
+                            timeframe=self.xchg_timeframe,
+                            since=since
+                        )
+                        break
+                    except ccxt.BaseError as exc:
+                        # Only network-level faults and the bare ``ExchangeError``
+                        # (CCXT's catch-all for unmapped server errors) are
+                        # transient; its subclasses (``BadSymbol``, ``BadRequest``,
+                        # ``AuthenticationError``, ...) are permanent.
+                        transient = (isinstance(exc, ccxt.NetworkError)
+                                     or type(exc) is ccxt.ExchangeError)
+                        if not transient or attempt >= _DOWNLOAD_MAX_ATTEMPTS:
+                            raise CCXTError(f"{self._client.id}: {exc}") from exc
+                        sleep(_DOWNLOAD_RETRY_BASE_DELAY * 2 ** (attempt - 1))
+                        attempt += 1
 
                 if not res:
                     tf += timedelta(days=1)
