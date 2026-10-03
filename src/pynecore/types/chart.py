@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from .pine_types import PyneFloat, PyneInt
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class ChartPoint:
     # The x-coordinate of the point, expressed as a bar index value (``na`` when the point
     # was created from a time only, e.g. ``chart.point.from_time``)

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from .volume_row import VolumeRow
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class Footprint:
     """
     Stores volume footprint data for a bar, including total buy/sell volume,

@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class VolumeRow:
     """
     Represents a single price row within a footprint bar. Contains volume data

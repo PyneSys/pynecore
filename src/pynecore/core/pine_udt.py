@@ -112,8 +112,12 @@ def udt(cls: Type[T]) -> Type[T]:
     :param cls: The class to decorate
     :return: The decorated class with added copy method
     """
-    # Apply the standard dataclass decorator with slots=True for better performance
-    decorated_cls = dataclass(cls, slots=True)  # type: ignore
+    # Apply the standard dataclass decorator with slots=True for better performance.
+    # eq=False: Pine objects compare by reference (array.includes / indexof never match a
+    # distinct object with equal fields), and a generated field-wise __eq__ would also
+    # change with the interpreter, since CPython 3.13 dropped the per-field identity
+    # shortcut that let two objects holding the same na compare equal.
+    decorated_cls = dataclass(cls, slots=True, eq=False)  # type: ignore
 
     def copy(self: T, **changes: Any) -> T:
         """
