@@ -3132,6 +3132,30 @@ class OHLCVReader:
         """
         return self._reader.get_size(start_timestamp, end_timestamp)
 
+    def get_last_bar_time(
+        self, start_timestamp: int | None = None, end_timestamp: int | None = None
+    ) -> int | None:
+        """Return the open time of the last real bar in a millisecond timestamp range.
+
+        Pine anchors ``last_bar_time`` on historical bars to the chart's final bar.
+
+        :param start_timestamp: Inclusive lower bound, or ``None`` for the beginning.
+        :param end_timestamp: Inclusive upper bound, or ``None`` for the end.
+        :return: Open time in milliseconds, or ``None`` when the range holds no real bar.
+        """
+        # Positional reads also serve the phantom gap records LEGACY files may hold
+        # (``volume == -1``; ``not (volume < 0)`` keeps NaN-volume real bars), so scan
+        # back over that tail. A file that declares its own period stores real bars
+        # only, so its negative volume is the source's own value.
+        skip_phantom_tail = self.period is None
+        start_pos, end_pos = self.get_positions(start_timestamp, end_timestamp)
+        for pos in range(end_pos - 1, start_pos - 1, -1):
+            bar = self.read(pos)
+            if skip_phantom_tail and bar.volume < 0:
+                continue
+            return int(bar.timestamp)
+        return None
+
     def save_to_csv(self, path: str | Path, as_datetime: bool = False) -> None:
         """Export all records to CSV without testing the file version.
 

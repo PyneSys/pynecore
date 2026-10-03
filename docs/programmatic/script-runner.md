@@ -68,7 +68,7 @@ ScriptRunner(
     viz_path: Path | None = None,
     viz_journal: bool = False,
     update_syminfo_every_run: bool = False,
-    last_bar_index: int = 0,
+    last_bar_index: int | None = None,
     last_bar_time: int | None = None,
     inputs: dict[str, Any] | None = None,
     settings: dict[str, Any] | None = None,
@@ -93,8 +93,9 @@ ScriptRunner(
 | `viz_path`                 | `Path \| None`     | Write plot-style + drawing visual data as NDJSON (see below)   |
 | `viz_journal`              | `bool`             | Emit per-bar drawing create/update/delete events               |
 | `update_syminfo_every_run` | `bool`             | Re-apply syminfo before each bar (for parallel runners)        |
-| `last_bar_index`           | `int`              | Override last bar index (for multi-script setups)              |
+| `last_bar_index`           | `int \| None`      | Index of the last historical bar, for `last_bar_index`         |
 | `last_bar_time`            | `int \| None`      | Time (ms) of the last historical bar, for `last_bar_time`      |
+| `live`                     | `bool`             | Feed is history, then live updates (see Live Mode)             |
 | `inputs`                   | `dict \| None`     | Override `input()` values at runtime (see below)               |
 | `settings`                 | `dict \| None`     | Override script settings at runtime (see below)                |
 | `security_data`            | `dict \| None`     | OHLCV paths for `request.security()` contexts (see below)      |
@@ -102,8 +103,11 @@ ScriptRunner(
 | `magnifier_source_tf`      | `str \| None`      | Timeframe of the `magnifier_iter` bars                         |
 | `config_dir`               | `Path \| None`     | Workdir `config/` folder, for its `symbol_map.toml`            |
 
-`last_bar_time` matters for scripts that read `last_bar_time` on historical bars: Pine fixes it to
-the chart's final bar, while `None` makes it track the current bar (live semantics).
+On historical bars Pine fixes `last_bar_index` and `last_bar_time` to the chart's final bar. With a
+list or tuple `ohlcv_iter` outside live mode the runner takes both from its last bar, so they need
+to be passed only for any other iterable (a generator, a reader). Without them they track the
+current bar, as on a realtime bar, and `calc_bars_count` has no end to count back from, so every
+bar is calculated.
 
 The remaining keyword parameters (`broker_plugin`, `broker_event_loop`, `broker_store_ctx`,
 `chart_provider_name`, `chart_provider_instance`, `chart_data_path`, `time_from`, `log_ohlcv`,
@@ -129,8 +133,8 @@ runner = ScriptRunner(
 
 Keys are the **parameter names** of `main()` (`length`), not the `title` shown in the settings
 dialog (`"Length"`). This is the same name the input's `[inputs.<name>]` section uses in the
-script's `.toml`. A key that matches no input is silently ignored, so check the spelling when a
-value does not seem to apply.
+script's `.toml`. A key that matches no input raises `ValueError`, which lists the script's
+input names, so a typo or a title used as a key fails loudly.
 
 ### Overriding Script Settings
 
@@ -353,6 +357,59 @@ for candle, plot_data in runner.run_iter():
     # NA values print as "NaN" in f-strings
     print(f"RSI={rsi:.2f}")  # "RSI=NaN" during warmup, "RSI=65.32" after
 ```
+
+## Live Mode
+
+By default every bar is history. The runner reads one item ahead of the bar it executes, because
+`barstate.islast` and the confirmation of higher-timeframe `request.security()` values depend on
+whether another bar follows. A list or a file costs nothing extra this way. A generator that
+waits for the market does: each bar's result only comes out when the next candle arrives, one
+candle late.
+
+With `live=True` the iterator yields three phases:
+
+1. The historical (warmup) bars, closed, as in a backtest.
+2. `LIVE_TRANSITION`, once, when the history is done.
+3. The live updates. An `OHLCV` with `is_closed=False` is a price update of the forming bar, one
+   with `is_closed=True` closes it. A new timestamp opens a new bar.
+
+```python
+from pynecore.core.script_runner import ScriptRunner, LIVE_TRANSITION
+from pynecore.types.ohlcv import OHLCV
+
+
+def feed():
+    yield from history          # closed bars, oldest first
+    yield LIVE_TRANSITION
+    while True:
+        bar = wait_for_closed_candle()  # your exchange / websocket code
+        yield OHLCV(timestamp=bar.ts, open=bar.o, high=bar.h, low=bar.l, close=bar.c,
+                    volume=bar.v, is_closed=True)
+
+
+runner = ScriptRunner(Path("rsi.py"), feed(), syminfo, live=True)
+for candle, plot_data in runner.run_iter():
+    print(candle.timestamp, plot_data["RSI"])  # printed as soon as the candle closed
+```
+
+What live mode changes:
+
+- **No delay.** A closed live bar is executed and yielded as soon as it arrives. Only the warmup
+  bars are read one ahead, and the last of them runs as soon as `LIVE_TRANSITION` comes.
+- **`barstate`** reports `ishistory` on the warmup bars, `islastconfirmedhistory` on the last of
+  them, and `isrealtime` from the transition on.
+- **Intra-bar updates.** An indicator runs on every update of the forming bar, a strategy only
+  with `calc_on_every_tick=true`. `var` variables roll back between these runs and `varip`
+  variables keep their value, as in Pine. `run_iter()` yields on bar close only; pass
+  `on_tick=` to see every update.
+- **Strategy orders start at the transition.** The warmup bars build the script's state, but
+  their `strategy.*` orders are ignored, so the strategy does not start with a position it took
+  in the past. Orders are simulated (paper trading) unless a broker plugin is attached.
+- **Feed errors are dropped with a warning.** A bar that would move time backwards (a closed bar
+  older than the last one, or an update of a bar that is already closed) is not executed.
+
+A feed that only knows closed candles skips the `is_closed=False` updates. It still has to drop
+the candle that is still forming: most REST APIs return it as the last row.
 
 ## Trade Object
 

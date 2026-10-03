@@ -16,7 +16,7 @@ def __test_set_lib_properties_keeps_historical_last_bar_index_fixed__():
         volume=10.0,
     )
 
-    _set_lib_properties(candle, 2, ZoneInfo("UTC"), lib, None, last_bar_index=4)
+    _set_lib_properties(candle, 2, ZoneInfo("UTC"), None, last_bar_index=4)
 
     assert lib.bar_index == 2
     assert lib.last_bar_index == 4

@@ -91,6 +91,7 @@ def run(script_file: str) -> None:
 
             runner = ScriptRunner(
                 script_path, ohlcv_iter, syminfo, last_bar_index=size - 1,
+                last_bar_time=reader.get_last_bar_time(start_ts, end_ts),
                 plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
                 lossless_volume=reader.lossless_volume,
                 lossless_prices=reader.lossless_prices,

@@ -313,7 +313,9 @@ class Script:
             _programmatic_settings.clear()
 
         # Apply programmatic inputs (override .toml values)
+        input_overrides: set[str] = set()
         if is_runnable and _programmatic_inputs:
+            input_overrides = set(_programmatic_inputs)
             for key, value in _programmatic_inputs.items():
                 _old_input_values[key] = value
                 _old_input_values[key + '__global__'] = value
@@ -328,6 +330,16 @@ class Script:
             setattr(func, 'script', self)
 
             if is_runnable:
+                # The inputs are only known once the defaults of main() have run. Strict
+                # compilation suffixes the input ids with ``__global__``; an override is
+                # keyed by the plain name, the way the toml spells it.
+                input_names = {key.removesuffix('__global__') for key in self.inputs}
+                unknown = input_overrides - input_names - self.inputs.keys()
+                if unknown:
+                    raise ValueError(
+                        f"Unknown input(s): {', '.join(sorted(unknown))}. Inputs are keyed by "
+                        f"the main() parameter name: {', '.join(sorted(input_names)) or 'none'}")
+
                 # Save toml file if not in pytest and not disabled by env var PYNE_SAVE_SCRIPT_TOML = 0
                 save = os.environ.get('PYNE_SAVE_SCRIPT_TOML', '1') == '1' and 'pytest' not in sys.modules
                 if save and not save_overrides:

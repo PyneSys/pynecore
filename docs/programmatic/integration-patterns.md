@@ -143,45 +143,53 @@ class PyneStrategySignals(IStrategy):
 
 ## Live Data Feed
 
-Process bars as they arrive from an exchange:
+Process bars as they close on an exchange. The feed yields the closed history first, then
+`LIVE_TRANSITION`, then every new candle once it has closed, and the runner runs in
+[live mode](./script-runner.md#live-mode), so each live bar's result comes out as soon as the
+candle closes. CCXT's `fetch_ohlcv` returns the still-forming candle as its last row, so the
+feed passes on only the candles whose period has ended:
 
 ```python
 import ccxt
 import time
+from pynecore.core.script_runner import ScriptRunner, LIVE_TRANSITION
 from pynecore.types.ohlcv import OHLCV
 
 exchange = ccxt.binance({"enableRateLimit": True})
 
 
-def live_candles(symbol, timeframe, warmup=200):
-    """Yield OHLCV bars: historical warmup first, then poll for new bars."""
-    # Warmup: fetch historical bars
-    raw = exchange.fetch_ohlcv(symbol, timeframe, limit=warmup)
-    for bar in raw:
-        yield OHLCV(
-            timestamp=bar[0],  # CCXT and PyneCore both use milliseconds
-            open=bar[1], high=bar[2], low=bar[3], close=bar[4], volume=bar[5],
-        )
+def closed_candles(symbol, timeframe, limit):
+    """The last ``limit`` closed candles; the forming candle is dropped."""
+    bar_ms = exchange.parse_timeframe(timeframe) * 1000
+    now = exchange.milliseconds()
+    raw = exchange.fetch_ohlcv(symbol, timeframe, limit=limit + 1)
+    return [
+        OHLCV(timestamp=bar[0],  # CCXT and PyneCore both use milliseconds
+              open=bar[1], high=bar[2], low=bar[3], close=bar[4], volume=bar[5])
+        for bar in raw if bar[0] + bar_ms <= now
+    ][-limit:]
 
-    # Live: poll for new bars
-    last_ts = raw[-1][0]
+
+def live_candles(symbol, timeframe, warmup=200):
+    """Closed history, ``LIVE_TRANSITION``, then each new candle once it closes."""
+    history = closed_candles(symbol, timeframe, warmup)
+    yield from history
+    yield LIVE_TRANSITION
+
+    last_ts = history[-1].timestamp
     while True:
         time.sleep(10)
-        raw = exchange.fetch_ohlcv(symbol, timeframe, since=last_ts, limit=5)
-        for bar in raw:
-            if bar[0] > last_ts:
-                last_ts = bar[0]
-                yield OHLCV(
-                    timestamp=bar[0],  # CCXT and PyneCore both use milliseconds
-                    open=bar[1], high=bar[2], low=bar[3], close=bar[4], volume=bar[5],
-                )
+        for candle in closed_candles(symbol, timeframe, 5):
+            if candle.timestamp > last_ts:
+                last_ts = candle.timestamp
+                yield candle
 
 
-# Use with ScriptRunner
 runner = ScriptRunner(
     script_path=Path("my_indicator.py"),
     ohlcv_iter=live_candles("BTC/USDT", "1h"),
     syminfo=syminfo,
+    live=True,
 )
 
 for candle, plot_data in runner.run_iter():
@@ -189,6 +197,9 @@ for candle, plot_data in runner.run_iter():
     if rsi < 30:  # NA values return False for all comparisons — no special handling needed
         print(f"RSI oversold: {rsi:.2f} at {candle.close}")
 ```
+
+Without `live=True` the runner treats the feed as history and reads one bar ahead, so every
+result would arrive a candle late.
 
 > For a complete live CCXT example, see
 > [pynecore-examples/04-live-ccxt](https://github.com/PyneSys/pynecore-examples/tree/main/04-live-ccxt).
@@ -267,12 +278,11 @@ sweep leaves the script's configuration as it was (see
 - **Materialize generators**: If running multiple scripts on the same data, convert the OHLCV
   iterator to a list first (`list(reader.read_from(...))`) to avoid re-reading from disk.
 
-- **Cache in live systems**: When integrating with frameworks that re-call your indicator function
-  on every new bar (like FreqTrade), cache computed values keyed by timestamp. Only run PyneCore
-  on new bars — return cached values for bars you've already processed.
-
-- **Batch processing**: PyneCore processes ~16,000 bars/second. For most use cases (hourly/daily
-  data), re-running from scratch is fast enough that caching isn't necessary.
+- **Re-run instead of caching partial results**: frameworks like FreqTrade call your indicator
+  function with the full DataFrame on every new candle. Run the script over all of it again. A
+  script carries state from bar to bar (moving averages, `var` variables, the strategy's
+  position), so running it on the new bars alone gives different values. A full re-run of a simple
+  indicator over 5,000 bars takes a few tens of milliseconds.
 
 ## Complete Examples
 

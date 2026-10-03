@@ -80,7 +80,6 @@ def __test_live_ltf_e2e_warmup_and_closed_windows__(script_path, module_key, sym
     from pathlib import Path
     from datetime import datetime, UTC
 
-    from pynecore import lib
     from pynecore.core.script_runner import ScriptRunner, LIVE_TRANSITION
     from pynecore.core.plugin.live_provider import PluginSymbol
     from pynecore.providers.replay import ReplayConfig
@@ -131,19 +130,16 @@ def __test_live_ltf_e2e_warmup_and_closed_windows__(script_path, module_key, sym
         historical = [_chart_ohlcv(_TS0 + i * _CHART_STEP) for i in range(_N_HIST)]
         live_chart = [_chart_ohlcv(_TS0 + (_N_HIST + i) * _CHART_STEP) for i in range(_N_LIVE)]
 
-        setattr(lib, '_is_live', True)
-        try:
-            runner = ScriptRunner(
-                script_path,
-                itertools.chain(historical, [LIVE_TRANSITION], live_chart),
-                syminfo,
-                security_data=security_data,
-            )
-            rows = []
-            for _candle, pv in runner.run_iter():
-                rows.append((pv["n"], pv["sum"]))
-        finally:
-            setattr(lib, '_is_live', False)
+        runner = ScriptRunner(
+            script_path,
+            itertools.chain(historical, [LIVE_TRANSITION], live_chart),
+            syminfo,
+            security_data=security_data,
+            live=True,
+        )
+        rows = []
+        for _candle, pv in runner.run_iter():
+            rows.append((pv["n"], pv["sum"]))
 
     _assert_rows(rows, expected_size, expected_sum, log)
 

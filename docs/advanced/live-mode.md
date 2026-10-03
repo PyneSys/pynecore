@@ -5,7 +5,7 @@ title: "Live Mode"
 description: "Real-time data streaming with intra-bar updates, varip support, and paper trading"
 icon: "stream"
 date: "2026-04-08"
-lastmod: "2026-09-28"
+lastmod: "2026-10-03"
 draft: false
 toc: true
 categories: ["Advanced", "Strategy", "Live"]
@@ -74,8 +74,8 @@ script sees for the first time.
 
 ### Transition
 
-The ScriptRunner detects the transition automatically when the iterator yields its first
-`BarUpdate` object (instead of a plain `OHLCV`).  At this point:
+The data iterator marks the end of the history with the `LIVE_TRANSITION` sentinel, and the
+ScriptRunner switches to the live phase when it reads it.  At this point:
 
 - `barstate.islastconfirmedhistory` becomes `True` on the final historical bar
 - Output writers flush to disk (plot CSV, trade CSV)
@@ -83,15 +83,16 @@ The ScriptRunner detects the transition automatically when the iterator yields i
 
 ### Live Phase
 
-The provider streams `BarUpdate` objects via WebSocket.  Each update carries an OHLCV snapshot
-and an `is_closed` flag:
+The provider streams `OHLCV` updates via WebSocket.  The `is_closed` field tells a price update
+of the forming bar from its close:
 
 ```
-BarUpdate(ohlcv=OHLCV(...), is_closed=False)   # intra-bar tick
-BarUpdate(ohlcv=OHLCV(...), is_closed=True)     # bar closed
+OHLCV(..., is_closed=False)   # intra-bar tick
+OHLCV(..., is_closed=True)    # bar closed
 ```
 
-The script executes on **every update** — both intra-bar ticks and bar closes.
+An indicator executes on **every update** — both intra-bar ticks and bar closes.  A strategy
+executes on the bar close, and on every tick only with `calc_on_every_tick=true`.
 
 ## Intra-Bar Updates
 
@@ -143,8 +144,8 @@ as it does in backtesting with the bar magnifier.
 ### Strategy Suppression
 
 During the historical phase, all 7 strategy functions (`entry`, `exit`, `close`, `close_all`,
-`cancel`, `cancel_all`, `order`) are no-ops.  This is controlled by the internal
-`lib._strategy_suppressed` flag — the same pattern as `lib._lib_semaphore`.
+`cancel`, `cancel_all`, `order`) are no-ops.  Live mode turns this on for the historical phase
+and lifts it at the transition.
 
 ## Output
 
@@ -208,19 +209,21 @@ Press `Ctrl+C` to stop live streaming.  The provider goes through a graceful shu
 │             │    live_ohlcv_generator() ┌──────┴───────┐
 │             │ ◄──── Queue ◄──── async ──│  WebSocket   │
 └──────┬──────┘                           └──────────────┘
-       │ Iterator[OHLCV | BarUpdate]
+       │ Iterator[OHLCV]: history, LIVE_TRANSITION, live updates
        │
 ┌──────▼───────┐
-│ ScriptRunner │
-│              │  isinstance() detects BarUpdate → live transition
+│ ScriptRunner │  live=True
+│              │  LIVE_TRANSITION → live transition
 │  historical  │  OHLCV bars → normal backtest loop
-│  live loop   │  BarUpdate → intra-bar + bar close processing
+│  live loop   │  OHLCV(is_closed=...) → intra-bar + bar close processing
 └──────────────┘
 ```
 
 The `live_ohlcv_generator` bridges the async WebSocket world to synchronous iteration via a
 background thread and `queue.Queue`.  The ScriptRunner is completely data-source agnostic — it
-only cares whether it receives `OHLCV` or `BarUpdate` objects.
+only needs the history, the `LIVE_TRANSITION` sentinel and the live updates, in this order.  Any
+feed can drive it from Python: see [Live Mode](../programmatic/script-runner.md#live-mode) in the
+ScriptRunner API.
 
 ## Limitations
 

@@ -104,7 +104,6 @@ def __test_several_rounds_on_one_bar_do_not_mix_slot_data__(script_path, module_
     import tempfile
     from pathlib import Path
 
-    from pynecore import lib
     from pynecore.core.script_runner import ScriptRunner, LIVE_TRANSITION
     from pynecore.types.na import NA
 
@@ -121,16 +120,12 @@ def __test_several_rounds_on_one_bar_do_not_mix_slot_data__(script_path, module_
                 live.append(__test_helper_bar(h, False))
                 live.append(__test_helper_bar(h, False))
                 live.append(__test_helper_bar(h, True))
-            setattr(lib, '_is_live', True)
-            try:
-                r = ScriptRunner(
-                    script_path,
-                    itertools.chain(historical, [LIVE_TRANSITION], live),
-                    syminfo, security_data={"120": feed})
-                return [(c.timestamp, pv.get("a"), pv.get("b"), pv.get("v"))
-                        for c, pv in r.run_iter()]
-            finally:
-                setattr(lib, '_is_live', False)
+            r = ScriptRunner(
+                script_path,
+                itertools.chain(historical, [LIVE_TRANSITION], live),
+                syminfo, security_data={"120": feed}, live=True)
+            return [(c.timestamp, pv.get("a"), pv.get("b"), pv.get("v"))
+                    for c, pv in r.run_iter()]
 
     syminfo.period = "60"
     # 30s: long enough for the whole run many times over, short enough that the

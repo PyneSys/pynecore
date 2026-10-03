@@ -126,6 +126,24 @@ def __test_unknown_setting_raises_and_leaves_nothing_behind__(tmp_path: Path):
     assert __test_helper_length(module) == 10
 
 
+# noinspection PyProtectedMember
+def __test_unknown_input_raises__(tmp_path: Path):
+    """ An input key that is not a main() parameter (a title, a typo) is an error """
+    path = __test_helper_script_path(tmp_path)
+    with pytest.raises(ValueError, match="Length"):
+        import_script(path, inputs={"Length": 33})
+    assert not script_mod._old_input_values
+
+
+def __test_strict_compiled_input_is_keyed_by_the_plain_name__(tmp_path: Path):
+    """ Strict compilation suffixes the input with ``__global__``: the plain name overrides it """
+    path = tmp_path / "strict_settings.py"
+    path.write_text(SCRIPT_SOURCE.format(library_import="").replace(
+        "length=input.int", "length__global__=input.int"), encoding="utf-8")
+    module = import_script(path, inputs={"length": 33})
+    assert inspect.signature(module.main).parameters["length__global__"].default == 33
+
+
 def __test_helper_import_in_child(path: Path, save_overrides: bool) -> list[str]:
     """Import with overrides where the decorator saves the toml (never under pytest)"""
     probe = (

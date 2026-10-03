@@ -59,7 +59,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, UTC
 from multiprocessing import parent_process
 from time import monotonic
-from typing import TYPE_CHECKING, Any, Callable, Iterator, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from ..types.na import set_bool_na
 from .security_shm import (
@@ -81,7 +81,8 @@ from .security_mp import apply_child_run_env
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from multiprocessing.synchronize import Lock as LockType
+    from multiprocessing.process import BaseProcess
+    from multiprocessing.synchronize import Condition, Lock as LockType
     from .live_runner import LiveBarStreamer
     from .security import DevBatchSpec
     from ..types.ohlcv import OHLCV
@@ -121,15 +122,16 @@ def _start_parent_death_watchdog() -> None:
     if parent is None:  # not started through multiprocessing
         return
 
-    def _watch() -> None:
-        parent.join()  # blocks on the parent's sentinel, not a poll loop
+    def _watch(runner: BaseProcess) -> None:
+        runner.join()  # blocks on the parent's sentinel, not a poll loop
         logger.warning(
             "Security process %d orphaned (parent %s gone); exiting.",
-            os.getpid(), parent.pid,
+            os.getpid(), runner.pid,
         )
         os._exit(1)
 
-    threading.Thread(target=_watch, daemon=True, name="sec-parent-watchdog").start()
+    threading.Thread(target=_watch, args=(parent,), daemon=True,
+                     name="sec-parent-watchdog").start()
 
 
 # Warmup window for cross-symbol live security contexts. 500 bars matches the
@@ -138,6 +140,7 @@ def _start_parent_death_watchdog() -> None:
 _DEFAULT_WARMUP_BARS = 500
 
 
+# noinspection PyProtectedMember
 def _run_rate_source_loop(
         sec_id: str,
         data_source: 'PluginSymbol',
@@ -160,7 +163,6 @@ def _run_rate_source_loop(
     from .live_runner import download_warmup_in_memory, LiveBarStreamer
     from .security_shm import write_result, write_na
     from pynecore.lib.timeframe import _in_seconds
-    from pynecore.lib import _parse_timezone
 
     provider_cls = load_plugin(data_source.provider_name)
     if not issubclass(provider_cls, LiveProviderPlugin):
@@ -184,8 +186,6 @@ def _run_rate_source_loop(
         provider.syminfo = syminfo
     else:
         syminfo = provider.update_symbol_info()
-
-    tz = _parse_timezone(syminfo.timezone)
 
     tf_seconds = _in_seconds(data_source.timeframe)
     time_to = datetime.now(UTC)
@@ -429,7 +429,7 @@ def security_process_main(
         chart_type_warmup: 'str | None' = None,
         registry: 'dict[str, dict] | None' = None,
         chart_calendar=None,
-        ring_conditions: dict | None = None,
+        ring_conditions: 'dict[str, Condition] | None' = None,
         consumer_ids: 'dict[str, list[str]] | None' = None,
         registry_pipe=None,
         chart_ring_capacity: 'dict[str, int] | None' = None,
@@ -591,7 +591,6 @@ def security_process_main(
     # ── Source dispatch: file (backtest) or live provider (cross-symbol live) ──
     from .syminfo import SymInfo
     from ..types.ohlcv import OHLCV
-    live_provider = None
     live_streamer: 'LiveBarStreamer | None' = None
     bar_buffer: list[OHLCV] = []
     # Watermark used by the live path to dedupe streamer bars against the
@@ -610,12 +609,14 @@ def security_process_main(
     # Warmup horizon (ms): the instant the REST warmup ended. The live LTF-window
     # path uses it to drop a still-forming warmup tail bar. Set in the live branch.
     warmup_horizon_ms: int = 0
+    # Timestamp of a warmup tail bar a WS close refined in place (live path only).
+    ws_refined_tail_ts: float | None = None
 
     if isinstance(data_source, PluginSymbol):
         # Live cross-symbol path: own provider + warmup download + WS stream.
         from .plugin import load_plugin
         from .plugin.live_provider import LiveProviderPlugin
-        from .live_runner import download_warmup_in_memory, LiveBarStreamer
+        from . import live_runner
         from pynecore.lib.timeframe import _in_seconds
 
         provider_cls = load_plugin(data_source.provider_name)
@@ -662,13 +663,13 @@ def security_process_main(
         # closing in the (REST-done → WS-connected) window would be lost.
         # ``last_historical_timestamp=None`` because warmup hasn't run yet;
         # the post-warmup catch-up below dedupes against the warmup tail.
-        live_streamer = LiveBarStreamer(
+        live_streamer = streamer = live_runner.LiveBarStreamer(
             live_provider, data_source.symbol, data_source.timeframe,
             syminfo=syminfo,
             last_historical_timestamp=None,
         )
-        live_streamer.start()
-        bar_buffer = download_warmup_in_memory(live_provider, time_from, time_to)
+        streamer.start()
+        bar_buffer = live_runner.download_warmup_in_memory(live_provider, time_from, time_to)
         last_warmup_ts = bar_buffer[-1].timestamp if bar_buffer else None
         # Equal-timestamp WS closes refine the warmup tail — providers whose
         # REST window includes the currently forming candle deliver the true
@@ -677,18 +678,16 @@ def security_process_main(
         # lets equal timestamps through for refinement. A tail refined this way
         # is authoritative *and* already consumed from the streamer queue, so the
         # LTF pop loop below must keep it (the stream will not redeliver it).
-        ws_refined_tail_ts: float | None = None
         if last_warmup_ts is not None:
-            for _bar in live_streamer.pop_new_closed_bars():
+            for _bar in streamer.pop_new_closed_bars():
                 if _bar.timestamp == last_warmup_ts and bar_buffer:
                     bar_buffer[-1] = _bar
                     ws_refined_tail_ts = _bar.timestamp
                 elif _bar.timestamp > last_warmup_ts:
                     bar_buffer.append(_bar)
         else:
-            bar_buffer.extend(live_streamer.pop_new_closed_bars())
+            bar_buffer.extend(streamer.pop_new_closed_bars())
         reader = None
-        ohlcv_path = None
     else:
         # File mode (backtest, same-symbol live with HTF aggregator).
         ohlcv_path = data_source
@@ -1104,15 +1103,17 @@ def security_process_main(
 
     def _ensure_snapshot() -> instance_state.RootVarSnapshot | None:
         nonlocal var_snapshot
-        if var_snapshot is None:
-            var_snapshot = instance_state.RootVarSnapshot(root_keys)
-        return var_snapshot if var_snapshot.has_vars else None
+        snapshot = var_snapshot
+        if snapshot is None:
+            snapshot = var_snapshot = instance_state.RootVarSnapshot(root_keys)
+        return snapshot if snapshot.has_vars else None
 
     def _ensure_series_snapshot() -> instance_state.RootSeriesSnapshot | None:
         nonlocal series_snapshot
-        if series_snapshot is None:
-            series_snapshot = instance_state.RootSeriesSnapshot(root_keys)
-        return series_snapshot if series_snapshot.has_series else None
+        snapshot = series_snapshot
+        if snapshot is None:
+            snapshot = series_snapshot = instance_state.RootSeriesSnapshot(root_keys)
+        return snapshot if snapshot.has_series else None
 
     def _ensure_child_snapshot() -> instance_state.RootChildSnapshot:
         nonlocal child_snapshot
@@ -1168,7 +1169,7 @@ def security_process_main(
             and isinstance(data_source, PluginSymbol)):
         from pynecore.lib.timeframe import _in_seconds
         assert ltf_take_value is not None and ltf_publish is not None
-        _streamer = cast('LiveBarStreamer', live_streamer)
+        _streamer = live_streamer
         _take_value = ltf_take_value
         _publish = ltf_publish
         ltf_span_ms = int(_in_seconds(data_source.timeframe) * 1000)
@@ -1200,7 +1201,7 @@ def security_process_main(
         last_warmup_ts = bar_buffer[-1].timestamp if bar_buffer else None
 
         def _run_ltf_intrabar(intrabar, bar_index, confirmed, is_new, islast):
-            _set_lib_properties(intrabar, bar_index, tz, lib, round_decimals,
+            _set_lib_properties(intrabar, bar_index, tz, round_decimals,
                                 lossless_volume=lossless_volume,
                                 lossless_prices=lossless_prices)
             lib.last_bar_index = float(bar_index)
@@ -1336,11 +1337,11 @@ def security_process_main(
 
     def _bar_open_at(idx: int) -> int:
         """Open instant (ms) of the source bar at ``idx``, 0 past the end."""
-        _bar = _read_bar(idx)
-        return 0 if _bar is None else _bar.timestamp
+        src_bar = _read_bar(idx)
+        return 0 if src_bar is None else src_bar.timestamp
 
-    def _next_frontier(next_open: int, next2_open: int) -> int:
-        """Frontier close to publish with the bar preceding ``next_open``.
+    def _next_frontier(upcoming_open: int, upcoming2_open: int) -> int:
+        """Frontier close to publish with the bar preceding ``upcoming_open``.
 
         "Every bar of mine closing at or before this is already in the ring" —
         that is the next UNPUBLISHED bar's scheduled close minus one ms. A static
@@ -1348,8 +1349,8 @@ def security_process_main(
         the frontier goes to ``+inf``; a streaming source instead assumes the
         schedule's next bar, which is what the chart will target next.
         """
-        if next_open:
-            return actual_bar_close(next_open, next2_open, own_calendar,
+        if upcoming_open:
+            return actual_bar_close(upcoming_open, upcoming2_open, own_calendar,
                                     own_timeframe) - 1
         if reader is not None:
             return FRONTIER_INF
@@ -1453,11 +1454,11 @@ def security_process_main(
         counter, whether or not this process serves it alone."""
         if not round_is_last_step[0]:
             return
-        for _member in sec_ids:
-            sync_block.increment_rounds_done(_member)
-            done_event_map[_member].set()
+        for member in sec_ids:
+            sync_block.increment_rounds_done(member)
+            done_event_map[member].set()
 
-    def _chart_driven_step(round_flags: int) -> 'Iterator[tuple]':
+    def _chart_driven_step(slot_flags: int) -> 'Iterator[tuple]':
         """The one step of an ordinary round: whatever the chart put in the slot.
 
         The round context is unpacked HERE, once: the chart may already be
@@ -1465,7 +1466,7 @@ def security_process_main(
         every as-of of the round must come from these two values and not from a
         later re-read.
 
-        :param round_flags: The slot's flags, read by the caller.
+        :param slot_flags: The slot's flags, read by the caller.
         :return: A one-item iterator of ``(target_time, flags, more_steps,
             dev_values)``; ``dev_values`` is ``None`` — the pushed OHLCV is read
             from the slot.
@@ -1473,8 +1474,8 @@ def security_process_main(
         sec_ctx.round_tick, sec_ctx.round_sched_next_open = (
             sync_block.get_round_context(sec_id))
         round_is_last_step[0] = True
-        yield (sync_block.get_target_time(sec_id), round_flags,
-               bool(round_flags & FLAG_MORE_STEPS), None)
+        yield (sync_block.get_target_time(sec_id), slot_flags,
+               bool(slot_flags & FLAG_MORE_STEPS), None)
 
     def _dev_batch_steps() -> 'Iterator[tuple]':
         """Replay a planned developing-batch sequence, one record per step.
@@ -1497,7 +1498,8 @@ def security_process_main(
         :return: Iterator of ``(target_time, flags, more_steps, dev_values)``.
         """
         nonlocal dev_batch_next
-        assert dev_batch_records is not None
+        records = dev_batch_records
+        assert records is not None
         prev_tick = -1
         record = dev_batch_next
         while record is not None:
@@ -1506,7 +1508,7 @@ def security_process_main(
             # One record of lookahead: whether this step is the last one of its
             # chart bar (and of the whole sequence) is a property of the NEXT
             # record, so the iterator always stands one record ahead.
-            following = next(dev_batch_records, None)
+            following = next(records, None)
             dev_batch_next = following
             if tick != prev_tick:
                 # A fresh chart bar: do not run further ahead of the chart than
@@ -1518,23 +1520,22 @@ def security_process_main(
             sec_ctx.round_sched_next_open = sched_next_open
             if kind == DEV_BATCH_DEVELOPING:
                 step_flags = FLAG_IS_DEVELOPING | FLAG_DEV_HISTORICAL
-                dev_values = (r_open, r_high, r_low, r_close, r_volume,
-                              period_start)
+                step_values = (r_open, r_high, r_low, r_close, r_volume,
+                               period_start)
             elif kind == DEV_BATCH_CLOSED:
                 step_flags = FLAG_CLOSED_OVERRIDE | FLAG_DEV_HISTORICAL
-                dev_values = (r_open, r_high, r_low, r_close, r_volume,
-                              period_start)
+                step_values = (r_open, r_high, r_low, r_close, r_volume,
+                               period_start)
             else:
                 # Prefill: the child reads its OWN file up to this target, the
                 # closed periods that precede the first containing one.
                 step_flags = 0
-                dev_values = None
-            last = following is None
-            more = not last and following[7] == tick
+                step_values = None
+            more = following is not None and following[7] == tick
             if more:
                 step_flags |= FLAG_MORE_STEPS
-            round_is_last_step[0] = last
-            yield period_start, step_flags, more, dev_values
+            round_is_last_step[0] = following is None
+            yield period_start, step_flags, more, step_values
             record = following
 
     def _dev_batch_throttle() -> None:
@@ -1567,11 +1568,11 @@ def security_process_main(
             dev_batch_pending.clear()
             return
         own = sync_block.index_of(sec_id)
-        chart = sync_block.chart_index
+        chart_idx = sync_block.chart_index
         with cond:
             try:
                 while True:
-                    watermark = sync_block.get_watermark(chart, own)
+                    watermark = sync_block.get_watermark(chart_idx, own)
                     while dev_batch_pending and dev_batch_pending[0] <= watermark:
                         dev_batch_pending.popleft()
                     if (len(dev_batch_pending) < RING_RESUME_ENTRIES
@@ -1585,7 +1586,7 @@ def security_process_main(
                     sync_block.set_parked_until(
                         sec_id,
                         dev_batch_pending[len(dev_batch_pending) - RING_RESUME_ENTRIES])
-                    if sync_block.get_watermark(chart, own) != watermark:
+                    if sync_block.get_watermark(chart_idx, own) != watermark:
                         continue
                     cond.wait(_DEV_BATCH_WAIT_SECONDS)
             finally:
@@ -1710,7 +1711,7 @@ def security_process_main(
                             snap.restore()
                         _ensure_child_snapshot().restore()
 
-                    _set_lib_properties(_ha_apply(ohlcv), current_bar, tz, lib, round_decimals,
+                    _set_lib_properties(_ha_apply(ohlcv), current_bar, tz, round_decimals,
                                         lossless_volume=lossless_volume,
                                         lossless_prices=lossless_prices,
                                         derived_prices=_derived_prices)
@@ -1796,7 +1797,7 @@ def security_process_main(
 
                     last_dev_period_start = None
 
-                    _set_lib_properties(_ha_apply(ohlcv), current_bar, tz, lib, round_decimals,
+                    _set_lib_properties(_ha_apply(ohlcv), current_bar, tz, round_decimals,
                                         lossless_volume=lossless_volume,
                                         lossless_prices=lossless_prices,
                                         derived_prices=_derived_prices)
@@ -1893,7 +1894,7 @@ def security_process_main(
                     sec_ctx.is_round_last = not next_open or next_open > target_time
 
                     total_bars = _current_total()
-                    _set_lib_properties(_ha_apply(ohlcv_file_bar), current_bar, tz, lib, round_decimals,
+                    _set_lib_properties(_ha_apply(ohlcv_file_bar), current_bar, tz, round_decimals,
                                         lossless_volume=lossless_volume,
                                         lossless_prices=lossless_prices,
                                         derived_prices=_derived_prices)

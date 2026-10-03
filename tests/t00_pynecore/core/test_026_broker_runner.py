@@ -23,7 +23,6 @@ from typing import cast
 
 import pytest
 
-from pynecore import lib as _lib
 from pynecore.core.broker.models import (
     CancelIntent,
     CapabilityLevel,
@@ -573,18 +572,16 @@ def __test_live_intra_bar_sync_dispatches_on_next_tick__(tmp_path):
         yield live[2]
         observations.append(('after_tick_3', len(plugin.entry_calls)))
 
-    # Set live flags before instantiation so the historical suppression
-    # and live transition paths run as in production.
     for key in [script_path.stem]:
         sys.modules.pop(key, None)
-    setattr(_lib, '_is_live', True)
-    setattr(_lib, '_strategy_suppressed', True)
 
+    # Live mode runs the historical suppression and live transition paths as in production
     runner = ScriptRunner(
         script_path=script_path,
         ohlcv_iter=observing_iter(),
         syminfo=_make_syminfo(),
         broker_plugin=plugin,  # type: ignore[arg-type]
+        live=True,
     )
     runner.script.calc_on_every_tick = True
 
@@ -680,14 +677,13 @@ def __test_live_broker_marks_open_trade_before_each_tick__(tmp_path):
         yield from live
 
     sys.modules.pop(script_path.stem, None)
-    setattr(_lib, '_is_live', True)
-    setattr(_lib, '_strategy_suppressed', True)
 
     runner = ScriptRunner(
         script_path=script_path,
         ohlcv_iter=observing_iter(),
         syminfo=_make_syminfo(),
         broker_plugin=cast(BrokerPlugin, plugin),
+        live=True,
     )
     runner.script.calc_on_every_tick = True
 

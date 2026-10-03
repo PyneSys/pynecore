@@ -99,7 +99,6 @@ def __test_developing_consumer_does_not_wait_for_its_own_close__(script_path, mo
     import tempfile
     from pathlib import Path
 
-    from pynecore import lib
     from pynecore.core.script_runner import ScriptRunner, LIVE_TRANSITION
     from pynecore.types.na import NA
 
@@ -116,16 +115,12 @@ def __test_developing_consumer_does_not_wait_for_its_own_close__(script_path, mo
                 live.append(__test_helper_bar(h, False))
                 live.append(__test_helper_bar(h, False))
                 live.append(__test_helper_bar(h, True))
-            setattr(lib, '_is_live', True)
-            try:
-                r = ScriptRunner(
-                    script_path,
-                    itertools.chain(historical, [LIVE_TRANSITION], live),
-                    syminfo, security_data={"120": feed})
-                return [(c.timestamp, pv.get("a"), pv.get("b"), pv.get("v"))
-                        for c, pv in r.run_iter()]
-            finally:
-                setattr(lib, '_is_live', False)
+            r = ScriptRunner(
+                script_path,
+                itertools.chain(historical, [LIVE_TRANSITION], live),
+                syminfo, security_data={"120": feed}, live=True)
+            return [(c.timestamp, pv.get("a"), pv.get("b"), pv.get("v"))
+                    for c, pv in r.run_iter()]
 
     syminfo.period = "60"
     rows = __test_helper_run_with_timeout(scenario)

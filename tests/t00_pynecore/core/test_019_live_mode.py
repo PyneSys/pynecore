@@ -34,17 +34,13 @@ def _make_ohlcv(ts, close=100.0, is_closed=True):
 
 
 def _create_live_runner(script_path, module_key, syminfo, ohlcv_iter):
-    """Helper: set live mode flags, clean module cache, create ScriptRunner."""
+    """Helper: clean module cache, create a live ScriptRunner."""
     from pynecore.core.script_runner import ScriptRunner
-    from pynecore import lib
 
     for key in [module_key, script_path.stem]:
         sys.modules.pop(key, None)
 
-    # Use setattr to avoid FunctionIsolationTransformer mangling the assignment
-    setattr(lib, '_is_live', True)
-    setattr(lib, '_strategy_suppressed', True)
-    return ScriptRunner(script_path, ohlcv_iter, syminfo)
+    return ScriptRunner(script_path, ohlcv_iter, syminfo, live=True)
 
 
 def _chain_live(historical, live):
@@ -263,6 +259,36 @@ def __test_a_closed_bar_behind_the_forming_bar_does_not_move_the_clock_backwards
     # Bar 180 compares against bar 120's close, not the late 99.0 for bar 60.
     assert results[2][1]["c"] == 103.0
     assert results[2][1]["c1"] == 102.5
+
+
+def __test_a_late_tick_behind_the_forming_bar_does_not_move_the_clock_backwards__(
+        script_path, module_key, syminfo,
+):
+    """An intra-bar update of an older period arriving after the next bar opened is dropped.
+
+    Taken as a new bar it would advance ``bar_index`` under a timestamp behind
+    the bar already on the clock, and the bar that then closes would compare
+    against the late tick instead of the bar before it.
+    """
+    historical = [_make_ohlcv(0, 100.0)]
+    live = [
+        _make_ohlcv(120, is_closed=False, close=102.0),  # bar 120 opens
+        _make_ohlcv(60, is_closed=False, close=90.0),    # late tick of bar 60
+        _make_ohlcv(120, is_closed=True, close=102.5),
+        _make_ohlcv(180, is_closed=True, close=103.0),
+    ]
+
+    runner = _create_live_runner(
+        script_path, module_key, syminfo,
+        _chain_live(historical, live),
+    )
+    results = [(c, dict(p)) for c, p in runner.run_iter()]
+
+    assert [candle.timestamp for candle, _ in results] == [0, 120, 180]
+    assert results[1][1]["c"] == 102.5
+    assert results[1][1]["c1"] == 100.0
+    assert results[2][1]["c1"] == 102.5
+    assert runner.bar_index == 2
 
 
 def __test_a_reserved_closed_bar_does_not_move_the_clock_backwards__(

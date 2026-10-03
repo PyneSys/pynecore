@@ -51,9 +51,10 @@ def __test_last_bar_time_anchored__(script_path, module_key, syminfo):
 
 
 def __test_last_bar_time_tracking_default__(script_path, module_key, syminfo):
-    """No anchor (``last_bar_time=None`` — live semantics): ``last_bar_time`` tracks
-    the current bar, so the current bar is always the right edge of the viewport."""
-    r = _make_runner(script_path, module_key, syminfo, _bars(3))
+    """No anchor (a feed of unknown length and ``last_bar_time=None`` — live semantics):
+    ``last_bar_time`` tracks the current bar, so the current bar is always the right edge
+    of the viewport."""
+    r = _make_runner(script_path, module_key, syminfo, iter(_bars(3)))
 
     rows = [dict(_plot) for _, _plot in r.run_iter()]
     times = [_TS0 + i * _STEP for i in range(3)]

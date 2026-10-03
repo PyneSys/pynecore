@@ -104,7 +104,6 @@ def __test_two_live_htf_contexts_do_not_deadlock__(script_path, module_key, symi
     import tempfile
     from pathlib import Path
 
-    from pynecore import lib
     from pynecore.core.script_runner import ScriptRunner, LIVE_TRANSITION
     from pynecore.types.na import NA
 
@@ -116,16 +115,12 @@ def __test_two_live_htf_contexts_do_not_deadlock__(script_path, module_key, symi
             feed = __test_helper_write_feed(Path(td))
             historical = [__test_helper_bar(h) for h in range(_N_HIST)]
             live = [__test_helper_bar(h) for h in range(_N_HIST, _N_HOURS)]
-            setattr(lib, '_is_live', True)
-            try:
-                r = ScriptRunner(
-                    script_path,
-                    itertools.chain(historical, [LIVE_TRANSITION], live),
-                    syminfo, security_data={"120": feed})
-                return [(c.timestamp, pv.get("a"), pv.get("b"), pv.get("v"))
-                        for c, pv in r.run_iter()]
-            finally:
-                setattr(lib, '_is_live', False)
+            r = ScriptRunner(
+                script_path,
+                itertools.chain(historical, [LIVE_TRANSITION], live),
+                syminfo, security_data={"120": feed}, live=True)
+            return [(c.timestamp, pv.get("a"), pv.get("b"), pv.get("v"))
+                    for c, pv in r.run_iter()]
 
     syminfo.period = "60"
     rows = __test_helper_run_with_timeout(scenario)

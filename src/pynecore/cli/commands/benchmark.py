@@ -83,9 +83,9 @@ def benchmark(
     secho("")
 
     # Timing results
-    import_times = []
-    run_times = []
-    total_times = []
+    import_times: list[float] = []
+    run_times: list[float] = []
+    total_times: list[float] = []
 
     # Total iterations including warmup
     total_iterations = warmup + iterations
@@ -123,9 +123,8 @@ def benchmark(
                 # Create runner
                 runner = ScriptRunner(
                     script,
-                    iter(ohlcv_list),
+                    ohlcv_list,
                     syminfo,
-                    last_bar_index=len(ohlcv_list) - 1,
                     plot_path=None if no_output else app_state.output_dir / f"benchmark_{i}.csv",
                     lossless_volume=reader.lossless_volume,
                     lossless_prices=reader.lossless_prices
@@ -162,7 +161,7 @@ def benchmark(
     std_run = statistics.stdev(run_times) if len(run_times) > 1 else 0
 
     # Candles per second
-    candles_per_second = candles / avg_run if avg_run > 0 else 0
+    candles_per_second = candles / avg_run if avg_run > 0 else 0.0
 
     # Create results table
     table = Table(title="Benchmark Results", show_header=True, header_style="bold magenta")

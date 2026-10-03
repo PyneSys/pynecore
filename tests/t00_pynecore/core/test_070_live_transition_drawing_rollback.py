@@ -31,16 +31,13 @@ def _make_ohlcv(ts, close=100.0, is_closed=True):
 
 
 def _create_live_runner(script_path, module_key, syminfo, ohlcv_iter):
-    """Helper: set live mode flags, clean module cache, create ScriptRunner."""
+    """Helper: clean module cache, create a live ScriptRunner."""
     from pynecore.core.script_runner import ScriptRunner
-    from pynecore import lib
 
     for key in [module_key, script_path.stem]:
         sys.modules.pop(key, None)
 
-    setattr(lib, '_is_live', True)
-    setattr(lib, '_strategy_suppressed', True)
-    return ScriptRunner(script_path, ohlcv_iter, syminfo)
+    return ScriptRunner(script_path, ohlcv_iter, syminfo, live=True)
 
 
 def _chain_live(historical, live):

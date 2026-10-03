@@ -1,4 +1,4 @@
-from typing import Iterable, Iterator, Generator, Callable, TYPE_CHECKING, Any, cast
+from typing import Iterable, Iterator, Generator, Callable, Sequence, TYPE_CHECKING, Any, cast
 from types import ModuleType
 import asyncio
 import concurrent.futures
@@ -45,6 +45,7 @@ from pynecore.types import script_type
 from pynecore.core.plugin.live_provider import PluginSymbol
 
 if TYPE_CHECKING:
+    # noinspection PyProtectedMember
     from multiprocessing.connection import Connection
     from multiprocessing.process import BaseProcess
     from zoneinfo import ZoneInfo
@@ -174,7 +175,8 @@ def import_script(script_path: Path, *, inputs: dict[str, Any] | None = None,
     :return: The executed module
     :raises ImportError: If the file cannot be read, is not Pyne code or has no
                          ``main`` function
-    :raises ValueError: If a ``settings`` key is not a settable script field
+    :raises ValueError: If an ``inputs`` key is not an input of the script, or a ``settings``
+                       key is not a settable script field
     """
     # Check for @pyne magic doc comment before importing (prevents import errors)
     # Without this user may get strange errors which are very hard to debug.
@@ -365,7 +367,8 @@ def _clean_bar(ohlcv: OHLCV, round_decimals: int | None,
                          else restore_f32_volume(ohlcv.volume))
 
 
-def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: ModuleType,
+# noinspection PyProtectedMember
+def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo',
                         round_decimals: int | None, last_bar_index: int | None = None,
                         last_bar_time: int | None = None,
                         lossless_volume: bool = False,
@@ -385,9 +388,6 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo', lib: Modul
         the mintick grid, so ``_round_price`` must not touch it — TradingView
         keeps the full-precision value (measured).
     """
-    if TYPE_CHECKING:  # This is needed for the type checker to work
-        from .. import lib
-
     # The 18 properties below are written straight into the module namespace:
     # a module attribute store costs twice a dict store (measured 20.4 vs
     # 10.4 ns), and this whole block runs once per bar. The reads stay on the
@@ -577,18 +577,17 @@ def _iter_chart_bar_times(path: Path, first_time_ms: int,
         yield from reader.iter_timestamps(first_time_ms, last_time_ms)
 
 
+# noinspection PyProtectedMember
 def _try_in_seconds(period: str | None) -> int | None:
     """Convert a TradingView period to seconds, or ``None`` when unparseable.
 
     :param period: Period in TradingView notation, or ``None``.
     :return: The period in seconds, or ``None``.
     """
-    from ..lib.timeframe import _in_seconds
-
     if not period:
         return None
     try:
-        return _in_seconds(period)
+        return timeframe_lib._in_seconds(period)
     except (ValueError, AssertionError):
         return None
 
@@ -626,6 +625,7 @@ def _measure_feed_period_sec(path: Path, declared: str | None = None) -> int | N
         return (reader.read(1).timestamp - reader.read(0).timestamp) // 1000
 
 
+# noinspection PyProtectedMember
 def _resample_finer_security_feed(data_path: str, target_tf: str,
                                   tmp_dir_holder: 'list[str]') -> str:
     """Pre-resample a finer ``--security`` base feed to the security timeframe.
@@ -648,7 +648,6 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
     """
     from .aggregator import aggregate_ohlcv
     from .datetime import parse_timezone
-    from ..lib.timeframe import _in_seconds
 
     src = Path(data_path)
     toml_path = src.with_suffix('.toml')
@@ -656,7 +655,7 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
         # No syminfo metadata to drive the resample grid — keep the existing feed.
         return data_path
     try:
-        target_sec = _in_seconds(target_tf)
+        target_sec = timeframe_lib._in_seconds(target_tf)
     except (ValueError, AssertionError):
         return data_path
     si = SymInfo.load_toml(toml_path)
@@ -779,6 +778,7 @@ def _calc_window_security_feed(data_path: str, ctx_tf: str, calc_tf: str,
     return str(out)
 
 
+# noinspection PyProtectedMember
 def _derives_from_chart_feed(symbol: str, timeframe: str, is_ltf: bool,
                              chart_symbol: str, chart_tf: str) -> bool:
     """Whether a security context is served by resampling the chart's own feed.
@@ -941,13 +941,13 @@ def _security_cyclic_groups(contexts: dict, states: dict) -> set[int]:
                 continue
             edges.setdefault(unit, set()).add(target)
 
-    def _returns_to(unit: tuple) -> bool:
-        """Whether following the edges out of ``unit`` leads back to it."""
+    def _returns_to(start: tuple) -> bool:
+        """Whether following the edges out of ``start`` leads back to it."""
         seen: set[tuple] = set()
-        stack = list(edges.get(unit, ()))
+        stack = list(edges.get(start, ()))
         while stack:
             node = stack.pop()
-            if node == unit:
+            if node == start:
                 return True
             if node in seen:
                 continue
@@ -958,7 +958,8 @@ def _security_cyclic_groups(contexts: dict, states: dict) -> set[int]:
     return {unit[1] for unit in edges if unit[0] == 'g' and _returns_to(unit)}
 
 
-def _security_merge_key(sid: str, contexts: dict, states: dict, prepared: dict):
+def _security_merge_key(sid: str, contexts: dict, states: dict,
+                        prepared: 'dict[str, tuple]'):
     """What a context must agree on to share a child process, or None.
 
     Two halves, because they answer to different things:
@@ -1010,7 +1011,7 @@ def _security_merge_key(sid: str, contexts: dict, states: dict, prepared: dict):
 
 
 def _security_merge_group(sid: str, all_sec_ids: list[str], contexts: dict,
-                          states: dict, prepared: dict, processes: dict,
+                          states: dict, prepared: 'dict[str, tuple]', processes: dict,
                           no_process_ids: set, unresolved_ids: set,
                           ohlcv_paths: dict, missing_data: dict,
                           disabled: bool, cyclic_groups: set) -> 'list[str] | None':
@@ -1115,7 +1116,7 @@ def _security_merge_group(sid: str, all_sec_ids: list[str], contexts: dict,
 
 
 def _security_spawn_maps(sid: str, members: 'list[str] | None', contexts: dict,
-                         states: dict, prepared: dict, consumers: dict,
+                         states: dict, prepared: 'dict[str, tuple]', consumers: dict,
                          capacity: int, arena: int) -> tuple:
     """Build the per-member spawn arguments of one security child process.
 
@@ -1199,15 +1200,16 @@ class ScriptRunner:
                  '_round_decimals', '_lossless_volume', '_lossless_prices',
                  '_config_dir', '_symbol_map', '_script_timeframe',
                  '_chart_bar_window',
-                 'broker_balance', '_sim_logged_open_ids', '_inputs', '_settings')
+                 'broker_balance', '_sim_logged_open_ids', '_inputs', '_settings', '_live')
 
     # noinspection PyProtectedMember
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
                  plot_path: Path | None = None, strat_path: Path | None = None,
                  trade_path: Path | None = None,
                  viz_path: Path | None = None, viz_journal: bool = False,
-                 update_syminfo_every_run: bool = False, last_bar_index=0,
+                 update_syminfo_every_run: bool = False, last_bar_index: int | None = None,
                  last_bar_time: int | None = None,
+                 live: bool = False,
                  inputs: dict[str, Any] | None = None,
                  settings: dict[str, Any] | None = None,
                  security_data: 'dict[str, str | Path | PluginSymbol] | None' = None,
@@ -1250,10 +1252,21 @@ class ScriptRunner:
                             create/update/delete events (to the file and/or ``viz_events``)
         :param update_syminfo_every_run: If it is needed to update the syminfo lib in every run,
                                          needed for parallel script executions
-        :param last_bar_index: Last bar index, the index of the last bar of the historical data
-        :param last_bar_time: UNIX time (ms) of the last bar of the historical data. Pine fixes
-                              ``last_bar_time`` on historical bars to the chart's final bar;
-                              ``None`` falls back to tracking the current bar (live semantics)
+        :param last_bar_index: Index of the last bar of the historical data, which Pine reports
+                               as ``last_bar_index`` on every historical bar. ``None`` takes it
+                               from a list or tuple ``ohlcv_iter``; for any other iterable it
+                               tracks the current bar, as on a realtime bar
+        :param last_bar_time: UNIX time (ms) of the last bar of the historical data, reported as
+                              ``last_bar_time`` on every historical bar. ``None`` takes it from a
+                              list or tuple ``ohlcv_iter``; for any other iterable it tracks the
+                              current bar, as on a realtime bar
+        :param live: Run in live mode. ``ohlcv_iter`` then yields the historical (warmup)
+                     bars, then :data:`LIVE_TRANSITION`, then the live updates: ``OHLCV`` with
+                     ``is_closed=False`` for each intra-bar tick and ``is_closed=True`` when the
+                     bar closes. A closed live bar is executed and yielded as soon as it
+                     arrives, while a historical bar is held until the next item shows
+                     whether it was the last one. Strategy orders start at the transition:
+                     the warmup bars only build the script's state.
         :param inputs: Optional dictionary of input values to pass to the script, keyed by
                        the ``main()`` parameter name; overrides values from .toml files
         :param settings: Optional dictionary of script settings (decorator arguments such as
@@ -1477,8 +1490,9 @@ class ScriptRunner:
             # through the engine's own ``_run_async`` (identical loop + timeout
             # to every other broker call). Only wired when the plugin actually
             # provides the actuator — other plugins simply stay state-only.
-            _failsafe_publish = getattr(broker_plugin, 'publish_native_failsafe_sl', None)
-            if _failsafe_publish is not None:
+            _failsafe_attr = getattr(broker_plugin, 'publish_native_failsafe_sl', None)
+            if _failsafe_attr is not None:
+                _failsafe_publish = cast('Callable[[Any], Any]', _failsafe_attr)
                 _engine = cast('OrderSyncEngine', self._order_sync_engine)
 
                 # noinspection PyProtectedMember
@@ -1539,8 +1553,16 @@ class ScriptRunner:
         self.ohlcv_iter = ohlcv_iter
         self.syminfo = syminfo
         self.update_syminfo_every_run = update_syminfo_every_run
+        # A list or tuple of bars knows its own end; a stream does not, and its bars are left
+        # tracking the current one. In live mode the sequence also holds the live updates.
+        if isinstance(ohlcv_iter, Sequence) and ohlcv_iter and not live:
+            if last_bar_index is None:
+                last_bar_index = len(ohlcv_iter) - 1
+            if last_bar_time is None:
+                last_bar_time = ohlcv_iter[-1].timestamp
         self.last_bar_index = last_bar_index
         self.last_bar_time = last_bar_time
+        self._live = live
         # Pre-increment scheme: bumped at the start of each bar's processing
         # (warmup, live, security loops). Starting at -1 keeps the first
         # processed bar at index 0 — matches Pine ``bar_index`` semantics.
@@ -1758,15 +1780,12 @@ class ScriptRunner:
             position.process_orders()
 
     # noinspection PyProtectedMember
-    def _write_viz_bar(self, candle) -> None:
+    def _write_viz_bar(self) -> None:
         """Emit the current bar's visual data (values + colors + journal events).
 
         Reads the just-populated ``lib._plot_data`` / ``lib._viz_dyn`` and the
         current-bar time (``lib._time``, already in milliseconds). Must be called
         after the script body ran and before the per-bar viz-state is cleared.
-
-        :param candle: The current OHLCV bar (kept for signature parity; time is
-                       taken from ``lib._time`` which the runner already set).
         """
         if self.viz_writer is None and self._viz_shadow is None:
             return
@@ -1824,6 +1843,7 @@ class ScriptRunner:
         if self._order_sync_engine is None:
             position.process_deferred_margin_call()
 
+    # noinspection PyProtectedMember
     @property
     def plot_meta(self) -> dict:
         """The registered plot-family metadata for the current/last run.
@@ -1916,6 +1936,7 @@ class ScriptRunner:
             # Closing this iterator early (break, close()) must run the runner's cleanup now
             results.close()
 
+    # noinspection PyProtectedMember
     def _run_iter(self, on_progress: Callable[[datetime], None] | None = None,
                   on_tick: Callable[[OHLCV], None] | None = None) \
             -> Generator[tuple[OHLCV, dict[str, Any]] | tuple[OHLCV, dict[str, Any], list['Trade']],
@@ -1931,6 +1952,10 @@ class ScriptRunner:
         from ..lib import _parse_timezone, barstate, string
         from pynecore.core import instance_state
         from . import script
+
+        # Run-scoped like the rest of the lib state: ``_reset_lib_vars`` clears both at the end
+        lib._is_live = self._live
+        lib._strategy_suppressed = self._live
 
         is_strat = self.script.script_type == script_type.strategy
 
@@ -2347,7 +2372,7 @@ class ScriptRunner:
                 from .import_hook import security_merge_disabled
                 _merge_disabled = security_merge_disabled()
                 _cyclic_groups = _security_cyclic_groups(
-                    cast('dict[str, dict]', sec_contexts), sec_states)
+                    sec_contexts, sec_states)
                 sec_merge_primary: dict[str, str] = {}
                 sec_merge_members: dict[str, list[str]] = {}
 
@@ -2414,9 +2439,9 @@ class ScriptRunner:
                     sends this record, so the wait ends.
                     """
                     record = {_sid: _sec_record(_sid)}
-                    for _target, _conn in list(sec_registry_pipes.items()):
+                    for _target, _pipe in list(sec_registry_pipes.items()):
                         try:
-                            _conn.send(record)
+                            _pipe.send(record)
                         except (BrokenPipeError, OSError):
                             # The child is gone; its death is handled by the
                             # liveness watcher, not here.
@@ -2445,6 +2470,7 @@ class ScriptRunner:
                 _dev_batch_allowed = (
                     _batch_allowed
                     and self._chart_bar_window is not None
+                    and self.last_bar_index is not None
                     and self._magnifier_iter is None
                     and stf is None
                     and not (getattr(self.script, 'calc_bars_count', 0) or 0)
@@ -2459,6 +2485,7 @@ class ScriptRunner:
                 # halves have to hand their result over through this map.
                 _sec_prepared: dict[str, tuple] = {}
 
+                # noinspection PyProtectedMember
                 def _prepare_security_context(sid: str, data_source) -> tuple:
                     """Derive everything the CHART needs before this context's
                     first signal — without starting its child process.
@@ -2667,6 +2694,7 @@ class ScriptRunner:
                     )
 
                 # Callback for lazy resolution of deferred security contexts
+                # noinspection PyProtectedMember
                 def _deferred_resolve(sid: str, symbol: str, timeframe: str | None):
                     if sid not in deferred_sec_ids:
                         return
@@ -2677,7 +2705,6 @@ class ScriptRunner:
                     # ``symbol`` keeps the marker for ``_resolve_security_data``
                     # (which needs it to route a same-symbol request to the chart
                     # feed).
-                    # noinspection PyProtectedMember
                     from ..lib.ticker import _split_chart_type
                     base_symbol, chart_type = _split_chart_type(symbol)
                     # Resolve actual timeframe
@@ -2764,7 +2791,6 @@ class ScriptRunner:
                         # this for static ``is_ltf`` contexts).
                         from ..lib import timeframe as tf_module
                         from .resampler import Resampler
-                        # noinspection PyProtectedMember
                         chart_mod, chart_mult = tf_module._process_tf(current_chart_tf)
                         if chart_mod in ('D', 'W', 'M') and chart_mult == 1:
                             sec_state.chart_resampler = (
@@ -3081,7 +3107,7 @@ class ScriptRunner:
                 nonlocal broker_trades_closed_written
                 _write_plot_row(bar_candle, lib._plot_data, echo_lib)
 
-                self._write_viz_bar(bar_candle)
+                self._write_viz_bar()
 
                 if is_strat and self.trades_writer and position:
                     # ``SimPosition`` rebuilds ``new_closed_trades`` every bar, so
@@ -3094,29 +3120,29 @@ class ScriptRunner:
                         broker_trades_closed_written = len(position.new_closed_trades)
                     else:
                         new_trades = position.new_closed_trades
-                    for t in new_trades:
+                    for closed_trade in new_trades:
                         self._trade_num += 1
                         self.trades_writer.write(
-                            self._trade_num, t.entry_bar_index,
-                            "Entry long" if t.size > 0 else "Entry short",
-                            t.entry_comment if t.entry_comment else t.entry_id,
-                            string.format_time(t.entry_time),  # type: ignore
-                            t.entry_price, abs(t.size), t.profit,
-                            f"{t.profit_percent:.2f}", t.cum_profit,
-                            f"{t.cum_profit_percent:.2f}", t.max_runup,
-                            f"{t.max_runup_percent:.2f}", t.max_drawdown,
-                            f"{t.max_drawdown_percent:.2f}",
+                            self._trade_num, closed_trade.entry_bar_index,
+                            "Entry long" if closed_trade.size > 0 else "Entry short",
+                            closed_trade.entry_comment if closed_trade.entry_comment else closed_trade.entry_id,
+                            string.format_time(closed_trade.entry_time),  # type: ignore
+                            closed_trade.entry_price, abs(closed_trade.size), closed_trade.profit,
+                            f"{closed_trade.profit_percent:.2f}", closed_trade.cum_profit,
+                            f"{closed_trade.cum_profit_percent:.2f}", closed_trade.max_runup,
+                            f"{closed_trade.max_runup_percent:.2f}", closed_trade.max_drawdown,
+                            f"{closed_trade.max_drawdown_percent:.2f}",
                         )
                         self.trades_writer.write(
-                            self._trade_num, t.exit_bar_index,
-                            "Exit long" if t.size > 0 else "Exit short",
-                            t.exit_comment if t.exit_comment else t.exit_id,
-                            string.format_time(t.exit_time),  # type: ignore
-                            t.exit_price, abs(t.size), t.profit,
-                            f"{t.profit_percent:.2f}", t.cum_profit,
-                            f"{t.cum_profit_percent:.2f}", t.max_runup,
-                            f"{t.max_runup_percent:.2f}", t.max_drawdown,
-                            f"{t.max_drawdown_percent:.2f}",
+                            self._trade_num, closed_trade.exit_bar_index,
+                            "Exit long" if closed_trade.size > 0 else "Exit short",
+                            closed_trade.exit_comment if closed_trade.exit_comment else closed_trade.exit_id,
+                            string.format_time(closed_trade.exit_time),  # type: ignore
+                            closed_trade.exit_price, abs(closed_trade.size), closed_trade.profit,
+                            f"{closed_trade.profit_percent:.2f}", closed_trade.cum_profit,
+                            f"{closed_trade.cum_profit_percent:.2f}", closed_trade.max_runup,
+                            f"{closed_trade.max_runup_percent:.2f}", closed_trade.max_drawdown,
+                            f"{closed_trade.max_drawdown_percent:.2f}",
                         )
 
             # noinspection PyProtectedMember
@@ -3299,7 +3325,9 @@ class ScriptRunner:
             # bars. 0 (or a value that covers the whole history) calculates every
             # bar.
             calc_bars_count = getattr(self.script, 'calc_bars_count', 0) or 0
-            calc_start = self.last_bar_index + 1 - calc_bars_count if calc_bars_count > 0 else 0
+            # A feed of unknown length has no last N bars to restrict to
+            calc_start = (self.last_bar_index + 1 - calc_bars_count
+                          if calc_bars_count > 0 and self.last_bar_index is not None else 0)
             series_index = -1
 
             if is_live and self._broker_plugin is not None:
@@ -3379,7 +3407,7 @@ class ScriptRunner:
                 if last_index is not None and calc_start > 0:
                     last_index -= calc_start
                 _set_lib_properties(
-                    exec_candle, self.bar_index, self.tz, lib, self._round_decimals,
+                    exec_candle, self.bar_index, self.tz, self._round_decimals,
                     last_index,
                     (self.last_bar_time if stf is None else stf.last_bar_time),
                     self._lossless_volume, self._lossless_prices,
@@ -3544,6 +3572,7 @@ class ScriptRunner:
                 # under the same timestamp.
                 last_confirmed_timestamp: int | None = None
                 warned_about_stale_tick = False
+                warned_about_late_tick = False
                 sub_bars: list[OHLCV] = []
                 # The warmup loop just executed that bar, so an update continuing
                 # it has a run to discard.
@@ -3627,18 +3656,31 @@ class ScriptRunner:
                     # behind the bar already on the clock. It is not history
                     # replayed — it is a real bar arriving out of order — but
                     # the strategy has already moved on, and Pine's ``time``
-                    # never runs backwards.
-                    if (candle.is_closed
-                            and last_bar_timestamp is not None
+                    # never runs backwards. A late intra-bar update of that
+                    # older period is dropped for the same reason: taken as a
+                    # new bar it would advance ``bar_index`` under a timestamp
+                    # behind the one already on the clock. Warned once per run,
+                    # like the stale ticks above.
+                    if (last_bar_timestamp is not None
                             and candle.timestamp < last_bar_timestamp):
-                        broker_warning(
-                            "feed closed bar ts=%d behind the bar already "
-                            "open at ts=%d — dropped: executing it would move "
-                            "the strategy's clock backwards; the provider is "
-                            "opening the next period ahead of the previous "
-                            "period's close",
-                            candle.timestamp, last_bar_timestamp,
-                        )
+                        if candle.is_closed:
+                            broker_warning(
+                                "feed closed bar ts=%d behind the bar already "
+                                "open at ts=%d — dropped: executing it would move "
+                                "the strategy's clock backwards; the provider is "
+                                "opening the next period ahead of the previous "
+                                "period's close",
+                                candle.timestamp, last_bar_timestamp,
+                            )
+                        elif not warned_about_late_tick:
+                            warned_about_late_tick = True
+                            broker_warning(
+                                "feed sends intra-bar updates for ts=%d behind "
+                                "the bar already open at ts=%d; dropping them: "
+                                "executing one would move the strategy's clock "
+                                "backwards",
+                                candle.timestamp, last_bar_timestamp,
+                            )
                         continue
 
                     if is_new_bar:
@@ -3650,7 +3692,7 @@ class ScriptRunner:
                     barstate.isconfirmed = bar_update.is_closed
                     barstate.isnew = is_new_bar
 
-                    _set_lib_properties(candle, self.bar_index, self.tz, lib, self._round_decimals,
+                    _set_lib_properties(candle, self.bar_index, self.tz, self._round_decimals,
                                         lossless_volume=self._lossless_volume,
                                         lossless_prices=self._lossless_prices)
                     # Live: no next bar exists, so HTF confirmation keeps the
@@ -4108,7 +4150,7 @@ class ScriptRunner:
             for root_key in root_keys:
                 instance_state.discard_root(root_key)
 
-    # noinspection PyProtectedMember
+    # noinspection PyProtectedMember,PyShadowingNames
     def _run_iter_magnified(self, lib, barstate, position, run_main, lib_mains, var_snapshot,
                             drawing_snapshot, is_strat, on_progress, string,
                             child_snapshot=None):
@@ -4169,7 +4211,7 @@ class ScriptRunner:
             barstate.isnew = True
 
             # Set lib OHLCV to the aggregated chart-bar values (what the script sees)
-            _set_lib_properties(window.aggregated, self.bar_index, self.tz, lib, self._round_decimals,
+            _set_lib_properties(window.aggregated, self.bar_index, self.tz, self._round_decimals,
                                 lossless_volume=self._lossless_volume,
                                 lossless_prices=self._lossless_prices)
             lib._next_time = window.next_time
@@ -4316,7 +4358,7 @@ class ScriptRunner:
                 self.plot_writer.write_ohlcv(updated_candle)
 
             # Write visual data (plot styles + drawings) for this aggregated bar
-            self._write_viz_bar(window.aggregated)
+            self._write_viz_bar()
 
             # Yield results
             if not is_strat:
@@ -4547,6 +4589,7 @@ class ScriptRunner:
             return None
         from .plugin import load_plugin
         from .plugin.provider import ProviderPlugin
+        # noinspection PyBroadException
         try:
             provider_cls = load_plugin(mapped.provider)
         except Exception:  # noqa: BLE001 - unknown/uninstalled provider
@@ -4557,7 +4600,8 @@ class ScriptRunner:
             mapped.native_symbol, timeframe, data_dir,
             provider_name=mapped.provider)
 
-    def _scan_ticker_suggestions(self, symbol: str, data_dir: 'Path | None') -> list[str]:
+    @staticmethod
+    def _scan_ticker_suggestions(symbol: str, data_dir: 'Path | None') -> list[str]:
         """Return existing ``.ohlcv`` stems whose ticker matches ``symbol``.
 
         Scans the data dir's sibling syminfo ``.toml`` files and matches on

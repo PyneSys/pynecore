@@ -1445,22 +1445,8 @@ def run(
         # Get the iterator using the correct UTC timestamps
         size = reader.get_size(time_from_ts, time_to_ts)
         # Pine anchors ``last_bar_time`` on historical bars to the chart's final
-        # bar, known up front from the data window. Positional reads also serve
-        # the phantom gap records LEGACY files may hold (``volume == -1``;
-        # ``not (volume < 0)`` keeps NaN-volume real bars), so scan back over
-        # that tail for the last real bar of the window. A file that declares its
-        # own period stores real bars only, so its negative volume is the
-        # source's own value. Both the record and ``last_bar_time`` are Unix
-        # milliseconds.
-        skip_phantom_tail = reader.period is None
-        last_bar_time = None
-        start_pos, end_pos = reader.get_positions(time_from_ts, time_to_ts)
-        for pos in range(end_pos - 1, start_pos - 1, -1):
-            window_tail_bar = reader.read(pos)
-            if skip_phantom_tail and window_tail_bar.volume < 0:
-                continue
-            last_bar_time = int(window_tail_bar.timestamp)
-            break
+        # bar, known up front from the data window.
+        last_bar_time = reader.get_last_bar_time(time_from_ts, time_to_ts)
         magnifier_iter = None
 
         # The run's chart bar window. The bar loop's bars come out of it, and so
@@ -1700,12 +1686,7 @@ def run(
                 sys.path.insert(0, str(lib_dir))
                 lib_path_added = True
 
-            # Set live mode flags before ScriptRunner creation
-            if live:
-                from pynecore import lib as _lib
-                _lib._is_live = True
-                _lib._strategy_suppressed = True
-            else:
+            if not live:
                 _pin_timenow(last_bar_time)
 
             # Show loading spinner while importing
@@ -1727,7 +1708,7 @@ def run(
                         chart_provider_name = provider_data.parsed_string.provider
                         chart_provider_instance = provider_data.provider_instance
                     runner = ScriptRunner(script, ohlcv_iter, syminfo, last_bar_index=size - 1,
-                                          last_bar_time=last_bar_time,
+                                          last_bar_time=last_bar_time, live=live,
                                           plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
                                           viz_path=viz_path if viz else None, viz_journal=viz_journal,
                                           security_data=security_data,
