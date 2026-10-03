@@ -678,6 +678,29 @@ def _atomic_ohlcv_download_target(provider: 'ProviderPlugin'):
         temp_path.unlink(missing_ok=True)
 
 
+def _fetch_provider_symbol_info(provider: 'ProviderPlugin') -> SymInfo:
+    """Load the symbol metadata for a provider-mode run, fresh from the venue.
+
+    Provider mode re-downloads the bar data on every run, and the metadata
+    must be just as fresh: the venue publishes dated session exceptions
+    (holidays, trading breaks) only days ahead, so a cached sidecar from an
+    earlier run does not know about them and the live session calendar
+    would treat a closed market as open. When the venue cannot be reached
+    and a cached sidecar exists, the run continues on the cached metadata
+    with a warning rather than failing before the data download gets its
+    own say about the connection.
+    """
+    cached = provider.is_symbol_info_exists()
+    try:
+        return provider.get_symbol_info(force_update=True)
+    except Exception as e:  # plugin exception families differ per venue
+        if not cached:
+            raise
+        secho(f"Warning: symbol info refresh failed ({e}); using the cached symbol info",
+              err=True, fg=colors.YELLOW)
+        return provider.get_symbol_info()
+
+
 def _download_provider_data(provider_str: str, time_from_str: str | None) -> _ProviderData:
     """
     Download historical data from a provider and return the result.
@@ -749,7 +772,7 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
     # Fetch symbol info
     with Progress(SpinnerColumn(finished_text="[green]✓"), TextColumn("{task.description}")) as progress:
         task = progress.add_task("Fetching symbol info...", total=1)
-        syminfo = provider_instance.get_symbol_info(force_update=not provider_instance.is_symbol_info_exists())
+        syminfo = _fetch_provider_symbol_info(provider_instance)
         progress.update(task, completed=1)
 
     # Download OHLCV data (always fresh in provider mode). In bar-count
