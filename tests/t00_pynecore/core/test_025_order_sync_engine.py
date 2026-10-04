@@ -14502,3 +14502,93 @@ def __test_read_outage_warnings_are_throttled_across_tick_syncs__(caplog):
         b.down = True
         engine.sync(BAR_TS + 121_000)
         assert len(outage_warnings()) == 3
+
+
+def _start_test_loop() -> tuple[asyncio.AbstractEventLoop, asyncio.Event]:
+    """Start a broker loop on a daemon thread; ``release`` frees stalled coroutines."""
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True, name="test-loop")
+    thread.start()
+    started = threading.Event()
+    loop.call_soon_threadsafe(started.set)
+    assert started.wait(timeout=5.0), "loop failed to start"
+    return loop, asyncio.Event()
+
+
+def _stop_test_loop(loop: asyncio.AbstractEventLoop, release: asyncio.Event) -> None:
+    """Release every stalled coroutine, let it finish, then stop the loop."""
+    async def _finish() -> None:
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    asyncio.run_coroutine_threadsafe(_finish(), loop).result(timeout=5.0)
+    loop.call_soon_threadsafe(loop.stop)
+
+
+def __test_recovery_bridge_timeout_surfaces_unknown_disposition__():
+    """An expired bridge wait on a one-way recovery step is an unknown disposition, not a crash."""
+    loop, release = _start_test_loop()
+    try:
+        b = MockBroker()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=BrokerPosition(),
+            symbol=SYMBOL,
+            run_tag=RUN_TAG,
+            event_loop=loop,
+            execute_timeout=0.1,
+        )
+        with pytest.raises(OrderDispositionUnknownError) as excinfo:
+            engine._run_async_recovery(release.wait(), client_order_id="coid-clear")
+        assert excinfo.value.client_order_id == "coid-clear"
+        assert isinstance(excinfo.value.cause, TimeoutError)
+    finally:
+        _stop_test_loop(loop, release)
+
+
+def __test_hedging_exit_cancel_bridge_timeout_does_not_crash__(tmp_path):
+    """A stalled per-exit bracket clear retires the exit instead of killing the run.
+
+    Measured live 2026-10-04 (bybit chaos cycle 228): a REST stall made the
+    one-way ``run_exit_bracket_clear`` outrun the dispatch bridge inside
+    ``_dispatch_cancel`` and the raw ``TimeoutError`` escaped ``_broker_sync``.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+
+    loop, release = _start_test_loop()
+    try:
+        with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+            ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+            b = MockBroker()
+            b.position_port = b
+            b.raw_legs = [_pleg("1", "buy", 2.0)]
+            engine = OrderSyncEngine(
+                broker=b,  # type: ignore[arg-type]
+                position=BrokerPosition(),
+                symbol=SYMBOL,
+                run_tag=RUN_TAG,
+                event_loop=loop,
+                execute_timeout=0.1,
+                store_ctx=ctx,
+            )
+            ex = ExitIntent(pine_id="X", from_entry="L", symbol=SYMBOL, side="sell",
+                            qty=2.0, tp_price=120.0, sl_price=90.0)
+            engine._dispatch_new(ex)
+            assert set(engine.order_mapping[ex.intent_key]) == {"bracket:1"}
+
+            stalled = threading.Event()
+
+            async def _stalled_amend(symbol, leg_id, *, side, tp_price, sl_price,
+                                     trail_offset, coid):
+                stalled.set()
+                await release.wait()
+
+            b.amend_bracket = _stalled_amend
+            engine._dispatch_cancel(ex)
+            assert stalled.is_set(), "the bracket clear never reached the port"
+            # Unknown disposition on a whole-row exit: eager retire, no halt.
+            assert ex.intent_key not in engine.order_mapping
+            assert engine._cancel_disposition_pending == {}
+    finally:
+        _stop_test_loop(loop, release)

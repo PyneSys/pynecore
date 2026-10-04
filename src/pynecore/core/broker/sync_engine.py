@@ -2340,13 +2340,13 @@ class OrderSyncEngine:
         one_way_port: PositionPort | None = getattr(self._broker, 'position_port', None)
         if not self._one_way_replay_done and one_way_port is not None:
             try:
-                replayed = self._run_async(
+                replayed = self._run_async_recovery(
                     self._one_way_emulator.restart_replay(one_way_port),
                 )
-            except ExchangeConnectionError as e:
+            except (OrderDispositionUnknownError, ExchangeConnectionError) as e:
                 _blog_warning(
                     "restart settle skipped before one-way emulation replay "
-                    "could complete (connection error: %s) — retrying next bar", e,
+                    "could complete (%s) — retrying next bar", e,
                 )
                 return
             if not replayed:
@@ -2526,13 +2526,13 @@ class OrderSyncEngine:
         one_way_port: PositionPort | None = getattr(self._broker, 'position_port', None)
         if not self._one_way_replay_done and one_way_port is not None:
             try:
-                replayed = self._run_async(
+                replayed = self._run_async_recovery(
                     self._one_way_emulator.restart_replay(one_way_port),
                 )
-            except ExchangeConnectionError as e:
+            except (OrderDispositionUnknownError, ExchangeConnectionError) as e:
                 _blog_warning(
                     "sync skipped before one-way emulation replay could "
-                    "complete (connection error: %s) — retrying next sync", e,
+                    "complete (%s) — retrying next sync", e,
                 )
                 return
             if not replayed:
@@ -12297,7 +12297,7 @@ class OrderSyncEngine:
                     "(not emitted by Pine after restart)", format_intent_key(ikey),
                 )
                 try:
-                    self._run_async(
+                    self._run_async_recovery(
                         self._one_way_emulator.run_exit_bracket_clear(
                             self._build_cancel_envelope(cancel), one_way_port,
                         ),
@@ -12329,7 +12329,7 @@ class OrderSyncEngine:
             # re-clearing it (idempotent amend-to-None) cannot tear down a live
             # survivor bracket (those rows are ``active``, untouched).
             try:
-                drained_keys = self._run_async(
+                drained_keys = self._run_async_recovery(
                     self._one_way_emulator.drain_clearing_rows(
                         self._symbol, one_way_port,
                     ),
@@ -12372,7 +12372,7 @@ class OrderSyncEngine:
             # deterministic entry coid, so a re-dispatch cannot double-open, and an
             # ambiguous retry leaves the row live rather than halting the bot.
             try:
-                self._run_async(
+                self._run_async_recovery(
                     self._one_way_emulator.drain_residual_opens(
                         self._symbol, one_way_port,
                     ),
@@ -19200,10 +19200,11 @@ class OrderSyncEngine:
                 # position side — the broadcast clear the ownership index
                 # fixes). An entry cancel (no ``from_entry``) is a working-order
                 # cancel and stays on the regular path.
-                self._run_async(
+                self._run_async_recovery(
                     self._one_way_emulator.run_exit_bracket_clear(
                         cancel_envelope, port,
                     ),
+                    client_order_id=cancel_envelope.client_order_id(KIND_CANCEL),
                 )
             else:
                 # ``execute_cancel`` returns a bool: ``True`` = confirmed
@@ -19319,6 +19320,42 @@ class OrderSyncEngine:
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result(
             timeout=self._timeout,
         )
+
+    def _run_async_recovery(
+            self, coro: Coroutine[Any, Any, _T], *, client_order_id: str = '',
+    ) -> _T:
+        """Run an idempotent one-way recovery composite from the engine's thread.
+
+        The restart replay, the clearing-row and residual-open drains and the
+        per-exit bracket clear all work on persist-first rows that the next
+        sync re-drives, so a bridge wait that expires is an ambiguous outcome
+        for them, never a fault to crash or halt on: it surfaces as
+        :class:`OrderDispositionUnknownError` and the caller's park-and-retry
+        handles it like a plugin-classified timeout. A coroutine that completes
+        with any other fault raises it unchanged. Measured live 2026-10-04: a
+        bracket clear stalled behind a REST fault outran the bridge and the raw
+        ``TimeoutError`` killed the run from ``_dispatch_cancel``.
+
+        :param coro: The recovery coroutine.
+        :param client_order_id: The id the step dispatches under, when known.
+        :raises OrderDispositionUnknownError: When the bridge wait expires.
+        """
+        if self._loop is None:
+            return asyncio.run(coro)
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        try:
+            return future.result(timeout=self._timeout)
+        except TimeoutError as exc:
+            _blog_warning(
+                "one-way recovery step outran the %.0fs bridge window; its "
+                "persist-first row stays live and the next sync re-drives it",
+                self._timeout,
+            )
+            raise OrderDispositionUnknownError(
+                "one-way recovery step timed out on the dispatch bridge",
+                client_order_id=client_order_id,
+                cause=exc,
+            ) from exc
 
     def _mark_reads_confirmed(self) -> None:
         """Record that a read round trip completed, refreshing the broker view."""
@@ -19711,8 +19748,10 @@ class OrderSyncEngine:
         violations — escalates to the controlled halt. A
         non-retryable ``ProviderError`` (a permanent misconfiguration) propagates
         unchanged. The idempotent recovery composites (one-way replay, drain,
-        bracket-clear) deliberately do NOT use this — they are wrapped in
-        ``except ExchangeConnectionError`` park-and-retry and must not halt.
+        bracket-clear) deliberately do NOT use this — they ride
+        :meth:`_run_async_recovery`, whose expired bridge wait surfaces as
+        ``OrderDispositionUnknownError`` into their park-and-retry, and must
+        not halt.
         The outcome-driven cancel/entry-stop retry loops
         (:meth:`_drive_cancel_tentative`,
         :meth:`_resolve_entry_stop_cancel_then_fire`,
