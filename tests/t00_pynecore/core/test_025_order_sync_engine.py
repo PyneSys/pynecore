@@ -1275,6 +1275,57 @@ def __test_stale_marker_defers_while_another_reversal_close_covers_the_book__():
     assert [c.intent.pine_id for c in b.entry_calls[2:]] == ["S1", "S2"]
 
 
+def __test_new_reversal_defers_while_a_fresh_close_covers_every_open_trade__():
+    """A second reversal key must not close legs a fresh close is consuming.
+
+    Measured live (cTrader pyramid lane, cycle 226): the stop-and-reverse
+    of three pyramided longs dispatched one close per leg; while those
+    fills trickled in the script re-emitted its second short leg one bar
+    later and the engine armed a second close over the same legs — the
+    venue rejected it POSITION_NOT_FOUND for a leg the first close had
+    already taken. While a fresh close covers every journaled open trade,
+    a new reversal key defers and opens raw once the book is flat.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    for i, eid in enumerate(("L1", "L2", "L3")):
+        pos.entry_orders[eid] = _entry_order(eid, 1.0)
+        engine.sync(BAR_TS + i * 60_000)
+        engine._route_event(  # type: ignore[attr-defined]
+            _fill_event('buy', 1.0, 50_000.0 + i, pine_id=eid, xchg_id=f"xchg-{eid}"))
+    assert pos.size == 3.0
+
+    # Pine reverses: one close for the whole journaled book.
+    for eid in ("L1", "L2", "L3"):
+        del pos.entry_orders[eid]
+    pos.entry_orders["S1"] = _entry_order("S1", -1.0)
+    engine.sync(BAR_TS + 180_000)
+    assert len(b.close_calls) == 1
+    close = _dispatched_close(b.close_calls[0])
+    assert close.qty == 3.0
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(close, 1.0, 50_010.0))
+    assert pos.size == 2.0, "the first leg's fill trickled in"
+
+    # The second short leg arrives while S1's close still covers L2 and L3:
+    # no second close, the entry re-emits next sync.
+    pos.entry_orders["S2"] = _entry_order("S2", -1.0)
+    engine.sync(BAR_TS + 240_000)
+    assert len(b.close_calls) == 1
+    assert "S2" not in engine._pending_reversal_opens
+    assert [c.intent.pine_id for c in b.entry_calls] == ["L1", "L2", "L3"]
+
+    # The remaining fills settle the book flat: S1 opens on the fill, S2
+    # goes out raw on the next sync.
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(close, 2.0, 50_020.0, xchg_id="xchg-rc", fill_id="rc-2"))
+    assert pos.size == 0.0
+    assert engine._pending_reversal_opens == {}
+    engine.sync(BAR_TS + 300_000)
+    assert [c.intent.pine_id for c in b.entry_calls[3:]] == ["S1", "S2"]
+    assert len(b.close_calls) == 1
+
+
 def __test_flat_snapshot_during_a_pending_reversal_only_starts_the_clock__():
     """A glitched flat /positions read must not clear a reversing book.
 

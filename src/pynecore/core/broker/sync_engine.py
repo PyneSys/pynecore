@@ -14809,6 +14809,26 @@ class OrderSyncEngine:
                 or (marker.armed_bar_ts_ms == self._current_bar_ts_ms
                     and elapsed < _CLOSE_DECLINE_RETRY_S))
 
+    def _fresh_reversal_close_covering_book(self) -> "_PendingReversalOpen | None":
+        """The fresh reversal marker whose close consumes every open trade, if any.
+
+        Coverage is judged on journaled entry ids, not quantity: a close
+        dispatched for the trades that are open NOW is the one live close
+        for the book, while a same-side add that filled after an earlier
+        close was armed is NOT covered by it and needs its own close.
+        """
+        open_ids = {
+            trade.entry_id for trade in self._position.open_trades
+            if trade.entry_id is not None
+        }
+        if not open_ids:
+            return None
+        for other in self._pending_reversal_opens.values():
+            if (self._reversal_close_fresh(other)
+                    and open_ids <= other.consumed_entry_ids):
+                return other
+        return None
+
     @staticmethod
     def _reversal_close_pending_skip(
             intent: EntryIntent, message: str,
@@ -14911,6 +14931,23 @@ class OrderSyncEngine:
             # duplicate at worst no-ops.
             self._drop_envelope(marker.close_pine_id)
             self._order_mapping.pop(marker.close_pine_id, None)
+        else:
+            # A NEW reversal key while another key's fresh close already
+            # consumes every open trade: a pyramid script re-emits its
+            # second leg one bar after the first leg's stop-and-reverse,
+            # whose close legs are still filling (measured live: cTrader
+            # pyramid lane, cycle 226 — the second close targeted a leg the
+            # first close had already taken, POSITION_NOT_FOUND). The book
+            # has exactly one live close; this entry re-emits every sync
+            # and dispatches raw once that close settles the book flat.
+            covering = self._fresh_reversal_close_covering_book()
+            if covering is not None:
+                raise self._reversal_close_pending_skip(
+                    intent,
+                    f"Reversal entry {format_intent_key(key)} deferred: the "
+                    f"fresh reversal close {covering.close_pine_id!r} already "
+                    f"covers the remaining exposure; re-evaluating next sync.",
+                )
         self._retire_reversal_closing_surfaces(intent)
         if self._position.size == 0.0:
             # Fill events routed during the sweep's broker round-trips
