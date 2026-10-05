@@ -338,6 +338,12 @@ def _sync(engine: OrderSyncEngine, *, bar_ts: int = BAR_TS) -> None:
     engine.sync(bar_ts)
 
 
+def _age_reversal_markers(engine: OrderSyncEngine, seconds: float) -> None:
+    """Pretend ``seconds`` of wall time passed since the reversal markers armed."""
+    for marker in engine._pending_reversal_opens.values():
+        marker.armed_monotonic -= seconds
+
+
 def _fill_event(side: str, qty: float, price: float, *,
                 pine_id: str, leg: LegType = LegType.ENTRY,
                 xchg_id: str = "xchg-1", fill_id: str | None = None,
@@ -942,9 +948,11 @@ def __test_stale_reversal_close_rerun_mints_a_fresh_coid__():
     engine.sync(BAR_TS + 60_000)
     assert len(b.close_calls) == 1
     assert "S" in engine._pending_reversal_opens
-    # The close never settles: force the marker past the stale window and
-    # onto an older bar so the next re-emission takes the re-run branch.
+    # The close never settles: force the marker past the stale window, the
+    # settle floor and onto an older bar so the next re-emission takes the
+    # re-run branch.
     engine._pending_reversal_opens["S"].blocked_syncs = 10
+    _age_reversal_markers(engine, engine._timeout + 1.0)
 
     engine.sync(BAR_TS + 120_000)
     assert len(b.close_calls) == 2
@@ -1120,6 +1128,7 @@ def __test_rejected_reversal_close_arms_the_marker_and_retries_after_the_stale_w
 
     # Past the window the protocol re-runs; this time the close confirms
     # and the parked entry opens on the settled book.
+    _age_reversal_markers(engine, engine._timeout + 1.0)
     engine.sync(BAR_TS + 600_000)
     assert len(b.close_calls) == 2
     assert "S" in engine._pending_reversal_opens
@@ -1153,6 +1162,7 @@ def __test_persistently_rejected_reversal_close_dispatches_once_per_bar__():
 
     # The next bar re-drives the close once; it confirms and the parked
     # entry opens on the settled book.
+    _age_reversal_markers(engine, engine._timeout + 1.0)
     engine.sync(BAR_TS + 120_000)
     assert len(b.close_calls) == 2
     engine._route_event(  # type: ignore[attr-defined]
@@ -1184,6 +1194,7 @@ def __test_stale_reversal_close_redispatches_after_the_grace_syncs__():
     for i in range(_REVERSAL_CLOSE_STALE_SYNCS):
         engine.sync(BAR_TS + 120_000 + i * 60_000)
         assert len(b.close_calls) == 1
+    _age_reversal_markers(engine, engine._timeout + 1.0)
     engine.sync(BAR_TS + 600_000)
     assert len(b.close_calls) == 2
     assert b.close_calls[1].intent.synthetic_kind == 'reversal_close'
@@ -1248,6 +1259,7 @@ def __test_stale_marker_defers_while_another_reversal_close_covers_the_book__():
     # fresh close) and the other defers against it — never two closes for
     # the same exposure.
     stale_bar = BAR_TS + 240_000 + _REVERSAL_CLOSE_STALE_SYNCS * 60_000
+    _age_reversal_markers(engine, engine._timeout + 1.0)
     engine.sync(stale_bar)
     engine.sync(stale_bar)
     assert len(b.close_calls) == 3
@@ -1372,6 +1384,7 @@ def __test_declined_close_arms_the_marker_and_the_retry_waits_a_bar__():
 
     # The next bar re-runs the protocol with a fresh close dispatch, and
     # its fill settles the book and opens the parked entry as usual.
+    _age_reversal_markers(engine, engine._timeout + 1.0)
     engine.sync(BAR_TS + 120_000)
     assert len(b.close_calls) == 2
     close = _dispatched_close(b.close_calls[1])
@@ -1399,6 +1412,7 @@ def __test_stale_redispatch_waits_for_the_next_bar__():
     assert len(b.close_calls) == 1
     assert "S" in engine._pending_reversal_opens
 
+    _age_reversal_markers(engine, engine._timeout + 1.0)
     engine.sync(BAR_TS + 120_000)
     assert len(b.close_calls) == 2
 
@@ -1428,6 +1442,64 @@ def __test_stale_redispatch_time_cap_re_drives_within_the_same_bar__():
     marker = engine._pending_reversal_opens["S"]
     marker.armed_monotonic -= _CLOSE_DECLINE_RETRY_S + 1.0
     engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 2
+    assert _dispatched_close(b.close_calls[1]).synthetic_kind == 'reversal_close'
+
+
+def __test_stale_redispatch_honours_the_settle_floor_across_a_bar_boundary__():
+    """A bar boundary right after arming must not re-drive the close early.
+
+    A reversal signalled on a bar close arms the marker in the same instant
+    the next bar opens, so the "next bar" leg of the stale gate is met at
+    once; the event-driven syncs of that first second then pushed the
+    marker past the stale-sync bound and re-dispatched the close ~2 s after
+    the first one, racing the venue's own fill (Bybit pyramid lane, cycle
+    233, 2026-10-05: the duplicate rejected ``110017`` "position is zero"
+    with the first close's fill landing right behind it). The marker stays
+    fresh until ``execute_timeout`` has elapsed, whatever the bar says.
+    """
+    from pynecore.core.broker.sync_engine import _REVERSAL_CLOSE_STALE_SYNCS
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1
+
+    # The next bar opens in the same instant; its sync storm runs past the
+    # stale-sync bound while the first close is still inside the floor.
+    for _ in range(_REVERSAL_CLOSE_STALE_SYNCS + 5):
+        engine.sync(BAR_TS + 120_000)
+    assert len(b.close_calls) == 1
+    assert "S" in engine._pending_reversal_opens
+
+    # The venue's fill lands: the book settles and the parked entry opens
+    # without a duplicate close ever having been sent.
+    engine._route_event(  # type: ignore[attr-defined]
+        _reversal_close_fill(_dispatched_close(b.close_calls[0]), 1.0, 49_950.0))
+    assert pos.size == 0.0
+    assert b.entry_calls[-1].intent.pine_id == "S"
+    assert len(b.close_calls) == 1
+
+
+def __test_stale_redispatch_re_drives_once_the_settle_floor_has_elapsed__():
+    """Past the settle floor the next-bar re-drive proceeds as before."""
+    from pynecore.core.broker.sync_engine import _REVERSAL_CLOSE_STALE_SYNCS
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS + 60_000)
+    for _ in range(_REVERSAL_CLOSE_STALE_SYNCS + 1):
+        engine.sync(BAR_TS + 120_000)
+    assert len(b.close_calls) == 1
+
+    _age_reversal_markers(engine, engine._timeout + 1.0)
+    engine.sync(BAR_TS + 120_000)
     assert len(b.close_calls) == 2
     assert _dispatched_close(b.close_calls[1]).synthetic_kind == 'reversal_close'
 

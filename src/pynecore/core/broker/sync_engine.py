@@ -561,9 +561,11 @@ class _PendingReversalOpen:
     close_qty: float
     consumed_entry_ids: frozenset[str]
     armed_bar_ts_ms: int
-    #: ``time.monotonic()`` at arming — the wall-clock leg of the stale
-    #: re-dispatch gate (:data:`_CLOSE_DECLINE_RETRY_S`), so a slow chart's
-    #: bar boundary cannot park a stuck close for hours.
+    #: ``time.monotonic()`` at arming — the wall-clock legs of the stale
+    #: re-dispatch gate: the ``execute_timeout`` settle floor that a bar
+    #: boundary alone cannot shorten, and the :data:`_CLOSE_DECLINE_RETRY_S`
+    #: cap so a slow chart's bar boundary cannot park a stuck close for
+    #: hours.
     armed_monotonic: float
     blocked_syncs: int = 0
     #: Set when a same-bar ``skip_flip`` re-placement supersedes the parked
@@ -14784,14 +14786,28 @@ class OrderSyncEngine:
         """Whether ``marker``'s close leg is still inside its settle window.
 
         Fresh = fewer than :data:`_REVERSAL_CLOSE_STALE_SYNCS` deferrals, or
-        still on the arming bar within :data:`_CLOSE_DECLINE_RETRY_S`. A
-        fresh close is the one live close-then-open leg for the book; a
-        stale one may be re-driven.
+        younger than the engine's ``execute_timeout``, or still on the
+        arming bar within :data:`_CLOSE_DECLINE_RETRY_S`. A fresh close is
+        the one live close-then-open leg for the book; a stale one may be
+        re-driven.
+
+        The wall-clock floor is what makes the bar boundary a usable beat:
+        a reversal signalled on a bar close arms the marker in the same
+        instant the next bar opens, so without it the "next bar" leg of the
+        gate is satisfied immediately and a handful of event-driven syncs
+        re-drives the close seconds after dispatch, racing the venue's own
+        fill (measured live 2026-10-05, Bybit pyramid lane, cycle 233: the
+        duplicate hit ``110017`` "position is zero" ~2 s after the first
+        close, whose fill event landed right behind it). The dispatch
+        bridge grants the venue ``execute_timeout`` to confirm an order, so
+        a settle wait shorter than that would declare the close stuck
+        before its own dispatch would have been allowed to finish.
         """
+        elapsed = time.monotonic() - marker.armed_monotonic
         return (marker.blocked_syncs <= _REVERSAL_CLOSE_STALE_SYNCS
+                or elapsed < self._timeout
                 or (marker.armed_bar_ts_ms == self._current_bar_ts_ms
-                    and (time.monotonic() - marker.armed_monotonic
-                         < _CLOSE_DECLINE_RETRY_S)))
+                    and elapsed < _CLOSE_DECLINE_RETRY_S))
 
     @staticmethod
     def _reversal_close_pending_skip(
@@ -14846,7 +14862,10 @@ class OrderSyncEngine:
             # boundary is the venue-paced beat — the fresh re-dispatch
             # additionally waits for the NEXT bar after arming, capped by
             # :data:`_CLOSE_DECLINE_RETRY_S` so a slow chart's bar cannot
-            # park a stuck close for hours.
+            # park a stuck close for hours, and floored by the engine's
+            # ``execute_timeout`` so a bar-close signal (whose next bar
+            # opens in the same instant) cannot re-drive the close before
+            # the venue had a fair chance to fill the first one.
             if self._reversal_close_fresh(marker):
                 raise self._reversal_close_pending_skip(
                     intent,
