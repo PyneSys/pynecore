@@ -185,6 +185,8 @@ extra_fields: dict[str, Any] = {}
 
 # Lib semaphore - to prevent lib`s main function to do things it must not (plot, strategy things, etc.)
 _lib_semaphore = False
+# Imported library mains run examples; their drawings must not enter the chart registry.
+_in_lib_main = False
 
 # Security-child flag — True in a ``request.security`` worker process. The child
 # re-runs the WHOLE script at the context's timeframe, while TradingView only ever

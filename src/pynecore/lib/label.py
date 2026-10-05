@@ -97,6 +97,9 @@ def new(*args: Any, **kwargs: Any) -> Label:
     :param point: ``chart.point`` object (point form, keyword equivalent of the first positional)
     :return: A label object
     """
+    if lib._in_lib_main:
+        return NA(Label)
+
     if args:
         names = _POINT_PARAMS if isinstance(args[0], ChartPoint) else _COORD_PARAMS
         if len(args) > len(names):
@@ -173,6 +176,9 @@ def delete(id):
 # noinspection PyShadowingBuiltins,PyProtectedMember
 def copy(id):
     """Copy label object"""
+    if lib._in_lib_main:
+        return NA(Label)
+
     if isinstance(id, NA):
         return NA(Label)
     clone = _copy(id)

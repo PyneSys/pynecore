@@ -38,6 +38,9 @@ def new(points: list[ChartPoint], curved: bool = False, closed: bool = False,
     :param force_overlay: If true, the drawing will display on the main chart pane
     :return: The ID of a new polyline object
     """
+    if lib._in_lib_main:
+        return NA(Polyline)
+
     if not points or len(points) == 0:
         return NA(Polyline)
 

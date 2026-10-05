@@ -1,3 +1,4 @@
+from .. import lib
 from ..core.module_property import module_property
 from ..types.base import next_vid
 from ..types.linefill import LineFill
@@ -19,6 +20,9 @@ def new(line1: Line, line2: Line, color: _color.Color) -> LineFill:
     :param color: The color used to fill the space between the lines
     :return: The ID of a linefill object that can be passed to other linefill.*() functions
     """
+    if lib._in_lib_main:
+        return NA(LineFill)
+
     if isinstance(line1, NA) or isinstance(line2, NA):
         return NA(LineFill)
 

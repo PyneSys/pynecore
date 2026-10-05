@@ -156,6 +156,18 @@ def main():
     ...
 ```
 
+Exported functions may reference library constants, but must not capture non-constant
+variables from the module or library `main()` scope. The AST validator also checks helpers
+and default arguments reached by an export. Create per-call state and drawings inside the
+exported function, or pass them as parameters. This check applies to handwritten Pyne and
+to libraries run directly as the main script.
+
+When a library is imported, drawing constructors and copies called by its `main()` (including
+its helper calls) return typed `na` handles without allocating or registering drawings.
+Setters and deletion on those handles have no effect. The same library draws normally when
+run as the main script, and an exported function called by the importing script can create
+normal drawings. This suppression is separate from the `request.security` execution context.
+
 ## 4. The main() Function
 
 The `main()` function is called **once per bar** during execution. It receives input parameters

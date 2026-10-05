@@ -910,8 +910,13 @@ def security_process_main(
         effect is suppressed in a security child)."""
         # The script's bool na mode, re-applied on every entry (see ScriptRunner)
         set_bool_na(na_bool)
-        for _title, _lib_main in script_mod._registered_libraries:
-            bound_entries.get(id(_lib_main), _lib_main)()
+        lib._in_lib_main = True
+        try:
+            for _title, _lib_main in script_mod._registered_libraries:
+                if _lib_main is not main_func:
+                    bound_entries.get(id(_lib_main), _lib_main)()
+        finally:
+            lib._in_lib_main = False
         run_main()
 
     # Plain-OHLCV fast path: the requested expression is only raw price series,
@@ -1973,4 +1978,5 @@ def security_process_main(
             _block.close()
         sync_block.close()
         lib._lib_semaphore = False
+        lib._in_lib_main = False
         lib._in_security = False

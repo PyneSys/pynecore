@@ -520,6 +520,7 @@ def _reset_lib_vars():
 
     lib.extra_fields = {}
     lib._lib_semaphore = False
+    lib._in_lib_main = False
     lib._is_live = False
     lib._strategy_suppressed = False
     lib._dg_reset()
@@ -3051,9 +3052,13 @@ class ScriptRunner:
                     # noinspection PyCallingNonCallable
                     signal_rate_sources_fn()
                 lib._lib_semaphore = True
-                for run_lib_main in lib_mains:
-                    run_lib_main()
-                lib._lib_semaphore = False
+                lib._in_lib_main = True
+                try:
+                    for run_lib_main in lib_mains:
+                        run_lib_main()
+                finally:
+                    lib._in_lib_main = False
+                    lib._lib_semaphore = False
                 try:
                     r = run_main()
                 finally:
@@ -4182,9 +4187,13 @@ class ScriptRunner:
                 sec_begin_bar_fn(lib._time, lib._next_time,
                                  bool(barstate.isconfirmed))
             lib._lib_semaphore = True
-            for run_lib_main in lib_mains:
-                run_lib_main()
-            lib._lib_semaphore = False
+            lib._in_lib_main = True
+            try:
+                for run_lib_main in lib_mains:
+                    run_lib_main()
+            finally:
+                lib._in_lib_main = False
+                lib._lib_semaphore = False
             try:
                 return run_main()
             finally:

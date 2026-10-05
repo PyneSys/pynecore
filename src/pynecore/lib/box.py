@@ -82,6 +82,9 @@ def new(*args: Any, **kwargs: Any) -> Box:
     :param bottom_right: Bottom-right corner ``chart.point`` (point form, keyword equivalent of the second positional)
     :return: A box object
     """
+    if lib._in_lib_main:
+        return NA(Box)
+
     if args:
         names = _POINT_PARAMS if isinstance(args[0], ChartPoint) else _COORD_PARAMS
         if len(args) > len(names):
@@ -173,6 +176,9 @@ def delete(id):
 
 # noinspection PyShadowingBuiltins,PyProtectedMember
 def copy(id):
+    if lib._in_lib_main:
+        return NA(Box)
+
     if isinstance(id, NA):
         return NA(Box)
     clone = _copy(id)

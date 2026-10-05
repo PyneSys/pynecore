@@ -78,6 +78,9 @@ def new(*args: Any, **kwargs: Any) -> Line:
     :param second_point: Second ``chart.point`` (point form, keyword equivalent of the second positional)
     :return: A line object
     """
+    if lib._in_lib_main:
+        return NA(Line)
+
     if args:
         names = _POINT_PARAMS if isinstance(args[0], ChartPoint) else _COORD_PARAMS
         if len(args) > len(names):
@@ -151,6 +154,9 @@ def delete(id):
 # noinspection PyShadowingBuiltins,PyProtectedMember
 def copy(id):
     """Copy line object"""
+    if lib._in_lib_main:
+        return NA(Line)
+
     if isinstance(id, NA):
         return NA(Line)
     clone = _copy(id)

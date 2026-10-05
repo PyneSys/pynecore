@@ -1,3 +1,4 @@
+from .. import lib
 from ..core.module_property import module_property
 from ..core.safe_convert import native_int_or as _native_int_or
 from ..types.base import next_vid
@@ -65,6 +66,9 @@ def new(position: _position.Position, columns: int, rows: int, bgcolor: _color.C
                           script occupies a separate pane. Optional. The default is false
     :return: A table object
     """
+    if lib._in_lib_main:
+        return NA(Table)
+
     table = Table(
         position=position,
         columns=_coord(columns),
