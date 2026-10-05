@@ -582,6 +582,7 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
     from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
     from pynecore.transformers.outer_write import OuterWriteTransformer
     from pynecore.transformers.export_capture import ExportCaptureTransformer
+    from pynecore.transformers.security_drawings import SecurityDrawingsTransformer
     from pynecore.transformers.const_fold import ConstFoldTransformer
     from pynecore.transformers.dynamic_default import DynamicDefaultTransformer
     from pynecore.transformers.inline_series_hoist import InlineSeriesHoistTransformer
@@ -615,6 +616,7 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
     if not path.is_relative_to(Path(__file__).parent.parent):
         transformed = OuterWriteTransformer().visit(transformed)
         transformed = ExportCaptureTransformer().visit(transformed)
+        transformed = SecurityDrawingsTransformer().visit(transformed)
     # TradingView folds constant subtrees at parse time with fdlibm
     # transcendentals and a 16-decimal embedding cap, while runtime
     # series-fed calls use the Intel-LIBM intrinsics (lib.math /

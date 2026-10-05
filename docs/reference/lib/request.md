@@ -76,6 +76,16 @@ period closes.
 compile time; the Python stub itself is not called by a transformed script. Conditional calls and
 nested security requests are supported.
 
+Drawing constructors and copies (`label.new`, `line.new`, `box.new`, `table.new`,
+`polyline.new`, `linefill.new`, and the corresponding `copy` functions) are not
+allowed in request expressions. AST validation follows local helpers and variable
+dependencies, and applies to handwritten Pyne as well as compiled Pine. This also
+applies to `security_lower_tf()`.
+
+A returned UDT may contain drawing fields initialized to `na`. Create its drawings
+in the chart context after the request returns; declaring an empty drawing field
+does not create a drawing in the requested context.
+
 ### security_lower_tf()
 
 Requests intrabar values from a lower timeframe, returning an array of values per chart bar.
