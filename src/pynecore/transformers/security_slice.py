@@ -2307,8 +2307,8 @@ def _build_clone(main: ast.FunctionDef, kept: list[int], name: str) -> ast.Funct
     runner may discover — but it keeps ``main``'s parameter list so the child
     can call it with no arguments exactly like ``main``. The defaults the clone
     RUNS with are bound from ``main`` afterwards (see :func:`_bind_defaults`);
-    the copied default expressions only stay in the signature so the lowering
-    passes see the same ``input`` calls in it that ``main`` has.
+    the copied default expressions stay until input lowering has processed the
+    signature. Final emission replaces them with inert placeholders.
 
     Only the KEPT statements are copied, through one memo shared across the
     statements of the clone, so an object hanging off several of them is copied
@@ -2335,13 +2335,8 @@ def _build_clone(main: ast.FunctionDef, kept: list[int], name: str) -> ast.Funct
 def _bind_defaults(main_name: str, clone_name: str) -> list[ast.stmt]:
     """Statements rebinding the clone's parameter defaults to ``main``'s.
 
-    The clone's signature carries a COPY of ``main``'s default expressions, and
-    those are ``input.*()`` calls: re-evaluating them at the clone's ``def``
-    yields the source defaults, not the configured values. ``script``'s
-    decorator runs at ``main``'s ``def`` and clears the loaded overrides
-    (``core/script.py``), so by the time the clone is defined they are gone. The
-    values ``main`` was bound with are the configured ones, and handing the very
-    same tuple to the clone is what makes the child compute what the chart does.
+    The values ``main`` was bound with include the configured inputs. The clone
+    receives the same defaults without evaluating their expressions again.
     """
     def place(name: str, attr: str, ctx: ast.expr_context) -> ast.expr:
         # The type pass is behind us, so every emitted expression carries its
@@ -2358,3 +2353,19 @@ def _bind_defaults(main_name: str, clone_name: str) -> list[ast.stmt]:
     for stmt in stmts:
         ast_walk.fix_missing_locations(stmt)
     return stmts
+
+
+def finalize_clone_defaults(node: ast.Module) -> None:
+    """Make generated clone defaults inert after the input lowering passes.
+
+    :param node: The lowered module, before bytecode emission
+    """
+    for statement in node.body:
+        if (isinstance(statement, ast.FunctionDef)
+                and statement.name.startswith(CLONE_PREFIX)
+                and statement.name.endswith(CLONE_SUFFIX)):
+            statement.args.defaults = [ast.copy_location(ast.Constant(None), default)
+                                       for default in statement.args.defaults]
+            statement.args.kw_defaults = [
+                ast.copy_location(ast.Constant(None), default) if default is not None else None
+                for default in statement.args.kw_defaults]

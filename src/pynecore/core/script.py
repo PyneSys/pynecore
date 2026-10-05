@@ -3,7 +3,8 @@ import os
 import sys
 
 from dataclasses import dataclass, field, fields
-from enum import StrEnum
+from enum import Enum, StrEnum
+from inspect import signature
 from pathlib import Path
 
 import pynecore.lib.format as _format
@@ -71,6 +72,17 @@ _programmatic_settings: dict[str, Any] = {}
 #: Whether the toml the decorator saves records the programmatic overrides too
 _save_programmatic_overrides: bool = False
 inputs: dict[str, InputData] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class ScriptConfig:
+    """Resolved settings and input values safe to send to a security process."""
+
+    inputs: dict[str, Any]
+    settings: dict[str, Any]
+
+
+_resolved_configs: dict[str, ScriptConfig] | None = None
 
 
 # noinspection PyShadowingBuiltins,PyShadowingNames,PyDunderSlots,PyUnresolvedReferences
@@ -145,6 +157,26 @@ class Script:
         """
         return [f.name for f in fields(self)
                 if not f.name.startswith('_') and f.name not in self._SKIP_FIELDS]
+
+    def resolved_config(self, main: Callable) -> ScriptConfig:
+        """Snapshot the configured values, including TOML and programmatic overrides.
+
+        :param main: The module's decorated entry point
+        :return: Values keyed by the input ids and settable setting names
+        """
+        def transport(value: Any) -> Any:
+            if isinstance(value, Enum):
+                return value.value
+            if isinstance(value, Color):
+                return f'#{value.value:08X}'
+            return value
+
+        parameters = signature(main).parameters
+        return ScriptConfig(
+            inputs={name: transport(parameters[name].default) for name in self.inputs
+                    if name in parameters},
+            settings={name: transport(getattr(self, name)) for name in self.settable_fields()},
+        )
 
     def default(self, key: str) -> Any:
         """
@@ -296,8 +328,11 @@ class Script:
             self.pyramiding = 1
         self._defaults = {key: getattr(self, key) for key in self.settable_fields()}
 
-        # Load settings from toml file if exists
-        if toml_path.exists():
+        config = _resolved_configs.get(str(script_path)) if _resolved_configs is not None else None
+        # Security replicas use the chart's resolved configuration for each module.
+        if config is not None:
+            _old_input_values.update(config.inputs)
+        elif toml_path.exists():
             self.load(toml_path)
 
         # The programmatic overrides belong to the script being run. A library it imports
@@ -307,9 +342,9 @@ class Script:
         toml_input_values = dict(_old_input_values)
 
         # Programmatic settings (override .toml values), applied once the toml is saved
-        settings: dict[str, Any] = {}
+        settings: dict[str, Any] = dict(config.settings) if config is not None else {}
         if is_runnable:
-            settings = dict(_programmatic_settings)
+            settings.update(_programmatic_settings)
             _programmatic_settings.clear()
 
         # Apply programmatic inputs (override .toml values)
@@ -341,7 +376,8 @@ class Script:
                         f"the main() parameter name: {', '.join(sorted(input_names)) or 'none'}")
 
                 # Save toml file if not in pytest and not disabled by env var PYNE_SAVE_SCRIPT_TOML = 0
-                save = os.environ.get('PYNE_SAVE_SCRIPT_TOML', '1') == '1' and 'pytest' not in sys.modules
+                save = (config is None and os.environ.get('PYNE_SAVE_SCRIPT_TOML', '1') == '1'
+                        and 'pytest' not in sys.modules)
                 if save and not save_overrides:
                     # The overrides only configure this run: the toml keeps what it held
                     _old_input_values.clear()
@@ -363,6 +399,10 @@ class Script:
                 # module level, so a top-level import here is a cycle.
                 from pynecore import lib as _lib
                 _lib._script_timeframe = self.timeframe
+
+            if not is_runnable:
+                for key, value in settings.items():
+                    self.set_setting(key, value)
 
             _old_input_values.clear()
             return func
@@ -634,14 +674,15 @@ class Script:
 
         script.overlay = overlay
         script.dynamic_requests = dynamic_requests
+        script.na_bool = na_bool
+        decorate = script._decorate()
 
         def decorator(func):
             # Register library main function if not already registered
             lib_entry = (script.title or 'Untitled Library', func)
             if lib_entry not in _registered_libraries:
                 _registered_libraries.append(lib_entry)
-            script.na_bool = na_bool
-            return script._decorate()(func)
+            return decorate(func)
 
         return decorator
 
@@ -697,6 +738,8 @@ class _Input:
         # back the way ``input.int`` does
         if _id in _old_input_values:
             value = _old_input_values[_id]
+            if input_type == 'color' and isinstance(value, str):
+                return Color(value)
             return safe_convert.safe_int(value) if input_type == 'int' else value
         return float(defval) if input_type == 'int' else defval
 

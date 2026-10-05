@@ -438,6 +438,7 @@ def security_process_main(
         script_settings: 'dict[str, Any] | None' = None,
         dev_batch_spec: 'DevBatchSpec | None' = None,
         run_env: 'dict[str, str] | None' = None,
+        resolved_configs: 'dict[str, script_mod.ScriptConfig] | None' = None,
 ):
     assert result_locks is not None, "result_locks must be provided by script_runner"
     """
@@ -518,12 +519,11 @@ def security_process_main(
         symbol or timeframe only exists at runtime — such a context can be a
         dependency of a child that was already spawned, so its record cannot
         have been in that child's snapshot.
-    :param script_inputs: The runner's programmatic input overrides. They are
-        applied while this process imports the script, so the child computes
-        its context with the very values the chart runs with instead of the
-        ``.toml`` (or source) defaults.
-    :param script_settings: The runner's programmatic script setting overrides,
-        applied the same way as ``script_inputs``.
+    :param script_inputs: Input overrides to apply when ``resolved_configs`` is absent.
+    :param script_settings: Script setting overrides to apply when
+        ``resolved_configs`` is absent.
+    :param resolved_configs: The chart's resolved configuration per module. When provided,
+        script and library inputs/settings use this snapshot instead of their TOML.
     :param dev_batch_spec: What to reproduce a historical DEVELOPING batch's
         round sequence from (see :func:`security.iter_dev_batch_records`), or
         ``None``. The chart launches ONE round for it
@@ -830,12 +830,11 @@ def security_process_main(
     # same user file. Disable the save for this process before importing.
     os.environ['PYNE_SAVE_SCRIPT_TOML'] = '0'
 
-    # The runner's programmatic inputs and settings override the .toml values in
-    # the chart process; this process loads the same script from scratch, so the
-    # import must apply them too or the child would silently run a differently
-    # configured script than the chart it feeds.
-    script_module = import_script(Path(script_path), inputs=script_inputs,
-                                  settings=script_settings)
+    script_module = import_script(
+        Path(script_path),
+        inputs=script_inputs if resolved_configs is None else None,
+        settings=script_settings if resolved_configs is None else None,
+        resolved_configs=resolved_configs)
 
     # Inject security protocol into module globals. Imported library modules can
     # contain request.security() calls too, so their transformed code references

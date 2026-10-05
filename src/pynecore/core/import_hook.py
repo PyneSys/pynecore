@@ -733,6 +733,7 @@ def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None,
     from pynecore.transformers.unused_series_detector import UnusedSeriesDetectorTransformer
     from pynecore.transformers.persistent import PersistentTransformer
     from pynecore.transformers.input_transformer import InputTransformer
+    from pynecore.transformers.security_slice import finalize_clone_defaults
     from pynecore.transformers.safe_convert_transformer import SafeConvertTransformer
     from pynecore.transformers.safe_division_transformer import SafeDivisionTransformer
     from pynecore.transformers.float_tolerance import FloatToleranceTransformer
@@ -779,6 +780,7 @@ def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None,
     # raw ``x != x`` nan idiom, both of which the rewrite would break
     if not path.is_relative_to(Path(__file__).parent.parent):
         transformed = FloatToleranceTransformer(na_bool=na_bool).visit(transformed)
+    finalize_clone_defaults(transformed)
     if emit_layout:
         transformed = apply_layout(transformed, slot_layout)
 

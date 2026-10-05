@@ -150,7 +150,8 @@ def script_module_name(script_path: Path) -> str:
 # noinspection PyProtectedMember
 def import_script(script_path: Path, *, inputs: dict[str, Any] | None = None,
                   settings: dict[str, Any] | None = None,
-                  save_overrides: bool = False) -> ModuleType:
+                  save_overrides: bool = False,
+                  resolved_configs: dict[str, script_mod.ScriptConfig] | None = None) -> ModuleType:
     """
     Import the script: execute exactly this file as a fresh module.
 
@@ -172,6 +173,8 @@ def import_script(script_path: Path, *, inputs: dict[str, Any] | None = None,
     :param settings: Script settings keyed by decorator argument name (``initial_capital``,
                      ``commission_value``, ...); see :meth:`Script.settable_fields`
     :param save_overrides: Write ``inputs`` and ``settings`` into the script's ``.toml``
+    :param resolved_configs: Per-module chart configuration for a security replica;
+                            matching modules do not read or write their TOML
     :return: The executed module
     :raises ImportError: If the file cannot be read, is not Pyne code or has no
                          ``main`` function
@@ -208,6 +211,9 @@ def import_script(script_path: Path, *, inputs: dict[str, Any] | None = None,
     sys.modules[name] = module
     # The script's directory is on the path while it runs, for the libraries it imports
     sys.path.insert(0, str(script_path.parent))
+    script_mod.inputs.clear()
+    previous_configs = script_mod._resolved_configs
+    script_mod._resolved_configs = resolved_configs
     if inputs:
         script_mod._programmatic_inputs.update(inputs)
     if settings:
@@ -226,6 +232,8 @@ def import_script(script_path: Path, *, inputs: dict[str, Any] | None = None,
         # The decorator clears its input values when it completes; a failed import must not
         # hand them to the next one either
         script_mod._old_input_values.clear()
+        script_mod.inputs.clear()
+        script_mod._resolved_configs = previous_configs
 
     if not hasattr(module, 'main'):
         raise ImportError(f"Script '{script_path}' must have a 'main' function to run!")
@@ -1391,9 +1399,8 @@ class ScriptRunner:
         # This ensures that timestamp() calls in default parameters use the correct timezone
         _set_lib_syminfo_properties(syminfo)
 
-        # The overrides are kept: a security child re-imports the script in its own
-        # process, where nothing would apply them otherwise, and it would compute
-        # the context with the .toml (or source) values instead.
+        # Apply programmatic overrides to the initial import. Security replicas
+        # receive the complete resolved configuration of the script and its libraries.
         self._inputs: dict[str, Any] = dict(inputs) if inputs else {}
         self._settings: dict[str, Any] = dict(settings) if settings else {}
 
@@ -2199,6 +2206,10 @@ class ScriptRunner:
 
             if sec_contexts:
                 import os
+                resolved_configs = {
+                    str(Path(module.__file__).resolve()): module.main.script.resolved_config(module.main)
+                    for module in sec_modules
+                }
                 max_security = int(os.environ.get('PYNESYS_MAX_SECURITY_CONTEXTS', '64'))
                 if len(sec_contexts) > max_security:
                     raise RuntimeError(
@@ -2662,8 +2673,8 @@ class ScriptRunner:
                             _registry_child_conn,
                             _capacities,
                             _arenas,
-                            self._inputs,
-                            self._settings,
+                            None,  # Input overrides are included in resolved_configs.
+                            None,  # Setting overrides are included in resolved_configs.
                             _dev_batch_spec,
                         ),
                         # Read per spawn: the forkserver froze its own copy of
@@ -2671,7 +2682,7 @@ class ScriptRunner:
                         # have re-pinned ``timenow`` since. Kept out of ``args``
                         # because that tuple describes the CONTEXT, and its tail
                         # is what identifies a planned developing batch.
-                        kwargs={'run_env': child_run_env()},
+                        kwargs={'run_env': child_run_env(), 'resolved_configs': resolved_configs},
                         daemon=True,
                     )
                     proc.start()
