@@ -36,6 +36,9 @@ def in_module_bool_mode(bound: Callable, na_bool: bool) -> Callable:
         finally:
             _na.set_bool_na(not na_bool)
 
+    # State walkers must reach the binding's vector, dispatcher cache or
+    # series buffer through this mode guard, while calls still use the guard.
+    setattr(call, '__pyne_bound__', bound)
     return call
 
 F = TypeVar('F', bound=Callable[..., Any])  # Function type

@@ -17,6 +17,7 @@ from pynecore.core.broker.models import ScriptRequirements
 
 from pynecore.types import script_type as _script_type
 from pynecore.types.color import Color
+from pynecore.types.base import IntEnum
 from pynecore.types import PyneFloat, PyneInt
 from pynecore.types.pine_types import pine_int
 from pynecore.types.na import na_int
@@ -167,6 +168,8 @@ class Script:
         def transport(value: Any) -> Any:
             if isinstance(value, Enum):
                 return value.value
+            if isinstance(value, IntEnum):
+                return int(value)
             if isinstance(value, Color):
                 return f'#{value.value:08X}'
             return value

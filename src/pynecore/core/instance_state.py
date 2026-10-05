@@ -312,6 +312,7 @@ def _collect_bound_builtins(bound: Any, out: list) -> None:
     dispatcher its per-implementation vectors through ``__pyne_cache__``.
     Anything else is opaque — left alone, never dropped (dropping would
     reset its state on every iteration)."""
+    bound = getattr(bound, '__pyne_bound__', bound)
     if type(bound) is partial and bound.args:
         layout: dict[str, Any] | None = getattr(bound.func, '__pyne_layout__', None)
         if layout is not None:
@@ -622,6 +623,7 @@ def _carry_state(prev: tuple | None, layout: dict[str, Any]) -> list:
     """
     if prev is not None:
         prev_bound = prev[1]
+        prev_bound = getattr(prev_bound, '__pyne_bound__', prev_bound)
         if type(prev_bound) is partial and prev_bound.args \
                 and getattr(prev_bound.func, '__pyne_layout__', None) is layout:
             return prev_bound.args[0]
@@ -1176,6 +1178,7 @@ def _snap_child(entry: Any, seen: dict[int, _Node]) -> tuple:
         return 'vec', entry, _snap_vector(entry, entry[-1], seen)
     if type(entry) is tuple and len(entry) == 2:
         bound = entry[1]
+        bound = getattr(bound, '__pyne_bound__', bound)
         if type(bound) is partial and bound.args:
             layout: dict[str, Any] | None = getattr(bound.func, '__pyne_layout__', None)
             if layout is not None:

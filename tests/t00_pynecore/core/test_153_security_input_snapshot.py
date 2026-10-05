@@ -161,8 +161,30 @@ def main(length=input.int(2)):
     assert not script_mod.inputs
 
 
-def __test_security_process_uses_snapshot_after_toml_changes__(tmp_path, syminfo):
-    path = __test_helper_write(tmp_path)
+@pytest.mark.parametrize('scale_name', ['left', 'none', 'right'])
+def __test_snapshot_transports_scale_constants__(tmp_path, scale_name):
+    from pynecore.lib import scale
+
+    source = SOURCE.replace('plot, request, script, syminfo', 'plot, request, scale, script, syminfo')
+    source = source.replace("@script.indicator('Snapshot')",
+                            f"@script.indicator('Snapshot', scale=scale.{scale_name})")
+    path = __test_helper_write(tmp_path, source)
+    original = import_script(path)
+    configs = __test_helper_config(original)
+    setting = configs[str(path)].settings['scale']
+    assert type(setting) is int
+    assert setting == getattr(scale, scale_name)
+    configs = pickle.loads(pickle.dumps(configs))
+    replica = import_script(path, resolved_configs=configs)
+    assert replica.main.script.resolved_config(replica.main) == configs[str(path)]
+
+
+@pytest.mark.parametrize('scale_name', ['left', 'none', 'right'])
+def __test_security_process_uses_snapshot_after_toml_changes__(tmp_path, syminfo, scale_name):
+    source = SOURCE.replace('plot, request, script, syminfo', 'plot, request, scale, script, syminfo')
+    source = source.replace("@script.indicator('Snapshot')",
+                            f"@script.indicator('Snapshot', scale=scale.{scale_name})")
+    path = __test_helper_write(tmp_path, source)
     path.with_suffix('.toml').write_text('''[script]
 [inputs.length]
 value = 5
