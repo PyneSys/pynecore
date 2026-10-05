@@ -4,6 +4,7 @@ Alert
 The module is both a function (``alert(...)``) and a namespace (``alert.freq_once_per_bar``);
 call sites are routed to :func:`alert` by the module property AST transformer.
 """
+from .. import lib
 from ..types.alert import AlertEnum
 
 
@@ -30,6 +31,9 @@ def alert(
     :param message: Alert message to display
     :param freq: Alert frequency (currently ignored)
     """
+    if lib._lib_semaphore:
+        return
+
     try:
         # Try to use typer for nice colored output
         import typer

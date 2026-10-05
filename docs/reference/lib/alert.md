@@ -62,5 +62,13 @@ alert("Price crossed above SMA!", freq=alert.freq_once_per_bar)
 
 ## Compatibility Notes
 
-- The `freq` parameter is accepted for Pine Script compatibility but is **not enforced** — all `alert()` calls produce output regardless of the frequency constant used.
+- Calls made while an imported library's `main()` runs, including its helper calls, are suppressed.
+  Calls from the importing script into an exported library function can produce output normally.
+- Calls in `request.security` workers are suppressed to avoid duplicate output when they replay the script.
+- The `freq` parameter is accepted for Pine Script compatibility but is **not enforced**.
+  Outside the suppressed contexts, calls print on historical as well as realtime bars.
 - There is no support for alert conditions or webhook-based alerts. `alert()` is terminal output only.
+  A library run directly as the main script can also print these messages. TradingView instead
+  supports actual alerts only on realtime bars and does not allow creating an alert directly
+  from a library; an indicator or strategy must consume its exported function.
+  See [TradingView's library constraints](https://www.tradingview.com/pine-script-docs/concepts/libraries/#library-functions).
