@@ -45,6 +45,9 @@ _PACKAGE_DIR = str(Path(__file__).resolve().parent.parent) + os.sep
 # the first element of that constant's tuple. A ``.pyc`` holds many tuples; this
 # marker is what tells the records apart from every other one in ``co_consts``.
 _PYNE_DEPS = '__pyne_type_deps__'
+
+#: Source fingerprints consulted while validating imported enum captures.
+_PYNE_CAPTURE_DEPS = '__pyne_capture_deps__'
 #: Alias the loader binds ``set_bool_na`` to in a script module's baked prologue
 _PYNE_SET_BOOL_NA = '__pyne_set_bool_na·__'
 #: Module-level record of the script's bool na choice, read at the module
@@ -917,6 +920,25 @@ def _deps_current(code, pipeline_hash: str) -> bool:
     return all(dep_current(record, analyse_source, pipeline_hash) for record in records)
 
 
+def _capture_deps_current(code) -> bool:
+    """Revalidate source files used to prove imported enum captures constant.
+
+    :param code: The cached module code object.
+    :return: Whether all consulted source fingerprints still match.
+    """
+    for constant in code.co_consts:
+        if not isinstance(constant, tuple) or not constant or constant[0] != _PYNE_CAPTURE_DEPS:
+            continue
+        for path, mtime_ns, size in constant[1:]:
+            try:
+                stat = Path(path).stat()
+            except OSError:
+                return False
+            if (stat.st_mtime_ns, stat.st_size) != (mtime_ns, size):
+                return False
+    return True
+
+
 class PyneLoader(importlib.machinery.SourceFileLoader):
     """Loader that handles AST transformation"""
 
@@ -983,7 +1005,7 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
         # The pipeline is current, but the types this module was compiled against
         # live in OTHER modules; an edit to one of their interfaces makes this
         # bytecode wrong while CPython still sees a valid cache for it.
-        if _deps_current(code, pipeline_hash):
+        if _capture_deps_current(code) and _deps_current(code, pipeline_hash):
             return code
         return self._retransform(fullname, source_path, _PYNE_SENTINEL, pipeline_hash)
 
@@ -1142,6 +1164,12 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
                                         ast.Constant(value=record.digest)],
                                   ctx=ast.Load())
                         for _, record in sorted(table.deps.items())], ctx=ast.Load()),
+                ))
+            capture_deps = getattr(transformed, '_export_capture_deps', ())
+            if capture_deps:
+                baked.append(ast.Assign(
+                    targets=[ast.Name(id=_PYNE_CAPTURE_DEPS, ctx=ast.Store())],
+                    value=ast.Constant(value=(_PYNE_CAPTURE_DEPS, *capture_deps)),
                 ))
             # is_pyne_module guarantees body[0] is the module docstring; keep it first,
             # and stay after any ``from __future__`` imports (which must lead the module).

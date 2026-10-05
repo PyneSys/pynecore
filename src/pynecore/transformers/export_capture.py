@@ -5,7 +5,9 @@ but not objects or per-bar values created there, even through a helper. Local
 state created inside the exported call remains valid and belongs to its caller.
 """
 import ast
+from importlib.machinery import PathFinder
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from . import ast_walk
 from .pine_qualifier import CONST, lib_call_qualifier, lib_value_qualifier, builtin_call_qualifier
@@ -47,6 +49,144 @@ def _path(node: ast.AST) -> str:
     if isinstance(node, ast.Attribute):
         return _path(node.value) + '.' + node.attr
     return ''
+
+
+class _EnumResolver:
+    """Resolve enum declarations from source without executing imported modules."""
+
+    def __init__(self):
+        self.modules: dict[tuple[str, str, int], _Scope | None] = {}
+        self.sources: dict[str, tuple[int, int]] = {}
+
+    def module(self, name: str, owner: _Scope, level: int = 0) -> _Scope | None:
+        while owner.parent is not None:
+            owner = owner.parent
+        source = getattr(owner.node, '_module_file_path', '')
+        key = (name, source if level else '', level)
+        if key in self.modules:
+            return self.modules[key]
+        self.modules[key] = None
+        search = None
+        if level:
+            if not source:
+                return None
+            base = Path(source).parent
+            for _ in range(level - 1):
+                base = base.parent
+            search = [str(base)]
+        spec = None
+        try:
+            if not name and level:
+                path = base / '__init__.py'
+            else:
+                segments = name.split('.')
+                for index in range(len(segments)):
+                    # Resolve one component at a time: namespace packages need
+                    # not exist in sys.modules for their source to be inspected.
+                    spec = PathFinder.find_spec(segments[index], search)
+                    if spec is None:
+                        return None
+                    locations = spec.submodule_search_locations
+                    search = list(locations) if locations is not None else None
+                    if index < len(segments) - 1 and search is None:
+                        return None
+                if spec is None or not spec.origin or not spec.origin.endswith('.py'):
+                    return None
+                path = Path(spec.origin)
+            from .pine_type_artifact import stable_source
+            loaded = stable_source(path)
+            if loaded is None:
+                return None
+            data, fingerprint = loaded
+            tree = ast.parse(data, filename=str(path))
+        except (ImportError, OSError, SyntaxError, ValueError):
+            return None
+        tree._module_file_path = str(path.resolve())
+        self.sources[tree._module_file_path] = fingerprint
+        scope = _Scope(tree, None)
+
+        def bind(node: ast.AST) -> None:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                scope.bindings.setdefault(node.name, []).append(node)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    scope.bindings.setdefault(alias.asname or alias.name.split('.')[0], []).append(node)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    for item in ast_walk.walk(target):
+                        if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store):
+                            scope.bindings.setdefault(item.id, []).append(node)
+            else:
+                for child in ast_walk.iter_child_nodes(node):
+                    bind(child)
+
+        for statement in tree.body:
+            bind(statement)
+        self.modules[key] = scope
+        return scope
+
+    def resolve(self, parts: list[str], scope: _Scope, seen: set[tuple[_Scope, str]]) \
+            -> tuple[ast.ClassDef | str, _Scope] | None:
+        if not parts:
+            return None
+        owner = scope.resolve(parts[0])
+        if owner is None:
+            return None
+        key = (owner, '.'.join(parts))
+        bindings = owner.bindings[parts[0]]
+        if key in seen or len(bindings) != 1:
+            return None
+        seen = seen | {key}
+        binding = bindings[0]
+        if isinstance(binding, ast.ClassDef):
+            return (binding, owner) if len(parts) == 1 else None
+        if isinstance(binding, (ast.Assign, ast.AnnAssign)) and binding.value is not None:
+            alias = _path(binding.value)
+            return self.resolve(alias.split('.') + parts[1:], owner, seen) if alias else None
+        if isinstance(binding, ast.Import):
+            alias = next((alias for alias in binding.names
+                          if (alias.asname or alias.name.split('.')[0]) == parts[0]), None)
+            if alias is None:
+                return None
+            prefix = [parts[0]] if alias.asname else alias.name.split('.')
+            if parts[:len(prefix)] != prefix:
+                return None
+            module, tail, level = alias.name, parts[len(prefix):], 0
+        elif isinstance(binding, ast.ImportFrom):
+            alias = next((alias for alias in binding.names
+                          if (alias.asname or alias.name) == parts[0]), None)
+            if alias is None:
+                return None
+            module, tail, level = binding.module or '', [alias.name, *parts[1:]], binding.level
+        else:
+            return None
+        if module == 'enum' and not level and len(tail) == 1 \
+                and tail[0] in ('Enum', 'StrEnum', 'IntEnum'):
+            return tail[0], owner
+        imported = self.module(module, owner, level)
+        return self.resolve(tail, imported, seen) if imported is not None else None
+
+    def member(self, path: str, scope: _Scope) -> bool:
+        parts = path.split('.')
+        if len(parts) < 2:
+            return False
+        resolved = self.resolve(parts[:-1], scope, set())
+        if resolved is None or not isinstance(resolved[0], ast.ClassDef):
+            return False
+        definition, owner = resolved
+        if definition.decorator_list or definition.keywords:
+            return False
+        bases = [self.resolve(_path(base).split('.'), owner, set()) for base in definition.bases]
+        if not any(base is not None and isinstance(base[0], str) for base in bases):
+            return False
+        bindings = [statement for statement in definition.body
+                    if isinstance(statement, (ast.Assign, ast.AnnAssign))
+                    and any(isinstance(target, ast.Name) and target.id == parts[-1]
+                            for target in (statement.targets if isinstance(statement, ast.Assign)
+                                           else [statement.target]))]
+        return (len(bindings) == 1 and not parts[-1].startswith('_')
+                and isinstance(bindings[0].value, ast.Constant))
 
 
 class ExportCaptureTransformer(ast_walk.NodeTransformer):
@@ -134,6 +274,7 @@ class ExportCaptureTransformer(ast_walk.NodeTransformer):
             collect(statement, root)
         mains = [scopes[main] for main in main_nodes]
         global_scopes = {root, *mains}
+        enums = _EnumResolver()
         # Explicit outer writes invalidate an otherwise literal binding too.
         for scope in scopes.values():
             for name in scope.globals | scope.nonlocals:
@@ -152,15 +293,17 @@ class ExportCaptureTransformer(ast_walk.NodeTransformer):
                 if path.startswith('lib.'):
                     key = path[4:]
                     entry = lib_types().get(key)
-                    return (entry is not None and entry['kind'] == 'value'
-                            and not entry.get('callable', False)
-                            and lib_value_qualifier(key, entry['ty']) == CONST)
+                    if entry is not None:
+                        return (entry['kind'] == 'value' and not entry.get('callable', False)
+                                and lib_value_qualifier(key, entry['ty']) == CONST)
                 owner = scope.resolve(path.split('.')[0])
-                return owner is not None and any(
+                if owner is not None and any(
                     isinstance(binding, ast.ClassDef)
                     and any(_path(base).split('.')[-1] in ('Enum', 'StrEnum', 'IntEnum')
                             for base in binding.bases)
-                    for binding in owner.bindings[path.split('.')[0]])
+                    for binding in owner.bindings[path.split('.')[0]]):
+                    return True
+                return enums.member(path, scope)
             if isinstance(value, (ast.UnaryOp, ast.BinOp, ast.BoolOp, ast.Compare, ast.IfExp)):
                 return all(constant(child, scope, visiting) for child in ast_walk.iter_child_nodes(value)
                            if isinstance(child, ast.expr))
@@ -240,4 +383,6 @@ class ExportCaptureTransformer(ast_walk.NodeTransformer):
                         f'non-constant library global "{read.id}".',
                         (path, read.lineno, read.col_offset + 1, None),
                     )
+        node._export_capture_deps = tuple((path, *fingerprint)
+                                         for path, fingerprint in sorted(enums.sources.items()))
         return node
