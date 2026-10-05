@@ -725,6 +725,7 @@ def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None,
     from pynecore.transformers.export_once import ExportOnceTransformer
     from pynecore.transformers.function_isolation import FunctionIsolationTransformer
     from pynecore.transformers.series import SeriesTransformer
+    from pynecore.transformers.security_default import SecurityDefaultTransformer
     from pynecore.transformers.security_closed_shift_check import verify_closed_shift
     from pynecore.transformers.script_requirements import ScriptRequirementsTransformer
     from pynecore.transformers.unused_series_detector import UnusedSeriesDetectorTransformer
@@ -740,11 +741,15 @@ def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None,
     # state-contributing transformers fill it, apply_layout emits it
     slot_layout = ModuleLayout(compacted_series=pyne_mode == 'lib')
 
+    # Security reads now carry their expression's inferred type, including
+    # tuple fields; resolve bool defaults before the state plumbing is emitted.
+    transformed = SecurityDefaultTransformer().visit(tree)
+
     # A library's export surface is defined once per RUN, not once per bar:
     # the latch it runs under is a Persistent slot, so it must precede the
     # slot transformers, and the guarded definitions must reach them in
     # their final position
-    transformed = ExportOnceTransformer().visit(tree)
+    transformed = ExportOnceTransformer().visit(transformed)
     transformed = UnusedSeriesDetectorTransformer().optimize(transformed)
     transformed = SeriesTransformer(slot_layout).visit(transformed)
     # The series pass has just emitted the only two forms a runtime history

@@ -130,6 +130,9 @@ HELPER_ALIASES = {
 # - are purely for output/display purposes
 # This makes code run little bit faster
 NON_TRANSFORMABLE_FUNCTIONS = {
+    # The bool na factory reads only the script-wide mode, with no call-site state.
+    '__sec_bool_na·__',
+
     # Plot and display related (function-and-namespace modules appear as their
     # self-named function after the module property rewrite, e.g. lib.plot.plot)
     'lib.plot.plot', 'lib.plotchar', 'lib.plotshape', 'lib.plotarrow',
