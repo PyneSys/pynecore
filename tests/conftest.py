@@ -479,7 +479,7 @@ def log_comparator(capsys) -> LogComparatorProtocol:
         def round_match(match: re.Match) -> str:
             array_str = match.group(0)
             # Parse numbers from array string
-            numbers = [float(n) for n in re.findall(r'-?\d+\.?\d*(?:e[-+]?\d+)?', array_str)]
+            numbers = [float(n) for n in re.findall(r'-?\d++\.?+\d*+(?:e[-+]?\d++)?+', array_str)]
             # Round numbers and normalize zero
             rounded = []
             for n in numbers:
@@ -490,8 +490,8 @@ def log_comparator(capsys) -> LogComparatorProtocol:
                 rounded.append(n)
             return str(rounded).replace("'", "")
 
-        # Find arrays with floating point numbers and round them
-        pattern = r'\[-?\d+\.?\d*(?:e[-+]?\d+)?(?:\s*,\s*-?\d+\.?\d*(?:e[-+]?\d+)?)*\]'
+        # Possessive quantifiers prevent backtracking over digits and items in malformed arrays.
+        pattern = r'\[-?\d++\.?+\d*+(?:e[-+]?\d++)?+(?:\s*+,\s*+-?\d++\.?+\d*+(?:e[-+]?\d++)?+)*+\]'
         return re.sub(pattern, round_match, text)
 
     @contextmanager
