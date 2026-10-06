@@ -9,8 +9,6 @@ from pynecore.lib import script, timeframe, syminfo
 # noinspection PyUnreachableCode
 @script.indicator(title="Timeframe Basic", shorttitle="tf_basic")
 def main():
-    import pytest
-
     # No script-level ``timeframe``: every ``timeframe.*`` builtin describes the
     # chart, so they all follow ``syminfo.period`` below. A script that DOES declare
     # one reports THAT timeframe instead -- MEASURED on TradingView
@@ -97,15 +95,15 @@ def main():
     assert timeframe.multiplier == 3
     assert timeframe.period == "3M"
 
-    with pytest.raises(AssertionError):
-        syminfo.period = "3Y"
-        assert timeframe.multiplier == 1
 
-    with pytest.raises(AssertionError):
-        syminfo.period = "5X"
-        assert timeframe.change("1D")
-
-
-def __test_timeframe_basic__(runner, dummy_ohlcv_iter):
+def __test_timeframe_basic__(runner, dummy_ohlcv_iter, monkeypatch):
     """ Basic """
+    import pytest
+
     next(runner(dummy_ohlcv_iter).run_iter())
+
+    monkeypatch.setattr(syminfo, "period", "3Y")
+    pytest.raises(AssertionError, timeframe.multiplier).match("Invalid timeframe: wrong modifier!")
+
+    monkeypatch.setattr(syminfo, "period", "5X")
+    pytest.raises(AssertionError, timeframe.change, "1D").match("Invalid timeframe: wrong modifier!")
