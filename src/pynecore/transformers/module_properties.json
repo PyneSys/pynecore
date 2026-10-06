@@ -222,6 +222,9 @@
     },
     "freq_once_per_bar_close": {
       "type": "variable"
+    },
+    "lib": {
+      "type": "variable"
     }
   },
   "lib.array": {
@@ -1125,6 +1128,9 @@
     "HLineEnum": {
       "type": "variable"
     },
+    "NA": {
+      "type": "variable"
+    },
     "PlotMeta": {
       "type": "variable"
     },
@@ -1444,6 +1450,9 @@
       "type": "variable"
     },
     "get_line2": {
+      "type": "variable"
+    },
+    "lib": {
       "type": "variable"
     },
     "new": {
@@ -3357,6 +3366,9 @@
       "type": "variable"
     },
     "delete": {
+      "type": "variable"
+    },
+    "lib": {
       "type": "variable"
     },
     "merge_cells": {
