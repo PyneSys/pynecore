@@ -29,6 +29,7 @@ from pynecore.core.broker.spot_inventory import (
     fold_inventory,
 )
 from pynecore.core.broker.storage import BrokerStore, RunContext
+from pynecore.core.broker.store_helpers import STATE_CONFIRMED
 
 PLUGIN = "TestSpotBroker"
 ACCOUNT = "testspot-demo-001"
@@ -725,6 +726,121 @@ def __test_reconcile_grace_clears_when_settlement_lands__(tmp_path: Path):
     assert not mgr.quarantined
     epoch = ctx.get_latest_spot_epoch(port.product_id)
     assert epoch is not None and epoch.pending_conflict_ts_ms is None
+    store.close()
+
+
+def __test_reconcile_unexplained_drift_holds_the_cursor__(tmp_path: Path):
+    """A conclusive-but-empty catch-up must not advance past a live drift.
+
+    Measured live (Bybit spot lane, cycle 258): the balance showed a
+    close fill the execution list did not return 61 s later; the cursor
+    advanced to that read's end, so the next read's overlapped start sat
+    1.4 s past the fill and it was never recovered — a false quarantine.
+    While the drift is unexplained the cursor stays where it was.
+    """
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    port = FakeSpotPort(balance=Decimal('5'))
+    mgr = _manager(ctx, port, hook=lambda r, c: None)
+    assert not _run(mgr.startup()).quarantined
+
+    # The balance moved, the history lags: the read drains nothing and
+    # offers an advanced cursor.
+    port.balance = Decimal('6')
+    port.batches["anchor-0"] = SpotExecutionBatch(next_cursor="anchor-1")
+    _run(mgr.reconcile(T0_MS))
+    epoch = ctx.get_latest_spot_epoch(port.product_id)
+    assert epoch is not None
+    assert epoch.pending_conflict_ts_ms == T0_MS
+    assert epoch.exec_cursor == "anchor-0", "an unexplained drift holds the cursor"
+
+    # The venue indexes the fill behind the balance: the held cursor
+    # re-reads the span and recovers it; only then does the cursor move.
+    port.batches["anchor-0"] = SpotExecutionBatch(
+        executions=(_fill("late-1", base='1', price='100'),),
+        next_cursor="anchor-1",
+    )
+    delivered = _run(mgr.reconcile(T0_MS + 10_000))
+    assert [row.fill_id for row in delivered] == ["late-1"]
+    assert not mgr.quarantined
+    epoch = ctx.get_latest_spot_epoch(port.product_id)
+    assert epoch is not None
+    assert epoch.pending_conflict_ts_ms is None
+    assert epoch.exec_cursor == "anchor-1"
+    assert port.fetch_calls[1:] == ["anchor-0", "anchor-0"]
+    store.close()
+
+
+def __test_reconcile_in_flight_own_order_holds_the_quarantine__(tmp_path: Path):
+    """A drift the bot's own live order covers is latency, not a conflict.
+
+    Past the settlement grace the quarantine holds while the unfilled
+    quantity of the bot's live rows on the drift's side covers it; it
+    fires as soon as those rows resolve without a fill, and a drift
+    beyond them is never excused.
+    """
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    port = FakeSpotPort(balance=Decimal('10'))
+    calls: list = []
+    mgr = _manager(ctx, port, hook=lambda r, c: calls.append((r, c)))
+    assert not _run(mgr.startup()).quarantined
+    port.balance = Decimal('11')
+    mgr.record_live_fill(_fill("own-1", base='1', price='100'))
+    _run(mgr.reconcile(T0_MS))
+    assert not mgr.quarantined
+
+    # The bot's close is dispatched; its fill reaches the balance only.
+    ctx.upsert_order(
+        "close-1", symbol="BTCUSD", side="sell", qty=1.0, filled_qty=0.0,
+        state=STATE_CONFIRMED, intent_key="L", exchange_order_id="X1",
+        extras={},
+    )
+    port.balance = Decimal('10')
+    _run(mgr.reconcile(T0_MS + 60_000))
+    assert not mgr.quarantined
+    for i in (1, 2, 3):
+        _run(mgr.reconcile(T0_MS + 60_000 + 31_000 * i))
+        assert not mgr.quarantined, "the in-flight sell covers the drift"
+    assert not calls
+    held = _read_events(ctx, 'spot_inventory_conflict_held')
+    assert len(held) == 1, "the hold logs once per set of covering rows"
+    assert held[0]['client_order_ids'] == ["close-1"]
+    assert held[0]['drift'] == '-1'
+
+    # The row resolves without a fill: nothing covers the drift any more.
+    ctx.close_order("close-1")
+    _run(mgr.reconcile(T0_MS + 60_000 + 31_000 * 4))
+    assert mgr.quarantined
+    assert len(calls) == 1 and 'spot_inventory_conflict' in calls[0][0]
+    store.close()
+
+
+def __test_reconcile_in_flight_order_never_excuses_a_larger_drift__(tmp_path: Path):
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    port = FakeSpotPort(balance=Decimal('10'))
+    calls: list = []
+    mgr = _manager(ctx, port, hook=lambda r, c: calls.append((r, c)))
+    assert not _run(mgr.startup()).quarantined
+    port.balance = Decimal('12')
+    mgr.record_live_fill(_fill("own-1", base='2', price='100'))
+    _run(mgr.reconcile(T0_MS))
+    assert not mgr.quarantined
+
+    # A live sell of 1 cannot explain a drift of -2 (an external sale
+    # rode along): the grace expires into the quarantine as before.
+    ctx.upsert_order(
+        "close-1", symbol="BTCUSD", side="sell", qty=1.0, filled_qty=0.0,
+        state=STATE_CONFIRMED, intent_key="L", exchange_order_id="X1",
+        extras={},
+    )
+    port.balance = Decimal('10')
+    _run(mgr.reconcile(T0_MS + 60_000))
+    assert not mgr.quarantined
+    _run(mgr.reconcile(T0_MS + 60_000 + 31_000))
+    assert mgr.quarantined
+    assert not _read_events(ctx, 'spot_inventory_conflict_held')
     store.close()
 
 

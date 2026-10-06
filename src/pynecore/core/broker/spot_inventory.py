@@ -535,6 +535,7 @@ class SpotInventoryManager:
         self._quarantine_reason: str | None = None
         self._pending_halt: SpotInventoryConflictError | None = None
         self._started = False
+        self._conflict_hold_coids: frozenset[str] = frozenset()
 
     # --- Introspection ------------------------------------------------------
 
@@ -1026,11 +1027,13 @@ class SpotInventoryManager:
                     'spot_inventory_conflict_resolved',
                     payload={'product_id': port.product_id},
                 )
+            self._conflict_hold_coids = frozenset()
             await self._maybe_compact_dust()
             return []
 
         # Mismatch. Try the innocent explanation first: fills we have
         # not seen yet (settlement / stream gap).
+        cursor_before = epoch.exec_cursor
         try:
             recovered, conclusive, _ = await self._catch_up(epoch.exec_cursor)
         except SpotInventoryConflictError:
@@ -1061,10 +1064,26 @@ class SpotInventoryManager:
                     payload={'product_id': port.product_id,
                              'recovered_fills': recovered},
                 )
+                self._conflict_hold_coids = frozenset()
                 return delivered
         self._epoch = self._store.get_latest_spot_epoch(port.product_id)
         epoch = self._epoch
         assert epoch is not None
+        if cursor_before is not None and epoch.exec_cursor != cursor_before:
+            # The drift is still unexplained, so the history the catch-up
+            # just drained is NOT complete: the venue indexes its
+            # execution list behind its wallet balance (measured live,
+            # Bybit spot: the balance showed a fill the list did not
+            # return 61 s later). Keeping the advanced cursor would put
+            # the next read's overlapped start past that fill and lose
+            # it for good; hold the cursor where it was until the drift
+            # resolves — re-reading the span is free (fill-id dedup).
+            self._store.set_spot_epoch_cursor(
+                port.product_id, epoch.epoch_seq, cursor_before,
+            )
+            self._epoch = self._store.get_latest_spot_epoch(port.product_id)
+            epoch = self._epoch
+            assert epoch is not None
 
         pending_since = epoch.pending_conflict_ts_ms
         context = self._conflict_context(balance, drift)
@@ -1095,8 +1114,54 @@ class SpotInventoryManager:
                 "grace stays armed", port.product_id,
             )
         if now_ms - pending_since >= port.settlement_grace_s * 1000.0:
+            explaining = self._in_flight_orders_explaining(drift)
+            if explaining:
+                # The bot's own live orders account for the whole drift:
+                # their fill has reached the balance but not the venue's
+                # execution history yet. That is latency, not a foreign
+                # actor — keep the grace armed and keep draining the
+                # history; the quarantine fires the moment the rows
+                # resolve without a fill or the drift outgrows them.
+                if explaining != self._conflict_hold_coids:
+                    self._conflict_hold_coids = explaining
+                    self._store.log_event(
+                        'spot_inventory_conflict_held',
+                        payload={**context, 'client_order_ids': list(explaining)},
+                    )
+                    logger.warning(
+                        "spot inventory: balance invariant mismatch for %r "
+                        "(drift=%s) is covered by the bot's in-flight "
+                        "order(s) %s; holding the quarantine until their "
+                        "fills reach the execution history",
+                        port.product_id, context['drift'], sorted(explaining),
+                    )
+                return delivered
             self._enter_quarantine('spot_inventory_conflict', context)
         return delivered
+
+    def _in_flight_orders_explaining(self, drift: Decimal) -> frozenset[str]:
+        """The bot's live orders whose unfilled quantity covers ``drift``.
+
+        A sell moves the base balance by exactly its quantity, a buy by
+        the quantity minus any base-denominated fee, so the unfilled
+        quantity of the live rows on the drift's side bounds the drift
+        they can explain. Empty when no such rows exist or the drift
+        exceeds them.
+        """
+        if drift == 0:
+            return frozenset()
+        side = 'sell' if drift < 0 else 'buy'
+        rows = [
+            row for row in self._store.iter_live_orders(symbol=self._symbol)
+            if row.side == side
+        ]
+        unfilled = sum(
+            (Decimal(str(row.qty)) - Decimal(str(row.filled_qty)) for row in rows),
+            Decimal(0),
+        )
+        if unfilled <= 0 or abs(drift) > unfilled + self._port.base_tolerance:
+            return frozenset()
+        return frozenset(row.client_order_id for row in rows)
 
     async def _maybe_compact_dust(self) -> None:
         """Retire an unsellable-dust ledger into the epoch baseline.
