@@ -4,6 +4,7 @@ library's entry runs under the script's choice even when another script's run
 switched the mode off in between.
 """
 import sys
+from functools import wraps
 from pathlib import Path
 
 from pynecore.types.na import set_bool_na
@@ -42,6 +43,19 @@ def __test_the_library_entry_runs_in_the_scripts_mode__():
     try:
         runner = ScriptRunner(DATA_DIR / 'bool_na_lib_entry.py', iter(_make_ohlcv(3)),
                               _make_syminfo())
+        library_results = []
+        library_entry = sys.modules['bool_na_lib_entry_lib'].main
+
+        @wraps(library_entry)
+        def observe_library_entry(*args, **kwargs):
+            result = library_entry(*args, **kwargs)
+            library_results.append(result)
+            return result
+
+        script_core._registered_libraries[:] = [
+            (title, observe_library_entry if entry is library_entry else entry)
+            for title, entry in script_core._registered_libraries
+        ]
         results = []
         for _candle, plot_data in runner.run_iter():
             results.append(dict(plot_data))
@@ -54,6 +68,6 @@ def __test_the_library_entry_runs_in_the_scripts_mode__():
         sys.modules.pop('bool_na_lib_entry', None)
         set_bool_na(False)
 
-    assert [r['lib_seen'] for r in results] == [1.0, 1.0, 1.0]
+    assert library_results == [1.0, 1.0, 1.0]
     assert [r['main_seen'] for r in results] == [1.0, 1.0, 1.0]
     assert [r['udt_seen'] for r in results] == [1.0, 1.0, 1.0]
