@@ -6,14 +6,15 @@ from pynecore.lib import plot, script, timeframe
 
 @script.indicator(title="Timeframe Change Empty", shorttitle="tf_change_empty")
 def main():
-    # An empty timeframe string is the chart's own timeframe, so these two agree
-    # on every bar (measured against TradingView over a full history)
+    # Omitted and empty timeframes use the chart timeframe, so all three agree
+    # on every bar (measured against TradingView over a full history).
     plot(1 if timeframe.change("") else 0, "empty")
     plot(1 if timeframe.change(timeframe.period) else 0, "period")
+    plot(1 if timeframe.change() else 0, "default")
 
 
 def __test_change_empty_timeframe_is_chart_timeframe__(csv_reader, runner, log):
-    """ timeframe.change("") equals timeframe.change(timeframe.period) """
+    """ Omitted, empty and explicit chart timeframes agree on every bar. """
     from pathlib import Path
 
     syminfo_path = Path(__file__).parent / "data" / "timeframe.toml"
@@ -25,6 +26,10 @@ def __test_change_empty_timeframe_is_chart_timeframe__(csv_reader, runner, log):
             changes += 1 if _plot['empty'] else 0
             assert _plot['empty'] == _plot['period'], \
                 f"bar {i}: empty={_plot['empty']} != period={_plot['period']}"
+            assert _plot['default'] == _plot['period'], \
+                f"bar {i}: default={_plot['default']} != period={_plot['period']}"
+            if i == 0:
+                assert _plot['default'] == 0
 
     assert bars > 0, "no bars were run"
     log.info("Empty timeframe matched the chart timeframe on %d bars (%d changes)",

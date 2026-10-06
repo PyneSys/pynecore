@@ -29,11 +29,11 @@ __all__ = ['change']
 # ``Persistent`` markers are rewritten by the AST transformer, so the IDE sees neither
 # the next-bar reads of the state variables nor their lazy-init narrowing.
 # noinspection PyProtectedMember,PyUnusedLocal,PyUnresolvedReferences,PyTypeChecker
-def change(timeframe: str) -> bool:
+def change(timeframe: str = "") -> bool:
     """
     Detects changes in the specified timeframe.
 
-    :param timeframe: The timeframe to check
+    :param timeframe: The timeframe to check; omitted or empty uses the chart timeframe.
     :return: Returns true on the first bar of a `timeframe`, false otherwise.
     """
     last_dt: Persistent[datetime | None] = None

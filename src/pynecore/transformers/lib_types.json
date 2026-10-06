@@ -9043,7 +9043,10 @@
    "ty": "i"
   },
   "timeframe.change": {
-   "defaults": 0,
+   "default_ty": [
+    "s"
+   ],
+   "defaults": 1,
    "kind": "function",
    "names": [
     "timeframe"
