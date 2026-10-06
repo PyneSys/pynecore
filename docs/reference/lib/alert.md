@@ -5,7 +5,7 @@ title: "alert"
 description: "Alert triggering functions"
 icon: "notifications"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-10-06"
 draft: false
 toc: true
 categories: ["Reference", "Library"]
@@ -15,7 +15,9 @@ tags: ["alert", "library", "reference"]
 
 # alert
 
-The `alert` namespace provides a callable function for triggering alerts during script execution. In PyneCore, alerts print a highlighted message to the terminal rather than sending notifications — the `freq` parameter is accepted for Pine Script compatibility but has no effect at runtime.
+The `alert` namespace provides a callable function for triggering alerts during script execution. In PyneCore, `alert()` prints a highlighted message to the terminal, so converted Pine scripts that call it run unchanged. The `freq` parameter is accepted for Pine Script compatibility but has no effect at runtime.
+
+On TradingView, an alert is the only way a Pine script can reach the outside world: the script cannot send orders to a broker or make network calls, so trading bots receive its alerts through a TradingView webhook. A PyneCore script needs no such detour. It trades directly through a broker plugin (`pyne run --broker`, see [Live Mode](../../advanced/live-mode.md)), and as Python code it can send any notification itself — a Telegram or Discord message, an email, an HTTP request — with the library of your choice.
 
 ## Quick Example
 
@@ -67,8 +69,11 @@ alert("Price crossed above SMA!", freq=alert.freq_once_per_bar)
 - Calls in `request.security` workers are suppressed to avoid duplicate output when they replay the script.
 - The `freq` parameter is accepted for Pine Script compatibility but is **not enforced**.
   Outside the suppressed contexts, calls print on historical as well as realtime bars.
-- There is no support for alert conditions or webhook-based alerts. `alert()` is terminal output only.
-  A library run directly as the main script can also print these messages. TradingView instead
+- `alertcondition()` is accepted and does nothing, and TradingView's webhook delivery has no
+  counterpart: a script that needs to notify an external service calls it directly from Python.
+  Guard such calls with `barstate.isrealtime` in live mode, since the script also runs on the
+  historical bars.
+- A library run directly as the main script can also print `alert()` messages. TradingView instead
   supports actual alerts only on realtime bars and does not allow creating an alert directly
   from a library; an indicator or strategy must consume its exported function.
   See [TradingView's library constraints](https://www.tradingview.com/pine-script-docs/concepts/libraries/#library-functions).
