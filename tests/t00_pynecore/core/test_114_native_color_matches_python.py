@@ -18,7 +18,7 @@ from pynecore.types.na import NA
 
 def __test_helper_implementation(backend):
     if backend == 'python':
-        return color.PYTHON_IMPLEMENTATIONS['new']
+        return color._PYTHON_IMPLEMENTATIONS['new']
     try:
         from pynecore.core._native_color import new
     except ImportError:
@@ -107,6 +107,6 @@ def __test_color_falls_back_to_python__(mode):
         if mode == 'unavailable' else ''
     subprocess.run([sys.executable, '-B', '-c', setup + (
         "from pynecore.lib import color\n"
-        "assert color.new is color.PYTHON_IMPLEMENTATIONS['new']\n"
+        "assert color.new is color._PYTHON_IMPLEMENTATIONS['new']\n"
         "assert color.new(color.red, 30).value == 0xF23645B3\n"
     )], env=env, check=True, capture_output=True, text=True)

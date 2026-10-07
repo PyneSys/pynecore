@@ -41,6 +41,7 @@ def __test_registry_excludes_typing_machinery__():
     banned = {
         'cast', 'overload', 'TypeVar', 'TypeAlias', 'TYPE_CHECKING', 'Literal',
         'Any', 'Callable', 'module_property', 'module_function_property',
+        'PYTHON_IMPLEMENTATIONS',
         # TypeVar instances used across lib modules
         'T', 'TFI', 'TFIB', 'TKey', 'TValue', 'Number',
     }

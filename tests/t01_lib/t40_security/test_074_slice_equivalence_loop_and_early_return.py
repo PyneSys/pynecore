@@ -29,7 +29,7 @@ def main():
 __test_helper_early_return_script = '''"""
 @pyne
 """
-from pynecore.lib import bar_index, close, plot, request, script, syminfo
+from pynecore.lib import bar_index, close, request, script, syminfo
 from pynecore.types import Persistent, Series
 
 
@@ -40,8 +40,7 @@ def main():
     if bar_index % 3 == 2:
         return
     acc = acc + close * 0.001
-    plot(x, "x")
-    plot(acc, "acc")
+    return {"x": x, "acc": acc}
 '''
 
 # Every timestamp here is Unix MILLISECONDS.

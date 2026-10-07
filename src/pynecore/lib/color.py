@@ -164,7 +164,7 @@ def from_gradient(value: int | float | NA[float], bottom_value: int | float | NA
 
 
 #: The Python implementation remains available for native equivalence checks.
-PYTHON_IMPLEMENTATIONS = {'new': new}
+_PYTHON_IMPLEMENTATIONS = {'new': new}
 
 if not _os.environ.get('PYNE_NO_NATIVE_COLOR'):
     try:

@@ -99,8 +99,8 @@ _trail_pending = 2
 # for the orders that use neither, which keeps their dedup-by-id semantics intact.
 _ExitOrderKey: _TypeAlias = (tuple[str | None, str | None]
                              | tuple[str | None, str | None, int]
-                             | tuple[str | None, str | None, int | None, int])
-_MarketOrderKey: _TypeAlias = tuple[_OrderType, str | None, str | None, int | None, int | None]
+                             | tuple[str | None, str | None, int | None, int | str])
+_MarketOrderKey: _TypeAlias = tuple[_OrderType, str | None, str | None, int | None, int | str | None]
 
 #
 # Imports after constants
@@ -115,9 +115,9 @@ if True:
 # Helpers
 #
 
-# Call sites of ``strategy.close()`` / ``strategy.close_all()``, numbered in
-# first-seen order. The code object is part of the key, so the dict keeps it
-# alive and an id can never be recycled onto a different statement.
+# Compatibility call sites for untransformed Python and dynamic callable values.
+# Transformed direct calls pass a source stamp and never consult this registry.
+# Keeping the code object alive prevents its identity from being recycled.
 _close_call_sites: dict[tuple[object, int], int] = {}
 
 # The one ``book_seq`` every ``strategy.close()`` of a ``close_by_id`` script shares.
@@ -137,6 +137,8 @@ def _close_call_site(frame) -> int:
     the frame that reached us, so the code object plus its offset is the identity;
     the caller's own call site is deliberately NOT part of it.
 
+    Direct transformed calls use a baked source stamp instead of this fallback.
+
     :param frame: The calling frame, i.e. ``sys._getframe(1)`` at the call site.
     :return: A small stable integer for this statement, for ``Order.book_seq``.
     """
@@ -149,7 +151,7 @@ def _close_call_site(frame) -> int:
 
 
 def _exit_key(exit_id: str | None, order_id: str | None,
-              entry_seq: int | None = None, book_seq: int | None = None) -> '_ExitOrderKey':
+              entry_seq: int | None = None, book_seq: int | str | None = None) -> '_ExitOrderKey':
     """Build an exit/close order-book key. THE single construction rule.
 
     Trailing Nones are dropped, so an order that uses neither discriminator keeps
@@ -161,9 +163,10 @@ def _exit_key(exit_id: str | None, order_id: str | None,
     its own. It stays None for a leg still waiting on a pending entry order, for
     every id-bound close, and on the live broker path, which has no binding book.
 
-    ``book_seq`` (see :func:`_close_call_site`) is the call site of a backtest
-    partial close, so same-bar closes from different statements get distinct keys
-    and STACK while a repeat of one statement evicts its own earlier order.
+    ``book_seq`` is the baked source stamp of a transformed close, or the integer
+    from :func:`_close_call_site` for a raw call. Same-bar closes from different
+    statements get distinct keys and STACK, while a repeated statement evicts
+    its own earlier order.
     """
     if book_seq is not None:
         return exit_id, order_id, entry_seq, book_seq
@@ -380,7 +383,7 @@ class Order:
         self.entry_seq: int | None = None
         # Stamped only by strategy.close()/close_all() in backtest (see _close_call_site);
         # left None everywhere else so the order-book key keeps its bare shape.
-        self.book_seq: int | None = None
+        self.book_seq: int | str | None = None
         # ``[Decimal qty_total, booked, leg_qtys, order_qty]`` commission pool, set only
         # where one TradingView order is executed as two PyneCore fills (the
         # reversal split in _process_order).
@@ -6243,7 +6246,8 @@ def cancel_all():
 # noinspection PyProtectedMember,PyShadowingBuiltins,PyShadowingNames,PyUnusedLocal,unused-parameter
 def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
           qty_percent: PyneFloat = na_float, alert_message: PyneStr = na_str,
-          immediately: bool = False, disable_alert: bool = False):
+          immediately: bool = False, disable_alert: bool = False, *,
+          _call_site: str | None = None):
     """
     Creates an order to exit from the part of a position opened by entry orders with a specific identifier.
 
@@ -6365,6 +6369,7 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
     # reproduces that, since the key already carries the id.
     if isinstance(position, SimPosition):
         order.book_seq = (_CLOSE_BY_ID_SLOT if close_by_id
+                          else _call_site if _call_site is not None
                           else _close_call_site(_sys._getframe(1)))
 
     # Add order to position (this will handle orderbook and exit_orders)
@@ -6380,7 +6385,7 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
 
 # noinspection PyProtectedMember,PyShadowingNames,PyUnusedLocal,unused-parameter
 def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immediately: bool = False,
-              disable_alert: bool = False):
+              disable_alert: bool = False, *, _call_site: str | None = None):
     """
     Creates an order to close an open position completely, regardless of the identifiers of the entry
     orders that opened or added to it.
@@ -6404,7 +6409,8 @@ def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immedi
     # Stamp the call site so a close_all stacked behind a same-bar partial close
     # fills too (backtest only; live close-dispatch handled separately, stays None).
     if isinstance(position, SimPosition):
-        order.book_seq = _close_call_site(_sys._getframe(1))
+        order.book_seq = (_call_site if _call_site is not None
+                          else _close_call_site(_sys._getframe(1)))
 
     # Add order to position (this will handle orderbook and exit_orders)
     position._add_order(order)

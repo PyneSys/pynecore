@@ -1,7 +1,7 @@
 """
 @pyne
 """
-from pynecore.lib import bar_index, close, plot, request, script, syminfo, timeframe
+from pynecore.lib import bar_index, close, request, script, syminfo, timeframe
 from pynecore.types import Series
 
 
@@ -15,8 +15,7 @@ def main():
         return
     own: Series[float] = request.security(syminfo.tickerid, timeframe.period, close)
     dep: Series[float] = request.security("EXCH:PEER", timeframe.period, own + 1000.0)
-    plot(own, "own")
-    plot(dep, "dep")
+    return {"own": own, "dep": dep}
 
 
 # Every timestamp here is Unix MILLISECONDS.
@@ -109,7 +108,8 @@ def __test_early_return_does_not_strand_a_consumer__(runner, log):
     for i, (ts, own, dep) in enumerate(rows):
         assert ts == _T0 + i * _STEP
         if i % 3 == 2:
-            continue  # the bar ``main()`` returned early on: no plot values
+            assert own is None and dep is None, f"bar {i}: early return published output"
+            continue
         assert own == 100.0 + i, f"bar {i}: own={own}"
         # The peer context reads the chart-context producer's value for its own
         # bar, so ``dep`` is the chart close plus 1000.

@@ -162,9 +162,6 @@
     "session_module": {
       "type": "variable"
     },
-    "sys": {
-      "type": "variable"
-    },
     "time": {
       "type": "property"
     },
@@ -1985,9 +1982,6 @@
       "type": "variable"
     },
     "style_steplinebr": {
-      "type": "variable"
-    },
-    "sys": {
       "type": "variable"
     }
   },

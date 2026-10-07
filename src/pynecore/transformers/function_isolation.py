@@ -94,6 +94,7 @@ apply there.
 from typing import cast, Any
 import ast
 import builtins
+import hashlib
 import importlib
 import types
 
@@ -147,7 +148,7 @@ NON_TRANSFORMABLE_FUNCTIONS = {
 
     # Strategy
     'lib.strategy.entry', 'lib.strategy.order', 'lib.strategy.exit', 'lib.strategy.close',
-    'lib.strategy.cancel', 'lib.strategy.cancel_all',
+    'lib.strategy.close_all', 'lib.strategy.cancel', 'lib.strategy.cancel_all',
     'lib.strategy.equity', 'lib.strategy.eventrades', 'lib.strategy.initial_capital',
     'lib.strategy.grossloss', 'lib.strategy.grossprofit', 'lib.strategy.losstrades',
     'lib.strategy.max_drawdown', 'lib.strategy.max_runup', 'lib.strategy.netprofit',
@@ -488,6 +489,7 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
         self._ordinals: dict[str, int] = {}
         self._used_helpers: set[str] = set()
         self._resolve_cache: dict[str, Any] = {}
+        self._close_module = ''
         # scope -> its instance-vector slot, and the index every varying site
         # of that scope reads out of it (by node identity)
         self._pin_slots: dict[str, int] = {}
@@ -830,6 +832,11 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
     # --- visitors ------------------------------------------------------------
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
+        # A source stamp survives bytecode caching and cannot collide with a
+        # statement in another imported library. Standalone AST users may not
+        # have the loader's source path, so their module gets a content stamp.
+        self._close_module = getattr(node, '_module_file_path', None) or hashlib.sha256(
+            ast.dump(node, include_attributes=True).encode()).hexdigest()
         self.layout.assign_scope_ids(node)
         self.index = _ScopeIndex(self.layout)
         self.index.visit(node)
@@ -964,6 +971,16 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
             node.func.value = cast(ast.expr, self.visit(node.func.value))
 
         route = self.route_for_callee(node.func, self._scope_stack)
+        path = _get_func_path(node.func)
+        if path in {'lib.strategy.close', 'lib.strategy.close_all'} and not any(
+                'lib' in self.index.assigned.get('·'.join(self._scope_stack[:i]), ())
+                for i in range(len(self._scope_stack) + 1)):
+            # This is the close STATEMENT, independent of the caller instance
+            # or loop iteration. Unknown callable values keep the runtime
+            # compatibility path instead of receiving a foreign keyword.
+            node.keywords.append(ast.keyword(
+                arg='_call_site', value=ast.Constant(
+                    value=f'{self._close_module}:{node.lineno}:{node.col_offset}')))
         if not self._scope_stack:
             if route in (_FAST, _FAST_SHARED) \
                     or (isinstance(route, tuple) and self._is_carrier(route[1])):
