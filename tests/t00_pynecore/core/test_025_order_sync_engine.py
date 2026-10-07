@@ -28,6 +28,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeOrderRejectedError,
     ExchangeRateLimitError,
     InsufficientMarginError,
+    MarketClosedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
     UnexpectedCancelError,
@@ -810,6 +811,33 @@ def _open_long_with_bracket(b, engine, pos):
     engine._route_event(  # type: ignore[attr-defined]
         _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
     assert pos.size == 1.0
+
+
+def __test_market_closed_reject_defers_a_protective_exit_instead_of_halting__():
+    """A venue session pause declining an exit is retried, never fatal.
+
+    The reported Capital.com incident: a dispatch landed inside the 21:00 UTC
+    maintenance break and the venue answered "currently closed". Nothing
+    landed and the position cannot move while the market is paused, so the
+    non-entry reject contract (fatal) is wrong here — the intent re-evaluates
+    on the next sync once trading resumes.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    b.raise_on_next_exit = MarketClosedError("BTCUSD is currently closed")
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    assert pos.size == 1.0
+    assert len(b.exit_calls) == 1
+    assert f"L-X{INTENT_KEY_SEP}L" not in engine.active_intents  # not pinned while declined
+
+    # Market reopened: the next sync re-dispatches the protective exit.
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.exit_calls) == 2
+    assert f"L-X{INTENT_KEY_SEP}L" in engine.active_intents
 
 
 def __test_market_reversal_dispatches_the_close_leg_and_parks_the_entry__():

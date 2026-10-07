@@ -90,6 +90,18 @@ class InsufficientMarginError(ExchangeOrderRejectedError):
     """
 
 
+class MarketClosedError(ExchangeOrderRejectedError):
+    """The exchange refused an order because the instrument is not tradable now.
+
+    A scheduled session pause, a maintenance break or a trading halt: the
+    venue evaluated the request and declined it synchronously, so nothing
+    landed and the position is untouched. Non-terminal for EVERY intent kind
+    — the sync engine drops the dispatch and re-evaluates the intent once
+    trading resumes, instead of the fatal contract a protective-order reject
+    otherwise carries.
+    """
+
+
 class ClientOrderIdSpentError(ExchangeOrderRejectedError):
     """A create was refused because the deterministic client order id is
     already consumed by a now-terminal order, on a venue that never allows

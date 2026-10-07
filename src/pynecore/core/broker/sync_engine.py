@@ -45,6 +45,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
     ExchangeRateLimitError,
+    MarketClosedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
@@ -15936,7 +15937,23 @@ class OrderSyncEngine:
             # bracket is suppressed. Non-entry intents (exit / close) keep
             # the fatal contract: a protective order the exchange refuses
             # is a real exposure that must surface, not be silently
-            # dropped.
+            # dropped — except when the venue is simply not trading: a
+            # session pause leaves the position untouched and nothing can
+            # move it either, so every intent kind re-evaluates once the
+            # market reopens (measured live: a Capital.com reversal close
+            # dispatched into the 21:00 UTC maintenance pause killed the run).
+            if isinstance(e, MarketClosedError):
+                _blog_warning(
+                    "dispatch declined for %s: %s: %s", intent, type(e).__name__, e,
+                )
+                self._reanchor_envelope_after_reject(intent.intent_key)
+                raise OrderSkippedByPlugin(
+                    f"{type(intent).__name__} {format_intent_key(intent.intent_key)} "
+                    f"declined: the market is closed ({e}); re-evaluating next sync.",
+                    intent_key=intent.intent_key,
+                    reason="market_closed",
+                    context={'symbol': intent.symbol, 'pine_id': intent.pine_id},
+                ) from e
             if not isinstance(intent, EntryIntent):
                 _blog_error(
                     "dispatch failed for %s: %s: %s",
