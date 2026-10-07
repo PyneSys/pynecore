@@ -11705,6 +11705,104 @@ def __test_cancel_only_restart_kept_entry_is_adopted_not_cancelled__(tmp_path):
         assert engine._restart_reconstructed_entry_keys == {}  # type: ignore[attr-defined]
 
 
+def __test_rotated_restart_cancels_predecessor_tag_working_order__(tmp_path):
+    """A rotated restart (new script, new run_tag) still owns its predecessor's
+    resting entry: the first script that drops it cancels it at the venue.
+
+    The reported cTrader rotation incident: the previous instance (tag
+    ``prev``) left a STOP entry resting and stopped cleanly; the next instance
+    of the same logical run loads a different script, so its own tag differs.
+    The journal adopts the row and the envelope anchor under the shared run,
+    but the restart scan used to admit only live orders under the CURRENT
+    tag, so the resting order was neither reconstructed nor cancelled. When
+    the new script later re-emitted the same entry id, the persisted anchor
+    rebuilt the predecessor's COID onto a fresh MARKET dispatch while the
+    STOP stayed working — it filled an hour later into an unmanaged leg.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    prev_coid = build_client_order_id(
+        run_tag="prev", pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=0,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        ctx.record_envelope(key="L", bar_ts_ms=BAR_TS, retry_seq=0, run_tag="prev")
+        _seed_live_entry_order_row(ctx, coid=prev_coid, order_id="wo-1", pine_id="L")
+        b = MockBroker()
+        b.open_orders = [_live_stop_entry_order(prev_coid, order_id="wo-1", stop=1.30000)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        engine.settle_restart_state(BAR_TS)
+        assert "L" in pos.entry_orders  # the predecessor's order is reconstructed
+        assert engine._order_mapping["L"] == ["wo-1"]  # type: ignore[attr-defined]
+
+        # The rotated script never declares L on its first bar.
+        del pos.entry_orders["L"]
+        engine.sync(BAR_TS)
+
+        assert len(b.entry_calls) == 0
+        assert len(b.cancel_calls) == 1
+        assert "L" not in engine._order_mapping  # type: ignore[attr-defined]
+
+        # A later re-emission of L mints a fresh entry: nothing of the
+        # predecessor's dispatch identity leaks onto it.
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=1.20000)
+        engine.sync(BAR_TS + 60_000)
+        assert len(b.entry_calls) == 1
+        assert b.entry_calls[0].client_order_id(KIND_ENTRY) != prev_coid
+
+
+def __test_rotated_restart_adopts_predecessor_tag_order_by_position_alias__(tmp_path):
+    """A re-declared entry binds to the predecessor's live order even when the
+    journal row keys it by a position alias (cTrader shape) — no duplicate
+    dispatch, and the bound envelope carries the live order's own tag.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    prev_coid = build_client_order_id(
+        run_tag="prev", pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=0,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        ctx.record_envelope(key="L", bar_ts_ms=BAR_TS, retry_seq=0, run_tag="prev")
+        # cTrader reserves the positionId for a pending order and keys the row
+        # by it; the venue order id lives in ``extras`` only.
+        ctx.upsert_order(
+            prev_coid, symbol=SYMBOL, side="buy", qty=1.0, state='confirmed',
+            intent_key="L", pine_entry_id="L",
+            exchange_order_id="pos-9", extras={'order_id': "wo-1", 'position_id': "pos-9"},
+        )
+        b = MockBroker()
+        b.open_orders = [_live_stop_entry_order(prev_coid, order_id="wo-1", stop=1.30000)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        engine.settle_restart_state(BAR_TS)
+        assert "L" in pos.entry_orders
+        assert pos.entry_orders["L"].stop == 1.30000
+
+        # The rotated script leaves the entry standing.
+        engine.sync(BAR_TS)
+
+        assert len(b.entry_calls) == 0
+        assert len(b.cancel_calls) == 0
+        assert engine._order_mapping["L"] == ["wo-1"]  # type: ignore[attr-defined]
+        assert "L" in engine._active_intents  # type: ignore[attr-defined]
+        envelope = engine._envelopes["L"]  # type: ignore[attr-defined]
+        assert envelope.client_order_id(KIND_ENTRY) == prev_coid
+
+
 def __test_restart_close_cancels_partially_filled_entry_residual_first__(tmp_path):
     """A keyed close replaces, rather than preserves, a reconstructed entry.
 

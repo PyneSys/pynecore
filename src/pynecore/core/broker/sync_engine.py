@@ -1731,6 +1731,13 @@ class OrderSyncEngine:
         # ``pid_hash`` (not ``pine_id``) because the COID hash is one-way; the
         # builder forward-hashes ``intent.pine_id`` to match.
         self._restart_live_entry_anchors: dict[str, tuple[int, int]] = {}
+        # The ``run_tag`` each snapshotted anchor was dispatched under, keyed
+        # by ``pid_hash``. A rotated bot (different script source, hence a
+        # different tag) adopts the previous instance's journal rows and
+        # envelopes under the shared logical run, so the live order's tag may
+        # differ from this process's own; the rebuilt COID must carry the
+        # live order's tag or it names an order the venue never saw.
+        self._restart_live_entry_tags: dict[str, str] = {}
         # Live exchange order ids for the same snapshot, keyed by ``pid_hash``.
         # The COID-anchor snapshot above only rebuilds a byte-identical
         # ``client_order_id``; it does NOT stop the first post-restart diff from
@@ -11484,8 +11491,7 @@ class OrderSyncEngine:
             return
         for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
             pine_id = row.pine_entry_id
-            order_id = row.exchange_order_id
-            if pine_id is None or not order_id:
+            if pine_id is None:
                 continue
             # Exit / bracket rows carry a parent ``from_entry``; only a bare
             # working entry order is reconstructable here.
@@ -11494,9 +11500,19 @@ class OrderSyncEngine:
             # The order must STILL be live at the venue (present in the scan
             # snapshot, which only records this run's entry-kind working orders).
             # A journal row whose order the venue no longer lists — externally
-            # filled / cancelled — is left to reconcile.
-            ex_order = self._restart_live_entry_orders_by_id.get(order_id)
-            if ex_order is None:
+            # filled / cancelled — is left to reconcile. A venue that keys the
+            # row by a position alias (cTrader reserves the ``positionId`` for
+            # a pending order) keeps the venue order id in ``extras``.
+            ex_order = None
+            order_id = None
+            for handle in (row.exchange_order_id, (row.extras or {}).get('order_id')):
+                if handle is None or handle == '':
+                    continue
+                ex_order = self._restart_live_entry_orders_by_id.get(str(handle))
+                if ex_order is not None:
+                    order_id = str(handle)
+                    break
+            if ex_order is None or order_id is None:
                 continue
             # Already tracked: an in-session dispatch, a prior reconstruction, or
             # (on the direct-``sync`` path) the script re-declared it before this
@@ -12086,6 +12102,7 @@ class OrderSyncEngine:
                     "broker order", format_intent_key(key),
                 )
                 self._dispatch_cancel(old)
+                self._forget_restart_live_entry(old.pine_id)
 
         # Pine semantic: when an entry intent fails to dispatch in this same
         # sync (e.g. plugin reports qty below venue minimum), a bracket exit
@@ -13632,20 +13649,18 @@ class OrderSyncEngine:
         if anchor is not None:
             self._reject_anchor_bars.pop(intent.intent_key, None)
             adopted = self._maybe_adopt_restart_entry_anchor(intent, anchor)
-            bar_ts_ms, retry_seq = (
+            # A live-order adoption carries the live order's own tag; a
+            # replayed anchor keeps the tag it was dispatched under — either
+            # way the rebuilt coids name the rows the venue and the journal
+            # actually hold.
+            bar_ts_ms, retry_seq, run_tag = (
                 adopted if adopted is not None
-                else (anchor.bar_ts_ms, anchor.retry_seq)
+                else (anchor.bar_ts_ms, anchor.retry_seq,
+                      anchor.run_tag or self._run_tag)
             )
-            # A live-order adoption is always this run's own tag (the scan
-            # only snapshots orders under it); a replayed anchor keeps the
-            # tag it was dispatched under so the rebuilt coids name the rows
-            # the venue and the journal actually hold.
             envelope = DispatchEnvelope(
                 intent=intent,
-                run_tag=(
-                    self._run_tag if adopted is not None
-                    else anchor.run_tag or self._run_tag
-                ),
+                run_tag=run_tag,
                 bar_ts_ms=bar_ts_ms,
                 retry_seq=retry_seq,
                 coid_max_len=self._coid_max_len,
@@ -13654,10 +13669,10 @@ class OrderSyncEngine:
             return envelope
         adopted = self._maybe_adopt_restart_entry_anchor(intent, None)
         if adopted is not None:
-            bar_ts_ms, retry_seq = adopted
+            bar_ts_ms, retry_seq, run_tag = adopted
             envelope = DispatchEnvelope(
                 intent=intent,
-                run_tag=self._run_tag,
+                run_tag=run_tag,
                 bar_ts_ms=bar_ts_ms,
                 retry_seq=retry_seq,
                 coid_max_len=self._coid_max_len,
@@ -13794,9 +13809,12 @@ class OrderSyncEngine:
 
         Reads ``get_open_orders`` once and records every entry working order
         this run owns — its ``client_order_id`` parses cleanly, its
-        ``run_tag`` matches ours, and its kind is :data:`KIND_ENTRY` or
-        :data:`KIND_ENTRY_STOP` — into :attr:`_restart_live_entry_anchors`,
-        keyed by ``pid_hash`` -> ``(bar_ts_ms, retry_seq)``. An id that is
+        ``run_tag`` is one of :meth:`_journaled_run_tags` (our own, or a
+        rotated predecessor's whose journal this run adopted), and its kind
+        is :data:`KIND_ENTRY` or :data:`KIND_ENTRY_STOP` — into
+        :attr:`_restart_live_entry_anchors`, keyed by ``pid_hash`` ->
+        ``(bar_ts_ms, retry_seq)``, with the order's own tag in
+        :attr:`_restart_live_entry_tags`. An id that is
         not canonical but parses as a wire form (short-budget venue) with a
         matching ``run_tag`` and entry kind lands in
         :attr:`_restart_live_wire_entry_orders` instead, deferred to the
@@ -13820,7 +13838,8 @@ class OrderSyncEngine:
         completes before any fresh entry dispatch can mint a colliding COID.
         """
         orders = self._run_async_read(self._broker.get_open_orders(self._symbol))
-        by_pid: dict[str, set[tuple[int, int]]] = {}
+        owned_tags = self._journaled_run_tags()
+        by_pid: dict[str, set[tuple[int, int, str]]] = {}
         order_ids_by_pid: dict[str, list[str]] = {}
         wire_orders: list[tuple[str, int, str]] = []
         wire_order_id_by_coid: dict[str, str] = {}
@@ -13836,27 +13855,30 @@ class OrderSyncEngine:
                 # whole and matched lazily at adoption time.
                 wire = parse_wire_client_order_id(coid)
                 if (wire is not None
-                        and wire.run_tag == self._run_tag
+                        and wire.run_tag in owned_tags
                         and wire.kind in (KIND_ENTRY, KIND_ENTRY_STOP)):
                     wire_orders.append((coid, wire.bar_ts_ms, wire.kind))
                     if order.id:
                         wire_order_id_by_coid[coid] = order.id
                         orders_by_id[order.id] = order
                 continue
-            if (parsed.run_tag != self._run_tag
+            if (parsed.run_tag not in owned_tags
                     or parsed.kind not in (KIND_ENTRY, KIND_ENTRY_STOP)):
                 continue
             by_pid.setdefault(parsed.pid_hash, set()).add(
-                (parsed.bar_ts_ms, parsed.retry_seq),
+                (parsed.bar_ts_ms, parsed.retry_seq, parsed.run_tag),
             )
             if order.id:
                 order_ids_by_pid.setdefault(parsed.pid_hash, []).append(order.id)
                 orders_by_id[order.id] = order
         adopted: dict[str, tuple[int, int]] = {}
+        adopted_tags: dict[str, str] = {}
         adopted_order_ids: dict[str, list[str]] = {}
         for pid_hash, anchors in by_pid.items():
             if len(anchors) == 1:
-                adopted[pid_hash] = next(iter(anchors))
+                bar_ts_ms, retry_seq, run_tag = next(iter(anchors))
+                adopted[pid_hash] = (bar_ts_ms, retry_seq)
+                adopted_tags[pid_hash] = run_tag
                 ids = order_ids_by_pid.get(pid_hash)
                 if ids:
                     adopted_order_ids[pid_hash] = ids
@@ -13867,6 +13889,7 @@ class OrderSyncEngine:
                     "reconcile", pid_hash, sorted(anchors),
                 )
         self._restart_live_entry_anchors = adopted
+        self._restart_live_entry_tags = adopted_tags
         self._restart_live_entry_order_ids = adopted_order_ids
         self._restart_live_wire_entry_orders = wire_orders
         self._restart_live_wire_order_id_by_coid = wire_order_id_by_coid
@@ -13877,6 +13900,56 @@ class OrderSyncEngine:
                 "for COID adoption (%d wire-form)",
                 len(adopted) + len(wire_orders), len(wire_orders),
             )
+
+    def _journaled_run_tags(self) -> set[str]:
+        """Every ``run_tag`` the orders this run owns were dispatched under.
+
+        Always this process's own tag. A rotated bot (same logical run, new
+        script source, hence a new tag) also inherits the previous instance's
+        envelopes and live rows through the journal's same-run adoption, so
+        the tags those carry are owned too — the venue still lists their
+        working orders under the old tag. Pure-local: reads the replayed
+        envelope anchors and the live journal rows.
+        """
+        tags = {self._run_tag}
+        for anchor in self._persisted_envelope_anchors.values():
+            if anchor.run_tag:
+                tags.add(anchor.run_tag)
+        if self._store_ctx is not None:
+            for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+                parsed = parse_client_order_id(row.client_order_id)
+                if parsed is not None:
+                    tags.add(parsed.run_tag)
+                    continue
+                wire = parse_wire_client_order_id(row.client_order_id)
+                if wire is not None:
+                    tags.add(wire.run_tag)
+        return tags
+
+    def _forget_restart_live_entry(self, pine_id: str) -> None:
+        """Drop ``pine_id``'s live order from the restart scan snapshot.
+
+        The scan runs once; it is not refreshed after the entry-orphan sweep
+        cancels a reconstructed order at the venue. Left in the snapshot, a
+        later re-declaration of the same Pine id would bind to the cancelled
+        order id and rebuild its dead COID instead of dispatching fresh.
+        """
+        pid_hash = hash_pine_id(pine_id)
+        self._restart_live_entry_anchors.pop(pid_hash, None)
+        self._restart_live_entry_tags.pop(pid_hash, None)
+        for order_id in self._restart_live_entry_order_ids.pop(pid_hash, []):
+            self._restart_live_entry_orders_by_id.pop(order_id, None)
+        if self._restart_live_wire_entry_orders:
+            _, _, matched = self._match_wire_restart_anchor(pine_id)
+            if matched:
+                for coid in matched:
+                    order_id = self._restart_live_wire_order_id_by_coid.pop(coid, None)
+                    if order_id is not None:
+                        self._restart_live_entry_orders_by_id.pop(order_id, None)
+                self._restart_live_wire_entry_orders = [
+                    entry for entry in self._restart_live_wire_entry_orders
+                    if entry[0] not in matched
+                ]
 
     def _hydrate_restart_entry_adoptions(self, new_map: dict[str, Intent]) -> None:
         """Bind live broker entry orders to their re-declared Pine intents.
@@ -13920,7 +13993,7 @@ class OrderSyncEngine:
             order_ids = self._restart_live_entry_order_ids.get(pid_hash)
             matched_wire: list[str] = []
             if anchor is None:
-                anchor, matched_wire = self._match_wire_restart_anchor(intent.pine_id)
+                anchor, _, matched_wire = self._match_wire_restart_anchor(intent.pine_id)
                 if anchor is None:
                     continue
                 order_ids = [
@@ -13946,6 +14019,7 @@ class OrderSyncEngine:
                 # to re-journal — consume the snapshot entry here so the
                 # build-time scan does not keep matching it.
                 self._restart_live_entry_anchors.pop(pid_hash, None)
+                self._restart_live_entry_tags.pop(pid_hash, None)
                 if matched_wire:
                     self._restart_live_wire_entry_orders = [
                         entry for entry in self._restart_live_wire_entry_orders
@@ -13960,7 +14034,7 @@ class OrderSyncEngine:
 
     def _maybe_adopt_restart_entry_anchor(
             self, intent: Intent, current: EnvelopeRecord | None,
-    ) -> tuple[int, int] | None:
+    ) -> tuple[int, int, str] | None:
         """Adopt a live broker entry order's pinned anchor at build time.
 
         Consumes a :meth:`_scan_live_entry_anchors_for_restart` snapshot entry
@@ -13998,8 +14072,8 @@ class OrderSyncEngine:
         ``record_envelope`` infrastructure failure leaves the snapshot intact
         for the next retry rather than silently losing the recovered id.
 
-        :return: The ``(bar_ts_ms, retry_seq)`` to build with, or ``None`` to
-            keep the engine's own (fresh mint or persisted anchor).
+        :return: The ``(bar_ts_ms, retry_seq, run_tag)`` to build with, or
+            ``None`` to keep the engine's own (fresh mint or persisted anchor).
         """
         if not isinstance(intent, EntryIntent) or not (
                 self._restart_live_entry_anchors
@@ -14007,9 +14081,10 @@ class OrderSyncEngine:
             return None
         pid_hash = hash_pine_id(intent.pine_id)
         adopted = self._restart_live_entry_anchors.get(pid_hash)
+        run_tag = self._restart_live_entry_tags.get(pid_hash, self._run_tag)
         matched_wire: list[str] = []
         if adopted is None:
-            adopted, matched_wire = self._match_wire_restart_anchor(intent.pine_id)
+            adopted, run_tag, matched_wire = self._match_wire_restart_anchor(intent.pine_id)
         if adopted is None:
             return None
         bar_ts_ms, retry_seq = adopted
@@ -14021,8 +14096,10 @@ class OrderSyncEngine:
                 key=intent.intent_key,
                 bar_ts_ms=bar_ts_ms,
                 retry_seq=retry_seq,
+                run_tag=run_tag,
             )
         self._restart_live_entry_anchors.pop(pid_hash, None)
+        self._restart_live_entry_tags.pop(pid_hash, None)
         if matched_wire:
             self._restart_live_wire_entry_orders = [
                 entry for entry in self._restart_live_wire_entry_orders
@@ -14030,14 +14107,14 @@ class OrderSyncEngine:
             ]
         _blog_info(
             "restart: adopted live entry order anchor for %s "
-            "(bar_ts_ms=%d retry_seq=%d)",
-            intent.pine_id, bar_ts_ms, retry_seq,
+            "(bar_ts_ms=%d retry_seq=%d run_tag=%s)",
+            intent.pine_id, bar_ts_ms, retry_seq, run_tag,
         )
-        return bar_ts_ms, retry_seq
+        return bar_ts_ms, retry_seq, run_tag
 
     def _match_wire_restart_anchor(
             self, pine_id: str,
-    ) -> tuple[tuple[int, int] | None, list[str]]:
+    ) -> tuple[tuple[int, int] | None, str, list[str]]:
         """Forward-hash match wire-form restart snapshot entries to ``pine_id``.
 
         For each live wire order the scan snapshotted, rebuilds the candidate
@@ -14048,15 +14125,18 @@ class OrderSyncEngine:
         collapse into a single ``(bar_ts_ms, retry_seq)`` — genuinely
         ambiguous multi-anchor matches are logged and left to reconcile.
 
-        :return: ``(anchor, matched_wire_coids)`` — ``(None, [])`` when
-            nothing (or nothing unambiguous) matches.
+        :return: ``(anchor, run_tag, matched_wire_coids)`` — ``run_tag`` is
+            the matched order's own tag; ``(None, own tag, [])`` when nothing
+            (or nothing unambiguous) matches.
         """
-        anchors: set[tuple[int, int]] = set()
+        anchors: set[tuple[int, int, str]] = set()
         matched: list[str] = []
         for wire_coid, bar_ts_ms, kind in self._restart_live_wire_entry_orders:
+            wire = parse_wire_client_order_id(wire_coid)
+            run_tag = wire.run_tag if wire is not None else self._run_tag
             for retry_seq in range(_WIRE_ADOPT_RETRY_SCAN_MAX):
                 canonical = build_client_order_id(
-                    run_tag=self._run_tag,
+                    run_tag=run_tag,
                     pine_id=pine_id,
                     bar_ts_ms=bar_ts_ms,
                     kind=kind,
@@ -14064,19 +14144,20 @@ class OrderSyncEngine:
                 )
                 if encode_wire_client_order_id(
                         canonical, len(wire_coid)) == wire_coid:
-                    anchors.add((bar_ts_ms, retry_seq))
+                    anchors.add((bar_ts_ms, retry_seq, run_tag))
                     matched.append(wire_coid)
                     break
         if not anchors:
-            return None, []
+            return None, self._run_tag, []
         if len(anchors) > 1:
             _blog_warning(
                 "restart entry-anchor adoption: ambiguous wire-form live "
                 "orders for pine_id %r (%s) — skipping adoption, leaving "
                 "them to reconcile", pine_id, sorted(anchors),
             )
-            return None, []
-        return next(iter(anchors)), matched
+            return None, self._run_tag, []
+        bar_ts_ms, retry_seq, run_tag = next(iter(anchors))
+        return (bar_ts_ms, retry_seq), run_tag, matched
 
     def _build_cancel_envelope(self, cancel: CancelIntent) -> DispatchEnvelope:
         return DispatchEnvelope(
