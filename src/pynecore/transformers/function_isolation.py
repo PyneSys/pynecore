@@ -131,6 +131,8 @@ HELPER_ALIASES = {
 # - are purely for output/display purposes
 # This makes code run little bit faster
 NON_TRANSFORMABLE_FUNCTIONS = {
+    # Visualization cursors belong to the caller; metadata is stored per run.
+    'collect_meta_changes',
     # The bool na factory reads only the script-wide mode, with no call-site state.
     '__sec_bool_na·__',
 

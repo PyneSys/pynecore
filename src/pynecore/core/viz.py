@@ -254,6 +254,19 @@ def serialize_meta(meta: Any) -> dict:
     return _clean(d)
 
 
+def collect_meta_changes(cursor: int = 0) -> tuple[int, list[dict[str, Any]]]:
+    """Read plot metadata updates independently of other visualization consumers.
+
+    The cursor is owned by the native writer, bridge, or other host consumer;
+    it is not script call-site state. Records are serialized once per changed
+    version and copied so readers cannot modify the shared serialization cache.
+
+    :param cursor: Previous revision; 0 reads every currently registered meta
+    :return: Current revision and latest metadata records changed since cursor
+    """
+    return lib._plot_meta.collect_changes(cursor, serialize_meta)
+
+
 #
 # Drawing serialization
 #
@@ -504,10 +517,12 @@ class VizWriter:
         self.path = Path(path)
         self._f: Any = None
         self._last_colors: dict[str, Any] = {}
+        self._meta_cursor = 0
         self.bars = 0
 
     def open(self) -> None:
         self._last_colors.clear()
+        self._meta_cursor = 0
         self.bars = 0
         self._f = open(self.path, 'w', buffering=1 << 16)
 
@@ -558,10 +573,10 @@ class VizWriter:
         ``"v"`` holds the per-bar plot values, ``"c"`` the color channels that
         changed since the last emitted value. Both keys are omitted when empty.
         """
-        if lib._plot_meta_new:
-            for meta in lib._plot_meta_new:
-                self._emit(serialize_meta(meta))
-            lib._plot_meta_new.clear()
+        self._meta_cursor, metas = collect_meta_changes(self._meta_cursor)
+        for record in metas:
+            self._emit(record)
+        lib._plot_meta_new.clear()
 
         rec: dict[str, Any] = {"t": "bar", "i": bar_index, "time": time_ms}
         if values:

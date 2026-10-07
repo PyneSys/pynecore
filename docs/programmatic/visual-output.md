@@ -80,9 +80,9 @@ The stream is [NDJSON](https://ndjson.org/): one JSON object per line. Every rec
 `"t"` field. The records appear in this order:
 
 1. `hdr` — always the first line.
-2. Interleaved `meta` and `bar` records (and `ev` records when journaling). A plot's `meta` is
-   emitted lazily, on the first bar the plot actually fires, immediately before that bar's `bar`
-   record.
+2. Interleaved `meta` and `bar` records (and `ev` records when journaling). Initial plot metadata
+   precedes the first `bar` record, including plots whose initial values are `na`. Changed
+   metadata is emitted before the bar that observes it.
 3. `drawings` — a full end-of-run snapshot, second to last.
 4. `end` — always the last line.
 
@@ -201,7 +201,9 @@ A three-bar indicator with a dynamic-colored `plot`, a static `plot`, a `fill`, 
 
 A plot's color is registered once, on the bar the plot first fires, as the `meta.color` static
 color. On every later bar the runtime compares the call's color to that registered color by object
-**identity** — a `color.*` constant or the exact same object is treated as static and never repeated.
+**identity** — a `color.*` constant or the exact same object uses the static metadata color.
+If a referenced `Color` is modified in place, its updated integer value causes a new `meta`
+record, without turning it into a separate per-bar color channel.
 
 Only a color that differs (for example the branches of a `bar_index % 2 == 0 ? color.red :
 color.lime` expression, or a fresh `color.new(...)` each bar) is a *dynamic channel*. Once a plot has
@@ -214,6 +216,28 @@ forward, falling back to `meta.color` before the first emitted change.
 
 `bgcolor` and `barcolor` likewise record every bar; an `na` (unpainted) bar is encoded as `null`, so
 a paint → unpaint → paint sequence round-trips exactly.
+
+## Independent Metadata Readers
+
+Host consumers can use `pynecore.core.viz.collect_meta_changes(cursor)` to read metadata updates
+without consuming the native writer's pending queue. Each reader owns its cursor; 0 reads all
+currently registered metadata, and subsequent calls return only the latest changed wire records.
+
+```python
+from pynecore.core.viz import collect_meta_changes
+
+cursor = 0
+for candle, plot_data in runner.run_iter():
+    cursor, metas = collect_meta_changes(cursor)
+    for meta in metas:
+        consume_meta(meta)
+```
+
+Serialization is cached across readers. Records are copied for each reader, and repeated writes
+to the same metadata between reads are coalesced. Unchanged revisions skip the metadata-registry
+scan. Mutable colors are checked by integer value once per distinct referenced color object per
+read; the `Color` construction and mutation APIs are unchanged. Run reset detaches previous
+metadata and color references and invalidates cached records.
 
 ## Ordinal-Id Semantics
 

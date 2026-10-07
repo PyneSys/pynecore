@@ -23,7 +23,7 @@ from ..core.script import script, input
 from ..types.na import NA, na_int
 from ..types import Series, PyneInt
 from ..types.pine_types import pine_int
-from ..types.plot_meta import PlotMeta
+from ..types.plot_meta import PlotMeta, PlotMetaRegistry as _PlotMetaRegistry
 from . import syminfo  # This should be imported before core.datetime to avoid circular import!
 from . import barstate, string, log, math, plot, hline, linefill, alert, dayofweek
 from .plot import plot as _plot
@@ -174,7 +174,7 @@ _script_timeframe: str | None = None
 _plot_data: dict[str, Any] = {}
 
 # Plot-family registration state
-_plot_meta: dict[str, PlotMeta] = {}  # id -> meta, insertion order = registration order
+_plot_meta: _PlotMetaRegistry = _PlotMetaRegistry()  # insertion order = registration order
 _plot_meta_new: list[PlotMeta] = []  # pending metas, drained only by the viz writer
 _viz_dyn: dict[str, Any] = {}  # per-bar dynamic channels, cleared with _plot_data
 _viz_seq: dict[str, int] = {}  # per-bar ordinal counters for bgcolor/barcolor/fill/hline
