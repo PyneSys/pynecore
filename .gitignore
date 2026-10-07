@@ -52,6 +52,7 @@ uv.lock
 # Native extension build products (sources are the .pyx files next to them)
 src/pynecore/core/_native_math.c
 src/pynecore/core/_native_rolling_sum.c
+src/pynecore/core/_native_color.c
 *.so
 *.pyd
 wheelhouse/

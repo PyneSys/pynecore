@@ -3,3 +3,4 @@ include NOTICE
 include LICENSE
 include src/pynecore/core/_native_math.pyx
 include src/pynecore/core/_native_rolling_sum.pyx
+include src/pynecore/core/_native_color.pyx

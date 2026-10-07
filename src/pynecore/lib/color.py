@@ -1,6 +1,6 @@
-from typing import cast
+import os as _os
 
-from ..types.color import Color
+from ..types.color import Color, _alpha
 from ..types.na import NA
 from ..types.pine_types import PyneFloat
 
@@ -87,9 +87,8 @@ def new(color: Color | str | NA[Color], transp: float | NA[float] = 0) -> Color 
     if isinstance(color, str):
         color = Color(color)
     # Build a fresh color so the caller's color (e.g. a color.* constant) is not mutated
-    result = Color(f'#{color.value:08X}')
-    # The guard above rules out na, which the positive na test cannot narrow away
-    result.t = cast(float, transp)
+    result = object.__new__(Color)
+    result.value = (color.value & 0xFFFFFF00) | _alpha(transp)  # type: ignore[arg-type]
     return result
 
 
@@ -162,3 +161,13 @@ def from_gradient(value: int | float | NA[float], bottom_value: int | float | NA
                  + (top_w * ((top >> shift) & 0xFF)) * position)
         result |= int(mixed / scale) << shift
     return Color(f'#{result | int(alpha):08X}')
+
+
+#: The Python implementation remains available for native equivalence checks.
+PYTHON_IMPLEMENTATIONS = {'new': new}
+
+if not _os.environ.get('PYNE_NO_NATIVE_COLOR'):
+    try:
+        from ..core._native_color import new as new
+    except ImportError:
+        pass
