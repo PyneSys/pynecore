@@ -1,7 +1,7 @@
 """
 @pyne
 """
-from pynecore.lib import script, plot, color, display, close, open, bar_index
+from pynecore.lib import script, plot, color, display, close, open, bar_index, na
 
 
 @script.indicator("PlotMeta", "pm", overlay=True)
@@ -12,23 +12,21 @@ def main():
          offset=2, trackprice=True, histbase=100.0, display=display.pane, force_overlay=True)
     # A plain plot to verify defaults (color None, linewidth 1, style None).
     plot(open, "plain")
-    # A conditional plot that only first fires on bar 3: its meta must be lazily
-    # registered exactly once (on bar 3) and its value must be absent before that.
-    if bar_index >= 3:
-        plot(close, "late", color=color.green)
+    plot(close if bar_index >= 3 else na, "late", color=color.green)
 
 
-def __test_plot_meta__(runner):
-    """Styled plot() calls register a complete PlotMeta; conditional plots register lazily.
+def __test_plot_meta__(runner, tmp_path):
+    """Styled and conditional-value plots register complete metadata and fixed CSV columns.
 
     A single styled plot exercises color/linewidth/style/offset/trackprice/histbase/
-    display/force_overlay; a plain plot verifies defaults; and a plot first reached on
-    bar 3 verifies lazy register-once behaviour (meta appears only after it fires, and its
-    per-bar value is absent on bars 0-2).
+    display/force_overlay; a plain plot verifies defaults; and a plot with values from
+    bar 3 keeps its column on every bar, with NaN values on bars 0-2.
     """
     from pynecore import lib
     from pynecore.core import viz
     from pynecore.types.ohlcv import OHLCV
+    from pynecore.types.na import isna_num
+    import csv
 
     base = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC, in ms
     rows = [
@@ -43,17 +41,25 @@ def __test_plot_meta__(runner):
             for i, (o, h, l, c) in enumerate(rows)]
 
     per_bar: list[dict] = []
-    for _candle, _plot in runner(iter(bars)).run_iter():
+    plot_path = tmp_path / 'plots.csv'
+    for _candle, _plot in runner(iter(bars), plot_path=plot_path).run_iter():
         per_bar.append(dict(_plot))
 
     assert len(per_bar) == 6
 
-    # Lazy registration: "late" absent on bars 0-2, present with the bar's close after.
     for i in range(3):
-        assert "late" not in per_bar[i]
+        assert isna_num(per_bar[i]["late"])
     for i in range(3, 6):
         assert "late" in per_bar[i]
         assert per_bar[i]["late"] == rows[i][3]
+
+    with plot_path.open(newline='') as source:
+        csv_rows = list(csv.DictReader(source))
+    assert len(csv_rows) == len(bars)
+    assert all(set(row) == {'time', 'open', 'high', 'low', 'close', 'volume',
+                            'styled', 'plain', 'late'} for row in csv_rows)
+    assert [row['late'] for row in csv_rows[:3]] == ['NaN'] * 3
+    assert [float(row['late']) for row in csv_rows[3:]] == [row[3] for row in rows[3:]]
 
     # The always-present plots carry the right per-bar values.
     for i in range(6):

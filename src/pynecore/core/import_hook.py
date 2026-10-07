@@ -584,6 +584,7 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
     from pynecore.transformers.builtin_shadow import BuiltinShadowTransformer
     from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
     from pynecore.transformers.outer_write import OuterWriteTransformer
+    from pynecore.transformers.plot_scope import PlotScopeTransformer
     from pynecore.transformers.export_capture import ExportCaptureTransformer
     from pynecore.transformers.security_drawings import SecurityDrawingsTransformer
     from pynecore.transformers.const_fold import ConstFoldTransformer
@@ -611,6 +612,8 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
     # so the lib.<ns>.<name> chains it emits get their imports added there
     transformed = BuiltinShadowTransformer().visit(transformed)
     transformed = ImportNormalizerTransformer().visit(transformed)
+    if not path.is_relative_to(Path(__file__).parent.parent):
+        transformed = PlotScopeTransformer(source).visit(transformed)
     # The language rule that an object created outside a function may not be
     # modified inside one. It reads the normalized ``lib.*`` chains and runs
     # well before function isolation, whose per-call-site copies would report

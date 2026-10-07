@@ -7,7 +7,6 @@ if TYPE_CHECKING:
     from pynecore.types.type_checker import *
     from ..types.session import SessionInfo
 
-import sys
 import math as _math
 from bisect import bisect_right as _bisect_right
 
@@ -422,9 +421,6 @@ def plotshape(series: Any, title: str | None = None, style: Any = None, location
     """
     if _lib_semaphore:
         return
-    if bar_index == 0:
-        if sys._getframe(1).f_code.co_name != 'main':  # noqa
-            raise RuntimeError("The plotshape function can only be called from the main function!")
     t = _uniq_title('Shapes' if title is None else title)
     # TradingView exports whatever the series holds, not a truthiness flag: a
     # numeric series marks the bar AND carries its value into the exported
@@ -477,9 +473,6 @@ def plotchar(series: Any, title: str | None = None, char: str | None = None, loc
     """
     if _lib_semaphore:
         return
-    if bar_index == 0:
-        if sys._getframe(1).f_code.co_name != 'main':  # noqa
-            raise RuntimeError("The plotchar function can only be called from the main function!")
     t = _uniq_title('Chars' if title is None else title)
     _plot_data[t] = int(series) if isinstance(series, bool) else series
     meta = _plot_meta.get(t)
@@ -525,9 +518,6 @@ def plotarrow(series: Any, title: str | None = None, colorup: Any = None, colord
     """
     if _lib_semaphore:
         return
-    if bar_index == 0:
-        if sys._getframe(1).f_code.co_name != 'main':  # noqa
-            raise RuntimeError("The plotarrow function can only be called from the main function!")
     t = _uniq_title('Arrows' if title is None else title)
     _plot_data[t] = int(series) if isinstance(series, bool) else series
     meta = _plot_meta.get(t)
@@ -575,9 +565,6 @@ def plotcandle(open: Any, high: Any, low: Any, close: Any, title: str | None = N
     """
     if _lib_semaphore:
         return
-    if bar_index == 0:
-        if sys._getframe(1).f_code.co_name != 'main':  # noqa
-            raise RuntimeError("The plotcandle function can only be called from the main function!")
     base = 'Candles' if title is None else title
     c = 0
     t = base
@@ -631,9 +618,6 @@ def plotbar(open: Any, high: Any, low: Any, close: Any, title: str | None = None
     """
     if _lib_semaphore:
         return
-    if bar_index == 0:
-        if sys._getframe(1).f_code.co_name != 'main':  # noqa
-            raise RuntimeError("The plotbar function can only be called from the main function!")
     base = 'Bars' if title is None else title
     c = 0
     t = base
@@ -677,9 +661,6 @@ def bgcolor(color: Any = None, offset: int = 0, editable: bool = True, show_last
     """
     if _lib_semaphore:
         return
-    if bar_index == 0:
-        if sys._getframe(1).f_code.co_name != 'main':  # noqa
-            raise RuntimeError("The bgcolor function can only be called from the main function!")
     if title is None:
         title = _auto_viz_title('bgcolor:title', 'Background color')
     n = _viz_seq.get('bgcolor', 0)
@@ -711,9 +692,6 @@ def barcolor(color: Any = None, offset: int = 0, editable: bool = True, show_las
     """
     if _lib_semaphore:
         return
-    if bar_index == 0:
-        if sys._getframe(1).f_code.co_name != 'main':  # noqa
-            raise RuntimeError("The barcolor function can only be called from the main function!")
     if title is None:
         title = _auto_viz_title('barcolor:title', 'Bar color')
     n = _viz_seq.get('barcolor', 0)
@@ -769,9 +747,6 @@ def fill(*args: Any, **kwargs: Any) -> None:
     """
     if _lib_semaphore:
         return
-    if bar_index == 0:
-        if sys._getframe(1).f_code.co_name != 'main':  # noqa
-            raise RuntimeError("The fill function can only be called from the main function!")
     if args:
         if isinstance(args[0], HLine):
             names = _FILL_HLINE_PARAMS
@@ -852,10 +827,6 @@ def alertcondition(*_, **__):
     """
     if _lib_semaphore:
         return
-    if bar_index == 0:  # Only check if it is the first bar for performance reasons
-        # Check if it is called from the main function
-        if sys._getframe(1).f_code.co_name != 'main':  # noqa
-            raise RuntimeError("The alertcondition function can only be called from the main function!")
 
 
 ### Other ###

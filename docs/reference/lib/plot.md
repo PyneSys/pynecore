@@ -44,7 +44,15 @@ Records a series value on every bar for output. In PyneCore, this writes the val
 
 **Returns:** `Plot` — a plot reference object.
 
-> **Note:** `plot()` must be called from the script's `main()` function. Calling it from a helper function raises `RuntimeError`.
+> **Note:** Plot declarations must execute unconditionally in the direct body of the module-level `main()` function, before any possible early return. Calls inside helpers, branches, loops, or conditional expressions raise a source-located `SyntaxError` during AST transformation, before the script runs. This rule also applies to `plotshape`, `plotchar`, `plotarrow`, `plotcandle`, `plotbar`, `hline`, `fill`, `bgcolor`, `barcolor`, and `alertcondition`.
+
+To show a plot conditionally, keep the call unconditional and pass `na` when it should be hidden. The CSV retains its column and records `NaN` on those bars:
+
+```python
+plot(close if bar_index >= 3 else na, title="Close Price")
+```
+
+Import aliases and single static function aliases are supported. Passing plot functions as callbacks or storing them in containers is rejected because their call scope cannot be verified. Plot references returned by `plot()` can still be stored and passed to `fill()`.
 
 ```python
 p = plot(close, title="Close Price")

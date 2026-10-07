@@ -1,5 +1,4 @@
 from typing import Any
-import sys
 
 from ..types.plot import PlotEnum, Plot
 from ..types.plot_meta import PlotMeta
@@ -69,11 +68,6 @@ def plot(series: Any, title: str | None = None, color: Any = None, linewidth: in
         _lib = lib
     if lib._lib_semaphore:
         return Plot('')
-
-    if lib.bar_index == 0:  # Only check if it is the first bar for performance reasons
-        # Check if it is called from the main function
-        if sys._getframe(1).f_code.co_name != 'main':  # noqa
-            raise RuntimeError("The plot function can only be called from the main function!")
 
     # Ensure unique title
     title: str = 'Plot' if title is None else title

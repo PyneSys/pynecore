@@ -433,9 +433,15 @@ from pynecore.lib import close, high, low, open, plot, request, script, ta, time
 def main():
     hot = close > open
     if hot:
-        plot(high)
+        upper = high
+    else:
+        upper = low
     if close - open:
-        plot(low)
+        lower = low
+    else:
+        lower = high
+    plot(upper)
+    plot(lower)
     daily = request.security(timeframe.period, "D", ta.sma(close, 5))
     plot(daily + low)
 
