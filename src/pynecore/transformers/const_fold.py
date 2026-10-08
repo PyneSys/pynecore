@@ -1,6 +1,7 @@
 import ast
 import builtins
 import math
+from collections import Counter
 from decimal import Decimal, ROUND_HALF_EVEN, localcontext
 
 from pynecore.core import fdlibm
@@ -153,6 +154,66 @@ def _assigned_names(node: ast.AST) -> set[str]:
         elif isinstance(n, ast.ExceptHandler) and n.name:
             names.add(n.name)
     return names
+
+
+class _ScopeBindings(ast_walk.NodeVisitor):
+    """Count bindings in one Python scope, including unreachable assignments."""
+
+    def __init__(self, body: list[ast.stmt]) -> None:
+        self.names: Counter[str] = Counter()
+        self.wildcard_import = False
+        for statement in body:
+            self.visit(statement)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.names[node.id] += 1
+
+    def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        self.names[node.name] += 1
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        self.visit(node.args)
+        if node.returns is not None:
+            self.visit(node.returns)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self.visit(node.args)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.names[node.name] += 1
+        for expression in [*node.bases, *node.keywords, *node.decorator_list]:
+            self.visit(expression)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            self.names[alias.asname or alias.name.split('.')[0]] += 1
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        for alias in node.names:
+            if alias.name == '*':
+                self.wildcard_import = True
+            else:
+                self.names[alias.asname or alias.name] += 1
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.name is not None:
+            self.names[node.name] += 1
+        self.generic_visit(node)
+
+    def visit_MatchAs(self, node: ast.MatchAs | ast.MatchStar) -> None:
+        if node.name is not None:
+            self.names[node.name] += 1
+        self.generic_visit(node)
+
+    visit_MatchStar = visit_MatchAs
+
+    def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
+        if node.rest is not None:
+            self.names[node.rest] += 1
+        self.generic_visit(node)
 
 
 class _ExprFolder(ast_walk.NodeTransformer):
@@ -408,6 +469,10 @@ class ConstFoldTransformer:
     rebinds a name must not move the type the enclosing scope still reads
     for it.
 
+    A numeric module binding with no rebinding or explicit outer write can
+    also be folded inside functions. Parameters and local bindings shadow
+    it throughout their scope; enclosing function locals are not captured.
+
     Runs right after import normalization (the folder matches the
     ``lib.math.*`` chains that pass emits) and only over user/compiled
     scripts -- pynecore's own lib modules must keep their raw expressions.
@@ -420,7 +485,22 @@ class ConstFoldTransformer:
 
     def visit(self, tree: ast.Module) -> ast.Module:
         self._blocked = _mutated_stateful_names(tree.body)
-        self._process_body(tree.body, {}, {})
+        bindings = _ScopeBindings(tree.body)
+        outer_writes = {name for node in ast_walk.walk(tree)
+                        if isinstance(node, (ast.Global, ast.Nonlocal)) for name in node.names}
+        self._global_names = {name for name, count in bindings.names.items()
+                              if count == 1 and name not in outer_writes}
+        # Parameterized annotations can carry Series/Persistent state instead
+        # of a native scalar value.
+        self._global_names.difference_update(
+            statement.target.id for statement in tree.body
+            if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name)
+            and isinstance(statement.annotation, ast.Subscript))
+        if bindings.wildcard_import:
+            self._global_names.clear()
+        self._global_env: dict[str, int | float] = {}
+        self._global_types: dict[str, str] = {}
+        self._process_body(tree.body, self._global_env, self._global_types)
         return tree
 
     def _process_body(self, body: list[ast.stmt], env: dict[str, int | float],
@@ -449,12 +529,21 @@ class ConstFoldTransformer:
                     if kw_default is not None:
                         stmt.args.kw_defaults[i] = self._fold(kw_default, env, types)
                 env.pop(stmt.name, None)
-                # Free variables of a nested scope are not tracked: the body
-                # starts from an empty environment
+                bound = set(_ScopeBindings(stmt.body).names)
+                bound.update(arg.arg for arg in [*stmt.args.posonlyargs, *stmt.args.args,
+                                                  *stmt.args.kwonlyargs,
+                                                  stmt.args.vararg, stmt.args.kwarg]
+                             if arg is not None)
+                captured = {name: value for name, value in self._global_env.items()
+                            if name in self._global_names and name not in bound}
+                captured_types = {name: self._global_types[name] for name in captured}
+                outer_globals, outer_types = self._global_env, self._global_types
+                self._global_env, self._global_types = captured, captured_types
                 outer_blocked = self._blocked
                 self._blocked = _mutated_stateful_names(stmt.body)
-                self._process_body(stmt.body, {}, {})
+                self._process_body(stmt.body, dict(captured), dict(captured_types))
                 self._blocked = outer_blocked
+                self._global_env, self._global_types = outer_globals, outer_types
             case ast.ClassDef():
                 env.pop(stmt.name, None)
                 self._process_body(stmt.body, {}, {})
