@@ -419,6 +419,11 @@ def _anchored(impls: list[Implementation], qualname: str,
         one: the implementation is then selected here, once, from the static
         types rather than per bar from the values.
     :return: The dispatch callable.
+
+    A fully pinned stateless implementation may supply ``__pyne_pinned_bind__``.
+    Its factory receives the ordinary pinned fallback, selected implementation,
+    live overload group and positional arity. The returned entry must fall back
+    when any of those contracts change and expose the fallback's bound cache.
     """
     _cache: dict[Implementation, tuple[Callable, list | None, Callable]] = \
         {} if cache is None else cache
@@ -561,6 +566,12 @@ def _anchored(impls: list[Implementation], qualname: str,
 
     dispatch_pinned.__pyne_cache__ = _cache
     dispatch_pinned.__pyne_impls__ = impls
+    # Stateless implementations may fuse a result cache into the pinned entry.
+    # The factory retains dispatch_pinned as the fallback for changed call shapes
+    # or implementations; wildcard positions still need ordinary verification.
+    factory = getattr(chosen.func, '__pyne_pinned_bind__', None)
+    if factory is not None and not wildcards and not hasattr(chosen.func, '__pyne_layout__'):
+        return factory(dispatch_pinned, chosen, impls, argc)
     return dispatch_pinned
 
 

@@ -1,7 +1,8 @@
 """
 Builtin library of Pyne
 """
-from typing import TYPE_CHECKING, TypeAlias, Any, TypeVar, overload as _typing_overload
+from typing import TYPE_CHECKING, TypeAlias, Any, TypeVar, Callable as _Callable, \
+    overload as _typing_overload
 
 if TYPE_CHECKING:
     from pynecore.types.type_checker import *
@@ -9,6 +10,7 @@ if TYPE_CHECKING:
 
 import math as _math
 from bisect import bisect_right as _bisect_right
+from builtins import map as _builtin_map
 
 from functools import lru_cache as _lru_cache
 from datetime import datetime, timedelta, time as dt_time, date, UTC, \
@@ -33,7 +35,7 @@ from . import timeframe as timeframe_module
 from . import session as session_module
 from ._fixnan import fixnan
 
-from pynecore.core.overload import overload
+from pynecore.core.overload import overload, Implementation as _OverloadImplementation
 from pynecore.core.safe_convert import native_int_or as _native_int_or
 from pynecore.core.datetime import parse_datestring as _parse_datestring, parse_timezone as _parse_timezone, \
     TimezoneNotFoundError, civil_days as _civil_days, julian_civil_days as _julian_civil_days, \
@@ -237,6 +239,160 @@ def _get_dt(time: int | float | None = None, timezone: str | None = None) -> dat
     return dt.astimezone(_parse_timezone(timezone))
 
 
+@_lru_cache(maxsize=1024)
+def _timestamp_components_cached(tz: _tzinfo, year: int, month: int, day: int,
+                                 hour: int, minute: int, second: int) -> PyneInt:
+    """Compute a timestamp from a resolved zone and normalized native components.
+
+    This private helper is called only by plain runtime code, never emitted as a
+    script call. Its bounded result cache is independent of call-site state.
+
+    :param tz: Resolved timezone object
+    :param year: Native year
+    :param month: Native month
+    :param day: Native day
+    :param hour: Native hour
+    :param minute: Native minute
+    :param second: Native second
+    :return: UNIX timestamp in milliseconds
+    """
+    # Pine accepts out-of-range components and rolls them over (e.g. hour 26 ->
+    # next day + 2h, month 13 -> next January). Normalize the month into the
+    # year, then carry the day through timedelta so the wall clock overflows
+    # before the timezone conversion.
+    # TradingView substitutes 0 for an na component instead of propagating the na
+    # (measured: an na year/month/hour/second each lands on the year-0 / month-0 /
+    # hour-0 / second-0 timestamp, never on na), so every component truncates
+    # through the na-tolerant conversion.
+    y = year
+    m = month
+    y += (m - 1) // 12
+    m = (m - 1) % 12 + 1
+    d = day
+    # The clock components roll over into days too, so they are carried into the
+    # day count before every calendar decision below. The wall clock is not moved
+    # by the carry (the timedelta at the end shifts wall time, not absolute time),
+    # but a rollover that leaves datetime's range -- hour 24 on the last
+    # representable day -- now folds like any other out-of-range date instead of
+    # raising OverflowError.
+    clock_seconds = hour * 3600 + minute * 60 + second
+    day_carry, second_of_day = divmod(clock_seconds, 86400)
+    d += day_carry
+    # TradingView runs the Julian calendar before 1582-10-15 and the Gregorian
+    # one from that day on, the same hybrid Java's GregorianCalendar keeps, and
+    # reads the ten dates the switch skipped as Julian too (measured:
+    # timestamp(1582, 10, 5, 0, 0) == timestamp(1582, 10, 15, 0, 0), and
+    # timestamp(1, 1, 1, 0, 0) is two days before the proleptic Gregorian
+    # instant). datetime only knows the proleptic Gregorian calendar, so the
+    # difference is carried as whole days on the wall clock -- exact, because
+    # no zone observes DST that far back.
+    gregorian_day = _civil_days(y, m, d)
+    calendar_shift = 0
+    if gregorian_day < _GREGORIAN_CUTOVER_DAY:
+        calendar_shift = _julian_civil_days(y, m, d) - gregorian_day
+    # The date may also fall outside datetime's 1..9999 years, which Pine does
+    # not limit at all: TradingView keeps counting in both directions and
+    # clamps nothing (measured: timestamp(9999, 31, 12, 23, 59) ==
+    # timestamp(10001, 7, 12, 23, 59) == 253450598340000, and
+    # timestamp(1000000, 1, 1, 0, 0) == 31494784780800000). The Gregorian
+    # calendar repeats exactly every 400 years, so an unrepresentable date is
+    # folded into 2000..2399 by whole cycles and their length added back to the
+    # result. Month, day and weekday are preserved, so a named zone's DST rules
+    # land on the same wall clock as the unfolded date would. Representable
+    # dates keep their own year, and with it the zone's real offset history.
+    target_day = gregorian_day + calendar_shift
+    cycles = 0
+    if not (_MINYEAR <= y <= _MAXYEAR and _MIN_DATETIME_DAY <= target_day <= _MAX_DATETIME_DAY):
+        cycles = (target_day - _CYCLE_ANCHOR_DAY) // _GREGORIAN_CYCLE_DAYS
+        y -= cycles * 400
+    dt = datetime(y, m, 1, tzinfo=tz) + timedelta(
+        days=d - 1 + calendar_shift, seconds=second_of_day
+    )
+    return pine_int(int(dt.timestamp() * 1000) + cycles * _GREGORIAN_CYCLE_MS)
+
+
+def _timestamp_components(timezone: str | None, year: int | float, month: int | float,
+                          day: int | float, hour: int | float = 0, minute: int | float = 0,
+                          second: int | float = 0) -> PyneInt:
+    """Resolve the current zone and normalize components before shared lookup.
+
+    :param timezone: Explicit timezone or the current exchange timezone
+    :param year: Year
+    :param month: Month
+    :param day: Day
+    :param hour: Hour
+    :param minute: Minute
+    :param second: Second
+    :return: UNIX timestamp in milliseconds
+    """
+    tz = _parse_timezone(timezone)
+    return _timestamp_components_cached(
+        tz, _native_int_or(year, 0), _native_int_or(month, 0), _native_int_or(day, 0),
+        _native_int_or(hour, 0), _native_int_or(minute, 0), _native_int_or(second, 0),
+    )
+
+
+def _bind_timestamp_components(fallback: _Callable, implementation: _OverloadImplementation,
+                               implementations: list[_OverloadImplementation], argc: int,
+                               *, with_timezone: bool) -> _Callable:
+    """Keep one immutable result per pinned call site, with shared LRU on a miss.
+
+    Only runtime binding calls this helper; scripts reach it through the overload
+    protocol. It must keep binding because each site owns its last key/result.
+
+    :param fallback: Ordinary pinned dispatcher
+    :param implementation: Selected implementation
+    :param implementations: Live overload group
+    :param argc: Pinned positional argument count
+    :param with_timezone: Whether the first argument is a timezone
+    :return: Call-site timestamp entry
+    """
+    original = implementation.func
+    group = len(implementations)
+    defaults = (0, 0, 0)
+    count = argc - int(with_timezone)
+    padding = defaults[:6 - count]
+    last = None
+
+    def cached(*args, **kwargs):
+        nonlocal last
+        if kwargs or len(args) != argc or len(implementations) != group \
+                or implementation.func is not original:
+            return fallback(*args, **kwargs)
+        timezone = args[0] if with_timezone else None
+        components = args[1:] if with_timezone else args
+        # Resolve even on a hit: timezone=None and timezone-cache invalidation
+        # must both observe the current runtime environment.
+        tz = _parse_timezone(timezone)
+        types = tuple(_builtin_map(type, components))
+        key = (tz, types, components)
+        if last is not None and last[0] == key:
+            return last[1]
+        normalized = tuple(_native_int_or(value, 0) for value in components) + padding
+        result = _timestamp_components_cached(tz, *normalized)
+        # Numeric subclasses may change their conversion without changing their
+        # numeric value. Their native conversion remains observable on every call.
+        last = (key, result) if all(t is int or t is float for t in types) else None
+        return result
+
+    cached.__pyne_cache__ = fallback.__pyne_cache__
+    cached.__pyne_impls__ = implementations
+    return cached
+
+
+def _timestamp_component_overload(func: _Callable) -> _Callable:
+    """Opt component overloads into the stateless pinned-binding cache protocol.
+
+    :param func: Plain timestamp component implementation
+    :return: Implementation with its call-site cache factory attached
+    """
+    with_timezone = func.__code__.co_varnames[0] == 'timezone'
+    func.__pyne_pinned_bind__ = lambda fallback, impl, impls, argc: _bind_timestamp_components(
+        fallback, impl, impls, argc, with_timezone=with_timezone,
+    )
+    return func
+
+
 @overload
 def timestamp(date_string: DateStr) -> PyneInt:  # It is more pythonic, but not supported by Pine Script
     """
@@ -276,6 +432,7 @@ def timestamp(dateString: DateStr) -> PyneInt:
 
 # noinspection PyShadowingNames
 @overload
+@_timestamp_component_overload
 def timestamp(timezone: TimezoneStr | None, year: int | float, month: int | float, day: int | float,
               hour: int | float = 0, minute: int | float = 0, second: int | float = 0) -> PyneInt:
     """
@@ -292,65 +449,12 @@ def timestamp(timezone: TimezoneStr | None, year: int | float, month: int | floa
     :param second: Second
     :return: UNIX timestamp in milliseconds
     """
-    tz = _parse_timezone(timezone)
-    # Pine accepts out-of-range components and rolls them over (e.g. hour 26 ->
-    # next day + 2h, month 13 -> next January). Normalize the month into the
-    # year, then carry the day through timedelta so the wall clock overflows
-    # before the timezone conversion.
-    # TradingView substitutes 0 for an na component instead of propagating the na
-    # (measured: an na year/month/hour/second each lands on the year-0 / month-0 /
-    # hour-0 / second-0 timestamp, never on na), so every component truncates
-    # through the na-tolerant conversion.
-    y = _native_int_or(year, 0)
-    m = _native_int_or(month, 0)
-    y += (m - 1) // 12
-    m = (m - 1) % 12 + 1
-    d = _native_int_or(day, 0)
-    # The clock components roll over into days too, so they are carried into the
-    # day count before every calendar decision below. The wall clock is not moved
-    # by the carry (the timedelta at the end shifts wall time, not absolute time),
-    # but a rollover that leaves datetime's range -- hour 24 on the last
-    # representable day -- now folds like any other out-of-range date instead of
-    # raising OverflowError.
-    clock_seconds = (_native_int_or(hour, 0) * 3600 + _native_int_or(minute, 0) * 60
-                     + _native_int_or(second, 0))
-    day_carry, second_of_day = divmod(clock_seconds, 86400)
-    d += day_carry
-    # TradingView runs the Julian calendar before 1582-10-15 and the Gregorian
-    # one from that day on, the same hybrid Java's GregorianCalendar keeps, and
-    # reads the ten dates the switch skipped as Julian too (measured:
-    # timestamp(1582, 10, 5, 0, 0) == timestamp(1582, 10, 15, 0, 0), and
-    # timestamp(1, 1, 1, 0, 0) is two days before the proleptic Gregorian
-    # instant). datetime only knows the proleptic Gregorian calendar, so the
-    # difference is carried as whole days on the wall clock -- exact, because
-    # no zone observes DST that far back.
-    gregorian_day = _civil_days(y, m, d)
-    calendar_shift = 0
-    if gregorian_day < _GREGORIAN_CUTOVER_DAY:
-        calendar_shift = _julian_civil_days(y, m, d) - gregorian_day
-    # The date may also fall outside datetime's 1..9999 years, which Pine does
-    # not limit at all: TradingView keeps counting in both directions and
-    # clamps nothing (measured: timestamp(9999, 31, 12, 23, 59) ==
-    # timestamp(10001, 7, 12, 23, 59) == 253450598340000, and
-    # timestamp(1000000, 1, 1, 0, 0) == 31494784780800000). The Gregorian
-    # calendar repeats exactly every 400 years, so an unrepresentable date is
-    # folded into 2000..2399 by whole cycles and their length added back to the
-    # result. Month, day and weekday are preserved, so a named zone's DST rules
-    # land on the same wall clock as the unfolded date would. Representable
-    # dates keep their own year, and with it the zone's real offset history.
-    target_day = gregorian_day + calendar_shift
-    cycles = 0
-    if not (_MINYEAR <= y <= _MAXYEAR and _MIN_DATETIME_DAY <= target_day <= _MAX_DATETIME_DAY):
-        cycles = (target_day - _CYCLE_ANCHOR_DAY) // _GREGORIAN_CYCLE_DAYS
-        y -= cycles * 400
-    dt = datetime(y, m, 1, tzinfo=tz) + timedelta(
-        days=d - 1 + calendar_shift, seconds=second_of_day
-    )
-    return pine_int(int(dt.timestamp() * 1000) + cycles * _GREGORIAN_CYCLE_MS)
+    return _timestamp_components(timezone, year, month, day, hour, minute, second)
 
 
 # noinspection PyShadowingNames
 @overload
+@_timestamp_component_overload
 def timestamp(year: int | float, month: int | float, day: int | float, hour: int | float = 0,
               minute: int | float = 0, second: int | float = 0) -> int:
     """
@@ -366,7 +470,7 @@ def timestamp(year: int | float, month: int | float, day: int | float, hour: int
     :param second: Second
     :return: UNIX timestamp in milliseconds
     """
-    return timestamp(None, year=year, month=month, day=day, hour=hour, minute=minute, second=second)
+    return _timestamp_components(None, year, month, day, hour, minute, second)
 
 
 ### Plotting ###
