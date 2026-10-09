@@ -28,8 +28,9 @@ selects the series semantics of those modules, nothing about the gate.
 Usage:
     python3 scripts/edge_rules_collector.py [path/to/pyneide_edge_rules.py]
 
-The default spec path assumes the sibling checkout layout of the PyneSys
-monorepo (``../PyneIDE/python/pyneide_edge_rules.py`` next to this repo);
+The default spec path assumes the checkout layout of the PyneSys workspace:
+the PyneIDE repository next to the monorepo that holds this repo
+(``../../PyneIDE/python/pyneide_edge_rules.py`` from here);
 ``PYNE_EDGE_RULES_SPEC`` overrides it.
 """
 import importlib.util
@@ -56,11 +57,11 @@ EXTRAS: dict[str, Any] = {
 
 
 def default_spec_path() -> Path:
-    """The spec's path under the monorepo's sibling-checkout layout, or the override."""
+    """The spec's path under the workspace's checkout layout, or the override."""
     override = os.environ.get('PYNE_EDGE_RULES_SPEC')
     if override:
         return Path(override)
-    return Path(__file__).resolve().parents[2] / 'PyneIDE' / 'python' / 'pyneide_edge_rules.py'
+    return Path(__file__).resolve().parents[3] / 'PyneIDE' / 'python' / 'pyneide_edge_rules.py'
 
 
 def load_spec(path: Path) -> Any:

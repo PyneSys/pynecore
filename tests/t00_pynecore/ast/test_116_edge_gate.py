@@ -122,7 +122,7 @@ def __test_only_an_edge_module_is_gated__():
     ('match close:\n    case 1:\n        pass\n', 'edge-syntax', "'match'"),
     ('def f():\n    global g\n', 'edge-syntax', "'global'"),
     ('del close\n', 'edge-syntax', "'del'"),
-    ('assert close > 0\n', 'edge-syntax', "'assert'"),
+    ('assert close > 0, str.tostring(close)\n', 'edge-assert', 'assert message'),
     ('x = {1: 2}\n', 'edge-syntax', 'dict literal'),
     ('x = {1, 2}\n', 'edge-syntax', 'set literal'),
     ('x = [i for i in (1, 2)]\n', 'edge-syntax', 'comprehension'),
@@ -132,7 +132,6 @@ def __test_only_an_edge_module_is_gated__():
     ('x = 1 | 2\n', 'edge-syntax', "'|'"),
     ('x = 1 << 2\n', 'edge-syntax', "'<<'"),
     ('x = close is None\n', 'edge-syntax', "'is'"),
-    ('x = 1 in (1, 2)\n', 'edge-syntax', "'in'"),
     ('def f(*a):\n    pass\n', 'edge-syntax', '*args'),
     ('def f(a, *, b):\n    pass\n', 'edge-syntax', 'keyword-only'),
     ('x = lambda: 1\n', 'edge-lambda', 'lambda'),
@@ -172,6 +171,8 @@ def __test_one_construct_is_one_finding__():
     '__all__ = ["f"]\nfrom typing import Protocol, Any\nclass _ProtocolF(Protocol):\n    def __call__(self, x: int) -> Any: ...\n',
     'for i in range(3):\n    pass\nwhile close > 1:\n    break\n',
     'x = 1 if close > 1 else 2\nx += 1\n',
+    'assert close > 0\nassert close > 1, "positive"\n',
+    'x = 1 in (1, 2)\ny = 3 not in (1, 2)\n',
 ])
 def __test_pine_is_let_through__(snippet: str):
     diags = _gate(HEAD + snippet)

@@ -40,7 +40,7 @@ __all__ = ['EDGE_RULES_VERSION', 'STRICT_ENV', 'DIAG_ENV', 'edge_rules', 'strict
 
 #: The profile revision this gate was written against. ``edge_rules.json``
 #: must carry the same one.
-EDGE_RULES_VERSION: Final = '2026.07.1'
+EDGE_RULES_VERSION: Final = '2026.09.2'
 
 #: ``1`` makes an edge module's first diagnostic an error, ``0`` never
 #: does; unset is ``0`` until the corpus is clean enough to flip the default.
@@ -61,7 +61,7 @@ _NODE_LABELS: Final[dict[str, str]] = {
     'AsyncFunctionDef': "'async def'", 'AsyncFor': "'async for'",
     'AsyncWith': "'async with'", 'Await': "'await'",
     'Try': "'try'", 'TryStar': "'try'", 'Raise': "'raise'",
-    'Assert': "'assert'", 'With': "'with'", 'Delete': "'del'",
+    'With': "'with'", 'Delete': "'del'",
     'Global': "'global'", 'Nonlocal': "'nonlocal'", 'Match': "'match'",
     'Yield': "'yield'", 'YieldFrom': "'yield from'",
     'List': 'a list literal', 'Dict': 'a dict literal',
@@ -328,6 +328,15 @@ class _Gate:
                 self._report(node, 'edge-lambda',
                              f"'lambda' outside a field(default_factory=...) UDT field "
                              f'default {_SUFFIX}', 'define a function instead')
+                return
+        elif isinstance(node, ast.Assert):
+            # A failed assertion ends the run on every runtime, and a compiled
+            # script carries its message verbatim: only a string literal can be
+            if node.msg is not None and not (isinstance(node.msg, ast.Constant)
+                                             and isinstance(node.msg.value, str)):
+                self._report(node.msg, 'edge-assert',
+                             f'an assert message other than a string literal {_SUFFIX}',
+                             'write the message as a string literal')
                 return
         elif isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store):
             self._report(node, 'edge-subscript', f'subscript assignment {_SUFFIX}',
