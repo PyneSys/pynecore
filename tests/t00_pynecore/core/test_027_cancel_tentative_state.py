@@ -250,6 +250,7 @@ class _MockBroker:
     raise_on_cancel: list[Exception] = field(default_factory=list)
     cancel_returns: list[bool] = field(default_factory=list)
     cancel_outcomes: list[CancelDispositionOutcome] = field(default_factory=list)
+    raise_on_cancel_with_outcome: list[Exception] = field(default_factory=list)
     cancel_with_outcome_calls: list[DispatchEnvelope] = field(default_factory=list)
     cancel_calls: list[DispatchEnvelope] = field(default_factory=list)
     capabilities: ExchangeCapabilities = field(default_factory=lambda: ExchangeCapabilities(
@@ -271,6 +272,8 @@ class _MockBroker:
             self, envelope: DispatchEnvelope,
     ) -> CancelDispositionOutcome:
         self.cancel_with_outcome_calls.append(envelope)
+        if self.raise_on_cancel_with_outcome:
+            raise self.raise_on_cancel_with_outcome.pop(0)
         if self.cancel_outcomes:
             return self.cancel_outcomes.pop(0)
         return CancelDispositionOutcome.UNKNOWN
@@ -539,6 +542,50 @@ def __test_stale_grace_waits_while_broker_reads_unconfirmed__():
     assert engine.halted is True
     assert engine._halted_reason == 'partial_bracket_cancel_disposition_unresolved'
     assert len(broker.cancel_with_outcome_calls) == 3
+
+
+def __test_transport_failure_on_cancel_probe_is_not_venue_evidence__():
+    """A cancel probe that never reached the venue must not feed the halt.
+
+    A flaky link can refuse individual requests while the periodic reads
+    still succeed, so the broker view stays confirmed. Each refused probe
+    raises ``OrderDispositionUnknownError`` from the plugin; the loop keeps
+    the entry armed, resets the retry count (no answer is no evidence), and
+    never promotes on those alone. Only a probe the venue answered with
+    ``UNKNOWN`` counts, and the pass after it halts.
+    """
+    events: list[BrokerEvent] = []
+    broker = _MockBroker(raise_on_cancel_with_outcome=[
+        OrderDispositionUnknownError("refused", client_order_id='xchg-parent'),
+        OrderDispositionUnknownError("refused", client_order_id='xchg-parent'),
+        OrderDispositionUnknownError("refused", client_order_id='xchg-parent'),
+    ])
+    engine = _mk_engine(broker, events=events,
+                        cancel_tentative_stale_grace_s=1.0)
+    intent = _seed_parent_intent_and_leg(engine)
+    engine._cancel_disposition_pending[intent.intent_key] = _CancelTentativeMeta(
+        since_ts_ms=BAR_TS - 5_000, reason='broker_timeout',
+    )
+    engine._mark_reads_confirmed()
+    for step in range(1, 4):
+        engine._drive_cancel_tentative(now_ms=BAR_TS + step * 1_000)
+    meta = engine._cancel_disposition_pending[intent.intent_key]
+    assert engine.halted is False
+    assert len(broker.cancel_with_outcome_calls) == 3
+    assert meta.retry_count == 0
+    assert meta.last_retry_outcome is CancelDispositionOutcome.UNKNOWN
+    assert not [e for e in events
+                if isinstance(e, PartialBracketCancelTentativeDegradedEvent)]
+    # The venue answers UNKNOWN once the link is back: that probe is the
+    # first real evidence, and the next pass halts on it.
+    engine._drive_cancel_tentative(now_ms=BAR_TS + 4_000)
+    assert engine.halted is False
+    assert len(broker.cancel_with_outcome_calls) == 4
+    assert meta.retry_count == 1
+    engine._drive_cancel_tentative(now_ms=BAR_TS + 5_000)
+    assert engine.halted is True
+    assert engine._halted_reason == 'partial_bracket_cancel_disposition_unresolved'
+    assert len(broker.cancel_with_outcome_calls) == 4
 
 
 def __test_dispatch_cancel_unknown_preserves_entry_envelope__():

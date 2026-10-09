@@ -9904,10 +9904,14 @@ class OrderSyncEngine:
             if envelope is None or not isinstance(envelope.intent, CancelIntent):
                 cancel = CancelIntent(pine_id=intent_key, symbol=self._symbol)
                 envelope = self._build_cancel_envelope(cancel)
-            # Only a probe made against a reachable venue counts as evidence;
-            # an outage invalidates the earlier count so the halt needs one
-            # fresh in-session ``UNKNOWN`` after reads recover.
-            meta.retry_count = meta.retry_count + 1 if reads_confirmed else 0
+            # Only a probe the venue answered counts as evidence; an outage
+            # invalidates the earlier count so the halt needs one fresh
+            # in-session ``UNKNOWN`` after the venue is reachable again. A
+            # probe that RAISED never got an answer (the plugin reports a
+            # transport failure as ``OrderDispositionUnknownError``), even
+            # while the periodic reads still succeed — a flaky link refuses
+            # individual requests — so it resets the count like a read
+            # outage does instead of being counted as an ambiguous answer.
             meta.last_retry_ts_ms = now_ms
             try:
                 outcome = self._run_async(
@@ -9921,8 +9925,10 @@ class OrderSyncEngine:
                     "cancel-tentative retry for %r raised %s; treating as UNKNOWN",
                     format_intent_key(intent_key), e,
                 )
+                meta.retry_count = 0
                 meta.last_retry_outcome = CancelDispositionOutcome.UNKNOWN
                 continue
+            meta.retry_count = meta.retry_count + 1 if reads_confirmed else 0
             meta.last_retry_outcome = outcome
             if outcome is CancelDispositionOutcome.UNKNOWN:
                 continue
