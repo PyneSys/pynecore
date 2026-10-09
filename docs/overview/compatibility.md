@@ -30,7 +30,7 @@ API is covered, how closely the results match, and where PyneCore differs on pur
 The match with TradingView is measured, not assumed: published TradingView scripts are converted
 with PyneComp, run by PyneCore, and every comparable output is compared with TradingView's own.
 
-> **Validation status** — snapshot <!--wild:generated_at-->2026-10-02<!--/wild-->, [Pyne in the Wild](https://wild.pynesys.io/)
+> **Validation status** — snapshot <!--wild:generated_at-->2026-10-09<!--/wild-->, [Pyne in the Wild](https://wild.pynesys.io/)
 >
 > - **<!--wild:scripts_total-->1,000<!--/wild-->** published open-source TradingView scripts (<!--wild:indicators-->502<!--/wild--> indicators,
 >   <!--wild:strategies-->498<!--/wild--> strategies; Pine Script v4: <!--wild:pine_v4-->329<!--/wild-->, v5: <!--wild:pine_v5-->364<!--/wild-->,
@@ -308,7 +308,7 @@ the quirk needs a rule of its own for `time_close()` on that single bar.
 ## Precision
 
 What "matches TradingView" means, measured on the validation corpus (snapshot
-<!--wild:generated_at-->2026-10-02<!--/wild-->):
+<!--wild:generated_at-->2026-10-09<!--/wild-->):
 
 - **Plotted values**: <!--wild:bars_exact_pct-->99.771<!--/wild-->% of <!--wild:bars_compared-->131,744,274<!--/wild--> values are identical to
   TradingView to the bit. In <!--wild:scripts_bit_exact-->865<!--/wild--> of the <!--wild:scripts_fidelity_compared-->884<!--/wild--> compared plot

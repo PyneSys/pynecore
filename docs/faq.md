@@ -26,7 +26,7 @@ PyneCore is an open-source framework that implements TradingView's Pine Script p
 ### How does PyneCore relate to TradingView?
 
 PyneCore is not affiliated with or endorsed by TradingView. It is an independent project that
-implements Pine Script's functionality and execution model in Python. PyneCore is validated against TradingView on <!--wild:scripts_total-->1,000<!--/wild--> published TradingView scripts (Pine Script v4–v6, converted to Pyne code with [PyneComp](https://pynesys.io)): all <!--wild:tv_verified-->1,353<!--/wild--> comparable outputs match, <!--wild:bars_exact_pct-->99.771<!--/wild-->% of <!--wild:bars_compared_millions-->132<!--/wild--> million plotted values are bit-identical, and <!--wild:strategy_trades-->353,577<!--/wild--> strategy trades match TradingView's timing (snapshot <!--wild:generated_at-->2026-10-02<!--/wild-->, [Pyne in the Wild](https://wild.pynesys.io/)). See [Compatibility](./overview/compatibility.md) for details.
+implements Pine Script's functionality and execution model in Python. PyneCore is validated against TradingView on <!--wild:scripts_total-->1,000<!--/wild--> published TradingView scripts (Pine Script v4–v6, converted to Pyne code with [PyneComp](https://pynesys.io)): all <!--wild:tv_verified-->1,353<!--/wild--> comparable outputs match, <!--wild:bars_exact_pct-->99.771<!--/wild-->% of <!--wild:bars_compared_millions-->132<!--/wild--> million plotted values are bit-identical, and <!--wild:strategy_trades-->353,577<!--/wild--> strategy trades match TradingView's timing (snapshot <!--wild:generated_at-->2026-10-09<!--/wild-->, [Pyne in the Wild](https://wild.pynesys.io/)). See [Compatibility](./overview/compatibility.md) for details.
 
 ### Is PyneCore free to use?
 
@@ -172,7 +172,7 @@ You can use either or both methods (even in the same script) based on your prefe
 ### How reliable is PyneCore compared to TradingView?
 
 PyneCore's results are measured against TradingView on a public validation corpus,
-[Pyne in the Wild](https://wild.pynesys.io/). The snapshot of <!--wild:generated_at-->2026-10-02<!--/wild--> covers
+[Pyne in the Wild](https://wild.pynesys.io/). The snapshot of <!--wild:generated_at-->2026-10-09<!--/wild--> covers
 <!--wild:scripts_total-->1,000<!--/wild--> published open-source TradingView scripts (<!--wild:indicators-->502<!--/wild--> indicators,
 <!--wild:strategies-->498<!--/wild--> strategies), written in Pine Script v4 (<!--wild:pine_v4-->329<!--/wild-->), v5 (<!--wild:pine_v5-->364<!--/wild-->) and v6
 (<!--wild:pine_v6-->307<!--/wild-->), converted to Pyne code with [PyneComp](https://pynesys.io) and tested on

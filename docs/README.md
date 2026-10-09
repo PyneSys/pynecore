@@ -23,7 +23,7 @@ The results are validated against TradingView on <!--wild:scripts_total-->1,000<
 all <!--wild:tv_verified-->1,353<!--/wild--> comparable outputs match, <!--wild:bars_exact_pct-->99.771<!--/wild-->% of
 <!--wild:bars_compared_millions-->132<!--/wild--> million plotted values are bit-identical, and
 <!--wild:strategy_trades-->353,577<!--/wild--> strategy trades match TradingView's timing (snapshot
-<!--wild:generated_at-->2026-10-02<!--/wild-->, [Pyne in the Wild](https://wild.pynesys.io/)). See
+<!--wild:generated_at-->2026-10-09<!--/wild-->, [Pyne in the Wild](https://wild.pynesys.io/)). See
 [Compatibility](./overview/compatibility.md) for the status of each feature.
 
 ## Documentation Sections
