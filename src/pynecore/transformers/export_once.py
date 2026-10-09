@@ -101,7 +101,8 @@ class ExportOnceTransformer(ast_walk.NodeTransformer):
             if isinstance(stmt, ast.FunctionDef) and stmt.name == 'main':
                 main = stmt
                 break
-        if main is None:
+        if main is None or not any(isinstance(stmt, ast.FunctionDef) and _is_export(stmt)
+                                   for stmt in main.body):
             return node
 
         # A name the library binds anywhere ELSE in ``main`` stays out of the

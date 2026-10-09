@@ -23,8 +23,8 @@ from pynecore.core.import_hook import (
     _reject_reserved_names,
     _PYNE_SENTINEL,
 )
-from pynecore.transformers import pine_type_artifact
-from pynecore.transformers.pine_type_artifact import dep_record, lookup
+from pynecore.transformers import module_interface
+from pynecore.transformers.module_interface import dep_record, lookup
 from pynecore.transformers.pine_type_transformer import PineTypeTransformer, module_table
 
 
@@ -354,7 +354,7 @@ def _typed_against(monkeypatch, dependent: str, dependency: Path):
         table = module_table(tree)
         path = getattr(tree, '_module_file_path', '')
         if table is not None and Path(path).stem == dependent:
-            interface = lookup(str(dependency), import_hook.analyse_source,
+            interface = lookup(str(dependency), import_hook.compile_interface,
                                _get_transform_pipeline_hash())
             if interface is not None:
                 record = dep_record(interface)
@@ -365,8 +365,8 @@ def _typed_against(monkeypatch, dependent: str, dependency: Path):
     try:
         yield
     finally:
-        pine_type_artifact._registry.clear()
-        pine_type_artifact._analysing.clear()
+        module_interface._registry.clear()
+        module_interface._analysing.clear()
 
 
 def _dependency_pair(tmp_path: Path, ret: str = "int") -> tuple[Path, Path]:
@@ -389,21 +389,15 @@ def _build_dependent(app: Path, lib: Path, monkeypatch) -> tuple[str, float]:
 
 
 @contextmanager
-def _counted(monkeypatch):
-    """Count the analyses and the retransforms one load costs."""
-    counts = {"analyse": 0, "transform": 0}
-    real_analyse = import_hook.analyse_source
+def _counted(monkeypatch, app: Path):
+    """Count the dependency transforms and the retransforms one load costs."""
+    counts = {"dependency": 0, "transform": 0}
     real_transform = PyneLoader.source_to_code
 
-    def analyse(path: str):
-        counts["analyse"] += 1
-        return real_analyse(path)
-
     def transform(self, data, path, *, _optimize: int = -1):
-        counts["transform"] += 1
+        counts["transform" if Path(path).resolve() == app.resolve() else "dependency"] += 1
         return real_transform(self, data, path, _optimize=_optimize)
 
-    monkeypatch.setattr(import_hook, "analyse_source", analyse)
     monkeypatch.setattr(PyneLoader, "source_to_code", transform)
     yield counts
 
@@ -412,8 +406,8 @@ def _reload(app: Path, lib: Path, monkeypatch) -> tuple[dict, tuple]:
     """Load the dependent again from a cold registry, as a new process would."""
     # The registry answers for this process only; a fresh process starts empty,
     # which is the situation the invalidation exists for.
-    pine_type_artifact._registry.clear()
-    with _typed_against(monkeypatch, app.stem, lib), _counted(monkeypatch) as counts:
+    module_interface._registry.clear()
+    with _typed_against(monkeypatch, app.stem, lib), _counted(monkeypatch, app) as counts:
         with _bytecode_writing_enabled():
             code = PyneLoader(app.stem, str(app)).get_code(app.stem)
     return counts, _baked_deps(code)
@@ -426,7 +420,7 @@ def __test_untouched_dependency_costs_one_stat__(tmp_path, monkeypatch):
 
     counts, records = _reload(app, lib, monkeypatch)
 
-    assert counts["analyse"] == 0, "an untouched dependency must not be re-analysed"
+    assert counts["dependency"] == 0, "an untouched dependency must not be transformed"
     assert counts["transform"] == 0, "valid bytecode was needlessly retransformed"
     assert _cache_from_source(app).stat().st_mtime_ns == mtime
     assert records[0].digest == digest
@@ -442,7 +436,7 @@ def __test_edited_dependency_body_keeps_the_cache__(tmp_path, monkeypatch):
 
     counts, records = _reload(app, lib, monkeypatch)
 
-    assert counts["analyse"] == 1, "the moved file has to be re-analysed exactly once"
+    assert counts["dependency"] == 1, "the moved file has to be transformed exactly once"
     assert counts["transform"] == 0, "an unchanged interface must not invalidate the cache"
     assert _cache_from_source(app).stat().st_mtime_ns == mtime
     assert records[0].digest == digest
@@ -486,8 +480,8 @@ def _real_pair(tmp_path: Path, ret: str = "int") -> tuple[Path, Path]:
 
 def _load(app: Path):
     """Load the dependent from a cold registry, as a new process would."""
-    pine_type_artifact._registry.clear()
-    pine_type_artifact._analysing.clear()
+    module_interface._registry.clear()
+    module_interface._analysing.clear()
     with _bytecode_writing_enabled():
         return PyneLoader(app.stem, str(app)).get_code(app.stem)
 

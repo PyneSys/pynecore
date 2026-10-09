@@ -131,11 +131,13 @@ This prints the transformed module without running it. For readability the dump 
 
 The same output is available through environment variables when running scripts:
 
-| Variable             | Effect                                                                                               |
-|----------------------|------------------------------------------------------------------------------------------------------|
-| `PYNE_AST_DEBUG=1`   | Print the transformed code of every `@pyne` module (with named slot constants)                        |
-| `PYNE_AST_DEBUG_RAW` | Print the exact emission (literal indexes); `1` dumps every module, a file path dumps only that file  |
-| `PYNE_AST_SAVE=1`    | Save the transformed modules to `/tmp/pyne/` (with named slot constants)                              |
+| Variable                | Effect                                                                                               |
+|-------------------------|------------------------------------------------------------------------------------------------------|
+| `PYNE_AST_DEBUG=1`      | Print the transformed code of every `@pyne` module (with named slot constants)                       |
+| `PYNE_AST_DEBUG_RAW`    | Print the exact emission (literal indexes); `1` dumps every module, a file path dumps only that file |
+| `PYNE_AST_SAVE=1`       | Save the transformed modules to `/tmp/pyne/` (with named slot constants)                             |
+| `PYNE_AST_TIMING=1`     | Print the wall time of every transform step to stderr                                                |
+| `PYNE_AST_SEQUENTIAL=1` | Run the rules of a fused phase as separate passes (the reference mode; see AST Transformations)      |
 
 ## Debugging Security Contexts
 

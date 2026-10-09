@@ -17,8 +17,8 @@ module is the exception: it is typed from the interface that module publishes,
 never from this call site, and every interface consulted is recorded in the
 table's ``deps`` so the loader can invalidate what a moved signature broke. It
 stamps ``_pine_ty`` on every expression and keeps the derived table on the
-module node, so the passes that follow -- the overload pin, and the artifact
-the AOT compiler consumes -- have the types without re-deriving them.
+module node, so the passes that follow -- the overload pin, and the interface
+the module publishes -- have the types without re-deriving them.
 """
 import ast
 
@@ -44,7 +44,8 @@ class PineTypeTransformer:
                  pipeline_hash: str = '', qualify_windows: bool = False):
         #: ``'lib'``, ``'edge'`` or None -- the strict gate keys off this
         self.pyne_mode = pyne_mode
-        #: Re-derives an imported module's table from its source path. Injected
+        #: Answers an imported module's interface from its source path, compiling
+        #: the module into its own .pyc when no current one holds it. Injected
         #: rather than imported: the only real one lives in the import hook,
         #: which imports this pass
         self.analyse = analyse

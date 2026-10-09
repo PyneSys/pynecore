@@ -15,7 +15,6 @@ The diagnostics are the same information in both modes. A hand-written script
 collects them and keeps running with runtime dispatch; ``@pyne edge`` raises on
 the first one. One code path, one message; only the raising is conditional.
 """
-import ast
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -204,15 +203,22 @@ class DepRecord:
     The stat pair is what makes the common case free: an untouched dependency
     answers from ``os.stat`` alone, without parsing anything. It is only when
     the file moved that the digest has to be re-derived and compared -- an
-    edit that leaves the INTERFACE alone (a body change, a comment) then keeps
-    the dependent's cached bytecode valid.
+    edit that leaves the INTERFACE and the ROUTES alone (a body change that
+    keeps every export as stateful as it was, a comment) then keeps the
+    dependent's cached bytecode valid.
     """
     #: Resolved source path of the dependency
     path: str
     mtime_ns: int
     size: int
-    #: The dependency's interface digest when the dependent was transformed
+    #: The dependency's interface digest when the dependent was transformed, or
+    #: ``module_interface.SOURCE_DIGEST`` for a plain Python module a route was
+    #: read through, which only its stat pair can vouch for
     digest: str
+    #: The dependency's routes digest when the dependent was transformed, or
+    #: ``''`` when it was never settled -- which no derived digest matches, so
+    #: the record holds only while the file does not move
+    routes: str = ''
 
 
 @dataclass(slots=True, frozen=True)
@@ -304,8 +310,8 @@ class ModuleInterface:
     #: Digest of ``exports``, ``all``, ``classes`` and ``extensions``, blind to
     #: every body
     digest: str
-    #: Every module this one's types were derived from, its own dependencies'
-    #: dependencies included. An interface can be INFERRED from a third
+    #: Every module this one's types were derived from or that it imports, its own
+    #: dependencies' dependencies included. An interface can be INFERRED from a third
     #: module -- an export with annotated parameters and no return annotation
     #: takes its return from whatever it calls -- so a consumer that only
     #: checked this module's own source would keep believing a signature that
@@ -326,6 +332,14 @@ class ModuleInterface:
     #: one may be a confident wrong answer. Part of the contract -- an
     #: importer that consults such a module has to give its own pins up too
     suppressed: str = ''
+    #: Digest of how a call into this module is ROUTED -- which of its
+    #: functions carry state and therefore take a hidden state argument, and
+    #: the module-level bindings that decide what an imported name is at run
+    #: time. The lowering settles it, so it is ``''`` on an interface read off
+    #: the analysis alone. Outside ``digest`` on purpose: it is not a type,
+    #: and a module's signatures do not move because a body started keeping
+    #: state -- but a dependent's emission does
+    routes: str = ''
 
 
 @dataclass(slots=True)
@@ -347,9 +361,10 @@ class PineTypeTable:
     #: in declaration order. The selection reads these, and so does the
     #: interface a dependent module resolves the group's calls against
     groups: dict[str, tuple[ImplSig, ...]] = field(default_factory=dict)
-    #: Resolved path -> the state of every module this one's types were
-    #: derived from. A dependent's cached bytecode is only valid while every
-    #: record here still describes the file on disk
+    #: Resolved path -> the state of every module this one's types were derived
+    #: from, and of every Pyne module it imports at module level: what an import
+    #: binds is what a dependent's call is routed on. A dependent's cached
+    #: bytecode is only valid while every record here still describes the file on disk
     deps: dict[str, DepRecord] = field(default_factory=dict)
     #: Every class name an annotation in this module may name -> its class
     #: id: the ones the module declares in any scope, and the ones its imports
@@ -419,14 +434,18 @@ class PineTypeError(SyntaxError):
         return cls(diag.render(), (filename, diag.line, diag.col + 1, text))
 
 
-#: Re-derives one module's tree and type table from its source path, without
-#: compiling or executing anything. The import hook owns the only real one
-#: (``core.import_hook.analyse_source``); it is passed in rather than imported
-#: so the analysis stays free of the loader.
+#: Produces one module's interface from its source path and the pipeline digest,
+#: without executing the module. It is asked when no transform of this process
+#: published the interface: it reads the interface the module's own ``.pyc``
+#: carries, when that ``.pyc`` is one the given pipeline wrote and still holds,
+#: and otherwise transforms the module into its ``.pyc`` the way importing it
+#: would -- whose lowering imports what the module calls, as it does on any
+#: import. The import hook owns the
+#: only real one (``core.import_hook.compile_interface``); it is passed in rather
+#: than imported so the analysis stays free of the loader.
 #:
-#: The third element is the ``(mtime_ns, size)`` of the very bytes that were
-#: parsed, read as one pair with them, or None when no such pair could be had.
-#: An interface built from the tree is only allowed to carry THAT fingerprint:
-#: a stat taken before the read describes whatever the file was then, and
-#: pairing it with signatures read afterwards records a state that never was.
-Analyser = Callable[[str], tuple[ast.Module, PineTypeTable, tuple[int, int] | None] | None]
+#: The interface carries the ``(mtime_ns, size)`` of the very bytes it was
+#: derived from, read as one pair with them: a stat taken before the read
+#: describes whatever the file was then, and pairing it with signatures read
+#: afterwards records a state that never was.
+Analyser = Callable[[str, str], ModuleInterface | None]

@@ -67,6 +67,7 @@ class _EnumResolver:
             return self.modules[key]
         self.modules[key] = None
         search = None
+        package_init: Path | None = None
         if level:
             if not source:
                 return None
@@ -74,10 +75,12 @@ class _EnumResolver:
             for _ in range(level - 1):
                 base = base.parent
             search = [str(base)]
+            if not name:
+                package_init = base / '__init__.py'
         spec = None
         try:
-            if not name and level:
-                path = base / '__init__.py'
+            if package_init is not None:
+                path = package_init
             else:
                 segments = name.split('.')
                 for index in range(len(segments)):
@@ -93,7 +96,7 @@ class _EnumResolver:
                 if spec is None or not spec.origin or not spec.origin.endswith('.py'):
                     return None
                 path = Path(spec.origin)
-            from .pine_type_artifact import stable_source
+            from .module_interface import stable_source
             loaded = stable_source(path)
             if loaded is None:
                 return None
@@ -101,8 +104,9 @@ class _EnumResolver:
             tree = ast.parse(data, filename=str(path))
         except (ImportError, OSError, SyntaxError, ValueError):
             return None
-        tree._module_file_path = str(path.resolve())
-        self.sources[tree._module_file_path] = fingerprint
+        module_path = str(path.resolve())
+        setattr(tree, '_module_file_path', module_path)
+        self.sources[module_path] = fingerprint
         scope = _Scope(tree, None)
 
         def bind(node: ast.AST) -> None:
@@ -172,9 +176,11 @@ class _EnumResolver:
         if len(parts) < 2:
             return False
         resolved = self.resolve(parts[:-1], scope, set())
-        if resolved is None or not isinstance(resolved[0], ast.ClassDef):
+        if resolved is None:
             return False
         definition, owner = resolved
+        if not isinstance(definition, ast.ClassDef):
+            return False
         if definition.decorator_list or definition.keywords:
             return False
         bases = [self.resolve(_path(base).split('.'), owner, set()) for base in definition.bases]
@@ -383,6 +389,6 @@ class ExportCaptureTransformer(ast_walk.NodeTransformer):
                         f'non-constant library global "{read.id}".',
                         (path, read.lineno, read.col_offset + 1, None),
                     )
-        node._export_capture_deps = tuple((path, *fingerprint)
-                                         for path, fingerprint in sorted(enums.sources.items()))
+        setattr(node, '_export_capture_deps', tuple((path, *fingerprint)
+                                                   for path, fingerprint in sorted(enums.sources.items())))
         return node

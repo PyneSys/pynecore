@@ -1,10 +1,9 @@
 from typing import Any, cast
 import ast
 import importlib
-import json
-from pathlib import Path
 
 from . import ast_walk
+from .module_property import module_properties
 
 # Pine namespaces whose pynecore module has a different name
 _NAMESPACE_RENAMES = {
@@ -36,11 +35,7 @@ class BuiltinShadowTransformer(ast_walk.NodeTransformer):
 
     def __init__(self):
         # Structure: module -> name -> {"type": "property"|"variable"}
-        try:
-            with open(Path(__file__).parent / "module_properties.json") as f:
-                self.registry: dict[str, dict[str, Any]] = json.load(f)
-        except (IOError, json.JSONDecodeError) as e:
-            raise RuntimeError(f"Failed to load module properties config: {e}")
+        self.registry: dict[str, dict[str, Any]] = module_properties()
 
         # alias -> (library module, exported names or None, builtin namespace)
         self.aliases: dict[str, tuple[Any, frozenset[str] | None, str]] = {}

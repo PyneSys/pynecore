@@ -18,8 +18,9 @@ from pathlib import Path
 
 import pytest
 
-from pynecore.core.import_hook import PyneLoader, analyse_source
-from pynecore.transformers import pine_edge_gate, pine_type_artifact
+from pynecore.core.import_hook import PyneLoader
+from tests.t00_pynecore.pine_analysis import analyse_module
+from pynecore.transformers import pine_edge_gate, module_interface
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
 from pynecore.transformers.pine_edge_gate import (
     EDGE_RULES_VERSION, DIAG_ENV, STRICT_ENV, edge_rules, gate_module, gated, render_diags,
@@ -34,11 +35,11 @@ _JSON_PATH = _REPO_ROOT / 'src' / 'pynecore' / 'transformers' / 'edge_rules.json
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
-    pine_type_artifact._registry.clear()
-    pine_type_artifact._analysing.clear()
+    module_interface._registry.clear()
+    module_interface._analysing.clear()
     yield
-    pine_type_artifact._registry.clear()
-    pine_type_artifact._analysing.clear()
+    module_interface._registry.clear()
+    module_interface._analysing.clear()
 
 
 def _gate(source: str) -> list[Diag]:
@@ -326,7 +327,7 @@ def __test_without_strict_the_module_compiles_and_keeps_the_list__(tmp_path, mon
     monkeypatch.setenv(STRICT_ENV, '0')
     path = _write(tmp_path, 'edge_lenient', EDGE_MODULE)
     _compile(path)
-    analysed = analyse_source(str(path))
+    analysed = analyse_module(str(path))
     assert analysed is not None
     # The structural half names the construct; the typed half of the same
     # node is not repeated behind it
@@ -344,7 +345,7 @@ def __test_a_hand_written_script_is_never_gated__(tmp_path, monkeypatch):
                   .replace('    a = getattr', '    try:\n        pass\n    except TypeError:\n'
                                               '        pass\n    a = getattr'))
     _compile(path)
-    analysed = analyse_source(str(path))
+    analysed = analyse_module(str(path))
     assert analysed is not None
     # The type half is still measured -- the structural half is not applied
     assert _reasons(analysed[1].diags) == ['unknown-call']
@@ -515,7 +516,7 @@ def __test_the_merge_keeps_an_unrelated_typed_finding__(tmp_path, monkeypatch):
     path = _write(tmp_path, 'edge_merge', EDGE_MODULE.replace(
         '    a = getattr(close, "x")', '    a = nosuchname | 1'))
     _compile(path)
-    analysed = analyse_source(str(path))
+    analysed = analyse_module(str(path))
     assert analysed is not None
     assert _reasons(analysed[1].diags) == ['edge-syntax', 'unknown-name']
 
@@ -525,7 +526,7 @@ def __test_the_merged_list_is_in_source_order__(tmp_path, monkeypatch):
     path = _write(tmp_path, 'edge_order', EDGE_MODULE.replace(
         '    a = getattr(close, "x")', '    a = nosuch\n    b = [1]\n    c = getattr(close, "x")'))
     _compile(path)
-    analysed = analyse_source(str(path))
+    analysed = analyse_module(str(path))
     assert analysed is not None
     positions = [(diag.line, diag.col) for diag in analysed[1].diags]
     assert positions == sorted(positions) and len(positions) == 3
@@ -551,6 +552,6 @@ def __test_a_rejected_expression_covers_its_parts__(tmp_path, monkeypatch):
     path = _write(tmp_path, 'edge_span', EDGE_MODULE.replace(
         '    a = getattr(close, "x")', '    a = f"bar {close} and {close}"\n    b = nosuch | 1'))
     _compile(path)
-    analysed = analyse_source(str(path))
+    analysed = analyse_module(str(path))
     assert analysed is not None
     assert _reasons(analysed[1].diags) == ['edge-syntax', 'edge-syntax', 'unknown-name']

@@ -117,26 +117,73 @@ def _is_stateful_annotation(node: ast.expr) -> bool:
     return name.startswith('Persistent') or name.startswith('IBPersistent')
 
 
-def _mutated_stateful_names(body: list[ast.stmt]) -> frozenset[str]:
+class _ModuleFacts:
     """
-    Names of a scope that carry state across bars AND are stored more than
-    once: a later mutation of a ``Persistent`` variable makes every read of
-    it depend on the previous bar, so straight-line constant propagation
-    (which only kills names at/after the mutating line) must never track
-    them. A Persistent assigned only by its initializer stays a constant on
-    every bar and folds like TradingView folds a ``var`` chain.
+    What the fold needs to know about a module before it starts, from one walk.
+
+    ``blocked`` maps the module and every function definition to the names of
+    its body that carry state across bars AND are stored more than once: a
+    later mutation of a ``Persistent`` variable makes every read of it depend
+    on the previous bar, so straight-line constant propagation (which only
+    kills names at/after the mutating line) must never track them. A
+    Persistent assigned only by its initializer stays a constant on every bar
+    and folds like TradingView folds a ``var`` chain. A scope's body counts
+    with everything nested in it, nested function bodies included.
+
+    ``outer_writes`` holds the names any ``global`` / ``nonlocal`` statement
+    declares, and ``has_walrus`` whether the module contains a ``:=`` at all.
     """
-    stateful: set[str] = set()
-    stores: dict[str, int] = {}
-    for stmt in body:
-        for n in ast_walk.walk(stmt):
-            if (isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)
-                    and _is_stateful_annotation(n.annotation)):
-                stateful.add(n.target.id)
-            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
-                stores[n.id] = stores.get(n.id, 0) + 1
-    # The AnnAssign target itself is one store: only additional ones mutate
-    return frozenset(name for name in stateful if stores.get(name, 0) > 1)
+
+    def __init__(self, tree: ast.Module) -> None:
+        self.outer_writes: set[str] = set()
+        self.has_walrus = False
+        # Per scope, what its OWN region holds (nested function bodies are
+        # regions of their own, added in below)
+        stateful: dict[ast.AST, set[str]] = {}
+        stores: dict[ast.AST, Counter[str]] = {}
+        enclosing: dict[ast.AST, ast.AST] = {}
+        scopes: list[ast.AST] = []
+        regions: list[tuple[ast.AST, list[ast.AST]]] = [(tree, [tree])]
+        while regions:
+            scope, pending = regions.pop()
+            own_stateful = stateful[scope] = set()
+            own_stores = stores[scope] = Counter()
+            while pending:
+                node = pending.pop()
+                if isinstance(node, ast.Name):
+                    if isinstance(node.ctx, ast.Store):
+                        own_stores[node.id] += 1
+                    continue
+                function = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                if function:
+                    # The body is the function's own region; the name, decorators,
+                    # parameters and annotations stand in the enclosing one
+                    enclosing[node] = scope
+                    scopes.append(node)
+                    regions.append((node, list(node.body)))
+                elif (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+                        and _is_stateful_annotation(node.annotation)):
+                    own_stateful.add(node.target.id)
+                elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                    self.outer_writes.update(node.names)
+                elif isinstance(node, ast.NamedExpr):
+                    self.has_walrus = True
+                for field in node._fields:
+                    value = getattr(node, field, None)
+                    if isinstance(value, ast.AST):
+                        pending.append(value)
+                    elif isinstance(value, list) and not (function and field == 'body'):
+                        pending.extend(item for item in value if isinstance(item, ast.AST))
+        # A nested function is found after the one enclosing it: in reverse,
+        # every region is complete before it is added to its enclosing scope
+        for scope in reversed(scopes):
+            outer = enclosing[scope]
+            stateful[outer].update(stateful[scope])
+            stores[outer].update(stores[scope])
+        # The AnnAssign target itself is one store: only additional ones mutate
+        self.blocked: dict[ast.AST, frozenset[str]] = {
+            scope: frozenset(name for name in names if stores[scope][name] > 1)
+            for scope, names in stateful.items()}
 
 
 def _assigned_names(node: ast.AST) -> set[str]:
@@ -153,6 +200,46 @@ def _assigned_names(node: ast.AST) -> set[str]:
             names.add(n.target.id)
         elif isinstance(n, ast.ExceptHandler) and n.name:
             names.add(n.name)
+    return names
+
+
+#: The fields that hold statement blocks (and the handlers / cases holding blocks)
+_BLOCK_FIELDS = frozenset({'body', 'orelse', 'finalbody', 'handlers', 'cases'})
+
+
+def _statement_bindings(stmt: ast.AST, memo: dict[ast.AST, frozenset[str]]) -> frozenset[str]:
+    """
+    :func:`_assigned_names` of a statement, ``except`` handler or ``match`` case,
+    remembered in ``memo``.
+
+    A compound statement binds what its own expressions bind plus what the
+    statements of its blocks bind, so with the blocks taken from the memo every
+    statement of a nest is walked once, not once per enclosing statement. The
+    fold never changes what a statement binds -- it only replaces constant
+    expressions -- so an entry stays valid for the whole pass.
+    """
+    names = memo.get(stmt)
+    if names is None:
+        found: set[str] = set()
+        # The bindings the statement node itself carries
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            found.add(stmt.name)
+        elif isinstance(stmt, (ast.Global, ast.Nonlocal)):
+            found.update(stmt.names)
+        elif isinstance(stmt, ast.ExceptHandler) and stmt.name:
+            found.add(stmt.name)
+        for field in stmt._fields:
+            value = getattr(stmt, field, None)
+            if field in _BLOCK_FIELDS and isinstance(value, list):
+                for item in value:
+                    found.update(_statement_bindings(item, memo))
+            elif isinstance(value, ast.AST):
+                found.update(_assigned_names(value))
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, ast.AST):
+                        found.update(_assigned_names(item))
+        names = memo[stmt] = frozenset(found)
     return names
 
 
@@ -480,16 +567,21 @@ class ConstFoldTransformer:
 
     def __init__(self) -> None:
         # Per-scope set of Persistent names a later store mutates; their
-        # reads are never constant (see _mutated_stateful_names)
+        # reads are never constant (see _ModuleFacts)
         self._blocked: frozenset[str] = frozenset()
+        self._scope_blocked: dict[ast.AST, frozenset[str]] = {}
+        self._has_walrus = False
+        self._bindings_memo: dict[ast.AST, frozenset[str]] = {}
 
     def visit(self, tree: ast.Module) -> ast.Module:
-        self._blocked = _mutated_stateful_names(tree.body)
+        facts = _ModuleFacts(tree)
+        self._scope_blocked = facts.blocked
+        self._has_walrus = facts.has_walrus
+        self._bindings_memo = {}
+        self._blocked = facts.blocked[tree]
         bindings = _ScopeBindings(tree.body)
-        outer_writes = {name for node in ast_walk.walk(tree)
-                        if isinstance(node, (ast.Global, ast.Nonlocal)) for name in node.names}
         self._global_names = {name for name, count in bindings.names.items()
-                              if count == 1 and name not in outer_writes}
+                              if count == 1 and name not in facts.outer_writes}
         # Parameterized annotations can carry Series/Persistent state instead
         # of a native scalar value.
         self._global_names.difference_update(
@@ -508,6 +600,12 @@ class ConstFoldTransformer:
         for stmt in body:
             self._process_stmt(stmt, env, types)
 
+    def _kill(self, stmt: ast.stmt, env: dict[str, int | float]) -> None:
+        """Drop every name a statement can (re)bind from the environment."""
+        if env:
+            for name in _statement_bindings(stmt, self._bindings_memo):
+                env.pop(name, None)
+
     def _fold(self, node: ast.expr, env: dict[str, int | float],
               types: dict[str, str]) -> ast.expr:
         return _ExprFolder(env, types).visit(node)  # type: ignore[return-value]
@@ -516,10 +614,11 @@ class ConstFoldTransformer:
                       types: dict[str, str]) -> None:
         # A walrus rebinding anywhere in the statement makes that name
         # untrackable from here on (evaluation order inside one statement
-        # is not modeled)
-        for n in ast_walk.walk(stmt):
-            if isinstance(n, ast.NamedExpr) and isinstance(n.target, ast.Name):
-                env.pop(n.target.id, None)
+        # is not modeled). A module without any walrus is not searched
+        if self._has_walrus:
+            for n in ast_walk.walk(stmt):
+                if isinstance(n, ast.NamedExpr) and isinstance(n.target, ast.Name):
+                    env.pop(n.target.id, None)
 
         match stmt:
             case ast.FunctionDef() | ast.AsyncFunctionDef():
@@ -540,7 +639,7 @@ class ConstFoldTransformer:
                 outer_globals, outer_types = self._global_env, self._global_types
                 self._global_env, self._global_types = captured, captured_types
                 outer_blocked = self._blocked
-                self._blocked = _mutated_stateful_names(stmt.body)
+                self._blocked = self._scope_blocked[stmt]
                 self._process_body(stmt.body, dict(captured), dict(captured_types))
                 self._blocked = outer_blocked
                 self._global_env, self._global_types = outer_globals, outer_types
@@ -570,8 +669,7 @@ class ConstFoldTransformer:
                             env[name] = v
                 else:
                     stmt.value = self._fold(stmt.value, env, types)
-                    for name in _assigned_names(stmt):
-                        env.pop(name, None)
+                    self._kill(stmt, env)
             case ast.AnnAssign():
                 if stmt.value is None:
                     if isinstance(stmt.target, ast.Name):
@@ -605,45 +703,36 @@ class ConstFoldTransformer:
                 stmt.test = self._fold(stmt.test, env, types)
                 self._process_body(stmt.body, dict(env), dict(types))
                 self._process_body(stmt.orelse, dict(env), dict(types))
-                for name in _assigned_names(stmt):
-                    env.pop(name, None)
+                self._kill(stmt, env)
             case ast.For() | ast.AsyncFor():
                 stmt.iter = self._fold(stmt.iter, env, types)
                 # Names the loop assigns are unknown both inside (previous
                 # iteration) and after it; a constant assigned inside the
                 # body re-enters the environment past its own line
-                for name in _assigned_names(stmt):
-                    env.pop(name, None)
+                self._kill(stmt, env)
                 self._process_body(stmt.body, dict(env), dict(types))
                 self._process_body(stmt.orelse, dict(env), dict(types))
-                for name in _assigned_names(stmt):
-                    env.pop(name, None)
+                self._kill(stmt, env)
             case ast.While():
-                for name in _assigned_names(stmt):
-                    env.pop(name, None)
+                self._kill(stmt, env)
                 stmt.test = self._fold(stmt.test, env, types)
                 self._process_body(stmt.body, dict(env), dict(types))
                 self._process_body(stmt.orelse, dict(env), dict(types))
-                for name in _assigned_names(stmt):
-                    env.pop(name, None)
+                self._kill(stmt, env)
             case ast.With() | ast.AsyncWith():
                 for item in stmt.items:
                     item.context_expr = self._fold(item.context_expr, env, types)
-                for name in _assigned_names(stmt):
-                    env.pop(name, None)
+                self._kill(stmt, env)
                 self._process_body(stmt.body, dict(env), dict(types))
-                for name in _assigned_names(stmt):
-                    env.pop(name, None)
+                self._kill(stmt, env)
             case ast.Try():
-                for name in _assigned_names(stmt):
-                    env.pop(name, None)
+                self._kill(stmt, env)
                 self._process_body(stmt.body, dict(env), dict(types))
                 for handler in stmt.handlers:
                     self._process_body(handler.body, dict(env), dict(types))
                 self._process_body(stmt.orelse, dict(env), dict(types))
                 self._process_body(stmt.finalbody, dict(env), dict(types))
-                for name in _assigned_names(stmt):
-                    env.pop(name, None)
+                self._kill(stmt, env)
             case ast.Return() | ast.Expr():
                 if stmt.value is not None:
                     stmt.value = self._fold(stmt.value, env, types)
@@ -665,5 +754,4 @@ class ConstFoldTransformer:
             case _:
                 # Unmodeled statement kind: fold nothing inside, kill what
                 # it can rebind
-                for name in _assigned_names(stmt):
-                    env.pop(name, None)
+                self._kill(stmt, env)

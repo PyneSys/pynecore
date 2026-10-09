@@ -13,6 +13,8 @@ _DRAWING_CALLS = frozenset(
     for method in methods
 )
 _REQUESTS = {'lib.request.security', 'lib.request.security_lower_tf'}
+#: The last segment of every name in ``_REQUESTS``
+_REQUEST_ATTRS = frozenset(name.rpartition('.')[2] for name in _REQUESTS)
 
 
 @dataclass(eq=False)
@@ -33,6 +35,13 @@ class SecurityDrawingsTransformer(ast_walk.NodeTransformer):
     """Check expression dependencies without forbidding empty drawing fields."""
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
+        # A request resolves to a dotted name only through an attribute chain,
+        # so the attribute carrying its last segment stands somewhere in the
+        # module -- directly in the call or in the alias it goes through. A
+        # module without one has no request to check (most scripts).
+        if not any(isinstance(sub, ast.Attribute) and sub.attr in _REQUEST_ATTRS
+                   for sub in ast_walk.walk(node)):
+            return node
         root = _Scope(None)
         owners = {}
         bodies = {}
@@ -131,7 +140,7 @@ class SecurityDrawingsTransformer(ast_walk.NodeTransformer):
                 continue
             for function in owner.bindings[call.func.id]:
                 scope = bodies.get(function)
-                if scope not in request_scopes:
+                if scope is None or scope not in request_scopes:
                     continue
                 args = function.args
                 for argument, value in zip([*args.posonlyargs, *args.args], call.args):

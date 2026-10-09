@@ -21,6 +21,7 @@ first unexpected bar in live trading.
 from __future__ import annotations
 
 import ast
+from typing import cast
 
 from pynecore.transformers.locations import fix_locations
 
@@ -134,14 +135,15 @@ def _is_script_strategy_decorator(node: ast.expr) -> bool:
     return False
 
 
-class ScriptRequirementsTransformer(ast_walk.NodeTransformer):
+class ScriptRequirementsTransformer(ast_walk.NodeVisitor):
     """
     Compute :class:`ScriptRequirements` for a strategy script and inject it
     into the ``@script.strategy(...)`` decorator as the
     ``_broker_requirements`` keyword argument.
 
     No-op on scripts that have no ``@script.strategy(...)`` decorator
-    (indicator scripts).
+    (indicator scripts). The walk itself replaces no node, so it is a plain
+    visit; only the module visit edits the tree, and returns it.
     """
 
     def __init__(self) -> None:
@@ -159,10 +161,16 @@ class ScriptRequirementsTransformer(ast_walk.NodeTransformer):
         self._strategy_decorator: ast.Call | None = None
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
-        self.generic_visit(node)
-        if self._strategy_decorator is None:
+        # The requirements only ever land on a strategy decorator, and a
+        # definition can only stand among statements: without one, the
+        # call-site walk would compute flags nothing reads
+        if not any(_is_script_strategy_decorator(decorator)
+                   for stmt in ast_walk.walk_statements(node)
+                   if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   for decorator in stmt.decorator_list):
             return node
-        self._inject_requirements(node, self._strategy_decorator)
+        self.generic_visit(node)
+        self._inject_requirements(node, cast(ast.Call, self._strategy_decorator))
         fix_locations(node)
         return node
 

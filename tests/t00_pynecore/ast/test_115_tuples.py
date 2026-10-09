@@ -25,15 +25,16 @@ import ast
 import json
 import os
 import sys
+import zlib
 from pathlib import Path
 
 import pytest
 
-from pynecore.core.import_hook import PIPELINE_DIGEST, analyse_source
-from pynecore.transformers import pine_type_artifact
+from tests.t00_pynecore.pine_analysis import analyse_module
+from pynecore.transformers import module_interface
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
-from pynecore.transformers.pine_type_artifact import (
-    build_interface, registered, table_json, _interface_from_json,
+from pynecore.transformers.module_interface import (
+    build_interface, interface_from_payload, interface_payload, registered,
 )
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
@@ -48,11 +49,11 @@ from pynecore.transformers.pine_type_table import PineTypeTable
 @pytest.fixture(autouse=True)
 def _clean_registry():
     """Keep the process-wide interface registry from leaking between tests."""
-    pine_type_artifact._registry.clear()
-    pine_type_artifact._analysing.clear()
+    module_interface._registry.clear()
+    module_interface._analysing.clear()
     yield
-    pine_type_artifact._registry.clear()
-    pine_type_artifact._analysing.clear()
+    module_interface._registry.clear()
+    module_interface._analysing.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -92,7 +93,7 @@ def _write(tmp_path: Path, name: str, source: str) -> Path:
 
 def _analysed(path: Path) -> tuple[ast.Module, PineTypeTable]:
     """Run the analysing half of the pipeline, cross-module resolution included."""
-    analysed = analyse_source(str(path))
+    analysed = analyse_module(str(path))
     assert analysed is not None, 'the module was not recognized as Pyne code'
     return analysed[0], analysed[1]
 
@@ -547,7 +548,7 @@ def __test_a_tuple_element_type_moves_the_digest__(tmp_path):
     """An element's type is part of the contract: a dependent's unpack follows it"""
     def digest_of(source: str) -> str:
         path = _write(tmp_path, 'tup_digest', source)
-        pine_type_artifact._registry.clear()
+        module_interface._registry.clear()
         sys.modules.pop('tup_digest', None)
         tree, table = _analysed(path)
         return build_interface(tree, table, str(path.resolve())).digest
@@ -559,8 +560,8 @@ def __test_a_tuple_element_type_moves_the_digest__(tmp_path):
     assert before != after
 
 
-def __test_the_artifact_round_trips_a_tuple__(tmp_path):
-    """What the JSON carries is what a later process reads back"""
+def __test_the_payload_round_trips_a_tuple__(tmp_path):
+    """What the .pyc carries is what a later process reads back"""
     path = _write(tmp_path, 'tup_json', '''"""
 @pyne
 """
@@ -574,12 +575,13 @@ def split(x: int) -> tuple[int, float]:
     tree, table = _analysed(path)
     interface = build_interface(tree, table, str(path.resolve()))
 
-    data = json.loads(json.dumps(
-        table_json(tree, table, interface, path.read_bytes(), PIPELINE_DIGEST)))
-    assert data['interface']['exports']['split']['ret'] == tuple_of([INT, FLOAT])
+    payload = interface_payload(interface)
+    assert json.loads(zlib.decompress(payload))['exports']['split']['ret'] == tuple_of([INT, FLOAT])
 
     stat = os.stat(path)
-    restored = _interface_from_json(interface.path, data, (stat.st_mtime_ns, stat.st_size))
+    restored = interface_from_payload(interface.path, payload, interface.deps,
+                                      (stat.st_mtime_ns, stat.st_size))
+    assert restored is not None
     assert restored.exports == interface.exports
     assert restored.digest == interface.digest
 
@@ -880,12 +882,12 @@ other = math.max(wrapped(1), 1)
     assert table.pins_suppressed is not None
     assert all(get_pin(node) is None for node in ast.walk(tree) if isinstance(node, ast.Call))
 
-    # The artifact carries the flag and the digest moves with it
+    # The payload carries the flag and the digest moves with it
     clean = build_interface(ast.parse('"""\n@pyne\n"""\n'), PineTypeTable(), str(lib_path))
     assert published.digest != clean.digest
-    data = json.loads(json.dumps(
-        table_json(tree, table, published, lib_path.read_bytes(), PIPELINE_DIGEST)))
-    assert data['interface']['suppressed'] == published.suppressed
-    rebuilt = _interface_from_json(str(lib_path), data, (0, -1))
+    payload = interface_payload(published)
+    assert json.loads(zlib.decompress(payload))['suppressed'] == published.suppressed
+    rebuilt = interface_from_payload(str(lib_path), payload, published.deps, (0, -1))
+    assert rebuilt is not None
     assert rebuilt.suppressed == published.suppressed
     assert rebuilt.digest == published.digest

@@ -21,14 +21,25 @@ the script the fast path can see -- and never stop anything. In an
 """
 import ast
 import re
-from collections.abc import Iterator
 
 from . import ast_walk
-from .node_ids import node_id
-from .pine_type_rules import UNKNOWN, FactoryFields, get_ty, render_ty
+from .pine_type_rules import TY_ATTR, UNKNOWN, FactoryFields, get_ty, render_ty
 from .pine_type_table import Diag, PineTypeTable, Unknown, qualify
 
 __all__ = ['unknown_diags']
+
+#: The node classes ``_Report._mark`` has a rule for
+_MARKED: frozenset[type] = frozenset({
+    ast.Call, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.AnnAssign, ast.match_case,
+    ast.ExceptHandler, ast.Expr, ast.Attribute, ast.Name, ast.Subscript, ast.Tuple, ast.List,
+    ast.Starred})
+
+#: Node classes that are never a value and hold nothing: expression contexts and
+#: operators
+_OPAQUE: frozenset[type] = frozenset(
+    cls for cls in vars(ast).values()
+    if isinstance(cls, type) and issubclass(cls, (ast.expr_context, ast.operator, ast.unaryop,
+                                                  ast.cmpop, ast.boolop)))
 
 #: Names the transforms own: every dunder the emission spells, and every name
 #: in the middle-dot namespace the transformers reserve (``__lib·bar_index``,
@@ -83,9 +94,13 @@ class _Report:
         self.skip: set[int] = set()
         self.attr_bases: set[int] = set()
         self.statement_values: set[int] = set()
-        #: (line, col) -> the value expressions starting there, for following
-        #: a binding's provenance back to the expression it was assigned from
-        self.at: dict[tuple[int, int], list[ast.expr]] = {}
+        #: Every occurrence of an untyped expression, as (depth, pre-order
+        #: position, node)
+        self.untyped: list[tuple[int, int, ast.expr]] = []
+        #: (line, col) -> the untyped expressions starting there, for following
+        #: a binding's provenance back to the expression it was assigned from;
+        #: built by ``_positions`` when one is first followed
+        self.at: dict[tuple[int, int], list[ast.expr]] | None = None
         #: What the engine already reported: its diagnostics' origins, and
         #: the positions they stand at. A node it diagnosed is not diagnosed
         #: again, and a name whose provenance IS such a diagnostic is that
@@ -98,10 +113,7 @@ class _Report:
         self.diags: list[Diag] = []
 
     def run(self) -> list[Diag]:
-        self._index(self.tree, '')
-        for node in self._value_exprs():
-            if get_ty(node) != UNKNOWN:
-                continue
+        for node in self._index():
             if id(node) in self.attr_bases and isinstance(node, (ast.Name, ast.Attribute)):
                 continue
             if not self._maximal(node) or id(node) in self.statement_values:
@@ -115,52 +127,104 @@ class _Report:
 
     # --- indexing --------------------------------------------------------
 
-    def _index(self, node: ast.AST, scope: str) -> None:
-        """Record every node's parent and scope, and what is not a value position."""
-        self.scope_of[id(node)] = scope
+    def _index(self) -> list[ast.expr]:
+        """
+        Record the parents and scopes the report reads, and what is not a value position.
+
+        One pre-order walk, which also collects the untyped expressions: what
+        the report visits are the value positions among them, parent by parent
+        in breadth-first order, field order within one parent. That is the
+        order of (depth, pre-order position), so the walk tags each occurrence
+        with both, and which of them is a value position is only read once the
+        whole tree is indexed.
+
+        Only what is read later is recorded: the parent of an untyped
+        expression (the cascade test, which only ever asks about one), the
+        scope of a name or a call (the binding and callee lookups). An
+        expression context or an operator is never a value and no rule reads
+        one, so it is not entered at all.
+
+        :return: The value expressions without a type, in breadth-first order
+        """
+        untyped = self.untyped
+        parent_of = self.parent_of
+        scope_of = self.scope_of
+        position = 0
+        stack: list[tuple[ast.AST, ast.AST | None, str, int]] = [(self.tree, None, '', 0)]
+        pop = stack.pop
+        push = stack.append
+        while stack:
+            node, parent, scope, depth = pop()
+            position += 1
+            cls = type(node)
+            if isinstance(node, ast.expr):
+                if getattr(node, TY_ATTR, UNKNOWN) == UNKNOWN:
+                    parent_of[id(node)] = parent
+                    untyped.append((depth, position, node))
+                if isinstance(node, ast.Name):
+                    scope_of[id(node)] = scope
+                    if isinstance(node.ctx, ast.Load):
+                        # A name read marks nothing and holds nothing
+                        continue
+                elif cls is ast.Call:
+                    scope_of[id(node)] = scope
+            if cls in _MARKED:
+                scope = self._mark(node, scope)
+            # Reversed, so the children come off the stack in source order
+            depth += 1
+            for name in reversed(node._fields):
+                value = getattr(node, name, None)
+                if isinstance(value, ast.AST):
+                    if type(value) not in _OPAQUE:
+                        push((value, node, scope, depth))
+                elif isinstance(value, list):
+                    for item in reversed(value):
+                        if isinstance(item, ast.AST) and type(item) not in _OPAQUE:
+                            push((item, node, scope, depth))
+        return [node for _, _, node in sorted(untyped, key=lambda entry: (entry[0], entry[1]))
+                if id(node) not in self.skip]
+
+    def _mark(self, node: ast.AST, scope: str) -> str:
+        """
+        What under one node is not a value position.
+
+        :param node: The node
+        :param scope: The scope it stands in
+        :return: The scope its children stand in
+        """
         if isinstance(node, ast.Call):
-            for sub in ast_walk.walk(node.func):
-                self.skip.add(id(sub))
+            self._skip_subtree(node.func)
             # ``method_call(delete, box)`` selects a method by its function:
             # the selector is a name of code, not a value
             if _dotted(node.func) in ('method_call', 'lib.method_call') and node.args:
-                for sub in ast_walk.walk(node.args[0]):
-                    self.skip.add(id(sub))
+                self._skip_subtree(node.args[0])
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             for decorator in node.decorator_list:
-                for sub in ast_walk.walk(decorator):
-                    self.skip.add(id(sub))
+                self._skip_subtree(decorator)
             if isinstance(node, ast.ClassDef):
                 for base in node.bases:
-                    for sub in ast_walk.walk(base):
-                        self.skip.add(id(sub))
+                    self._skip_subtree(base)
                 # ``field(default_factory=...)`` as a UDT field's default: the
                 # dataclass machinery builds it, the annotation types the field
                 for value in self.factory.of(node):
-                    for sub in ast_walk.walk(value):
-                        self.skip.add(id(sub))
+                    self._skip_subtree(value)
             else:
                 for arg in node.args.args + node.args.posonlyargs + node.args.kwonlyargs:
                     if arg.annotation is not None:
-                        for sub in ast_walk.walk(arg.annotation):
-                            self.skip.add(id(sub))
+                        self._skip_subtree(arg.annotation)
                 if node.returns is not None:
-                    for sub in ast_walk.walk(node.returns):
-                        self.skip.add(id(sub))
+                    self._skip_subtree(node.returns)
                 scope = qualify(scope, node.name)
         elif isinstance(node, ast.AnnAssign):
-            for sub in ast_walk.walk(node.annotation):
-                self.skip.add(id(sub))
+            self._skip_subtree(node.annotation)
         elif isinstance(node, ast.match_case):
             # A pattern matches, it does not evaluate: the ``match`` itself is
             # what is not Pine, and the structural gate says so
-            for sub in ast_walk.walk(node.pattern):
-                self.skip.add(id(sub))
+            self._skip_subtree(node.pattern)
         elif isinstance(node, ast.ExceptHandler):
             # ``except TypeError:`` names a class to catch, not a value
             if node.type is not None:
-                for sub in ast_walk.walk(node.type):
-                    self.skip.add(id(sub))
+                self._skip_subtree(node.type)
         if isinstance(node, ast.Expr):
             if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
                 self.skip.add(id(node.value))
@@ -172,20 +236,42 @@ class _Report:
                 and not isinstance(getattr(node, 'ctx', ast.Load()), ast.Load):
             self.skip.add(id(node))
             if isinstance(node, (ast.Tuple, ast.List)):
-                for sub in ast_walk.walk(node):
-                    self.skip.add(id(sub))
-        if isinstance(node, ast.expr) and hasattr(node, 'lineno'):
-            self.at.setdefault((node.lineno, node.col_offset), []).append(node)
-        for child in ast_walk.iter_child_nodes(node):
-            self.parent_of[id(child)] = node
-            self._index(child, scope)
+                self._skip_subtree(node)
+        return scope
 
-    def _value_exprs(self) -> Iterator[ast.expr]:
-        for parent in ast_walk.walk(self.tree):
-            for _, value in ast.iter_fields(parent):
-                for item in value if isinstance(value, list) else [value]:
-                    if isinstance(item, ast.expr) and id(item) not in self.skip:
-                        yield item
+    def _skip_subtree(self, node: ast.AST) -> None:
+        """
+        Mark every expression of a subtree as no value position.
+
+        :param node: The subtree's root
+        """
+        # The usual case is a callee, a dotted chain down to a name
+        while isinstance(node, ast.Attribute):
+            self.skip.add(id(node))
+            node = node.value
+        if isinstance(node, ast.Name):
+            self.skip.add(id(node))
+            return
+        for sub in ast_walk.walk(node):
+            self.skip.add(id(sub))
+
+    def _positions(self) -> dict[tuple[int, int], list[ast.expr]]:
+        """
+        The untyped expressions starting at each position, in pre-order, built on first use.
+
+        Only a binding's provenance is followed through it, and only to an
+        untyped expression, so the ones ``_index`` collected are all it needs.
+
+        :return: (line, col) -> the untyped expressions starting there
+        """
+        if self.at is None:
+            at: dict[tuple[int, int], list[ast.expr]] = {}
+            # ``_index`` collected them in pre-order
+            for _, _, node in self.untyped:
+                if hasattr(node, 'lineno'):
+                    at.setdefault((node.lineno, node.col_offset), []).append(node)
+            self.at = at
+        return self.at
 
     def _maximal(self, node: ast.expr) -> bool:
         """Whether no enclosing value expression is unknown too (one cascade, one report)."""
@@ -267,7 +353,7 @@ class _Report:
         """The unknown value expression a binding's provenance points at, if it is one."""
         if origin.reason != 'unknown-value':
             return None
-        for candidate in self.at.get((origin.line, origin.col), ()):
+        for candidate in self._positions().get((origin.line, origin.col), ()):
             if get_ty(candidate) == UNKNOWN and id(candidate) not in self.skip:
                 return candidate
         return None

@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 import pynecore.core.import_hook as import_hook
-from pynecore.core.import_hook import PyneLoader, analyse_source
+from pynecore.core.import_hook import PyneLoader, _get_transform_pipeline_hash, compile_interface
 
 
 def main():
@@ -88,10 +88,10 @@ def __test_overflowing_stage_reruns_with_measured_headroom__(tmp_path, monkeypat
 
 
 def __test_deep_elif_chain_interface_is_derived__(tmp_path):
-    """Analysing a deeply nested dependency yields its interface instead of nothing"""
+    """Transforming a deeply nested dependency for a lookup yields its interface instead of nothing"""
     path = tmp_path / "deep_switch_lib.py"
     __test_helper_write_switch_module(path, 600)
     limit = sys.getrecursionlimit()
 
-    assert analyse_source(str(path)) is not None
+    assert compile_interface(str(path.resolve()), _get_transform_pipeline_hash()) is not None
     assert sys.getrecursionlimit() == limit

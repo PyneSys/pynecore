@@ -115,53 +115,9 @@ def _module_names(module: ast.Module) -> set[str]:
     return names
 
 
-def _local_names(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
-    """Names the function body binds itself, so they shadow the module's.
-
-    Every parameter and every ``Store``-context ``Name`` of the body counts,
-    wherever in the body it stands: Python binds a local for the whole call, so
-    ``lastPivot: Pivot = lastPivot(this)`` makes ``lastPivot`` local even where
-    the module binds the same spelling. Nested definitions are not entered —
-    they get their own set, seeded with this one.
-
-    :param func: The function definition.
-    :return: The names local to it.
-    """
-    names: set[str] = set()
-    spec = func.args
-    for arg in [*spec.posonlyargs, *spec.args, *spec.kwonlyargs, spec.vararg, spec.kwarg]:
-        if arg is not None:
-            names.add(arg.arg)
-    for stmt in func.body:
-        for sub in _walk_own(stmt):
-            if isinstance(sub, ast.Name) and isinstance(sub.ctx, (ast.Store, ast.Del)):
-                names.add(sub.id)
-            elif isinstance(sub, (ast.Import, ast.ImportFrom)):
-                for alias in sub.names:
-                    names.add(alias.asname or alias.name.split('.')[0])
-    for stmt in ast_walk.walk(func):
-        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
-                and stmt is not func:
-            names.add(stmt.name)
-    return names
-
-
-#: Node types that open a scope of their own: the walk stops at them, and a
-#: ``def`` is then picked up by :func:`_nested_defs` and checked on its own.
-_SCOPES: tuple[type[ast.AST], ...] = (ast.FunctionDef, ast.AsyncFunctionDef,
-                                      ast.Lambda, ast.ClassDef)
-
-
-def _walk_own(node: ast.AST):
-    """``node`` and every descendant of it, stopping at a nested scope.
-
-    ``node`` itself is yielded only when it is not a scope of its own, so a walk
-    started on a statement list never enters a definition standing in it.
-    """
-    if isinstance(node, _SCOPES):
-        return
-    yield node
-    yield from ast_walk.iter_descendants(node, _SCOPES)
+#: The candidates :meth:`OuterWriteTransformer._check_node` can report
+_WRITES: tuple[type[ast.AST], ...] = (ast.Global, ast.Assign, ast.AnnAssign, ast.AugAssign,
+                                      ast.Delete, ast.Call)
 
 
 def _nested_defs(node: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
@@ -182,6 +138,70 @@ def _nested_defs(node: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
             continue
         pending.extend(ast_walk.iter_child_nodes(child))
     return found
+
+
+def _scan_function(func: ast.FunctionDef | ast.AsyncFunctionDef) \
+        -> tuple[set[str], list[ast.AST], list[ast.FunctionDef | ast.AsyncFunctionDef]]:
+    """One walk of a function body for everything the check needs from it.
+
+    The local names are the names the body binds itself, so they shadow the
+    module's. Every parameter and every ``Store``-context ``Name`` of the body
+    counts, wherever in the body it stands: Python binds a local for the whole
+    call, so ``lastPivot: Pivot = lastPivot(this)`` makes ``lastPivot`` local
+    even where the module binds the same spelling. Nested definitions are not
+    entered — they get their own set, seeded with this one — but their names
+    are locals, at any depth.
+
+    The writes are the body's own nodes that may write an object, in the
+    order a pre-order walk of the body meets them; they can only be judged
+    once every local name is known.
+
+    The nested definitions are the ones :func:`_nested_defs` finds, in its
+    order: that walk takes the last child first, which for definitions (none
+    of them encloses another) is the reverse of the pre-order this walk meets
+    them in.
+
+    :param func: The function definition.
+    :return: The local names, the write candidates and the nested definitions.
+    """
+    names: set[str] = set()
+    spec = func.args
+    for arg in [*spec.posonlyargs, *spec.args, *spec.kwonlyargs, spec.vararg, spec.kwarg]:
+        if arg is not None:
+            names.add(arg.arg)
+    writes: list[ast.AST] = []
+    defs: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    # Pre-order, left to right: (node, whether it stands in a class body)
+    pending: list[tuple[ast.AST, bool]] = [(stmt, False) for stmt in reversed(func.body)]
+    while pending:
+        node, in_class = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            defs.append(node)
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, ast.ClassDef):
+            in_class = True
+        elif not in_class:
+            if isinstance(node, ast.Name):
+                if isinstance(node.ctx, (ast.Store, ast.Del)):
+                    names.add(node.id)
+                continue
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    names.add(alias.asname or alias.name.split('.')[0])
+            elif isinstance(node, _WRITES):
+                writes.append(node)
+        children = list(ast_walk.iter_child_nodes(node))
+        pending.extend((child, in_class) for child in reversed(children))
+    # Definitions and classes bind their names in the scope they stand in,
+    # the ones nested deeper in this function included
+    for stmt in ast_walk.walk_statements(func):
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
+                and stmt is not func:
+            names.add(stmt.name)
+    defs.reverse()
+    return names, writes, defs
 
 
 class OuterWriteTransformer(ast_walk.NodeTransformer):
@@ -212,11 +232,11 @@ class OuterWriteTransformer(ast_walk.NodeTransformer):
         """
         if func.name.startswith(_TEST_PREFIX):
             return
-        locals_here = shadowed | _local_names(func)
-        for stmt in func.body:
-            for sub in _walk_own(stmt):
-                self._check_node(sub, locals_here)
-        for inner in _nested_defs(func):
+        local_names, writes, nested = _scan_function(func)
+        locals_here = shadowed | local_names
+        for node in writes:
+            self._check_node(node, locals_here)
+        for inner in nested:
             self._check_function(inner, frozenset(locals_here))
 
     def _check_node(self, node: ast.AST, shadowed: frozenset[str] | set[str]) -> None:

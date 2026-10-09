@@ -3,9 +3,11 @@ What one module publishes, and how another one finds it again.
 
 The inference is per-module, but a call into an imported module needs that
 module's signatures -- and re-deriving them on every import would cost a full
-parse per dependency per process. So the answer is published three times over,
-each cheaper than the last to reach: a process-wide registry, a JSON artifact
-next to the ``.pyc``, and a re-analysis from source as the last resort.
+transform per dependency per process. So the answer is published twice over,
+the cheaper one first: a process-wide registry, and a constant baked into the
+module's own ``.pyc``, which the import hook reads back without executing
+anything. A module that has neither is transformed into its ``.pyc`` the way
+importing it would, once, and answers from that transform.
 
 The INTERFACE is what a dependent is allowed to depend on: the exported
 signatures, the classes a dependent may annotate with and the module's
@@ -20,48 +22,48 @@ consulted. Neither is signature -- neither moves the digest -- and both are
 what a cached answer has to be checked against before it may be handed out,
 the registry's answers included.
 
-Nothing here imports the import hook. The analyser and the pipeline digest are
-passed IN, so the analysis stays usable without a loader -- and so the hook can
-keep importing this module instead of the other way round.
+A dependent's bytecode depends on one more thing, which is not a type and so
+has a digest of its own: how each call into the module is ROUTED. The
+lowering emits a call into a state-carrying function with the hidden state
+argument and a call into a stateless one plainly, and which one a function is
+can change with nothing but its body. The routes digest is settled by the
+lowering, so an interface published off the analysis alone carries none; a
+dependency record compares it beside the interface digest wherever the record
+is checked for a dependent's bytecode.
+
+Nothing here imports the import hook. What reads a ``.pyc`` and what
+transforms a module into one is passed IN (an ``Analyser``), so the analysis
+stays usable without a loader -- and so the hook can keep importing this
+module instead of the other way round.
 """
 import ast
 import hashlib
-import importlib.util
 import json
 import os
-import sys
+import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import ast_walk
-from .node_ids import assign_node_ids, node_id
-from .pine_type_rules import TY_ATTR, UNKNOWN, ImplSig, annotation_type, impl_sig
+from .pine_type_rules import UNKNOWN, ImplSig, annotation_type, impl_sig
 from .pine_type_table import (
-    Analyser, ClassSig, DepRecord, ExportSig, ModuleInterface, PineTypeTable, Unknown,
-    qualify,
+    Analyser, ClassSig, DepRecord, ExportSig, ModuleInterface, PineTypeTable, qualify,
 )
+from .slot_layout import ModuleLayout
 
 __all__ = [
-    'ARTIFACT_VERSION', 'NO_FINGERPRINT', 'build_interface', 'interface_digest',
+    'NO_FINGERPRINT', 'build_interface', 'interface_digest',
+    'routes_shape', 'routes_digest',
     'source_digest', 'stable_source', 'register', 'registered', 'lookup',
-    'analysing', 'analysing_scope',
-    'dep_record', 'dep_current', 'artifact_path', 'artifact_enabled',
-    'write_artifact', 'read_artifact', 'table_json',
+    'closes_cycle', 'analysing_scope', 'Compile', 'compiling', 'reached_back',
+    'SOURCE_DIGEST', 'dep_record', 'source_record', 'add_dep', 'dep_current', 'settle',
+    'interface_payload', 'interface_from_payload',
 ]
 
-#: Bumped whenever the JSON shape changes. An artifact of a different version
-#: is not read, the same way one of a different pipeline is not.
-ARTIFACT_VERSION = 8
-
-#: Environment override for the artifact. ``'1'`` writes one for every Pyne
-#: module, ``'0'`` for none; unset leaves it to the module's mode.
-ARTIFACT_ENV = 'PYNE_TYPE_ARTIFACT'
-
-#: Length of every digest this module produces. Short on purpose: it names a
-#: file and rides in a code constant, and a collision only costs a needless
-#: retransform.
+#: Length of every digest this module produces. Short on purpose: it rides in a
+#: code constant, and a collision only costs a needless retransform.
 _DIGEST_LEN = 16
 
 #: The fingerprint of a source whose bytes no stat could be paired with -- an
@@ -70,6 +72,11 @@ _DIGEST_LEN = 16
 #: fingerprint check; it is the same pairing ``dep_record`` gives an
 #: unstat-able dependency.
 NO_FINGERPRINT = (0, -1)
+
+#: The digest of a dependency record that stands for a plain Python module: it
+#: publishes no interface to re-derive, so the record holds exactly as long as
+#: the file's stat does. No derived digest is spelled like it.
+SOURCE_DIGEST = 'source'
 
 #: How many times a stable read is retried before it gives up. A file being
 #: rewritten under the reader settles within a rename or two; anything past
@@ -83,6 +90,33 @@ _registry: dict[str, ModuleInterface] = {}
 #: reaches ``lookup`` for A while A is still being analysed; answering None
 #: there is what terminates it.
 _analysing: set[str] = set()
+
+
+@dataclass(slots=True)
+class Compile:
+    """
+    One transform of a dependency that a lookup started, while it runs.
+
+    Such a transform runs in the middle of ANOTHER module's: typically inside
+    the type pass of the module that imports it. It is only the transform
+    importing the dependency would produce while it reaches none of the
+    modules under analysis around it. One that does -- an import cycle back
+    into them -- gets no interface where the real import, which runs once
+    their analysis is done, gets one; and its lowering would import what the
+    module calls, among them a module whose own analysis has not returned.
+    So it stops once its analysis is done (see ``reached_back``): its types
+    are still the best answer there is, the rest is left to the import.
+    """
+    #: Resolved source path of the module being transformed
+    path: str
+    #: The modules whose analysis was on the stack when the transform began
+    outer: frozenset[str]
+    #: Whether the transform has reached one of them since
+    cyclic: bool = False
+
+
+#: The dependency transforms in progress, innermost last
+_compiles: list[Compile] = []
 
 
 def _key(path: str) -> str:
@@ -129,7 +163,8 @@ def build_interface(tree: ast.Module, table: PineTypeTable, path: str,
                         under, as one indivisible pair; None stats the file
                         now, and ``NO_FINGERPRINT`` says the pairing could not
                         be had at all
-    :return: The module's interface, digest included
+    :return: The module's interface, digest included; its routes are left to
+             the lowering, which is the only thing that can settle them
     """
     exports: dict[str, ExportSig] = {}
 
@@ -197,10 +232,10 @@ def stable_source(path: Path) -> tuple[bytes, tuple[int, int]] | None:
     does NOT give that: an atomic replace landing between the read and the stat
     pairs one version's bytes with another version's fingerprint, and an
     interface built from that pairing is stale in a way the fingerprint check
-    then certifies as fresh. Every reader here goes through this -- the loader
-    transforming a module, the artifact validating its own source digest, the
-    analyser re-deriving a dependency -- because they all publish a fingerprint
-    alongside signatures they read.
+    then certifies as fresh. Every reader that publishes a fingerprint
+    alongside signatures it read goes through this -- the loader transforming
+    a module, the analyser deriving one's types, the enum capture proving an
+    imported constant.
 
     The pairing is taken through ONE open file: ``fstat`` before the read and
     again after it, both on the same descriptor, so a replacement is either
@@ -268,7 +303,8 @@ def _collect_defs(node: ast.AST, scope: str,
     :param out: Collects (definition, its id, the scope it was declared in), in
                 source order
     """
-    for child in ast_walk.iter_child_nodes(node):
+    # A definition is a statement, and no expression holds one
+    for child in ast_walk.iter_child_statements(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
             key = qualify(scope, child.name)
             out.append((child, key, scope))
@@ -461,6 +497,113 @@ def _canonical(payload: object) -> str:
     return json.dumps(payload, sort_keys=True, separators=(',', ':'))
 
 
+# --- the routes -----------------------------------------------------------
+
+
+def routes_shape(tree: ast.Module) -> str:
+    """
+    The module-level structure a call into the module is routed by, bodies left out.
+
+    A dependent's lowering classifies a call into this module by what the
+    imported name IS when the module has run: a plain function, an overload
+    dispatcher, an ``Exported`` proxy, a module property, a class, or whatever
+    an assignment or an import bound it to. Every one of those is decided by a
+    statement outside any function body -- a definition's decorators, an
+    assignment, an import, a class body -- so the shape is the module with
+    every function body left out, and an edit inside one never moves it.
+    Docstrings and source positions are left out too: neither routes a call.
+
+    It is taken off the ANALYSED tree, before the lowering adds plumbing of
+    its own, which follows the bodies.
+
+    :param tree: The analysed module
+    :return: Its shape, as canonical text
+    """
+    return _canonical([_shape(stmt) for stmt in tree.body if not _is_docstring(stmt)])
+
+
+#: The nodes a statement list holds, which hold statement lists of their own
+_STATEMENT_LIKE = (ast.stmt, ast.excepthandler, ast.match_case)
+
+
+def _shape(node: ast.AST) -> object:
+    """
+    One statement of the routes shape.
+
+    :param node: A statement, ``except`` handler or ``match`` case
+    :return: Its JSON-ready shape
+    """
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        # What a call reaches is the decorators' return value; the body and
+        # the parameters (the interface's business) do not decide that
+        return ['def', node.name, [ast.dump(decorator) for decorator in node.decorator_list]]
+    shaped: list[object] = [type(node).__name__]
+    for name, value in ast.iter_fields(node):
+        if isinstance(value, list):
+            shaped.append([name, [_shape(item) if isinstance(item, _STATEMENT_LIKE)
+                                  else ast.dump(item) if isinstance(item, ast.AST) else item
+                                  for item in value if not _is_docstring(item)]])
+        elif isinstance(value, ast.AST):
+            shaped.append([name, ast.dump(value)])
+        else:
+            shaped.append([name, value])
+    return shaped
+
+
+def _is_docstring(node: object) -> bool:
+    """
+    Whether a statement is a bare string literal.
+
+    :param node: The statement
+    :return: True for a docstring, or any other string standing as a statement
+    """
+    return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) \
+        and isinstance(node.value.value, str)
+
+
+def routes_digest(shape: str, tree: ast.Module, layout: ModuleLayout) -> str:
+    """
+    Digest of how every call into a module is routed, once its lowering settled it.
+
+    The shape says what each module-level name is; the lowering adds the one
+    fact no statement spells: which definitions carry state. A dependent calls
+    such a function on the fast route, with the hidden state argument in
+    front, and one without plainly -- and neither emission runs against the
+    other kind of function. Statefulness is only settled by the lowering, as
+    it follows calls: a function that calls a state-carrying one carries
+    state itself.
+
+    The definitions counted are the ones an importer can reach, the same the
+    shape lists: module-level ones, and those in a class body or a
+    module-level branch. A definition nested in a function is out of every
+    importer's reach, and so is whether it keeps state.
+
+    :param shape: ``routes_shape`` of the analysed tree
+    :param tree: The same tree after the lowering
+    :param layout: The slot layout that lowering allocated
+    :return: A short hex digest
+    """
+    # Only a plain ``def`` is given a state parameter; an ``async def`` never is
+    carriers = [[node.name, isinstance(node, ast.FunctionDef)
+                 and layout.state_carrying(layout.scope_segment(node))]
+                for node in _reachable_defs(tree)]
+    return _digest(_canonical([shape, carriers]).encode('utf-8'))
+
+
+def _reachable_defs(node: ast.AST) -> Iterator[ast.FunctionDef | ast.AsyncFunctionDef]:
+    """
+    The definitions of a module that do not stand inside another definition.
+
+    :param node: The node to descend into
+    :return: Every such definition, in source order
+    """
+    for child in ast_walk.iter_child_statements(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield child
+        else:
+            yield from _reachable_defs(child)
+
+
 # --- the registry ---------------------------------------------------------
 
 
@@ -483,106 +626,75 @@ def registered(path: str) -> ModuleInterface | None:
     return _registry.get(_key(path))
 
 
-def lookup(path: str, analyse: Analyser | None, pipeline_hash: str) -> ModuleInterface | None:
+def lookup(path: str, analyse: Analyser | None, pipeline_hash: str,
+           settled: bool = False) -> ModuleInterface | None:
     """
     A module's interface, from wherever it is cheapest to get.
 
-    The registry answers within a process, the artifact across processes, and
-    a re-analysis when neither does. A failed analysis is NOT remembered: the
-    file may be written, fixed or restored a moment later, and a cached "no"
-    would outlive the reason for it.
+    The registry answers within a process. When it cannot, the analyser does:
+    it reads the interface the module's own ``.pyc`` carries, and when there
+    is no such ``.pyc`` that still holds, it transforms the module into one --
+    the very transform importing the module would run, which the import then
+    finds done. A failed answer is NOT remembered: the file may be written,
+    fixed or restored a moment later, and a cached "no" would outlive the
+    reason for it.
 
-    Both cached answers are checked against the file before they are handed
-    out, and both are checked the same way: the module's own fingerprint --
-    one ``os.stat``, against the one the interface itself carries -- AND its
-    whole dependency closure, because an inferred signature can move without a
-    single byte of this module changing. A registry entry is not exempt from
-    the second half: a module registered early in a process keeps answering
-    for the rest of it, and an edit to a module its exports were INFERRED from
-    lands nowhere near its own source. Whichever check fails, the entry is
-    evicted and the answer re-derived rather than handed out stale.
+    A caller that needs the ROUTES asks for a SETTLED interface, and gets one
+    whose routes are settled or none at all: a registry entry the analysis
+    alone published -- a module the lowering of which has not run yet -- is
+    then not an answer, and the analyser is asked instead. A caller that does
+    not gets what the types need, settled or not.
+
+    A registry entry is checked against the file before it is handed out: the
+    module's own fingerprint -- one ``os.stat``, against the one the interface
+    itself carries -- AND its whole dependency closure, because an inferred
+    signature can move without a single byte of this module changing. A
+    module registered early in a process keeps answering for the rest of it,
+    and an edit to a module its exports were INFERRED from lands nowhere near
+    its own source. Whichever check fails, the entry is evicted and the answer
+    re-derived rather than handed out stale. The analyser holds a ``.pyc`` to
+    the same two checks.
 
     :param path: Source path of the module
-    :param analyse: Re-derives the tree and table from source; None to look no
-                    further than the artifact
-    :param pipeline_hash: Digest of the pipeline an artifact must come from
+    :param analyse: Reads or transforms the module when the registry cannot
+                    answer; None to look no further than the registry
+    :param pipeline_hash: Digest of the pipeline a ``.pyc`` must come from
+    :param settled: Whether the caller needs the routes too
     :return: The interface, or None when it cannot be had
     """
     key = _key(path)
     # A module still being analysed cannot answer for itself; saying so is
     # what makes an import cycle terminate instead of recursing
-    if key in _analysing:
+    if _closes_cycle(key):
         return None
 
-    # This stat decides EVICTION and nothing else. It is taken before either
-    # fallback reads a byte, so it describes the file as it was then -- fine
+    # This stat decides EVICTION and nothing else. It is taken before the
+    # analyser reads a byte, so it describes the file as it was then -- fine
     # for "has the entry's file moved", and never a fingerprint to publish:
-    # each fallback pairs its own read with its own stat instead
+    # the analyser pairs its own read with its own stat instead
     stat = _stat(key)
     hit = _registry.get(key)
     if hit is not None:
         if stat is not None and (hit.mtime_ns, hit.size) == (stat.st_mtime_ns, stat.st_size) \
-                and _closure_current(key, hit, analyse, pipeline_hash):
-            return hit
-        del _registry[key]
-    if stat is None:
+                and _closure_current(key, hit, analyse, pipeline_hash, settled):
+            # Current, but an entry without routes cannot answer a caller that
+            # needs them; the analyser below replaces it
+            if not settled or hit.routes:
+                return hit
+        else:
+            _registry.pop(key, None)
+    if stat is None or analyse is None:
         return None
 
-    # Everything below may reach back here through a dependency's own
-    # validation; the mark is what makes a cycle in the closure answer None
-    # -- a module under analysis is NOT current -- instead of recursing
-    with analysing_scope(key):
-        interface = _from_artifact(key, analyse, pipeline_hash)
-        if interface is None and analyse is not None:
-            analysed = analyse(key)
-            if analysed is not None:
-                tree, table, fingerprint = analysed
-                interface = build_interface(
-                    tree, table, key,
-                    NO_FINGERPRINT if fingerprint is None else fingerprint)
+    interface = analyse(key, pipeline_hash)
     if interface is None:
         return None
     register(interface)
-    return interface
-
-
-def _from_artifact(key: str, analyse: Analyser | None,
-                   pipeline_hash: str) -> ModuleInterface | None:
-    """
-    The interface an artifact carries, when it still describes the world.
-
-    Two things have to hold, and the second is the one a source digest cannot
-    see: the module's own bytes must be the ones the artifact was written
-    from, AND every module the analysis consulted must still say what it said
-    then. An export whose return was INFERRED from a call into a third module
-    moves when that module's signature moves, while this file stays untouched.
-
-    The source is read through ``stable_source``, so the fingerprint the
-    interface goes out under is the one belonging to the very bytes whose
-    digest just matched -- not to whatever the file was before the read.
-
-    :param key: Resolved source path of the module
-    :param analyse: Re-derives a dependency that the stat check cannot clear
-    :param pipeline_hash: Digest of the pipeline the artifact must come from
-    :return: The interface, or None when the artifact may not be trusted
-    """
-    data = read_artifact(Path(key), pipeline_hash)
-    if data is None:
-        return None
-    stable = stable_source(Path(key))
-    if stable is None:
-        return None
-    source, fingerprint = stable
-    if data.get('src') != source_digest(source):
-        return None
-    interface = _interface_from_json(key, data, fingerprint)
-    if not _closure_current(key, interface, analyse, pipeline_hash):
-        return None
-    return interface
+    return interface if not settled or interface.routes else None
 
 
 def _closure_current(key: str, interface: ModuleInterface, analyse: Analyser | None,
-                     pipeline_hash: str) -> bool:
+                     pipeline_hash: str, settled: bool) -> bool:
     """
     Whether every module an interface was derived from still says the same thing.
 
@@ -597,31 +709,58 @@ def _closure_current(key: str, interface: ModuleInterface, analyse: Analyser | N
     analysis answers None, which makes it not current -- the conservative end
     of a cycle, and the one that terminates.
 
+    The routes are part of the question when the caller needs them: the
+    routes of an interface follow its dependencies' routes -- a function that
+    calls a function which started keeping state keeps state itself -- so an
+    entry whose closure moved its routes is as stale as one whose closure
+    moved a signature.
+
     :param key: Resolved source path of the module the interface belongs to
     :param interface: The interface whose closure is being checked
-    :param analyse: Re-derives a dependency the stat check cannot clear
-    :param pipeline_hash: Digest of the pipeline an artifact must come from
+    :param analyse: Reads or transforms a dependency the stat check cannot clear
+    :param pipeline_hash: Digest of the pipeline a ``.pyc`` must come from
+    :param settled: Whether the routes have to hold too
     :return: True while every dependency still matches what was recorded
     """
     if not interface.deps:
         return True
     with analysing_scope(key):
-        return all(dep_current(record, analyse, pipeline_hash)
+        return all(dep_current(record, analyse, pipeline_hash, settled)
                    for record in interface.deps.values())
 
 
-def analysing(path: str) -> bool:
+def _closes_cycle(key: str) -> bool:
     """
-    Whether a module's own analysis is on the stack right now.
+    Whether reaching a module closes an import cycle, noted where it matters.
+
+    A module closes one while its own analysis is on the stack. Every
+    dependency transform in progress that began while it already was has
+    just reached back into it, and is marked for it (see ``Compile``).
+
+    :param key: Resolved source path of the module reached
+    :return: True while it is being analysed
+    """
+    if key not in _analysing:
+        return False
+    for compile_ in _compiles:
+        if key in compile_.outer:
+            compile_.cyclic = True
+    return True
+
+
+def closes_cycle(path: str) -> bool:
+    """
+    Whether reaching a module closes an import cycle: its analysis is on the stack.
 
     This is what tells an import CYCLE apart from a module that simply has no
     interface to give. Both make ``lookup`` answer None, and only one of them
-    is worth telling the user about.
+    is worth telling the user about. Asking is reaching the module, which a
+    dependency transform in progress is marked for (see ``Compile``).
 
     :param path: Source path of the module, empty when it has none
     :return: True while it is being analysed
     """
-    return bool(path) and _key(path) in _analysing
+    return bool(path) and _closes_cycle(_key(path))
 
 
 @contextmanager
@@ -651,6 +790,38 @@ def analysing_scope(path: str) -> Iterator[None]:
         _analysing.discard(key)
 
 
+@contextmanager
+def compiling(path: str) -> Iterator[Compile]:
+    """
+    Track one dependency transform a lookup started, for as long as it runs.
+
+    :param path: Source path of the module being transformed
+    :return: The transform's record
+    """
+    compile_ = Compile(_key(path), frozenset(_analysing))
+    _compiles.append(compile_)
+    try:
+        yield compile_
+    finally:
+        _compiles.pop()
+
+
+def reached_back(path: str) -> bool:
+    """
+    Whether a module's dependency transform reached back into a module under analysis.
+
+    Asked by the transform once the module's analysis is done, which is when
+    the answer is complete: the type pass looks up every Pyne module the
+    module imports, so whatever its lowering would import has been reached by
+    then -- and when one of them reached back, the lowering must not run (see
+    ``Compile``). A transform no lookup started, an import's own, is never one.
+
+    :param path: Source path of the module being transformed
+    :return: True when its transform has to stop at the analysis
+    """
+    return bool(_compiles) and _compiles[-1].cyclic and _compiles[-1].path == _key(path)
+
+
 # --- the dependency records -----------------------------------------------
 
 
@@ -668,26 +839,77 @@ def dep_record(interface: ModuleInterface) -> DepRecord:
     :return: The record to bake into the dependent
     """
     return DepRecord(path=_key(interface.path), mtime_ns=interface.mtime_ns,
-                     size=interface.size, digest=interface.digest)
+                     size=interface.size, digest=interface.digest, routes=interface.routes)
 
 
-def dep_current(record: DepRecord, analyse: Analyser | None, pipeline_hash: str) -> bool:
+def source_record(path: str) -> DepRecord | None:
+    """
+    The record of a plain Python module a dependent's routes were read through.
+
+    Such a module publishes no interface: a route read off the object it binds
+    holds while it binds the same object, and nothing short of its source
+    staying as it was says so. The record travels in the dependency closure
+    like any other, so it reaches the dependents of the dependent too.
+
+    :param path: Resolved source path of the module
+    :return: The record, or None when the file cannot be stat'ed
+    """
+    stat = _stat(path)
+    if stat is None:
+        return None
+    return DepRecord(path=_key(path), mtime_ns=stat.st_mtime_ns, size=stat.st_size,
+                     digest=SOURCE_DIGEST, routes=SOURCE_DIGEST)
+
+
+def add_dep(deps: dict[str, DepRecord], interface: ModuleInterface, own_path: str) -> None:
+    """
+    Record the dependency on one module, and the dependencies it carries.
+
+    Its dependencies are the dependent's too. An export whose return was
+    INFERRED from a call one module further out moves when THAT module's
+    signature moves, and nothing about the dependent or its direct dependency
+    changes when it does -- so the closure has to be carried, not just the edge.
+
+    :param deps: The dependent's records, keyed by path; extended in place
+    :param interface: The interface the dependent now depends on
+    :param own_path: The dependent's own source path
+    """
+    record = dep_record(interface)
+    deps[record.path] = record
+    for inherited in interface.deps.values():
+        if inherited.path == own_path:
+            # A cyclic pair names the dependent in the other's closure; its
+            # own source is not something it can be invalidated by
+            continue
+        deps.setdefault(inherited.path, inherited)
+
+
+def dep_current(record: DepRecord, analyse: Analyser | None, pipeline_hash: str,
+                settled: bool = False) -> bool:
     """
     Whether a dependency still means what the dependent was built against.
 
     The stat pair is checked first and answers on its own: an untouched file
     costs one ``os.stat`` and no parsing at all, which is the case every
     ordinary import is. Only a file that moved is worth re-deriving an
-    interface for -- and a body edit lands here and still says yes.
+    interface for -- and a body edit lands here and still says yes, unless it
+    changed whether a function keeps state.
 
     That short-circuit is only sound because the closure is TRANSITIVE: a
     dependent records its dependencies' dependencies too, so a third module's
-    signature moving is a record of its own here rather than a change hiding
-    behind an untouched file.
+    signature -- or routes -- moving is a record of its own here rather than a
+    change hiding behind an untouched file.
+
+    The routes are compared when the caller asks for them, which is what a
+    check of a dependent's BYTECODE does: its emission routed every call into
+    the dependency. A check that only vouches for types has no routes to
+    compare. A plain module's record (``SOURCE_DIGEST``) has nothing to
+    re-derive, so for it the stat pair is the whole answer.
 
     :param record: What the dependent remembers
-    :param analyse: Re-derives the dependency when the artifact cannot
-    :param pipeline_hash: Digest of the pipeline an artifact must come from
+    :param analyse: Reads or transforms the dependency once its file moved
+    :param pipeline_hash: Digest of the pipeline a ``.pyc`` must come from
+    :param settled: Whether the routes have to match too
     :return: True while the dependent's bytecode is still valid
     """
     try:
@@ -696,222 +918,119 @@ def dep_current(record: DepRecord, analyse: Analyser | None, pipeline_hash: str)
         return False
     if stat.st_mtime_ns == record.mtime_ns and stat.st_size == record.size:
         return True
-    interface = lookup(record.path, analyse, pipeline_hash)
-    return interface is not None and interface.digest == record.digest
-
-
-# --- the artifact ---------------------------------------------------------
-
-
-def artifact_enabled(pyne_mode: str | None) -> bool:
-    """
-    Whether this module's types are worth writing out.
-
-    ``@pyne edge`` is the compiler's own output, which is what the AOT front
-    end consumes, so that is the default. The environment overrides it either
-    way -- writing one for a hand-written script is how the types are
-    inspected during development.
-
-    :param pyne_mode: The module's mode word, None for a hand-written script
-    :return: Whether to write the artifact
-    """
-    override = os.environ.get(ARTIFACT_ENV)
-    if override == '1':
-        return True
-    if override == '0':
+    if record.digest == SOURCE_DIGEST:
         return False
-    return pyne_mode == 'edge'
+    interface = lookup(record.path, analyse, pipeline_hash, settled)
+    if interface is None or interface.digest != record.digest:
+        return False
+    return not settled or interface.routes == record.routes
 
 
-def artifact_path(source_path: Path, pipeline_hash: str) -> Path:
+def settle(record: DepRecord, analyse: Analyser, pipeline_hash: str) -> DepRecord:
     """
-    Where a module's type artifact lives.
+    A dependency record with the routes it was made without, when they can be had.
 
-    Beside the ``.pyc``, and named after the pipeline that produced it, so an
-    artifact of a different pipeline is a different file and never has to be
-    invalidated. The cache directory comes from ``importlib`` itself, so a
-    ``sys.pycache_prefix`` tree is honoured exactly as it is for bytecode.
+    The type pass records a dependency off whatever interface it found, and
+    one the analysis alone published -- a module whose lowering had not run
+    yet -- has no routes. Before the record is baked into the dependent it is
+    settled -- usually for free, from the registry entry the dependency's own
+    transform replaced it with. The routes are only taken from an interface at
+    the record's own fingerprint and digest: a file that moved in between
+    leaves the record unsettled, which no later check accepts once the file
+    moves, so it costs at most a retransform.
 
-    The path is resolved first: the writer is handed whatever spelling the
-    loader was given, the reader a resolved dependency path, and both have to
-    name the same file.
-
-    :param source_path: Path to the ``.py`` source
-    :param pipeline_hash: Digest of the transform pipeline
-    :return: Path to the artifact file
+    :param record: The record the type pass made
+    :param analyse: Reads or transforms the dependency when the registry cannot
+                    settle it
+    :param pipeline_hash: Digest of the pipeline a ``.pyc`` must come from
+    :return: The record with its routes, or the record itself
     """
-    resolved = source_path.resolve()
-    cache = Path(importlib.util.cache_from_source(str(resolved)))
-    return cache.parent / f'{resolved.stem}.{pipeline_hash[:12]}.pynetypes.json'
+    if record.routes:
+        return record
+    interface = lookup(record.path, analyse, pipeline_hash, settled=True)
+    if interface is None or (interface.mtime_ns, interface.size) != (record.mtime_ns, record.size) \
+            or interface.digest != record.digest:
+        return record
+    return replace(record, routes=interface.routes)
 
 
-def write_artifact(tree: ast.Module, table: PineTypeTable, interface: ModuleInterface,
-                   source: bytes, path: Path, pipeline_hash: str) -> None:
+# --- the payload ----------------------------------------------------------
+
+
+def interface_payload(interface: ModuleInterface) -> bytes:
     """
-    Write a module's types next to its bytecode, best effort.
+    An interface as the one constant its module's ``.pyc`` carries it in.
 
-    Best effort is the whole contract: the artifact is a cache, and a
-    read-only install, a full disk or a racing process may all deny it. None
-    of that may fail an import, so every write error is swallowed -- the types
-    are simply re-derived next time.
+    Everything a dependent reads off the interface, the routes included --
+    and nothing that already rides in the ``.pyc`` elsewhere or that is not
+    the module's to say: the dependency closure is the module's own baked
+    dependency records, and the fingerprint is paired with the payload by
+    whoever bakes it, from the read the transform was given.
 
-    :param tree: The finished tree, which is renumbered before it is listed
-    :param table: The type table of the module
-    :param interface: What the module publishes
-    :param source: The module's raw source bytes
-    :param path: Path to the ``.py`` source
-    :param pipeline_hash: Digest of the transform pipeline
+    Compressed, because it rides in every ``.pyc`` and stays referenced by the
+    module for as long as it lives: the JSON of a large library's interface
+    runs to tens of kilobytes -- a quarter of its bytecode -- and repeats the
+    same keys for every signature, which compresses some twentyfold.
+
+    :param interface: The interface to serialize
+    :return: Compressed canonical JSON
     """
-    if sys.dont_write_bytecode:
-        return
-    target = artifact_path(path, pipeline_hash)
+    return zlib.compress(_canonical({
+        'all': list(interface.all) if interface.all is not None else None,
+        'classes': {name: _class_json(sig) for name, sig in interface.classes.items()},
+        'extensions': {cid: {name: _export_json(published)
+                             for name, published in methods.items()}
+                       for cid, methods in interface.extensions.items()},
+        'exports': {name: _export_json(sig) for name, sig in interface.exports.items()},
+        'suppressed': interface.suppressed,
+        'routes': interface.routes,
+    }).encode('utf-8'))
+
+
+def interface_from_payload(path: str, payload: bytes, deps: dict[str, DepRecord],
+                           fingerprint: tuple[int, int]) -> ModuleInterface | None:
+    """
+    Rebuild the interface a ``.pyc`` carries.
+
+    The digest is recomputed rather than read back, so what a dependent is
+    checked against is always a digest of what it was actually handed. The
+    routes have to be read back: they are the lowering's verdict, and nothing
+    short of lowering the module again could recompute them.
+
+    :param path: Resolved source path of the module
+    :param payload: What ``interface_payload`` made of the interface
+    :param deps: The dependency closure the module was transformed under
+    :param fingerprint: Of the source the ``.pyc`` was just validated against
+    :return: The interface it describes, or None for a payload that is no
+             interface
+    """
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(_canonical(
-            table_json(tree, table, interface, source, pipeline_hash)), encoding='utf-8')
-    except OSError:
-        pass
-
-
-def read_artifact(path: Path, pipeline_hash: str) -> dict | None:
-    """
-    Read back a module's artifact, when there is a usable one.
-
-    :param path: Path to the ``.py`` source
-    :param pipeline_hash: Digest of the transform pipeline it must come from
-    :return: The parsed artifact, or None
-    """
-    try:
-        data = json.loads(artifact_path(path, pipeline_hash).read_text(encoding='utf-8'))
-    except (OSError, ValueError):
+        published = json.loads(zlib.decompress(payload))
+    except (zlib.error, ValueError, TypeError):
         return None
-    if not isinstance(data, dict):
+    if not isinstance(published, dict):
         return None
-    if data.get('v') != ARTIFACT_VERSION or data.get('pipeline') != pipeline_hash:
-        return None
-    return data
-
-
-def table_json(tree: ast.Module, table: PineTypeTable, interface: ModuleInterface,
-               source: bytes, pipeline_hash: str) -> dict:
-    """
-    The whole analysis of one module, as the artifact spells it.
-
-    The expression list is taken over the FINAL tree and renumbered right
-    here: the ids the inference handed out describe a tree the lowering has
-    since rewritten, so they would name nothing a reader could find. The fresh
-    pre-order numbering is what makes two artifacts of the same source
-    diffable.
-
-    :param tree: The finished tree
-    :param table: The type table of the module
-    :param interface: What the module publishes
-    :param source: The module's raw source bytes
-    :param pipeline_hash: Digest of the transform pipeline
-    :return: The JSON-ready structure
-    """
-    assign_node_ids(tree)
-    exprs = []
-    for node in ast_walk.walk(tree):
-        if not isinstance(node, ast.expr):
-            continue
-        ty = getattr(node, TY_ATTR, None)
-        if ty is None:
-            continue
-        exprs.append([node_id(node), ty, getattr(node, 'lineno', 0),
-                      getattr(node, 'col_offset', 0)])
-    exprs.sort(key=lambda entry: entry[0])
-
-    return {
-        'v': ARTIFACT_VERSION,
-        'module': interface.path or table.module_path,
-        'src': source_digest(source),
-        'pipeline': pipeline_hash,
-        'exprs': exprs,
-        'bindings': {scope: {name: _binding_json(binding)
-                             for name, binding in names.items()}
-                     for scope, names in table.bindings.items()},
-        'funcs': {key: {'params': list(func.params), 'ret': func.ret, 'line': func.line}
-                  for key, func in table.funcs.items()},
-        'contexts': [{'cid': result.cid, 'key': result.key, 'params': list(result.params),
-                      'ret': result.ret, 'pins': _pins_json(result.pins, table)}
-                     for result in table.contexts.values()],
-        'calls': [{'callee': call.callee, 'line': call.line, 'col': call.col,
-                   'argc': call.argc, 'ty': call.ty, 'pin': call.pin}
-                  for call in table.calls],
-        'diags': [{'message': diag.message, 'line': diag.line, 'col': diag.col,
-                   'origin': _unknown_json(diag.origin), 'fix': diag.fix,
-                   'end_line': diag.end_line, 'end_col': diag.end_col}
-                  for diag in table.diags],
-        # The module's dependency closure, which is also the interface's: a
-        # reader validates it before it may trust the published signatures
-        'deps': {path: {'mtime_ns': record.mtime_ns, 'size': record.size,
-                        'digest': record.digest}
-                 for path, record in table.deps.items()},
-        'interface': {
-            'all': list(interface.all) if interface.all is not None else None,
-            'classes': {name: _class_json(sig) for name, sig in interface.classes.items()},
-            'extensions': {cid: {name: _export_json(published)
-                                 for name, published in methods.items()}
-                           for cid, methods in interface.extensions.items()},
-            'exports': {name: _export_json(sig) for name, sig in interface.exports.items()},
-            'suppressed': interface.suppressed,
-        },
-    }
-
-
-def _pins_json(pins: dict[int, str | None], table: PineTypeTable) -> list[dict]:
-    """
-    One context's overload pins, keyed by where the call STANDS.
-
-    The node ids the inference hands out describe the tree it walked, and the
-    lowering builds new call nodes over it -- so an id written out here would
-    name nothing a reader could find, not even in this same artifact, whose
-    expression list is renumbered over the FINAL tree. The source position is
-    the one identity both trees agree on, and it is what ``calls`` is listed
-    by too.
-
-    :param pins: Call node id -> the pin this context justified there
-    :param table: The module's type table, for the positions
-    :return: One entry per pinned call, in source order
-    """
-    entries = [{'line': table.call_pos[nid][0], 'col': table.call_pos[nid][1], 'pin': pin}
-               for nid, pin in pins.items() if nid in table.call_pos]
-    entries.sort(key=lambda entry: (entry['line'], entry['col']))
-    return entries
-
-
-def _binding_json(binding) -> dict:
-    """
-    One binding, with its provenance when it has one.
-
-    :param binding: The binding to serialize
-    :return: Its JSON form
-    """
-    out: dict = {'ty': binding.ty, 'line': binding.line}
-    if binding.unknown is not None:
-        out['unknown'] = _unknown_json(binding.unknown)
-    if binding.series:
-        out['series'] = True
-    return out
-
-
-def _unknown_json(unknown: Unknown | None) -> dict | None:
-    """
-    Where a type was lost, when that is recorded.
-
-    :param unknown: The provenance, or None
-    :return: Its JSON form, or None
-    """
-    if unknown is None:
-        return None
-    return {'reason': unknown.reason, 'line': unknown.line, 'col': unknown.col,
-            'detail': unknown.detail}
+    all_names = published.get('all')
+    exports = {name: _export_from_json(name, sig)
+               for name, sig in (published.get('exports') or {}).items()}
+    classes = {name: _class_from_json(name, sig)
+               for name, sig in (published.get('classes') or {}).items()}
+    extensions = {cid: {name: _export_from_json(name, method)
+                        for name, method in (methods or {}).items()}
+                  for cid, methods in (published.get('extensions') or {}).items()}
+    interface = ModuleInterface(
+        path=path, exports=exports,
+        all=tuple(all_names) if all_names is not None else None,
+        classes=classes, extensions=extensions, digest='', deps=dict(deps),
+        mtime_ns=fingerprint[0], size=fingerprint[1],
+        suppressed=str(published.get('suppressed') or ''),
+        routes=str(published.get('routes') or ''))
+    return replace(interface, digest=interface_digest(interface))
 
 
 def _export_json(sig: ExportSig) -> dict:
     """
-    One published signature, in the artifact's shape.
+    One published signature, in the payload's shape.
 
     :param sig: The signature to serialize
     :return: Its JSON form
@@ -927,50 +1046,9 @@ def _export_json(sig: ExportSig) -> dict:
     }
 
 
-def _interface_from_json(path: str, data: dict,
-                         fingerprint: tuple[int, int]) -> ModuleInterface:
-    """
-    Rebuild an interface an artifact carries.
-
-    The digest is recomputed rather than read back, so a hand-edited or
-    truncated artifact cannot make a dependency look current. The fingerprint
-    is NOT read back either: it is the one paired with the bytes the caller
-    just matched against the artifact, which is the only pairing of digest and
-    stat that ever held on this machine.
-
-    :param path: Resolved source path of the module
-    :param data: The whole artifact -- the published section and the
-                 dependency closure it was derived under
-    :param fingerprint: Of the source bytes the artifact was just validated
-                        against
-    :return: The interface it describes
-    """
-    published = data.get('interface') or {}
-    all_names = published.get('all')
-    exports = {name: _export_from_json(name, sig)
-               for name, sig in (published.get('exports') or {}).items()}
-    deps = {}
-    for dep_path, record in (data.get('deps') or {}).items():
-        deps[dep_path] = DepRecord(path=dep_path, mtime_ns=record.get('mtime_ns', 0),
-                                   size=record.get('size', -1),
-                                   digest=record.get('digest', ''))
-    classes = {name: _class_from_json(name, sig)
-               for name, sig in (published.get('classes') or {}).items()}
-    extensions = {cid: {name: _export_from_json(name, method)
-                        for name, method in (methods or {}).items()}
-                  for cid, methods in (published.get('extensions') or {}).items()}
-    interface = ModuleInterface(
-        path=path, exports=exports,
-        all=tuple(all_names) if all_names is not None else None,
-        classes=classes, extensions=extensions, digest='', deps=deps,
-        mtime_ns=fingerprint[0], size=fingerprint[1],
-        suppressed=str(published.get('suppressed') or ''))
-    return replace(interface, digest=interface_digest(interface))
-
-
 def _export_from_json(name: str, data: dict) -> ExportSig:
     """
-    Rebuild one published signature an artifact carries.
+    Rebuild one published signature a payload carries.
 
     :param name: The exported name
     :param data: Its JSON form
@@ -992,7 +1070,7 @@ def _export_from_json(name: str, data: dict) -> ExportSig:
 
 def _class_json(sig: ClassSig) -> dict:
     """
-    One published class, in the artifact's shape.
+    One published class, in the payload's shape.
 
     :param sig: The class to serialize
     :return: Its JSON form
@@ -1000,7 +1078,7 @@ def _class_json(sig: ClassSig) -> dict:
     return {
         'id': sig.id,
         'fields': dict(sig.fields),
-        # The artifact is written with sorted keys, so the declaration order
+        # The payload is written with sorted keys, so the declaration order
         # a constructor binds positional arguments by travels on its own
         'order': list(sig.fields),
         'required': sig.required,
@@ -1010,7 +1088,7 @@ def _class_json(sig: ClassSig) -> dict:
 
 def _class_from_json(name: str, data: dict) -> ClassSig:
     """
-    Rebuild one published class an artifact carries.
+    Rebuild one published class a payload carries.
 
     :param name: The class name
     :param data: Its JSON form

@@ -5,6 +5,31 @@ from pathlib import Path
 
 from . import ast_walk
 
+__all__ = ['ModulePropertyTransformer', 'module_properties']
+
+_module_properties: dict[str, dict[str, dict[str, Any]]] | None = None
+
+
+def module_properties() -> dict[str, dict[str, dict[str, Any]]]:
+    """
+    The ``module_properties.json`` registry, read once per process.
+
+    The document is shared by every caller and must be treated as read-only.
+
+    :return: module -> name -> {"type": "property"|"variable"}
+    :raises RuntimeError: When the registry cannot be read
+    """
+    global _module_properties
+    loaded = _module_properties
+    if loaded is None:
+        try:
+            with open(Path(__file__).parent / "module_properties.json") as f:
+                loaded = json.load(f)
+        except (IOError, json.JSONDecodeError) as e:
+            raise RuntimeError(f"Failed to load module properties config: {e}")
+        _module_properties = loaded
+    return loaded
+
 
 class ModulePropertyTransformer(ast_walk.NodeTransformer):
     """
@@ -24,55 +49,52 @@ class ModulePropertyTransformer(ast_walk.NodeTransformer):
 
     def __init__(self):
         # Structure: module -> name -> {"type": "property"|"variable"}
-        self.module_info: dict[str, dict[str, dict[str, Any]]] = {}
+        self.module_info: dict[str, dict[str, dict[str, Any]]] = module_properties()
 
-        # Load config
-        try:
-            with open(Path(__file__).parent / "module_properties.json") as f:
-                self.module_info = json.load(f)
-        except (IOError, json.JSONDecodeError) as e:
-            raise RuntimeError(f"Failed to load module properties config: {e}")
+        # The callee of every call met so far and every node of every type
+        # annotation, both by identity: what the visit of an attribute needs to
+        # know about the place it stands in, without a parent link per node
+        self._callees: set[ast.AST] = set()
+        self._annotation_nodes: set[ast.AST] = set()
 
-        # Child -> parent links of this pass, kept here rather than on the nodes:
-        # ``ast.parse`` shares one instance of every context and operator node
-        # (``Load``, ``Add``, ``Eq``, ...) across ALL trees of the process, so a
-        # link stored on a node would tie those singletons to this tree, and
-        # every later ``copy.deepcopy`` of a subtree — in this transform or in
-        # the next one — would copy the whole tree it leads back to.
-        self._parents: dict[ast.AST, ast.AST] = {}
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        self._callees.add(node.func)
+        return self.generic_visit(node)
 
-    def visit(self, node: ast.AST) -> ast.AST:
-        """
-        Override the generic visit method to record the parent of each child
-        node for chain detection.
-        """
-        for field, value in ast.iter_fields(node):
-            if isinstance(value, ast.AST):
-                self._parents[value] = node
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, ast.AST):
-                        self._parents[item] = node
+    def _note_annotation(self, annotation: ast.AST | None) -> None:
+        if annotation is not None:
+            self._annotation_nodes.update(ast_walk.walk(annotation))
 
-        return super().visit(node)
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST:
+        self._note_annotation(node.annotation)
+        return self.generic_visit(node)
+
+    def visit_arg(self, node: ast.arg) -> ast.AST:
+        self._note_annotation(node.annotation)
+        return self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> ast.AST:
+        self._note_annotation(node.returns)
+        return self.generic_visit(node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
         """Process attribute access, but skip if inside type annotations."""
-        node = cast(ast.Attribute, self.generic_visit(node))
-
-        # Skip if inside type annotations
-        if self._is_in_type_annotation(node):
-            return node
-
-        # Retrieve the AST parent node
-        parent = self._parents.get(node)
-
-        # Intermediate module - if the parent is also an Attribute, this is not the topmost attribute
-        if isinstance(parent, ast.Attribute):
-            return node
+        # Intermediate modules of the chain (attributes whose parent is also an
+        # Attribute) are not the topmost attribute: only what hangs below the
+        # chain is visited, and they stay as they are
+        inner = node
+        while isinstance(inner.value, ast.Attribute):
+            inner = inner.value
+        inner.value = self.visit(inner.value)
 
         # If this node has already been processed, or the chain does not start with lib..., skip
         if hasattr(node, '_processed') or not self._is_lib_reference(node):
+            return node
+
+        # Skip if inside type annotations
+        if node in self._annotation_nodes:
             return node
 
         # Now it's the topmost attribute (e.g., ...data_window)
@@ -86,7 +108,7 @@ class ModulePropertyTransformer(ast_walk.NodeTransformer):
         # Call site — explicit calls stay as they are, except when the callee is a
         # function-and-namespace module (its registry entry contains a self-named
         # function): ``lib.plot(...)`` routes to ``lib.plot.plot(...)``
-        if isinstance(parent, ast.Call) and parent.func == node:
+        if node in self._callees:
             inner_attrs = self.module_info.get(full_path)
             if inner_attrs is not None and name in inner_attrs:
                 result: ast.expr = ast.Attribute(value=node, attr=name, ctx=ast.Load())
@@ -172,52 +194,6 @@ class ModulePropertyTransformer(ast_walk.NodeTransformer):
             final_attr = attrs[-1]  # 'data_window'
             return module_path, final_attr
         return None, None
-
-    def _is_in_type_annotation(self, node: ast.Attribute) -> bool:
-        """Check if the node is inside a type annotation."""
-        current = node
-        while current in self._parents:
-            parent = self._parents[current]
-
-            # Check if we're in an annotated assignment's annotation
-            if (isinstance(parent, ast.AnnAssign) and parent.annotation and
-                    self._is_node_in_subtree(node, cast(ast.AST, parent.annotation))):
-                return True
-
-            # Check if we're in a function argument's annotation
-            if (isinstance(parent, ast.arg) and parent.annotation and
-                    self._is_node_in_subtree(node, cast(ast.AST, parent.annotation))):
-                return True
-
-            # Check if we're in a function return annotation
-            if (isinstance(parent, ast.FunctionDef) and parent.returns and
-                    self._is_node_in_subtree(node, parent.returns)):
-                return True
-
-            # Check if we're in an async function return annotation
-            if (isinstance(parent, ast.AsyncFunctionDef) and parent.returns and
-                    self._is_node_in_subtree(node, parent.returns)):
-                return True
-
-            current = parent
-
-        return False
-
-    @staticmethod
-    def _is_node_in_subtree(node: ast.AST, subtree: ast.AST | None) -> bool:
-        """Check if a node is contained within a subtree."""
-        if subtree is None:
-            return False
-
-        if node is subtree:
-            return True
-
-        # Recursively check all child nodes
-        for child in ast_walk.walk(subtree):
-            if child is node:
-                return True
-
-        return False
 
     @staticmethod
     def _copy_node(node: ast.AST) -> ast.expr:

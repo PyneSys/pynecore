@@ -204,6 +204,15 @@ def main():
 
 Alternatively, use `plot()` calls within the function body. Both approaches can be combined.
 
+## 5. Reserved Names
+
+The transform adds names of its own to the script, so two kinds of identifier are reserved and rejected with a `SyntaxError` at load time:
+
+- any identifier containing a middle dot (`·`);
+- the plain double-underscore names the transform emits, such as `__state__`, `__bool1__`, `__cmp3__` or any `__pyne_<name>__`.
+
+Other double-underscore names, including the ones PyneComp writes into compiled scripts (`__block_result__`, `__input_1__`, ...), are allowed. Strings and comments are not checked. See [AST Transformations](../advanced/ast-transformations.md#reserved-identifier-namespace) for the complete list.
+
 ## Complete Example
 
 ```python

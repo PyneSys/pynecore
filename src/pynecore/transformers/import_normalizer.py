@@ -1,7 +1,8 @@
 import ast
-from typing import Dict, Set, List, Optional, cast
+from typing import Dict, Set, List, cast
 
 from . import ast_walk
+from .pine_type_infer import lib_star_exports
 
 NON_MODULE_ATTRS = {
     'input',  # class
@@ -47,10 +48,6 @@ class ImportNormalizerTransformer(ast_walk.NodeTransformer):
         #: statement rebinding the name to something else
         self.alias_bindings: dict[str, list[tuple[int, str | None]]] = {}
         self._stmt_index = 0
-        # Track function level imports to move up
-        self.function_imports: List[ast.ImportFrom] = []
-        # Current function being processed
-        self.current_function: Optional[str] = None
         # Track direct module imports: alias -> module_path
         self.module_imports: Dict[str, str] = {}
         # Track wildcard imports: module_path -> set of exposed names
@@ -59,6 +56,9 @@ class ImportNormalizerTransformer(ast_walk.NodeTransformer):
         self.required_submodules: Set[str] = set()
         # Track function parameters to avoid replacing them
         self.function_parameters: Set[str] = set()
+        #: The parameters of the function being entered, whose defaults
+        #: :meth:`visit_FunctionDef` has already visited in the enclosing scope
+        self._defaults_visited: ast.arguments | None = None
 
     @staticmethod
     def _is_lib_import(node: ast.ImportFrom) -> bool:
@@ -85,17 +85,17 @@ class ImportNormalizerTransformer(ast_walk.NodeTransformer):
 
     @staticmethod
     def _get_module_all(module: str) -> Set[str]:
-        """Get the __all__ list from a module by importing it."""
-        try:
-            # Import the module
-            imported = __import__(module, fromlist=['__all__'])
-            # Get its __all__ list
-            if hasattr(imported, '__all__'):
-                return set(imported.__all__)
-        except (ImportError, AttributeError):
-            pass
-        # Return empty set if anything goes wrong
-        return set()
+        """
+        Get the ``__all__`` of a lib module from the generated registry.
+
+        The lib is not imported here: its sources are not part of the pipeline
+        hash, the generated ``lib_types.json`` is, so an ``__all__`` edit reaches
+        the cached script bytecode only through the regenerated file.
+
+        :param module: The module a ``from ... import *`` names
+        :return: Its exported names, empty when it is no lib module with ``__all__``
+        """
+        return set(lib_star_exports().get(module, ()))
 
     def _handle_wildcard_import(self, module: str) -> None:
         """Process a wildcard import by recording all names from module's __all__."""
@@ -194,8 +194,11 @@ class ImportNormalizerTransformer(ast_walk.NodeTransformer):
                         target = 'lib' if len(parts) <= 2 else 'lib.' + '.'.join(parts[2:])
                         bound = alias.asname or parts[-1]
                         self.alias_bindings.setdefault(bound, []).append((index, target))
+            if not self.module_imports:
+                continue
+            stored = _stored_names(stmt)
             for name in self.module_imports:
-                if _rebinds(stmt, name):
+                if _rebinds(stmt, name, stored):
                     self.alias_bindings.setdefault(name, []).append((index, None))
 
         # Process the rest of the module to collect attribute usages
@@ -238,10 +241,6 @@ class ImportNormalizerTransformer(ast_walk.NodeTransformer):
                     names=[ast.alias(name=f'pynecore.lib.{submodule}', asname=None)]
                 )
             )
-
-        # Function level imports moved up
-        if self.function_imports:
-            imports.extend(self.function_imports)
 
         # Insert imports after the docstring and the ``__future__`` block
         insert_pos = 1 if (new_body and isinstance(new_body[0], ast.Expr) and
@@ -319,10 +318,7 @@ class ImportNormalizerTransformer(ast_walk.NodeTransformer):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
         """Process function definitions and handle imports"""
-        old_function = self.current_function
         old_parameters = self.function_parameters.copy()
-
-        self.current_function = node.name
 
         # Parameter default values are evaluated in the ENCLOSING scope at def-execution
         # time, not inside the function body. Visit them before the parameter names enter
@@ -350,16 +346,41 @@ class ImportNormalizerTransformer(ast_walk.NodeTransformer):
             self.function_parameters.add(node.args.kwarg.arg)
 
         # Process function
+        self._defaults_visited = node.args
         node = cast(ast.FunctionDef, self.generic_visit(node))
 
         # Reset function context
-        self.current_function = old_function
         self.function_parameters = old_parameters
         return node
 
+    def visit_arguments(self, node: ast.arguments) -> ast.arguments:
+        """Visit a parameter list, skipping defaults that were visited already."""
+        if node is not self._defaults_visited:
+            return cast(ast.arguments, self.generic_visit(node))
+        self._defaults_visited = None
+        for arg in (*node.posonlyargs, *node.args, node.vararg, *node.kwonlyargs, node.kwarg):
+            if arg is not None:
+                self.visit(arg)
+        return node
 
-def _rebinds(stmt: ast.stmt, name: str) -> bool:
-    """Whether a top-level statement binds ``name`` to something other than a lib module."""
+
+def _stored_names(stmt: ast.stmt) -> set[str]:
+    """The names of every ``Store``-context ``Name`` in a statement that is no
+    import or definition (those bind by their own rules in :func:`_rebinds`)."""
+    if isinstance(stmt, (ast.ImportFrom, ast.Import, ast.FunctionDef, ast.AsyncFunctionDef,
+                         ast.ClassDef)):
+        return set()
+    return {node.id for node in ast_walk.walk(stmt)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+
+
+def _rebinds(stmt: ast.stmt, name: str, stored: set[str]) -> bool:
+    """Whether a top-level statement binds ``name`` to something other than a lib module.
+
+    :param stmt: The statement.
+    :param name: The lib-module alias.
+    :param stored: :func:`_stored_names` of the statement.
+    """
     if isinstance(stmt, ast.ImportFrom):
         return any((alias.asname or alias.name) == name for alias in stmt.names)
     if isinstance(stmt, ast.Import):
@@ -367,5 +388,4 @@ def _rebinds(stmt: ast.stmt, name: str) -> bool:
                    and not alias.name.startswith('pynecore.lib') for alias in stmt.names)
     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         return stmt.name == name
-    return any(isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Store)
-               for node in ast_walk.walk(stmt))
+    return name in stored

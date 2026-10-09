@@ -1,7 +1,8 @@
 import ast
 import hashlib
 import re
-from collections.abc import Container
+from collections.abc import Container, Iterator
+from typing import Any
 
 from ..core.import_hook import PYNE_RESERVED_NAME_CHAR
 from . import ast_walk
@@ -127,6 +128,37 @@ def _is_lib_series_chain(node: ast.expr) -> bool:
     return not (chain and chain[0] in NON_SERIES_LIB_ATTRS)
 
 
+#: Attribute names of the ``lib.request`` functions the security passes lower
+_REQUEST_FUNCS = frozenset({'security', 'security_lower_tf'})
+
+
+def has_security_call(tree: ast.AST) -> bool:
+    """Whether ``tree`` holds a ``lib.request.security[_lower_tf](...)`` call.
+
+    Every rewrite of the security passes starts at such a call, and most scripts
+    have none: for them, this walk is all a security pass costs.
+
+    :param tree: The tree to search.
+    :return: True when at least one such call stands anywhere in it.
+    """
+    for node in ast_walk.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr in _REQUEST_FUNCS):
+            continue
+        owner = func.value
+        if (isinstance(owner, ast.Attribute) and owner.attr == 'request'
+                and isinstance(owner.value, ast.Name) and owner.value.id == 'lib'):
+            return True
+    return False
+
+
+#: Per function, the direct-``Name`` calls of its own body as ``(callee name,
+#: call)`` pairs (see :meth:`SecurityTransformer._own_calls`)
+_OwnCalls = dict[ast.FunctionDef | ast.AsyncFunctionDef, list[tuple[str, ast.Call]]]
+
+
 class _SeriesScope:
     """What one function scope binds, as the passes AFTER this one see it.
 
@@ -177,6 +209,15 @@ _CONDITIONAL_EXPRS: tuple[type[ast.AST], ...] = (
 _EXIT_STMTS: tuple[type[ast.AST], ...] = (
     ast.Return, ast.Raise, ast.Break, ast.Continue,
 )
+
+# Compound statements whose statement lists ``_recurse_subbodies`` transforms
+# on their own, and the fields holding those lists (``handlers`` / ``cases``
+# hold them one level down, in each handler / case).
+_SUB_BODY_STMTS: tuple[type[ast.AST], ...] = (
+    ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith,
+    ast.Try, ast.TryStar, ast.Match,
+)
+_SUB_BODY_FIELDS = frozenset({'body', 'orelse', 'finalbody', 'handlers', 'cases'})
 
 # Lift rounds: each round moves a signal one call level up, so the cap only
 # has to exceed the deepest unconditional helper chain a script can have.
@@ -279,6 +320,9 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         self._needs_ltf_unzip = False
         self._ltf_sec_ids: set[str] = set()
         self._module_file: str = '<script>'
+        # ``_module_file`` as last hashed by :meth:`_gen_id`, and its hash
+        self._hashed_file: str | None = None
+        self._module_hash = ''
         # Sids whose __sec_signal__ is emitted in the function's top block
         # (module-level or hoistable arguments). Only these may be depended on.
         self._top_sec_ids: set[str] = set()
@@ -291,13 +335,19 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         # Bindings of the function scope chain being processed, innermost last
         # (see :meth:`_scope_bindings`).
         self._scopes: list[_SeriesScope] = []
+        # The own-body nodes :meth:`_may_defer` gathered, per function
+        self._own_nodes: dict[ast.AST, list[ast.AST]] = {}
+        # The binding counts :meth:`_lowered_hoistable` keeps per function
+        self._binding_counts_memo: dict[ast.AST, tuple[dict[str, int], set[str]]] = {}
 
     def _gen_id(self) -> str:
         # The module hash keeps sec ids unique across modules: the main script and
         # any imported library may each have their own security calls, and their
         # contexts are merged into one registry by the runner
-        module_hash = hashlib.sha1(self._module_file.encode()).hexdigest()[:8]
-        sec_id = f"sec\xb7{module_hash}\xb7{self._counter}"
+        if self._hashed_file != self._module_file:
+            self._hashed_file = self._module_file
+            self._module_hash = hashlib.sha1(self._module_file.encode()).hexdigest()[:8]
+        sec_id = f"sec\xb7{self._module_hash}\xb7{self._counter}"
         self._counter += 1
         return sec_id
 
@@ -471,9 +521,30 @@ class SecurityTransformer(ast_walk.NodeTransformer):
                        if isinstance(child, ast.expr))
         return False
 
+    @staticmethod
+    def _binding_counts(
+            func: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> tuple[dict[str, int], set[str]]:
+        """How often ``func`` binds or deletes each name, and what it declares
+        ``global`` / ``nonlocal`` -- nested functions included.
+
+        :param func: the function to count
+        :return: name -> number of ``Store`` / ``Del`` occurrences, and the
+            declared names
+        """
+        counts: dict[str, int] = {}
+        declared: set[str] = set()
+        for sub in ast_walk.walk(func):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, (ast.Store, ast.Del)):
+                counts[sub.id] = counts.get(sub.id, 0) + 1
+            elif isinstance(sub, (ast.Global, ast.Nonlocal)):
+                declared.update(sub.names)
+        return counts, declared
+
     @classmethod
     def _hoistable_bindings(
-            cls, func: ast.FunctionDef | ast.AsyncFunctionDef
+            cls, func: ast.FunctionDef | ast.AsyncFunctionDef,
+            binding_counts: tuple[dict[str, int], set[str]] | None = None
     ) -> tuple[dict[str, ast.Assign], set[str]]:
         """Top-level bindings of ``func`` that may be moved to its first
         statements, together with its stable parameters.
@@ -500,16 +571,12 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         semantics that later passes rewrite.
 
         :param func: the function being transformed
+        :param binding_counts: its :meth:`_binding_counts`, when already known
         :return: mapping of binding name to its assignment statement, and the
             set of stable parameter names
         """
-        counts: dict[str, int] = {}
-        declared: set[str] = set()
-        for sub in ast_walk.walk(func):
-            if isinstance(sub, ast.Name) and isinstance(sub.ctx, (ast.Store, ast.Del)):
-                counts[sub.id] = counts.get(sub.id, 0) + 1
-            elif isinstance(sub, (ast.Global, ast.Nonlocal)):
-                declared.update(sub.names)
+        counts, declared = (cls._binding_counts(func) if binding_counts is None
+                            else binding_counts)
         args = func.args
         params = {a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)}
         if args.vararg is not None:
@@ -542,6 +609,27 @@ class SecurityTransformer(ast_walk.NodeTransformer):
                         ok = True
             prefix = prefix and ok
         return hoistable, stable_params
+
+    def _lowered_hoistable(
+            self, func: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> tuple[dict[str, ast.Assign], set[str]]:
+        """:meth:`_hoistable_bindings` of a function of the lowered module.
+
+        The lift rounds and the stable-argument walk ask it of the same few
+        functions (the script entry above all) over and over. Its expensive
+        half, the :meth:`_binding_counts` walk over the whole function, is
+        kept: a lift rewrites statement lists but binds no name (the signal
+        arguments it moves are simple chains), so the counts stay exact for the
+        rest of the pass. The scan of the body itself is redone every time, as
+        a lift may have reordered it.
+
+        :param func: a function of the module after the per-function lowering
+        :return: what :meth:`_hoistable_bindings` returns for it
+        """
+        counts = self._binding_counts_memo.get(func)
+        if counts is None:
+            counts = self._binding_counts_memo[func] = self._binding_counts(func)
+        return self._hoistable_bindings(func, counts)
 
     @staticmethod
     def _referenced_names(node: ast.expr) -> set[str]:
@@ -620,8 +708,9 @@ class SecurityTransformer(ast_walk.NodeTransformer):
                 and node.value.id == 'Lookahead')
         return False
 
+    @staticmethod
     def _scope_bindings(
-            self, func: ast.FunctionDef | ast.AsyncFunctionDef
+            func: ast.FunctionDef | ast.AsyncFunctionDef, own_nodes: list[ast.AST]
     ) -> _SeriesScope:
         """Collect what ONE function scope binds (see :class:`_SeriesScope`).
 
@@ -640,6 +729,8 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         guessed about.
 
         :param func: The function whose own scope is being collected.
+        :param own_nodes: The nodes of its own body
+            (:meth:`_walk_skip_funcs_body`).
         :return: The scope's bindings.
         """
         series: set[str] = set()
@@ -658,29 +749,26 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             if _is_param_series_annotation(arg.annotation):
                 series.add(arg.arg)
 
-        for stmt in func.body:
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        for node in own_nodes:
+            if (isinstance(node, ast.Name)
+                    and isinstance(node.ctx, (ast.Store, ast.Del))):
+                locals_.add(node.id)
+            if isinstance(node, ast.AnnAssign):
+                if (isinstance(node.target, ast.Name)
+                        and _is_series_annotation(node.annotation)):
+                    series.add(node.target.id)
                 continue
-            for node in self._walk_skip_funcs(stmt):
-                if (isinstance(node, ast.Name)
-                        and isinstance(node.ctx, (ast.Store, ast.Del))):
-                    locals_.add(node.id)
-                if isinstance(node, ast.AnnAssign):
-                    if (isinstance(node.target, ast.Name)
-                            and _is_series_annotation(node.annotation)):
-                        series.add(node.target.id)
-                    continue
-                if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
-                    continue
-                target = node.targets[0]
-                if not (isinstance(target, ast.Name)
-                        and _HIST_TEMP_RE.fullmatch(target.id)):
-                    continue
-                if target.id in seen:
-                    hist.pop(target.id, None)
-                    continue
-                seen.add(target.id)
-                hist[target.id] = node.value
+            if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
+                continue
+            target = node.targets[0]
+            if not (isinstance(target, ast.Name)
+                    and _HIST_TEMP_RE.fullmatch(target.id)):
+                continue
+            if target.id in seen:
+                hist.pop(target.id, None)
+                continue
+            seen.add(target.id)
+            hist[target.id] = node.value
         return _SeriesScope(series, locals_, hist)
 
     def _is_declared_series(self, name: str) -> bool:
@@ -1023,30 +1111,29 @@ class SecurityTransformer(ast_walk.NodeTransformer):
     # --- Collection ---
 
     def _collect_calls(
-            self, body: list[ast.stmt]
+            self, own_nodes: list[ast.AST]
     ) -> list[tuple[ast.Call, str, bool]]:
         """
         Find all request.security() and request.security_lower_tf() calls in
         function body, skipping nested functions. Marks each call node with
         _sec_id attribute.
 
+        :param own_nodes: The nodes of the function's own body
+            (:meth:`_walk_skip_funcs_body`).
         :return: List of (call_node, sec_id, is_ltf) tuples
         """
         calls = []
-        for stmt in body:
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for node in self._walk_skip_funcs(stmt):
-                if isinstance(node, ast.Call):
-                    if self._is_security_call(node):
-                        sec_id = self._gen_id()
-                        node._sec_id = sec_id  # type: ignore[attr-defined]
-                        calls.append((node, sec_id, False))
-                    elif self._is_security_lower_tf_call(node):
-                        sec_id = self._gen_id()
-                        node._sec_id = sec_id  # type: ignore[attr-defined]
-                        self._ltf_sec_ids.add(sec_id)
-                        calls.append((node, sec_id, True))
+        for node in own_nodes:
+            if isinstance(node, ast.Call):
+                if self._is_security_call(node):
+                    sec_id = self._gen_id()
+                    node._sec_id = sec_id  # type: ignore[attr-defined]
+                    calls.append((node, sec_id, False))
+                elif self._is_security_lower_tf_call(node):
+                    sec_id = self._gen_id()
+                    node._sec_id = sec_id  # type: ignore[attr-defined]
+                    self._ltf_sec_ids.add(sec_id)
+                    calls.append((node, sec_id, True))
         return calls
 
     # --- Body transformation ---
@@ -1083,8 +1170,12 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             # write block FIRST. Its producer then precedes the outer context
             # in program order, so the outer context's child waits for it and
             # pairs its value instead of answering the read with the default.
+            # The sub-bodies are done (no marked call is left in them), so only
+            # the statement's own parts are searched: re-walking them at every
+            # nesting level would make a long ``elif`` chain quadratic.
             call_nodes_here = [
-                n for n in self._walk_skip_funcs_post(stmt)
+                n for part in self._own_parts(stmt)
+                for n in self._walk_skip_funcs_post(part)
                 if isinstance(n, ast.Call) and hasattr(n, '_sec_id')
             ]
 
@@ -1111,11 +1202,59 @@ class SecurityTransformer(ast_walk.NodeTransformer):
                     expr = ast_walk.clone(call_exprs[sid])
                     expr = replacer.visit(expr)
                     new_body.append(self._write_block(sid, expr))
-                new_body.append(replacer.visit(stmt))
+                new_body.append(self._replace_own_calls(replacer, stmt))
             else:
                 new_body.append(stmt)
 
         return new_body
+
+    @staticmethod
+    def _own_parts(stmt: ast.stmt):
+        """The children of ``stmt`` that :meth:`_recurse_subbodies` does not
+        transform, nested definitions excluded.
+
+        For a compound statement that is everything but its statement lists
+        (the ``except`` types, ``match`` patterns and guards included); any
+        other statement keeps all of its children.
+
+        :param stmt: a statement of the body being transformed
+        """
+        if not isinstance(stmt, _SUB_BODY_STMTS):
+            for child in ast_walk.iter_child_nodes(stmt):
+                if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    yield child
+            return
+        for holder in (stmt, *getattr(stmt, 'handlers', ()), *getattr(stmt, 'cases', ())):
+            for field in holder._fields:
+                if field in _SUB_BODY_FIELDS:
+                    continue
+                value = getattr(holder, field, None)
+                if isinstance(value, ast.AST):
+                    yield value
+                elif isinstance(value, list):
+                    yield from (item for item in value if isinstance(item, ast.AST))
+
+    @staticmethod
+    def _replace_own_calls(replacer: '_CallReplacer', stmt: ast.stmt) -> ast.stmt:
+        """Replace the marked calls of ``stmt`` outside its transformed sub-bodies.
+
+        :param replacer: the replacer of the body being transformed
+        :param stmt: a statement holding marked calls in its own parts
+        :return: the statement with those calls replaced
+        """
+        if not isinstance(stmt, _SUB_BODY_STMTS):
+            return replacer.visit(stmt)
+        for holder in (stmt, *getattr(stmt, 'handlers', ()), *getattr(stmt, 'cases', ())):
+            for field in holder._fields:
+                if field in _SUB_BODY_FIELDS:
+                    continue
+                value = getattr(holder, field, None)
+                if isinstance(value, ast.AST):
+                    setattr(holder, field, replacer.visit(value))
+                elif isinstance(value, list):
+                    value[:] = [replacer.visit(item) if isinstance(item, ast.AST) else item
+                                for item in value]
+        return stmt
 
     def _recurse_subbodies(
             self, stmt: ast.stmt, call_exprs: dict[str, ast.expr],
@@ -1155,21 +1294,34 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         every function pushes its bindings — a function without a
         ``request.security()`` of its own may still be the scope that DECLARES
         the series a nested one reads. The body below finishes its own contexts
-        before ``generic_visit`` descends, so a nested scope always sees the
-        chain above it.
+        before the nested definitions are visited
+        (:meth:`_visit_nested_defs`), so a nested scope always sees the chain
+        above it.
+
+        The nodes of the function's own body are gathered once, for both the
+        bindings and the security calls (or taken from :meth:`_may_defer`).
         """
-        self._scopes.append(self._scope_bindings(node))
+        own_nodes = self._own_nodes.pop(node, None)
+        if own_nodes is None:
+            own_nodes = list(self._walk_skip_funcs_body(node))
+        self._scopes.append(self._scope_bindings(node, own_nodes))
         try:
-            return self._process_func_body(node)
+            return self._process_func_body(node, own_nodes)
         finally:
             self._scopes.pop()
 
-    def _process_func_body(self, node: ast.FunctionDef | ast.AsyncFunctionDef):
-        """Transform a function containing request.security() / security_lower_tf() calls."""
-        calls = self._collect_calls(node.body)
+    def _process_func_body(self, node: ast.FunctionDef | ast.AsyncFunctionDef,
+                           own_nodes: list[ast.AST]):
+        """Transform a function containing request.security() / security_lower_tf() calls.
+
+        :param node: The function.
+        :param own_nodes: The nodes of its own body (:meth:`_walk_skip_funcs_body`).
+        """
+        calls = self._collect_calls(own_nodes)
 
         if not calls:
-            return self.generic_visit(node)
+            self._visit_nested_defs(node)
+            return node
 
         call_exprs: dict[str, ast.expr] = {}
         sec_ids: list[str] = []
@@ -1325,19 +1477,14 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         # branch the chart skipped would stall the consumer for good.
         hoistable, stable_params = self._hoistable_bindings(node)
         available = set(hoistable) | stable_params
-        reached: set[str] = set()
-        for stmt in self._unconditional_stmts(node.body):
-            for call, sid, _is_ltf in calls:
-                if sid not in reached and self._reached_unconditionally(stmt, call):
-                    reached.add(sid)
+        reached_ids = self._reached_ids(node.body)
+        reached = {sid for call, sid, _is_ltf in calls if id(call) in reached_ids}
         top_sec_ids = []
         runtime_sec_ids: set[str] = set()
         needed_names: set[str] = set()
         for sid in sec_ids:
             sym_expr, tf_expr, _la_expr = self._signal_args[sid]
-            runtime_resolved = any(
-                e is not None and not self._is_module_level_expr(e)
-                for e in (sym_expr, tf_expr))
+            runtime_resolved = self._resolved_at_runtime(sym_expr, tf_expr)
             if runtime_resolved and sid not in reached and sid not in self._keep_top:
                 self._deferred_by_reach.add(sid)
                 runtime_sec_ids.add(sid)
@@ -1362,7 +1509,94 @@ class SecurityTransformer(ast_walk.NodeTransformer):
                 + [self._wait_block(sec_ids)]
         )
 
-        return self.generic_visit(node)
+        self._visit_nested_defs(node)
+        return node
+
+    def _visit_nested_defs(self, node: ast.AST) -> None:
+        """Process the function definitions standing in ``node``'s statements.
+
+        What ``generic_visit`` would do, without walking every expression on
+        the way: a definition only ever stands in a statement list, and it is
+        the only node this pass rewrites — in place, handing back the same
+        node — so the statements alone lead to every one, in the same order.
+        A definition nested in another one is reached through that one's own
+        processing.
+
+        :param node: the module or function whose definitions to process
+        """
+        stack = [ast_walk.iter_child_statements(node)]
+        while stack:
+            for child in stack[-1]:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    self._process_func(child)
+                else:
+                    stack.append(ast_walk.iter_child_statements(child))
+                    break
+            else:
+                stack.pop()
+
+    @classmethod
+    def _resolved_at_runtime(cls, symbol: ast.expr | None,
+                             timeframe: ast.expr | None) -> bool:
+        """Whether a context's feed is only known once the script runs.
+
+        :param symbol: the ``symbol`` argument, or None
+        :param timeframe: the ``timeframe`` argument, or None
+        :return: True when either is not evaluable at module level
+        """
+        return any(e is not None and not cls._is_module_level_expr(e)
+                   for e in (symbol, timeframe))
+
+    @classmethod
+    def _reached_ids(cls, body: list[ast.stmt]) -> set[int]:
+        """Ids of the expressions evaluated every time ``body`` is entered.
+
+        :param body: a function body
+        :return: the ids of the :meth:`_unconditional_exprs` of its
+            :meth:`_unconditional_stmts`
+        """
+        reached: set[int] = set()
+        for stmt in cls._unconditional_stmts(body):
+            reached.update(id(expr) for expr in cls._unconditional_exprs(stmt))
+        return reached
+
+    def _may_defer(self, module: ast.Module) -> bool:
+        """Whether lowering ``module`` can defer a signal by reach.
+
+        The decision :meth:`_process_func_body` makes per context, made up
+        front: a call whose symbol or timeframe is resolved at runtime and that
+        is not reached every time its function runs. It is made on the
+        untransformed tree, which is exactly what every function body still is
+        when its turn comes -- a function's lowering never edits the body of
+        another one.
+
+        The own-body nodes it walks are kept for :meth:`_process_func`, for
+        the same reason: they are still what that function's turn would find.
+
+        :param module: the module about to be lowered
+        :return: True when at least one context will be deferred by reach
+        """
+        for func in ast_walk.walk_statements(module):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            own_nodes = self._own_nodes[func] = list(self._walk_skip_funcs_body(func))
+            deferrable = []
+            for node in own_nodes:
+                if not isinstance(node, ast.Call):
+                    continue
+                if self._is_security_call(node):
+                    symbol, timeframe = self._extract_args(node)[:2]
+                elif self._is_security_lower_tf_call(node):
+                    symbol, timeframe = self._extract_ltf_args(node)[:2]
+                else:
+                    continue
+                if self._resolved_at_runtime(symbol, timeframe):
+                    deferrable.append(node)
+            if deferrable:
+                reached = self._reached_ids(func.body)
+                if any(id(call) not in reached for call in deferrable):
+                    return True
+        return False
 
     def _analyze_dependencies(self, node: ast.Module) -> None:
         """Run the taint analysis on the lowered module and record its result.
@@ -1396,7 +1630,8 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             if sid in analyzer.in_loop:
                 ctx['in_loop'] = ast.Constant(value=True)
 
-    def _signal_sites(self, module: ast.Module) -> dict[str, tuple[str, ...]]:
+    def _signal_sites(self, module: ast.Module, own_calls: _OwnCalls
+                      ) -> dict[str, tuple[str, ...]]:
         """Where every ``__sec_signal__`` stands and with which arguments.
 
         Both halves are read off the FINAL tree, after
@@ -1405,20 +1640,38 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         that — not the shape it had in the helper — is what decides the feed.
 
         :param module: the lowered module
+        :param own_calls: the module's :meth:`_own_calls`
         :return: sid -> (host function key, ``ast.dump`` of each argument)
         """
         sites: dict[str, tuple[str, ...]] = {}
         for func, key in self._function_keys(module).items():
-            for stmt in self._walk_skip_funcs_body(func):
-                if not (isinstance(stmt, ast.Call)
-                        and isinstance(stmt.func, ast.Name)
-                        and stmt.func.id == '__sec_signal__'):
+            for name, call in own_calls[func]:
+                if name != '__sec_signal__':
                     continue
-                sid = self._call_sid(stmt)
+                sid = self._call_sid(call)
                 if sid is None:
                     continue
-                sites[sid] = (key, *(ast.dump(arg) for arg in stmt.args[1:]))
+                sites[sid] = (key, *(ast.dump(arg) for arg in call.args[1:]))
         return sites
+
+    @classmethod
+    def _own_calls(cls, module: ast.Module) -> _OwnCalls:
+        """The direct-``Name`` calls of every function's OWN body.
+
+        Read off the final tree once and shared by the passes over it that look
+        for call sites and signals, instead of each walking every body again.
+
+        :param module: the lowered module
+        :return: function -> ``(callee name, call)`` pairs in
+            :meth:`_walk_skip_funcs_body` order, for every function in
+            :func:`ast_walk.walk_statements` order
+        """
+        found: _OwnCalls = {}
+        for func in ast_walk.walk_statements(module):
+            if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                found[func] = [(sub.func.id, sub) for sub in cls._walk_skip_funcs_body(func)
+                               if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)]
+        return found
 
     @staticmethod
     def _walk_skip_funcs_body(func: ast.FunctionDef | ast.AsyncFunctionDef):
@@ -1436,23 +1689,17 @@ class SecurityTransformer(ast_walk.NodeTransformer):
 
         The key is the dotted path of the definition, with an occurrence index
         where one scope defines the same name twice, so two functions never
-        share it.
+        share it. Only a definition standing directly in a scope's statement
+        list gets one: a definition inside an ``if`` / loop / ``with`` / ``try``
+        body has no key, so its signals never form a hosted group.
         """
         keys: dict[ast.FunctionDef | ast.AsyncFunctionDef, str] = {}
 
-        def own_defs(body: list[ast.stmt]):
-            """Definitions this scope makes, at any statement depth of its own
-            body, without descending into the definitions themselves."""
-            for stmt in body:
-                for sub in SecurityTransformer._walk_skip_funcs(stmt):
-                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        yield sub
-                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    yield stmt
-
         def walk(body: list[ast.stmt], prefix: str) -> None:
             seen: dict[str, int] = {}
-            for func in own_defs(body):
+            for func in body:
+                if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
                 count = seen.get(func.name, 0)
                 seen[func.name] = count + 1
                 key = f'{prefix}{func.name}' + (f'#{count}' if count else '')
@@ -1462,69 +1709,52 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         walk(module.body, '')
         return keys
 
+    @staticmethod
     def _call_sites_by_name(
-            self, module: ast.Module
-    ) -> tuple[dict[str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, ast.Call]]],
-               dict[str, int]]:
-        """Every direct call of every name, and how often each name is read.
+            own_calls: _OwnCalls
+    ) -> dict[str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, ast.Call]]]:
+        """Every direct call of every name.
 
         Unlike :meth:`_lift_candidates` this does not care whether a call is
         reached unconditionally — a stable signal argument is the same value
         wherever the call happens. What it does care about is seeing ALL of the
-        sites: the two counts together are what proves a name is only ever used
-        by calling it, so substituting its parameters covers every way the
-        function can run.
+        sites: together with how often each name is read (see :meth:`_census`)
+        they are what proves a name is only ever used by calling it, so
+        substituting its parameters covers every way the function can run.
 
-        :param module: the lowered module
+        :param own_calls: the module's :meth:`_own_calls`
         :return: callee name -> its call sites as ``(caller function, call
-            node)``, and how often each name is READ anywhere in the module
+            node)``
         """
-        load_counts: dict[str, int] = {}
-        for sub in ast_walk.walk(module):
-            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
-                load_counts[sub.id] = load_counts.get(sub.id, 0) + 1
         sites: dict[str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef,
                                     ast.Call]]] = {}
-        for caller in ast_walk.walk_statements(module):
-            if not isinstance(caller, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for stmt in caller.body:
-                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                for sub in self._walk_skip_funcs(stmt):
-                    if (isinstance(sub, ast.Call)
-                            and isinstance(sub.func, ast.Name)):
-                        sites.setdefault(sub.func.id, []).append((caller, sub))
-        return sites, load_counts
+        for caller, calls in own_calls.items():
+            for name, call in calls:
+                sites.setdefault(name, []).append((caller, call))
+        return sites
 
     def _signal_call_sites(
-            self, module: ast.Module
+            self, own_calls: _OwnCalls
     ) -> dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, list[ast.expr]]]:
         """Every ``__sec_signal__`` of the final tree, with its host function.
 
-        :param module: the lowered module
+        :param own_calls: the module's :meth:`_own_calls`
         :return: sid -> ``(function the signal stands in, its arguments after
             the sid)``
         """
         found: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef,
                                list[ast.expr]]] = {}
-        for func in ast_walk.walk_statements(module):
-            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for stmt in func.body:
-                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        for func, calls in own_calls.items():
+            for name, call in calls:
+                if name != '__sec_signal__':
                     continue
-                for sub in self._walk_skip_funcs(stmt):
-                    if not (isinstance(sub, ast.Call)
-                            and isinstance(sub.func, ast.Name)
-                            and sub.func.id == '__sec_signal__'):
-                        continue
-                    sid = self._call_sid(sub)
-                    if sid is not None:
-                        found[sid] = (func, list(sub.args[1:]))
+                sid = self._call_sid(call)
+                if sid is not None:
+                    found[sid] = (func, list(call.args[1:]))
         return found
 
-    def _stable_signal_args(self, module: ast.Module) -> dict[str, tuple[str, ...]]:
+    def _stable_signal_args(self, own_calls: _OwnCalls,
+                            load_counts: dict[str, int]) -> dict[str, tuple[str, ...]]:
         """The signal arguments of every context that cannot change during a bar.
 
         A context's signal decides WHICH feed it reads. When the expressions
@@ -1558,11 +1788,13 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         The walk ends at a function nobody calls — the script entry — whose
         parameters are its ``input.*`` defaults, fixed for the run.
 
-        :param module: the lowered module
+        :param own_calls: the module's :meth:`_own_calls`
+        :param load_counts: how often each name is read in the module
+            (:meth:`_census`)
         :return: sid -> ``ast.dump`` of each fully substituted argument, for
             the contexts whose arguments are stable
         """
-        call_sites, load_counts = self._call_sites_by_name(module)
+        call_sites = self._call_sites_by_name(own_calls)
         # Every context's walk passes through the script entry, and the tree
         # is only read here, so each function's bindings are computed once.
         bindings_of: dict[int, tuple[dict[str, ast.Assign], set[str]]] = {}
@@ -1574,7 +1806,7 @@ class SecurityTransformer(ast_walk.NodeTransformer):
                 return None
             found = bindings_of.get(id(func))
             if found is None:
-                found = bindings_of[id(func)] = self._hoistable_bindings(func)
+                found = bindings_of[id(func)] = self._lowered_hoistable(func)
             hoistable, stable_params = found
             available = set(hoistable) | stable_params
             if not all(self._is_simple_chain(a, available) for a in args):
@@ -1613,7 +1845,7 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             return answers.pop() if len(answers) == 1 else None
 
         stable: dict[str, tuple[str, ...]] = {}
-        for sid, (host, args) in self._signal_call_sites(module).items():
+        for sid, (host, args) in self._signal_call_sites(own_calls).items():
             dumps = resolve(host, list(args), 0)
             if dumps is not None:
                 stable[sid] = dumps
@@ -1726,7 +1958,7 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             late |= self._sid_set(sid, 'late_reads')
         return not (depends & late) and not (set(members) & late)
 
-    def _assign_groups(self, module: ast.Module) -> None:
+    def _assign_groups(self, module: ast.Module, load_counts: dict[str, int]) -> None:
         """Write the ``group`` ordinal into every context.
 
         Contexts with an identical :meth:`_group_key` form one group and get
@@ -1743,9 +1975,11 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         must have signalled and resolved to the same thing first.
 
         :param module: the lowered module
+        :param load_counts: how often each name is read in it (:meth:`_census`)
         """
-        sites = self._signal_sites(module)
-        stable_args = self._stable_signal_args(module)
+        own_calls = self._own_calls(module)
+        sites = self._signal_sites(module, own_calls)
+        stable_args = self._stable_signal_args(own_calls, load_counts)
         by_key: dict[tuple[str | None, ...], list[str]] = {}
         stable_of_key: dict[tuple[str | None, ...], bool] = {}
         for sid in self._all_contexts:
@@ -1804,10 +2038,9 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         while pending:
             func = pending.pop()
             for stmt in self._unconditional_stmts(func.body):
-                for sub in self._walk_skip_funcs(stmt):
+                for sub in self._unconditional_exprs(stmt):
                     if not (isinstance(sub, ast.Call)
-                            and isinstance(sub.func, ast.Name)
-                            and self._reached_unconditionally(stmt, sub)):
+                            and isinstance(sub.func, ast.Name)):
                         continue
                     if sub.func.id == '__sec_read__':
                         sid = self._call_sid(sub)
@@ -1821,7 +2054,7 @@ class SecurityTransformer(ast_walk.NodeTransformer):
                         seen.add(id(callee))
                         pending.append(callee)
 
-    def _mark_signal_per_bar(self, module: ast.Module) -> None:
+    def _mark_signal_per_bar(self, module: ast.Module, counts: dict[str, int]) -> None:
         """Flag every context signalled exactly once per script entry run.
 
         The developing batch plans one round per chart bar and every
@@ -1834,15 +2067,9 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         loop) gets no flag and keeps the per-bar transport.
 
         :param module: the transformed module, after the cross-function lift
+        :param counts: how many ``__sec_signal__`` calls of each sid it holds
+            (:meth:`_census`)
         """
-        counts: dict[str, int] = {}
-        for node in ast_walk.walk(module):
-            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                    and node.func.id == '__sec_signal__'):
-                sid = self._call_sid(node)
-                if sid is not None:
-                    counts[sid] = counts.get(sid, 0) + 1
-
         entry: ast.FunctionDef | ast.AsyncFunctionDef | None = None
         for node in ast_walk.walk_statements(module):
             if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -1865,8 +2092,7 @@ class SecurityTransformer(ast_walk.NodeTransformer):
                     ctx = self._all_contexts.get(sid)
                     if ctx is not None:
                         ctx['signal_per_bar'] = ast.Constant(value=True)
-            if any(isinstance(sub, _EXIT_STMTS)
-                   for sub in self._walk_skip_funcs(stmt)):
+            if self._can_exit(stmt):
                 return
 
     @classmethod
@@ -1884,9 +2110,30 @@ class SecurityTransformer(ast_walk.NodeTransformer):
                 continue
             if isinstance(stmt, _UNCONDITIONAL_STMTS):
                 yield stmt
-            if any(isinstance(sub, _EXIT_STMTS)
-                   for sub in cls._walk_skip_funcs(stmt)):
+            if cls._can_exit(stmt):
                 return
+
+    @staticmethod
+    def _can_exit(stmt: ast.stmt) -> bool:
+        """Whether ``stmt`` holds a statement that can end its body early.
+
+        Every form of ``_EXIT_STMTS`` is a statement, so only the statement
+        lists are searched, never an expression. A nested definition's exits
+        end that function, not this body, so definitions are not entered.
+
+        :param stmt: a statement that is not itself a definition
+        :return: True when a ``return`` / ``raise`` / ``break`` / ``continue``
+            stands in it
+        """
+        stack: list[ast.AST] = [stmt]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, _EXIT_STMTS):
+                return True
+            for child in ast_walk.iter_child_statements(node):
+                if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    stack.append(child)
+        return False
 
     # --- Cross-function signal lift ---
 
@@ -1943,23 +2190,30 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             return first.value
         return None
 
-    @classmethod
-    def _reached_unconditionally(cls, node: ast.AST, target: ast.Call) -> bool:
-        """Whether ``target`` is evaluated every time ``node`` is evaluated.
+    @staticmethod
+    def _unconditional_exprs(stmt: ast.stmt) -> list[ast.AST]:
+        """The expressions evaluated every time ``stmt`` is evaluated, in pre-order.
 
         Walks only the expression children, stopping at any form that may skip
-        its operands (see ``_CONDITIONAL_EXPRS``). Call arguments count as
-        unconditional: Python evaluates every one of them before the call.
+        its operands (see ``_CONDITIONAL_EXPRS``; the form itself is listed).
+        Call arguments count as unconditional: Python evaluates every one of
+        them before the call. Gathered in one walk per statement, so asking
+        about every call of the statement costs no further walk.
+
+        :param stmt: the statement whose expressions are wanted
+        :return: the nodes in the order :meth:`_walk_skip_funcs` yields them
         """
-        if node is target:
-            return True
-        if isinstance(node, _CONDITIONAL_EXPRS):
-            return False
-        for child in ast_walk.iter_child_nodes(node):
-            if isinstance(child, (ast.expr, ast.keyword)):
-                if cls._reached_unconditionally(child, target):
-                    return True
-        return False
+        reached: list[ast.AST] = []
+        stack = [child for child in reversed(list(ast_walk.iter_child_nodes(stmt)))
+                 if isinstance(child, (ast.expr, ast.keyword))]
+        while stack:
+            node = stack.pop()
+            reached.append(node)
+            if isinstance(node, _CONDITIONAL_EXPRS):
+                continue
+            stack.extend(child for child in reversed(list(ast_walk.iter_child_nodes(node)))
+                         if isinstance(child, (ast.expr, ast.keyword)))
+        return reached
 
     @classmethod
     def _leading_bindings(cls, body: list[ast.stmt], limit: int,
@@ -2045,7 +2299,7 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         return mapping
 
     def _lift_candidates(
-            self, module: ast.Module
+            self, module: ast.Module, load_counts: dict[str, int]
     ) -> list[tuple[ast.FunctionDef | ast.AsyncFunctionDef,
                     ast.FunctionDef | ast.AsyncFunctionDef, ast.Call, int]]:
         """Helper functions whose signal block may move up one call level.
@@ -2056,7 +2310,12 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         unconditionally there, and has no statement ahead of it that can end
         that body early.
 
+        A name read anywhere else (an alias, a callback, a second call) means
+        the helper may run a different number of times than the single site
+        suggests, hence ``load_counts``.
+
         :param module: the lowered module
+        :param load_counts: how often each name is read in it (:meth:`_census`)
         :return: ``(helper, caller, call, stmt_index)`` tuples, ordered by call
             site so lifted signals keep their source order
         """
@@ -2064,13 +2323,6 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             n for n in ast_walk.walk_statements(module)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
-        # A name read anywhere else (an alias, a callback, a second call) means
-        # the helper may run a different number of times than the single site
-        # below suggests.
-        load_counts: dict[str, int] = {}
-        for sub in ast_walk.walk(module):
-            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
-                load_counts[sub.id] = load_counts.get(sub.id, 0) + 1
 
         # Every unconditional direct-call site, keyed by callee name.
         sites: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef,
@@ -2086,16 +2338,13 @@ class SecurityTransformer(ast_walk.NodeTransformer):
                     # own body does belongs to its scope.
                     continue
                 if isinstance(stmt, _UNCONDITIONAL_STMTS):
-                    for sub in self._walk_skip_funcs(stmt):
-                        if (isinstance(sub, ast.Call)
-                                and isinstance(sub.func, ast.Name)
-                                and self._reached_unconditionally(stmt, sub)):
+                    for sub in self._unconditional_exprs(stmt):
+                        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
                             sites[sub.func.id] = (caller, sub, idx)
                 # Anything beyond this statement may never be reached. A
                 # nested def's own ``return`` belongs to that function, not to
                 # this body, so nested scopes are skipped.
-                blocked = any(isinstance(sub, _EXIT_STMTS)
-                              for sub in self._walk_skip_funcs(stmt))
+                blocked = self._can_exit(stmt)
 
         candidates = []
         for helper in funcs:
@@ -2133,7 +2382,7 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         if bindings is None:
             return False
 
-        hoistable, stable_params = self._hoistable_bindings(caller)
+        hoistable, stable_params = self._lowered_hoistable(caller)
         available = set(hoistable) | stable_params
 
         lifted: list[tuple[ast.Expr, str, list[ast.expr]]] = []
@@ -2257,7 +2506,8 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             ast_walk.fix_missing_locations(new_stmt)
             caller_block.body.append(new_stmt)
 
-    def _lift_helper_signals(self, module: ast.Module) -> None:
+    def _lift_helper_signals(
+            self, module: ast.Module) -> tuple[dict[str, int], dict[str, int]]:
         """Move helper-scoped ``__sec_signal__`` calls up to their caller.
 
         A signal emitted at a helper's top runs where the helper is CALLED, so
@@ -2275,14 +2525,38 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         signalling from the outermost caller.
 
         :param module: the lowered module
+        :return: the :meth:`_census` of the module as the lift leaves it
         """
         for _ in range(_MAX_LIFT_ROUNDS):
+            census = self._census(module)
             moved = False
-            for helper, caller, call, _idx in self._lift_candidates(module):
+            for helper, caller, call, _idx in self._lift_candidates(module, census[0]):
                 if self._lift_signal(helper, caller, call):
                     moved = True
             if not moved:
-                break
+                return census
+        return self._census(module)
+
+    @classmethod
+    def _census(cls, module: ast.Module) -> tuple[dict[str, int], dict[str, int]]:
+        """How often each name is read, and each sid signalled, in the module.
+
+        :param module: the lowered module
+        :return: name -> ``Load`` occurrences, and sid -> ``__sec_signal__``
+            calls
+        """
+        loads: dict[str, int] = {}
+        signals: dict[str, int] = {}
+        for sub in ast_walk.walk(module):
+            if isinstance(sub, ast.Name):
+                if isinstance(sub.ctx, ast.Load):
+                    loads[sub.id] = loads.get(sub.id, 0) + 1
+            elif (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+                  and sub.func.id == '__sec_signal__'):
+                sid = cls._call_sid(sub)
+                if sid is not None:
+                    signals[sid] = signals.get(sid, 0) + 1
+        return loads, signals
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
         return self._process_func(node)  # type: ignore[return-value]
@@ -2292,17 +2566,19 @@ class SecurityTransformer(ast_walk.NodeTransformer):
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
         self._module_file = getattr(node, '_module_file_path', '<script>')
-        if not any(isinstance(sub, ast.Call) and (self._is_security_call(sub)
-                                                  or self._is_security_lower_tf_call(sub))
-                   for sub in ast_walk.walk(node)):
+        if not has_security_call(node):
             # Every rewrite of this pass starts at a security call: a module
             # without one would only be walked to be handed back unchanged
             return node
-        original = None if self._keep_top else ast_walk.clone(node)
-        node = self.generic_visit(node)  # type: ignore[assignment]
+        # Only a context deferred by reach can call for the re-run below, which
+        # starts from the module as it is now: the copy is kept only when the
+        # lowering is going to defer one.
+        original = (ast_walk.clone(node) if not self._keep_top and self._may_defer(node)
+                    else None)
+        self._visit_nested_defs(node)
 
         if self._all_contexts:
-            self._lift_helper_signals(node)
+            load_counts, signal_counts = self._lift_helper_signals(node)
             self._analyze_dependencies(node)
             # Dependencies are only known on the lowered module. A deferred
             # signal that turns out to be a producer must stay in the top block
@@ -2316,15 +2592,17 @@ class SecurityTransformer(ast_walk.NodeTransformer):
                     producers.update(dep.value for dep in deps.elts
                                      if isinstance(dep, ast.Constant))
             keep_top = self._deferred_by_reach & producers
-            if keep_top and original is not None:
+            if keep_top and not self._keep_top:
+                # ``_may_defer`` foresaw every deferral
+                assert original is not None
                 second = SecurityTransformer()
                 second._keep_top = frozenset(keep_top)
                 return second.visit(original)
             self._mark_always_read(node)
-            self._mark_signal_per_bar(node)
+            self._mark_signal_per_bar(node, signal_counts)
             # Groups are decided on the FINAL pass only: the re-run above
             # starts from the untransformed module and assigns its own.
-            self._assign_groups(node)
+            self._assign_groups(node, load_counts)
 
             # Add barmerge import if needed (SecurityTransformer runs AFTER ImportNormalizer,
             # so we must add it ourselves)
@@ -2440,6 +2718,115 @@ _PARAM_PREFIX = '\x00param\x00'
 # mutations happen at all, so it is substituted like any other argument.
 _CTRL_PARAM = '<ctrl>'
 
+# Change-tracking cells of a function's summaries (see
+# ``_DependencyAnalyzer._visit_scope_body``), followed by its scope key. A
+# name's taint class is tracked under its root name, a call site binding under
+# its parameter token; neither can start with these.
+_RET_CELL = '\x01ret\x00'
+_OUT_CELL = '\x01out\x00'
+_ALIAS_CELL = '\x01alias\x00'
+
+
+# What :meth:`_DependencyAnalyzer._collect_loop_names` does with a node, by its
+# class
+_LOOP_NAMES_OTHER = 0  # nothing of its own: visit its children
+_LOOP_NAMES_LEAF = 1  # a node that never has a child
+_LOOP_NAMES_NAME = 2
+_LOOP_NAMES_IMPORT = 3
+_LOOP_NAMES_DECLARATION = 4
+_LOOP_NAMES_CAPTURE = 5
+_LOOP_NAMES_MAPPING = 6
+_LOOP_NAMES_FUNCTION = 7
+_LOOP_NAMES_ASSIGN = 8
+_LOOP_NAMES_ANN_ASSIGN = 9
+_LOOP_NAMES_AUG_ASSIGN = 10
+_LOOP_NAMES_CONDITIONAL = 11
+_LOOP_NAMES_LOOP = 12
+
+_loop_name_kinds: dict[type, int] = {}
+
+
+def _loop_name_kind(cls: type) -> int:
+    """The ``_collect_loop_names`` kind of a node class, decided once per class."""
+    kind = _loop_name_kinds.get(cls)
+    if kind is not None:
+        return kind
+    if issubclass(cls, ast.Name):
+        kind = _LOOP_NAMES_NAME
+    elif issubclass(cls, (ast.Import, ast.ImportFrom)):
+        kind = _LOOP_NAMES_IMPORT
+    elif issubclass(cls, (ast.Global, ast.Nonlocal)):
+        kind = _LOOP_NAMES_DECLARATION
+    elif issubclass(cls, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+        kind = _LOOP_NAMES_CAPTURE
+    elif issubclass(cls, ast.MatchMapping):
+        kind = _LOOP_NAMES_MAPPING
+    elif issubclass(cls, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        kind = _LOOP_NAMES_FUNCTION
+    elif issubclass(cls, ast.Assign):
+        kind = _LOOP_NAMES_ASSIGN
+    elif issubclass(cls, ast.AnnAssign):
+        kind = _LOOP_NAMES_ANN_ASSIGN
+    elif issubclass(cls, ast.AugAssign):
+        kind = _LOOP_NAMES_AUG_ASSIGN
+    elif issubclass(cls, (ast.For, ast.AsyncFor, ast.While)):
+        kind = _LOOP_NAMES_LOOP
+    elif issubclass(cls, _CONDITIONAL_NODES):
+        kind = _LOOP_NAMES_CONDITIONAL
+    elif issubclass(cls, (ast.expr_context, ast.operator, ast.unaryop, ast.cmpop, ast.boolop,
+                          ast.Constant)):
+        kind = _LOOP_NAMES_LEAF
+    else:
+        kind = _LOOP_NAMES_OTHER
+    _loop_name_kinds[cls] = kind
+    return kind
+
+
+# What :meth:`_DependencyAnalyzer._scan_scope` does with a node, by its class
+_SCAN_ENTER = 0  # nothing of its own: walk its children
+_SCAN_LEAF = 1  # a node that never has a child
+_SCAN_NAME = 2
+_SCAN_IMPORT = 3
+_SCAN_GLOBAL = 4
+_SCAN_NONLOCAL = 5
+_SCAN_DEF = 6
+_SCAN_CALL = 7
+_SCAN_LOOP = 8
+_SCAN_UNMODELLED = 9
+_SCAN_UNMODELLED_LOOP = 10
+
+_scan_kinds: dict[type, int] = {}
+
+
+def _scan_kind(cls: type) -> int:
+    """The scan kind of a node class, decided once per class."""
+    kind = _scan_kinds.get(cls)
+    if kind is not None:
+        return kind
+    if issubclass(cls, ast.Name):
+        kind = _SCAN_NAME
+    elif issubclass(cls, (ast.Import, ast.ImportFrom)):
+        kind = _SCAN_IMPORT
+    elif issubclass(cls, ast.Global):
+        kind = _SCAN_GLOBAL
+    elif issubclass(cls, ast.Nonlocal):
+        kind = _SCAN_NONLOCAL
+    elif issubclass(cls, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        kind = _SCAN_DEF
+    elif issubclass(cls, (ast.For, ast.AsyncFor, ast.While)):
+        kind = _SCAN_UNMODELLED_LOOP if issubclass(cls, _UNMODELLED_NODES) else _SCAN_LOOP
+    elif issubclass(cls, _UNMODELLED_NODES):
+        kind = _SCAN_UNMODELLED
+    elif issubclass(cls, ast.Call):
+        kind = _SCAN_CALL
+    elif issubclass(cls, (ast.expr_context, ast.operator, ast.unaryop, ast.cmpop, ast.boolop,
+                          ast.Constant)):
+        kind = _SCAN_LEAF
+    else:
+        kind = _SCAN_ENTER
+    _scan_kinds[cls] = kind
+    return kind
+
 
 class _Scope:
     """One lexical scope of the analysed module (the module or a function).
@@ -2453,9 +2840,15 @@ class _Scope:
     :ivar globals: names the scope declares ``global``
     :ivar funcs: nested function name to scope key
     :ivar body: the scope's statement list
+    :ivar calls: the direct-``Name`` calls of the scope's own code (nested
+        function definitions excluded) in evaluation order — the arguments
+        before the call — as ``(callee name, call, inside a loop)``. The whole
+        ``for`` / ``while`` subtree counts as inside the loop: its iterator
+        expression runs once, but counting it in only over-approximates the
+        ``in_loop`` marking
     """
 
-    __slots__ = ('key', 'node', 'parent', 'locals', 'globals', 'funcs', 'body')
+    __slots__ = ('key', 'node', 'parent', 'locals', 'globals', 'funcs', 'body', 'calls')
 
     def __init__(self, key: str, node: ast.AST, parent: str | None,
                  body: list[ast.stmt]):
@@ -2466,6 +2859,7 @@ class _Scope:
         self.globals: set[str] = set()
         self.funcs: dict[str, str] = {}
         self.body = body
+        self.calls: list[tuple[str, ast.Call, bool]] = []
 
 
 class _DependencyAnalyzer:
@@ -2548,6 +2942,11 @@ class _DependencyAnalyzer:
         self._bound: set[str] = set()
         self._fallback_scopes: set[str] = set()
         self.fallback_reasons: dict[str, str] = {}
+        # Per scope key, the unmodelled constructs of the scope's own code in
+        # walk order, and the keys of the scopes whose own code has a loop,
+        # both gathered by :meth:`_build_scopes`
+        self._unmodelled: dict[str, list[ast.AST]] = {}
+        self._loop_scopes: set[str] = set()
         self._ret: dict[str, set[str]] = {}
         self._ret_alias: dict[str, set[str]] = {}
         self._param_out: dict[str, dict[str, set[str]]] = {}
@@ -2557,32 +2956,28 @@ class _DependencyAnalyzer:
         self._parent: dict[str, str] = {}
         self._taint: dict[str, set[str]] = {}
         self._loop_cells: dict[int, dict[str, str]] = {}
+        # Memo of :meth:`_foreign_uses`, by function node id
+        self._foreign_memo: dict[int, dict[str, int]] = {}
         self._name_cells: dict[str, str] = {}
         self._ctrl: set[str] = set()
         self._order: dict[str, int] = {}
         self._scope: str = ''
         self._changed = False
         self._final = False
+        # Change tracking of the fixpoint rounds (see :meth:`_visit_scope_body`):
+        # a counter bumped on every change, the counter value of each cell's
+        # last change, the cells the statement being visited has read so far
+        # (``None`` outside a scope's body), and per statement id ``(counter
+        # before its last visit, ctrl in, ctrl out, ``_ctrl`` left behind,
+        # cells read)``
+        self._tick = 0
+        self._stamps: dict[str, int] = {}
+        self._reads: set[str] | None = None
+        self._memo: dict[int, tuple[int, set[str], set[str], set[str], set[str]]] = {}
+        # Number of ``return`` / ``break`` / ``continue`` statements visited
+        self._escapes = 0
 
     # --- scopes ---
-
-    @staticmethod
-    def _child_funcs(node: ast.AST):
-        """Yield the function definitions directly owned by ``node``'s scope."""
-        # An explicit stack of child iterators: a recursive generator pays one
-        # ``yield from`` hop per tree level for every node it passes through. A
-        # definition only ever stands in a statement list, so no expression is
-        # entered
-        stack = [ast_walk.iter_child_statements(node)]
-        while stack:
-            for child in stack[-1]:
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    yield child
-                else:
-                    stack.append(ast_walk.iter_child_statements(child))
-                    break
-            else:
-                stack.pop()
 
     @staticmethod
     def _params(fn: 'ast.FunctionDef | ast.AsyncFunctionDef') -> list[ast.arg]:
@@ -2603,23 +2998,10 @@ class _DependencyAnalyzer:
         used: set[str] = {''}
         while work:
             scope = work.pop()
-            declared: set[str] = set()
-            for sub in self._iter_stmts_skip_funcs(scope.node):
-                if isinstance(sub, ast.Global):
-                    scope.globals.update(sub.names)
-                    declared.update(sub.names)
-                elif isinstance(sub, ast.Nonlocal):
-                    declared.update(sub.names)
             if isinstance(scope.node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 scope.locals.update(p.arg for p in self._params(scope.node))
-            for sub in self._iter_stmts_skip_funcs(scope.node):
-                if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
-                    scope.locals.add(sub.id)
-                elif isinstance(sub, (ast.Import, ast.ImportFrom)):
-                    for alias in sub.names:
-                        bound = alias.asname or alias.name.split('.')[0]
-                        scope.locals.add(bound)
-            for fn in self._child_funcs(scope.node):
+            funcs, declared = self._scan_scope(scope)
+            for fn in funcs:
                 scope.locals.add(fn.name)
                 key = (scope.key + '.' if scope.key else '') + fn.name
                 while key in used:
@@ -2631,6 +3013,88 @@ class _DependencyAnalyzer:
                 scope.funcs[fn.name] = key
                 work.append(child)
             scope.locals -= declared
+
+    def _scan_scope(self, scope: _Scope) -> tuple[
+            list[ast.FunctionDef | ast.AsyncFunctionDef], set[str]]:
+        """Walk the scope's own code once, gathering everything kept per scope.
+
+        The walk covers every descendant of the scope's node except the inside
+        of a nested function definition, which is a scope of its own; together
+        the scopes walk every node of the module exactly once. On the way it
+        records the scope's bound names, ``global`` names, loops, unmodelled
+        constructs (in walk order) and direct-``Name`` calls (see
+        :attr:`_Scope.calls`).
+
+        :param scope: the scope to walk
+        :return: the function definitions the scope owns, in walk order, and
+            the names it declares ``global`` / ``nonlocal``
+        """
+        funcs: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+        declared: set[str] = set()
+        unmodelled: list[ast.AST] = []
+        bound = scope.locals
+        calls = scope.calls
+        kinds = _scan_kinds
+        children_of = ast_walk.iter_child_nodes
+        loops = 0
+        # Per node being walked: its remaining children, the node itself when
+        # it is a direct-``Name`` call — recorded once its children are done,
+        # which puts the arguments first — and whether it is a loop. The kind
+        # check stands in for the type narrowing, hence ``Any``
+        stack: list[tuple[Iterator[Any], Any, bool]] = [
+            (children_of(scope.node), None, False)]
+        while stack:
+            children, call, loop = stack[-1]
+            for sub in children:
+                kind = kinds.get(sub.__class__)
+                if kind is None:
+                    kind = _scan_kind(sub.__class__)
+                if kind == _SCAN_ENTER:
+                    stack.append((children_of(sub), None, False))
+                    break
+                if kind == _SCAN_LEAF:
+                    continue
+                if kind == _SCAN_NAME:
+                    # Its only child is the context
+                    if isinstance(sub.ctx, ast.Store):
+                        bound.add(sub.id)
+                    continue
+                if kind == _SCAN_CALL:
+                    named = isinstance(sub.func, ast.Name)
+                    stack.append((children_of(sub), sub if named else None, False))
+                    break
+                if kind == _SCAN_IMPORT:
+                    for alias in sub.names:
+                        bound.add(alias.asname or alias.name.split('.')[0])
+                    continue
+                if kind == _SCAN_GLOBAL:
+                    scope.globals.update(sub.names)
+                    declared.update(sub.names)
+                    continue
+                if kind == _SCAN_NONLOCAL:
+                    declared.update(sub.names)
+                    continue
+                if kind == _SCAN_DEF:
+                    funcs.append(sub)
+                    continue
+                if kind != _SCAN_LOOP:
+                    unmodelled.append(sub)
+                if kind != _SCAN_UNMODELLED:
+                    self._loop_scopes.add(scope.key)
+                    loops += 1
+                    stack.append((children_of(sub), None, True))
+                else:
+                    stack.append((children_of(sub), None, False))
+                break
+            else:
+                stack.pop()
+                if call is not None:
+                    calls.append((call.func.id, call, loops > 0))
+                if loop:
+                    loops -= 1
+        if unmodelled:
+            self._unmodelled[scope.key] = unmodelled
+        return funcs, declared
 
     def _q(self, name: str, scope_key: str | None = None) -> str:
         """Qualify a bare name with the key of the scope that binds it."""
@@ -2649,6 +3113,10 @@ class _DependencyAnalyzer:
                 return key + '\x00' + name
             key = scope.parent
 
+    def _scope_of(self, fn: ast.FunctionDef | ast.AsyncFunctionDef) -> _Scope:
+        """The scope of a function definition of the module."""
+        return self._scopes[self._key_of[id(fn)]]
+
     def _lookup_func(self, name: str) -> str | None:
         """Scope key of the user function ``name`` resolves to, if any."""
         key: str | None = self._scope
@@ -2661,6 +3129,12 @@ class _DependencyAnalyzer:
             key = scope.parent
         fn = self._funcs.get(name)
         return self._key_of.get(id(fn)) if fn is not None else None
+
+    def _touch(self, cell: str) -> None:
+        """Record that ``cell`` of the analysis state has just grown."""
+        self._tick += 1
+        self._stamps[cell] = self._tick
+        self._changed = True
 
     # --- alias classes ---
 
@@ -2678,11 +3152,14 @@ class _DependencyAnalyzer:
         if ra == rb:
             return
         self._parent[rb] = ra
-        merged = self._taint.get(ra, set()) | self._taint.get(rb, set())
-        self._taint.pop(rb, None)
-        if merged != self._taint.get(ra, set()):
-            self._changed = True
-        self._taint[ra] = merged
+        self._taint[ra] = self._taint.get(ra, set()) | self._taint.pop(rb, set())
+        # A merge is a change even when neither class gains taint: a later add
+        # to one alias now reaches the other, and ``_record_ret_alias`` compares
+        # classes, not taints. Each pair of classes merges once, so this cannot
+        # keep the fixpoint loop from converging. A statement that read either
+        # root has to look again.
+        self._touch(ra)
+        self._stamps[rb] = self._tick
 
     @staticmethod
     def _bare(name: str) -> str:
@@ -2692,7 +3169,10 @@ class _DependencyAnalyzer:
     def _get_taint(self, name: str) -> set[str]:
         if self._bare(name) in _UNTAINTABLE_ROOTS:
             return set()
-        return set(self._taint.get(self._find(name), ()))
+        root = self._find(name)
+        if self._reads is not None:
+            self._reads.add(root)
+        return set(self._taint.get(root, ()))
 
     def _add_taint(self, name: str, taint: set[str]) -> None:
         if self._bare(name) in _UNTAINTABLE_ROOTS:
@@ -2704,7 +3184,7 @@ class _DependencyAnalyzer:
         cur = self._taint.setdefault(root, set())
         if not taint <= cur:
             cur |= taint
-            self._changed = True
+            self._touch(root)
 
     # --- parameter tokens ---
 
@@ -2744,7 +3224,7 @@ class _DependencyAnalyzer:
         callee's call sites. A function the module calls somewhere the analysis
         never reached has no recorded call site, so its tokens expand to every
         sid instead of to nothing — but only in the final rounds
-        (``_final``): before the first fixpoint a callee visited ahead of its
+        (``_final``): during the first round a callee visited ahead of its
         call site merely has not been bound YET, and expanding it to every sid
         then would pin a spurious dependency that no later round can retract.
         """
@@ -2759,15 +3239,22 @@ class _DependencyAnalyzer:
             if item in seen:
                 continue
             seen.add(item)
-            key = item[len(_PARAM_PREFIX):].rpartition('\x00')[0]
-            scope = self._scopes.get(key)
-            if (self._final and key not in self._bound and scope is not None
-                    and isinstance(scope.node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and scope.node.name in self._called_names):
+            if self._reads is not None:
+                self._reads.add(item)
+            if self._final and self._of_unreached_call(item):
                 out |= self._all
                 continue
             work.extend(self._param_in.get(item, ()))
         return out
+
+    def _of_unreached_call(self, token: str) -> bool:
+        """Whether ``token`` belongs to a function the module calls only where
+        the analysis never reached (see :meth:`_resolve_tokens`)."""
+        key = token[len(_PARAM_PREFIX):].rpartition('\x00')[0]
+        scope = self._scopes.get(key)
+        return (key not in self._bound and scope is not None
+                and isinstance(scope.node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and scope.node.name in self._called_names)
 
     # --- helpers ---
 
@@ -2836,36 +3323,6 @@ class _DependencyAnalyzer:
             return False
         return True
 
-    @staticmethod
-    def _iter_stmts_skip_funcs(node: ast.AST):
-        """All descendant nodes of ``node``, not entering nested function defs."""
-        return ast_walk.iter_descendants(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-
-    @staticmethod
-    def _walk_loop_depth(node: ast.AST, depth: int):
-        """Yield ``(node, loop_depth)`` pairs, not entering nested function defs.
-
-        The whole ``for`` / ``while`` subtree counts as one level deeper — the
-        iterator expression itself runs once, but treating it as in-loop only
-        over-approximates the ``in_loop`` marking.
-        """
-        # An explicit stack of (child iterator, depth): a recursive generator
-        # pays one ``yield from`` hop per tree level for every node
-        stack = [(ast_walk.iter_child_nodes(node), depth)]
-        while stack:
-            children, level = stack[-1]
-            for child in children:
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                sub_depth = level + 1 if isinstance(
-                    child, (ast.For, ast.AsyncFor, ast.While)
-                ) else level
-                yield child, sub_depth
-                stack.append((ast_walk.iter_child_nodes(child), sub_depth))
-                break
-            else:
-                stack.pop()
-
     # --- program order of the write sites ---
 
     def _compute_site_order(self) -> None:
@@ -2878,34 +3335,37 @@ class _DependencyAnalyzer:
 
         Sites the walk never reaches (dead code) are numbered last, in
         registration order.
+
+        A function is walked at its FIRST call site only. A later walk of it
+        could not number anything: the first one numbered every site reachable
+        from it except through the functions then being walked, and each of
+        those either is still being walked (and cut again) or has since
+        numbered what it reaches. That keeps the walk linear in the module
+        instead of re-walking a helper at every call of it.
         """
         counter = 0
         visiting: set[str] = set()
+        walked: set[str] = set()
 
-        def walk(node: ast.AST) -> None:
+        def walk(scope: _Scope) -> None:
             nonlocal counter
-            for child in ast_walk.iter_child_nodes(node):
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                # Arguments are evaluated before the call they belong to
-                walk(child)
-                if not isinstance(child, ast.Call) or not isinstance(child.func, ast.Name):
-                    continue
-                name = child.func.id
+            # The calls stand in evaluation order: arguments before their call
+            for name, call, _in_loop in scope.calls:
                 if name == '__sec_write__':
-                    sid = self._sid_arg(child)
+                    sid = self._sid_arg(call)
                     if sid is not None and sid not in self._order:
                         self._order[sid] = counter
                         counter += 1
-                elif name in self._funcs and name not in visiting:
+                elif name in self._funcs and name not in visiting and name not in walked:
                     visiting.add(name)
-                    walk(self._funcs[name])
+                    walk(self._scope_of(self._funcs[name]))
                     visiting.discard(name)
+                    walked.add(name)
 
-        walk(self._module)
+        walk(self._scopes[''])
         for name, fn in self._funcs.items():
             if name not in self._called_names:
-                walk(fn)
+                walk(self._scope_of(fn))
         for sid in self._all:
             if sid not in self._order:
                 self._order[sid] = counter
@@ -2929,9 +3389,10 @@ class _DependencyAnalyzer:
         and cannot see the private cell — keeps the single scope-wide cell.
         """
         for key, scope in self._scopes.items():
-            uses, loops, parents = self._collect_loop_names(scope)
-            if not loops:
+            if key not in self._loop_scopes:
+                # No loop of its own: nothing to give a cell to
                 continue
+            uses, loops, parents = self._collect_loop_names(scope)
             binders: dict[str, list[int]] = {}
             for loop_id, names in loops.items():
                 for name in names:
@@ -2989,119 +3450,164 @@ class _DependencyAnalyzer:
                     first_store = False
                 seen[name] = (count + 1, first_store)
 
-        def foreign(name: str, shadowed: frozenset[str]) -> None:
+        def foreign(name: str, count: int = 1) -> None:
             # An occurrence no loop owns: the name can only be disqualified.
-            if name not in shadowed:
-                uses[name] = uses.get(name, 0) + 1
+            uses[name] = uses.get(name, 0) + count
 
-        def target(node: ast.AST, stack: list[int], shadowed: frozenset[str],
-                   in_func: bool, cond: frozenset[int],
+        def target(node: ast.AST, stack: list[int], cond: frozenset[int],
                    after: frozenset[int]) -> None:
             if isinstance(node, ast.Name):
-                if in_func:
-                    foreign(node.id, shadowed)
-                elif node.id not in shadowed:
-                    record(node.id, True, stack, cond, after)
+                record(node.id, True, stack, cond, after)
             elif isinstance(node, (ast.Tuple, ast.List)):
                 for elt in node.elts:
-                    target(elt, stack, shadowed, in_func, cond, after)
+                    target(elt, stack, cond, after)
             elif isinstance(node, ast.Starred):
-                target(node.value, stack, shadowed, in_func, cond, after)
+                target(node.value, stack, cond, after)
             else:
-                visit(node, stack, shadowed, in_func, cond, after)
+                visit(node, stack, cond, after)
 
-        def visit(node: ast.AST, stack: list[int], shadowed: frozenset[str],
-                  in_func: bool, cond: frozenset[int],
+        def visit(node: Any, stack: list[int], cond: frozenset[int],
                   after: frozenset[int]) -> None:
-            if isinstance(node, ast.Name):
-                if in_func or not isinstance(node.ctx, ast.Load):
-                    foreign(node.id, shadowed)
-                elif node.id not in shadowed:
+            # ``node`` is narrowed by its kind, hence ``Any``
+            kind = kinds.get(node.__class__)
+            if kind is None:
+                kind = _loop_name_kind(node.__class__)
+            if kind == _LOOP_NAMES_LEAF:
+                return
+            if kind == _LOOP_NAMES_NAME:
+                if not isinstance(node.ctx, ast.Load):
+                    foreign(node.id)
+                else:
                     record(node.id, False, stack, cond, after)
                 return
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if kind == _LOOP_NAMES_IMPORT:
                 for alias in node.names:
-                    foreign((alias.asname or alias.name).split('.')[0], shadowed)
+                    foreign((alias.asname or alias.name).split('.')[0])
                 return
-            if isinstance(node, (ast.Global, ast.Nonlocal)):
+            if kind == _LOOP_NAMES_DECLARATION:
                 for name in node.names:
-                    foreign(name, shadowed)
+                    foreign(name)
                 return
-            if isinstance(node, ast.ExceptHandler) and node.name is not None:
-                foreign(node.name, shadowed)
-            elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
-                foreign(node.name, shadowed)
-            elif isinstance(node, ast.MatchMapping) and node.rest is not None:
-                foreign(node.rest, shadowed)
-            if node is not scope.node and isinstance(
-                    node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-                # A nested function binding the name owns its own variable, so
-                # nothing below it belongs to this scope.
-                inner = self._scopes.get(self._key_of.get(id(node), ''))
-                own = frozenset(inner.locals) if inner is not None else frozenset()
-                for child in ast_walk.iter_child_nodes(node):
-                    visit(child, stack, shadowed | own, True, cond, after)
-                return
-            if isinstance(node, ast.Assign):
-                visit(node.value, stack, shadowed, in_func, cond, after)
+            if kind == _LOOP_NAMES_CAPTURE:
+                # ``except ... as name``, a match capture
+                if node.name is not None:
+                    foreign(node.name)
+            elif kind == _LOOP_NAMES_MAPPING:
+                if node.rest is not None:
+                    foreign(node.rest)
+            elif kind == _LOOP_NAMES_FUNCTION:
+                if node is not scope.node:
+                    # Everything below a nested function is an occurrence outside
+                    # every loop of this scope (see :meth:`_foreign_uses`).
+                    for name, count in self._foreign_uses(node).items():
+                        foreign(name, count)
+                    return
+            elif kind == _LOOP_NAMES_ASSIGN:
+                visit(node.value, stack, cond, after)
                 for item in node.targets:
-                    target(item, stack, shadowed, in_func, cond, after)
+                    target(item, stack, cond, after)
                 return
-            if isinstance(node, ast.AnnAssign):
+            elif kind == _LOOP_NAMES_ANN_ASSIGN:
                 # ``x: T = v`` evaluates ``v`` before binding ``x``; a bare
                 # ``x: T`` binds nothing, so its name only counts as a use.
                 if node.value is not None:
-                    visit(node.value, stack, shadowed, in_func, cond, after)
-                visit(node.annotation, stack, shadowed, in_func, cond, after)
+                    visit(node.value, stack, cond, after)
+                visit(node.annotation, stack, cond, after)
                 if node.value is not None or not isinstance(node.target, ast.Name):
-                    target(node.target, stack, shadowed, in_func, cond, after)
-                elif in_func:
-                    foreign(node.target.id, shadowed)
-                elif node.target.id not in shadowed:
+                    target(node.target, stack, cond, after)
+                else:
                     record(node.target.id, False, stack, cond, after)
                 return
-            if isinstance(node, ast.AugAssign):
+            elif kind == _LOOP_NAMES_AUG_ASSIGN:
                 # ``acc += x`` reads the target before it stores into it.
                 if isinstance(node.target, ast.Name):
-                    if in_func:
-                        foreign(node.target.id, shadowed)
-                    elif node.target.id not in shadowed:
-                        record(node.target.id, False, stack, cond, after)
+                    record(node.target.id, False, stack, cond, after)
                 else:
-                    visit(node.target, stack, shadowed, in_func, cond, after)
-                visit(node.value, stack, shadowed, in_func, cond, after)
+                    visit(node.target, stack, cond, after)
+                visit(node.value, stack, cond, after)
                 return
-            if isinstance(node, _CONDITIONAL_NODES):
+            elif kind == _LOOP_NAMES_CONDITIONAL or kind == _LOOP_NAMES_LOOP:
                 # Code below may be skipped on some pass through every loop
                 # already entered, so nothing it stores establishes a name there.
                 cond = cond | frozenset(stack)
-            if not in_func and isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
-                loop_id = id(node)
-                parents[loop_id] = stack[-1] if stack else None
-                loops[loop_id] = {}
-                stack = stack + [loop_id]
-                # The ``else`` clause also runs after zero iterations, when
-                # nothing in the body has executed.
-                else_cond = cond | {loop_id}
-                if isinstance(node, (ast.For, ast.AsyncFor)):
-                    visit(node.iter, stack, shadowed, in_func, cond, after)
-                    target(node.target, stack, shadowed, in_func, cond, after)
-                else:
-                    visit(node.test, stack, shadowed, in_func, cond, after)
-                for child in node.body:
-                    visit(child, stack, shadowed, in_func, cond, after)
-                for child in node.orelse:
-                    visit(child, stack, shadowed, in_func, else_cond,
-                          after | {loop_id})
-                return
+                if kind == _LOOP_NAMES_LOOP:
+                    loop_id = id(node)
+                    parents[loop_id] = stack[-1] if stack else None
+                    loops[loop_id] = {}
+                    stack = stack + [loop_id]
+                    # The ``else`` clause also runs after zero iterations, when
+                    # nothing in the body has executed.
+                    else_cond = cond | {loop_id}
+                    if isinstance(node, (ast.For, ast.AsyncFor)):
+                        visit(node.iter, stack, cond, after)
+                        target(node.target, stack, cond, after)
+                    else:
+                        visit(node.test, stack, cond, after)
+                    for child in node.body:
+                        visit(child, stack, cond, after)
+                    for child in node.orelse:
+                        visit(child, stack, else_cond, after | {loop_id})
+                    return
             for child in ast_walk.iter_child_nodes(node):
-                visit(child, stack, shadowed, in_func, cond, after)
+                visit(child, stack, cond, after)
 
-        visit(scope.node, [], frozenset(), False, frozenset(), frozenset())
+        kinds = _loop_name_kinds
+        visit(scope.node, [], frozenset(), frozenset())
         written = {loop_id: {name: seen for name, seen in names.items()
                              if name in scope.locals}
                    for loop_id, names in loops.items()}
         return uses, written, parents
+
+    def _foreign_uses(self, func: ast.AST) -> dict[str, int]:
+        """Name occurrences inside a nested function, as an enclosing scope counts them.
+
+        For :meth:`_collect_loop_names` every occurrence below a nested
+        function belongs to the scope being walked but to no loop of it, unless
+        the function — or one nested further down, below it — binds the name
+        itself and so owns that occurrence. That does not depend on which
+        enclosing scope asks, so each function is counted once instead of once
+        per scope above it.
+
+        :param func: a ``def`` or ``lambda`` nested in the scope being walked
+        :return: name -> occurrences not owned by a function at or below ``func``
+        """
+        found = self._foreign_memo.get(id(func))
+        if found is not None:
+            return found
+        inner = self._scopes.get(self._key_of.get(id(func), ''))
+        own = inner.locals if inner is not None else frozenset()
+        counts: dict[str, int] = {}
+
+        def add(name: str, count: int = 1) -> None:
+            counts[name] = counts.get(name, 0) + count
+
+        stack = list(ast_walk.iter_child_nodes(func))
+        while stack:
+            node = stack.pop()
+            if isinstance(node, ast.Name):
+                add(node.id)
+                continue
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    add((alias.asname or alias.name).split('.')[0])
+                continue
+            if isinstance(node, (ast.Global, ast.Nonlocal)):
+                for name in node.names:
+                    add(name)
+                continue
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                for name, count in self._foreign_uses(node).items():
+                    add(name, count)
+                continue
+            if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+                if node.name is not None:
+                    add(node.name)
+            elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+                add(node.rest)
+            stack.extend(ast_walk.iter_child_nodes(node))
+        found = {name: count for name, count in counts.items() if name not in own}
+        self._foreign_memo[id(func)] = found
+        return found
 
     @staticmethod
     def _is_loop_var(name: str, uses: int, binders: list[int],
@@ -3150,25 +3656,22 @@ class _DependencyAnalyzer:
         callees: dict[str, set[str]] = {}
         loop_callees: set[str] = set()
 
-        scopes: list[tuple[str, ast.AST]] = [('', self._module)]
-        scopes.extend((name, fn) for name, fn in self._funcs.items())
+        scopes: list[tuple[str, _Scope]] = [('', self._scopes[''])]
+        scopes.extend((name, self._scope_of(fn)) for name, fn in self._funcs.items())
 
-        for scope, root in scopes:
+        for scope, own in scopes:
             own_sids.setdefault(scope, set())
             callees.setdefault(scope, set())
-            for node, depth in self._walk_loop_depth(root, 0):
-                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
-                    continue
-                fname = node.func.id
+            for fname, node, in_loop in own.calls:
                 if fname == '__sec_write__':
                     sid = self._sid_arg(node)
                     if sid is not None:
                         own_sids[scope].add(sid)
-                        if depth > 0:
+                        if in_loop:
                             self.in_loop.add(sid)
                 elif fname in self._funcs:
                     callees[scope].add(fname)
-                    if depth > 0:
+                    if in_loop:
                         loop_callees.add(fname)
 
         reached: set[str] = set()
@@ -3353,8 +3856,11 @@ class _DependencyAnalyzer:
             cur = self._param_in.setdefault(token, set())
             if not arg_taint <= cur:
                 cur |= arg_taint
-                self._changed = True
+                self._touch(token)
 
+        if self._reads is not None:
+            self._reads.add(_RET_CELL + key)
+            self._reads.add(_OUT_CELL + key)
         result = self._subst(self._ret.get(key, set()), token_map)
         if key in self._fallback_scopes:
             # An unmodelled construct in the callee: its return can carry
@@ -3408,6 +3914,8 @@ class _DependencyAnalyzer:
         key = self._lookup_func(expr.func.id)
         if key is None:
             return []
+        if self._reads is not None:
+            self._reads.add(_ALIAS_CELL + key)
         params = self._ret_alias.get(key)
         if not params:
             return []
@@ -3431,14 +3939,20 @@ class _DependencyAnalyzer:
         if value is None or not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             return
         aliased = self._ret_alias.setdefault(scope.key, set())
+        reads = self._reads
         for root in self._alias_roots(value):
             cls_root = self._find(self._q(root))
+            if reads is not None:
+                reads.add(cls_root)
             for param in self._params(fn):
                 if param.arg in aliased:
                     continue
-                if self._find(scope.key + '\x00' + param.arg) == cls_root:
+                param_root = self._find(scope.key + '\x00' + param.arg)
+                if reads is not None:
+                    reads.add(param_root)
+                if param_root == cls_root:
                     aliased.add(param.arg)
-                    self._changed = True
+                    self._touch(_ALIAS_CELL + scope.key)
 
     @staticmethod
     def _collection_namespace(func: ast.Attribute) -> str | None:
@@ -3477,11 +3991,87 @@ class _DependencyAnalyzer:
 
     # --- statements ---
 
-    def _visit_body(self, body: list[ast.stmt], ctrl: set[str]) -> set[str]:
-        """Visit a statement list; return the control taint after it."""
+    def _visit_body(self, body: list[ast.stmt], ctrl: set[str], top: bool = False) -> set[str]:
+        """Visit a statement list; return the control taint after it.
+
+        While the reads are recorded (see :meth:`_visit_scope_body`), a
+        statement of a final round none of whose inputs changed since its last
+        visit is skipped and hands on the control taint it handed on then.
+
+        :param body: the statements
+        :param ctrl: the control taint the first of them runs under
+        :param top: whether ``body`` is a scope's own body, whose escape
+            accumulators nothing reads afterwards
+        :return: the control taint after the last statement
+        """
+        if self._reads is None:
+            for stmt in body:
+                ctrl = self._visit_stmt(stmt, ctrl)
+            return ctrl
+        memo = self._memo
+        stamps = self._stamps
+        skip = self._final
         for stmt in body:
-            ctrl = self._visit_stmt(stmt, ctrl)
+            entry = memo.get(id(stmt)) if skip else None
+            if entry is not None:
+                start, ctrl_in, ctrl_out, ctrl_last, cells = entry
+                if ctrl_in == ctrl and all(stamps.get(cell, 0) <= start for cell in cells):
+                    # The enclosing statement's visit depends on these too
+                    self._reads |= cells
+                    # A ``match`` guard after a case body reads ``_ctrl`` as
+                    # the body's last statement left it
+                    self._ctrl = ctrl_last
+                    ctrl = ctrl_out
+                    continue
+            outer = self._reads
+            self._reads = cells = set()
+            start = self._tick
+            escapes = self._escapes
+            ctrl_out = self._visit_stmt(stmt, ctrl)
+            outer |= cells
+            self._reads = outer
+            # A statement holding a ``return`` / ``break`` / ``continue`` also
+            # feeds the escape accumulators of its block, which the memo does
+            # not replay. Whether it holds one does not depend on the taint, so
+            # such a statement is simply never skipped.
+            if top or self._escapes == escapes:
+                memo[id(stmt)] = (start, ctrl, ctrl_out, self._ctrl, cells)
+            ctrl = ctrl_out
         return ctrl
+
+    def _visit_scope_body(self, scope: _Scope, ctrl: set[str]) -> None:
+        """Visit a scope's statements, skipping those a visit cannot change.
+
+        A statement's visit is a function of the control taint it starts under
+        and of the state cells it reads: the taint classes of names, the
+        summaries of the functions it calls, the call-site bindings of the
+        tokens it resolves. Everything a visit writes only ever grows, so when
+        none of that changed since the statement's last visit, visiting it
+        again rewrites what is already there and changes nothing — skipping it
+        leaves the state, the change flag and the number of rounds exactly as
+        a full visit would. The same holds for a statement nested in a block,
+        whose position fixes the loop cells and the scope it is visited under.
+
+        What a visit reads is recorded by the readers themselves into
+        ``_reads``, the set of the innermost statement being visited, and
+        handed up to every enclosing one; every change stamps its cell with a
+        fresh counter value (:meth:`_touch`). A cell stamped after a visit
+        started — even by that same visit — makes the statement due again.
+
+        Statements are only skipped in the final rounds. Three facts are left
+        out of the recorded reads because they no longer change once the first
+        round has run: the fallback scopes and the bound callees, both settled
+        by reaching every modelled call and every unmodelled expression, which
+        each round does whatever the taint, and the final mode itself. What a
+        first-round visit would have done differently under them is settled
+        once, when the final mode starts (:meth:`_settle_first_round`).
+
+        :param scope: the scope whose body to visit
+        :param ctrl: the control taint the body starts under
+        """
+        self._reads = set()
+        self._visit_body(scope.body, ctrl, top=True)
+        self._reads = None
 
     def _visit_block(self, body: list[ast.stmt], ctrl: set[str]) -> tuple[set[str], set[str]]:
         """Visit a nested block and collect the escapes taken inside it.
@@ -3604,14 +4194,16 @@ class _DependencyAnalyzer:
             return ctrl | escaped
         if isinstance(stmt, ast.Return):
             taint = self._expr_taint(stmt.value) | ctrl
-            self._record_escape(self._ret, taint)
+            self._record_return(taint)
             self._record_ret_alias(stmt.value)
             self._escaped |= taint
+            self._escapes += 1
             return ctrl | taint
         if isinstance(stmt, (ast.Break, ast.Continue)):
             # The decision to leave the loop is itself tainted, so everything
             # that runs after the loop is conditional on that taint.
             self._broke |= ctrl
+            self._escapes += 1
             return ctrl
         return ctrl
 
@@ -3628,14 +4220,14 @@ class _DependencyAnalyzer:
             )
             self._changed = True
 
-    def _record_escape(self, store: dict[str, set[str]], taint: set[str]) -> None:
+    def _record_return(self, taint: set[str]) -> None:
         if not taint:
-            store.setdefault(self._scope, set())
+            self._ret.setdefault(self._scope, set())
             return
-        cur = store.setdefault(self._scope, set())
+        cur = self._ret.setdefault(self._scope, set())
         if not taint <= cur:
             cur |= taint
-            self._changed = True
+            self._touch(_RET_CELL + self._scope)
 
     # --- per-scope pre/post steps ---
 
@@ -3684,21 +4276,61 @@ class _DependencyAnalyzer:
             cur = outs.setdefault(self._token(qualified), set())
             if not taint <= cur:
                 cur |= taint
-                self._changed = True
+                self._touch(_OUT_CELL + scope.key)
 
     # --- driver ---
+
+    def _settle_first_round(self, fallback: frozenset[str]) -> None:
+        """Keep the first round's statement memo only where a final round would
+        have visited alike.
+
+        A first-round visit differs from a final-round one in what it saw of
+        the facts the first round settles (see :meth:`_visit_scope_body`): a
+        fallback scope the round only discovered on the way — then every
+        entry is dropped, which is rare — and the tokens of an unreached call,
+        which only the final mode expands to every sid.
+
+        :param fallback: the fallback scopes before the first round
+        """
+        if self._fallback_scopes != fallback:
+            self._memo.clear()
+            return
+        unreached = [
+            key for key, entry in self._memo.items()
+            if any(cell.startswith(_PARAM_PREFIX) and self._of_unreached_call(cell)
+                   for cell in entry[4])
+        ]
+        for key in unreached:
+            del self._memo[key]
+
+    def _saturated(self) -> bool:
+        """Whether every write already depends on every other sid.
+
+        The result is read off ``depends`` alone, and ``depends`` only grows, so
+        from here on no further round can change it.
+        """
+        for sid, deps in self.depends.items():
+            if not self._all - {sid} <= deps:
+                return False
+        return True
 
     def run(self) -> None:
         self._funcs = {
             n.name: n for n in ast_walk.walk_statements(self._module)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
-        self._called_names = {
-            n.func.id for n in ast_walk.walk(self._module)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-            and n.func.id in self._funcs
-        }
         self._build_scopes()
+        if len(self._all) < 2:
+            # ``depends`` and ``late_reads`` only ever name ANOTHER context, so a
+            # lone one has neither, whatever the taint says. ``in_loop`` needs
+            # no taint at all.
+            self._mark_in_loop()
+            return
+        # The scopes' calls together are every call of the module
+        self._called_names = {
+            name for scope in self._scopes.values() for name, _call, _in_loop in scope.calls
+            if name in self._funcs
+        }
         self._mark_private_loop_vars()
         self._mark_in_loop()
         self._compute_site_order()
@@ -3714,17 +4346,17 @@ class _DependencyAnalyzer:
             if (isinstance(node, ast.ClassDef)
                     and self._is_plain_record(node, factories, class_names)):
                 record_nodes.update(id(sub) for sub in ast_walk.walk(node))
-        for key, scope in self._scopes.items():
-            for sub in self._iter_stmts_skip_funcs(scope.node):
+        for key in self._scopes:
+            for sub in self._unmodelled.get(key, ()):
                 if id(sub) in record_nodes:
                     continue
-                if isinstance(sub, _UNMODELLED_NODES):
-                    self._fallback_scopes.add(key)
-                    self.fallback_reasons.setdefault(key, type(sub).__name__)
-                    break
+                self._fallback_scopes.add(key)
+                self.fallback_reasons.setdefault(key, type(sub).__name__)
+                break
 
         self._seed_params()
         ordered = list(self._scopes.values())
+        fallback = frozenset(self._fallback_scopes)
         for _ in range(_MAX_FIXPOINT_ROUNDS):
             self._changed = False
             for scope in ordered:
@@ -3741,15 +4373,21 @@ class _DependencyAnalyzer:
                         # Everything in a called function runs under the
                         # conditions of its call sites (see _CTRL_PARAM).
                         ctrl.add(self._ctrl_token(scope.key))
-                self._visit_body(scope.body, ctrl)
+                self._visit_scope_body(scope, ctrl)
                 if scope.parent is not None:
                     self._record_param_out(scope)
-            if self._changed:
-                continue
-            if self._final:
+            if self._final and not self._changed:
                 break
-            # Converged with every reachable call site bound: from here a
-            # token still without a call site belongs to an unreached call.
+            if self._saturated():
+                break
+            if not self._final:
+                self._settle_first_round(fallback)
+            # Every round visits the same calls, whatever the taint, so after
+            # the first one ``_bound`` holds every call site the analysis
+            # reaches: from here a token still without a call site belongs to
+            # an unreached call. Where the final mode starts does not change
+            # the result — every round only adds, and the iteration stops at
+            # the least fixpoint of the final rounds either way.
             self._final = True
 
         # Only a producer whose site PRECEDES this write can be waited for.

@@ -1,17 +1,19 @@
-from typing import cast
 import ast
 
 from . import ast_walk
 from .lib_series import BUILTIN_PRICE_SERIES
 
 
-class InputTransformer(ast_walk.NodeTransformer):
+class InputTransformer(ast_walk.NodeVisitor):
     """
     Transform input function calls:
     1. Add _id parameter to input calls
     2. Add getattr for source inputs at the start of functions
     3. Add required imports (lib, na) if not present
     Must be applied after SeriesTransformer.
+
+    Every edit is made in place and no node is replaced, so the walk is a plain
+    visit; the module visit returns the module.
     """
 
     def __init__(self):
@@ -124,7 +126,7 @@ class InputTransformer(ast_walk.NodeTransformer):
         self.current_function = node.name
 
         # Process function arguments and body
-        node = cast(ast.FunctionDef, self.generic_visit(node))
+        self.generic_visit(node)
 
         # Add getattr for each source input in this function
         source_vars = self.function_source_vars.get(self.current_function, {})
@@ -159,7 +161,7 @@ class InputTransformer(ast_walk.NodeTransformer):
     def visit_Module(self, node: ast.Module) -> ast.Module:
         """Add required imports if not present"""
         # Process the module first to collect existing imports
-        node = cast(ast.Module, self.generic_visit(node))
+        self.generic_visit(node)
 
         if not self.has_source_inputs:
             return node

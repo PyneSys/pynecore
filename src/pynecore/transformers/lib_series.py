@@ -90,7 +90,9 @@ class LibrarySeriesTransformer(ast_walk.NodeTransformer):
 
     def _insert_function_declarations(self, node: ast.Module) -> None:
         """Insert collected declarations into their target functions."""
-        for stmt in ast_walk.walk(node):
+        if not self.declarations_to_insert:
+            return
+        for stmt in ast_walk.walk_statements(node):
             if isinstance(stmt, ast.FunctionDef) and stmt.name in self.declarations_to_insert:
                 decls = self.declarations_to_insert[stmt.name]
                 stmt.body = decls + stmt.body

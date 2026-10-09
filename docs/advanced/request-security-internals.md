@@ -5,7 +5,7 @@ title: "request.security() Internals"
 description: "Technical deep-dive into the multiprocessing architecture behind request.security()"
 icon: "memory"
 date: "2026-03-27"
-lastmod: "2026-03-28"
+lastmod: "2026-10-08"
 draft: false
 toc: true
 categories: ["Advanced", "Technical Implementation"]
@@ -47,7 +47,9 @@ examples, and data preparation, see the [request.security() Library page](../lib
 ## AST Transformation
 
 The `SecurityTransformer` rewrites each `lib.request.security()` call into four protocol
-functions. For example:
+functions. Around it the pipeline runs `SecurityDrawings` and `SecurityInstantiation` (before it),
+and `SecuritySlice`, `SecurityDefault` and `VerifyClosedShift` (after it); see the step tables on
+the [AST Transformation](./ast-transformations.md#the-steps) page. For example:
 
 **Before:**
 
@@ -63,7 +65,7 @@ def main():
     if __active_security__ is None:
         __sec_signal__("sec-abc-0")  # chart: signal security process
 
-    if __active_security__ == "sec-abc-0":
+    if __active_security__ is not None and "sec-abc-0" in __active_security__:
         __sec_write__("sec-abc-0", lib.ta.sma(lib.close, 20))  # security: write result
     daily = __sec_read__("sec-abc-0", lib.na)  # both: read result
 
@@ -71,8 +73,8 @@ def main():
         __sec_wait__("sec-abc-0")  # chart: wait for completion
 ```
 
-The `__active_security__` variable is `None` in the chart process and set to the security ID
-in each security process. This makes the same compiled code run correctly in all contexts.
+The `__active_security__` variable is `None` in the chart process and the set of security IDs the
+process serves in a security process. This makes the same compiled code run correctly in all contexts.
 
 Write/read blocks stay at the **same scope level** as the original call, preventing `NameError`
 for conditionally-scoped variables.
@@ -96,8 +98,8 @@ size when data outgrows the block.
 
 1. **Spawn** — `multiprocessing.Process` with `spawn` mode
 2. **Init** — re-register import hooks, open shared memory by name, load OHLCV + syminfo
-3. **Import** — re-import script module (AST transforms run again, fresh Series state)
-4. **Configure** — `lib._lib_semaphore = True`, `__active_security__ = sec_id`
+3. **Import** — re-import script module through the import hook (it loads the same transformed bytecode as the chart; fresh Series state)
+4. **Configure** — `lib._lib_semaphore = True`, `__active_security__` = the set of security IDs this process serves; if the context has a `slice_main` clone (`SecuritySlice`), the process runs that function instead of `main()`
 5. **Loop** — `advance_event.wait()` → run bars to `target_time` → `data_ready.set()` + `done_event.set()`
 6. **Shutdown** — `stop_event` detected → cleanup and exit
 

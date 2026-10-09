@@ -230,6 +230,11 @@ class DynamicDefaultTransformer(ast_walk.NodeTransformer):
         """Whether the default expression references runtime ``lib`` state."""
         return any(isinstance(n, ast.Name) and n.id == 'lib' for n in ast_walk.walk(expr))
 
+    def _has_dynamic_default(self, args: ast.arguments) -> bool:
+        """Whether any parameter default references runtime ``lib`` state."""
+        return any(default is not None and self._is_dynamic(default)
+                   for default in [*args.defaults, *args.kw_defaults])
+
     def _prologue_if(self, param_name: str, default: ast.expr) -> ast.If:
         """Build ``if <param> is __dyn_default__: <param> = <default>``."""
         return ast.If(
@@ -319,7 +324,12 @@ class DynamicDefaultTransformer(ast_walk.NodeTransformer):
             if isinstance(stmt, ast.ClassDef):
                 self._lower_udt_defaults(stmt, bindings)
             bindings.track(stmt)
-        node = self.generic_visit(node)  # type: ignore[assignment]
+        # Only a function with a dynamic default is rewritten, and functions are
+        # statements: without one, no expression of the module is visited
+        if any(isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and not is_script_entry(stmt) and self._has_dynamic_default(stmt.args)
+               for stmt in ast_walk.walk_statements(node)):
+            node = self.generic_visit(node)  # type: ignore[assignment]
         if self._field_used:
             _insert_import(node.body, ast.ImportFrom(
                 module='pynecore.types.na',

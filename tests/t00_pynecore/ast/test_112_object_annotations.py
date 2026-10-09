@@ -17,14 +17,15 @@ import ast
 import json
 import os
 import sys
+import zlib
 from pathlib import Path
 
 import pytest
 
-from pynecore.core.import_hook import PIPELINE_DIGEST, analyse_source
-from pynecore.transformers import pine_type_artifact
-from pynecore.transformers.pine_type_artifact import (
-    build_interface, interface_digest, registered, table_json, _interface_from_json,
+from tests.t00_pynecore.pine_analysis import analyse_module
+from pynecore.transformers import module_interface
+from pynecore.transformers.module_interface import (
+    build_interface, interface_digest, interface_from_payload, interface_payload, registered,
 )
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
@@ -36,11 +37,11 @@ from pynecore.transformers.pine_type_table import ModuleInterface, PineTypeTable
 @pytest.fixture(autouse=True)
 def _clean_registry():
     """Keep the process-wide interface registry from leaking between tests."""
-    pine_type_artifact._registry.clear()
-    pine_type_artifact._analysing.clear()
+    module_interface._registry.clear()
+    module_interface._analysing.clear()
     yield
-    pine_type_artifact._registry.clear()
-    pine_type_artifact._analysing.clear()
+    module_interface._registry.clear()
+    module_interface._analysing.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -63,7 +64,7 @@ def _write(tmp_path: Path, name: str, source: str) -> Path:
 
 def _analysed(path: Path) -> tuple[ast.Module, PineTypeTable]:
     """Run the analysing half of the pipeline, cross-module resolution included."""
-    analysed = analyse_source(str(path))
+    analysed = analyse_module(str(path))
     assert analysed is not None, 'the module was not recognized as Pyne code'
     return analysed[0], analysed[1]
 
@@ -380,19 +381,21 @@ def __test_adding_a_class_moves_the_digest__(tmp_path):
     assert base.digest != added.digest
 
 
-def __test_the_artifact_round_trips_the_classes__(tmp_path):
-    """What the JSON carries is what a later process reads back"""
+def __test_the_payload_round_trips_the_classes__(tmp_path):
+    """What the .pyc carries is what a later process reads back"""
     path = _write(tmp_path, 'ob_json_mod', CLASS_BASE)
     tree, table = _analysed(path)
     interface = build_interface(tree, table, str(path.resolve()))
 
-    data = json.loads(json.dumps(
-        table_json(tree, table, interface, path.read_bytes(), PIPELINE_DIGEST)))
+    payload = interface_payload(interface)
+    data = json.loads(zlib.decompress(payload))
 
-    assert list(data['interface']['classes']) == ['Settings']
-    assert data['interface']['classes']['Settings']['fields'] == {'depth': INT}
+    assert list(data['classes']) == ['Settings']
+    assert data['classes']['Settings']['fields'] == {'depth': INT}
     stat = os.stat(path)
-    restored = _interface_from_json(interface.path, data, (stat.st_mtime_ns, stat.st_size))
+    restored = interface_from_payload(interface.path, payload, interface.deps,
+                                      (stat.st_mtime_ns, stat.st_size))
+    assert restored is not None
     assert list(restored.classes) == ['Settings']
     assert restored.classes['Settings'] == interface.classes['Settings']
     assert restored.digest == interface.digest

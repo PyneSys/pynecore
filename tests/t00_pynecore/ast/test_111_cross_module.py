@@ -19,10 +19,12 @@ from pathlib import Path
 
 import pytest
 
-from pynecore.core.import_hook import PyneLoader, _baked_deps, analyse_source
+import pynecore.core.import_hook as import_hook
+from pynecore.core.import_hook import PyneLoader, _baked_deps
+from tests.t00_pynecore.pine_analysis import analyse_module
 from pynecore.core.instance_state import _make_state  # noqa: internal API
-from pynecore.transformers import pine_type_artifact
-from pynecore.transformers.pine_type_artifact import interface_digest, registered
+from pynecore.transformers import module_interface
+from pynecore.transformers.module_interface import interface_digest, registered
 from pynecore.transformers.pine_type_rules import (
     FLOAT, INT, OBJECT, UNKNOWN, get_pin, get_ty, tuple_of,
 )
@@ -35,11 +37,11 @@ DEPS_CONST = '__pyne_type_deps__'
 @pytest.fixture(autouse=True)
 def _clean_registry():
     """Keep the process-wide interface registry from leaking between tests."""
-    pine_type_artifact._registry.clear()
-    pine_type_artifact._analysing.clear()
+    module_interface._registry.clear()
+    module_interface._analysing.clear()
     yield
-    pine_type_artifact._registry.clear()
-    pine_type_artifact._analysing.clear()
+    module_interface._registry.clear()
+    module_interface._analysing.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -62,7 +64,7 @@ def _write(tmp_path: Path, name: str, source: str) -> Path:
 
 def _analysed(path: Path) -> tuple[ast.Module, PineTypeTable]:
     """Run the analysing half of the pipeline, cross-module resolution included."""
-    analysed = analyse_source(str(path))
+    analysed = analyse_module(str(path))
     assert analysed is not None, 'the module was not recognized as Pyne code'
     return analysed[0], analysed[1]
 
@@ -450,18 +452,17 @@ def beta(x: int) -> int:
     return alpha(x) + 1
 ''')
 
-    # The inner analysis is where the cycle is noticed, and it is the module's
-    # INTERFACE that comes back from it -- so the table is captured on the way
+    # The inner transform is where the cycle is noticed, and it is the module's
+    # INTERFACE that comes back from it -- so the table is captured on the way,
+    # where the transform publishes what its analysis found
     tables: dict[str, PineTypeTable] = {}
-    original = analyse_source
+    original = import_hook._publish
 
-    def capture(path: str):
-        result = original(path)
-        if result is not None:
-            tables[str(Path(path).resolve())] = result[1]
-        return result
+    def capture(analysed, table, path, fingerprint):
+        tables[str(Path(path).resolve())] = table
+        return original(analysed, table, path, fingerprint)
 
-    monkeypatch.setattr('pynecore.core.import_hook.analyse_source', capture)
+    monkeypatch.setattr(import_hook, '_publish', capture)
 
     tree, table = _analysed(first)
 
@@ -523,17 +524,17 @@ value = helper(3)
     assert diag.message == ("'helper' is imported more than once, so what it calls is "
                             "unknown")
     assert diag.fix == "import 'helper' once, under a name nothing else binds"
-    # Nothing was consulted, so nothing is depended on -- neither module's
-    # signatures decided anything here
-    assert table.deps == {}
-    assert first.exists() and second.exists()
+    # Neither module's signatures decided anything here, but both are
+    # imported: the lowering routes a call on whatever the import binds, so
+    # both are depended on
+    assert set(table.deps) == {str(first.resolve()), str(second.resolve())}
 
 
 def __test_two_imports_in_exclusive_branches_are_unknown_too__(tmp_path, monkeypatch):
     """A guarded pair of imports is two bindings, whichever one runs"""
     monkeypatch.syspath_prepend(tmp_path)
-    _write(tmp_path, 'xm_guard_a', PLAIN_LIB)
-    _write(tmp_path, 'xm_guard_b', PLAIN_LIB.replace('-> int', '-> float'))
+    first = _write(tmp_path, 'xm_guard_a', PLAIN_LIB)
+    second = _write(tmp_path, 'xm_guard_b', PLAIN_LIB.replace('-> int', '-> float'))
     app = _write(tmp_path, 'xm_guard_app', """\"\"\"
 @pyne
 \"\"\"
@@ -550,7 +551,7 @@ value = helper(3)
     assert get_ty(_call(tree, 'helper')) == UNKNOWN
     assert _diag(table, 'rebound-name').fix == \
         "import 'helper' once, under a name nothing else binds"
-    assert table.deps == {}
+    assert set(table.deps) == {str(first.resolve()), str(second.resolve())}
 
 
 def __test_one_import_inside_a_branch_still_types_the_call__(tmp_path, monkeypatch):
@@ -621,7 +622,7 @@ def main(helper):
 def __test_a_relative_import_is_not_resolved__(tmp_path, monkeypatch):
     """A relative import names a package this pass has no anchor for"""
     monkeypatch.syspath_prepend(tmp_path)
-    _write(tmp_path, 'xm_rel_pkg.sibling', PLAIN_LIB)
+    sibling = _write(tmp_path, 'xm_rel_pkg.sibling', PLAIN_LIB)
     app = _write(tmp_path, 'xm_rel_pkg.consumer', '''"""
 @pyne
 """
@@ -633,7 +634,9 @@ value = helper(3)
     tree, table = _analysed(app)
 
     assert get_ty(_call(tree, 'helper')) == UNKNOWN
-    assert table.deps == {}
+    # The types cannot follow it, but a module importing this one can reach
+    # ``helper`` through it, so the file is still depended on
+    assert set(table.deps) == {str(sibling.resolve())}
     # Unresolved is unresolved: the call is reported as one nothing types
     assert [diag.origin.reason for diag in table.diags
             if diag.origin is not None] == ['unknown-call']

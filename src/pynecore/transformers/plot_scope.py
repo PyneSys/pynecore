@@ -25,6 +25,9 @@ _LOCAL_CONTEXTS = (
     ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
 )
 
+#: Child nodes that hold nothing this pass looks at: no binding, call or reference
+_INERT = (ast.expr_context, ast.operator, ast.unaryop, ast.cmpop, ast.boolop)
+
 
 @dataclass(eq=False)
 class _Scope:
@@ -52,7 +55,8 @@ class PlotScopeTransformer(ast_walk.NodeTransformer):
         owners: dict[ast.AST, _Scope] = {}
         parents: dict[ast.AST, ast.AST] = {}
         allowed: set[ast.Call] = set()
-        aliases: set[ast.AST] = set()
+        # A single static alias of a plot function: the aliased reference -> the name it binds
+        aliases: dict[ast.AST, ast.Name] = {}
         calls: list[ast.Call] = []
         references: list[ast.Name | ast.Attribute] = []
 
@@ -71,21 +75,25 @@ class PlotScopeTransformer(ast_walk.NodeTransformer):
                         child.bindings[arg.arg] = []
                 entry = (isinstance(current, ast.FunctionDef) and current.name == 'main'
                          and isinstance(parents.get(current), ast.Module))
-                body = [current.body] if isinstance(current, ast.Lambda) else current.body
+                body = {id(current.body)} if isinstance(current, ast.Lambda) \
+                    else {id(stmt) for stmt in current.body}
                 for part in ast_walk.iter_child_nodes(current):
                     if isinstance(current, ast.Lambda) and part is current.body:
                         parents[part] = current
                         collect(part, child)
-                    elif part not in body:
+                    elif id(part) not in body:
                         parents[part] = current
                         collect(part, scope)
                 if isinstance(current, ast.Lambda):
                     return
-                may_return = False
+                # Only the entry's direct body has to know whether an earlier
+                # statement can return, and only until one can
+                may_return = not entry
                 for stmt in current.body:
                     parents[stmt] = current
-                    collect(stmt, child, entry and not may_return)
-                    may_return |= self._has_return(stmt)
+                    collect(stmt, child, not may_return)
+                    if not may_return:
+                        may_return = self._has_return(stmt)
                 return
             if isinstance(current, ast.ClassDef):
                 scope.bindings.setdefault(current.name, []).append(current)
@@ -104,7 +112,7 @@ class PlotScopeTransformer(ast_walk.NodeTransformer):
                 if (isinstance(current, (ast.Assign, ast.AnnAssign))
                         and len(targets) == 1 and isinstance(targets[0], ast.Name)
                         and isinstance(current.value, (ast.Name, ast.Attribute))):
-                    aliases.add(current.value)
+                    aliases[current.value] = targets[0]
             if isinstance(current, ast.Call):
                 calls.append(current)
                 if direct:
@@ -114,6 +122,8 @@ class PlotScopeTransformer(ast_walk.NodeTransformer):
             if isinstance(current, _LOCAL_CONTEXTS):
                 direct = False
             for part in ast_walk.iter_child_nodes(current):
+                if isinstance(part, _INERT):
+                    continue
                 parents[part] = current
                 collect(part, scope, direct)
 
@@ -152,8 +162,8 @@ class PlotScopeTransformer(ast_walk.NodeTransformer):
             if isinstance(parent, ast.Attribute) and parent.value is ref:
                 if parent.attr in {'plot', 'hline'} or parent.attr.startswith(('style_', 'linestyle_')):
                     continue
-            if ref in aliases:
-                target = parent.targets[0] if isinstance(parent, ast.Assign) else parent.target
+            target = aliases.get(ref)
+            if target is not None:
                 scope = owners[target].resolve(target.id)
                 if scope is not None and len(scope.bindings[target.id]) == 1:
                     continue
@@ -163,12 +173,19 @@ class PlotScopeTransformer(ast_walk.NodeTransformer):
 
     @staticmethod
     def _has_return(node: ast.AST) -> bool:
-        """Whether a statement can return from its own enclosing function."""
-        scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
-        if isinstance(node, scopes):
-            return False
-        return isinstance(node, ast.Return) or any(
-            isinstance(child, ast.Return) for child in ast_walk.iter_descendants(node, scopes))
+        """Whether a statement can return from its own enclosing function.
+
+        A ``return`` is a statement, so only the statements nested in this one
+        are searched, never an expression, and not the scopes opened inside it.
+        """
+        pending = [node]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, ast.Return):
+                return True
+            if not isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                pending.extend(ast_walk.iter_child_statements(current))
+        return False
 
     def _reject(self, module: ast.Module, node: ast.AST, name: str, reason: str) -> None:
         """Raise a source-located error before the module can execute."""

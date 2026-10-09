@@ -46,12 +46,19 @@ Classification sources:
   own slots or any non-direct call site; a name whose LAST definition is
   decorated routes uniform (the runtime value is the decorator's return
   value — an ``overload`` dispatcher, an ``lru_cache`` wrapper, ...);
-- cross-module callees (``lib.*``, user Pyne libraries): the callee module
-  is imported at transform time and the object inspected —
-  ``__pyne_bind__`` marks an overload dispatcher (uniform),
+- cross-module callees: every one is classified by :func:`classify_callee`
+  — ``__pyne_bind__`` marks an overload dispatcher (uniform),
   ``__pyne_layout__`` proves state-carrying, a ``__pyne_slot_layout__``
   marker in the function's globals with no layout attribute proves
-  stateless, everything else falls to uniform.
+  stateless, everything else falls to uniform. A ``pynecore.lib`` callee is
+  NOT inspected here: its classification was computed by the same function
+  when ``scripts/lib_type_collector.py`` generated ``lib_types.json``, and is
+  read from that file's ``routes`` section. The file is hashed into the
+  pipeline digest and the lib sources mostly are not, so a lib edit that
+  changes a route reaches the cached script bytecode through the
+  regenerated file (``test_104`` fails until it is regenerated). Any other
+  callee module (a user Pyne library, a plain module, the rest of
+  ``pynecore``) is imported at transform time and the object inspected.
 
 Unprovable always degrades to uniform (correct, only slower) — an error can
 only come from a false proof, never from missing knowledge.
@@ -91,24 +98,31 @@ consumer's cadence (a sort comparator, a filter predicate), which is not
 loop-iteration semantics, so the loop form's same-bar rollback must not
 apply there.
 """
+from pathlib import Path
 from typing import cast, Any
 import ast
 import builtins
 import hashlib
 import importlib
+import keyword
 import types
 
 from ..core.pine_export import Exported
 from ..utils.stdlib_checker import is_stdlib
 from . import ast_walk
+from . import module_interface
 from .call_inline import SUPPORT_ALIAS_PREFIX
+from .pine_type_infer import lib_routes
 from .pine_type_rules import (get_pin, get_pins, get_ty, get_varying, get_vector,
                               stamp_lowering)
 from .pine_qualifier import SERIES_LENGTH_KEYWORD, get_series_len, get_series_lens
+from .pine_type_table import Analyser, PineTypeTable
+from .pine_type_transformer import module_table
 # noinspection PyProtectedMember
 from .slot_layout import DEFAULT_STATE_PARAM, ModuleLayout, scope_for_function
 
-__all__ = ['FunctionIsolationTransformer', 'NON_TRANSFORMABLE_FUNCTIONS', 'HELPER_ALIASES']
+__all__ = ['FunctionIsolationTransformer', 'NON_TRANSFORMABLE_FUNCTIONS', 'HELPER_ALIASES',
+           'classify_callee']
 
 # The runtime helpers are injected as a module-level import into the user's
 # own namespace, so they get the same collision-safe middle-dot alias as the
@@ -332,6 +346,55 @@ _UNIFORM = 'uniform'
 
 _Route = str | tuple[str, str]
 
+#: The package whose callees are routed from the generated ``routes`` table
+#: instead of being imported and inspected (see :func:`classify_callee`)
+_LIB_PACKAGE = 'pynecore.lib'
+
+#: The routes decided by what the callee object carries: they hold only while
+#: the modules that bound and defined it say the same thing
+_OBJECT_ROUTES = (_DIRECT, _FAST, _FAST_SHARED)
+
+#: pynecore's own package directory: its sources are part of the pipeline
+#: identity, not dependencies of a module
+_PACKAGE_DIR = Path(__file__).resolve().parent.parent
+
+
+def classify_callee(obj: Any) -> str:
+    """
+    The route of a cross-module callee, decided from the object itself.
+
+    The single definition of what a callee object proves: the transform runs it
+    on a user library's (or any other non-lib module's) object at transform
+    time, and ``scripts/lib_type_collector.py`` runs it on every ``pynecore.lib``
+    path to generate the ``routes`` section of ``lib_types.json``, which the
+    transform reads for lib callees instead.
+
+    :param obj: The resolved callee object.
+    :return: One of the route constants (never a ``('same', ...)`` tuple).
+    """
+    if isinstance(obj, Exported):
+        return _UNIFORM  # the anchor's bind unwraps it
+    if isinstance(obj, type):
+        return _SKIP
+    bound_self = getattr(obj, '__self__', None)
+    if bound_self is not None and isinstance(bound_self, type):
+        return _SKIP  # classmethod
+    if isinstance(obj, (types.BuiltinFunctionType, types.BuiltinMethodType)):
+        return _SKIP
+    if getattr(obj, '__pyne_bind__', None) is not None:
+        # Overload dispatcher — the implementation is chosen at runtime.
+        # Must be checked BEFORE the layout: functools.wraps copies the
+        # first implementation's __dict__ (its __pyne_layout__ included)
+        # onto the dispatcher.
+        return _UNIFORM
+    if getattr(obj, '__pyne_layout__', None) is not None:
+        return _FAST_SHARED if getattr(obj, '__pyne_shared_call_site__', False) else _FAST
+    if getattr(obj, '__module_property__', False):
+        return _SKIP  # Pine-style module property getter — stateless by design
+    if isinstance(obj, types.FunctionType) and '__pyne_slot_layout__' in obj.__globals__:
+        return _DIRECT  # transformed module, no layout -> provably stateless
+    return _UNIFORM
+
 
 def _is_test_function(name: str) -> bool:
     """Whether a function follows the ``__test_*__`` convention (called by
@@ -355,9 +418,48 @@ def _get_func_path(func: ast.expr) -> str | None:
     return None
 
 
+_LOCATION_ATTRIBUTES = ('lineno', 'col_offset', 'end_lineno', 'end_col_offset')
+
+
+def _copy_name_chain(func: ast.expr, location: list[int]) -> ast.expr | None:
+    """What reparsing a plain ``a.b.c`` callee and locating every node at the
+    callee's span yields, built directly.
+
+    :param func: The callee expression.
+    :param location: The callee's line, column, end line and end column.
+    :return: The copy, or None when the callee is not a chain of plain names
+        the parser would read back unchanged.
+    """
+    new: ast.expr
+    if isinstance(func, ast.Name):
+        name = func.id
+        new = ast.Name(id=name, ctx=ast.Load())
+    elif isinstance(func, ast.Attribute):
+        name = func.attr
+        value = _copy_name_chain(func.value, location)
+        if value is None:
+            return None
+        new = ast.Attribute(value=value, attr=name, ctx=ast.Load())
+    else:
+        return None
+    # The parser normalizes a non-ASCII identifier and reads a keyword back as
+    # something else; those take the reparse
+    if not (name.isascii() and name.isidentifier()) or keyword.iskeyword(name):
+        return None
+    new.lineno, new.col_offset, new.end_lineno, new.end_col_offset = location
+    return new
+
+
 class _ScopeIndex(ast_walk.NodeVisitor):
-    """Pass 1a: per-scope name bindings (defs, classes, everything else
-    assigned) and the module-level import map."""
+    """Pass 1: per-scope name bindings (defs, classes, everything else
+    assigned), the module-level import map, and every call site of the
+    isolation territory with the scope it stands in.
+
+    The territory mirrors the transformer's skip rules: decorators, defaults,
+    annotations, class bodies and test functions are not part of it. A site is
+    only classified once the index is complete (a name assigned anywhere in a
+    scope decides the route of every call in it), and the classification is
+    the input of the carrier fixpoint."""
 
     def __init__(self, layout: ModuleLayout):
         self.layout = layout
@@ -368,15 +470,29 @@ class _ScopeIndex(ast_walk.NodeVisitor):
         self.assigned: dict[str, set[str]] = {'': set()}
         # name -> (module path, attribute or None)
         self.import_map: dict[str, tuple[str, str | None]] = {}
-        self._stack: list[str] = []
+        #: Every territory call site, with the function-name path of its scope
+        self.sites: list[tuple[ast.Call, list[str]]] = []
+        #: The route list of every territory scope, filled once the sites are
+        #: classified
+        self.scope_routes: dict[str, list[_Route]] = {}
+        # Scopes that will get an instance-vector slot once the body is
+        # emitted. The slot does not exist yet, so the fixpoint cannot see it
+        # in the layout — but it makes the definition state-carrying, and a
+        # caller that routed around the state parameter would call it short
+        self.pin_carriers: set[str] = set()
+        #: Scope id of the definition being indexed, '' at module level
+        self._scope = ''
+        #: Scope segments of the enclosing definitions
+        self._segments: list[str] = []
+        #: Whether the node being visited is isolation territory
+        self._territory = True
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        outer = '·'.join(self._stack)
+        outer = self._scope
         segment = self.layout.scope_segment(node)
-        target = f'{outer}·{segment}' if outer else segment
-        self.defs[outer][node.name] = (target, bool(node.decorator_list))
-        self._stack.append(segment)
-        scope = '·'.join(self._stack)
+        scope = f'{outer}·{segment}' if outer else segment
+        self.defs[outer][node.name] = (scope, bool(node.decorator_list))
+        self._scope = scope
         self.defs.setdefault(scope, {})
         self.classes.setdefault(scope, set())
         assigned = self.assigned.setdefault(scope, set())
@@ -387,24 +503,49 @@ class _ScopeIndex(ast_walk.NodeVisitor):
             assigned.add(args.vararg.arg)
         if args.kwarg:
             assigned.add(args.kwarg.arg)
-        self.generic_visit(node)
-        self._stack.pop()
+        territory = self._territory
+        isolated = territory and not _is_test_function(node.name)
+        if isolated:
+            self.scope_routes.setdefault(scope, [])
+            if get_varying(node):
+                self.pin_carriers.add(scope)
+        self._segments.append(segment)
+        # Every field is indexed, only the body of an isolated definition is
+        # territory
+        for field in node._fields:
+            value = getattr(node, field, None)
+            self._territory = isolated and field == 'body'
+            if isinstance(value, ast.AST):
+                self.visit(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, ast.AST):
+                        self.visit(item)
+        self._territory = territory
+        self._segments.pop()
+        self._scope = outer
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        self.classes['·'.join(self._stack)].add(node.name)
+        self.classes[self._scope].add(node.name)
         # Class bodies are not isolation scopes — don't index their content
+
+    def visit_Call(self, node: ast.Call) -> None:
+        self.generic_visit(node)
+        if self._territory and self._segments \
+                and isinstance(node.func, (ast.Name, ast.Attribute)):
+            self.sites.append((node, self._segments.copy()))
 
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, (ast.Store, ast.Del)):
-            self.assigned['·'.join(self._stack)].add(node.id)
+            self.assigned[self._scope].add(node.id)
 
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
         if node.name:
-            self.assigned['·'.join(self._stack)].add(node.name)
+            self.assigned[self._scope].add(node.name)
         self.generic_visit(node)
 
     def visit_Import(self, node: ast.Import) -> None:
-        scope = '·'.join(self._stack)
+        scope = self._scope
         for alias in node.names:
             bound = alias.asname or alias.name.split('.')[0]
             if scope:
@@ -414,50 +555,13 @@ class _ScopeIndex(ast_walk.NodeVisitor):
                 self.import_map[bound] = (module, None)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        scope = '·'.join(self._stack)
+        scope = self._scope
         for alias in node.names:
             bound = alias.asname or alias.name
             if scope:
                 self.assigned[scope].add(bound)
             elif node.module and not node.level:
                 self.import_map[bound] = (node.module, alias.name)
-
-
-class _RouteCollector(ast_walk.NodeVisitor):
-    """Pass 1b: prelim route of every call site per scope, input of the
-    carrier fixpoint. Mirrors the transformer's skip rules (decorators,
-    defaults, class bodies, test functions are not isolation territory)."""
-
-    def __init__(self, transformer: 'FunctionIsolationTransformer'):
-        self.transformer = transformer
-        self.scope_routes: dict[str, list[_Route]] = {}
-        # Scopes that will get an instance-vector slot once the body is
-        # emitted. The slot does not exist yet, so the fixpoint cannot see it
-        # in the layout — but it makes the definition state-carrying, and a
-        # caller that routed around the state parameter would call it short
-        self.pin_carriers: set[str] = set()
-        self._stack: list[str] = []
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        if _is_test_function(node.name):
-            return
-        self._stack.append(self.transformer.layout.scope_segment(node))
-        scope = '·'.join(self._stack)
-        self.scope_routes.setdefault(scope, [])
-        if get_varying(node):
-            self.pin_carriers.add(scope)
-        for stmt in node.body:
-            self.visit(stmt)
-        self._stack.pop()
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        pass
-
-    def visit_Call(self, node: ast.Call) -> None:
-        self.generic_visit(node)
-        if self._stack and isinstance(node.func, (ast.Name, ast.Attribute)):
-            route = self.transformer.route_for_callee(node.func, self._stack)
-            self.scope_routes['·'.join(self._stack)].append(route)
 
 
 def _stamped_call(bound: ast.expr, node: ast.Call) -> ast.Call:
@@ -479,8 +583,18 @@ def _stamped_call(bound: ast.expr, node: ast.Call) -> ast.Call:
 class FunctionIsolationTransformer(ast_walk.NodeTransformer):
     """Rewrite call sites to the parent-slot / anchored emission (pass 2)."""
 
-    def __init__(self, layout: ModuleLayout):
+    def __init__(self, layout: ModuleLayout, analyse: Analyser | None = None,
+                 pipeline_hash: str = ''):
+        """
+        :param layout: The module's slot layout.
+        :param analyse: Answers a module's interface without executing it, for
+            the dependency records of the routed callees; None to record only
+            what the in-process registry knows.
+        :param pipeline_hash: Digest of the pipeline the module is transformed by.
+        """
         self.layout = layout
+        self._analyse = analyse
+        self._pipeline_hash = pipeline_hash
         self.index = _ScopeIndex(layout)
         self.carrier: dict[str, bool] = {}
         self._pin_carriers: set[str] = set()
@@ -490,12 +604,18 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
         self._comp_iter_depth = 0
         self._ordinals: dict[str, int] = {}
         self._used_helpers: set[str] = set()
-        self._resolve_cache: dict[str, Any] = {}
+        self._resolve_cache: dict[str, tuple[Any, tuple[types.ModuleType, ...]]] = {}
+        #: The module's type table: the dependency records the routes extend
+        self._table: PineTypeTable | None = None
+        #: The module files a route was already tracked through, as spelled
+        self._tracked_files: set[str] = set()
         self._close_module = ''
         # scope -> its instance-vector slot, and the index every varying site
         # of that scope reads out of it (by node identity)
         self._pin_slots: dict[str, int] = {}
         self._pin_index: dict[str, dict[int, int]] = {}
+        #: id(call node) -> (the node, its route), as the index's sites were classified
+        self.routes: dict[int, tuple[ast.Call, _Route]] = {}
 
     # --- classification ----------------------------------------------------
 
@@ -547,14 +667,20 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
 
         entry = self.index.import_map.get(base)
         if entry is not None:
-            if is_stdlib(entry[0]):
+            module_name, attr = entry
+            if is_stdlib(module_name):
                 return _SKIP
-            obj = self._resolve_imported(path, parts)
+            target = '.'.join([f'{module_name}.{attr}' if attr else module_name] + parts[1:])
+            if target == _LIB_PACKAGE or target.startswith(_LIB_PACKAGE + '.'):
+                # Spelled the way a script spells it (``lib.ta.sma``); a path the
+                # generator did not record is not provable, like an unresolvable one
+                return lib_routes().get('lib' + target[len(_LIB_PACKAGE):], _UNIFORM)
+            obj, modules = self._resolve_imported(path, parts)
             if obj is None:
                 return _UNIFORM
-            route = self._classify_object(obj)
-            if route == _FAST and getattr(obj, '__pyne_shared_call_site__', False):
-                return _FAST_SHARED
+            route = classify_callee(obj)
+            if route in _OBJECT_ROUTES:
+                self._track_route(obj, modules)
             return route
         if len(parts) == 1 and base in vars(builtins):
             return _SKIP
@@ -589,17 +715,27 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
         index = sub.slice.value
         return 0 <= index < len(scope.slots) and scope.slots[index].kind == 'series'
 
-    def _resolve_imported(self, path: str, parts: list[str]) -> Any | None:
-        """Resolve a dotted callee path through the module-level import map
-        at transform time (imports are cached in sys.modules)."""
+    def _resolve_imported(self, path: str, parts: list[str]) \
+            -> tuple[Any | None, tuple[types.ModuleType, ...]]:
+        """Resolve a dotted callee path of a non-lib module through the
+        module-level import map at transform time (imports are cached in
+        sys.modules).
+
+        :param path: The dotted callee path.
+        :param parts: Its segments.
+        :return: The callee object (None when unresolvable), and every module
+            the resolution read an attribute of or imported on the way.
+        """
         try:
             return self._resolve_cache[path]
         except KeyError:
             pass
         module_name, attr = self.index.import_map[parts[0]]
         obj: Any | None
+        modules: list[types.ModuleType] = []
         try:
             obj = importlib.import_module(module_name)
+            modules.append(obj)
             for name in ([attr] if attr else []) + parts[1:]:
                 try:
                     obj = getattr(obj, name)
@@ -611,36 +747,54 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
                     if not isinstance(obj, types.ModuleType):
                         raise
                     obj = importlib.import_module(f'{obj.__name__}.{name}')
+                if isinstance(obj, types.ModuleType):
+                    modules.append(obj)
         except Exception:  # noqa: any resolution failure means "unprovable"
             obj = None
-        self._resolve_cache[path] = obj
-        return obj
+        result = obj, tuple(modules)
+        self._resolve_cache[path] = result
+        return result
 
-    @staticmethod
-    def _classify_object(obj: Any) -> str:
-        """Classify a transform-time resolved callee object."""
-        if isinstance(obj, Exported):
-            return _UNIFORM  # the anchor's bind unwraps it
-        if isinstance(obj, type):
-            return _SKIP
-        bound_self = getattr(obj, '__self__', None)
-        if bound_self is not None and isinstance(bound_self, type):
-            return _SKIP  # classmethod
-        if isinstance(obj, (types.BuiltinFunctionType, types.BuiltinMethodType)):
-            return _SKIP
-        if getattr(obj, '__pyne_bind__', None) is not None:
-            # Overload dispatcher — the implementation is chosen at runtime.
-            # Must be checked BEFORE the layout: functools.wraps copies the
-            # first implementation's __dict__ (its __pyne_layout__ included)
-            # onto the dispatcher.
-            return _UNIFORM
-        if getattr(obj, '__pyne_layout__', None) is not None:
-            return _FAST
-        if getattr(obj, '__module_property__', False):
-            return _SKIP  # Pine-style module property getter — stateless by design
-        if isinstance(obj, types.FunctionType) and '__pyne_slot_layout__' in obj.__globals__:
-            return _DIRECT  # transformed module, no layout -> provably stateless
-        return _UNIFORM
+    def _track_route(self, obj: Any, modules: tuple[types.ModuleType, ...]) -> None:
+        """Make the module's cache depend on what a callee's route was decided by.
+
+        The route is read off the object the import chain BINDS, so it holds
+        while every module on that chain still binds the same object and the
+        module defining it still gives it the same state. A Pyne module among
+        them is recorded like an import the type pass records (its routes are
+        part of its record); a plain Python module publishes no interface, so
+        it is recorded by its source fingerprint alone -- a plain module
+        reexporting a Pyne function is otherwise invisible to the cache. Both
+        records are part of the module's dependency closure, so they reach the
+        modules depending on THIS one as well: a route that moves here moves
+        the routes of every caller of the function it is in.
+
+        :param obj: The callee object.
+        :param modules: The modules its resolution went through.
+        """
+        table = self._table
+        if table is None:
+            return
+        files = [getattr(module, '__file__', None) for module in modules]
+        if isinstance(obj, types.FunctionType):
+            files.append(obj.__globals__.get('__file__'))
+        for file in files:
+            if not isinstance(file, str) or file in self._tracked_files:
+                continue
+            self._tracked_files.add(file)
+            if not file.endswith('.py'):
+                continue
+            key = str(Path(file).resolve())
+            if (key == table.module_path or key in table.deps
+                    or Path(key).is_relative_to(_PACKAGE_DIR)):
+                continue
+            interface = module_interface.lookup(key, self._analyse, self._pipeline_hash)
+            if interface is not None:
+                module_interface.add_dep(table.deps, interface, table.module_path)
+                continue
+            record = module_interface.source_record(key)
+            if record is not None:
+                table.deps[key] = record
 
     def _is_carrier(self, scope_id: str) -> bool:
         """Whether a same-module scope carries state (fixpoint result)."""
@@ -683,13 +837,17 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
 
     @staticmethod
     def _copy_callee(func: ast.expr) -> ast.expr:
-        """Fresh, attribute-free copy of a callee expression. Other
-        transformers hang ``parent`` backlinks on nodes, which would make a
-        ``deepcopy`` drag the entire module tree along — rebuilding from
-        source sidesteps that. The reparse stamps ``lineno=1`` on every node;
-        those must be overwritten with the original callee's location, or the
-        lazy-resolve branch emits line-1 line events mid-statement (double
-        breakpoint hits and derailed step-over on the first bar)."""
+        """Fresh, attribute-free copy of a callee expression: what reparsing
+        its source text yields, built directly for a plain name chain. Every
+        node of the copy is stamped with the original callee's location: the
+        reparse alone puts ``lineno=1`` on them, and the lazy-resolve branch
+        would then emit line-1 line events mid-statement (double breakpoint
+        hits and derailed step-over on the first bar)."""
+        location = [getattr(func, attr, None) for attr in _LOCATION_ATTRIBUTES]
+        if None not in location:
+            copy = _copy_name_chain(func, location)
+            if copy is not None:
+                return copy
         copy = cast(ast.expr, ast.parse(ast.unparse(func), mode='eval').body)
         for node in ast_walk.walk(copy):
             ast.copy_location(node, func)
@@ -839,13 +997,19 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
         # have the loader's source path, so their module gets a content stamp.
         self._close_module = getattr(node, '_module_file_path', None) or hashlib.sha256(
             ast.dump(node, include_attributes=True).encode()).hexdigest()
+        self._table = module_table(node)
         self.layout.assign_scope_ids(node)
         self.index = _ScopeIndex(self.layout)
         self.index.visit(node)
-        collector = _RouteCollector(self)
-        collector.visit(node)
-        self._pin_carriers = collector.pin_carriers
-        self.carrier = self._run_fixpoint(collector.scope_routes)
+        scope_routes = self.index.scope_routes
+        for site, stack in self.index.sites:
+            route = self.route_for_callee(site.func, stack)
+            scope_routes['·'.join(stack)].append(route)
+            # The emission reaches this site in the same scope and finds the
+            # same callee, so it reuses the route instead of classifying again
+            self.routes[id(site)] = (site, route)
+        self._pin_carriers = self.index.pin_carriers
+        self.carrier = self._run_fixpoint(scope_routes)
 
         node = cast(ast.Module, self.generic_visit(node))
 
@@ -972,7 +1136,9 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
             # argument of a nested state-carrying callee is never passed
             node.func.value = cast(ast.expr, self.visit(node.func.value))
 
-        route = self.route_for_callee(node.func, self._scope_stack)
+        collected = self.routes.get(id(node))
+        route = collected[1] if collected is not None and collected[0] is node \
+            else self.route_for_callee(node.func, self._scope_stack)
         path = _get_func_path(node.func)
         if path in {'lib.strategy.close', 'lib.strategy.close_all'} and not any(
                 'lib' in self.index.assigned.get('·'.join(self._scope_stack[:i]), ())
@@ -1018,7 +1184,7 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
 
         ordinal = self._ordinals.get(scope, 0)
         self._ordinals[scope] = ordinal + 1
-        call_id = f'{scope}·{_get_func_path(node.func) or "<callee>"}·{ordinal}'
+        call_id = f'{scope}·{path or "<callee>"}·{ordinal}'
         scope_layout = self.layout.scope(scope)
         pin_expr, vector = self._channel_args(node, scope)
         if route == _FAST:

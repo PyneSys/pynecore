@@ -29,18 +29,19 @@ import ast
 import json
 import os
 import sys
+import zlib
 from pathlib import Path
 
 import pytest
 
-from pynecore.core.import_hook import PIPELINE_DIGEST, analyse_source
+from tests.t00_pynecore.pine_analysis import analyse_module
 from pynecore.core.instance_state import _make_state
-from pynecore.transformers import pine_type_artifact
+from pynecore.transformers import module_interface
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
 from pynecore.transformers.persistent import PersistentTransformer
-from pynecore.transformers.pine_type_artifact import (
-    build_interface, registered, table_json, _interface_from_json,
+from pynecore.transformers.module_interface import (
+    build_interface, interface_from_payload, interface_payload, registered,
 )
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
@@ -58,11 +59,11 @@ from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
 @pytest.fixture(autouse=True)
 def _clean_registry():
     """Keep the process-wide interface registry from leaking between tests."""
-    pine_type_artifact._registry.clear()
-    pine_type_artifact._analysing.clear()
+    module_interface._registry.clear()
+    module_interface._analysing.clear()
     yield
-    pine_type_artifact._registry.clear()
-    pine_type_artifact._analysing.clear()
+    module_interface._registry.clear()
+    module_interface._analysing.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -109,7 +110,7 @@ def _write(tmp_path: Path, name: str, source: str) -> Path:
 
 def _analysed(path: Path) -> tuple[ast.Module, PineTypeTable]:
     """Run the analysing half of the pipeline, cross-module resolution included."""
-    analysed = analyse_source(str(path))
+    analysed = analyse_module(str(path))
     assert analysed is not None, 'the module was not recognized as Pyne code'
     return analysed[0], analysed[1]
 
@@ -1168,7 +1169,7 @@ def __test_a_field_type_change_moves_the_digest__(tmp_path):
         # The SAME path every time: a class id carries the module key, so two
         # file names would move the digest by themselves
         path = _write(tmp_path, 'shp_digest', source)
-        pine_type_artifact._registry.clear()
+        module_interface._registry.clear()
         sys.modules.pop('shp_digest', None)
         tree, table = _analysed(path)
         return build_interface(tree, table, str(path.resolve())).digest
@@ -1183,8 +1184,8 @@ def __test_a_field_type_change_moves_the_digest__(tmp_path):
     assert base == body_edit
 
 
-def __test_the_artifact_round_trips_an_extension__(tmp_path, monkeypatch):
-    """An extension is part of the contract, so it is in the JSON and in the digest"""
+def __test_the_payload_round_trips_an_extension__(tmp_path, monkeypatch):
+    """An extension is part of the contract, so it is in the payload and in the digest"""
     monkeypatch.syspath_prepend(tmp_path)
     base = _write(tmp_path, 'shp_ext_base', BASE_LIB)
     path = _write(tmp_path, 'shp_json_ext', EXTENSION_LIB)
@@ -1192,12 +1193,13 @@ def __test_the_artifact_round_trips_an_extension__(tmp_path, monkeypatch):
     interface = build_interface(tree, table, str(path.resolve()))
 
     cid = class_id(str(base.resolve()), 'Pivot')
-    data = json.loads(json.dumps(
-        table_json(tree, table, interface, path.read_bytes(), PIPELINE_DIGEST)))
-    assert data['interface']['extensions'][cid]['tag']['ret'] == STR
+    payload = interface_payload(interface)
+    assert json.loads(zlib.decompress(payload))['extensions'][cid]['tag']['ret'] == STR
 
     stat = os.stat(path)
-    restored = _interface_from_json(interface.path, data, (stat.st_mtime_ns, stat.st_size))
+    restored = interface_from_payload(interface.path, payload, interface.deps,
+                                      (stat.st_mtime_ns, stat.st_size))
+    assert restored is not None
     assert restored.extensions == interface.extensions
     assert restored.digest == interface.digest
 
@@ -1205,28 +1207,29 @@ def __test_the_artifact_round_trips_an_extension__(tmp_path, monkeypatch):
     # resolves through this signature
     changed = _write(tmp_path, 'shp_json_ext', EXTENSION_LIB.replace(
         '-> str:\n    return "x"', '-> int:\n    return 1'))
-    pine_type_artifact._registry.clear()
+    module_interface._registry.clear()
     sys.modules.pop('shp_json_ext', None)
     moved_tree, moved_table = _analysed(changed)
     moved = build_interface(moved_tree, moved_table, str(changed.resolve()))
     assert moved.digest != interface.digest
 
 
-def __test_the_artifact_round_trips_a_class__(tmp_path):
-    """What the JSON carries is what a later process reads back"""
+def __test_the_payload_round_trips_a_class__(tmp_path):
+    """What the .pyc carries is what a later process reads back"""
     path = _write(tmp_path, 'shp_json', SHAPED_LIB)
     tree, table = _analysed(path)
     interface = build_interface(tree, table, str(path.resolve()))
 
-    data = json.loads(json.dumps(
-        table_json(tree, table, interface, path.read_bytes(), PIPELINE_DIGEST)))
+    payload = interface_payload(interface)
 
-    published = data['interface']['classes']['Settings']
+    published = json.loads(zlib.decompress(payload))['classes']['Settings']
     assert published['fields'] == {'depth': INT, 'weights': array_of(FLOAT)}
     assert published['methods']['bump']['ret'] == INT
 
     stat = os.stat(path)
-    restored = _interface_from_json(interface.path, data, (stat.st_mtime_ns, stat.st_size))
+    restored = interface_from_payload(interface.path, payload, interface.deps,
+                                      (stat.st_mtime_ns, stat.st_size))
+    assert restored is not None
     assert restored.classes == interface.classes
     assert restored.digest == interface.digest
 

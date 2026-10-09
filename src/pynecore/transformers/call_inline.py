@@ -379,23 +379,41 @@ def _deep_copy(node: ast.expr) -> ast.expr:
     :param node: The expression.
     :return: A copy sharing no node with the original.
     """
-    def walk(value: Any) -> Any:
-        if isinstance(value, ast.AST):
-            new = type(value).__new__(type(value))
-            fields = set(value._fields)
-            for field, item in ast.iter_fields(value):
-                setattr(new, field, walk(item))
-            # Everything the other passes hung on the node travels with it:
-            # the Pine type stamp, the exactness marker, the node id. Losing a
-            # stamp would silently retype a preserved operand
-            for key, item in vars(value).items():
-                if key not in fields:
-                    setattr(new, key, item)
-            return new
-        if isinstance(value, list):
-            return [walk(item) for item in value]
-        return value
-    return cast(ast.expr, walk(node))
+    return cast(ast.expr, _copy_node(node))
+
+
+def _copy_node(value: ast.AST) -> ast.AST:
+    """Copy a node: its fields deeply, everything else hung on it as it is."""
+    cls = value.__class__
+    new = cls.__new__(cls)
+    state = new.__dict__
+    fields = cls._fields
+    for field in fields:
+        try:
+            item = getattr(value, field)
+        except AttributeError:
+            continue
+        if isinstance(item, ast.AST):
+            item = _copy_node(item)
+        elif isinstance(item, list):
+            item = [_copy_value(entry) for entry in item]
+        state[field] = item
+    # Everything the other passes hung on the node travels with it: the Pine
+    # type stamp, the exactness marker, the node id. Losing a stamp would
+    # silently retype a preserved operand
+    for key, item in value.__dict__.items():
+        if key not in fields:
+            state[key] = item
+    return new
+
+
+def _copy_value(value: Any) -> Any:
+    """Copy a field value: a node or a list deeply, anything else as it is."""
+    if isinstance(value, ast.AST):
+        return _copy_node(value)
+    if isinstance(value, list):
+        return [_copy_value(item) for item in value]
+    return value
 
 
 class _Template:
@@ -413,6 +431,12 @@ class _Template:
         :return: The inlined expression.
         """
         return cast(ast.expr, self._render(args, used))
+
+
+#: Derived templates, process-wide: ``(module, name)`` -> the parsed functions
+#: of the module they were derived from (see :func:`_module_functions`) and the
+#: template, None for a body that is not derivable
+_derived: dict[tuple[str, str], tuple[dict[str, ast.FunctionDef], _Template | None]] = {}
 
 
 def derive_template(module_name: str, func_name: str) -> _Template:
@@ -906,15 +930,16 @@ def _replace_node(root: ast.AST, old: ast.AST, new: ast.AST) -> bool:
 
 
 class _PlaceholderSubstitutor(ast_walk.NodeTransformer):
-    """Replace every read of one placeholder with a freshly built expression."""
+    """Replace every read of a placeholder with a freshly built expression."""
 
-    def __init__(self, name: str, factory: Any):
-        self.name = name
-        self.factory = factory
+    def __init__(self, factories: dict[str, Callable[[], ast.expr]]):
+        #: Placeholder name -> the factory building its replacement
+        self.factories = factories
 
     def visit_Name(self, node: ast.Name) -> ast.expr:
-        if node.id == self.name:
-            return cast(ast.expr, self.factory())
+        factory = self.factories.get(node.id)
+        if factory is not None:
+            return factory()
         return node
 
 
@@ -1026,6 +1051,38 @@ class _NameIndex(ast_walk.NodeVisitor):
             self.import_map[bound] = (cast(str, node.module), alias.name)
 
 
+class _Rebinds(ast_walk.NodeVisitor):
+    """Find whether a subtree binds one name: a store or delete, a definition,
+    an ``except ... as``, an import alias or a match capture."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.found = False
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id == self.name and not isinstance(node.ctx, ast.Load):
+            self.found = True
+
+    def _visit_named(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+                     | ast.ExceptHandler | ast.MatchAs | ast.MatchStar) -> None:
+        if node.name == self.name:
+            self.found = True
+        self.generic_visit(node)
+
+    visit_FunctionDef = _visit_named
+    visit_AsyncFunctionDef = _visit_named
+    visit_ClassDef = _visit_named
+    visit_ExceptHandler = _visit_named
+    visit_MatchAs = _visit_named
+    visit_MatchStar = _visit_named
+
+    def visit_Import(self, node: ast.Import | ast.ImportFrom) -> None:
+        if any((alias.asname or alias.name.split('.')[0]) == self.name for alias in node.names):
+            self.found = True
+
+    visit_ImportFrom = visit_Import
+
+
 class CallInlineTransformer(ast_walk.NodeTransformer):
     """Replace calls to allow-listed Pine builtins with their own body."""
 
@@ -1045,7 +1102,6 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
         #: ``nonlocal`` anywhere inside it (the pass adds no such declaration,
         #: so one scan per function answers for every loop in it)
         self._declared: dict[int, frozenset[str]] = {}
-        self._blocked = 0
         #: Number of sites rewritten -- the pass's own tests assert on it
         self.inlined = 0
 
@@ -1131,7 +1187,11 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
         return obj
 
     def _template(self, key: tuple[str, str]) -> _Template | None:
-        """The template of an allow-listed function, derived once.
+        """The template of an allow-listed function, derived once per source.
+
+        A template is never changed by a render, so one derivation serves every
+        module of the process -- for as long as the parsed source it was
+        derived from is the current one.
 
         :param key: ``(module, name)``.
         :return: The template, or None when the body is not derivable.
@@ -1140,10 +1200,21 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
             return self._templates[key]
         except KeyError:
             pass
+        template: _Template | None
         try:
-            template: _Template | None = derive_template(*key)
+            functions = _module_functions(key[0])
         except NotDerivable:
             template = None
+        else:
+            derived = _derived.get(key)
+            if derived is not None and derived[0] is functions:
+                template = derived[1]
+            else:
+                try:
+                    template = derive_template(*key)
+                except NotDerivable:
+                    template = None
+                _derived[key] = (functions, template)
         self._templates[key] = template
         return template
 
@@ -1197,12 +1268,22 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
         # pass's own emission, and the user's subtrees must stay untouched
         _mark_exact(expression)
 
+        # The anchors are collected here, from the FOLDED body: a guard folded
+        # away takes its anchors with it, and an import nothing reads is dead
+        # weight. The arguments going in below bring none of their own -- a
+        # nested inlined call registered its anchors when it was inlined
+        del used
         reads: dict[int, int] = {index: 0 for index in placeholders}
+        indexes = {name: index for index, name in placeholders.items()}
         for child in ast_walk.walk(expression):
             if isinstance(child, ast.Name):
-                for index, name in placeholders.items():
-                    if child.id == name:
-                        reads[index] += 1
+                index = indexes.get(child.id)
+                if index is not None:
+                    reads[index] += 1
+                elif child.id.startswith(SUPPORT_ALIAS_PREFIX):
+                    anchor_name = _anchor_of(child.id)
+                    if anchor_name is not None:
+                        self._used.add(anchor_name)
         always: list[ast.Name] = []
         _always_nodes(expression, always)
         first_always: dict[int, ast.Name] = {}
@@ -1221,6 +1302,9 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
                    if index in ordered]
         force = bool(impure) and natural != ordered
 
+        # Every placeholder is put in by ONE substitution pass at the end: the
+        # replacements hold no placeholder, so the order they go in is moot
+        factories: dict[str, Callable[[], ast.expr]] = {}
         probes: list[ast.expr] = []
         for index, kind in enumerate(classes):
             if kind == _ARG_CONST:
@@ -1234,16 +1318,14 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
                     # the probe is only there to pin WHERE it is read
                     probes.append(_probe(_arg_copy(argument),
                                          cast(ast.Name, argument).id))
-                    _PlaceholderSubstitutor(
-                        name, lambda a=argument: _arg_copy(a)).visit(expression)
+                    factories[name] = lambda a=argument: _arg_copy(a)
                     continue
                 self._counter += 1
                 temp = _TEMP_NAME.format(self._counter)
                 probes.append(_probe(ast.NamedExpr(
                     target=ast.Name(id=temp, ctx=ast.Store()),
                     value=_arg_copy(argument)), temp))
-                _PlaceholderSubstitutor(
-                    name, lambda t=temp: ast.Name(id=t, ctx=ast.Load())).visit(expression)
+                factories[name] = lambda t=temp: ast.Name(id=t, ctx=ast.Load())
                 continue
             #  - a name is free to re-read, so it always goes in as itself;
             #  - a slot read is free of side effects but costs an index, so it
@@ -1255,8 +1337,7 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
                 or (kind == _ARG_SLOT and (reads[index] <= 1 or anchor is None)) \
                 or (kind == _ARG_IMPURE and reads[index] <= 1 and anchor is not None)
             if direct:
-                _PlaceholderSubstitutor(
-                    name, lambda a=argument: _arg_copy(a)).visit(expression)
+                factories[name] = lambda a=argument: _arg_copy(a)
                 continue
             # Read more than once: bound once at its first read, which the
             # order check above proved is on every path
@@ -1264,20 +1345,13 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
             temp = _TEMP_NAME.format(self._counter)
             _replace_node(expression, cast(ast.Name, anchor), ast.NamedExpr(
                 target=ast.Name(id=temp, ctx=ast.Store()), value=_arg_copy(argument)))
-            _PlaceholderSubstitutor(
-                name, lambda t=temp: ast.Name(id=t, ctx=ast.Load())).visit(expression)
+            factories[name] = lambda t=temp: ast.Name(id=t, ctx=ast.Load())
+        if factories:
+            _PlaceholderSubstitutor(factories).visit(expression)
 
         if probes:
             expression = _chain(probes, expression)
 
-        # Collected from the FINAL expression: a guard folded away takes its
-        # anchors with it, and an import nothing reads is dead weight
-        del used
-        for child in ast_walk.walk(expression):
-            if isinstance(child, ast.Name) and child.id.startswith(SUPPORT_ALIAS_PREFIX):
-                anchor_name = _anchor_of(child.id)
-                if anchor_name is not None:
-                    self._used.add(anchor_name)
         self.inlined += 1
         return ast.copy_location(
             stamp_lowering(expression, get_ty(node)), node)
@@ -1287,7 +1361,7 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
     def visit_Module(self, node: ast.Module) -> ast.Module:
         self.index = _NameIndex()
         self.index.visit(node)
-        node = cast(ast.Module, self.generic_visit(node))
+        self._visit_definitions(node)
         if self._used:
             import_stmt = ast.ImportFrom(
                 module=SUPPORT_MODULE,
@@ -1306,6 +1380,22 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
                     break
             node.body.insert(insert_pos, import_stmt)
         return node
+
+    def _visit_definitions(self, node: ast.AST) -> None:
+        """Visit the function definitions among the statements under ``node``.
+
+        Outside a function body nothing is inlined, so no expression there is
+        entered; a definition is a statement, and the walk only descends
+        through statements to reach every one of them. A class body is not
+        entered (see ``visit_ClassDef``).
+
+        :param node: The module, or a statement outside every function.
+        """
+        for child in ast_walk.iter_child_statements(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.visit(child)
+            elif not isinstance(child, ast.ClassDef):
+                self._visit_definitions(child)
 
     def _loop_counter(self, node: ast.For) -> str | None:
         """The counter of a loop whose value is never na anywhere in its body.
@@ -1334,23 +1424,10 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
                 or self._resolve(path, path.split('.'), entry) is not pine_range:
             return None
         name = node.target.id
+        rebinds = _Rebinds(name)
         for stmt in node.body:
-            for child in ast_walk.walk(stmt):
-                if isinstance(child, ast.Name) and child.id == name \
-                        and not isinstance(child.ctx, ast.Load):
-                    return None
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
-                        and child.name == name:
-                    return None
-                if isinstance(child, ast.ExceptHandler) and child.name == name:
-                    return None
-                if isinstance(child, (ast.Import, ast.ImportFrom)) \
-                        and any((alias.asname or alias.name.split('.')[0]) == name
-                                for alias in child.names):
-                    return None
-                if isinstance(child, (ast.MatchAs, ast.MatchStar)) and child.name == name:
-                    return None
-        if name in self._declared_names(self._functions[-1]):
+            rebinds.visit(stmt)
+        if rebinds.found or name in self._declared_names(self._functions[-1]):
             return None
         return name
 
@@ -1381,10 +1458,9 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
         return node
 
     def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
-        # A temporary bound in a class body would become a class attribute
-        self._blocked += 1
-        self.generic_visit(node)
-        self._blocked -= 1
+        # A temporary bound in a class body would become a class attribute, so
+        # no site in it is inlined -- a method body included -- and the subtree
+        # is not entered at all
         return node
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
@@ -1411,18 +1487,14 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
         return node
 
     def visit_Lambda(self, node: ast.Lambda) -> ast.Lambda:
-        # A walrus in a lambda binds in the lambda's own scope
-        self._blocked += 1
-        self.generic_visit(node)
-        self._blocked -= 1
+        # A walrus in a lambda binds in the lambda's own scope, so no site in
+        # it is inlined and it is not entered
         return node
 
     def _visit_comprehension(self, node: ast.expr) -> ast.expr:
         # A walrus is illegal in a comprehension's iterable and binds to the
-        # containing scope elsewhere in it
-        self._blocked += 1
-        self.generic_visit(node)
-        self._blocked -= 1
+        # containing scope elsewhere in it, so no site in it is inlined and it
+        # is not entered
         return node
 
     visit_ListComp = _visit_comprehension
@@ -1432,6 +1504,6 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
 
     def visit_Call(self, node: ast.Call) -> ast.expr:
         self.generic_visit(node)
-        if self._blocked or not self._func_depth:
+        if not self._func_depth:
             return node
         return self._inline(node) or node

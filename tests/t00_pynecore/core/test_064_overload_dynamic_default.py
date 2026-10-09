@@ -1,8 +1,7 @@
 """
 @pyne
 """
-# noinspection PyProtectedMember
-from pynecore.core.instance_state import __dyn_default__
+from pynecore.core import instance_state
 # noinspection PyProtectedMember
 from pynecore.core.overload import overload
 
@@ -22,6 +21,11 @@ def main():
 # Whole libraries died on it (chrono_utils' ``SessionTimeRange.init()``).
 #
 
+# The sentinel itself: Pyne code may not spell the names the transform emits, so
+# the compiled shape below holds it under a name of its own
+DYN_DEFAULT = getattr(instance_state, '__dyn_default__')
+
+
 class _Marker:
     pass
 
@@ -40,8 +44,8 @@ def _init(this: _Marker, value: int = 0):  # type: ignore[no-redef]
 # noinspection PyUnusedLocal,PyRedeclaration
 @overload
 def _init(this: _Holder,  # type: ignore[no-redef]
-          a: _Marker = __dyn_default__, b: _Marker = __dyn_default__):
-    return f'holder:{a is __dyn_default__}:{b is __dyn_default__}'
+          a: _Marker = DYN_DEFAULT, b: _Marker = DYN_DEFAULT):
+    return f'holder:{a is DYN_DEFAULT}:{b is DYN_DEFAULT}'
 
 
 def __test_omitted_dynamic_default_dispatches__():

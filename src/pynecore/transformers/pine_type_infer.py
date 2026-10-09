@@ -29,7 +29,10 @@ publishes -- and never from the argument types at the call site: the callee's
 body belongs to another module, which is analysed once, on its own. An
 overload group is still pinned there, because a pin selects among signatures
 and needs no body. Every interface consulted is recorded in ``table.deps``, so
-the loader can tell when a dependency's signatures moved.
+the loader can tell when a dependency's signatures moved -- and so is every
+Pyne module the module imports, consulted or not, because the lowering routes
+a call on whatever object an import binds, which may live one module further
+out than any interface the types read.
 
 The other bounded fixpoint that remains is the loop one: a loop-carried
 variable only reaches its type on the second walk of the body.
@@ -42,6 +45,7 @@ import ast
 import importlib.util
 import json
 from bisect import bisect_right
+from collections import deque
 from collections.abc import Callable, Container, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,9 +53,9 @@ from typing import Any, Final
 
 from ..utils.stdlib_checker import is_stdlib
 from . import ast_walk
-from . import pine_type_artifact
+from . import module_interface
 from .dynamic_default import is_script_entry
-from .node_ids import assign_node_ids, node_id
+from .node_ids import ID_ATTR, assign_node_ids, node_id
 from .pine_type_report import unknown_diags
 from .pine_type_rules import (
     INT, FLOAT, BOOL, STR, TYPELESS, UNKNOWN, VOID, OBJECT, NUMERIC,
@@ -76,8 +80,8 @@ from .pine_qualifier import (
     set_series_len, set_series_lens,
 )
 
-__all__ = ['infer_module', 'lib_types', 'lib_classes', 'lib_namespaces',
-           'TY_ATTR', 'get_ty', 'set_ty', 'inherit_ty']
+__all__ = ['infer_module', 'lib_types', 'lib_classes', 'lib_namespaces', 'lib_routes',
+           'lib_star_exports', 'TY_ATTR', 'get_ty', 'set_ty', 'inherit_ty']
 
 #: How many times a loop body is re-inferred before the types are declared
 #: stable. Both lattices are two high (int -> float -> unknown, const -> simple
@@ -123,17 +127,50 @@ _SHAPE_FORMS: Final[dict[str, Callable[[str], str]]] = {
 _Scope = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef
 _SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 
+#: Node classes no scan of ``_scan_tree`` finds anything under: a name, a
+#: constant, an expression context, an operator
+_HOLLOW: frozenset[type] = frozenset(
+    cls for cls in vars(ast).values()
+    if isinstance(cls, type) and (cls in (ast.Name, ast.Constant) or issubclass(
+        cls, (ast.expr_context, ast.operator, ast.unaryop, ast.cmpop, ast.boolop))))
+
+#: The node classes besides ``Name`` that bind or declare a name in their scope
+#: (see ``_scope_facts``)
+_BINDING_TYPES: frozenset[type] = frozenset({
+    ast.alias, ast.ExceptHandler, ast.MatchAs, ast.MatchStar, ast.MatchMapping, ast.Global,
+    ast.Nonlocal})
+
 #: Where one position stands in a module body's control flow: the chain of
 #: (compound statement, branch label) pairs leading down to it from the body.
 #: Two positions are mutually exclusive when the first branch they take apart
 #: is one no single pass runs both of -- see ``_mutually_exclusive``.
 _BranchPath = tuple[tuple[ast.stmt, str], ...]
 
+#: Expression class -> the ``_Inference._e_<Class>`` rule typing it, None for a
+#: class with no rule; resolved on first sight instead of per node
+_EXPR_RULES: dict[type, Callable[..., str] | None] = {}
+
+#: Expression class -> how ``_Inference._expr_qual`` derives its qualifier;
+#: resolved on first sight (``_qual_rule``) instead of matched per node
+_QUAL_RULES: dict[type, Callable[..., int]] = {}
+
 _LIB_TYPES_PATH = Path(__file__).parent / 'lib_types.json'
+_LIB_REGISTRY: dict[str, Any] = {}
 _LIB_TYPES: dict[str, Any] = {}
 _LIB_CLASSES: dict[str, 'ClassSig'] = {}
 _LIB_SCALARS: dict[str, str] = {}
 _LIB_NAMESPACES: set[str] = set()
+
+
+def _lib_registry() -> dict[str, Any]:
+    """
+    The generated lib registry file, parsed once for every view of it below.
+
+    :return: Its top-level sections
+    """
+    if not _LIB_REGISTRY:
+        _LIB_REGISTRY.update(json.loads(_LIB_TYPES_PATH.read_text()))
+    return _LIB_REGISTRY
 
 
 def lib_types() -> dict[str, Any]:
@@ -148,7 +185,7 @@ def lib_types() -> dict[str, Any]:
     :return: name -> entry mapping
     """
     if not _LIB_TYPES:
-        _LIB_TYPES.update(json.loads(_LIB_TYPES_PATH.read_text())['names'])
+        _LIB_TYPES.update(_lib_registry()['names'])
     return _LIB_TYPES
 
 
@@ -164,7 +201,7 @@ def lib_classes() -> dict[str, ClassSig]:
     :return: Class id -> what that class declares
     """
     if not _LIB_CLASSES:
-        published = json.loads(_LIB_TYPES_PATH.read_text())['classes']
+        published = _lib_registry()['classes']
         for name, fields in published.items():
             cid = builtin_class_id(name)
             _LIB_CLASSES[cid] = ClassSig(name=name, id=cid, fields=dict(fields), methods={})
@@ -183,10 +220,35 @@ def lib_scalar_classes() -> dict[str, str]:
     :return: Class id -> the scalar it is
     """
     if not _LIB_SCALARS:
-        published = json.loads(_LIB_TYPES_PATH.read_text()).get('scalar_classes') or {}
+        published = _lib_registry().get('scalar_classes') or {}
         _LIB_SCALARS.update({object_ty(builtin_class_id(name)): scalar
                              for name, scalar in published.items()})
     return _LIB_SCALARS
+
+
+def lib_routes() -> dict[str, str]:
+    """
+    The call-site route of every lib callee path that does not route uniform.
+
+    ``FunctionIsolationTransformer`` reads a ``pynecore.lib`` callee's route
+    here instead of importing and inspecting the object; the generator computed
+    each entry with the transformer's own ``classify_callee``.
+
+    :return: Callee path as a script spells it (``lib.ta.sma``) -> route
+    """
+    return _lib_registry()['routes']
+
+
+def lib_star_exports() -> dict[str, list[str]]:
+    """
+    The ``__all__`` of every lib module that defines one.
+
+    ``ImportNormalizerTransformer`` expands ``from pynecore.lib... import *``
+    from here instead of importing the module.
+
+    :return: Module name (``pynecore.lib.ta``) -> its ``__all__``, sorted
+    """
+    return _lib_registry()['star_exports']
 
 
 def lib_namespaces() -> set[str]:
@@ -224,8 +286,9 @@ def infer_module(tree: ast.Module, module_path: str = '', *,
 
     :param tree: The module to walk; it is stamped in place
     :param module_path: Absolute source path, for diagnostics
-    :param analyse: Re-derives an imported module's table from its source path,
-                    for resolving a call into another module
+    :param analyse: Produces an imported module's interface from its source
+                    path when no transform of this process published it, for
+                    resolving a call into another module
     :param pipeline_hash: Digest of the transform pipeline, which an imported
                           module's cached interface has to have been built by
     :param qualify_windows: Whether to decide the machine of every window call
@@ -240,7 +303,7 @@ def infer_module(tree: ast.Module, module_path: str = '', *,
     # what terminates an import cycle -- and marking it HERE rather than only
     # in ``lookup`` is what makes the cycle visible to the module that has it,
     # instead of to a throwaway re-analysis one level further down
-    with pine_type_artifact.analysing_scope(module_path):
+    with module_interface.analysing_scope(module_path):
         engine.run(tree)
     return engine.table
 
@@ -263,6 +326,28 @@ class _Frame:
     #: Name of a ``pine_loop(...)`` counter object -> the type its counter
     #: has, the join of the bounds it was built and stepped with
     loop_counters: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True, frozen=True)
+class _ScopeFacts:
+    """
+    What one lexical scope's own statements bind, declare and read.
+
+    Nested scopes are not descended into: their bindings, declarations and
+    reads belong to them. Their HEADERS -- decorators, defaults, annotations,
+    bases -- are evaluated where the nested scope stands, and are read here.
+    """
+    #: Every name a statement binds by something other than a ``def`` -- see
+    #: ``_bound_positions``, which answers the same with the positions
+    bound: set[str]
+    #: Names a ``global`` statement sends to the module scope
+    declared_global: set[str]
+    #: Names a ``nonlocal`` statement sends to an enclosing function scope
+    declared_nonlocal: set[str]
+    #: Every name read, the nested scopes' headers included
+    loaded: set[str]
+    #: The nested definitions, classes and lambdas, headers' lambdas included
+    nested: tuple[_Scope, ...]
 
 
 @dataclass(slots=True, frozen=True)
@@ -301,8 +386,9 @@ class _Inference:
     def __init__(self, module_path: str, *, analyse: Analyser | None = None,
                  pipeline_hash: str = '', qualify_windows: bool = False):
         self.table = PineTypeTable(module_path=module_path)
-        #: How an imported module's table is re-derived, when one is needed.
-        #: Not ``_analyse`` -- that name is the walker's own body analysis
+        #: How an imported module's interface is produced when the registry
+        #: has none. Not ``_analyse`` -- that name is the walker's own body
+        #: analysis
         self._analyser = analyse
         #: Which pipeline an imported module's cached interface must come from
         self._pipeline_hash = pipeline_hash
@@ -311,6 +397,8 @@ class _Inference:
         self.table.bindings[''] = self._frames[0].names
         #: Names bound by the enclosing lib import, e.g. ``lib``
         self._lib_aliases: set[str] = set()
+        #: id(node) -> the node and the registry key it references (``_lib_name``)
+        self._lib_names: dict[int, tuple[ast.AST, str | None]] = {}
         #: Module-level name -> the import that binds it. Module level only: a
         #: function-level import is a local of that scope and stays opaque,
         #: the same shapes the isolation pass declines to resolve
@@ -369,10 +457,17 @@ class _Inference:
         #: definition's answer is built from its nested scopes' answers, so
         #: without it every nested scope is rescanned once per enclosing one
         self._scope_free_memo: dict[int, tuple[_Scope, frozenset[str], frozenset[str]]] = {}
-        #: id(def node) -> the node and its ``global`` / ``nonlocal`` names. A
-        #: definition is analysed once per calling context, but what it declares
-        #: does not depend on the context. The frames only ever read the sets.
-        self._declared_memo: dict[int, tuple[ast.AST, set[str], set[str]]] = {}
+        #: id(scope node) -> the node and what its own statements bind, declare
+        #: and read (``_scope_facts``). The collection, every context's frame and
+        #: the free-name scan all ask it, and none of the answers depends on the
+        #: context. The frames only ever read the sets.
+        self._facts_memo: dict[int, tuple[_Scope, _ScopeFacts]] = {}
+        #: id(def node) -> the node and its own ``return`` statements, in the
+        #: order the return type joins them. A body is analysed once per context,
+        #: but where its returns stand does not move
+        self._returns_memo: dict[int, tuple[ast.AST, list[ast.Return]]] = {}
+        #: id(def node) -> the node and the bare names it calls (``_called_names``)
+        self._called_memo: dict[int, tuple[ast.AST, set[str]]] = {}
         #: One call site's analysis identity -- everything but the
         #: free-variable types of a memo key, plus the call node -> the memo
         #: key that currently answers it. What makes a re-analysis of the SAME
@@ -598,9 +693,11 @@ class _Inference:
 
     def _lookup(self, name: str) -> Binding | None:
         """Find a name in the innermost live scope that has it."""
-        declared = self._declared_home(name)
-        if declared is not None:
-            return declared.get(name)
+        current = self._frames[-1]
+        if current.declared_global or current.declared_nonlocal:
+            declared = self._declared_home(name)
+            if declared is not None:
+                return declared.get(name)
         for frame in reversed(self._frames):
             found = frame.names.get(name)
             if found is not None:
@@ -779,9 +876,9 @@ class _Inference:
             name: [(position, self._branches.of(position)) for position in positions]
             for name, positions in _bound_positions(tree.body).items()}
         self._rebound[''] = set(self._module_rebinds)
+        annotations, self._sec_writes = _scan_tree(tree)
         self._collect_imports(tree)
-        self._collect_classes(tree)
-        self._sec_writes = _security_writes(tree)
+        self._collect_classes(tree, annotations)
         self._collect(tree.body, '')
         self._body(tree.body)
         self._flush_pending()
@@ -804,6 +901,8 @@ class _Inference:
         self.table.exportable = _exportable_names(
             tree.body, self._module_rebinds, self._overload_groups)
         self._publish_methods()
+        # Last, so it records and nothing reads it: no type here rests on it
+        self._record_imports(tree)
 
     def _publish_methods(self) -> None:
         """
@@ -879,7 +978,7 @@ class _Inference:
         for stmt in statements:
             self._add_shadowed(stmt)
 
-    def _collect_classes(self, tree: ast.Module) -> None:
+    def _collect_classes(self, tree: ast.Module, annotations: dict[str, ast.expr]) -> None:
         """
         Every class an annotation of this module may name, with what it holds.
 
@@ -922,12 +1021,13 @@ class _Inference:
         an object would type against a class nothing holds.
 
         :param tree: The module being walked
+        :param annotations: Every dotted name its annotations spell -> where
         """
         own = self._own_class_nodes(tree)
         module_key = self.table.module_path or ''
         names = {name: class_id(module_key, name) for name in own}
         imported: dict[str, ClassSig] = {}
-        for spelled, node in _annotation_names(tree).items():
+        for spelled, node in annotations.items():
             parts = spelled.split('.')
             if spelled in names or spelled in imported:
                 continue
@@ -1049,8 +1149,7 @@ class _Inference:
         :param binding: What it names
         :param node: The ``alias`` node, whose position identifies the binding
         """
-        if binding.module == 'pynecore' or binding.module.startswith('pynecore.') \
-                or is_stdlib(binding.module):
+        if _publishes_nothing(binding.module):
             return
         if name in self._imports:
             self._multi_imports.add(name)
@@ -1129,7 +1228,7 @@ class _Inference:
                 own.update(arg.arg for arg in _every_param(stmt))
                 own.update(arg.arg for arg in (stmt.args.vararg, stmt.args.kwarg)
                            if arg is not None)
-                own.update(_bound_names(stmt.body))
+                own.update(self._scope_facts(stmt).bound)
                 self._collect(stmt.body, key)
             else:
                 for nested in _statement_lists(stmt):
@@ -1368,15 +1467,20 @@ class _Inference:
         the time a called helper comes up it already has its contexts and is
         skipped. A cycle has no such order and takes the first one left.
         """
-        remaining = [(key, node, _called_names(node)) for key, node in self._pending[-1]]
+        remaining = [(key, node, self._called_names(node)) for key, node in self._pending[-1]]
         self._pending[-1].clear()
+        # How many OTHER definitions still waiting call each one, kept current
+        # as they leave instead of recounted for every pick
+        callers = [sum(1 for other, (_, _, names) in enumerate(remaining)
+                       if other != index and node.name in names)
+                   for index, (_, node, _) in enumerate(remaining)]
         while remaining:
-            picked = next(
-                (index for index, (_, node, _) in enumerate(remaining)
-                 if not any(other != index and node.name in names
-                            for other, (_, _, names) in enumerate(remaining))),
-                0)
-            key, node, _ = remaining.pop(picked)
+            picked = next((index for index, count in enumerate(callers) if not count), 0)
+            key, node, names = remaining.pop(picked)
+            callers.pop(picked)
+            for index, (_, waiting, _) in enumerate(remaining):
+                if waiting.name in names:
+                    callers[index] -= 1
             nid = node_id(node)
             if nid is None or nid not in self._walked:
                 self._declaration_context(key, node)
@@ -1489,13 +1593,9 @@ class _Inference:
         result = ContextResult(cid=cid, key=key, params=params, quals=quals)
         self.table.contexts[memo] = result
         self._in_progress.add(guard)
-        declared = self._declared_memo.get(id(node))
-        if declared is None or declared[0] is not node:
-            declared = (node, *_declared_names(node.body))
-            self._declared_memo[id(node)] = declared
-        _, declared_global, declared_nonlocal = declared
-        self._frames = env + [_Frame(key, declared_global=declared_global,
-                                     declared_nonlocal=declared_nonlocal)]
+        facts = self._scope_facts(node)
+        self._frames = env + [_Frame(key, declared_global=facts.declared_global,
+                                     declared_nonlocal=facts.declared_nonlocal)]
         self._contexts.append(cid)
         self._pin_sink.append(result.pins)
         self._pending.append([])
@@ -1641,12 +1741,66 @@ class _Inference:
             return cached
         # The definition's own name is bound where the definition stands, so a
         # body that calls itself is reading its own scope, not the one above
-        lexical, module_level = _scope_free(node, self._scope_free_memo)
+        lexical, module_level = _scope_free(node, self._scope_free_memo, self._scope_facts)
         free = (tuple(sorted(lexical - {node.name})),
                 tuple(sorted(module_level - {node.name})))
         if nid is not None:
             self._free[nid] = free
         return free
+
+    def _scope_facts(self, node: _Scope) -> _ScopeFacts:
+        """
+        What one scope's own statements bind, declare and read, computed once.
+
+        :param node: The definition, class or lambda
+        :return: Its facts
+        """
+        cached = self._facts_memo.get(id(node))
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        facts = _scope_facts(node)
+        self._facts_memo[id(node)] = (node, facts)
+        return facts
+
+    def _called_names(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+        """
+        Every bare name a definition calls, nested definitions included, computed once.
+
+        A nested definition is pending once per context of the body it stands
+        in, and what it calls does not depend on the context.
+
+        :param node: The definition
+        :return: The bare callee names it mentions; never mutated by a reader
+        """
+        cached = self._called_memo.get(id(node))
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        names = _called_names(node)
+        self._called_memo[id(node)] = (node, names)
+        return names
+
+    def _returns(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.Return]:
+        """
+        A definition's own ``return`` statements, nested scopes left out, computed once.
+
+        :param node: The definition
+        :return: Its returns, in the order the return type joins them
+        """
+        cached = self._returns_memo.get(id(node))
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        # Statements only: no expression holds one. Popped back to front, which
+        # is the order the joined return type reports a disagreement in
+        returns: list[ast.Return] = []
+        stack = list(ast_walk.iter_child_statements(node))
+        while stack:
+            current = stack.pop()
+            if isinstance(current, ast.Return):
+                returns.append(current)
+            elif not isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                stack.extend(ast_walk.iter_child_statements(current))
+        self._returns_memo[id(node)] = (node, returns)
+        return returns
 
     def _bind_params(self, node: ast.FunctionDef | ast.AsyncFunctionDef,
                      params: tuple[str, ...], quals: tuple[int, ...]) -> None:
@@ -1724,11 +1878,10 @@ class _Inference:
         the return that disagreed.
         """
         result: str | None = None
-        for stmt in _walk_own_scope(node):
-            if isinstance(stmt, ast.Return):
-                ty = VOID if stmt.value is None else self._ty_of(stmt.value)
-                result = ty if result is None else \
-                    self._joined(result, ty, stmt, 'the function')
+        for stmt in self._returns(node):
+            ty = VOID if stmt.value is None else self._ty_of(stmt.value)
+            result = ty if result is None else \
+                self._joined(result, ty, stmt, 'the function')
         return VOID if result is None else result
 
     def _store(self, target: ast.expr, ty: str, source: ast.AST, series: bool = False,
@@ -1908,18 +2061,27 @@ class _Inference:
 
     def _expr(self, node: ast.expr) -> str:
         """Type one expression, stamping it and everything under it."""
-        method = getattr(self, f'_e_{type(node).__name__}', None)
-        if method is None:
+        cls = type(node)
+        try:
+            rule = _EXPR_RULES[cls]
+        except KeyError:
+            rule = _EXPR_RULES[cls] = getattr(_Inference, f'_e_{cls.__name__}', None)
+        if rule is None:
             for child in ast_walk.iter_child_nodes(node):
                 if isinstance(child, ast.expr):
                     self._expr(child)
             ty = UNKNOWN
         else:
-            ty = method(node)
-        nid = node_id(node)
+            ty = rule(self, node)
+        # ``_stamp`` inlined, the qualifier recorded under the same id read:
+        # every expression of every walk passes through here
+        nid = getattr(node, ID_ATTR, None)
         if nid is not None:
             self._q[nid] = self._expr_qual(node)
-        return self._stamp(node, ty)
+            self._ty[nid] = ty
+        existing = getattr(node, TY_ATTR, None)
+        setattr(node, TY_ATTR, ty if existing is None else join(existing, ty))
+        return ty
 
     # --- qualifiers --------------------------------------------------------
 
@@ -1930,36 +2092,35 @@ class _Inference:
         :param node: The expression
         :return: Its qualifier, series when the walk did not reach it
         """
-        nid = node_id(node)
+        nid = getattr(node, ID_ATTR, None)
         return SERIES if nid is None else self._q.get(nid, SERIES)
 
     def _expr_qual(self, node: ast.expr) -> int:
         """
         The qualifier of an expression whose children this walk has just visited.
 
+        What each class of expression derives it from is ``_qual_rule``.
+
         :param node: The expression
         :return: Its qualifier
         """
-        match node:
-            case ast.Constant():
-                return CONST
-            case ast.Name():
-                return self._name_qual(node)
-            case ast.Attribute():
-                return self._attribute_qual(node)
-            case ast.Call():
-                return self._call_qual(node)
-            case ast.Subscript():
-                # A position of a tuple is the tuple's; anything else is the
-                # history operator or a container read, which is series
-                if is_tuple(self._ty_of(node.value)):
-                    return self._qual(node.value)
-                return SERIES
-            case ast.NamedExpr():
-                return self._qual(node.value)
-            case ast.Lambda() | ast.ListComp() | ast.SetComp() | ast.DictComp() \
-                    | ast.GeneratorExp() | ast.Await() | ast.Yield() | ast.YieldFrom():
-                return SERIES
+        cls = type(node)
+        try:
+            rule = _QUAL_RULES[cls]
+        except KeyError:
+            rule = _QUAL_RULES[cls] = _qual_rule(cls)
+        return rule(self, node)
+
+    def _subscript_qual(self, node: ast.Subscript) -> int:
+        """The qualifier of a subscript: a tuple position's, or series."""
+        # A position of a tuple is the tuple's; anything else is the history
+        # operator or a container read, which is series
+        if is_tuple(self._ty_of(node.value)):
+            return self._qual(node.value)
+        return SERIES
+
+    def _children_qual(self, node: ast.expr) -> int:
+        """The qualifier of an operation: the strongest of its operands'."""
         return max((self._qual(child) for child in ast_walk.iter_child_nodes(node)
                     if isinstance(child, ast.expr)), default=CONST)
 
@@ -2012,8 +2173,7 @@ class _Inference:
         Each ``return`` carries the conditions it stands under, the bare one of an
         early exit included -- the value it skips is the one the caller misses.
         """
-        return max((self._qual(stmt) for stmt in _walk_own_scope(node)
-                    if isinstance(stmt, ast.Return)), default=CONST)
+        return max((self._qual(stmt) for stmt in self._returns(node)), default=CONST)
 
     # Each ``_e_*`` returns the type; the caller stamps it.
 
@@ -4158,14 +4318,14 @@ class _Inference:
         :param node: The node the interface is wanted for
         :return: The interface, or None when there is none to be had
         """
-        if pine_type_artifact.analysing(path):
+        if module_interface.closes_cycle(path):
             self._node_diag(
                 f"'{dotted}' imports this module back, so its signatures are not "
                 f"available yet", node, 'import-cycle', dotted,
                 fix=f'break the import cycle between {self.table.module_path} and {path}')
             return None
         if path not in self._interfaces:
-            interface = pine_type_artifact.lookup(path, self._analyser, self._pipeline_hash)
+            interface = module_interface.lookup(path, self._analyser, self._pipeline_hash)
             self._interfaces[path] = interface
             if interface is not None:
                 if interface.suppressed:
@@ -4186,29 +4346,106 @@ class _Inference:
                 # the class id that value carries
                 for sig in interface.classes.values():
                     self._class_sigs.setdefault(sig.id, sig)
-                record = pine_type_artifact.dep_record(interface)
-                self.table.deps[record.path] = record
-                # Its dependencies are this module's too. An export whose
-                # return was INFERRED from a call one module further out moves
-                # when THAT module's signature moves, and nothing about this
-                # module or its direct dependency changes when it does -- so
-                # the closure has to be carried, not just the edge
-                for inherited in interface.deps.values():
-                    if inherited.path == self.table.module_path:
-                        # A cyclic pair names this module in the other's
-                        # closure; its own source is not something it can be
-                        # invalidated by
-                        continue
-                    self.table.deps.setdefault(inherited.path, inherited)
+                self._record_dep(interface)
         return self._interfaces[path]
+
+    def _record_dep(self, interface: ModuleInterface) -> None:
+        """
+        Record the dependency on one module, and the dependencies it carries
+        (see :func:`module_interface.add_dep`).
+
+        :param interface: The interface this module now depends on
+        """
+        module_interface.add_dep(self.table.deps, interface, self.table.module_path)
+
+    def _record_imports(self, tree: ast.Module) -> None:
+        """
+        Record a dependency on every Pyne module this one imports, consulted or not.
+
+        The types only need the interfaces a call was typed against, but the
+        lowering routes calls by what an import BINDS: it resolves a dotted
+        callee through the module-level imports and reads the state the object
+        at the end carries. That object need not live where the import points.
+        ``from b import g`` in library ``a`` puts ``b.g`` into ``a``'s globals,
+        and a script calling ``a.g(x)`` is routed on ``b``'s ``g`` -- while its
+        types consulted ``a`` alone, which neither exports ``g`` nor changes
+        when ``g`` starts keeping state. Recording what every module imports
+        closes that gap along the closure: the script inherits ``a``'s records,
+        and ``b`` is one of them.
+
+        Every import spelling counts, since every one of them binds something
+        another module can reach through: the dotted prefixes ``import a.b``
+        walks, the module of a ``from`` import or a ``*`` import, and the
+        submodules a ``from`` import takes out of a package. A relative import
+        is resolved against this module's own directory -- what it needs is a
+        FILE, which the directory answers without any package context. What is
+        no Pyne module records nothing: ``lookup`` gives it no interface.
+
+        Nothing is diagnosed and nothing is typed from what this finds: an
+        import that no call reaches is no reason for an import-cycle report,
+        and a class it publishes was never named here.
+
+        :param tree: The module being walked
+        """
+        paths: dict[str, None] = {}
+        anchor = Path(self.table.module_path).parent if self.table.module_path else None
+        for stmt in _module_statements(tree.body):
+            if isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    if _publishes_nothing(alias.name):
+                        continue
+                    parts = alias.name.split('.')
+                    # ``import a.b`` binds ``a`` and reaches ``a.b`` through it;
+                    # ``import a.b as x`` binds ``a.b`` itself
+                    first = len(parts) if alias.asname else 1
+                    for end in range(first, len(parts) + 1):
+                        source = self._module_source('.'.join(parts[:end]))
+                        if source is not None:
+                            paths[source] = None
+            elif isinstance(stmt, ast.ImportFrom):
+                package: Path | None = None
+                if stmt.level:
+                    if anchor is None:
+                        continue
+                    directory = anchor
+                    for _ in range(stmt.level - 1):
+                        directory = directory.parent
+                    source = _package_member(directory, stmt.module or '')
+                    if not stmt.module:
+                        # ``from . import x``: the names are the package's own,
+                        # whether or not it has an ``__init__.py``
+                        package = directory
+                elif stmt.module and not _publishes_nothing(stmt.module):
+                    source = self._module_source(stmt.module)
+                else:
+                    continue
+                if source is not None:
+                    paths[source] = None
+                    if Path(source).name == '__init__.py':
+                        package = Path(source).parent
+                if package is None:
+                    continue
+                # A name a package hands out may be one of its submodules
+                for alias in stmt.names:
+                    member = None if alias.name == '*' else _package_member(package, alias.name)
+                    if member is not None:
+                        paths[member] = None
+        for path in paths:
+            if path in self._interfaces:
+                # Consulted by a call already, and recorded then if it had an
+                # interface to give
+                continue
+            interface = module_interface.lookup(path, self._analyser, self._pipeline_hash)
+            if interface is not None:
+                self._record_dep(interface)
 
     def _module_source(self, dotted: str) -> str | None:
         """
         Where a module's source lives, without importing the module itself.
 
         ``find_spec`` is what keeps this free of side effects: the module whose
-        signatures are wanted is never executed -- the analysis reads its
-        source -- and a segment that is not a module has no spec at all, which
+        signatures are wanted is never executed -- its interface is read off
+        its ``.pyc`` or its source -- and a segment that is not a module has no spec at all, which
         is exactly the question the caller is asking.
 
         :param dotted: Dotted module name
@@ -4359,6 +4596,9 @@ class _Inference:
 
         for key, sites in varying.items():
             set_varying(targets[key], sites or None)
+        if not any(varying.values()):
+            # No callee has a vector to be handed, so no call site gets one
+            return
         per_instance = {id(call) for sites in varying.values() for call in sites}
         for node in ast_walk.walk(tree):
             if not isinstance(node, ast.Call) or id(node) in per_instance:
@@ -4386,38 +4626,131 @@ class _Inference:
         :param node: The referenced expression
         :return: The dotted key, or None when this is not a lib reference
         """
+        # Asked several times per node and walk, of a tree that does not change
+        # and aliases fixed before the walk starts
+        cached = self._lib_names.get(id(node))
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        name = None
         dotted = _dotted(node)
-        if dotted is None:
-            return None
-        head, _, rest = dotted.partition('.')
-        if head in self._lib_aliases and rest:
-            return rest
-        return None
+        if dotted is not None:
+            head, _, rest = dotted.partition('.')
+            if head in self._lib_aliases and rest:
+                name = rest
+        self._lib_names[id(node)] = (node, name)
+        return name
 
 
-def _security_writes(tree: ast.Module) -> dict[str, list[ast.expr]]:
+def _qual_rule(cls: type) -> Callable[..., int]:
     """
-    What every security id publishes, by id.
+    How ``_Inference._expr_qual`` derives the qualifier of one expression class.
 
-    ``SecurityTransformer`` splits one ``request.security(...)`` expression
-    into a guarded ``__sec_write__('id', expr)`` and a ``__sec_read__('id',
-    default)`` that stands where the expression did. Collected up front, in one
-    walk, because the read is what a script's value flows through and it has to
-    find the write however the two are laid out.
+    A constant is const; a name, an attribute, a call and a subscript have
+    rules of their own; a walrus is its value's; what Pine has no qualifier
+    for -- a lambda, a comprehension, a generator -- is series. Anything else
+    is an operation, as strong as its strongest operand. The common operations
+    name their operands outright: the same operands ``_children_qual`` finds,
+    without asking the class for its fields.
 
-    :param tree: The module being walked
-    :return: security id -> the expressions written under it
+    :param cls: The expression class
+    :return: The rule, called with the walker and the node
     """
-    out: dict[str, list[ast.expr]] = {}
-    for node in ast_walk.walk(tree):
-        if not isinstance(node, ast.Call) or len(node.args) < 2:
-            continue
-        if _dotted(node.func) != '__sec_write__':
-            continue
-        sec_id = node.args[0]
-        if isinstance(sec_id, ast.Constant) and isinstance(sec_id.value, str):
-            out.setdefault(sec_id.value, []).append(node.args[1])
-    return out
+    if issubclass(cls, ast.Constant):
+        return lambda engine, node: CONST
+    if issubclass(cls, ast.Name):
+        return _Inference._name_qual
+    if issubclass(cls, ast.Attribute):
+        return _Inference._attribute_qual
+    if issubclass(cls, ast.Call):
+        return _Inference._call_qual
+    if issubclass(cls, ast.Subscript):
+        return _Inference._subscript_qual
+    if issubclass(cls, ast.NamedExpr):
+        return lambda engine, node: engine._qual(node.value)
+    if issubclass(cls, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp,
+                        ast.GeneratorExp, ast.Await, ast.Yield, ast.YieldFrom)):
+        return lambda engine, node: SERIES
+    if cls is ast.BinOp:
+        return lambda engine, node: max(engine._qual(node.left), engine._qual(node.right))
+    if cls is ast.UnaryOp:
+        return lambda engine, node: engine._qual(node.operand)
+    if cls is ast.IfExp:
+        return lambda engine, node: max(engine._qual(node.test), engine._qual(node.body),
+                                        engine._qual(node.orelse))
+    if cls is ast.BoolOp:
+        return lambda engine, node: max(map(engine._qual, node.values), default=CONST)
+    if cls is ast.Compare:
+        return lambda engine, node: max([engine._qual(node.left),
+                                         *map(engine._qual, node.comparators)])
+    return _Inference._children_qual
+
+
+def _scan_tree(tree: ast.Module) -> tuple[dict[str, ast.expr], dict[str, list[ast.expr]]]:
+    """
+    What the walk needs from the whole tree before it starts, in one pass over it.
+
+    Every dotted name the module's annotations spell, with where it stands.
+    Only the annotations, not the whole tree: this is what decides which
+    imports are worth resolving an interface for, and an import a call reaches
+    is resolved by the call itself. A stringized annotation is parsed and read
+    the same way, since that is how a forward reference is spelled.
+
+    What every security id publishes, by id. ``SecurityTransformer`` splits
+    one ``request.security(...)`` expression into a guarded
+    ``__sec_write__('id', expr)`` and a ``__sec_read__('id', default)`` that
+    stands where the expression did. Collected up front, because the read is
+    what a script's value flows through and it has to find the write however
+    the two are laid out.
+
+    :param tree: The module to scan
+    :return: (dotted spelling -> the annotation node it was found in,
+              security id -> the expressions written under it)
+    """
+    annotations: dict[str, ast.expr] = {}
+    writes: dict[str, list[ast.expr]] = {}
+
+    def take(node: ast.expr, where: ast.expr) -> None:
+        for child in ast_walk.walk(node):
+            if isinstance(child, (ast.Name, ast.Attribute)):
+                spelled = _dotted(child)
+                if spelled is not None:
+                    annotations.setdefault(spelled, where)
+            elif isinstance(child, ast.Constant) and isinstance(child.value, str):
+                try:
+                    take(ast.parse(child.value, mode='eval').body, where)
+                except SyntaxError:
+                    continue
+
+    # Breadth first, the order ``ast.walk`` visits in: the first annotation to
+    # spell a name is the one recorded, and the writes of an id keep their order.
+    # A name or a constant holds nothing either collection reads, and leaving
+    # them unentered reorders nothing
+    todo: deque[ast.AST] = deque([tree])
+    popleft = todo.popleft
+    append = todo.append
+    while todo:
+        node = popleft()
+        if isinstance(node, ast.Call):
+            if len(node.args) >= 2 and _dotted(node.func) == '__sec_write__':
+                sec_id = node.args[0]
+                if isinstance(sec_id, ast.Constant) and isinstance(sec_id.value, str):
+                    writes.setdefault(sec_id.value, []).append(node.args[1])
+        elif isinstance(node, (ast.arg, ast.AnnAssign)):
+            if node.annotation is not None:
+                take(node.annotation, node.annotation)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.returns is not None:
+                take(node.returns, node.returns)
+        for name in node._fields:
+            value = getattr(node, name, None)
+            if isinstance(value, ast.AST):
+                if type(value) not in _HOLLOW:
+                    append(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, ast.AST) and type(item) not in _HOLLOW:
+                        append(item)
+    return annotations, writes
 
 
 def _every_param(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.arg]:
@@ -4442,7 +4775,7 @@ def _bound_positions(body: Sequence[ast.AST]) -> dict[str, list[tuple[int, int]]
     it only says where the name lives, and a scope that declares ``global g``
     without ever assigning to it reads the very binding the declaration names.
     An actual store through the declaration is an assignment like any other and
-    is recorded as one. ``_declared_names`` is what tracks the declarations.
+    is recorded as one. ``_scope_facts`` is what tracks the declarations.
 
     The positions are what makes MODULE scope answerable: binding is
     sequential up there, so a call written above the rebinding still reaches
@@ -4558,50 +4891,82 @@ def _exportable_names(body: Sequence[ast.stmt],
     return frozenset(exportable)
 
 
-def _bound_names(body: Sequence[ast.AST]) -> set[str]:
+def _scope_facts(node: _Scope) -> _ScopeFacts:
     """
-    Every name one scope's statements bind by something other than a ``def``.
+    What one lexical scope's own statements bind, declare and read, in one walk.
 
-    :param body: The scope's own statements
-    :return: The names it binds
+    The bound names are the ones ``_bound_positions`` records, without the
+    positions. A ``global``/``nonlocal`` declaration is not a binding at all:
+    it says the name lives in ANOTHER scope, so every read and every write goes
+    there. What makes a ``global helper`` scope's ``helper()`` unresolvable is
+    the STORE the declaration enables, not the declaration -- and the store is
+    an ordinary assignment, recorded as a binding where it stands. The
+    declarations are what tells the free-name walk to take such a name back
+    out of the locals.
+
+    Nested scopes are not descended into: their bindings, declarations and
+    reads belong to them. A nested scope's decorators, defaults and annotations
+    are evaluated where the scope STANDS, so they are read here -- and only
+    read: nothing in them binds or declares a name for this scope.
+
+    :param node: The scope to scan
+    :return: What its own statements bind, declare and read
     """
-    return set(_bound_positions(body))
-
-
-def _declared_names(body: Sequence[ast.AST]) -> tuple[set[str], set[str]]:
-    """
-    The names one scope declares ``global`` or ``nonlocal``.
-
-    Such a declaration is not a binding at all: it says the name lives in
-    ANOTHER scope, so every read and every write goes there. What makes a
-    ``global helper`` scope's ``helper()`` unresolvable is the STORE the
-    declaration enables, not the declaration -- and the store is an ordinary
-    assignment, which ``_bound_positions`` records where it stands. This is
-    what tells the free-name walk to take such a name back out of the locals.
-
-    Nested definitions are not descended into: their declarations belong to
-    their own scope.
-
-    :param body: The scope's own statements
-    :return: (``global`` names, ``nonlocal`` names)
-    """
-    globals_: set[str] = set()
-    nonlocals: set[str] = set()
-    stack: list[ast.AST] = list(body)
+    stack: list[ast.AST] = list(node.body) if isinstance(node.body, list) else [node.body]
+    bound: set[str] = set()
+    declared_global: set[str] = set()
+    declared_nonlocal: set[str] = set()
+    loaded: set[str] = set()
+    nested: list[_Scope] = []
+    headers: list[ast.AST] = []
     while stack:
         current = stack.pop()
-        if isinstance(current, _SCOPE_NODES):
+        if isinstance(current, ast.Name):
+            if isinstance(current.ctx, ast.Load):
+                loaded.add(current.id)
+            else:
+                bound.add(current.id)
+            # Nothing under a name but its context
             continue
-        if isinstance(current, ast.Global):
-            globals_.update(current.names)
-        elif isinstance(current, ast.Nonlocal):
-            nonlocals.update(current.names)
+        if isinstance(current, _SCOPE_NODES):
+            nested.append(current)
+            if isinstance(current, ast.ClassDef):
+                bound.add(current.name)
+            headers.extend(_scope_header(current))
+            continue
+        if type(current) in _BINDING_TYPES:
+            if isinstance(current, ast.Global):
+                declared_global.update(current.names)
+            elif isinstance(current, ast.Nonlocal):
+                declared_nonlocal.update(current.names)
+            elif isinstance(current, ast.alias):
+                bound.add((current.asname or current.name).split('.')[0])
+            elif isinstance(current, ast.MatchMapping):
+                if current.rest is not None:
+                    bound.add(current.rest)
+            elif isinstance(current, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) \
+                    and current.name is not None:
+                bound.add(current.name)
         stack.extend(ast_walk.iter_child_nodes(current))
-    return globals_, nonlocals
+    # The headers hold expressions only, so the one scope they can open is a lambda
+    while headers:
+        current = headers.pop()
+        if isinstance(current, ast.Name):
+            if isinstance(current.ctx, ast.Load):
+                loaded.add(current.id)
+            continue
+        if isinstance(current, _SCOPE_NODES):
+            nested.append(current)
+            headers.extend(_scope_header(current))
+            continue
+        headers.extend(ast_walk.iter_child_nodes(current))
+    return _ScopeFacts(bound=bound, declared_global=declared_global,
+                       declared_nonlocal=declared_nonlocal, loaded=loaded,
+                       nested=tuple(nested))
 
 
-def _scope_free(node: _Scope, memo: dict[int, tuple[_Scope, frozenset[str], frozenset[str]]]
-                ) -> tuple[frozenset[str], frozenset[str]]:
+def _scope_free(node: _Scope, memo: dict[int, tuple[_Scope, frozenset[str], frozenset[str]]],
+                facts_of: Callable[[_Scope], _ScopeFacts]) -> tuple[frozenset[str], frozenset[str]]:
     """
     The names one lexical scope reads from OUTSIDE itself.
 
@@ -4631,41 +4996,31 @@ def _scope_free(node: _Scope, memo: dict[int, tuple[_Scope, frozenset[str], froz
     :param memo: id(scope) -> the scope and its answer; the tree does not change
                  while it is analysed, so one scope's answer holds for every
                  enclosing one
+    :param facts_of: What a scope's own statements bind, declare and read
+                     (``_scope_facts``, memoized by the caller)
     :return: (names resolved lexically, names ``global`` forces to the module)
     """
     cached = memo.get(id(node))
     if cached is not None and cached[0] is node:
         return cached[1], cached[2]
-    body: list[ast.AST] = list(node.body) if isinstance(node.body, list) else [node.body]
-    declared_global, declared_nonlocal = _declared_names(body)
-    bound = _bound_names(body) - declared_global - declared_nonlocal
+    facts = facts_of(node)
+    declared_global = facts.declared_global
+    bound = facts.bound - declared_global - facts.declared_nonlocal
     args = getattr(node, 'args', None)
     if isinstance(args, ast.arguments):
         bound.update(arg.arg for arg in
                      args.posonlyargs + args.args + args.kwonlyargs)
         bound.update(arg.arg for arg in (args.vararg, args.kwarg) if arg is not None)
+    # A nested definition or class binds its name here, unless a ``global``
+    # sends the name to the module
+    for scope in facts.nested:
+        if not isinstance(scope, ast.Lambda) and scope.name not in declared_global:
+            bound.add(scope.name)
 
-    loaded: set[str] = set()
-    nested: list[_Scope] = []
-    stack: list[ast.AST] = list(body)
-    while stack:
-        current = stack.pop()
-        if isinstance(current, _SCOPE_NODES):
-            nested.append(current)
-            if not isinstance(current, ast.Lambda) and current.name not in declared_global:
-                bound.add(current.name)
-            # A nested definition's decorators, defaults and annotations are
-            # evaluated where the definition STANDS, not inside it
-            stack.extend(_scope_header(current))
-            continue
-        if isinstance(current, ast.Name) and isinstance(current.ctx, ast.Load):
-            loaded.add(current.id)
-        stack.extend(ast_walk.iter_child_nodes(current))
-
-    free = (loaded - bound) - declared_global
-    module_free = loaded & declared_global
-    for scope in nested:
-        nested_free, nested_module = _scope_free(scope, memo)
+    free = (facts.loaded - bound) - declared_global
+    module_free = facts.loaded & declared_global
+    for scope in facts.nested:
+        nested_free, nested_module = _scope_free(scope, memo, facts_of)
         free |= nested_free - bound
         module_free |= nested_module
     answer = frozenset(free), frozenset(module_free)
@@ -4909,42 +5264,39 @@ def _is_method(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     return False
 
 
-def _annotation_names(tree: ast.Module) -> dict[str, ast.expr]:
+def _publishes_nothing(module: str) -> bool:
     """
-    Every dotted name a module's annotations spell, with where it stands.
+    Whether an imported module is one no Pine interface can come from.
 
-    Only the annotations, not the whole tree: this is what decides which
-    imports are worth resolving an interface for, and an import a call reaches
-    is resolved by the call itself. A stringized annotation is parsed and read
-    the same way, since that is how a forward reference is spelled.
+    ``pynecore`` itself is left out because the lib registry already owns
+    those names, and the standard library because it publishes none.
 
-    :param tree: The module to scan
-    :return: dotted spelling -> the annotation node it was found in
+    :param module: Dotted module name an import spells
+    :return: True when the import is not worth an interface lookup
     """
-    out: dict[str, ast.expr] = {}
+    return module == 'pynecore' or module.startswith('pynecore.') or is_stdlib(module)
 
-    def take(node: ast.expr, where: ast.expr) -> None:
-        for child in ast_walk.walk(node):
-            if isinstance(child, (ast.Name, ast.Attribute)):
-                spelled = _dotted(child)
-                if spelled is not None:
-                    out.setdefault(spelled, where)
-            elif isinstance(child, ast.Constant) and isinstance(child.value, str):
-                try:
-                    take(ast.parse(child.value, mode='eval').body, where)
-                except SyntaxError:
-                    continue
 
-    for node in ast_walk.walk(tree):
-        if isinstance(node, (ast.arg, ast.AnnAssign)):
-            annotation = node.annotation
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            annotation = node.returns
-        else:
-            continue
-        if annotation is not None:
-            take(annotation, annotation)
-    return out
+def _package_member(directory: Path, dotted: str) -> str | None:
+    """
+    The source of a module below a package directory, found without importing.
+
+    The candidates are tried in the import hook's order, ``name.py`` before
+    ``name/__init__.py``.
+
+    :param directory: The package directory the name is relative to
+    :param dotted: Dotted module name below it; empty for the package itself
+    :return: Its source path, or None when there is no such file
+    """
+    if dotted:
+        target = directory.joinpath(*dotted.split('.'))
+        candidates = (target.parent / f'{target.name}.py', target / '__init__.py')
+    else:
+        candidates = (directory / '__init__.py',)
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
 
 
 def _line(node: ast.AST) -> int:
@@ -5144,8 +5496,10 @@ def _own_calls(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.Call]:
         current = stack.pop()
         if isinstance(current, ast.Call):
             calls.append(current)
-        if not isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            stack.extend(ast_walk.iter_child_nodes(current))
+        elif isinstance(current, (ast.Name, ast.FunctionDef, ast.AsyncFunctionDef)):
+            # A name holds no call, a nested definition owns its own
+            continue
+        stack.extend(ast_walk.iter_child_nodes(current))
     calls.sort(key=lambda call: node_id(call) or 0)
     return calls
 
@@ -5153,17 +5507,6 @@ def _own_calls(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.Call]:
 def _per_context(call: ast.Call) -> bool:
     """Whether a call site's answer differs between the contexts reaching it."""
     return get_pins(call) is not None or get_series_lens(call) is not None
-
-
-def _walk_own_scope(node: ast.AST):
-    """Walk a function body without descending into nested function scopes."""
-    stack = list(ast_walk.iter_child_nodes(node))
-    while stack:
-        current = stack.pop()
-        yield current
-        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-            continue
-        stack.extend(ast_walk.iter_child_nodes(current))
 
 
 def _enumerated(node: ast.expr) -> ast.expr | None:

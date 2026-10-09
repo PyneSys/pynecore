@@ -1,7 +1,7 @@
 from typing import cast
 import ast
 
-from . import ast_walk
+from .phase import Rule
 from .pine_type_rules import BOOL, FLOAT, INT, TYPELESS, get_ty, set_ty, stamp_lowering
 
 #: Operand types whose runtime values are native numbers, bools or na (an ``NA``
@@ -36,7 +36,7 @@ def _reread(node: ast.expr) -> ast.expr:
     return ast.Constant(value=cast(ast.Constant, node).value)
 
 
-class SafeDivisionTransformer(ast_walk.NodeTransformer):
+class SafeDivisionTransformer(Rule):
     """
     Transformer that converts division operations to safe alternatives
     that preserve Pine Script semantics.
@@ -79,6 +79,8 @@ class SafeDivisionTransformer(ast_walk.NodeTransformer):
         self._counter = 0
         self._func_depth = 0
         self._blocked = 0
+        #: Per enclosing function body, the ``_blocked`` count of the scope around it
+        self._outer_blocked: list[int] = []
 
     def _temp(self) -> str:
         self._counter += 1
@@ -152,13 +154,10 @@ class SafeDivisionTransformer(ast_walk.NodeTransformer):
             orelse=set_ty(ast.Call(func=_safe_convert_attr('safe_div'),
                                    args=[left_ref(), right_ref()], keywords=[]), ty))
 
-    def visit_BinOp(self, node: ast.BinOp) -> ast.expr:
+    def leave_BinOp(self, node: ast.BinOp) -> ast.expr:
         """
-        Visit BinOp nodes and transform division operations
+        Transform division operations
         """
-        # Continue normal transformation for children
-        self.generic_visit(node)
-
         # Check if it's a division operation
         if isinstance(node.op, ast.Div):
             # A literal division by a nonzero literal (e.g. 1/2) cannot raise
@@ -182,60 +181,41 @@ class SafeDivisionTransformer(ast_walk.NodeTransformer):
 
         return node
 
-    def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
-        # A temporary bound in a class body would become a class attribute
+    def _block(self, node: ast.AST) -> None:
         self._blocked += 1
-        self.generic_visit(node)
+
+    def _unblock(self, node: ast.AST) -> ast.AST:
         self._blocked -= 1
         return node
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        # Decorators and defaults are evaluated in the ENCLOSING scope, so they
-        # keep that scope's depth; only the body gets the function's own
-        node.decorator_list = [cast(ast.expr, self.visit(d)) for d in node.decorator_list]
-        node.args = cast(ast.arguments, self.visit(node.args))
-        if node.returns is not None:
-            node.returns = cast(ast.expr, self.visit(node.returns))
-        # The body is a scope of its own even inside a class body: a temporary
-        # bound there is a plain local again
-        blocked, self._blocked = self._blocked, 0
+    # A temporary bound in a class body would become a class attribute
+    enter_ClassDef = _block
+    leave_ClassDef = _unblock
+    # A walrus in a lambda binds in the lambda's own scope
+    enter_Lambda = _block
+    leave_Lambda = _unblock
+    # A walrus is illegal in a comprehension's iterable and binds to the
+    # containing scope elsewhere in it
+    enter_ListComp = enter_SetComp = enter_DictComp = enter_GeneratorExp = _block
+    leave_ListComp = leave_SetComp = leave_DictComp = leave_GeneratorExp = _unblock
+
+    def enter_function_body(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        # Decorators and defaults are evaluated in the ENCLOSING scope, so only
+        # the body gets the function's own depth. The body is a scope of its
+        # own even inside a class body: a temporary bound there is a plain
+        # local again
+        self._outer_blocked.append(self._blocked)
+        self._blocked = 0
         self._func_depth += 1
-        node.body = [cast(ast.stmt, self.visit(stmt)) for stmt in node.body]
+
+    def leave_function_body(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         self._func_depth -= 1
-        self._blocked = blocked
-        return node
+        self._blocked = self._outer_blocked.pop()
 
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AsyncFunctionDef:
-        self.visit_FunctionDef(cast(ast.FunctionDef, node))
-        return node
-
-    def visit_Lambda(self, node: ast.Lambda) -> ast.Lambda:
-        # A walrus in a lambda binds in the lambda's own scope
-        self._blocked += 1
-        self.generic_visit(node)
-        self._blocked -= 1
-        return node
-
-    def _visit_comprehension(self, node: ast.expr) -> ast.expr:
-        # A walrus is illegal in a comprehension's iterable and binds to the
-        # containing scope elsewhere in it
-        self._blocked += 1
-        self.generic_visit(node)
-        self._blocked -= 1
-        return node
-
-    visit_ListComp = _visit_comprehension
-    visit_SetComp = _visit_comprehension
-    visit_DictComp = _visit_comprehension
-    visit_GeneratorExp = _visit_comprehension
-
-    def visit_Module(self, node: ast.Module) -> ast.Module:
+    def leave_Module(self, node: ast.Module) -> ast.Module:
         """
         Add safe_convert import if needed
         """
-        # Process the module first
-        node = cast(ast.Module, self.generic_visit(node))
-
         # Only add the import if we actually transformed any divisions
         if not self.has_division_operations:
             return node

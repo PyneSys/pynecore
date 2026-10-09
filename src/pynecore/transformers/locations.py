@@ -23,18 +23,48 @@ its attribute-op line events on the span's end line, re-creating the bug.
 """
 import ast
 
-from . import ast_walk
-
 __all__ = ('fix_locations',)
 
+_AST = ast.AST
 
-def _located(node: ast.AST) -> bool:
-    return getattr(node, 'lineno', None) is not None
+#: Node classes that carry neither a location nor a child (expression contexts
+#: and operators): there is nothing to fill in them and nothing below them
+_INERT: frozenset[type] = frozenset(
+    cls for cls in vars(ast).values()
+    if isinstance(cls, type) and issubclass(cls, _AST)
+    and not cls._fields and not cls._attributes)
 
 
 def _stamp_point(node: ast.AST, line: int, col: int) -> None:
     node.lineno = node.end_lineno = line  # type: ignore[attr-defined]
     node.col_offset = node.end_col_offset = col  # type: ignore[attr-defined]
+
+
+def _earliest_line(node: ast.AST) -> int | None:
+    """The smallest line number located anywhere inside ``node``, itself included.
+
+    :param node: The subtree root.
+    :return: The line, or None when nothing in the subtree is located.
+    """
+    best: int | None = None
+    stack = [node]
+    pop = stack.pop
+    push = stack.append
+    while stack:
+        current = pop()
+        lineno = getattr(current, 'lineno', None)
+        if lineno is not None and (best is None or lineno < best):
+            best = lineno
+        for name in current._fields:
+            value = getattr(current, name, None)
+            if isinstance(value, _AST):
+                if value.__class__ not in _INERT:
+                    push(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, _AST) and item.__class__ not in _INERT:
+                        push(item)
+    return best
 
 
 def fix_locations(tree: ast.AST, line: int = 1, col: int = 0) -> ast.AST:
@@ -57,7 +87,7 @@ def fix_locations(tree: ast.AST, line: int = 1, col: int = 0) -> ast.AST:
     while stack:
         node, line, col = pop()
         if 'lineno' in node._attributes:
-            if _located(node):
+            if getattr(node, 'lineno', None) is not None:
                 line, col = node.lineno, node.col_offset  # type: ignore[attr-defined]
                 if getattr(node, 'end_lineno', None) is None:
                     node.end_lineno = line  # type: ignore[attr-defined]
@@ -67,11 +97,17 @@ def fix_locations(tree: ast.AST, line: int = 1, col: int = 0) -> ast.AST:
                 if isinstance(node, ast.stmt):
                     # Hoisted payloads keep their source lines — anchor the new
                     # statement next to them rather than at the function entry
-                    inner = [getattr(n, 'lineno') for n in ast_walk.walk(node) if _located(n)]
-                    if inner:
-                        line, col = min(inner), 0
+                    inner = _earliest_line(node)
+                    if inner is not None:
+                        line, col = inner, 0
                 _stamp_point(node, line, col)
-        children = list(ast_walk.iter_child_nodes(node))
-        for child in reversed(children):
-            push((child, line, col))
+        for name in reversed(node._fields):
+            value = getattr(node, name, None)
+            if isinstance(value, _AST):
+                if value.__class__ not in _INERT:
+                    push((value, line, col))
+            elif isinstance(value, list):
+                for item in reversed(value):
+                    if isinstance(item, _AST) and item.__class__ not in _INERT:
+                        push((item, line, col))
     return tree

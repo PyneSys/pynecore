@@ -18,17 +18,33 @@ The JSON is read at transform time instead of importing the lib: importing it
 while the lib itself is being transformed would be circular (see the lazy
 import pattern in ``transformers/const_fold.py``).
 
+Two sections are not extracted from the source but measured on the IMPORTED
+lib, because what they record only exists once the import hook has transformed
+it: ``routes``, the call-site route ``FunctionIsolationTransformer`` gives each
+lib callee (``ta.sma`` carries a slot layout, ``ta.highest`` is an overload
+dispatcher), and ``star_exports``, the ``__all__`` a ``from pynecore.lib...
+import *`` expands to. The transform reads both from here instead of
+inspecting the live lib: the lib sources are not part of the pipeline hash,
+this file is, so a route-relevant lib edit invalidates cached script bytecode
+only through the regenerated file -- and ``test_104`` fails until it is
+regenerated.
+
 Usage:
     python3 scripts/lib_type_collector.py
 """
 import ast
+import importlib
 import json
+import pkgutil
 import sys
+import types
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 
+import pynecore.lib  # noqa: E402
+from pynecore.transformers.function_isolation import classify_callee  # noqa: E402
 from pynecore.transformers.pine_type_rules import (  # noqa: E402
     annotation_takes_none, annotation_type, builtin_class_id, constant_type, join,
     object_ty, ANNOTATION_TYPES, BOOL, FLOAT, INT, NONE_DEFAULT, OBJECT, STR, TYPELESS,
@@ -37,7 +53,12 @@ from pynecore.transformers.pine_type_rules import (  # noqa: E402
 
 #: Registry format version. Bump whenever the shape below changes; the
 #: consumers (the inference engine, and the PyneAOT front end) pin it.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
+
+#: The route ``classify_callee`` gives a callee it proves nothing about. The
+#: ``routes`` section leaves such paths out, and the transform reads a path it
+#: does not find there the same way
+_UNIFORM = 'uniform'
 
 
 class LibTypeCollector:
@@ -117,8 +138,30 @@ class LibTypeCollector:
                 names[f'{parent}.{leaf}' if parent else leaf] = entries[leaf]
 
         _resolve_aliases(names, aliases)
+        modules = self._import_lib()
         return {'v': SCHEMA_VERSION, 'names': names, 'classes': self._collect_fields(),
-                'scalar_classes': self._collect_scalars()}
+                'scalar_classes': self._collect_scalars(),
+                'routes': collect_routes(), 'star_exports': collect_star_exports(modules)}
+
+    def _import_lib(self) -> list[types.ModuleType]:
+        """
+        Import every module of the lib package, through the import hook.
+
+        The routes are a property of the TRANSFORMED lib, so they are measured on
+        the imported one -- which has to be the tree this collector reads the
+        source of, or the two halves of the registry would describe different
+        libs.
+
+        :return: The lib package and every module under it, by name
+        """
+        imported = Path(pynecore.lib.__file__).resolve().parent
+        if imported != self.lib_path.resolve():
+            raise RuntimeError(f"the imported pynecore.lib is {imported}, not {self.lib_path}: "
+                               "put this source tree first on the import path")
+        modules = [pynecore.lib]
+        for info in pkgutil.walk_packages(pynecore.lib.__path__, 'pynecore.lib.'):
+            modules.append(importlib.import_module(info.name))
+        return sorted(modules, key=lambda module: module.__name__)
 
     def _collect_fields(self) -> dict[str, dict[str, str]]:
         """
@@ -193,6 +236,93 @@ class LibTypeCollector:
         with open(self.json_path, 'w') as f:
             json.dump(registry, f, indent=1, sort_keys=True)
             f.write('\n')
+
+
+def collect_routes() -> dict[str, str]:
+    """
+    The call-site route of every lib callee path that does not route uniform.
+
+    The paths are walked the way ``FunctionIsolationTransformer`` resolves a
+    callee, attribute by attribute from ``lib``: through the lib's own
+    submodules (a module a lib module merely imports, like ``lib.alert.lib``,
+    is not followed), and through the namespace objects that publish callables
+    as members (see :func:`_is_namespace`). Each object is classified by the
+    transformer's own :func:`classify_callee`, so the decision exists once.
+
+    A class is left out, and the transform routes its path uniform, which is
+    correct for any callee: a script constructs no object through a lib path
+    (``NA`` and ``Series`` come from ``pynecore.types``), while which classes a
+    lib module holds depends on its imports and even on the environment
+    (``lib.log`` defines its rich handler only where rich is in use) -- a
+    registry recording them would differ between two machines.
+
+    Every lib module must be imported first (``LibTypeCollector._import_lib``):
+    a submodule is reachable as an attribute of its package only once loaded.
+
+    :return: Callee path as a script spells it (``lib.ta.sma``) -> route
+    """
+    routes: dict[str, str] = {}
+    _record_routes('lib', pynecore.lib, routes)
+    return dict(sorted(routes.items()))
+
+
+def _record_routes(path: str, owner: object, routes: dict[str, str]) -> None:
+    """
+    Classify every member of a lib module or namespace, recursively.
+
+    :param path: The owner's path as a script spells it
+    :param owner: The module or namespace object
+    :param routes: The route table, filled in place
+    """
+    for name in dir(owner):
+        if name.startswith('__') and name.endswith('__'):
+            continue
+        try:
+            value = getattr(owner, name)
+        except Exception:  # noqa: the transform reads a failing lookup as unprovable
+            continue
+        key = f'{path}.{name}'
+        if isinstance(value, types.ModuleType):
+            if value.__name__ == f'pynecore.{key}':
+                _record_routes(key, value, routes)
+            continue
+        if isinstance(value, type):
+            continue
+        route = classify_callee(value)
+        if route != _UNIFORM:
+            routes[key] = route
+        if _is_namespace(value):
+            _record_routes(key, value, routes)
+
+
+def _is_namespace(value: object) -> bool:
+    """
+    Whether a lib object is a namespace a script calls members of.
+
+    The lib publishes such a namespace as the one instance of a private class
+    (``chart.point = _ChartPoint()``, ``input = _Input()``), so
+    ``chart.point.new`` is a callee path of its own. A value object (a
+    ``Color`` constant, a ``Source``) is an instance of a public class, and a
+    private enum's member (``strategy._order_type_entry``) is a scalar; neither
+    has a member a script calls.
+
+    :param value: A member of a lib module
+    :return: True when its members are callee paths too
+    """
+    cls = type(value)
+    return (cls.__name__.startswith('_') and cls.__module__.startswith('pynecore.')
+            and not isinstance(value, (int, float, str)))
+
+
+def collect_star_exports(modules: list[types.ModuleType]) -> dict[str, list[str]]:
+    """
+    The ``__all__`` of every lib module that defines one.
+
+    :param modules: The imported lib modules
+    :return: Module name -> its ``__all__``, sorted
+    """
+    return {module.__name__: sorted(module.__all__)
+            for module in modules if hasattr(module, '__all__')}
 
 
 def _resolve_aliases(names: dict[str, Any], aliases: list[tuple[str, str]]) -> None:

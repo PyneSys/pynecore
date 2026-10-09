@@ -26,7 +26,7 @@ import ast
 import copy
 from collections import deque
 from collections.abc import Callable, Iterator
-from typing import Any
+from typing import Any, get_args
 
 __all__ = ['NodeVisitor', 'NodeTransformer', 'walk', 'iter_child_nodes', 'iter_descendants',
            'iter_child_statements', 'walk_statements', 'fix_missing_locations', 'clone']
@@ -49,6 +49,33 @@ _LEGACY_CONSTANT_VISITORS = ('visit_Num', 'visit_Str', 'visit_Bytes', 'visit_Nam
 
 #: Marks a node the visit leaves alone: a leaf without a visitor method
 _SKIP = object()
+
+
+def _may_hold_node(annotation: Any) -> bool:
+    """Whether a field typed ``annotation`` can hold a node or a list of nodes."""
+    if isinstance(annotation, type):
+        return issubclass(annotation, _AST)
+    args = get_args(annotation)
+    # An unknown or unparameterized annotation could hold anything
+    return not args or any(_may_hold_node(arg) for arg in args)
+
+
+#: Node class -> its fields that can hold a node or a list of nodes, in
+#: ``_fields`` order. The identifiers, strings and numbers a node also carries
+#: (``Name.id``, ``Attribute.attr``, ``Constant.value``, ...) are never looked
+#: at by a walk; where the running Python does not describe its field types
+#: (``_field_types`` arrived in 3.13), every field is kept
+_node_fields: dict[type, tuple[str, ...]] = {}
+
+
+def _node_fields_of(cls: type) -> tuple[str, ...]:
+    fields = _node_fields.get(cls)
+    if fields is None:
+        types = getattr(cls, '_field_types', None)
+        fields = cls._fields if types is None else tuple(
+            name for name in cls._fields if name not in types or _may_hold_node(types[name]))
+        _node_fields[cls] = fields
+    return fields
 
 #: (visitor class, node class) -> the function visiting it, or ``_SKIP``
 _dispatch: dict[tuple[type, type], Any] = {}
@@ -88,11 +115,14 @@ class NodeVisitor(ast.NodeVisitor):
                 self.visit(child)
             return
         dispatch = _dispatch
-        for field in node._fields:
-            try:
-                value = getattr(node, field)
-            except AttributeError:
-                continue
+        fields = _node_fields.get(node.__class__)
+        if fields is None:
+            fields = _node_fields_of(node.__class__)
+        # A field the node does not set reads as None either way, so the
+        # instance dict stands in for ``getattr``
+        state = node.__dict__
+        for field in fields:
+            value = state.get(field)
             if isinstance(value, _AST):
                 method = dispatch.get((cls, value.__class__))
                 if method is None:
@@ -131,11 +161,12 @@ class NodeTransformer(ast.NodeTransformer):
         cls = self.__class__
         fast = cls.visit is NodeTransformer.visit
         dispatch = _dispatch
-        for field in node._fields:
-            try:
-                old_value = getattr(node, field)
-            except AttributeError:
-                continue
+        fields = _node_fields.get(node.__class__)
+        if fields is None:
+            fields = _node_fields_of(node.__class__)
+        state = node.__dict__
+        for field in fields:
+            old_value = state.get(field)
             if isinstance(old_value, list):
                 new_values = []
                 for value in old_value:
@@ -180,11 +211,12 @@ _DEFAULT_GENERIC = (NodeVisitor.generic_visit, NodeTransformer.generic_visit)
 
 def iter_child_nodes(node: ast.AST) -> Iterator[ast.AST]:
     """The direct child nodes of ``node``, as :func:`ast.iter_child_nodes` yields them."""
-    for field in node._fields:
-        try:
-            value = getattr(node, field)
-        except AttributeError:
-            continue
+    fields = _node_fields.get(node.__class__)
+    if fields is None:
+        fields = _node_fields_of(node.__class__)
+    state = node.__dict__
+    for field in fields:
+        value = state.get(field)
         if isinstance(value, _AST):
             yield value
         elif isinstance(value, list):
@@ -202,13 +234,15 @@ def walk(node: ast.AST) -> Iterator[ast.AST]:
     todo = deque([node])
     popleft = todo.popleft
     append = todo.append
+    node_fields = _node_fields
     while todo:
         node = popleft()
-        for field in node._fields:
-            try:
-                value = getattr(node, field)
-            except AttributeError:
-                continue
+        fields = node_fields.get(node.__class__)
+        if fields is None:
+            fields = _node_fields_of(node.__class__)
+        state = node.__dict__
+        for field in fields:
+            value = state.get(field)
             if isinstance(value, _AST):
                 append(value)
             elif isinstance(value, list):
@@ -359,6 +393,10 @@ _ATOMIC: frozenset[type] = frozenset({
 
 _deepcopy: Callable[..., Any] = copy.deepcopy
 
+#: Per node class, the optional fields a constructor leaves absent when omitted
+_UNFILLED: dict[type, frozenset[str]] = {}
+_NO_DEFAULT = object()
+
 
 def clone(node: Any, memo: dict[int, Any] | None = None) -> Any:
     """``copy.deepcopy`` of a tree, list of nodes, or anything holding them.
@@ -397,17 +435,26 @@ def _clone(value: Any, memo: dict[int, Any]) -> Any:
         state = value.__dict__
         fields = cls._fields
         # ``deepcopy`` rebuilds a node through its constructor, which fills an
-        # absent field with its default; only a node with every field present
-        # is guaranteed to come out the same without that call
+        # absent list field or context with its default. An absent optional
+        # field it leaves absent (the class attribute answers None for it), so
+        # only those may be missing for the copy to come out the same without
+        # that call
+        unfilled = _UNFILLED.get(cls)
+        if unfilled is None:
+            unfilled = _UNFILLED[cls] = frozenset(
+                field for field in fields if getattr(cls, field, _NO_DEFAULT) is None)
         for field in fields:
-            if field not in state:
+            if field not in state and field not in unfilled:
                 return _deepcopy(value, memo)
         new = cls.__new__(cls)
         memo[key] = new
         new_state = new.__dict__
         # The constructor sets the fields first, then the state is laid over
-        # them: same key order as a ``deepcopy``
+        # them. Same content as a ``deepcopy``; where an optional field is absent
+        # the instance dict's key order may differ, which nothing reads
         for field in fields:
+            if field not in state:
+                continue
             item = state[field]
             new_state[field] = item if item.__class__ in _ATOMIC else _clone(item, memo)
         for name, item in state.items():

@@ -2,10 +2,36 @@ from typing import cast
 import ast
 
 from . import ast_walk
+from .phase import Rule
 from .pine_type_rules import INT, get_ty, stamp_lowering
 
 
-class SafeConvertTransformer(ast_walk.NodeTransformer):
+class _RangeBinding(ast_walk.NodeVisitor):
+    """Find whether a module binds the name ``range`` anywhere: a definition,
+    a stored name or an import alias."""
+
+    def __init__(self) -> None:
+        self.found = False
+
+    def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef
+                          | ast.ClassDef) -> None:
+        if node.name == 'range':
+            self.found = True
+        self.generic_visit(node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+    visit_ClassDef = visit_FunctionDef
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id == 'range' and isinstance(node.ctx, ast.Store):
+            self.found = True
+
+    def visit_alias(self, node: ast.alias) -> None:
+        if (node.asname or node.name) == 'range':
+            self.found = True
+
+
+class SafeConvertTransformer(Rule):
     """
     Transformer that converts float(na) and int(na) calls to safe alternatives
     that preserve Pine Script semantics.
@@ -36,11 +62,32 @@ class SafeConvertTransformer(ast_walk.NodeTransformer):
         self.lib = lib
         self.has_safe_convert_import = False
         self.has_convert_functions = False  # Track if float()/int() is used
+        #: The module being transformed, None when the root is not a module
+        self.module: ast.Module | None = None
         #: The module binds its own ``range`` (ta.range, array.range), so a
-        #: ``range(...)`` call is not the builtin consumer
-        self.range_shadowed = False
+        #: ``range(...)`` call is not the builtin consumer; None until asked
+        self.range_shadowed: bool | None = None
         #: Loop counters bound by an enclosing ``for ... in range(...)``
         self.range_vars: set[str] = set()
+        #: Per enclosing ``for``, the counter it added to ``range_vars``, if any
+        self._for_counters: list[str | None] = []
+
+    def _is_builtin_range(self) -> bool:
+        """
+        Whether a ``range`` call is the builtin, i.e. the module binds no ``range``.
+
+        Only a ``range`` call or loop asks, and most modules have none, so the
+        whole-module scan waits for the first one. The rewrites done by then
+        (this pass's, and those of the rules sharing its traversal) bind no
+        ``range`` and drop no binding, so the scan answers as it would have
+        before them.
+        """
+        if self.range_shadowed is None:
+            scan = _RangeBinding()
+            if self.module is not None:
+                scan.visit(self.module)
+            self.range_shadowed = scan.found
+        return not self.range_shadowed
 
     def _native_int(self, arg: ast.expr) -> ast.expr:
         """Wrap a Python-native consumer's argument in the native truncation."""
@@ -73,27 +120,28 @@ class SafeConvertTransformer(ast_walk.NodeTransformer):
             return index
         return self._native_int(index)
 
-    def visit_For(self, node: ast.For) -> ast.AST:
+    def enter_For(self, node: ast.For) -> None:
         """
-        Visit For nodes, remembering a ``range()`` loop's counter as a native int
+        Remember a ``range()`` loop's counter as a native int while its loop is visited
         """
         counter = None
         if (isinstance(node.target, ast.Name) and isinstance(node.iter, ast.Call)
                 and isinstance(node.iter.func, ast.Name) and node.iter.func.id == 'range'
-                and not self.range_shadowed and node.target.id not in self.range_vars):
+                and node.target.id not in self.range_vars and self._is_builtin_range()):
             counter = node.target.id
             self.range_vars.add(counter)
-        self.generic_visit(node)
+        self._for_counters.append(counter)
+
+    def leave_For(self, node: ast.For) -> ast.AST:
+        counter = self._for_counters.pop()
         if counter is not None:
             self.range_vars.discard(counter)
         return node
 
-    def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+    def leave_Subscript(self, node: ast.Subscript) -> ast.AST:
         """
-        Visit Subscript nodes and truncate a Pine int index for a Python-native container
+        Truncate a Pine int index for a Python-native container
         """
-        self.generic_visit(node)
-
         # A series buffer read: the SeriesTransformer has rewritten the series
         # to its ``<state param>[slot]`` reference
         base = node.value
@@ -113,21 +161,14 @@ class SafeConvertTransformer(ast_walk.NodeTransformer):
             node.slice = self._native_index(index)
         return node
 
-    def visit_Call(self, node: ast.Call) -> ast.AST:
+    def leave_Call(self, node: ast.Call) -> ast.AST:
         """
-        Visit Call nodes and transform float() and int() calls
+        Transform float() and int() calls, and truncate the arguments of range()
         """
-        # Continue normal transformation for children
-        self.generic_visit(node)
-
         if not isinstance(node.func, ast.Name):
             return node
 
-        # Check for the builtin module
-        if hasattr(node.func, 'module') and getattr(node.func, 'module') == 'builtins':
-            return node
-
-        if node.func.id == 'range' and not node.keywords and not self.range_shadowed:
+        if node.func.id == 'range' and not node.keywords and self._is_builtin_range():
             node.args = [arg if isinstance(arg, ast.Starred)
                          or isinstance(arg, ast.Constant) and type(arg.value) is int
                          else self._native_int(arg) for arg in node.args]
@@ -157,21 +198,13 @@ class SafeConvertTransformer(ast_walk.NodeTransformer):
 
         return node
 
-    def visit_Module(self, node: ast.Module) -> ast.Module:
+    def enter_Module(self, node: ast.Module) -> None:
+        self.module = node
+
+    def leave_Module(self, node: ast.Module) -> ast.Module:
         """
         Add safe_convert import if needed
         """
-        self.range_shadowed = any(
-            (isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-             and child.name == 'range')
-            or (isinstance(child, ast.Name) and child.id == 'range'
-                and isinstance(child.ctx, ast.Store))
-            or (isinstance(child, ast.alias) and (child.asname or child.name) == 'range')
-            for child in ast_walk.walk(node))
-
-        # Process the module first
-        node = cast(ast.Module, self.generic_visit(node))
-
         # Only add the import if we actually transformed any functions
         if not self.has_convert_functions:
             return node

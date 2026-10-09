@@ -45,6 +45,35 @@ def _is_persistent_annotation(annotation: ast.AST) -> bool:
     return False
 
 
+#: The decorators that make a ``main`` the script entry this pass works in
+_MAIN_DECORATORS = ('lib.script.indicator', 'lib.script.strategy',
+                    'script.indicator', 'script.strategy')
+
+
+def _get_decorator_name(decorator: Any) -> Optional[str]:
+    """Get the full name of a decorator."""
+    if isinstance(decorator, ast.Name):
+        return decorator.id
+    elif isinstance(decorator, ast.Attribute):
+        parts = []
+        current = decorator
+        while isinstance(current, ast.Attribute):
+            parts.append(current.attr)
+            current = current.value
+        if isinstance(current, ast.Name):
+            parts.append(current.id)
+        return '.'.join(reversed(parts))
+    elif isinstance(decorator, ast.Call):
+        return _get_decorator_name(decorator.func)
+    return None
+
+
+def _has_nested_function(func: ast.FunctionDef) -> bool:
+    """Whether a ``def`` stands anywhere inside a function."""
+    return any(isinstance(stmt, ast.FunctionDef) and stmt is not func
+               for stmt in ast_walk.walk_statements(func))
+
+
 class ClosureArgumentsTransformer(ast_walk.NodeTransformer):
     """Transform closure variables in inner functions to function arguments."""
 
@@ -67,6 +96,15 @@ class ClosureArgumentsTransformer(ast_walk.NodeTransformer):
         self.persistent_vars: Set[str] = set()
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
+        # Only a function defined inside the decorated main can have closure
+        # variables threaded: without one, neither pass would change anything
+        if not any(isinstance(stmt, ast.FunctionDef) and stmt.name == 'main'
+                   and any(_get_decorator_name(decorator) in _MAIN_DECORATORS
+                           for decorator in stmt.decorator_list)
+                   and _has_nested_function(stmt)
+                   for stmt in ast_walk.walk_statements(node)):
+            return node
+
         # First pass: collect all function definitions and their closure variables
         collector = ClosureVariableCollector()
         collector.visit(node)
@@ -110,9 +148,7 @@ class ClosureArgumentsTransformer(ast_walk.NodeTransformer):
         is_main_decorated = False
         if node.name == 'main':
             for decorator in node.decorator_list:
-                decorator_name = self._get_decorator_name(decorator)
-                if decorator_name in ('lib.script.indicator', 'lib.script.strategy',
-                                      'script.indicator', 'script.strategy'):
+                if _get_decorator_name(decorator) in _MAIN_DECORATORS:
                     is_main_decorated = True
                     break
 
@@ -232,23 +268,6 @@ class ClosureArgumentsTransformer(ast_walk.NodeTransformer):
 
         return node
 
-    def _get_decorator_name(self, decorator: Any) -> Optional[str]:
-        """Get the full name of a decorator."""
-        if isinstance(decorator, ast.Name):
-            return decorator.id
-        elif isinstance(decorator, ast.Attribute):
-            parts = []
-            current = decorator
-            while isinstance(current, ast.Attribute):
-                parts.append(current.attr)
-                current = current.value
-            if isinstance(current, ast.Name):
-                parts.append(current.id)
-            return '.'.join(reversed(parts))
-        elif isinstance(decorator, ast.Call):
-            return self._get_decorator_name(decorator.func)
-        return None
-
     @staticmethod
     def _get_function_key(func_name: str) -> str:
         """Get unique key for a function based on its scope."""
@@ -282,6 +301,8 @@ class ClosureVariableCollector(ast_walk.NodeVisitor):
         self.current_function: Optional[str] = None
         # Stack of function scopes
         self.function_stack: List[str] = []
+        # The stack joined: the key of the current scope
+        self._scope_key = ''
         # Variables defined in each scope
         self.scope_variables: Dict[str, Set[str]] = {}
         # Variables used in each scope
@@ -312,6 +333,7 @@ class ClosureVariableCollector(ast_walk.NodeVisitor):
         self.current_function = node.name
         if self.current_function:
             self.function_stack.append(self.current_function)
+            self._scope_key = '.'.join(self.function_stack)
             scope_key = self._get_scope_key()
             self.scope_variables[scope_key] = set()
             self.scope_uses[scope_key] = set()
@@ -355,6 +377,7 @@ class ClosureVariableCollector(ast_walk.NodeVisitor):
         self.in_main_function = old_in_main
         if self.function_stack:
             self.function_stack.pop()
+            self._scope_key = '.'.join(self.function_stack)
 
     def visit_Name(self, node: ast.Name) -> None:
         if self.current_function:
@@ -416,28 +439,10 @@ class ClosureVariableCollector(ast_walk.NodeVisitor):
     def _has_required_decorator(self, node: ast.FunctionDef) -> bool:
         """Check if function has required decorator."""
         for decorator in node.decorator_list:
-            decorator_name = self._get_decorator_name(decorator)
-            if decorator_name in ('lib.script.indicator', 'lib.script.strategy', 'script.indicator', 'script.strategy'):
+            if _get_decorator_name(decorator) in _MAIN_DECORATORS:
                 return True
         return False
 
-    def _get_decorator_name(self, decorator: Any) -> Optional[str]:
-        """Get the full name of a decorator."""
-        if isinstance(decorator, ast.Name):
-            return decorator.id
-        elif isinstance(decorator, ast.Attribute):
-            parts = []
-            current = decorator
-            while isinstance(current, ast.Attribute):
-                parts.append(current.attr)
-                current = current.value
-            if isinstance(current, ast.Name):
-                parts.append(current.id)
-            return '.'.join(reversed(parts))
-        elif isinstance(decorator, ast.Call):
-            return self._get_decorator_name(decorator.func)
-        return None
-
     def _get_scope_key(self) -> str:
         """Get unique key for current scope."""
-        return '.'.join(self.function_stack)
+        return self._scope_key

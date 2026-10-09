@@ -6,6 +6,14 @@ stale one silently changes which overload a call site pins and which slots the
 inference believes are int-typed. The committed JSON must always match what
 scripts/lib_type_collector.py generates from the current lib source.
 
+The ``routes`` and ``star_exports`` sections are what the transform reads
+INSTEAD of the live lib (FunctionIsolation's call-site route of a lib callee,
+ImportNormalizer's ``import *`` expansion). The lib sources are not part of the
+pipeline hash and this file is, so this guard is what turns a route-relevant
+lib edit -- a builtin gaining or losing state, an overload group, a module
+property, an ``__all__`` entry -- into a regenerated file and with it into
+retransformed script bytecode.
+
 The spot checks below are the second half of the guard: they pin the handful
 of entries the inference leans on hardest, so a collector change that keeps
 the file self-consistent but flips a type still fails here.
@@ -27,6 +35,10 @@ def _load_collector():
     return module
 
 
+_REGENERATE = ("lib_types.json is stale — regenerate it with `python scripts/lib_type_collector.py` "
+               "from the pynecore checkout root (venv active), and commit the result")
+
+
 def __test_lib_types_json_is_current__():
     """The committed registry is what the collector produces today"""
     module = _load_collector()
@@ -34,8 +46,34 @@ def __test_lib_types_json_is_current__():
     generated = collector.collect()
     committed = json.loads(_JSON_PATH.read_text())
 
-    assert generated == committed, \
-        "lib_types.json is stale — rerun scripts/lib_type_collector.py"
+    assert generated == committed, _REGENERATE
+
+
+def __test_lib_routes_are_current__():
+    """
+    The routes and ``import *`` lists the transform reads are the live lib's.
+
+    The generic guard above fails on these too; this one names what changed, so
+    a lib edit that moved a call-site route is visible as such.
+    """
+    module = _load_collector()
+    generated = module.LibTypeCollector(project_src=_REPO_ROOT / 'src').collect()
+    committed = json.loads(_JSON_PATH.read_text())
+
+    changes = []
+    for section in ('routes', 'star_exports'):
+        now, then = generated[section], committed.get(section, {})
+        for key in sorted(now.keys() | then.keys()):
+            if now.get(key) == then.get(key):
+                continue
+            if section == 'routes':
+                change = f"{then.get(key, 'uniform')} -> {now.get(key, 'uniform')}"
+            else:
+                added = sorted(set(now.get(key, ())) - set(then.get(key, ())))
+                removed = sorted(set(then.get(key, ())) - set(now.get(key, ())))
+                change = f"added {added}, removed {removed}"
+            changes.append(f"{section}[{key!r}]: {change}")
+    assert not changes, _REGENERATE + ". Changed:\n  " + "\n  ".join(changes)
 
 
 def __test_schema_version_matches_the_collector__():
@@ -88,6 +126,29 @@ def __test_load_bearing_entries__():
     # module key reserved for the lib
     assert names['line.new']['impls'][0]['ret'] == 'o:lib#Line'
     assert names['chart.point.new']['ret'] == 'o:lib#ChartPoint'
+
+
+def __test_load_bearing_routes__():
+    """The lib callees whose route decides the emitted call carry the expected one"""
+    routes = json.loads(_JSON_PATH.read_text())['routes']
+
+    # A builtin with own state takes the parent-slot route
+    assert routes['lib.ta.sma'] == 'fast'
+    assert routes['lib.math.sum'] == 'fast'
+    # ... and one TradingView advances per execution skips the loop rollback
+    assert routes['lib.ta.percentile_linear_interpolation'] == 'fast-shared'
+    # A stateless helper of a transformed lib module is a plain call
+    assert routes['lib.ta._linreg_fit'] == 'direct'
+    # A module property and a namespace's classmethod are skipped
+    assert routes['lib.ta.tr'] == 'skip'
+    assert routes['lib.input.timeframe'] == 'skip'
+    # An overload dispatcher is anchored (uniform), which is what an absent path means
+    assert 'lib.ta.highest' not in routes
+    assert set(routes.values()) <= {'skip', 'direct', 'fast', 'fast-shared'}
+
+    exports = json.loads(_JSON_PATH.read_text())['star_exports']
+    assert {'close', 'hl2', 'plot', 'math'} <= set(exports['pynecore.lib'])
+    assert 'sma' in exports['pynecore.lib.ta']
 
 
 def __test_a_none_default_records_what_its_annotation_takes__():

@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from pynecore.core.import_hook import analyse_source
+from tests.t00_pynecore.pine_analysis import analyse_module
 from pynecore.transformers.pine_type_infer import infer_module, lib_types
 from pynecore.transformers.pine_type_rules import (
     BOOL, FLOAT, INT, UNKNOWN, builtin_class_id, get_ty, object_ty,
@@ -505,7 +505,7 @@ def __test_the_analysed_pipeline_leaves_no_untyped_value__(tmp_path: Path):
     """
     script = tmp_path / 'plumbed.py'
     script.write_text(_PLUMBED)
-    analysed = analyse_source(str(script))
+    analysed = analyse_module(str(script))
     assert analysed is not None, "the analysis did not recognize the script"
     tree = analysed[0]
 

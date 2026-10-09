@@ -44,6 +44,9 @@ class PersistentTransformer(ast_walk.NodeTransformer):
         self.current_scope: str = ''
         # scope -> var name -> value slot
         self.var_slots: dict[str, dict[str, int]] = {}
+        #: Every name ``var_slots`` holds in any scope: a name outside it is
+        #: no persistent anywhere, which settles most lookups at once
+        self._slot_names: set[str] = set()
         self.persistent_declarations: dict[str, set[str]] = {}
         self.local_vars: dict[str, set[str]] = {}
 
@@ -58,6 +61,8 @@ class PersistentTransformer(ast_walk.NodeTransformer):
         :param var_name: Source-level variable name.
         :return: (declaring scope, slot index) or None.
         """
+        if var_name not in self._slot_names:
+            return None
         if (var_name in self.local_vars.get(self.current_scope, ())
                 and var_name not in self.persistent_declarations.get(self.current_scope, ())):
             return None
@@ -212,6 +217,7 @@ class PersistentTransformer(ast_walk.NodeTransformer):
             # Lazy pattern: value slot + flag slot, initializer runs on first call
             slot = scope_layout.add_var(var_name, ast.Constant(value=None), varip=varip)
             self.var_slots.setdefault(self.current_scope, {})[var_name] = slot
+            self._slot_names.add(var_name)
             flag = scope_layout.add_flag(var_name, varip=varip)
             value = cast(ast.expr, self.visit(node.value))
             return ast.If(
@@ -233,6 +239,7 @@ class PersistentTransformer(ast_walk.NodeTransformer):
         init = node.value if node.value is not None else na_init
         slot = scope_layout.add_var(var_name, init, varip=varip)
         self.var_slots.setdefault(self.current_scope, {})[var_name] = slot
+        self._slot_names.add(var_name)
         return None
 
     def visit_Assign(self, node: ast.Assign) -> ast.Assign:

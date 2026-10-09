@@ -76,18 +76,33 @@ def collect_scope_segments(tree: ast.Module) -> dict[int, str]:
     :param tree: The module AST.
     :return: ``id(def node) -> segment`` mapping.
     """
-    segments: dict[int, str] = {}
+    return _scan_scopes(tree)[0]
 
-    def assign(scope_node: ast.AST) -> None:
+
+def _scan_scopes(tree: ast.Module) -> tuple[dict[int, str], dict[int, bool]]:
+    """The scope segment of every function definition, and whether it nests one.
+
+    :param tree: The module AST.
+    :return: ``id(def node) -> segment`` and ``id(def node) -> whether a
+        ``FunctionDef`` stands anywhere inside it``.
+    """
+    segments: dict[int, str] = {}
+    nests: dict[int, bool] = {}
+
+    def assign(scope_node: ast.AST) -> bool:
         counts: dict[str, int] = {}
+        nested = False
         for func in _scope_defs(scope_node):
             n = counts.get(func.name, 0) + 1
             counts[func.name] = n
             segments[id(func)] = func.name if n == 1 else f'{func.name}·{n}'
-            assign(func)
+            inner = assign(func)
+            nests[id(func)] = inner
+            nested = nested or inner or isinstance(func, ast.FunctionDef)
+        return nested
 
     assign(tree)
-    return segments
+    return segments, nests
 
 
 @dataclass
@@ -218,18 +233,26 @@ class ModuleLayout:
         """
         self.scopes: dict[str, ScopeLayout] = {}
         self._segments: dict[int, str] = {}
+        #: id(def node) -> whether a ``FunctionDef`` stands anywhere inside it
+        self._nests: dict[int, bool] = {}
+        #: The module the two maps above were computed for
+        self._tree: ast.Module | None = None
         self.compacted_series = compacted_series
 
     def assign_scope_ids(self, tree: ast.Module) -> None:
-        """(Re)build the definition -> scope-segment mapping for a module.
+        """Build the definition -> scope-segment mapping for a module.
 
-        Every transformer entry point (and :func:`apply_layout`) calls this;
-        the rebuild is deterministic, so repeated calls on the same tree
-        agree even after body mutations.
+        Every transformer entry point (and :func:`apply_layout`) calls this.
+        The mapping is computed by the first call for a module and kept: no
+        pass of the lowering adds, removes, moves or renames a definition, so
+        every later stage would compute the same one.
 
         :param tree: The module AST.
         """
-        self._segments = collect_scope_segments(tree)
+        if tree is self._tree:
+            return
+        self._tree = tree
+        self._segments, self._nests = _scan_scopes(tree)
 
     def scope_segment(self, node: ast.FunctionDef) -> str:
         """Disambiguated scope segment of a function definition.
@@ -238,6 +261,18 @@ class ModuleLayout:
         :return: ``name`` or ``name·N`` for repeated names in one scope.
         """
         return self._segments.get(id(node), node.name)
+
+    def nests_definition(self, node: ast.FunctionDef) -> bool:
+        """Whether a ``FunctionDef`` stands anywhere inside a definition.
+
+        :param node: The function definition.
+        :return: True if a nested definition exists, at any depth.
+        """
+        try:
+            return self._nests[id(node)]
+        except KeyError:
+            return any(isinstance(child, ast.FunctionDef)
+                       for child in ast_walk.walk_statements(node) if child is not node)
 
     def scope(self, scope_id: str) -> ScopeLayout:
         """Return (creating on demand) the layout of a scope.
@@ -285,8 +320,7 @@ def scope_for_function(layout: ModuleLayout, scope_id: str, node: ast.FunctionDe
     :return: The scope's layout.
     """
     scope = layout.scope(scope_id)
-    if any(isinstance(child, ast.FunctionDef)
-           for child in ast_walk.walk_statements(node) if child is not node):
+    if layout.nests_definition(node):
         scope.state_param = f'__state·{scope_id}__'
     return scope
 
@@ -384,7 +418,8 @@ def _process_nested_bodies(node: ast.AST, scope_prefix: str, layout: ModuleLayou
     scope (:func:`_scope_defs` collects it there), so it must get the same
     hidden parameter and layout attach as a top-level one.
     """
-    for name, value in ast.iter_fields(node):
+    for name in node._fields:
+        value = getattr(node, name, None)
         if not isinstance(value, list) or not value:
             continue
         if isinstance(value[0], ast.stmt):

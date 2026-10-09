@@ -5,7 +5,7 @@ title: "Function Isolation"
 description: "How function isolation works in PyneCore and why it's essential for Pine Script compatibility"
 icon: "privacy_tip"
 date: "2025-03-31"
-lastmod: "2026-06-10"
+lastmod: "2026-10-09"
 draft: false
 toc: true
 categories: ["Advanced"]
@@ -68,10 +68,12 @@ The state-related AST transformers (see [AST Transformation](./ast-transformatio
 A layout is a plain dict with these keys:
 
 - `init` — template value for every slot; instantiation is essentially `list(init)`
-- `series` — `(slot, max_bars_back)` pairs; instantiation puts a fresh `SeriesImpl` circular buffer into these slots
+- `series` — `(slot, max_bars_back, elem)` triples; instantiation puts a fresh `SeriesImpl` circular buffer into these slots. `elem` is the statically known element type name (`'float'` selects the native `nan` as the series' out-of-range na value) or `None`
 - `varip` — slot indexes excluded from the `var` rollback on intra-bar re-execution
 - `children` — `(slot, call_id, in_loop)` triples describing the function's isolated call sites
 - `names` — per-slot debug names (used only by debug tooling)
+- `pin` — present only for a scope whose body resolves something per instance: the slot that holds the instance vector (see `core/instance_state.py`)
+- `compacted` — present and true only for `@pyne lib` modules, whose series are na-compacted rolling windows
 
 The key idea is the **parent-slot scheme**: the state of a callee instance occupies a dedicated *child slot of the caller's state vector*, assigned at transform time. All live state therefore forms a **tree** hanging off a few root vectors. There is no global instance cache and no key lookups — reaching an instance's state is a list index away, and dropping a parent releases its entire subtree through normal garbage collection.
 
@@ -95,6 +97,27 @@ At transform time every call site is classified, because the best possible emiss
 - **uniform** — the callee cannot be resolved at transform time (function-valued variables, parameters, conditionally rebound names, overload dispatchers). Emission: anchor slot with `__bind_any__` and an identity check.
 - **skip** — builtins, stdlib, types/constructors, module properties, plot/log-style display functions, and the synthetic series-slot method calls emitted by the Series transformer. Untouched.
 
+### Where the classification comes from
+
+The transformer never guesses: a site whose callee it cannot prove anything about routes uniform, which is correct for any callee and only slower. What it can prove comes from four places:
+
+- **Same-module definitions** are classified from the module's own slot layout plus a fixpoint over its call graph: a function carries state if it has slots of its own or any call site that is not direct.
+- **`NON_TRANSFORMABLE_FUNCTIONS`** in `transformers/function_isolation.py` lists the callees that skip by name, before anything is resolved: the stateless functions of plain (untransformed) modules, which nothing else could prove stateless — the `lib` display, drawing, math and string functions, the `cast_*` helpers, `method_call`, and the like. An entry must never name a function that keeps per-call-site state.
+- **`pynecore.lib` callees** are looked up in the `routes` section of the generated `transformers/lib_types.json`, keyed the way a script spells them (`lib.ta.sma`). A path not listed there routes uniform. The lib is not imported to decide the route.
+- **Every other imported module** (a user Pyne library, a plain module, the rest of `pynecore`) is imported at transform time and the callee object is inspected.
+
+One function, `classify_callee`, turns a callee object into a route: an `Exported` proxy or an overload dispatcher (`__pyne_bind__`) is uniform; a class, a classmethod, a builtin or a module property is skipped; a `__pyne_layout__` attribute proves it state-carrying (the fast route, or its fast-shared variant for a machine marked `__pyne_shared_call_site__`); a function of a transformed module without a layout is direct. The transform runs it on the live object of a non-lib callee, and `scripts/lib_type_collector.py` runs it on every lib callee path to generate the `routes` section.
+
+The reason for the generated table is the bytecode cache. A cached script is valid as long as the pipeline hash matches, and the hash covers `transformers/` (with `lib_types.json`) but not the lib sources. A route read off the live lib would let an edit of `lib/ta.py` change a builtin from stateless to state-carrying while every cached script that calls it keeps the old emission, and crash on the missing `__pyne_layout__`. Read from the table, the same edit leaves the cache valid only until the table is regenerated, and the regeneration changes the hash.
+
+**When you change a lib function in a way that moves its route** — give a builtin state or take its state away, turn it into an `@overload` group, make it a module property, mark it `__pyne_shared_call_site__`, or add a name to a module's `__all__` — regenerate the registry and commit it with the change:
+
+```bash
+python scripts/lib_type_collector.py
+```
+
+`tests/t00_pynecore/ast/test_104_lib_types_registry.py` regenerates the registry in memory and fails, naming every changed route, until the committed file matches. When you add a new stateless function that compiled scripts call, decide its route in the same change as well: list it in `NON_TRANSFORMABLE_FUNCTIONS` if it keeps no per-call-site state, or leave it out (it then routes uniform, or fast/direct when it lives in a transformed lib module) and say why in a comment next to the function.
+
 ### Fast path
 
 The child slot is filled on first call and reused afterwards — the hot path is a single list read:
@@ -106,19 +129,16 @@ lib.ta.sma(__st·__ if (__st·__ := __state__[1]) is not None
 
 ### Fast path in a loop
 
-A call site inside a loop needs one instance per iteration. The loop's call counter indexes a child list, grown on demand:
+A call site inside a loop keeps **one** instance, shared by every iteration. TradingView keeps one state per call site however often a loop body executes it on a bar (a `var` counter in a called function counts 1, 2, 3 on one bar and 4, 5, 6 on the next). The whole guard folds into a helper, `__loop_state__`, which also restores the callee's builtin machines to their bar-start state before every same-bar re-execution; user state (`Persistent` variables) accumulates across the iterations:
 
 ```python
 def main(__state__):
-    __cnt·0__ = 0
-    __chl·0__ = __state__[0]
     total = 0
     for length in (5, 10, 20):
-        total += counter(__chl·0__[__i·__] if (__i·__ := ((__cnt·0__ := (__cnt·0__ + 1)) - 1)) < __chl·0__.__len__()
-                         else __grow·__(__chl·0__, counter))
+        total += counter(__loop_state·__(__state__, 0, counter))
 ```
 
-The counter guard calls `__chl·0__.__len__()` rather than `len(__chl·0__)` on purpose: a script variable named `len` (a common Pine input name) would shadow the builtin in the function scope, so a bare `len(...)` could resolve to that value and fail. Calling the list's `__len__` slot directly sidesteps name resolution.
+The slot holds a `[state, last_bar, snapshot]` cell that is private to the helper: the first call of a bar refreshes the snapshot, every further call on that bar restores it.
 
 ### Uniform path
 
@@ -129,7 +149,9 @@ When the callee is only known at runtime, the call site gets an **anchor slot** 
  else __bind_any·__(__state__, 7, f))(x)
 ```
 
-`__bind_any__` handles what the callee turns out to be at runtime: state-carrying functions get a fresh state vector baked into a partial, exported library functions are unwrapped, overload dispatchers are bound through their `__pyne_bind__` factory, and plain callables pass through as-is. Loop-shaped uniform sites keep a list of pairs indexed by the call counter, so each iteration keeps its own instance.
+`__bind_any__` handles what the callee turns out to be at runtime: state-carrying functions get a fresh state vector baked into a partial, exported library functions are unwrapped, overload dispatchers are bound through their `__pyne_bind__` factory, and plain callables pass through as-is. Loop-shaped uniform sites fold the whole guard into `__bind_loop__(__state__, 7, f)(x)`: one shared instance with the same same-bar rollback as the fast loop form.
+
+Python forbids assignment expressions anywhere inside a comprehension's iterable, so a straight-line site under an iterable folds its guard into one helper call instead (`__slot_state·__` for the fast path, `__bind_slot·__` for the uniform path).
 
 Note: when the callee at a uniform site changes (`g = a if cond else b; g(x)`), the site is rebound with fresh state — state does not survive an `a -> b -> a` swap.
 
@@ -168,7 +190,7 @@ def main():
 @pyne
 """
 from pynecore.core.instance_state import __resolve_slot__ as __resolve_slot·__
-__pyne_slot_layout__ = {'main': {'init': (None, None), 'series': (), 'varip': (), 'children': ((0, 'main·t·0', False), (1, 'main·t·1', False)), 'names': ('main·t·0', 'main·t·1')}, 'main·t': {'init': (None,), 'series': ((0, None),), 'varip': (), 'children': (), 'names': ('a',)}}
+__pyne_slot_layout__ = {'main': {'init': (None, None), 'series': (), 'varip': (), 'children': ((0, 'main·t·0', False), (1, 'main·t·1', False)), 'names': ('main·t·0', 'main·t·1')}, 'main·t': {'init': (None,), 'series': ((0, None, 'float'),), 'varip': (), 'children': (), 'names': ('a',)}}
 
 def main(__state·main__):
 

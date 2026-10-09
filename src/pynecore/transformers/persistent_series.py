@@ -1,4 +1,5 @@
 import ast
+from typing import cast
 
 from . import ast_walk
 
@@ -13,12 +14,42 @@ SERIES_PERSISTENT_TYPES = {
 }
 
 
+def _persistent_half(node: ast.AnnAssign) -> str | None:
+    """The persistent half of a series-carrying persistent declaration, else None."""
+    if not isinstance(node.target, ast.Name):
+        return None
+    annotation = node.annotation
+    if isinstance(annotation, ast.Subscript):
+        annotation = annotation.value
+        if not isinstance(annotation, ast.Name):
+            return None
+    elif not isinstance(annotation, ast.Name):
+        return None
+    return SERIES_PERSISTENT_TYPES.get(annotation.id)
+
+
 class PersistentSeriesTransformer(ast_walk.NodeTransformer):
     """
     Transform PersistentSeries and IBPersistentSeries declarations into a
     Persistent (resp. IBPersistent) + Series combination.
     Must be applied before PersistentTransformer and SeriesTransformer.
     """
+
+    def visit_Module(self, node: ast.Module) -> ast.Module:
+        # Both the split declarations and the imports of the split types are
+        # statements: a module with neither is left as it is, without visiting
+        # a single expression
+        for stmt in ast_walk.walk_statements(node):
+            if isinstance(stmt, ast.AnnAssign):
+                if _persistent_half(stmt) is not None:
+                    break
+            elif isinstance(stmt, ast.ImportFrom) and stmt.module \
+                    and stmt.module.startswith('pynecore') \
+                    and any(alias.name in SERIES_PERSISTENT_TYPES for alias in stmt.names):
+                break
+        else:
+            return node
+        return cast(ast.Module, self.generic_visit(node))
 
     def visit_ImportFrom(self, node):
         """Handle imports, only remove the split types while keeping the rest"""
@@ -34,29 +65,13 @@ class PersistentSeriesTransformer(ast_walk.NodeTransformer):
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST | list[ast.AnnAssign]:
         """Split a series-carrying persistent annotation into its persistent and Series halves"""
-        if hasattr(node, '_ps_transformed'):
-            return node
-
-        if not isinstance(node.target, ast.Name):
-            return node
-
-        # Check if it's a series-carrying persistent type
-        persistent_type = None
-        series_type = None
-
-        if isinstance(node.annotation, ast.Subscript):
-            if isinstance(node.annotation.value, ast.Name):
-                persistent_type = SERIES_PERSISTENT_TYPES.get(node.annotation.value.id)
-                if persistent_type is not None:
-                    series_type = node.annotation.slice
-        elif isinstance(node.annotation, ast.Name):
-            persistent_type = SERIES_PERSISTENT_TYPES.get(node.annotation.id)
-
+        persistent_type = _persistent_half(node)
         if persistent_type is None:
             return node
+        series_type = node.annotation.slice if isinstance(node.annotation, ast.Subscript) else None
 
         # Create two declarations
-        var_name = node.target.id
+        var_name = cast(ast.Name, node.target).id
         value = node.value
 
         # 1. Persistent declaration
@@ -74,7 +89,6 @@ class PersistentSeriesTransformer(ast_walk.NodeTransformer):
         # half has to point at the line the user wrote
         ast.copy_location(persistent_decl, node)
         ast_walk.fix_missing_locations(persistent_decl)
-        setattr(persistent_decl, "_ps_transformed", True)
 
         # 2. Series declaration
         series_decl = ast.AnnAssign(
@@ -89,6 +103,5 @@ class PersistentSeriesTransformer(ast_walk.NodeTransformer):
         )
         ast.copy_location(series_decl, node)
         ast_walk.fix_missing_locations(series_decl)
-        setattr(series_decl, "_ps_transformed", True)
 
         return [persistent_decl, series_decl]

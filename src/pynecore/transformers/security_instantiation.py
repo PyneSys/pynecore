@@ -37,7 +37,7 @@ Must run after ImportNormalizerTransformer (security calls are in their
 import ast
 
 from . import ast_walk
-from .security import SecurityTransformer
+from .security import SecurityTransformer, has_security_call
 
 __all__ = ['SecurityInstantiationTransformer']
 
@@ -64,16 +64,9 @@ class _FuncInfo:
 
 def _ordered_walk(node: ast.AST):
     """DFS in source order (``ast.walk`` is BFS; clone/call-site numbering
-    must be stable and follow the source).
-
-    Iterative: a recursive generator pays one ``yield from`` hop per tree level
-    for every node it hands out.
-    """
-    stack = [node]
-    while stack:
-        current = stack.pop()
-        yield current
-        stack.extend(reversed(list(ast_walk.iter_child_nodes(current))))
+    must be stable and follow the source)."""
+    yield node
+    yield from ast_walk.iter_descendants(node)
 
 
 class _RegionIndex:
@@ -117,6 +110,9 @@ class SecurityInstantiationTransformer:
 
     def __init__(self):
         self._clones_made = 0
+        # Every candidate of the module as it is now (see :meth:`_candidates`);
+        # dropped whenever a clone changes the module
+        self._candidates_now: list[tuple[_FuncInfo, list[ast.Call]]] | None = None
 
     # --- collection ---
 
@@ -163,7 +159,20 @@ class SecurityInstantiationTransformer:
                  ) -> list[tuple[_FuncInfo, list[ast.Call]]]:
         """Return the eligible security-bearing functions with at least
         ``min_sites`` direct-Name call sites, each with its call sites in
-        source order. Eligibility applies every bail-out."""
+        source order. Eligibility applies every bail-out.
+
+        The candidates are only re-derived after the module has changed: the
+        fixpoint's last round and the specialization ask about the very same
+        module.
+        """
+        if self._candidates_now is None:
+            self._candidates_now = self._candidates(module)
+        return [(info, sites) for info, sites in self._candidates_now
+                if len(sites) >= min_sites]
+
+    def _candidates(self, module: ast.Module) -> list[tuple[_FuncInfo, list[ast.Call]]]:
+        """Every security-bearing function that passes the bail-outs, with its
+        direct-Name call sites in source order (possibly none)."""
         infos = self._collect_functions(module)
 
         by_name: dict[str, list[_FuncInfo]] = {}
@@ -172,13 +181,14 @@ class SecurityInstantiationTransformer:
 
         # Direct bearers (subtree contains a security call) and name-level
         # call edges among module functions (for transitivity and cycle
-        # detection), from one walk per function.
+        # detection), from one walk per function. Both are sets, so the walk
+        # need not follow the source order.
         bearing: set[str] = set()
         edges: dict[str, set[str]] = {}
         for info in infos:
             name = info.node.name
             callees = edges.setdefault(name, set())
-            for n in _ordered_walk(info.node):
+            for n in ast_walk.walk(info.node):
                 if not isinstance(n, ast.Call):
                     continue
                 if self._is_security_call(n):
@@ -232,9 +242,7 @@ class SecurityInstantiationTransformer:
                 index = regions[id(info.region)] = _RegionIndex(info.region)
             if name in index.non_call_refs:
                 continue
-            sites = index.call_sites.get(name, [])
-            if len(sites) >= min_sites:
-                eligible.append((info, sites))
+            eligible.append((info, index.call_sites.get(name, [])))
         return eligible
 
     # --- cloning ---
@@ -256,6 +264,7 @@ class SecurityInstantiationTransformer:
         if not eligible:
             return False
         info, sites = eligible[0]
+        self._candidates_now = None
         name = info.node.name
         existing = {
             n.name for n in ast_walk.walk_statements(module)
@@ -358,8 +367,9 @@ class SecurityInstantiationTransformer:
     # --- pipeline API ---
 
     def visit(self, module: ast.Module) -> ast.Module:
-        if not any(self._is_security_call(n) for n in ast_walk.walk(module)):
+        if not has_security_call(module):
             return module
+        self._candidates_now = None
         # Fixpoint: cloning a caller duplicates its callees' call sites, so
         # re-analyze until no eligible multi-site bearer remains. Bounded by
         # the clone cap (each iteration makes at least one clone).

@@ -9,7 +9,7 @@ from collections.abc import Callable
 # ``<= 1e-10`` / ``>= -1e-10``.
 from pynecore.core.pine_compare import EPSILON
 
-from . import ast_walk
+from .phase import Rule
 from .pine_type_rules import BOOL, stamp_lowering
 
 # op -> (bound, comparison of the bound against the difference). ``a < b``
@@ -43,12 +43,13 @@ _READS: dict[type, int] = {
     ast.Eq: 4, ast.NotEq: 3,
 }
 
-# The only node kinds whose evaluation provably cannot run user code. The test
-# below is inverted -- anything not on this list counts as able to rebind a name
-# another operand reads -- because arbitrary Python hides behind an attribute
+# The only operands whose evaluation provably cannot run user code. The test
+# below is inverted -- anything else counts as able to rebind a name another
+# operand reads -- because arbitrary Python hides behind an attribute
 # (``property``, ``__getattribute__``), a subscript (``__getitem__``) and every
-# overloaded operator dunder, not just behind a call.
-_PURE_NODES = (ast.Name, ast.Constant, ast.expr_context)
+# overloaded operator dunder, not just behind a call. Neither kind holds a
+# child expression, so the operand's root decides.
+_PURE_NODES = (ast.Name, ast.Constant)
 
 #: The alias the interned bool na (``pynecore.types.na.na_bool``) is bound to in a
 #: script that keeps the three-state bool
@@ -62,7 +63,20 @@ def _unreachable() -> ast.expr:
 
 def _may_rebind(node: ast.expr) -> bool:
     """Whether evaluating this operand can change what another operand reads."""
-    return not all(isinstance(n, _PURE_NODES) for n in ast_walk.walk(node))
+    return not isinstance(node, _PURE_NODES)
+
+
+def _bool_compare(left: ast.expr, ops: list[ast.cmpop],
+                  comparators: list[ast.expr]) -> ast.Compare:
+    """A comparison the rewrite emits.
+
+    It is a bool by construction: it probes a type or a float difference, never
+    an ``NA``. The mark keeps the truthiness pass from casting it when that pass
+    runs after this one (see ``PineTruthinessTransformer._bool_value``).
+    """
+    node = ast.Compare(left=left, ops=ops, comparators=comparators)
+    node.pine_bool = True  # type: ignore[attr-defined]
+    return node
 
 
 def _insert_import(body: list[ast.stmt], stmt: ast.ImportFrom) -> None:
@@ -85,7 +99,7 @@ def _is_skippable_const(node: ast.expr) -> bool:
     return isinstance(node, ast.Constant) and isinstance(node.value, (str, bool))
 
 
-class FloatToleranceTransformer(ast_walk.NodeTransformer):
+class FloatToleranceTransformer(Rule):
     """
     Give the comparison operators TradingView's tolerant float semantics.
 
@@ -195,7 +209,7 @@ class FloatToleranceTransformer(ast_walk.NodeTransformer):
     def _is_float(operand: ast.expr) -> ast.expr:
         """``operand.__class__ is float`` -- an attribute read instead of a
         ``type()`` call, which measures ~1.2 ns cheaper per operand."""
-        return ast.Compare(
+        return _bool_compare(
             left=ast.Attribute(value=operand, attr='__class__', ctx=ast.Load()),
             ops=[ast.Is()], comparators=[ast.Name(id='float', ctx=ast.Load())])
 
@@ -203,7 +217,7 @@ class FloatToleranceTransformer(ast_walk.NodeTransformer):
     def _is_na(operand: ast.expr) -> ast.expr:
         """``not (operand == operand)`` -- the na test that covers both
         representations: a nan answers False to ``==``, and so does an ``NA``."""
-        return ast.UnaryOp(op=ast.Not(), operand=ast.Compare(
+        return ast.UnaryOp(op=ast.Not(), operand=_bool_compare(
             left=operand, ops=[ast.Eq()], comparators=[operand]))
 
     def _na_tail(self, left: ast.expr, left_ref: Callable[[], ast.expr],
@@ -222,8 +236,7 @@ class FloatToleranceTransformer(ast_walk.NodeTransformer):
             ast.Name(id=_NA_BOOL_NAME, ctx=ast.Load()),
         ])
 
-    def visit_Module(self, node: ast.Module) -> ast.Module:
-        node = self.generic_visit(node)  # type: ignore[assignment]
+    def leave_Module(self, node: ast.Module) -> ast.Module:
         if self._na_bool_used:
             _insert_import(node.body, ast.ImportFrom(
                 module='pynecore.types.na',
@@ -240,13 +253,13 @@ class FloatToleranceTransformer(ast_walk.NodeTransformer):
             bound, cmp_op = form
             if type(op) in _NON_STRICT_FORMS:
                 return ast.BoolOp(op=ast.Or(), values=[
-                    ast.Compare(left=left, ops=[type(op)()], comparators=[right]),
-                    ast.Compare(left=ast.Constant(value=bound), ops=[cmp_op()],
-                                comparators=[ast.BinOp(left=left_ref(), op=ast.Sub(),
-                                                       right=right_ref())]),
+                    _bool_compare(left=left, ops=[type(op)()], comparators=[right]),
+                    _bool_compare(left=ast.Constant(value=bound), ops=[cmp_op()],
+                                  comparators=[ast.BinOp(left=left_ref(), op=ast.Sub(),
+                                                         right=right_ref())]),
                 ])
-            return ast.Compare(left=ast.Constant(value=bound), ops=[cmp_op()],
-                               comparators=[ast.BinOp(left=left, op=ast.Sub(), right=right)])
+            return _bool_compare(left=ast.Constant(value=bound), ops=[cmp_op()],
+                                 comparators=[ast.BinOp(left=left, op=ast.Sub(), right=right)])
 
         # ``==``/``!=``: the tolerant branch is only reachable for real floats
         guard_left = self._is_float(left)
@@ -259,8 +272,8 @@ class FloatToleranceTransformer(ast_walk.NodeTransformer):
 
         if isinstance(op, ast.Eq):
             tolerant: ast.expr = ast.BoolOp(op=ast.Or(), values=[
-                ast.Compare(left=left_ref(), ops=[ast.Eq()], comparators=[right_ref()]),
-                ast.Compare(
+                _bool_compare(left=left_ref(), ops=[ast.Eq()], comparators=[right_ref()]),
+                _bool_compare(
                     left=ast.Constant(value=-EPSILON), ops=[ast.LtE(), ast.LtE()],
                     comparators=[ast.BinOp(left=left_ref(), op=ast.Sub(), right=right_ref()),
                                  ast.Constant(value=EPSILON)]),
@@ -269,20 +282,18 @@ class FloatToleranceTransformer(ast_walk.NodeTransformer):
             self._temp_counter += 1
             diff = f"__cmp{self._temp_counter}__"
             tolerant = ast.BoolOp(op=ast.Or(), values=[
-                ast.Compare(
+                _bool_compare(
                     left=ast.Constant(value=EPSILON), ops=[ast.Lt()],
                     comparators=[ast.NamedExpr(
                         target=ast.Name(id=diff, ctx=ast.Store()),
                         value=ast.BinOp(left=left_ref(), op=ast.Sub(), right=right_ref()))]),
-                ast.Compare(left=ast.Constant(value=-EPSILON), ops=[ast.Gt()],
-                            comparators=[ast.Name(id=diff, ctx=ast.Load())]),
+                _bool_compare(left=ast.Constant(value=-EPSILON), ops=[ast.Gt()],
+                              comparators=[ast.Name(id=diff, ctx=ast.Load())]),
             ])
-        exact = ast.Compare(left=left_ref(), ops=[type(op)()], comparators=[right_ref()])
+        exact = _bool_compare(left=left_ref(), ops=[type(op)()], comparators=[right_ref()])
         return ast.IfExp(test=guard, body=tolerant, orelse=exact)
 
-    def visit_Compare(self, node: ast.Compare) -> ast.expr:
-        self.generic_visit(node)
-
+    def leave_Compare(self, node: ast.Compare) -> ast.expr:
         # An earlier pass may have emitted a comparison that already IS the
         # tolerance (``PineTruthinessTransformer``'s bounds): rewriting it would
         # add a second EPSILON to a threshold that was measured on TradingView.
@@ -326,13 +337,6 @@ class FloatToleranceTransformer(ast_walk.NodeTransformer):
         # hold, which is what Python's own chain semantics do
         rewritten = (clauses[0] if len(clauses) == 1
                      else ast.BoolOp(op=ast.And(), values=clauses))
-        # The comparisons the rewrite emitted are bools by construction: each
-        # one probes a type or a float difference, never an ``NA``. Marking them
-        # keeps the truthiness pass from casting them when it runs after this
-        # one (see ``PineTruthinessTransformer._bool_value``).
-        for emitted in ast_walk.walk(rewritten):
-            if isinstance(emitted, ast.Compare):
-                emitted.pine_bool = True  # type: ignore[attr-defined]
         # Whatever shape the rewrite took, it stands where a comparison stood,
         # so it is a bool; the guards, differences and temporaries it emitted
         # around the preserved operands are typed from those operands

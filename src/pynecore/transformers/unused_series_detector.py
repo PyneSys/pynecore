@@ -22,12 +22,13 @@ def _is_in_annotation_context(node: ast.Subscript) -> bool:
     return False
 
 
-class UnusedSeriesDetectorTransformer(ast_walk.NodeTransformer):
+class UnusedSeriesDetectorTransformer(ast_walk.NodeVisitor):
     """
     AST transformer that removes unnecessary Series annotations.
 
     For variables annotated as Series[T] but never indexed with subscript operator [],
     this transformer changes their type to just T, avoiding unnecessary Series overhead.
+    The detection walk only collects; :meth:`optimize` edits the tree.
     """
 
     def __init__(self):
@@ -174,13 +175,19 @@ class UnusedSeriesDetectorTransformer(ast_walk.NodeTransformer):
                 if owner is not None and owner != scope:
                     self.indexed_vars.setdefault(owner, set()).add(var_name)
 
+        # Nothing to remove when every scope indexes all the Series it declares
+        if all(names <= self.indexed_vars.get(scope, set())
+               for scope, names in self.series_vars.items()):
+            return tree
+
         # Second pass: remove Series annotations from non-indexed variables
         optimizer = SeriesOptimizer(self.series_vars, self.indexed_vars)
-        return optimizer.visit(tree)
+        optimizer.visit(tree)
+        return tree
 
 
-class SeriesOptimizer(ast_walk.NodeTransformer):
-    """Second pass transformer that actually removes the unused Series annotations"""
+class SeriesOptimizer(ast_walk.NodeVisitor):
+    """Second pass that actually removes the unused Series annotations, in place"""
 
     def __init__(self, series_vars: Dict[str, Set[str]], indexed_vars: Dict[str, Set[str]]):
         self.series_vars = series_vars

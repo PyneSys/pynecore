@@ -1,5 +1,8 @@
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from dataclasses import replace
 from typing import TYPE_CHECKING, TypeVar, cast
+import gc
+import marshal
 import os
 import sys
 import threading
@@ -7,23 +10,27 @@ import hashlib
 import importlib.util
 import importlib.machinery
 import re
+import unicodedata
 from pathlib import Path
 
-# A leaf module (stdlib imports only), and imported here rather than inside the
-# loader on purpose: the loader runs it over pynecore's own modules, so a lazy
-# import would have the hook load the pass through itself
+# Leaf modules (stdlib imports only), imported here rather than inside the loader
+# on purpose: the loader runs them over pynecore's own modules, so a lazy import
+# would have the hook load them through itself
 from pynecore.transformers.type_erasure import erase_type_calls, has_erasure_marker
+from pynecore.transformers.pipeline_names import PIPELINE_NAME, is_pipeline_name
 
 if TYPE_CHECKING:
     import ast
 
-    from pynecore.transformers.pine_type_table import DepRecord, Diag, PineTypeTable
+    from pynecore.transformers.pine_type_table import (
+        DepRecord, Diag, ModuleInterface, PineTypeTable,
+    )
     from pynecore.transformers.slot_layout import ModuleLayout
 
 __all__ = ['PYNE_RESERVED_NAME_CHAR', 'PIPELINE_DIGEST', 'security_slice_disabled',
            'security_merge_disabled', 'security_dev_skip_disabled',
            'source_starts_with_pyne',
-           'analyse_source', 'PyneLoader', 'PyneImportHook']
+           'compile_interface', 'PyneLoader', 'PyneImportHook']
 
 
 # Module-level constant the transform pipeline bakes into every transformed module
@@ -45,6 +52,12 @@ _PACKAGE_DIR = str(Path(__file__).resolve().parent.parent) + os.sep
 # the first element of that constant's tuple. A ``.pyc`` holds many tuples; this
 # marker is what tells the records apart from every other one in ``co_consts``.
 _PYNE_DEPS = '__pyne_type_deps__'
+
+# Name of the constant a transformed module carries its OWN interface in, and the
+# first element of that constant's tuple: ``(name, mtime_ns, size, payload)``,
+# the payload being ``module_interface.interface_payload``. Like the records, it
+# is read off a ``.pyc`` without executing the module (see ``compile_interface``).
+_PYNE_INTERFACE = '__pyne_interface__'
 
 #: Source fingerprints consulted while validating imported enum captures.
 _PYNE_CAPTURE_DEPS = '__pyne_capture_deps__'
@@ -86,36 +99,32 @@ def source_starts_with_pyne(head: bytes) -> bool:
     return _PYNE_HEAD_RE.match(head) is not None
 
 
-# Everything the transformers inject into script scope is named with a Unicode
-# middle dot: the scope-qualified state parameters and slot constants
+# Nearly everything the transformers inject into script scope is named with a
+# Unicode middle dot: the scope-qualified state parameters and slot constants
 # (``__state·main__``, ``__slot·main·x__``), the generated temporaries
 # (``__st·__``, ``__cnt·0__``) and the aliased runtime helper imports
 # (``__resolve_slot·__``). The separator is a legal identifier character in
 # Python (``Other_ID_Continue``), so the namespace is only collision-free while
 # scripts stay out of it — a script name spelled with it would shadow or clobber
-# an injected one and break the emission in ways no transformer can detect.
+# an injected one and break the emission in ways no transformer can detect. The
+# few plain double-underscore names the transform emits are listed in
+# ``transformers/pipeline_names.py`` and reserved the same way.
 PYNE_RESERVED_NAME_CHAR = '·'
 
 
-def _reject_reserved_names(tree: "ast.Module", source: str, path: Path) -> None:
-    """Reject Pyne code that spells an identifier in the transformers' namespace.
+def _identifiers(tree: "ast.Module") -> "Iterator[tuple[ast.AST, str]]":
+    """Every identifier of a parsed module, with the node that spells it.
 
-    :param tree: Parsed module AST of ``source``.
-    :param source: Full module source, used for the error location.
-    :param path: Source path, used for the error location.
-    :raises SyntaxError: If any identifier resolves to a name containing the separator.
+    The parsed tree is what has to be checked, not the source spelling: Python
+    NFKC-normalizes identifiers while parsing, so a bound name can differ from every
+    spelling in the source. The token stream cannot stand in for the tree either —
+    before Python 3.12 the tokenizer hands out a whole f-string as a single string
+    token, hiding every name its replacement expressions bind
+    (``f"{(__st·__ := x)}"``).
+
+    :param tree: Parsed module.
+    :return: (node, identifier) pairs, in walk order.
     """
-    # ASCII is NFKC-invariant and the separator is not ASCII, so a pure-ASCII module —
-    # virtually every script — cannot produce a reserved name in any spelling
-    if source.isascii():
-        return
-    # The parsed tree is what has to be checked, not the source spelling. Python
-    # NFKC-normalizes identifiers while parsing, so the bound name can carry a
-    # separator the source never spells: U+0387 GREEK ANO TELEIA normalizes to one
-    # outright, U+013F / U+0140 (LATIN LETTER L WITH MIDDLE DOT) decompose into one.
-    # The token stream cannot stand in for the tree either — before Python 3.12 the
-    # tokenizer hands out a whole f-string as a single string token, hiding every
-    # name its replacement expressions bind (``f"{(__st·__ := x)}"``).
     import ast
 
     # A template string's interpolation carries its own source text in ``str``
@@ -139,16 +148,68 @@ def _reject_reserved_names(tree: "ast.Module", source: str, path: Path) -> None:
             if field == 'str' and isinstance(node, interpolation):
                 continue
             for name in (value if isinstance(value, list) else (value,)):
-                if not isinstance(name, str) or PYNE_RESERVED_NAME_CHAR not in name:
-                    continue
-                lineno = getattr(node, 'lineno', 1)
-                lines = source.splitlines()
-                raise SyntaxError(
-                    f"'{name}' contains '{PYNE_RESERVED_NAME_CHAR}', which is reserved "
-                    f"for PyneCore's internal names in Pyne code — rename the identifier",
-                    (str(path), lineno, getattr(node, 'col_offset', 0) + 1,
-                     lines[lineno - 1] if 0 < lineno <= len(lines) else None),
-                )
+                if isinstance(name, str):
+                    yield node, name
+
+
+def _identifier_error(node: "ast.AST", message: str, source: str, path: Path) -> SyntaxError:
+    """A ``SyntaxError`` pointing at the identifier a node spells."""
+    lineno = getattr(node, 'lineno', 1)
+    lines = source.splitlines()
+    return SyntaxError(message, (str(path), lineno, getattr(node, 'col_offset', 0) + 1,
+                                 lines[lineno - 1] if 0 < lineno <= len(lines) else None))
+
+
+def _reject_reserved_names(tree: "ast.Module", source: str, path: Path) -> None:
+    """Reject Pyne code that spells an identifier in the transformers' namespace.
+
+    :param tree: Parsed module AST of ``source``.
+    :param source: Full module source, used for the error location.
+    :param path: Source path, used for the error location.
+    :raises SyntaxError: If any identifier resolves to a name containing the separator.
+    """
+    # ASCII is NFKC-invariant and the separator is not ASCII, so a pure-ASCII module —
+    # virtually every script — cannot produce a reserved name in any spelling
+    if source.isascii():
+        return
+    # A separator in a bound name can only come from a character whose NFKC form
+    # contains one: the separator itself, U+0387 GREEK ANO TELEIA (normalizes to one
+    # outright) or U+013F / U+0140 LATIN LETTER L WITH MIDDLE DOT (decompose into
+    # one). The separator is a starter that never takes part in composition, so
+    # testing each distinct non-ASCII character on its own is exact; a module with
+    # none of them cannot bind a reserved name, whatever else it spells outside
+    # ASCII (PyneComp's header dash, a non-English comment or string)
+    if not any(PYNE_RESERVED_NAME_CHAR in unicodedata.normalize('NFKC', char)
+               for char in set(source) if char > '\x7f'):
+        return
+    for node, name in _identifiers(tree):
+        if PYNE_RESERVED_NAME_CHAR in name:
+            raise _identifier_error(
+                node, f"'{name}' contains '{PYNE_RESERVED_NAME_CHAR}', which is reserved "
+                      f"for PyneCore's internal names in Pyne code — rename the identifier",
+                source, path)
+
+
+def _reject_pipeline_names(tree: "ast.Module", source: str, path: Path) -> None:
+    """Reject user code that spells one of the plain names the transform emits.
+
+    :param tree: Parsed module AST of ``source``, its ``__test_`` functions removed.
+    :param source: Full module source, used for the prefilter and the error location.
+    :param path: Source path, used for the error location.
+    :raises SyntaxError: If any identifier is a name of :data:`PIPELINE_NAME`.
+    """
+    # Every such identifier is spelled in the source, after NFKC normalization for
+    # a module that leaves ASCII; a module whose text holds no match -- virtually
+    # every script -- cannot bind one, and only a match in a string or comment is
+    # left to be told apart by the tree
+    text = source if source.isascii() else unicodedata.normalize('NFKC', source)
+    if PIPELINE_NAME.search(text) is None:
+        return
+    for node, name in _identifiers(tree):
+        if is_pipeline_name(name):
+            raise _identifier_error(
+                node, f"'{name}' is a name PyneCore's transform generates, reserved in "
+                      f"Pyne code — rename the identifier", source, path)
 
 
 #: Env switch turning the per-context ``main()`` slicing off (see
@@ -218,6 +279,136 @@ def _cache_from_source(source_path: Path) -> Path:
     return Path(importlib.util.cache_from_source(str(source_path)))
 
 
+#: The runtime interface the emission calls into: the helpers the transform
+#: imports or the runner injects into a script module, by defining file. Emitted
+#: code calls them by name, position and keyword, so their parameter lists (a
+#: class: its fields) pin cached bytecode -- their bodies do not, as a cached
+#: script calls whatever the current body does
+_RUNTIME_ABI: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ('core/instance_state.py', ('__resolve_slot__', '__loop_state__', '__slot_state__',
+                                '__attach_layout__', '__bind_any__', '__bind_pinned__',
+                                '__bind_loop__', '__bind_slot__')),
+    ('core/safe_convert.py', ('safe_div', 'safe_float', 'safe_int', 'native_int')),
+    ('core/security.py', ('__sec_signal__', '__sec_write__', '__sec_read__', '__sec_wait__',
+                          '__ltf_unzip__')),
+    ('core/broker/models.py', ('ScriptRequirements',)),
+)
+
+_DEFINITION_RE = re.compile(r'^([ \t]*)(?:async[ \t]+def|def|class)[ \t]+(\w+)\b', re.M)
+
+
+def _interface_of(node: "ast.AST") -> tuple:
+    """The calling interface of a definition: parameters, or a class's fields."""
+    import ast
+
+    if isinstance(node, ast.ClassDef):
+        return ('class', tuple(stmt.target.id for stmt in node.body
+                               if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)),
+                tuple(_interface_of(stmt) for stmt in node.body
+                      if isinstance(stmt, ast.FunctionDef) and stmt.name == '__init__'))
+    assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    args = node.args
+    return ('def', tuple(arg.arg for arg in args.posonlyargs), tuple(arg.arg for arg in args.args),
+            args.vararg.arg if args.vararg else None, tuple(arg.arg for arg in args.kwonlyargs),
+            args.kwarg.arg if args.kwarg else None, len(args.defaults),
+            tuple(default is not None for default in args.kw_defaults))
+
+
+def _runtime_abi(*, whole_files: bool = False,
+                 root: Path | None = None) -> dict[str, dict[str, list[tuple]]]:
+    """The calling interfaces of the definitions listed in :data:`_RUNTIME_ABI`.
+
+    Only the named definitions are parsed -- a function's header up to the colon
+    that closes its signature, a class's block up to the next line indented no
+    deeper -- so the cost stays far below parsing the files whole; a definition
+    the cut cannot isolate falls back to the whole file.
+    Every definition of a name counts (the security protocol defines chart and
+    child variants of each function).
+
+    :param whole_files: Parse every file whole instead (the reference the cut is
+                        checked against).
+    :param root: Package directory to read; this package when omitted.
+    :return: File -> name -> the interfaces of its definitions, in file order; an
+             empty list for a name that is no longer defined.
+    """
+    import ast
+    import textwrap
+
+    package_dir = root if root is not None else Path(__file__).parent.parent
+    result: dict[str, dict[str, list[tuple]]] = {}
+    for relative, names in _RUNTIME_ABI:
+        try:
+            text = (package_dir / relative).read_text(encoding='utf-8')
+        except OSError:
+            text = ''
+        found: dict[str, list[tuple]] = {name: [] for name in names}
+        result[relative] = found
+        if whole_files:
+            for node in ast.walk(ast.parse(text)):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
+                        and node.name in found:
+                    found[node.name].append((node.lineno, _interface_of(node)))
+            for name in found:
+                found[name] = [interface for _, interface in sorted(found[name])]
+            continue
+        lines = text.splitlines()
+        whole: "ast.Module | None" = None
+        line_of = 0
+        position = 0
+        for match in _DEFINITION_RE.finditer(text):
+            name = match.group(2)
+            if name not in found:
+                continue
+            line_of += text.count('\n', position, match.start())
+            position = match.start()
+            first = line_of
+            if match.group(0).lstrip().startswith('class'):
+                indent = len(match.group(1).expandtabs())
+                last = first + 1
+                while last < len(lines):
+                    line = lines[last]
+                    stripped = line.lstrip()
+                    if stripped and len(line) - len(stripped) <= indent \
+                            and not stripped.startswith((')', ']', '}')):
+                        break
+                    last += 1
+                snippet = '\n'.join(lines[first:last])
+            else:
+                # The header ends at the first line that closes every bracket the
+                # signature opened and ends with the colon
+                depth = 0
+                last = first
+                while last < len(lines):
+                    line = lines[last]
+                    depth += sum(line.count(char) for char in '([{') \
+                        - sum(line.count(char) for char in ')]}')
+                    last += 1
+                    if depth <= 0 and line.rstrip().endswith(':'):
+                        break
+                header = textwrap.dedent('\n'.join(lines[first:last]))
+                snippet = header + '\n    pass'
+            definition: "ast.AST | None" = None
+            try:
+                definition = ast.parse(textwrap.dedent(snippet)).body[0]
+            except (SyntaxError, IndexError):
+                pass
+            if getattr(definition, 'name', None) != name:
+                if whole is None:
+                    whole = ast.parse(text)
+                definition = next((node for node in ast.walk(whole)
+                                   if getattr(node, 'name', None) == name
+                                   and getattr(node, 'lineno', 0) == first + 1), None)
+                if definition is None:
+                    continue
+            found[name].append(_interface_of(definition))
+    return result
+
+
+def _runtime_abi_digest() -> str:
+    """Digest of :func:`_runtime_abi`, mixed into the pipeline hash."""
+    return hashlib.sha256(repr(sorted(_runtime_abi().items())).encode('utf-8')).hexdigest()
+
+
 _transform_pipeline_hash: str | None = None
 _transform_pipeline_flag: bool | None = None
 _transform_pipeline_files_hash: str | None = None
@@ -252,8 +443,10 @@ def _get_transform_pipeline_hash() -> str:
         return _transform_pipeline_hash
     files_hash = _transform_pipeline_files_hash
     if files_hash is None:
-        # This module pins the transformer pipeline order; ``pine_compare`` holds
-        # a constant the pipeline bakes into the emitted bytecode
+        # This module runs the reserved-name check, the edge gate and the two
+        # halves (their steps live in ``transformers/pipeline.py``, hashed with the
+        # rest of that directory); ``pine_compare`` holds a constant the pipeline
+        # bakes into the emitted bytecode
         files = [Path(__file__), Path(__file__).parent / "pine_compare.py"]
         # The call-inlining pass copies these bodies into the emission, so a
         # wrapper edit must invalidate cached script bytecode just like a
@@ -261,6 +454,16 @@ def _get_transform_pipeline_hash() -> str:
         lib_dir = Path(__file__).parent.parent / "lib"
         files.extend([lib_dir / "math.py", lib_dir / "array.py",
                       Path(__file__).parent / "inline_support.py"])
+        # The constant-folding pass evaluates literal math calls through these
+        # implementations and bakes the results into the emission; the native
+        # twins are bit-exact to them, so the Python sources pin the values
+        files.extend([Path(__file__).parent / "fdlibm.py",
+                      Path(__file__).parent / "pine_math.py"])
+        # ... and they reach it through the Pine number types, ``na`` and the
+        # overload dispatch (``math.round``), whose behaviour shapes the folded value
+        package_dir = Path(__file__).parent.parent
+        files.extend([package_dir / "types" / "pine_types.py", package_dir / "types" / "na.py",
+                      Path(__file__).parent / "overload.py"])
         transformers_dir = Path(__file__).parent.parent / "transformers"
         try:
             files.extend(transformers_dir.iterdir())
@@ -274,6 +477,7 @@ def _get_transform_pipeline_hash() -> str:
                     digest.update(f.read_bytes())
             except OSError:
                 pass
+        digest.update(_runtime_abi_digest().encode('utf-8'))
         files_hash = digest.hexdigest()
         _transform_pipeline_files_hash = files_hash
 
@@ -519,6 +723,13 @@ def _with_nesting_headroom(run: Callable[["ast.Module"], _T], tree: "ast.Module"
         limit = sys.getrecursionlimit()
         base = max(limit, _TRANSFORM_RECURSION_LIMIT)
         sys.setrecursionlimit(base)
+        # A transform allocates hundreds of thousands of short-lived AST nodes,
+        # dicts and lists that reference counting frees on its own; the cyclic
+        # collector, triggered by the allocation count alone, would rescan the
+        # growing young generations over and over. The outermost stage switches
+        # it off for its duration and back on only if it was on
+        collect = gc.isenabled()
+        gc.disable()
         try:
             try:
                 return run(tree)
@@ -532,6 +743,8 @@ def _with_nesting_headroom(run: Callable[["ast.Module"], _T], tree: "ast.Module"
             return run(fresh)
         finally:
             sys.setrecursionlimit(limit)
+            if collect:
+                gc.enable()
 
 
 def _analyse_tree(tree: "ast.Module", source: str, path: Path,
@@ -540,9 +753,9 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
 
     This half only ANALYSES: it normalizes the tree into the form the type pass
     reads and stamps the types onto it, without emitting any of the state
-    plumbing the second half does. Splitting it out is what lets an imported
-    module's signatures be derived without compiling or running anything
-    (:func:`analyse_source`).
+    plumbing the second half does. A dependency transformed for another module's
+    lookup stops here when it reaches back into a module still under analysis
+    (see :func:`compile_interface`).
 
     :param tree: The parsed module; it is transformed in place where the passes do so.
     :param source: Full module source, for the reserved-name error location.
@@ -566,6 +779,10 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
     transformed.body = [node for node in transformed.body
                         if not (isinstance(node, ast.FunctionDef)
                                 and node.name.startswith('__test_') and node.name.endswith('__'))]
+    user_code = not path.is_relative_to(Path(__file__).parent.parent)
+    # pynecore's own lib modules ARE the runtime side of these names
+    if user_code:
+        _reject_pipeline_names(transformed, source, path)
 
     # The edge gate reads the tree AS WRITTEN: what follows injects plumbing
     # no profile should judge. Its findings join the type diagnostics below
@@ -578,107 +795,13 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
     edge = gated(pyne_mode)
     structural = gate_module(transformed) if edge else []
 
-    # Transform AST - lazy import transformers only when needed
-    from pynecore.transformers.import_lifter import ImportLifterTransformer
-    from pynecore.transformers.type_checking_stripper import TypeCheckingStripperTransformer
-    from pynecore.transformers.builtin_shadow import BuiltinShadowTransformer
-    from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
-    from pynecore.transformers.outer_write import OuterWriteTransformer
-    from pynecore.transformers.plot_scope import PlotScopeTransformer
-    from pynecore.transformers.export_capture import ExportCaptureTransformer
-    from pynecore.transformers.security_drawings import SecurityDrawingsTransformer
-    from pynecore.transformers.const_fold import ConstFoldTransformer
-    from pynecore.transformers.dynamic_default import DynamicDefaultTransformer
-    from pynecore.transformers.inline_series_hoist import InlineSeriesHoistTransformer
-    from pynecore.transformers.security import SecurityTransformer
-    from pynecore.transformers.security_instantiation import (
-        SecurityInstantiationTransformer,
-    )
-    from pynecore.transformers.security_slice import SecuritySliceTransformer
-    from pynecore.transformers.persistent_series import PersistentSeriesTransformer
-    from pynecore.transformers.lib_series import LibrarySeriesTransformer
-    from pynecore.transformers.closure_arguments_transformer import ClosureArgumentsTransformer
-    from pynecore.transformers.pine_type_transformer import PineTypeTransformer
-    from pynecore.transformers.module_property import ModulePropertyTransformer
-    from pynecore.transformers.ta_variable_hoist import TaVariableHoistTransformer
-    from pynecore.transformers.pine_truthiness import PineTruthinessTransformer
+    # The steps, their order and the reason for it live in transformers/pipeline.py
+    from pynecore.transformers.pipeline import ANALYSIS, PipelineContext, run_steps
 
-    transformed = ImportLifterTransformer().visit(transformed)
-    transformed = TypeCheckingStripperTransformer().visit(transformed)
-    # Before import normalization: the pass trusts a callee by the module's own
-    # ``typing`` imports, which it reads as written
-    transformed = erase_type_calls(transformed)
-    # The builtin-namespace fallback must run before import normalization
-    # so the lib.<ns>.<name> chains it emits get their imports added there
-    transformed = BuiltinShadowTransformer().visit(transformed)
-    transformed = ImportNormalizerTransformer().visit(transformed)
-    if not path.is_relative_to(Path(__file__).parent.parent):
-        transformed = PlotScopeTransformer(source).visit(transformed)
-    # The language rule that an object created outside a function may not be
-    # modified inside one. It reads the normalized ``lib.*`` chains and runs
-    # well before function isolation, whose per-call-site copies would report
-    # the same write once per copy. Only user scripts are subject to it --
-    # pynecore's own lib modules ARE the module-level machinery
-    if not path.is_relative_to(Path(__file__).parent.parent):
-        transformed = OuterWriteTransformer().visit(transformed)
-        transformed = ExportCaptureTransformer().visit(transformed)
-        transformed = SecurityDrawingsTransformer().visit(transformed)
-    # TradingView folds constant subtrees at parse time with fdlibm
-    # transcendentals and a 16-decimal embedding cap, while runtime
-    # series-fed calls use the Intel-LIBM intrinsics (lib.math /
-    # core.pine_math); the fold pass replays that split. It needs the
-    # normalized lib.math.* chains, and only user/compiled scripts get
-    # it -- pynecore's own lib modules must keep their raw expressions
-    if not path.is_relative_to(Path(__file__).parent.parent):
-        transformed = ConstFoldTransformer().visit(transformed)
-    # Per-call evaluation of lib.*-referencing parameter defaults; must
-    # precede the series/isolation passes so the moved expressions get
-    # their series slots and call-site anchors like any body statement
-    transformed = DynamicDefaultTransformer().visit(transformed)
-    # Lazy-context history hoist must run before call-site anchoring:
-    # the hoisted statements are the anchorable call sites
-    transformed = InlineSeriesHoistTransformer().visit(transformed)
-    # Pine's tolerant float-to-bool conversion, over the script's OWN
-    # bool contexts: it runs before the passes that emit control flow of
-    # their own (lazy-init flags and friends), whose tests are bools by
-    # construction. Only user/compiled scripts get it -- see the
-    # comparison rewrite at the end of the pipeline for the same rule
-    if not path.is_relative_to(Path(__file__).parent.parent):
-        transformed = PineTruthinessTransformer().visit(transformed)
-    # Pine instantiation semantics: clone security-bearing functions
-    # per call site so each call site gets its own security contexts
-    transformed = SecurityInstantiationTransformer().visit(transformed)
-    transformed = SecurityTransformer().visit(transformed)
-    transformed = PersistentSeriesTransformer().visit(transformed)
-    transformed = LibrarySeriesTransformer().visit(transformed)
-    transformed = ModulePropertyTransformer().visit(transformed)
-    # Stateful ta builtin variables become one unconditional per-bar
-    # evaluation at the top of main (TradingView keeps a single engine
-    # series per builtin variable, gates notwithstanding); must follow
-    # the property transformer (bare reads are calls by now) and precede
-    # the series/persistent/isolation passes so the hoisted call site is
-    # anchored like any hand-written statement
-    transformed = TaVariableHoistTransformer().visit(transformed)
-    transformed = ClosureArgumentsTransformer().visit(transformed)
-    # Pine's static types, stamped on the nodes. The last point where
-    # the tree still looks like Pine: the annotations are intact (the
-    # series pass rewrites and consumes them), the `/` is still a
-    # BinOp (safe division wraps it into a call), and the
-    # security-bearing functions are already instantiated per call
-    # site. Analysis only -- it stamps, it does not rewrite.
-    # It also decides the machine of every window call (``ta.highest`` and its
-    # kin) from the Pine qualifier of the length -- in a script, not in
-    # pynecore's own lib modules, whose machines ARE those calls
-    transformed = PineTypeTransformer(
-        pyne_mode, analyse=analyse_source, pipeline_hash=_get_transform_pipeline_hash(),
-        qualify_windows=not path.is_relative_to(Path(__file__).parent.parent)
-    ).visit(transformed)
-    # Per-context backward slices of main(), emitted as ordinary module-level
-    # functions the security children run instead of main(). Last of this half:
-    # the clones must see the tree every earlier pass produced (the hoisted ta
-    # assignments among them), and the lowering half then lays them out like any
-    # other function, with their own slot layout.
-    transformed = SecuritySliceTransformer().visit(transformed)
+    ctx = PipelineContext(path=path, pyne_mode=pyne_mode, source=source, user_code=user_code,
+                          analyse=compile_interface,
+                          pipeline_hash=_get_transform_pipeline_hash())
+    transformed = run_steps(ANALYSIS, transformed, ctx)
     table = module_table(transformed)
     if table is not None:
         # One node, one report: where the structural half names the
@@ -729,71 +852,18 @@ def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None,
     """
     import ast
 
-    from pynecore.transformers.call_inline import CallInlineTransformer
-    from pynecore.transformers.export_once import ExportOnceTransformer
-    from pynecore.transformers.function_isolation import FunctionIsolationTransformer
-    from pynecore.transformers.series import SeriesTransformer
-    from pynecore.transformers.security_default import SecurityDefaultTransformer
-    from pynecore.transformers.security_closed_shift_check import verify_closed_shift
-    from pynecore.transformers.script_requirements import ScriptRequirementsTransformer
-    from pynecore.transformers.unused_series_detector import UnusedSeriesDetectorTransformer
-    from pynecore.transformers.persistent import PersistentTransformer
-    from pynecore.transformers.input_transformer import InputTransformer
-    from pynecore.transformers.security_slice import finalize_clone_defaults
-    from pynecore.transformers.safe_convert_transformer import SafeConvertTransformer
-    from pynecore.transformers.safe_division_transformer import SafeDivisionTransformer
-    from pynecore.transformers.float_tolerance import FloatToleranceTransformer
-    from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
-    from pynecore.transformers.locations import fix_locations
+    from pynecore.transformers.pipeline import LOWERING, PipelineContext, run_steps
+    from pynecore.transformers.slot_layout import ModuleLayout
 
     # Shared slot allocator of the module (see slot_layout.py); the
-    # state-contributing transformers fill it, apply_layout emits it
+    # state-contributing steps fill it, apply_layout emits it
     slot_layout = ModuleLayout(compacted_series=pyne_mode == 'lib')
-
-    # Security reads now carry their expression's inferred type, including
-    # tuple fields; resolve bool defaults before the state plumbing is emitted.
-    transformed = SecurityDefaultTransformer().visit(tree)
-
-    # A library's export surface is defined once per RUN, not once per bar:
-    # the latch it runs under is a Persistent slot, so it must precede the
-    # slot transformers, and the guarded definitions must reach them in
-    # their final position
-    transformed = ExportOnceTransformer().visit(transformed)
-    transformed = UnusedSeriesDetectorTransformer().optimize(transformed)
-    transformed = SeriesTransformer(slot_layout).visit(transformed)
-    # The series pass has just emitted the only two forms a runtime history
-    # reference can take, so the source-level ``closed_shift`` candidate can now
-    # be checked exactly; the verifier only ever CLEARS the flag
-    transformed = verify_closed_shift(transformed, slot_layout)
-    transformed = PersistentTransformer(slot_layout).visit(transformed)
-    # Trivial builtin wrappers are copied into their call sites BEFORE the
-    # isolation pass, so a site that is no longer a call gets no anchor slot
-    # and no binding guard. Its arguments are already lowered here, and the
-    # comparisons it emits are marked ``pine_exact`` so the float tolerance
-    # rewrite below leaves the copied raw na tests alone
-    transformed = CallInlineTransformer().visit(transformed)
-    # Call-site classification needs the var/series slots, so the
-    # isolation transformer must run after Persistent and Series
-    transformed = FunctionIsolationTransformer(slot_layout).visit(transformed)
-    transformed = ScriptRequirementsTransformer().visit(transformed)
-    transformed = InputTransformer().visit(transformed)
-    transformed = SafeConvertTransformer(lib=pyne_mode == 'lib').visit(transformed)
-    transformed = SafeDivisionTransformer().visit(transformed)
-    # After SafeDivision so wrapped operands (safe_div calls) are bound
-    # once by the walrus instead of evaluating twice. Only user/compiled
-    # scripts get Pine's tolerant comparison semantics: pynecore's own
-    # lib modules implement the natively bit-exact builtins and use the
-    # raw ``x != x`` nan idiom, both of which the rewrite would break
-    if not path.is_relative_to(Path(__file__).parent.parent):
-        transformed = FloatToleranceTransformer(na_bool=na_bool).visit(transformed)
-    finalize_clone_defaults(transformed)
-    if emit_layout:
-        transformed = apply_layout(transformed, slot_layout)
-
-    # Debugger-safe variant of ast.fix_missing_locations: synthetic
-    # nodes get point anchors, so no prologue bytecode maps onto the
-    # function's last line (see transformers/locations.py)
-    fix_locations(transformed)
+    ctx = PipelineContext(path=path, pyne_mode=pyne_mode,
+                          user_code=not path.is_relative_to(Path(__file__).parent.parent),
+                          analyse=compile_interface,
+                          pipeline_hash=_get_transform_pipeline_hash(),
+                          na_bool=na_bool, emit_layout=emit_layout, slot_layout=slot_layout)
+    transformed = run_steps(LOWERING, tree, ctx)
 
     # Debug output if requested. The pretty dump and the saved copy go
     # through the display rewrite (named index constants instead of
@@ -828,59 +898,269 @@ def _lower_tree(tree: "ast.Module", path: Path, pyne_mode: str | None,
     return transformed, slot_layout
 
 
-def analyse_source(path: str) -> \
-        "tuple[ast.Module, PineTypeTable, tuple[int, int] | None] | None":
-    """Derive one module's types from its source, compiling and running nothing.
+def _transform_module(tree: "ast.Module", source: str, path: Path, pyne_mode: str | None,
+                      na_bool: bool, fingerprint: tuple[int, int] | None) \
+        -> "tuple[PineTypeTable | None, ModuleInterface | None, ast.Module]":
+    """Run both halves of the pipeline, publishing what the module exports on the way.
 
-    This is how a module that is not imported yet still answers for its own
-    signatures: a dependent's cached bytecode is checked before either module is
-    executed, so the check cannot rely on an import. Only the analysing half of
-    the pipeline runs, which emits no state plumbing and has no side effects
-    beyond the tree it builds and throws away.
-
-    The fingerprint comes back with the tree because it belongs to it: it is the
-    one the parsed bytes were read under, and a caller building an interface from
-    the tree has no other honest one to pair with the signatures.
-
-    :param path: Path to the ``.py`` source.
-    :return: The analysed tree, its type table and the fingerprint of the bytes
-             they were derived from, or None when the file is not readable, not
-             parseable, or not Pyne code.
+    :param tree: The parsed module; it is transformed in place where the passes do so.
+    :param source: Full module source.
+    :param path: Source path.
+    :param pyne_mode: The module's mode word, None for a hand-written script.
+    :param na_bool: Whether the module keeps Pine's three-state bool.
+    :param fingerprint: The ``(mtime_ns, size)`` the source was read under, None
+        when no such pairing could be had.
+    :return: The type table, the interface with its routes settled (its
+        dependency records are not, see :func:`_settle_deps`), and the lowered tree.
     """
-    import ast
-
     # Lazy for the same reason the transformers are: this module is loaded
     # through the hook itself, so importing it at module level would re-enter a
     # half-initialized package
-    from pynecore.transformers.pine_type_artifact import stable_source
+    from pynecore.transformers.module_interface import reached_back
     from pynecore.transformers.pine_type_transformer import module_table
 
-    # One stable read: the bytes analysed here and the fingerprint they are
-    # published under have to describe the same file
-    stable = stable_source(Path(path))
-    if stable is None:
-        return None
-    data, fingerprint = stable
-    try:
-        source = data.decode('utf-8')
-        tree = ast.parse(source)
-    except (UnicodeDecodeError, SyntaxError, ValueError):
-        return None
-
-    is_pyne_module, pyne_mode = _module_mode(tree)
-    if not is_pyne_module:
-        return None
-
-    try:
-        analysed = _with_nesting_headroom(
-            lambda module: _analyse_tree(module, source, Path(path), pyne_mode), tree, source)
-    except (SyntaxError, RecursionError):
-        # An unanalysable dependency is not a failure to report here: the
-        # module that actually imports it raises the real error, with the real
-        # traceback. All this can say is that no interface could be derived.
-        return None
+    analysed = _analyse_tree(tree, source, path, pyne_mode)
     table = module_table(analysed)
-    return None if table is None else (analysed, table, fingerprint)
+    published = None if table is None else _publish(analysed, table, path, fingerprint)
+    # A dependency a lookup transforms stops here when its analysis reached back
+    # into a module still under analysis (see ``_compile_into_cache``)
+    if reached_back(str(path)):
+        raise _ReachedBack
+    published, lowered = _lower_published(analysed, published, path, pyne_mode, na_bool)
+    return table, published, lowered
+
+
+def _publish(analysed: "ast.Module", table: "PineTypeTable", path: Path,
+             fingerprint: tuple[int, int] | None) -> "ModuleInterface":
+    """Publish what an analysed module exports, for every module that imports it.
+
+    In this process through the registry, across processes through the constant
+    the loader bakes into the .pyc. Read off the ANALYSED tree, before the lowering:
+    the isolation pass prepends a state parameter to every script function and the
+    series pass rewrites the annotations, so a signature taken afterwards is the
+    emission's, not the module's. It is registered right away, so a module the
+    lowering imports that imports this one back finds it.
+
+    :param analysed: The analysed tree.
+    :param table: Its type table.
+    :param path: Source path.
+    :param fingerprint: The ``(mtime_ns, size)`` the source was read under, None
+        when no such pairing could be had.
+    :return: The interface, its routes not settled yet.
+    """
+    from pynecore.transformers.module_interface import NO_FINGERPRINT, build_interface, register
+
+    published = build_interface(analysed, table, str(path.resolve()),
+                                NO_FINGERPRINT if fingerprint is None else fingerprint)
+    register(published)
+    return published
+
+
+def _lower_published(analysed: "ast.Module", published: "ModuleInterface | None", path: Path,
+                     pyne_mode: str | None, na_bool: bool) \
+        -> "tuple[ModuleInterface | None, ast.Module]":
+    """Lower an analysed module, and settle the routes of what it published.
+
+    :param analysed: The analysed tree; it is lowered in place where the passes do so.
+    :param published: What :func:`_publish` published for it, None when nothing.
+    :param path: Source path.
+    :param pyne_mode: The module's mode word, None for a hand-written script.
+    :param na_bool: Whether the module keeps Pine's three-state bool.
+    :return: The interface with its routes, registered again, and the lowered tree.
+    """
+    from pynecore.transformers.module_interface import register, routes_digest, routes_shape
+
+    # The routes follow the module as written, before the lowering adds plumbing
+    shape = '' if published is None else routes_shape(analysed)
+    lowered, layout = _lower_tree(analysed, path, pyne_mode, na_bool=na_bool)
+    if published is not None:
+        published = replace(published, routes=routes_digest(shape, lowered, layout))
+        register(published)
+    return published, lowered
+
+
+def _settle_deps(table: "PineTypeTable", interface: "ModuleInterface") -> "ModuleInterface":
+    """Settle the routes of a transformed module's dependency records.
+
+    The type pass records each dependency off whatever interface it found, and one
+    the analysis alone published has no routes (see ``module_interface.settle``).
+    The table's records are what the loader bakes, and the interface's are what a
+    dependent of THIS module inherits, so both are replaced.
+
+    :param table: The module's type table; its records are replaced in place.
+    :param interface: The interface the transform published.
+    :return: The interface with the settled records, registered.
+    """
+    from pynecore.transformers.module_interface import register, settle
+
+    if not table.deps:
+        return interface
+    pipeline_hash = _get_transform_pipeline_hash()
+    table.deps = {path: settle(record, compile_interface, pipeline_hash)
+                  for path, record in table.deps.items()}
+    interface = replace(interface, deps=dict(table.deps))
+    register(interface)
+    return interface
+
+
+class _ReachedBack(Exception):
+    """A dependency's transform stopped after its analysis (``module_interface.reached_back``)."""
+
+
+#: Resolved paths of the Pyne modules whose transform is running in this process.
+#: Such a module published its interface before its lowering started, and a
+#: transform of it from inside its own would only race the outer one's ``.pyc``
+#: (see ``compile_interface``).
+_transforming: set[str] = set()
+
+
+def compile_interface(path: str, pipeline_hash: str) -> "ModuleInterface | None":
+    """One Pyne module's interface for another module's transform, executing nothing of it.
+
+    The ``Analyser`` of every type pass and dependency check: it is asked when no
+    transform of this process published the interface. The module's own ``.pyc``
+    answers when it is one importing the module would run as it is -- the given
+    pipeline's, of the current source, built against dependencies that still say
+    the same thing -- without executing anything: the interface is a constant
+    baked into it (``_PYNE_INTERFACE``). Otherwise the module is transformed into
+    its ``.pyc`` here, by the same transform its import would run, so that import
+    finds the work done and reuses it (see :func:`_compile_into_cache`).
+
+    The ``.pyc`` is read under the module's analysing mark, because checking its
+    dependency records may reach back here for this very module, and a module
+    under analysis answers None -- the end of the cycle. The transform runs
+    outside it, the way the loader transforms a module: the analysis marks
+    itself, and the lowering imports what the module calls -- one that imports
+    the module back has to find the interface it publishes before lowering.
+
+    :param path: Resolved path to the ``.py`` source.
+    :param pipeline_hash: Digest of the pipeline the ``.pyc`` must come from.
+    :return: The interface, its routes settled unless its transform reached back
+             into a module under analysis; None when the file is not readable, not
+             Pyne code, does not transform, or is being transformed already.
+    """
+    # Lazy for the same reason the transformers are: this module is loaded
+    # through the hook itself, so importing it at module level would re-enter a
+    # half-initialized package
+    from pynecore.transformers.module_interface import analysing_scope
+
+    if path in _transforming:
+        return None
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(4096)
+    except OSError:
+        return None
+    if not source_starts_with_pyne(head):
+        return None
+    source_path = Path(path)
+    with analysing_scope(path):
+        interface = _cached_interface(source_path, pipeline_hash)
+    if interface is not None:
+        return interface
+    return _compile_into_cache(source_path)
+
+
+def _uint32(value: int) -> bytes:
+    """One field of a ``.pyc`` header (PEP 552): little-endian, modulo 2**32."""
+    return (value & 0xFFFFFFFF).to_bytes(4, 'little')
+
+
+def _cached_interface(source_path: Path, pipeline_hash: str) -> "ModuleInterface | None":
+    """The interface a module's ``.pyc`` carries, when an import would run that ``.pyc``.
+
+    Every check an import makes is made here, in the same order: CPython's own
+    (the timestamp header against the source's stat), the pipeline certificate,
+    and the dependency records ``get_code`` re-checks -- so an interface read
+    here is never one whose module the import then transforms again. The baked
+    fingerprint is checked on top: the header only keeps whole seconds.
+
+    :param source_path: Path to the ``.py`` source.
+    :param pipeline_hash: Digest of the pipeline the ``.pyc`` must come from.
+    :return: The interface, or None when there is no such ``.pyc``.
+    """
+    from pynecore.transformers.module_interface import interface_from_payload
+
+    try:
+        stat = os.stat(source_path)
+        data = _cache_from_source(source_path).read_bytes()
+    except OSError:
+        return None
+    if data[:4] != importlib.util.MAGIC_NUMBER or data[4:8] != _uint32(0) \
+            or data[8:12] != _uint32(int(stat.st_mtime)) or data[12:16] != _uint32(stat.st_size):
+        return None
+    try:
+        code = marshal.loads(data[16:])
+    except (EOFError, ValueError, TypeError):
+        return None
+    if _PYNE_SENTINEL not in code.co_names or pipeline_hash not in code.co_consts:
+        return None
+    baked = next((const for const in code.co_consts
+                  if isinstance(const, tuple) and const and const[0] == _PYNE_INTERFACE), None)
+    if baked is None or (baked[1], baked[2]) != (stat.st_mtime_ns, stat.st_size):
+        return None
+    if not (_capture_deps_current(code) and _deps_current(code, pipeline_hash)):
+        return None
+    return interface_from_payload(str(source_path), baked[3],
+                                  {record.path: record for record in _baked_deps(code)},
+                                  (baked[1], baked[2]))
+
+
+def _compile_into_cache(source_path: Path) -> "ModuleInterface | None":
+    """Transform a module the way importing it would, and leave its ``.pyc`` for the import.
+
+    The source is transformed and compiled through :class:`PyneLoader`, and the
+    bytecode is written where, and how, ``SourceLoader.get_code`` writes it -- a
+    timestamp ``.pyc`` with the source's permissions, not at all under
+    ``sys.dont_write_bytecode``, silently not into an unwritable cache -- so the
+    import that follows accepts it as its own. The header has to describe the
+    bytes that were transformed, the ones the transform read as one pair with
+    their fingerprint. Where nothing can be written, what the transform
+    registered still answers for the rest of the process.
+
+    A transform whose analysis reached back into a module under analysis is not
+    what the import will produce (see ``module_interface.Compile``): it stops
+    once its analysis is done, and answers with what that published -- the types,
+    without routes and without any bytecode.
+
+    :param source_path: Path to the ``.py`` source.
+    :return: The interface the transform published, or None when it published
+             none or the source does not transform.
+    """
+    from pynecore.transformers.module_interface import compiling, registered
+
+    loader = PyneLoader(source_path.stem, str(source_path))
+    try:
+        data = loader.get_data(str(source_path))
+    except OSError:
+        return None
+    with compiling(str(source_path)):
+        try:
+            code = loader.source_to_code(data, str(source_path))
+        except _ReachedBack:
+            return registered(str(source_path))
+        except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError):
+            # An untransformable dependency is not a failure to report here: the
+            # module that actually imports it raises the real error, with the
+            # real traceback. All this can say is that it publishes nothing.
+            return None
+    interface = registered(str(source_path))
+    if interface is None or sys.dont_write_bytecode:
+        return interface
+    # The header has to describe the bytes that were transformed, so it is only
+    # written while the file is still at their fingerprint -- which no file is
+    # at for bytes that had none to give
+    try:
+        stat = os.stat(source_path)
+    except OSError:
+        return interface
+    if (stat.st_mtime_ns, stat.st_size) != (interface.mtime_ns, interface.size):
+        return interface
+    loader.set_data(str(_cache_from_source(source_path)),
+                    importlib.util.MAGIC_NUMBER + _uint32(0) + _uint32(int(stat.st_mtime))
+                    + _uint32(stat.st_size) + marshal.dumps(code),
+                    _mode=stat.st_mode | 0o200)
+    return interface
 
 
 def _baked_deps(code) -> "tuple[DepRecord, ...]":
@@ -901,13 +1181,17 @@ def _baked_deps(code) -> "tuple[DepRecord, ...]":
     for const in code.co_consts:
         if isinstance(const, tuple) and const and const[0] == _PYNE_DEPS:
             return tuple(DepRecord(path=record[0], mtime_ns=record[1],
-                                   size=record[2], digest=record[3])
+                                   size=record[2], digest=record[3], routes=record[4])
                          for record in const[1:])
     return ()
 
 
 def _deps_current(code, pipeline_hash: str) -> bool:
-    """Whether every module this bytecode was typed against still says the same thing.
+    """Whether every module this bytecode was built against still says the same thing.
+
+    The same thing in both senses the emission read it in: the signatures the
+    types were derived from, and the routes every call into the module was
+    emitted on.
 
     :param code: The module's code object.
     :param pipeline_hash: Digest of the current transform pipeline.
@@ -918,9 +1202,10 @@ def _deps_current(code, pipeline_hash: str) -> bool:
         return True
 
     # Lazy, as above -- and skipped entirely for a module with no dependencies
-    from pynecore.transformers.pine_type_artifact import dep_current
+    from pynecore.transformers.module_interface import dep_current
 
-    return all(dep_current(record, analyse_source, pipeline_hash) for record in records)
+    return all(dep_current(record, compile_interface, pipeline_hash, settled=True)
+               for record in records)
 
 
 def _capture_deps_current(code) -> bool:
@@ -959,9 +1244,10 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
         of file mtimes, cache markers or a read-only install location.
 
         The same blind spot applies across modules: a module's types are derived from
-        the INTERFACES it imports, and CPython's check sees none of them. So a module
-        that was typed against others also carries their state in a
-        ``__pyne_type_deps__`` constant, re-checked here before the cache is accepted.
+        the INTERFACES it imports, its calls into them are routed by whether the
+        callee keeps state, and CPython's check sees none of it. So a module that was
+        built against others also carries their state in a ``__pyne_type_deps__``
+        constant, re-checked here before the cache is accepted.
 
         :param fullname: Fully-qualified module name being loaded.
         :return: The compiled code object (retransformed if the cache was foreign,
@@ -1072,12 +1358,10 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             # would re-enter a half-initialized package. It is also why the
             # pairing below cannot be read any earlier than here: a module that
             # merely MENTIONS @pyne reaches this method while its own transform
-            # is on the stack, and pine_type_artifact is one of them.
-            from pynecore.transformers.pine_type_artifact import (
-                NO_FINGERPRINT, artifact_enabled, build_interface, register,
-                stable_source, write_artifact,
+            # is on the stack, and module_interface is one of them.
+            from pynecore.transformers.module_interface import (
+                interface_payload, stable_source,
             )
-            from pynecore.transformers.pine_type_transformer import module_table
 
             # The fingerprint the interface this transform publishes is derived
             # from, read together with the bytes it describes (see
@@ -1101,7 +1385,6 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
                         # loader gave, and publish it under no fingerprint
                         fingerprint = None
                     else:
-                        source_bytes = on_disk
                         tree = ast.parse(data_str)
                         # The file that owns the fingerprint owns the verdict
                         # too: what replaced this source need not be Pyne code
@@ -1112,37 +1395,23 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             pipeline_hash = _get_transform_pipeline_hash()
             # Read off the source tree: the analysis rewrites the decorator
             bool_na = _script_bool_na(tree, path)
-            module_path = str(path.resolve())
 
-            def transform(module: ast.Module):
-                analysed = _analyse_tree(module, data_str, path, pyne_mode)
-                module_types = module_table(analysed)
-
-                # What this module publishes, for every module that imports it: in
-                # this process through the registry, across processes through the
-                # artifact beside the .pyc. Read off the ANALYSED tree, before the
-                # lowering: the isolation pass prepends a state parameter to every
-                # script function and the series pass rewrites the annotations, so a
-                # signature taken afterwards is the emission's, not the module's.
-                published = None
-                if module_types is not None:
-                    published = build_interface(
-                        analysed, module_types, module_path,
-                        NO_FINGERPRINT if fingerprint is None else fingerprint)
-                    register(published)
-
-                lowered, _ = _lower_tree(analysed, path, pyne_mode, na_bool=bool(bool_na))
-                return module_types, published, lowered
-
-            table, interface, transformed = _with_nesting_headroom(transform, tree, data_str)
-
-            # No fingerprint means no artifact: a reader validates one by
-            # digesting the source it now finds, and nothing here knows which
-            # bytes that will be
-            if (table is not None and interface is not None
-                    and fingerprint is not None and artifact_enabled(pyne_mode)):
-                write_artifact(transformed, table, interface, source_bytes, path,
-                               pipeline_hash)
+            key = str(path.resolve())
+            outermost = key not in _transforming
+            _transforming.add(key)
+            try:
+                table, interface, transformed = _with_nesting_headroom(
+                    lambda module: _transform_module(module, data_str, path, pyne_mode,
+                                                     bool(bool_na), fingerprint),
+                    tree, data_str)
+                # The lowering has imported what it routed calls into, so the routes
+                # of those dependencies are settled by now -- the records the type
+                # pass made before that still have to be given them
+                if table is not None and interface is not None:
+                    interface = _settle_deps(table, interface)
+            finally:
+                if outermost:
+                    _transforming.discard(key)
 
             # Bake a pipeline-identity sentinel into the module body so a loaded code
             # object can be distinguished from foreign or stale bytecode (see get_code).
@@ -1154,9 +1423,10 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
                 targets=[ast.Name(id=_PYNE_SENTINEL, ctx=ast.Store())],
                 value=ast.Constant(value=pipeline_hash),
             )]
-            # The interfaces this module's types were derived from. A tuple of
-            # constants folds into ONE code constant, which is what lets get_code
-            # find the records without executing the module.
+            # The interfaces this module's types were derived from, and the routes
+            # its calls into them were emitted on. A tuple of constants folds into
+            # ONE code constant, which is what lets get_code find the records
+            # without executing the module.
             if table is not None and table.deps:
                 baked.append(ast.Assign(
                     targets=[ast.Name(id=_PYNE_DEPS, ctx=ast.Store())],
@@ -1164,9 +1434,20 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
                         ast.Tuple(elts=[ast.Constant(value=record.path),
                                         ast.Constant(value=record.mtime_ns),
                                         ast.Constant(value=record.size),
-                                        ast.Constant(value=record.digest)],
+                                        ast.Constant(value=record.digest),
+                                        ast.Constant(value=record.routes)],
                                   ctx=ast.Load())
                         for _, record in sorted(table.deps.items())], ctx=ast.Load()),
+                ))
+            # What the module publishes, for a dependent's transform to read off the
+            # .pyc without executing it (see ``compile_interface``). Paired with the
+            # fingerprint of the bytes it was derived from; without one there is no
+            # pairing a reader could check, so nothing is baked.
+            if interface is not None and fingerprint is not None:
+                baked.append(ast.Assign(
+                    targets=[ast.Name(id=_PYNE_INTERFACE, ctx=ast.Store())],
+                    value=ast.Constant(value=(_PYNE_INTERFACE, interface.mtime_ns,
+                                              interface.size, interface_payload(interface))),
                 ))
             capture_deps = getattr(transformed, '_export_capture_deps', ())
             if capture_deps:

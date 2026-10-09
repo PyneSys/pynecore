@@ -22,6 +22,14 @@ class ImportLifterTransformer(ast_walk.NodeTransformer):
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
         """Process module and add lifted imports at the top"""
+        # Only a lib import standing directly in a function body is lifted:
+        # without one there is nothing to visit
+        if not any(isinstance(stmt, ast.FunctionDef)
+                   and any(isinstance(inner, ast.ImportFrom) and self._is_lib_import(inner)
+                           for inner in stmt.body)
+                   for stmt in ast_walk.walk_statements(node)):
+            return node
+
         # Process the entire module first to collect all imports
         node = cast(ast.Module, self.generic_visit(node))
 

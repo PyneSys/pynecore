@@ -81,6 +81,13 @@ _OP_SYMBOLS: Final[dict[str, str]] = {
 
 _SUFFIX: Final = 'is not Pine'
 
+#: Nodes the walk has nothing to check in: contexts and operators, which the
+#: node that holds them is judged by
+_INERT: Final = (ast.expr_context, ast.boolop, ast.operator, ast.unaryop, ast.cmpop)
+
+#: Where a statement stops binding names in its own scope
+_NESTED_SCOPES: Final = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
 _rules: dict[str, Any] | None = None
 
 
@@ -201,10 +208,13 @@ class _Gate:
         self.module_bound_at: dict[str, int] = {}
         self.allowed_lambdas: set[int] = set()
         self.allowed_lists: set[int] = set()
-        #: For each enclosing function, innermost last: name -> index of the
-        #: body statement that first binds it (-1 for a parameter), and the
-        #: index of the body statement being visited
-        self._locals: list[dict[str, int]] = []
+        #: For each enclosing function, innermost last: the function, name ->
+        #: index of the body statement that first binds it (-1 for a
+        #: parameter), and the index of the body statement being visited. The
+        #: bindings are only needed by an attribute store, so they are
+        #: collected (``None`` until then) when the first one asks
+        self._functions: list[ast.FunctionDef] = []
+        self._locals: list[dict[str, int] | None] = []
         self._local_index: list[int] = []
         self._stmt_index = 0
         self._reported: set[int] = set()
@@ -217,7 +227,8 @@ class _Gate:
     # --- collection pre-pass ---------------------------------------------
 
     def _collect(self) -> None:
-        for node in ast_walk.walk(self.tree):
+        # Definitions and imports are statements: no expression is entered
+        for node in ast_walk.walk_statements(self.tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 self.def_names.add(node.name)
             elif isinstance(node, ast.ImportFrom):
@@ -244,7 +255,7 @@ class _Gate:
         # there, as the value of a field in a decorated class body (the
         # predicate is the type pass's, so the gate and the typing agree)
         factory = FactoryFields(self.tree)
-        for node in ast_walk.walk(self.tree):
+        for node in ast_walk.walk_statements(self.tree):
             if not isinstance(node, ast.ClassDef) or len(node.decorator_list) != 1 \
                     or not self._decorator_ok(node.decorator_list[0], self.class_decorators):
                 continue
@@ -265,8 +276,7 @@ class _Gate:
 
     def _visit(self, node: ast.AST) -> None:
         kind = type(node).__name__
-        if isinstance(node, (ast.expr_context, ast.boolop, ast.operator, ast.unaryop,
-                             ast.cmpop)):
+        if isinstance(node, _INERT):
             return
         if kind == 'List' and id(node) in self.allowed_lists:
             return
@@ -286,7 +296,8 @@ class _Gate:
             self._check_function(node)
             # The body is visited statement by statement, so a store on a
             # name knows whether the name is bound yet
-            self._locals.append(_scope_bound(node))
+            self._functions.append(node)
+            self._locals.append(None)
             self._local_index.append(-1)
             for child in ast_walk.iter_child_nodes(node):
                 if isinstance(child, ast.stmt):
@@ -295,6 +306,7 @@ class _Gate:
             for index, stmt in enumerate(node.body):
                 self._local_index[-1] = index
                 self._visit(stmt)
+            self._functions.pop()
             self._locals.pop()
             self._local_index.pop()
             return
@@ -350,7 +362,8 @@ class _Gate:
             else:
                 self._check_ident(node, node.arg)
         for child in ast_walk.iter_child_nodes(node):
-            self._visit(child)
+            if not isinstance(child, _INERT):
+                self._visit(child)
 
     # --- structural rules ------------------------------------------------
 
@@ -470,14 +483,18 @@ class _Gate:
         if chain is None:
             return
         root = chain[0]
-        if any(root in bound and bound[root] <= index
-               for bound, index in zip(self._locals, self._local_index)) \
-                or self.module_bound_at.get(root, len(self.tree.body)) < self._stmt_index:
-            # A value of that name stands in front of the function or module
+        if root not in self.def_names and root not in self.import_bound:
             return
-        if root in self.def_names or root in self.import_bound:
-            self._report(node, 'edge-attr-store', f"assigning an attribute on '{root}' {_SUFFIX}",
-                         'functions and modules are not objects')
+        # A value of that name stands in front of the function or module
+        for depth, bound in enumerate(self._locals):
+            if bound is None:
+                self._locals[depth] = bound = _scope_bound(self._functions[depth])
+            if root in bound and bound[root] <= self._local_index[depth]:
+                return
+        if self.module_bound_at.get(root, len(self.tree.body)) < self._stmt_index:
+            return
+        self._report(node, 'edge-attr-store', f"assigning an attribute on '{root}' {_SUFFIX}",
+                     'functions and modules are not objects')
 
     def _decorator_ok(self, decorator: ast.expr, allowed: frozenset[tuple[str, str]],
                       allow_script: bool = False) -> bool:
@@ -552,14 +569,11 @@ def _stored_names(stmt: ast.stmt) -> set[str]:
     rules answer for, and its body binds elsewhere: the walk stops there.
     """
     out: set[str] = set()
-    pending: list[ast.AST] = [stmt]
-    while pending:
-        node = pending.pop()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            continue
+    if isinstance(stmt, _NESTED_SCOPES):
+        return out
+    for node in ast_walk.iter_descendants(stmt, _NESTED_SCOPES):
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
             out.add(node.id)
-        pending.extend(ast_walk.iter_child_nodes(node))
     return out
 
 

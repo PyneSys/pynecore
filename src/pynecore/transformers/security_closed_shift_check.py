@@ -299,7 +299,8 @@ def _collect_writes(module: ast.Module) \
         write's value is resolved there, see :func:`_name_binding`).
     """
     scopes: list[_Scope] = [module]
-    for node in ast_walk.walk(module):
+    # A definition is a statement: the statements alone hold every one.
+    for node in ast_walk.walk_statements(module):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             scopes.append(node)
     writes: dict[str, list[tuple[ast.expr, _Scope]]] = {}

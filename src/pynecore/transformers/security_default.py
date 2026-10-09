@@ -43,25 +43,33 @@ class SecurityDefaultTransformer(ast_walk.NodeTransformer):
                     ast.Tuple(elts=values, ctx=ast.Load()), ty), default)
         return default
 
-    def visit_Call(self, node: ast.Call) -> ast.Call:
-        node = self.generic_visit(node)  # type: ignore[assignment]
-        if (isinstance(node.func, ast.Name) and node.func.id == '__sec_read__'
-                and len(node.args) == 2):
-            node.args[1] = self._default(node.args[1], get_ty(node))
-        return node
-
     def visit_Module(self, node: ast.Module) -> ast.Module:
         self._used = False
-        node = self.generic_visit(node)  # type: ignore[assignment]
+        # Security reads are only ever emitted together with the module's
+        # ``__security_contexts__`` registry: without it there is nothing to
+        # resolve, and most scripts have none.
+        if not any(isinstance(stmt, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == '__security_contexts__'
+                           for target in stmt.targets)
+                   for stmt in node.body):
+            return node
+        # Each read is resolved on its own: a default never holds another
+        # read, so neither the order nor a rebuild of the tree around them
+        # matters, and a plain walk finds them all.
+        for sub in ast_walk.walk(node):
+            if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+                    and sub.func.id == '__sec_read__' and len(sub.args) == 2):
+                sub.args[1] = self._default(sub.args[1], get_ty(sub))
         if self._used:
             insert_at = 0
             if (node.body and isinstance(node.body[0], ast.Expr)
                     and isinstance(node.body[0].value, ast.Constant)
                     and isinstance(node.body[0].value.value, str)):
                 insert_at = 1
-            while (insert_at < len(node.body)
-                   and isinstance(node.body[insert_at], ast.ImportFrom)
-                   and node.body[insert_at].module == '__future__'):
+            while insert_at < len(node.body):
+                stmt = node.body[insert_at]
+                if not (isinstance(stmt, ast.ImportFrom) and stmt.module == '__future__'):
+                    break
                 insert_at += 1
             node.body.insert(insert_at, ast.ImportFrom(
                 module='pynecore.types.na',

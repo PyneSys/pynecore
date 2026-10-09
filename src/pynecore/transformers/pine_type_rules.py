@@ -217,7 +217,7 @@ def inherit_ty(new, old):
 # --- the lattice ----------------------------------------------------------
 
 # One character per type so a per-node stamp costs one interned str, and the
-# artifact stays compact. The chain is int -> float -> unknown; everything
+# published interface stays compact. The chain is int -> float -> unknown; everything
 # else is a flat peer that joins to UNKNOWN with anything but itself.
 INT: Final = 'i'
 FLOAT: Final = 'f'
