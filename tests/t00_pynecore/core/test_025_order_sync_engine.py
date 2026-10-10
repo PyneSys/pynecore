@@ -129,6 +129,10 @@ class MockBroker:
     # entry instead of hammering the venue every tick.
     always_raise_on_entry: Exception | None = None
     raise_on_next_exit: Exception | None = None
+    # Persistent exit-reject hook (see ``always_raise_on_entry``): raises on EVERY
+    # ``execute_exit`` until reset, to drive the second refusal of a protective
+    # exit inside one dispatch.
+    always_raise_on_exit: Exception | None = None
     raise_on_next_close: Exception | None = None
     raise_on_next_modify_entry: Exception | None = None
     raise_on_next_modify_exit: Exception | None = None
@@ -201,6 +205,8 @@ class MockBroker:
 
     async def execute_exit(self, envelope):
         self.exit_calls.append(envelope)
+        if self.always_raise_on_exit is not None:
+            raise self.always_raise_on_exit
         if self.raise_on_next_exit is not None:
             err = self.raise_on_next_exit
             self.raise_on_next_exit = None
@@ -3806,12 +3812,23 @@ def __test_entry_insufficient_margin_does_not_halt__():
     assert "L" not in engine.active_intents
 
 
-def __test_exit_exchange_reject_still_halts__():
-    """An exchange reject on a protective exit surfaces and halts, unlike an entry reject."""
-    # The non-fatal handling is ENTRY-only. A plain exchange reject on a
-    # protective EXIT is a real exposure (the position is open, the bracket
-    # the broker refused leaves it unprotected) and must surface, not be
-    # silently dropped.
+def _open_long(b, engine, pos, pine_id="L", qty=1.0, price=50_000.0, bar_ts=BAR_TS):
+    """Open a long via a market entry and its fill, no bracket yet."""
+    pos.entry_orders[pine_id] = _entry_order(pine_id, qty)
+    engine.sync(bar_ts)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', qty, price, pine_id=pine_id, xchg_id=f"xchg-{pine_id}"))
+    assert any(trade.entry_id == pine_id for trade in pos.open_trades)
+
+
+def __test_exit_reject_over_a_vanished_parent_retires_the_stale_exit__():
+    """A rejected exit whose parent holds nothing and has no working entry is moot.
+
+    The venue closed the position before the bracket reached it (or the
+    script re-emitted a bracket for a dead entry): nothing is exposed, so the
+    run continues and the stale tracking is retired instead of the process
+    dying on the reject.
+    """
     b = MockBroker()
     engine, pos = _mk_engine(b)
     pos.exit_orders[("TP", "L")] = _exit_order(
@@ -3819,8 +3836,137 @@ def __test_exit_exchange_reject_still_halts__():
     )
     b.raise_on_next_exit = ExchangeOrderRejectedError("Capital confirm REJECTED: X")
 
-    with pytest.raises(ExchangeOrderRejectedError):
-        engine.sync(BAR_TS)
+    engine.sync(BAR_TS)  # must not raise
+
+    assert f"TP{INTENT_KEY_SEP}L" not in engine.active_intents
+    assert ("TP", "L") not in pos.exit_orders
+    assert b.close_calls == []
+    assert not engine.quarantined
+    assert engine.halted is False
+
+
+def __test_exit_reject_over_a_live_parent_retries_once_under_a_fresh_id__():
+    """The first refusal of a bracket over a held parent is re-sent at once.
+
+    A bracket racing its own parent fill lands on the second try; the retry
+    carries a fresh client order id so an idempotency cache cannot dedupe it
+    into the refused attempt.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long(b, engine, pos)
+
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    b.raise_on_next_exit = ExchangeOrderRejectedError("venue reject")
+    engine.sync(BAR_TS + 60_000)  # must not raise
+
+    assert len(b.exit_calls) == 2
+    first, second = b.exit_calls
+    assert first.client_order_id('t') != second.client_order_id('t')
+    key = f"L-X{INTENT_KEY_SEP}L"
+    assert key in engine.active_intents
+    assert engine.order_mapping[key]
+    assert b.close_calls == []
+    assert not engine.quarantined
+    assert engine.halted is False
+
+
+def __test_exit_rejected_twice_over_a_live_parent_closes_it_defensively__():
+    """Two refusals of a bracket over a held parent flatten the parent and quarantine.
+
+    The venue will not protect the position, so leaving it open would be the
+    naked exposure the process must never carry: the parent is closed through
+    the bracket-reject recovery (defensive market close, pending marker) and
+    new entries are quarantined until an operator looks — the process itself
+    stays alive and keeps managing the book.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long(b, engine, pos)
+
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    b.always_raise_on_exit = ExchangeOrderRejectedError("venue reject")
+    engine.sync(BAR_TS + 60_000)  # must not raise
+
+    assert len(b.exit_calls) == 2
+    assert f"L-X{INTENT_KEY_SEP}L" not in engine.active_intents
+    assert len(b.close_calls) == 1
+    close = b.close_calls[0].intent
+    assert isinstance(close, CloseIntent)
+    assert close.synthetic_kind == 'defensive_close'
+    assert close.side == 'sell' and close.qty == 1.0 and close.immediately
+    assert "L" in engine.pending_defensive_close
+    assert engine.quarantined
+    assert engine.halted is False
+
+    # Quarantine blocks new exposure while the close settles.
+    b.always_raise_on_exit = None
+    pos.entry_orders["L2"] = _entry_order("L2", 1.0)
+    n_entries = len(b.entry_calls)
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.entry_calls) == n_entries
+
+
+def __test_exit_reject_while_the_parent_is_unfilled_waits_for_the_fill__():
+    """A bracket refused over a working parent is re-sent on the fill, not every sync."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=49_500.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    b.raise_on_next_exit = ExchangeOrderRejectedError("no position to protect")
+    key = f"L-X{INTENT_KEY_SEP}L"
+
+    engine.sync(BAR_TS)  # must not raise
+    assert len(b.exit_calls) == 1
+    assert key not in engine.active_intents
+    assert b.close_calls == []
+
+    # Identical spec, parent still resting: no re-send.
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.exit_calls) == 1
+
+    # The parent fills: the bracket goes out and pins.
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 49_500.0, pine_id="L"))
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.exit_calls) == 2
+    assert key in engine.active_intents
+    assert not engine.quarantined
+
+
+def __test_close_reject_retries_per_bar_and_quarantines_after_the_cap__():
+    """A refused Pine close is re-driven once per bar; the cap quarantines entries.
+
+    The position keeps whatever protection rests on it, so the close simply
+    retries; a position the venue will not let us reduce must not be built
+    on, hence the quarantine after the third refusal — the close itself keeps
+    retrying.
+    """
+    from pynecore.core.broker.sync_engine import _CLOSE_REJECT_QUARANTINE_CAP
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long(b, engine, pos)
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -1.0, order_type=_order_type_close, exit_id="Close position order",
+    )
+
+    for i in range(1, _CLOSE_REJECT_QUARANTINE_CAP + 1):
+        b.raise_on_next_close = ExchangeOrderRejectedError("position not found")
+        engine.sync(BAR_TS + i * 60_000)  # must not raise
+        engine.sync(BAR_TS + i * 60_000)  # same-bar storm: no second attempt
+        assert len(b.close_calls) == i
+        assert "" not in engine.active_intents
+        assert engine.quarantined is (i >= _CLOSE_REJECT_QUARANTINE_CAP)
+    assert engine.halted is False
+
+    # Entries are blocked, the close still goes out and lands.
+    pos.entry_orders["L2"] = _entry_order("L2", 1.0)
+    n_entries = len(b.entry_calls)
+    engine.sync(BAR_TS + 600_000)
+    assert len(b.entry_calls) == n_entries
+    assert len(b.close_calls) == _CLOSE_REJECT_QUARANTINE_CAP + 1
+    assert "" in engine.active_intents
 
 
 def __test_unchanged_entry_is_not_redispatched__():
@@ -6142,6 +6288,166 @@ def __test_reconcile_rearms_missing_stop_protection__(caplog):
     assert len(b.exit_calls) == n_exits + 2
     assert all(len(ids) == 2 for key, ids in engine.order_mapping.items()
                if chr(0) in key)
+
+
+def __test_stop_coverage_is_judged_per_exit_under_pyramiding__():
+    """One pyramid parent losing its stop leg is re-armed even when the rest hold theirs.
+
+    Both exits rest a TP; only L3's SL is gone. An aggregate ratio would call
+    the position protected (one stop for half the size); the per-exit rule
+    retires exactly L3-X so its full bracket comes back, and leaves L2-X alone.
+    """
+    b = MockBroker(two_leg_exits=True)
+    engine, pos = _spot_like_pyramid(b)
+    template = b._mk_order(b.exit_calls[0], 't')
+    l2_key, l3_key = f"L2-X{chr(0)}L2", f"L3-X{chr(0)}L3"
+    l2_tp, l2_sl = engine.order_mapping[l2_key]
+    l3_tp, _l3_sl = engine.order_mapping[l3_key]
+    b.open_orders = [
+        _resting_leg(replace(template, id=l2_tp, side="sell"), qty=0.00999, price=2492.0),
+        _resting_leg(replace(template, id=l2_sl, side="sell"), qty=0.00999, stop=2488.5),
+        _resting_leg(replace(template, id=l3_tp, side="sell"), qty=0.00999, price=2492.0),
+    ]
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.01999, entry_price=2489.5,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cash",
+    )
+    n_cancels = len(b.cancel_calls)
+    engine.reconcile()  # first observation
+    assert len(b.cancel_calls) == n_cancels
+    engine.reconcile()
+    cancelled = [(c.intent.pine_id, c.intent.from_entry) for c in b.cancel_calls[n_cancels:]]
+    assert cancelled == [("L3-X", "L3")]
+    assert l2_key in engine.active_intents
+    assert l3_key not in engine.active_intents
+
+
+def _list_resting_stops(b, engine, pos) -> None:
+    """Make the mock venue list one resting stop leg per active exit (sized to its parent)."""
+    template = b._mk_order(b.exit_calls[0], 't')
+    b.open_orders = []
+    for key, intent in engine.active_intents.items():
+        if not isinstance(intent, ExitIntent):
+            continue
+        parents = [t for t in pos.open_trades if t.entry_id == intent.from_entry]
+        held = sum(abs(t.size) for t in parents)
+        reduce_side = "sell" if parents and parents[0].sign > 0 else "buy"
+        for leg_id in engine.order_mapping[key]:
+            b.open_orders.append(_resting_leg(
+                replace(template, id=leg_id, side=reduce_side), qty=held, stop=intent.sl_price))
+
+
+def _age_shrink_observation(engine, seconds: float) -> None:
+    """Pretend the venue has reported the reduced size for ``seconds`` with no fill since."""
+    observed = engine._shrink_observed  # type: ignore[attr-defined]
+    assert observed is not None
+    engine._shrink_observed = (observed[0], observed[1] - seconds)  # type: ignore[attr-defined]
+    engine._last_position_fill_monotonic -= seconds  # type: ignore[attr-defined]
+
+
+def __test_external_partial_reduction_is_adopted_after_the_confirmation_window__():
+    """A venue position below the book is booked as a reduction once it is proven external.
+
+    First observation only starts the window; past the grace with no fill and
+    nothing in flight the book shrinks through the FIFO, the surviving parent
+    keeps its exit, and the next diff amends the bracket to the new size.
+    """
+    from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+    key = f"L-X{INTENT_KEY_SEP}L"
+    _list_resting_stops(b, engine, pos)
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.6, entry_price=50_000.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cross",
+    )
+
+    engine.reconcile()
+    assert pos.size == 1.0  # observed, not yet adopted
+    engine.reconcile()
+    assert pos.size == 1.0  # still inside the window
+
+    _age_shrink_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+    n_cancels = len(b.cancel_calls)
+    engine.reconcile()
+    assert pos.size == pytest.approx(0.6)
+    assert [(t.entry_id, round(t.size, 12)) for t in pos.open_trades] == [("L", 0.6)]
+    assert pos.closed_trades[-1].size == pytest.approx(0.4)
+    assert key in engine.active_intents and "L" in engine.active_intents
+    assert len(b.cancel_calls) == n_cancels
+
+    # Pine rebuilds the exit from the shrunk parent: the bracket is amended.
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 0.6, "L-X", stop=49_000.0)
+    engine.sync(BAR_TS + 60_000)
+    assert b.modify_exit_calls[-1][1].intent.qty == pytest.approx(0.6)
+    assert engine.active_intents[key].qty == pytest.approx(0.6)
+
+
+def __test_external_reduction_consuming_a_pyramid_parent_retires_it__():
+    """FIFO consumption of a whole parent cancels its exit and drops its tracking."""
+    from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    for i, pine_id in enumerate(("L1", "L2")):
+        pos.entry_orders[pine_id] = _entry_order(pine_id, 1.0)
+        pos.exit_orders[(f"{pine_id}-X", pine_id)] = _exit_order(
+            pine_id, 1.0, f"{pine_id}-X", stop=49_000.0)
+        engine.sync(BAR_TS + i * 60_000)
+        engine._route_event(  # type: ignore[attr-defined]
+            _fill_event('buy', 1.0, 50_000.0 + i, pine_id=pine_id, xchg_id=f"xchg-{pine_id}"))
+    assert pos.size == 2.0
+    _list_resting_stops(b, engine, pos)
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=1.0, entry_price=50_000.5,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cross",
+    )
+    engine.reconcile()
+    _age_shrink_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+    n_cancels = len(b.cancel_calls)
+    engine.reconcile()
+
+    assert pos.size == pytest.approx(1.0)
+    assert [t.entry_id for t in pos.open_trades] == ["L2"]
+    cancelled = [(c.intent.pine_id, c.intent.from_entry) for c in b.cancel_calls[n_cancels:]]
+    assert cancelled == [("L1-X", "L1")]
+    assert "L1" not in engine.active_intents
+    assert f"L1-X{INTENT_KEY_SEP}L1" not in engine.active_intents
+    assert ("L1-X", "L1") not in pos.exit_orders
+    assert f"L2-X{INTENT_KEY_SEP}L2" in engine.active_intents
+
+
+def __test_external_reduction_is_not_adopted_while_our_own_close_is_in_flight__():
+    """A dispatched close explains the smaller venue size: no adoption, the fill will."""
+    from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -0.4, order_type=_order_type_close, exit_id="Close position order",
+    )
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1 and engine.order_mapping[""]
+    _list_resting_stops(b, engine, pos)
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.6, entry_price=50_000.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cross",
+    )
+    engine.reconcile()
+    _age_shrink_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+    engine.reconcile()
+    assert pos.size == 1.0
+
+    # The close fill lands and the book agrees with the venue; the observation is dropped.
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 0.4, 50_100.0, pine_id="", leg=LegType.CLOSE,
+                    xchg_id=engine.order_mapping[""][0], fill_id="c-1"))
+    assert pos.size == pytest.approx(0.6)
+    engine.reconcile()
+    assert engine._shrink_observed is None  # type: ignore[attr-defined]
 
 
 def __test_flat_close_retires_adopted_bracket_keyed_on_a_foreign_parent_id__():
@@ -14589,30 +14895,106 @@ def __test_moot_exit_modify_reject_retires_instead_of_crashing__():
     assert len(b.modify_exit_calls) == 1
 
 
-def __test_exit_modify_reject_over_a_live_parent_still_raises__():
-    """The moot-modify degrade must NOT swallow a live parent's reject.
-
-    With an open trade under the parent, a rejected exit modify means real
-    exposure just lost its protection replacement — that stays a raising
-    condition, not a silent retire.
-    """
-    b = MockBroker()
-    engine, pos = _mk_engine(b)
-
+def _open_long_with_tp(b, engine, pos, *, limit=51_000.0):
+    """Open long 1.0 with a resting TP exit; returns the exit's diff key."""
     pos.entry_orders["L1"] = _entry_order("L1", 1.0)
-    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X",
-                                                  limit=51_000.0)
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X", limit=limit)
     engine.sync(BAR_TS)
     engine._route_event(  # type: ignore[attr-defined]
         _fill_event('buy', 1.0, 50_000.0, pine_id="L1"))
     assert any(trade.entry_id == "L1" for trade in pos.open_trades)
+    return f"L1-X{INTENT_KEY_SEP}L1"
 
-    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X",
-                                                  limit=52_000.0)
+
+def __test_exit_modify_reject_on_a_native_bracket_keeps_the_old_protection__():
+    """A refused in-place amend leaves the old levels armed: keep them, stop re-sending.
+
+    The OLD intent stays active, the refused spec is not re-sent while Pine
+    emits it unchanged (one venue call, not one per sync), and a retuned level
+    goes out again.
+    """
+    b = MockBroker()
+    b.capabilities = ExchangeCapabilities(
+        short_selling=CapabilityLevel.NATIVE, tp_sl_bracket=CapabilityLevel.NATIVE,
+    )
+    engine, pos = _mk_engine(b)
+    key = _open_long_with_tp(b, engine, pos)
+
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X", limit=52_000.0)
     b.raise_on_next_modify_exit = ExchangeOrderRejectedError("venue reject")
-    with pytest.raises(ExchangeOrderRejectedError):
-        engine.sync(BAR_TS + 60_000)
+    engine.sync(BAR_TS + 60_000)  # must not raise
+    assert len(b.modify_exit_calls) == 1
+    assert engine.active_intents[key].tp_price == 51_000.0
     assert "L1" in engine.active_intents
+    assert b.close_calls == []
+
+    # Same refused levels: no re-send.
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.modify_exit_calls) == 1
+
+    # Retuned levels: the amend goes out and lands.
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X", limit=53_000.0)
+    engine.sync(BAR_TS + 180_000)
+    assert len(b.modify_exit_calls) == 2
+    assert engine.active_intents[key].tp_price == 53_000.0
+    assert not engine.quarantined
+
+
+def __test_exit_modify_reject_with_the_old_legs_still_listed_keeps_them__():
+    """Software legs the venue still lists after a refused amend stay in charge."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    key = _open_long_with_tp(b, engine, pos)
+    old_leg_id = engine.order_mapping[key][0]
+    b.open_orders = [_resting_leg(
+        _fill_event('sell', 1.0, 0.0, pine_id="L1-X", xchg_id=old_leg_id).order,
+        qty=1.0, price=51_000.0,
+    )]
+
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X", limit=52_000.0)
+    b.raise_on_next_modify_exit = ExchangeOrderRejectedError("venue reject")
+    n_exits = len(b.exit_calls)
+    engine.sync(BAR_TS + 60_000)  # must not raise
+
+    assert len(b.exit_calls) == n_exits
+    assert engine.active_intents[key].tp_price == 51_000.0
+    assert engine.order_mapping[key] == [old_leg_id]
+    assert b.close_calls == []
+
+
+def __test_exit_modify_reject_with_the_old_legs_gone_redispatches_fresh__():
+    """A refused amend that already tore the old legs down re-arms the exit fresh.
+
+    The venue lists none of the previous legs, so the parent is unprotected:
+    the replacement goes out as a new dispatch and pins; a refusal of that
+    dispatch too flattens the parent defensively and quarantines.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    key = _open_long_with_tp(b, engine, pos)
+    b.open_orders = []
+
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X", limit=52_000.0)
+    b.raise_on_next_modify_exit = ExchangeOrderRejectedError("venue reject")
+    n_exits = len(b.exit_calls)
+    engine.sync(BAR_TS + 60_000)  # must not raise
+    assert len(b.exit_calls) == n_exits + 1
+    assert engine.active_intents[key].tp_price == 52_000.0
+    assert b.close_calls == []
+    assert not engine.quarantined
+
+    # The same shape with the fresh dispatch refused as well: defensive close.
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X", limit=53_000.0)
+    b.raise_on_next_modify_exit = ExchangeOrderRejectedError("venue reject")
+    b.raise_on_next_exit = ExchangeOrderRejectedError("venue reject")
+    engine.sync(BAR_TS + 120_000)  # must not raise
+    assert len(b.exit_calls) == n_exits + 2
+    assert key not in engine.active_intents
+    assert len(b.close_calls) == 1
+    assert b.close_calls[0].intent.synthetic_kind == 'defensive_close'
+    assert "L1" in engine.pending_defensive_close
+    assert engine.quarantined
+    assert engine.halted is False
 
 
 def _software_partial_native_exit_broker():

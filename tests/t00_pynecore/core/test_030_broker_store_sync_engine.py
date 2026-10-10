@@ -441,6 +441,82 @@ def __test_reconcile_cancels_a_journal_owned_reduce_leg_no_intent_maps__(
         ctx.close()
 
 
+def __test_reconcile_cancels_a_journal_owned_stray_entry_no_intent_manages__(
+        tmp_path: Path,
+) -> None:
+    """A run-owned OPENING order with no intent is cancelled on sight.
+
+    A prior run's resting entry (or an adoption the restart replay could not
+    place) survives only as a live journal row: nothing manages it, yet its
+    fill would open exposure with no bracket and no close. Unlike a reduce
+    leg it is not weighed against the held size — it goes at once.
+    """
+    db = tmp_path / "broker.sqlite"
+    broker = _MockBroker()
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, pos = _mk_engine(broker, ctx)
+        engine.sync(BAR_TS)
+
+        coid = "prior-run-resting-entry"
+        ctx.upsert_order(
+            coid, symbol=SYMBOL, side="buy", qty=1.0, state="live",
+            intent_key="Z", exchange_order_id="xchg-stray",
+            pine_entry_id="Z",
+        )
+        broker.open_orders = [ExchangeOrder(
+            id="xchg-stray", symbol=SYMBOL, side="buy",
+            order_type=OrderType.LIMIT, qty=1.0, filled_qty=0.0,
+            remaining_qty=1.0, price=49_000.0, stop_price=None,
+            average_fill_price=None, status=OrderStatus.OPEN,
+            timestamp=0.0, fee=0.0, fee_currency="", client_order_id=coid,
+        )]
+        broker.position = None
+
+        engine.reconcile()
+
+        assert broker.cancel_broker_order_calls == ["xchg-stray"]
+        assert not [
+            row for row in ctx.iter_live_orders(symbol=SYMBOL)
+            if row.client_order_id == coid
+        ]
+        assert "xchg-stray" in engine._strategy_cancel_expected_ids  # type: ignore[attr-defined]
+        ctx.close()
+
+
+def __test_reconcile_leaves_a_row_owned_by_a_live_intent_alone__(
+        tmp_path: Path,
+) -> None:
+    """A journal row whose intent is active is ours and live, not a stray."""
+    db = tmp_path / "broker.sqlite"
+    broker = _MockBroker()
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, pos = _mk_engine(broker, ctx)
+        pos.entry_orders["L"] = Order("L", 1.0, order_type=_order_type_entry, limit=49_000.0)
+        engine.sync(BAR_TS)
+        assert "L" in engine.active_intents
+        # The venue lists the resting entry under an id the mapping does not
+        # carry (the shape of emulator-owned legs): the row's intent is live.
+        ctx.upsert_order(
+            "leg-row", symbol=SYMBOL, side="buy", qty=1.0, state="live",
+            intent_key="L", exchange_order_id="xchg-unmapped", pine_entry_id="L",
+        )
+        broker.open_orders = [ExchangeOrder(
+            id="xchg-unmapped", symbol=SYMBOL, side="buy",
+            order_type=OrderType.LIMIT, qty=1.0, filled_qty=0.0,
+            remaining_qty=1.0, price=49_000.0, stop_price=None,
+            average_fill_price=None, status=OrderStatus.OPEN,
+            timestamp=0.0, fee=0.0, fee_currency="", client_order_id="leg-row",
+        )]
+        broker.position = None
+
+        engine.reconcile()
+
+        assert broker.cancel_broker_order_calls == []
+        ctx.close()
+
+
 # === Plugin-resolved parked dispatches =====================================
 
 

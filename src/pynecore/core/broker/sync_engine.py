@@ -103,6 +103,7 @@ from pynecore.core.broker.models import (
     OcaType,
     NativeFailsafeStateTransitionEvent,
     OrderEvent,
+    OrderStatus,
     OrderType,
     PartialBracketCancelTentativeDegradedEvent,
     PartialBracketCancelTentativeResolvedEvent,
@@ -129,6 +130,7 @@ from pynecore.core.broker.software_entry_stop_engine import (
 from pynecore.core.broker.one_way_emulator import CloseFanResult, OneWayEmulator
 from pynecore.core.broker.storage import (
     EnvelopeRecord,
+    OrderRow,
     PendingRecord,
     RunContext,
 )
@@ -414,6 +416,12 @@ before events are re-routed.
 
 
 _ENTRY_REJECT_RETRY_CAP = 3
+
+# Consecutive venue rejects of the same Pine close after which the engine
+# quarantines new entries: a position that cannot be reduced must not be built
+# on. The close itself keeps retrying once per bar (see
+# :meth:`OrderSyncEngine._recover_rejected_close`).
+_CLOSE_REJECT_QUARANTINE_CAP = 3
 """Consecutive exchange-reject re-dispatch cap for one entry intent
 (:attr:`OrderSyncEngine._rejected_entry_intents`).
 
@@ -889,6 +897,20 @@ class _ParentEntryParkedModifyDeferred(Exception):
     """
 
 
+class _RejectedModifyDeferred(Exception):
+    """Internal control-flow signal raised by :meth:`OrderSyncEngine._dispatch_modify`
+    when the venue refused an exit amend while the previous protection is still
+    armed (an in-place amend of a native bracket, software legs the venue still
+    lists, or emulator-owned legs).
+
+    The caller keeps ``_active_intents[key]`` pointing at the OLD intent; the
+    refused spec is remembered in ``_rejected_exit_modifies`` so the identical
+    amend is not re-sent every sync — Pine changing the levels releases it.
+
+    Module-private — never propagates outside :mod:`sync_engine`.
+    """
+
+
 @dataclasses.dataclass(frozen=True)
 class _EngineTriggerLegSpec:
     """Per-leg spec produced by :meth:`OrderSyncEngine._enumerate_engine_trigger_legs`.
@@ -1128,6 +1150,18 @@ class OrderSyncEngine:
         # key, a key that leaves the desired set, or a dispatch that finally
         # succeeds resets the counter so a genuinely new order retries freely.
         self._rejected_entry_intents: dict[str, tuple[EntryIntent, int]] = {}
+        # Venue-refused protective dispatches (:meth:`_recover_rejected_exit`,
+        # :meth:`_recover_rejected_exit_modify`, :meth:`_recover_rejected_close`).
+        # ``_rejected_exit_intents``: a bracket refused while its parent is still
+        # unfilled — the identical spec is not re-sent until the parent fills or
+        # Pine changes it. ``_rejected_exit_modifies``: an amend refused while the
+        # previous protection stayed armed — suppressed until Pine changes it.
+        # ``_close_reject_counts``: consecutive rejects per close key for the
+        # quarantine cap. All three are pruned at the top of the cycle when the
+        # desired intent changes or disappears.
+        self._rejected_exit_intents: dict[str, ExitIntent] = {}
+        self._rejected_exit_modifies: dict[str, ExitIntent] = {}
+        self._close_reject_counts: dict[str, int] = {}
         # Cumulative fill qty already applied to each in-flight ``CloseIntent``,
         # keyed by ``CloseIntent.intent_key`` (the bare ``pine_id``). ``record_fill``
         # reduces ``_position.size`` / ``open_trades`` on a partial close but never
@@ -1541,8 +1575,12 @@ class OrderSyncEngine:
         )
         # Last reduce-coverage finding :meth:`_enforce_reduce_coverage_invariant`
         # logged, so a persisting condition is reported once, not per pass.
-        self._reduce_coverage_warned: tuple[str, float, float] | None = None
-        self._reduce_coverage_current: tuple[str, float, float] | None = None
+        self._reduce_coverage_warned: tuple[Any, ...] | None = None
+        self._reduce_coverage_current: tuple[Any, ...] | None = None
+        # Venue size observed BELOW the book on the book's own side, with the
+        # monotonic time it was first seen at that size — the confirmation
+        # window of :meth:`_adopt_external_shrink`.
+        self._shrink_observed: tuple[float, float] | None = None
 
         # Intent keys whose ``_order_mapping`` entry was seeded from a
         # recovered close-park anchor (see :meth:`_verify_pending_dispatches`).
@@ -4740,11 +4778,144 @@ class OrderSyncEngine:
             for entry_id in cleared_entry_ids:
                 self._external_flatten_cleared_entry_ids.add(entry_id)
                 self._cleanup_position_tracking(entry_id)
+        elif (not is_startup and exch_pos is not None
+              and self._external_shrink_delta(exch_pos) > 0.0):
+            self._flat_observed_with_intents_since = 0.0
+            self._adopt_external_shrink(exch_pos)
         else:
             # Venue and book agree (or the book is already flat): any earlier
-            # flat observation is obsolete.
+            # flat or shrink observation is obsolete.
             self._flat_observed_with_intents_since = 0.0
+            self._shrink_observed = None
         self._enforce_reduce_coverage_invariant(exch_pos)
+
+    def _external_shrink_delta(self, exch_pos: ExchangePosition) -> float:
+        """How far the venue holds BELOW the book on the book's own side.
+
+        ``0.0`` when the venue holds at least the book, when the venue side
+        is the opposite of the book (a flip is foreign exposure, not a
+        reduction of ours) or carries an unrecognised label, and when the
+        difference is below the venue's dust threshold (spot fee residuals
+        off the qty grid are not an external trade).
+        """
+        book = self._position.size
+        if book == 0.0:
+            return 0.0
+        side = (exch_pos.side or '').lower()
+        if side not in ('long', 'short') or (side == 'long') != (book > 0.0):
+            return 0.0
+        delta = round(abs(book) - abs(float(exch_pos.size)), 12)
+        if delta <= 0.0:
+            return 0.0
+        spot_port = getattr(self._broker, 'spot_inventory_port', None)
+        dust_threshold = getattr(spot_port, 'position_dust_threshold', Decimal(0))
+        if (isinstance(dust_threshold, Decimal) and dust_threshold > 0
+                and Decimal(str(delta)) < dust_threshold):
+            return 0.0
+        return delta
+
+    def _adopt_external_shrink(self, exch_pos: ExchangePosition) -> None:
+        """Book an external reduction of the position the venue reports.
+
+        The exchange is the source of truth for position state, yet the
+        periodic reconcile used to act on a shrink-to-ZERO only: a partial
+        venue reduction nobody routed through the engine — the operator
+        closing part of the position in the venue UI, a partial liquidation,
+        a reduce order from a prior run filling — left the book oversized
+        for the rest of the run. Every exit then rested or amended for
+        exposure the account no longer held (the stale-reduce class the
+        coverage pass catches at the venue), and the script traded on a
+        position view that was simply wrong.
+
+        A snapshot can also run ahead of our own fill stream, so the shrink
+        is adopted only once it is PROVEN external: the venue has reported
+        the same reduced size for :data:`EXTERNAL_FLATTEN_CONFIRM_GRACE_S`,
+        no fill routed in that window, and nothing of ours is in flight that
+        could explain it (parked dispatches, pending defensive / reversal /
+        surplus closes, a dispatched close). The reduction is then booked as
+        a synthetic closing fill at the venue's average entry price (the mark
+        is not in the snapshot, so the realized P&L on the adopted piece is
+        approximate — stated in the log) and walked through the FIFO exactly
+        like a real close: a parent consumed in full has its exits cancelled
+        and its tracking retired, a parent that survives keeps its exit and
+        the next diff amends the bracket to the new size.
+        """
+        delta = self._external_shrink_delta(exch_pos)
+        venue_abs = abs(float(exch_pos.size))
+        now = time.monotonic()
+        observed = self._shrink_observed
+        if observed is None or observed[0] != venue_abs:
+            self._shrink_observed = (venue_abs, now)
+            _blog_warning(
+                "exchange holds %s but the book %s — confirming the external "
+                "reduction of %s over the next %.0fs before adopting it",
+                venue_abs, self._position.size, delta,
+                EXTERNAL_FLATTEN_CONFIRM_GRACE_S,
+            )
+            return
+        if (now - observed[1] < EXTERNAL_FLATTEN_CONFIRM_GRACE_S
+                or now - self._last_position_fill_monotonic
+                < EXTERNAL_FLATTEN_CONFIRM_GRACE_S):
+            return
+        if (self._pending_verification or self._pending_defensive_close
+                or self._pending_reversal_opens
+                or self._pending_flip_surplus_closes):
+            return
+        for key, intent in self._active_intents.items():
+            if isinstance(intent, CloseIntent) and self._order_mapping.get(key):
+                return
+        self._shrink_observed = None
+        price = float(exch_pos.entry_price)
+        if not price > 0.0:
+            price = float(self._position.avg_price)
+        if not price > 0.0:
+            price = float(self._position.open_trades[0].entry_price)
+        side = 'sell' if self._position.size > 0.0 else 'buy'
+        ts = time.time()
+        synthetic = OrderEvent(
+            order=ExchangeOrder(
+                id=f"__external_reduce__{int(ts * 1000)}", symbol=self._symbol,
+                side=side, order_type=OrderType.MARKET, qty=delta,
+                filled_qty=delta, remaining_qty=0.0, price=None, stop_price=None,
+                average_fill_price=price, status=OrderStatus.FILLED, timestamp=ts,
+                fee=0.0, fee_currency="",
+            ),
+            event_type='filled', fill_price=price, fill_qty=delta, timestamp=ts,
+            leg_type=LegType.CLOSE,
+        )
+        closed_before = len(self._position.new_closed_trades)
+        self._position.record_fill(synthetic)
+        consumed = {
+            trade.entry_id
+            for trade in self._position.new_closed_trades[closed_before:]
+            if trade.entry_id is not None
+        }
+        gone = sorted(
+            entry_id for entry_id in consumed
+            if not any(trade.entry_id == entry_id
+                       for trade in self._position.open_trades)
+        )
+        _blog_warning(
+            "exchange holds %s but the book held %s for %.0fs with nothing of "
+            "ours in flight — external reduction of %s adopted as a %s at %s "
+            "(FIFO over entries %s; realized P&L on the adopted piece is "
+            "approximate), book now %s; fully consumed entries retired: %s",
+            venue_abs, round(abs(self._position.size) + delta, 12),
+            EXTERNAL_FLATTEN_CONFIRM_GRACE_S, delta, side, price,
+            sorted(consumed), self._position.size, gone or 'none',
+        )
+        for entry_id in gone:
+            for key, intent in list(self._active_intents.items()):
+                if isinstance(intent, ExitIntent) and intent.from_entry == entry_id:
+                    self._cancel_and_retire_exit_leg(key, intent)
+            self._cleanup_position_tracking(entry_id, cascade_reason='external_reduce')
+        if self._store_ctx is not None:
+            self._store_ctx.log_event(
+                'external_reduce_adopted', client_order_id=None, intent_key=None,
+                payload={'venue_size': venue_abs, 'delta': delta, 'price': price,
+                         'consumed': sorted(consumed), 'retired': gone,
+                         'book_size': self._position.size},
+            )
 
     def _enforce_reduce_coverage_invariant(
             self, exch_pos: ExchangePosition | None,
@@ -4836,15 +5007,17 @@ class OrderSyncEngine:
                 key_of_order[oid] = key
         legs_by_exit: dict[str, list[ExchangeOrder]] = {}
         orphans: list[tuple[ExchangeOrder, str | None]] = []
-        owned_rows: dict[str, str] | None = None
+        strays: list[tuple[ExchangeOrder, str]] = []
+        owned_rows: dict[str, OrderRow] | None = None
         for order in orders:
             if order.remaining_qty <= 0.0:
                 continue
-            if not (order.reduce_only or (reduce_side and order.side == reduce_side)):
-                continue
+            reduces = bool(
+                order.reduce_only or (reduce_side and order.side == reduce_side),
+            )
             key = key_of_order.get(order.id)
             if key is not None:
-                if isinstance(self._active_intents.get(key), ExitIntent):
+                if reduces and isinstance(self._active_intents.get(key), ExitIntent):
                     legs_by_exit.setdefault(key, []).append(order)
                 continue
             if self._store_ctx is None:
@@ -4853,13 +5026,39 @@ class OrderSyncEngine:
                 owned_rows = {}
                 for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
                     if row.exchange_order_id:
-                        owned_rows[row.exchange_order_id] = row.client_order_id
-                    owned_rows[row.client_order_id] = row.client_order_id
-            coid = owned_rows.get(order.id) or (
-                owned_rows.get(order.client_order_id or '')
+                        owned_rows[row.exchange_order_id] = row
+                    owned_rows[row.client_order_id] = row
+            row = owned_rows.get(order.id) or owned_rows.get(order.client_order_id or '')
+            if row is None or row.client_order_id in self._pending_verification:
+                # Another run's or the operator's order (not ours to judge),
+                # or a parked dispatch the verification pass owns.
+                continue
+            owner = row.intent_key
+            if owner is not None and owner in self._active_intents:
+                # A live intent owns the row without a venue-id mapping
+                # (emulator legs, adopted rows): it is that exit's leg.
+                if reduces and isinstance(self._active_intents[owner], ExitIntent):
+                    legs_by_exit.setdefault(owner, []).append(order)
+                continue
+            if reduces:
+                orphans.append((order, row.client_order_id))
+            else:
+                strays.append((order, row.client_order_id))
+        for order, coid in strays:
+            # A bot-owned order on the OPENING side that no intent manages
+            # would add exposure nobody protects or closes when it fills — a
+            # prior run's resting entry, an adoption the restart replay could
+            # not place. Cancel it before it can.
+            _blog_warning(
+                "stray-order invariant: bot-owned %s order %s (%s) rests on the "
+                "venue for %s with no intent managing it — cancelling it before "
+                "it can open unmanaged exposure",
+                order.side, order.id, coid, order.remaining_qty,
             )
-            if coid is not None:
-                orphans.append((order, coid))
+            self._cancel_owned_venue_order(
+                order, coid, 'stray_entry_cancelled',
+                payload={'side': order.side, 'remaining_qty': order.remaining_qty},
+            )
         exit_coverage = {
             key: max(leg.remaining_qty for leg in legs)
             for key, legs in legs_by_exit.items()
@@ -4919,25 +5118,10 @@ class OrderSyncEngine:
                         "maps to no intent, cancelling it",
                         coverage, held_abs, excess, order.id, coid,
                     )
-                    self._strategy_cancel_expected_ids.add(order.id)
-                    try:
-                        self._run_async_write(
-                            self._broker.cancel_broker_order_ref(order.id),
-                        )
-                    except (ExchangeConnectionError, OrderDispositionUnknownError) as e:
-                        _blog_warning(
-                            "reduce-coverage cancel of %s failed transiently (%s) "
-                            "— the next reconcile retries", order.id, e,
-                        )
+                    if not self._cancel_owned_venue_order(
+                            order, coid, 'reduce_coverage_orphan_cancelled',
+                            payload={'coverage': coverage, 'held': held_abs}):
                         continue
-                    if self._store_ctx is not None and coid is not None:
-                        self._store_ctx.close_order(coid)
-                        self._store_ctx.log_event(
-                            'reduce_coverage_orphan_cancelled',
-                            client_order_id=coid, intent_key=None,
-                            payload={'coverage': coverage, 'held': held_abs,
-                                     'exchange_order_id': order.id},
-                        )
                 excess -= cov
             if excess > rounding:
                 self._warn_reduce_coverage_once(
@@ -4946,43 +5130,70 @@ class OrderSyncEngine:
                     "exceed the held %s by %s and no stale candidate explains "
                     "it — operator attention", held_abs, excess,
                 )
-        sl_coverage = sum(
-            max((leg.remaining_qty for leg in legs if leg.stop_price is not None),
-                default=0.0)
-            for legs in legs_by_exit.values()
-        )
+        # Stop coverage is judged per exit, not in aggregate: under
+        # pyramiding one parent can lose its stop leg while the others keep
+        # theirs, and a position-wide ratio would call that protected.
         unprotected = [
             (key, intent) for key, intent in list(self._active_intents.items())
             if isinstance(intent, ExitIntent) and intent.sl_price is not None
+            and self._parent_open_exposure(intent.from_entry)[0] > 0.0
             and not any(leg.stop_price is not None
                         for leg in legs_by_exit.get(key, []))
         ]
-        if held_abs <= 0.0 or not unprotected or sl_coverage >= 0.5 * held_abs:
+        if held_abs <= 0.0 or not unprotected:
             return
-        state = ('unprotected', round(sl_coverage, 12), round(held_abs, 12))
+        state = ('unprotected', tuple(sorted(key for key, _intent in unprotected)))
         self._reduce_coverage_current = state
         if self._reduce_coverage_warned != state:
             _blog_warning(
-                "stop-coverage invariant: the venue rests stop legs for %s of "
-                "the held %s — re-arming on the next pass unless a stop leg "
-                "shows up", sl_coverage, held_abs,
+                "stop-coverage invariant: %d exit(s) declare a stop but no stop "
+                "leg rests on the venue for them (%s) — re-arming on the next "
+                "pass unless a stop leg shows up", len(unprotected),
+                ", ".join(format_intent_key(key) or key for key, _intent in unprotected),
             )
             return
         for key, intent in unprotected:
+            parent_held = self._parent_open_exposure(intent.from_entry)[0]
             _blog_warning(
                 "stop-coverage invariant: exit %s declares a stop but no stop "
-                "leg rests on the venue (held %s, stop coverage %s) — retiring "
+                "leg rests on the venue for its parent %r holding %s — retiring "
                 "the exit so the next sync re-arms its full bracket",
-                format_intent_key(key), held_abs, sl_coverage,
+                format_intent_key(key), intent.from_entry, parent_held,
             )
             self._cancel_and_retire_exit_leg(key, intent)
             if self._store_ctx is not None:
                 self._store_ctx.log_event(
                     'stop_coverage_rearm',
                     client_order_id=None, intent_key=key,
-                    payload={'held': held_abs, 'sl_coverage': sl_coverage},
+                    payload={'held': held_abs, 'parent_held': parent_held},
                 )
         self._reduce_coverage_current = None
+
+    def _cancel_owned_venue_order(
+            self, order: ExchangeOrder, coid: str | None, event_kind: str,
+            *, payload: dict,
+    ) -> bool:
+        """Cancel a bot-owned venue order no intent manages; close its journal row.
+
+        Returns ``False`` when the cancel failed transiently — the next
+        reconcile pass sees the order again and retries.
+        """
+        self._strategy_cancel_expected_ids.add(order.id)
+        try:
+            self._run_async_write(self._broker.cancel_broker_order_ref(order.id))
+        except (ExchangeConnectionError, OrderDispositionUnknownError) as e:
+            _blog_warning(
+                "cancel of bot-owned order %s failed transiently (%s) — the next "
+                "reconcile retries", order.id, e,
+            )
+            return False
+        if self._store_ctx is not None and coid is not None:
+            self._store_ctx.close_order(coid)
+            self._store_ctx.log_event(
+                event_kind, client_order_id=coid, intent_key=None,
+                payload={**payload, 'exchange_order_id': order.id},
+            )
+        return True
 
     def _warn_reduce_coverage_once(
             self, kind: str, value: float, held: float, msg: str, *args: object,
@@ -9191,7 +9402,7 @@ class OrderSyncEngine:
         new_intent = dataclasses.replace(bracket_intent, qty=target_qty)
         try:
             self._dispatch_modify(bracket_intent, new_intent)
-        except _ParentEntryParkedModifyDeferred:
+        except (_ParentEntryParkedModifyDeferred, _RejectedModifyDeferred):
             return
         except OrderSkippedByPlugin as e:
             # The qty amend escalated into the bracket-attach-reject
@@ -12438,6 +12649,14 @@ class OrderSyncEngine:
                 desired = new_map.get(rkey)
                 if desired != self._rejected_entry_intents[rkey][0]:
                     del self._rejected_entry_intents[rkey]
+        # Same release rule for the venue-refused exits and amends.
+        for refused in (self._rejected_exit_intents, self._rejected_exit_modifies):
+            for rkey in list(refused):
+                if new_map.get(rkey) != refused[rkey]:
+                    del refused[rkey]
+        for rkey in list(self._close_reject_counts):
+            if rkey not in new_map:
+                del self._close_reject_counts[rkey]
 
         # Keys the §12 #4 coexistence preflight pops from ``new_map`` because a
         # partial and a whole-row exit collide on the same ``from_entry`` THIS
@@ -13495,6 +13714,15 @@ class OrderSyncEngine:
                         # marker the moment the script changes or cancels it.
                         skipped_entry_ids_this_sync.add(intent.pine_id)
                         continue
+                    if (isinstance(intent, ExitIntent)
+                            and self._rejected_exit_intents.get(key) == intent
+                            and self._parent_open_exposure(intent.from_entry)[0]
+                            <= 0.0):
+                        # The venue refused this exact bracket while its parent
+                        # was unfilled and nothing changed since. It is re-sent
+                        # the moment the parent fills (held qty > 0) or Pine
+                        # retunes it (released by the pruning pass above).
+                        continue
                     close_gate = (
                         self._close_skip_bar_gate.get(key)
                         if isinstance(intent, CloseIntent) else None
@@ -13748,6 +13976,13 @@ class OrderSyncEngine:
                         self._rejected_entry_intents.pop(key, None)
                         self._active_intents[key] = intent
                         continue
+                if (isinstance(intent, ExitIntent)
+                        and self._rejected_exit_modifies.get(key) == intent):
+                    # The venue refused this exact amend while the previous
+                    # protection stayed armed; re-sending it every sync only
+                    # repeats the reject. Pine retuning the levels releases the
+                    # marker in the pruning pass and the amend goes out again.
+                    continue
                 try:
                     self._dispatch_modify(self._active_intents[key], intent)
                 except OrderSkippedByPlugin as e:
@@ -13781,6 +14016,11 @@ class OrderSyncEngine:
                     # no broker call was made. Keep the OLD intent active so
                     # the next sync re-diffs once the parent's disposition
                     # resolves.
+                    continue
+                except _RejectedModifyDeferred:
+                    # The venue refused the exit amend but the previous
+                    # protection is still armed — keep the OLD intent active;
+                    # the refused spec is suppressed until Pine changes it.
                     continue
                 except OrderDispositionUnknownError:
                     # Native-to-engine partial-bracket conversion path
@@ -15547,7 +15787,9 @@ class OrderSyncEngine:
             self._drop_envelope(key)
             self._remove_pine_order_for_intent(old)
 
-    def _dispatch_new(self, intent: Intent, *, _coid_spent_retry: int = 0) -> None:
+    def _dispatch_new(
+            self, intent: Intent, *, _coid_spent_retry: int = 0, _reject_retry: int = 0,
+    ) -> None:
         # ``_coid_spent_retry`` counts the internal re-dispatches of the
         # :class:`ClientOrderIdSpentError` recovery below (never passed by
         # external callers): each pass re-anchors the envelope on a bumped
@@ -16164,6 +16406,7 @@ class OrderSyncEngine:
                 else:
                     order = self._run_async_write(self._broker.execute_close(envelope))
                     self._order_mapping[intent.intent_key] = [order.id]
+                self._close_reject_counts.pop(intent.intent_key, None)
                 # This close is now live on the wire — reset its cumulative-fill
                 # ledger so a stale value from an earlier close cycle on the same
                 # ``pine_id`` cannot make the clamp under-reserve the fresh close.
@@ -16224,7 +16467,10 @@ class OrderSyncEngine:
                 "re-dispatching under a fresh id", intent, e,
             )
             self._reanchor_envelope_after_reject(intent.intent_key)
-            self._dispatch_new(intent, _coid_spent_retry=_coid_spent_retry + 1)
+            self._dispatch_new(
+                intent, _coid_spent_retry=_coid_spent_retry + 1,
+                _reject_retry=_reject_retry,
+            )
         except ExchangeOrderRejectedError as e:
             # The exchange rejected the order outright — no parent fill (the
             # ``BracketAttachAfterFillRejectedError`` branch above owns the
@@ -16246,14 +16492,19 @@ class OrderSyncEngine:
             # — the intent stays out of ``_active_intents`` and is added
             # to ``skipped_entry_ids_this_sync``, so the next bar
             # re-evaluates the signal freely and any same-sync dependent
-            # bracket is suppressed. Non-entry intents (exit / close) keep
-            # the fatal contract: a protective order the exchange refuses
-            # is a real exposure that must surface, not be silently
-            # dropped — except when the venue is simply not trading: a
-            # session pause leaves the position untouched and nothing can
-            # move it either, so every intent kind re-evaluates once the
-            # market reopens (measured live: a Capital.com reversal close
-            # dispatched into the 21:00 UTC maintenance pause killed the run).
+            # bracket is suppressed. A refused EXIT or Pine CLOSE is not
+            # fatal either — the position it concerns is live and only a
+            # running engine can act on it: :meth:`_recover_rejected_exit`
+            # retries once, then closes the unprotected parent defensively
+            # and quarantines; :meth:`_recover_rejected_close` retries once
+            # per bar and quarantines after the cap. Synthetic closes keep
+            # their owners' contracts (the defensive / reversal / marketable
+            # / partial-trigger paths catch the reject themselves). A venue
+            # that is simply not trading comes first: a session pause leaves
+            # the position untouched and nothing can move it either, so
+            # every intent kind re-evaluates once the market reopens
+            # (measured live: a Capital.com reversal close dispatched into
+            # the 21:00 UTC maintenance pause killed the run).
             if isinstance(e, MarketClosedError):
                 _blog_warning(
                     "dispatch declined for %s: %s: %s", intent, type(e).__name__, e,
@@ -16266,6 +16517,11 @@ class OrderSyncEngine:
                     reason="market_closed",
                     context={'symbol': intent.symbol, 'pine_id': intent.pine_id},
                 ) from e
+            if isinstance(intent, ExitIntent):
+                self._recover_rejected_exit(intent, e, attempt=_reject_retry)
+                return
+            if isinstance(intent, CloseIntent) and intent.synthetic_kind is None:
+                self._recover_rejected_close(intent, e)
             if not isinstance(intent, EntryIntent):
                 _blog_error(
                     "dispatch failed for %s: %s: %s",
@@ -16290,6 +16546,231 @@ class OrderSyncEngine:
                 intent, type(e).__name__, e,
             )
             raise
+
+    def _parent_open_exposure(self, from_entry: str | None) -> tuple[float, float]:
+        """Return ``(qty, sign)`` of the open trades booked under ``from_entry``.
+
+        ``qty`` is the absolute size summed over every open trade of the entry
+        (pyramiding stacks several under one id); ``sign`` is ``+1.0`` for a
+        long, ``-1.0`` for a short and ``0.0`` when nothing is held.
+        """
+        qty = 0.0
+        sign = 0.0
+        if from_entry is None:
+            return qty, sign
+        for trade in self._position.open_trades:
+            if trade.entry_id == from_entry:
+                qty += abs(float(trade.size))
+                sign = trade.sign
+        return qty, sign
+
+    def _recover_rejected_exit(
+            self, intent: ExitIntent, error: ExchangeOrderRejectedError, *, attempt: int,
+    ) -> None:
+        """Keep the run alive and the parent protected after a venue-refused exit.
+
+        The venue refusing a protective order never ends the process: the
+        position it should guard is live, and a dead bot cannot act on it.
+        What happens depends on what the exit was meant to protect:
+
+        - **Nothing is held and the parent entry is gone** — the exit is moot
+          (the venue closed the position before the bracket reached it); its
+          tracking is retired like a moot amend.
+        - **Nothing is held but the parent entry is still working** — there is
+          no exposure yet; the refused spec is remembered and re-sent only once
+          the parent fills or Pine changes it, instead of on every sync.
+        - **The parent is held, first refusal** — one immediate re-dispatch
+          under a fresh client order id (a bracket racing its own parent fill
+          lands on the second try).
+        - **The parent is held, second refusal** — the venue will not protect
+          the position, so the parent is closed defensively through the
+          bracket-reject recovery (:meth:`_handle_bracket_attach_after_fill_reject`)
+          and new entries are quarantined: the operator must look before more
+          exposure is opened on a venue that refuses protection.
+
+        Every branch but the immediate retry raises :class:`OrderSkippedByPlugin`
+        so the callers run their usual bookkeeping.
+        """
+        key = intent.intent_key
+        held, sign = self._parent_open_exposure(intent.from_entry)
+        if held <= 0.0:
+            self._reanchor_envelope_after_reject(key)
+            if intent.from_entry in self._active_intents:
+                self._rejected_exit_intents[key] = intent
+                _blog_warning(
+                    "exit %s rejected by the venue while parent %r is still "
+                    "unfilled (%s: %s) — nothing is exposed yet; the bracket "
+                    "is re-sent once the parent fills or the script changes it",
+                    intent, intent.from_entry, type(error).__name__, error,
+                )
+                raise OrderSkippedByPlugin(
+                    f"Exit {format_intent_key(key)} rejected by exchange "
+                    f"({type(error).__name__}: {error}) while its parent is "
+                    f"unfilled; re-sent after the parent fills.",
+                    intent_key=key,
+                    reason="broker_rejected_exit",
+                    context={'symbol': intent.symbol, 'pine_id': intent.pine_id,
+                             'from_entry': intent.from_entry},
+                ) from error
+            _blog_warning(
+                "exit %s rejected by the venue but parent %r holds no open "
+                "trade and no working entry — retiring the stale exit "
+                "tracking: %s", intent, intent.from_entry, error,
+            )
+            self._cleanup_position_tracking(intent.from_entry)
+            raise OrderSkippedByPlugin(
+                f"Exit {format_intent_key(key)} rejected by exchange over a "
+                f"parent that holds nothing; stale tracking retired.",
+                intent_key=key,
+                reason="stale_exit_rejected",
+                context={'symbol': intent.symbol, 'pine_id': intent.pine_id,
+                         'from_entry': intent.from_entry},
+            ) from error
+        if attempt == 0:
+            _blog_warning(
+                "exit %s rejected by the venue over live parent %r holding %s "
+                "(%s: %s) — re-dispatching once under a fresh client order id",
+                intent, intent.from_entry, held, type(error).__name__, error,
+            )
+            self._reanchor_envelope_after_reject(key)
+            self._dispatch_new(intent, _reject_retry=attempt + 1)
+            return
+        position_coid = (
+            self._resolve_parent_opening_ref(intent.from_entry) or intent.from_entry
+        )
+        deal_id: str | None = None
+        if self._store_ctx is not None:
+            row = self._store_ctx.get_order(position_coid)
+            if row is not None:
+                deal_id = row.exchange_order_id
+        qty = min(abs(intent.qty), held)
+        _blog_error(
+            "exit %s rejected by the venue twice over live parent %r holding %s "
+            "(%s: %s) — the venue refuses to protect the position: closing the "
+            "parent defensively and quarantining new entries",
+            intent, intent.from_entry, held, type(error).__name__, error,
+        )
+        self.record_quarantine(
+            'protective_exit_rejected',
+            context={'symbol': intent.symbol, 'pine_id': intent.pine_id,
+                     'from_entry': intent.from_entry, 'held_qty': held,
+                     'cause': str(error)},
+            intent_key=key,
+        )
+        self._reanchor_envelope_after_reject(key)
+        unprotected = BracketAttachAfterFillRejectedError(
+            f"protective exit {format_intent_key(key)} rejected by the venue "
+            f"over a live parent: {error}",
+            position_coid=position_coid,
+            symbol=intent.symbol,
+            position_side='buy' if sign > 0.0 else 'sell',
+            qty=qty,
+            position_deal_id=deal_id,
+            from_entry=intent.from_entry,
+            exit_id=intent.pine_id,
+            error_message=str(error),
+        )
+        unprotected.__cause__ = error
+        self._handle_bracket_attach_after_fill_reject(intent, unprotected)
+
+    def _recover_rejected_close(
+            self, intent: CloseIntent, error: ExchangeOrderRejectedError,
+    ) -> None:
+        """Turn a venue-refused Pine close into a per-bar retry with a quarantine cap.
+
+        A close the venue refuses leaves the position exactly as it was —
+        still guarded by whatever brackets rest on it — so the run continues
+        and the close is re-driven once per bar through the caller's decline
+        gate. After :data:`_CLOSE_REJECT_QUARANTINE_CAP` consecutive refusals
+        the engine quarantines new entries: a position that cannot be reduced
+        must not be built on. The close keeps retrying regardless; a changed or
+        withdrawn close resets the count at the top of the cycle, a landed
+        dispatch resets it on the success path.
+        """
+        key = intent.intent_key
+        self._reanchor_envelope_after_reject(key)
+        count = self._close_reject_counts.get(key, 0) + 1
+        self._close_reject_counts[key] = count
+        _blog_warning(
+            "close %s rejected by the venue (%s: %s) — reject %d of %d before "
+            "quarantine, retrying next bar", intent, type(error).__name__, error,
+            count, _CLOSE_REJECT_QUARANTINE_CAP,
+        )
+        if count >= _CLOSE_REJECT_QUARANTINE_CAP:
+            self.record_quarantine(
+                'close_rejected_repeatedly',
+                context={'symbol': intent.symbol, 'pine_id': intent.pine_id,
+                         'reject_count': count, 'cause': str(error)},
+                intent_key=key,
+            )
+        raise OrderSkippedByPlugin(
+            f"Close {format_intent_key(key)} rejected by exchange "
+            f"({type(error).__name__}: {error}); retrying next bar.",
+            intent_key=key,
+            reason="broker_rejected_close",
+            context={'symbol': intent.symbol, 'pine_id': intent.pine_id,
+                     'reject_count': count},
+        ) from error
+
+    def _old_exit_protection_still_armed(self, key: str) -> bool:
+        """Whether an exit's previous legs survived a refused amend.
+
+        A native bracket is amended in place on the position, so a refusal
+        leaves the old levels standing; legs the one-way emulator owns
+        (``bracket:`` refs) are amended in place too. Software legs are checked
+        against the venue's open orders. When the venue cannot be read the old
+        legs are assumed live — the next sync re-diffs and looks again.
+        """
+        if self._tp_sl_bracket_native:
+            return True
+        mapped = self._order_mapping.get(key, [])
+        if not mapped:
+            return False
+        if all(ref.startswith('bracket:') for ref in mapped):
+            return True
+        try:
+            orders = self._run_async_read(self._broker.get_open_orders(self._symbol))
+        except (ExchangeConnectionError, ExchangeRateLimitError,
+                OrderDispositionUnknownError) as e:
+            _blog_warning(
+                "cannot read open orders after the refused exit amend of %s (%s) "
+                "— assuming the previous legs are still armed until the next sync",
+                format_intent_key(key), e,
+            )
+            return True
+        live = {order.id for order in orders}
+        return any(ref in live for ref in mapped)
+
+    def _recover_rejected_exit_modify(
+            self, old: Intent, new: ExitIntent, error: ExchangeOrderRejectedError,
+    ) -> None:
+        """Keep a live parent protected after the venue refused an exit amend.
+
+        When the previous legs are still armed the position is as protected as
+        before the amend: the OLD intent stays active
+        (:class:`_RejectedModifyDeferred`) and the refused spec is suppressed
+        until Pine changes it. When the amend already tore the previous legs
+        down the replacement goes out as a fresh dispatch; a refusal there
+        closes the parent defensively through :meth:`_recover_rejected_exit`.
+        """
+        key = new.intent_key
+        if self._old_exit_protection_still_armed(key):
+            self._rejected_exit_modifies[key] = new
+            _blog_warning(
+                "exit amend %s -> %s rejected by the venue (%s: %s) — the previous "
+                "protection stays armed; the refused levels are not re-sent until "
+                "the script changes them",
+                old, new, type(error).__name__, error,
+            )
+            raise _RejectedModifyDeferred(key)
+        _blog_warning(
+            "exit amend %s -> %s rejected by the venue after the previous legs "
+            "were taken down (%s: %s) — dispatching the replacement fresh",
+            old, new, type(error).__name__, error,
+        )
+        self._order_mapping.pop(key, None)
+        self._reanchor_envelope_after_reject(key)
+        self._dispatch_new(new, _reject_retry=1)
 
     def _dispatch_engine_trigger_partial_bracket(
             self, intent: ExitIntent,
@@ -19363,9 +19844,12 @@ class OrderSyncEngine:
             # replacement bracket would protect, so the reject ("no
             # confirmed entry row" on Capital.com) proves there is nothing
             # left to guard. Retire the stale tracking and continue — a
-            # raw raise here kills the whole run over a dead intent. Any
-            # other reject (a live parent losing its protection) still
-            # re-raises: swallowing it would leave real exposure unguarded.
+            # raw raise here kills the whole run over a dead intent. A live
+            # parent's reject goes to :meth:`_recover_rejected_exit_modify`:
+            # protection that is still armed stays and the refused spec is
+            # suppressed; protection the amend tore down is re-dispatched
+            # fresh and, if refused again, the parent is closed defensively.
+            # A Pine close's reject retries per bar with a quarantine cap.
             if (isinstance(new, ExitIntent)
                     and new.from_entry is not None
                     and not any(trade.entry_id == new.from_entry
@@ -19377,6 +19861,11 @@ class OrderSyncEngine:
                 )
                 self._cleanup_position_tracking(new.from_entry)
                 return
+            if isinstance(new, ExitIntent):
+                self._recover_rejected_exit_modify(old, new, e)
+                return
+            if isinstance(new, CloseIntent) and new.synthetic_kind is None:
+                self._recover_rejected_close(new, e)
             _blog_error(
                 "modify failed for %s: %s: %s", new, type(e).__name__, e,
             )
