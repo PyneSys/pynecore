@@ -2696,15 +2696,14 @@ def create_chart_protocol(
                 _wait_with_liveness(state.data_ready, sec_id, sec_processes,
                                     failed_children)
         if round_state['tick']:
-            # A confirmed bar's own close is the round tick, so the frontier
-            # stops one ms below it; a developing round publishes nothing, so
-            # its frontier may reach the tick itself (see ``__sec_write__``).
-            # noinspection PyProtectedMember
-            frontier = (round_state['tick'] - 1 if lib.barstate.isconfirmed
-                        else round_state['tick'])
+            # A producer that did not write this bar will never append an entry
+            # closing at or before the round tick: its next append is a later
+            # bar's, closing past it. So the frontier reaches the tick itself,
+            # confirmed or developing — one ms below would hold a consumer whose
+            # as-of is this bar's close, while the next chart bar waits on it.
             for sec_id, writer in chart_writers.items():
                 if sec_id not in chart_bar_written:
-                    writer.set_frontier_close(frontier)
+                    writer.set_frontier_close(round_state['tick'])
         chart_bar_written.clear()
         chart_bar_value.clear()
         signalled_primaries.clear()
