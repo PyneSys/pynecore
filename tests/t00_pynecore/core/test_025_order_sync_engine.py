@@ -5987,6 +5987,163 @@ def __test_full_leg_fill_retires_the_spent_software_bracket__():
     assert len(engine.order_mapping[l3_key]) == 2
 
 
+def _resting_leg(order: ExchangeOrder, *, qty: float, stop: float | None = None,
+                 price: float | None = None) -> ExchangeOrder:
+    """The venue's open-orders view of a dispatched bracket leg."""
+    return replace(
+        order, qty=qty, filled_qty=0.0, remaining_qty=qty,
+        price=price, stop_price=stop, status=OrderStatus.OPEN,
+    )
+
+
+def _spot_like_pyramid(b: MockBroker) -> tuple[OrderSyncEngine, BrokerPosition]:
+    """Two fee-netted entries (0.009995 each) with two-leg software brackets."""
+    from decimal import Decimal
+
+    b.spot_inventory_port = SimpleNamespace(
+        position_dust_threshold=Decimal("0.00001"),
+    )
+    engine, pos = _mk_engine(b, mintick=0.01)
+    for i, (pine_id, price) in enumerate([("L2", 2489.0), ("L3", 2490.0)], start=1):
+        pos.entry_orders[pine_id] = _entry_order(pine_id, 0.009995)
+        pos.exit_orders[(f"{pine_id}-X", pine_id)] = _exit_order(
+            pine_id, 0.009995, f"{pine_id}-X", limit=2492.0, stop=2488.5)
+        engine.sync(BAR_TS + i * 60_000)
+        engine._route_event(  # type: ignore[attr-defined]
+            _fill_event('buy', 0.009995, price, pine_id=pine_id,
+                        xchg_id=f"xchg-{pine_id}"))
+    assert pos.size == pytest.approx(0.01999)
+    return engine, pos
+
+
+def __test_reconcile_cancels_the_stale_bracket_whose_parent_no_longer_holds__():
+    """Resting reduce orders above the held size cancel the stale bracket.
+
+    The venue view is judged, not the book: whatever left the leg behind
+    (here the cycle-274 shape — L2's exit still rests its full TP while
+    the book holds a 0.00001 fee residual under L2), the resting reduce
+    coverage exceeds the held inventory by a whole leg, and the exit whose
+    parent holds less than half its leg size is the stale one. The
+    rightly-sized L3 bracket must survive untouched.
+    """
+    b = MockBroker(two_leg_exits=True)
+    engine, pos = _spot_like_pyramid(b)
+    l2_key = f"L2-X{chr(0)}L2"
+    l3_key = f"L3-X{chr(0)}L3"
+    l2_tp = b.exit_calls[0]
+    l3_tp = b.exit_calls[1]
+    assert l2_tp.intent.from_entry == "L2" and l3_tp.intent.from_entry == "L3"
+
+    # The book after L2's SL leg filled and the FIFO walk ate L1's residual:
+    # L2 keeps a sub-step residual, L3 is whole.
+    l2_trade = next(t for t in pos.open_trades if t.entry_id == "L2")
+    l2_trade.size = 0.00001
+    pos.size = 0.010005
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.010005, entry_price=2489.5,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0,
+        margin_mode="cash",
+    )
+    l2_ids = engine.order_mapping[l2_key]
+    l3_ids = engine.order_mapping[l3_key]
+    template = b._mk_order(l2_tp, 't')
+    b.open_orders = [
+        _resting_leg(replace(template, id=l2_ids[0], side="sell"),
+                     qty=0.00999, price=2492.0),
+        _resting_leg(replace(template, id=l3_ids[0], side="sell"),
+                     qty=0.00999, price=2492.0),
+        _resting_leg(replace(template, id=l3_ids[1], side="sell"),
+                     qty=0.00999, stop=2488.5),
+    ]
+    n_cancels = len(b.cancel_calls)
+
+    engine.reconcile()
+
+    cancelled = [(c.intent.pine_id, c.intent.from_entry)
+                 for c in b.cancel_calls[n_cancels:]]
+    assert cancelled == [("L2-X", "L2")]
+    assert l2_key not in engine.active_intents
+    assert ("L2-X", "L2") not in pos.exit_orders
+    assert l3_key in engine.active_intents
+    assert engine.order_mapping[l3_key] == l3_ids
+    assert pos.size == pytest.approx(0.010005)
+
+
+def __test_reconcile_leaves_rounding_sized_coverage_alone__(caplog):
+    """A leg a hair larger than its fee-netted parent is rounding, not stale."""
+    b = MockBroker(two_leg_exits=True)
+    engine, pos = _spot_like_pyramid(b)
+    l2_tp, l3_tp = b.exit_calls[0], b.exit_calls[1]
+    template = b._mk_order(l2_tp, 't')
+    legs = []
+    for key in (f"L2-X{chr(0)}L2", f"L3-X{chr(0)}L3"):
+        tp_id, sl_id = engine.order_mapping[key]
+        legs.append(_resting_leg(replace(template, id=tp_id, side="sell"),
+                                 qty=0.00999, price=2492.0))
+        legs.append(_resting_leg(replace(template, id=sl_id, side="sell"),
+                                 qty=0.00999, stop=2488.5))
+    b.open_orders = legs
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.01999, entry_price=2489.5,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0,
+        margin_mode="cash",
+    )
+    n_cancels = len(b.cancel_calls)
+    with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+        engine.reconcile()
+    assert len(b.cancel_calls) == n_cancels
+    assert len(engine.active_intents) == 4
+    assert not [r for r in caplog.records if "coverage invariant" in r.getMessage()]
+    assert l3_tp.intent.from_entry == "L3"
+
+
+def __test_reconcile_rearms_missing_stop_protection__(caplog):
+    """A held position whose stop legs are gone gets its brackets re-armed.
+
+    The first pass only observes the deficit (a just-dispatched leg can be
+    missing from one snapshot); the second consecutive pass retires every
+    stop-declaring exit without a resting stop leg — cancelling the lone
+    TP siblings — so the next sync dispatches fresh, full brackets.
+    """
+    b = MockBroker(two_leg_exits=True)
+    engine, pos = _spot_like_pyramid(b)
+    l2_tp = b.exit_calls[0]
+    template = b._mk_order(l2_tp, 't')
+    legs = []
+    for key in (f"L2-X{chr(0)}L2", f"L3-X{chr(0)}L3"):
+        tp_id, _sl_id = engine.order_mapping[key]
+        legs.append(_resting_leg(replace(template, id=tp_id, side="sell"),
+                                 qty=0.00999, price=2492.0))
+    b.open_orders = legs
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.01999, entry_price=2489.5,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0,
+        margin_mode="cash",
+    )
+    n_cancels = len(b.cancel_calls)
+    n_exits = len(b.exit_calls)
+    with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+        engine.reconcile()
+    # First observation: reported, nothing cancelled yet.
+    assert len(b.cancel_calls) == n_cancels
+    assert [r for r in caplog.records if "re-arming on the next pass" in r.getMessage()]
+    with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+        engine.reconcile()
+    cancelled = sorted((c.intent.pine_id, c.intent.from_entry)
+                       for c in b.cancel_calls[n_cancels:])
+    assert cancelled == [("L2-X", "L2"), ("L3-X", "L3")]
+    assert not any(isinstance(i, ExitIntent) for i in engine.active_intents.values())
+    assert pos.size == pytest.approx(0.01999)
+    # Pine re-emits both exits: fresh two-leg brackets go out.
+    for pine_id in ("L2", "L3"):
+        pos.exit_orders[(f"{pine_id}-X", pine_id)] = _exit_order(
+            pine_id, 0.009995, f"{pine_id}-X", limit=2492.0, stop=2488.5)
+    engine.sync(BAR_TS + 10 * 60_000)
+    assert len(b.exit_calls) == n_exits + 2
+    assert all(len(ids) == 2 for key, ids in engine.order_mapping.items()
+               if chr(0) in key)
+
+
 def __test_flat_close_retires_adopted_bracket_keyed_on_a_foreign_parent_id__():
     """A flat book must retire adopted exit legs keyed on the prior run's id.
 

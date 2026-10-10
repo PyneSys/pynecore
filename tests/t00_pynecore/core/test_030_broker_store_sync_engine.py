@@ -81,6 +81,8 @@ class _MockBroker:
     )
     cancel_calls: list[DispatchEnvelope] = field(default_factory=list)
     open_orders: list[ExchangeOrder] = field(default_factory=list)
+    cancel_broker_order_calls: list[str] = field(default_factory=list)
+    position: ExchangePosition | None = None
     raise_on_next_entry: Exception | None = None
     raise_on_next_modify_entry: Exception | None = None
     capabilities: ExchangeCapabilities = field(default_factory=ExchangeCapabilities)
@@ -124,6 +126,9 @@ class _MockBroker:
         self.cancel_calls.append(envelope)
         return True
 
+    async def cancel_broker_order_ref(self, ref):
+        self.cancel_broker_order_calls.append(ref)
+
     async def modify_entry(self, old, new):
         self.modify_entry_calls.append((old, new))
         if self.raise_on_next_modify_entry is not None:
@@ -138,8 +143,8 @@ class _MockBroker:
     async def get_open_orders(self, symbol=None):
         return list(self.open_orders)
 
-    async def get_position(self, symbol):  # pragma: no cover — unused
-        return None
+    async def get_position(self, symbol):
+        return self.position
 
     def watch_orders(self):  # pragma: no cover — unused
         raise NotImplementedError
@@ -387,6 +392,53 @@ def __test_restart_recovers_parked_dispatch_via_get_open_orders__(
         envelopes, pending = ctx_b.replay()
         assert pending == {}
         assert "L" in envelopes
+
+
+def __test_reconcile_cancels_a_journal_owned_reduce_leg_no_intent_maps__(
+        tmp_path: Path,
+) -> None:
+    """A run-owned reduce leg with no intent is cancelled against a flat venue.
+
+    The cross-script adoption shape (bybit-spot cycle 90): the prior run's
+    protective leg survives only as a live journal row — no intent, no
+    Pine order-book slot — and rests on the venue against inventory the
+    account no longer holds. The reduce-coverage pass judges the venue
+    view: a sell resting for a flat holding is excess, the journal proves
+    the leg is ours, so it is cancelled by raw ref, its row closed and its
+    id marked as an engine-owned cancel for the follow-up push.
+    """
+    db = tmp_path / "broker.sqlite"
+    broker = _MockBroker()
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, pos = _mk_engine(broker, ctx)
+        engine.sync(BAR_TS)
+        assert pos.size == 0.0
+
+        coid = "adopted-prior-run-tp"
+        ctx.upsert_order(
+            coid, symbol=SYMBOL, side="sell", qty=0.00999, state="live",
+            intent_key="L-X\0L", exchange_order_id="xchg-orphan",
+            from_entry="L", pine_entry_id="L-X", tp_level=2492.0,
+        )
+        broker.open_orders = [ExchangeOrder(
+            id="xchg-orphan", symbol=SYMBOL, side="sell",
+            order_type=OrderType.LIMIT, qty=0.00999, filled_qty=0.0,
+            remaining_qty=0.00999, price=2492.0, stop_price=None,
+            average_fill_price=None, status=OrderStatus.OPEN,
+            timestamp=0.0, fee=0.0, fee_currency="", client_order_id=coid,
+        )]
+        broker.position = None
+
+        engine.reconcile()
+
+        assert broker.cancel_broker_order_calls == ["xchg-orphan"]
+        assert not [
+            row for row in ctx.iter_live_orders(symbol=SYMBOL)
+            if row.client_order_id == coid
+        ], "the cancelled leg's journal row must be closed"
+        assert "xchg-orphan" in engine._strategy_cancel_expected_ids  # type: ignore[attr-defined]
+        ctx.close()
 
 
 # === Plugin-resolved parked dispatches =====================================

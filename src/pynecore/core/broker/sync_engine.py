@@ -1539,6 +1539,10 @@ class OrderSyncEngine:
         self._strategy_cancel_expected_ids = _BoundedIdSet(
             _MODIFY_PARKED_CANCEL_IDS_CAP,
         )
+        # Last reduce-coverage finding :meth:`_enforce_reduce_coverage_invariant`
+        # logged, so a persisting condition is reported once, not per pass.
+        self._reduce_coverage_warned: tuple[str, float, float] | None = None
+        self._reduce_coverage_current: tuple[str, float, float] | None = None
 
         # Intent keys whose ``_order_mapping`` entry was seeded from a
         # recovered close-park anchor (see :meth:`_verify_pending_dispatches`).
@@ -4740,6 +4744,259 @@ class OrderSyncEngine:
             # Venue and book agree (or the book is already flat): any earlier
             # flat observation is obsolete.
             self._flat_observed_with_intents_since = 0.0
+        self._enforce_reduce_coverage_invariant(exch_pos)
+
+    def _enforce_reduce_coverage_invariant(
+            self, exch_pos: ExchangePosition | None,
+    ) -> None:
+        """Venue-side guard: resting reduce orders must not exceed the held size.
+
+        Every incident of the stale-protective-leg class shares one
+        observable, whatever its cause: a reduce-side order rests on the
+        venue for exposure the account no longer holds — a leg adopted
+        from a prior run against a flat book (bybit-spot cycles 87 and
+        90), a parent kept alive by a sub-step fee residual (cycle 262), a
+        bracket whose sibling leg filled while the FIFO walk consumed
+        another parent (cycle 274: two stale TPs sold 0.01998 against
+        0.010005 held). The per-cause fixes each closed one shape; this
+        pass judges the venue view itself so the next shape cannot sell
+        inventory the book does not own:
+
+        ``coverage = sum(exit intents: max resting leg) + sum(bot-owned
+        orphan reduce orders)``, ``excess = coverage - |held|``.
+
+        A whole-row bracket's TP and SL are alternatives, so an exit intent
+        counts once (its larger resting leg). Orders mapped to an entry or
+        close intent are not reduce coverage; orders no intent maps count
+        only when this run's durable journal owns them (another run's
+        legs on the same account are not ours to judge). An excess at or
+        below half the smallest counted leg is venue rounding of a
+        fee-netted or contract-converted leg, never a stale leg.
+
+        Above that the stale candidates are cancelled largest-deficit
+        first until the excess is gone: an exit intent whose parent holds
+        less than half the leg size in the book goes through
+        :meth:`_cancel_and_retire_exit_leg` (the proven whole-intent
+        sweep — the next sync re-arms a right-sized bracket for whatever
+        the parent still holds); an owned orphan through
+        ``cancel_broker_order_ref``. An excess no candidate explains is
+        logged, never acted on — a leg the book still owes is not cancelled
+        on arithmetic alone.
+
+        The mirror check RE-ARMS missing stop protection: when the stop-side
+        coverage is below half of the held size while an exit intent
+        declares a stop, every stop-declaring exit without a resting stop
+        leg is retired (its lone TP sibling cancelled), so the next sync
+        dispatches a fresh, full bracket for what the parent holds — the
+        cycle 274 shape left a trade without its SL for 30 minutes before
+        the stale TP sold it, and a log line reaches no one on an
+        unattended bot. The deficit must be observed on two consecutive
+        passes first: a leg dispatched moments ago can be missing from one
+        open-orders snapshot, and retiring it there would double the
+        bracket.
+
+        Position-attached brackets (NATIVE ``tp_sl_bracket``) never show up
+        in ``get_open_orders``, so the pass is inert there. A failed read
+        skips the pass — a live bot must not halt on a recoverable read.
+        """
+        if self._tp_sl_bracket_native or self._sync_count == 0:
+            return
+        self._reduce_coverage_current = None
+        try:
+            self._check_reduce_coverage(exch_pos)
+        finally:
+            self._reduce_coverage_warned = self._reduce_coverage_current
+
+    def _check_reduce_coverage(self, exch_pos: ExchangePosition | None) -> None:
+        held_abs = 0.0
+        held_side = ''
+        if exch_pos is not None:
+            held_side = (exch_pos.side or '').lower()
+            if held_side in ('long', 'short'):
+                held_abs = abs(float(exch_pos.size))
+            else:
+                held_side = ''
+        if held_side == 'long' or (not held_side and not self._short_selling_supported):
+            reduce_side = 'sell'
+        elif held_side == 'short':
+            reduce_side = 'buy'
+        else:
+            reduce_side = ''
+        try:
+            orders = self._run_async_read(self._broker.get_open_orders(self._symbol))
+        except (ExchangeConnectionError, ExchangeRateLimitError,
+                OrderDispositionUnknownError) as e:
+            _blog_warning(
+                "reduce-coverage check skipped: open-orders read failed (%s)", e,
+            )
+            return
+        key_of_order: dict[str, str] = {}
+        for key, ids in self._order_mapping.items():
+            for oid in ids:
+                key_of_order[oid] = key
+        legs_by_exit: dict[str, list[ExchangeOrder]] = {}
+        orphans: list[tuple[ExchangeOrder, str | None]] = []
+        owned_rows: dict[str, str] | None = None
+        for order in orders:
+            if order.remaining_qty <= 0.0:
+                continue
+            if not (order.reduce_only or (reduce_side and order.side == reduce_side)):
+                continue
+            key = key_of_order.get(order.id)
+            if key is not None:
+                if isinstance(self._active_intents.get(key), ExitIntent):
+                    legs_by_exit.setdefault(key, []).append(order)
+                continue
+            if self._store_ctx is None:
+                continue
+            if owned_rows is None:
+                owned_rows = {}
+                for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+                    if row.exchange_order_id:
+                        owned_rows[row.exchange_order_id] = row.client_order_id
+                    owned_rows[row.client_order_id] = row.client_order_id
+            coid = owned_rows.get(order.id) or (
+                owned_rows.get(order.client_order_id or '')
+            )
+            if coid is not None:
+                orphans.append((order, coid))
+        exit_coverage = {
+            key: max(leg.remaining_qty for leg in legs)
+            for key, legs in legs_by_exit.items()
+        }
+        coverage = sum(exit_coverage.values()) + sum(
+            order.remaining_qty for order, _coid in orphans
+        )
+        smallest_leg = min(
+            [leg.remaining_qty for legs in legs_by_exit.values() for leg in legs]
+            + [order.remaining_qty for order, _coid in orphans],
+            default=0.0,
+        )
+        rounding = 0.5 * smallest_leg
+        excess = coverage - held_abs
+        if (legs_by_exit or orphans) and excess > rounding:
+            candidates: list[tuple[float, float, str, ExchangeOrder | None, str | None]] = []
+            for key, cov in exit_coverage.items():
+                intent = self._active_intents[key]
+                assert isinstance(intent, ExitIntent)
+                parent_held = sum(
+                    abs(trade.size) for trade in self._position.open_trades
+                    if trade.entry_id == intent.from_entry
+                )
+                deficit = cov - parent_held
+                if deficit > 0.5 * cov:
+                    candidates.append((deficit, cov, key, None, None))
+            for order, coid in orphans:
+                candidates.append(
+                    (order.remaining_qty, order.remaining_qty, '', order, coid),
+                )
+            candidates.sort(key=lambda c: c[0], reverse=True)
+            for deficit, cov, key, order, coid in candidates:
+                if excess <= rounding:
+                    break
+                if order is None:
+                    intent = self._active_intents[key]
+                    assert isinstance(intent, ExitIntent)
+                    _blog_warning(
+                        "reduce-coverage invariant: resting reduce orders %s "
+                        "exceed the held %s by %s — exit %s rests %s for a "
+                        "parent holding %s, cancelling the stale bracket",
+                        coverage, held_abs, excess, format_intent_key(key),
+                        cov, cov - deficit,
+                    )
+                    self._cancel_and_retire_exit_leg(key, intent)
+                    if self._store_ctx is not None:
+                        self._store_ctx.log_event(
+                            'reduce_coverage_stale_exit_cancelled',
+                            client_order_id=None, intent_key=key,
+                            payload={'coverage': coverage, 'held': held_abs,
+                                     'leg_qty': cov, 'parent_held': cov - deficit},
+                        )
+                else:
+                    _blog_warning(
+                        "reduce-coverage invariant: resting reduce orders %s "
+                        "exceed the held %s by %s — bot-owned order %s (%s) "
+                        "maps to no intent, cancelling it",
+                        coverage, held_abs, excess, order.id, coid,
+                    )
+                    self._strategy_cancel_expected_ids.add(order.id)
+                    try:
+                        self._run_async_write(
+                            self._broker.cancel_broker_order_ref(order.id),
+                        )
+                    except (ExchangeConnectionError, OrderDispositionUnknownError) as e:
+                        _blog_warning(
+                            "reduce-coverage cancel of %s failed transiently (%s) "
+                            "— the next reconcile retries", order.id, e,
+                        )
+                        continue
+                    if self._store_ctx is not None and coid is not None:
+                        self._store_ctx.close_order(coid)
+                        self._store_ctx.log_event(
+                            'reduce_coverage_orphan_cancelled',
+                            client_order_id=coid, intent_key=None,
+                            payload={'coverage': coverage, 'held': held_abs,
+                                     'exchange_order_id': order.id},
+                        )
+                excess -= cov
+            if excess > rounding:
+                self._warn_reduce_coverage_once(
+                    'excess', excess, held_abs,
+                    "reduce-coverage invariant: resting reduce orders still "
+                    "exceed the held %s by %s and no stale candidate explains "
+                    "it — operator attention", held_abs, excess,
+                )
+        sl_coverage = sum(
+            max((leg.remaining_qty for leg in legs if leg.stop_price is not None),
+                default=0.0)
+            for legs in legs_by_exit.values()
+        )
+        unprotected = [
+            (key, intent) for key, intent in list(self._active_intents.items())
+            if isinstance(intent, ExitIntent) and intent.sl_price is not None
+            and not any(leg.stop_price is not None
+                        for leg in legs_by_exit.get(key, []))
+        ]
+        if held_abs <= 0.0 or not unprotected or sl_coverage >= 0.5 * held_abs:
+            return
+        state = ('unprotected', round(sl_coverage, 12), round(held_abs, 12))
+        self._reduce_coverage_current = state
+        if self._reduce_coverage_warned != state:
+            _blog_warning(
+                "stop-coverage invariant: the venue rests stop legs for %s of "
+                "the held %s — re-arming on the next pass unless a stop leg "
+                "shows up", sl_coverage, held_abs,
+            )
+            return
+        for key, intent in unprotected:
+            _blog_warning(
+                "stop-coverage invariant: exit %s declares a stop but no stop "
+                "leg rests on the venue (held %s, stop coverage %s) — retiring "
+                "the exit so the next sync re-arms its full bracket",
+                format_intent_key(key), held_abs, sl_coverage,
+            )
+            self._cancel_and_retire_exit_leg(key, intent)
+            if self._store_ctx is not None:
+                self._store_ctx.log_event(
+                    'stop_coverage_rearm',
+                    client_order_id=None, intent_key=key,
+                    payload={'held': held_abs, 'sl_coverage': sl_coverage},
+                )
+        self._reduce_coverage_current = None
+
+    def _warn_reduce_coverage_once(
+            self, kind: str, value: float, held: float, msg: str, *args: object,
+    ) -> None:
+        """Log a reduce-coverage finding once per distinct state.
+
+        The reconcile pass repeats every few syncs; a condition that persists
+        unchanged must not flood the log with the same warning.
+        """
+        state = (kind, round(value, 12), round(held, 12))
+        self._reduce_coverage_current = state
+        if self._reduce_coverage_warned == state:
+            return
+        _blog_warning(msg, *args)
 
     def _adopt_size_with_replayed_close(
             self,
