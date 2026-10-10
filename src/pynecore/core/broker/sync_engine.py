@@ -6032,6 +6032,9 @@ class OrderSyncEngine:
                 self._cleanup_closed_position(event)
             for closed_entry_id in fifo_closed:
                 self._cleanup_position_tracking(closed_entry_id)
+            if t == 'filled' and event.leg_type in (
+                    LegType.TAKE_PROFIT, LegType.STOP_LOSS):
+                self._retire_spent_software_bracket(event)
             # A flat book must not keep exit tracking under ANY parent id.
             # The per-entry cleanup above keys on the ids the FIFO walk (and
             # the dust flatten) actually consumed — but a startup-adopted
@@ -6709,6 +6712,52 @@ class OrderSyncEngine:
         self._active_intents.pop(key, None)
         self._drop_envelope(key)
         self._remove_pine_order_for_intent(intent)
+
+    def _retire_spent_software_bracket(self, event: OrderEvent) -> None:
+        """Retire a whole-row exit whose venue leg just filled in full.
+
+        A SOFTWARE bracket maps ONE :class:`ExitIntent` to two independent
+        venue legs (TP limit + SL stop) that the venue does not link: a
+        full fill of either leg spends the whole exit, yet the sibling
+        keeps resting for the exit's full qty — against inventory the fill
+        just sold. The per-entry cleanup reaches it only when the fill's
+        FIFO walk consumed the exit's OWN parent completely; under
+        pyramiding the walk consumes the OLDEST trade instead, and spot
+        fee-netted entries (0.009995) against grid-quantized legs
+        (0.00999) leave a sub-step residual on every parent, so the parent
+        always "survives" (measured live: bybit-spot cycle 274 — the L2-X
+        and L3-X SL legs filled, their TP siblings rested on for 30
+        minutes and then filled too, selling 0.01998 against 0.010005
+        held: negative spot ledger -> quarantine, the surviving trade
+        unprotected in between).
+
+        Cancel the sibling, retire the intent and drop its Pine-side order;
+        the next sync re-arms a fresh bracket for whatever trades the book
+        still holds. Only a venue leg this intent owns qualifies —
+        position-attached brackets report their fills as ``close`` legs or
+        under the parent's own id and never match an exit intent here.
+        """
+        key = self._filled_intent_key(event)
+        if key is None:
+            return
+        intent = self._active_intents.get(key)
+        if not isinstance(intent, ExitIntent):
+            return
+        order = event.order
+        mapped = self._order_mapping.get(key, [])
+        if order is None or order.id not in mapped:
+            return
+        siblings = [oid for oid in mapped if oid != order.id]
+        if siblings:
+            self._order_mapping[key] = siblings
+        else:
+            self._order_mapping.pop(key, None)
+        _blog_info(
+            "bracket leg of %s filled in full — retiring the spent exit%s",
+            format_intent_key(key),
+            " and cancelling its resting sibling leg" if siblings else "",
+        )
+        self._cancel_and_retire_exit_leg(key, intent)
 
     def _trim_cancelled_bracket_leg(self, event: OrderEvent, key: str) -> None:
         """Drop one venue-cancelled leg from an exit intent, keep the rest.

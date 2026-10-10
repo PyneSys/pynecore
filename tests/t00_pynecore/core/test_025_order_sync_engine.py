@@ -120,6 +120,8 @@ class MockBroker:
     position: ExchangePosition | None = None
     streamed_events: list[OrderEvent] = field(default_factory=list)
     watch_orders_impl: str = "generator"  # "generator" | "not_implemented"
+    #: Mint a SOFTWARE bracket as two venue legs (TP, SL) per ``execute_exit``.
+    two_leg_exits: bool = False
     raise_on_next_entry: Exception | None = None
     # Persistent entry-reject hook: unlike ``raise_on_next_entry`` (fires once
     # then clears), this raises on EVERY ``execute_entry`` until reset, to prove
@@ -203,6 +205,8 @@ class MockBroker:
             err = self.raise_on_next_exit
             self.raise_on_next_exit = None
             raise err
+        if self.two_leg_exits:
+            return [self._mk_order(envelope, 't'), self._mk_order(envelope, 's')]
         return [self._mk_order(envelope, 't')]
 
     async def execute_close(self, envelope):
@@ -5898,6 +5902,89 @@ def __test_close_fill_books_subdust_residual_flat_and_retires_the_bracket__():
         isinstance(intent, ExitIntent) and intent.from_entry == "L3"
         for intent in engine.active_intents.values()
     )
+
+
+def __test_full_leg_fill_retires_the_spent_software_bracket__():
+    """A bracket leg's full fill must cancel its sibling and retire the exit.
+
+    The venue does not link the two legs of a SOFTWARE bracket, so once the
+    SL fills the TP keeps resting for the exit's full qty. Under pyramiding
+    the fill's FIFO walk consumes the OLDEST trade, not the exit's own
+    parent, and spot fee-netted entries (0.009995) against grid-quantized
+    legs (0.00999) leave a sub-step residual on the parent anyway — so the
+    per-entry cleanup never retires the spent exit. Measured live:
+    bybit-spot cycle 274, the stale L2-X / L3-X TP legs filled 30 minutes
+    after their SL siblings and sold 0.01998 against 0.010005 held
+    (negative spot ledger -> quarantine).
+    """
+    from decimal import Decimal
+
+    b = MockBroker(two_leg_exits=True)
+    b.spot_inventory_port = SimpleNamespace(
+        position_dust_threshold=Decimal("0.00001"),
+    )
+    engine, pos = _mk_engine(b, mintick=0.01)
+
+    for i, (pine_id, price) in enumerate(
+            [("L1", 2488.0), ("L2", 2489.0), ("L3", 2490.0)], start=1):
+        pos.entry_orders[pine_id] = _entry_order(pine_id, 0.009995)
+        pos.exit_orders[(f"{pine_id}-X", pine_id)] = _exit_order(
+            pine_id, 0.009995, f"{pine_id}-X", limit=2492.0, stop=2488.5)
+        engine.sync(BAR_TS + i * 60_000)
+        engine._route_event(  # type: ignore[attr-defined]
+            _fill_event('buy', 0.009995, price, pine_id=pine_id,
+                        xchg_id=f"xchg-{pine_id}"))
+    assert pos.size == pytest.approx(0.029985)
+    l3_key = f"L3-X{chr(0)}L3"
+    l2_key = f"L2-X{chr(0)}L2"
+    l3_tp, l3_sl = engine.order_mapping[l3_key]
+    _l2_tp, l2_sl = engine.order_mapping[l2_key]
+    n_cancels = len(b.cancel_calls)
+
+    # L3's SL fires first: FIFO consumes L1 (partially — the fee-netted
+    # entry is a hair larger than the grid-sized leg).
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 0.00999, 2488.4, pine_id="L3-X",
+                    leg=LegType.STOP_LOSS, xchg_id=l3_sl, fill_id="f-l3"),
+        from_entry="L3",
+    ))
+    assert pos.size == pytest.approx(0.019995)
+    assert any(trade.entry_id == "L3" for trade in pos.open_trades)
+    # The spent exit is gone with its resting TP sibling cancelled.
+    assert l3_key not in engine.active_intents
+    assert l3_key not in engine.order_mapping
+    assert ("L3-X", "L3") not in pos.exit_orders
+    sweep = [
+        (envelope.intent.pine_id, envelope.intent.from_entry)
+        for envelope in b.cancel_calls[n_cancels:]
+    ]
+    assert sweep == [("L3-X", "L3")], "the resting TP sibling must be cancelled"
+    assert l3_tp not in engine.order_mapping.get(l3_key, [])
+    # The untouched bracket keeps both legs.
+    assert len(engine.order_mapping[l2_key]) == 2
+
+    # L2's SL fires next: FIFO finishes L1 and leaves a residual on L2 —
+    # the parent survives, the spent exit must still go.
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 0.00999, 2488.3, pine_id="L2-X",
+                    leg=LegType.STOP_LOSS, xchg_id=l2_sl, fill_id="f-l2"),
+        from_entry="L2",
+    ))
+    assert pos.size == pytest.approx(0.010005)
+    assert any(trade.entry_id == "L2" for trade in pos.open_trades)
+    assert l2_key not in engine.active_intents
+    assert ("L2-X", "L2") not in pos.exit_orders
+    assert "L1" not in engine.active_intents
+
+    # Pine re-emits L3's exit for the still-open trade: a FRESH bracket
+    # is dispatched for it instead of the dead one diffing "unchanged".
+    n_exits = len(b.exit_calls)
+    pos.exit_orders[("L3-X", "L3")] = _exit_order(
+        "L3", 0.009995, "L3-X", limit=2492.0, stop=2488.5)
+    engine.sync(BAR_TS + 10 * 60_000)
+    assert len(b.exit_calls) == n_exits + 1
+    assert b.exit_calls[-1].intent.from_entry == "L3"
+    assert len(engine.order_mapping[l3_key]) == 2
 
 
 def __test_flat_close_retires_adopted_bracket_keyed_on_a_foreign_parent_id__():
