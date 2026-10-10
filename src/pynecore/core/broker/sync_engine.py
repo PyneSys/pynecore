@@ -34,7 +34,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Coroutine, Iterable, Iterator
 from concurrent import futures
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, TypeVar, overload
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, overload
 
 from pynecore import lib
 from pynecore.core.broker.disappearance import resolve_unexpected_cancel_policy
@@ -453,6 +453,20 @@ freely. Notional-based skips are deliberately excluded: their bound moves with
 price, so a fixed qty can cross the threshold on a later tick and must keep
 re-evaluating.
 """
+
+
+class _RejectedEntry(NamedTuple):
+    """Reject memory of one entry key (:attr:`OrderSyncEngine._rejected_entry_intents`)."""
+
+    intent: EntryIntent
+    """The exact intent the venue / plugin refused."""
+    count: int
+    """Consecutive refusals of that intent."""
+    order: Any
+    """The Pine ``Order`` instance refused by the venue; ``None`` for a
+    deterministic plugin decline, which no re-issue can clear."""
+    bar_ts_ms: int
+    """Bar on which the last refusal happened."""
 
 
 class _BoundedIdSet:
@@ -1149,7 +1163,11 @@ class OrderSyncEngine:
         # bot keeps running, the signal stays dropped). A CHANGED intent on the
         # key, a key that leaves the desired set, or a dispatch that finally
         # succeeds resets the counter so a genuinely new order retries freely.
-        self._rejected_entry_intents: dict[str, tuple[EntryIntent, int]] = {}
+        # A venue-side reject also pins the Pine ``Order`` instance and the bar
+        # it was refused on: a fresh ``strategy.entry`` call on a later bar (a
+        # new signal) releases the suppression even with value-equal
+        # parameters, because funds / risk vetoes clear over time.
+        self._rejected_entry_intents: dict[str, _RejectedEntry] = {}
         # Venue-refused protective dispatches (:meth:`_recover_rejected_exit`,
         # :meth:`_recover_rejected_exit_modify`, :meth:`_recover_rejected_close`).
         # ``_rejected_exit_intents``: a bracket refused while its parent is still
@@ -7668,8 +7686,8 @@ class OrderSyncEngine:
         the start-of-cycle pruning pass.
         """
         marker = self._rejected_entry_intents.get(key)
-        return (marker is not None and marker[0] == intent
-                and marker[1] >= _ENTRY_REJECT_RETRY_CAP)
+        return (marker is not None and marker.intent == intent
+                and marker.count >= _ENTRY_REJECT_RETRY_CAP)
 
     def _record_entry_reject(
             self, key: str, intent: EntryIntent, exc: OrderSkippedByPlugin,
@@ -7695,13 +7713,18 @@ class OrderSyncEngine:
         pass drops the marker the moment Pine changes or cancels the order.
         """
         if exc.reason in _TERMINAL_PLUGIN_SKIP_REASONS:
-            self._rejected_entry_intents[key] = (intent, _ENTRY_REJECT_RETRY_CAP)
+            self._rejected_entry_intents[key] = _RejectedEntry(
+                intent, _ENTRY_REJECT_RETRY_CAP, None, self._current_bar_ts_ms,
+            )
             return
         if exc.reason != "broker_rejected_entry":
             return
         marker = self._rejected_entry_intents.get(key)
-        count = marker[1] + 1 if marker is not None and marker[0] == intent else 1
-        self._rejected_entry_intents[key] = (intent, count)
+        count = marker.count + 1 if marker is not None and marker.intent == intent else 1
+        self._rejected_entry_intents[key] = _RejectedEntry(
+            intent, count, self._position.entry_orders.get(intent.pine_id),
+            self._current_bar_ts_ms,
+        )
 
     def _resolve_deferred_for_entry(self, entry_id: str) -> None:
         """An entry fill unblocks every exit that references it via ticks.
@@ -12643,12 +12666,32 @@ class OrderSyncEngine:
         # suppression only ever silences the EXACT doomed order. A key still
         # present with an equal intent keeps its marker (suppressed at the
         # dispatch site below); a key whose intent changed, or that Pine no
-        # longer wants, is retried freely.
+        # longer wants, is retried freely. A venue reject is also released
+        # when the script re-issued the entry (a new Pine ``Order`` instance)
+        # on a later bar: that is a new signal, and the funds / risk veto
+        # that refused the old one may have cleared — measured live
+        # (capitalcom, 2026-10-10): an insufficient-margin reject kept every
+        # later value-equal ``strategy.entry`` silenced for the rest of the
+        # 6 h cycle, even after the account was funded. A re-issue on the
+        # refusal bar itself is consumed into the marker instead, so a script
+        # that re-calls ``strategy.entry`` on every tick gets one reject
+        # budget per bar, not one per tick.
         if self._rejected_entry_intents:
             for rkey in list(self._rejected_entry_intents):
+                marker = self._rejected_entry_intents[rkey]
                 desired = new_map.get(rkey)
-                if desired != self._rejected_entry_intents[rkey][0]:
+                if desired != marker.intent:
                     del self._rejected_entry_intents[rkey]
+                    continue
+                if marker.order is None:
+                    continue
+                current = self._position.entry_orders.get(marker.intent.pine_id)
+                if current is marker.order:
+                    continue
+                if self._current_bar_ts_ms > marker.bar_ts_ms:
+                    del self._rejected_entry_intents[rkey]
+                else:
+                    self._rejected_entry_intents[rkey] = marker._replace(order=current)
         # Same release rule for the venue-refused exits and amends.
         for refused in (self._rejected_exit_intents, self._rejected_exit_modifies):
             for rkey in list(refused):

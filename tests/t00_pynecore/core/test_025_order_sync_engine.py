@@ -1998,6 +1998,62 @@ def __test_entry_persistent_reject_is_bounded_not_hammered__():
     assert engine.active_intents.keys() == {"L"}
 
 
+def __test_entry_reject_cap_released_by_reissue_on_later_bar__():
+    """A re-issued value-equal entry on a later bar gets a fresh reject budget."""
+    # Measured live (capitalcom, 2026-10-10): an insufficient-margin reject
+    # exhausted the cap on the first signal, and every later crossover's
+    # ``strategy.entry("L")`` — value-equal, so the marker matched — stayed
+    # silenced for the rest of the 6 h cycle even after the account was funded.
+    # A new Pine ``Order`` instance is a new signal; on a later bar it must be
+    # dispatched again. The pinned (sticky) instance stays suppressed, and a
+    # same-bar re-issue does not reopen the budget (per-tick storm guard).
+    from pynecore.core.broker.sync_engine import _ENTRY_REJECT_RETRY_CAP
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    b.always_raise_on_entry = InsufficientMarginError("Capital reject: RC_NOT_ENOUGH_MARGIN")
+    for _ in range(_ENTRY_REJECT_RETRY_CAP + 5):
+        engine.sync(BAR_TS)
+    assert len(b.entry_calls) == _ENTRY_REJECT_RETRY_CAP
+
+    # A re-issue on the reject bar itself does not reopen the budget.
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == _ENTRY_REJECT_RETRY_CAP
+
+    # Sticky re-emission of the same instance on later bars stays suppressed.
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.entry_calls) == _ENTRY_REJECT_RETRY_CAP
+
+    # The account is funded; the next signal re-issues the entry on a later bar.
+    b.always_raise_on_entry = None
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.entry_calls) == _ENTRY_REJECT_RETRY_CAP + 1
+    assert engine.active_intents.keys() == {"L"}
+
+
+def __test_entry_terminal_plugin_skip_not_released_by_reissue__():
+    """A deterministic plugin decline stays suppressed across re-issues."""
+    # ``below_min_size`` is a pure function of the intent: a re-issued
+    # value-equal order would be declined identically, so only a changed
+    # intent may retry it.
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    b.always_raise_on_entry = OrderSkippedByPlugin(
+        "qty below venue minimum", intent_key="L", reason="below_min_size",
+    )
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.entry_calls) == 1
+    assert "L" not in engine.active_intents
+
+
 def __test_entry_reject_same_bar_retry_bumps_retry_seq__():
     """A same-bar retry after a reject keeps ``bar_ts_ms`` but bumps ``retry_seq`` to 1."""
     # A same-bar retry after an exchange reject must mint a FRESH COID: same
