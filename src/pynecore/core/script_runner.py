@@ -1204,7 +1204,7 @@ class ScriptRunner:
                  '_time_from', '_sec_syminfos', '_chart_type_warmup', '_missing_sec_data',
                  '_signal_rate_sources_fn', '_sec_begin_bar_fn', '_sec_end_bar_fn',
                  '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
-                 '_engine_event_stream_future',
+                 '_engine_event_stream_future', '_broker_stop_settle_s', 'broker_stop_settled',
                  '_broker_store_ctx', '_log_ohlcv', '_price_decimals',
                  '_round_decimals', '_lossless_volume', '_lossless_prices',
                  '_config_dir', '_symbol_map', '_script_timeframe',
@@ -1227,6 +1227,7 @@ class ScriptRunner:
                  broker_plugin: 'BrokerPlugin | None' = None,
                  broker_event_loop: 'asyncio.AbstractEventLoop | None' = None,
                  broker_store_ctx: 'RunContext | None' = None,
+                 broker_stop_settle_s: float = 0.0,
                  log_ohlcv: bool = False,
                  chart_provider_name: str | None = None,
                  chart_provider_instance: Any = None,
@@ -1308,6 +1309,11 @@ class ScriptRunner:
                                  (tests, backtests) — the ``run_tag`` is then derived
                                  locally from the plugin's ``account_id``. Caller owns
                                  the lifecycle: ``close()`` on shutdown.
+        :param broker_stop_settle_s: How long a broker run stopped by
+                                     :class:`KeyboardInterrupt` waits for the fills of the
+                                     market orders it already dispatched, before its
+                                     teardown stops the broker event stream. ``0`` skips
+                                     the wait. The outcome is :attr:`broker_stop_settled`.
         :param lossless_volume: Whether ``ohlcv_iter`` yields the feed's own volume,
                                 needing no float32 storage clean-up. Read from the
                                 chart feed's :attr:`OHLCVReader.lossless_volume`;
@@ -1421,6 +1427,10 @@ class ScriptRunner:
         self._broker_store_ctx: 'RunContext | None' = broker_store_ctx
         self._order_sync_engine: 'OrderSyncEngine | None' = None
         self._engine_event_stream_future: Any = None
+        self._broker_stop_settle_s = broker_stop_settle_s
+        # Whether the stop wait saw every dispatched market order filled; None
+        # when the run was not stopped (or has no broker, or no wait was asked)
+        self.broker_stop_settled: bool | None = None
         self.broker_balance: dict[str, float] | None = None
         # Identities of open SimPosition trades already announced via
         # ``[SIM]`` logging — so each fill is narrated once in paper mode.
@@ -1866,18 +1876,23 @@ class ScriptRunner:
         """Full snapshot of the live drawing objects (lines/labels/boxes/...)."""
         return viz.drawings_snapshot()
 
-    def settle_broker_in_flight(self, timeout_s: float) -> bool:
-        """Wait for the fills of already-dispatched market orders before a stop.
+    def _settle_broker_stop(self) -> None:
+        """Ingest the fills of already-dispatched market orders at a stop.
 
-        :param timeout_s: Upper bound of the wait, in seconds.
-        :return: ``True`` when nothing dispatched is left waiting for its fill
-            (also when the run has no broker).
+        Runs while the run is unwinding from :class:`KeyboardInterrupt`, BEFORE
+        the teardown stops the broker event stream: the fills arrive through
+        that stream, and the position, the journal and the trade output must
+        still be open to take them. A repeated stop during the wait ends it
+        early; the teardown then proceeds and the next run reconciles the
+        order from the venue.
         """
-        if self._order_sync_engine is None:
-            return True
-        return cast('OrderSyncEngine', self._order_sync_engine).settle_in_flight_fills(
-            timeout_s,
-        )
+        if self._order_sync_engine is None or self._broker_stop_settle_s <= 0.0:
+            return
+        engine = cast('OrderSyncEngine', self._order_sync_engine)
+        try:
+            self.broker_stop_settled = engine.settle_in_flight_fills(self._broker_stop_settle_s)
+        except KeyboardInterrupt:
+            self.broker_stop_settled = False
 
     @property
     def broker_position_snapshot(self) -> 'Any | None':
@@ -1953,6 +1968,11 @@ class ScriptRunner:
                     yield item[0], dict(item[1]), list(item[2])
                 else:
                     yield item[0], dict(item[1])
+        except KeyboardInterrupt as stop:
+            # A stop that lands here, between two bars, must still reach the
+            # runner's own stop handling before its teardown
+            results.throw(stop)
+            raise
         finally:
             # Closing this iterator early (break, close()) must run the runner's cleanup now
             results.close()
@@ -3985,6 +4005,10 @@ class ScriptRunner:
         except GeneratorExit:
             pass
 
+        except KeyboardInterrupt:
+            self._settle_broker_stop()
+            raise
+
         finally:  # Python reference counter will close this even if the iterator is not exhausted
             if is_strat and position:
                 # Broker mode: flush trades that closed after the last bar-close
@@ -5195,5 +5219,12 @@ class ScriptRunner:
                         bid/ask in the progress spinner.
         :raises AssertionError: If the 'main' function does not return a dictionary
         """
-        for _ in self.run_iter(on_progress=on_progress, on_tick=on_tick, copy_results=False):
-            pass
+        results = self._run_iter(on_progress, on_tick)
+        try:
+            for _ in results:
+                pass
+        except KeyboardInterrupt as stop:
+            # A stop that lands here, between two bars, must still reach the
+            # runner's own stop handling before its teardown
+            results.throw(stop)
+            raise

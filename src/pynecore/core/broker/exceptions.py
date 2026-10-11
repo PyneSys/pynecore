@@ -21,6 +21,7 @@ __all__ = [
     'ExchangeOrderRejectedError',
     'ExchangeRateLimitError',
     'InsufficientMarginError',
+    'MarketClosedError',
     'OrderDispositionUnknownError',
     'OrderSkippedByPlugin',
     'OrderSyncError',

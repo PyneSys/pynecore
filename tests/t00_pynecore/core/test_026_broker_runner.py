@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import sys
 import textwrap
+import threading
+from collections.abc import Generator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
@@ -143,16 +145,16 @@ class MockBrokerPlugin:
         self.cancel_calls.append(envelope.intent)
         return True
 
-    async def modify_entry(self, old, new):
+    async def modify_entry(self, _old, new):
         return [self._mk_order(new)]
 
-    async def modify_exit(self, old, new):
+    async def modify_exit(self, _old, new):
         return [self._mk_order(new)]
 
-    async def get_open_orders(self, symbol=None):
+    async def get_open_orders(self, _symbol=None):
         return list(self.startup_open_orders)
 
-    async def get_position(self, symbol):
+    async def get_position(self, _symbol):
         return self.startup_position
 
     async def get_balance(self):
@@ -408,8 +410,10 @@ def __test_close_dispatches_execute_close__(tmp_path):
     next(it)  # bar 1 — sync dispatches entry; we now inject a fill
 
     assert len(plugin.entry_calls) == 1
-    exch_id = runner._order_sync_engine._order_mapping["L"][0]
-    runner._order_sync_engine.on_order_event(OrderEvent(
+    engine = runner._order_sync_engine
+    assert engine is not None
+    exch_id = engine._order_mapping["L"][0]
+    engine.on_order_event(OrderEvent(
         order=ExchangeOrder(
             id=exch_id, symbol="BTCUSDT", side="buy",
             order_type=OrderType.MARKET, qty=1.0, filled_qty=1.0,
@@ -459,7 +463,9 @@ def __test_order_event_fill_updates_broker_position__(tmp_path):
     assert len(plugin.entry_calls) == 1
 
     # Simulate the exchange filling the order.
-    exch_id = runner._order_sync_engine._order_mapping["L"][0]
+    engine = runner._order_sync_engine
+    assert engine is not None
+    exch_id = engine._order_mapping["L"][0]
     fill = OrderEvent(
         order=ExchangeOrder(
             id=exch_id, symbol="BTCUSDT", side="buy",
@@ -471,7 +477,7 @@ def __test_order_event_fill_updates_broker_position__(tmp_path):
         event_type='filled', fill_price=50_000.0, fill_qty=1.0,
         timestamp=0.0, pine_id="L", leg_type=LegType.ENTRY,
     )
-    runner._order_sync_engine.on_order_event(fill)
+    engine.on_order_event(fill)
     # Mirror the fill on the mock exchange so per-sync reconcile sees a
     # consistent ``/positions`` snapshot.
     plugin.startup_position = ExchangePosition(
@@ -756,15 +762,17 @@ def main():
 '''
 
 
-def _drive_entry_and_close(runner, plugin):
+def _drive_entry_and_close(runner: ScriptRunner, plugin: MockBrokerPlugin) -> Generator:
     """Enter on bar 0, fill it, close on bar 2, fill the close, then let the
     run continue. Returns after the close fill has been recorded."""
-    it = iter(runner.run_iter())
+    it = cast(Generator, runner.run_iter())
     next(it)  # bar 0 — entry created
     next(it)  # bar 1 — sync dispatches execute_entry
 
-    exch_id = runner._order_sync_engine._order_mapping["L"][0]
-    runner._order_sync_engine.on_order_event(OrderEvent(
+    engine = runner._order_sync_engine
+    assert engine is not None
+    exch_id = engine._order_mapping["L"][0]
+    engine.on_order_event(OrderEvent(
         order=ExchangeOrder(
             id=exch_id, symbol="BTCUSDT", side="buy",
             order_type=OrderType.MARKET, qty=1.0, filled_qty=1.0,
@@ -786,7 +794,7 @@ def _drive_entry_and_close(runner, plugin):
 
     assert len(plugin.close_calls) == 1
     # Fill the close on the exchange and flatten the mirrored position.
-    runner._order_sync_engine.on_order_event(OrderEvent(
+    engine.on_order_event(OrderEvent(
         order=ExchangeOrder(
             id="xchg-close", symbol="BTCUSDT", side="sell",
             order_type=OrderType.MARKET, qty=1.0, filled_qty=1.0,
@@ -861,7 +869,9 @@ def __test_broker_intrabar_close_flushed_on_shutdown__(tmp_path):
     # Record the close fill NOW (as an intra-bar drain would), before any
     # further closed-bar write, then stop the run immediately — mirroring a
     # graceful shutdown right after an intra-bar close.
-    runner._order_sync_engine.apply_async_events()
+    engine = runner._order_sync_engine
+    assert engine is not None
+    engine.apply_async_events()
     pos = runner.script.position
     assert len(pos.closed_trades) == 1
     # Terminate the generator (GeneratorExit -> finally export path). No further
@@ -872,3 +882,80 @@ def __test_broker_intrabar_close_flushed_on_shutdown__(tmp_path):
     types = [r[2] for r in rows]
     assert types == ["Entry long", "Exit long"], \
         f"intra-bar-closed trade must be flushed on shutdown, got {types}"
+
+
+def _stopped_after_entry_dispatch(tmp_path: Path, settle_s: float):
+    """A broker run whose market entry is dispatched on bar 1 and still waits
+    for its fill; returns the runner, its generator and the trades path."""
+    plugin = MockBrokerPlugin(
+        capabilities=ExchangeCapabilities(reduce_only=CapabilityLevel.NATIVE),
+    )
+    script_path = __test_helper_write_script(tmp_path, _ENTRY_THEN_CLOSE_SCRIPT)
+    trade_path = tmp_path / "trades.csv"
+    runner = ScriptRunner(
+        script_path=script_path,
+        ohlcv_iter=_make_bars(8),
+        syminfo=_make_syminfo(),
+        broker_plugin=plugin,  # type: ignore[arg-type]
+        trade_path=trade_path,
+        broker_stop_settle_s=settle_s,
+    )
+    it = cast(Generator, runner.run_iter())
+    next(it)  # bar 0 — entry created
+    next(it)  # bar 1 — sync dispatches execute_entry
+    engine = runner._order_sync_engine
+    assert engine is not None and engine.awaiting_market_fills()
+    return runner, it, trade_path
+
+
+def _entry_fill(exch_id: str) -> OrderEvent:
+    return OrderEvent(
+        order=ExchangeOrder(
+            id=exch_id, symbol="BTCUSDT", side="buy",
+            order_type=OrderType.MARKET, qty=1.0, filled_qty=1.0,
+            remaining_qty=0.0, price=None, stop_price=None,
+            average_fill_price=50_000.0, status=OrderStatus.FILLED,
+            timestamp=0.0, fee=0.0, fee_currency="",
+        ),
+        event_type='filled', fill_price=50_000.0, fill_qty=1.0,
+        timestamp=0.0, pine_id="L", leg_type=LegType.ENTRY,
+    )
+
+
+def __test_stop_waits_for_the_fill_before_the_teardown__(tmp_path):
+    """A stop right after a market dispatch ingests the fill that arrives
+    AFTER the stop, while the event stream and the trade output are still
+    open: the position and the trades CSV own what the venue executed."""
+    runner, it, trade_path = _stopped_after_entry_dispatch(tmp_path, 5.0)
+    engine = runner._order_sync_engine
+    assert engine is not None
+    exch_id = engine._order_mapping["L"][0]
+    late_fill = threading.Timer(0.05, engine.on_order_event, args=(_entry_fill(exch_id),))
+    late_fill.start()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            it.throw(KeyboardInterrupt)
+    finally:
+        late_fill.cancel()
+        late_fill.join()
+
+    assert runner.broker_stop_settled is True
+    assert not engine.awaiting_market_fills()
+    assert runner.script.position.size == pytest.approx(1.0)
+    assert [r[2] for r in _read_trade_rows(trade_path)][:1] == ["Entry long"]
+
+
+def __test_stop_gives_up_when_no_fill_arrives__(tmp_path):
+    """No fill within the wait: the stop reports it and the teardown proceeds."""
+    runner, it, _ = _stopped_after_entry_dispatch(tmp_path, 0.05)
+    with pytest.raises(KeyboardInterrupt):
+        it.throw(KeyboardInterrupt)
+    assert runner.broker_stop_settled is False
+
+
+def __test_stop_without_a_settle_wait_does_not_wait__(tmp_path):
+    """No wait asked for: the stop unwinds at once and reports nothing."""
+    runner, it, _ = _stopped_after_entry_dispatch(tmp_path, 0.0)
+    with pytest.raises(KeyboardInterrupt):
+        it.throw(KeyboardInterrupt)
+    assert runner.broker_stop_settled is None

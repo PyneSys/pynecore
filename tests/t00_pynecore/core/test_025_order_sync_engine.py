@@ -10417,6 +10417,32 @@ def __test_defensive_close_fill_matched_by_order_ref__(tmp_path):
         store.close()
 
 
+def __test_settle_in_flight_fills_waits_for_the_defensive_close_fill__(tmp_path):
+    """A stop right after a defensive close waits for that close's FILL.
+
+    The defensive close is dispatched outside ``_active_intents`` and lives
+    only as a pending marker; settling must still count it, or the stopped
+    run would report success while the close FILL is unrecorded.
+    """
+    store, ctx, engine, pos, b = _bracket_reject_scenario(tmp_path)
+    try:
+        assert "Long" in engine.pending_defensive_close
+        assert engine.awaiting_market_fills()
+        assert not engine.settle_in_flight_fills(0.05)
+
+        engine.on_order_event(_fill_event(
+            'sell', qty=1.0, price=50_000.0,
+            pine_id="__pyne_defensive_close__coid-entry",
+            leg=LegType.CLOSE,
+            xchg_id='xchg-2',
+        ))
+        assert engine.settle_in_flight_fills(5.0)
+        assert "Long" not in engine.pending_defensive_close
+        assert not engine.awaiting_market_fills()
+    finally:
+        store.close()
+
+
 def __test_defensive_close_fill_writes_audit_event__(tmp_path):
     """A defensive close FILL writes a ``'defensive_close_filled'`` audit event to the events table.
 

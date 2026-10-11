@@ -2234,13 +2234,16 @@ class OrderSyncEngine:
             except BrokerManualInterventionError as e:
                 self._record_halt(e)
                 raise
-            except Exception:
+            except Exception as exc:
+                # Any plugin error: the stream is the only push channel, so
+                # it is reopened rather than abandoned
                 delay = EVENT_STREAM_RESTART_BACKOFF_S[
                     min(attempt, len(EVENT_STREAM_RESTART_BACKOFF_S) - 1)]
                 attempt += 1
-                _log.exception(
-                    "watch_orders stream terminated with an error; "
-                    "reopening in %.0fs (attempt %d)", delay, attempt,
+                _log.error(
+                    "watch_orders stream terminated with an error (%s); "
+                    "reopening in %.0fs (attempt %d)", exc, delay, attempt,
+                    exc_info=exc,
                 )
                 # Retry pacing tick, bounded by the backoff schedule.
                 await asyncio.sleep(delay)
@@ -2343,7 +2346,15 @@ class OrderSyncEngine:
 
         A resting limit / stop entry is not counted: it may rest for hours, and
         its journal row already owns whatever it later fills into.
+
+        A defensive close after a bracket-attach reject is dispatched outside
+        :attr:`_active_intents` and lives only as a
+        :class:`PendingDefensiveClose` marker, so it counts while its FILL is
+        unobserved or legs of its fan are still outstanding.
         """
+        for marker in self._pending_defensive_close.values():
+            if not marker.fill_observed or self._is_defensive_close_fan_incomplete(marker):
+                return True
         for key, intent in self._active_intents.items():
             if isinstance(intent, EntryIntent):
                 if intent.order_type is not OrderType.MARKET:
@@ -2367,12 +2378,18 @@ class OrderSyncEngine:
         the bar-close entry). Events are drained as they arrive until no
         dispatched market order is waiting, or ``timeout_s`` runs out.
 
+        The fills arrive through :meth:`run_event_stream`, so this must run
+        while the stream is still open -- before the runner's teardown stops
+        it. Every drain goes through :meth:`apply_async_events`: a repeated
+        stop during the wait lands between two drains, never inside one.
+
         :param timeout_s: Upper bound of the wait, in seconds.
         :return: ``True`` when every dispatched market order has its fill.
+        :raises BrokerManualInterventionError: When the engine halted.
         """
         deadline = time.monotonic() + timeout_s
         events = self._event_queue
-        self._drain_events()
+        self.apply_async_events()
         while self.awaiting_market_fills():
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
@@ -2380,7 +2397,7 @@ class OrderSyncEngine:
             with events.not_empty:
                 if not events.queue:
                     events.not_empty.wait(remaining)
-            self._drain_events()
+            self.apply_async_events()
         return True
 
     @critical_section
@@ -3206,10 +3223,7 @@ class OrderSyncEngine:
         pine_id = event.pine_id
         if pine_id is not None and pine_id in self._pending_flip_surplus_closes:
             return pine_id
-        order = event.order
-        if order is None:
-            return None
-        event_coid = order.client_order_id
+        event_coid = event.order.client_order_id
         if event_coid is None:
             return None
         for close_key, pending in self._pending_flip_surplus_closes.items():
@@ -3262,7 +3276,7 @@ class OrderSyncEngine:
             # The whole correction is confirmed gone from the book: a later
             # cancel / reject echo for the same order must not halt the run.
             del self._pending_flip_surplus_closes[close_key]
-            fill_order_id = event.order.id if event.order is not None else None
+            fill_order_id = event.order.id
             # The marker was the duplicate-fill guard; it is gone now, so
             # hand its identities to the shared settled-close cache before
             # anything can redeliver this fill.
@@ -3326,8 +3340,6 @@ class OrderSyncEngine:
         if fill_id and fill_id not in pending.settled_fill_ids:
             pending.settled_fill_ids = pending.settled_fill_ids + (fill_id,)
         order = event.order
-        if order is None:
-            return
         if order.id and order.id not in pending.settled_leg_order_ids:
             pending.settled_leg_order_ids = (
                 pending.settled_leg_order_ids + (order.id,)
@@ -5083,7 +5095,9 @@ class OrderSyncEngine:
         legs_by_exit: dict[str, list[ExchangeOrder]] = {}
         orphans: list[tuple[ExchangeOrder, str | None]] = []
         strays: list[tuple[ExchangeOrder, str]] = []
-        owned_rows: dict[str, OrderRow] | None = None
+        # This run's live journal rows by venue and client order id, read on
+        # the first order that needs them
+        owned_rows = None
         for order in orders:
             if order.remaining_qty <= 0.0:
                 continue
@@ -5098,11 +5112,12 @@ class OrderSyncEngine:
             if self._store_ctx is None:
                 continue
             if owned_rows is None:
-                owned_rows = {}
+                rows: dict[str, OrderRow] = {}
                 for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
                     if row.exchange_order_id:
-                        owned_rows[row.exchange_order_id] = row
-                    owned_rows[row.client_order_id] = row
+                        rows[row.exchange_order_id] = row
+                    rows[row.client_order_id] = row
+                owned_rows = rows
             row = owned_rows.get(order.id) or owned_rows.get(order.client_order_id or '')
             if row is None or row.client_order_id in self._pending_verification:
                 # Another run's or the operator's order (not ours to judge),
@@ -5208,13 +5223,13 @@ class OrderSyncEngine:
         # Stop coverage is judged per exit, not in aggregate: under
         # pyramiding one parent can lose its stop leg while the others keep
         # theirs, and a position-wide ratio would call that protected.
-        unprotected = [
-            (key, intent) for key, intent in list(self._active_intents.items())
-            if isinstance(intent, ExitIntent) and intent.sl_price is not None
-            and self._parent_open_exposure(intent.from_entry)[0] > 0.0
-            and not any(leg.stop_price is not None
-                        for leg in legs_by_exit.get(key, []))
-        ]
+        unprotected: list[tuple[str, ExitIntent]] = []
+        for key, intent in list(self._active_intents.items()):
+            if (isinstance(intent, ExitIntent) and intent.sl_price is not None
+                    and self._parent_open_exposure(intent.from_entry)[0] > 0.0
+                    and not any(leg.stop_price is not None
+                                for leg in legs_by_exit.get(key, []))):
+                unprotected.append((key, intent))
         if held_abs <= 0.0 or not unprotected:
             return
         state = ('unprotected', tuple(sorted(key for key, _intent in unprotected)))
@@ -5656,25 +5671,24 @@ class OrderSyncEngine:
             # warning so the operator can intervene if the broker
             # ultimately fills the residual against an unprotected
             # position.
-            if event.order is not None:
-                _ct_key = self._find_key_for_order_id(event.order.id)
-                if (_ct_key is not None
-                        and _ct_key in self._cancel_disposition_pending):
-                    _blog_info(
-                        "cancel-tentative %r resolved by broker %s event",
-                        _ct_key, t,
-                    )
-                    self._clear_intent_cancel_disposition_pending(
+            _ct_key = self._find_key_for_order_id(event.order.id)
+            if (_ct_key is not None
+                    and _ct_key in self._cancel_disposition_pending):
+                _blog_info(
+                    "cancel-tentative %r resolved by broker %s event",
+                    _ct_key, t,
+                )
+                self._clear_intent_cancel_disposition_pending(
+                    _ct_key,
+                    outcome=CancelDispositionOutcome.ALREADY_FILLED,
+                    via='order_event',
+                    now_ms=self._cancel_tentative_now_ms(),
+                    is_partial_fill=(t == 'partial'),
+                )
+                if t == 'partial':
+                    self._cancel_residual_after_partial_resolution(
                         _ct_key,
-                        outcome=CancelDispositionOutcome.ALREADY_FILLED,
-                        via='order_event',
-                        now_ms=self._cancel_tentative_now_ms(),
-                        is_partial_fill=(t == 'partial'),
                     )
-                    if t == 'partial':
-                        self._cancel_residual_after_partial_resolution(
-                            _ct_key,
-                        )
             # Reset the per-event FIFO closure cache. Populated below only
             # when :meth:`BrokerPosition.record_fill` actually walks FIFO
             # for this event; consumed by
@@ -5709,7 +5723,7 @@ class OrderSyncEngine:
                     "order_id=%s) — already settled this session",
                     t,
                     event.pine_id,
-                    event.order.id if event.order is not None else None,
+                    event.order.id,
                 )
                 return
             # Late parent-ENTRY fill after no-FIFO defensive-close settle.
@@ -5731,7 +5745,7 @@ class OrderSyncEngine:
                     "the no-FIFO settle branch",
                     t,
                     event.pine_id,
-                    event.order.id if event.order is not None else None,
+                    event.order.id,
                 )
                 return
             # General duplicate-fill gate. The two guards above only cover
@@ -5753,7 +5767,7 @@ class OrderSyncEngine:
                     t,
                     event.fill_id,
                     event.pine_id,
-                    event.order.id if event.order is not None else None,
+                    event.order.id,
                 )
                 return
             # Late close leg of an entry the external-flatten clear already
@@ -5857,7 +5871,7 @@ class OrderSyncEngine:
                             "(pine=%r, order_id=%s) — marker stays armed, "
                             "the fan applied %s of %s so far",
                             event.pine_id,
-                            event.order.id if event.order is not None else None,
+                            event.order.id,
                             no_fifo_marker.applied_close_qty,
                             no_fifo_marker.expected_close_qty,
                         )
@@ -5886,7 +5900,7 @@ class OrderSyncEngine:
                         "(pine=%r, order_id=%s, size=%s) — settling re-armed "
                         "marker without applying to BrokerPosition",
                         event.pine_id,
-                        event.order.id if event.order is not None else None,
+                        event.order.id,
                         self._position.size,
                     )
                     # Adopted-position state: the defensive close reduces the
@@ -5907,10 +5921,7 @@ class OrderSyncEngine:
                     # keeps a single-shot fill correct on plugins that
                     # populate only the final aggregate.
                     if self._position.size != 0.0:
-                        if event.order is None:
-                            order_side = None
-                        else:
-                            order_side = event.order.side
+                        order_side = event.order.side
                         fill_qty = event.fill_qty or 0.0
                         # ``True`` when this terminal 'filled' was
                         # preceded by one or more ``partial`` events in
@@ -5949,18 +5960,6 @@ class OrderSyncEngine:
                                 if remaining < 0.0:
                                     remaining = 0.0
                                 fill_qty = remaining
-                                if order_side is None:
-                                    # Buy-close shrinks long; sell-close
-                                    # shrinks short — map from position
-                                    # side to the order side that closes
-                                    # it.
-                                    pos_side = (
-                                        marker.reject_context.position_side
-                                    )
-                                    if pos_side == "buy":
-                                        order_side = "sell"
-                                    elif pos_side == "sell":
-                                        order_side = "buy"
                         if fill_qty > 0.0 and order_side in ("buy", "sell"):
                             signed_delta = (
                                 fill_qty if order_side == "buy"
@@ -6047,7 +6046,7 @@ class OrderSyncEngine:
                         "defensive-close partial fill with zero qty ignored "
                         "(pine=%r, order_id=%s) — position size NOT updated",
                         event.pine_id,
-                        event.order.id if event.order is not None else None,
+                        event.order.id,
                     )
                     return
                 # Only apply the signed close delta when the in-memory
@@ -6072,7 +6071,7 @@ class OrderSyncEngine:
                 # :attr:`_position` carrying the un-applied partial qty
                 # while the broker is flat.
                 matched_id = self._match_pending_defensive_close(event)
-                if self._position.size != 0.0 and event.order is not None:
+                if self._position.size != 0.0:
                     signed_delta = (fill_qty if event.order.side == "buy"
                                     else -fill_qty)
                     self._position.size += signed_delta
@@ -6154,7 +6153,7 @@ class OrderSyncEngine:
                     "state (pine=%r, order_id=%s, fill_qty=%s, size=%s) — "
                     "marker stays armed until final 'filled' event",
                     event.pine_id,
-                    event.order.id if event.order is not None else None,
+                    event.order.id,
                     fill_qty,
                     self._position.size,
                 )
@@ -6265,8 +6264,7 @@ class OrderSyncEngine:
                                 "slice NOT booked, marker stays armed for "
                                 "reconcile",
                                 event.pine_id,
-                                event.order.id
-                                if event.order is not None else None,
+                                event.order.id,
                                 fill_qty_value,
                             )
             # Snapshot the FIFO frontier BEFORE :meth:`record_fill` walks
@@ -6344,9 +6342,7 @@ class OrderSyncEngine:
             # fallback pair :meth:`_cleanup_closed_position` resolves on. The
             # keyed ``CloseIntent`` slot is keyed by that entry id.
             close_key = event.from_entry or event.pine_id
-            if (close_key is None
-                    and event.leg_type == LegType.CLOSE
-                    and event.order is not None):
+            if close_key is None and event.leg_type == LegType.CLOSE:
                 # A ``strategy.close_all`` fill carries no entry id in either
                 # field. Attribute it to the in-flight close_all slot (empty
                 # intent key) iff the venue order id belongs to that dispatch
@@ -6429,10 +6425,7 @@ class OrderSyncEngine:
                 # still-working qty and pass an oversell. ``record_fill`` above
                 # has already applied the fill to ``_position.size`` (real
                 # inventory moved); we only suppress the spurious ledger credit.
-                is_retired_fill = (
-                    event.order is not None
-                    and event.order.id in self._retired_entry_order_ids
-                )
+                is_retired_fill = event.order.id in self._retired_entry_order_ids
                 if isinstance(active_entry, EntryIntent) and not is_retired_fill:
                     fill_qty_value = event.fill_qty or 0.0
                     if fill_qty_value > 0.0:
@@ -6626,7 +6619,7 @@ class OrderSyncEngine:
                         "(pine=%r, order_id=%s, qty=%s, price=%s) — marker "
                         "stays armed for stale-grace resolution",
                         event.pine_id,
-                        event.order.id if event.order is not None else None,
+                        event.order.id,
                         fill_qty_value, fill_price_value,
                     )
                 else:
@@ -6763,10 +6756,7 @@ class OrderSyncEngine:
                 if self._store_ctx is not None:
                     self._store_ctx.log_event(
                         'venue_driven_cancel',
-                        client_order_id=(
-                            event.order.client_order_id
-                            if event.order is not None else None
-                        ),
+                        client_order_id=event.order.client_order_id,
                         intent_key=key,
                         payload={'cancel_reason': event.cancel_reason},
                     )
@@ -6790,10 +6780,7 @@ class OrderSyncEngine:
                 if self._store_ctx is not None:
                     self._store_ctx.log_event(
                         'oca_sibling_cancel',
-                        client_order_id=(
-                            event.order.client_order_id
-                            if event.order is not None else None
-                        ),
+                        client_order_id=event.order.client_order_id,
                         intent_key=key,
                     )
                 return
@@ -6820,10 +6807,7 @@ class OrderSyncEngine:
                     if self._store_ctx is not None:
                         self._store_ctx.log_event(
                             'cancel_after_full_fill_ignored',
-                            client_order_id=(
-                                event.order.client_order_id
-                                if event.order is not None else None
-                            ),
+                            client_order_id=event.order.client_order_id,
                             intent_key=key,
                         )
                     return
@@ -7315,7 +7299,7 @@ class OrderSyncEngine:
         sync re-diffs it fresh (mirrors the last-leg branch of
         :meth:`_handle_expected_native_cancel_all`).
         """
-        order_id = event.order.id if event.order is not None else None
+        order_id = event.order.id
         remaining = [
             oid for oid in self._order_mapping.get(key, []) if oid != order_id
         ]
@@ -7363,10 +7347,7 @@ class OrderSyncEngine:
             if self._store_ctx is not None:
                 self._store_ctx.log_event(
                     'expected_bracket_close_cancel',
-                    client_order_id=(
-                        event.order.client_order_id
-                        if event.order is not None else None
-                    ),
+                    client_order_id=event.order.client_order_id,
                     intent_key=key,
                 )
             return
@@ -7386,10 +7367,7 @@ class OrderSyncEngine:
         if self._store_ctx is not None:
             self._store_ctx.log_event(
                 'expected_bracket_close_cancel',
-                client_order_id=(
-                    event.order.client_order_id
-                    if event.order is not None else None
-                ),
+                client_order_id=event.order.client_order_id,
                 intent_key=key,
             )
 
@@ -8438,9 +8416,9 @@ class OrderSyncEngine:
         # completes a fan whose grid-snapped fills legitimately total less
         # than the Pine-unit plan (see
         # :meth:`_is_defensive_close_fan_incomplete`).
-        books_new_leg = applied_now > 0.0 and (
-            event.order is None
-            or event.order.id not in marker.settled_leg_order_ids
+        books_new_leg = (
+            applied_now > 0.0
+            and event.order.id not in marker.settled_leg_order_ids
         )
         fan_incomplete = self._is_defensive_close_fan_incomplete(
             marker,
@@ -8480,7 +8458,6 @@ class OrderSyncEngine:
         # :attr:`_settled_defensive_close_order_refs` from it.
         settled_leg_order_ids = marker.settled_leg_order_ids
         if (expected_close_qty is not None
-                and event.order is not None
                 and event.order.id not in settled_leg_order_ids):
             settled_leg_order_ids = settled_leg_order_ids + (event.order.id,)
         # Persist ``fill_observed=True`` on the marker BEFORE attempting
@@ -8537,7 +8514,7 @@ class OrderSyncEngine:
             # this field so the duplicate is filtered out before any
             # state mutation.
             observed_fill_order_id = (
-                event.order.id if event.order is not None else None
+                event.order.id
             )
             # Snapshot the FIFO-closed entry ids captured in
             # :meth:`_route_event` before ``record_fill`` walked
@@ -8640,7 +8617,7 @@ class OrderSyncEngine:
             # :meth:`_is_duplicate_defensive_close_fill` before it
             # reaches :meth:`record_fill`.
             fill_order_id = (
-                event.order.id if event.order is not None else None
+                event.order.id
             )
             audit_exchange_order_id = (
                 marker.close_order_ref
@@ -8964,11 +8941,10 @@ class OrderSyncEngine:
                 self._settled_defensive_close_parent_coids.add(
                     marker.close_client_order_id,
                 )
-        if event.order is not None:
-            self._settled_defensive_close_order_refs.add(event.order.id)
-            event_coid = event.order.client_order_id
-            if event_coid is not None:
-                self._settled_defensive_close_client_order_ids.add(event_coid)
+        self._settled_defensive_close_order_refs.add(event.order.id)
+        event_coid = event.order.client_order_id
+        if event_coid is not None:
+            self._settled_defensive_close_client_order_ids.add(event_coid)
 
     def _cleanup_closed_position(self, event: OrderEvent) -> None:
         """Drop tracking for an entry fully closed by a TP/SL/CLOSE fill.
@@ -10684,12 +10660,9 @@ class OrderSyncEngine:
         feed the §2.6.5 trail coalesce window. Genuine state transitions
         bypass the throttle.
         """
-        parent_ref = leg.parent_entry_dispatch_ref
-        if parent_ref is None:
-            return
         trigger_kind = 'trail' if old_state == new_state else 'lifecycle'
         self._recompute_native_failsafe_for_parent(
-            parent_ref, trigger_kind=trigger_kind,
+            leg.parent_entry_dispatch_ref, trigger_kind=trigger_kind,
         )
 
     def _recompute_native_failsafe_for_parent(
@@ -12859,8 +12832,6 @@ class OrderSyncEngine:
             native_by_from_entry: dict[str, ExitIntent] = {}
             for cand in new_map.values():
                 if not isinstance(cand, ExitIntent):
-                    continue
-                if cand.from_entry is None:
                     continue
                 if cand.is_partial_qty_bracket:
                     partials_by_from_entry.setdefault(
@@ -18167,8 +18138,6 @@ class OrderSyncEngine:
                 settled_position_coid = (
                     marker.reject_context.position_coid
                 )
-                if settled_position_coid is None:
-                    continue
                 settled_row = self._store_ctx.get_order(
                     settled_position_coid,
                 )

@@ -1724,6 +1724,7 @@ def run(
                                           broker_plugin=broker_plugin,
                                           broker_event_loop=broker_event_loop,
                                           broker_store_ctx=broker_store_ctx,
+                                          broker_stop_settle_s=_STOP_FILL_SETTLE_S,
                                           log_ohlcv=live and not no_log_ohlcv,
                                           chart_provider_name=chart_provider_name,
                                           chart_provider_instance=chart_provider_instance,
@@ -1958,12 +1959,14 @@ def run(
                         progress.stop()
                         stop_reason = "interrupted"
                         broker_warning("live streaming stopped (interrupted)")
-                        if not runner.settle_broker_in_flight(_STOP_FILL_SETTLE_S):
+                        # The runner waited for the fills before its teardown
+                        # stopped the event stream (see ``broker_stop_settle_s``)
+                        if runner.broker_stop_settled is False:
+                            # Timed out, or cut short by a repeated stop
                             broker_warning(
                                 "stopped with a dispatched market order still "
-                                "waiting for its fill after %.0fs; the next run "
-                                "reconciles it from the venue",
-                                _STOP_FILL_SETTLE_S,
+                                "waiting for its fill; the next run reconciles "
+                                "it from the venue",
                             )
                     except BrokerManualInterventionError:
                         # The ``[BROKER] ERROR sync engine halted by …`` line
