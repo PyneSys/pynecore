@@ -298,8 +298,12 @@ Converts a value to its string representation.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| value | any | The value to convert (float, int, bool, or string) |
-| fmt | str \| Format | Number format string, default `"#.##########"` |
+| value | any | The value to convert (float, int, bool, string, array or matrix) |
+| format | str \| Format \| None | Number format string or `format.*` constant; `None` (default) prints up to ten decimals |
+
+Without a format, a number prints with up to ten decimals, and in exponential notation outside
+`(1e-21, 1e21)` (`"1E21"`). A result that rounds to zero carries no sign. An array prints as
+`[a, b]` and a matrix as one such line per row, every element formatted with the same format.
 
 **Returns:** `str`
 
@@ -308,6 +312,7 @@ Converts a value to its string representation.
 str_val: str = str.tostring(123.45)              # "123.45"
 str_fmt: str = str.tostring(123.45, "#.##")      # "123.45"
 bool_str: str = str.tostring(True)               # "true"
+arr_str: str = str.tostring(array.from_items(1.0, 2.5))  # "[1, 2.5]"
 ```
 
 ### trim()

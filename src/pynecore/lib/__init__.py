@@ -22,6 +22,7 @@ from ..core.module_property import module_property, module_function_property
 from ..core.series import SeriesImpl as _SeriesImpl
 from ..core.script import script, input
 
+from ..types.color import Color as _Color
 from ..types.na import NA, na_int
 from ..types import Series, PyneInt
 from ..types.pine_types import pine_int
@@ -991,22 +992,28 @@ def nz(source: NA[_T] | _T) -> _T: ...
 def nz(source: NA[_T] | _T, replacement: _T) -> _T: ...
 
 
-def nz(source: Any, replacement: Any = 0) -> Any:
+def nz(source: Any, replacement: Any = 0.0) -> Any:
     """
-    Replace NA values with a replacement value or 0 if not specified
+    Replace NA values with a replacement value or zero if not specified
 
     Uses the na() predicate semantics for floats: inf/-inf/nan are all na, so
-    ``nz(inf, -5)`` is ``-5``.
+    ``nz(inf, -5)`` is ``-5``. Without a replacement a number becomes 0, a bool
+    false and a color transparent black (TV: ``nz(color(na))`` has r, g, b 0 and
+    t 100).
 
     :param source: The source value
-    :param replacement: The replacement value, default is 0
+    :param replacement: The replacement value, default is zero of the source's type
     :return: The source value if it is not NA, otherwise the replacement value
     """
     if isinstance(source, float):
         return source if _math.isfinite(source) else replacement
     if isinstance(source, NA):
         # nz on a bool answers a bool (TV: ``nz(na_bool)`` is false)
-        return bool(replacement) if source.type is bool else replacement
+        if source.type is bool:
+            return bool(replacement)
+        if source.type is _Color and type(replacement) is float:
+            return _Color('#00000000')
+        return replacement
     return source
 
 

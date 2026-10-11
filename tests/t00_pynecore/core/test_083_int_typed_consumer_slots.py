@@ -35,9 +35,11 @@ NORMALIZERS = {"int", "_native_int_or", "_trade_index", "_na_size", "_coord"}
 # module, not an argument any script can reach. ``decimals`` is the number of
 # fraction places a format mask spells out -- ``len()`` of a pattern slice,
 # capped at 16 inside the module -- never an argument of a script-callable.
+# ``size`` is a mask's grouping size, likewise a ``len()`` of a pattern slice.
 ALLOWED = {
     ("strategy/__init__.py", "_settle_close_pass_trades", "closed_before"),
     ("string.py", "_round_digits_fast", "decimals"),
+    ("string.py", "_group_digits", "size"),
 }
 
 

@@ -70,5 +70,5 @@ def __test_finite_values_untouched__(log):
 
     syminfo.mintick = 0.01
     assert _format_number(1234.5678, fmt_type=_format.mintick) == '1234.57'
-    assert _format_number(0.25, fmt_type=_format.percent) == '25%'
+    assert _format_number(0.25, fmt_type=_format.percent) == '0.25%'
     assert _format_number(-3.5, precision='+#.##;-#.##') == '-3.5'

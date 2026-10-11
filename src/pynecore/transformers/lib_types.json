@@ -4772,7 +4772,7 @@
   },
   "nz": {
    "default_ty": [
-    "i"
+    "f"
    ],
    "defaults": 1,
    "kind": "function",
@@ -7114,8 +7114,11 @@
    "ret": "f"
   },
   "string.tostring": {
+   "default_none_ok": [
+    true
+   ],
    "default_ty": [
-    "s"
+    "0"
    ],
    "defaults": 1,
    "kind": "function",
@@ -9408,6 +9411,7 @@
   "lib.strategy.position_entry_name": "skip",
   "lib.strategy.position_size": "skip",
   "lib.strategy.wintrades": "skip",
+  "lib.string._copysign": "skip",
   "lib.string.isinf": "skip",
   "lib.string.localcontext": "skip",
   "lib.ta._linreg_fit": "direct",

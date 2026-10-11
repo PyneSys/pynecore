@@ -2762,6 +2762,9 @@
     "PyneStr": {
       "type": "variable"
     },
+    "ROUND_DOWN": {
+      "type": "variable"
+    },
     "ROUND_HALF_EVEN": {
       "type": "variable"
     },

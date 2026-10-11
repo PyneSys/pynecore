@@ -22,3 +22,20 @@ def __test_time__(csv_reader, runner, dict_comparator, log):
             dict_comparator(_plot, candle.extra_fields)
             if i > 300:
                 break
+
+
+def __test_nz_default_by_type__():
+    """ one-argument nz answers the zero of the source's type """
+    # Measured on TradingView: color.r/g/b of nz(color(na)) are 0, color.t is 100
+    from pynecore.lib import color
+    from pynecore.types.color import Color
+    from pynecore.types.na import NA
+
+    zero = nz(float('nan'))
+    assert zero == 0.0 and type(zero) is float
+    assert nz(NA(bool)) is False
+    transparent = nz(NA(Color))
+    assert isinstance(transparent, Color)
+    assert (color.r(transparent), color.g(transparent), color.b(transparent),
+            color.t(transparent)) == (0, 0, 0, 100)
+    assert nz(NA(Color), color.red) is color.red

@@ -34,8 +34,8 @@ def main():
 | Constant          | Type     | Description                                                                                                  |
 |-------------------|----------|--------------------------------------------------------------------------------------------------------------|
 | `format.inherit`  | `Format` | Inherits the display format from the parent series. Use with `script.indicator()`.                           |
-| `format.mintick`  | `Format` | Rounds a number to the nearest mintick value when passed to `str.tostring()`.                                |
-| `format.percent`  | `Format` | Formats output values as a percentage (appends `%`). Use with `script.indicator()`.                          |
+| `format.mintick`  | `Format` | Rounds to whole ticks and prints the tick's decimals in `str.tostring()` (`1.1` → `1.10000`).                |
+| `format.percent`  | `Format` | Formats output values as a percentage; `str.tostring()` prints two decimals and `%` (`0.5` → `0.50%`).       |
 | `format.price`    | `Format` | Formats output values as prices. Use with `script.indicator()`.                                              |
 | `format.volume`   | `Format` | Formats output values as volume (e.g., `5183` → `5.183K`). Use with `script.indicator()`.                   |
 

@@ -88,13 +88,48 @@ def __test_fast_path_matches_general_for_str_format__(mask: str):
     (0.375, '{0,number,#.##}', '0.38'),
     (2.5, '{0,number,#}', '2'),
     (3.5, '{0,number,#}', '4'),
-    (1234.5678, '{0}', '1234.568'),
+    (1234.5678, '{0}', '1,234.568'),
     (0.5, '{0,number,#.0}', '.5'),
     (7.0, '{0,number,0.00}', '7.00'),
 ])
 def __test_str_format_literal_expectations__(value: float, pattern: str, expected: str):
     """exact ties go to even and inexact ones follow the double's true value"""
     assert pine_format(pattern, value) == expected
+
+
+@pytest.mark.parametrize("pattern,expected", [
+    ('{0,number,000}', '-000'),
+    ('{0,number,+0;-0}', '-0'),
+    ('{0,number,0;(0)}', '(0)'),
+    ('{0,number,$#.00}', '-$.00'),
+    ('{0,number,integer}', '-0'),
+])
+def __test_str_format_negative_zero_takes_the_negative_prefix__(pattern: str, expected: str):
+    """-0.0 is negative to DecimalFormat: its sign lives in the prefix, never among the digits"""
+    assert pine_format(pattern, -0.0) == expected
+
+
+@pytest.mark.parametrize("tick,value,expected", [
+    # Just below half a tick: rounding must not happen in a '+ 0.5' addition
+    (1.0, 0.49999999999999994, '0'),
+    (1.0, -0.49999999999999994, '0'),
+    (1.0, 0.5, '1'),
+    (1.0, -0.5, '-1'),
+    # An odd count above 2**52 is already whole and stays put
+    (1.0, 4503599627370497.0, '4503599627370497'),
+    # A quotient that overflows to infinity saturates like a long
+    (0.00001, 1e308, '92233720368547.77000'),
+    (0.00001, -1e308, '-92233720368547.77000'),
+])
+def __test_mintick_tick_count_edges__(tick: float, value: float, expected: str):
+    """the tick count rounds half away from zero exactly and saturates on overflow"""
+    saved = syminfo.mintick
+    syminfo.mintick = tick
+    try:
+        assert _format_number(value, fmt_type=_format.mintick) == expected
+        assert _format_number_general(value, fmt_type=_format.mintick) == expected
+    finally:
+        syminfo.mintick = saved
 
 
 @pytest.mark.parametrize("tick", __test_helper_MINTICKS)
@@ -117,7 +152,7 @@ def __test_mintick_follows_the_current_symbol__():
         syminfo.mintick = 0.01
         assert _format_number(1234.5678, fmt_type=_format.mintick) == '1234.57'
         syminfo.mintick = 0.00001
-        assert _format_number(1234.5678, fmt_type=_format.mintick) == '1234.5678'
+        assert _format_number(1234.5678, fmt_type=_format.mintick) == '1234.56780'
         syminfo.mintick = 1.0
         assert _format_number(1234.5678, fmt_type=_format.mintick) == '1235'
     finally:
@@ -154,8 +189,8 @@ def __test_native_float_dispatch__():
     (1200.0, '#.##########', '1200'),
     (0.5, '#.0', '.5'),
     (0.5, '#.#', '0.5'),
-    (-0.0, '#.##', '-0'),
-    (-0.001, '#.##', '-0'),
+    (-0.0, '#.##', '0'),
+    (-0.001, '#.##', '0'),
     (5.0, '0.00####', '5'),
     (-3.5, '+#.##;-#.##', '-3.5'),
     (-3.5, '#.##;(#.##)', '(3.5)'),

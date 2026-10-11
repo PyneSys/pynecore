@@ -119,18 +119,36 @@ def color_str(c: Any) -> str | None:
     return f'#{c.value:08X}'
 
 
-def _coord(x: Any) -> Any:
-    """Drawing coordinate: NA -> ``None``, everything else unchanged."""
-    return None if isinstance(x, NA) else x
+# Every numeric field is written in the spelling of its Pine type, whatever Python class the
+# value has at run time: a Pine int field as an integer (``2``), a Pine float field as a float
+# (``100.0``). A Pine int is a double at run time and a literal stays a Python int, so without
+# this the same field would print as ``2`` or ``2.0`` depending on where the value came from.
+
+def _int_field(v: Any) -> Any:
+    """Pine int field: NA -> ``None``, an integral double -> ``int``, else unchanged."""
+    if v is None or isinstance(v, NA):
+        return None
+    if type(v) is float and v.is_integer():
+        return int(v)
+    return v
+
+
+def _float_field(v: Any) -> Any:
+    """Pine float field: NA -> ``None``, a number -> ``float``, else unchanged."""
+    if v is None or isinstance(v, NA):
+        return None
+    if type(v) is int:
+        return float(v)
+    return v
 
 
 def _size_val(v: Any) -> Any:
-    """Cell/text size: a ``Size`` constant -> its name, an int -> the int."""
+    """Cell/text size: a ``Size`` constant -> its name, a number -> an int."""
     if v is None:
         return None
     if isinstance(v, str):
         return enum_name(v, SIZE, str(v))
-    return v
+    return _int_field(v)
 
 
 def json_default(o: Any) -> Any:
@@ -183,22 +201,22 @@ def serialize_meta(meta: Any) -> dict:
     if not meta.editable:
         d["editable"] = False
     if meta.offset:
-        d["offset"] = meta.offset
+        d["offset"] = _int_field(meta.offset)
     if meta.show_last is not None:
-        d["show_last"] = meta.show_last
+        d["show_last"] = _int_field(meta.show_last)
     if meta.format is not None:
         d["format"] = meta.format
     if meta.precision is not None:
-        d["precision"] = meta.precision
+        d["precision"] = _int_field(meta.precision)
 
     if k == 'plot':
         d["style"] = enum_name(meta.style, PLOT_STYLE, "line")
         d["color"] = color_str(meta.color)
-        d["linewidth"] = meta.linewidth
+        d["linewidth"] = _int_field(meta.linewidth)
         if meta.trackprice:
             d["trackprice"] = True
         if meta.histbase:
-            d["histbase"] = meta.histbase
+            d["histbase"] = _float_field(meta.histbase)
         if meta.join:
             d["join"] = True
     elif k == 'shape':
@@ -221,9 +239,9 @@ def serialize_meta(meta: Any) -> dict:
         d["colorup"] = color_str(meta.colorup)
         d["colordown"] = color_str(meta.colordown)
         if meta.minheight is not None:
-            d["minheight"] = meta.minheight
+            d["minheight"] = _int_field(meta.minheight)
         if meta.maxheight is not None:
-            d["maxheight"] = meta.maxheight
+            d["maxheight"] = _int_field(meta.maxheight)
     elif k == 'candle':
         d["color"] = color_str(meta.color)
         d["wickcolor"] = color_str(meta.wickcolor)
@@ -231,9 +249,9 @@ def serialize_meta(meta: Any) -> dict:
     elif k == 'bar':
         d["color"] = color_str(meta.color)
     elif k == 'hline':
-        d["price"] = meta.price
+        d["price"] = _float_field(meta.price)
         d["color"] = color_str(meta.color)
-        d["linewidth"] = meta.linewidth
+        d["linewidth"] = _int_field(meta.linewidth)
         d["linestyle"] = enum_name(meta.linestyle, HLINE_LINESTYLE, "solid")
     elif k == 'fill':
         d["color"] = color_str(meta.color)
@@ -274,13 +292,13 @@ def collect_meta_changes(cursor: int = 0) -> tuple[int, list[dict[str, Any]]]:
 def _line_dict(l: Any) -> dict:
     return {
         "id": l.vid,
-        "x1": _coord(l.x1), "y1": _coord(l.y1),
-        "x2": _coord(l.x2), "y2": _coord(l.y2),
+        "x1": _int_field(l.x1), "y1": _float_field(l.y1),
+        "x2": _int_field(l.x2), "y2": _float_field(l.y2),
         "xloc": enum_name(l.xloc, XLOC),
         "extend": enum_name(l.extend, EXTEND),
         "color": color_str(l.color),
         "style": enum_name(l.style, LINE_STYLE),
-        "width": l.width,
+        "width": _int_field(l.width),
         "force_overlay": l.force_overlay,
     }
 
@@ -288,7 +306,7 @@ def _line_dict(l: Any) -> dict:
 def _label_dict(la: Any) -> dict:
     return {
         "id": la.vid,
-        "x": _coord(la.x), "y": _coord(la.y),
+        "x": _int_field(la.x), "y": _float_field(la.y),
         "text": la.text,
         "xloc": enum_name(la.xloc, XLOC),
         "yloc": enum_name(la.yloc, YLOC),
@@ -307,10 +325,10 @@ def _label_dict(la: Any) -> dict:
 def _box_dict(b: Any) -> dict:
     return {
         "id": b.vid,
-        "left": _coord(b.left), "top": _coord(b.top),
-        "right": _coord(b.right), "bottom": _coord(b.bottom),
+        "left": _int_field(b.left), "top": _float_field(b.top),
+        "right": _int_field(b.right), "bottom": _float_field(b.bottom),
         "border_color": color_str(b.border_color),
-        "border_width": b.border_width,
+        "border_width": _int_field(b.border_width),
         "border_style": enum_name(b.border_style, LINE_STYLE),
         "extend": enum_name(b.extend, EXTEND),
         "xloc": enum_name(b.xloc, XLOC),
@@ -329,10 +347,10 @@ def _box_dict(b: Any) -> dict:
 
 def _cell_dict(col: int, row: int, cell: Any) -> dict:
     d = {
-        "col": col, "row": row,
+        "col": _int_field(col), "row": _int_field(row),
         "text": cell.text,
-        "width": cell.width,
-        "height": cell.height,
+        "width": _float_field(cell.width),
+        "height": _float_field(cell.height),
         "text_color": color_str(cell.text_color),
         "text_halign": enum_name(cell.text_halign, ALIGN),
         "text_valign": enum_name(cell.text_valign, ALIGN),
@@ -345,8 +363,8 @@ def _cell_dict(col: int, row: int, cell: Any) -> dict:
     if cell.is_merged:
         # [start_col, start_row, end_col, end_row] of the merged range; the range's
         # top-left cell renders, the others are hidden by it.
-        d["merge"] = [cell.merge_start_col, cell.merge_start_row,
-                      cell.merge_end_col, cell.merge_end_row]
+        d["merge"] = [_int_field(cell.merge_start_col), _int_field(cell.merge_start_row),
+                      _int_field(cell.merge_end_col), _int_field(cell.merge_end_row)]
     return d
 
 
@@ -354,20 +372,20 @@ def _table_dict(t: Any) -> dict:
     return {
         "id": t.vid,
         "position": enum_name(t.position, POSITION),
-        "columns": t.columns,
-        "rows": t.rows,
+        "columns": _int_field(t.columns),
+        "rows": _int_field(t.rows),
         "bgcolor": color_str(t.bgcolor),
         "frame_color": color_str(t.frame_color),
-        "frame_width": t.frame_width,
+        "frame_width": _int_field(t.frame_width),
         "border_color": color_str(t.border_color),
-        "border_width": t.border_width,
+        "border_width": _int_field(t.border_width),
         "force_overlay": t.force_overlay,
         "cells": [_cell_dict(col, row, cell) for (col, row), cell in t.cells.items()],
     }
 
 
 def _point_dict(p: Any) -> dict:
-    return {"index": _coord(p.index), "time": _coord(p.time), "price": _coord(p.price)}
+    return {"index": _int_field(p.index), "time": _int_field(p.time), "price": _float_field(p.price)}
 
 
 def _polyline_dict(p: Any) -> dict:
@@ -380,7 +398,7 @@ def _polyline_dict(p: Any) -> dict:
         "line_color": color_str(p.line_color),
         "fill_color": color_str(p.fill_color),
         "line_style": enum_name(p.line_style, LINE_STYLE),
-        "line_width": p.line_width,
+        "line_width": _int_field(p.line_width),
         "force_overlay": p.force_overlay,
     }
 
@@ -580,7 +598,7 @@ class VizWriter:
 
         rec: dict[str, Any] = {"t": "bar", "i": bar_index, "time": time_ms}
         if values:
-            rec["v"] = dict(values)
+            rec["v"] = {k: _float_field(v) for k, v in values.items()}
         c: dict[str, Any] = {}
         for cid, val in dyn.items():
             enc = _encode_color_channel(val)
