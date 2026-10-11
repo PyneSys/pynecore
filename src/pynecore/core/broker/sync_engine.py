@@ -15427,6 +15427,14 @@ class OrderSyncEngine:
             # noinspection PyBroadException
             try:
                 self._dispatch_cancel(old)
+            except (ExchangeConnectionError, OrderDispositionUnknownError) as e:
+                # A venue outage is an expected, handled condition here; its
+                # traceback would only alarm the operator.
+                _blog_warning(
+                    "reversal pre-clear: cancel of closing leg %s did not "
+                    "complete (%s); harmless for the reduce-only close — "
+                    "reconcile will re-drive", format_intent_key(key), e,
+                )
             except Exception:
                 _log.exception(
                     "reversal pre-clear: cancel of closing leg %s failed; "
@@ -16685,11 +16693,28 @@ class OrderSyncEngine:
                 },
             ) from e
         except Exception as e:
-            _blog_error(
-                "dispatch failed for %s: %s: %s",
-                intent, type(e).__name__, e,
-            )
+            self._log_dispatch_failure(intent, e)
             raise
+
+    @staticmethod
+    def _log_dispatch_failure(intent: Intent, exc: Exception) -> None:
+        """Log a dispatch that raised outside the dedicated recovery branches.
+
+        A transport loss is a WARNING: nothing was booked and the sync loop
+        retries the whole diff on the next pass, so an ERROR would flag a
+        self-healing outage as a failure (measured: cTrader cycle 249, a wire
+        stall; the close dispatched cleanly one bar later).
+        """
+        if isinstance(exc, ExchangeConnectionError):
+            _blog_warning(
+                "dispatch of %s interrupted by a connection loss (%s); "
+                "retried on the next sync", intent, exc,
+            )
+            return
+        _blog_error(
+            "dispatch failed for %s: %s: %s",
+            intent, type(exc).__name__, exc,
+        )
 
     def _parent_open_exposure(self, from_entry: str | None) -> tuple[float, float]:
         """Return ``(qty, sign)`` of the open trades booked under ``from_entry``.

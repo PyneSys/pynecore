@@ -890,6 +890,62 @@ def __test_market_reversal_dispatches_the_close_leg_and_parks_the_entry__():
     assert "S" not in engine._rejected_entry_intents
 
 
+def __test_reversal_pre_clear_outage_is_a_warning_without_traceback__(caplog):
+    """A venue outage during the reversal pre-clear is handled, not a crash.
+
+    The cancel of the consumed parent's exit is best-effort; when the venue
+    is unreachable the sweep must log one plain WARNING and still dispatch
+    the reversal close. A traceback for this handled condition (measured:
+    cTrader cycle 249, a chaos wire stall) only alarms the operator.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+    b.raise_on_next_cancel = ExchangeConnectionError("connection lost")
+
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    with caplog.at_level(logging.WARNING):
+        engine.sync(BAR_TS + 60_000)
+
+    pre_clear = [
+        rec for rec in caplog.records
+        if "reversal pre-clear: cancel of closing leg" in rec.getMessage()
+    ]
+    assert len(pre_clear) == 1
+    assert pre_clear[0].levelno == logging.WARNING
+    assert pre_clear[0].exc_info is None, "handled outage logged a traceback"
+    assert len(b.close_calls) == 1, "reversal close withheld by the outage"
+
+
+def __test_dispatch_connection_loss_is_a_warning_and_retried__(caplog):
+    """A transport loss mid-dispatch self-heals on the next sync: no ERROR."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    b.raise_on_next_exit = ExchangeConnectionError("connection lost")
+    n_exits = len(b.exit_calls)
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(ExchangeConnectionError):
+            engine.sync(BAR_TS + 60_000)
+    dispatch_lines = [
+        rec for rec in caplog.records
+        if "L-X" in rec.getMessage() and "connection" in rec.getMessage()
+    ]
+    assert dispatch_lines and all(
+        rec.levelno == logging.WARNING for rec in dispatch_lines
+    ), "a self-healing connection loss was logged as an error"
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.ERROR]
+
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.exit_calls) > n_exits, "the interrupted exit was not retried"
+    assert f"L-X{INTENT_KEY_SEP}L" in engine.active_intents
+
+
 def __test_parked_reversal_entry_opens_when_the_close_settles_flat__():
     """The close leg's fill flattens the book and opens the raw entry."""
     b = MockBroker()
