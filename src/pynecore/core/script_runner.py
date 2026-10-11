@@ -2170,6 +2170,8 @@ class ScriptRunner:
         sec_states = None
         sec_sync_block = None
         sec_result_blocks = None
+        sec_result_locks = None
+        sec_ring_conditions = None
 
         # --- Currency rate provider (default) ---
         # Always install a provider so ``request.currency_rate()`` works
@@ -4155,6 +4157,19 @@ class ScriptRunner:
                 # outlive the run until the module's next run rebinds them.
                 for _sec_mod in sec_modules:
                     remove_protocol(_sec_mod)
+                # The chart protocol and this run's nested helpers reference each
+                # other, so the containers they close over are cyclic garbage that
+                # only a full GC pass frees — with every OS semaphore inside. A
+                # process running many scripts would exhaust the system-wide
+                # named-semaphore limit before that pass comes; empty them now.
+                sec_states.clear()
+                if sec_result_locks is not None:
+                    sec_result_locks.clear()
+                if sec_ring_conditions is not None:
+                    sec_ring_conditions.clear()
+                self._signal_rate_sources_fn = None
+                self._sec_begin_bar_fn = None
+                self._sec_end_bar_fn = None
 
             # Remove temp dirs created for HTF security-feed resampling.
             if sec_resample_dirs:
