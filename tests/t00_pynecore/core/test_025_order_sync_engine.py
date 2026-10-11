@@ -3541,6 +3541,52 @@ def __test_rate_limit_backoff_blocks_new_exposure__():
     assert len(b.entry_calls) == 1
 
 
+def __test_unconfirmed_view_reports_a_deferred_entry_once_per_outage__(caplog):
+    """
+    A sync retries on every market update, so an outage must not repeat the
+    same deferral WARNING on each retry (measured: 318 lines within one bar).
+    Each deferred entry is reported once per unconfirmed stretch, and again
+    when a later outage defers it anew.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+
+    def throttle_reads() -> None:
+        b.raise_on_next_get_position = ExchangeRateLimitError(
+            "error.too-many.requests", retry_after=30.0,
+        )
+        with pytest.raises(ExchangeConnectionError):
+            engine.reconcile()
+
+    def deferral_lines() -> int:
+        return sum(
+            1 for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and "entry intent 'N' deferred" in rec.getMessage()
+        )
+
+    throttle_reads()
+    pos.entry_orders["N"] = _entry_order("N", 1.0, limit=49_000.0)
+    with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+        for _ in range(5):
+            engine.sync(BAR_TS)
+        assert b.entry_calls == [], "new exposure opened on an unconfirmed view"
+        assert deferral_lines() == 1, "deferral repeated within one outage"
+
+        # Reads recover while the script no longer wants the entry.
+        del pos.entry_orders["N"]
+        engine._read_backoff_until = 0.0
+        engine.sync(BAR_TS + 60_000)
+        assert engine._read_view_confirmed
+
+        # A later outage defers the entry again: reported again, once.
+        throttle_reads()
+        pos.entry_orders["N"] = _entry_order("N", 1.0, limit=49_000.0)
+        for _ in range(3):
+            engine.sync(BAR_TS + 120_000)
+        assert deferral_lines() == 2, "a new outage's deferral was not reported"
+
+
 def __test_unconfirmed_view_still_cancels_and_closes__():
     """
     The unconfirmed-view gate must only block *new* exposure. Cancelling an

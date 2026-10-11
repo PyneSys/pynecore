@@ -1057,6 +1057,13 @@ class OrderSyncEngine:
         #: Monotonic timestamp of the last WARNING-level read-outage line
         #: (:meth:`_warn_read_outage`); ``0.0`` while the view is confirmed.
         self._read_outage_warned_at = 0.0
+        #: Entry intent keys already reported as deferred in the current
+        #: unconfirmed stretch. A sync retries on every market update, so an
+        #: outage would otherwise repeat the same deferral line hundreds of
+        #: times per entry (measured: 318 WARNING lines within one bar of a
+        #: capitalcom REST outage, cycle 269). Cleared by
+        #: :meth:`_mark_reads_confirmed`.
+        self._outage_deferred_entries: set[str] = set()
         #: Monotonic deadline until which broker reads are parked after a venue
         #: rate limit, honouring the ``retry_after`` the venue asked for.
         #: ``0.0`` means "not throttled".
@@ -13198,11 +13205,14 @@ class OrderSyncEngine:
                 # move the level closer, which opens exposure just as much.
                 # The key stays in ``new_map``, so the cancellation loop above
                 # does not mistake the deferral for a strategy-side cancel.
-                _blog_warning(
-                    "entry intent %r deferred — broker position view "
-                    "unconfirmed this cycle; retrying next sync",
-                    format_intent_key(key),
-                )
+                if key not in self._outage_deferred_entries:
+                    self._outage_deferred_entries.add(key)
+                    _blog_warning(
+                        "entry intent %r deferred — broker position view "
+                        "unconfirmed; retrying on every sync until a read "
+                        "succeeds",
+                        format_intent_key(key),
+                    )
                 if key not in self._active_intents:
                     # A never-dispatched entry has no exchange-side parent,
                     # so its bracket must be deferred with it: the exit
@@ -20480,6 +20490,7 @@ class OrderSyncEngine:
         self._read_view_confirmed = True
         self._reads_unconfirmed_since = 0.0
         self._read_outage_warned_at = 0.0
+        self._outage_deferred_entries.clear()
 
     def _warn_read_outage(self, msg: str, *args: Any) -> None:
         """Log a read-outage WARNING at most once per :data:`READ_OUTAGE_WARN_INTERVAL_S`.

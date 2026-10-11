@@ -1838,7 +1838,7 @@ def __test_integration_capitalcom_parked_dispatch_recovers_and_unparks__(
                 ],
             },
             ('history/activity', 'get'): {'activities': [
-                {'epic': _CAP_SYMBOL, 'direction': 'BUY', 'size': 1.0,
+                {'epic': _CAP_SYMBOL, 'details': {'direction': 'BUY', 'size': 1.0},
                  'dateUTC': act_iso, 'dealId': 'deal-P',
                  'type': 'WORKING_ORDER', 'status': 'ACCEPTED'},
             ]},
