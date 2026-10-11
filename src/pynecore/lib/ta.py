@@ -787,7 +787,7 @@ def _series_window_extreme(source: float, length: int, is_max: bool, _bars: bool
 # noinspection PyUnusedLocal,DuplicatedCode
 @overload
 def highest(source: Series[float], length: int, _bars: bool = False, _tuple: bool = False, _check_eq: bool = False,
-            _series_length: bool = False) -> PyneFloat:
+            _series_length: bool | None = False) -> PyneFloat:
     """
     Calculate the highest value of the source series with the given length.
 
@@ -798,7 +798,9 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
                    internal use only
     :param _check_eq: If true, check for equality too, internal use only
     :param _series_length: True when ``length`` is a ``series`` value (passed by the
-                           type pass from its qualifier), which selects ``_series_window_extreme``
+                           type pass from its qualifier), which selects ``_series_window_extreme``;
+                           False or None (the entry of an instance created with no vector,
+                           e.g. through a cross-module call) runs the ring
     :return: The highest value of the source series
     """
     # An int-typed Pine value can still carry a fraction (``int / int``); the
@@ -937,7 +939,7 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
 
 
 @overload
-def highest(length: int, _series_length: bool = False) -> PyneFloat:
+def highest(length: int, _series_length: bool | None = False) -> PyneFloat:
     return highest(high, length, _series_length=_series_length)
 
 
@@ -956,13 +958,14 @@ for _impl in getattr(highest, '__pyne_impls__'):
 
 # noinspection PyUnusedLocal
 @overload
-def highestbars(source: Series[float], length: int, _series_length: bool = False) -> PyneInt:
+def highestbars(source: Series[float], length: int, _series_length: bool | None = False) -> PyneInt:
     """
     Calculate the number of bars since the highest value of the source series with the given length.
 
     :param source: The source series
     :param length: The length of the highest value
-    :param _series_length: True when ``length`` is a ``series`` value, internal use only
+    :param _series_length: True when ``length`` is a ``series`` value, False or None for the
+                           ring, internal use only
     :return: The number of bars since the highest value of the source series
     """
     # The bars form of ``highest`` yields the offset, an int; the annotation
@@ -971,7 +974,7 @@ def highestbars(source: Series[float], length: int, _series_length: bool = False
 
 
 @overload
-def highestbars(length: int, _series_length: bool = False) -> PyneInt:
+def highestbars(length: int, _series_length: bool | None = False) -> PyneInt:
     return cast(PyneInt, highest(high, length, _bars=True, _series_length=_series_length))
 
 
@@ -1160,7 +1163,7 @@ def _series_linreg(source: float, length: int, offset: int) -> PyneFloat:
 # The IDE findings here are ``@pyne`` transform artifacts: ``Persistent`` writes look
 # unused because they are read on the NEXT bar.
 # noinspection PyUnusedLocal
-def linreg(source: Series[float], length: int, offset: int, _series_length: bool = False) -> PyneFloat:
+def linreg(source: Series[float], length: int, offset: int, _series_length: bool | None = False) -> PyneFloat:
     """
     Computes the linear regression value of the source series over a given period.
 
@@ -1168,7 +1171,9 @@ def linreg(source: Series[float], length: int, offset: int, _series_length: bool
     :param length: Number of bars to calculate regression
     :param offset: Number of bars to shift the result
     :param _series_length: True when ``length`` is a ``series`` value (passed by the
-                           type pass from its qualifier), which selects ``_series_linreg``
+                           type pass from its qualifier), which selects ``_series_linreg``;
+                           False or None (the entry of an instance created with no vector,
+                           e.g. through a cross-module call) runs the ring
     :return: Linear regression value
     """
     # An int-typed Pine value can still carry a fraction (``int / int``); the
@@ -1227,7 +1232,7 @@ def linreg(source: Series[float], length: int, offset: int, _series_length: bool
 @overload
 def lowest(source: Series[float], length: int,
            _bars: bool = False, _tuple: bool = False, _check_eq: bool = False,
-           _series_length: bool = False) \
+           _series_length: bool | None = False) \
         -> PyneFloat:
     """
     Calculate the lowest value of the source series with the given length.
@@ -1239,7 +1244,9 @@ def lowest(source: Series[float], length: int,
                    Internal use only
     :param _check_eq: If true, check for equality too, internal use only
     :param _series_length: True when ``length`` is a ``series`` value (passed by the
-                           type pass from its qualifier), which selects ``_series_window_extreme``
+                           type pass from its qualifier), which selects ``_series_window_extreme``;
+                           False or None (the entry of an instance created with no vector,
+                           e.g. through a cross-module call) runs the ring
     :return: The lowest value of the source series
     """
     # An int-typed Pine value can still carry a fraction (``int / int``); the
@@ -1337,7 +1344,7 @@ def lowest(source: Series[float], length: int,
 
 
 @overload
-def lowest(length: int, _series_length: bool = False) -> PyneFloat:
+def lowest(length: int, _series_length: bool | None = False) -> PyneFloat:
     return lowest(low, length, _series_length=_series_length)
 
 
@@ -1348,20 +1355,21 @@ for _impl in getattr(lowest, '__pyne_impls__'):
 
 # noinspection PyUnusedLocal
 @overload
-def lowestbars(source: Series[float], length: int, _series_length: bool = False) -> PyneInt:
+def lowestbars(source: Series[float], length: int, _series_length: bool | None = False) -> PyneInt:
     """
     Calculate the number of bars since the lowest value of the source series with the given length.
 
     :param source: The source series
     :param length: The length of the lowest value
-    :param _series_length: True when ``length`` is a ``series`` value, internal use only
+    :param _series_length: True when ``length`` is a ``series`` value, False or None for the
+                           ring, internal use only
     :return: The number of bars since the lowest value of the source series
     """
     return cast(PyneInt, lowest(source, length, _bars=True, _series_length=_series_length))
 
 
 @overload
-def lowestbars(length: int, _series_length: bool = False) -> PyneInt:
+def lowestbars(length: int, _series_length: bool | None = False) -> PyneInt:
     return cast(PyneInt, lowest(low, length, _bars=True, _series_length=_series_length))
 
 
