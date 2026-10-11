@@ -48,6 +48,7 @@ from pynecore.core.broker.models import (
     CANCEL_REASON_VENUE_REDUCE_ONLY,
     INTENT_KEY_SEP,
     BrokerEvent,
+    CancelDispositionOutcome,
     CapabilityLevel,
     CloseIntent,
     DispatchEnvelope,
@@ -4428,6 +4429,65 @@ def __test_spot_full_close_pre_clears_resting_exits_before_the_close_dispatch__(
         for i in engine.active_intents.values() if isinstance(i, ExitIntent)
     }
     assert len(b.exit_calls) == 2  # no same-sync re-arm of the swept legs
+
+
+def _spot_long_with_exit(outcome):
+    """Spot engine holding a 1.0 long protected by ``L1-X``; cancels answer ``outcome``."""
+    from decimal import Decimal
+
+    b = MockBroker()
+    b.spot_inventory_port = SimpleNamespace(
+        position_dust_threshold=Decimal("0.00001"),
+    )
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L1"] = _entry_order("L1", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L1", xchg_id="x1", fill_id="f1"))
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", -1.0, "L1-X", stop=49_000.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.exit_calls) == 1
+
+    outcome_calls: list[DispatchEnvelope] = []
+
+    async def _cancel_with_outcome(envelope):
+        outcome_calls.append(envelope)
+        return outcome
+
+    b.execute_cancel_with_outcome = _cancel_with_outcome  # type: ignore[attr-defined]
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -1.0, order_type=_order_type_close, exit_id="Close position order",
+    )
+    return b, engine, outcome_calls
+
+
+def __test_spot_full_close_withheld_when_a_pre_cleared_leg_already_filled__():
+    """A leg that fills during its pre-clear cancel withholds the spot close.
+
+    Measured live (bybit-spot cycle 277, 2026-10-10): the SL triggered in the
+    same instant the flat signal's pre-clear cancelled it; the close still
+    sold the same quantity, the extra sell came out of the wallet baseline and
+    the spot ledger quarantined on negative inventory.
+    """
+    b, engine, outcome_calls = _spot_long_with_exit(CancelDispositionOutcome.ALREADY_FILLED)
+
+    engine.sync(BAR_TS + 120_000)
+
+    assert [e.intent.pine_id for e in outcome_calls] == ["L1-X"]
+    assert len(b.close_calls) == 0
+    assert len(b.cancel_calls) == 0
+    assert not engine.quarantined
+
+
+def __test_spot_full_close_dispatches_after_a_confirmed_pre_clear_cancel__():
+    """A confirmed pre-clear cancel lets the close go out, with no second cancel."""
+    b, engine, outcome_calls = _spot_long_with_exit(CancelDispositionOutcome.CANCEL_CONFIRMED)
+
+    engine.sync(BAR_TS + 120_000)
+
+    assert len(outcome_calls) == 1
+    assert len(b.cancel_calls) == 0
+    assert len(b.close_calls) == 1
 
 
 def __test_spot_partial_close_keeps_the_resting_exits_armed__():

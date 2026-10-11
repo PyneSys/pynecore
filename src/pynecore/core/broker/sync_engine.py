@@ -15761,7 +15761,7 @@ class OrderSyncEngine:
             self._rejected_entry_intents.pop(key, None)
             self._active_intents[key] = entry
 
-    def _pre_clear_spot_exits_for_full_close(self, intent: 'CloseIntent') -> None:
+    def _pre_clear_spot_exits_for_full_close(self, intent: 'CloseIntent') -> bool:
         """Cancel the resting exit legs a spot full-close is about to strand.
 
         Spot has no reduce-only: a venue-resident SL/TP leg that triggers
@@ -15781,11 +15781,23 @@ class OrderSyncEngine:
         Runs only for a script close (``synthetic_kind is None``) that
         consumes its target's whole remaining exposure — a partial close
         keeps the position alive, so its protection must stay armed.
+
+        Each leg is cancelled through
+        :meth:`BrokerPlugin.execute_cancel_with_outcome`, because a leg can
+        trigger in the same instant the sweep cancels it (measured live:
+        bybit-spot cycle 277, 2026-10-10 — the SL filled during its pre-clear
+        cancel, the close still sold the same quantity, and the extra sell
+        came out of the wallet baseline). A leg the venue reports as
+        ``ALREADY_FILLED`` has sold the inventory the close was about to sell.
+
+        :return: ``False`` when a swept leg filled during its cancel — the
+            caller must withhold the close and re-evaluate against the book
+            the leg's fill settles; ``True`` otherwise.
         """
         if getattr(self._broker, 'spot_inventory_port', None) is None:
-            return
+            return True
         if intent.synthetic_kind is not None:
-            return
+            return True
         open_trades = self._position.open_trades
         if intent.pine_id:
             consumed_ids = {intent.pine_id}
@@ -15800,13 +15812,14 @@ class OrderSyncEngine:
             }
             remaining = abs(self._position.size)
         if not consumed_ids or intent.qty < remaining * (1.0 - 1e-9):
-            return
+            return True
         # Same-sync re-arm guard: should the diff loop reach a swept leg's
         # (re-emitted) ExitIntent AFTER this close in the same sync, the
         # marker suppresses the fresh dispatch (see the ExitIntent gate in
         # :meth:`_dispatch_new`). Reset at the top of every diff, so a close
         # that fails re-arms protection on the next sync.
         self._spot_close_cleared_entry_ids.update(consumed_ids)
+        leg_filled = False
         for key, old in list(self._active_intents.items()):
             if not isinstance(old, ExitIntent):
                 continue
@@ -15816,19 +15829,68 @@ class OrderSyncEngine:
                 "spot full-close pre-clear: cancelling resting exit %s "
                 "before the close dispatch", format_intent_key(key),
             )
-            # noinspection PyBroadException
-            try:
-                self._dispatch_cancel(old)
-            except Exception:
-                _log.exception(
-                    "spot full-close pre-clear: cancel of exit leg %s "
-                    "failed; the close still dispatches and the post-fill "
-                    "retire sweep re-drives", format_intent_key(key),
-                )
+            if self._pre_clear_cancel_leg(old) is CancelDispositionOutcome.ALREADY_FILLED:
+                leg_filled = True
             self._order_mapping.pop(key, None)
             self._active_intents.pop(key, None)
             self._drop_envelope(key)
             self._remove_pine_order_for_intent(old)
+        return not leg_filled
+
+    def _pre_clear_cancel_leg(self, old: ExitIntent) -> CancelDispositionOutcome:
+        """Cancel one pre-cleared spot exit and report how the venue settled it.
+
+        A native leg is cancelled through
+        :meth:`BrokerPlugin.execute_cancel_with_outcome`. Any outcome other
+        than a definitive one (``ALREADY_FILLED`` or a confirmed cancel) falls
+        back to :meth:`_dispatch_cancel`, whose journaled cancel obligation
+        covers an ambiguous disposition; a repeated cancel of a gone order is
+        a benign no-op. Engine-trigger partial-bracket legs have no venue
+        order to race and are torn down by :meth:`_dispatch_cancel` directly.
+        Failures are logged and never block the close.
+        """
+        key = old.intent_key
+        outcome = CancelDispositionOutcome.UNKNOWN
+        if not self._partial_bracket_engine.has_active_legs_for_intent(key):
+            cancel = CancelIntent(
+                pine_id=old.pine_id, symbol=self._symbol, from_entry=old.from_entry,
+            )
+            try:
+                outcome = self._run_async(
+                    self._broker.execute_cancel_with_outcome(
+                        self._build_cancel_envelope(cancel),
+                    ),
+                )
+            except BrokerManualInterventionError as e:
+                self._record_halt(e)
+                raise
+            except Exception as e:  # noqa: BLE001
+                _blog_warning(
+                    "spot full-close pre-clear: cancel of exit leg %s raised "
+                    "%s: %s; falling back to the journaled cancel",
+                    format_intent_key(key), type(e).__name__, e,
+                )
+        if outcome is CancelDispositionOutcome.ALREADY_FILLED:
+            _blog_warning(
+                "spot full-close pre-clear: exit leg %s filled during its "
+                "cancel; the close is withheld until its fill settles the book",
+                format_intent_key(key),
+            )
+            return outcome
+        if outcome in (CancelDispositionOutcome.CANCEL_CONFIRMED,
+                       CancelDispositionOutcome.TOO_LATE_TO_CANCEL,
+                       CancelDispositionOutcome.STILL_OPEN):
+            return outcome
+        # noinspection PyBroadException
+        try:
+            self._dispatch_cancel(old)
+        except Exception:
+            _log.exception(
+                "spot full-close pre-clear: cancel of exit leg %s "
+                "failed; the close still dispatches and the post-fill "
+                "retire sweep re-drives", format_intent_key(key),
+            )
+        return outcome
 
     def _dispatch_new(
             self, intent: Intent, *, _coid_spent_retry: int = 0, _reject_retry: int = 0,
@@ -16414,7 +16476,15 @@ class OrderSyncEngine:
                         orders = self._run_async_write(self._broker.execute_exit(envelope))
                         self._order_mapping[intent.intent_key] = [o.id for o in orders]
             elif isinstance(intent, CloseIntent):
-                self._pre_clear_spot_exits_for_full_close(intent)
+                if not self._pre_clear_spot_exits_for_full_close(intent):
+                    raise OrderSkippedByPlugin(
+                        f"Close {format_intent_key(intent.intent_key)} withheld: "
+                        f"a pre-cleared exit leg filled during its cancel; "
+                        f"re-evaluating against the settled book next sync.",
+                        intent_key=intent.intent_key,
+                        reason="pre_clear_leg_filled",
+                        context={'symbol': intent.symbol, 'pine_id': intent.pine_id},
+                    )
                 if port is not None:
                     # Hedging-mode emulation: fan the close out FIFO across the
                     # position-side legs (persist-first close-leg ledger). The
