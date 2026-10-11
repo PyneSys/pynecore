@@ -36,6 +36,7 @@ from pynecore.lib.log import logger as pyne_logger
 from pynecore.lib.timeframe import in_seconds
 
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
+from pynecore.core.broker.interrupt_guard import request_interrupt
 from pynecore.lib.log import broker_info, broker_warning
 from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.script_runner import ScriptRunner, DataRequirements, SecurityRequirement
@@ -47,6 +48,11 @@ from ...cli.utils.api_error_handler import APIErrorHandler
 
 __all__ = []
 
+
+#: How long a stopped live run waits for the fills of market orders it already
+#: dispatched, so the journal owns what the venue executed. Well inside the
+#: supervisor's shutdown grace.
+_STOP_FILL_SETTLE_S = 15.0
 
 #: Task name given to :func:`_drain_loop_tasks`, used to keep a drain from
 #: cancelling a sibling drain (only possible when the teardown is invoked twice
@@ -1905,20 +1911,23 @@ def run(
                     # ``KeyboardInterrupt`` path as Ctrl-C, so a stopped run
                     # still tears down cleanly and prints its completion +
                     # cleanup summary instead of dying at return_code=-15 with
-                    # no visible cleanup outcome.
-                    _prev_sigterm = None
-                    _sigterm_installed = False
+                    # no visible cleanup outcome. Both signals go through the
+                    # interrupt guard: a stop that arrives while the sync
+                    # engine is dispatching is raised only once that sync
+                    # completes, so an order already on the wire is recorded
+                    # instead of landing behind the run's back.
+                    _prev_signals: dict[int, Any] = {}
                     if broker_plugin is not None:
-                        def _on_sigterm(_signum, _frame):
-                            raise KeyboardInterrupt
-                        try:
-                            _prev_sigterm = signal.getsignal(signal.SIGTERM)
-                            signal.signal(signal.SIGTERM, _on_sigterm)
-                            _sigterm_installed = True
-                        except (ValueError, OSError):
-                            # signal.signal only works on the main thread; a
-                            # non-main-thread run keeps the default disposition.
-                            _sigterm_installed = False
+                        def _on_stop_signal(_signum, _frame):
+                            request_interrupt()
+                        for _signum in (signal.SIGTERM, signal.SIGINT):
+                            try:
+                                _prev_signals[_signum] = signal.getsignal(_signum)
+                                signal.signal(_signum, _on_stop_signal)
+                            except (ValueError, OSError):
+                                # signal.signal only works on the main thread; a
+                                # non-main-thread run keeps the default disposition.
+                                _prev_signals.pop(_signum, None)
                     # When the spinner is suppressed (durable log / non-TTY)
                     # a quiet phase would otherwise print nothing for tens of
                     # seconds; a periodic heartbeat keeps the transcript alive
@@ -1949,6 +1958,13 @@ def run(
                         progress.stop()
                         stop_reason = "interrupted"
                         broker_warning("live streaming stopped (interrupted)")
+                        if not runner.settle_broker_in_flight(_STOP_FILL_SETTLE_S):
+                            broker_warning(
+                                "stopped with a dispatched market order still "
+                                "waiting for its fill after %.0fs; the next run "
+                                "reconciles it from the venue",
+                                _STOP_FILL_SETTLE_S,
+                            )
                     except BrokerManualInterventionError:
                         # The ``[BROKER] ERROR sync engine halted by …`` line
                         # logged from ``OrderSyncEngine._record_halt`` already
@@ -1965,9 +1981,9 @@ def run(
                     finally:
                         if heartbeat is not None:
                             heartbeat.stop()
-                        if _sigterm_installed:
+                        for _signum, _previous in _prev_signals.items():
                             try:
-                                signal.signal(signal.SIGTERM, _prev_sigterm)
+                                signal.signal(_signum, _previous)
                             except (ValueError, OSError):
                                 pass
 

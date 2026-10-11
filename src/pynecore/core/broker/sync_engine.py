@@ -50,6 +50,7 @@ from pynecore.core.broker.exceptions import (
     OrderSkippedByPlugin,
 )
 from pynecore.core.plugin import ProviderError, is_retryable_provider_error
+from pynecore.core.broker.interrupt_guard import critical_section
 from pynecore.core.broker.idempotency import (
     KIND_CANCEL,
     KIND_CLOSE,
@@ -2330,6 +2331,52 @@ class OrderSyncEngine:
                 context=dict(self._halted_context),
             )
 
+    def awaiting_market_fills(self) -> bool:
+        """Whether a dispatched market entry or close still waits for its fill.
+
+        A resting limit / stop entry is not counted: it may rest for hours, and
+        its journal row already owns whatever it later fills into.
+        """
+        for key, intent in self._active_intents.items():
+            if isinstance(intent, EntryIntent):
+                if intent.order_type is not OrderType.MARKET:
+                    continue
+                filled = self._active_entry_filled_qty.get(key, 0.0)
+            elif isinstance(intent, CloseIntent):
+                filled = self._active_close_filled_qty.get(key, 0.0)
+            else:
+                continue
+            if filled < intent.qty - 1e-12:
+                return True
+        return False
+
+    def settle_in_flight_fills(self, timeout_s: float) -> bool:
+        """Ingest the fills of already-dispatched market orders before a stop.
+
+        A stop that arrives right after a market dispatch would otherwise end
+        the run before the venue's fill event is routed: the venue holds the
+        exposure while the journal row still records nothing filled (measured
+        live: capitalcom cycle 268, 2026-10-11 — the rotation stop landed on
+        the bar-close entry). Events are drained as they arrive until no
+        dispatched market order is waiting, or ``timeout_s`` runs out.
+
+        :param timeout_s: Upper bound of the wait, in seconds.
+        :return: ``True`` when every dispatched market order has its fill.
+        """
+        deadline = time.monotonic() + timeout_s
+        events = self._event_queue
+        self._drain_events()
+        while self.awaiting_market_fills():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return False
+            with events.not_empty:
+                if not events.queue:
+                    events.not_empty.wait(remaining)
+            self._drain_events()
+        return True
+
+    @critical_section
     def apply_async_events(self) -> None:
         """Drain any async-arrived broker events into the position state.
 
@@ -2347,6 +2394,7 @@ class OrderSyncEngine:
         self.raise_if_halted()
         self._drain_events()
 
+    @critical_section
     def settle_restart_state(self, bar_ts_ms: int) -> None:
         """Run the one-time restart settle BEFORE the first post-restart script.
 
@@ -2439,6 +2487,7 @@ class OrderSyncEngine:
             self._reconstruct_pine_bracket_state()
             self._pine_bracket_reconstruct_done = True
 
+    @critical_section
     def sync(self, bar_ts_ms: int, *, last_price: float | None = None) -> None:
         """Run one diff/dispatch cycle.
 
@@ -4397,6 +4446,7 @@ class OrderSyncEngine:
         magnitude = min(abs(broker_signed), abs(owned_signed))
         return magnitude if broker_signed > 0.0 else -magnitude
 
+    @critical_section
     def reconcile(self) -> None:
         """Read-side position reconciliation with the exchange.
 

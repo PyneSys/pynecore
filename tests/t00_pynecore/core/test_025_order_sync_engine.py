@@ -3855,6 +3855,69 @@ def __test_restart_keeps_journal_anchor_on_cross_bar_live_retry__(tmp_path):
         assert b.entry_calls[0].retry_seq == 1
 
 
+def __test_stop_during_a_dispatch_is_raised_after_the_sync__():
+    """A stop request that lands mid-dispatch lets the sync record the order.
+
+    Measured live (capitalcom cycle 268, 2026-10-11): the rotation SIGTERM
+    arrived during a market entry POST; the venue opened the position while
+    the interrupted run never recorded it.
+    """
+    from pynecore.core.broker import interrupt_guard
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    original = b.execute_entry
+
+    async def _entry_hit_by_stop(envelope):
+        interrupt_guard.request_interrupt()
+        return await original(envelope)
+
+    b.execute_entry = _entry_hit_by_stop  # type: ignore[method-assign]
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            engine.sync(BAR_TS)
+    finally:
+        interrupt_guard._pending = False  # noqa
+    assert len(b.entry_calls) == 1
+    assert engine.active_intents.keys() == {"L"}
+    assert "L" in engine.order_mapping
+
+
+def __test_settle_in_flight_fills_waits_for_the_market_fill__():
+    """A stopped run ingests the fill of a market entry it already dispatched."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    assert engine.awaiting_market_fills()
+
+    engine.on_order_event(_fill_event('buy', 1.0, 50_000.0, pine_id="L", xchg_id="x1"))
+    assert engine.settle_in_flight_fills(5.0)
+    assert pos.size == 1.0
+    assert not engine.awaiting_market_fills()
+
+
+def __test_settle_in_flight_fills_gives_up_at_the_timeout__():
+    """No fill arriving within the bound ends the wait with ``False``."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    assert not engine.settle_in_flight_fills(0.05)
+    assert pos.size == 0.0
+
+
+def __test_resting_limit_entry_is_not_awaited_at_stop__():
+    """A working limit entry may rest for hours — the stop does not wait for it."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=40_000.0)
+    engine.sync(BAR_TS)
+    assert not engine.awaiting_market_fills()
+    assert engine.settle_in_flight_fills(0.05)
+
+
 def __test_entry_insufficient_margin_does_not_halt__():
     """An ``InsufficientMarginError`` on an entry is non-fatal, same as a plain reject."""
     # InsufficientMarginError is a typed, non-terminal ExchangeOrderRejectedError

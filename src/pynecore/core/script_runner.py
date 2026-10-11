@@ -1866,6 +1866,19 @@ class ScriptRunner:
         """Full snapshot of the live drawing objects (lines/labels/boxes/...)."""
         return viz.drawings_snapshot()
 
+    def settle_broker_in_flight(self, timeout_s: float) -> bool:
+        """Wait for the fills of already-dispatched market orders before a stop.
+
+        :param timeout_s: Upper bound of the wait, in seconds.
+        :return: ``True`` when nothing dispatched is left waiting for its fill
+            (also when the run has no broker).
+        """
+        if self._order_sync_engine is None:
+            return True
+        return cast('OrderSyncEngine', self._order_sync_engine).settle_in_flight_fills(
+            timeout_s,
+        )
+
     @property
     def broker_position_snapshot(self) -> 'Any | None':
         if self._order_sync_engine is None:
