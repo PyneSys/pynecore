@@ -79,8 +79,9 @@ instance. Everything else emits exactly what it emitted before; a scope with
 no varying site gets no slot.
 
 The vector reaches an instance where the instance is CREATED, so a call site
-that creates none cannot hand one over. A ``@pine_method`` call is skipped
-here entirely and binds through the method cache
+that creates none cannot hand one over. A ``method_call`` site is anchored on
+the uniform route like a dispatcher site, but its anchor binds the method the
+receiver selects at run time in a per-site cache
 (:mod:`~pynecore.core.pine_method`), and an overload dispatcher builds its
 implementations' vectors itself (``overload._anchored``): a varying site
 inside either falls back to value dispatch, with the type pass's
@@ -257,7 +258,7 @@ NON_TRANSFORMABLE_FUNCTIONS = {
     'copy', 'dataclass', 'dccopy',
     'pytest.raises',
 
-    'method_call', 'pine_range',
+    'pine_range',
 
     # ``lib.math.sum``'s machine step: the state lives in the machine it is handed
     'rolling_sum_step',

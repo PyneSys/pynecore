@@ -58,16 +58,16 @@ from .dynamic_default import is_script_entry
 from .node_ids import ID_ATTR, assign_node_ids, node_id
 from .pine_type_report import unknown_diags
 from .pine_type_rules import (
-    INT, FLOAT, BOOL, STR, TYPELESS, UNKNOWN, VOID, OBJECT, NUMERIC,
+    INT, FLOAT, BOOL, TYPELESS, UNKNOWN, VOID, OBJECT, NUMERIC,
     join, binop_type, unaryop_type, compare_type, annotation_type, bare_wrapper,
     LIB_TYPE_OVERRIDES, OVERRIDE_PARAM_NAMES, BUILTIN_CALL_TYPES, BUILTIN_NAME_TYPES,
     TY_ATTR, get_ty, set_ty, inherit_ty,
     constant_type, pin_for, get_pins, set_pin, set_pins, set_vector, set_varying,
     overload_result, ImplSig, overload_pick, default_fit, FIT_REQUIRED, FactoryFields,
-    impl_sig, _param_defaults, _dotted, _DYN_DEFAULT,
+    impl_sig, _param_defaults, _dotted, _DYN_DEFAULT,  # noqa: internal API
     CLASS_SEP, LIB_MODULE, SCALARS, PINE_LOOP, array_of, builtin_class_id, class_id, class_of,
-    element_of, elements_of, head, is_array,
-    is_map, is_matrix, is_tuple, key_of, map_of, matrix_of, namespace_of,
+    element_of, elements_of, is_array,
+    is_map, is_matrix, is_tuple, key_of, matrix_of, namespace_of,
     object_ty, render_ty, shape_conflict, tuple_of, value_of,
 )
 from .pine_type_table import (
@@ -146,17 +146,31 @@ _BINDING_TYPES: frozenset[type] = frozenset({
 #: is one no single pass runs both of -- see ``_mutually_exclusive``.
 _BranchPath = tuple[tuple[ast.stmt, str], ...]
 
-#: Expression class -> the ``_Inference._e_<Class>`` rule typing it, None for a
-#: class with no rule; resolved on first sight instead of per node
+#: Expression class -> the ``_Inference._e_<class>`` rule typing it (class name
+#: lowercased), None for a class with no rule; resolved on first sight instead of
+#: per node
 _EXPR_RULES: dict[type, Callable[..., str] | None] = {}
 
 #: Expression class -> how ``_Inference._expr_qual`` derives its qualifier;
 #: resolved on first sight (``_qual_rule``) instead of matched per node
 _QUAL_RULES: dict[type, Callable[..., int]] = {}
 
+
+def _walker_rule(rule: Callable[[Any], str]) -> Callable[..., str]:
+    """
+    A static expression rule in the calling convention of the walk.
+
+    ``_Inference._expr`` calls every rule as ``rule(walker, node)``; a rule that
+    needs nothing of the walker is a static method and takes the node alone.
+
+    :param rule: The static rule
+    :return: The rule, taking the walker as well
+    """
+    return lambda walker, node: rule(node)
+
 _LIB_TYPES_PATH = Path(__file__).parent / 'lib_types.json'
 _LIB_REGISTRY: dict[str, Any] = {}
-_LIB_TYPES: dict[str, Any] = {}
+_LIB_TYPES: dict[str, dict[str, Any]] = {}
 _LIB_CLASSES: dict[str, 'ClassSig'] = {}
 _LIB_SCALARS: dict[str, str] = {}
 _LIB_NAMESPACES: set[str] = set()
@@ -173,7 +187,7 @@ def _lib_registry() -> dict[str, Any]:
     return _LIB_REGISTRY
 
 
-def lib_types() -> dict[str, Any]:
+def lib_types() -> dict[str, dict[str, Any]]:
     """
     The generated lib registry, loaded once.
 
@@ -805,7 +819,8 @@ class _Inference:
                        col=getattr(node, 'col_offset', 0),
                        detail=f'{render_ty(left)} vs {render_ty(right)}')
 
-    def _unknown(self, reason: str, node: ast.AST, detail: str = '') -> Unknown:
+    @staticmethod
+    def _unknown(reason: str, node: ast.AST, detail: str = '') -> Unknown:
         return Unknown(reason=reason, line=getattr(node, 'lineno', 0),
                        col=getattr(node, 'col_offset', 0), detail=detail)
 
@@ -1322,8 +1337,9 @@ class _Inference:
                     iter_ty = UNKNOWN
                 self._store_iteration(stmt, iter_ty)
                 self._conds.append(self._qual(stmt.iter))
+                loop_body = stmt.body
                 try:
-                    self._loop(stmt, lambda: self._body(stmt.body))
+                    self._loop(stmt, lambda: self._body(loop_body))
                 finally:
                     self._conds.pop()
                 self._body(stmt.orelse)
@@ -2008,7 +2024,7 @@ class _Inference:
             return found.ty if found is not None else UNKNOWN
         if isinstance(target, ast.Attribute):
             # ``point.price += x`` reads the field before it writes it
-            return self._e_Attribute(target)
+            return self._e_attribute(target)
         return UNKNOWN
 
     def _element_type(self, iter_node: ast.expr, iter_ty: str) -> str:
@@ -2065,7 +2081,10 @@ class _Inference:
         try:
             rule = _EXPR_RULES[cls]
         except KeyError:
-            rule = _EXPR_RULES[cls] = getattr(_Inference, f'_e_{cls.__name__}', None)
+            found = vars(_Inference).get(f'_e_{cls.__name__.lower()}')
+            if isinstance(found, staticmethod):
+                found = _walker_rule(found.__func__)
+            rule = _EXPR_RULES[cls] = found
         if rule is None:
             for child in ast_walk.iter_child_nodes(node):
                 if isinstance(child, ast.expr):
@@ -2108,8 +2127,74 @@ class _Inference:
         try:
             rule = _QUAL_RULES[cls]
         except KeyError:
-            rule = _QUAL_RULES[cls] = _qual_rule(cls)
+            rule = _QUAL_RULES[cls] = self._qual_rule(cls)
         return rule(self, node)
+
+    @staticmethod
+    def _qual_rule(expr_class: type) -> Callable[..., int]:
+        """
+        How ``_Inference._expr_qual`` derives the qualifier of one expression class.
+
+        A constant is const; a name, an attribute, a call and a subscript have
+        rules of their own; a walrus is its value's; what Pine has no qualifier
+        for -- a lambda, a comprehension, a generator -- is series. Anything else
+        is an operation, as strong as its strongest operand. The common operations
+        name their operands outright: the same operands ``_children_qual`` finds,
+        without asking the class for its fields.
+
+        :param expr_class: The expression class
+        :return: The rule, called with the walker and the node
+        """
+        if issubclass(expr_class, ast.Constant):
+            return lambda engine, node: CONST
+        if issubclass(expr_class, ast.Name):
+            return _Inference._name_qual
+        if issubclass(expr_class, ast.Attribute):
+            return _Inference._attribute_qual
+        if issubclass(expr_class, ast.Call):
+            return _Inference._call_qual
+        if issubclass(expr_class, ast.Subscript):
+            return _Inference._subscript_qual
+        if issubclass(expr_class, ast.NamedExpr):
+            return _Inference._namedexpr_qual
+        if issubclass(expr_class, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp,
+                            ast.GeneratorExp, ast.Await, ast.Yield, ast.YieldFrom)):
+            return lambda engine, node: SERIES
+        if expr_class is ast.BinOp:
+            return _Inference._binop_qual
+        if expr_class is ast.UnaryOp:
+            return _Inference._unaryop_qual
+        if expr_class is ast.IfExp:
+            return _Inference._ifexp_qual
+        if expr_class is ast.BoolOp:
+            return _Inference._boolop_qual
+        if expr_class is ast.Compare:
+            return _Inference._compare_qual
+        return _Inference._children_qual
+
+    def _namedexpr_qual(self, node: ast.NamedExpr) -> int:
+        """The qualifier of a walrus: its value's."""
+        return self._qual(node.value)
+
+    def _binop_qual(self, node: ast.BinOp) -> int:
+        """The qualifier of a binary operation: the stronger operand's."""
+        return max(self._qual(node.left), self._qual(node.right))
+
+    def _unaryop_qual(self, node: ast.UnaryOp) -> int:
+        """The qualifier of a unary operation: its operand's."""
+        return self._qual(node.operand)
+
+    def _ifexp_qual(self, node: ast.IfExp) -> int:
+        """The qualifier of a conditional expression: the strongest of its parts'."""
+        return max(self._qual(node.test), self._qual(node.body), self._qual(node.orelse))
+
+    def _boolop_qual(self, node: ast.BoolOp) -> int:
+        """The qualifier of a boolean operation: the strongest operand's."""
+        return max(map(self._qual, node.values), default=CONST)
+
+    def _compare_qual(self, node: ast.Compare) -> int:
+        """The qualifier of a comparison chain: the strongest operand's."""
+        return max(self._qual(node.left), *map(self._qual, node.comparators))
 
     def _subscript_qual(self, node: ast.Subscript) -> int:
         """The qualifier of a subscript: a tuple position's, or series."""
@@ -2125,7 +2210,7 @@ class _Inference:
                     if isinstance(child, ast.expr)), default=CONST)
 
     def _name_qual(self, node: ast.Name) -> int:
-        """The qualifier of a bare name read, resolved the way ``_e_Name`` types it."""
+        """The qualifier of a bare name read, resolved the way ``_e_name`` types it."""
         if node.id == _DYN_DEFAULT:
             return CONST
         found = self._lookup(node.id)
@@ -2177,7 +2262,8 @@ class _Inference:
 
     # Each ``_e_*`` returns the type; the caller stamps it.
 
-    def _e_Constant(self, node: ast.Constant) -> str:
+    @staticmethod
+    def _e_constant(node: ast.Constant) -> str:
         # A stamp already on the node wins: the constant folder replaces a
         # Pine-typed subtree with its literal and records what the TYPE was,
         # which the Python literal alone can no longer tell (``14 / 8`` folds
@@ -2187,7 +2273,7 @@ class _Inference:
             return existing
         return constant_type(node.value)
 
-    def _e_Name(self, node: ast.Name) -> str:
+    def _e_name(self, node: ast.Name) -> str:
         """
         Type a bare name read.
 
@@ -2255,7 +2341,7 @@ class _Inference:
             return False
         return annotation_type(node, self._classes) != UNKNOWN
 
-    def _e_Attribute(self, node: ast.Attribute) -> str:
+    def _e_attribute(self, node: ast.Attribute) -> str:
         base = self._expr(node.value)
         if node.attr == '__class__':
             # ``PineTruthinessTransformer``'s float test reads the Python class
@@ -2472,37 +2558,37 @@ class _Inference:
             self._shape_diags.add(nid)
         self._diag(message, node, self._unknown(reason, node, detail), fix=fix)
 
-    def _e_BinOp(self, node: ast.BinOp) -> str:
+    def _e_binop(self, node: ast.BinOp) -> str:
         return binop_type(node.op, self._expr(node.left), self._expr(node.right))
 
-    def _e_UnaryOp(self, node: ast.UnaryOp) -> str:
+    def _e_unaryop(self, node: ast.UnaryOp) -> str:
         return unaryop_type(node.op, self._expr(node.operand))
 
-    def _e_BoolOp(self, node: ast.BoolOp) -> str:
+    def _e_boolop(self, node: ast.BoolOp) -> str:
         for value in node.values:
             self._expr(value)
         return BOOL
 
-    def _e_Compare(self, node: ast.Compare) -> str:
+    def _e_compare(self, node: ast.Compare) -> str:
         left = self._expr(node.left)
         right = left
         for comparator in node.comparators:
             right = self._expr(comparator)
         return compare_type(left, right)
 
-    def _e_IfExp(self, node: ast.IfExp) -> str:
+    def _e_ifexp(self, node: ast.IfExp) -> str:
         self._expr(node.test)
         # MEASURED: ``d > 1 ? d : R`` is int, ``d > 1 ? d : 1.0`` is float --
         # the arms join, they do not widen unconditionally
         return self._joined(self._expr(node.body), self._expr(node.orelse),
                             node, 'the ternary')
 
-    def _e_NamedExpr(self, node: ast.NamedExpr) -> str:
+    def _e_namedexpr(self, node: ast.NamedExpr) -> str:
         ty = self._expr(node.value)
         self._store(node.target, ty, node, qual=self._qual(node.value))
         return ty
 
-    def _e_Subscript(self, node: ast.Subscript) -> str:
+    def _e_subscript(self, node: ast.Subscript) -> str:
         base = self._expr(node.value)
         self._expr(node.slice)
         if is_tuple(base):
@@ -2551,7 +2637,7 @@ class _Inference:
             return node.id in lib_types()
         return self._lib_name(node) is not None
 
-    def _e_Tuple(self, node: ast.Tuple) -> str:
+    def _e_tuple(self, node: ast.Tuple) -> str:
         """
         A tuple literal is a tuple of what its elements are.
 
@@ -2569,15 +2655,15 @@ class _Inference:
     # PyneComp emits a Pine tuple as either of the two Python sequence
     # literals; the empty one -- the array a security read defaults to -- has
     # no elements and stays an object
-    _e_List = _e_Tuple
+    _e_list = _e_tuple
 
-    def _e_Set(self, node: ast.Set) -> str:
+    def _e_set(self, node: ast.Set) -> str:
         """A set is not a Pine type; its elements are still typed."""
         for element in node.elts:
             self._expr(element)
         return OBJECT
 
-    def _e_Dict(self, node: ast.Dict) -> str:
+    def _e_dict(self, node: ast.Dict) -> str:
         for key in node.keys:
             if key is not None:
                 self._expr(key)
@@ -2585,7 +2671,7 @@ class _Inference:
             self._expr(value)
         return OBJECT
 
-    def _e_ListComp(self, node) -> str:
+    def _e_listcomp(self, node) -> str:
         """
         Walk a comprehension so nothing under it is left untyped.
 
@@ -2608,11 +2694,11 @@ class _Inference:
             self._expr(node.elt)
         return OBJECT
 
-    _e_SetComp = _e_ListComp
-    _e_GeneratorExp = _e_ListComp
-    _e_DictComp = _e_ListComp
+    _e_setcomp = _e_listcomp
+    _e_generatorexp = _e_listcomp
+    _e_dictcomp = _e_listcomp
 
-    def _e_Call(self, node: ast.Call) -> str:
+    def _e_call(self, node: ast.Call) -> str:
         nid = node_id(node)
         if nid is not None:
             # Whatever another walk found for this call, this one decides anew
@@ -3545,6 +3631,12 @@ class _Inference:
         receiver_ty = self._ty_of(args[0]) if args else UNKNOWN
         namespace = namespace_of(receiver_ty)
         if namespace is not None and f'{namespace}.{name}' in lib_types():
+            # The builtin takes none of a closure-converted method's captures,
+            # which the closure pass threaded right after the receiver: the
+            # runtime drops them the same way (``pine_method.method_call``)
+            captures: tuple[str, ...] = getattr(node, 'pyne_closure_args', ())
+            if captures:
+                args = [args[0], *args[1 + len(captures):]]
             return self._builtin_method(f'{namespace}.{name}', node, args)
         resolved = self._resolve_func(spelled, node)
         if resolved is None:
@@ -3562,12 +3654,19 @@ class _Inference:
         if key in self._overload_groups:
             # A group is per-signature already: the receiver and the arguments
             # select the implementation the way the direct spelling's pin
-            # does. Nothing is STAMPED, though -- the node's callee is the
-            # plumbing, whose runtime dispatch selects on the values itself
+            # does, and the pin is stamped on the ``method_call`` node the same
+            # way: its anchor hands it to the call site's dispatch entry, which
+            # binds the group with it (``core/pine_method``). Without it the
+            # method spelling would select from the VALUES, and take the float
+            # implementation for an int-typed fractional argument
             self._ensure_group(key, frame)
             if not self._group_call_fits(key, name, node, args):
+                self._record_pin(node, None)
                 return UNKNOWN
-            pin = None if node.keywords else pin_for([self._ty_of(a) for a in args])
+            pin = None
+            if not node.keywords and not any(isinstance(a, ast.Starred) for a in args):
+                pin = pin_for([self._ty_of(a) for a in args])
+            self._record_pin(node, pin)
             return self._group_type(key, pin)
         return self._call_context(key, node, frame, args, record=False)
 
@@ -4549,34 +4648,34 @@ class _Inference:
         memo: dict[tuple[str, int], tuple] = {}
 
         def vector_of(key: str, cid: int, stack: frozenset) -> tuple:
-            sites = varying.get(key)
-            if not sites:
+            callee_sites = varying.get(key)
+            if not callee_sites:
                 return ()
             token = (key, cid)
-            found = memo.get(token)
-            if found is not None:
-                return found
+            memoized = memo.get(token)
+            if memoized is not None:
+                return memoized
             if token in stack:
                 # A context cycle cannot be unfolded; the callee keeps its
                 # default, which is the dispatch it had before
-                return (None,) * len(sites)
-            built = tuple(entry_of(site, cid, stack | {token}) for site in sites)
+                return (None,) * len(callee_sites)
+            built = tuple(entry_of(site, cid, stack | {token}) for site in callee_sites)
             memo[token] = built
             return built
 
         def entry_of(site: ast.Call, cid: int, stack: frozenset) -> Any:
-            nid = node_id(site)
-            if nid is None:
+            site_id = node_id(site)
+            if site_id is None:
                 return None
             if get_series_lens(site) is not None:
-                return self._series_len.get(nid, {}).get(cid)
+                return self._series_len.get(site_id, {}).get(cid)
             if get_pins(site) is not None:
-                return self._pins.get(nid, {}).get(cid)
-            callee = self._callee_key.get(nid)
-            target = self._call_ctx.get(nid, {}).get(cid)
-            if callee is None or target is None:
+                return self._pins.get(site_id, {}).get(cid)
+            site_callee = self._callee_key.get(site_id)
+            target = self._call_ctx.get(site_id, {}).get(cid)
+            if site_callee is None or target is None:
                 return None
-            return vector_of(callee, target, stack)
+            return vector_of(site_callee, target, stack)
 
         changed = True
         while changed:
@@ -4594,12 +4693,12 @@ class _Inference:
                     memo.clear()
                     changed = True
 
-        for key, sites in varying.items():
-            set_varying(targets[key], sites or None)
+        for key, key_sites in varying.items():
+            set_varying(targets[key], key_sites or None)
         if not any(varying.values()):
             # No callee has a vector to be handed, so no call site gets one
             return
-        per_instance = {id(call) for sites in varying.values() for call in sites}
+        per_instance = {id(call) for key_sites in varying.values() for call in key_sites}
         for node in ast_walk.walk(tree):
             if not isinstance(node, ast.Call) or id(node) in per_instance:
                 continue
@@ -4641,50 +4740,6 @@ class _Inference:
         return name
 
 
-def _qual_rule(cls: type) -> Callable[..., int]:
-    """
-    How ``_Inference._expr_qual`` derives the qualifier of one expression class.
-
-    A constant is const; a name, an attribute, a call and a subscript have
-    rules of their own; a walrus is its value's; what Pine has no qualifier
-    for -- a lambda, a comprehension, a generator -- is series. Anything else
-    is an operation, as strong as its strongest operand. The common operations
-    name their operands outright: the same operands ``_children_qual`` finds,
-    without asking the class for its fields.
-
-    :param cls: The expression class
-    :return: The rule, called with the walker and the node
-    """
-    if issubclass(cls, ast.Constant):
-        return lambda engine, node: CONST
-    if issubclass(cls, ast.Name):
-        return _Inference._name_qual
-    if issubclass(cls, ast.Attribute):
-        return _Inference._attribute_qual
-    if issubclass(cls, ast.Call):
-        return _Inference._call_qual
-    if issubclass(cls, ast.Subscript):
-        return _Inference._subscript_qual
-    if issubclass(cls, ast.NamedExpr):
-        return lambda engine, node: engine._qual(node.value)
-    if issubclass(cls, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp,
-                        ast.GeneratorExp, ast.Await, ast.Yield, ast.YieldFrom)):
-        return lambda engine, node: SERIES
-    if cls is ast.BinOp:
-        return lambda engine, node: max(engine._qual(node.left), engine._qual(node.right))
-    if cls is ast.UnaryOp:
-        return lambda engine, node: engine._qual(node.operand)
-    if cls is ast.IfExp:
-        return lambda engine, node: max(engine._qual(node.test), engine._qual(node.body),
-                                        engine._qual(node.orelse))
-    if cls is ast.BoolOp:
-        return lambda engine, node: max(map(engine._qual, node.values), default=CONST)
-    if cls is ast.Compare:
-        return lambda engine, node: max([engine._qual(node.left),
-                                         *map(engine._qual, node.comparators)])
-    return _Inference._children_qual
-
-
 def _scan_tree(tree: ast.Module) -> tuple[dict[str, ast.expr], dict[str, list[ast.expr]]]:
     """
     What the walk needs from the whole tree before it starts, in one pass over it.
@@ -4709,8 +4764,8 @@ def _scan_tree(tree: ast.Module) -> tuple[dict[str, ast.expr], dict[str, list[as
     annotations: dict[str, ast.expr] = {}
     writes: dict[str, list[ast.expr]] = {}
 
-    def take(node: ast.expr, where: ast.expr) -> None:
-        for child in ast_walk.walk(node):
+    def take(expr: ast.expr, where: ast.expr) -> None:
+        for child in ast_walk.walk(expr):
             if isinstance(child, (ast.Name, ast.Attribute)):
                 spelled = _dotted(child)
                 if spelled is not None:
@@ -5061,8 +5116,13 @@ def _called_names(node: ast.AST) -> set[str]:
     :param node: The subtree to scan
     :return: The bare callee names it mentions
     """
-    return {child.func.id for child in ast_walk.walk(node)
-            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)}
+    names: set[str] = set()
+    for child in ast_walk.walk(node):
+        if isinstance(child, ast.Call):
+            callee = child.func
+            if isinstance(callee, ast.Name):
+                names.add(callee.id)
+    return names
 
 
 def _labelled_lists(stmt: ast.stmt) -> Iterator[tuple[str, list[ast.stmt]]]:
@@ -5082,10 +5142,12 @@ def _labelled_lists(stmt: ast.stmt) -> Iterator[tuple[str, list[ast.stmt]]]:
         nested = getattr(stmt, label, None)
         if isinstance(nested, list):
             yield label, nested
-    for index, handler in enumerate(getattr(stmt, 'handlers', None) or ()):
-        yield f'handler:{index}', handler.body
-    for index, case in enumerate(getattr(stmt, 'cases', None) or ()):
-        yield f'case:{index}', case.body
+    if isinstance(stmt, (ast.Try, ast.TryStar)):
+        for index, handler in enumerate(stmt.handlers):
+            yield f'handler:{index}', handler.body
+    elif isinstance(stmt, ast.Match):
+        for index, case in enumerate(stmt.cases):
+            yield f'case:{index}', case.body
 
 
 def _module_statements(body: Sequence[ast.stmt]) -> Iterator[ast.stmt]:

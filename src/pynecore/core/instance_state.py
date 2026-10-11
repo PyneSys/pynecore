@@ -166,8 +166,8 @@ _shared_caches: list[dict] = []
 def register_shared_cache(cache: dict) -> dict:
     """Register a module-lifetime bound cache for clearing on :func:`reset`.
 
-    Anchorless call paths (direct dispatcher calls, ``method_call`` dispatch)
-    keep their bound instances in module-lifetime dicts instead of anchor
+    Anchorless call paths (direct dispatcher calls, direct ``method_call``
+    calls) keep their bound instances in module-lifetime dicts instead of anchor
     slots. The legacy runtime kept such state in its global instance cache,
     which ``reset()`` dropped between runs — registering the dict keeps that
     contract.
@@ -309,9 +309,12 @@ def _collect_builtins(state: list, layout: dict[str, Any], out: list) -> None:
 def _collect_bound_builtins(bound: Any, out: list) -> None:
     """Collect the builtin-machine vectors behind an anchored binding: a
     state-carrying partial exposes its vector directly, an overload
-    dispatcher its per-implementation vectors through ``__pyne_cache__``.
-    Anything else is opaque — left alone, never dropped (dropping would
-    reset its state on every iteration)."""
+    dispatcher its per-implementation vectors and a ``method_call`` entry its
+    per-method ones through ``__pyne_cache__``. A cache entry with no vector
+    of its own is walked through its binding: a ``method_call`` entry binds an
+    overloaded method as that group's own dispatcher. Anything else is opaque
+    — left alone, never dropped (dropping would reset its state on every
+    iteration)."""
     bound = getattr(bound, '__pyne_bound__', bound)
     if type(bound) is partial and bound.args:
         layout: dict[str, Any] | None = getattr(bound.func, '__pyne_layout__', None)
@@ -324,6 +327,8 @@ def _collect_bound_builtins(bound: Any, out: list) -> None:
             vec = entry[1]
             if vec is not None:
                 _collect_builtins(vec, vec[-1], out)
+            else:
+                _collect_bound_builtins(entry[2], out)
 
 
 def _snap_collected(vecs: list) -> list:
@@ -1166,11 +1171,13 @@ def _snap_child(entry: Any, seen: dict[int, _Node]) -> tuple:
     trailing element, see :func:`_make_state`); an anchored ``(callee, bound)``
     pair whose bound is a state-carrying partial exposes its vector as
     ``bound.args[0]``; an anchored overload dispatcher exposes its
-    per-implementation vectors through ``__pyne_cache__``; a bound closure whose
-    entire state is one series publishes it as ``__pyne_series__``
-    (``inline_series``). Anything else (a method binder's opaque closure) cannot
-    be walked — it is DROPPED on restore, which re-binds it fresh, exactly what
-    :func:`reset` did for every child.
+    per-implementation vectors, and an anchored ``method_call`` entry its
+    per-method ones, through ``__pyne_cache__`` (an entry with no vector of its
+    own, an overloaded method bound as its group's dispatcher, is snapshotted
+    through its binding); a bound closure whose entire state is one series
+    publishes it as ``__pyne_series__`` (``inline_series``). Anything else
+    cannot be walked — it is DROPPED on restore, which re-binds it fresh,
+    exactly what :func:`reset` did for every child.
     """
     if entry is None:
         return ('none',)
@@ -1192,10 +1199,17 @@ def _snap_child(entry: Any, seen: dict[int, _Node]) -> tuple:
         # measured as a diverging donchian channel.
         cache: dict[Any, Any] | None = getattr(bound, '__pyne_cache__', None)
         if cache is not None:
-            return ('dispatch', entry, cache, tuple(cache),
-                    tuple((vector, _snap_vector(vector, vector[-1], seen))
-                          for vector in (impl_entry[1] for impl_entry in cache.values())
-                          if vector is not None))
+            vectors: list = []
+            nested: list = []
+            for cache_entry in cache.values():
+                vector = cache_entry[1]
+                if vector is not None:
+                    vectors.append((vector, _snap_vector(vector, vector[-1], seen)))
+                    continue
+                inner = _snap_child((cache_entry[0], cache_entry[2]), seen)
+                if inner[0] != 'drop':
+                    nested.append(inner)
+            return 'dispatch', entry, cache, tuple(cache), tuple(vectors), tuple(nested)
         # A closure-held series must be ROLLED BACK, never dropped: re-binding
         # gives an empty buffer, and ``expr[n]`` then reads na forever.
         series = getattr(bound, '__pyne_series__', None)
@@ -1223,10 +1237,113 @@ def _restore_vector(state: list, snap: tuple, done: dict[int, Any]) -> None:
     _restore_children(state, child_vals, done)
 
 
+def _rewind_vector(state: list, layout: dict[str, Any]) -> None:
+    """Return a state vector the discarded pass CREATED to its creation state,
+    in place, keeping what it does not roll back.
+
+    An instance born after the snapshot has "not existing yet" as its baseline
+    for everything a re-execution rolls back, but its varip slots are not
+    rolled back: TradingView keeps a varip advance of such an instance across
+    the discarded pass (measured with ``calc_on_order_fills``, a function first
+    called in the fill pass: its varip counter reads 2 on the committed pass,
+    its var counter 1). So every slot goes back to its template except the
+    varip slots (lazy-init flags of varips included, they are varip slots
+    themselves), the instance vector, and the child slots, which are rewound
+    the same way -- a varip deeper in the subtree survives too.
+
+    :param state: The state vector, rewound in place.
+    :param layout: Its layout entry.
+    """
+    fresh = _make_state(layout)
+    kept = set(layout['varip'])
+    pin: int | None = layout.get('pin')
+    if pin is not None:
+        kept.add(pin)
+    children = {slot: in_loop for slot, _call_id, in_loop in layout['children']}
+    for slot in range(len(fresh) - 1):  # the trailing layout reference stays
+        if slot in kept:
+            continue
+        in_loop = children.get(slot)
+        state[slot] = fresh[slot] if in_loop is None else _rewind_child(state[slot], in_loop)
+
+
+def _rewind_child(value: Any, in_loop: bool) -> Any:
+    """Rewind one child slot of a vector created after the snapshot (see
+    :func:`_rewind_vector`).
+
+    :param value: The slot's value.
+    :param in_loop: Whether the slot is a loop-site cell.
+    :return: The value the slot should hold.
+    """
+    if value is None:
+        return None
+    if not in_loop:
+        return _rewind_entry(value)
+    payload = _rewind_entry(value[0])
+    if payload is None:
+        return None
+    value[0] = payload
+    # Not this bar any more: the next call takes a fresh bar-start baseline of
+    # the rewound subtree instead of restoring the discarded pass's one
+    value[1] = None
+    return value
+
+
+def _rewind_entry(entry: Any) -> Any:
+    """Rewind a child-slot payload created after the snapshot: a fast-path
+    vector, or an anchored pair whose binding exposes its state (a
+    state-carrying partial, a dispatch cache). Anything else holds no varip
+    and is dropped -- it re-binds fresh, which is its creation state.
+
+    :param entry: The payload.
+    :return: The payload to keep, or None to drop it.
+    """
+    if type(entry) is list:
+        _rewind_vector(entry, entry[-1])
+        return entry
+    if type(entry) is tuple and len(entry) == 2:
+        bound = getattr(entry[1], '__pyne_bound__', entry[1])
+        if type(bound) is partial and bound.args:
+            layout: dict[str, Any] | None = getattr(bound.func, '__pyne_layout__', None)
+            if layout is not None:
+                _rewind_vector(bound.args[0], layout)
+                return entry
+        cache: dict[Any, Any] | None = getattr(bound, '__pyne_cache__', None)
+        if cache is not None:
+            for key in list(cache):
+                _rewind_cache_entry(cache, key)
+            return entry
+    return None
+
+
+def _rewind_cache_entry(cache: dict[Any, Any], key: Any) -> None:
+    """Rewind one dispatch-cache entry created after the snapshot (see
+    :func:`_rewind_vector`); an entry with no walkable state is dropped and
+    re-binds fresh.
+
+    :param cache: The dispatch cache (an overload dispatcher's or a
+        ``method_call`` entry's).
+    :param key: The entry's key.
+    """
+    entry = cache[key]
+    vector = entry[1]
+    if vector is not None:
+        _rewind_vector(vector, vector[-1])
+    elif _rewind_entry((entry[0], entry[2])) is None:
+        del cache[key]
+
+
 def _restore_children(state: list, child_vals: tuple, done: dict[int, Any]) -> None:
-    """Restore the child slots of a state vector from :func:`_snap_children`."""
+    """Restore the child slots of a state vector from :func:`_snap_children`.
+
+    A slot that was empty at the snapshot and holds an instance now got it from
+    the discarded pass; it is rewound to its creation state rather than
+    emptied, so the varip slots in it survive (see :func:`_rewind_vector`)."""
     for entry in child_vals:
         slot, in_loop, child_snap = entry[0], entry[1], entry[2]
+        if child_snap[0] == 'none':
+            state[slot] = _rewind_child(state[slot], in_loop)
+            continue
         payload = _restore_payload(child_snap, done)
         if not in_loop:
             state[slot] = payload
@@ -1254,11 +1371,12 @@ def _restore_payload(child_snap: tuple, done: dict[int, Any]) -> Any:
         cache, keys, vectors = child_snap[2], child_snap[3], child_snap[4]
         for vector, vector_snap in vectors:
             _restore_vector(vector, vector_snap, done)
-        # A signature the discarded pass reached first has no bar-start baseline
-        # to return to; dropping it re-binds fresh on the next call, which is
-        # what an unwalkable binding did for every entry before.
+        for inner in child_snap[5]:
+            _restore_payload(inner, done)
+        # A signature the discarded pass reached first has its creation state as
+        # its bar-start baseline, varip slots excepted (see _rewind_vector)
         for key in [key for key in cache if key not in keys]:
-            del cache[key]
+            _rewind_cache_entry(cache, key)
         return child_snap[1]
     return None
 

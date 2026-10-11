@@ -2109,9 +2109,10 @@ def main():
 
 def __test_a_function_selector_naming_a_group_is_typed_like_the_direct_call__():
     """``method_call(scale, 2, 3)`` selects the implementation the receiver and the
-    arguments pin, without stamping the plumbing; a call no implementation takes is a
-    bad call of the METHOD, and one the group cannot settle statically reads as the
-    direct spelling does, named after the method"""
+    arguments pin, and stamps that pin on the plumbing for its anchor to bind the group
+    with, exactly where the direct spelling would carry one; a call no implementation
+    takes is a bad call of the METHOD, and one the group cannot settle statically reads
+    as the direct spelling does, named after the method"""
     tree, table = _infer(UDT_SETUP + '''
 from pynecore.core.overload import overload
 
@@ -2150,10 +2151,74 @@ def main():
     messages = sorted(diag.message for diag in table.diags)
     assert messages == ["no overload of 'scale' takes these arguments",
                         "the call to method 'scale' has no known type"]
-    plumbing = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name) and node.func.id == 'method_call']
-    assert len(plumbing) == 4 and all(get_pin(node) is None for node in plumbing)
+    pins = {node.targets[0].id: get_pin(node.value) for node in ast.walk(tree)
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name) and node.value.func.id == 'method_call'}
+    assert pins == {'x': None, 'y': 'ii', 'z': None, 'w': None}
 
+
+def __test_a_builtin_winning_a_closure_method_call_takes_no_captures__(tmp_path):
+    """A nested method named like the builtin its receiver reaches runs the BUILTIN,
+    which takes none of the captures the closure pass threads after the receiver:
+    ``method_call(get, values, offset, 0)`` is ``array.get(values, 0)``, a float and
+    no bad call"""
+    path = _write(tmp_path, 'shp_closure_builtin', '''"""
+@pyne
+"""
+from pynecore.core.pine_method import method, method_call
+from pynecore.lib import array, script
+
+
+@script.indicator("t")
+def main():
+    offset: int = 1
+    values = array.new_float()
+
+    @method
+    def get(this: list[float], i: int) -> float:
+        return array.get(this, i + offset)
+
+    x = method_call(get, values, 0)
+''')
+    tree, table = _analysed(path)
+    call = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name) and node.func.id == 'method_call')
+    assert ast.unparse(call) == 'method_call(get, values, offset, 0)'
+    assert getattr(call, 'pyne_closure_args') == ('offset',)
+    assert get_ty(call) == FLOAT
+    assert [diag.message for diag in table.diags] == []
+
+
+
+def __test_an_unpacked_receiver_hands_the_captures_over_by_name__(tmp_path):
+    """An unpacked receiver leaves no position after it, so the closure pass hands a
+    method's captures over in the ``__pyne_captures__`` keyword the dispatcher keeps
+    for the method alone: a visible keyword named like a capture is never taken for
+    one, and the call carries no positional capture names for the type pass"""
+    path = _write(tmp_path, 'shp_closure_unpacked', '''"""
+@pyne
+"""
+from pynecore.core.pine_method import method, method_call
+from pynecore.lib import array, script
+
+
+@script.indicator("t")
+def main():
+    index: int = 1
+    values = array.new_float()
+    pair = [values]
+
+    @method
+    def get(this: list[float], i: int) -> float:
+        return array.get(this, i + index)
+
+    x = method_call(get, *pair, index=0)
+''')
+    tree, _ = _analysed(path)
+    call = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name) and node.func.id == 'method_call')
+    assert ast.unparse(call) == 'method_call(get, *pair, index=0, __pyne_captures__=(index,))'
+    assert not hasattr(call, 'pyne_closure_args')
 
 def __test_a_method_call_that_reaches_no_method_names_the_method__():
     """The plumbing is always there: what is missing is a method of the receiver"""

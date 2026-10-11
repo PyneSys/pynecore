@@ -1,11 +1,13 @@
 """
 Unit tests for the slot-based pine method dispatch (core/pine_method.py).
 
-``method_call`` sites are not transformed, so the dispatch binds the
-runtime-selected method through a module-lifetime per-method cache: one
-shared instance per method function, surviving function-object re-creation
-(state from the cache, closure from the passed object) and cleared by
-``instance_state.reset()`` — the formalized legacy empty-scope semantics.
+A transformed ``method_call`` site is anchored and gets its own dispatch entry
+from ``method_call.__pyne_bind__``, with its own per-method cache: one instance
+per method per CALL SITE. These tests call ``method_call`` itself, which is the
+anchorless fallback: one module-lifetime cache shared by every direct call,
+surviving function-object re-creation (state from the cache, closure from the
+passed object) and cleared by ``instance_state.reset()``. The per-site entries
+are exercised directly through the factory at the end.
 """
 import sys
 import types
@@ -52,8 +54,8 @@ def __test_builtin_string_method__():
 
 
 def __test_local_method_shared_state__():
-    """ A local method keeps ONE shared instance: state persists across
-    calls and across receivers (the legacy empty-scope semantics) """
+    """ Without an anchor a local method keeps ONE shared instance: state
+    persists across direct calls and across receivers """
     acc = _make_method('shared_state.m')
     assert method_call(acc, _Receiver(), 1.0) == 1.0
     assert method_call(acc, _Receiver(), 2.0) == 3.0  # other receiver, same instance
@@ -108,14 +110,56 @@ def __test_exported_method_via_receiver_module__():
 
 def __test_closure_converted_method__():
     """ A closure-converted method needs no reordering: the closure transform
-    prepends the closure parameters and inserts the arguments before the
-    receiver, so the positional order lines up as-is """
-    def m(c1, c2, var, x):
-        return (c1, c2, type(var).__name__, x)
+    declares the closure parameters right after the receiver and passes the
+    arguments there, so the positional order lines up as-is """
+    def m(var, c1, c2, x):
+        return type(var).__name__, c1, c2, x
     m.__module__ = 'fake_t017'
     m.__qualname__ = 'closure_conv.m'
-    result = method_call(m, 'c1', 'c2', _Receiver(), 7.0)
-    assert result == ('c1', 'c2', '_Receiver', 7.0)
+    result = method_call(m, _Receiver(), 'c1', 'c2', 7.0)
+    assert result == ('_Receiver', 'c1', 'c2', 7.0)
+
+
+def __test_closure_capture_is_not_the_receiver__():
+    """ A builtin-named method whose first capture is a builtin container still
+    runs the user method: the builtin lookup sees the RECEIVER, which the
+    closure transform keeps in front of the captures """
+    def size(var, captured, x):
+        return var + len(captured) + x
+    size.__module__ = 'fake_t017'
+    size.__qualname__ = 'closure_builtin_name.size'
+    assert method_call(size, 3.0, [1.0, 2.0], 10.0) == 15.0
+
+
+def __test_builtin_winning_drops_closure_captures__():
+    """ A builtin that wins the dispatch of a closure-converted method takes the
+    visible arguments only: the captures the method publishes as
+    ``__pyne_closure__`` are dropped after the receiver, a visible keyword named
+    like a capture stays the builtin's, and the captures of an unpacked-receiver
+    site (``__pyne_captures__``) never reach the builtin """
+    def get(var, index, i):
+        return var[i + index]
+    get.__module__ = 'fake_t017'
+    get.__qualname__ = 'closure_builtin_wins.get'
+    setattr(get, '__pyne_closure__', ('index',))
+    values = [1.0, 2.0]
+    assert method_call(get, values, 1, 0) == 1.0  # array.get(values, 0)
+    assert method_call(get, values, 1, index=0) == 1.0  # array.get(values, index=0)
+    assert method_call(get, *[values], 0, __pyne_captures__=(1,)) == 1.0
+
+
+def __test_unpacked_receiver_captures_follow_the_receiver__():
+    """ The captures of an unpacked-receiver site reach the method right after
+    its receiver, where the closure transform declares them """
+    receiver = _Receiver()
+
+    def shift(var, offset, x):
+        assert var is receiver
+        return x + offset
+    shift.__module__ = 'fake_t017'
+    shift.__qualname__ = 'closure_unpacked.shift'
+    setattr(shift, '__pyne_closure__', ('offset',))
+    assert method_call(shift, *[receiver], 1.0, __pyne_captures__=(10.0,)) == 11.0
 
 
 def __test_dispatcher_method__():
@@ -123,8 +167,8 @@ def __test_dispatcher_method__():
     shared anchored entry from its factory """
     calls = []
 
-    def make_bound():
-        calls.append(True)
+    def make_bound(pin=None):
+        calls.append(pin)
         def bound(var, x):
             return x + 1
         return bound
@@ -162,3 +206,51 @@ def __test_no_such_method_asserts__():
     """ An unresolvable string method fails loudly """
     with pytest.raises(AssertionError, match='No such method'):
         method_call('definitely_missing', _Receiver())
+
+
+def __test_anchored_entries_keep_state_per_site__():
+    """ Every anchor gets its own dispatch entry with its own method instances:
+    two sites calling the same method count independently, and each keeps its
+    state across a re-created function object """
+    site_a = method_call.__pyne_bind__(None)
+    site_b = method_call.__pyne_bind__(None)
+    assert site_a is not site_b and site_a is not method_call
+    acc = _make_method('per_site.m')
+    assert site_a(acc, _Receiver(), 1.0) == 1.0
+    assert site_b(acc, _Receiver(), 10.0) == 10.0  # its own instance
+    assert site_a(acc, _Receiver(), 2.0) == 3.0
+    again = _make_method('per_site.m')  # main() re-ran: a new function object
+    assert site_b(again, _Receiver(), 5.0) == 15.0
+    assert site_a(again, _Receiver(), 1.0) == 4.0
+    assert method_call(acc, _Receiver(), 7.0) == 7.0  # the fallback is a third instance
+
+
+def __test_anchored_entry_exposes_its_cache__():
+    """ An anchored entry publishes its method states as ``__pyne_cache__``,
+    the shape the loop-site rollback and the re-execution snapshot walk """
+    site = method_call.__pyne_bind__(None)
+    acc = _make_method('cache_shape.m')
+    site(acc, _Receiver(), 2.0)
+    entries = list(site.__pyne_cache__.values())
+    assert len(entries) == 1
+    target, state, _bound = entries[0]
+    assert target is acc and state[0] == 2.0
+
+
+def __test_anchored_entries_exported_method_per_site__():
+    """ A string-dispatched library method is bound per anchor too """
+    mod = types.ModuleType('fake_udt_t017_sites')
+    exec('class Point:\n    pass', mod.__dict__)
+    exported = Exported()
+    exported.set(_make_method('exported_sites.m'))
+    mod.mymethod = exported
+    sys.modules['fake_udt_t017_sites'] = mod
+    try:
+        point = mod.Point()
+        site_a = method_call.__pyne_bind__(None)
+        site_b = method_call.__pyne_bind__(None)
+        assert site_a('mymethod', point, 2.0) == 2.0
+        assert site_b('mymethod', point, 3.0) == 3.0
+        assert site_a('mymethod', point, 1.0) == 3.0
+    finally:
+        del sys.modules['fake_udt_t017_sites']
