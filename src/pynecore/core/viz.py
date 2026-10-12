@@ -518,14 +518,17 @@ def reset_state() -> None:
 
 
 def _encode_color_channel(v: Any) -> Any:
-    """Encode a dynamic color channel: Color -> hex, tuple -> list, NA -> None."""
+    """Encode a dynamic color channel: Color -> hex, tuple -> list, NA -> None.
+
+    The only number a channel carries is a gradient fill's top/bottom value, a Pine float.
+    """
     if v is None or isinstance(v, NA):
         return None
     if isinstance(v, Color):
         return color_str(v)
     if isinstance(v, tuple):
         return [_encode_color_channel(x) for x in v]
-    return v
+    return _float_field(v)
 
 
 class VizWriter:

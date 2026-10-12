@@ -161,3 +161,14 @@ def __test_heartbeat_disabled_at_zero_interval_never_starts__():
     heartbeat.start()
     assert not heartbeat._thread.is_alive()  # noqa: SLF001
     heartbeat.stop()
+
+
+def __test_rich_formatter_leaves_the_rendered_message_for_later_handlers__(monkeypatch):
+    """Every handler shares one record: after the Rich formatter cleared the arguments, a later
+    handler (or a propagated one) must still see the rendered message, not the bare pattern."""
+    monkeypatch.setattr(log_module, "rich", True)
+    formatter = log_module.PineLogFormatter()
+    record = logging.LogRecord("pyne", logging.INFO, __file__, 0, "price={0}", (12.5,), None)
+    assert formatter.format(record) == "price=12.5"
+    assert formatter.format(record) == "price=12.5"
+    assert record.getMessage() == "price=12.5"

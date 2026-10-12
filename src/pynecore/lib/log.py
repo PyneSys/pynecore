@@ -13,6 +13,7 @@ from pathlib import Path
 DURABLE_LOG_WIDTH = 200
 
 from .string import format as _format
+from ..core.format_args import check_format_args as _check_format_args
 from .. import lib
 
 # Try to import rich, but don't fail if not available
@@ -163,13 +164,15 @@ class PineLogFormatter(logging.Formatter):
         else:
             msg = str(record.msg)
 
+        # The record is shared by every handler: store the rendered message, so a later handler
+        # (or a propagated one) does not see the bare pattern after the arguments are cleared
+        record.msg = msg
         record.args = ()
 
         record.created = lib._time / 1000 if lib._time else record.created
         if rich:
             return msg
 
-        record.msg = msg
         return super().format(record)
 
 
@@ -260,7 +263,11 @@ def info(formatString: str, *args: Any, **kwargs: Any) -> None:
     :param formatString: Message format string
     :param args: Arguments to format the message
     :param kwargs: Additional arguments (unused)
+    :raises TypeError: If an argument is not an int, float, bool or string value or an array
+        of them
     """
+    # Checked here, not where the handler formats: logging would swallow the error there
+    _check_format_args(args)
     # noinspection PyProtectedMember
     if lib._lib_semaphore:
         if _security_logger:
@@ -277,7 +284,11 @@ def warning(formatString: str, *args: Any, **kwargs: Any) -> None:
     :param formatString: Message format string
     :param args: Arguments to format the message
     :param kwargs: Additional arguments (unused)
+    :raises TypeError: If an argument is not an int, float, bool or string value or an array
+        of them
     """
+    # Checked here, not where the handler formats: logging would swallow the error there
+    _check_format_args(args)
     # noinspection PyProtectedMember
     if lib._lib_semaphore:
         if _security_logger:
@@ -294,7 +305,11 @@ def error(formatString: str, *args: Any, **kwargs: Any) -> None:
     :param formatString: Message format string
     :param args: Arguments to format the message
     :param kwargs: Additional arguments (unused)
+    :raises TypeError: If an argument is not an int, float, bool or string value or an array
+        of them
     """
+    # Checked here, not where the handler formats: logging would swallow the error there
+    _check_format_args(args)
     # noinspection PyProtectedMember
     if lib._lib_semaphore:
         if _security_logger:

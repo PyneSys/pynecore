@@ -7,6 +7,7 @@ from math import isinf, copysign as _copysign
 from datetime import datetime, UTC
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_HALF_EVEN, localcontext
 
+from ..core.format_args import check_format_args as _check_format_args
 from ..core.safe_convert import native_int_or as _native_int_or
 from ..types.matrix import Matrix as _Matrix
 from ..types.na import NA, na_float, na_int
@@ -1022,7 +1023,10 @@ def format(formatString: str, *args: Any) -> str:
     :param args: Values to format
     :return: Formatted string, or na if the format pattern is na
     :raises ValueError: If the pattern is malformed
+    :raises TypeError: If an argument is not an int, float, bool or string value or an array
+        of them
     """
+    _check_format_args(args)
     # na-propagation (Pine): a na format pattern yields na (e.g. the TV
     # Technical Ratings idiom ``str.repeat("\n", 0) + "{0}"`` — the repeat
     # returns na, the concat propagates it, and str.format passes it through).

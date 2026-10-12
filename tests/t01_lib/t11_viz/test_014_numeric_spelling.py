@@ -10,13 +10,15 @@ must not show that: a Pine int field prints as an integer, a Pine float field as
 import json
 
 from pynecore.core.viz import (
-    _box_dict, _label_dict, _line_dict, _point_dict, _table_dict, serialize_meta,
+    _box_dict, _encode_color_channel, _label_dict, _line_dict, _point_dict, _scrub, _table_dict,
+    serialize_meta,
 )
-from pynecore.lib import position
+from pynecore.lib import color, position
 from pynecore.types.box import Box
 from pynecore.types.chart import ChartPoint
 from pynecore.types.label import Label
 from pynecore.types.line import Line
+from pynecore.types.na import NA
 from pynecore.types.plot_meta import PlotMeta
 from pynecore.types.table import Table
 
@@ -71,3 +73,12 @@ def __test_meta_fields_ignore_the_python_class__():
     h_inp = serialize_meta(PlotMeta(id="h", kind="hline", price=50.0, linewidth=1.0))
     assert __test_helper_dump(h_lit) == __test_helper_dump(h_inp)
     assert type(h_lit["price"]) is float
+
+
+def __test_gradient_fill_values_ignore_the_python_class__():
+    """a gradient fill's top/bottom values are float fields in the color channel"""
+    lit = _encode_color_channel((70, 30, color.red, color.blue))
+    inp = _encode_color_channel((70.0, 30.0, color.red, color.blue))
+    assert __test_helper_dump({"c": lit}) == __test_helper_dump({"c": inp})
+    assert (type(lit[0]), type(lit[1])) == (float, float)
+    assert _scrub(_encode_color_channel((NA(float), 30, None, color.blue)))[:3] == [None, 30.0, None]
