@@ -2,7 +2,7 @@ from typing import cast
 import ast
 
 from .phase import Rule
-from .pine_type_rules import BOOL, FLOAT, INT, TYPELESS, get_ty, set_ty, stamp_lowering
+from .pine_type_rules import BOOL, FLOAT, INT, STR, TYPELESS, get_ty, set_ty, stamp_lowering
 
 #: Operand types whose runtime values are native numbers, bools or na (an ``NA``
 #: object or a nan). Division on those can raise nothing but
@@ -71,10 +71,18 @@ class SafeDivisionTransformer(Rule):
     The inline form requires both operands to be numeric-typed by the type pass:
     for those, the plain division can raise nothing but ``ZeroDivisionError``,
     while ``safe_div`` also turns a ``TypeError`` into na.
+
+    With ``pine_mod`` (user code), ``a % b`` becomes ``safe_convert.safe_mod(a, b)``:
+    Pine's remainder is truncated (C's ``fmod``) where Python's is floored, and a zero
+    divisor gives na. A string left operand is Python's formatting and stays. pynecore's
+    own lib modules keep Python's ``%``: their ring buffers index with the floored one.
+
+    An augmented assignment (``x /= y``, ``x %= y``) is written out as the plain
+    assignment of the same safe call; a sliced subscript target keeps Python's operator.
     """
 
-    def __init__(self):
-        self.has_safe_convert_import = False
+    def __init__(self, pine_mod: bool = False):
+        self.pine_mod = pine_mod
         self.has_division_operations = False  # Track if division is used
         self._counter = 0
         self._func_depth = 0
@@ -154,10 +162,81 @@ class SafeDivisionTransformer(Rule):
             orelse=set_ty(ast.Call(func=_safe_convert_attr('safe_div'),
                                    args=[left_ref(), right_ref()], keywords=[]), ty))
 
+    def _is_pine_mod(self, op: ast.operator, left: ast.expr) -> bool:
+        """Whether a ``%`` is Pine's remainder rather than Python's string formatting."""
+        return (self.pine_mod and isinstance(op, ast.Mod) and get_ty(left) != STR
+                and not (isinstance(left, ast.Constant) and isinstance(left.value, str))
+                and not isinstance(left, ast.JoinedStr))
+
+    def _bind_once(self, node: ast.expr, temps: list[str]) -> tuple[ast.expr, ast.expr]:
+        """
+        Evaluate one part of an augmented assignment's target once for its read and store.
+
+        A literal is read twice. Everything else, a name included, is bound to a temporary
+        by the read: the index, the target lookup and the right side all run between the
+        read and the store, and any of them may rebind a name.
+
+        :param node: The receiver or the index of the target.
+        :param temps: Collects the temporaries bound.
+        :return: The expression of the part for the read, and the one for the store.
+        """
+        if isinstance(node, ast.Constant):
+            return node, _reread(node)
+        temp = self._temp()
+        temps.append(temp)
+        return ast.NamedExpr(target=ast.Name(id=temp, ctx=ast.Store()), value=node), _load(temp)
+
+    def leave_AugAssign(self, node: ast.AugAssign) -> ast.stmt | list[ast.stmt]:
+        """
+        Write out an augmented division or Pine remainder as a plain assignment.
+
+        Python evaluates the receiver and the index of an augmented target once, before
+        the right side; the written-out form reads the target through the same values
+        it stores to (see :meth:`_bind_once`). A temporary bound outside a function body
+        is deleted right after the statement.
+        """
+        if isinstance(node.op, ast.Div):
+            helper = 'safe_div'
+        elif self._is_pine_mod(node.op, node.target):
+            helper = 'safe_mod'
+        else:
+            return node
+        target = node.target
+        temps: list[str] = []
+        if isinstance(target, ast.Name):
+            current: ast.expr = _load(target.id)
+        elif isinstance(target, ast.Attribute):
+            receiver, stored = self._bind_once(target.value, temps)
+            current = ast.Attribute(value=receiver, attr=target.attr, ctx=ast.Load())
+            target = ast.Attribute(value=stored, attr=target.attr, ctx=ast.Store())
+        elif isinstance(target, ast.Subscript) and not any(
+                isinstance(part, ast.Slice) for part in ast.walk(target.slice)):
+            receiver, stored = self._bind_once(target.value, temps)
+            index, stored_index = self._bind_once(target.slice, temps)
+            current = ast.Subscript(value=receiver, slice=index, ctx=ast.Load())
+            target = ast.Subscript(value=stored, slice=stored_index, ctx=ast.Store())
+        else:
+            return node
+        self.has_division_operations = True
+        ty = get_ty(node.target)
+        value = stamp_lowering(ast.Call(func=_safe_convert_attr(helper),
+                                        args=[set_ty(current, ty), node.value], keywords=[]),
+                               ty)
+        assign = ast.copy_location(ast.Assign(targets=[target], value=value), node)
+        if not temps or (self._func_depth and not self._blocked):
+            return assign
+        return [assign, ast.copy_location(ast.Delete(
+            targets=[ast.Name(id=temp, ctx=ast.Del()) for temp in temps]), node)]
+
     def leave_BinOp(self, node: ast.BinOp) -> ast.expr:
         """
-        Transform division operations
+        Transform division and Pine remainder operations
         """
+        if self._is_pine_mod(node.op, node.left):
+            self.has_division_operations = True
+            return ast.copy_location(stamp_lowering(
+                ast.Call(func=_safe_convert_attr('safe_mod'), args=[node.left, node.right],
+                         keywords=[]), get_ty(node)), node)
         # Check if it's a division operation
         if isinstance(node.op, ast.Div):
             # A literal division by a nonzero literal (e.g. 1/2) cannot raise
@@ -220,40 +299,40 @@ class SafeDivisionTransformer(Rule):
         if not self.has_division_operations:
             return node
 
-        # Check for existing safe_convert import
+        # Only an import that binds the module itself to ``safe_convert`` provides
+        # the name the emitted calls read
         for stmt in node.body:
-            if isinstance(stmt, ast.ImportFrom) and stmt.module == 'pynecore.core.safe_convert':
-                self.has_safe_convert_import = True
-                # Check if it's imported as 'safe_convert'
-                for alias in stmt.names:
-                    if alias.name == 'safe_convert' or alias.asname == 'safe_convert':
-                        return node
-            elif isinstance(stmt, ast.ImportFrom) and stmt.module == 'pynecore.core':
-                for alias in stmt.names:
-                    if alias.name == 'safe_convert':
-                        self.has_safe_convert_import = True
-                        return node
+            if isinstance(stmt, ast.ImportFrom):
+                module = 'pynecore.core' if stmt.level == 0 else 'core'
+                bound = (stmt.module == module and any(
+                    alias.name == 'safe_convert' and alias.asname in (None, 'safe_convert')
+                    for alias in stmt.names))
+            elif isinstance(stmt, ast.Import):
+                bound = any(alias.name == 'pynecore.core.safe_convert'
+                            and alias.asname == 'safe_convert' for alias in stmt.names)
+            else:
+                continue
+            if bound:
+                return node
 
-        # Add import if needed
-        if not self.has_safe_convert_import:
-            import_stmt = ast.ImportFrom(
-                module='pynecore.core',
-                names=[ast.alias(name='safe_convert', asname=None)],
-                level=0
-            )
+        import_stmt = ast.ImportFrom(
+            module='pynecore.core',
+            names=[ast.alias(name='safe_convert', asname=None)],
+            level=0
+        )
 
-            # Find the right position to insert import - after the docstring if it exists
-            insert_pos = 0
-            if (node.body and isinstance(node.body[0], ast.Expr) and
-                    isinstance(cast(ast.Expr, node.body[0]).value, ast.Constant)):
-                insert_pos = 1
+        # Find the right position to insert import - after the docstring if it exists
+        insert_pos = 0
+        if (node.body and isinstance(node.body[0], ast.Expr) and
+                isinstance(cast(ast.Expr, node.body[0]).value, ast.Constant)):
+            insert_pos = 1
 
-            # Insert after any existing imports
-            while (insert_pos < len(node.body) and
-                   (isinstance(node.body[insert_pos], ast.Import) or
-                    isinstance(node.body[insert_pos], ast.ImportFrom))):
-                insert_pos += 1
+        # Insert after any existing imports
+        while (insert_pos < len(node.body) and
+               (isinstance(node.body[insert_pos], ast.Import) or
+                isinstance(node.body[insert_pos], ast.ImportFrom))):
+            insert_pos += 1
 
-            node.body.insert(insert_pos, import_stmt)
+        node.body.insert(insert_pos, import_stmt)
 
         return node

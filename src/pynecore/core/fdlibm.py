@@ -1,4 +1,4 @@
-"""Bit-exact Python port of fdlibm 5.3 sin/cos/exp/asin/acos/atan.
+"""Bit-exact Python port of fdlibm 5.3 sin/cos/tan/exp/log/pow/asin/acos/atan.
 
 Ported from the SunSoft fdlibm sources (netlib.org/fdlibm), which carry the
 following notice that must be preserved:
@@ -15,12 +15,16 @@ following notice that must be preserved:
 Python floats are IEEE binary64 and Python arithmetic maps 1:1 onto the C
 double operations, so the port is bit-exact by construction; it is verified
 against Java StrictMath (the same fdlibm lineage) over millions of arguments.
+
+``tan``, ``log`` and ``pow`` serve the parse-time constant fold only (see
+``transformers.const_fold``): at runtime the venue computes them with its Intel-LIBM
+intrinsics, so they have no compiled twin in ``_native_math``.
 """
 import math as _math
 import os as _os
 from struct import pack as _pack, unpack as _unpack
 
-__all__ = ['sin', 'cos', 'exp', 'asin', 'acos', 'atan']
+__all__ = ['sin', 'cos', 'exp', 'asin', 'acos', 'atan', 'log', 'tan', 'pow']
 
 _M32 = 0xFFFFFFFF
 
@@ -606,6 +610,359 @@ def atan(x: float) -> float:
         return x - x * (s1 + s2)
     z = _ATAN_HI[id_] - ((x * (s1 + s2) - _ATAN_LO[id_]) - x)
     return -z if hx < 0 else z
+
+
+# --- log (e_log.c) -----------------------------------------------------------
+
+_LN2_HI = 6.93147180369123816490e-01
+_LN2_LO = 1.90821492927058770002e-10
+_TWO54 = 1.80143985094819840000e+16
+_LG1 = 6.666666666666735130e-01
+_LG2 = 3.999999999940941908e-01
+_LG3 = 2.857142874366239149e-01
+_LG4 = 2.222219843214978396e-01
+_LG5 = 1.818357216161805012e-01
+_LG6 = 1.531383769920937332e-01
+_LG7 = 1.479819860511658591e-01
+
+
+def log(x: float) -> float:
+    hx = _hi(x)
+    lx = _lo(x)
+    k = 0
+    if hx < 0x00100000:                     # x < 2**-1022
+        if ((hx & 0x7fffffff) | lx) == 0:
+            return -_math.inf               # log(+-0) = -inf
+        if hx < 0:
+            return _math.nan                # log(-#) = NaN
+        k -= 54
+        x *= _TWO54                         # subnormal: scale up x
+        hx = _hi(x)
+    if hx >= 0x7ff00000:
+        return x + x
+    k += (hx >> 20) - 1023
+    hx &= 0x000fffff
+    i = (hx + 0x95f64) & 0x100000
+    x = _set_hi(x, hx | (i ^ 0x3ff00000))  # normalize x or x/2
+    k += i >> 20
+    f = x - 1.0
+    if (0x000fffff & (2 + hx)) < 3:         # |f| < 2**-20
+        if f == 0.0:
+            if k == 0:
+                return 0.0
+            dk = float(k)
+            return dk * _LN2_HI + dk * _LN2_LO
+        r = f * f * (0.5 - 0.33333333333333333 * f)
+        if k == 0:
+            return f - r
+        dk = float(k)
+        return dk * _LN2_HI - ((r - dk * _LN2_LO) - f)
+    s = f / (2.0 + f)
+    dk = float(k)
+    z = s * s
+    i = hx - 0x6147a
+    w = z * z
+    j = 0x6b851 - hx
+    t1 = w * (_LG2 + w * (_LG4 + w * _LG6))
+    t2 = z * (_LG1 + w * (_LG3 + w * (_LG5 + w * _LG7)))
+    i |= j
+    r = t2 + t1
+    if i > 0:
+        hfsq = 0.5 * f * f
+        if k == 0:
+            return f - (hfsq - s * (hfsq + r))
+        return dk * _LN2_HI - ((hfsq - (s * (hfsq + r) + dk * _LN2_LO)) - f)
+    if k == 0:
+        return f - s * (f - r)
+    return dk * _LN2_HI - ((s * (f - r) - dk * _LN2_LO) - f)
+
+
+# --- tan (k_tan.c, s_tan.c) --------------------------------------------------
+
+_T = (
+    3.33333333333334091986e-01,
+    1.33333333333201242699e-01,
+    5.39682539762260521377e-02,
+    2.18694882948595424599e-02,
+    8.86323982359930005737e-03,
+    3.59207910759131235356e-03,
+    1.45620945432529025516e-03,
+    5.88041240820264096874e-04,
+    2.46463134818469906812e-04,
+    7.81794442939557092300e-05,
+    7.14072491382608190305e-05,
+    -1.85586374855275456654e-05,
+    2.59073051863633712884e-05,
+)
+_PIO4 = 7.85398163397448278999e-01
+_PIO4LO = 3.06161699786838301793e-17
+
+
+def _kernel_tan(x: float, y: float, iy: int) -> float:
+    hx = _hi(x)
+    ix = hx & 0x7fffffff
+    if ix < 0x3e300000:                     # |x| < 2**-28
+        if ((ix | _lo(x)) | (iy + 1)) == 0:
+            return _math.inf                # 1 / |x| of a zero
+        if iy == 1:
+            return x
+        # compute -1 / (x+y) carefully
+        w = x + y
+        z = _set_lo(w, 0)
+        v = y - (z - x)
+        a = _div(-1.0, w)
+        t = _set_lo(a, 0)
+        s = 1.0 + t * z
+        return t + a * (s + t * v)
+    if ix >= 0x3FE59428:                    # |x| >= 0.6744
+        if hx < 0:
+            x = -x
+            y = -y
+        z = _PIO4 - x
+        w = _PIO4LO - y
+        x = z + w
+        y = 0.0
+    z = x * x
+    w = z * z
+    r = _T[1] + w * (_T[3] + w * (_T[5] + w * (_T[7] + w * (_T[9] + w * _T[11]))))
+    v = z * (_T[2] + w * (_T[4] + w * (_T[6] + w * (_T[8] + w * (_T[10] + w * _T[12])))))
+    s = z * x
+    r = y + z * (s * (r + v) + y)
+    r += _T[0] * s
+    w = x + r
+    if ix >= 0x3FE59428:
+        v = float(iy)
+        return float(1 - ((hx >> 30) & 2)) * (v - 2.0 * (x - (w * w / (w + v) - r)))
+    if iy == 1:
+        return w
+    # compute -1.0 / (x+r) accurately
+    z = _set_lo(w, 0)
+    v = r - (z - x)
+    a = -1.0 / w
+    t = _set_lo(a, 0)
+    s = 1.0 + t * z
+    return t + a * (s + t * v)
+
+
+def tan(x: float) -> float:
+    ix = _hi(x) & 0x7fffffff
+    if ix <= 0x3fe921fb:
+        return _kernel_tan(x, 0.0, 1)
+    if ix >= 0x7ff00000:
+        return x - x
+    n, y0, y1 = _rem_pio2(x)
+    return _kernel_tan(y0, y1, 1 - ((n & 1) << 1))
+
+
+# --- pow (e_pow.c) -----------------------------------------------------------
+
+_BP = (1.0, 1.5)
+_DP_H = (0.0, 5.84962487220764160156e-01)
+_DP_L = (0.0, 1.35003920212974897128e-08)
+_TWO53 = 9007199254740992.0
+_TINY = 1.0e-300
+_PL1 = 5.99999999999994648725e-01
+_PL2 = 4.28571428578550184252e-01
+_PL3 = 3.33333329818377432918e-01
+_PL4 = 2.72728123808534006489e-01
+_PL5 = 2.30660745775561754067e-01
+_PL6 = 2.06975017800338417784e-01
+_LG2_P = 6.93147180559945286227e-01
+_LG2_H = 6.93147182464599609375e-01
+_LG2_L = -1.90465429995776804525e-09
+_OVT = 8.0085662595372944372e-17
+_CP = 9.61796693925975554329e-01
+_CP_H = 9.61796700954437255859e-01
+_CP_L = -7.02846165095275826516e-09
+_IVLN2 = 1.44269504088896338700e+00
+_IVLN2_H = 1.44269502162933349609e+00
+_IVLN2_L = 1.92596299112661746887e-08
+
+
+def _div(a: float, b: float) -> float:
+    """C's ``a / b``, where a zero divisor gives an infinity or a nan instead of raising."""
+    if b != 0.0:
+        return a / b
+    if a != a or a == 0.0:
+        return _math.nan
+    return _math.copysign(_math.inf, a) * _math.copysign(1.0, b)
+
+
+def pow(x: float, y: float) -> float:
+    hx = _hi(x)
+    lx = _lo(x)
+    hy = _hi(y)
+    ly = _lo(y)
+    ix = hx & 0x7fffffff
+    iy = hy & 0x7fffffff
+
+    if (iy | ly) == 0:                      # x**0 = 1
+        return 1.0
+    if ix > 0x7ff00000 or (ix == 0x7ff00000 and lx != 0) \
+            or iy > 0x7ff00000 or (iy == 0x7ff00000 and ly != 0):
+        return x + y                        # +-NaN
+
+    # yisint: 0 -- y is not an integer, 1 -- odd integer, 2 -- even integer
+    yisint = 0
+    if hx < 0:
+        if iy >= 0x43400000:
+            yisint = 2
+        elif iy >= 0x3ff00000:
+            k = (iy >> 20) - 0x3ff
+            if k > 20:
+                j = ly >> (52 - k)
+                if (j << (52 - k)) == ly:
+                    yisint = 2 - (j & 1)
+            elif ly == 0:
+                j = iy >> (20 - k)
+                if (j << (20 - k)) == iy:
+                    yisint = 2 - (j & 1)
+
+    if ly == 0:
+        if iy == 0x7ff00000:                # y is +-inf
+            if ((ix - 0x3ff00000) | lx) == 0:
+                return y - y                # inf**+-1 is NaN
+            if ix >= 0x3ff00000:            # (|x|>1)**+-inf = inf,0
+                return y if hy >= 0 else 0.0
+            return -y if hy < 0 else 0.0    # (|x|<1)**-,+inf = inf,0
+        if iy == 0x3ff00000:                # y is +-1
+            return _div(1.0, x) if hy < 0 else x
+        if hy == 0x40000000:                # y is 2
+            return x * x
+        if hy == 0x3fe00000 and hx >= 0:    # y is 0.5, x >= +0
+            return _math.sqrt(x)
+
+    ax = abs(x)
+    if lx == 0 and (ix == 0x7ff00000 or ix == 0 or ix == 0x3ff00000):
+        z = ax                              # x is +-0, +-inf, +-1
+        if hy < 0:
+            z = _div(1.0, z)
+        if hx < 0:
+            if ((ix - 0x3ff00000) | yisint) == 0:
+                z = _math.nan               # (-1)**non-int is NaN
+            elif yisint == 1:
+                z = -z                      # (x<0)**odd = -(|x|**odd)
+        return z
+
+    n = (hx >> 31) + 1
+    if (n | yisint) == 0:
+        return _math.nan                    # (x<0)**(non-int) is NaN
+
+    s = 1.0                                 # sign of the result
+    if (n | (yisint - 1)) == 0:
+        s = -1.0                            # (-ve)**(odd int)
+
+    if iy > 0x41e00000:                     # |y| > 2**31
+        if iy > 0x43f00000:                 # |y| > 2**64, must o/uflow
+            if ix <= 0x3fefffff:
+                return _HUGE * _HUGE if hy < 0 else _TINY * _TINY
+            if ix >= 0x3ff00000:
+                return _HUGE * _HUGE if hy > 0 else _TINY * _TINY
+        # over/underflow if x is not close to one
+        if ix < 0x3fefffff:
+            return s * _HUGE * _HUGE if hy < 0 else s * _TINY * _TINY
+        if ix > 0x3ff00000:
+            return s * _HUGE * _HUGE if hy > 0 else s * _TINY * _TINY
+        # |1-x| <= 2**-20: log(x) by x-x^2/2+x^3/3-x^4/4
+        t = ax - 1.0
+        w = (t * t) * (0.5 - t * (0.3333333333333333333333 - t * 0.25))
+        u = _IVLN2_H * t
+        v = t * _IVLN2_L - w * _IVLN2
+        t1 = _set_lo(u + v, 0)
+        t2 = v - (t1 - u)
+    else:
+        n = 0
+        if ix < 0x00100000:                 # subnormal x
+            ax *= _TWO53
+            n -= 53
+            ix = _hi(ax)
+        n += (ix >> 20) - 0x3ff
+        j = ix & 0x000fffff
+        ix = j | 0x3ff00000                 # normalize ix
+        if j <= 0x3988E:                    # |x| < sqrt(3/2)
+            k = 0
+        elif j < 0xBB67A:                   # |x| < sqrt(3)
+            k = 1
+        else:
+            k = 0
+            n += 1
+            ix -= 0x00100000
+        ax = _set_hi(ax, ix)
+
+        # ss = s_h+s_l = (x-1)/(x+1) or (x-1.5)/(x+1.5)
+        u = ax - _BP[k]
+        v = 1.0 / (ax + _BP[k])
+        ss = u * v
+        s_h = _set_lo(ss, 0)
+        # t_h = ax+bp[k] High
+        t_h = _set_hi(0.0, ((ix >> 1) | 0x20000000) + 0x00080000 + (k << 18))
+        t_l = ax - (t_h - _BP[k])
+        s_l = v * ((u - s_h * t_h) - s_h * t_l)
+        # log(ax)
+        s2 = ss * ss
+        r = s2 * s2 * (_PL1 + s2 * (_PL2 + s2 * (_PL3 + s2 * (_PL4 + s2 * (_PL5 + s2 * _PL6)))))
+        r += s_l * (s_h + ss)
+        s2 = s_h * s_h
+        t_h = _set_lo(3.0 + s2 + r, 0)
+        t_l = r - ((t_h - 3.0) - s2)
+        # u+v = ss*(1+...)
+        u = s_h * t_h
+        v = s_l * t_h + t_l * ss
+        # 2/(3log2)*(ss+...)
+        p_h = _set_lo(u + v, 0)
+        p_l = v - (p_h - u)
+        z_h = _CP_H * p_h
+        z_l = _CP_L * p_h + p_l * _CP + _DP_L[k]
+        # log2(ax) = (ss+..)*2/(3*log2) = n + dp_h + z_h + z_l
+        t = float(n)
+        t1 = _set_lo(((z_h + z_l) + _DP_H[k]) + t, 0)
+        t2 = z_l - (((t1 - t) - _DP_H[k]) - z_h)
+
+    # split up y into y1+y2 and compute (y1+y2)*(t1+t2)
+    y1 = _set_lo(y, 0)
+    p_l = (y - y1) * t1 + y * t2
+    p_h = y1 * t1
+    z = p_l + p_h
+    j = _hi(z)
+    i = _lo(z)
+    if j >= 0x40900000:                     # z >= 1024
+        if ((j - 0x40900000) | i) != 0:
+            return s * _HUGE * _HUGE        # overflow
+        if p_l + _OVT > z - p_h:
+            return s * _HUGE * _HUGE
+    elif (j & 0x7fffffff) >= 0x4090cc00:    # z <= -1075
+        if (((j & _M32) - 0xc090cc00) | i) != 0:
+            return s * _TINY * _TINY        # underflow
+        if p_l <= z - p_h:
+            return s * _TINY * _TINY
+
+    # 2**(p_h+p_l)
+    i = j & 0x7fffffff
+    k = (i >> 20) - 0x3ff
+    n = 0
+    if i > 0x3fe00000:                      # |z| > 0.5: n = [z+0.5]
+        n = j + (0x00100000 >> (k + 1))
+        k = ((n & 0x7fffffff) >> 20) - 0x3ff
+        t = _set_hi(0.0, n & ~(0x000fffff >> k))
+        n = ((n & 0x000fffff) | 0x00100000) >> (20 - k)
+        if j < 0:
+            n = -n
+        p_h -= t
+    t = _set_lo(p_l + p_h, 0)
+    u = t * _LG2_H
+    v = (p_l - (t - p_h)) * _LG2_P + t * _LG2_L
+    z = u + v
+    w = v - (z - u)
+    t = z * z
+    t1 = z - t * (_EP1 + t * (_EP2 + t * (_EP3 + t * (_EP4 + t * _EP5))))
+    r = (z * t1) / (t1 - 2.0) - (w + z * w)
+    z = 1.0 - (r - z)
+    j = _hi(z) + (n << 20)
+    if (j >> 20) <= 0:
+        z = _math.ldexp(z, n)               # subnormal output
+    else:
+        z = _set_hi(z, _hi(z) + (n << 20))
+    return s * z
 
 
 #: The pure-Python implementations. ``_native_math``, when built, rebinds the public

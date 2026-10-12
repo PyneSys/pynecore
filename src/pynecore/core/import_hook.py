@@ -288,7 +288,7 @@ _RUNTIME_ABI: tuple[tuple[str, tuple[str, ...]], ...] = (
     ('core/instance_state.py', ('__resolve_slot__', '__loop_state__', '__slot_state__',
                                 '__attach_layout__', '__bind_any__', '__bind_pinned__',
                                 '__bind_loop__', '__bind_slot__')),
-    ('core/safe_convert.py', ('safe_div', 'safe_float', 'safe_int', 'native_int',
+    ('core/safe_convert.py', ('safe_div', 'safe_mod', 'safe_float', 'safe_int', 'native_int',
                               'safe_float_items', 'safe_float_matrix', 'implicit_convert')),
     ('core/security.py', ('__sec_signal__', '__sec_write__', '__sec_read__', '__sec_wait__',
                           '__ltf_unzip__')),
@@ -460,6 +460,8 @@ def _get_transform_pipeline_hash() -> str:
         # twins are bit-exact to them, so the Python sources pin the values
         files.extend([Path(__file__).parent / "fdlibm.py",
                       Path(__file__).parent / "pine_math.py"])
+        # ... and a constant ``%`` through the runtime's own ``safe_mod``
+        files.append(Path(__file__).parent / "safe_convert.py")
         # ... and they reach it through the Pine number types, ``na`` and the
         # overload dispatch (``math.round``), whose behaviour shapes the folded value
         package_dir = Path(__file__).parent.parent

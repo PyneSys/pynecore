@@ -194,7 +194,7 @@ A row named `Expression/<Rule>` is a rule of the fused phase `Expression`; the `
 | `Input`                     | Add `_id` to input calls, rebind source inputs                  | no             | Before the Expression phase (SafeConvert must see the rebinding)         |
 | `Expression`                | Expression-level rewrites in one post-order traversal (phase)   | -              | See "Fused Phases and the Sequential Mode"                               |
 | `Expression/SafeConvert`    | Lower `float()` / `int()` and truncate Python-native indexes    | no             | After Input (its binding scan must see the rebinding)                    |
-| `Expression/SafeDivision`   | Give `/` Pine's division-by-zero and na semantics               | no             | Before FloatTolerance (wrapped operands are bound once)                  |
+| `Expression/SafeDivision`   | Give `/` and `%` Pine's zero-divisor and na semantics           | no             | Before FloatTolerance (wrapped operands are bound once)                  |
 | `Expression/FloatTolerance` | Give comparisons TradingView's tolerant float semantics         | yes            | After SafeDivision                                                       |
 | `FinalizeCloneDefaults`     | Make the defaults of the security clones inert                  | no             | After the input lowering                                                 |
 | `ApplyLayout`               | Emit the slot layout, state parameters and attach statements    | no             | After every step that allocates slots; skipped when `emit_layout` is off |
@@ -452,7 +452,7 @@ c = lib.close * 2.0 + 3.141592653589793
 
 Key aspects:
 - Constants propagate through single names in straight-line order; control flow conservatively kills the names it assigns. A `Persistent` that is stored more than once never counts as constant
-- The folded surface is `+`, `-`, `*`, `/`, the `lib.math` constants (`pi`, `e`, `phi`, `rphi`), fdlibm `sin`/`cos`/`exp`/`asin`/`acos`/`atan` and the exact `sqrt`, `abs`, `floor`, `ceil`, `min`, `max`, `avg`, `sign`, `round`, `todegrees`, `toradians`. Anything else (`pow`, `log`, `tan`, `random`, ...) stays in the code and evaluates at runtime
+- The folded surface is `+`, `-`, `*`, `/`, `%` (Pine's truncated remainder, `safe_convert.safe_mod`), the `lib.math` constants (`pi`, `e`, `phi`, `rphi`), fdlibm `sin`/`cos`/`tan`/`exp`/`log`/`pow`/`asin`/`acos`/`atan`, `log10` as fdlibm `log(x) / log(10)` (measured: that is the parser's `log10`, not `StrictMath.log10`), and the exact `sqrt`, `abs`, `floor`, `ceil`, `min`, `max`, `avg`, `sign`, `round`, `todegrees`, `toradians`. Anything else (`random`, `sum`, `round_to_mintick`, ...) stays in the code and evaluates at runtime
 - Each maximal constant subtree is replaced by its quantized literal (`quantize_embed`); the cap applies once, where the value is embedded
 - A numeric module-level binding that is never rebound or written through `global` / `nonlocal` also folds inside functions; parameters and local bindings shadow it
 - The pass needs the `lib.math.*` chains from `ImportNormalizer`, and it skips pynecore's own lib modules, which must keep their raw expressions
@@ -1021,6 +1021,9 @@ Key aspects:
 - Inside a function body, a division of numeric-typed operands (per the type pass) is written out as an expression that runs the plain division first and calls `safe_div` only when that cannot be its result: a quotient that equals itself is exactly what `safe_div` returns, and a zero divisor is swapped for `zero_divisor`, whose reflected division answers `nan` and so lands in the fallback
 - Operands are evaluated once and in source order; module level, class bodies, lambdas, comprehensions, decorators and default arguments keep the plain `safe_div` call
 - A literal divided by a nonzero literal stays a plain division (in user code `ConstFold` has folded it already); a literal zero divisor keeps the call
+- A zero divisor keeps its sign: a runtime `1 / -0.0` is `-inf` (measured), as `-6.0 % 3` gives that `-0.0`
+- In user code `a % b` becomes `safe_convert.safe_mod(a, b)`: Pine's remainder is truncated (C's `fmod`, the sign of the dividend: `-7 % 3` is `-1`) where Python's is floored, and a zero divisor or a na operand gives na. A string left operand is Python's formatting and stays. pynecore's own lib modules keep Python's `%`, which their ring buffers index with
+- An augmented `x /= y` or (in user code) `x %= y` is written out as `x = safe_convert.safe_div(x, y)` / `safe_mod(x, y)` when its target (a name, or an attribute or a name- or literal-indexed subscript of a name) can be read again
 - Only adds the import when a division was actually transformed
 
 #### FloatTolerance

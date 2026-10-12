@@ -136,6 +136,27 @@ def __test_rebound_module_values_are_not_captured__(rebinding):
     assert isinstance(_return(tree, 'main'), ast.Name)
 
 
+@pytest.mark.parametrize('rebinding', [
+    'del N',
+    'from math import pi as N',
+    'import math as N',
+    'from math import *',
+    'if True:\n    from math import *',
+    'match 6:\n    case N:\n        pass',
+    'match [6]:\n    case [*N]:\n        pass',
+    'match {}:\n    case {**N}:\n        pass',
+])
+def __test_rebinding_statement_ends_a_constant_chain__(rebinding):
+    tree = _fold(f'N = 14\n{rebinding}\nY = N\n')
+    assert isinstance(tree.body[-1].value, ast.Name)
+
+
+@pytest.mark.parametrize('literal', ['1e309', '-1e309'])
+def __test_overflowing_float_literal_is_not_folded__(literal):
+    namespace = _execute(_fold(f'X = {literal}\nY = X * 2\n'))
+    assert namespace['Y'] == float(literal)
+
+
 def __test_global_write_from_another_function_is_not_folded__():
     tree = _fold('''N = 14
 def main():

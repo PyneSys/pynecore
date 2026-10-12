@@ -5,6 +5,7 @@ from collections import Counter
 from decimal import Decimal, ROUND_HALF_EVEN, localcontext
 
 from pynecore.core import fdlibm
+from pynecore.core.safe_convert import safe_mod
 from pynecore.transformers.pine_type_rules import (
     INT, FLOAT, BOOL, STR, UNKNOWN, NUMERIC, join, binop_type, unaryop_type,
     annotation_type, set_ty, LIB_TYPE_OVERRIDES,
@@ -16,28 +17,42 @@ __all__ = ['ConstFoldTransformer', 'quantize_embed']
 # Sentinel for "not a compile-time constant"
 _BAIL = object()
 
-# lib.math functions folded with the fdlibm (StrictMath) implementations.
-# TradingView's parser folds constant expressions with StrictMath; at runtime
-# sin/cos/exp go through the JIT's Intel-LIBM intrinsics instead (see
-# ``core.pine_math``), which disagree with fdlibm in the last ulp, so their
-# fold must NOT go through the runtime implementations. asin/acos/atan have no
-# intrinsic -- their runtime is fdlibm too -- but they fold all the same.
+#: ``StrictMath.log(10)``, the divisor of the parser's ``log10``
+_LN10 = fdlibm.log(10.0)
+
+
+def _fold_log10(x: float) -> float:
+    # MEASURED (8/8 arguments where the candidates differ): the parser's log10 is
+    # ``StrictMath.log(x) / StrictMath.log(10)``, not ``StrictMath.log10``
+    return fdlibm.log(x) / _LN10
+
+
+# lib.math functions folded with the fdlibm (StrictMath) implementations, with
+# their argument counts. TradingView's parser folds constant expressions with
+# StrictMath; at runtime sin/cos/exp/log/log10/pow go through the JIT's Intel-LIBM
+# intrinsics instead (see ``core.pine_math``), which disagree with fdlibm in the
+# last ulp, so their fold must NOT go through the runtime implementations.
+# MEASURED for log/log10/pow/tan (CAPITALCOM:EURUSD 60): a constant call embeds
+# the StrictMath double, a series one the Intel-LIBM double. asin/acos/atan have
+# no intrinsic -- their runtime is fdlibm too -- but they fold all the same.
 _FOLD_FDLIBM = {
-    'sin': fdlibm.sin,
-    'cos': fdlibm.cos,
-    'exp': fdlibm.exp,
-    'asin': fdlibm.asin,
-    'acos': fdlibm.acos,
-    'atan': fdlibm.atan,
+    'sin': (fdlibm.sin, 1),
+    'cos': (fdlibm.cos, 1),
+    'tan': (fdlibm.tan, 1),
+    'exp': (fdlibm.exp, 1),
+    'log': (fdlibm.log, 1),
+    'log10': (_fold_log10, 1),
+    'pow': (fdlibm.pow, 2),
+    'asin': (fdlibm.asin, 1),
+    'acos': (fdlibm.acos, 1),
+    'atan': (fdlibm.atan, 1),
 }
 
 # lib.math functions with no fold/runtime split: they are plain IEEE-754
 # arithmetic on both sides (TV's JVM has no JIT intrinsic for them), so the
 # fold calls the runtime implementations themselves and cannot diverge from
-# them. Functions with an Intel-LIBM runtime intrinsic but no ported fdlibm
-# fold port (pow, log, log10, tan) and the stateful/instrument-dependent ones
-# (random, sum, round_to_mintick) are deliberately absent: their constant
-# calls stay in the code and evaluate at runtime.
+# them. The stateful/instrument-dependent ones (random, sum, round_to_mintick)
+# are absent: their calls are no constants.
 #
 # Filled on first use: this module is imported by the import hook while it
 # transforms pynecore.lib's own @pyne modules, so a top-level lib import
@@ -62,14 +77,16 @@ _MATH_CONSTANTS = {
     'rphi': 1 / ((1 + math.sqrt(5)) / 2),
 }
 
-# Binary operators folded. Mod/FloorDiv/Pow are absent: Pine's runtime forms
-# of those do not compile to the plain Python operators, so a fold here could
-# disagree with what the emitted code computes.
+# Binary operators folded. ``%`` is Pine's truncated remainder, the runtime's
+# own ``safe_mod`` (MEASURED: a constant ``-7 % 3`` is -1 like a series one).
+# Pine has no ``//`` or ``**``, so a FloorDiv or Pow is hand-written Python and
+# keeps its Python meaning at runtime.
 _BIN_OPS = {
     ast.Add: lambda a, b: a + b,
     ast.Sub: lambda a, b: a - b,
     ast.Mult: lambda a, b: a * b,
     ast.Div: lambda a, b: a / b,
+    ast.Mod: safe_mod,
 }
 
 
@@ -200,12 +217,20 @@ class _ModuleFacts:
             for scope, names in stateful.items()}
 
 
+#: The :func:`_statement_bindings` entry of a wildcard import, which can bind any name
+_ANY_NAME = '*'
+
+
 def _assigned_names(node: ast.AST) -> set[str]:
-    """Every name a statement (sub)tree can (re)bind."""
+    """Every name a statement (sub)tree can (re)bind or delete."""
     names: set[str] = set()
     for n in ast_walk.walk(node):
-        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
             names.add(n.id)
+        elif isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name:
+            names.add(n.name)
+        elif isinstance(n, ast.MatchMapping) and n.rest:
+            names.add(n.rest)
         elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names.add(n.name)
         elif isinstance(n, (ast.Global, ast.Nonlocal)):
@@ -242,6 +267,10 @@ def _statement_bindings(stmt: ast.AST, memo: dict[ast.AST, frozenset[str]]) -> f
             found.update(stmt.names)
         elif isinstance(stmt, ast.ExceptHandler) and stmt.name:
             found.add(stmt.name)
+        elif isinstance(stmt, ast.Import):
+            found.update(alias.asname or alias.name.split('.')[0] for alias in stmt.names)
+        elif isinstance(stmt, ast.ImportFrom):
+            found.update(alias.asname or alias.name for alias in stmt.names)
         for field in stmt._fields:
             value = getattr(stmt, field, None)
             if field in _BLOCK_FIELDS and isinstance(value, list):
@@ -480,7 +509,8 @@ def _try_eval(node: ast.expr, env: dict[str, int | float]):
     divisor): those stay in the code and keep their runtime behavior.
     """
     if isinstance(node, ast.Constant):
-        if type(node.value) in (int, float):
+        # An overflowing float literal (``1e309``) is an infinity: a domain edge
+        if type(node.value) is int or (type(node.value) is float and math.isfinite(node.value)):
             return node.value
         return _BAIL
     if isinstance(node, ast.Name):
@@ -500,7 +530,7 @@ def _try_eval(node: ast.expr, env: dict[str, int | float]):
         right = _try_eval(node.right, env)
         if left is _BAIL or right is _BAIL:
             return _BAIL
-        if isinstance(node.op, ast.Div) and right == 0:
+        if isinstance(node.op, (ast.Div, ast.Mod)) and right == 0:
             return _BAIL
         v = op(left, right)
         return _BAIL if isinstance(v, float) and not math.isfinite(v) else v
@@ -524,9 +554,10 @@ def _try_eval(node: ast.expr, env: dict[str, int | float]):
                 return _BAIL
             args.append(v)
         if name in _FOLD_FDLIBM:
-            if len(args) != 1:
+            function, arity = _FOLD_FDLIBM[name]
+            if len(args) != arity:
                 return _BAIL
-            v = _FOLD_FDLIBM[name](float(args[0]))
+            v = function(*[float(arg) for arg in args])
         elif name in _FOLD_EXACT_NAMES:
             if not args:
                 return _BAIL
@@ -617,7 +648,11 @@ class ConstFoldTransformer:
     def _kill(self, stmt: ast.stmt, env: dict[str, int | float]) -> None:
         """Drop every name a statement can (re)bind from the environment."""
         if env:
-            for name in _statement_bindings(stmt, self._bindings_memo):
+            names = _statement_bindings(stmt, self._bindings_memo)
+            if _ANY_NAME in names:
+                env.clear()
+                return
+            for name in names:
                 env.pop(name, None)
 
     def _fold(self, node: ast.expr, env: dict[str, int | float],
@@ -760,8 +795,7 @@ class ConstFoldTransformer:
             case ast.Global() | ast.Nonlocal():
                 for name in stmt.names:
                     env.pop(name, None)
-            case ast.Import() | ast.ImportFrom() | ast.Pass() | ast.Break() | ast.Continue() \
-                    | ast.Delete():
+            case ast.Pass() | ast.Break() | ast.Continue():
                 pass
             case _:
                 # Unmodeled statement kind: fold nothing inside, kill what

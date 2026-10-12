@@ -273,7 +273,7 @@ LOWERING: Sequence[Step | Phase] = (
     # is never numeric
     Phase('Expression', (
         RuleStep('SafeConvert', lambda ctx: SafeConvertTransformer(lib=ctx.pyne_mode == 'lib')),
-        RuleStep('SafeDivision', lambda ctx: SafeDivisionTransformer()),
+        RuleStep('SafeDivision', lambda ctx: SafeDivisionTransformer(pine_mod=ctx.user_code)),
         # After SafeDivision so wrapped operands (safe_div calls) are bound once by
         # the walrus instead of evaluating twice. Only user code gets Pine's
         # tolerant comparison semantics: pynecore's own lib modules implement the

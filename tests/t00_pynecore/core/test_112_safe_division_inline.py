@@ -6,6 +6,7 @@ Python ``/``, which the import hook would otherwise lower through the very pass
 under test.
 """
 import ast
+import math
 import struct
 from math import inf
 from typing import Any
@@ -29,11 +30,10 @@ def __test_helper_reference_div(a: Any, b: Any) -> Any:
     try:
         return a / b
     except ZeroDivisionError:
-        if a > 0:
-            return inf
-        if a < 0:
-            return -inf
-        return na_float
+        # MEASURED: the sign of a zero divisor counts, ``1 / -0.0`` is -inf
+        if a == 0:
+            return na_float
+        return inf if (a > 0) == (math.copysign(1.0, b) > 0) else -inf
     except TypeError:
         return na_float
 
@@ -268,3 +268,44 @@ def __test_safe_division_zero_divisor__():
         quotient = numerator / zero_divisor
         assert not quotient == quotient, numerator
     assert isinstance(NA(None) / zero_divisor, NA)
+
+
+def __test_augmented_division_evaluates_its_target_once__():
+    """``x[i] /= y`` stores where Python's operator stores: the receiver and the index
+    are evaluated once, before the index and the right side, which may rebind them"""
+    source = ("a = [8.0, 100.0]\ni = 0\na[i] /= (i := 1)\n"
+              "r = [8.0]\ns = [100.0]\nold = r\nr[(r := s) and 0] /= 2\n"
+              "class C:\n    v = [9.0]\n    k = 0\n    v[k] /= (k := 0) + 2\n"
+              "def f(g, h):\n    b = [6.0, 1.0]\n    j = 0\n    b[j] /= (j := 1)\n"
+              "    g().x /= h()\n    return b\n")
+    namespace = __test_helper_compile(source)
+    assert namespace['a'] == [8.0, 100.0]
+    assert namespace['old'] == [4.0] and namespace['s'] == [100.0]
+    assert namespace['C'].v == [4.5]
+    # No temporary is left behind outside a function body
+    assert not [name for name in namespace if '·' in name]
+    assert not [name for name in vars(namespace['C']) if '·' in name]
+    calls: list[str] = []
+    holder = type('Holder', (), {'x': 3.0})()
+
+    def g() -> Any:
+        calls.append('g')
+        return holder
+
+    def h() -> float:
+        calls.append('h')
+        return 0.0
+
+    assert namespace['f'](g, h) == [6.0, 1.0]
+    assert calls == ['g', 'h'] and holder.x == inf
+
+
+def __test_safe_convert_helper_import_still_adds_the_module__():
+    """Importing a helper from ``safe_convert`` does not bind the module name the
+    emitted calls read, so the module import is still added"""
+    namespace = __test_helper_compile(
+        "from pynecore.core.safe_convert import safe_div\nb = 0\ny = 1 / b\n")
+    assert namespace['y'] == inf
+    emitted = __test_helper_emit(
+        "from pynecore.core import safe_convert as conv\nb = 0\ny = 1 / b\n")
+    assert 'from pynecore.core import safe_convert\n' in emitted

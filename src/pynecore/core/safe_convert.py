@@ -1,4 +1,4 @@
-from math import inf
+from math import copysign as _copysign, fmod as _fmod, inf
 from typing import Any
 
 from ..types import NA, PyneFloat, PyneInt
@@ -47,10 +47,11 @@ def safe_div(a: PyneFloat, b: PyneFloat):
     except ZeroDivisionError:
         if not (a == a):
             return na_float
+        # MEASURED: ``1 / x`` of a runtime ``-0.0`` is -inf -- the zero's sign counts
         if a > 0:
-            return inf
+            return inf if _copysign(1.0, b) > 0.0 else _NEG_INF
         if a < 0:
-            return _NEG_INF
+            return _NEG_INF if _copysign(1.0, b) > 0.0 else inf
         return na_float
     except TypeError:
         return na_float
@@ -84,6 +85,31 @@ def safe_float(value: PyneFloat) -> float:
     except TypeError:
         # NA values throw TypeError, convert these to NA
         return na_float
+
+
+def safe_mod(a: PyneFloat, b: PyneFloat) -> PyneFloat:
+    """
+    Pine's ``%``: the truncated remainder, which takes the sign of the dividend.
+
+    MEASURED on TradingView, const and series operands alike: ``-7 % 3`` is ``-1``,
+    ``7 % -3`` is ``1`` and ``-7.5 % 2`` is ``-1.5`` -- C's ``fmod``, not Python's
+    floored ``%`` (``2``, ``-2``, ``0.5``); a series ``-6.0 % 3`` is ``-0.0``. A zero
+    divisor and a na operand give na instead of raising. Two Python ints keep an int
+    result, so an int-typed remainder stays an int value.
+
+    :param a: The dividend.
+    :param b: The divisor.
+    :return: The remainder, or na.
+    """
+    try:
+        if a.__class__ is int and b.__class__ is int:
+            r = abs(a) % abs(b)
+            return -r if a < 0 else r
+        r = _fmod(a, b)
+    except (ZeroDivisionError, ValueError, TypeError):
+        # A zero divisor, an infinite dividend or an ``NA`` operand
+        return na_float
+    return r if r == r else na_float
 
 
 def safe_float_items(items: list[PyneInt] | NA) -> list[float] | NA:

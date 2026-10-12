@@ -149,6 +149,14 @@ def __test_safe_div_negative_by_zero_is_neg_inf__():
     assert safe_div(-1.0, 0.0) == -math.inf
 
 
+def __test_safe_div_by_negative_zero_flips_the_infinity__():
+    """MEASURED on TradingView: ``1 / x`` of a runtime ``-0.0`` (a series ``-6.0 % 3``) is
+    -inf -- the sign of the zero divisor counts"""
+    assert safe_div(1.0, -0.0) == -math.inf
+    assert safe_div(-1.0, -0.0) == math.inf
+    assert safe_div(1, 0) == math.inf
+
+
 def __test_safe_div_zero_by_zero_is_nan__():
     """0 / 0 returns nan"""
     assert math.isnan(safe_div(0.0, 0.0))
