@@ -83,10 +83,16 @@ def quantize_embed(v: int | float) -> int | float:
     ``|v| >= 1e-3``; below that the exact double is embedded. Constant
     chains keep exact doubles internally: this cap applies exactly once,
     at the runtime embedding site. Measured over 60+ anchored delta probes
-    (probe_fold_* series, 2026-08).
+    (probe_fold_* series, 2026-08). A zero is embedded unsigned, as ``0.0``.
     """
     if type(v) is int:
         return v
+    # Measured 2026-10-12 through ``1 / (x * close)``: ``-0.0``, ``0.0 * -1``, ``-0.0 / 1``,
+    # ``-c0`` of a const ``c0 = 0.0`` and a ``var`` or ``input.float`` default of ``-0.0``
+    # all reach the runtime as +0.0, while the same arithmetic on input/simple/series
+    # operands keeps the IEEE -0.0
+    if v == 0.0:
+        return 0.0
     if builtins.abs(v) < 1e-3:
         return v
     # A double can carry ~309 integer digits in front of the 16 capped
@@ -94,6 +100,14 @@ def quantize_embed(v: int | float) -> int | float:
     with localcontext() as ctx:
         ctx.prec = 340
         return float(Decimal(repr(v)).quantize(Decimal('1e-16'), rounding=ROUND_HALF_EVEN))
+
+
+def _is_literal(node: ast.expr, value: int | float) -> bool:
+    """Whether ``node`` is already the literal ``value``: same type, same value, same zero
+    sign (``-0.0 == 0.0`` would keep a signed literal the embedding has to replace)."""
+    return (isinstance(node, ast.Constant) and type(node.value) is type(value)
+            and node.value == value
+            and math.copysign(1.0, node.value) == math.copysign(1.0, value))
 
 
 def _is_lib_math_attr(node: ast.expr) -> str | None:
@@ -323,7 +337,7 @@ class _ExprFolder(ast_walk.NodeTransformer):
             if v is not _BAIL:
                 q = quantize_embed(v)  # type: ignore[arg-type]
                 ty = const_type(node, self.env, self.types)
-                if isinstance(node, ast.Constant) and node.value == q and type(node.value) is type(q):
+                if _is_literal(node, q):
                     return _stamp(node, ty)
                 return _stamp(ast.copy_location(ast.Constant(value=q), node), ty)
         return super().visit(node)
@@ -657,8 +671,7 @@ class ConstFoldTransformer:
                     # environment keeps the exact double for const chains
                     q = quantize_embed(v)
                     ty = const_type(stmt.value, env, types)
-                    if not (isinstance(stmt.value, ast.Constant) and stmt.value.value == q
-                            and type(stmt.value.value) is type(q)):
+                    if not _is_literal(stmt.value, q):
                         stmt.value = ast.copy_location(ast.Constant(value=q), stmt.value)
                     _stamp(stmt.value, ty)
                     for name in targets:
@@ -682,8 +695,7 @@ class ConstFoldTransformer:
                     # what the folded initializer happens to be
                     declared = annotation_type(stmt.annotation)
                     ty = declared if declared != UNKNOWN else const_type(stmt.value, env, types)
-                    if not (isinstance(stmt.value, ast.Constant) and stmt.value.value == q
-                            and type(stmt.value.value) is type(q)):
+                    if not _is_literal(stmt.value, q):
                         stmt.value = ast.copy_location(ast.Constant(value=q), stmt.value)
                     _stamp(stmt.value, ty)
                     types[stmt.target.id] = ty
