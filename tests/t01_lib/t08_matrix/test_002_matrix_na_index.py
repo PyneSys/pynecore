@@ -41,10 +41,10 @@ def __test_get_na_index_returns_na__():
 
 
 def __test_get_na_index_matches_the_element_type__():
-    """ The na handed back carries the matrix's element type """
+    """ The na handed back carries the matrix's element type: the string na is the
+    empty string """
     m = matrix.new(1, 1, "x")
-    value = matrix.get(m, NA(int), 0)
-    assert isinstance(value, NA) and value.type is str
+    assert matrix.get(m, NA(int), 0) == ""
     # An empty matrix has no knowable element type
     empty = matrix.new(0, 0)
     assert _is_na(matrix.get(empty, NA(int), 0))

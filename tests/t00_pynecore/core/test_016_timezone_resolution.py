@@ -7,6 +7,7 @@ Covers ``core.datetime.parse_timezone`` diagnostics and the behaviour of
 actionable error instead of every bar silently becoming ``na`` (which made
 ``time(timeframe.period, session, "America/Chicago")`` produce 0 trades).
 """
+import pickle
 from contextlib import contextmanager
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -97,3 +98,20 @@ def __test_time_session_in_and_out_unchanged__():
     lib._time = int(datetime(2025, 7, 1, 3, 0, tzinfo=chi).timestamp() * 1000)  # pre-open
     pre_open = lib.time("15", "0900-1600", "America/Chicago")
     assert pre_open != pre_open  # na (a Pine int na is the native nan)
+
+
+def __test_minute_offset_zone_crosses_the_process_boundary__():
+    """A minute-offset zone pickles (security children receive it inside calendars)"""
+    from pynecore.core.security import BarCalendar
+
+    zone = parse_timezone("UTC+5:30")
+    assert zone.utcoffset(datetime(2025, 7, 1)).total_seconds() == 5.5 * 3600
+    assert parse_timezone("GMT+0530") is zone
+    assert pickle.loads(pickle.dumps(zone)) is zone
+
+    calendar = pickle.loads(pickle.dumps(BarCalendar(tz=zone)))
+    assert calendar.tz is zone
+
+    negative = parse_timezone("UTC-3:45")
+    assert negative.utcoffset(datetime(2025, 7, 1)).total_seconds() == -3.75 * 3600
+    assert pickle.loads(pickle.dumps(negative)) is negative

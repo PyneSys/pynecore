@@ -941,7 +941,8 @@ def is_na(x: Any = None) -> bool | NA:
     Check if the value is NA.
 
     inf/-inf/nan floats all count as na here, even though they participate in
-    arithmetic and comparisons as normal IEEE-754 values.
+    arithmetic and comparisons as normal IEEE-754 values. The empty string is
+    the string na: TradingView answers ``na("")`` true.
 
     :param x: The value to test, or a type to build an NA sentinel of
     """
@@ -954,6 +955,9 @@ def is_na(x: Any = None) -> bool | NA:
         return not _math.isfinite(x)
     if isinstance(x, NA):
         return True
+    if x.__class__ is str:
+        # The string na is the empty string (``NA(str)``)
+        return not x
     if x is None:
         return _na_none
     # A type or a subscripted generic builds an na of that type. The generic is

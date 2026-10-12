@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from pynecore.core.import_hook import PyneLoader
-from tests.t00_pynecore.pine_analysis import analyse_module
+from ..pine_analysis import analyse_module
 from pynecore.transformers import pine_edge_gate, module_interface
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
 from pynecore.transformers.pine_edge_gate import (
@@ -118,7 +118,8 @@ def __test_only_an_edge_module_is_gated__():
 
 @pytest.mark.parametrize("snippet,reason,words", [
     ('try:\n    x = 1\nexcept TypeError:\n    x = 2\n', 'edge-syntax', "'try'"),
-    ('with open("f") as h:\n    pass\n', 'edge-syntax', "'with'"),
+    # Not at the start of the snippet: a string opening with ``with`` reads as SQL to the IDE
+    ('x = 1\nwith open("f") as h:\n    pass\n', 'edge-syntax', "'with'"),
     ('match close:\n    case 1:\n        pass\n', 'edge-syntax', "'match'"),
     ('def f():\n    global g\n', 'edge-syntax', "'global'"),
     ('del close\n', 'edge-syntax', "'del'"),

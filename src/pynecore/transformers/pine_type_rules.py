@@ -37,8 +37,11 @@ __all__ = [
     'OVERRIDE_PARAM_NAMES',
     'is_int_typed', 'TY_ATTR', 'get_ty', 'set_ty', 'inherit_ty',
     'constant_type', 'stamp_lowering', 'BUILTIN_CALL_TYPES', 'BUILTIN_NAME_TYPES',
-    'PIN_ATTR', 'PINS_ATTR', 'PINNABLE', 'PIN_ANY', 'get_pin', 'set_pin', 'get_pins', 'set_pins',
+    'PIN_ATTR', 'PINS_ATTR', 'PINNABLE', 'PIN_CONTAINERS', 'PIN_ANY', 'get_pin', 'set_pin', 'get_pins', 'set_pins',
     'VECTOR_ATTR', 'VARYING_ATTR', 'get_vector', 'set_vector', 'get_varying', 'set_varying',
+    'WIDEN_ATTR', 'WIDEN_FLOAT', 'WIDEN_ITEMS', 'WIDEN_MATRIX', 'WIDEN_STRING_NA', 'get_widen',
+    'set_widen', 'WIDEN_SITE_ATTR', 'WIDENS_ATTR', 'get_widen_site', 'set_widen_site',
+    'get_widens', 'set_widens',
     'pin_for', 'overload_result', 'ImplSig', 'overload_pick',
     'FactoryFields',
     'TYPELESS', 'NONE_DEFAULT', 'FIT_OMISSIBLE', 'FIT_REQUIRED', 'FIT_UNSURE',
@@ -69,6 +72,33 @@ VECTOR_ATTR: Final = '_pine_vector'
 #: Attribute a definition carries its instance-varying inner call sites under,
 #: in source order. Their index in this list IS their index in the vector.
 VARYING_ATTR: Final = '_pine_varying'
+
+#: Attribute a value carries when Pine converts it implicitly where it goes: an
+#: int into a float-element container, a typeless ``na`` into a string (see
+#: ``implicit_conversion.py``). Present only where every context agrees on it.
+WIDEN_ATTR: Final = '_pine_widen'
+
+#: The value is one int element: it is converted to float
+WIDEN_FLOAT: Final = 'f'
+
+#: The value is an int array whose elements are copied in: they are converted
+WIDEN_ITEMS: Final = 'a'
+
+#: The value is an int matrix whose elements are copied in: they are converted
+WIDEN_MATRIX: Final = 'm'
+
+#: The value is a typeless ``na`` literal that goes where a string goes: it is the
+#: string na, the empty string
+WIDEN_STRING_NA: Final = 's'
+
+#: Attribute a value carries where the contexts of the body it is in disagree on
+#: its conversion: the call ``safe_convert.implicit_convert(value, kind)`` that
+#: takes the value's place, an instance-varying site whose vector entry is the
+#: conversion of that instance (see ``implicit_conversion.py``).
+WIDEN_SITE_ATTR: Final = '_pine_widen_site'
+
+#: Attribute that call carries its PER-CONTEXT conversions under.
+WIDENS_ATTR: Final = '_pine_widens'
 
 
 def get_pin(node) -> str | None:
@@ -170,6 +200,73 @@ def set_varying(node, sites: list | None):
     :return: ``node``
     """
     setattr(node, VARYING_ATTR, sites)
+    return node
+
+
+def get_widen(node) -> str | None:
+    """
+    Read the implicit conversion a value needs where it goes.
+
+    :param node: The value node
+    :return: ``WIDEN_FLOAT``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX`` or ``WIDEN_STRING_NA``, or None
+    """
+    return getattr(node, WIDEN_ATTR, None)
+
+
+def set_widen(node, kind: str | None):
+    """
+    Stamp the conversion a value needs, ``None`` included (a later context that
+    decides against it has to erase what an earlier one wrote).
+
+    :param node: The value node
+    :param kind: ``WIDEN_FLOAT``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX``, ``WIDEN_STRING_NA`` or None
+    :return: ``node``
+    """
+    setattr(node, WIDEN_ATTR, kind)
+    return node
+
+
+def get_widen_site(node) -> ast.Call | None:
+    """
+    Read the per-instance conversion call a value is to be wrapped in.
+
+    :param node: The value node
+    :return: The ``safe_convert.implicit_convert`` call, or None when the contexts agree
+    """
+    return getattr(node, WIDEN_SITE_ATTR, None)
+
+
+def set_widen_site(node, site: ast.Call | None):
+    """
+    Stamp the per-instance conversion call of a value, ``None`` included.
+
+    :param node: The value node
+    :param site: The ``safe_convert.implicit_convert`` call, or None
+    :return: ``node``
+    """
+    setattr(node, WIDEN_SITE_ATTR, site)
+    return node
+
+
+def get_widens(node) -> dict[int, str | None] | None:
+    """
+    Read the per-context conversions of a per-instance conversion call.
+
+    :param node: A call node
+    :return: context id -> ``WIDEN_*`` or None, or None when the node is no such call
+    """
+    return getattr(node, WIDENS_ATTR, None)
+
+
+def set_widens(node, widens: dict[int, str | None] | None):
+    """
+    Stamp the per-context conversions of a per-instance conversion call.
+
+    :param node: The ``safe_convert.implicit_convert`` call
+    :param widens: context id -> ``WIDEN_*`` or None (no conversion in that context)
+    :return: ``node``
+    """
+    setattr(node, WIDENS_ATTR, widens)
     return node
 
 
@@ -390,9 +487,8 @@ def head(ty: str) -> str:
     The lattice character a type behaves as.
 
     Every shape is an object, so this is what the char-based rules -- the
-    arithmetic, the pin, the overload selection -- read. It is also why the
-    pin wire format is untouched by shapes: ``pin_for(['a:i', 'i'])`` and
-    ``pin_for(['o', 'i'])`` are the same question.
+    arithmetic, the overload selection -- read. The pin reads the shape itself
+    where it has a witness for it (``PIN_CONTAINERS``).
 
     :param ty: Any type
     :return: Its single-character head
@@ -1216,10 +1312,25 @@ def is_int_typed(ty: str) -> bool:
 
 #: Types a pin can name. The runtime turns each character back into a WITNESS
 #: value and runs the ordinary selector on it, so a character may only appear
-#: here when one value stands for the whole type. An object does not qualify:
-#: what discriminates two container overloads is the ELEMENT type, and no
-#: single witness carries that.
+#: here when one value stands for the whole type. A drawing, a user type or a
+#: map does not qualify; an array or a matrix does when its element is a scalar
+#: (see ``PIN_CONTAINERS``).
 PINNABLE: Final = frozenset({INT, FLOAT, BOOL, STR})
+
+#: Pin character of an array or a matrix of one scalar. Its witness holds one
+#: element of that scalar (``core/overload.py``'s ``_PIN_WITNESSES``), which is
+#: exactly what the selector samples, so the static element type decides even
+#: where the runtime head element would not: an int literal in a float array, a
+#: double-valued Pine int in an int array, an empty container
+PIN_CONTAINERS: Final = {
+    _ARRAY + INT: 'I', _ARRAY + FLOAT: 'F', _ARRAY + BOOL: 'B', _ARRAY + STR: 'S',
+    _MATRIX + INT: '1', _MATRIX + FLOAT: '2', _MATRIX + BOOL: '3', _MATRIX + STR: '4',
+}
+
+#: Pin character of an array or a matrix of a scalar -> the shaped type it names
+_PIN_CONTAINER_TYPES: Final = {char: ty for ty, char in PIN_CONTAINERS.items()}
+
+_PIN_CONTAINER_CHARS: Final = frozenset(_PIN_CONTAINER_TYPES)
 
 #: Pin character for a position the runtime has no witness value for
 PIN_ANY: Final = '*'
@@ -1230,11 +1341,12 @@ def pin_for(arg_types: list[str]) -> str | None:
     The overload pin a call site's argument types justify.
 
     A pin is only worth emitting where the static answer can DIFFER from the
-    dynamic one, and that is exactly where an int-typed argument is involved:
-    ``int / int`` keeps the int TYPE while the value is a Python float, so the
-    runtime selector -- which sees values, not types -- widens it to the float
-    implementation. Every other shape already agrees, and is left on the
-    ordinary path rather than pinned for nothing.
+    dynamic one: where an int-typed argument is involved -- ``int / int`` keeps
+    the int TYPE while the value is a Python float, so the runtime selector,
+    which sees values, not types, widens it to the float implementation -- and
+    where an array or a matrix of a scalar is, whose head element the runtime
+    samples (an empty one has none). Every other shape already agrees, and is
+    left on the ordinary path rather than pinned for nothing.
 
     A position the runtime cannot witness -- a container, a drawing, a user
     type, an unsettled one -- pins as ``PIN_ANY``. It says nothing about that
@@ -1247,12 +1359,10 @@ def pin_for(arg_types: list[str]) -> str | None:
     :param arg_types: Type of each positional argument, in order
     :return: One character per argument, or None when the site is not pinnable
     """
-    # A shaped argument pins as its head, which is an object -- and an object
-    # has no witness, so the wire format never sees a shape
-    arg_types = [head(t) for t in arg_types]
-    if not arg_types or INT not in arg_types:
+    chars = [PIN_CONTAINERS.get(t) or (t if t in PINNABLE else PIN_ANY) for t in arg_types]
+    if INT not in chars and not any(c in _PIN_CONTAINER_CHARS for c in chars):
         return None
-    return ''.join(t if t in PINNABLE else PIN_ANY for t in arg_types)
+    return ''.join(chars)
 
 
 def overload_result(returns: list[str]) -> str:
@@ -1468,6 +1578,20 @@ def _takes(impl: ImplSig, wanted: tuple[str, ...], exact_arity: bool) -> int:
         return _NO
     verdict = _YES
     for declared, want in zip(impl.params, wanted):
+        shaped = _PIN_CONTAINER_TYPES.get(want)
+        if shaped is not None:
+            # The witness is a one-element container, which the selector takes
+            # by its container and that element: exactly the declared shape
+            # takes it, a bare or element-unknown one of the same container may
+            if declared == shaped:
+                continue
+            if declared in (UNKNOWN, OBJECT) or (
+                    (is_array(declared) and is_array(shaped)
+                     or is_matrix(declared) and is_matrix(shaped))
+                    and element_of(declared) == UNKNOWN):
+                verdict = _MAYBE
+                continue
+            return _NO
         declared = head(declared)
         if declared == UNKNOWN:
             verdict = _MAYBE

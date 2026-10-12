@@ -815,63 +815,210 @@ def _format_value(value: Any) -> str:
     return str(value)
 
 
+#: The pattern letters ``str.format_time`` knows: TradingView formats with Java's
+#: ``SimpleDateFormat`` (US locale), and any other unquoted letter is a run-time error
+_TIME_LETTERS = frozenset('GyYMLwWDdFEuaHkKhmsSzZX')
+_MONTH_NAMES = ('January', 'February', 'March', 'April', 'May', 'June', 'July', 'August',
+                'September', 'October', 'November', 'December')
+_DAY_NAMES = ('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')
+#: ``str.format_time`` without a format
+_DEFAULT_TIME_FORMAT = "yyyy-MM-dd'T'HH:mm:ssZ"
+#: Java's long zone names (``zzzz``) by short name and UTC offset in minutes -- a short
+#: name alone is ambiguous (``CST`` is Chicago and Shanghai). MEASURED on TradingView
+_ZONE_LONG_NAMES: dict[tuple[str, int], str] = {
+    ('EST', -300): 'Eastern Standard Time', ('EDT', -240): 'Eastern Daylight Time',
+    ('CST', -360): 'Central Standard Time', ('CDT', -300): 'Central Daylight Time',
+    ('MST', -420): 'Mountain Standard Time', ('MDT', -360): 'Mountain Daylight Time',
+    ('PST', -480): 'Pacific Standard Time', ('PDT', -420): 'Pacific Daylight Time',
+    ('GMT', 0): 'Greenwich Mean Time', ('UTC', 0): 'Coordinated Universal Time',
+    ('BST', 60): 'British Summer Time',
+    ('CET', 60): 'Central European Standard Time', ('CEST', 120): 'Central European Summer Time',
+    ('EET', 120): 'Eastern European Standard Time', ('EEST', 180): 'Eastern European Summer Time',
+    ('MSK', 180): 'Moscow Standard Time', ('IST', 330): 'India Standard Time',
+    ('CST', 480): 'China Standard Time', ('HKT', 480): 'Hong Kong Standard Time',
+    ('SGT', 480): 'Singapore Standard Time', ('JST', 540): 'Japan Standard Time',
+    ('AEST', 600): 'Australian Eastern Standard Time',
+    ('AEDT', 660): 'Australian Eastern Daylight Time',
+}
+#: Java's short name of a zone the IANA database names by its offset only
+_ZONE_SHORT_NAMES: dict[str, str] = {
+    # MEASURED: the timezone TradingView spells "UTC" is Java's GMT; "Etc/UTC" stays UTC
+    'UTC': 'GMT',
+    'Asia/Singapore': 'SGT',
+}
+
+
 @lru_cache(maxsize=32)
-def _datatime_fmt_tv2py(fmt: str) -> str:
+def _parse_time_format(fmt: str) -> tuple[str | tuple[str, int], ...]:
     """
-    Convert Pine format to Python format
+    Split a ``SimpleDateFormat`` pattern into literal text and letter runs.
 
-    :param fmt: Pine format string
-    :return: Python format string
+    A run of one pattern letter is a field, its length the field's width or form. Text
+    between single quotes is literal, and ``''`` is a quote, inside quotes too. Every
+    character that is not a letter is literal.
+
+    :param fmt: The pattern
+    :return: The literal strings and ``(letter, count)`` fields, in order
+    :raises ValueError: On a letter that is no pattern letter
     """
-    # Handle escaped parts first
-    escaped_parts = {}
-    i = 0
-    while "'" in fmt:
-        start = fmt.find("'")
-        end = fmt.find("'", start + 1)
-        if end == -1:
-            break
-        key = f"__ESC{i}__"
-        escaped_parts[key] = fmt[start + 1:end]
-        fmt = fmt[:start] + key + fmt[end + 1:]
-        i += 1
+    tokens: list[str | tuple[str, int]] = []
+    literal: list[str] = []
+    i, n = 0, len(fmt)
+    while i < n:
+        c = fmt[i]
+        if c == "'":
+            if i + 1 < n and fmt[i + 1] == "'":
+                literal.append("'")
+                i += 2
+                continue
+            i += 1
+            while i < n:
+                if fmt[i] == "'":
+                    if i + 1 < n and fmt[i + 1] == "'":
+                        literal.append("'")
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                literal.append(fmt[i])
+                i += 1
+            continue
+        if not ('a' <= c <= 'z' or 'A' <= c <= 'Z'):
+            literal.append(c)
+            i += 1
+            continue
+        if c not in _TIME_LETTERS:
+            # MEASURED: an unquoted ``T`` fails with "Invalid `format` value" (RE10122)
+            raise ValueError(f"Invalid format value for str.format_time(): {fmt}")
+        j = i
+        while j < n and fmt[j] == c:
+            j += 1
+        if literal:
+            tokens.append(''.join(literal))
+            literal.clear()
+        tokens.append((c, j - i))
+        i = j
+    if literal:
+        tokens.append(''.join(literal))
+    return tuple(tokens)
 
-    # Format mapping
-    mapping = {
-        'yyyy': '%Y',  # Year
-        'yy': '%y',
-        'MM': '%m',  # Month
-        'dd': '%d',  # Day
-        'HH': '%H',  # Hour
-        'hh': '%I',  # Hour (12)
-        'mm': '%M',  # Minute
-        'ss': '%S',  # Second
-        'SSS': '%f',  # Milliseconds
-        'aa': '%p',  # AM/PM
-        'A': '%p',  # AM/PM
-        'E': '%a',  # Weekday abbr
-        'EEE': '%a',  # Weekday abbr
-        'EEEE': '%A',  # Weekday
-        'MMM': '%b',  # Month abbr
-        'MMMM': '%B',  # Month name
-        'z': '@',  # Timezone name (temp)
-        'Z': '%z',  # Timezone
-        '@': '%Z',  # Timezone name
-    }
 
-    # Sort by length for proper replacement
-    patterns = sorted(mapping.keys(), key=len, reverse=True)
+def _week_fields(dt: datetime) -> tuple[int, int]:
+    """
+    The US week of the year and its week-based year: weeks start on Sunday, and the
+    week holding 1 January is week 1 -- of the next year too, in late December.
 
-    # Replace patterns
-    result = fmt
-    for pattern in patterns:
-        result = result.replace(pattern, mapping[pattern])
+    :param dt: The local date and time
+    :return: ``(week, week_year)``
+    """
+    weekday = (dt.weekday() + 1) % 7  # Sunday 0
+    year = dt.year
+    if dt.month == 12 and dt.day + 6 - weekday > 31:
+        return 1, year + 1
+    jan1 = (datetime(year, 1, 1).weekday() + 1) % 7
+    return (dt.timetuple().tm_yday - 1 + jan1) // 7 + 1, year
 
-    # Restore escaped parts
-    for key, value in escaped_parts.items():
-        result = result.replace(key, value)
 
-    return result
+def _offset_fields(dt: datetime) -> tuple[str, int, int]:
+    """
+    The UTC offset of a local time as its sign, hours and minutes.
+
+    :param dt: The aware local date and time
+    :return: ``(sign, hours, minutes)``
+    """
+    offset = dt.utcoffset()
+    seconds = int(offset.total_seconds()) if offset is not None else 0
+    sign = '-' if seconds < 0 else '+'
+    minutes = abs(seconds) // 60
+    return sign, minutes // 60, minutes % 60
+
+
+def _time_field(dt: datetime, letter: str, count: int) -> str:
+    """
+    Format one ``SimpleDateFormat`` field, the way the US locale prints it.
+
+    :param dt: The aware local date and time
+    :param letter: The pattern letter
+    :param count: How many times it repeats
+    :return: The field's text
+    """
+    if letter in 'yY':
+        year = dt.year if letter == 'y' else _week_fields(dt)[1]
+        return f'{year % 100:02d}' if count == 2 else f'{year:0{count}d}'
+    if letter in 'ML':
+        if count >= 4:
+            return _MONTH_NAMES[dt.month - 1]
+        if count == 3:
+            return _MONTH_NAMES[dt.month - 1][:3]
+        value = dt.month
+    elif letter == 'E':
+        name = _DAY_NAMES[dt.weekday()]
+        return name if count >= 4 else name[:3]
+    elif letter == 'a':
+        return 'AM' if dt.hour < 12 else 'PM'
+    elif letter == 'G':
+        return 'AD'
+    elif letter == 'z':
+        sign, hours, minutes = _offset_fields(dt)
+        name = _ZONE_SHORT_NAMES.get(getattr(dt.tzinfo, 'key', ''), dt.tzname() or '')
+        if name[:1] in '+-':
+            # An offset-only zone (``Etc/GMT+4``) is named the way Java names it, both
+            # short and long: ``GMT-04:00``
+            return f'GMT{sign}{hours:02d}:{minutes:02d}'
+        if count < 4:
+            return name
+        offset = (hours * 60 + minutes) * (-1 if sign == '-' else 1)
+        return _ZONE_LONG_NAMES.get((name, offset), name)
+    elif letter == 'Z':
+        sign, hours, minutes = _offset_fields(dt)
+        return f'{sign}{hours:02d}{minutes:02d}'
+    elif letter == 'X':
+        sign, hours, minutes = _offset_fields(dt)
+        if hours == 0 and minutes == 0:
+            return 'Z'
+        if count == 1:
+            return f'{sign}{hours:02d}'
+        return f'{sign}{hours:02d}:{minutes:02d}' if count >= 3 else f'{sign}{hours:02d}{minutes:02d}'
+    elif letter == 'S':
+        value = dt.microsecond // 1000
+    elif letter == 'd':
+        value = dt.day
+    elif letter == 'D':
+        value = dt.timetuple().tm_yday
+    elif letter == 'F':
+        value = (dt.day - 1) // 7 + 1
+    elif letter == 'w':
+        value = _week_fields(dt)[0]
+    elif letter == 'W':
+        first = (dt.replace(day=1).weekday() + 1) % 7
+        value = (dt.day - 1 + first) // 7 + 1
+    elif letter == 'u':
+        value = dt.weekday() + 1
+    elif letter == 'H':
+        value = dt.hour
+    elif letter == 'k':
+        value = dt.hour or 24
+    elif letter == 'K':
+        value = dt.hour % 12
+    elif letter == 'h':
+        value = dt.hour % 12 or 12
+    elif letter == 'm':
+        value = dt.minute
+    else:
+        value = dt.second
+    return f'{value:0{count}d}'
+
+
+def _format_datetime(dt: datetime, fmt: str) -> str:
+    """
+    Format a local date and time with a ``SimpleDateFormat`` pattern.
+
+    :param dt: The aware local date and time
+    :param fmt: The pattern
+    :return: The formatted text
+    """
+    return ''.join([token if isinstance(token, str) else _time_field(dt, *token)
+                    for token in _parse_time_format(fmt)])
 
 
 #
@@ -885,15 +1032,17 @@ def contains(source: str | NA[str], str: str | NA[str]) -> PyneBool:
 
     :param source: Source string
     :param str: Substring to search for
-    :return: True if the source string contains the str substring, na if either
-        argument is na.
+    :return: True if the source string contains the str substring. A na string is the
+        empty string, so every string contains a na substring.
     """
-    # na-propagation (Pine): a na source/substring yields na, never a search.
-    # Without this guard ``str in na`` would loop forever, since NA.__getitem__
+    # A typeless na is the string na, the empty string (MEASURED: contains("abc", na)
+    # is true). Without this ``str in na`` would loop forever, since NA.__getitem__
     # returns self for every index and the ``in`` operator falls back to the
     # sequence protocol.
-    if isinstance(source, NA) or source is None or isinstance(str, NA) or str is None:
-        return NA(bool)
+    if isinstance(source, NA) or source is None:
+        source = ""
+    if isinstance(str, NA) or str is None:
+        str = ""
     return str in source
 
 
@@ -906,6 +1055,11 @@ def endswith(source: str, str: str) -> bool:
     :param str: Substring to search for
     :return: True if the source string ends with the substring specified in str, false otherwise.
     """
+    # A typeless na is the string na, the empty string
+    if isinstance(source, NA) or source is None:
+        source = ""
+    if isinstance(str, NA) or str is None:
+        str = ""
     return source.endswith(str)
 
 
@@ -1021,17 +1175,16 @@ def format(formatString: str, *args: Any) -> str:
 
     :param formatString: Format pattern
     :param args: Values to format
-    :return: Formatted string, or na if the format pattern is na
+    :return: Formatted string; a na format pattern is the empty string
     :raises ValueError: If the pattern is malformed
     :raises TypeError: If an argument is not an int, float, bool or string value or an array
         of them
     """
     _check_format_args(args)
-    # na-propagation (Pine): a na format pattern yields na (e.g. the TV
-    # Technical Ratings idiom ``str.repeat("\n", 0) + "{0}"`` — the repeat
-    # returns na, the concat propagates it, and str.format passes it through).
+    # A typeless na pattern is the string na, the empty string (MEASURED: the
+    # Technical Ratings idiom ``str.format(str.repeat("\n", 0) + "{0}", 5)`` is "5")
     if isinstance(formatString, NA) or formatString is None:
-        return NA(str)
+        return ""
 
     out: list[str] = []
     for piece in _parse_format_pattern(formatString):
@@ -1078,26 +1231,21 @@ def format_time(time: int | NA[int], format: str | None = None,
     Format timestamp according to format string and timezone
 
     :param time: UNIX timestamp in milliseconds
-    :param format: Format string (Pine format)
+    :param format: A ``SimpleDateFormat`` pattern, ``yyyy-MM-dd'T'HH:mm:ssZ`` by default
     :param timezone: Timezone string (UTC±HHMM, GMT±HHMM or IANA name)
-    :return: Formatted time string, or na when ``time`` is na
+    :return: Formatted time string; a na ``time`` is the epoch
+    :raises ValueError: On an unquoted letter that is no pattern letter
     """
-    # na timestamp formats to na (Pine na-propagation)
+    # MEASURED (v5 and v6): a na time formats as 0, the epoch -- ``1970-01-01 00:00:00.000``
+    # in UTC -- and the result is not na
     if time is None or not (time == time):  # is_na_arg
-        return NA(str)
+        time = 0
 
-    # Default format
-    fmt = format if format else "yyyy-MM-ddTHH:mm:ssZ"
-
-    # Convert timestamp to datetime
-    dt = datetime.fromtimestamp(time / 1000, UTC)
-
-    # Convert timezone using _parse_timezone
+    # Whole seconds and milliseconds apart: a float division would round 42 ms to 41.999
+    seconds, millis = divmod(int(time), 1000)
+    dt = datetime.fromtimestamp(seconds, UTC).replace(microsecond=millis * 1000)
     dt = dt.astimezone(_parse_timezone(timezone or _syminfo.timezone))
-
-    # Convert format and apply
-    py_fmt = _datatime_fmt_tv2py(fmt)
-    return dt.strftime(py_fmt)
+    return _format_datetime(dt, format if format else _DEFAULT_TIME_FORMAT)
 
 
 def length(string: str) -> PyneInt:
@@ -1107,6 +1255,9 @@ def length(string: str) -> PyneInt:
     :param string: String to get the length of
     :return: Amount of chars in the string
     """
+    # A typeless na is the string na, the empty string
+    if isinstance(string, NA) or string is None:
+        string = ""
     return pine_int(len(string))
 
 
@@ -1117,6 +1268,9 @@ def lower(source: str) -> str:
     :param source: Source string
     :return: A new string with all letters converted to lowercase.
     """
+    # A typeless na is the string na, the empty string
+    if isinstance(source, NA) or source is None:
+        source = ""
     return source.lower()
 
 
@@ -1149,6 +1303,11 @@ def match(source: str, regex: str) -> str:
     :param regex: Regular expression
     :return: New substring of the source string if it matches a regex regular expression, an empty string otherwise.
     """
+    # A typeless na is the string na, the empty string
+    if isinstance(source, NA) or source is None:
+        source = ""
+    if isinstance(regex, NA) or regex is None:
+        regex = ""
     m = re.match(_pine_regex_to_python(regex), source)
     if m is None:
         return ""
@@ -1164,6 +1323,11 @@ def pos(source: str, str: str) -> PyneInt:
     :param str: Subtring to search for
     :return: Position of the first occurrence of the str string in the source string, 'na' otherwise.
     """
+    # A typeless na is the string na, the empty string
+    if isinstance(source, NA) or source is None:
+        source = ""
+    if isinstance(str, NA) or str is None:
+        str = ""
     res = source.find(str)
     if res == -1:
         return na_int
@@ -1181,16 +1345,16 @@ def repeat(source: str, repeat: int, separator: str = '') -> PyneStr:
     :param separator: Separator string
     :return: New string consisting of the source string repeated the specified number of times,
              separated by the separator string. A na source or repeat count — and a repeat
-             count of zero — yields na; a na separator behaves as ''.
+             count of zero — yields the string na, the empty string; a na separator
+             behaves as ''.
     """
-    # na-propagation (Pine): without this guard ``[source] * repeat`` with a na
-    # count evaluates through ``NA.__rmul__`` to na, and ``str.join(na)`` falls
-    # back to the sequence protocol, which never terminates (NA.__getitem__
-    # returns self for every index).
+    # Without this guard ``[source] * repeat`` with a na count evaluates through
+    # ``NA.__rmul__`` to na, and ``str.join(na)`` falls back to the sequence
+    # protocol, which never terminates (NA.__getitem__ returns self for every index)
     if isinstance(source, NA) or source is None or repeat is None or not (repeat == repeat):
-        return NA(str)
+        return ""
     if repeat <= 0:
-        return NA(str)
+        return ""
     if isinstance(separator, NA) or separator is None:
         separator = ''
     return separator.join([source] * int(repeat))
@@ -1205,13 +1369,17 @@ def replace(source: str, target: str, replacement: str, occurrence=0) -> PyneStr
     :param replacement: Replacement string
     :param occurrence: Occurrence to replace
     :return: New string with the nth occurrence of target string replaced with the replacement
-             string, or na if source or target is na.
+             string. A na string argument is the empty string.
     """
-    # na-propagation (Pine): a na source would reach ``source.find`` through
-    # ``NA.__getattr__``, which answers na to every attribute and turns the scan below
-    # into a silent non-result — same trap as in ``repeat``/``contains``.
-    if isinstance(source, NA) or source is None or isinstance(target, NA) or target is None:
-        return NA(str)
+    # A typeless na is the string na, the empty string. Left as it is, a na source
+    # would reach ``source.find`` through ``NA.__getattr__``, which answers na to
+    # every attribute and turns the scan below into a silent non-result.
+    if isinstance(source, NA) or source is None:
+        source = ""
+    if isinstance(target, NA) or target is None:
+        target = ""
+    if isinstance(replacement, NA) or replacement is None:
+        replacement = ""
     # A negative occurrence is a compile error on TradingView (CE10039), so it can only
     # arrive from hand-written Pyne code; leaving the source untouched is the quiet option.
     if occurrence < 0:
@@ -1245,6 +1413,13 @@ def replace_all(source: str, target: str, replacement: str) -> str:
     :param replacement: Replacement string
     :return: New string with each occurrence of the target string replaced with the replacement string.
     """
+    # A typeless na is the string na, the empty string
+    if isinstance(source, NA) or source is None:
+        source = ""
+    if isinstance(target, NA) or target is None:
+        target = ""
+    if isinstance(replacement, NA) or replacement is None:
+        replacement = ""
     return source.replace(target, replacement)
 
 
@@ -1256,6 +1431,11 @@ def split(string: str, separator: str) -> list[str]:
     :param separator: Separator
     :return: Array of substrings
     """
+    # A typeless na is the string na, the empty string
+    if isinstance(string, NA) or string is None:
+        string = ""
+    if isinstance(separator, NA) or separator is None:
+        separator = ""
     if not separator:
         # An empty separator splits into individual characters, but an empty source still
         # yields one empty piece, exactly like every other separator does. Python raises
@@ -1274,6 +1454,11 @@ def startswith(source: str, str: str) -> bool:
     :param str: The substring to search for
     :return: True if the source string starts with the str substring, false otherwise
     """
+    # A typeless na is the string na, the empty string
+    if isinstance(source, NA) or source is None:
+        source = ""
+    if isinstance(str, NA) or str is None:
+        str = ""
     return source.startswith(str)
 
 
@@ -1285,13 +1470,13 @@ def substring(source: str, begin_pos: int, end_pos: int | None = None) -> PyneSt
     :param begin_pos: The starting position
     :param end_pos: The ending position
     :return: The substring of the source string starting at the specified position and ending at
-             the specified position, or na when the source is na
+             the specified position; a na source is the empty string
     """
-    # na-propagation (Pine): an na source has no substring, and no length either --
-    # the end position defaults to ``len(source)``, so the source has to be resolved
-    # before any position is.
+    # A typeless na source is the string na, the empty string. The end position
+    # defaults to ``len(source)``, so the source has to be resolved before any
+    # position is.
     if isinstance(source, NA) or source is None:
-        return NA(str)
+        source = ""
     # Pine's int is a static type only: an int-TYPED expression can carry a
     # fractional value (``14 / 8``), so the positions are truncated where they
     # are CONSUMED -- ahead of the range checks and of the empty-slice test,
@@ -1318,6 +1503,9 @@ def tonumber(string: str) -> PyneFloat:
     :param string: Value to convert
     :return: Float equivalent of the value or `na` if the conversion is not possible.
     """
+    # A typeless na is the string na, the empty string
+    if isinstance(string, NA) or string is None:
+        string = ""
     try:
         return float(string)
     except ValueError:
@@ -1374,6 +1562,9 @@ def trim(source: str) -> str:
     :param source: Source string
     :return: Source string without leading and trailing whitespaces.
     """
+    # A typeless na is the string na, the empty string
+    if isinstance(source, NA) or source is None:
+        source = ""
     return source.strip()
 
 
@@ -1384,4 +1575,7 @@ def upper(source: str) -> str:
     :param source: Source string
     :return: A new string with all letters converted to uppercase.
     """
+    # A typeless na is the string na, the empty string
+    if isinstance(source, NA) or source is None:
+        source = ""
     return source.upper()

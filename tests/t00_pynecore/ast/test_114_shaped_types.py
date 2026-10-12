@@ -34,7 +34,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.t00_pynecore.pine_analysis import analyse_module
+from ..pine_analysis import analyse_module
 from pynecore.core.instance_state import _make_state
 from pynecore.transformers import module_interface
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
@@ -215,16 +215,20 @@ def __test_every_shape_heads_to_an_object__(ty: str):
     assert head(ty) == OBJECT
 
 
-def __test_the_pin_never_sees_a_shape__():
-    """``pin_for(['a:i', 'i'])`` and ``pin_for(['o', 'i'])`` are one question"""
-    assert pin_for([array_of(INT), INT]) == pin_for([OBJECT, INT])
-    # A shape has no witness value, so it takes the wildcard: the position is
-    # left out of the selection, not allowed to block the int next to it
-    assert pin_for([array_of(INT), INT]) == PIN_ANY + 'i'
+def __test_the_pin_reads_a_shape_only_where_it_has_a_witness__():
+    """An array or matrix of a scalar pins its element type; any other shape is a wildcard"""
+    assert pin_for([array_of(INT), INT]) == 'Ii'
+    assert pin_for([array_of(FLOAT)]) == 'F'
+    assert pin_for([matrix_of(FLOAT), STR]) == '2s'
+    # A shape without a witness value takes the wildcard: the position is left
+    # out of the selection, not allowed to block the int next to it
+    assert pin_for([PIVOT, INT]) == PIN_ANY + 'i'
+    assert pin_for([map_of(STR, FLOAT), INT]) == PIN_ANY + 'i'
     # ... and the arguments a shape READS OUT are pinnable as usual
     assert pin_for([INT, INT]) == 'ii'
-    # A site with nothing int-typed in it is still not worth a pin
-    assert pin_for([array_of(INT), FLOAT]) is None
+    # A site with neither an int nor a witnessed container is still not worth a pin
+    assert pin_for([PIVOT, FLOAT]) is None
+    assert pin_for([map_of(STR, FLOAT), FLOAT]) is None
 
 
 @pytest.mark.parametrize("left,right,expected", [

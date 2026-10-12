@@ -58,11 +58,13 @@ from .dynamic_default import is_script_entry
 from .node_ids import ID_ATTR, assign_node_ids, node_id
 from .pine_type_report import unknown_diags
 from .pine_type_rules import (
-    INT, FLOAT, BOOL, TYPELESS, UNKNOWN, VOID, OBJECT, NUMERIC,
+    INT, FLOAT, BOOL, STR, TYPELESS, UNKNOWN, VOID, OBJECT, NUMERIC,
     join, binop_type, unaryop_type, compare_type, annotation_type, bare_wrapper,
     LIB_TYPE_OVERRIDES, OVERRIDE_PARAM_NAMES, BUILTIN_CALL_TYPES, BUILTIN_NAME_TYPES,
     TY_ATTR, get_ty, set_ty, inherit_ty,
-    constant_type, pin_for, get_pins, set_pin, set_pins, set_vector, set_varying,
+    constant_type, pin_for, get_pins, set_pin, set_pins, set_vector, get_varying, set_varying,
+    WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_STRING_NA, set_widen, get_widen_site,
+    set_widen_site, get_widens, set_widens,
     overload_result, ImplSig, overload_pick, default_fit, FIT_REQUIRED, FactoryFields,
     impl_sig, _param_defaults, _dotted, _DYN_DEFAULT,  # noqa: internal API
     CLASS_SEP, LIB_MODULE, SCALARS, PINE_LOOP, array_of, builtin_class_id, class_id, class_of,
@@ -494,6 +496,11 @@ class _Inference:
         self._ty: dict[int, str] = {}
         #: Node id -> context id -> the pin that context justified
         self._pins: dict[int, dict[int, str | None]] = {}
+        # Per value node: the conversion each context decided it needs on its
+        # way into a float-element container (see ``_record_widen``)
+        self._widens: dict[int, dict[int, str | None]] = {}
+        #: Value node id -> the node, for the per-instance conversion sites
+        self._widen_nodes: dict[int, ast.expr] = {}
         #: Where the running context collects its inner pins; None at module
         #: level, which owns no context result
         self._pin_sink: list[dict[int, str | None] | None] = [None]
@@ -503,6 +510,10 @@ class _Inference:
         self._signed: set[str] = set()
         #: Call node ids already reported as pin-disagreeing
         self._pin_diags: set[int] = set()
+        #: Contexts an instance is created in with no instance vector: reached
+        #: through a call site the per-instance channel does not record (a
+        #: method call, a call this analysis could not bind)
+        self._unvectored: set[int] = set()
         #: Call node id -> calling context id -> the context the callee was
         #: instantiated in there. What ``_pins`` is for an overload site, this
         #: is for a call to a generic user function: the per-instance channel
@@ -898,8 +909,10 @@ class _Inference:
         self._body(tree.body)
         self._flush_pending()
         self._stamp_window_machines()
+        self._stamp_widen_sites()
         self._stamp_instance_vectors(tree)
         self._suppress_pins(tree)
+        self._report_unhandled_widens()
         # Where the types ran out, once per cause: the coverage meter of a
         # hand-written script, the first error of an edge module
         self.table.diags.extend(unknown_diags(tree, self.table))
@@ -1261,6 +1274,11 @@ class _Inference:
                 self._definition(stmt)
             case ast.Assign():
                 ty = self._expr(stmt.value)
+                target = stmt.targets[0] if len(stmt.targets) == 1 else None
+                if isinstance(target, ast.Name):
+                    found = self._lookup(target.id)
+                    if found is not None:
+                        ty = self._declared_constructor(found.ty, stmt.value, ty)
                 qual = self._qual(stmt.value)
                 for target in stmt.targets:
                     self._store(target, ty, stmt.value, qual=qual)
@@ -1271,6 +1289,8 @@ class _Inference:
             case ast.AnnAssign():
                 declared: str | None = annotation_type(stmt.annotation, self._classes)
                 value_ty = self._expr(stmt.value) if stmt.value is not None else None
+                if declared is not None and value_ty is not None and stmt.value is not None:
+                    value_ty = self._declared_constructor(declared, stmt.value, value_ty)
                 unknown = None
                 if bare_wrapper(stmt.annotation):
                     # ``x: Series = expr`` and ``var x = expr``: the wrapper says
@@ -1924,13 +1944,15 @@ class _Inference:
             self._stamp(target, ty if is_tuple(ty) else OBJECT)
             self._distribute(target, ty, source, qual)
         elif isinstance(target, ast.Attribute):
-            self._field_store(self._expr(target.value), target, ty)
+            self._field_store(self._expr(target.value), target, ty,
+                              source if isinstance(source, ast.expr) else None)
             self._stamp(target, ty)
         elif isinstance(target, ast.Subscript):
             self._expr(target.value)
             self._stamp(target, ty)
 
-    def _field_store(self, base: str, node: ast.Attribute, ty: str) -> None:
+    def _field_store(self, base: str, node: ast.Attribute, ty: str,
+                     value: ast.AST | None = None) -> None:
         """
         Check a ``obj.field = value`` against the receiver's class.
 
@@ -1942,6 +1964,7 @@ class _Inference:
         :param base: The receiver's type
         :param node: The attribute target
         :param ty: The type being stored
+        :param value: The stored value, when the store has one
         """
         cid = class_of(base)
         if cid is not None:
@@ -1949,6 +1972,8 @@ class _Inference:
             if sig is None:
                 return
             found = sig.fields.get(node.attr)
+            if found is not None and value is not None:
+                ty = self._declared_constructor(found, value, ty)
             if found is None:
                 self._node_diag(
                     f"'{sig.name}' has no field '{node.attr}'", node,
@@ -2580,8 +2605,14 @@ class _Inference:
         self._expr(node.test)
         # MEASURED: ``d > 1 ? d : R`` is int, ``d > 1 ? d : 1.0`` is float --
         # the arms join, they do not widen unconditionally
-        return self._joined(self._expr(node.body), self._expr(node.orelse),
-                            node, 'the ternary')
+        body = self._expr(node.body)
+        orelse = self._expr(node.orelse)
+        joined = self._joined(body, orelse, node, 'the ternary')
+        # A typeless na arm next to a string is the string na
+        for arm, arm_ty in ((node.body, body), (node.orelse, orelse)):
+            if arm_ty == TYPELESS:
+                self._record_widen(arm, WIDEN_STRING_NA if joined == STR else None)
+        return joined
 
     def _e_namedexpr(self, node: ast.NamedExpr) -> str:
         ty = self._expr(node.value)
@@ -2922,6 +2953,168 @@ class _Inference:
                 fix='annotate the parameters so every call site agrees')
         return pin
 
+    def _record_widen(self, node: ast.expr, kind: str | None) -> None:
+        """
+        Merge this context's conversion verdict for a value into its stamp.
+
+        Mirrors :meth:`_record_pin`: a later walk of the SAME context overwrites
+        its verdict, another context adds its own. A context whose value is a
+        float already (``_WIDEN_HARMLESS``) has no say: converting a float to
+        float changes nothing, so the conversion an int context needs is kept
+        -- a generic ``array.push(a, v)`` into a float array converts ``v``
+        whether it is reached with an int or with a float. The node carries a
+        conversion while every other context agrees on it; a body that puts
+        its parameter into a float array in one context and into an int array
+        in another has no single conversion that is right for both, so the
+        stamp is cleared and :meth:`_stamp_widen_sites` makes the value an
+        instance-varying site once every context has been walked.
+
+        :param node: The value node
+        :param kind: What this context decided (``WIDEN_*``, ``_WIDEN_HARMLESS``),
+                     or None when the value must stay as it is
+        """
+        if kind == WIDEN_STRING_NA and not _is_na_literal(node):
+            # Only Pine's own ``na`` is replaced by the empty string: a typeless
+            # parameter or the dynamic-default marker holds a value of its own
+            kind = None
+        nid = node_id(node)
+        if nid is None:
+            set_widen(node, None if kind == _WIDEN_HARMLESS else kind)
+            return
+        seen = self._widens.setdefault(nid, {})
+        seen[self._context] = kind
+        self._widen_nodes[nid] = node
+        needed = set(seen.values()) - {_WIDEN_HARMLESS}
+        set_widen(node, next(iter(needed)) if len(needed) == 1 else None)
+
+    def _stamp_widen_sites(self) -> None:
+        """
+        Give every value whose conversion differs per context its per-instance site.
+
+        The site is the call ``safe_convert.implicit_convert(value, None)`` that
+        :mod:`~pynecore.transformers.implicit_conversion` puts in the value's
+        place, carrying the conversion of each context. To the per-instance
+        channel it is an instance-varying site like a varying overload pin
+        (``_stamp_instance_vectors``): its vector entry is the conversion THIS
+        instance needs (``WIDEN_*``), or None for none, and the isolation pass
+        hands the call that entry in place of the None. A float that goes into
+        a float container needs nothing, the way it has no say in the constant
+        stamp.
+        """
+        for nid, seen in self._widens.items():
+            node = self._widen_nodes.get(nid)
+            if node is None:
+                continue
+            if len(set(seen.values()) - {_WIDEN_HARMLESS}) < 2:
+                set_widen_site(node, None)
+                continue
+            site = ast.copy_location(ast.Call(
+                func=ast.Attribute(value=ast.Name(id='safe_convert', ctx=ast.Load()),
+                                   attr='implicit_convert', ctx=ast.Load()),
+                args=[node, ast.Constant(value=None)], keywords=[]), node)
+            set_widens(site, {cid: None if kind == _WIDEN_HARMLESS else kind
+                              for cid, kind in seen.items()})
+            set_widen_site(node, site)
+
+    def _report_unhandled_widens(self) -> None:
+        """
+        Report the per-instance conversions some instance cannot be given.
+
+        A site converts per instance only where the instance knows which
+        instance it is. That fails in two ways: the site belongs to no
+        definition's varying sites (an overload implementation, a definition a
+        later one of the same name shadows, a module whose pins were taken
+        away), or an instance that needs a conversion is created by a call site
+        the channel does not record -- a method found by name on the receiver's
+        class, a call this analysis could not bind -- or is reached from such an
+        instance through its
+        varying sites, and runs with the all-None default vector. A site of the
+        first kind is dropped, so the value goes in unconverted everywhere; one
+        of the second kind still converts in every instance that is handed its
+        vector. Both are reported.
+        """
+        placed: set[int] = set()
+        varying_sites: set[int] = set()
+        for definitions in self._defs.values():
+            for definition in definitions:
+                for site in get_varying(definition) or ():
+                    placed.add(id(site))
+                    nid = node_id(site)
+                    if nid is not None:
+                        varying_sites.add(nid)
+        unvectored = set(self._unvectored)
+        frontier = list(unvectored)
+        while frontier:
+            caller = frontier.pop()
+            for site_nid in varying_sites:
+                callee = self._call_ctx.get(site_nid, {}).get(caller)
+                if callee is not None and callee not in unvectored:
+                    unvectored.add(callee)
+                    frontier.append(callee)
+        for nid, node in self._widen_nodes.items():
+            site = get_widen_site(node)
+            if site is None:
+                continue
+            if id(site) not in placed:
+                set_widen_site(node, None)
+            elif not any(kind is not None for cid, kind in (get_widens(site) or {}).items()
+                         if cid in unvectored):
+                continue
+            self._diag(
+                'the implicit conversion of a value differs per call context, and not '
+                'every instance can be given its own',
+                node, self._unknown('context-dependent-widen', node),
+                fix='annotate the parameters so every call site passes the same types')
+
+    def _declared_constructor(self, declared: str, value: ast.AST, value_ty: str) -> str:
+        """
+        The type a container constructor builds where a declaration says what it holds.
+
+        A constructor reads its element type off the value it is built from, so
+        ``Matrix[float]`` built with ``matrix.new(1, 1, -3)`` -- PyneComp's
+        spelling of ``matrix.new<float>(1, 1, -3)``, whose template it cannot
+        emit -- reads as a matrix of ints. The declaration is the template: the
+        int initial value is converted to the float the container holds, and
+        the constructor builds the declared type.
+
+        A typeless ``na`` assigned to a string is the string na, the empty string.
+
+        :param declared: The declared type of the target
+        :param value: The assigned value
+        :param value_ty: The type the value was inferred to
+        :return: ``declared`` when the value is such a constructor or a string na,
+                 else ``value_ty``
+        """
+        if value_ty == TYPELESS:
+            self._record_widen(value, WIDEN_STRING_NA if declared == STR else None)
+            return STR if declared == STR and _is_na_literal(value) else value_ty
+        if value_ty == declared or element_of(declared) != FLOAT \
+                or element_of(value_ty) != INT or not isinstance(value, ast.Call) \
+                or not ((is_array(declared) and is_array(value_ty))
+                        or (is_matrix(declared) and is_matrix(value_ty))):
+            return value_ty
+        callee = self._lib_name(value.func)
+        positions = _CONSTRUCTOR_ELEMENTS.get(callee) if callee is not None else None
+        if positions is None:
+            return value_ty
+        if positions == ():
+            elements = [arg for arg in value.args if not isinstance(arg, ast.Starred)]
+        else:
+            entry = lib_types().get(callee)
+            names = entry.get('names') if isinstance(entry, dict) else None
+            if names is None:
+                names = OVERRIDE_PARAM_NAMES.get(callee)
+            elements = [arg for arg in (_bound_arg(value.args, value.keywords, at, names)
+                                        for at in positions) if arg is not None]
+        for arg in elements:
+            if self._ty_of(arg) == INT:
+                self._record_widen(arg, WIDEN_FLOAT)
+        nid = node_id(value)
+        if nid is not None:
+            self._ty[nid] = declared
+        set_ty(value, declared)
+        return declared
+
     def _lib_call_type(self, callee: str, args: Sequence[ast.expr],
                        keywords: Sequence[ast.keyword], argc: int | None,
                        pin: str | None = None) -> str:
@@ -2946,6 +3139,9 @@ class _Inference:
         :return: The type the call evaluates to
         """
         entry = lib_types().get(callee)
+        if callee in _MAP_KEY_LOOKUPS:
+            self._record_key_widen(args, keywords,
+                                   entry.get('names') if isinstance(entry, dict) else None)
         override = LIB_TYPE_OVERRIDES.get(callee)
         if override is not None:
             names = entry.get('names') if isinstance(entry, dict) else None
@@ -3051,6 +3247,11 @@ class _Inference:
             result = passed[0]
             for ty in passed[1:]:
                 result = join(result, ty)
+            # An int next to a float is converted where it goes in, as Pine does,
+            # and a typeless na next to a string is the string na
+            for arg in args:
+                if not isinstance(arg, ast.Starred):
+                    self._record_widen(arg, _widen_for('array', result, self._ty_of(arg)))
             return array_of(result) if result != UNKNOWN else None
         if override.startswith('merge_') or override.startswith('put_'):
             return self._merge_override(override, args, keywords, param_names)
@@ -3070,6 +3271,26 @@ class _Inference:
                 return base
             return None
         return self._shape_override(override, args, keywords, param_names)
+
+    def _record_key_widen(self, args: Sequence[ast.expr], keywords: Sequence[ast.keyword],
+                          param_names: list[str] | None) -> None:
+        """
+        Record the conversion of the key a map call is handed.
+
+        A typeless ``na`` key of a string-keyed map is the string na, the empty
+        string: ``map.put(m, na, v)`` stores under ``""``, and ``map.get(m, na)``
+        reads it back.
+
+        :param args: The positional arguments, the map first and the key second
+        :param keywords: The keyword arguments
+        :param param_names: The callee's declared parameter order
+        """
+        key = _bound_arg(args, keywords, 1, param_names)
+        if key is None:
+            return
+        base = self._arg_ty(args, keywords, 0, param_names)
+        self._record_widen(key, WIDEN_STRING_NA if is_map(base) and key_of(base) == STR
+                           and self._ty_of(key) == TYPELESS else None)
 
     def _merge_override(self, form: str, args: Sequence[ast.expr],
                         keywords: Sequence[ast.keyword],
@@ -3129,7 +3350,9 @@ class _Inference:
                 key = self._arg_ty(args, keywords, 1, param_names)
                 fits = (key != UNKNOWN and key in _UNCHECKED) \
                     or (key != UNKNOWN and _fits(key_of(base), key))
-                if not fits:
+                if fits:
+                    self._record_key_widen(args, keywords, param_names)
+                else:
                     operand_at, other = 1, key
         elif kind(other):
             fits = element_of(other) != UNKNOWN \
@@ -3139,13 +3362,16 @@ class _Inference:
             fits = join(element, other) == element
         else:
             fits = False
+        operand = _bound_arg(args, keywords, operand_at, param_names)
+        if operand is not None:
+            self._record_widen(operand, _widen_for(put_kind if putting else form, element, other)
+                               if fits else None)
         if fits:
             if putting:
                 # ``map.put`` hands back what the key held before
                 return value_of(base) if put_kind == 'map' else VOID
             return base
         receiver = _bound_arg(args, keywords, 0, param_names)
-        operand = _bound_arg(args, keywords, operand_at, param_names)
         where = operand if operand is not None else receiver
         assert where is not None
         nid = node_id(where)
@@ -3668,7 +3894,10 @@ class _Inference:
                 pin = pin_for([self._ty_of(a) for a in args])
             self._record_pin(node, pin)
             return self._group_type(key, pin)
-        return self._call_context(key, node, frame, args, record=False)
+        # The method handed over as a function is the one the call site's dispatch
+        # entry binds, so the instance vector stamped here configures it
+        # (``core/pine_method``)
+        return self._call_context(key, node, frame, args)
 
     def _unknown_method(self, node: ast.Call) -> str:
         """
@@ -4047,9 +4276,10 @@ class _Inference:
         :param frame: Index of the frame whose scope declares the callee
         :param args: The positional arguments, when they are not the node's own
         :param record: Whether the site takes part in the per-instance channel.
-                       A method call does not: the isolation pass leaves
-                       ``method_call`` raw and anchors nothing there, so a
-                       vector stamped on it would configure nobody
+                       A method a ``method_call`` finds by NAME on the
+                       receiver's class does not: the dispatch entry hands a
+                       vector only to the method passed as a function, so a
+                       vector stamped there would configure nobody
         :return: The type this call evaluates to
         """
         definitions = self._defs.get(key)
@@ -4070,9 +4300,12 @@ class _Inference:
             # definition states, so the call is typed by whatever the body
             # says with UNKNOWN parameters
             settled = self._analyse(key, target, self._declared_params(target), parents)
-            if settled is not None and nid is not None:
+            if settled is None:
+                return UNKNOWN
+            self._unvectored.add(settled.cid)
+            if nid is not None:
                 self._call_q[nid] = settled.ret_qual
-            return UNKNOWN if settled is None else settled.ret
+            return settled.ret
         if (key, params, node_id(target)) in self._in_progress:
             self._diag(f"'{_dotted(node.func)}' is re-entrant, so its result type is unknown",
                        node, self._unknown('recursion', node, key))
@@ -4092,6 +4325,8 @@ class _Inference:
             # instance the call site never actually establishes
             self._call_ctx.setdefault(nid, {})[self._context] = result.cid
             self._callee_key[nid] = key
+        else:
+            self._unvectored.add(result.cid)
         return result.ret
 
     def _call_params(self, target: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -4153,19 +4388,27 @@ class _Inference:
                 return None
             annotated = annotation_type(arg.annotation, self._classes)
             if annotated != UNKNOWN:
-                if passed is not None:
-                    given = self._ty_of(passed)
-                    if given not in _UNCHECKED and not _fits(annotated, given):
-                        reject(f"'{name}' takes {render_ty(annotated)} for "
-                                        f"'{arg.arg}', {render_ty(given)} passed")
-                        return None
+                given_node = passed if passed is not None else default
+                given = self._ty_of(given_node)
+                if passed is not None and given not in _UNCHECKED \
+                        and not _fits(annotated, given):
+                    reject(f"'{name}' takes {render_ty(annotated)} for "
+                                    f"'{arg.arg}', {render_ty(given)} passed")
+                    return None
+                if report and given == TYPELESS:
+                    # A typeless na passed (or defaulted) to a string is the string na
+                    self._record_widen(given_node,
+                                       WIDEN_STRING_NA if annotated == STR else None)
                 out.append(annotated)
             elif passed is None:
                 out.append(self._ty_of(default))
             elif default is None:
                 out.append(self._ty_of(passed))
             else:
-                out.append(join(self._ty_of(default), self._ty_of(passed)))
+                joined = join(self._ty_of(default), self._ty_of(passed))
+                if report and self._ty_of(passed) == TYPELESS:
+                    self._record_widen(passed, WIDEN_STRING_NA if joined == STR else None)
+                out.append(joined)
         return tuple(out)
 
     def _call_quals(self, target: ast.FunctionDef | ast.AsyncFunctionDef, node: ast.Call,
@@ -4597,16 +4840,19 @@ class _Inference:
         inside it whose answer differs between those contexts cannot be
         emitted as a constant. Such a site is *instance-varying*: an overload
         site whose pin differs (``get_pins`` is present), a window call whose
-        machine differs (``get_series_lens`` is present), or a call to a
-        generic callee whose own instance vector differs. They are the same
+        machine differs (``get_series_lens`` is present), the conversion call of
+        a value whose implicit conversion differs (``get_widens`` is present),
+        or a call to a generic callee whose own instance vector differs. They are the same
         question one level apart, so the definition is recursive and settled by
         a fixpoint -- making a callee's site vary can make its caller's site
         vary too.
 
         A function's VECTOR under one context is one entry per varying site of
         that function, in source order: the pin character for an overload site,
-        whether the length is series for a window call, the callee's own vector
-        (nested) for a generic one, and None where this
+        whether the length is series for a window call, the conversion
+        (``WIDEN_*``) for a value whose implicit conversion differs
+        (``_stamp_widen_sites``), the callee's own vector (nested) for a
+        generic one, and None where this
         context reached the site with nothing to say. None means "configure
         nothing" all the way down -- the callee then keeps the all-None default
         its layout carries, which is the value dispatch the site had before
@@ -4664,6 +4910,9 @@ class _Inference:
             return built
 
         def entry_of(site: ast.Call, cid: int, stack: frozenset) -> Any:
+            widens = get_widens(site)
+            if widens is not None:
+                return widens.get(cid)
             site_id = node_id(site)
             if site_id is None:
                 return None
@@ -4738,6 +4987,70 @@ class _Inference:
                 name = rest
         self._lib_names[id(node)] = (node, name)
         return name
+
+
+#: Constructors whose element type comes from the values they are built from,
+#: by the positions of those values; ``()`` is every positional argument
+_CONSTRUCTOR_ELEMENTS: dict[str, tuple[int, ...]] = {
+    'array.new': (1,),
+    'matrix.new': (2,),
+    'array.from_items': (),
+}
+
+
+#: The map calls that look a key up: the key goes where a string-keyed map's keys
+#: are, so a typeless ``na`` key converts there the way it does in ``map.put``
+_MAP_KEY_LOOKUPS: Final = frozenset({'map.get', 'map.contains', 'map.remove'})
+
+#: A conversion verdict that never reaches a stamp: the value goes into a float
+#: container as a float already, so converting it would change nothing
+_WIDEN_HARMLESS: Final = '='
+
+#: The spellings of Pine's typeless ``na`` in value position: the name itself, and
+#: what ``module_property`` rewrites it to
+_NA_LITERALS: Final = frozenset({'na', 'lib.na', '_na_none', 'lib._na_none'})
+
+
+def _is_na_literal(node: ast.AST) -> bool:
+    """Whether a value is Pine's typeless ``na`` itself."""
+    return isinstance(node, (ast.Name, ast.Attribute)) and _dotted(node) in _NA_LITERALS
+
+
+def _widen_for(kind: str, element: str, other: str) -> str | None:
+    """
+    The conversion a value needs to go into a container of ``element``.
+
+    Pine converts an int that goes into a float container: a single element
+    (``array.push``, ``map.put``, ``matrix.set``), and the elements of an int
+    array or matrix copied in (``array.concat``, ``matrix.add_row``,
+    ``matrix.concat``). Arithmetic merges (``matrix.sum``, ``matrix.kron``)
+    compute floats anyway; converting their operand first changes no value.
+
+    :param kind: The put kind (``array``, ``map``, ``matrix``, ``matrix_array``)
+                 or the merge form (``merge_array``, ``merge_matrix``, ...)
+    :param element: The container's element (or map value) type
+    :param other: The value's type
+    :return: ``WIDEN_FLOAT``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX``, ``_WIDEN_HARMLESS``
+             when the value is a float (or holds floats) already, ``WIDEN_STRING_NA`` for
+             a typeless na element of a string container, or None
+    """
+    if element == STR:
+        return WIDEN_STRING_NA if kind in ('array', 'map', 'matrix') and other == TYPELESS \
+            else None
+    if element != FLOAT:
+        return None
+    if kind in ('array', 'map', 'matrix'):
+        return WIDEN_FLOAT if other == INT else _WIDEN_HARMLESS if other == FLOAT else None
+    if kind in ('matrix_array', 'merge_array'):
+        if not is_array(other):
+            return None
+        conversion = WIDEN_ITEMS
+    elif is_matrix(other):
+        conversion = WIDEN_MATRIX
+    else:
+        return None
+    held = element_of(other)
+    return conversion if held == INT else _WIDEN_HARMLESS if held == FLOAT else None
 
 
 def _scan_tree(tree: ast.Module) -> tuple[dict[str, ast.expr], dict[str, list[ast.expr]]]:
@@ -5547,7 +5860,8 @@ def _own_calls(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.Call]:
 
     A nested definition owns its own sites, so the walk stops there; a lambda
     does NOT own one, because the isolation pass anchors a lambda's sites in
-    the enclosing function's state vector.
+    the enclosing function's state vector. The conversion call a value is to be
+    wrapped in (``get_widen_site``) is a site too, just before the value itself.
 
     :param node: The definition to walk
     :return: The call nodes, ordered by their pre-order node id
@@ -5556,19 +5870,30 @@ def _own_calls(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.Call]:
     stack: list[ast.AST] = list(node.body)
     while stack:
         current = stack.pop()
+        site = get_widen_site(current)
+        if site is not None:
+            calls.append(site)
         if isinstance(current, ast.Call):
             calls.append(current)
         elif isinstance(current, (ast.Name, ast.FunctionDef, ast.AsyncFunctionDef)):
             # A name holds no call, a nested definition owns its own
             continue
         stack.extend(ast_walk.iter_child_nodes(current))
-    calls.sort(key=lambda call: node_id(call) or 0)
+    calls.sort(key=_site_order)
     return calls
+
+
+def _site_order(call: ast.Call) -> tuple[int, int]:
+    """The pre-order position of a call site; a conversion call goes before its value."""
+    if get_widens(call) is not None:
+        return node_id(call.args[0]) or 0, 0
+    return node_id(call) or 0, 1
 
 
 def _per_context(call: ast.Call) -> bool:
     """Whether a call site's answer differs between the contexts reaching it."""
-    return get_pins(call) is not None or get_series_lens(call) is not None
+    return get_pins(call) is not None or get_series_lens(call) is not None \
+        or get_widens(call) is not None
 
 
 def _enumerated(node: ast.expr) -> ast.expr | None:

@@ -73,18 +73,24 @@ generic body is shared by every context it is instantiated in, so a site
 inside it whose pin differs per context cannot be a constant — the type pass
 marks such sites (``get_varying`` on the definition), this pass reserves ONE
 slot for the vector and the site reads its own entry out of it,
-``__state__[k][j]``. A call site whose callee has such sites passes the
+``__state__[k][j]``. A value whose implicit conversion differs per context
+is such a site too: ImplicitConversion wrapped it in
+``safe_convert.implicit_convert(value, None)``, and the entry takes the None's
+place. A call site whose callee has such sites passes the
 vector for the instance it creates, so the callee's body resolves per
 instance. Everything else emits exactly what it emitted before; a scope with
 no varying site gets no slot.
 
 The vector reaches an instance where the instance is CREATED, so a call site
 that creates none cannot hand one over. A ``method_call`` site is anchored on
-the uniform route like a dispatcher site, but its anchor binds the method the
+the uniform route like a dispatcher site, and its anchor binds the method the
 receiver selects at run time in a per-site cache
-(:mod:`~pynecore.core.pine_method`), and an overload dispatcher builds its
-implementations' vectors itself (``overload._anchored``): a varying site
-inside either falls back to value dispatch, with the type pass's
+(:mod:`~pynecore.core.pine_method`): the vector reaches the dispatch entry
+through ``__pyne_bind__`` and configures the method passed as a function, the
+one the type pass resolved, while a method found by name gets none. An
+overload dispatcher builds its implementations' vectors itself
+(``overload._anchored``): a varying site inside it, or inside a method found by
+name, falls back to value dispatch, with the type pass's
 ``context-dependent-pin`` diagnostic left standing.
 
 Deliberately left untouched (raw calls): module-level call sites (a stateful
@@ -114,7 +120,7 @@ from . import ast_walk
 from . import module_interface
 from .call_inline import SUPPORT_ALIAS_PREFIX
 from .pine_type_infer import lib_routes
-from .pine_type_rules import (get_pin, get_pins, get_ty, get_varying, get_vector,
+from .pine_type_rules import (get_pin, get_pins, get_ty, get_varying, get_vector, get_widens,
                               stamp_lowering)
 from .pine_qualifier import SERIES_LENGTH_KEYWORD, get_series_len, get_series_lens
 from .pine_type_table import Analyser, PineTypeTable
@@ -150,6 +156,10 @@ NON_TRANSFORMABLE_FUNCTIONS = {
     'collect_meta_changes',
     # The bool na factory reads only the script-wide mode, with no call-site state.
     '__sec_bool_na·__',
+    # The element conversions ImplicitConversion emits copy a container or select the
+    # conversion an instance vector entry names, with no state.
+    'safe_convert.safe_float_items', 'safe_convert.safe_float_matrix',
+    'safe_convert.implicit_convert',
 
     # Plot and display related (function-and-namespace modules appear as their
     # self-named function after the module property rewrite, e.g. lib.plot.plot)
@@ -1121,6 +1131,12 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
     def visit_Call(self, node: ast.Call) -> ast.expr:
         node.args = [cast(ast.expr, self.visit(arg)) for arg in node.args]
         node.keywords = [cast(ast.keyword, self.visit(kw)) for kw in node.keywords]
+        if get_widens(node) is not None:
+            # A value whose implicit conversion differs per instance: the
+            # conversion is this instance's vector entry
+            entry = self._vector_entry(node, '·'.join(self._scope_stack))
+            if entry is not None:
+                node.args[1] = entry
         if get_series_len(node):
             # The type pass found the window's length series in every context
             node.keywords.append(ast.keyword(arg=SERIES_LENGTH_KEYWORD,
@@ -1216,12 +1232,8 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
         constant = get_vector(node)
         pin: ast.expr | None = None if stamped is None else ast.Constant(value=stamped)
         vector: ast.expr | None = None if constant is None else ast.Constant(value=constant)
-        index = self._pin_index.get(scope)
-        position = index.get(id(node)) if index is not None else None
-        if position is not None:
-            entry = ast.Subscript(
-                value=self._slot_ref(self._state_param(), self._pin_slots[scope]),
-                slice=ast.Constant(value=position), ctx=ast.Load())
+        entry = self._vector_entry(node, scope)
+        if entry is not None:
             if get_series_lens(node) is not None:
                 # A window call whose machine differs per instance takes it as
                 # an argument: true for a series length, None or false for a ring
@@ -1231,3 +1243,18 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
             else:
                 vector = entry
         return pin, vector
+
+    def _vector_entry(self, node: ast.Call, scope: str) -> ast.Subscript | None:
+        """The read of an instance-varying site's own entry: ``__state__[k][j]``.
+
+        :param node: The call node
+        :param scope: Scope id of the call site
+        :return: The subscript, or None when the site is not instance-varying here
+        """
+        index = self._pin_index.get(scope)
+        position = index.get(id(node)) if index is not None else None
+        if position is None:
+            return None
+        return ast.Subscript(
+            value=self._slot_ref(self._state_param(), self._pin_slots[scope]),
+            slice=ast.Constant(value=position), ctx=ast.Load())

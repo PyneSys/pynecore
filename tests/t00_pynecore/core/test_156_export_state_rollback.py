@@ -80,7 +80,8 @@ def __test_exported_overloads_restore_each_machine__(modes, root):
     def target():
         raise AssertionError('the call must use the anchored dispatcher')
 
-    target.__pyne_bind__ = lambda pin=None: _anchored([numeric, textual], 'export', pin=pin)
+    target.__pyne_bind__ = lambda pin=None, _vector=None: _anchored([numeric, textual], 'export',
+                                                                    pin=pin)
     exported = _export(target, library)
     bound = instance_state.__bind_any__(state, 0, exported)
     assert bound(5.0) == 5.0

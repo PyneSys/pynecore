@@ -34,6 +34,7 @@ from pynecore.transformers.dynamic_default import DynamicDefaultTransformer
 from pynecore.transformers.export_capture import ExportCaptureTransformer
 from pynecore.transformers.export_once import ExportOnceTransformer
 from pynecore.transformers.float_tolerance import FloatToleranceTransformer
+from pynecore.transformers.implicit_conversion import ImplicitConversionTransformer
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
 from pynecore.transformers.import_lifter import ImportLifterTransformer
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
@@ -221,6 +222,11 @@ ANALYSIS: Sequence[Step] = (
     # the length -- in user code, not in pynecore's own lib modules, whose machines
     # ARE those calls
     Step('PineType', _pine_types),
+    # Pine's int-to-float conversion of the values that go into a float-element
+    # container, from the conversions the type pass marked: right after it, so the
+    # security slices below clone the converted values. User code only -- pynecore's
+    # own lib modules implement the containers
+    Step('ImplicitConversion', _visit(ImplicitConversionTransformer), user_code_only=True),
     # Per-context backward slices of main(), emitted as ordinary module-level
     # functions the security children run instead of main(). Last of this half: the
     # clones must see the tree every earlier step produced (the hoisted ta

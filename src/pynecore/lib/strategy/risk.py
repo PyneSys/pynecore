@@ -28,7 +28,7 @@ def max_drawdown(
 
     lib._script.position.risk_max_drawdown_value = value
     lib._script.position.risk_max_drawdown_type = type
-    lib._script.position.risk_max_drawdown_alert = None if isinstance(alert_message, NA) else str(alert_message)
+    lib._script.position.risk_max_drawdown_alert = str(alert_message) if alert_message else None
 
 
 # noinspection PyProtectedMember,PyDunderSlots,PyUnresolvedReferences
@@ -59,7 +59,7 @@ def max_cons_loss_days(count: int, alert_message: PyneStr = NA(str)) -> None:
         return
 
     lib._script.position.risk_max_cons_loss_days = count
-    lib._script.position.risk_max_cons_loss_days_alert = None if isinstance(alert_message, NA) else str(alert_message)
+    lib._script.position.risk_max_cons_loss_days_alert = str(alert_message) if alert_message else None
 
 
 # noinspection PyProtectedMember,PyDunderSlots,PyUnresolvedReferences
@@ -75,7 +75,7 @@ def max_intraday_filled_orders(count: int, alert_message: PyneStr = NA(str)) -> 
 
     lib._script.position.risk_max_intraday_filled_orders = count
     lib._script.position.risk_max_intraday_filled_orders_alert = (
-        None if isinstance(alert_message, NA) else str(alert_message)
+        str(alert_message) if alert_message else None
     )
 
 
@@ -96,7 +96,7 @@ def max_intraday_loss(value: float | int, type: strategy.QtyType = strategy.perc
 
     lib._script.position.risk_max_intraday_loss_value = value
     lib._script.position.risk_max_intraday_loss_type = type
-    lib._script.position.risk_max_intraday_loss_alert = None if isinstance(alert_message, NA) else str(alert_message)
+    lib._script.position.risk_max_intraday_loss_alert = str(alert_message) if alert_message else None
 
 
 # noinspection PyProtectedMember,PyDunderSlots,PyUnresolvedReferences

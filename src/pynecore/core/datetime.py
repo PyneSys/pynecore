@@ -1,4 +1,6 @@
+import io
 import re
+import struct
 import sys
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta, timezone as dt_timezone, tzinfo, UTC
@@ -179,16 +181,55 @@ def _parse_timezone_cached(timezone: str) -> ZoneInfo:
         )
 
     prefix, sign, hours, minutes = match.groups()
-    offset = int(hours)
-    if minutes:
-        offset += int(minutes) / 60
+    hours = int(hours)
+    minutes = int(minutes) if minutes else 0
 
-    # UTC/GMT+X maps to Etc/GMT-X and vice versa
     # Special case: offset 0 should use UTC directly
-    if offset == 0:
+    if hours == 0 and minutes == 0:
         return ZoneInfo("UTC")
-    zone = f"Etc/GMT{'-' if sign == '+' else '+'}{int(abs(offset))}"
-    return ZoneInfo(zone)
+    if minutes == 0:
+        # UTC/GMT+X maps to Etc/GMT-X and vice versa
+        return ZoneInfo(f"Etc/GMT{'-' if sign == '+' else '+'}{hours}")
+    # The IANA database has whole hours only: ``GMT+0530`` is a zone of its own
+    return _fixed_offset_zone(sign, hours, minutes)
+
+
+class _FixedOffsetZone(ZoneInfo):
+    """
+    A zone with one fixed UTC offset that the IANA database has no entry for.
+
+    A ``ZoneInfo`` read from a file stream cannot be pickled, but zones travel to the
+    ``request.security`` child processes inside calendars and batch specifications. This
+    one pickles as its key and is rebuilt by :func:`_parse_timezone_cached` on the other
+    side, which hands out the same cached instance as a local parse would.
+    """
+
+    def __reduce__(self):
+        return _parse_timezone_cached, (self.key,)
+
+
+@lru_cache(maxsize=None)
+def _fixed_offset_zone(sign: str, hours: int, minutes: int) -> ZoneInfo:
+    """
+    A zone with one fixed UTC offset, named the way Java names it (``GMT+05:30``).
+
+    Built from a minimal TZif image -- no transitions, one local time type -- so it
+    is a real ``ZoneInfo`` like every other zone. Cached on the offset, so every
+    spelling of it (``UTC+5:30``, ``GMT+0530``, an unpickled zone) is one instance,
+    the way ``ZoneInfo`` keeps one instance per database key.
+
+    :param sign: ``+`` or ``-``
+    :param hours: The offset's hours
+    :param minutes: The offset's minutes
+    :return: The zone
+    """
+    name = f"GMT{sign}{hours:02d}:{minutes:02d}"
+    seconds = (hours * 3600 + minutes * 60) * (-1 if sign == '-' else 1)
+    abbreviation = name.encode() + b'\0'
+    header = b'TZif' + bytes(16) + struct.pack('>6l', 0, 0, 0, 0, 1, len(abbreviation))
+    local_time_type = struct.pack('>lBB', seconds, 0, 0)
+    return _FixedOffsetZone.from_file(io.BytesIO(header + local_time_type + abbreviation),
+                                      key=name)
 
 
 # Lazily bound to the ``lib.syminfo`` module on first use. Importing it at module

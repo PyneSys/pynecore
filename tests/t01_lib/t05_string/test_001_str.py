@@ -65,19 +65,21 @@ def __test_str__(runner, dummy_ohlcv_iter, file_reader, log_comparator):
 
 
 def __test_str_contains_na__():
-    """ str.contains(na, ...) answers the bool na (na with the three-state bool, false
-    without it) and never iterates the na argument forever; a real source still
+    """ A na string is the empty string, so str.contains(na, "a") is false and
+    str.contains("abc", na) is true (MEASURED on TradingView, v5 and v6, in both
+    bool modes); the typeless na never iterates forever; a real source still
     searches normally """
     from pynecore.lib import string as _string
-    from pynecore.types.na import NA, na_bool, set_bool_na
-    assert _string.contains(NA(str), "Closes") is False
-    assert _string.contains("Market Closes", NA(str)) is False
-    set_bool_na(True)
-    try:
-        assert _string.contains(NA(str), "Closes") is na_bool
-        assert _string.contains("Market Closes", NA(str)) is na_bool
-    finally:
-        set_bool_na(False)
+    from pynecore.types.na import NA, set_bool_na
+    for bool_na in (False, True):
+        set_bool_na(bool_na)
+        try:
+            assert _string.contains(NA(str), "Closes") is False
+            assert _string.contains("Market Closes", NA(str)) is True
+            assert _string.contains(NA(None), "Closes") is False
+            assert _string.contains("Market Closes", NA(None)) is True
+        finally:
+            set_bool_na(False)
     assert _string.contains("Market Closes", "Closes") is True
     assert _string.contains("Market Open", "Closes") is False
 

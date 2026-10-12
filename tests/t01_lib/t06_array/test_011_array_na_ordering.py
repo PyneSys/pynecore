@@ -45,18 +45,17 @@ def __test_sort_puts_numeric_na_last__():
 
 
 def __test_sort_puts_string_na_first__():
-    """ na sorts as the smallest value of a string array """
-    # Measured on TradingView: sort(["b", "a", na]) -> na, "a", "b" and the
-    # descending form is that reversed -- the opposite end from a numeric array.
+    """ na sorts as the smallest value of a string array: it is the empty string """
+    # Measured on TradingView: sort(["b", "a", na]) -> na, "a", "b" (printed
+    # ``[, a, b]``) and the descending form is that reversed -- the opposite end
+    # from a numeric array.
     a = ["b", "a", NA(str)]
     array.sort(a)
-    assert _is_na(a[0])
-    assert a[1:] == ["a", "b"]
+    assert a == ["", "a", "b"]
 
     b = ["b", "a", NA(str)]
     array.sort(b, order.descending)
-    assert b[:2] == ["b", "a"]
-    assert _is_na(b[2])
+    assert b == ["b", "a", ""]
 
 
 def __test_sort_indices_follows_the_same_order__():

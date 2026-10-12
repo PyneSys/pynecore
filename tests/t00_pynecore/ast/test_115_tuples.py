@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.t00_pynecore.pine_analysis import analyse_module
+from ..pine_analysis import analyse_module
 from pynecore.transformers import module_interface
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
 from pynecore.transformers.module_interface import (

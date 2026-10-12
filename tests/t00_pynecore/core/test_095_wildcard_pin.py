@@ -88,3 +88,26 @@ def __test_the_selection_ignores_only_the_wildcard_positions__():
     assert _select_pinned(impls, 'i' + _PIN_ANY) is None
     # 'is': fully witnessed, one candidate
     assert _select_pinned(impls, 'is') is impls[0]
+
+
+def __test_the_wildcard_selection_binds_omitted_defaults__():
+    """An implementation whose optional parameter the call omits is a candidate, its default checked"""
+    from pynecore.core.overload import _PIN_ANY, _select_pinned, Implementation
+
+    def as_int(x: int, marker: Marker, n: int = 0):
+        return 'INT'
+
+    def as_float(x: float, marker: Marker, n: int = 0):
+        return 'FLOAT'
+
+    # A bool is no float to the selector, widened or not
+    def bad_default(x: int, marker: Marker, n: float = True):
+        return 'BAD'
+
+    impls = [Implementation(as_int), Implementation(as_float)]
+    # 'i*' on a two-argument call: the int-typed position names the int implementation
+    assert _select_pinned(impls, 'i' + _PIN_ANY) is impls[0]
+    # A default that does not fit its declared type rules the implementation out
+    assert _select_pinned([Implementation(bad_default)], 'i' + _PIN_ANY) is None
+    # More arguments than positional parameters: no candidate
+    assert _select_pinned(impls, 'i' + _PIN_ANY * 3) is None

@@ -78,8 +78,14 @@ class NA(Generic[T]):
     ``NA(int)`` (and the ``na(float)`` / ``na(int)`` constructor faces)
     transparently produces the native nan.
 
-    All other types (str, bool, drawing objects, UDTs, ...) get interned NA
-    instances: every operation returns self, every comparison is False.
+    ``NA(str)`` returns the empty string: TradingView does not tell a na
+    string from ``""`` -- it prints empty, concatenates as nothing and
+    ``na("")`` is true -- so the empty string is the string na.
+
+    All other types (bool under the three-state mode, drawing objects, UDTs,
+    ...) get interned NA instances: every operation returns self, every
+    comparison is False. A typeless na concatenated with a string gives the
+    string, the way the string na does.
     """
     __slots__ = ('type',)
 
@@ -89,6 +95,8 @@ class NA(Generic[T]):
     def __new__(cls, type: Type[T] | T | None = int) -> Self:
         if type is float or type is int:
             return _NAN  # type: ignore[return-value]
+        if type is str:
+            return ""  # type: ignore[return-value]
         if type is bool and not _bool_na:
             return False  # type: ignore[return-value]
         return cls._interned(type)
@@ -153,10 +161,15 @@ class NA(Generic[T]):
     def __neg__(self) -> Self:
         return self
 
-    def __add__(self, _: Any) -> Self:
+    def __add__(self, other: Any) -> Any:
+        # A string na is the empty string: concatenation keeps the other side
+        if other.__class__ is str:
+            return other
         return self
 
-    def __radd__(self, _: Any) -> Self:
+    def __radd__(self, other: Any) -> Any:
+        if other.__class__ is str:
+            return other
         return self
 
     def __sub__(self, _: Any) -> Self:
@@ -284,7 +297,7 @@ class NA(Generic[T]):
 
 na_float: float = _NAN
 na_int: float = _NAN
-na_str = NA(str)
+na_str: str = ""
 # The bool na itself, built past the switch: the constant exists in both modes
 na_bool: NA[bool] = NA._interned(bool)
 

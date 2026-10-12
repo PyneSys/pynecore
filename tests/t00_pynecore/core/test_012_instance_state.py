@@ -219,8 +219,8 @@ def __test_bind_any_dispatcher_hook__():
     def bound_instance(x):
         return x * 10
 
-    def factory(pin=None):
-        seen.append(pin)
+    def factory(pin=None, vector=None):
+        seen.append((pin, vector))
         return bound_instance
     fake_dispatcher.__pyne_bind__ = factory
 
@@ -229,11 +229,15 @@ def __test_bind_any_dispatcher_hook__():
     assert bound is bound_instance
     assert parent[2] == (fake_dispatcher, bound_instance)
     assert bound(2) == 20
-    assert seen == [None]  # an unpinned site still binds
+    assert seen == [(None, None)]  # an unpinned site still binds
 
     parent = _make_state(LAYOUT_PARENT)
     __bind_any__(parent, 2, fake_dispatcher, 'if')
-    assert seen == [None, 'if']
+    assert seen == [(None, None), ('if', None)]
+
+    parent = _make_state(LAYOUT_PARENT)
+    __bind_any__(parent, 2, fake_dispatcher, None, ('f',))
+    assert seen[-1] == (None, ('f',))  # the factory receives the instance vector too
 
 
 def __test_bind_loop__():

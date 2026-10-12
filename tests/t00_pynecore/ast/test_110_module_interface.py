@@ -26,7 +26,7 @@ from pynecore.core.import_hook import (
     PIPELINE_DIGEST, PyneLoader, _PYNE_INTERFACE, _baked_deps, _cache_from_source,
     _get_transform_pipeline_hash, compile_interface,
 )
-from tests.t00_pynecore.pine_analysis import analyse_module
+from ..pine_analysis import analyse_module
 from pynecore.transformers import module_interface
 from pynecore.transformers.module_interface import (
     NO_FINGERPRINT, build_interface, interface_digest, lookup, register, registered,

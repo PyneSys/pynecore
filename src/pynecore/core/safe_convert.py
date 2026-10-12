@@ -1,6 +1,8 @@
 from math import inf
+from typing import Any
 
 from ..types import NA, PyneFloat, PyneInt
+from ..types.matrix import Matrix
 from ..types.na import na_float, na_int
 from ..types.pine_types import pine_int
 
@@ -82,6 +84,65 @@ def safe_float(value: PyneFloat) -> float:
     except TypeError:
         # NA values throw TypeError, convert these to NA
         return na_float
+
+
+def safe_float_items(items: list[PyneInt] | NA) -> list[float] | NA:
+    """
+    The elements of an int array as floats, for copying into a float array.
+
+    Pine converts the elements of an ``array<int>`` that ``array.concat`` or
+    ``matrix.add_row`` copies into a float container; the transform wraps such
+    an operand in this call. The source array is left as it is.
+
+    :param items: The int array, or na
+    :return: A new list of the elements as floats (na elements stay na), or the na
+    """
+    if isinstance(items, NA):
+        return items
+    return [safe_float(item) for item in items]
+
+
+def safe_float_matrix(matrix: Matrix[PyneInt] | NA) -> Matrix[float] | NA:
+    """
+    The elements of an int matrix as floats, for copying into a float matrix.
+
+    The ``matrix.concat`` counterpart of :func:`safe_float_items`.
+
+    :param matrix: The int matrix, or na
+    :return: A new matrix of the same shape holding the elements as floats, or the na
+    """
+    if isinstance(matrix, NA):
+        return matrix
+    result: Matrix[float] = Matrix(matrix.rows, matrix.cols)
+    result.data = [[safe_float(item) for item in row] for row in matrix.data]
+    return result
+
+
+def implicit_convert(value: Any, kind: str | None) -> Any:
+    """
+    The implicit conversion one instance of a shared function body applies to a value.
+
+    A generic body can put the same value into a float container in one call-site
+    context and into an int container in another, so whether Pine converts it is a
+    property of the instance. The transform wraps such a value in this call and
+    hands it the instance's own vector entry, one of the type pass's conversion
+    characters: ``'f'`` converts one int to float, ``'a'`` / ``'m'`` copy an int
+    array / matrix as floats, ``'s'`` is the string na (the value is Pine's typeless
+    na), None converts nothing.
+
+    :param value: The value on its way into the container
+    :param kind: The conversion character, or None
+    :return: The value as the container receives it
+    """
+    if kind is None:
+        return value
+    if kind == 'f':
+        return safe_float(value)
+    if kind == 'a':
+        return safe_float_items(value)
+    if kind == 'm':
+        return safe_float_matrix(value)
+    return ''
 
 
 def native_int(value: PyneInt) -> int | NA:

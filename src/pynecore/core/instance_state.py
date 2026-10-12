@@ -646,8 +646,10 @@ def _bind_target(func: Any, prev: tuple | None = None, pin: str | None = None,
     ``inline_series``) get a fresh per-anchor binding from it — that is how the
     dispatcher receives the caller's anchor and keeps one instance per
     implementation in it. The factory takes the call site's overload pin, so a
-    dispatcher can resolve it once here instead of selecting on every bar; a
-    factory with nothing to pin simply ignores it.
+    dispatcher can resolve it once here instead of selecting on every bar, and
+    its instance vector, which a ``method_call`` entry writes into the instance
+    of the method the type pass resolved; a factory with nothing to pin or to
+    configure simply ignores them.
 
     :param func: The callee as it appears at the call site.
     :param prev: The anchor's previous ``(callee, bound)`` entry, if any.
@@ -675,7 +677,7 @@ def _bind_unwrapped(target: Any, prev: tuple | None, pin: str | None,
                     vector: tuple | None) -> Callable:
     """The binding proper, past the export proxy (see :func:`_bind_target`)."""
     if hasattr(target, '__pyne_bind__'):
-        return target.__pyne_bind__(pin)
+        return target.__pyne_bind__(pin, vector)
     if isinstance(target, type) or (
             hasattr(target, '__self__') and isinstance(target.__self__, type)):
         return target

@@ -886,7 +886,10 @@ def new_string(size: int | NA = 0, initial_value: str = NA(str)) -> list[str]:
     :return: New array of the specified size
     """
     size = _na_size(size)
-    assert isinstance(initial_value, (str, NA)), "Initial value must be str!"
+    if isinstance(initial_value, NA):
+        # A typeless na: the string na is the empty string
+        initial_value = ""
+    assert isinstance(initial_value, str), "Initial value must be str!"
     return [initial_value] * size
 
 

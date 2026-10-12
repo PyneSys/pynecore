@@ -532,7 +532,8 @@ class ReadOnlySeriesView(Generic[T]):
         return f"ReadOnlySeriesView({list(self)})"
 
 
-def _inline_series_instance(_pin: str | None = None) -> Callable[..., Any]:
+def _inline_series_instance(_pin: str | None = None,
+                            _vector: tuple | None = None) -> Callable[..., Any]:
     """One ``inline_series`` instance: a closure over its own series buffer.
 
     The slot transform routes ``inline_series`` call sites on the uniform
@@ -542,6 +543,8 @@ def _inline_series_instance(_pin: str | None = None) -> Callable[..., Any]:
 
     :param _pin: The call site's overload pin, part of the factory protocol.
         There is one implementation here, so there is nothing to select.
+    :param _vector: The call site's instance vector, part of the factory
+        protocol. The buffer is the whole instance, so there is nothing to configure.
     :return: The bound instance with the public ``inline_series`` signature.
     """
     series: SeriesImpl = SeriesImpl()

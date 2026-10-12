@@ -21,7 +21,7 @@ import pytest
 
 import pynecore.core.import_hook as import_hook
 from pynecore.core.import_hook import PyneLoader, _baked_deps
-from tests.t00_pynecore.pine_analysis import analyse_module
+from ..pine_analysis import analyse_module
 from pynecore.core.instance_state import _make_state  # noqa: internal API
 from pynecore.transformers import module_interface
 from pynecore.transformers.module_interface import interface_digest, registered

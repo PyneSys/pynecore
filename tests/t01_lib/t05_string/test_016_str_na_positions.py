@@ -70,27 +70,30 @@ def __test_replace_na_occurrence_is_the_first__(na):
 
 
 @pytest.mark.parametrize('na', NAS)
-def __test_na_source_propagates_instead_of_crashing__(na):
-    """An na source yields na at every position combination
+def __test_na_source_is_the_empty_string__(na):
+    """An na source is the empty string at every position combination (MEASURED on
+    TradingView: ``str.substring(na, 0)`` is ``""``)
 
-    The end position defaults to ``len(source)``, which an na source cannot
+    The end position defaults to ``len(source)``, which a typeless na source cannot
     answer, so the source has to be resolved before any position is.
     """
-    for end in (None, 0, 1, na):
-        result = string.substring(NA(str), 0) if end is None else string.substring(NA(str), 0, end)
-        assert isinstance(result, NA), f"end={end!r} gave {result!r}"
+    for source in (NA(str), NA(None)):
+        for end in (None, 0, 1, na):
+            result = string.substring(source, 0) if end is None \
+                else string.substring(source, 0, end)
+            assert result == "", f"end={end!r} gave {result!r}"
 
 
 @pytest.mark.parametrize('na', NAS)
 def __test_repeat_na_count_yields_na__(na):
-    """A typeless na repeat count is na, not a TypeError"""
-    assert isinstance(string.repeat("a", NA(None)), NA)
-    assert isinstance(string.repeat("a", na), NA)
+    """A typeless na repeat count is the string na, the empty string, not a TypeError"""
+    assert string.repeat("a", NA(None)) == ""
+    assert string.repeat("a", na) == ""
 
 
 @pytest.mark.parametrize('na', NAS)
 def __test_repeat_na_count_is_na__(na):
-    """An na repeat count answers na instead of raising"""
+    """An na repeat count answers the string na, the empty string, instead of raising"""
     # The guard read ``repeat != repeat``, which is False for the NA object --
     # only the nan spelling ever reached it.
-    assert isinstance(string.repeat("ab", na), NA)
+    assert string.repeat("ab", na) == ""

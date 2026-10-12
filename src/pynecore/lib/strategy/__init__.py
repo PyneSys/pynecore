@@ -315,17 +315,19 @@ class Order:
         # ``SimPosition._add_order`` / ``_bind_entry``).
         self.act_seq = 0
 
-        self.oca_name = oca_name
+        # A na string is the empty string, and a typeless na is falsy too: either
+        # one leaves the name or text unset -- an empty oca name groups nothing
+        self.oca_name = oca_name or None
         self.oca_type = oca_type if oca_type is not None else _oca.none
 
-        self.comment = comment
-        self.alert_message = alert_message
-        self.comment_profit = comment_profit
-        self.comment_loss = comment_loss
-        self.comment_trailing = comment_trailing
-        self.alert_profit = alert_profit
-        self.alert_loss = alert_loss
-        self.alert_trailing = alert_trailing
+        self.comment = comment or None
+        self.alert_message = alert_message or None
+        self.comment_profit = comment_profit or None
+        self.comment_loss = comment_loss or None
+        self.comment_trailing = comment_trailing or None
+        self.alert_profit = alert_profit or None
+        self.alert_loss = alert_loss or None
+        self.alert_trailing = alert_trailing or None
 
         self.trail_price = trail_price
         self.trail_offset = trail_offset or 0  # in ticks
@@ -6356,8 +6358,7 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
                 size = -position.sign * room
 
     order = Order(id, size, exit_id=exit_id, order_type=_order_type_close,
-                  comment=None if isinstance(comment, NA) else comment,
-                  alert_message=None if isinstance(alert_message, NA) else alert_message)
+                  comment=comment, alert_message=alert_message)
 
     # Stamp the call site so several same-bar partial closes on this entry stack
     # when they come from DIFFERENT statements and collapse when they come from
@@ -7549,20 +7550,21 @@ def _exit_leg(position: PositionBase, exit_id: str, from_entry: str,
     if _trail_price is not None:
         _trail_price = _price_round(_trail_price, -direction)
 
-    _comment = comment if comment == comment else None  # is_na_arg
-    _alert_message = alert_message if alert_message == alert_message else None  # is_na_arg
-    _comment_profit = comment_profit if comment_profit == comment_profit else None  # is_na_arg
-    _comment_loss = comment_loss if comment_loss == comment_loss else None  # is_na_arg
-    _comment_trailing = comment_trailing if comment_trailing == comment_trailing else None  # is_na_arg
-    _alert_profit = alert_profit if alert_profit == alert_profit else None  # is_na_arg
-    _alert_loss = alert_loss if alert_loss == alert_loss else None  # is_na_arg
-    _alert_trailing = alert_trailing if alert_trailing == alert_trailing else None  # is_na_arg
+    # A na string is the empty string: either one leaves the text unset
+    _comment = comment or None
+    _alert_message = alert_message or None
+    _comment_profit = comment_profit or None
+    _comment_loss = comment_loss or None
+    _comment_trailing = comment_trailing or None
+    _alert_profit = alert_profit or None
+    _alert_loss = alert_loss or None
+    _alert_trailing = alert_trailing or None
     # Kept as issued: a pyramid add filling later inherits a leg off this call
     # without the script re-stating it (see SimPosition._spawn_legs_for_add).
     issue_spec = (_limit, _stop, _trail_price,
                   qty if qty == qty else None,
                   qty_percent if qty_percent == qty_percent else None,
-                  oca_name if oca_name == oca_name else None)
+                  oca_name or None)
 
     # Default OCA settings for strategy.exit() - matches TradingView behavior.
     # Pine's strategy.exit() has no oca_type parameter: its legs always form a
@@ -7571,11 +7573,8 @@ def _exit_leg(position: PositionBase, exit_id: str, from_entry: str,
     # pyramid adds are independent, so one add's fill must not reduce the
     # other's leg. The name is built into a local -- assigning the caller's
     # ``oca_name`` would leak the first entry's group onto every later leg.
-    leg_oca = oca_name
-    if isinstance(leg_oca, NA):
-        # Use a unique name based on the exit id and from_entry
-        leg_oca = f"__exit_{exit_id}_{from_entry}_{entry_seq}_oca__"
-    _oca_name = leg_oca if leg_oca == leg_oca else None  # is_na_arg
+    # A na name -- the empty string or a typeless na -- names no group
+    _oca_name = oca_name or f"__exit_{exit_id}_{from_entry}_{entry_seq}_oca__"
 
     # Unchanged re-issue: the resting leg already IS the order this call would
     # build, so replacing it is pure cost. ``SimPosition._add_order`` would

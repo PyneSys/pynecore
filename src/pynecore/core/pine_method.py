@@ -32,7 +32,7 @@ from ..types import linefill as linefill_types
 from ..types import polyline as polyline_types
 from ..types.na import NA
 
-from .instance_state import _make_state, register_shared_cache  # noqa: internal API
+from .instance_state import _configure, _make_state, register_shared_cache  # noqa: internal API
 from .pine_export import Exported, in_module_bool_mode
 
 
@@ -105,7 +105,7 @@ _method_anchors: dict[str, tuple[Any, list | None, Callable]] = register_shared_
 
 # noinspection PyShadowingNames
 def _bound_method(method: Any, cache: dict[str, tuple[Any, list | None, Callable]],
-                  pin: str | None = None) -> Callable:
+                  pin: str | None = None, vector: tuple | None = None) -> Callable:
     """Bound instance of a runtime-dispatched method, kept in a dispatch cache.
 
     The cache belongs to one call site (an anchored entry, see
@@ -120,6 +120,8 @@ def _bound_method(method: Any, cache: dict[str, tuple[Any, list | None, Callable
     :param cache: The dispatch cache the bound instance lives in.
     :param pin: The call site's overload pin, for a method that is an overload
         group: the group's anchored entry selects its implementation with it.
+    :param vector: The call site's instance vector, written into the state of a
+        method created here (see ``instance_state._configure``).
     :return: The callable to invoke with the visible arguments.
     :raises ValueError: If an ``Exported`` proxy is not initialized yet.
     """
@@ -147,7 +149,7 @@ def _bound_method(method: Any, cache: dict[str, tuple[Any, list | None, Callable
         layout: dict[str, Any] | None = getattr(target, '__pyne_layout__', None)
         if layout is not None:
             state = entry[1] if entry is not None and entry[1] is not None \
-                else _make_state(layout)
+                else _configure(_make_state(layout), layout, vector)
             bound = partial(target, state)
         else:
             bound = target  # stateless — called raw
@@ -186,7 +188,7 @@ def _adapt_exported_kwargs(exported: Exported, kwargs: dict) -> dict:
 
 
 def _dispatcher(cache: dict[str, tuple[Any, list | None, Callable]],
-                pin: str | None = None) -> Callable[..., Any]:
+                pin: str | None = None, vector: tuple | None = None) -> Callable[..., Any]:
     """Create a ``method_call`` dispatch entry bound to one dispatch cache.
 
     The module-level :func:`method_call` is the entry of the anchorless
@@ -202,6 +204,11 @@ def _dispatcher(cache: dict[str, tuple[Any, list | None, Callable]],
         selects from the static argument types, like a direct call's pin does.
         It reaches only the method handed over as a function -- the one the
         type pass resolved; a builtin the receiver reaches first ignores it.
+    :param vector: The call site's instance vector, which the type pass stamps
+        where it resolved the method to a generic function of the calling module
+        whose instance varies with its caller (an implicit conversion, a pin of
+        a call inside it). Like the pin it configures only the method handed
+        over as a function.
     :return: The dispatch entry.
     """
 
@@ -296,7 +303,7 @@ def _dispatcher(cache: dict[str, tuple[Any, list | None, Callable]],
 
             if __pyne_captures__ is not None:
                 args = __pyne_captures__ + args
-            return _bound_method(method, cache, pin)(var, *args, **kwargs)
+            return _bound_method(method, cache, pin, vector)(var, *args, **kwargs)
 
         return None
 
@@ -306,4 +313,4 @@ def _dispatcher(cache: dict[str, tuple[Any, list | None, Callable]],
 
 method_call = _dispatcher(_method_anchors)
 # Per-anchor entries for the call sites the isolation transform anchors
-setattr(method_call, '__pyne_bind__', lambda pin=None: _dispatcher({}, pin))
+setattr(method_call, '__pyne_bind__', lambda pin=None, vector=None: _dispatcher({}, pin, vector))

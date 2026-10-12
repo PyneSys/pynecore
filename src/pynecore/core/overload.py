@@ -44,7 +44,7 @@ import os
 from typing import (TypeVar, Callable, get_type_hints, overload as typing_overload,
                     Any, Type, Union, get_args, get_origin, cast)
 from functools import wraps, partial
-from inspect import signature
+from inspect import Parameter, signature
 from collections import defaultdict
 from types import FunctionType, UnionType
 
@@ -68,9 +68,17 @@ def _is_state_param(name: str) -> bool:
     return name == '__state__' or (name.startswith('__state·') and name.endswith('__'))
 
 
+#: A ``__pyne_pinned_bind__`` factory: (fallback, implementation, implementations,
+#: arity) -> the pinned dispatcher
+_PinnedBind = Callable[[Callable[..., Any], 'Implementation', list['Implementation'], int],
+                       Callable[..., Any]]
+
+
 class Implementation:
-    __slots__ = ('func', 'sig', 'type_hints', 'param_types')
+    __slots__ = ('func', 'sig', 'type_hints', 'param_types', 'pinned_bind')
     func: FunctionType
+    # The function's ``__pyne_pinned_bind__`` factory, when it supplies one
+    pinned_bind: _PinnedBind | None
     sig: Any  # Signature object of the VISIBLE parameters
     type_hints: dict
     param_types: tuple  # Cached visible parameter types for quick checking
@@ -92,6 +100,7 @@ class Implementation:
             # values are new, the matching metadata is unchanged — skip the
             # expensive signature()/get_type_hints() recompute
             self.func = func
+            self.pinned_bind = _pinned_bind_of(func)
             return
         sig = signature(func)
         params = list(sig.parameters.values())
@@ -102,9 +111,15 @@ class Implementation:
             params = params[1:]
         hints = get_type_hints(func)
         self.func = func
+        self.pinned_bind = _pinned_bind_of(func)
         self.sig = sig.replace(parameters=params)
         self.type_hints = hints
         self.param_types = tuple((p.name, hints.get(p.name, Any)) for p in params)
+
+
+def _pinned_bind_of(func: FunctionType) -> _PinnedBind | None:
+    """The ``__pyne_pinned_bind__`` factory a function carries, or None."""
+    return func.__dict__.get('__pyne_pinned_bind__')
 
 
 _registry: dict[str, list[Implementation]] = defaultdict(list)
@@ -307,8 +322,15 @@ def _select(impls: list[Implementation], args: tuple, kwargs: dict) -> Implement
 #: type pass decided on; the witnesses turn them back into values the ordinary
 #: :func:`_select` understands, so the static and the dynamic decision run the
 #: SAME code and cannot drift apart. Only types with one unambiguous witness
-#: are pinnable, which is why there is no entry for a container or a drawing.
-_PIN_WITNESSES: dict[str, Any] = {'i': 0, 'f': 0.0, 'b': True, 's': ''}
+#: are pinnable: the four scalars, and an array or a matrix of one of them,
+#: whose witness holds one element of that scalar (the selector samples the
+#: head element). A container of drawings or user types, and a map, have none.
+#: The characters are ``transformers/pine_type_rules.py``'s ``PIN_CONTAINERS``.
+_PIN_WITNESSES: dict[str, Any] = {
+    'i': 0, 'f': 0.0, 'b': True, 's': '',
+    'I': [0], 'F': [0.0], 'B': [True], 'S': [''],
+    '1': Matrix(1, 1, 0), '2': Matrix(1, 1, 0.0), '3': Matrix(1, 1, True), '4': Matrix(1, 1, ''),
+}
 
 #: Pin character for a position with no witness — a container, a drawing, a
 #: user type, or a type the pass could not settle. The position carries no
@@ -335,13 +357,48 @@ def _select_pinned(impls: list[Implementation], pin: str) -> Implementation | No
     probes = [(index, _PIN_WITNESSES[char])
               for index, char in enumerate(pin) if char != _PIN_ANY]
     for strict in (True, False):
-        matches = [impl for impl in impls
-                   if len(impl.param_types) == argc
-                   and all(_check_type(value, impl.param_types[index][1], strict)
-                           for index, value in probes)]
+        matches = [impl for impl in impls if _takes_pinned(impl, argc, probes, strict)]
         if matches:
             return matches[0] if len(matches) == 1 else None
     return None
+
+
+def _takes_pinned(impl: Implementation, argc: int, probes: list[tuple[int, Any]],
+                  strict: bool) -> bool:
+    """Whether an implementation takes a pin's witnessed positions.
+
+    The call fills the first ``argc`` positional parameters; a parameter it
+    omits takes its default, which has to fit its declared type the way
+    :func:`_select` checks it. The wildcard positions are not looked at.
+
+    :param impl: One registered implementation.
+    :param argc: The number of positional arguments the call site passes.
+    :param probes: The witnessed positions and their witness values.
+    :param strict: Match without the int-where-float-is-wanted widening.
+    :return: True when the implementation takes the call.
+    """
+    params = list(impl.sig.parameters.values())
+    positional = [p for p in params
+                  if p.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)]
+    if argc > len(positional):
+        return False
+    try:
+        bound = impl.sig.bind(*range(argc))
+    except TypeError:
+        return False
+    if not all(_check_type(value, impl.param_types[index][1], strict) for index, value in probes):
+        return False
+    bound.apply_defaults()
+    supplied = {p.name for p in positional[:argc]}
+    for p in params:
+        if p.name in supplied or p.name not in impl.type_hints \
+                or p.kind in (Parameter.VAR_POSITIONAL, Parameter.VAR_KEYWORD):
+            continue
+        default = bound.arguments[p.name]
+        if default is not __dyn_default__ and not _check_type(default, impl.type_hints[p.name],
+                                                              strict):
+            return False
+    return True
 
 
 def _type_token(value: Any) -> Any:
@@ -569,10 +626,12 @@ def _anchored(impls: list[Implementation], qualname: str,
     # Stateless implementations may fuse a result cache into the pinned entry.
     # The factory retains dispatch_pinned as the fallback for changed call shapes
     # or implementations; wildcard positions still need ordinary verification.
-    factory = getattr(chosen.func, '__pyne_pinned_bind__', None)
-    if factory is not None and not wildcards and not hasattr(chosen.func, '__pyne_layout__'):
-        return factory(dispatch_pinned, chosen, impls, argc)
-    return dispatch_pinned
+    if wildcards or hasattr(chosen.func, '__pyne_layout__'):
+        return dispatch_pinned
+    pinned_bind = chosen.pinned_bind
+    if pinned_bind is None:
+        return dispatch_pinned
+    return pinned_bind(dispatch_pinned, chosen, impls, argc)
 
 
 def overload(func: Callable[..., T]) -> Callable[..., T]:
@@ -616,7 +675,7 @@ def overload(func: Callable[..., T]) -> Callable[..., T]:
         # _bind_target.
         _dispatcher.__dict__.pop('__pyne_layout__', None)
         setattr(_dispatcher, '__pyne_bind__',
-                lambda pin=None: _anchored(_registry[qualname], qualname, pin=pin))
+                lambda pin=None, _vector=None: _anchored(_registry[qualname], qualname, pin=pin))
         _dispatchers[qualname] = _dispatcher
 
     return _dispatcher

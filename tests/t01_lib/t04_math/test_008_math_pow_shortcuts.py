@@ -16,6 +16,7 @@ divergence, so the bases below are exactly the ones measured to disagree.
 import math as _math
 
 from pynecore.lib import math
+from pynecore.types.color import Color
 from pynecore.types.na import NA, na_float, set_bool_na
 
 
@@ -64,7 +65,7 @@ def __test_pow_every_na_face_is_na_float__():
     makes ``pow`` return the numeric na itself, as base and as exponent."""
     set_bool_na(True)
     try:
-        faces = (float('nan'), NA(None), NA(str), NA(bool))
+        faces = (float('nan'), NA(None), NA(Color), NA(bool))
         assert isinstance(NA(bool), NA)
         for face in faces:
             for exponent in (2, 2.0, 3, 0.5):

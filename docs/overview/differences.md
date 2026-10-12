@@ -294,7 +294,13 @@ f = na(float)
 ```
 
 Most of the time it is not necessary to specify the type, it is needed only when you want to use method
-overloading. If you do not specify the type, it will be `NA[int]` by default.
+overloading. Without a type, `na` is the typeless na.
+
+A numeric na is a native `float('nan')`, and a string na is the empty string: `na(str)` is `""`,
+and `na("")` is `True`. This is what Pine does too: it does not tell a na string from `""` --
+it prints empty, concatenates as nothing, and `str.contains("abc", na)` is `true`. A bare `na`
+written where a string goes (`s: str = na`, a string parameter, `"a" if c else na`, a string
+array element) is the empty string as well.
 
 ### Array
 

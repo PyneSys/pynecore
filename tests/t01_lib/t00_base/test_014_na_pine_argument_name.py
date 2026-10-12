@@ -27,7 +27,8 @@ def __test_na_predicate_argument_is_named_x__():
 def __test_na_type_constructor_and_bare_value_still_work__():
     """Naming the parameter must not break na's other two faces."""
     assert isinstance(na(), NA)
-    assert isinstance(na(x=str), NA)
+    # The string na is the empty string
+    assert na(x=str) == ""
     # The type-constructor face must behave identically through the keyword
     assert repr(na(x=float)) == repr(na(float))
 
