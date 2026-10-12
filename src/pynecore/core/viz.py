@@ -228,7 +228,8 @@ def serialize_meta(meta: Any) -> dict:
             d["text"] = meta.text
         d["textcolor"] = color_str(meta.textcolor)
     elif k == 'char':
-        d["char"] = meta.char if meta.char is not None else "◆"
+        # MEASURED: TradingView's default character
+        d["char"] = meta.char if meta.char is not None else "★"
         d["location"] = enum_name(meta.location, LOCATION, "abovebar")
         d["size"] = enum_name(meta.size, SIZE, "auto")
         d["color"] = color_str(meta.color)

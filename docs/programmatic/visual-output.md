@@ -120,7 +120,7 @@ repeated `id` as an update of the earlier record.
 | `linewidth` | int | plot, hline | Line width in pixels                                          |
 | `trackprice`, `histbase`, `join` | — | plot | Present only when non-default                     |
 | `style`, `location`, `size` | str | shape | Defaults `xcross` / `abovebar` / `auto`               |
-| `char`    | str  | char       | The character (default `◆`)                                    |
+| `char`    | str  | char       | The character (default `★`)                                    |
 | `location`, `size` | str | char | Defaults `abovebar` / `auto`                            |
 | `text`, `textcolor` | str | shape, char | Marker text and its color                             |
 | `colorup`, `colordown` | str | arrow | Up / down arrow colors                                |

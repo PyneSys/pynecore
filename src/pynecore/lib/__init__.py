@@ -562,7 +562,7 @@ def plotchar(series: Any, title: str | None = None, char: str | None = None, loc
 
     :param series: The value plotted (stored raw)
     :param title: Plot title
-    :param char: The character to draw; default '◆'
+    :param char: The character to draw, the first one of the string; default '★'
     :param location: Marker location (``location.*``); default ``location.abovebar``
     :param color: Marker color
     :param offset: Horizontal shift in bars
@@ -582,10 +582,12 @@ def plotchar(series: Any, title: str | None = None, char: str | None = None, loc
     _plot_data[t] = int(series) if isinstance(series, bool) else series
     meta = _plot_meta.get(t)
     if meta is None:
-        meta = PlotMeta(id=t, kind='char', title=t, char=char, location=location, color=color,
-                        offset=offset, text=text, textcolor=textcolor, editable=editable,
-                        size=size, show_last=show_last, display=display, format=format,
-                        precision=precision, force_overlay=force_overlay)
+        # MEASURED: only the first character is drawn (``char="ab"`` draws ``a``)
+        meta = PlotMeta(id=t, kind='char', title=t, char=None if char is None else char[:1],
+                        location=location, color=color, offset=offset, text=text,
+                        textcolor=textcolor, editable=editable, size=size, show_last=show_last,
+                        display=display, format=format, precision=precision,
+                        force_overlay=force_overlay)
         _plot_meta[t] = meta
         _plot_meta_new.append(meta)
     if not meta.dynamic:

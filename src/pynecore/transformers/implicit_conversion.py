@@ -19,8 +19,10 @@ converts every value the type pass marked as such an int:
 
 A typeless ``na`` literal that goes where a string goes -- a string variable or
 field, a string parameter, a ternary arm next to a string, an element of a string
-container, the key of a string-keyed map -- is the string na, which TradingView does
-not tell from ``""``: it becomes the empty string literal.
+container, the key of a string-keyed map, a string parameter of a lib function -- is
+the string na, which TradingView does not tell from ``""``: it becomes the empty string
+literal. Passed as compile-time text of the study (a plot title, a ``plotchar`` char,
+an ``alertcondition`` message, see ``NA_TEXT_PARAMS``) it is the text ``na`` instead.
 
 A generic body is shared by every context it is instantiated in, and one value in it
 can need a conversion in one context and none in another: ``array.push(a, v)`` into a
@@ -36,7 +38,8 @@ import ast
 
 from . import ast_walk
 from .pine_type_rules import (
-    FLOAT, STR, WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_STRING_NA, array_of, get_ty,
+    FLOAT, STR, WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_NA_TEXT, WIDEN_STRING_NA, array_of,
+    get_ty,
     get_widen, get_widen_site, matrix_of, set_ty, set_widen, set_widen_site, stamp_lowering,
 )
 
@@ -73,6 +76,8 @@ class ImplicitConversionTransformer(ast_walk.NodeTransformer):
         set_widen(node, None)
         if kind == WIDEN_STRING_NA:
             return set_ty(ast.copy_location(ast.Constant(value=''), node), STR)
+        if kind == WIDEN_NA_TEXT:
+            return set_ty(ast.copy_location(ast.Constant(value='na'), node), STR)
         if kind == WIDEN_FLOAT:
             literal = _int_literal(node)
             if literal is not None:

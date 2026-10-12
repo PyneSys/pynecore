@@ -300,7 +300,10 @@ A numeric na is a native `float('nan')`, and a string na is the empty string: `n
 and `na("")` is `True`. This is what Pine does too: it does not tell a na string from `""` --
 it prints empty, concatenates as nothing, and `str.contains("abc", na)` is `true`. A bare `na`
 written where a string goes (`s: str = na`, a string parameter, `"a" if c else na`, a string
-array element) is the empty string as well.
+array element, a lib function's string argument like `label.new(x, y, na)`) is the empty string
+as well. The one exception is text Pine compiles into the indicator's metadata: a plot title,
+a `plotchar` char or text, a `plotshape` text or an `alertcondition` title or message given
+as `na` is the text `na`, just as on TradingView.
 
 ### Array
 

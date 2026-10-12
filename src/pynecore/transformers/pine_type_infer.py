@@ -63,7 +63,8 @@ from .pine_type_rules import (
     LIB_TYPE_OVERRIDES, OVERRIDE_PARAM_NAMES, BUILTIN_CALL_TYPES, BUILTIN_NAME_TYPES,
     TY_ATTR, get_ty, set_ty, inherit_ty,
     constant_type, pin_for, get_pins, set_pin, set_pins, set_vector, get_varying, set_varying,
-    WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_STRING_NA, set_widen, get_widen_site,
+    WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_STRING_NA, WIDEN_NA_TEXT, NA_TEXT_PARAMS,
+    NOT_PINE_STRINGS, set_widen, get_widen_site,
     set_widen_site, get_widens, set_widens,
     overload_result, ImplSig, overload_pick, default_fit, FIT_REQUIRED, FactoryFields,
     impl_sig, _param_defaults, _dotted, _DYN_DEFAULT,  # noqa: internal API
@@ -2773,7 +2774,84 @@ class _Inference:
             callee=callee, line=_line(node), col=_col(node), argc=argc, ty=ty, pin=pin))
         if self._qualify_windows and callee in WINDOW_CALLS:
             self._record_window(node, callee)
+        if isinstance(entry, dict):
+            self._record_lib_na_args(callee, entry, node.args, node.keywords)
         return ty
+
+    def _record_lib_na_args(self, callee: str, entry: dict[str, Any], args: Sequence[ast.expr],
+                            keywords: Sequence[ast.keyword]) -> None:
+        """
+        Mark the typeless ``na`` literals a lib call passes to its string parameters.
+
+        A string parameter takes the string na, the empty string -- MEASURED,
+        ``label.new(x, y, na)`` has the text ``""`` and ``array.join(a, na)`` joins
+        with nothing. Compile-time text of the study (``NA_TEXT_PARAMS``) takes the
+        text ``na`` instead. Any other parameter says nothing here: the type of a lib
+        parameter is the same in every context, and an element a container call
+        puts in is decided by the container (``_merge_override``).
+
+        :param callee: The registry key
+        :param entry: Its registry entry
+        :param args: The positional arguments, typed already (a method call's
+                     receiver first)
+        :param keywords: The keyword arguments, typed already
+        """
+        texts = NA_TEXT_PARAMS.get(callee, frozenset())
+        for name, declared, arg in self._lib_bound_args(callee, entry, args, keywords):
+            if self._ty_of(arg) != TYPELESS:
+                continue
+            if name in texts:
+                self._record_widen(arg, WIDEN_NA_TEXT)
+            elif declared == STR and (callee, name) not in NOT_PINE_STRINGS:
+                self._record_widen(arg, WIDEN_STRING_NA)
+
+    def _lib_bound_args(self, callee: str, entry: dict[str, Any], args: Sequence[ast.expr],
+                        keywords: Sequence[ast.keyword]
+                        ) -> list[tuple[str | None, str, ast.expr]]:
+        """
+        Bind a lib call's arguments to the callee's parameters.
+
+        An overload group binds a position only where every implementation that
+        takes the call agrees on the parameter there; ``fill`` and
+        ``alertcondition`` take ``*args`` and are bound the way Pine spells them.
+
+        :param callee: The registry key
+        :param entry: Its registry entry
+        :param args: The positional arguments, typed already (a method call's
+                     receiver first)
+        :param keywords: The keyword arguments, typed already
+        :return: ``(parameter name, declared type, argument)`` per argument; the
+                 name is None and the type UNKNOWN where the binding is not known
+        """
+        positional = [arg for arg in args if not isinstance(arg, ast.Starred)]
+        if len(positional) != len(args):
+            return []
+        kind = entry.get('kind')
+        if kind == 'function':
+            impls = [entry]
+        elif kind == 'overloads':
+            argc = len(positional) + len(keywords)
+            impls = [impl for impl in entry['impls'] if _arity_fits(impl, argc)
+                     and all(_lib_param_takes(declared, self._ty_of(arg))
+                             for declared, arg in zip(impl['params'], positional))]
+        else:
+            return []
+        names_of_varargs = _VARARG_NAMES.get(callee)
+        bound: list[tuple[str | None, str, ast.expr]] = []
+        for index, arg in enumerate(positional):
+            if names_of_varargs is not None:
+                name = names_of_varargs(positional, self._ty_of, index)
+                bound.append((name, UNKNOWN, arg))
+                continue
+            seen = {(impl['names'][index], impl['params'][index]) for impl in impls
+                    if index < len(impl['names'])}
+            bound.append(next(iter(seen)) + (arg,) if len(seen) == 1 else (None, UNKNOWN, arg))
+        for keyword in keywords:
+            seen = {impl['params'][impl['names'].index(keyword.arg)] for impl in impls
+                    if keyword.arg in impl['names']}
+            declared = next(iter(seen)) if len(seen) == 1 else UNKNOWN
+            bound.append((keyword.arg, declared, keyword.value))
+        return bound
 
     def _record_window(self, node: ast.Call, callee: str) -> None:
         """
@@ -2973,9 +3051,9 @@ class _Inference:
         :param kind: What this context decided (``WIDEN_*``, ``_WIDEN_HARMLESS``),
                      or None when the value must stay as it is
         """
-        if kind == WIDEN_STRING_NA and not _is_na_literal(node):
-            # Only Pine's own ``na`` is replaced by the empty string: a typeless
-            # parameter or the dynamic-default marker holds a value of its own
+        if kind in (WIDEN_STRING_NA, WIDEN_NA_TEXT) and not _is_na_literal(node):
+            # Only Pine's own ``na`` is replaced by a text: a typeless parameter or
+            # the dynamic-default marker holds a value of its own
             kind = None
         nid = node_id(node)
         if nid is None:
@@ -3822,7 +3900,10 @@ class _Inference:
         entry = lib_types().get(callee)
         if isinstance(entry, dict) and not self._lib_call_fits(callee, entry, node, args):
             return UNKNOWN
-        return self._lib_call_type(callee, args, node.keywords, _arity(args, node.keywords))
+        ty = self._lib_call_type(callee, args, node.keywords, _arity(args, node.keywords))
+        if isinstance(entry, dict):
+            self._record_lib_na_args(callee, entry, args, node.keywords)
+        return ty
 
     def _named_method(self, selector: ast.expr, node: ast.Call,
                       args: Sequence[ast.expr]) -> str | None:
@@ -5710,6 +5791,9 @@ def _span(node: ast.AST) -> tuple[tuple[int, int], tuple[int, int]]:
 #: object, and ``None`` -- the na of every object and reference type
 _UNCHECKED = frozenset({UNKNOWN, TYPELESS, OBJECT, VOID})
 
+#: The type of an ``hline`` object, the first argument of the hline form of ``fill``
+_HLINE: Final = 'o:lib#HLine'
+
 
 def _fits(declared: str, passed: str) -> bool:
     """
@@ -5842,6 +5926,64 @@ def _lib_impl_sig(impl: dict[str, Any]) -> ImplSig:
     return ImplSig(params=params, required=required,
                    open_ended=impl.get('vararg') is not None, ret=impl['ret'],
                    fits=''.join(fits), names=tuple(impl.get('names') or ()))
+
+
+def _lib_param_takes(declared: str, passed: str) -> bool:
+    """Whether a lib parameter may take an argument, as far as its type tells."""
+    if passed in _UNCHECKED:
+        return True
+    if declared in SCALARS:
+        return _fits(declared, passed)
+    if declared.startswith('o:'):
+        return passed not in SCALARS
+    return True
+
+
+def _fill_arg_name(positional: Sequence[ast.expr], ty_of: Callable[[ast.expr], str],
+                   index: int) -> str | None:
+    """
+    The parameter a positional ``fill`` argument binds to.
+
+    ``fill(a, b, color, title, editable, ...)`` fills with one color, and so does
+    the hline form, with the title at the same position. The gradient form
+    ``fill(a, b, top_value, bottom_value, top_color, bottom_color, title, ...)``
+    is the one the runtime ``fill`` picks for a first argument that is no hline
+    and a number third, or an ``na`` third followed by a fifth argument that is no
+    bool (``top_color`` where the other forms pass ``editable``; an ``na`` is no
+    bool either). Where the types do not tell the forms apart, nothing is bound.
+    Only the title matters to the caller.
+    """
+    first = ty_of(positional[0]) if positional else VOID
+    if first == _HLINE:
+        return 'title' if index == 3 else None
+    third = ty_of(positional[2]) if len(positional) > 2 else VOID
+    if third == TYPELESS and len(positional) > 4:
+        fifth = ty_of(positional[4])
+        if fifth != TYPELESS and fifth in _UNCHECKED:
+            return None
+        gradient = fifth != BOOL
+    elif third in (UNKNOWN, OBJECT):
+        return None
+    else:
+        gradient = third in NUMERIC
+    if gradient and first in _UNCHECKED:
+        return None
+    return 'title' if index == (6 if gradient else 3) else None
+
+
+def _alertcondition_arg_name(_positional: Sequence[ast.expr],
+                             _ty_of: Callable[[ast.expr], str], index: int) -> str | None:
+    """The parameter a positional ``alertcondition(condition, title, message)`` argument binds to."""
+    return ('condition', 'title', 'message')[index] if index < 3 else None
+
+
+#: How the positional arguments of a lib callee that takes ``*args`` bind to the
+#: parameters Pine spells for it
+_VARARG_NAMES: Final[dict[str, Callable[[Sequence[ast.expr], Callable[[ast.expr], str], int],
+                                        str | None]]] = {
+    'fill': _fill_arg_name,
+    'alertcondition': _alertcondition_arg_name,
+}
 
 
 def _arity_fits(impl: dict[str, Any], argc: int) -> bool:

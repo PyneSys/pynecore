@@ -39,7 +39,8 @@ __all__ = [
     'constant_type', 'stamp_lowering', 'BUILTIN_CALL_TYPES', 'BUILTIN_NAME_TYPES',
     'PIN_ATTR', 'PINS_ATTR', 'PINNABLE', 'PIN_CONTAINERS', 'PIN_ANY', 'get_pin', 'set_pin', 'get_pins', 'set_pins',
     'VECTOR_ATTR', 'VARYING_ATTR', 'get_vector', 'set_vector', 'get_varying', 'set_varying',
-    'WIDEN_ATTR', 'WIDEN_FLOAT', 'WIDEN_ITEMS', 'WIDEN_MATRIX', 'WIDEN_STRING_NA', 'get_widen',
+    'WIDEN_ATTR', 'WIDEN_FLOAT', 'WIDEN_ITEMS', 'WIDEN_MATRIX', 'WIDEN_STRING_NA', 'WIDEN_NA_TEXT',
+    'NA_TEXT_PARAMS', 'NOT_PINE_STRINGS', 'get_widen',
     'set_widen', 'WIDEN_SITE_ATTR', 'WIDENS_ATTR', 'get_widen_site', 'set_widen_site',
     'get_widens', 'set_widens',
     'pin_for', 'overload_result', 'ImplSig', 'overload_pick',
@@ -90,6 +91,40 @@ WIDEN_MATRIX: Final = 'm'
 #: The value is a typeless ``na`` literal that goes where a string goes: it is the
 #: string na, the empty string
 WIDEN_STRING_NA: Final = 's'
+
+#: The value is a typeless ``na`` literal passed as compile-time text of the study
+#: (``NA_TEXT_PARAMS``): TradingView writes it out as the text ``na``
+WIDEN_NA_TEXT: Final = 't'
+
+#: The parameters whose value TradingView compiles into the study's metadata rather
+#: than evaluating at run time, per lib callee. A typeless ``na`` there is not the
+#: string na: MEASURED, ``plot(title=na)`` is titled ``na``, ``plotchar(char=na)``
+#: draws ``n`` and ``alertcondition(message=na)`` reads ``na``, while ``title=""``
+#: stays empty. (``indicator`` and ``input.*`` titles reject a na at compile time.)
+NA_TEXT_PARAMS: Final[dict[str, frozenset[str]]] = {
+    'plot': frozenset({'title'}),
+    'plot.plot': frozenset({'title'}),
+    'plotchar': frozenset({'title', 'char', 'text'}),
+    'plotshape': frozenset({'title', 'text'}),
+    'plotarrow': frozenset({'title'}),
+    'plotbar': frozenset({'title'}),
+    'plotcandle': frozenset({'title'}),
+    'hline': frozenset({'title'}),
+    'hline.hline': frozenset({'title'}),
+    'bgcolor': frozenset({'title'}),
+    'barcolor': frozenset({'title'}),
+    'fill': frozenset({'title'}),
+    'alertcondition': frozenset({'title', 'message'}),
+}
+
+#: Lib parameters the registry types as strings that are no Pine string: an enum
+#: Pine spells as a constant (``matrix.sort``'s ``order``) and a Python-only
+#: extension (``sort_field``). A typeless ``na`` passed there is left as it is
+NOT_PINE_STRINGS: Final[frozenset[tuple[str, str]]] = frozenset({
+    ('matrix.sort', 'order'),
+    ('array.sort', 'sort_field'),
+    ('array.sort_indices', 'sort_field'),
+})
 
 #: Attribute a value carries where the contexts of the body it is in disagree on
 #: its conversion: the call ``safe_convert.implicit_convert(value, kind)`` that
@@ -208,7 +243,8 @@ def get_widen(node) -> str | None:
     Read the implicit conversion a value needs where it goes.
 
     :param node: The value node
-    :return: ``WIDEN_FLOAT``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX`` or ``WIDEN_STRING_NA``, or None
+    :return: ``WIDEN_FLOAT``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX``, ``WIDEN_STRING_NA`` or
+             ``WIDEN_NA_TEXT``, or None
     """
     return getattr(node, WIDEN_ATTR, None)
 
@@ -219,7 +255,8 @@ def set_widen(node, kind: str | None):
     decides against it has to erase what an earlier one wrote).
 
     :param node: The value node
-    :param kind: ``WIDEN_FLOAT``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX``, ``WIDEN_STRING_NA`` or None
+    :param kind: ``WIDEN_FLOAT``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX``, ``WIDEN_STRING_NA``,
+                 ``WIDEN_NA_TEXT`` or None
     :return: ``node``
     """
     setattr(node, WIDEN_ATTR, kind)

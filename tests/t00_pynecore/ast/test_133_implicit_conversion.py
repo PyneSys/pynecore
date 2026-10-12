@@ -86,6 +86,74 @@ def __test_typeless_na_where_a_string_goes_is_empty__(body, expected):
     assert not diags
 
 
+@pytest.mark.parametrize("body,expected", [
+    # a run-time string parameter of a lib function takes the string na
+    ('l = lib.label.new(lib.bar_index, lib.close, lib._na_none, tooltip=lib._na_none)',
+     "l = lib.label.new(lib.bar_index, lib.close, '', tooltip='')"),
+    ('s = lib.array.join(lib.array.from_items("a"), lib._na_none)',
+     "s = lib.array.join(lib.array.from_items('a'), '')"),
+    ('t = lib.ticker.new(lib._na_none, lib._na_none)', "t = lib.ticker.new('', '')"),
+    ('lib.log.info(lib._na_none)', "lib.log.info('')"),
+    # compile-time text of the study takes the text na
+    ('lib.plot(lib.close, title=lib._na_none)', "lib.plot(lib.close, title='na')"),
+    ('lib.plotchar(lib.close > lib.open, lib._na_none, lib._na_none, text=lib._na_none)',
+     "lib.plotchar(lib.close > lib.open, 'na', 'na', text='na')"),
+    ('lib.hline(1.1, lib._na_none)', "lib.hline(1.1, 'na')"),
+    ('lib.alertcondition(lib.close > 1, lib._na_none, message=lib._na_none)',
+     "lib.alertcondition(lib.close > 1, 'na', message='na')"),
+    ('p = lib.plot(lib.close)\nq = lib.plot(lib.open)\n'
+     'lib.fill(p, q, lib.color.red, lib._na_none)', "lib.fill(p, q, lib.color.red, 'na')"),
+    ('p = lib.plot(lib.close)\nq = lib.plot(lib.open)\n'
+     'lib.fill(p, q, 1.0, 2.0, lib.color.red, lib.color.blue, lib._na_none)',
+     "lib.fill(p, q, 1.0, 2.0, lib.color.red, lib.color.blue, 'na')"),
+    # an na top_value followed by a color is the gradient form: its bounds stay na
+    ('p = lib.plot(lib.close)\nq = lib.plot(lib.open)\n'
+     'lib.fill(p, q, lib._na_none, lib._na_none, lib.color.red, lib.color.blue, lib._na_none)',
+     "lib.fill(p, q, lib._na_none, lib._na_none, lib.color.red, lib.color.blue, 'na')"),
+    # an na top_color is no bool editable either: still the gradient form
+    ('p = lib.plot(lib.close)\nq = lib.plot(lib.open)\n'
+     'lib.fill(p, q, lib._na_none, 1.0, lib._na_none, lib.color.blue, lib._na_none)',
+     "lib.fill(p, q, lib._na_none, 1.0, lib._na_none, lib.color.blue, 'na')"),
+    # the hline form keeps its title third whatever follows
+    ('h = lib.hline(1.0)\ng = lib.hline(2.0)\n'
+     'lib.fill(h, g, lib._na_none, lib._na_none, lib._na_none)',
+     "lib.fill(h, g, lib._na_none, 'na', lib._na_none)"),
+    # an na color followed by a bool editable is the solid form
+    ('p = lib.plot(lib.close)\nq = lib.plot(lib.open)\n'
+     'lib.fill(p, q, lib._na_none, lib._na_none, True)',
+     "lib.fill(p, q, lib._na_none, 'na', True)"),
+    # a parameter that is no Pine string keeps its na
+    ('m = lib.matrix.new(1, 1, 0.0)\nlib.matrix.sort(m, 0, lib._na_none)',
+     'lib.matrix.sort(m, 0, lib._na_none)'),
+    ('x = lib.nz(lib._na_none)', 'x = lib.nz(lib._na_none)'),
+])
+def __test_typeless_na_lib_string_argument__(body, expected):
+    emitted, diags = __test_helper_widen(body)
+    assert expected in emitted.splitlines()
+    assert not diags
+
+
+def __test_typeless_na_builtin_method_string_argument__():
+    """The method spelling of a builtin binds its arguments the way the direct one does"""
+    source = __test_helper_PRELUDE + '''from pynecore.core.pine_method import method_call
+
+def main():
+    l = lib.label.new(lib.bar_index, lib.close, "x")
+    method_call('set_text', l, lib._na_none)
+    a = lib.array.from_items("a", "b")
+    s = method_call('join', a, lib._na_none)
+'''
+    tree = ast.parse(source)
+    table = infer_module(tree, 'test')
+    tree = cast(ast.Module, ImplicitConversionTransformer().visit(tree))
+    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                and node.name == 'main')
+    emitted = [ast.unparse(stmt) for stmt in main.body]
+    assert "method_call('set_text', l, '')" in emitted
+    assert "s = method_call('join', a, '')" in emitted
+    assert not table.diags
+
+
 def __test_a_declared_container_is_the_constructors_template__():
     """``Matrix[float]`` built from an int initial value builds floats, with no mismatch"""
     emitted, diags = __test_helper_widen('''
