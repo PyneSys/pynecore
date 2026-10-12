@@ -4644,6 +4644,110 @@ def __test_spot_full_close_withheld_when_a_pre_cleared_leg_already_filled__():
     assert not engine.quarantined
 
 
+def __test_spot_close_stays_withheld_until_the_pre_cleared_leg_fill_is_booked__():
+    """The withhold outlives the sync: the leg's fill can arrive much later.
+
+    Measured live (bybit-spot cycle 282, 2026-10-11): the SL filled during its
+    pre-clear cancel while the private stream was down; the next bar's sync
+    re-dispatched the close before the inventory catch-up booked the SL fill,
+    the close sold the same inventory again and the spot ledger quarantined.
+    """
+    b, engine, _ = _spot_long_with_exit(CancelDispositionOutcome.ALREADY_FILLED)
+    engine.sync(BAR_TS + 120_000)
+    exits_before = len(b.exit_calls)
+
+    # The script re-emits its persistent exit on the next bar.
+    pos = engine._position  # noqa
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", -1.0, "L1-X", stop=49_000.0)
+    engine.sync(BAR_TS + 180_000)
+
+    assert len(b.close_calls) == 0
+    assert len(b.exit_calls) == exits_before  # no re-armed sell leg either
+
+    sl_fill = _fill_event('sell', 1.0, 49_000.0, pine_id="L1-X",
+                          leg=LegType.STOP_LOSS, xchg_id="x-sl", fill_id="f-sl")
+    sl_fill.from_entry = "L1"
+    engine._route_event(sl_fill)  # noqa
+    engine.sync(BAR_TS + 240_000)
+
+    assert pos.size == 0.0
+    assert len(b.close_calls) == 0
+    assert not engine._pre_clear_filled_entries  # noqa
+    assert not engine.quarantined
+
+
+def __test_spot_close_withhold_releases_when_a_partial_leg_fill_lands__():
+    """A partial exit leg's booked fill releases the withhold for the remainder."""
+    from decimal import Decimal
+
+    b = MockBroker()
+    b.spot_inventory_port = SimpleNamespace(
+        position_dust_threshold=Decimal("0.00001"),
+    )
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L1"] = _entry_order("L1", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # noqa
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L1", xchg_id="x1", fill_id="f1"))
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", -0.5, "L1-X", limit=51_000.0)
+    engine.sync(BAR_TS + 60_000)
+
+    async def _already_filled(_envelope):
+        return CancelDispositionOutcome.ALREADY_FILLED
+
+    b.execute_cancel_with_outcome = _already_filled  # noqa
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -1.0, order_type=_order_type_close, exit_id="Close position order",
+    )
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.close_calls) == 0
+
+    tp_fill = _fill_event('sell', 0.5, 51_000.0, pine_id="L1-X",
+                          leg=LegType.TAKE_PROFIT, xchg_id="x-tp", fill_id="f-tp")
+    tp_fill.from_entry = "L1"
+    engine._route_event(tp_fill)  # noqa
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -0.5, order_type=_order_type_close, exit_id="Close position order",
+    )
+    engine.sync(BAR_TS + 180_000)
+
+    assert pos.size == 0.5
+    assert [e.intent.qty for e in b.close_calls] == [0.5]
+
+
+def __test_spot_close_against_a_flat_book_is_dropped__():
+    """Spot has no reduce-only: a flat-book close would sell foreign holdings."""
+    from decimal import Decimal
+
+    b = MockBroker()
+    b.spot_inventory_port = SimpleNamespace(
+        position_dust_threshold=Decimal("0.00001"),
+    )
+    engine, pos = _mk_engine(b)
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -1.0, order_type=_order_type_close, exit_id="Close position order",
+    )
+
+    engine.sync(BAR_TS)
+
+    assert len(b.close_calls) == 0
+
+
+def __test_spot_close_withhold_releases_after_the_wait_bound__(monkeypatch):
+    """A leg fill that never reaches the book does not strand the close for good."""
+    from pynecore.core.broker import sync_engine as sync_engine_mod
+
+    b, engine, _ = _spot_long_with_exit(CancelDispositionOutcome.ALREADY_FILLED)
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.close_calls) == 0
+
+    monkeypatch.setattr(sync_engine_mod, '_PRE_CLEAR_FILL_WAIT_S', 0.0)
+    engine.sync(BAR_TS + 180_000)
+
+    assert len(b.close_calls) == 1
+    assert not engine._pre_clear_filled_entries  # noqa
+
+
 def __test_spot_full_close_dispatches_after_a_confirmed_pre_clear_cancel__():
     """A confirmed pre-clear cancel lets the close go out, with no second cancel."""
     b, engine, outcome_calls = _spot_long_with_exit(CancelDispositionOutcome.CANCEL_CONFIRMED)
@@ -15032,7 +15136,7 @@ def __test_general_cancel_false_parks_defers_reemit_no_double_open__():
     assert len(b.entry_calls) == 2                    # re-dispatched after
 
 
-def __test_modify_cancel_reexecute_deferred_while_cancel_unlanded__():
+def __test_modify_cancel_reexecute_deferred_while_cancel_unlanded__(caplog):
     """Mismatched-kind modify (cancel + re-execute): when the cancel of the
     old working order does not land (``execute_cancel`` returns ``False``),
     the replacement must NOT be dispatched in the same sync — the old order
@@ -15050,16 +15154,21 @@ def __test_modify_cancel_reexecute_deferred_while_cancel_unlanded__():
     new = CloseIntent(pine_id="E", symbol=SYMBOL, side='sell', qty=3.0)
 
     b.false_on_next_cancel = True
-    with pytest.raises(_PartialBracketModifyDeferred):
-        engine._dispatch_modify(old, new)
-    assert "E" in engine._forced_cancel_pending
-    assert b.close_calls == []            # replacement NOT dispatched
-    assert len(b.cancel_calls) == 1
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(_PartialBracketModifyDeferred):
+            engine._dispatch_modify(old, new)
+        assert "E" in engine._forced_cancel_pending
+        assert b.close_calls == []            # replacement NOT dispatched
+        assert len(b.cancel_calls) == 1
 
-    with pytest.raises(_PartialBracketModifyDeferred):
-        engine._dispatch_modify(old, new)
-    assert len(b.cancel_calls) == 1       # no duplicate cancel round-trip
-    assert b.close_calls == []
+        with pytest.raises(_PartialBracketModifyDeferred):
+            engine._dispatch_modify(old, new)
+        assert len(b.cancel_calls) == 1       # no duplicate cancel round-trip
+        assert b.close_calls == []
+    # A deferral is retried, not failed: it must not surface as an ERROR
+    # (measured: bybit-spot cycle 282 logged ten "modify failed" errors for
+    # a deferral that resolved on its own once the venue recovered).
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.ERROR]
 
 
 def __test_strategy_order_market_reduce_is_not_folded_on_margin__():

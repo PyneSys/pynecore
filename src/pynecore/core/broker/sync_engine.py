@@ -627,6 +627,13 @@ _REVERSAL_CLOSE_STALE_SYNCS = 3
 #: stream), so an earlier retry would mostly re-hit the same decline.
 _CLOSE_DECLINE_RETRY_S = 60.0
 
+#: How long a spot close stays withheld behind a pre-cleared exit leg the
+#: venue reported filled while that fill has not reached the book. The
+#: inventory catch-up books such a fill within a few reconcile passes even
+#: with the private stream down; the bound keeps a fill that never arrives
+#: from leaving the position without a close for the rest of the run.
+_PRE_CLEAR_FILL_WAIT_S = 600.0
+
 
 @dataclasses.dataclass(slots=True)
 class _PendingFlipSurplusClose:
@@ -1322,6 +1329,16 @@ class OrderSyncEngine:
         # Suppresses a same-sync re-dispatch of those legs; reset at the top
         # of every :meth:`_diff_and_dispatch`.
         self._spot_close_cleared_entry_ids: set[str] = set()
+        # Entry id -> (the entry's open size, monotonic time) recorded when
+        # the spot full-close pre-clear found one of its exit legs
+        # ``ALREADY_FILLED``. The leg sold that inventory at the venue, but
+        # its fill can reach the book much later (measured live: bybit-spot
+        # cycle 282, 2026-10-11 — the private stream was down, the inventory
+        # catch-up booked the fill a minute later). Until the book shrinks
+        # below the recorded size, the entry is retired, or
+        # :data:`_PRE_CLEAR_FILL_WAIT_S` passes, every close and re-armed
+        # exit of the entry is withheld (:meth:`_pre_clear_fill_pending`).
+        self._pre_clear_filled_entries: dict[str, tuple[float, float]] = {}
         # Snapshot of the drain batch currently being routed by
         # :meth:`_drain_events`, plus the index of the NEXT event to route.
         # Lets the ``cancelled`` classifier look AHEAD at the not-yet-routed
@@ -9241,6 +9258,7 @@ class OrderSyncEngine:
         # branch needs them populated). Idempotent / no-op when nothing is
         # registered, so the never-filled cancel path can call it safely.
         self._retire_native_failsafe_for_entry(closed_entry_id)
+        self._pre_clear_filled_entries.pop(closed_entry_id, None)
         # Cascade-cancel any active engine-trigger partial legs under
         # this entry — the parent just flattened, so every leg's row
         # must be marked ``cascaded_cancel_by_parent_close`` and the
@@ -11598,6 +11616,15 @@ class OrderSyncEngine:
             return intents
 
         remaining = abs(self._position.size)
+        if remaining <= 1e-12 and getattr(self._broker, 'spot_inventory_port', None) is not None:
+            # Spot has no reduce-only: a close against a flat book is a plain
+            # sell of the wallet's foreign holdings (the spot ledger then
+            # quarantines on negative inventory). The book cannot lag the
+            # venue here the way it can on derivatives — the startup adoption
+            # folds the whole execution ledger into the position and every
+            # live fill reaches the engine exactly once — so a flat book means
+            # there is nothing of ours to sell.
+            return [i for i in intents if not isinstance(i, CloseIntent)]
         if remaining <= 1e-12:
             # No locally-known exposure: the engine cannot safely cap, and a
             # close-when-flat is a reduce-only no-op at the broker. Suppressing
@@ -15829,9 +15856,11 @@ class OrderSyncEngine:
         came out of the wallet baseline). A leg the venue reports as
         ``ALREADY_FILLED`` has sold the inventory the close was about to sell.
 
-        :return: ``False`` when a swept leg filled during its cancel — the
-            caller must withhold the close and re-evaluate against the book
-            the leg's fill settles; ``True`` otherwise.
+        :return: ``False`` when a swept leg filled during its cancel, now or
+            on an earlier sync whose fill the book has not booked yet
+            (:meth:`_pre_clear_fill_pending`) — the caller must withhold the
+            close and re-evaluate against the book the leg's fill settles;
+            ``True`` otherwise.
         """
         if getattr(self._broker, 'spot_inventory_port', None) is None:
             return True
@@ -15850,6 +15879,13 @@ class OrderSyncEngine:
                 if trade.entry_id is not None
             }
             remaining = abs(self._position.size)
+        # Evaluate every id: the check also releases the settled markers.
+        fill_pending = [
+            entry_id for entry_id in consumed_ids
+            if self._pre_clear_fill_pending(entry_id)
+        ]
+        if fill_pending:
+            return False
         if not consumed_ids or intent.qty < remaining * (1.0 - 1e-9):
             return True
         # Same-sync re-arm guard: should the diff loop reach a swept leg's
@@ -15870,11 +15906,49 @@ class OrderSyncEngine:
             )
             if self._pre_clear_cancel_leg(old) is CancelDispositionOutcome.ALREADY_FILLED:
                 leg_filled = True
+                if old.from_entry is not None:
+                    self._pre_clear_filled_entries[old.from_entry] = (
+                        self._entry_open_size(old.from_entry), time.monotonic(),
+                    )
             self._order_mapping.pop(key, None)
             self._active_intents.pop(key, None)
             self._drop_envelope(key)
             self._remove_pine_order_for_intent(old)
         return not leg_filled
+
+    def _entry_open_size(self, entry_id: str) -> float:
+        """Absolute open size the book holds for ``entry_id``."""
+        return sum(
+            abs(trade.size) for trade in self._position.open_trades
+            if trade.entry_id == entry_id
+        )
+
+    def _pre_clear_fill_pending(self, entry_id: str) -> bool:
+        """Whether a pre-cleared exit leg of ``entry_id`` sold at the venue unbooked.
+
+        ``True`` while the book still holds the size recorded when the
+        pre-clear cancel answered ``ALREADY_FILLED``: selling that inventory
+        again would come out of the wallet baseline (the spot ledger then
+        quarantines on negative inventory). The marker is released once the
+        book shrinks, and after :data:`_PRE_CLEAR_FILL_WAIT_S` without the
+        fill, so the close is re-evaluated against the venue again.
+        """
+        marker = self._pre_clear_filled_entries.get(entry_id)
+        if marker is None:
+            return False
+        recorded, since = marker
+        if self._entry_open_size(entry_id) < recorded * (1.0 - 1e-9):
+            del self._pre_clear_filled_entries[entry_id]
+            return False
+        if time.monotonic() - since < _PRE_CLEAR_FILL_WAIT_S:
+            return True
+        del self._pre_clear_filled_entries[entry_id]
+        _blog_warning(
+            "spot full-close pre-clear: the fill of entry %r's pre-cleared exit "
+            "leg has not reached the book in %.0fs; re-evaluating its close",
+            entry_id, _PRE_CLEAR_FILL_WAIT_S,
+        )
+        return False
 
     def _pre_clear_cancel_leg(self, old: ExitIntent) -> CancelDispositionOutcome:
         """Cancel one pre-cleared spot exit and report how the venue settled it.
@@ -15974,6 +16048,23 @@ class OrderSyncEngine:
                     f"same-sync spot full close; re-evaluating next sync.",
                     intent_key=intent.intent_key,
                     reason='spot_full_close_pre_clear',
+                    context={
+                        'symbol': intent.symbol,
+                        'from_entry': intent.from_entry,
+                    },
+                )
+            # A pre-cleared leg of this entry sold at the venue and its fill
+            # is not booked yet: a re-armed leg would sell the same
+            # inventory again once its level trades.
+            if (intent.from_entry is not None
+                    and self._pre_clear_fill_pending(intent.from_entry)):
+                raise OrderSkippedByPlugin(
+                    f"Exit {format_intent_key(intent.intent_key)} "
+                    f"skipped: a pre-cleared exit leg of its entry filled at "
+                    f"the venue and the fill has not reached the book yet; "
+                    f"re-evaluating next sync.",
+                    intent_key=intent.intent_key,
+                    reason='pre_clear_leg_fill_pending',
                     context={
                         'symbol': intent.symbol,
                         'from_entry': intent.from_entry,
@@ -20036,6 +20127,10 @@ class OrderSyncEngine:
             _blog_error(
                 "modify failed for %s: %s: %s", new, type(e).__name__, e,
             )
+            raise
+        except _PartialBracketModifyDeferred:
+            # Control-flow signal, not a failure: the raise site already
+            # logged the deferral and the caller retries on the next sync.
             raise
         except Exception as e:
             _blog_error(
