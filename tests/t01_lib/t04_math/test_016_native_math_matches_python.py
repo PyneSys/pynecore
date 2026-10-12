@@ -22,7 +22,7 @@ import pytest
 from pynecore.core import fdlibm, pine_math
 
 _FUNCTIONS = (
-    (pine_math, ('cos', 'sin', 'exp', 'log', 'log10')),
+    (pine_math, ('cos', 'sin', 'tan', 'exp', 'log', 'log10')),
     (fdlibm, ('sin', 'cos', 'exp', 'asin', 'acos', 'atan')),
 )
 
@@ -40,7 +40,7 @@ def __test_helper_bits(x: float) -> int:
 
 
 def __test_helper_arguments(count: int) -> list[float]:
-    """Specials plus seeded random arguments covering every branch of the ten functions."""
+    """Specials plus seeded random arguments covering every branch of the twelve functions."""
     rnd = random.Random(20260923)
     args = list(_SPECIALS)
     for _ in range(count):

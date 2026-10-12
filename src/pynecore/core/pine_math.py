@@ -1,6 +1,6 @@
 """Runtime-exact transcendental functions for Pine-compatible execution.
 
-Implements the cos/sin/exp/log/log10/pow algorithms that HotSpot JVMs before
+Implements the cos/sin/tan/exp/log/log10/pow algorithms that HotSpot JVMs before
 JDK 19 use for the ``Math`` functions of the same names on x86-64 (the Intel
 LIBM table-driven methods), so per-bar runtime results are bit-identical to the
 venue engine. None of them is correctly rounded, and the logarithms and ``pow``
@@ -12,7 +12,9 @@ This is an independent implementation written from the published algorithm
 description: argument reduction against a fixed-point table of 2/pi (huge
 arguments) or N = round(x * 32/pi) (normal range), a 64-entry split-precision
 table of cos/sin values at multiples of pi/32, and a shared polynomial
-reconstruction; ``log`` and ``log10`` reduce instead against a 129-bin table of
+reconstruction; ``tan`` uses a 32-entry table of per-breakpoint polynomials at
+multiples of pi/32 and adds an accurate reciprocal of the remainder modulo pi/2
+near the poles; ``log`` and ``log10`` reduce instead against a 129-bin table of
 -log(B) for the bins an approximate hardware reciprocal selects and finish with
 a short series, and ``pow`` takes ``log2(x)`` the same way from a 513-bin table,
 then ``2**(y * log2(x))`` from a 256-entry one. The reciprocal is the venue
@@ -27,7 +29,7 @@ import math as _math
 import os as _os
 from struct import pack as _pack, unpack as _unpack
 
-__all__ = ['cos', 'sin', 'exp', 'log', 'log10', 'pow']
+__all__ = ['cos', 'sin', 'tan', 'exp', 'log', 'log10', 'pow']
 
 _M32 = 0xFFFFFFFF
 _M64 = 0xFFFFFFFFFFFFFFFF
@@ -370,6 +372,395 @@ def sin(x: float) -> float:
         return x
     n = _round_n(x)
     return _sincos_poly(x, n, n & 63, 0.0)
+
+
+# --- tan ---------------------------------------------------------------------
+
+# 32 blocks of 176 bytes, one per breakpoint k*pi/32 of the half period: the
+# polynomial coefficients as eight lane pairs, then T_hi, T_lo, sigma, T_hl, tau
+# and the bit mask that splits the reciprocal near the poles.
+_TAN_TBL = bytes.fromhex(
+    '00000000000000000000000000000000fa102c88f464963f000000000000000000000000'
+    '0000000000000000000000003dc2e655e326823f555555555555d53f0000000000000000'
+    '0000000000000000e07d150e3d6d6d3f111111111111c13f000000000000000000000000'
+    '00000000e3752b4536da573f1cbaa11bbaa1ab3f00000000000000000000000000000000'
+    '000000000000f03f0000000000000000000000000000000000000000000000009b5f434e'
+    '833f953f0000000000000000468e6e3cea749b3f000000000000000011755bda63ad853f'
+    '9b0b23dc5875b93f8837cb260813883f8549fc76c92ad63fba08bb77857c753f217524b6'
+    '1e38b13f0c172259954e753f2d484687837fc23f305b051191e3643f2063663e09e6a33f'
+    'e3dae90ddf01633f06ca1d1faea8af3fa22d5b8cbb36b93fa5f7884e057d583c00000000'
+    '0000f03fd95d93a8e2dd833f00000000000000000000000000000000a39e275a0734aa3f'
+    '0000000000000000fa652d435301a73f000000000000000002461a89ef039d3ff8a52cd6'
+    'd977ca3f28465fb365a2973ffa58324351cfd83f09d98fb5e3888f3fea1c770154b1c23f'
+    '8e2f56f3578f883f23a728c00f37c73ff0f9b7204cf4803fe9684321aadfb63f63188928'
+    'b6b4793ff0bb2d178ecbb63f583155e0f575c93f14e83f59d3f52e3c000000000000f03f'
+    '50c5de030342a43f000000000000000000000000000000003e531493c58ebb3f00000000'
+    '00000000d036aa09f4d3b63f0000000000000000fd27b4dc5039b13fbbb07ad85e33d53f'
+    'a5e80ace82b3ab3f2631147941badd3fd4282b5ff152a53f6d1af259ab15d03f957dc222'
+    '84e9a03faac69fe16c57d03f50292c8f98489a3f2cf2b3c06294c53fb8a483181cb6943f'
+    '4086833fb80ec33fdc635c35086ad33f3d99ce1d4d706dbc000000000000f03f63ab822b'
+    '928eb73f000000000000000000000000000000004270f35656fccc3f0000000000000000'
+    '513956aa2501c93f00000000000000005d7c0e3d3305c53f2e9bed9bd90edf3f7cc4e75f'
+    '50f2c13fe525c196d9ede23fd8bb025a715cbe3f202c3686b708da3fed35444b42d3b93f'
+    '9140494bbd11d93fbe5866b5c7e4b53f76fda29392c0d33f941727da1099b23f2bdf0333'
+    'be89d13f32effc997982da3f67148cb62f8b703c000000000000f03f37430c9819f6c53f'
+    '0000000000000000000000000000000001e503cc0ff1df3f000000000000000045e8a444'
+    '3bb6dd3f00000000000000009fad6837a472db3fca1cd03db9fde53f11281da6b272d93f'
+    '0bad4556f977e93fabb313d0a38cd73f14f90bbf92f1e43f30e7534d60d0d53f00908b3f'
+    '3399e43f082fb8e22a32d43f35a83659e17ae23f9b1cc6b1fbb3d23f058647ef9e65e13f'
+    'ec340819b71ae13fea25b6cd4b568ebc000000000000f03fe31772b0f148d23f00000000'
+    '000000000000000000000000d0492c2b9cdef23f000000000000000098bc5526583ef33f'
+    '0000000000000000a21f69ff2e97f33fbd6334e987edee3fa0100e07b2f5f33fa490d7f4'
+    '100cf23fa38e4ea01a54f43fd3cc6a389e36f13fdd662a2221b5f43f7e77a9221708f23f'
+    '6e4aa0528f17f53f3100aadd3721f23f7cd44744017cf53f1d7f9c1e1193f23f90f9b72a'
+    'b861e53ff17d9c20c5a8873c000000000000f03fc6bc7041d892dc3f0000000000000000'
+    '00000000000000005a4dabc7245e084000000000000000005da73ee93d960b4000000000'
+    '000000005af2a794e2370f40cb61624b84f9f53f12d89d5ab0aa11401800c374a5f5fa3f'
+    'e3e82c7f8bfe1340fa548efe3473fd3f8d610d670ca116405870b94d12e00040dd44df24'
+    '5f9c1940ce6e7d696e000340828b29834dfc1c40d690d419198c05405028e42a0043ea3f'
+    'e6208e11b86d7abc0000000000000040b84533e326e5d4bf000000000000000000000000'
+    '0000000066599665599621400000000000000000fa102c88f46426400000000000000000'
+    '2337cd8342832c4000000000000000403dc2e655e3263240555555555555054039194534'
+    '961c3740abaaaaaaaaaa0a40e07d150e3d6d3d4011111111111111401f2038a7cebb4240'
+    '065bb0055bb01540e3752b4536da47401cbaa11bbaa11b40000000000000f03f00000000'
+    '000000000000000000000040000000000000000000000000000000000000000000000000'
+    'd3b8484ff9ea33bf00000000000000006f58f70ceab8203f0000000000000000118925d0'
+    'f3ba0abfe99fe4238c5aabbf2e22532d150df63e51941621b272a13fbc4d25bbb5d3e1be'
+    '8e3bf9dbdbc784bf0b63b4056433cd3ea7ad9aee2439743f97824a79b9b7b7be97f715e0'
+    'f5415dbf564a1ae4fb5da33e51a2c2e4aba2493f00e0f95ace49cebf1937748c60b81e3d'
+    '0000000000000000cf63481b9482d73f000000000000f03f00000000f8ffffff90d85a53'
+    '20932bbf00000000000000001fdf8f011dd6163f0000000000000000bef15903e43901bf'
+    '6d7c31a4177ea6bf0f2d678205b4eb3e1e621b2f5b459f3f38f2cc511753d5beacb937f4'
+    'ee4b80bfb5a291c793e9c03eb21d9a91c280703f0e5b6a33a248aabe5883260a43a455bf'
+    'e478d9df1fb6943e587a76d70618433f0000ea2ae8bbc9bf61ea237769233abd00000000'
+    '00000000ff9677df42e6d63f000000000000f03f00000000f8ffffffce07ffb9781c23bf'
+    '0000000000000000827151a5e0f00f3f0000000000000000bc4c0b799161f6bec6468a84'
+    'c01aa2bffa3564b1ecd3e13e32a81a2aea719c3fef99d2fd1addc9beafba8d3f633379bf'
+    'eac69f30d615b43e7104e6beba836b3f97a6a09411ae9dbeb3675c3e7bd04fbf3e3e8f9a'
+    '75bd863ea4b7bea4b11e3d3f00c0cf29ce49c5bf589315bf337b39bd0000000000000000'
+    '6cee1f87f066d63f000000000000f03f00000000f8ffffff56a5987d58391abf00000000'
+    '0000000001dc889dc204073f00000000000000002b2a74734a05edbe87458458132a9cbf'
+    '798a685526a3d73ed6f133eef4489a3f8898dca83989bfbeb8b5d4aa46f772bfa1ef0291'
+    '828fa83ecf29bcda2882673fb8af899256f490beedb41f74a3f346bf63667fa9bfb4793e'
+    '3fff89ca70db363f00a0a2a813eec0bfe14ba23d9f8b33bd0000000000000000696ccd11'
+    'fd01d63f000000000000f03f00000000f8ffffff974b151a016b11bf0000000000000000'
+    '3076422dbf47013f0000000000000000c82038b9d464e2be18bb6cbb8cab94bf924d8d88'
+    '8b56d03e7c0f73609bb1983f11fbb1e450f9b2be749fcf22cd216bbfa6f03f4a9e499f3e'
+    'ce832bfdd7aa643faf737b637c4883be1a5922e592c03fbfbce858a1ae3a6e3efa2fe8e5'
+    '2f9d323f00a036d67f47b9bfbcd2c2c2f95e13bd000000000000000023b1fdf266b5d53f'
+    '000000000000f03f00000000f8ffffff64cb1ac48d4405bf00000000000000006f3db0db'
+    'd27afb3e00000000000000002d96429ea5aed5beeff8792598238bbfd91e8a284114c83e'
+    'c58d19b03a9a973f53e2df2fd37ca5be6f336657aa7c61bfc3440960d64e953ef8aae0a4'
+    '46c6623f9cb28f6ba3e374be09044cdc52f933bf65e3ff9bec01633e449e86b866c52f3f'
+    '0040e0e162ccb0bf7f906b01bc9c11bd0000000000000000fad8b9e6b37fd53f00000000'
+    '0000f03f00000000f8ffffffa622af5dd729f4be000000000000000045a5bc067da2f73e'
+    '00000000000000009ac111723e1cc4be3ed56e95f4e37abf720e75ee1b90c33ef543d491'
+    '13f7963f6c1e6636096e93be81936f50e82251bf3fd46dcbb941903effb29866c7b0613f'
+    '2bf16b578a5a62bedce9a0e59d4923bfdd8403112c1c5b3eb63dd46899b82c3f00c0ca6e'
+    '14c4a0bf8cd57dcd0f50133d0000000000000000fbc8a285e05fd53f000000000000f03f'
+    '00000000f8ffffff00000000000000000000000000000000be0ef72b8f6af63e00000000'
+    '00000000000000000000000000000000000000007f2644d60528c23e176cc1166cc1963f'
+    '000000000000000000000000000000006291e0c4b26d8d3e671501bc6a56613f00000000'
+    '0000000000000000000000005c95791f4eda573e0bef349377bd2b3f0000000000000000'
+    '00000000000000000000000000000000555555555555d53f000000000000f03f00000000'
+    'f8ffffffa622af5dd729f43e000000000000000045a5bc067da2f73e0000000000000000'
+    '9ac111723e1cc43e3ed56e95f4e37a3f720e75ee1b90c33ef543d49113f7963f6c1e6636'
+    '096e933e81936f50e822513f3fd46dcbb941903effb29866c7b0613f2bf16b578a5a623e'
+    'dce9a0e59d49233fdd8403112c1c5b3eb63dd46899b82c3f00c0ca6e14c4a03f8cd57dcd'
+    '0f5013bd0000000000000000fbc8a285e05fd53f000000000000f03f00000000f8ffffff'
+    '64cb1ac48d44053f00000000000000006f3db0dbd27afb3e00000000000000002d96429e'
+    'a5aed53eeff8792598238b3fd91e8a284114c83ec58d19b03a9a973f53e2df2fd37ca53e'
+    '6f336657aa7c613fc3440960d64e953ef8aae0a446c6623f9cb28f6ba3e3743e09044cdc'
+    '52f9333f65e3ff9bec01633e449e86b866c52f3f0040e0e162ccb03f7f906b01bc9c113d'
+    '0000000000000000fad8b9e6b37fd53f000000000000f03f00000000f8ffffff974b151a'
+    '016b113f00000000000000003076422dbf47013f0000000000000000c82038b9d464e23e'
+    '18bb6cbb8cab943f924d8d888b56d03e7c0f73609bb1983f11fbb1e450f9b23e749fcf22'
+    'cd216b3fa6f03f4a9e499f3ece832bfdd7aa643faf737b637c48833e1a5922e592c03f3f'
+    'bce858a1ae3a6e3efa2fe8e52f9d323f00a036d67f47b93fbcd2c2c2f95e133d00000000'
+    '0000000023b1fdf266b5d53f000000000000f03f00000000f8ffffff56a5987d58391a3f'
+    '000000000000000001dc889dc204073f00000000000000002b2a74734a05ed3e87458458'
+    '132a9c3f798a685526a3d73ed6f133eef4489a3f8898dca83989bf3eb8b5d4aa46f7723f'
+    'a1ef0291828fa83ecf29bcda2882673fb8af899256f4903eedb41f74a3f3463f63667fa9'
+    'bfb4793e3fff89ca70db363f00a0a2a813eec03fe14ba23d9f8b333d0000000000000000'
+    '696ccd11fd01d63f000000000000f03f00000000f8ffffffce07ffb9781c233f00000000'
+    '00000000827151a5e0f00f3f0000000000000000bc4c0b799161f63ec6468a84c01aa23f'
+    'fa3564b1ecd3e13e32a81a2aea719c3fef99d2fd1addc93eafba8d3f6333793feac69f30'
+    'd615b43e7104e6beba836b3f97a6a09411ae9d3eb3675c3e7bd04f3f3e3e8f9a75bd863e'
+    'a4b7bea4b11e3d3f00c0cf29ce49c53f589315bf337b393d00000000000000006cee1f87'
+    'f066d63f000000000000f03f00000000f8ffffff90d85a5320932b3f0000000000000000'
+    '1fdf8f011dd6163f0000000000000000bef15903e439013f6d7c31a4177ea63f0f2d6782'
+    '05b4eb3e1e621b2f5b459f3f38f2cc511753d53eacb937f4ee4b803fb5a291c793e9c03e'
+    'b21d9a91c280703f0e5b6a33a248aa3e5883260a43a4553fe478d9df1fb6943e587a76d7'
+    '0618433f0000ea2ae8bbc93f61ea237769233a3d0000000000000000ff9677df42e6d63f'
+    '000000000000f03f00000000f8ffffffd3b8484ff9ea333f00000000000000006f58f70c'
+    'eab8203f0000000000000000118925d0f3ba0a3fe99fe4238c5aab3f2e22532d150df63e'
+    '51941621b272a13fbc4d25bbb5d3e13e8e3bf9dbdbc7843f0b63b4056433cd3ea7ad9aee'
+    '2439743f97824a79b9b7b73e97f715e0f5415d3f564a1ae4fb5da33e51a2c2e4aba2493f'
+    '00e0f95ace49ce3f1937748c60b81ebd0000000000000000cf63481b9482d73f00000000'
+    '0000f03f00000000f8ffffff66599665599621c00000000000000000fa102c88f4642640'
+    '00000000000000002337cd8342832cc000000000000000c03dc2e655e326324055555555'
+    '5555054039194534961c37c0abaaaaaaaaaa0ac0e07d150e3d6d3d401111111111111140'
+    '1f2038a7cebb42c0065bb0055bb015c0e3752b4536da47401cbaa11bbaa11b4000000000'
+    '0000f0bf0000000000000000000000000000004000000000000000000000000000000000'
+    '00000000000000005a4dabc7245e08c000000000000000005da73ee93d960b4000000000'
+    '000000005af2a794e2370fc0cb61624b84f9f5bf12d89d5ab0aa11401800c374a5f5fa3f'
+    'e3e82c7f8bfe13c0fa548efe3473fdbf8d610d670ca116405870b94d12e00040dd44df24'
+    '5f9c19c0ce6e7d696e0003c0828b29834dfc1c40d690d419198c05405028e42a0043eabf'
+    'e6208e11b86d7a3c0000000000000040b84533e326e5d4bf000000000000000000000000'
+    '00000000d0492c2b9cdef2bf000000000000000098bc5526583ef33f0000000000000000'
+    'a21f69ff2e97f3bfbd6334e987edeebfa0100e07b2f5f33fa490d7f4100cf23fa38e4ea0'
+    '1a54f4bfd3cc6a389e36f1bfdd662a2221b5f43f7e77a9221708f23f6e4aa0528f17f5bf'
+    '3100aadd3721f2bf7cd44744017cf53f1d7f9c1e1193f23f90f9b72ab861e5bff17d9c20'
+    'c5a887bc000000000000f03fc6bc7041d892dc3f00000000000000000000000000000000'
+    '01e503cc0ff1dfbf000000000000000045e8a4443bb6dd3f00000000000000009fad6837'
+    'a472dbbfca1cd03db9fde5bf11281da6b272d93f0bad4556f977e93fabb313d0a38cd7bf'
+    '14f90bbf92f1e4bf30e7534d60d0d53f00908b3f3399e43f082fb8e22a32d4bf35a83659'
+    'e17ae2bf9b1cc6b1fbb3d23f058647ef9e65e13fec340819b71ae1bfea25b6cd4b568e3c'
+    '000000000000f03fe31772b0f148d23f000000000000000000000000000000004270f356'
+    '56fcccbf0000000000000000513956aa2501c93f00000000000000005d7c0e3d3305c5bf'
+    '2e9bed9bd90edfbf7cc4e75f50f2c13fe525c196d9ede23fd8bb025a715cbebf202c3686'
+    'b708dabfed35444b42d3b93f9140494bbd11d93fbe5866b5c7e4b5bf76fda29392c0d3bf'
+    '941727da1099b23f2bdf0333be89d13f32effc997982dabf67148cb62f8b70bc00000000'
+    '0000f03f37430c9819f6c53f000000000000000000000000000000003e531493c58ebbbf'
+    '0000000000000000d036aa09f4d3b63f0000000000000000fd27b4dc5039b1bfbbb07ad8'
+    '5e33d5bfa5e80ace82b3ab3f2631147941badd3fd4282b5ff152a5bf6d1af259ab15d0bf'
+    '957dc22284e9a03faac69fe16c57d03f50292c8f98489abf2cf2b3c06294c5bfb8a48318'
+    '1cb6943f4086833fb80ec33fdc635c35086ad3bf3d99ce1d4d706d3c000000000000f03f'
+    '63ab822b928eb73f00000000000000000000000000000000a39e275a0734aabf00000000'
+    '00000000fa652d435301a73f000000000000000002461a89ef039dbff8a52cd6d977cabf'
+    '28465fb365a2973ffa58324351cfd83f09d98fb5e3888fbfea1c770154b1c2bf8e2f56f3'
+    '578f883f23a728c00f37c73ff0f9b7204cf480bfe9684321aadfb6bf63188928b6b4793f'
+    'f0bb2d178ecbb63f583155e0f575c9bf14e83f59d3f52ebc000000000000f03f50c5de03'
+    '0342a43f000000000000000000000000000000009b5f434e833f95bf0000000000000000'
+    '468e6e3cea749b3f000000000000000011755bda63ad85bf9b0b23dc5875b9bf8837cb26'
+    '0813883f8549fc76c92ad63fba08bb77857c75bf217524b61e38b1bf0c172259954e753f'
+    '2d484687837fc23f305b051191e364bf2063663e09e6a3bfe3dae90ddf01633f06ca1d1f'
+    'aea8af3fa22d5b8cbb36b9bfa5f7884e057d58bc000000000000f03fd95d93a8e2dd833f'
+    '00000000000000000000000000000000'
+)
+
+_T_2PI = _b2f(0x3fe45f306dc9c883)  # 2/pi
+# pi/32 split three ways, one split per lane: the low lane reduces by N * pi/2
+# (as 16N * pi/32), the high lane by n * pi/32.
+_T_P1_L, _T_P1_H = _b2f(0x3fb921fb54444000), _b2f(0x3fb921fb54440000)
+_T_P2_L, _T_P2_H = _b2f(0xbd32e7b967674000), _b2f(0x3d468c234c4c0000)
+_T_P3_L, _T_P3_H = _b2f(0x3aa8a2e03707344a), _b2f(0x3ae98a2e03707345)
+_T_QQ2 = _b2f(0x3d32e7b9676733af)  # pi/32 tail for the reciprocal's argument
+_T_MASK35 = 0xfffffffffffc0000
+_T_Q11 = _b2f(0x3f82609ab8fe4d77)
+_T_Q9 = _b2f(0x3f9664a0bf847a43)
+_T_Q7 = _b2f(0x3faba1ba52c4c8ab)
+_T_Q5 = _b2f(0x3fc1111111092746)
+_T_Q3 = _b2f(0x3fd5555555555612)
+_T_PI_4_HEAD = _b2f(0x3fe921fb00000000)  # pi/4 split head
+_T_PI_4_TAIL = _b2f(0x3e85110b4611a626)  # pi/4 split tail
+_T_TWO55 = _b2f(0x4360000000000000)
+_T_TWOM55 = _b2f(0x3c80000000000000)
+
+_TAN_ROWS = [tuple(_b2f(_u64(_TAN_TBL, j * 176 + 8 * k)) for k in range(21)) for j in range(32)]
+_TAN_MASKS = [_u64(_TAN_TBL, j * 176 + 168) for j in range(32)]
+
+
+def _tan_poly(x: float, n: int, quad: int, corr: float, huge: bool) -> float:
+    """Table-polynomial reconstruction of tan for x ~ n*(pi/32) + r.
+
+    Two reductions run side by side: r = x - n*pi/32 drives the breakpoint
+    polynomial, and x - N*pi/2 (N = round(x*2/pi)) the reciprocal that the poles
+    need. ``corr`` is the low half of a double-double reduced argument, added only
+    on the ``huge`` path (adding a zero would turn a -0.0 into +0.0).  Operation
+    order is fixed: every add/mul is a single IEEE double rounding.
+    """
+    k_l = float(int(x * _T_2PI + _math.copysign(0.5, x))) * 16.0
+    k_h = float(n)
+    j = (n + 469248 + (quad << 4)) & 31
+    row = _TAN_ROWS[j]
+
+    p1_l = _T_P1_L * k_l
+    p1_h = _T_P1_H * k_h
+    p2_l = _T_P2_L * k_l
+    p2_h = _T_P2_H * k_h
+    p3_l = _T_P3_L * k_l
+    p3_h = _T_P3_H * k_h
+    a0 = x - p1_l
+    b0 = x - p1_h
+    m = _T_QQ2 * k_l + a0
+    a1 = a0 - p2_l
+    r = b0 - p2_h
+    m = _b2f(_f2b(m) & _T_MASK35)
+    recip = 1.0 / m
+    c_l = ((a0 - a1) - p2_l) - p3_l
+    c_h = ((b0 - r) - p2_h) - p3_h
+    if huge:
+        c_l = c_l + corr
+        c_h = c_h + corr
+    c_l = c_l + (a1 - m)
+
+    r2 = r * r
+    r4 = r2 * r2
+    v_l = (row[2] * r + row[0]) + (row[6] * r + row[4]) * r2
+    v_h = (row[3] * r + row[1]) + (row[7] * r + row[5]) * r2
+    w_l = (row[12] * r + row[10]) + row[14] * r2
+    w_h = (row[13] * r + row[11]) + row[15] * r2
+    v_l = v_l + row[8] * r4
+    v_h = v_h + row[9] * r4
+    r5 = r * r4
+    v_l = v_l + w_l * r5
+    v_h = v_h + w_h * r5
+    poly = r4 * r4 * v_l + v_h
+
+    s_l = r * row[18]
+    s_h = r * row[19]
+    med = s_l + s_h
+    med_lo = s_h + (s_l - med)
+    poly = poly + (((row[18] + row[19]) * c_h + row[17]) + med_lo)
+
+    rmask = _b2f(_TAN_MASKS[j] & _f2b(recip))
+    tail = ((1.0 - m * rmask) - c_l * recip) * (recip * row[20])
+    high = rmask - row[16]
+    med_hi = med - high
+    high = high + med_hi
+    poly = poly + (med - high)
+    poly = poly - tail
+    return poly + med_hi
+
+
+def _tan_huge(x_bits: int) -> float:
+    """tan for |x| >= 12800 (and Inf/NaN): fixed-point reduction by 2/pi.
+
+    The 53-bit significand is multiplied by a window of the 2/pi table selected by
+    the exponent, in 32-bit limbs with 64-bit accumulators exactly as the venue
+    does; the integer bits above the binary point give the quadrant, the fraction
+    (complemented when it is at least one half) is normalized, converted to a
+    double-double, scaled by pi/4 and handed to the shared reconstruction.
+    """
+    hi16 = (x_bits >> 48) & 0xFFFF
+    if hi16 & 0x7FF0 == 0x7FF0:  # Inf or NaN
+        return _b2f(x_bits) * -0.0
+
+    off = (((hi16 & 0x7FF0) - 16224) >> 7) & 0xFFFC
+    w0, w1, w2, w3, w4, w5, w6 = (_u32(_PI_INV_TABLE, off + 4 * k) for k in range(7))
+    m_lo = x_bits & _M32
+    m_hi = (((x_bits >> 21) & _M32) | 0x80000000) >> 11
+
+    # 53 x 224-bit product, accumulated from the low limbs up; bits below the
+    # m_lo * w6 term are dropped
+    t = w5 * m_lo
+    acc = w5 * m_hi + (t >> 32)
+    t = (t & _M32) + w6 * m_hi
+    low = t & _M32
+    acc = acc + (t >> 32)
+    t = w4 * m_lo
+    nxt = w4 * m_hi
+    t3 = w3 * m_lo
+    acc = acc + (t & _M32)
+    low = low | ((acc & _M32) << 32)
+    nxt = nxt + (t >> 32) + (acc >> 32)
+    acc = w3 * m_hi
+    nxt = nxt + (t3 & _M32)
+    mid = nxt & _M32
+    acc = acc + (t3 >> 32) + (nxt >> 32)
+    t = w2 * m_lo
+    nxt = w2 * m_hi
+    acc = acc + (t & _M32)
+    mid = mid | ((acc & _M32) << 32)
+    nxt = nxt + (t >> 32) + (acc >> 32)
+    t = w1 * m_lo
+    top = w1 * m_hi
+    nxt = nxt + (t & _M32)
+    frac_lo = nxt & _M32
+    top = (top + (t >> 32) + (nxt >> 32) + m_lo * w0) & _M64
+
+    sign = hi16 & 32768
+    point = (off * 8 + 19 - (((hi16 >> 4) & 2047) - 1023)) & _M32  # binary-point offset
+    e_ctr = (point + 32) & _M32
+    flip = 0
+    if point < 0x80000000:  # binary point inside the top word
+        sh = (29 - point) & 31
+        top32 = (top << sh) & _M32
+        quad_bits = top32
+        top32 &= 0x3FFFFFFF
+        if top32 & 0x20000000:  # fraction >= 1/2: complement, bump the quadrant
+            top = (((top32 >> sh) << 32) | frac_lo) & _M64
+            limit = ((0x40000000 >> sh) << 32) & _M64
+            low, mid, top = _tan_complement(limit, low, mid, top)
+            flip = 32768
+            quad_bits = (quad_bits + 0x40000000) & _M32
+        else:
+            top = (((top32 >> sh) << 32) | frac_lo) & _M64
+    else:  # binary point below the top word
+        sh = (~point) & _M32
+        top = (((top << 32) | frac_lo) << (sh & 63)) & _M64
+        quad_bits = top
+        if top & 0x80000000:
+            top_lo = (top & _M32) >> (sh & 31)
+            limit = 0x100000000 >> (sh & 63)
+            low, mid, top = _tan_complement(limit, low, mid, top_lo)
+            flip = 32768
+            quad_bits = (((quad_bits >> 2) & _M32) + 0x40000000) & _M32
+        else:
+            top = (top & _M32) >> (sh & 31)
+            quad_bits = quad_bits >> 2
+
+    # normalize: shift the limbs until the leading bit of `top` is bit 29
+    if top == 0:
+        e_ctr = (e_ctr + 64) & _M32
+        top, mid, low = mid, low, 0
+        if top == 0:
+            e_ctr = (e_ctr + 64) & _M32
+            top, mid = mid, low
+    if top != 0:
+        d = 29 - (top.bit_length() - 1)
+        if d > 0:
+            top = ((top << d) | (mid >> (64 - d))) & _M64
+            mid = ((mid << d) | (low >> (64 - d))) & _M64
+            e_ctr = (e_ctr + d) & _M32
+        elif d < 0:
+            mid = (mid >> -d) | ((top << (64 + d)) & _M64)
+            top >>= -d
+            e_ctr = (e_ctr + d) & _M32
+
+    e_bits = (((16368 - ((e_ctr << 4) & _M32)) & _M32) | sign) ^ flip
+    f1 = float(top) * _b2f((e_bits & 0xFFFF) << 48)
+    f2 = float(mid >> 1) * _b2f(((e_bits - 1008) & 0xFFFF) << 48)
+    head = f1 * _T_PI_4_HEAD
+    tail = _T_PI_4_TAIL * (f1 + f2) + f2 * _T_PI_4_HEAD
+    red = head + tail
+    corr = tail + (head - red)
+
+    s_ext = _M32 if sign else 0
+    quad = ((((quad_bits & _M32) >> 30) + s_ext) ^ s_ext) & _M32
+    n = int(red * _PI32INV + _math.copysign(0.5, red))
+    return _tan_poly(red, n, quad, corr, True)
+
+
+def _tan_complement(limit: int, low: int, mid: int, top: int) -> tuple[int, int, int]:
+    """(limit - fraction) over three 64-bit limbs with a borrow chain."""
+    low2 = (0 - low) & _M64
+    borrow = 1 if low != 0 else 0
+    t = mid + borrow
+    mid2 = (0 - t) & _M64
+    borrow = 1 if t != 0 else 0
+    top2 = (limit - top - borrow) & _M64
+    return low2, mid2, top2
+
+
+def tan(x: float) -> float:
+    """Bit-exact venue-runtime tan."""
+    x_bits = _f2b(x)
+    hi16 = (x_bits >> 48) & 0x7FFF
+    band = hi16 - 16314
+    if band > 270:  # |x| >= 12800, Inf, NaN
+        return _tan_huge(x_bits)
+    if band >= 0:
+        n = int(x * _PI32INV + _math.copysign(0.5, x))
+        return _tan_poly(x, n, 0, 0.0, False)
+    if hi16 & 0x7FF0 == 0:  # zero or subnormal
+        return x
+    if hi16 < 15904:  # |x| < 2^-29
+        return (x + _T_TWO55 * x) * _T_TWOM55
+    x2 = x * x
+    x3 = x * x2
+    return x + ((((_T_Q11 * x2 + _T_Q9) * x2 + _T_Q7) * x2 + _T_Q5) * x2 + _T_Q3) * x3
 
 
 # --- exp ---------------------------------------------------------------------
@@ -1694,8 +2085,8 @@ def _pow_near_one(mant: float, mant_hi: float, lane: int, near_one: int, xb: int
 #: The pure-Python implementations. ``_native_math``, when built, rebinds the public
 #: names above to compiled twins of these (bit-identical, see that module); this keeps
 #: the originals reachable for the tests that hold the two paths against each other.
-PYTHON_IMPLEMENTATIONS = {'cos': cos, 'sin': sin, 'exp': exp, 'log': log, 'log10': log10,
-                          'pow': pow}
+PYTHON_IMPLEMENTATIONS = {'cos': cos, 'sin': sin, 'tan': tan, 'exp': exp, 'log': log,
+                          'log10': log10, 'pow': pow}
 
 if not _os.environ.get('PYNE_NO_NATIVE_MATH'):
     try:

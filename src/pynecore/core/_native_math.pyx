@@ -36,7 +36,7 @@ from . import fdlibm as _fd
 _py_fd_sin = _fd.PYTHON_IMPLEMENTATIONS['sin']
 _py_fd_cos = _fd.PYTHON_IMPLEMENTATIONS['cos']
 
-__all__ = ['cos', 'sin', 'exp', 'log', 'log10', 'pow',
+__all__ = ['cos', 'sin', 'tan', 'exp', 'log', 'log10', 'pow',
            'f_sin', 'f_cos', 'f_exp', 'f_asin', 'f_acos', 'f_atan']
 
 cdef uint64_t M64 = 0xFFFFFFFFFFFFFFFFULL
@@ -144,6 +144,235 @@ def sin(double x):
         return x
     n = round_n(x)
     return sincos_poly(x, n, <int>(n & 63), 0.0)
+
+
+# --- pine_math: tan ----------------------------------------------------------------
+
+cdef double T_2PI = _pm._T_2PI
+cdef double T_P1_L = _pm._T_P1_L
+cdef double T_P1_H = _pm._T_P1_H
+cdef double T_P2_L = _pm._T_P2_L
+cdef double T_P2_H = _pm._T_P2_H
+cdef double T_P3_L = _pm._T_P3_L
+cdef double T_P3_H = _pm._T_P3_H
+cdef double T_QQ2 = _pm._T_QQ2
+cdef uint64_t T_MASK35 = _pm._T_MASK35
+cdef double T_Q11 = _pm._T_Q11
+cdef double T_Q9 = _pm._T_Q9
+cdef double T_Q7 = _pm._T_Q7
+cdef double T_Q5 = _pm._T_Q5
+cdef double T_Q3 = _pm._T_Q3
+cdef double T_PI_4_HEAD = _pm._T_PI_4_HEAD
+cdef double T_PI_4_TAIL = _pm._T_PI_4_TAIL
+cdef double T_TWO55 = _pm._T_TWO55
+cdef double T_TWOM55 = _pm._T_TWOM55
+
+cdef double TAN_ROWS[32][21]
+cdef uint64_t TAN_MASKS[32]
+cdef uint32_t PI_INV_WORDS[41]
+
+cdef int _k
+for _i in range(32):
+    for _k in range(21):
+        TAN_ROWS[_i][_k] = _pm._TAN_ROWS[_i][_k]
+    TAN_MASKS[_i] = _pm._TAN_MASKS[_i]
+for _i in range(41):
+    PI_INV_WORDS[_i] = _pm._u32(_pm._PI_INV_TABLE, 4 * _i)
+
+
+cdef double tan_poly(double x, int64_t n, uint32_t quad, double corr, bint huge) noexcept nogil:
+    cdef double k_l = <double>(<int64_t>(x * T_2PI + copysign(0.5, x))) * 16.0
+    cdef double k_h = <double>n
+    cdef int j = <int>((n + 469248 + (<int64_t>quad << 4)) & 31)
+    cdef double *row = TAN_ROWS[j]
+    cdef double p1_l = T_P1_L * k_l
+    cdef double p1_h = T_P1_H * k_h
+    cdef double p2_l = T_P2_L * k_l
+    cdef double p2_h = T_P2_H * k_h
+    cdef double p3_l = T_P3_L * k_l
+    cdef double p3_h = T_P3_H * k_h
+    cdef double a0 = x - p1_l
+    cdef double b0 = x - p1_h
+    cdef double m = T_QQ2 * k_l + a0
+    cdef double a1 = a0 - p2_l
+    cdef double r = b0 - p2_h
+    cdef double recip, c_l, c_h, r2, r4, r5, v_l, v_h, w_l, w_h, poly
+    cdef double s_l, s_h, med, med_lo, rmask, tail, high, med_hi
+    m = b2f(f2b(m) & T_MASK35)
+    recip = 1.0 / m
+    c_l = ((a0 - a1) - p2_l) - p3_l
+    c_h = ((b0 - r) - p2_h) - p3_h
+    if huge:
+        c_l = c_l + corr
+        c_h = c_h + corr
+    c_l = c_l + (a1 - m)
+
+    r2 = r * r
+    r4 = r2 * r2
+    v_l = (row[2] * r + row[0]) + (row[6] * r + row[4]) * r2
+    v_h = (row[3] * r + row[1]) + (row[7] * r + row[5]) * r2
+    w_l = (row[12] * r + row[10]) + row[14] * r2
+    w_h = (row[13] * r + row[11]) + row[15] * r2
+    v_l = v_l + row[8] * r4
+    v_h = v_h + row[9] * r4
+    r5 = r * r4
+    v_l = v_l + w_l * r5
+    v_h = v_h + w_h * r5
+    poly = r4 * r4 * v_l + v_h
+
+    s_l = r * row[18]
+    s_h = r * row[19]
+    med = s_l + s_h
+    med_lo = s_h + (s_l - med)
+    poly = poly + (((row[18] + row[19]) * c_h + row[17]) + med_lo)
+
+    rmask = b2f(TAN_MASKS[j] & f2b(recip))
+    tail = ((1.0 - m * rmask) - c_l * recip) * (recip * row[20])
+    high = rmask - row[16]
+    med_hi = med - high
+    high = high + med_hi
+    poly = poly + (med - high)
+    poly = poly - tail
+    return poly + med_hi
+
+
+cdef inline void tan_complement(uint64_t limit, uint64_t *low, uint64_t *mid,
+                                uint64_t *top) noexcept nogil:
+    cdef uint64_t borrow = 1 if low[0] != 0 else 0
+    cdef uint64_t borrow2 = 1 if (mid[0] | borrow) != 0 else 0
+    low[0] = 0 - low[0]
+    mid[0] = 0 - mid[0] - borrow
+    top[0] = limit - top[0] - borrow2
+
+
+cdef double tan_huge(uint64_t x_bits) noexcept nogil:
+    cdef uint32_t hi16 = <uint32_t>((x_bits >> 48) & 0xFFFF)
+    cdef uint32_t off, sign, point, e_ctr, flip, sh, top32, e_bits, s_ext, quad
+    cdef uint64_t w0, w1, w2, w3, w4, w5, w6, m_lo, m_hi
+    cdef uint64_t t, t3, acc, nxt, low, mid, top, frac_lo, quad_bits, limit
+    cdef int d
+    cdef double f1, f2, head, tail, red, corr
+    cdef int64_t n
+    if hi16 & 0x7FF0 == 0x7FF0:
+        return b2f(x_bits) * -0.0
+
+    off = (((hi16 & 0x7FF0) - 16224) >> 7) & 0xFFFC
+    w0 = PI_INV_WORDS[off >> 2]
+    w1 = PI_INV_WORDS[(off >> 2) + 1]
+    w2 = PI_INV_WORDS[(off >> 2) + 2]
+    w3 = PI_INV_WORDS[(off >> 2) + 3]
+    w4 = PI_INV_WORDS[(off >> 2) + 4]
+    w5 = PI_INV_WORDS[(off >> 2) + 5]
+    w6 = PI_INV_WORDS[(off >> 2) + 6]
+    m_lo = x_bits & 0xFFFFFFFFULL
+    m_hi = (<uint32_t>(x_bits >> 21) | 0x80000000u) >> 11
+
+    t = w5 * m_lo
+    acc = w5 * m_hi + (t >> 32)
+    t = (t & 0xFFFFFFFFULL) + w6 * m_hi
+    low = t & 0xFFFFFFFFULL
+    acc = acc + (t >> 32)
+    t = w4 * m_lo
+    nxt = w4 * m_hi
+    t3 = w3 * m_lo
+    acc = acc + (t & 0xFFFFFFFFULL)
+    low = low | ((acc & 0xFFFFFFFFULL) << 32)
+    nxt = nxt + (t >> 32) + (acc >> 32)
+    acc = w3 * m_hi
+    nxt = nxt + (t3 & 0xFFFFFFFFULL)
+    mid = nxt & 0xFFFFFFFFULL
+    acc = acc + (t3 >> 32) + (nxt >> 32)
+    t = w2 * m_lo
+    nxt = w2 * m_hi
+    acc = acc + (t & 0xFFFFFFFFULL)
+    mid = mid | ((acc & 0xFFFFFFFFULL) << 32)
+    nxt = nxt + (t >> 32) + (acc >> 32)
+    t = w1 * m_lo
+    top = w1 * m_hi
+    nxt = nxt + (t & 0xFFFFFFFFULL)
+    frac_lo = nxt & 0xFFFFFFFFULL
+    top = top + (t >> 32) + (nxt >> 32) + m_lo * w0
+
+    sign = hi16 & 32768
+    point = <uint32_t>(off * 8 + 19 - (((hi16 >> 4) & 2047) - 1023))
+    e_ctr = point + 32
+    flip = 0
+    if point < 0x80000000u:
+        sh = (29 - point) & 31
+        top32 = <uint32_t>(top << sh)
+        quad_bits = top32
+        top32 &= 0x3FFFFFFF
+        top = ((<uint64_t>(top32 >> sh)) << 32) | frac_lo
+        if top32 & 0x20000000:
+            limit = (<uint64_t>(0x40000000u >> sh)) << 32
+            tan_complement(limit, &low, &mid, &top)
+            flip = 32768
+            quad_bits = <uint32_t>(quad_bits + 0x40000000u)
+    else:
+        sh = ~point
+        top = ((top << 32) | frac_lo) << (sh & 63)
+        quad_bits = top
+        if top & 0x80000000ULL:
+            top = (top & 0xFFFFFFFFULL) >> (sh & 31)
+            limit = 0x100000000ULL >> (sh & 63)
+            tan_complement(limit, &low, &mid, &top)
+            flip = 32768
+            quad_bits = <uint32_t>(<uint32_t>(quad_bits >> 2) + 0x40000000u)
+        else:
+            top = (top & 0xFFFFFFFFULL) >> (sh & 31)
+            quad_bits = quad_bits >> 2
+
+    if top == 0:
+        e_ctr = e_ctr + 64
+        top = mid
+        mid = low
+        low = 0
+        if top == 0:
+            e_ctr = e_ctr + 64
+            top = mid
+            mid = low
+    if top != 0:
+        d = 29 - (bit_length(top) - 1)
+        if d > 0:
+            top = (top << d) | (mid >> (64 - d))
+            mid = (mid << d) | (low >> (64 - d))
+            e_ctr = e_ctr + <uint32_t>d
+        elif d < 0:
+            mid = (mid >> -d) | (top << (64 + d))
+            top >>= -d
+            e_ctr = e_ctr - <uint32_t>(-d)
+
+    e_bits = ((16368u - (e_ctr << 4)) | sign) ^ flip
+    f1 = <double>(<int64_t>top) * b2f((<uint64_t>(e_bits & 0xFFFF)) << 48)
+    f2 = <double>(<int64_t>(mid >> 1)) * b2f((<uint64_t>((e_bits - 1008) & 0xFFFF)) << 48)
+    head = f1 * T_PI_4_HEAD
+    tail = T_PI_4_TAIL * (f1 + f2) + f2 * T_PI_4_HEAD
+    red = head + tail
+    corr = tail + (head - red)
+
+    s_ext = 0xFFFFFFFFu if sign else 0
+    quad = (((<uint32_t>quad_bits) >> 30) + s_ext) ^ s_ext
+    n = <int64_t>(red * PI32INV + copysign(0.5, red))
+    return tan_poly(red, n, quad, corr, True)
+
+
+def tan(double x):
+    """Bit-exact venue-runtime tan (compiled :func:`pine_math.tan`)."""
+    cdef uint64_t x_bits = f2b(x)
+    cdef int64_t hi16 = <int64_t>((x_bits >> 48) & 0x7FFF)
+    cdef int64_t band = hi16 - 16314
+    cdef double x2, x3
+    if band > 270:
+        return tan_huge(x_bits)
+    if band >= 0:
+        return tan_poly(x, <int64_t>(x * PI32INV + copysign(0.5, x)), 0, 0.0, False)
+    if hi16 & 0x7FF0 == 0:
+        return x
+    if hi16 < 15904:
+        return (x + T_TWO55 * x) * T_TWOM55
+    x2 = x * x
+    x3 = x * x2
+    return x + ((((T_Q11 * x2 + T_Q9) * x2 + T_Q7) * x2 + T_Q5) * x2 + T_Q3) * x3
 
 
 # --- pine_math: exp ----------------------------------------------------------------
@@ -1276,6 +1505,7 @@ def _install():
     """
     _pm.cos = cos
     _pm.sin = sin
+    _pm.tan = tan
     _pm.exp = exp
     _pm.log = log
     _pm.log10 = log10

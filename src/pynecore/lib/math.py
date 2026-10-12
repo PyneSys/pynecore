@@ -502,7 +502,7 @@ def tan(angle: TFI | NA[TFI]) -> PyneFloat:
     """
     if not (angle == angle):  # is_na_arg
         return na_float
-    return math.tan(angle)
+    return pine_math.tan(angle)
 
 
 def todegrees(radians: TFI | NA[TFI]) -> PyneFloat:
