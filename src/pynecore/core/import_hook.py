@@ -1581,5 +1581,11 @@ class PyneImportHook:
         return None
 
 
-# Install the import hook
-sys.meta_path.insert(0, PyneImportHook())
+# Install the import hook. Under pytest its assertion-rewrite finder stays in front:
+# that one claims only test files, which pytest must load untransformed (the transform
+# drops their ``__test_*__`` functions, so a test module loaded here collects no
+# tests), and leaves every other module to this hook.
+sys.meta_path.insert(
+    next((i + 1 for i, finder in reversed(list(enumerate(sys.meta_path)))
+          if type(finder).__module__ == '_pytest.assertion.rewrite'), 0),
+    PyneImportHook())

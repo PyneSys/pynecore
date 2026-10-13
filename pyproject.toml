@@ -53,7 +53,7 @@ optional-dependencies.cli = ["typer>=0.16", "rich", "tzdata"]
 optional-dependencies.all = ["typer>=0.16", "rich", "ccxt", "tzdata"]
 
 #Optional dependencies for development
-optional-dependencies.dev = ["pytest", "pytest-spec", "Cython>=3.0"]
+optional-dependencies.dev = ["pytest>=9.1", "pytest-spec", "Cython>=3.0"]
 
 ### Providers
 
@@ -103,7 +103,7 @@ replay = "pynecore.providers.replay:ReplayProvider"
 [tool.cibuildwheel]
 build = "cp311-* cp312-* cp313-* cp314-*"
 skip = "*-win32 *-manylinux_i686 *-musllinux_i686"
-test-requires = ["pytest", "pytest-spec"]
+test-requires = ["pytest>=9.1", "pytest-spec"]
 test-command = """\
 pytest -p no:cacheprovider \
 {project}/tests/t01_lib/t04_math/test_016_native_math_matches_python.py \
