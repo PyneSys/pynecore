@@ -55,6 +55,18 @@ def __test_float_both_forms__():
     assert inputs['o'].options == (1.0, 1.5)
 
 
+def __test_float_input_int_default_is_float__():
+    """
+    An int-spelled default of a float input is a float: TradingView prints
+    ``array.from(input.float(5), 3.0)`` as ``[5.0, 3.0]`` and
+    ``array.from(input.price(7))`` as ``[7.0]`` (CAPITALCOM:EURUSD 60)
+    """
+    value = pyne_input.float(5, 'f', _id='f')
+    assert type(value) is float and value == 5.0
+    value = pyne_input.price(7, 'p', _id='p')
+    assert type(value) is float and value == 7.0
+
+
 def __test_numeric_positional_keyword_clash_raises__():
     """A positional minval plus keyword minval is a TypeError, like plain Python"""
     with pytest.raises(TypeError, match="multiple values"):

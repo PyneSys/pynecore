@@ -918,7 +918,10 @@ class _Input:
             options=kwargs.get('options'),
             display=kwargs.get('display'),
         )
-        return defval if _id not in _old_input_values else safe_convert.safe_float(_old_input_values[_id])
+        # A float input is a float even when its default is spelled as an int:
+        # ``input.float(5)`` is ``5.0`` in a float container on TradingView
+        return safe_convert.safe_float(defval if _id not in _old_input_values
+                                       else _old_input_values[_id])
 
     # ``active`` is UI-only in Pine: accepted for signature parity, never read
     # noinspection PyUnusedParameter
