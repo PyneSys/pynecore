@@ -1569,7 +1569,7 @@ def __test_late_close_labelled_with_the_entry_pine_id_is_dropped_after_the_clear
 
     b.position = None
     engine.reconcile()
-    engine._flat_observed_with_intents_since = (  # type: ignore[attr-defined]
+    engine._flat_observed_since = (  # type: ignore[attr-defined]
         time.monotonic() - EXTERNAL_FLATTEN_CONFIRM_GRACE_S - 1.0)
     engine.reconcile()
     assert pos.size == 0.0
@@ -2018,7 +2018,7 @@ def __test_external_flatten_is_detected_despite_an_armed_bracket__():
     assert pos.size == 1.0, "flat observation must not clear immediately"
 
     # Still flat past the grace, no fill moved the book: external flatten.
-    engine._flat_observed_with_intents_since = (  # type: ignore[attr-defined]
+    engine._flat_observed_since = (  # type: ignore[attr-defined]
         time.monotonic() - EXTERNAL_FLATTEN_CONFIRM_GRACE_S - 1.0)
     engine.reconcile()
     assert pos.size == 0.0
@@ -2075,7 +2075,99 @@ def __test_a_flat_snapshot_right_after_a_fill_only_starts_the_clock__():
     # Bounded: the venue is STILL flat past the grace and the fill is no
     # longer recent — the flatten really was external, the state clears.
     aged = time.monotonic() - EXTERNAL_FLATTEN_CONFIRM_GRACE_S - 1.0
-    engine._flat_observed_with_intents_since = aged  # type: ignore[attr-defined]
+    engine._flat_observed_since = aged  # type: ignore[attr-defined]
+    engine._last_position_fill_monotonic = aged  # type: ignore[attr-defined]
+    engine.reconcile()
+    assert pos.size == 0.0
+
+
+def __test_a_flat_snapshot_with_nothing_tracked_in_flight_only_starts_the_clock__():
+    """Our own close whose tracking is already retired must not read as external.
+
+    The cTrader resting-lane incident (cycles 210, 238, 245): a
+    partial-bracket trigger close is dispatched and retires its own tracking
+    at once — the synthetic mapping goes, and with no legs left the ExitIntent
+    too. The same sync's periodic reconcile drained an empty queue, read the
+    venue already flat, and with no intent, no recent fill and no reversal to
+    gate on, cleared the book on the first observation. The close's own fill,
+    booked on the next drain, then walked the empty FIFO into a phantom
+    opposite position. A flat snapshot must only start the confirmation
+    clock; the fill arriving within the grace settles the book flat.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 0.01)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 0.01, 84_000.0, pine_id="L"))
+    assert pos.size == 0.01
+
+    # The entry fill is long past; the trigger close retired every tracking
+    # entry the gate could see before its own fill reached the queue.
+    engine._last_position_fill_monotonic = (  # type: ignore[attr-defined]
+        time.monotonic() - EXTERNAL_FLATTEN_CONFIRM_GRACE_S - 1.0)
+    engine._active_intents.clear()  # type: ignore[attr-defined]
+    b.position = None
+    engine.reconcile()
+    assert pos.size == 0.01, "a flat snapshot must not clear the book at once"
+
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 0.01, 84_796.52, pine_id="", leg=LegType.CLOSE,
+                    xchg_id="xchg-close", fill_id="close-1"),
+        pine_id=None, from_entry="__pyne_partial_trigger__L-X2\0L\0tp_partial",
+    ))
+    assert pos.size == 0.0
+    assert pos.open_trades == []
+    engine.reconcile()
+    assert pos.size == 0.0
+    assert engine._flat_observed_since == 0.0  # type: ignore[attr-defined]
+
+
+def __test_a_fill_restarts_the_external_flatten_clock__():
+    """A position booked inside an old confirmation window gets its own window.
+
+    The clock confirms that the venue stayed flat while the book did not
+    move. A full close followed by a fresh opposite entry between two
+    reconcile passes moves the book twice; a stale flat snapshot right after
+    the new entry must only start a new clock, not inherit the old window's
+    age and clear the fresh position together with its tracking.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    assert pos.size == 1.0
+
+    # A flat snapshot starts the clock; the window is nearly over.
+    b.position = None
+    engine.reconcile()
+    assert pos.size == 1.0
+    engine._flat_observed_since = (  # type: ignore[attr-defined]
+        time.monotonic() - EXTERNAL_FLATTEN_CONFIRM_GRACE_S - 1.0)
+
+    # Our close and a new short entry both book before the next reconcile.
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 50_100.0, pine_id="", leg=LegType.CLOSE,
+                    xchg_id="xchg-close", fill_id="close-1"),
+        pine_id=None, from_entry="L",
+    ))
+    assert pos.size == 0.0
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 50_100.0, pine_id="S", xchg_id="xchg-short",
+                    fill_id="short-1"))
+    assert pos.size == -1.0
+    assert engine._flat_observed_since == 0.0  # type: ignore[attr-defined]
+
+    # The venue read predates the short entry: only a fresh clock starts.
+    engine.reconcile()
+    assert pos.size == -1.0, "a fill must restart the flatten confirmation"
+    assert len(pos.open_trades) == 1
+
+    # Still flat past the new window with the book unmoved: external.
+    aged = time.monotonic() - EXTERNAL_FLATTEN_CONFIRM_GRACE_S - 1.0
+    engine._flat_observed_since = aged  # type: ignore[attr-defined]
     engine._last_position_fill_monotonic = aged  # type: ignore[attr-defined]
     engine.reconcile()
     assert pos.size == 0.0
@@ -3186,11 +3278,17 @@ def __test_sync_skips_periodic_reconcile_rate_limit_then_recovers__():
     assert b.get_position_calls == reads_after_throttle, "read issued while throttled"
     assert pos.size == 100.0
 
-    # Throttle expires -> the very next poll reconciles against the flat broker.
+    # Throttle expires -> the very next poll reads the flat broker and starts
+    # the external-flatten confirmation clock; past the grace the book clears.
     engine._read_backoff_until = 0.0
     engine.sync(BAR_TS + 120_000)
 
     assert b.get_position_calls > reads_after_throttle
+    assert pos.size == 100.0
+    assert engine._flat_observed_since > 0.0  # type: ignore[attr-defined]
+    engine._flat_observed_since = (  # type: ignore[attr-defined]
+        time.monotonic() - EXTERNAL_FLATTEN_CONFIRM_GRACE_S - 1.0)
+    engine.sync(BAR_TS + 180_000)
     assert pos.size == 0.0
     assert pos.open_trades == []
 
@@ -6437,6 +6535,10 @@ def __test_reconcile_spot_dust_clears_without_external_close_warning__(caplog):
     pos.sign = 1.0
     pos.avg_price = 1924.07
 
+    engine.reconcile()
+    assert pos.size == 0.000007, "flat observation must not clear immediately"
+    engine._flat_observed_since = (  # type: ignore[attr-defined]
+        time.monotonic() - EXTERNAL_FLATTEN_CONFIRM_GRACE_S - 1.0)
     with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
         engine.reconcile()
 
@@ -6464,6 +6566,10 @@ def __test_reconcile_spot_position_above_dust_threshold_warns_external_close__(c
     pos.sign = 1.0
     pos.avg_price = 1924.07
 
+    engine.reconcile()
+    assert pos.size == 0.00002, "flat observation must not clear immediately"
+    engine._flat_observed_since = (  # type: ignore[attr-defined]
+        time.monotonic() - EXTERNAL_FLATTEN_CONFIRM_GRACE_S - 1.0)
     with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
         engine.reconcile()
 
@@ -9386,6 +9492,12 @@ def __test_periodic_reconcile_clears_state_on_external_flatten__():
     engine._sync_count = 1  # simulate post-startup periodic call
 
     engine.reconcile()
+    assert pos.size == 100.0, "flat observation must not clear immediately"
+
+    # Still flat past the grace with the book unmoved: external flatten.
+    engine._flat_observed_since = (  # type: ignore[attr-defined]
+        time.monotonic() - EXTERNAL_FLATTEN_CONFIRM_GRACE_S - 1.0)
+    engine.reconcile()
 
     assert pos.size == 0.0
     assert pos.open_trades == []
@@ -9444,6 +9556,11 @@ def __test_sync_skips_periodic_reconcile_connection_error__():
     b.position = None
     engine.sync(BAR_TS + 60_000)
 
+    assert pos.size == 100.0
+    assert engine._flat_observed_since > 0.0  # type: ignore[attr-defined]
+    engine._flat_observed_since = (  # type: ignore[attr-defined]
+        time.monotonic() - EXTERNAL_FLATTEN_CONFIRM_GRACE_S - 1.0)
+    engine.sync(BAR_TS + 120_000)
     assert pos.size == 0.0
     assert pos.open_trades == []
 

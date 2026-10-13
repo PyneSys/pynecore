@@ -1557,19 +1557,13 @@ class OrderSyncEngine:
 
         # External-flatten confirmation clock: first ``monotonic()`` moment a
         # periodic reconcile observed the venue flat while the book was not
-        # AND ``_active_intents`` was non-empty (an in-flight close/exit fill
-        # of our own flattens ``/positions`` seconds before its OrderEvent
-        # arrives, so the observation alone proves nothing). ``0.0`` = not
-        # observing. If the venue stays flat past
-        # :meth:`_fill_report_grace_s` with no fill having
-        # reconciled the book, the flatten is external and the position
-        # state is cleared — an armed bracket keeps an ``ExitIntent`` in
-        # ``_active_intents`` for the position's whole life, so returning
-        # unconditionally on any active intent left external-flatten
-        # detection permanently dead for every protected bot (measured on
-        # the Bybit lane: a venue-closed position kept a stale book for 47
-        # minutes and mis-sized the next reversal).
-        self._flat_observed_with_intents_since = 0.0
+        # (an in-flight fill of our own flattens ``/positions`` before its
+        # OrderEvent is booked, so the observation alone proves nothing).
+        # ``0.0`` = not observing; every fill booked into the position resets
+        # it (:meth:`_route_event`). If the venue stays flat past
+        # :meth:`_fill_report_grace_s` with no fill having moved the book,
+        # the flatten is external and the position state is cleared.
+        self._flat_observed_since = 0.0
 
         # ``monotonic()`` moment the last fill was booked into the position
         # (:meth:`_route_event` → ``record_fill``). The external-flatten
@@ -4779,51 +4773,28 @@ class OrderSyncEngine:
                 )
                 self._adopt_signed_size(broker_signed, broker_entry_price)
         elif not is_startup and new_size == 0.0 and self._position.size != 0.0:
-            # Wait while bot-initiated work may be in flight — a close we
-            # dispatched ourselves will flatten /positions seconds before
-            # the matching ``OrderEvent`` reaches the queue. Pre-empting the
-            # event here would zero the position; the closing fill (which
-            # arrives with a non-zero ``signed_delta``) would then enter
-            # ``record_fill``'s ``Opening`` branch and be miscounted as a
-            # fresh entry in the opposite direction. The wait is BOUNDED:
-            # an armed bracket keeps an ``ExitIntent`` in
-            # ``_active_intents`` for the position's whole life, so an
-            # unconditional return here would disable external-flatten
-            # detection for every protected bot — a venue-closed position
-            # whose fill the plugin failed to attribute then keeps a stale
-            # book for the rest of the cycle and mis-sizes every later
-            # reversal close. An in-flight fill of our own arrives within
-            # seconds; a venue still flat after the grace with the book
-            # unmoved is an external flatten.
-            #
-            # The mirror race also needs the grace: a just-recorded ENTRY
-            # fill can precede the venue snapshot reflecting it (the
-            # /positions read raced the execution stream), so the snapshot
-            # still shows the PRE-fill flat. With no active intents — the
-            # bot's cancel lost to the fill and emptied the slots, and the
-            # script has not seen the position yet so no exit is armed —
-            # gating on intents alone cleared the freshly-booked position
-            # instantly, leaving a live venue leg nobody owned (measured on
-            # the Bybit resting lane). A fill recorded within the grace
-            # therefore starts the SAME bounded confirmation clock.
-            #
-            # A parked reversal is bot-initiated work in flight too: its
-            # close leg lives in ``_pending_reversal_opens``, NOT in
-            # ``_active_intents`` (the close dispatches synchronously and
-            # only the marker survives), so gating on intents alone let a
-            # glitched flat /positions read clear the book seconds before
-            # the reversal close's own fill arrived — the fill then walked
-            # an empty FIFO (measured on the Capital.com pyramid lane).
+            # A flat venue next to a holding book proves nothing on its own:
+            # every fill of ours flattens /positions before its OrderEvent is
+            # booked. The plugin delivers the event within its fill-report
+            # grace, so the flatten is external only when the venue stays flat
+            # for the grace with the book unmoved — the same confirmation
+            # the shrink branch below applies. The book is
+            # never cleared on the first observation, whatever is in flight:
+            # a dispatch can retire its own tracking before its fill arrives
+            # (a partial-bracket trigger close drops its synthetic mapping
+            # and, with no legs left, the ExitIntent too), and a periodic
+            # reconcile in the same sync then read the venue flat with
+            # nothing left to gate on — the close's own fill walked the
+            # cleared FIFO into a phantom opposite position (measured on the
+            # cTrader resting lane, cycles 210, 238 and 245). A just-booked
+            # ENTRY fill needs the grace too: the venue snapshot can predate
+            # it (the /positions read raced the execution stream).
             now = time.monotonic()
-            grace = self._fill_report_grace_s()
-            recent_fill = now - self._last_position_fill_monotonic < grace
-            if (self._active_intents or recent_fill
-                    or self._pending_reversal_opens):
-                if self._flat_observed_with_intents_since == 0.0:
-                    self._flat_observed_with_intents_since = now
-                if now - self._flat_observed_with_intents_since < grace:
-                    return
-            self._flat_observed_with_intents_since = 0.0
+            if self._flat_observed_since == 0.0:
+                self._flat_observed_since = now
+            if now - self._flat_observed_since < self._fill_report_grace_s():
+                return
+            self._flat_observed_since = 0.0
             spot_port = getattr(self._broker, 'spot_inventory_port', None)
             dust_threshold = getattr(
                 spot_port, 'position_dust_threshold', Decimal(0),
@@ -4867,12 +4838,12 @@ class OrderSyncEngine:
                 self._cleanup_position_tracking(entry_id)
         elif (not is_startup and exch_pos is not None
               and self._external_shrink_delta(exch_pos) > 0.0):
-            self._flat_observed_with_intents_since = 0.0
+            self._flat_observed_since = 0.0
             self._adopt_external_shrink(exch_pos)
         else:
             # Venue and book agree (or the book is already flat): any earlier
             # flat or shrink observation is obsolete.
-            self._flat_observed_with_intents_since = 0.0
+            self._flat_observed_since = 0.0
             self._shrink_observed = None
         self._enforce_reduce_coverage_invariant(exch_pos)
 
@@ -6565,6 +6536,11 @@ class OrderSyncEngine:
                 self._note_unbooked_exit_fill(event)
             self._position.record_fill(event)
             self._last_position_fill_monotonic = time.monotonic()
+            # The book moved, so a running external-flatten confirmation no
+            # longer measures an unmoved book: a later flat snapshot starts a
+            # fresh clock instead of clearing a position booked inside the
+            # old window.
+            self._flat_observed_since = 0.0
             self._last_fifo_closed_entry_ids = [
                 trade.entry_id
                 for trade in self._position.new_closed_trades[closed_count_before:]
