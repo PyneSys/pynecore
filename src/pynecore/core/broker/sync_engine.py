@@ -200,9 +200,10 @@ EVENT_STREAM_RESTART_BACKOFF_S: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 30.0)
 #: plugin call — escalates to the controlled halt.
 _WRITE_CLASSIFICATION_GRACE_MULT = 3.0
 
-#: Seconds the periodic reconcile keeps waiting after first observing the
-#: venue flat against a non-flat book WHILE intents are active, before
-#: concluding an external flatten. An in-flight fill of our own (a close /
+#: Default of :attr:`BrokerPlugin.fill_report_grace_s` for a plugin that does
+#: not declare its own. Seconds the periodic reconcile keeps waiting after first
+#: observing the venue flat against a non-flat book WHILE intents are active,
+#: before concluding an external flatten. An in-flight fill of our own (a close /
 #: TP / SL we dispatched) flattens ``/positions`` seconds before its
 #: OrderEvent arrives, so an immediate clear would double-book it; a venue
 #: still flat past this window with the book unmoved — no fill reconciled
@@ -1560,7 +1561,7 @@ class OrderSyncEngine:
         # of our own flattens ``/positions`` seconds before its OrderEvent
         # arrives, so the observation alone proves nothing). ``0.0`` = not
         # observing. If the venue stays flat past
-        # :data:`EXTERNAL_FLATTEN_CONFIRM_GRACE_S` with no fill having
+        # :meth:`_fill_report_grace_s` with no fill having
         # reconciled the book, the flatten is external and the position
         # state is cleared — an armed bracket keeps an ``ExitIntent`` in
         # ``_active_intents`` for the position's whole life, so returning
@@ -4814,14 +4815,13 @@ class OrderSyncEngine:
             # the reversal close's own fill arrived — the fill then walked
             # an empty FIFO (measured on the Capital.com pyramid lane).
             now = time.monotonic()
-            recent_fill = (now - self._last_position_fill_monotonic
-                           < EXTERNAL_FLATTEN_CONFIRM_GRACE_S)
+            grace = self._fill_report_grace_s()
+            recent_fill = now - self._last_position_fill_monotonic < grace
             if (self._active_intents or recent_fill
                     or self._pending_reversal_opens):
                 if self._flat_observed_with_intents_since == 0.0:
                     self._flat_observed_with_intents_since = now
-                if (now - self._flat_observed_with_intents_since
-                        < EXTERNAL_FLATTEN_CONFIRM_GRACE_S):
+                if now - self._flat_observed_with_intents_since < grace:
                     return
             self._flat_observed_with_intents_since = 0.0
             spot_port = getattr(self._broker, 'spot_inventory_port', None)
@@ -4914,7 +4914,7 @@ class OrderSyncEngine:
     def _settle_unbooked_exit_fills(self, exch_pos: ExchangePosition | None) -> None:
         """Settle held exit fills (:meth:`_note_unbooked_exit_fill`) against the venue.
 
-        Once no fill has routed for :data:`EXTERNAL_FLATTEN_CONFIRM_GRACE_S`,
+        Once no fill has routed for :meth:`_fill_report_grace_s`,
         nothing of ours is in flight, and the venue has reported the same size
         for that long, the venue decides between the two possible cases:
 
@@ -4935,7 +4935,8 @@ class OrderSyncEngine:
         if not self._unbooked_exit_ids:
             return
         now = time.monotonic()
-        if (now - self._last_position_fill_monotonic < EXTERNAL_FLATTEN_CONFIRM_GRACE_S
+        grace = self._fill_report_grace_s()
+        if (now - self._last_position_fill_monotonic < grace
                 or self._position_work_in_flight()):
             self._unbooked_exit_observed = None
             return
@@ -4944,7 +4945,7 @@ class OrderSyncEngine:
         if observed is None or observed[0] != venue:
             self._unbooked_exit_observed = (venue, now)
             return
-        if now - observed[1] < EXTERNAL_FLATTEN_CONFIRM_GRACE_S:
+        if now - observed[1] < grace:
             return
         book = self._position.size
         delta = self._unbooked_exit_delta
@@ -5176,7 +5177,7 @@ class OrderSyncEngine:
 
         A snapshot can also run ahead of our own fill stream, so the shrink
         is adopted only once it is PROVEN external: the venue has reported
-        the same reduced size for :data:`EXTERNAL_FLATTEN_CONFIRM_GRACE_S`,
+        the same reduced size for :meth:`_fill_report_grace_s`,
         no fill routed in that window, and nothing of ours is in flight that
         could explain it (parked dispatches, pending defensive / reversal /
         surplus closes, a dispatched close). The reduction is then booked as
@@ -5190,19 +5191,18 @@ class OrderSyncEngine:
         delta = self._external_shrink_delta(exch_pos)
         venue_abs = abs(float(exch_pos.size))
         now = time.monotonic()
+        grace = self._fill_report_grace_s()
         observed = self._shrink_observed
         if observed is None or observed[0] != venue_abs:
             self._shrink_observed = (venue_abs, now)
             _blog_warning(
                 "exchange holds %s but the book %s — confirming the external "
                 "reduction of %s over the next %.0fs before adopting it",
-                venue_abs, self._position.size, delta,
-                EXTERNAL_FLATTEN_CONFIRM_GRACE_S,
+                venue_abs, self._position.size, delta, grace,
             )
             return
-        if (now - observed[1] < EXTERNAL_FLATTEN_CONFIRM_GRACE_S
-                or now - self._last_position_fill_monotonic
-                < EXTERNAL_FLATTEN_CONFIRM_GRACE_S):
+        if (now - observed[1] < grace
+                or now - self._last_position_fill_monotonic < grace):
             return
         if self._position_work_in_flight():
             return
@@ -5243,7 +5243,7 @@ class OrderSyncEngine:
             "(FIFO over entries %s; realized P&L on the adopted piece is "
             "approximate), book now %s; fully consumed entries retired: %s",
             venue_abs, round(abs(self._position.size) + delta, 12),
-            EXTERNAL_FLATTEN_CONFIRM_GRACE_S, delta, side, price,
+            grace, delta, side, price,
             sorted(consumed), self._position.size, gone or 'none',
         )
         for entry_id in gone:
@@ -5258,6 +5258,15 @@ class OrderSyncEngine:
                          'consumed': sorted(consumed), 'retired': gone,
                          'book_size': self._position.size},
             )
+
+    def _fill_report_grace_s(self) -> float:
+        """Seconds a venue position change may precede the fill event explaining it.
+
+        The plugin's :attr:`BrokerPlugin.fill_report_grace_s` when it declares
+        one, :data:`EXTERNAL_FLATTEN_CONFIRM_GRACE_S` otherwise.
+        """
+        grace = getattr(self._broker, 'fill_report_grace_s', None)
+        return EXTERNAL_FLATTEN_CONFIRM_GRACE_S if grace is None else float(grace)
 
     def _position_work_in_flight(self) -> bool:
         """Whether work of ours that could still move the position is in flight.

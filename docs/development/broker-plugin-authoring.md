@@ -228,9 +228,9 @@ arrive late or out of order (a recovery backfill after an outage, a fill
 surfaced by a slower namespace). An exit-leg fill that would not reduce
 the book — the book is flat, or holds the fill's own side — is never
 booked as a new position. The engine holds it and settles it against
-`get_position()` once no fill has arrived for the confirmation grace,
-nothing of its own is in flight and the venue size has been stable for
-that long:
+`get_position()` once no fill has arrived for the fill report grace
+(see below), nothing of its own is in flight and the venue size has been
+stable for that long:
 
 - venue = book: the fill was already accounted for and is dropped;
 - venue = book + the fill: an earlier fill was booked out of order, and the
@@ -246,6 +246,20 @@ So the plugin must: honour the declared reduce-only semantics on every
 exit path; label a fill `LegType.ENTRY` whenever it opened exposure, never
 as an exit leg; and report the venue's net size with its side from
 `get_position()`.
+
+**Declare `fill_report_grace_s`.** The same window decides when a venue
+position that differs from the book counts as an external flatten or
+reduction. It is the longest time a position change can show in
+`get_position()` before the fill event that explains it arrives through
+`watch_orders()` with a healthy stream: the venue's publication lag plus
+the plugin's poll or backfill cadence for that fill. Left at `None`, the
+engine uses its conservative default (120 s), sized for polled venues
+whose activity feed publishes a deal up to a minute late. A push-stream
+venue that delivers fills in seconds declares its own worst case, so the
+bot reacts in seconds instead of minutes. Too short a value is the
+dangerous direction: the engine would book a change that the late fill
+then books a second time. The startup contract probe rejects anything but
+`None` or a positive, finite number.
 
 ## Capabilities: declare what you deliver end-to-end
 

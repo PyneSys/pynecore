@@ -108,6 +108,7 @@ class MockBroker:
     """
     client_order_id_max_len = 30  # BrokerPlugin contract attribute
     on_unexpected_cancel = "stop"  # BrokerPlugin contract attribute
+    fill_report_grace_s: float | None = None  # BrokerPlugin contract attribute
     entry_calls: list[DispatchEnvelope] = field(default_factory=list)
     exit_calls: list[DispatchEnvelope] = field(default_factory=list)
     close_calls: list[DispatchEnvelope] = field(default_factory=list)
@@ -6855,6 +6856,26 @@ def __test_external_partial_reduction_is_adopted_after_the_confirmation_window__
     assert engine.active_intents[key].qty == pytest.approx(0.6)
 
 
+def __test_external_reduction_waits_the_plugin_declared_fill_report_grace__():
+    """A plugin's ``fill_report_grace_s`` replaces the engine default window."""
+    b = MockBroker()
+    b.fill_report_grace_s = 5.0
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+    _list_resting_stops(b, engine, pos)
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.6, entry_price=50_000.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cross",
+    )
+    engine.reconcile()
+    _age_shrink_observation(engine, 4.0)
+    engine.reconcile()
+    assert pos.size == 1.0  # still inside the declared 5 s
+    _age_shrink_observation(engine, 2.0)
+    engine.reconcile()
+    assert pos.size == pytest.approx(0.6)
+
+
 def __test_external_reduction_consuming_a_pyramid_parent_retires_it__():
     """FIFO consumption of a whole parent cancels its exit and drops its tracking."""
     from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S
@@ -6995,6 +7016,23 @@ def __test_late_exit_fill_booked_out_of_order_takes_the_venue_size__():
     assert pos.avg_price == 49_500.0
     assert [round(t.size, 12) for t in pos.open_trades] == [-1.0]
     assert engine._unbooked_exit_ids == []  # type: ignore[attr-defined]
+
+
+def __test_late_exit_fill_settles_within_the_plugin_declared_grace__():
+    """A short declared fill report grace settles the held fill in seconds."""
+    b = MockBroker()
+    b.fill_report_grace_s = 3.0
+    engine, pos = _mk_engine(b)
+    _book_long_then_late_stop_loss(engine, pos)
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="short", size=1.0, entry_price=49_500.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cross",
+    )
+    engine._last_position_fill_monotonic -= 3.5  # type: ignore[attr-defined]
+    engine.reconcile()
+    _age_unbooked_exit_observation(engine, 3.5)
+    engine.reconcile()
+    assert pos.size == -1.0
 
 
 def __test_late_exit_fill_the_venue_cannot_attribute_is_dropped__():

@@ -190,6 +190,9 @@ def validate_plugin_contract(
       at least :data:`~pynecore.core.broker.idempotency.WIRE_CLIENT_ORDER_ID_MIN_LEN`;
       the wire-form client-order-id cannot stay deterministic-and-recognisable
       below that.
+    - **Fill report grace** — ``fill_report_grace_s`` must be ``None`` or a
+      positive, finite number of seconds; the engine's external-change
+      detection waits that long.
     - **Lifecycle** — with ``require_account_id=True`` the plugin must have
       populated ``_account_id`` during authentication *before* the broker
       storage derives the run identity from it; a silent ``"default"``
@@ -289,6 +292,16 @@ def validate_plugin_contract(
             f"wire-form client-order-id needs 14 raw prefix characters plus "
             f"a >=6-character hash tail to keep restart adoption sound. "
             f"Venues with shorter client-id fields are not supportable."
+        )
+
+    grace = plugin.fill_report_grace_s
+    if grace is not None and (
+            isinstance(grace, bool) or not isinstance(grace, (int, float))
+            or not math.isfinite(grace) or grace <= 0.0):
+        errors.append(
+            f"{name}.fill_report_grace_s is {grace!r} — must be None (the "
+            f"engine default) or a positive, finite number of seconds: the "
+            f"longest time a position change can precede its fill event."
         )
 
     # --- Override pairs ---

@@ -6,6 +6,8 @@ Unlike the duck-typed mocks in the runner tests, every plugin here is a REAL
 against the base class, so only genuine overrides count. The abstract surface
 is stubbed minimally; nothing is ever connected or executed.
 """
+import pytest
+
 from pynecore.core.broker.models import (
     CancelDispositionOutcome,
     CapabilityLevel,
@@ -197,6 +199,29 @@ def __test_non_int_budget_rejected__():
 
     errors, _ = validate_plugin_contract(_BoolBudget())
     assert any('client_order_id_max_len' in e for e in errors)
+
+
+# === Fill report grace ===
+
+
+@pytest.mark.parametrize("grace", [None, 5, 2.5, 120.0])
+def __test_fill_report_grace_valid_declarations_are_clean__(grace):
+    """``None`` (engine default) or a positive number of seconds is accepted."""
+    class _Grace(_ConformingPlugin):
+        fill_report_grace_s = grace
+
+    errors, _ = validate_plugin_contract(_Grace())
+    assert errors == []
+
+
+@pytest.mark.parametrize("grace", [0, -1.0, float('inf'), float('nan'), True, "5"])
+def __test_fill_report_grace_invalid_declarations_rejected__(grace):
+    """Zero, negative, non-finite, bool or non-numeric graces are errors."""
+    class _Grace(_ConformingPlugin):
+        fill_report_grace_s = grace
+
+    errors, _ = validate_plugin_contract(_Grace())
+    assert any('fill_report_grace_s' in e for e in errors)
 
 
 def __test_watch_orders_declared_but_not_overridden__():

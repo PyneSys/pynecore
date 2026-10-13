@@ -249,6 +249,24 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     latency may override.
     """
 
+    fill_report_grace_s: float | None = None
+    """
+    Longest time, in seconds, a position change can show in :meth:`get_position`
+    before the fill event that explains it arrives through :meth:`watch_orders`,
+    while the stream is healthy: the venue's own publication lag plus the
+    plugin's poll or backfill cadence for that fill.
+
+    The engine waits this long before it treats a venue position that differs
+    from the book as unexplained by fills of its own: an external flatten or
+    reduction, and the settlement of a held exit fill. A window shorter than the
+    real worst case lets the engine book a change that a late fill then books a
+    second time; a longer one only delays the reaction.
+
+    ``None`` (default) uses the engine's conservative built-in value
+    (``EXTERNAL_FLATTEN_CONFIRM_GRACE_S``, currently 120 seconds). A plugin that
+    knows its venue's worst case declares it.
+    """
+
     on_unexpected_cancel: str = "stop"
     """
     Policy for bot-owned orders that disappear without the bot cancelling them.
