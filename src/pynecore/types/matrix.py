@@ -46,10 +46,10 @@ class Matrix(Generic[T]):
         The row can consist of NA values, or an array can be used to provide values.
 
         :param row: The index where the new row will be inserted. If None, appends to the end.
-        :param array_id: Array to use for providing values to the new row. If shorter than matrix
-                        width, remaining cells are filled with NA. If longer, array is truncated.
-                        If matrix is empty, the array size determines the column count.
+        :param array_id: Array whose size must match the column count. A 0x0 matrix takes its
+                        column count from the array size.
         :raises IndexError: If row index is out of bounds.
+        :raises ValueError: If the array size does not match the column count.
         """
         row_idx: int = self.rows if row is None else row
 
@@ -57,16 +57,13 @@ class Matrix(Generic[T]):
             raise IndexError(f"Row index {row_idx} out of bounds for matrix with {self.rows} rows")
 
         if array_id is not None:
-            # If matrix is empty (0 columns), use array size to set column count
-            if self.cols == 0 and len(array_id) > 0:
-                self.cols = len(array_id)
-
-            new_row = []
-            for i in range(self.cols):
-                if i < len(array_id):
-                    new_row.append(array_id[i])
-                else:
-                    new_row.append(NA(T))
+            if (self.rows != 0 or self.cols != 0) and len(array_id) != self.cols:
+                raise ValueError(
+                    f"Row array size {len(array_id)} does not match the matrix column count "
+                    f"{self.cols}"
+                )
+            self.cols = len(array_id)
+            new_row = array_id.copy()
         else:
             new_row = [NA(T) for _ in range(self.cols)]
 
@@ -982,24 +979,29 @@ class Matrix(Generic[T]):
         The column can consist of NA values, or an array can be used to provide values.
 
         :param col: The index where the new column will be inserted. If None, appends to the end.
-        :param array_id: Array to use for providing values to the new column.
-                        If matrix is empty, the array size determines the row count.
+        :param array_id: Array whose size must match the row count. A 0x0 matrix takes its row
+                        count from the array size.
         :raises IndexError: If column index is out of bounds.
+        :raises ValueError: If the array size does not match the row count.
         """
         col_idx: int = self.cols if col is None else col
 
         if col_idx < 0 or col_idx > self.cols:
             raise IndexError(f"Column index {col_idx} out of bounds")
 
-        # If matrix is empty (0 rows) and array provided, create rows first
-        if self.rows == 0 and array_id and len(array_id) > 0:
-            self.rows = len(array_id)
-            self.data = [[] for _ in range(self.rows)]
-
-        for i in range(self.rows):
-            if array_id and i < len(array_id):
+        if array_id is not None:
+            if (self.rows != 0 or self.cols != 0) and len(array_id) != self.rows:
+                raise ValueError(
+                    f"Column array size {len(array_id)} does not match the matrix row count "
+                    f"{self.rows}"
+                )
+            if self.rows == 0:
+                self.rows = len(array_id)
+                self.data = [[] for _ in range(self.rows)]
+            for i in range(self.rows):
                 self.data[i].insert(col_idx, array_id[i])
-            else:
+        else:
+            for i in range(self.rows):
                 self.data[i].insert(col_idx, NA(T))
 
         self.cols += 1

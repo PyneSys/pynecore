@@ -92,7 +92,8 @@ def add_row(id: Matrix | NA, row: int | None = None, array_id: list[Any] | None 
 
     :param id: A matrix object.
     :param row: The index where the new row will be inserted. If None, appends to the end.
-    :param array_id: Array to use for providing values to the new row.
+    :param array_id: Array to use for providing values to the new row. Its size must match the
+                     column count; a 0x0 matrix takes its column count from it.
     """
     if isinstance(id, NA):
         return
@@ -106,7 +107,8 @@ def add_col(id: Matrix | NA, column: int | None = None, array_id: list[Any] | No
 
     :param id: A matrix object.
     :param column: The index where the new column will be inserted. If None, appends to the end.
-    :param array_id: Array to use for providing values to the new column.
+    :param array_id: Array to use for providing values to the new column. Its size must match
+                     the row count; a 0x0 matrix takes its row count from it.
     """
     if isinstance(id, NA):
         return
