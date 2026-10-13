@@ -5,19 +5,18 @@ from pathlib import Path
 import pytest
 
 from pynecore.core.broker.defaults import (
-    BrokerDefaults,
     VALID_INVENTORY_CONFLICT_POLICIES,
     VALID_UNEXPECTED_CANCEL_POLICIES,
     load_broker_defaults,
 )
+from pynecore.core.config import _ensured
 
 
 @pytest.fixture(autouse=True)
 def _clear_ensured_cache():
-    """Drop the ``_ensured`` cache between tests so each call hits disk."""
+    """Drop the cached config instances between tests so each call hits disk."""
     yield
-    if hasattr(BrokerDefaults, '_ensured'):
-        del BrokerDefaults._ensured
+    _ensured.clear()
 
 
 def __test_missing_file_returns_safe_defaults__(tmp_path: Path) -> None:
@@ -93,8 +92,7 @@ def __test_inventory_conflict_policy_loaded_and_validated__(tmp_path: Path) -> N
     defaults = load_broker_defaults(tmp_path)
     assert defaults.on_inventory_conflict == 'halt'
 
-    if hasattr(BrokerDefaults, '_ensured'):
-        del BrokerDefaults._ensured
+    _ensured.clear()
     (tmp_path / 'brokers.toml').write_text(
         'on_inventory_conflict = "ignore"\n',
         encoding='utf-8',

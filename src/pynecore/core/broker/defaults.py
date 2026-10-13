@@ -86,8 +86,8 @@ def load_broker_defaults(config_dir: Path) -> BrokerDefaults:
 
     Delegates to :func:`pynecore.core.config.ensure_config`, which
     auto-creates the file with commented defaults on first run, preserves
-    user-edited values across regenerations, and caches the result on the
-    dataclass. Validation runs after loading — invalid values raise
+    user-edited values across regenerations, and caches the result per
+    class and file. Validation runs after loading — invalid values raise
     :class:`ValueError` with the list of accepted policies so the
     misconfiguration surfaces immediately at startup, not at the first
     reconcile cycle.

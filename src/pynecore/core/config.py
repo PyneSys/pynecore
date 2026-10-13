@@ -15,6 +15,7 @@ Convention::
 import ast
 import dataclasses
 import inspect
+import logging
 import os
 import stat
 import tempfile
@@ -22,6 +23,11 @@ import textwrap
 import tomllib
 from pathlib import Path
 from typing import Any, cast
+
+logger = logging.getLogger(__name__)
+
+# Instances returned by ensure_config, by config class and resolved file path
+_ensured: dict[tuple[type, Path], object] = {}
 
 
 class mlstr(str):
@@ -265,8 +271,9 @@ def ensure_config(config_cls: type, config_path: Path) -> object:
        wherever the file allows it (see :func:`_replace_file`).
     3. Return a populated dataclass instance with user values over defaults.
 
-    The result is cached on ``config_cls._ensured``, so repeated calls
-    return the same instance without file I/O.
+    The result is cached per config class and resolved file path, so repeated
+    calls for the same class and file return the same instance without file I/O.
+    A subclass or another file gets its own instance.
 
     TOML table sections (e.g. ``[binance]``) not managed by the dataclass
     are preserved verbatim at the end of the file.
@@ -275,8 +282,10 @@ def ensure_config(config_cls: type, config_path: Path) -> object:
     :param config_path: Path to the TOML file.
     :return: A populated config dataclass instance.
     """
-    if hasattr(config_cls, '_ensured'):
-        return config_cls._ensured
+    cache_key = (config_cls, config_path.resolve())
+    cached = _ensured.get(cache_key)
+    if cached is not None:
+        return cached
 
     existing = None
     user_values = None
@@ -293,18 +302,26 @@ def ensure_config(config_cls: type, config_path: Path) -> object:
         if not extra_content.endswith('\n'):
             toml_content += '\n'
 
-    # Several processes may run at once and each reads the file here. A reader that
-    # met a truncated file mid-write would find no user values in it and write the
-    # bare template back over them, so an existing file is replaced atomically
-    # wherever it can be.
-    if existing is None:
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(toml_content, encoding='utf-8')
-    elif toml_content != existing:
-        _replace_file(config_path, toml_content)
+    # A file that does not parse would load this once and then fail every later start,
+    # so the file on disk is left as it is
+    try:
+        tomllib.loads(toml_content)
+    except tomllib.TOMLDecodeError as e:
+        logger.warning("Config file %s was not updated, its regenerated content is "
+                       "not valid TOML: %s", config_path, e)
+    else:
+        # Several processes may run at once and each reads the file here. A reader
+        # that met a truncated file mid-write would find no user values in it and
+        # write the bare template back over them, so an existing file is replaced
+        # atomically wherever it can be.
+        if existing is None:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(toml_content, encoding='utf-8')
+        elif toml_content != existing:
+            _replace_file(config_path, toml_content)
 
     instance = _create_instance(config_cls, user_values)
-    config_cls._ensured = instance
+    _ensured[cache_key] = instance
     return instance
 
 
@@ -411,11 +428,10 @@ def _extract_extra_sections(content: str, field_names: set[str] | None = None) -
     lines = content.splitlines()
     out: list[str] = []
     skipping = False
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith('[') and not stripped.startswith('#'):
+    for index, line in enumerate(lines):
+        header = _table_header_root(lines, index)
+        if header is not None:
             # New section header — decide whether to keep or drop.
-            header = stripped.strip('[]').split('.', 1)[0]
             skipping = field_names is not None and header in field_names
             if not skipping:
                 out.append(line)
@@ -425,6 +441,30 @@ def _extract_extra_sections(content: str, field_names: set[str] | None = None) -
             if out:
                 out.append(line)
     return '\n'.join(out)
+
+
+def _table_header_root(lines: list[str], index: int) -> str | None:
+    """
+    Return the root key of the table header on a line of a TOML file.
+
+    A line is a table header when it parses as one on its own (quoted keys,
+    whitespace inside the brackets and a trailing comment included) and the lines
+    before it are complete TOML, so it is not part of a multi-line string or array.
+
+    :param lines: Lines of a valid TOML file.
+    :param index: Index of the line to check.
+    :return: The decoded first key of the header (``a`` for ``[a.b]``,
+             ``["a"]`` or ``[[a]]``), or ``None`` when the line is not a header.
+    """
+    stripped = lines[index].strip()
+    if not stripped.startswith('['):
+        return None
+    try:
+        header = tomllib.loads(stripped)
+        tomllib.loads('\n'.join(lines[:index]))
+    except tomllib.TOMLDecodeError:
+        return None
+    return next(iter(header))
 
 
 def _create_instance(config_cls: type, user_values: dict | None):

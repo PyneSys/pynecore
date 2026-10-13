@@ -2,12 +2,15 @@
 
 import stat
 import sys
-from dataclasses import dataclass
+import tomllib
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
+from pynecore.core import config as config_module
 from pynecore.core.config import (
+    _ensured,
     ensure_config,
     extract_field_docs,
     format_value,
@@ -21,9 +24,7 @@ from pynecore.core.config import (
 def _clear_ensured_cache():
     """Clear cached config instances between tests."""
     yield
-    for cls in list(globals().values()):
-        if isinstance(cls, type) and hasattr(cls, '_ensured'):
-            del cls._ensured
+    _ensured.clear()
 
 
 @dataclass
@@ -72,7 +73,6 @@ def __test_format_value_multiline_str__():
     assert rendered.endswith("'''")
     assert "-----BEGIN EC PRIVATE KEY-----" in rendered
 
-    import tomllib
     parsed = tomllib.loads(f"key = {rendered}\n")
     assert parsed["key"] == pem
 
@@ -131,8 +131,7 @@ def __test_mlstr_field_round_trip__(tmp_path: Path):
     pem = "-----BEGIN KEY-----\nABC\n-----END KEY-----\n"
 
     cfg_path.write_text(f'secret = "{pem.replace(chr(10), chr(92) + "n")}"\n')
-    if hasattr(WithMlstr, "_ensured"):
-        del WithMlstr._ensured
+    _ensured.clear()
 
     inst = ensure_config(WithMlstr, cfg_path)
 
@@ -217,7 +216,7 @@ def __test_user_values_preserved__(tmp_path: Path):
     content = content.replace('#api_key = ""', 'api_key = "my_key"')
     content = content.replace("#enabled = false", "enabled = true")
     cfg_path.write_text(content)
-    del SampleConfig._ensured
+    _ensured.clear()
 
     result = ensure_config(SampleConfig, cfg_path)
 
@@ -243,7 +242,7 @@ def __test_new_field_appears__(tmp_path: Path):
     assert '#name = "default"' in content
 
     cfg_path.write_text('name = "custom"\n')
-    del MinimalConfig._ensured
+    _ensured.clear()
 
     result = ensure_config(SampleConfig, cfg_path)
 
@@ -262,7 +261,7 @@ def __test_removed_field_disappears__(tmp_path: Path):
     content = cfg_path.read_text()
     content = content.replace("#timeout = 30", "timeout = 60")
     cfg_path.write_text(content)
-    del SampleConfig._ensured
+    _ensured.clear()
 
     result = ensure_config(MinimalConfig, cfg_path)
 
@@ -331,7 +330,7 @@ def __test_extra_sections_preserved__(tmp_path: Path):
     content = cfg_path.read_text()
     content += '\n[binance]\napiKey = "binance_key"\nsecret = "binance_secret"\n'
     cfg_path.write_text(content)
-    del SampleConfig._ensured
+    _ensured.clear()
 
     result = ensure_config(SampleConfig, cfg_path)
 
@@ -339,6 +338,68 @@ def __test_extra_sections_preserved__(tmp_path: Path):
     assert "[binance]" in content
     assert 'apiKey = "binance_key"' in content
     assert 'secret = "binance_secret"' in content
+
+
+@dataclass
+class MapConfig:
+    """Configuration with a table field"""
+
+    api_key: str = ""
+    """API key for the service"""
+
+    symbol_map: dict = field(default_factory=dict)
+    """Symbol aliases"""
+
+
+@pytest.mark.parametrize("header", [
+    "[symbol_map] # provider aliases",
+    '["symbol_map"]',
+    "[ symbol_map ]",
+])
+def __test_field_table_header_forms_are_not_duplicated__(tmp_path: Path, header: str):
+    """A field's table section is regenerated once, whatever form its header takes."""
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(f'{header}\nEURUSD = "EUR/USD"\n\n["binance"] # venue\nx = 1\n')
+
+    result = ensure_config(MapConfig, cfg_path)
+
+    parsed = tomllib.loads(cfg_path.read_text())
+    assert parsed["symbol_map"] == {"EURUSD": "EUR/USD"}
+    assert parsed["binance"] == {"x": 1}
+    assert isinstance(result, MapConfig)
+    assert result.symbol_map == {"EURUSD": "EUR/USD"}
+
+
+def __test_header_like_lines_inside_values_are_not_headers__(tmp_path: Path):
+    """Lines of multi-line strings and arrays that look like headers stay in their value."""
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        '[binance]\n'
+        'note = """\n[symbol_map]\ntext\n"""\n'
+        'pairs = [\n[1, 2],\n]\n'
+        '\n[symbol_map]\nEURUSD = "EUR/USD"\n'
+    )
+
+    ensure_config(MapConfig, cfg_path)
+
+    parsed = tomllib.loads(cfg_path.read_text())
+    assert parsed["binance"] == {"note": "[symbol_map]\ntext\n", "pairs": [[1, 2]]}
+    assert parsed["symbol_map"] == {"EURUSD": "EUR/USD"}
+
+
+def __test_invalid_regenerated_content_is_not_written__(tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch):
+    """A regenerated file that would not parse leaves the file on disk unchanged."""
+    cfg_path = tmp_path / "config.toml"
+    original = 'api_key = "secret"\n'
+    cfg_path.write_text(original)
+    monkeypatch.setattr(config_module, "generate_toml", lambda *_args: "a = 1\na = 2\n")
+
+    result = ensure_config(SampleConfig, cfg_path)
+
+    assert cfg_path.read_text() == original
+    assert isinstance(result, SampleConfig)
+    assert result.api_key == "secret"
 
 
 def __test_ensure_config_returns_correct_instance__(tmp_path: Path):
@@ -437,7 +498,7 @@ def __test_unchanged_file_is_not_rewritten__(tmp_path: Path):
     content = cfg_path.read_text().replace('#api_key = ""', 'api_key = "secret"')
     cfg_path.write_text(content)
     before = cfg_path.stat()
-    del SampleConfig._ensured
+    _ensured.clear()
 
     ensure_config(SampleConfig, cfg_path)
 
@@ -484,3 +545,41 @@ def __test_hard_linked_file_is_written_in_place__(tmp_path: Path):
     content = other_path.read_text()
     assert 'api_key = "secret"' in content
     assert "#timeout = 30" in content
+
+
+@dataclass
+class ChildSampleConfig(SampleConfig):
+    """Subclass of the sample configuration"""
+
+    account: str = ""
+    """Account name"""
+
+
+def __test_subclass_does_not_reuse_parent_instance__(tmp_path: Path):
+    """A subclass reads and creates its own file after its parent was loaded."""
+    ensure_config(SampleConfig, tmp_path / "base.toml")
+    (tmp_path / "child.toml").write_text('api_key = "child-key"\naccount = "child-account"\n')
+
+    child = ensure_config(ChildSampleConfig, tmp_path / "child.toml")
+    assert isinstance(child, ChildSampleConfig)
+    assert child.api_key == "child-key"
+    assert child.account == "child-account"
+
+    created = ensure_config(ChildSampleConfig, tmp_path / "child2.toml")
+    assert isinstance(created, ChildSampleConfig)
+    assert created is not child
+    assert (tmp_path / "child2.toml").exists()
+
+
+def __test_second_file_gets_its_own_instance__(tmp_path: Path):
+    """The same class loaded from two files returns one instance per file."""
+    (tmp_path / "a.toml").write_text('api_key = "from-a"\n')
+    (tmp_path / "b.toml").write_text('api_key = "from-b"\n')
+
+    a = ensure_config(SampleConfig, tmp_path / "a.toml")
+    b = ensure_config(SampleConfig, tmp_path / "b.toml")
+    assert isinstance(a, SampleConfig) and isinstance(b, SampleConfig)
+    assert a.api_key == "from-a"
+    assert b.api_key == "from-b"
+    assert ensure_config(SampleConfig, tmp_path / "a.toml") is a
+    assert ensure_config(SampleConfig, tmp_path / "sub" / ".." / "a.toml") is a
