@@ -75,7 +75,7 @@ _C6 = -1.13596475577881948265e-11
 
 def _kernel_sin(x: float, y: float, iy: int) -> float:
     ix = _hi(x) & 0x7fffffff
-    if ix < 0x3e400000:                 # |x| < 2**-27
+    if ix < 0x3e400000:  # |x| < 2**-27
         return x
     z = x * x
     v = z * x
@@ -87,16 +87,16 @@ def _kernel_sin(x: float, y: float, iy: int) -> float:
 
 def _kernel_cos(x: float, y: float) -> float:
     ix = _hi(x) & 0x7fffffff
-    if ix < 0x3e400000:                 # |x| < 2**-27
+    if ix < 0x3e400000:  # |x| < 2**-27
         return 1.0
     z = x * x
     r = z * (_C1 + z * (_C2 + z * (_C3 + z * (_C4 + z * (_C5 + z * _C6)))))
-    if ix < 0x3FD33333:                 # |x| < 0.3
+    if ix < 0x3FD33333:  # |x| < 0.3
         return 1.0 - (0.5 * z - (z * r - x * y))
-    if ix > 0x3fe90000:                 # |x| > 0.78125
+    if ix > 0x3fe90000:  # |x| > 0.78125
         qx = 0.28125
     else:
-        qx = _b2f(((ix - 0x00200000) & _M32) << 32)     # x/4, low word zero
+        qx = _b2f(((ix - 0x00200000) & _M32) << 32)  # x/4, low word zero
     hz = 0.5 * z - qx
     a = 1.0 - qx
     return a - (hz - (z * r - x * y))
@@ -162,7 +162,7 @@ def _kernel_rem_pio2(x: list[float], e0: int, nx: int, prec: int) -> tuple[int, 
     jk: int = _INIT_JK[prec]
     jp = jk
     jx = nx - 1
-    jv = (e0 - 3) // 24 if e0 >= 3 else 0   # C int division truncates; e0>=?
+    jv = (e0 - 3) // 24 if e0 >= 3 else 0  # C int division truncates; e0>=?
     if jv < 0:
         jv = 0
     q0 = e0 - 24 * (jv + 1)
@@ -180,7 +180,7 @@ def _kernel_rem_pio2(x: list[float], e0: int, nx: int, prec: int) -> tuple[int, 
         q[i] = fw
 
     jz = jk
-    while True:                                     # recompute:
+    while True:  # recompute:
         i = 0
         j = jz
         z = q[jz]
@@ -230,7 +230,7 @@ def _kernel_rem_pio2(x: list[float], e0: int, nx: int, prec: int) -> tuple[int, 
             j = 0
             for i in range(jz - 1, jk - 1, -1):
                 j |= iq[i]
-            if j == 0:                              # need recomputation
+            if j == 0:  # need recomputation
                 k = 1
                 while iq[jk - k] == 0:
                     k += 1
@@ -241,7 +241,7 @@ def _kernel_rem_pio2(x: list[float], e0: int, nx: int, prec: int) -> tuple[int, 
                         fw += x[j] * f[jx + i - j]
                     q[i] = fw
                 jz += k
-                continue                            # goto recompute
+                continue  # goto recompute
         break
 
     if z == 0.0:
@@ -289,9 +289,9 @@ def _rem_pio2(x: float) -> tuple[int, float, float]:
     """__ieee754_rem_pio2: returns (n, y0, y1)."""
     hx = _hi(x)
     ix = hx & 0x7fffffff
-    if ix <= 0x3fe921fb:                    # |x| ~<= pi/4
+    if ix <= 0x3fe921fb:  # |x| ~<= pi/4
         return 0, x, 0.0
-    if ix < 0x4002d97c:                     # |x| < 3pi/4
+    if ix < 0x4002d97c:  # |x| < 3pi/4
         if hx > 0:
             z = x - _PIO2_1
             if ix != 0x3ff921fb:
@@ -311,7 +311,7 @@ def _rem_pio2(x: float) -> tuple[int, float, float]:
             y0 = z + _PIO2_2T
             y1 = (z - y0) + _PIO2_2T
         return -1, y0, y1
-    if ix <= 0x413921fb:                    # |x| ~<= 2^19*(pi/2)
+    if ix <= 0x413921fb:  # |x| ~<= 2^19*(pi/2)
         t = abs(x)
         n = int(t * _INVPIO2 + 0.5)
         fn = float(n)
@@ -323,14 +323,14 @@ def _rem_pio2(x: float) -> tuple[int, float, float]:
             j = ix >> 20
             y0 = r - w
             i = j - ((_hi(y0) >> 20) & 0x7ff)
-            if i > 16:                      # 2nd iteration, good to 118 bits
+            if i > 16:  # 2nd iteration, good to 118 bits
                 t2 = r
                 w = fn * _PIO2_2
                 r = t2 - w
                 w = fn * _PIO2_2T - ((t2 - r) - w)
                 y0 = r - w
                 i = j - ((_hi(y0) >> 20) & 0x7ff)
-                if i > 49:                  # 3rd iteration, 151 bits
+                if i > 49:  # 3rd iteration, 151 bits
                     t3 = r
                     w = fn * _PIO2_3
                     r = t3 - w
@@ -340,7 +340,7 @@ def _rem_pio2(x: float) -> tuple[int, float, float]:
         if hx < 0:
             return -n, -y0, -y1
         return n, y0, y1
-    if ix >= 0x7ff00000:                    # inf or NaN
+    if ix >= 0x7ff00000:  # inf or NaN
         return 0, x - x, x - x
     # all other (large) arguments
     lo = _lo(x)
@@ -419,18 +419,18 @@ def exp(x: float) -> float:
     hx &= 0x7fffffff
 
     hi = lo = 0.0
-    if hx >= 0x40862E42:                    # |x| >= 709.78...
+    if hx >= 0x40862E42:  # |x| >= 709.78...
         if hx >= 0x7ff00000:
             if ((hx & 0xfffff) | _lo(x)) != 0:
-                return x + x                # NaN
-            return x if xsb == 0 else 0.0   # exp(+-inf)
+                return x + x  # NaN
+            return x if xsb == 0 else 0.0  # exp(+-inf)
         if x > _O_THRESHOLD:
-            return _HUGE * _HUGE            # overflow
+            return _HUGE * _HUGE  # overflow
         if x < _U_THRESHOLD:
-            return _TWOM1000 * _TWOM1000    # underflow
+            return _TWOM1000 * _TWOM1000  # underflow
 
-    if hx > 0x3fd62e42:                     # |x| > 0.5 ln2
-        if hx < 0x3FF0A2B2:                 # |x| < 1.5 ln2
+    if hx > 0x3fd62e42:  # |x| > 0.5 ln2
+        if hx < 0x3FF0A2B2:  # |x| < 1.5 ln2
             hi = x - _LN2HI[xsb]
             lo = _LN2LO[xsb]
             k = 1 - xsb - xsb
@@ -440,7 +440,7 @@ def exp(x: float) -> float:
             hi = x - t * _LN2HI[0]
             lo = t * _LN2LO[0]
         x = hi - lo
-    elif hx < 0x3e300000:                   # |x| < 2**-28
+    elif hx < 0x3e300000:  # |x| < 2**-28
         return 1.0 + x
     else:
         k = 0
@@ -477,12 +477,12 @@ _QS4 = 7.70381505559019352791e-02
 def asin(x: float) -> float:
     hx = _hi(x)
     ix = hx & 0x7fffffff
-    if ix >= 0x3ff00000:                    # |x| >= 1
+    if ix >= 0x3ff00000:  # |x| >= 1
         if ((ix - 0x3ff00000) | _lo(x)) == 0:
             return x * _PIO2_HI + x * _PIO2_LO
-        return _math.nan                    # (x-x)/(x-x)
-    if ix < 0x3fe00000:                     # |x| < 0.5
-        if ix < 0x3e400000:                 # |x| < 2**-27
+        return _math.nan  # (x-x)/(x-x)
+    if ix < 0x3fe00000:  # |x| < 0.5
+        if ix < 0x3e400000:  # |x| < 2**-27
             return x
         t = x * x
         p = t * (_PS0 + t * (_PS1 + t * (_PS2 + t * (_PS3 + t * (_PS4 + t * _PS5)))))
@@ -495,7 +495,7 @@ def asin(x: float) -> float:
     p = t * (_PS0 + t * (_PS1 + t * (_PS2 + t * (_PS3 + t * (_PS4 + t * _PS5)))))
     q = 1.0 + t * (_QS1 + t * (_QS2 + t * (_QS3 + t * _QS4)))
     s = _math.sqrt(t)
-    if ix >= 0x3FEF3333:                    # |x| > 0.975
+    if ix >= 0x3FEF3333:  # |x| > 0.975
         w = p / q
         t = _PIO2_HI - (2.0 * (s + s * w) - _PIO2_LO)
     else:
@@ -511,21 +511,21 @@ def asin(x: float) -> float:
 def acos(x: float) -> float:
     hx = _hi(x)
     ix = hx & 0x7fffffff
-    if ix >= 0x3ff00000:                    # |x| >= 1
+    if ix >= 0x3ff00000:  # |x| >= 1
         if ((ix - 0x3ff00000) | _lo(x)) == 0:
             if hx > 0:
                 return 0.0
             return _PI_ACOS + 2.0 * _PIO2_LO
-        return _math.nan                    # (x-x)/(x-x)
-    if ix < 0x3fe00000:                     # |x| < 0.5
-        if ix <= 0x3c600000:                # |x| < 2**-57
+        return _math.nan  # (x-x)/(x-x)
+    if ix < 0x3fe00000:  # |x| < 0.5
+        if ix <= 0x3c600000:  # |x| < 2**-57
             return _PIO2_HI + _PIO2_LO
         z = x * x
         p = z * (_PS0 + z * (_PS1 + z * (_PS2 + z * (_PS3 + z * (_PS4 + z * _PS5)))))
         q = 1.0 + z * (_QS1 + z * (_QS2 + z * (_QS3 + z * _QS4)))
         r = p / q
         return _PIO2_HI - (x - (_PIO2_LO - x * r))
-    if hx < 0:                              # x < -0.5
+    if hx < 0:  # x < -0.5
         z = (1.0 + x) * 0.5
         p = z * (_PS0 + z * (_PS1 + z * (_PS2 + z * (_PS3 + z * (_PS4 + z * _PS5)))))
         q = 1.0 + z * (_QS1 + z * (_QS2 + z * (_QS3 + z * _QS4)))
@@ -548,10 +548,10 @@ def acos(x: float) -> float:
 # --- atan (s_atan.c) ---------------------------------------------------------
 
 _ATAN_HI = (
-    4.63647609000806093515e-01,             # atan(0.5) head
-    7.85398163397448278999e-01,             # atan(1.0) head
-    9.82793723247329054082e-01,             # atan(1.5) head
-    1.57079632679489655800e+00,             # atan(inf) head
+    4.63647609000806093515e-01,  # atan(0.5) head
+    7.85398163397448278999e-01,  # atan(1.0) head
+    9.82793723247329054082e-01,  # atan(1.5) head
+    1.57079632679489655800e+00,  # atan(inf) head
 )
 _ATAN_LO = (
     2.26987774529616870924e-17,
@@ -575,29 +575,29 @@ _AT10 = 1.62858201153657823623e-02
 def atan(x: float) -> float:
     hx = _hi(x)
     ix = hx & 0x7fffffff
-    if ix >= 0x44100000:                    # |x| >= 2**66
+    if ix >= 0x44100000:  # |x| >= 2**66
         if ix > 0x7ff00000 or (ix == 0x7ff00000 and _lo(x) != 0):
-            return x + x                    # NaN
+            return x + x  # NaN
         if hx > 0:
             return _ATAN_HI[3] + _ATAN_LO[3]
         return -_ATAN_HI[3] - _ATAN_LO[3]
-    if ix < 0x3fdc0000:                     # |x| < 0.4375
-        if ix < 0x3e200000:                 # |x| < 2**-29
+    if ix < 0x3fdc0000:  # |x| < 0.4375
+        if ix < 0x3e200000:  # |x| < 2**-29
             return x
         id_ = -1
     else:
         x = _math.fabs(x)
-        if ix < 0x3ff30000:                 # |x| < 1.1875
-            if ix < 0x3fe60000:             # 7/16 <= |x| < 11/16
+        if ix < 0x3ff30000:  # |x| < 1.1875
+            if ix < 0x3fe60000:  # 7/16 <= |x| < 11/16
                 id_ = 0
                 x = (2.0 * x - 1.0) / (2.0 + x)
-            else:                           # 11/16 <= |x| < 19/16
+            else:  # 11/16 <= |x| < 19/16
                 id_ = 1
                 x = (x - 1.0) / (x + 1.0)
-        elif ix < 0x40038000:               # |x| < 2.4375
+        elif ix < 0x40038000:  # |x| < 2.4375
             id_ = 2
             x = (x - 1.5) / (1.0 + 1.5 * x)
-        else:                               # 2.4375 <= |x| < 2**66
+        else:  # 2.4375 <= |x| < 2**66
             id_ = 3
             x = -1.0 / x
 
@@ -630,13 +630,13 @@ def log(x: float) -> float:
     hx = _hi(x)
     lx = _lo(x)
     k = 0
-    if hx < 0x00100000:                     # x < 2**-1022
+    if hx < 0x00100000:  # x < 2**-1022
         if ((hx & 0x7fffffff) | lx) == 0:
-            return -_math.inf               # log(+-0) = -inf
+            return -_math.inf  # log(+-0) = -inf
         if hx < 0:
-            return _math.nan                # log(-#) = NaN
+            return _math.nan  # log(-#) = NaN
         k -= 54
-        x *= _TWO54                         # subnormal: scale up x
+        x *= _TWO54  # subnormal: scale up x
         hx = _hi(x)
     if hx >= 0x7ff00000:
         return x + x
@@ -646,7 +646,7 @@ def log(x: float) -> float:
     x = _set_hi(x, hx | (i ^ 0x3ff00000))  # normalize x or x/2
     k += i >> 20
     f = x - 1.0
-    if (0x000fffff & (2 + hx)) < 3:         # |f| < 2**-20
+    if (0x000fffff & (2 + hx)) < 3:  # |f| < 2**-20
         if f == 0.0:
             if k == 0:
                 return 0.0
@@ -701,9 +701,9 @@ _PIO4LO = 3.06161699786838301793e-17
 def _kernel_tan(x: float, y: float, iy: int) -> float:
     hx = _hi(x)
     ix = hx & 0x7fffffff
-    if ix < 0x3e300000:                     # |x| < 2**-28
+    if ix < 0x3e300000:  # |x| < 2**-28
         if ((ix | _lo(x)) | (iy + 1)) == 0:
-            return _math.inf                # 1 / |x| of a zero
+            return _math.inf  # 1 / |x| of a zero
         if iy == 1:
             return x
         # compute -1 / (x+y) carefully
@@ -714,7 +714,7 @@ def _kernel_tan(x: float, y: float, iy: int) -> float:
         t = _set_lo(a, 0)
         s = 1.0 + t * z
         return t + a * (s + t * v)
-    if ix >= 0x3FE59428:                    # |x| >= 0.6744
+    if ix >= 0x3FE59428:  # |x| >= 0.6744
         if hx < 0:
             x = -x
             y = -y
@@ -788,6 +788,7 @@ def _div(a: float, b: float) -> float:
     return _math.copysign(_math.inf, a) * _math.copysign(1.0, b)
 
 
+# noinspection shadowing-builtins
 def pow(x: float, y: float) -> float:
     hx = _hi(x)
     lx = _lo(x)
@@ -796,11 +797,11 @@ def pow(x: float, y: float) -> float:
     ix = hx & 0x7fffffff
     iy = hy & 0x7fffffff
 
-    if (iy | ly) == 0:                      # x**0 = 1
+    if (iy | ly) == 0:  # x**0 = 1
         return 1.0
     if ix > 0x7ff00000 or (ix == 0x7ff00000 and lx != 0) \
             or iy > 0x7ff00000 or (iy == 0x7ff00000 and ly != 0):
-        return x + y                        # +-NaN
+        return x + y  # +-NaN
 
     # yisint: 0 -- y is not an integer, 1 -- odd integer, 2 -- even integer
     yisint = 0
@@ -819,41 +820,41 @@ def pow(x: float, y: float) -> float:
                     yisint = 2 - (j & 1)
 
     if ly == 0:
-        if iy == 0x7ff00000:                # y is +-inf
+        if iy == 0x7ff00000:  # y is +-inf
             if ((ix - 0x3ff00000) | lx) == 0:
-                return y - y                # inf**+-1 is NaN
-            if ix >= 0x3ff00000:            # (|x|>1)**+-inf = inf,0
+                return y - y  # inf**+-1 is NaN
+            if ix >= 0x3ff00000:  # (|x|>1)**+-inf = inf,0
                 return y if hy >= 0 else 0.0
-            return -y if hy < 0 else 0.0    # (|x|<1)**-,+inf = inf,0
-        if iy == 0x3ff00000:                # y is +-1
+            return -y if hy < 0 else 0.0  # (|x|<1)**-,+inf = inf,0
+        if iy == 0x3ff00000:  # y is +-1
             return _div(1.0, x) if hy < 0 else x
-        if hy == 0x40000000:                # y is 2
+        if hy == 0x40000000:  # y is 2
             return x * x
-        if hy == 0x3fe00000 and hx >= 0:    # y is 0.5, x >= +0
+        if hy == 0x3fe00000 and hx >= 0:  # y is 0.5, x >= +0
             return _math.sqrt(x)
 
     ax = abs(x)
     if lx == 0 and (ix == 0x7ff00000 or ix == 0 or ix == 0x3ff00000):
-        z = ax                              # x is +-0, +-inf, +-1
+        z = ax  # x is +-0, +-inf, +-1
         if hy < 0:
             z = _div(1.0, z)
         if hx < 0:
             if ((ix - 0x3ff00000) | yisint) == 0:
-                z = _math.nan               # (-1)**non-int is NaN
+                z = _math.nan  # (-1)**non-int is NaN
             elif yisint == 1:
-                z = -z                      # (x<0)**odd = -(|x|**odd)
+                z = -z  # (x<0)**odd = -(|x|**odd)
         return z
 
     n = (hx >> 31) + 1
     if (n | yisint) == 0:
-        return _math.nan                    # (x<0)**(non-int) is NaN
+        return _math.nan  # (x<0)**(non-int) is NaN
 
-    s = 1.0                                 # sign of the result
+    s = 1.0  # sign of the result
     if (n | (yisint - 1)) == 0:
-        s = -1.0                            # (-ve)**(odd int)
+        s = -1.0  # (-ve)**(odd int)
 
-    if iy > 0x41e00000:                     # |y| > 2**31
-        if iy > 0x43f00000:                 # |y| > 2**64, must o/uflow
+    if iy > 0x41e00000:  # |y| > 2**31
+        if iy > 0x43f00000:  # |y| > 2**64, must o/uflow
             if ix <= 0x3fefffff:
                 return _HUGE * _HUGE if hy < 0 else _TINY * _TINY
             if ix >= 0x3ff00000:
@@ -872,16 +873,16 @@ def pow(x: float, y: float) -> float:
         t2 = v - (t1 - u)
     else:
         n = 0
-        if ix < 0x00100000:                 # subnormal x
+        if ix < 0x00100000:  # subnormal x
             ax *= _TWO53
             n -= 53
             ix = _hi(ax)
         n += (ix >> 20) - 0x3ff
         j = ix & 0x000fffff
-        ix = j | 0x3ff00000                 # normalize ix
-        if j <= 0x3988E:                    # |x| < sqrt(3/2)
+        ix = j | 0x3ff00000  # normalize ix
+        if j <= 0x3988E:  # |x| < sqrt(3/2)
             k = 0
-        elif j < 0xBB67A:                   # |x| < sqrt(3)
+        elif j < 0xBB67A:  # |x| < sqrt(3)
             k = 1
         else:
             k = 0
@@ -925,14 +926,14 @@ def pow(x: float, y: float) -> float:
     z = p_l + p_h
     j = _hi(z)
     i = _lo(z)
-    if j >= 0x40900000:                     # z >= 1024
+    if j >= 0x40900000:  # z >= 1024
         if ((j - 0x40900000) | i) != 0:
-            return s * _HUGE * _HUGE        # overflow
+            return s * _HUGE * _HUGE  # overflow
         if p_l + _OVT > z - p_h:
             return s * _HUGE * _HUGE
-    elif (j & 0x7fffffff) >= 0x4090cc00:    # z <= -1075
+    elif (j & 0x7fffffff) >= 0x4090cc00:  # z <= -1075
         if (((j & _M32) - 0xc090cc00) | i) != 0:
-            return s * _TINY * _TINY        # underflow
+            return s * _TINY * _TINY  # underflow
         if p_l <= z - p_h:
             return s * _TINY * _TINY
 
@@ -940,7 +941,7 @@ def pow(x: float, y: float) -> float:
     i = j & 0x7fffffff
     k = (i >> 20) - 0x3ff
     n = 0
-    if i > 0x3fe00000:                      # |z| > 0.5: n = [z+0.5]
+    if i > 0x3fe00000:  # |z| > 0.5: n = [z+0.5]
         n = j + (0x00100000 >> (k + 1))
         k = ((n & 0x7fffffff) >> 20) - 0x3ff
         t = _set_hi(0.0, n & ~(0x000fffff >> k))
@@ -959,7 +960,7 @@ def pow(x: float, y: float) -> float:
     z = 1.0 - (r - z)
     j = _hi(z) + (n << 20)
     if (j >> 20) <= 0:
-        z = _math.ldexp(z, n)               # subnormal output
+        z = _math.ldexp(z, n)  # subnormal output
     else:
         z = _set_hi(z, _hi(z) + (n << 20))
     return s * z
