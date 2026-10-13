@@ -1,7 +1,7 @@
 """
 Builtin library of Pyne
 """
-from typing import TYPE_CHECKING, TypeAlias, Any, TypeVar, Callable as _Callable, \
+from typing import TYPE_CHECKING, TypeAlias, Any, TypeVar, \
     overload as _typing_overload
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ from bisect import bisect_right as _bisect_right
 from builtins import map as _builtin_map
 
 from functools import lru_cache as _lru_cache
+from types import FunctionType as _FunctionType
 from datetime import datetime, timedelta, time as dt_time, date, UTC, \
     timezone as _fixed_timezone, tzinfo as _tzinfo, MINYEAR as _MINYEAR, MAXYEAR as _MAXYEAR
 
@@ -241,20 +242,20 @@ def _get_dt(time: int | float | None = None, timezone: str | None = None) -> dat
 
 
 @_lru_cache(maxsize=1024)
-def _timestamp_components_cached(tz: _tzinfo, year: int, month: int, day: int,
-                                 hour: int, minute: int, second: int) -> PyneInt:
+def _timestamp_components_cached(tz: _tzinfo, y: int, m: int, d: int,
+                                 hours: int, minutes: int, seconds: int) -> PyneInt:
     """Compute a timestamp from a resolved zone and normalized native components.
 
     This private helper is called only by plain runtime code, never emitted as a
     script call. Its bounded result cache is independent of call-site state.
 
     :param tz: Resolved timezone object
-    :param year: Native year
-    :param month: Native month
-    :param day: Native day
-    :param hour: Native hour
-    :param minute: Native minute
-    :param second: Native second
+    :param y: Native year
+    :param m: Native month
+    :param d: Native day
+    :param hours: Native hour
+    :param minutes: Native minute
+    :param seconds: Native second
     :return: UNIX timestamp in milliseconds
     """
     # Pine accepts out-of-range components and rolls them over (e.g. hour 26 ->
@@ -265,18 +266,15 @@ def _timestamp_components_cached(tz: _tzinfo, year: int, month: int, day: int,
     # (measured: an na year/month/hour/second each lands on the year-0 / month-0 /
     # hour-0 / second-0 timestamp, never on na), so every component truncates
     # through the na-tolerant conversion.
-    y = year
-    m = month
     y += (m - 1) // 12
     m = (m - 1) % 12 + 1
-    d = day
     # The clock components roll over into days too, so they are carried into the
     # day count before every calendar decision below. The wall clock is not moved
     # by the carry (the timedelta at the end shifts wall time, not absolute time),
     # but a rollover that leaves datetime's range -- hour 24 on the last
     # representable day -- now folds like any other out-of-range date instead of
     # raising OverflowError.
-    clock_seconds = hour * 3600 + minute * 60 + second
+    clock_seconds = hours * 3600 + minutes * 60 + seconds
     day_carry, second_of_day = divmod(clock_seconds, 86400)
     d += day_carry
     # TradingView runs the Julian calendar before 1582-10-15 and the Gregorian
@@ -312,30 +310,30 @@ def _timestamp_components_cached(tz: _tzinfo, year: int, month: int, day: int,
     return pine_int(int(dt.timestamp() * 1000) + cycles * _GREGORIAN_CYCLE_MS)
 
 
-def _timestamp_components(timezone: str | None, year: int | float, month: int | float,
-                          day: int | float, hour: int | float = 0, minute: int | float = 0,
-                          second: int | float = 0) -> PyneInt:
+def _timestamp_components(timezone: str | None, y: int | float, m: int | float,
+                          d: int | float, hours: int | float = 0, minutes: int | float = 0,
+                          seconds: int | float = 0) -> PyneInt:
     """Resolve the current zone and normalize components before shared lookup.
 
     :param timezone: Explicit timezone or the current exchange timezone
-    :param year: Year
-    :param month: Month
-    :param day: Day
-    :param hour: Hour
-    :param minute: Minute
-    :param second: Second
+    :param y: Year
+    :param m: Month
+    :param d: Day
+    :param hours: Hour
+    :param minutes: Minute
+    :param seconds: Second
     :return: UNIX timestamp in milliseconds
     """
     tz = _parse_timezone(timezone)
     return _timestamp_components_cached(
-        tz, _native_int_or(year, 0), _native_int_or(month, 0), _native_int_or(day, 0),
-        _native_int_or(hour, 0), _native_int_or(minute, 0), _native_int_or(second, 0),
+        tz, _native_int_or(y, 0), _native_int_or(m, 0), _native_int_or(d, 0),
+        _native_int_or(hours, 0), _native_int_or(minutes, 0), _native_int_or(seconds, 0),
     )
 
 
-def _bind_timestamp_components(fallback: _Callable, implementation: _OverloadImplementation,
+def _bind_timestamp_components(fallback: _FunctionType, implementation: _OverloadImplementation,
                                implementations: list[_OverloadImplementation], argc: int,
-                               *, with_timezone: bool) -> _Callable:
+                               *, with_timezone: bool) -> _FunctionType:
     """Keep one immutable result per pinned call site, with shared LRU on a miss.
 
     Only runtime binding calls this helper; scripts reach it through the overload
@@ -353,7 +351,7 @@ def _bind_timestamp_components(fallback: _Callable, implementation: _OverloadImp
     defaults = (0, 0, 0)
     count = argc - int(with_timezone)
     padding = defaults[:6 - count]
-    last = None
+    last: tuple[tuple, PyneInt] | None = None
 
     def cached(*args, **kwargs):
         nonlocal last
@@ -376,19 +374,19 @@ def _bind_timestamp_components(fallback: _Callable, implementation: _OverloadImp
         last = (key, result) if all(t is int or t is float for t in types) else None
         return result
 
-    cached.__pyne_cache__ = fallback.__pyne_cache__
+    cached.__pyne_cache__ = fallback.__dict__['__pyne_cache__']
     cached.__pyne_impls__ = implementations
     return cached
 
 
-def _timestamp_component_overload(func: _Callable) -> _Callable:
+def _timestamp_component_overload(func: _FunctionType) -> _FunctionType:
     """Opt component overloads into the stateless pinned-binding cache protocol.
 
     :param func: Plain timestamp component implementation
     :return: Implementation with its call-site cache factory attached
     """
     with_timezone = func.__code__.co_varnames[0] == 'timezone'
-    func.__pyne_pinned_bind__ = lambda fallback, impl, impls, argc: _bind_timestamp_components(
+    func.__dict__['__pyne_pinned_bind__'] = lambda fallback, impl, impls, argc: _bind_timestamp_components(
         fallback, impl, impls, argc, with_timezone=with_timezone,
     )
     return func
@@ -1162,6 +1160,7 @@ _SESSION_DIGITS = frozenset('0123456789')
 _SESSION_DAY_DIGITS = frozenset('1234567')
 
 
+# noinspection PyProtectedMember
 def _parse_session_string(session: str, timezone: str | None = None) -> tuple['SessionInfo', ...]:
     """
     Parse a session string into one SessionInfo per time range.
@@ -2571,12 +2570,12 @@ def _tv_day_walk(day: date, multiplier: int, steps: int) -> date:
     # bars continue from that landing a bar length at a time; a landing that rounded up
     # into the chart year continues from the day after the previous year's last one.
     # Reaching the start of the previous year applies the same rule again from there.
-    days = _scheduled_year_days(day.year)
-    year = day.year
+    calendar_year = day.year
+    days = _scheduled_year_days(calendar_year)
     ordinal = _bisect_right(days, day) - 1
     if ordinal < 0:
-        year -= 1
-        days = _scheduled_year_days(year)
+        calendar_year -= 1
+        days = _scheduled_year_days(calendar_year)
         ordinal = len(days) - 1
     weekdays = len({d.weekday() for d in days})
     while True:
@@ -2584,12 +2583,12 @@ def _tv_day_walk(day: date, multiplier: int, steps: int) -> date:
         if steps <= bar:
             return days[(bar - steps) * multiplier]
         remaining = multiplier - position
-        previous = _scheduled_year_days(year - 1)
-        mirror = date(year - 1, 12, 31) - (
-                days[min(remaining, len(days)) - 1] - date(year, 1, 1))
+        previous = _scheduled_year_days(calendar_year - 1)
+        offset: timedelta = days[min(remaining, len(days)) - 1] - date(calendar_year, 1, 1)
+        mirror: date = date(calendar_year - 1, 12, 31) - offset
         while _scheduled_day_open_sec(mirror, _dbt_tz, _dbt_starts, _dbt_on) is None:
             mirror += timedelta(days=1)
-        if mirror.year == year:
+        if mirror.year == calendar_year:
             landing = len(previous) + _bisect_right(days, mirror) - 1
         else:
             landing = _bisect_right(previous, mirror) - 1
@@ -2600,7 +2599,7 @@ def _tv_day_walk(day: date, multiplier: int, steps: int) -> date:
         steps -= whole
         if steps == 0:
             return days[0] if landing >= len(previous) else previous[landing]
-        year -= 1
+        calendar_year -= 1
         days = previous
         ordinal = landing
 

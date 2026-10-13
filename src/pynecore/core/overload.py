@@ -53,7 +53,7 @@ from ..types.base import StrLiteral
 from ..types.matrix import Matrix
 from ..types.na import NA
 
-__all__ = ['overload']
+__all__ = ['overload', 'Implementation']
 
 T = TypeVar('T')
 
