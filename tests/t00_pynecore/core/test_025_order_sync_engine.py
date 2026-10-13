@@ -42,6 +42,7 @@ from pynecore.core.broker.sync_engine import (
     _SEEN_FILL_IDS_CAP,
     _SETTLED_DEFENSIVE_CLOSE_IDS_CAP,
     _BoundedIdSet,
+    _OPPOSITE_ENTRY_FILL_WAIT_S,
 )
 from pynecore.core.plugin import ProviderError, TransientProviderError
 from pynecore.core.broker.models import (
@@ -888,6 +889,90 @@ def __test_market_reversal_dispatches_the_close_leg_and_parks_the_entry__():
     assert "S" not in engine.active_intents
     assert "S" in engine._pending_reversal_opens
     assert "S" not in engine._rejected_entry_intents
+
+
+def __test_entry_waits_for_the_opposite_market_entry_fill_before_reversing__(caplog):
+    """An opposite entry never nets against a dispatched entry's unbooked fill.
+
+    Measured live (Capital.com cycle 276, 2026-10-13): a REST outage
+    swallowed the short entry's fill activity, the long signal then found a
+    flat book and went out raw, and the netting venue folded the two entries
+    into a flat position the book later read as twice the size. The long
+    entry waits for the short fill instead, then reverses close-then-open.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 1
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    with caplog.at_level(logging.INFO):
+        engine.sync(BAR_TS + 60_000)
+    assert len(b.entry_calls) == 1, "the opposite entry went out raw"
+    assert "L" not in engine.active_intents
+    assert "L" not in engine._rejected_entry_intents
+    deferrals = [rec for rec in caplog.records
+                 if "has not reported its fill yet" in rec.getMessage()]
+    assert deferrals and all(rec.levelno == logging.INFO for rec in deferrals)
+
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 50_000.0, pine_id="S", xchg_id="xchg-s"))
+    assert pos.size == -1.0
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.entry_calls) == 1
+    assert len(b.close_calls) == 1
+    close = _dispatched_close(b.close_calls[0])
+    assert close.synthetic_kind == 'reversal_close' and close.qty == 1.0
+    assert "L" in engine._pending_reversal_opens
+    assert engine._opposite_entry_fill_wait == {}
+
+
+def __test_entry_stops_waiting_for_an_opposite_fill_that_never_arrives__(caplog):
+    """The wait is bounded: a lost fill cannot block entries for the whole run."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.entry_calls) == 1
+
+    engine._opposite_entry_fill_wait["S"] = (
+        time.monotonic() - _OPPOSITE_ENTRY_FILL_WAIT_S - 1.0)
+    with caplog.at_level(logging.WARNING):
+        engine.sync(BAR_TS + 120_000)
+        assert len(b.entry_calls) == 2
+        assert b.entry_calls[-1].intent.pine_id == "L"
+        pos.entry_orders["L2"] = _entry_order("L2", 1.0)
+        engine.sync(BAR_TS + 180_000)
+    assert len(b.entry_calls) == 3, "an expired wait blocked a later entry"
+    assert b.entry_calls[-1].intent.pine_id == "L2"
+    expired = [rec for rec in caplog.records
+               if "opposite entries no longer wait for it" in rec.getMessage()]
+    assert len(expired) == 1 and expired[0].levelno == logging.WARNING
+
+
+def __test_resting_opposite_entry_does_not_wait_for_an_unbooked_fill__():
+    """A limit entry is placed as-is whatever the book holds, so it never waits."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=49_000.0)
+    engine.sync(BAR_TS + 60_000)
+    assert [c.intent.pine_id for c in b.entry_calls] == ["S", "L"]
+
+
+def __test_same_side_entry_does_not_wait_for_an_unbooked_fill__():
+    """Only an opposite entry can net against the unbooked one."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L1"] = _entry_order("L1", 1.0)
+    engine.sync(BAR_TS)
+    pos.entry_orders["L2"] = _entry_order("L2", 1.0)
+    engine.sync(BAR_TS + 60_000)
+    assert [c.intent.pine_id for c in b.entry_calls] == ["L1", "L2"]
 
 
 def __test_reversal_pre_clear_outage_is_a_warning_without_traceback__(caplog):
@@ -7285,6 +7370,49 @@ def __test_emulated_leg_close_fill_settles_the_defensive_close_marker__():
             f"leg fill with separator {wire_sep!r} did not settle the marker"
 
 
+def __test_close_leg_fill_naming_the_close_as_from_entry_settles_the_marker__():
+    """A one-way close-leg fill names its close in ``from_entry`` only.
+
+    Measured live (ctrader cycle 254, 2026-10-12): the defensive close's hedge
+    leg filled at once, but its fill carried no ``pine_id`` and no coid — just
+    ``from_entry`` set to the close's synthetic id — so the marker stayed
+    armed until the stale-grace snapshot settle.
+    """
+    from pynecore.core.broker.models import (
+        BracketAttachRejectContext, PendingDefensiveClose,
+    )
+    import time as _time
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0
+    pos.open_trades.append(Trade(
+        size=1.0, entry_id="Long", entry_bar_index=0, entry_time=0,
+        entry_price=50_000.0, commission=0.0, entry_comment=None,
+        entry_equity=1_000_000.0,
+    ))
+    engine._pending_defensive_close['Long'] = PendingDefensiveClose(  # noqa
+        entry_id='Long',
+        close_intent_key='__pyne_defensive_close__coid-1',
+        close_order_ref=None,
+        pending_since=_time.time(),
+        reject_context=BracketAttachRejectContext(
+            intent_key='Bracket\0Long', position_coid='coid-1',
+            position_side='buy', qty=1.0, symbol=SYMBOL,
+        ),
+        close_client_order_id='CLOSE-COID-1',
+    )
+    fill = _fill_event('sell', 1.0, 50_000.0, pine_id="",
+                       leg=LegType.CLOSE, xchg_id="xchg-leg", fill_id="leg-1")
+    fill = replace(fill, pine_id=None,
+                   from_entry='__pyne_defensive_close__coid-1')
+
+    engine._route_event(fill)  # noqa
+
+    assert 'Long' not in engine._pending_defensive_close  # noqa
+    assert pos.size == 0.0
+
+
 def __test_a_foreign_coid_fill_does_not_settle_the_marker__():
     """Only the marker's own coid (exact or leg-composed) may settle it."""
     from pynecore.core.broker.models import (
@@ -9684,6 +9812,60 @@ def _bracket_reject_error(
     if original_cause is not None:
         err.__cause__ = original_cause
     return err
+
+
+def __test_bracket_reject_of_a_level_crossed_at_fill_is_an_immediate_exit__(caplog):
+    """A stop already crossed by the entry fill closes at market without an ERROR.
+
+    Measured live (ctrader cycle 254, 2026-10-12): a reversal entry filled
+    after the 21:00 UTC session break above its own stop-loss; the venue
+    refused the stop, and the defensive close was exactly the immediate exit
+    Pine books for a crossed level — yet it was logged as an ERROR.
+    """
+    b = MockBroker()
+    b.raise_on_next_exit = _bracket_reject_error()
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0
+    pos.open_trades.append(Trade(
+        size=1.0, entry_id="Long", entry_bar_index=0, entry_time=0,
+        entry_price=48_990.0, commission=0.0, entry_comment=None,
+        entry_equity=1_000_000.0,
+    ))
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(OrderSkippedByPlugin) as exc:
+            engine._dispatch_new(_bracket_reject_exit_intent())  # noqa
+
+    assert exc.value.reason == "protective_level_crossed_at_fill"
+    assert len(b.close_calls) == 1
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        OrderSyncEngine._log_plugin_skip(exc.value)  # noqa
+        OrderSyncEngine._log_plugin_skip(OrderSkippedByPlugin(  # noqa
+            "below grid", intent_key="k", reason="below_min_volume"))
+    assert [rec.levelno for rec in caplog.records] == [logging.INFO, logging.WARNING]
+
+
+def __test_bracket_reject_below_the_fill_stays_an_error__(caplog):
+    """A stop still on the protective side of the fill is a genuine reject."""
+    b = MockBroker()
+    b.raise_on_next_exit = _bracket_reject_error()
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0
+    pos.open_trades.append(Trade(
+        size=1.0, entry_id="Long", entry_bar_index=0, entry_time=0,
+        entry_price=50_000.0, commission=0.0, entry_comment=None,
+        entry_equity=1_000_000.0,
+    ))
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(OrderSkippedByPlugin) as exc:
+            engine._dispatch_new(_bracket_reject_exit_intent())  # noqa
+
+    assert exc.value.reason == "bracket_reject_defensive_close"
+    assert [rec for rec in caplog.records if rec.levelno >= logging.ERROR]
 
 
 def __test_bracket_reject_dispatches_defensive_close_and_skips_intent__():

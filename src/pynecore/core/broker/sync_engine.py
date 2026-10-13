@@ -27,6 +27,7 @@ import asyncio
 import dataclasses
 import itertools
 import logging
+import math
 import queue
 import threading
 import time
@@ -633,6 +634,20 @@ _CLOSE_DECLINE_RETRY_S = 60.0
 #: with the private stream down; the bound keeps a fill that never arrives
 #: from leaving the position without a close for the rest of the run.
 _PRE_CLEAR_FILL_WAIT_S = 600.0
+
+#: How long a market entry stays deferred behind an opposite-side market
+#: entry whose fill has not reached the book. The fill normally lands within
+#: a few polls even after a venue outage; the bound keeps a fill that never
+#: arrives from blocking the strategy's entries for the rest of the run.
+_OPPOSITE_ENTRY_FILL_WAIT_S = 600.0
+
+#: :class:`OrderSkippedByPlugin` reasons that describe a completed, correct
+#: outcome or a short expected wait rather than a problem, logged at INFO
+#: instead of WARNING.
+_INFO_SKIP_REASONS = frozenset({
+    'protective_level_crossed_at_fill',
+    'opposite_entry_fill_pending',
+})
 
 
 @dataclasses.dataclass(slots=True)
@@ -1339,6 +1354,12 @@ class OrderSyncEngine:
         # :data:`_PRE_CLEAR_FILL_WAIT_S` passes, every close and re-armed
         # exit of the entry is withheld (:meth:`_pre_clear_fill_pending`).
         self._pre_clear_filled_entries: dict[str, tuple[float, float]] = {}
+        # In-flight market entry key -> monotonic time an opposite-side market
+        # entry was first deferred behind its unbooked fill
+        # (:meth:`_opposite_entry_fill_pending`). A key whose wait expired
+        # stays mapped to ``inf`` so it is reported once and never waited on
+        # again.
+        self._opposite_entry_fill_wait: dict[str, float] = {}
         # Snapshot of the drain batch currently being routed by
         # :meth:`_drain_events`, plus the index of the NEXT event to route.
         # Lets the ``cancelled`` classifier look AHEAD at the not-yet-routed
@@ -7820,7 +7841,7 @@ class OrderSyncEngine:
             try:
                 self._dispatch_new(resolved)
             except OrderSkippedByPlugin as e:
-                _blog_warning("%s", e)
+                self._log_plugin_skip(e)
                 continue
             self._active_intents[resolved.intent_key] = resolved
 
@@ -8149,7 +8170,12 @@ class OrderSyncEngine:
         :meth:`_route_event`. The match priority is:
 
         - ``event.pine_id`` against ``marker.close_intent_key`` — the WS
-          path, where ``OrderEvent.pine_id`` is reliable.
+          path, where ``OrderEvent.pine_id`` is reliable — then
+          ``event.from_entry`` against the same key: a one-way close-leg
+          fill names the close it serves as ``from_entry`` and carries no
+          ``pine_id`` (measured live: ctrader cycle 254, 2026-10-12 — the
+          defensive close filled at once, but the unmatched marker waited
+          for the stale-grace snapshot settle).
         - ``event.order.id`` against ``marker.close_order_ref`` — the
           polled-orders path once
           :meth:`_maybe_attach_defensive_close_ref` has backfilled the
@@ -8164,10 +8190,11 @@ class OrderSyncEngine:
         """
         if not self._pending_defensive_close:
             return None
-        pine_id = event.pine_id
-        if pine_id is not None:
+        for close_key in (event.pine_id, event.from_entry):
+            if close_key is None:
+                continue
             for entry_id, marker in self._pending_defensive_close.items():
-                if marker.close_intent_key == pine_id:
+                if marker.close_intent_key == close_key:
                     return entry_id
         order = event.order
         if order is not None:
@@ -9489,7 +9516,7 @@ class OrderSyncEngine:
             # re-evaluate. Re-raising here would propagate through
             # ``_route_event`` and crash the event drain on a condition
             # the recovery already handled.
-            _blog_warning("%s", e)
+            self._log_plugin_skip(e)
             self._active_intents.pop(bracket_key, None)
             return
         self._active_intents[bracket_key] = new_intent
@@ -13496,7 +13523,7 @@ class OrderSyncEngine:
                         try:
                             self._dispatch_new(intent)
                         except OrderSkippedByPlugin as e:
-                            _blog_warning("%s", e)
+                            self._log_plugin_skip(e)
                             continue
                         self._active_intents[key] = intent
                         continue
@@ -13562,7 +13589,7 @@ class OrderSyncEngine:
                         try:
                             self._dispatch_new(intent)
                         except OrderSkippedByPlugin as e:
-                            _blog_warning("%s", e)
+                            self._log_plugin_skip(e)
                             continue
                         self._active_intents[key] = intent
                         continue
@@ -13669,7 +13696,7 @@ class OrderSyncEngine:
                         try:
                             self._dispatch_new(intent)
                         except OrderSkippedByPlugin as e:
-                            _blog_warning("%s", e)
+                            self._log_plugin_skip(e)
                             continue
                         self._active_intents[key] = intent
                         continue
@@ -13843,12 +13870,13 @@ class OrderSyncEngine:
                     except OrderSkippedByPlugin as e:
                         # Plugin declined (e.g. qty below venue minimum) OR
                         # the bracket-attach-after-fill recovery path raised
-                        # ``reason="bracket_reject_defensive_close"`` — the
+                        # ``reason="bracket_reject_defensive_close"`` (or
+                        # ``"protective_level_crossed_at_fill"``) — the
                         # latter has already populated
                         # ``_defensively_closed_entries_this_sync`` so any
                         # remaining same-entry intents handled later in this
                         # loop short-circuit at the guard above.
-                        _blog_warning("%s", e)
+                        self._log_plugin_skip(e)
                         if isinstance(intent, EntryIntent):
                             skipped_entry_ids_this_sync.add(intent.pine_id)
                             self._record_entry_reject(key, intent, e)
@@ -14070,7 +14098,7 @@ class OrderSyncEngine:
                         try:
                             self._dispatch_new(intent)
                         except OrderSkippedByPlugin as e:
-                            _blog_warning("%s", e)
+                            self._log_plugin_skip(e)
                             skipped_entry_ids_this_sync.add(intent.pine_id)
                             self._record_entry_reject(key, intent, e)
                             continue
@@ -14091,7 +14119,7 @@ class OrderSyncEngine:
                     # cancelled the old order before the plugin declined the
                     # new one. The exchange now has nothing for this key, so
                     # drop it from active too.
-                    _blog_warning("%s", e)
+                    self._log_plugin_skip(e)
                     self._active_intents.pop(key, None)
                     continue
                 except _PartialBracketModifyDeferred:
@@ -14227,7 +14255,7 @@ class OrderSyncEngine:
         try:
             self._dispatch_new(intent)
         except OrderSkippedByPlugin as e:
-            _blog_warning("%s", e)
+            self._log_plugin_skip(e)
             skipped_entry_ids_this_sync.add(intent.pine_id)
             self._record_entry_reject(key, intent, e)
             # Consume this generation: a deterministic venue decline would
@@ -15916,6 +15944,89 @@ class OrderSyncEngine:
             self._remove_pine_order_for_intent(old)
         return not leg_filled
 
+    def _defer_behind_opposite_entry_fill(
+            self, intent: Intent, coid_spent_retry: int,
+    ) -> None:
+        """Defer a market entry while an opposite market entry's fill is unbooked.
+
+        Applies to the same entries the stop-and-reverse transform handles;
+        see :meth:`_opposite_entry_fill_pending` for why they must wait.
+
+        :param intent: The intent :meth:`_dispatch_new` is about to dispatch.
+        :param coid_spent_retry: The dispatch's spent-COID retry depth; only
+            the first attempt is judged.
+        :raises OrderSkippedByPlugin: With the non-counting
+            ``opposite_entry_fill_pending`` reason while the wait lasts.
+        """
+        if (coid_spent_retry != 0
+                or not isinstance(intent, EntryIntent)
+                or intent.order_type is not OrderType.MARKET
+                or intent.stop_fired_market
+                or intent.is_strategy_order
+                or intent.skip_flip):
+            return
+        in_flight = self._opposite_entry_fill_pending(intent)
+        if in_flight is None:
+            return
+        raise OrderSkippedByPlugin(
+            f"Entry {format_intent_key(intent.intent_key)} deferred: the "
+            f"opposite market entry {format_intent_key(in_flight.intent_key)} "
+            f"has not reported its fill yet; re-evaluating next sync.",
+            intent_key=intent.intent_key,
+            reason='opposite_entry_fill_pending',
+            context={'symbol': intent.symbol, 'pine_id': intent.pine_id},
+        )
+
+    def _opposite_entry_fill_pending(self, intent: EntryIntent) -> EntryIntent | None:
+        """Return a dispatched opposite-side market entry whose fill is unbooked.
+
+        Pine fills a pending market entry before the next one, so an opposite
+        entry placed after it reverses the position the first one opened. The
+        engine sees that position only once the first entry's fill reaches the
+        book; until then the book reads flat and the new entry would go out raw.
+        On a netting venue the raw entry then nets against the unbooked one: the
+        venue ends flat, and once both fills arrive the book holds twice the
+        size (measured live: Capital.com cycle 276, 2026-10-13 — a REST outage
+        swallowed the first entry's fill activity). Deferring until that fill
+        lands sends the new entry through the close-then-open reversal instead.
+        The wait ends after :data:`_OPPOSITE_ENTRY_FILL_WAIT_S` so a fill that
+        never arrives cannot block entries for the rest of the run.
+
+        :param intent: The market entry about to be dispatched.
+        :return: The in-flight entry to wait for, or ``None``.
+        """
+        pending: EntryIntent | None = None
+        live_keys: set[str] = set()
+        for key, other in self._active_intents.items():
+            if (key == intent.intent_key
+                    or not isinstance(other, EntryIntent)
+                    or other.order_type is not OrderType.MARKET
+                    or other.side == intent.side
+                    or key not in self._order_mapping):
+                continue
+            if self._active_entry_filled_qty.get(key, 0.0) >= other.qty - 1e-12:
+                continue
+            live_keys.add(key)
+            if pending is not None:
+                continue
+            now = time.monotonic()
+            since = self._opposite_entry_fill_wait.setdefault(key, now)
+            if since == math.inf:
+                continue
+            if now - since < _OPPOSITE_ENTRY_FILL_WAIT_S:
+                pending = other
+                continue
+            self._opposite_entry_fill_wait[key] = math.inf
+            _blog_warning(
+                "the fill of market entry %s has not reached the book in "
+                "%.0fs; opposite entries no longer wait for it",
+                format_intent_key(key), _OPPOSITE_ENTRY_FILL_WAIT_S,
+            )
+        for key in list(self._opposite_entry_fill_wait):
+            if key not in live_keys:
+                del self._opposite_entry_fill_wait[key]
+        return pending
+
     def _entry_open_size(self, entry_id: str) -> float:
         """Absolute open size the book holds for ``entry_id``."""
         return sum(
@@ -16207,6 +16318,7 @@ class OrderSyncEngine:
                 f"reversal; the remainder {remaining} opens the moment the "
                 f"book settles flat.",
             )
+        self._defer_behind_opposite_entry_fill(intent, _coid_spent_retry)
         if (_coid_spent_retry == 0
                 and isinstance(intent, EntryIntent)
                 and intent.order_type is OrderType.MARKET
@@ -17506,12 +17618,23 @@ class OrderSyncEngine:
                 },
             ) from e
 
-        _blog_error(
-            "bracket attach rejected after parent fill for %s; "
-            "issuing defensive market close "
-            "(deal_id=%s, side=%s, qty=%s): %s",
-            intent, e.position_deal_id, e.position_side, e.qty, e,
-        )
+        crossed_at = self._protective_level_crossed_at_fill(intent, e.position_side)
+        if crossed_at is not None:
+            _blog_info(
+                "exit %s: its protective level was already crossed at the "
+                "parent fill price %s, so the venue refused to attach it; "
+                "closing at market — the immediate exit Pine books for a "
+                "crossed level (deal_id=%s, side=%s, qty=%s)",
+                format_intent_key(intent.intent_key), crossed_at,
+                e.position_deal_id, e.position_side, e.qty,
+            )
+        else:
+            _blog_error(
+                "bracket attach rejected after parent fill for %s; "
+                "issuing defensive market close "
+                "(deal_id=%s, side=%s, qty=%s): %s",
+                intent, e.position_deal_id, e.position_side, e.qty, e,
+            )
         close_side = "sell" if e.position_side == "buy" else "buy"
         defensive_pine_id = f"__pyne_defensive_close__{e.position_coid}"
         close_intent = CloseIntent(
@@ -17754,12 +17877,24 @@ class OrderSyncEngine:
                     )
                     self._clear_pending_defensive_close(entry_id)
 
+        if crossed_at is not None:
+            message = (
+                f"Exit {format_intent_key(intent.intent_key)} filled at "
+                f"market: its protective level was already crossed at the "
+                f"entry fill (deal_id={e.position_deal_id})"
+            )
+            reason = "protective_level_crossed_at_fill"
+        else:
+            message = (
+                f"Bracket attach rejected after entry fill — parent position "
+                f"closed defensively (deal_id={e.position_deal_id}); "
+                f"intent re-evaluation deferred to next bar"
+            )
+            reason = "bracket_reject_defensive_close"
         raise OrderSkippedByPlugin(
-            f"Bracket attach rejected after entry fill — parent position "
-            f"closed defensively (deal_id={e.position_deal_id}); "
-            f"intent re-evaluation deferred to next bar",
+            message,
             intent_key=intent.intent_key,
-            reason="bracket_reject_defensive_close",
+            reason=reason,
             context={
                 'position_deal_id': e.position_deal_id,
                 'position_coid': e.position_coid,
@@ -17767,6 +17902,48 @@ class OrderSyncEngine:
                 'qty': e.qty,
             },
         ) from e
+
+    def _protective_level_crossed_at_fill(
+            self, intent: Intent, position_side: str,
+    ) -> float | None:
+        """The parent fill price when the refused exit's level was already crossed.
+
+        A stop-loss at or beyond the price the parent filled at (above it for
+        a long, below it for a short), or a take-profit already reached by
+        it, is an immediate exit in Pine: the level is crossed the moment the
+        position opens. The venue refuses to attach such a level, and the
+        defensive close is then exactly that exit, not a failed protection
+        (measured live: ctrader cycle 254, 2026-10-12 — a reversal entry
+        filled after the 21:00 UTC session break above its own stop).
+
+        :return: The parent's fill price when a level was crossed, ``None``
+            otherwise (also for a non-exit intent or an unknown fill).
+        """
+        if not isinstance(intent, ExitIntent) or intent.from_entry is None:
+            return None
+        fill_prices = [
+            trade.entry_price for trade in self._position.open_trades
+            if trade.entry_id == intent.from_entry
+        ]
+        if not fill_prices:
+            return None
+        fill_price = fill_prices[-1]
+        long = position_side == 'buy'
+        stop = intent.sl_price
+        if stop is not None and (stop >= fill_price if long else stop <= fill_price):
+            return fill_price
+        limit = intent.tp_price
+        if limit is not None and (limit <= fill_price if long else limit >= fill_price):
+            return fill_price
+        return None
+
+    @staticmethod
+    def _log_plugin_skip(e: OrderSkippedByPlugin) -> None:
+        """Log a plugin-declined dispatch at the severity its reason warrants."""
+        if e.reason in _INFO_SKIP_REASONS:
+            _blog_info("%s", e)
+        else:
+            _blog_warning("%s", e)
 
     def _cancel_bracket_reject_residuals(
             self, context: BracketAttachRejectContext,
