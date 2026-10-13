@@ -176,6 +176,41 @@ def __test_record_fill_side_flip_in_single_event__():
     assert p.closed_trades[0].exit_price == 52_000.0
 
 
+@pytest.mark.parametrize("leg", [
+    LegType.CLOSE, LegType.TAKE_PROFIT, LegType.STOP_LOSS, LegType.TRAILING_STOP,
+])
+def __test_exit_fill_while_flat_does_not_open__(leg):
+    """A late exit-leg fill on a flat book leaves the position flat."""
+    p = BrokerPosition()
+    assert not p.record_fill(_fill("sell", 1.0, 49_000.0, pine_id="Exit", leg=leg))
+    assert p.size == 0.0
+    assert p.sign == 0.0
+    assert p.open_trades == []
+    assert len(p.closed_trades) == 0
+    assert p.risk_intraday_filled_orders == 0
+
+
+@pytest.mark.parametrize("leg", [
+    LegType.CLOSE, LegType.TAKE_PROFIT, LegType.STOP_LOSS, LegType.TRAILING_STOP,
+])
+def __test_exit_fill_on_the_position_side_does_not_add__(leg):
+    """An exit-leg fill in the direction of the open position does not grow it."""
+    p = BrokerPosition()
+    p.record_fill(_fill("sell", 1.0, 50_000.0, pine_id="Short"))
+    assert not p.record_fill(_fill("sell", 1.0, 49_000.0, pine_id="Exit", leg=leg))
+    assert p.size == -1.0
+    assert p.avg_price == 50_000.0
+    assert [(t.entry_id, t.size) for t in p.open_trades] == [("Short", -1.0)]
+
+
+def __test_entry_fill_while_flat_still_opens__():
+    """The flat-book guard applies to exit legs only; an entry fill still opens."""
+    p = BrokerPosition()
+    p.record_fill(_fill("sell", 1.0, 50_000.0, pine_id="Short"))
+    assert p.size == -1.0
+    assert [(t.entry_id, t.size) for t in p.open_trades] == [("Short", -1.0)]
+
+
 def __test_update_unrealized_pnl_marks_to_market__():
     """Marking to market sets ``openprofit`` and rolls it into ``equity``."""
     p = BrokerPosition()

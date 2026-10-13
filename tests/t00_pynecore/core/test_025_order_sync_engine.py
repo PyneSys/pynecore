@@ -6920,6 +6920,293 @@ def __test_external_reduction_is_not_adopted_while_our_own_close_is_in_flight__(
     assert engine._shrink_observed is None  # type: ignore[attr-defined]
 
 
+def _age_unbooked_exit_observation(engine, seconds: float) -> None:
+    """Pretend the venue has reported the same size for ``seconds`` with no fill since."""
+    observed = engine._unbooked_exit_observed  # type: ignore[attr-defined]
+    assert observed is not None
+    engine._unbooked_exit_observed = (observed[0], observed[1] - seconds)  # type: ignore[attr-defined]
+    engine._last_position_fill_monotonic -= seconds  # type: ignore[attr-defined]
+
+
+def _book_long_then_late_stop_loss(engine, pos) -> None:
+    """Book a long ``L``, flatten it, then route ``L``'s stop-loss fill late.
+
+    The stop-loss leg is reduce-only on the venue, so the late fill does not
+    reduce the flat book: it is held instead of opening a short.
+    """
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L", xchg_id="xchg-L", fill_id="f-L"))
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 49_500.0, pine_id="S", xchg_id="xchg-S", fill_id="f-S"))
+    assert pos.size == 0.0
+    sl = _fill_event('sell', 1.0, 49_000.0, pine_id="L-X", leg=LegType.STOP_LOSS,
+                     xchg_id="xchg-SL", fill_id="f-SL")
+    engine._route_event(replace(sl, from_entry="L"))  # type: ignore[attr-defined]
+    assert pos.size == 0.0 and pos.open_trades == []
+
+
+def __test_late_exit_fill_matching_the_book_is_dropped__():
+    """The venue holds the book: the late exit fill was already accounted for."""
+    from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _book_long_then_late_stop_loss(engine, pos)
+    b.position = None
+
+    engine.reconcile()  # inside the no-fill grace: still held, nothing observed
+    assert engine._unbooked_exit_ids == ["L"]  # type: ignore[attr-defined]
+    assert engine._unbooked_exit_observed is None  # type: ignore[attr-defined]
+    engine._last_position_fill_monotonic -= EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0  # type: ignore[attr-defined]
+    engine.reconcile()
+    _age_unbooked_exit_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+    engine.reconcile()
+
+    assert engine._unbooked_exit_ids == []  # type: ignore[attr-defined]
+    assert pos.size == 0.0 and pos.open_trades == []
+
+
+def __test_late_exit_fill_booked_out_of_order_takes_the_venue_size__():
+    """The venue holds the book plus the late exit fill: an earlier fill was misordered.
+
+    Within the confirmation window nothing changes; past it the book takes the
+    venue's short, so the script no longer trades on a flat view.
+    """
+    from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _book_long_then_late_stop_loss(engine, pos)
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="short", size=1.0, entry_price=49_500.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cross",
+    )
+
+    engine.reconcile()  # inside the no-fill grace: nothing observed yet
+    assert pos.size == 0.0
+    engine._last_position_fill_monotonic -= EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0  # type: ignore[attr-defined]
+    engine.reconcile()  # first observation
+    assert pos.size == 0.0
+    _age_unbooked_exit_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+    engine.reconcile()
+
+    assert pos.size == -1.0 and pos.sign == -1.0
+    assert pos.avg_price == 49_500.0
+    assert [round(t.size, 12) for t in pos.open_trades] == [-1.0]
+    assert engine._unbooked_exit_ids == []  # type: ignore[attr-defined]
+
+
+def __test_late_exit_fill_the_venue_cannot_attribute_is_dropped__():
+    """A venue size that is neither the book nor the book plus the fill changes nothing."""
+    from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _book_long_then_late_stop_loss(engine, pos)
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="short", size=3.0, entry_price=49_500.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cross",
+    )
+    engine._last_position_fill_monotonic -= EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0  # type: ignore[attr-defined]
+    engine.reconcile()
+    _age_unbooked_exit_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+    engine.reconcile()
+
+    assert pos.size == 0.0 and pos.open_trades == []
+    assert engine._unbooked_exit_ids == []  # type: ignore[attr-defined]
+
+
+def __test_late_exit_fill_is_not_booked_when_another_run_shares_the_symbol__():
+    """Another run's exposure can make up the venue net, so it is not adopted."""
+    from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _book_long_then_late_stop_loss(engine, pos)
+    engine._venue_shared_with_other_runs = lambda: True  # type: ignore[method-assign]
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="short", size=1.0, entry_price=49_500.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cross",
+    )
+    engine._last_position_fill_monotonic -= EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0  # type: ignore[attr-defined]
+    engine.reconcile()
+    _age_unbooked_exit_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+    engine.reconcile()
+
+    assert pos.size == 0.0 and pos.open_trades == []
+    assert engine._unbooked_exit_ids == []  # type: ignore[attr-defined]
+
+
+def __test_late_exit_fill_waits_while_a_venue_size_change_restarts_the_window__():
+    """A venue size that moves during the window restarts the confirmation."""
+    from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _book_long_then_late_stop_loss(engine, pos)
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="short", size=2.0, entry_price=49_500.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cross",
+    )
+    engine._last_position_fill_monotonic -= EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0  # type: ignore[attr-defined]
+    engine.reconcile()
+    _age_unbooked_exit_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+    b.position = replace(b.position, size=1.0)
+    engine.reconcile()  # new size: the window starts over
+    assert pos.size == 0.0
+    assert engine._unbooked_exit_ids == ["L"]  # type: ignore[attr-defined]
+    _age_unbooked_exit_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+    engine.reconcile()
+    assert pos.size == -1.0
+
+
+def __test_new_entry_waits_while_an_exit_fill_awaits_settlement__():
+    """No entry is sized against a book a held exit fill may have put off.
+
+    The book is flat while the venue is short 1: a long entry dispatched now
+    would only flatten the venue while the book records a long. It waits for
+    the settlement and then goes out against the settled short.
+    """
+    from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _book_long_then_late_stop_loss(engine, pos)
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="short", size=1.0, entry_price=49_500.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cross",
+    )
+    pos.entry_orders["N"] = _entry_order("N", 1.0)
+
+    engine.sync(BAR_TS + 60_000)
+    assert b.entry_calls == [] and b.close_calls == []
+    assert "N" not in engine.active_intents
+
+    engine._last_position_fill_monotonic -= EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0  # type: ignore[attr-defined]
+    engine.reconcile()
+    _age_unbooked_exit_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+    engine.reconcile()
+    assert pos.size == -1.0
+
+    engine.sync(BAR_TS + 120_000)
+    assert b.entry_calls or b.close_calls
+
+
+def __test_settlement_to_flat_retires_the_spent_entry_so_it_can_re_enter__():
+    """A parent the settled book no longer holds is retired, not left as a dead slot.
+
+    A resting long ``N`` fills while ``L``'s late stop-loss is held, so the book
+    is long 1 against a flat venue. Settlement flattens the book; ``N``'s
+    tracking must go with it, or Pine's next ``N`` compares equal to the dead
+    slot and never dispatches.
+    """
+    from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["N"] = _entry_order("N", 1.0, limit=48_000.0)
+    engine.sync(BAR_TS)
+    assert [call.intent.pine_id for call in b.entry_calls] == ["N"]
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L", xchg_id="xchg-L", fill_id="f-L"))
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 49_500.0, pine_id="S", xchg_id="xchg-S", fill_id="f-S"))
+    sl = _fill_event('sell', 1.0, 49_000.0, pine_id="L-X", leg=LegType.STOP_LOSS,
+                     xchg_id="xchg-SL", fill_id="f-SL")
+    engine._route_event(replace(sl, from_entry="L"))  # type: ignore[attr-defined]
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 48_000.0, pine_id="N", xchg_id="xchg-1", fill_id="f-N"))
+    assert pos.size == 1.0
+    b.position = None
+
+    engine._last_position_fill_monotonic -= EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0  # type: ignore[attr-defined]
+    engine.reconcile()
+    _age_unbooked_exit_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+    engine.reconcile()
+    assert pos.size == 0.0 and pos.open_trades == []
+    assert "N" not in engine.active_intents
+    assert "N" not in engine.order_mapping
+
+    pos.entry_orders["N"] = _entry_order("N", 1.0, limit=48_000.0)
+    engine.sync(BAR_TS + 60_000)
+    assert [call.intent.pine_id for call in b.entry_calls] == ["N", "N"]
+
+
+def __test_unattributed_nonzero_settlement_keeps_every_exit_armed__():
+    """Settling to a non-flat size the ledger cannot split keeps all protection.
+
+    The book is short ``S`` 1 + ``T`` 0.5 with an exit on each, and a held
+    sell exit fill of an earlier long settles it to the venue's short 2.5.
+    Without an order ledger one fallback parent carries the 2.5, which does not
+    prove ``S`` or ``T`` closed: their exits must stay armed for the short.
+    """
+    from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    lib._script.pyramiding = 2
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    pos.entry_orders["T"] = _entry_order("T", -0.5)
+    pos.exit_orders[("S-X", "S")] = _exit_order("S", -1.0, "S-X", stop=51_000.0)
+    pos.exit_orders[("T-X", "T")] = _exit_order("T", -0.5, "T-X", stop=51_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 50_000.0, pine_id="S", xchg_id="xchg-S", fill_id="f-S"))
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 0.5, 50_000.0, pine_id="T", xchg_id="xchg-T", fill_id="f-T"))
+    engine.sync(BAR_TS)
+    exit_keys = {f"S-X{INTENT_KEY_SEP}S", f"T-X{INTENT_KEY_SEP}T"}
+    assert exit_keys <= set(engine.active_intents)
+    assert pos.size == -1.5
+    sl = _fill_event('sell', 1.0, 49_000.0, pine_id="L-X", leg=LegType.STOP_LOSS,
+                     xchg_id="xchg-SL", fill_id="f-SL")
+    engine._route_event(replace(sl, from_entry="L"))  # type: ignore[attr-defined]
+    assert pos.size == -1.5
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="short", size=2.5, entry_price=50_000.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cross",
+    )
+    n_cancels = len(b.cancel_calls)
+
+    engine._last_position_fill_monotonic -= EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0  # type: ignore[attr-defined]
+    engine.reconcile()
+    _age_unbooked_exit_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+    engine.reconcile()
+
+    assert pos.size == -2.5
+    assert exit_keys <= set(engine.active_intents)
+    assert all(key in engine.order_mapping for key in exit_keys)
+    assert len(b.cancel_calls) == n_cancels
+
+    engine.sync(BAR_TS + 60_000)
+    assert exit_keys <= set(engine.active_intents)
+    assert len(b.cancel_calls) == n_cancels
+
+
+def __test_venue_shared_with_other_runs_checks_the_journal_symbols__():
+    """Foreign live orders under this run's journal (wire) symbol are found."""
+    b = MockBroker()
+    engine, _ = _mk_engine(b)
+    queried: list[str] = []
+
+    def foreign_ids(*, symbol: str) -> set[str]:
+        queried.append(symbol)
+        return {"other-run-order"} if symbol == "BTCUSDT-WIRE" else set()
+
+    engine._store_ctx = SimpleNamespace(  # type: ignore[assignment]
+        iter_live_orders=lambda: iter([SimpleNamespace(symbol="BTCUSDT-WIRE")]),
+        foreign_live_exchange_order_ids=foreign_ids,
+    )
+    assert engine._venue_shared_with_other_runs() is True  # type: ignore[attr-defined]
+    assert "BTCUSDT-WIRE" in queried
+    engine._store_ctx = SimpleNamespace(  # type: ignore[assignment]
+        iter_live_orders=lambda: iter([]),
+        foreign_live_exchange_order_ids=lambda *, symbol: set(),
+    )
+    assert engine._venue_shared_with_other_runs() is False  # type: ignore[attr-defined]
+
+
 def __test_flat_close_retires_adopted_bracket_keyed_on_a_foreign_parent_id__():
     """A flat book must retire adopted exit legs keyed on the prior run's id.
 

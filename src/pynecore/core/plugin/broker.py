@@ -731,6 +731,13 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
         - Recovery events that backfill state missed during a network
           drop or restart, before the native stream catches up.
 
+        Events may therefore arrive late or out of order. An exit-leg fill
+        (close, TP, SL, trailing) that would not reduce the booked position is
+        never booked as a new one: exit legs are reduce-only on the venue
+        (:attr:`ExchangeCapabilities.reduce_only`), so the engine settles such
+        a fill against :meth:`get_position` instead. A fill that opened
+        exposure must carry ``LegType.ENTRY``.
+
         Plugins that decide a disappearance warrants a graceful halt
         instead of a soft cancel should raise
         :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError`

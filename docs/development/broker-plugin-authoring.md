@@ -114,7 +114,7 @@ trading depends on `update_symbol_info()` upholding these invariants:
 
 The abstract surface (`execute_entry` / `execute_exit` / `execute_close` /
 `execute_cancel`, the state queries, `get_capabilities`) is small. The
-following five requirements are what actually make a plugin safe to trade
+following six requirements are what actually make a plugin safe to trade
 with. `validate_plugin_contract()` (see below) enforces the
 machine-checkable subset at startup; the rest can only be upheld by you.
 
@@ -212,6 +212,40 @@ the run identity (`run_id`, `run_tag`, and with them the whole
 idempotency chain) derives from it. Left unset, `account_id` returns the
 `"default"` sentinel and every run of every account collides on one
 identity. The startup probe rejects this.
+
+### 6. Exit legs never open exposure; late fills are settled by the venue
+
+Every exit leg (`strategy.exit` take-profit / stop-loss / trailing,
+`strategy.close`) must be delivered **reduce-only end-to-end**: whatever
+the venue does with it, it can only reduce the position it closes, never
+open or grow one. This is what `reduce_only` declares (`NATIVE`: the
+venue's reduce-only flag; `SOFTWARE`: position-attached brackets or
+netting that cannot flip), and the validator refuses scripts with exits
+on a plugin that does not declare it.
+
+The engine builds on that guarantee, because `watch_orders()` events may
+arrive late or out of order (a recovery backfill after an outage, a fill
+surfaced by a slower namespace). An exit-leg fill that would not reduce
+the book — the book is flat, or holds the fill's own side — is never
+booked as a new position. The engine holds it and settles it against
+`get_position()` once no fill has arrived for the confirmation grace,
+nothing of its own is in flight and the venue size has been stable for
+that long:
+
+- venue = book: the fill was already accounted for and is dropped;
+- venue = book + the fill: an earlier fill was booked out of order, and the
+  book takes the venue size (parent trades rebuilt from the order ledger)
+  unless another run trades the same account and symbol;
+- anything else: the fill is dropped and the book stays as it is.
+
+Until it settles, new entries are deferred (exits and closes still
+dispatch), so no exposure is sized against a book that may be off by the
+held fill.
+
+So the plugin must: honour the declared reduce-only semantics on every
+exit path; label a fill `LegType.ENTRY` whenever it opened exposure, never
+as an exit leg; and report the venue's net size with its side from
+`get_position()`.
 
 ## Capabilities: declare what you deliver end-to-end
 

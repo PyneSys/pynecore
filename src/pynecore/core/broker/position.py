@@ -27,6 +27,12 @@ if TYPE_CHECKING:
 
 __all__ = ['BrokerPosition']
 
+# Legs that only ever reduce exposure: the plugin contract requires reduce-only
+# delivery for them (``ExchangeCapabilities.reduce_only``)
+_EXIT_LEG_TYPES = frozenset((
+    LegType.CLOSE, LegType.TAKE_PROFIT, LegType.STOP_LOSS, LegType.TRAILING_STOP,
+))
+
 
 class BrokerPosition(PositionBase):
     """
@@ -454,6 +460,24 @@ class BrokerPosition(PositionBase):
 
     # === Exchange-side state updates ===
 
+    def is_non_reducing_exit(self, event: 'OrderEvent') -> bool:
+        """
+        Whether an exit-leg fill would not reduce the booked position.
+
+        The plugin contract delivers exit legs reduce-only, so on the venue such a
+        fill reduced exposure the book no longer holds on that side: the book is
+        flat or holds the fill's own side. :meth:`record_fill` does not book it.
+
+        :param event: A fill event with ``fill_qty`` populated.
+        :return: ``True`` for an exit leg (close, TP, SL, trailing) whose fill
+            would open or grow a position in the book.
+        """
+        if event.leg_type not in _EXIT_LEG_TYPES:
+            return False
+        fill_qty = event.fill_qty or 0.0
+        signed_delta = fill_qty if event.order.side == "buy" else -fill_qty
+        return not self.size * signed_delta < 0.0
+
     def record_fill(self, event: 'OrderEvent') -> bool:
         """
         Record an exchange fill.
@@ -484,6 +508,12 @@ class BrokerPosition(PositionBase):
         signed_delta = fill_qty if event.order.side == "buy" else -fill_qty
         old_sign = self.sign
         new_size = self.size + signed_delta
+
+        # A late or out-of-order exit fill must not open or grow a position the
+        # venue may not hold: the diff engine could then "close" it with a real
+        # order. The sync engine settles such a fill against the venue position.
+        if self.is_non_reducing_exit(event):
+            return False
 
         # Commission bookkeeping — realized fee becomes part of net P&L at close
         fee = event.fee
@@ -591,10 +621,7 @@ class BrokerPosition(PositionBase):
         #     opposite position the diff engine could then "close" with a real
         #     reversing order.
         if remaining > 0.0:
-            if event.leg_type in (
-                LegType.CLOSE, LegType.TAKE_PROFIT,
-                LegType.STOP_LOSS, LegType.TRAILING_STOP,
-            ):
+            if event.leg_type in _EXIT_LEG_TYPES:
                 if old_sign * self.size > 0.0:
                     # Partial reduce-only fill against an under-counted FIFO:
                     # the residual already in ``self.size`` is authoritative.

@@ -534,6 +534,16 @@ def _is_composed_leg_coid(event_coid: str, parent_coid: str | None) -> bool:
             and event_coid[len(parent_coid)] in (':', '_'))
 
 
+def _sizes_match(actual: float, expected: float) -> bool:
+    """Whether two signed position sizes are equal up to float noise.
+
+    :param actual: The size observed (e.g. on the venue).
+    :param expected: The size it is compared with.
+    """
+    scale = max(abs(expected), abs(actual), 1.0)
+    return abs(actual - expected) <= scale * 1e-6 + 1e-9
+
+
 def _str_tuple_from_payload(data: dict, field: str) -> tuple[str, ...]:
     """Read a list-of-strings audit payload field as a tuple.
 
@@ -1080,11 +1090,11 @@ class OrderSyncEngine:
         #: (:meth:`_warn_read_outage`); ``0.0`` while the view is confirmed.
         self._read_outage_warned_at = 0.0
         #: Entry intent keys already reported as deferred in the current
-        #: unconfirmed stretch. A sync retries on every market update, so an
-        #: outage would otherwise repeat the same deferral line hundreds of
+        #: stretch of gated exposure. A sync retries on every market update, so
+        #: an outage would otherwise repeat the same deferral line hundreds of
         #: times per entry (measured: 318 WARNING lines within one bar of a
-        #: capitalcom REST outage, cycle 269). Cleared by
-        #: :meth:`_mark_reads_confirmed`.
+        #: capitalcom REST outage, cycle 269). Cleared by the first :meth:`sync`
+        #: that may open exposure again.
         self._outage_deferred_entries: set[str] = set()
         #: Monotonic deadline until which broker reads are parked after a venue
         #: rate limit, honouring the ``retry_after`` the venue asked for.
@@ -1645,6 +1655,14 @@ class OrderSyncEngine:
         # monotonic time it was first seen at that size — the confirmation
         # window of :meth:`_adopt_external_shrink`.
         self._shrink_observed: tuple[float, float] | None = None
+        # Exit-leg fills the book did not take because they did not reduce it
+        # (:meth:`BrokerPosition.is_non_reducing_exit`), waiting for
+        # :meth:`_settle_unbooked_exit_fills`: their summed signed quantity, the
+        # entry ids they name (for the log), and the venue size seen while they
+        # wait with the monotonic time it was first seen at that size.
+        self._unbooked_exit_delta = 0.0
+        self._unbooked_exit_ids: list[str] = []
+        self._unbooked_exit_observed: tuple[float | None, float] | None = None
 
         # Intent keys whose ``_order_mapping`` entry was seeded from a
         # recovered close-park anchor (see :meth:`_verify_pending_dispatches`).
@@ -2678,6 +2696,14 @@ class OrderSyncEngine:
         # ``_drive_entry_stop_triggers`` can both open new exposure and must
         # obey it too.
         may_open_exposure = self._guard_stuck_reads()
+        # A held exit fill (:meth:`_note_unbooked_exit_fill`) leaves the book
+        # either right or off by that fill until the venue settles it, so an
+        # entry sized against it could open the wrong exposure. Fills, exits
+        # and closes keep flowing; only new exposure waits for the settlement.
+        if self._unbooked_exit_ids:
+            may_open_exposure = False
+        if may_open_exposure:
+            self._outage_deferred_entries.clear()
         # One-time restart scan of live broker entry orders, so a bumped COID
         # the crash window dropped before journaling can be adopted at build
         # time (see :meth:`_scan_live_entry_anchors_for_restart` and
@@ -4677,6 +4703,7 @@ class OrderSyncEngine:
             m for m in self._pending_defensive_close.values()
             if m.entry_id in self._replayed_defensive_close_entry_ids
         ]
+        self._settle_unbooked_exit_fills(exch_pos)
         if is_startup and drained_mutated_position:
             _blog_info(
                 "skipping startup size adoption (exchange=%s, internal=%s) "
@@ -4749,72 +4776,7 @@ class OrderSyncEngine:
                     "adopting exchange",
                     broker_signed, self._position.size,
                 )
-                self._position.size = broker_signed
-                self._position.sign = (
-                    1.0 if broker_signed > 0.0
-                    else (-1.0 if broker_signed < 0.0 else 0.0)
-                )
-                if broker_signed == 0.0:
-                    self._position.avg_price = na_float
-                    self._position.open_trades.clear()
-                    self._position.openprofit = 0.0
-                    self._position.open_commission = 0.0
-                else:
-                    self._position.avg_price = broker_entry_price
-                    # Adoption restores the net size, but BrokerPosition has no
-                    # simulator to populate the FIFO ``open_trades``. Seed one
-                    # synthetic parent trade so a later exit fill nets against
-                    # it instead of walking an empty FIFO and minting a phantom
-                    # opposite-side position in ``record_fill``.
-                    if not (broker_entry_price > 0.0):
-                        _blog_warning(
-                            "adopted position has no usable entry price (%s) "
-                            "— seeding parent trade for size correctness; "
-                            "realized P&L on this trade will be approximate",
-                            broker_entry_price,
-                        )
-                    # Prefer a FAITHFUL per-entry FIFO reconstructed from the
-                    # durable order ledger: seed one parent trade per distinct
-                    # real Pine entry id that owns the adopted exposure, each
-                    # carrying its own filled size. On a HEDGED account two
-                    # separately-opened legs (entry ids ``A`` / ``B``, one broker
-                    # leg each) are then adopted as two 1000-unit trades rather
-                    # than one 2000 aggregate, so a later
-                    # ``strategy.close("A")`` binds to A's own 1000 and closes
-                    # only its leg (the Pine ``close`` helper sizes off the
-                    # matching ``open_trades`` entry) instead of flattening B
-                    # too. Falls back to the single synthetic-parent seed when
-                    # the ledger cannot faithfully account for the net (unmapped
-                    # / opposing exposure, or a durable sum that disagrees with
-                    # the adopted net).
-                    adopted_trades = self._recover_adopted_parent_trades(
-                        broker_signed,
-                    )
-                    if adopted_trades:
-                        for entry_id, trade_size in adopted_trades:
-                            self._position.reconstruct_parent_trade(
-                                entry_id=entry_id,
-                                size=trade_size,
-                                entry_price=broker_entry_price,
-                            )
-                    else:
-                        # Prefer the real Pine parent entry id recovered from the
-                        # durable bracket-ownership ledger so a post-restart
-                        # ``strategy.exit(..., from_entry='L')`` still resolves the
-                        # seeded trade and can re-target the reconstructed bracket
-                        # (the Pine ``exit`` helper matches ``open_trades`` by
-                        # ``entry_id``). Falls back to the synthetic id when no
-                        # single parent can be recovered (no bracket, or pyramided
-                        # multi-parent position).
-                        adopted_entry_id = (
-                            self._recover_adopted_parent_entry_id()
-                            or ADOPTED_STARTUP_ENTRY_ID
-                        )
-                        self._position.reconstruct_parent_trade(
-                            entry_id=adopted_entry_id,
-                            size=broker_signed,
-                            entry_price=broker_entry_price,
-                        )
+                self._adopt_signed_size(broker_signed, broker_entry_price)
         elif not is_startup and new_size == 0.0 and self._position.size != 0.0:
             # Wait while bot-initiated work may be in flight — a close we
             # dispatched ourselves will flatten /positions seconds before
@@ -4914,6 +4876,266 @@ class OrderSyncEngine:
             self._shrink_observed = None
         self._enforce_reduce_coverage_invariant(exch_pos)
 
+    def _note_unbooked_exit_fill(self, event: OrderEvent) -> None:
+        """Hold an exit fill the book does not take until the venue settles it.
+
+        Exit legs are reduce-only by the plugin contract, so the venue executed
+        this fill against exposure it held on the reduced side, while the book is
+        flat or holds the fill's own side. Either the book already accounts for
+        that reduction (a late or redelivered fill) or it booked an earlier fill
+        in the wrong order (the venue now holds the book plus this fill). The
+        event alone cannot tell which, so :meth:`record_fill` leaves the book as
+        it is and :meth:`_settle_unbooked_exit_fills` decides against the venue.
+
+        :param event: The exit-leg fill :meth:`BrokerPosition.is_non_reducing_exit`
+            flagged.
+        """
+        qty = event.fill_qty or 0.0
+        signed = qty if event.order.side == 'buy' else -qty
+        self._unbooked_exit_delta = round(self._unbooked_exit_delta + signed, 12)
+        self._unbooked_exit_ids.append(event.from_entry or event.pine_id or '')
+        self._unbooked_exit_observed = None
+        _blog_warning(
+            "exit fill (leg=%s qty=%s pine=%r from_entry=%r) does not reduce the "
+            "book (size=%s) — not booked; settling it against the venue position, "
+            "new entries wait until then",
+            event.leg_type, qty, event.pine_id, event.from_entry, self._position.size,
+        )
+        if self._store_ctx is not None:
+            self._store_ctx.log_event(
+                'unbooked_exit_fill', client_order_id=event.order.client_order_id,
+                exchange_order_id=event.order.id, intent_key=None,
+                payload={'leg_type': str(event.leg_type), 'qty': qty,
+                         'side': event.order.side, 'pine_id': event.pine_id,
+                         'from_entry': event.from_entry,
+                         'book_size': self._position.size},
+            )
+
+    def _settle_unbooked_exit_fills(self, exch_pos: ExchangePosition | None) -> None:
+        """Settle held exit fills (:meth:`_note_unbooked_exit_fill`) against the venue.
+
+        Once no fill has routed for :data:`EXTERNAL_FLATTEN_CONFIRM_GRACE_S`,
+        nothing of ours is in flight, and the venue has reported the same size
+        for that long, the venue decides between the two possible cases:
+
+        - The venue holds the book: the fills were already accounted for and are
+          dropped.
+        - The venue holds the book plus the fills: an earlier fill was booked out
+          of order, so the book takes that size, its parent trades rebuilt from
+          the order ledger as at startup; a parent it no longer holds has its
+          exits and tracking retired, unless the ledger cannot attribute the
+          size per entry id (one fallback parent then holds it and every exit
+          stays armed). Not when another run trades this account and symbol,
+          since the venue net is then not ours alone.
+        - Anything else: the venue cannot attribute them; they are dropped and
+          the book stays as it is.
+
+        :param exch_pos: The venue position this reconcile pass read.
+        """
+        if not self._unbooked_exit_ids:
+            return
+        now = time.monotonic()
+        if (now - self._last_position_fill_monotonic < EXTERNAL_FLATTEN_CONFIRM_GRACE_S
+                or self._position_work_in_flight()):
+            self._unbooked_exit_observed = None
+            return
+        venue = self._venue_signed_size(exch_pos)
+        observed = self._unbooked_exit_observed
+        if observed is None or observed[0] != venue:
+            self._unbooked_exit_observed = (venue, now)
+            return
+        if now - observed[1] < EXTERNAL_FLATTEN_CONFIRM_GRACE_S:
+            return
+        book = self._position.size
+        delta = self._unbooked_exit_delta
+        target = round(book + delta, 12)
+        entry_ids = sorted(set(self._unbooked_exit_ids))
+        self._unbooked_exit_delta = 0.0
+        self._unbooked_exit_ids = []
+        self._unbooked_exit_observed = None
+        if venue is not None and _sizes_match(venue, book):
+            outcome = 'already_booked'
+            _blog_info(
+                "unbooked exit fill(s) of %s settled: the venue holds the book's %s, "
+                "so they were already accounted for",
+                entry_ids, book,
+            )
+        elif (venue is not None and _sizes_match(venue, target)
+              and not self._venue_shared_with_other_runs()):
+            outcome = 'booked'
+            _blog_warning(
+                "unbooked exit fill(s) of %s settled: the venue holds %s, the book "
+                "%s plus their %s — an earlier fill was booked out of order; the "
+                "book takes the venue size (parent trades rebuilt from the order "
+                "ledger, realized P&L of the trades closed out of order is "
+                "approximate)",
+                entry_ids, venue, book, delta,
+            )
+            held_entry_ids = {
+                trade.entry_id for trade in self._position.open_trades
+                if trade.entry_id is not None
+            }
+            self._position.open_trades.clear()
+            self._position.open_commission = 0.0
+            exact = self._adopt_signed_size(
+                target, float(exch_pos.entry_price) if exch_pos else 0.0,
+            )
+            # A parent the adopted book no longer holds is spent: retire its
+            # exits and tracking, or the diff would call Pine's re-emission of
+            # the same entry "unchanged" and never dispatch it. Only when the
+            # adopted parents are exact: under the fallback parent, a missing
+            # entry id may still hold part of the venue's exposure, and its
+            # exits are that exposure's protection.
+            spent: set[str] = set()
+            if exact:
+                spent = held_entry_ids - {
+                    trade.entry_id for trade in self._position.open_trades
+                }
+            else:
+                _blog_warning(
+                    "the order ledger cannot attribute the settled %s to entry ids "
+                    "— the book holds it as one parent; the exits of %s stay armed",
+                    target, sorted(held_entry_ids) or 'none',
+                )
+            for entry_id in sorted(spent):
+                for key, intent in list(self._active_intents.items()):
+                    if isinstance(intent, ExitIntent) and intent.from_entry == entry_id:
+                        self._cancel_and_retire_exit_leg(key, intent)
+                self._cleanup_position_tracking(
+                    entry_id, cascade_reason='unbooked_exit_settled',
+                )
+        else:
+            outcome = 'unattributed'
+            _blog_warning(
+                "unbooked exit fill(s) of %s dropped: the venue holds %s, neither the "
+                "book's %s nor the book plus their %s (or another run trades this "
+                "symbol) — the book stays as it is",
+                entry_ids, venue, book, delta,
+            )
+        if self._store_ctx is not None:
+            self._store_ctx.log_event(
+                'unbooked_exit_fill_settled', client_order_id=None, intent_key=None,
+                payload={'outcome': outcome, 'venue_size': venue, 'book_size': book,
+                         'delta': delta, 'entry_ids': entry_ids,
+                         'book_size_after': self._position.size},
+            )
+
+    @staticmethod
+    def _venue_signed_size(exch_pos: ExchangePosition | None) -> float | None:
+        """The venue position as a signed size, ``None`` for an unknown side label.
+
+        :param exch_pos: A venue position snapshot, ``None`` when there is none.
+        :return: Positive long, negative short, ``0.0`` flat.
+        """
+        if exch_pos is None:
+            return 0.0
+        size = float(exch_pos.size)
+        side = (exch_pos.side or '').lower()
+        if size == 0.0 or side == 'flat':
+            return 0.0
+        if side == 'long':
+            return size
+        if side == 'short':
+            return -size
+        return None
+
+    def _venue_shared_with_other_runs(self) -> bool:
+        """Whether another run holds live orders on this account and symbol.
+
+        Journal rows carry the venue wire symbol, which can differ from
+        ``self._symbol``, so the symbols of this run's own live rows are checked
+        too.
+        """
+        if self._store_ctx is None:
+            return False
+        symbols = {row.symbol for row in self._store_ctx.iter_live_orders() if row.symbol}
+        symbols.add(self._symbol)
+        return any(
+            self._store_ctx.foreign_live_exchange_order_ids(symbol=symbol)
+            for symbol in symbols
+        )
+
+    def _adopt_signed_size(
+            self, broker_signed: float, broker_entry_price: float,
+    ) -> bool:
+        """Set the book to a venue-derived net size and seed its parent trades.
+
+        :param broker_signed: Signed size to adopt (positive long, negative short).
+        :param broker_entry_price: The venue's average entry price for it.
+        :return: Whether the parent trades are exact: the size is flat, or the
+            order ledger accounts for it per entry id. ``False`` when one
+            fallback parent carries the whole size, so the ledger could not say
+            which entries still hold it.
+        """
+        self._position.size = broker_signed
+        self._position.sign = (
+            1.0 if broker_signed > 0.0
+            else (-1.0 if broker_signed < 0.0 else 0.0)
+        )
+        if broker_signed == 0.0:
+            self._position.avg_price = na_float
+            self._position.open_trades.clear()
+            self._position.openprofit = 0.0
+            self._position.open_commission = 0.0
+            return True
+        else:
+            self._position.avg_price = broker_entry_price
+            # Adoption restores the net size, but BrokerPosition has no
+            # simulator to populate the FIFO ``open_trades``. Seed one
+            # synthetic parent trade so a later exit fill nets against
+            # it instead of walking an empty FIFO and minting a phantom
+            # opposite-side position in ``record_fill``.
+            if not (broker_entry_price > 0.0):
+                _blog_warning(
+                    "adopted position has no usable entry price (%s) "
+                    "— seeding parent trade for size correctness; "
+                    "realized P&L on this trade will be approximate",
+                    broker_entry_price,
+                )
+            # Prefer a FAITHFUL per-entry FIFO reconstructed from the
+            # durable order ledger: seed one parent trade per distinct
+            # real Pine entry id that owns the adopted exposure, each
+            # carrying its own filled size. On a HEDGED account two
+            # separately-opened legs (entry ids ``A`` / ``B``, one broker
+            # leg each) are then adopted as two 1000-unit trades rather
+            # than one 2000 aggregate, so a later
+            # ``strategy.close("A")`` binds to A's own 1000 and closes
+            # only its leg (the Pine ``close`` helper sizes off the
+            # matching ``open_trades`` entry) instead of flattening B
+            # too. Falls back to the single synthetic-parent seed when
+            # the ledger cannot faithfully account for the net (unmapped
+            # / opposing exposure, or a durable sum that disagrees with
+            # the adopted net).
+            adopted_trades = self._recover_adopted_parent_trades(
+                broker_signed,
+            )
+            if adopted_trades:
+                for entry_id, trade_size in adopted_trades:
+                    self._position.reconstruct_parent_trade(
+                        entry_id=entry_id,
+                        size=trade_size,
+                        entry_price=broker_entry_price,
+                    )
+                return True
+            # Prefer the real Pine parent entry id recovered from the
+            # durable bracket-ownership ledger so a post-restart
+            # ``strategy.exit(..., from_entry='L')`` still resolves the
+            # seeded trade and can re-target the reconstructed bracket
+            # (the Pine ``exit`` helper matches ``open_trades`` by
+            # ``entry_id``). Falls back to the synthetic id when no
+            # single parent can be recovered (no bracket, or pyramided
+            # multi-parent position).
+            adopted_entry_id = (
+                self._recover_adopted_parent_entry_id()
+                or ADOPTED_STARTUP_ENTRY_ID
+            )
+            self._position.reconstruct_parent_trade(
+                entry_id=adopted_entry_id,
+                size=broker_signed,
+                entry_price=broker_entry_price,
+            )
+            return False
+
     def _external_shrink_delta(self, exch_pos: ExchangePosition) -> float:
         """How far the venue holds BELOW the book on the book's own side.
 
@@ -4982,13 +5204,8 @@ class OrderSyncEngine:
                 or now - self._last_position_fill_monotonic
                 < EXTERNAL_FLATTEN_CONFIRM_GRACE_S):
             return
-        if (self._pending_verification or self._pending_defensive_close
-                or self._pending_reversal_opens
-                or self._pending_flip_surplus_closes):
+        if self._position_work_in_flight():
             return
-        for key, intent in self._active_intents.items():
-            if isinstance(intent, CloseIntent) and self._order_mapping.get(key):
-                return
         self._shrink_observed = None
         price = float(exch_pos.entry_price)
         if not price > 0.0:
@@ -5041,6 +5258,22 @@ class OrderSyncEngine:
                          'consumed': sorted(consumed), 'retired': gone,
                          'book_size': self._position.size},
             )
+
+    def _position_work_in_flight(self) -> bool:
+        """Whether work of ours that could still move the position is in flight.
+
+        Parked dispatches, pending defensive / reversal / surplus closes and a
+        dispatched close can each explain a venue size the book has not booked
+        yet, so a venue-vs-book difference is not proven while any of them runs.
+        """
+        if (self._pending_verification or self._pending_defensive_close
+                or self._pending_reversal_opens
+                or self._pending_flip_surplus_closes):
+            return True
+        return any(
+            isinstance(intent, CloseIntent) and self._order_mapping.get(key)
+            for key, intent in self._active_intents.items()
+        )
 
     def _enforce_reduce_coverage_invariant(
             self, exch_pos: ExchangePosition | None,
@@ -6318,6 +6551,9 @@ class OrderSyncEngine:
             # length here so the post-FILL slice gives us the exact set
             # of entry ids the FIFO walk consumed.
             closed_count_before = len(self._position.new_closed_trades)
+            if ((event.fill_qty or 0.0) > 0.0 and (event.fill_price or 0.0) > 0.0
+                    and self._position.is_non_reducing_exit(event)):
+                self._note_unbooked_exit_fill(event)
             self._position.record_fill(event)
             self._last_position_fill_monotonic = time.monotonic()
             self._last_fifo_closed_entry_ids = [
@@ -12680,7 +12916,8 @@ class OrderSyncEngine:
 
         :param intents: The dispatchable intents built for this sync.
         :param may_open_exposure: ``False`` when :meth:`_guard_stuck_reads`
-            could not confirm the broker position view this cycle. Cancels,
+            could not confirm the broker position view this cycle, or an exit
+            fill awaits :meth:`_settle_unbooked_exit_fills`. Cancels,
             adoption, orphan sweeps and every exposure-reducing dispatch
             (``ExitIntent`` / ``CloseIntent``) still run — only new and
             modified ``EntryIntent`` dispatches are deferred, because those
@@ -13223,7 +13460,8 @@ class OrderSyncEngine:
 
         for key, intent in new_map.items():
             if not may_open_exposure and isinstance(intent, EntryIntent):
-                # Unconfirmed broker view (see :meth:`_guard_stuck_reads`):
+                # Unconfirmed broker view (see :meth:`_guard_stuck_reads`)
+                # or an unsettled exit fill (see :meth:`sync`):
                 # an entry is the only intent kind that can open exposure, so
                 # it is the only one deferred here. Both the fresh-dispatch and
                 # the modify branch are covered — an amend can raise qty or
@@ -13233,10 +13471,11 @@ class OrderSyncEngine:
                 if key not in self._outage_deferred_entries:
                     self._outage_deferred_entries.add(key)
                     _blog_warning(
-                        "entry intent %r deferred — broker position view "
-                        "unconfirmed; retrying on every sync until a read "
-                        "succeeds",
+                        "entry intent %r deferred — broker position %s; "
+                        "retrying on every sync",
                         format_intent_key(key),
+                        "has an exit fill awaiting settlement"
+                        if self._unbooked_exit_ids else "view unconfirmed",
                     )
                 if key not in self._active_intents:
                     # A never-dispatched entry has no exchange-side parent,
@@ -20756,7 +20995,6 @@ class OrderSyncEngine:
         self._read_view_confirmed = True
         self._reads_unconfirmed_since = 0.0
         self._read_outage_warned_at = 0.0
-        self._outage_deferred_entries.clear()
 
     def _warn_read_outage(self, msg: str, *args: Any) -> None:
         """Log a read-outage WARNING at most once per :data:`READ_OUTAGE_WARN_INTERVAL_S`.

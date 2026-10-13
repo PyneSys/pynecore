@@ -499,6 +499,9 @@ class ExchangeCapabilities:
     # opposite-side order onto the existing position so it cannot flip).
     # UNSUPPORTED = scripts using ``strategy.exit`` / ``strategy.close`` are
     # rejected at startup.
+    # The engine relies on it: an exit-leg fill never opens or grows venue
+    # exposure, so one that would not reduce the book is settled against
+    # ``get_position()`` instead of booked (see ``is_non_reducing_exit``).
     reduce_only: CapabilityLevel = CapabilityLevel.UNSUPPORTED
 
     # === Streaming & position ===
