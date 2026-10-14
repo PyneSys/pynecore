@@ -965,6 +965,27 @@ def __test_resting_opposite_entry_does_not_wait_for_an_unbooked_fill__():
     assert [c.intent.pine_id for c in b.entry_calls] == ["S", "L"]
 
 
+def __test_entry_does_not_wait_once_the_opposite_fill_is_booked_below_its_qty__():
+    """A fill a hair below the intent's quantity is booked, so the wait ends.
+
+    Measured live (bybit-inverse cycle 223, 2026-10-13): the venue's lot
+    rounding filled a ``0.002`` short as ``0.0019963``; reading that as
+    unfilled kept the long reversal waiting the full bound.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 0.998, 50_000.0, pine_id="S", xchg_id="xchg-s"))
+    assert pos.size == -0.998
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.close_calls) == 1, "the reversal waited for a booked fill"
+    assert "L" in engine._pending_reversal_opens
+
+
 def __test_same_side_entry_does_not_wait_for_an_unbooked_fill__():
     """Only an opposite entry can net against the unbooked one."""
     b = MockBroker()
@@ -10241,6 +10262,8 @@ def _bracket_reject_exit_intent() -> ExitIntent:
 
 def _bracket_reject_error(
         original_cause: Exception | None = None,
+        *,
+        level_crossed: bool = False,
 ) -> BracketAttachAfterFillRejectedError:
     err = BracketAttachAfterFillRejectedError(
         "bracket attach reject",
@@ -10250,6 +10273,7 @@ def _bracket_reject_error(
         position_side='buy',
         qty=1.0,
         from_entry='Long',
+        level_crossed=level_crossed,
     )
     if original_cause is not None:
         err.__cause__ = original_cause
@@ -10288,6 +10312,34 @@ def __test_bracket_reject_of_a_level_crossed_at_fill_is_an_immediate_exit__(capl
         OrderSyncEngine._log_plugin_skip(OrderSkippedByPlugin(  # noqa
             "below grid", intent_key="k", reason="below_min_volume"))
     assert [rec.levelno for rec in caplog.records] == [logging.INFO, logging.WARNING]
+
+
+def __test_bracket_reject_of_a_level_the_market_crossed_is_an_immediate_exit__(caplog):
+    """A level the market traded through before the attach is Pine's exit, not an ERROR.
+
+    Measured live (bybit-inverse cycle 223, 2026-10-13): the long filled at
+    83076.5 with its stop at 83053.3, but the last price had already fallen
+    to 83052.9 when the trading stop was set, so Bybit refused it. The plugin
+    flags such a refusal; the defensive close is the stop's exit.
+    """
+    b = MockBroker()
+    b.raise_on_next_exit = _bracket_reject_error(level_crossed=True)
+    engine, pos = _mk_engine(b)
+    pos.size = 1.0
+    pos.open_trades.append(Trade(
+        size=1.0, entry_id="Long", entry_bar_index=0, entry_time=0,
+        entry_price=50_000.0, commission=0.0, entry_comment=None,
+        entry_equity=1_000_000.0,
+    ))
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(OrderSkippedByPlugin) as exc:
+            engine._dispatch_new(_bracket_reject_exit_intent())  # noqa
+
+    assert exc.value.reason == "protective_level_crossed_at_fill"
+    assert "crossed by the market" in str(exc.value)
+    assert len(b.close_calls) == 1
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
 
 
 def __test_bracket_reject_below_the_fill_stays_an_error__(caplog):

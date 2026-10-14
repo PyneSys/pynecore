@@ -171,6 +171,10 @@ class BracketAttachAfterFillRejectedError(ExchangeOrderRejectedError):
         reject. ``None`` falls back to ``qty`` (conservative).
     :ivar error_code: Exchange-side error code, if any.
     :ivar error_message: Exchange-side error message, if any.
+    :ivar level_crossed: ``True`` when the venue refused the level because
+        the market had already traded through it. The defensive close is then
+        the exit Pine books for a crossed level, not a failed protection, and
+        the engine logs it as such.
     """
 
     def __init__(
@@ -187,6 +191,7 @@ class BracketAttachAfterFillRejectedError(ExchangeOrderRejectedError):
             filled_qty: float | None = None,
             error_code: str | None = None,
             error_message: str | None = None,
+            level_crossed: bool = False,
     ) -> None:
         super().__init__(message)
         self.position_coid = position_coid
@@ -199,6 +204,7 @@ class BracketAttachAfterFillRejectedError(ExchangeOrderRejectedError):
         self.filled_qty = filled_qty
         self.error_code = error_code
         self.error_message = error_message
+        self.level_crossed = level_crossed
 
 
 class ExchangeRateLimitError(BrokerError):

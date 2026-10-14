@@ -16213,8 +16213,13 @@ class OrderSyncEngine:
         size (measured live: Capital.com cycle 276, 2026-10-13 — a REST outage
         swallowed the first entry's fill activity). Deferring until that fill
         lands sends the new entry through the close-then-open reversal instead.
-        The wait ends after :data:`_OPPOSITE_ENTRY_FILL_WAIT_S` so a fill that
-        never arrives cannot block entries for the rest of the run.
+        Any booked fill ends the wait, since the book then shows the position;
+        the venue's lot rounding routinely books a fill a hair below the
+        intent's quantity (measured live: bybit-inverse cycle 223, 2026-10-13 —
+        a ``0.0019963`` fill of a ``0.002`` entry read as unfilled kept the
+        reversal waiting the full bound). The wait ends after
+        :data:`_OPPOSITE_ENTRY_FILL_WAIT_S` so a fill that never arrives cannot
+        block entries for the rest of the run.
 
         :param intent: The market entry about to be dispatched.
         :return: The in-flight entry to wait for, or ``None``.
@@ -16228,7 +16233,7 @@ class OrderSyncEngine:
                     or other.side == intent.side
                     or key not in self._order_mapping):
                 continue
-            if self._active_entry_filled_qty.get(key, 0.0) >= other.qty - 1e-12:
+            if self._active_entry_filled_qty.get(key, 0.0) > 0.0:
                 continue
             live_keys.add(key)
             if pending is not None:
@@ -17852,6 +17857,15 @@ class OrderSyncEngine:
                 format_intent_key(intent.intent_key), crossed_at,
                 e.position_deal_id, e.position_side, e.qty,
             )
+        elif e.level_crossed:
+            _blog_info(
+                "exit %s: the market traded through its protective level "
+                "before the venue attached it; closing at market — the exit "
+                "Pine books once the level is crossed (deal_id=%s, side=%s, "
+                "qty=%s): %s",
+                format_intent_key(intent.intent_key), e.position_deal_id,
+                e.position_side, e.qty, e,
+            )
         else:
             _blog_error(
                 "bracket attach rejected after parent fill for %s; "
@@ -18101,11 +18115,12 @@ class OrderSyncEngine:
                     )
                     self._clear_pending_defensive_close(entry_id)
 
-        if crossed_at is not None:
+        if crossed_at is not None or e.level_crossed:
             message = (
                 f"Exit {format_intent_key(intent.intent_key)} filled at "
-                f"market: its protective level was already crossed at the "
-                f"entry fill (deal_id={e.position_deal_id})"
+                f"market: its protective level was already crossed "
+                f"{'at the entry fill' if crossed_at is not None else 'by the market'} "
+                f"(deal_id={e.position_deal_id})"
             )
             reason = "protective_level_crossed_at_fill"
         else:
