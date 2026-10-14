@@ -13,6 +13,7 @@ from pynecore.core.broker.models import (
     CapabilityLevel,
     ExchangeCapabilities,
 )
+from pynecore.core.broker.exceptions import VenueWritesQuarantinedError
 from pynecore.core.broker.validation import validate_plugin_contract
 from pynecore.core.plugin.broker import BrokerPlugin
 
@@ -143,6 +144,18 @@ def __test_conforming_plugin_is_clean__():
     errors, warnings = validate_plugin_contract(_ConformingPlugin())
     assert errors == []
     assert warnings == []
+
+
+def __test_ensure_venue_writes_allowed_follows_the_engine_latch__():
+    """The transport gate is open without a hook and closes while the hook reports a latch."""
+    plugin = _ConformingPlugin()
+    plugin.ensure_venue_writes_allowed()
+    latched = [False]
+    plugin.venue_writes_blocked = lambda: latched[0]
+    plugin.ensure_venue_writes_allowed()
+    latched[0] = True
+    with pytest.raises(VenueWritesQuarantinedError, match="POST /v5/order/create blocked"):
+        plugin.ensure_venue_writes_allowed("POST /v5/order/create")
 
 
 # === Capability declaration ===

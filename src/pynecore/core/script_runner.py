@@ -1204,7 +1204,8 @@ class ScriptRunner:
                  '_time_from', '_sec_syminfos', '_chart_type_warmup', '_missing_sec_data',
                  '_signal_rate_sources_fn', '_sec_begin_bar_fn', '_sec_end_bar_fn',
                  '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
-                 '_engine_event_stream_future', '_broker_stop_settle_s', 'broker_stop_settled',
+                 '_engine_event_stream_future', '_quarantine_resume_watch_future',
+                 '_broker_stop_settle_s', 'broker_stop_settled',
                  '_broker_store_ctx', '_log_ohlcv', '_price_decimals',
                  '_round_decimals', '_lossless_volume', '_lossless_prices',
                  '_config_dir', '_symbol_map', '_script_timeframe',
@@ -1427,6 +1428,7 @@ class ScriptRunner:
         self._broker_store_ctx: 'RunContext | None' = broker_store_ctx
         self._order_sync_engine: 'OrderSyncEngine | None' = None
         self._engine_event_stream_future: Any = None
+        self._quarantine_resume_watch_future: Any = None
         self._broker_stop_settle_s = broker_stop_settle_s
         # Whether the stop wait saw every dispatched market order filled; None
         # when the run was not stopped (or has no broker, or no wait was asked)
@@ -1542,17 +1544,19 @@ class ScriptRunner:
                 cast('OrderSyncEngine', self._order_sync_engine).enqueue_native_bracket_observed
             )
 
-            # Quarantine latch for the disappearance tracking's ``stop`` /
-            # ``stop_and_cancel`` policies: trading stops but the process
-            # (and the plugin's event stream) stays alive. Wired
-            # unconditionally, like the observed sink above — the engine
-            # latch is idempotent and thread-safe from the broker
-            # event-loop thread; plugins without disappearance tracking
-            # simply never call it. Without this wiring the tracker falls
-            # back to the process-exiting halt.
-            broker_plugin.quarantine_sink = (
-                cast('OrderSyncEngine', self._order_sync_engine).record_quarantine
-            )
+            # Quarantine latch for the disappearance tracking's ``stop``
+            # policy: trading stops but the process (and the plugin's event
+            # stream) stays alive. Wired unconditionally, like the observed
+            # sink above — the engine latch is idempotent and thread-safe from
+            # the broker event-loop thread; plugins without disappearance
+            # tracking simply never call it. Without this wiring the tracker
+            # falls back to the process-exiting halt.
+            engine = cast('OrderSyncEngine', self._order_sync_engine)
+            broker_plugin.quarantine_sink = engine.record_quarantine
+            # The read side of the same latch: every plugin checks it at its
+            # transport chokepoint, so an external-intervention quarantine also
+            # stops the plugin's own background writes.
+            broker_plugin.venue_writes_blocked = lambda: engine.venue_writes_blocked
 
             # Native bulk-cancel expected-cancel arm. A plugin whose
             # ``execute_cancel_all`` calls a single native endpoint (e.g. Bybit
@@ -1726,6 +1730,12 @@ class ScriptRunner:
                 engine.run_event_stream(),
                 loop,
             )
+            # Picks up an operator ``pyne broker resume`` while the main thread
+            # waits for market data (a closed market sends no updates).
+            self._quarantine_resume_watch_future = asyncio.run_coroutine_threadsafe(
+                engine.run_quarantine_resume_watch(),
+                loop,
+            )
         # Defensive-close pending markers from prior process instances
         # must be re-armed (or dropped, if the FILL already settled)
         # BEFORE the startup reconcile so the reconcile snapshot reflects
@@ -1893,6 +1903,16 @@ class ScriptRunner:
             self.broker_stop_settled = engine.settle_in_flight_fills(self._broker_stop_settle_s)
         except KeyboardInterrupt:
             self.broker_stop_settled = False
+
+    @property
+    def quarantine_resume_restart(self) -> bool:
+        """Whether the run stopped because an operator resumed its quarantine.
+
+        The caller then re-executes the process, so the bot re-syncs with the
+        venue through the startup path.
+        """
+        engine = self._order_sync_engine
+        return engine is not None and cast('OrderSyncEngine', engine).quarantine_resume_restart
 
     @property
     def broker_position_snapshot(self) -> 'Any | None':
@@ -4184,6 +4204,9 @@ class ScriptRunner:
             # unwinding — without that join the caller would close the
             # broker store / HTTP client while a reconcile pass inside
             # watch_orders is still mid-flight on the broker loop.
+            if self._quarantine_resume_watch_future is not None:
+                self._quarantine_resume_watch_future.cancel()
+                self._quarantine_resume_watch_future = None
             if self._engine_event_stream_future is not None:
                 self._engine_event_stream_future.cancel()
                 self._engine_event_stream_future = None

@@ -5,7 +5,7 @@ title: "Command Line Interface"
 description: "PyneCore Command Line Interface (CLI) overview and usage"
 icon: "terminal"
 date: "2025-04-03"
-lastmod: "2026-09-28"
+lastmod: "2026-10-14"
 draft: false
 toc: true
 categories: ["Usage", "CLI"]
@@ -24,5 +24,6 @@ PyneCore Command Line Interface (CLI) overview and usage
 - [Compile](./compile.md) - Converting Pine Script to Pyne code with PyneComp (PyneSys API key required)
 - [Data](./data.md) - Data management commands
 - [Symbol Browser TUI](./symbol-browser.md) - Interactive symbol picker for `pyne data download`
+- [Broker](./broker.md) - Managing live broker runs (resuming a quarantined bot)
 
 Other built-in commands: `pyne benchmark`, `pyne debug ast` and `pyne plugin list|info` (see `--help`).

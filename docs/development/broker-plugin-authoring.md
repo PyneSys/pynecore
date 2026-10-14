@@ -5,7 +5,7 @@ title: "Broker Plugin Authoring Guide"
 description: "The full contract a live broker plugin must uphold"
 icon: "account_balance"
 date: "2026-07-12"
-lastmod: "2026-07-19"
+lastmod: "2026-10-14"
 draft: false
 toc: true
 categories: ["Development"]
@@ -154,10 +154,35 @@ venue respectively):
 4. The tracker reports through `watch_orders()` with a dual signal: a
    synthesised `cancelled` `OrderEvent` (the engine's router cleans its
    tracking) plus the configured `on_unexpected_cancel` policy — the
-   default `stop` / `stop_and_cancel` latch the engine's **quarantine**
-   (trading stops, the process stays alive; wire the runner-injected
-   `quarantine_sink` into the tracker's `request_quarantine`), while
-   `halt` raises `UnexpectedCancelError` for a process exit.
+   default `stop` latches the engine's **external-intervention
+   quarantine** (wire the runner-injected `quarantine_sink` into the
+   tracker's `request_quarantine`), while `halt` raises
+   `UnexpectedCancelError` for a process exit.
+
+### 1a. An external intervention freezes every venue write — including yours
+
+A bot-owned order that someone else cancelled or changed means the
+operator (or another bot) knows something the bot does not. The engine
+then latches a `QuarantineKind.EXTERNAL_INTERVENTION` quarantine: the
+process stays alive and keeps ingesting events, but nothing is written
+to the venue — no entry, exit, close, cancel, amend, SL/TP update or
+protection re-arm — until the operator runs
+`pyne broker resume <run_id> <quarantine_id>`. The latch is stored in
+the broker store and survives every restart. A resume restarts the run in
+place, so the bot re-syncs through the regular startup path.
+
+The engine stops its own writes. Your plugin must stop the writes it
+starts on its own (sibling cancels, trailing-stop activation, deferred
+cleanup, retries): call `self.ensure_venue_writes_allowed(...)` at the
+single transport chokepoint every order-mutating request passes through,
+before anything leaves the client. It raises `VenueWritesQuarantinedError`,
+an `ExchangeConnectionError`, so every caller keeps its state and retries
+after the resume. Never treat it as "order not found" or as a settled
+outcome, and never retire a journal row because of it.
+
+A quarantine your plugin requests for its own venue trouble (for example
+a spot inventory conflict) keeps the default `QuarantineKind.ENTRY_BLOCK`:
+new exposure is blocked, protection keeps working.
 
 ### 2. `OrderEvent.fill_qty` is INCREMENTAL; `fill_id` must be stable
 
@@ -520,8 +545,8 @@ gates.
   (self-healing TOML at `workdir/config/plugins/<name>.toml`).
 - **Broker-agnostic policies do not belong in plugin configs.** The
   cross-broker `workdir/config/brokers.toml` (`BrokerDefaults`) owns them;
-  today that is `on_unexpected_cancel` (`stop` / `stop_and_cancel` /
-  `re_place` / `ignore` / `halt`) and `on_inventory_conflict`
+  today that is `on_unexpected_cancel` (`stop` / `re_place` / `ignore` /
+  `halt`) and `on_inventory_conflict`
   (`quarantine` / `halt`, spot venues only — deliberately narrower:
   `re_place` would buy back an operator's withdrawal and `ignore` would
   trade on corrupt books), injected onto the plugin instance by the CLI

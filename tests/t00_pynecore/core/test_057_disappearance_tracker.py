@@ -28,7 +28,7 @@ from pynecore.core.broker.disappearance import (
     MissingResolution,
 )
 from pynecore.core.broker.exceptions import UnexpectedCancelError
-from pynecore.core.broker.models import OrderEvent, OrderStatus
+from pynecore.core.broker.models import OrderEvent, OrderStatus, QuarantineKind
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import (
     BrokerStore,
@@ -361,57 +361,26 @@ def __test_policy_re_place_retires_without_halt__(tmp_path: Path) -> None:
         assert len(_read_events(ctx, 'unexpected_cancel_re_place')) == 1
 
 
-def __test_policy_stop_and_cancel_sweeps_before_event__(tmp_path: Path) -> None:
-    """The sibling sweep runs before the cancelled event is delivered."""
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
-        ctx = _open_run(store)
-        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
-        swept: list[str] = []
-
-        async def _sweep(row: OrderRow) -> None:
-            swept.append(row.client_order_id)
-
-        tracker = _make_tracker(ctx, policy='stop_and_cancel',
-                                cancel_siblings=_sweep)
-
-        async def scenario() -> None:
-            gen = tracker.observe({'working': set()}, T_EXPIRED)
-            event = await anext(gen)
-            assert event.event_type == 'cancelled'
-            assert swept == ["c1"]
-            with pytest.raises(UnexpectedCancelError):
-                await anext(gen)
-
-        _run(scenario())
-
-
-def __test_stop_and_cancel_requires_sweep_hook__(tmp_path: Path) -> None:
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
-        ctx = _open_run(store)
-        with pytest.raises(ValueError):
-            _make_tracker(ctx, policy='stop_and_cancel')
-        with pytest.raises(ValueError):
-            _make_tracker(ctx, policy='bogus')
-
-
 def __test_policy_stop_with_quarantine_hook_does_not_halt__(
         tmp_path: Path,
 ) -> None:
-    """With the quarantine hook wired, ``stop`` latches quarantine and the
-    observation loop survives — the process-exiting halt is never armed."""
+    """With the quarantine hook wired, ``stop`` latches an external-intervention
+    quarantine and the observation loop survives — the process-exiting halt is
+    never armed."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
-        latched: list[tuple[str, dict]] = []
+        latched: list[tuple[str, dict, QuarantineKind]] = []
         tracker = _make_tracker(
             ctx, policy='stop',
-            request_quarantine=lambda r, c: latched.append((r, c)),
+            request_quarantine=lambda r, c, *, kind: latched.append((r, c, kind)),
         )
         events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
         assert [ev.event_type for ev in events] == ['cancelled']
         assert tracker.pending_halt is None
         assert len(latched) == 1
-        reason, context = latched[0]
+        reason, context, kind = latched[0]
+        assert kind is QuarantineKind.EXTERNAL_INTERVENTION
         assert "c1" in reason
         assert context['policy'] == 'stop'
         assert context['client_order_id'] == "c1"
@@ -473,31 +442,6 @@ def __test_quarantine_hook_failure_falls_back_to_halt__(
 
         _run(scenario())
         assert len(_read_events(ctx, 'unexpected_cancel_quarantine')) == 0
-
-
-def __test_policy_stop_and_cancel_quarantines_and_sweeps__(
-        tmp_path: Path,
-) -> None:
-    """``stop_and_cancel`` with the hook wired: quarantine latched, sweep
-    still runs, no halt."""
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
-        ctx = _open_run(store)
-        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
-        latched: list[str] = []
-        swept: list[str] = []
-
-        async def _sweep(row: OrderRow) -> None:
-            swept.append(row.client_order_id)
-
-        tracker = _make_tracker(
-            ctx, policy='stop_and_cancel', cancel_siblings=_sweep,
-            request_quarantine=lambda reason, _context: latched.append(reason),
-        )
-        events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
-        assert [ev.event_type for ev in events] == ['cancelled']
-        assert tracker.pending_halt is None
-        assert len(latched) == 1
-        assert swept == ["c1"]
 
 
 # === Confirmation with discovered fills =====================================
@@ -852,61 +796,6 @@ def __test_throwing_register_executions_does_not_strand_row__(
         assert [ev.event_type for ev in events] == ['partial', 'cancelled']
         row = ctx.get_order("c1")
         assert row is not None and row.closed_ts_ms is not None
-
-
-def __test_throwing_cancel_siblings_still_arms_halt__(tmp_path: Path) -> None:
-    """A best-effort sweep that raises must not swallow the halt: it is
-    armed BEFORE the sweep, logged, and still delivered."""
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
-        ctx = _open_run(store)
-        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
-
-        async def _sweep(_row: OrderRow) -> None:
-            raise RuntimeError("sweep transport down")
-
-        tracker = _make_tracker(ctx, policy='stop_and_cancel',
-                                cancel_siblings=_sweep)
-
-        async def scenario() -> None:
-            gen = tracker.observe({'working': set()}, T_EXPIRED)
-            event = await anext(gen)
-            assert event.event_type == 'cancelled'
-            with pytest.raises(UnexpectedCancelError):
-                await anext(gen)
-
-        _run(scenario())
-        assert len(_read_events(ctx, 'unexpected_cancel_sweep_failed')) == 1
-
-
-def __test_cancel_siblings_sweep_receives_post_fill_row__(tmp_path: Path) -> None:
-    """A partial-fill-then-cancel under stop_and_cancel hands the sweep the
-    POST-fill row, so it can size its cleanup on the recovered quantity."""
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
-        ctx = _open_run(store)
-        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
-        swept: list[float] = []
-
-        async def _sweep(r: OrderRow) -> None:
-            swept.append(r.filled_qty)
-
-        tracker = _make_tracker(
-            ctx, policy='stop_and_cancel', cancel_siblings=_sweep,
-            confirm=_confirm_const(MissingConfirmation(
-                MissingResolution.CANCELLED,
-                cumulative_filled_qty=0.4, fill_price=1.1,
-                execution_ids=('E7',),
-            )),
-        )
-
-        async def scenario() -> None:
-            gen = tracker.observe({'working': set()}, T_EXPIRED)
-            assert (await anext(gen)).event_type == 'partial'
-            assert (await anext(gen)).event_type == 'cancelled'
-            with pytest.raises(UnexpectedCancelError):
-                await anext(gen)
-
-        _run(scenario())
-        assert swept == [pytest.approx(0.4)]
 
 
 def __test_promotion_without_quantity_only_merges_metadata__(

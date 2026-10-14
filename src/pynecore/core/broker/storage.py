@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
+from pynecore.core.broker.models import QuarantineKind
 from pynecore.core.broker.run_identity import RunIdentity
 
 __all__ = [
@@ -58,6 +59,7 @@ __all__ = [
     'OrderRow',
     'SpotExecutionRow',
     'SpotEpochRow',
+    'QuarantineRow',
     'TransactionRollbackError',
     'HEARTBEAT_INTERVAL_MS',
     'STALE_THRESHOLD_MS',
@@ -216,6 +218,21 @@ class SpotEpochRow:
     created_ts_ms: int
     pending_conflict_ts_ms: int | None = None
     pending_conflict: dict | None = None
+
+
+@dataclass(frozen=True)
+class QuarantineRow:
+    """One row of the ``quarantines`` table: a quarantine latch of a logical run."""
+    quarantine_id: str
+    run_id: str
+    kind: str
+    reason: str
+    intent_key: str | None
+    context: dict | None
+    entered_ts_ms: int
+    resume_requested_ts_ms: int | None = None
+    ended_ts_ms: int | None = None
+    end_reason: str | None = None
 
 
 # === Schema migrations =====================================================
@@ -493,6 +510,28 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         -- falls back to its own tag for those.
         ALTER TABLE envelopes
             ADD COLUMN run_tag TEXT;
+    """),
+    (8, "quarantines table", """
+        -- One row per quarantine latch of a logical run. Keyed by run_id,
+        -- not run_instance_id: an external-intervention quarantine must
+        -- survive every restart (systemd, crash, deploy, node move) until
+        -- an operator resumes it. ``pyne broker resume`` stamps
+        -- resume_requested_ts_ms from another process; the live bot (or
+        -- the next start) consumes the request and stamps ended_ts_ms.
+        CREATE TABLE quarantines (
+            quarantine_id          TEXT PRIMARY KEY,
+            run_id                 TEXT NOT NULL,
+            kind                   TEXT NOT NULL,
+            reason                 TEXT NOT NULL,
+            intent_key             TEXT,
+            context                TEXT,
+            entered_ts_ms          INTEGER NOT NULL,
+            resume_requested_ts_ms INTEGER,
+            ended_ts_ms            INTEGER,
+            end_reason             TEXT
+        );
+        CREATE INDEX idx_quarantines_open
+            ON quarantines (run_id) WHERE ended_ts_ms IS NULL;
     """),
 ]
 
@@ -1188,6 +1227,8 @@ class BrokerStore:
         ``spot_inventory_epoch``, ``spot_asset_owner``) are exempt from
         retention by design: a spot position's reconstructibility must
         not expire while the position is open, however old its fills are.
+        The ``quarantines`` table is exempt too: an open latch must never
+        expire, and an ended one is the operator's audit trail.
 
         :param retention_days: Rows older than this many days are
             eligible for purging.
@@ -1264,6 +1305,49 @@ class BrokerStore:
                 "next attempt in %d ms", PURGE_INTERVAL_MS,
                 exc_info=True,
             )
+
+    # --- Quarantine latches (operator CLI) -------------------------------
+
+    def open_quarantines(self) -> list[QuarantineRow]:
+        """Every quarantine latch not yet ended, across all runs, oldest first."""
+        with self.read_lock() as conn:
+            rows = conn.execute(
+                "SELECT * FROM quarantines WHERE ended_ts_ms IS NULL "
+                "ORDER BY entered_ts_ms",
+            ).fetchall()
+        return [_row_to_quarantine(row) for row in rows]
+
+    def request_quarantine_resume(
+            self, run_id: str, quarantine_id: str,
+    ) -> QuarantineRow | None:
+        """Stamp an operator resume request on an open quarantine latch.
+
+        Called from another process (``pyne broker resume``) while the bot
+        may be running. The bot consumes the request on its next quarantine
+        poll (or at its next start) and ends the latch itself; this method
+        only records the request. Idempotent: a second request keeps the
+        first stamp.
+
+        :param run_id: The logical run the latch belongs to.
+        :param quarantine_id: The latch to resume; a request naming another
+            or an already ended latch matches nothing.
+        :return: The latch row after the stamp, or ``None`` when no open
+            latch matches both ``run_id`` and ``quarantine_id``.
+        """
+        now = _now_ms()
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE quarantines SET resume_requested_ts_ms = ? "
+                "WHERE run_id = ? AND quarantine_id = ? "
+                "AND ended_ts_ms IS NULL AND resume_requested_ts_ms IS NULL",
+                (now, run_id, quarantine_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM quarantines WHERE run_id = ? AND quarantine_id = ? "
+                "AND ended_ts_ms IS NULL",
+                (run_id, quarantine_id),
+            ).fetchone()
+        return None if row is None else _row_to_quarantine(row)
 
 
 # === RunContext ============================================================
@@ -2585,6 +2669,69 @@ class RunContext:
                  base_asset, self.run_instance_id),
             )
 
+    # --- Quarantine latches -----------------------------------------------
+
+    def record_quarantine(
+            self, quarantine_id: str, *,
+            kind: str,
+            reason: str,
+            intent_key: str | None,
+            context: dict | None,
+            entered_ts_ms: int,
+    ) -> None:
+        """Persist a quarantine latch of this logical run, or escalate its kind.
+
+        Idempotent on ``quarantine_id``: a repeated call (the engine re-asserts
+        an unpersisted latch on its next poll) refreshes the latch, which is how
+        an escalation from an entry block to an external-intervention latch is
+        recorded on the same id, together with the escalation's reason. The
+        update is monotonic: an ``external_intervention`` row is never
+        rewritten, so a late ``entry_block`` write of the same id (one that
+        raced the escalation on another thread) cannot downgrade it.
+        """
+        context_json = json.dumps(context, default=str) if context else None
+        with self._store.transaction() as conn:
+            conn.execute(
+                "INSERT INTO quarantines ("
+                "  quarantine_id, run_id, kind, reason, intent_key, context,"
+                "  entered_ts_ms"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (quarantine_id) DO UPDATE SET"
+                "  kind = excluded.kind, reason = excluded.reason,"
+                "  intent_key = excluded.intent_key, context = excluded.context "
+                "WHERE quarantines.kind != ?",
+                (quarantine_id, self.run_id, kind, reason, intent_key,
+                 context_json, entered_ts_ms, str(QuarantineKind.EXTERNAL_INTERVENTION)),
+            )
+
+    def get_quarantine(self, quarantine_id: str) -> QuarantineRow | None:
+        """Return one latch of this logical run, ended or not."""
+        with self._store.read_lock() as conn:
+            row = conn.execute(
+                "SELECT * FROM quarantines WHERE run_id = ? AND quarantine_id = ?",
+                (self.run_id, quarantine_id),
+            ).fetchone()
+        return None if row is None else _row_to_quarantine(row)
+
+    def iter_open_quarantines(self) -> list[QuarantineRow]:
+        """Every latch of this logical run not yet ended, oldest first."""
+        with self._store.read_lock() as conn:
+            rows = conn.execute(
+                "SELECT * FROM quarantines WHERE run_id = ? AND ended_ts_ms IS NULL "
+                "ORDER BY entered_ts_ms",
+                (self.run_id,),
+            ).fetchall()
+        return [_row_to_quarantine(row) for row in rows]
+
+    def end_quarantine(self, quarantine_id: str, end_reason: str) -> None:
+        """Mark a latch of this logical run ended (no-op when already ended)."""
+        with self._store.transaction() as conn:
+            conn.execute(
+                "UPDATE quarantines SET ended_ts_ms = ?, end_reason = ? "
+                "WHERE run_id = ? AND quarantine_id = ? AND ended_ts_ms IS NULL",
+                (_now_ms(), end_reason, self.run_id, quarantine_id),
+            )
+
     # --- Lifecycle --------------------------------------------------------
 
     def heartbeat(self) -> None:
@@ -2693,6 +2840,33 @@ def _row_to_spot_epoch(row: sqlite3.Row) -> SpotEpochRow:
             else int(row['pending_conflict_ts_ms'])
         ),
         pending_conflict=conflict,
+    )
+
+
+def _row_to_quarantine(row: sqlite3.Row) -> QuarantineRow:
+    raw_context = row['context']
+    context: dict | None = None
+    if raw_context:
+        try:
+            parsed = json.loads(raw_context)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            context = parsed
+    return QuarantineRow(
+        quarantine_id=row['quarantine_id'],
+        run_id=row['run_id'],
+        kind=row['kind'],
+        reason=row['reason'],
+        intent_key=row['intent_key'],
+        context=context,
+        entered_ts_ms=int(row['entered_ts_ms']),
+        resume_requested_ts_ms=(
+            None if row['resume_requested_ts_ms'] is None
+            else int(row['resume_requested_ts_ms'])
+        ),
+        ended_ts_ms=None if row['ended_ts_ms'] is None else int(row['ended_ts_ms']),
+        end_reason=row['end_reason'],
     )
 
 

@@ -18,20 +18,26 @@ Unit tests for the ``BrokerStore`` API itself live in
 the two layers.
 """
 import asyncio
+import signal
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from typer import Exit
 
 from pynecore import lib
 from pynecore.core.broker.exceptions import OrderDispositionUnknownError
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore, RunContext
+from pynecore.core.broker import sync_engine as sync_engine_module
 from pynecore.core.broker.sync_engine import OrderSyncEngine
+from pynecore.cli.app import app_state
+from pynecore.cli.commands.broker import resume as cli_resume
 from pynecore.core.broker.exceptions import OrderSkippedByPlugin
 from pynecore.core.broker.models import (
+    QuarantineKind,
     CapabilityLevel,
     DispatchEnvelope,
     ExchangeCapabilities,
@@ -2574,3 +2580,222 @@ def __test_partial_bracket_dispatch_without_parent_soft_skips__(
             intent.intent_key,
         )
         ctx.close()
+
+
+# --- Persisted quarantine latch -------------------------------------------------
+
+
+def _latch_external(engine: OrderSyncEngine) -> str:
+    engine.record_quarantine("operator moved the stop", kind=QuarantineKind.EXTERNAL_INTERVENTION)
+    assert engine.quarantine_id is not None
+    return engine.quarantine_id
+
+
+def __test_an_external_quarantine_survives_a_restart__(tmp_path: Path) -> None:
+    """A restart (systemd, crash, deploy, node move) is never a resume."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        first = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), first)
+        quarantine_id = _latch_external(engine)
+        first.close()
+
+        restarted = _open_ctx(store)
+        broker = _MockBroker()
+        engine, position = _mk_engine(broker, restarted)
+
+        assert engine.venue_writes_blocked
+        assert engine.quarantine_id == quarantine_id
+        position.entry_orders["L"] = Order(
+            "L", 1.0, order_type=_order_type_entry, limit=50_000.0,
+        )
+        engine.sync(BAR_TS)
+        assert broker.entry_calls == []
+
+
+def __test_an_entry_block_quarantine_ends_at_restart__(tmp_path: Path) -> None:
+    """Venue-trouble quarantines keep their restart semantics; only interventions persist."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        first = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), first)
+        engine.record_quarantine("close_rejected_repeatedly")
+        quarantine_id = engine.quarantine_id
+        assert quarantine_id is not None
+        first.close()
+
+        restarted = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), restarted)
+
+        assert not engine.quarantined
+        row = restarted.get_quarantine(quarantine_id)
+        assert row is not None and row.end_reason == 'restart'
+
+
+def __test_a_resume_requested_while_the_bot_was_down_starts_it_normally__(
+        tmp_path: Path,
+) -> None:
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        first = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), first)
+        quarantine_id = _latch_external(engine)
+        first.close()
+
+        assert store.request_quarantine_resume(first.run_id, quarantine_id) is not None
+
+        restarted = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), restarted)
+        assert not engine.quarantined
+        row = restarted.get_quarantine(quarantine_id)
+        assert row is not None and row.end_reason == 'operator_resume'
+
+
+def __test_a_resume_request_must_name_the_open_latch_of_that_run__(tmp_path: Path) -> None:
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), ctx)
+        quarantine_id = _latch_external(engine)
+
+        assert store.request_quarantine_resume(ctx.run_id, "deadbeef") is None
+        assert store.request_quarantine_resume("other-run", quarantine_id) is None
+        assert [row.quarantine_id for row in store.open_quarantines()] == [quarantine_id]
+        row = store.request_quarantine_resume(ctx.run_id, quarantine_id)
+        assert row is not None and row.resume_requested_ts_ms is not None
+
+
+def __test_the_resume_watch_ends_the_latch_and_stops_the_run_for_a_restart__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A running bot picks the resume up by itself and stops through the stop-signal path."""
+    signals: list[int] = []
+    monkeypatch.setattr(sync_engine_module._thread, 'interrupt_main', signals.append)  # noqa
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), ctx)
+        quarantine_id = _latch_external(engine)
+        store.request_quarantine_resume(ctx.run_id, quarantine_id)
+
+        asyncio.run(asyncio.wait_for(engine.run_quarantine_resume_watch(interval_s=0.0), 5.0))
+
+        assert engine.quarantine_resume_restart
+        assert signals == [signal.SIGTERM]
+        row = ctx.get_quarantine(quarantine_id)
+        assert row is not None and row.end_reason == 'operator_resume'
+
+
+def __test_the_resume_watch_persists_a_latch_whose_store_write_failed__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), ctx)
+        original = ctx.record_quarantine
+
+        def _failing(*_args, **_kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(ctx, 'record_quarantine', _failing)
+        quarantine_id = _latch_external(engine)
+        assert ctx.get_quarantine(quarantine_id) is None
+        monkeypatch.setattr(ctx, 'record_quarantine', original)
+
+        async def _watch_until_persisted() -> None:
+            task = asyncio.create_task(engine.run_quarantine_resume_watch(interval_s=0.0))
+            for _ in range(100):
+                await asyncio.sleep(0)
+                if ctx.get_quarantine(quarantine_id) is not None:
+                    break
+            task.cancel()
+
+        asyncio.run(_watch_until_persisted())
+        row = ctx.get_quarantine(quarantine_id)
+        assert row is not None and row.kind == QuarantineKind.EXTERNAL_INTERVENTION
+
+
+def __test_the_resume_command_stamps_the_request_and_lists_open_latches_on_a_miss__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(app_state, '_workdir', tmp_path)
+    store_path = tmp_path / "output" / "logs" / "broker.sqlite"
+    with BrokerStore(store_path, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), ctx)
+        quarantine_id = _latch_external(engine)
+
+        with pytest.raises(Exit):
+            cli_resume(ctx.run_id, "deadbeef")
+        assert quarantine_id in capsys.readouterr().err
+
+        cli_resume(ctx.run_id, quarantine_id)
+        row = ctx.get_quarantine(quarantine_id)
+        assert row is not None and row.resume_requested_ts_ms is not None
+
+
+
+def __test_a_late_entry_block_write_never_downgrades_a_persisted_escalation__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An entry-block store write that finishes after the escalation persisted is a no-op.
+
+    The latch is persisted outside the latch lock, so the main thread's
+    ``ENTRY_BLOCK`` write can still be in flight while the broker thread
+    escalates to ``EXTERNAL_INTERVENTION`` and persists it. A restart ends an
+    entry-block row by itself, so a downgrade would let the bot trade again
+    without an operator resume.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), ctx)
+        original = ctx.record_quarantine
+        escalated: list[bool] = []
+
+        def _escalate_while_in_flight(*args, **kwargs):
+            if not escalated:
+                escalated.append(True)
+                engine.record_quarantine(
+                    "operator moved the stop", kind=QuarantineKind.EXTERNAL_INTERVENTION,
+                )
+            original(*args, **kwargs)
+
+        monkeypatch.setattr(ctx, 'record_quarantine', _escalate_while_in_flight)
+        engine.record_quarantine("close_rejected_repeatedly")
+        quarantine_id = engine.quarantine_id
+        assert quarantine_id is not None
+
+        row = ctx.get_quarantine(quarantine_id)
+        assert row is not None
+        assert row.kind == QuarantineKind.EXTERNAL_INTERVENTION
+        assert row.reason == "operator moved the stop"
+        ctx.close()
+
+        restarted = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), restarted)
+        assert engine.venue_writes_blocked
+        assert engine.quarantine_id == quarantine_id
+
+
+def __test_a_late_write_of_an_older_latch_does_not_mark_the_escalation_persisted__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The escalation's own failed write stays pending even when an older write lands."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), ctx)
+        original = ctx.record_quarantine
+        calls: list[str] = []
+
+        def _escalation_write_fails(*args, **kwargs):
+            calls.append(kwargs['kind'])
+            if len(calls) == 1:
+                engine.record_quarantine(
+                    "operator moved the stop", kind=QuarantineKind.EXTERNAL_INTERVENTION,
+                )
+            if kwargs['kind'] == QuarantineKind.EXTERNAL_INTERVENTION:
+                raise OSError("disk full")
+            original(*args, **kwargs)
+
+        monkeypatch.setattr(ctx, 'record_quarantine', _escalation_write_fails)
+        engine.record_quarantine("close_rejected_repeatedly")
+
+        assert calls == [QuarantineKind.ENTRY_BLOCK, QuarantineKind.EXTERNAL_INTERVENTION]
+        assert not engine._quarantine_persisted, (  # noqa
+            "the resume watch must still re-assert the escalation"
+        )

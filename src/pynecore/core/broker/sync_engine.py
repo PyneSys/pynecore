@@ -28,7 +28,11 @@ import dataclasses
 import itertools
 import logging
 import math
+import _thread
+import contextlib
 import queue
+import secrets
+import signal
 import threading
 import time
 from collections import OrderedDict
@@ -49,6 +53,7 @@ from pynecore.core.broker.exceptions import (
     MarketClosedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
+    VenueWritesQuarantinedError,
 )
 from pynecore.core.plugin import ProviderError, is_retryable_provider_error
 from pynecore.core.broker.interrupt_guard import critical_section
@@ -112,6 +117,8 @@ from pynecore.core.broker.models import (
     PartialBracketCancelTentativeStartedEvent,
     PendingDefensiveClose,
     QuarantineEnteredEvent,
+    QuarantineKind,
+    QuarantineResumedEvent,
     format_intent_key,
 )
 from pynecore.core.broker.native_failsafe_manager import (
@@ -134,6 +141,7 @@ from pynecore.core.broker.storage import (
     EnvelopeRecord,
     OrderRow,
     PendingRecord,
+    QuarantineRow,
     RunContext,
 )
 from pynecore.core.broker.store_helpers import (
@@ -1767,16 +1775,32 @@ class OrderSyncEngine:
         self._halted_context: dict = {}
 
         # Quarantine latch. Unlike the halt above, quarantine stops TRADING
-        # without stopping the BOT: entry dispatch (new orders and entry
-        # amends) is blocked, while event ingestion, reconcile, protective
-        # exits, cancels and closes keep running — the process stays a live
-        # observer of its open exposure instead of dying on a live market.
-        # Latched via :meth:`record_quarantine` (idempotent, emits one
-        # :class:`QuarantineEnteredEvent`); never cleared in-process — the
-        # operator resolves the cause and restarts the strategy.
+        # without stopping the BOT: the process stays a live observer of its
+        # open exposure instead of dying on a live market. Both kinds block
+        # entry dispatch (new orders and entry amends); an
+        # ``EXTERNAL_INTERVENTION`` latch additionally blocks EVERY venue write
+        # (:attr:`venue_writes_blocked`), while event ingestion keeps running.
+        # Latched via :meth:`record_quarantine` and persisted in the store under
+        # ``_quarantine_id``; only an operator resume
+        # (:meth:`run_quarantine_resume_watch`) ends it, never the engine.
         self._quarantined: bool = False
         self._quarantine_reason: str | None = None
         self._quarantine_context: dict = {}
+        self._quarantine_kind: QuarantineKind | None = None
+        self._quarantine_id: str | None = None
+        self._quarantine_intent_key: str | None = None
+        self._quarantine_entered_ts_ms: int = 0
+        # False while the latch is not yet in the store (a failed write); the
+        # resume watch re-asserts it so a restart can never lose the latch.
+        self._quarantine_persisted: bool = True
+        # Bumped on every latch transition (under ``_quarantine_lock``). A store
+        # write marks the latch persisted only when no transition happened
+        # since it snapshotted the latch, so a write of an older state that
+        # finishes late never reports a newer latch as durable.
+        self._quarantine_generation: int = 0
+        # Set once an operator resume was consumed: the runner stops and
+        # re-executes the process so the bot re-syncs through the startup path.
+        self._quarantine_resume_restart: bool = False
         # Serializes the latch transition (record_quarantine runs on the
         # broker event-loop thread, the gates read on the main thread):
         # check-and-set under the lock keeps the latch + its one event
@@ -1901,6 +1925,7 @@ class OrderSyncEngine:
         self._restart_reconstructed_entry_keys: dict[str, EntryIntent] = {}
         self._restart_entry_scan_done: bool = False
         if store_ctx is not None:
+            self._restore_quarantine(store_ctx)
             envelopes, pending = store_ctx.replay()
             self._persisted_envelope_anchors = dict(envelopes)
             pending = self._absorb_journal_retry_rows(pending)
@@ -2330,50 +2355,262 @@ class OrderSyncEngine:
         """``True`` once :meth:`record_quarantine` has latched the quarantine."""
         return self._quarantined
 
+    @property
+    def quarantine_kind(self) -> QuarantineKind | None:
+        """The latched quarantine's kind, or ``None`` when not quarantined."""
+        return self._quarantine_kind
+
+    @property
+    def quarantine_id(self) -> str | None:
+        """The latched quarantine's id (the operator resumes it by this id)."""
+        return self._quarantine_id
+
+    @property
+    def venue_writes_blocked(self) -> bool:
+        """``True`` while an external-intervention quarantine forbids every venue write.
+
+        Read by the engine's write runners and, through the plugin's
+        ``venue_writes_blocked`` hook, by every plugin's transport chokepoint.
+        """
+        return self._quarantine_kind is QuarantineKind.EXTERNAL_INTERVENTION
+
+    @property
+    def quarantine_resume_restart(self) -> bool:
+        """``True`` once an operator resume was consumed and the run must re-execute."""
+        return self._quarantine_resume_restart
+
     def record_quarantine(
             self,
             reason: str,
             context: dict | None = None,
             *,
             intent_key: str | None = None,
+            kind: QuarantineKind = QuarantineKind.ENTRY_BLOCK,
     ) -> None:
-        """Latch the quarantine state and emit the operator event.
+        """Latch the quarantine state, persist it and emit the operator event.
 
-        Idempotent — the first call latches and emits one
-        :class:`QuarantineEnteredEvent`; later calls are no-ops. After
-        this, :meth:`sync` keeps running (ingestion, reconcile, exits,
-        cancels and closes all flow) but new entry orders and entry
-        amends are blocked until the operator restarts the strategy —
-        the engine never leaves quarantine on its own.
+        The first call latches under a fresh quarantine id and emits one
+        :class:`QuarantineEnteredEvent`. A later call is a no-op, except that an
+        ``EXTERNAL_INTERVENTION`` request escalates a latched ``ENTRY_BLOCK`` on
+        the same id (and emits the event again with the new kind). The engine
+        never leaves quarantine on its own: the operator resumes it with
+        ``pyne broker resume``.
 
-        Thread-safe: callable from the broker event-loop thread (it is
-        the target the runner wires into the plugin's ``quarantine_sink``),
-        while the dispatch gates read the latch on the main thread. The
-        check-and-set runs under a lock so concurrent callers latch (and
-        emit the event) exactly once, and reason/context are populated
-        BEFORE the flag flips. The blocking boundary is admission-time: a
-        dispatch that already passed its gate when the latch flipped is
-        allowed to complete (its exposure predates the intervention); no
-        exposure dispatch is admitted after the latch is observable.
+        ``ENTRY_BLOCK`` blocks new entry orders and entry amends while
+        ingestion, reconcile, exits, cancels and closes keep running.
+        ``EXTERNAL_INTERVENTION`` blocks every venue write (see
+        :attr:`venue_writes_blocked`); only ingestion keeps running.
+
+        Thread-safe: callable from the broker event-loop thread (it is the
+        target the runner wires into the plugin's ``quarantine_sink``), while
+        the dispatch gates read the latch on the main thread. The check-and-set
+        runs under a lock so concurrent callers latch (and emit) exactly once,
+        and reason/context are populated BEFORE the flag flips. The blocking
+        boundary is admission-time: a dispatch that already passed its gate when
+        the latch flipped is allowed to complete (its exposure predates the
+        intervention); no write is admitted after the latch is observable.
         """
         with self._quarantine_lock:
-            if self._quarantined:
+            if self._quarantined and not (
+                    kind is QuarantineKind.EXTERNAL_INTERVENTION
+                    and self._quarantine_kind is QuarantineKind.ENTRY_BLOCK):
                 return
+            escalated = self._quarantined
+            if not escalated:
+                self._quarantine_id = secrets.token_hex(4)
+                self._quarantine_entered_ts_ms = int(time.time() * 1000)
             self._quarantine_reason = reason
             self._quarantine_context = dict(context or {})
+            self._quarantine_intent_key = intent_key
+            self._quarantine_kind = kind
+            self._quarantine_persisted = False
+            self._quarantine_generation += 1
             self._quarantined = True
+        self._persist_quarantine()
+        if kind is QuarantineKind.EXTERNAL_INTERVENTION:
+            behaviour = (
+                "the bot leaves the venue untouched (no order, amend, cancel "
+                "or close); ingestion keeps running"
+            )
+        else:
+            behaviour = (
+                "entry dispatch is blocked while ingestion/exits/cancels/"
+                "closes keep running"
+            )
         _blog_error(
-            "sync engine quarantined: %s (intent_key=%s, context=%r) — "
-            "trading stopped, process stays alive; entry dispatch is "
-            "blocked while ingestion/cancel/close keep running. Operator "
-            "restart required to resume.",
-            reason, format_intent_key(intent_key), context,
+            "sync engine %s: %s (kind=%s, intent_key=%s, context=%r) — trading "
+            "stopped, process stays alive; %s. Resume with: %s",
+            "quarantine escalated" if escalated else "quarantined",
+            reason, kind, format_intent_key(intent_key), context, behaviour,
+            self._quarantine_resume_command(),
         )
         self._emit_broker_event(QuarantineEnteredEvent(
             reason=reason,
             intent_key=intent_key,
             context=dict(context or {}),
+            quarantine_id=self._quarantine_id or '',
+            kind=kind,
         ))
+
+    def _quarantine_resume_command(self) -> str:
+        """The operator command that resumes the latched quarantine."""
+        if self._store_ctx is None:
+            return "restart the strategy (no broker store to persist the latch)"
+        return f"pyne broker resume '{self._store_ctx.run_id}' {self._quarantine_id}"
+
+    def _persist_quarantine(self) -> None:
+        """Write the latch into the store; a failed write is retried by the resume watch.
+
+        Runs on the thread that latched (or on the resume watch), outside the
+        latch lock: the latch is snapshotted under the lock, and the write marks
+        it persisted only if no transition happened meanwhile. The store's
+        monotonic upsert keeps a late write of an older ``ENTRY_BLOCK`` snapshot
+        from downgrading an escalation another thread already persisted.
+        """
+        with self._quarantine_lock:
+            store_ctx = self._store_ctx
+            quarantine_id = self._quarantine_id
+            if store_ctx is None or quarantine_id is None:
+                self._quarantine_persisted = True
+                return
+            generation = self._quarantine_generation
+            kind = self._quarantine_kind or QuarantineKind.ENTRY_BLOCK
+            reason = self._quarantine_reason or ''
+            intent_key = self._quarantine_intent_key
+            context = dict(self._quarantine_context)
+            entered_ts_ms = self._quarantine_entered_ts_ms
+        try:
+            store_ctx.record_quarantine(
+                quarantine_id,
+                kind=str(kind),
+                reason=reason,
+                intent_key=intent_key,
+                context=context,
+                entered_ts_ms=entered_ts_ms,
+            )
+        except Exception as exc:  # noqa: BLE001 -- the latch must not depend on the disk
+            _blog_warning(
+                "quarantine %s could not be persisted (%s) — retrying; the latch "
+                "holds in memory", quarantine_id, exc,
+            )
+            return
+        with self._quarantine_lock:
+            if generation == self._quarantine_generation:
+                self._quarantine_persisted = True
+
+    def _restore_quarantine(self, store_ctx: RunContext) -> None:
+        """Restore a persisted external-intervention latch at construction.
+
+        Runs before any venue I/O, so a restarted bot (systemd, crash, deploy,
+        node move) never writes to the venue while an operator has not resumed
+        the intervention. An ``ENTRY_BLOCK`` latch of an earlier process is ended
+        here: it never survived a restart. A latch whose resume was requested
+        while the bot was down is ended as resumed.
+        """
+        latest: QuarantineRow | None = None
+        for row in store_ctx.iter_open_quarantines():
+            if row.resume_requested_ts_ms is not None:
+                store_ctx.end_quarantine(row.quarantine_id, 'operator_resume')
+                _blog_info(
+                    "quarantine %s was resumed by the operator while the bot was "
+                    "down", row.quarantine_id,
+                )
+            elif row.kind != QuarantineKind.EXTERNAL_INTERVENTION:
+                store_ctx.end_quarantine(row.quarantine_id, 'restart')
+            else:
+                if latest is not None:
+                    store_ctx.end_quarantine(latest.quarantine_id, 'superseded')
+                latest = row
+        if latest is None:
+            return
+        self._quarantine_id = latest.quarantine_id
+        self._quarantine_kind = QuarantineKind.EXTERNAL_INTERVENTION
+        self._quarantine_reason = latest.reason
+        self._quarantine_context = dict(latest.context or {})
+        self._quarantine_intent_key = latest.intent_key
+        self._quarantine_entered_ts_ms = latest.entered_ts_ms
+        self._quarantined = True
+        _blog_error(
+            "starting in quarantine %s (%s) — an external intervention was "
+            "detected before the restart; the bot leaves the venue untouched. "
+            "Resume with: %s",
+            latest.quarantine_id, latest.reason, self._quarantine_resume_command(),
+        )
+
+    async def run_quarantine_resume_watch(self, interval_s: float = 5.0) -> None:
+        """Watch the store for an operator resume of the latched quarantine.
+
+        Long-lived task on the broker event loop (it keeps running while the
+        main thread waits for market data, so a resume is picked up even on a
+        closed market). It also re-asserts a latch whose store write failed.
+        On a resume request it ends the latch, emits
+        :class:`QuarantineResumedEvent` and asks the main thread to stop the
+        run through the regular stop-signal path; the runner then re-executes
+        the process, which re-syncs with the venue through the startup path
+        (adoption, replay, reconcile) exactly like a fresh start.
+        """
+        while not self._quarantine_resume_restart:
+            await asyncio.sleep(interval_s)
+            if not self._quarantined or self._store_ctx is None:
+                continue
+            if not self._quarantine_persisted:
+                self._persist_quarantine()
+            quarantine_id = self._quarantine_id
+            if quarantine_id is None:
+                continue
+            try:
+                row = self._store_ctx.get_quarantine(quarantine_id)
+            except Exception as exc:  # noqa: BLE001 -- a store hiccup retries next tick
+                _blog_warning("quarantine resume check failed (%s) — retrying", exc)
+                continue
+            if row is None or (row.resume_requested_ts_ms is None
+                               and row.ended_ts_ms is None):
+                continue
+            self._consume_quarantine_resume(quarantine_id)
+            return
+
+    def _consume_quarantine_resume(self, quarantine_id: str) -> None:
+        kind = self._quarantine_kind or QuarantineKind.ENTRY_BLOCK
+        if self._store_ctx is not None:
+            self._store_ctx.end_quarantine(quarantine_id, 'operator_resume')
+        self._quarantine_resume_restart = True
+        _blog_warning(
+            "quarantine %s resumed by the operator — stopping the run and "
+            "restarting it in place to re-sync with the venue", quarantine_id,
+        )
+        self._emit_broker_event(QuarantineResumedEvent(
+            quarantine_id=quarantine_id, kind=kind,
+        ))
+        # Delivered as a stop signal so it takes the same path as SIGTERM: the
+        # interrupt guard defers it past a running critical section. A no-op
+        # where no handler is installed (no CLI runner).
+        _thread.interrupt_main(signal.SIGTERM)
+
+    @contextlib.contextmanager
+    def _follow_up_write_deferred(self, what: str) -> Iterator[None]:
+        """Keep routing an event past a follow-up write the quarantine refused.
+
+        Event routing books what the venue reports even while an
+        external-intervention quarantine forbids every venue write. A follow-up
+        write the event triggers (an OCA sibling cancel, a bracket amend, a
+        cleanup cancel, a reversal open) raises
+        :class:`VenueWritesQuarantinedError` before anything is sent; this
+        scope absorbs it at the write's own call site, so the rest of the
+        event's bookkeeping -- the fill booking above all -- still runs. The
+        operator resume restarts the run, which re-syncs with the venue.
+
+        :param what: The deferred step, for the debug log.
+        """
+        try:
+            yield
+        except VenueWritesQuarantinedError:
+            _log.debug("%s deferred by the external-intervention quarantine", what)
+
+    def _raise_if_venue_writes_blocked(self, coro: Coroutine[Any, Any, Any]) -> None:
+        """Refuse a venue write before it is scheduled, while the latch forbids writes."""
+        if self._quarantine_kind is QuarantineKind.EXTERNAL_INTERVENTION:
+            coro.close()
+            raise VenueWritesQuarantinedError()
 
     def raise_if_halted(self) -> None:
         """Re-raise the latched halt as :class:`BrokerManualInterventionError`.
@@ -2511,6 +2748,10 @@ class OrderSyncEngine:
             ``lib.last_bar_time`` at the call site). Anchors the stale-window
             timer for the native-failsafe rehydrate, exactly as in :meth:`sync`.
         """
+        if self.venue_writes_blocked:
+            # External-intervention quarantine: observe only. The resume
+            # restarts the run, which does this work on the startup path.
+            return
         if self._pine_bracket_reconstruct_done:
             return
         self._current_bar_ts_ms = bar_ts_ms
@@ -2679,6 +2920,10 @@ class OrderSyncEngine:
         # also called from contexts that don't pre-drain (e.g. tests, the
         # backtest path with broker mode), so this remains the safety net.
         self._drain_events()
+        if self.venue_writes_blocked:
+            # External-intervention quarantine: ingestion only. No diff, no
+            # protection driver, no reconcile repair may touch the venue.
+            return
         # Never open new exposure against a position state the engine could
         # not re-read. Runs BEFORE the restart scans and
         # ``_verify_pending_dispatches`` below, because each of those reads
@@ -3617,6 +3862,10 @@ class OrderSyncEngine:
         first :meth:`reconcile`. No-op without persistence — a pure
         in-memory session cannot survive a restart by definition.
         """
+        if self.venue_writes_blocked:
+            # External-intervention quarantine: observe only. The resume
+            # restarts the run, which does this work on the startup path.
+            return
         if self._store_ctx is None:
             return
         try:
@@ -4552,6 +4801,12 @@ class OrderSyncEngine:
         ``_reconcile_snapshot`` + ``_emit_unexpected_cancellations`` for the
         reference implementation.
         """
+        if self.venue_writes_blocked:
+            # External-intervention quarantine: book what the venue reports,
+            # adopt and repair nothing. The operator resume restarts the run,
+            # which re-syncs through the startup reconcile.
+            self._drain_events()
+            return
         # Drain queued broker events before any pending-close bookkeeping.
         # Startup ``reconcile`` (called from ``start_broker``) runs after
         # ``run_event_stream`` has been scheduled — by the time we get here
@@ -5849,7 +6104,16 @@ class OrderSyncEngine:
                         self._register_native_cancel_all_expected(event.symbol)
                         drained_any = True
                         continue
-                    self._route_event(event)
+                    try:
+                        self._route_event(event)
+                    except VenueWritesQuarantinedError:
+                        # A follow-up write that ends the event's routing (its
+                        # bookkeeping is done) is deferred to the post-resume
+                        # restart; writes with bookkeeping after them are
+                        # absorbed at their own call site
+                        # (:meth:`_follow_up_write_deferred`). Keep routing the
+                        # rest of the batch.
+                        _log.debug("follow-up write of %s deferred by quarantine", event)
                     drained_any = True
             finally:
                 self._drain_batch = []
@@ -5862,7 +6126,7 @@ class OrderSyncEngine:
         # they can fill into an oversell (see
         # :meth:`_reconcile_short_gate_after_fill`). Skipped when nothing was
         # drained — the position cannot have moved.
-        if drained_any:
+        if drained_any and not self.venue_writes_blocked:
             self._retry_forced_cancels()
             self._reconcile_short_gate_after_fill()
 
@@ -6761,12 +7025,16 @@ class OrderSyncEngine:
                 self._retire_stale_pending_partial_legs(
                     event.pine_id, reason='stale_parent_at_entry_fill',
                 )
-                self._resolve_deferred_for_entry(event.pine_id)
-                self._amend_bracket_qty_for_entry_fill(event)
+                with self._follow_up_write_deferred("deferred exit dispatch"):
+                    self._resolve_deferred_for_entry(event.pine_id)
+                with self._follow_up_write_deferred("bracket qty amend"):
+                    self._amend_bracket_qty_for_entry_fill(event)
                 self._promote_pending_partial_bracket_legs(event)
                 self._retire_entry_stop_watch_on_fill(event)
-            self._cascade_oca_cancel(event)
-            self._cascade_oca_reduce(event)
+            with self._follow_up_write_deferred("OCA cascade cancel"):
+                self._cascade_oca_cancel(event)
+            with self._follow_up_write_deferred("OCA cascade reduce"):
+                self._cascade_oca_reduce(event)
             # When a closing leg fully closes the position, drop the
             # entry + matching exit intents and clear Pine's order
             # dicts. Pine's ``strategy.exit`` is unconditional in most
@@ -6824,12 +7092,15 @@ class OrderSyncEngine:
             if (closing_leg
                     and self._position.size == 0
                     and not fifo_closed):
-                self._cleanup_closed_position(event)
+                with self._follow_up_write_deferred("closed-position cleanup"):
+                    self._cleanup_closed_position(event)
             for closed_entry_id in fifo_closed:
-                self._cleanup_position_tracking(closed_entry_id)
+                with self._follow_up_write_deferred("closed-entry cleanup"):
+                    self._cleanup_position_tracking(closed_entry_id)
             if t == 'filled' and event.leg_type in (
                     LegType.TAKE_PROFIT, LegType.STOP_LOSS):
-                self._retire_spent_software_bracket(event)
+                with self._follow_up_write_deferred("spent bracket retire"):
+                    self._retire_spent_software_bracket(event)
             # A flat book must not keep exit tracking under ANY parent id.
             # The per-entry cleanup above keys on the ids the FIFO walk (and
             # the dust flatten) actually consumed — but a startup-adopted
@@ -6846,7 +7117,8 @@ class OrderSyncEngine:
             # inventory while the surviving reservation shrank each new
             # partial exit to the 5e-06 dust and starved the entry).
             if closing_leg and self._position.size == 0:
-                self._retire_orphan_exits_on_flat_book()
+                with self._follow_up_write_deferred("orphan exit retire"):
+                    self._retire_orphan_exits_on_flat_book()
             # Defensive-close FILL: when a defensive-close marker is in
             # flight, the FILL event arrives carrying the synthetic
             # CloseIntent's pine_id rather than the parent entry id, so
@@ -6891,7 +7163,8 @@ class OrderSyncEngine:
             # id this fill just consumed, and dispatching before the
             # cleanup would let it wipe the fresh registration (engine
             # loses the live venue order it just opened).
-            self._maybe_open_after_reversal_close()
+            with self._follow_up_write_deferred("reversal open"):
+                self._maybe_open_after_reversal_close()
         elif t == 'cancelled':
             # Terminal failure for an in-flight defensive close: the
             # synthetic flatten was cancelled by the broker (or an
@@ -7198,34 +7471,21 @@ class OrderSyncEngine:
         :func:`~pynecore.core.broker.disappearance.resolve_unexpected_cancel_policy`
         decision so the mapping stays identical to the tracker path.
 
-        - ``stop`` / ``stop_and_cancel`` latch :meth:`record_quarantine`
-          (idempotent) — the process keeps running but new entry dispatch is
-          blocked, so the strategy's next-bar re-dispatch of the cancelled
-          entry is suppressed and the re-place duel stops.
+        - ``stop`` latches an ``EXTERNAL_INTERVENTION`` :meth:`record_quarantine`
+          — the process keeps running but no venue write is admitted, so the
+          strategy's next-bar re-dispatch of the cancelled order is
+          suppressed and whatever the operator left on the venue stays as is.
         - ``halt`` records and RAISES :class:`UnexpectedCancelError` out of
           the event-application path (mirroring
           :meth:`_halt_if_defensive_close_terminal`) so the engine performs
           its graceful stop.
         - ``ignore`` / ``re_place`` only audit-log.
 
-        ``stop_and_cancel`` additionally runs the engine-side best-effort
-        sibling sweep (:meth:`_sweep_siblings_after_unexpected_cancel`) —
-        the push-path analogue of the tracker's ``cancel_siblings`` hook.
-        On a reliable-push venue the tracker never detects a push-observed
-        cancel (the plugin retires the row on the terminal push), so
-        without the engine-side sweep the policy's cancel half would
-        silently never run and the remaining bot-owned orders would rest
-        live after the operator-selected safety response fired. Ordering
-        mirrors :meth:`DisappearanceTracker._apply_policy`: the quarantine
-        / halt signal is armed BEFORE the sweep, and the sweep swallows
-        per-intent failures, so a failing cancel can never soften the
-        safety outcome.
-
         Tracker-synthesised ``cancelled`` events
         (:attr:`OrderEvent.from_disappearance_tracker`) are skipped: the
         tracker already applied the policy before emitting them, so
-        re-applying would double the audit / sibling sweep and — for
-        ``halt`` — raise from the wrong place. Their teardown above still
+        re-applying would double the audit and — for ``halt`` — raise from
+        the wrong place. Their teardown above still
         runs (the tracker never touches ``_order_mapping``); only the policy
         is gated off here.
 
@@ -7262,98 +7522,8 @@ class OrderSyncEngine:
             exchange_order_id=exchange_order_id,
         )
         if halt is not None:
-            # Record BEFORE the sweep (mirrors the tracker's "signal armed
-            # before the best-effort sweep" ordering) so a raising sweep can
-            # never swallow the halt; the raise itself runs after the sweep
-            # so the remaining orders are still cancelled best-effort.
             self._record_halt(halt)
-        if policy == 'stop_and_cancel':
-            self._sweep_siblings_after_unexpected_cancel(
-                key, origin_coid=coid,
-            )
-        if halt is not None:
             raise halt
-
-    def _sweep_siblings_after_unexpected_cancel(
-            self, origin_key: str, *, origin_coid: str | None,
-    ) -> None:
-        """Best-effort sibling cancel sweep for push-detected ``stop_and_cancel``.
-
-        The engine-side analogue of the reference plugins'
-        ``cancel_siblings`` tracker hook: cancels every OTHER bot-owned
-        working order the engine still tracks, so the quarantine / halt
-        does not strand resting entries or exits that could execute after
-        the safety response fired. Semantics mirror the plugin sweeps
-        (e.g. Bybit's ``_cancel_sibling_working_orders``):
-
-        - An entry that already carries filled exposure is left for the
-          operator — cancelling its residual working order would strand
-          real broker exposure without tracking.
-        - Cancels go through :meth:`_dispatch_cancel`, so an ambiguous
-          disposition lands in the cancel-tentative / forced-cancel retry
-          machinery instead of being treated as settled, and each mapping
-          is kept until its cancel outcome is known.
-        - Per-intent failures are swallowed and audited
-          (``unexpected_cancel_sweep_failed``) — the sweep runs while the
-          quarantine / halt is already armed, so a failing cancel never
-          softens the safety outcome. A settled cancel is audited as
-          ``unexpected_cancel_cascade``.
-
-        The active intent slots are deliberately KEPT (matching the
-        tracker path, which never touches engine state for swept
-        siblings): the quarantine blocks new entry dispatch, an unchanged
-        Pine book diffs to no-op, and ``reconcile()`` observes the final
-        broker-side state.
-
-        :param origin_key: The intent key of the unexpectedly cancelled
-            order — already torn down by the caller; skipped defensively.
-        :param origin_coid: The origin order's client order id, recorded on
-            the audit rows.
-        """
-        for key, intent in list(self._active_intents.items()):
-            if key == origin_key:
-                continue
-            has_mapping = bool(self._order_mapping.get(key))
-            has_engine_legs = (
-                isinstance(intent, ExitIntent)
-                and self._partial_bracket_engine.has_active_legs_for_intent(
-                    key,
-                )
-            )
-            if not has_mapping and not has_engine_legs:
-                # Nothing working at the broker (or engine-side) for this
-                # slot — no order to strand.
-                continue
-            if (isinstance(intent, EntryIntent)
-                    and self._active_entry_filled_qty.get(key, 0.0) > 0.0):
-                # Real broker exposure — never cancel-and-retire it.
-                continue
-            # noinspection PyBroadException
-            try:
-                self._dispatch_cancel(intent)
-            except Exception:
-                _log.exception(
-                    "stop_and_cancel sibling sweep: cancel of %s failed; "
-                    "quarantine/halt stays armed",
-                    format_intent_key(key),
-                )
-                if self._store_ctx is not None:
-                    self._store_ctx.log_event(
-                        'unexpected_cancel_sweep_failed',
-                        client_order_id=origin_coid,
-                        intent_key=key,
-                    )
-                continue
-            _blog_info(
-                "stop_and_cancel sibling sweep: cancelled %s",
-                format_intent_key(key),
-            )
-            if self._store_ctx is not None:
-                self._store_ctx.log_event(
-                    'unexpected_cancel_cascade',
-                    client_order_id=origin_coid,
-                    intent_key=key,
-                )
 
     def _bot_close_in_flight_for(self, from_entry: str) -> bool:
         """True when a bot-initiated close/reduce for ``from_entry`` is live.
@@ -8970,7 +9140,8 @@ class OrderSyncEngine:
         if not cleanup_targets and not marker.fifo_closed_entry_ids:
             cleanup_targets.append(marker.entry_id)
         for cleanup_id in cleanup_targets:
-            self._cleanup_position_tracking(cleanup_id)
+            with self._follow_up_write_deferred("closed-entry cleanup"):
+                self._cleanup_position_tracking(cleanup_id)
         # Drop any parked-dispatch envelope for the synthetic close.
         # When ``execute_close`` parked with
         # :class:`OrderDispositionUnknownError`, ``_park_pending`` left
@@ -10530,7 +10701,8 @@ class OrderSyncEngine:
                 is OcaPartialFillPolicy.FULL_FILL_ONLY
             )
             if not skip_oca_cascade:
-                self._cascade_oca_cancel_for_key(intent_key)
+                with self._follow_up_write_deferred("OCA cascade cancel"):
+                    self._cascade_oca_cancel_for_key(intent_key)
             # Drop ``_active_intents[intent_key]`` so the next sync's
             # diff-loop sees an empty slot and either reissues the script
             # intent or adopts the retained mapping via the post-restart
@@ -18422,6 +18594,10 @@ class OrderSyncEngine:
         No-op without persistence (``store_ctx is None``) — pure in-memory
         sessions cannot survive a restart by definition.
         """
+        if self.venue_writes_blocked:
+            # External-intervention quarantine: observe only. The resume
+            # restarts the run, which does this work on the startup path.
+            return
         if self._store_ctx is None:
             return
         # First pass: reseed duplicate-fill caches from every persisted
@@ -20947,7 +21123,11 @@ class OrderSyncEngine:
         provider; calls hop to that loop via ``run_coroutine_threadsafe``.
         In unit tests no loop is supplied — the coroutine is driven to
         completion by a transient ``asyncio.run``.
+
+        Every caller is a venue write, so the external-intervention quarantine
+        gate applies here too (:class:`VenueWritesQuarantinedError`).
         """
+        self._raise_if_venue_writes_blocked(coro)
         if self._loop is None:
             return asyncio.run(coro)
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result(
@@ -20972,7 +21152,10 @@ class OrderSyncEngine:
         :param coro: The recovery coroutine.
         :param client_order_id: The id the step dispatches under, when known.
         :raises OrderDispositionUnknownError: When the bridge wait expires.
+        :raises VenueWritesQuarantinedError: While an external-intervention
+            quarantine forbids venue writes (nothing is scheduled).
         """
+        self._raise_if_venue_writes_blocked(coro)
         if self._loop is None:
             return asyncio.run(coro)
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
@@ -21397,7 +21580,10 @@ class OrderSyncEngine:
         :param coro: A direct order-dispatch broker coroutine.
         :return: The coroutine's result.
         :raises BrokerManualInterventionError: On an untranslated transient fault.
+        :raises VenueWritesQuarantinedError: While an external-intervention
+            quarantine forbids venue writes (nothing is scheduled).
         """
+        self._raise_if_venue_writes_blocked(coro)
         try:
             if self._loop is None:
                 return asyncio.run(coro)

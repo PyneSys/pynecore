@@ -65,13 +65,13 @@ def __test_invalid_policy_raises_value_error__(tmp_path: Path) -> None:
 
 
 def __test_valid_policy_set_contents__() -> None:
-    """``VALID_UNEXPECTED_CANCEL_POLICIES`` holds exactly the five expected policies.
+    """``VALID_UNEXPECTED_CANCEL_POLICIES`` holds exactly the four expected policies.
 
     Guard against accidental drift between the validator's allow-set
     and the policy branches implemented in
     :meth:`DisappearanceTracker._apply_policy`."""
     assert VALID_UNEXPECTED_CANCEL_POLICIES == frozenset({
-        'stop', 'stop_and_cancel', 're_place', 'ignore', 'halt',
+        'stop', 're_place', 'ignore', 'halt',
     })
 
 

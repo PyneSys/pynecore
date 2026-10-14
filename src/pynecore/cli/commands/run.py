@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import signal
 import tempfile
@@ -995,6 +996,20 @@ def _download_provider_data_resilient(
             delay = min(delay * 2.0, _PROVIDER_RETRY_MAX_DELAY)
 
 
+def _restart_in_place() -> None:
+    """Re-execute this process with its original command line, keeping its PID.
+
+    Used after an operator resumed the run's quarantine (``pyne broker resume``):
+    the bot re-syncs with the venue through the regular startup path (adoption,
+    replay, reconcile), while a supervisor (systemd, a container runtime) sees
+    no exit and restarts nothing.
+    """
+    logging.shutdown()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(sys.executable, sys.orig_argv)
+
+
 def _pin_timenow(last_bar_time: int | None) -> None:
     """Pin ``timenow`` to the final bar of a bounded historical replay.
 
@@ -1485,6 +1500,9 @@ def run(
         # narrates the cleanup outcome + next step so a failed run never ends
         # without a visible cleanup status.
         broker_run_reached_summary = False
+        # Set when the run stopped because an operator resumed its quarantine;
+        # the process then re-executes itself after the teardown below.
+        restart_after_quarantine_resume = False
         # Live OHLCV consumer generator — captured here so the outer
         # ``finally`` can close it explicitly *before* the broker event
         # loop is torn down. Without that, the consumer's own ``finally``
@@ -1957,8 +1975,17 @@ def run(
                         # every log line, otherwise leaving an orphan
                         # ``⠧ Live — …`` row in the transcript.
                         progress.stop()
-                        stop_reason = "interrupted"
-                        broker_warning("live streaming stopped (interrupted)")
+                        if runner.quarantine_resume_restart:
+                            stop_reason = "quarantine resumed"
+                            restart_after_quarantine_resume = True
+                            broker_warning(
+                                "live streaming stopped — the operator resumed "
+                                "the quarantine; restarting in place to re-sync "
+                                "with the venue"
+                            )
+                        else:
+                            stop_reason = "interrupted"
+                            broker_warning("live streaming stopped (interrupted)")
                         # The runner waited for the fills before its teardown
                         # stopped the event stream (see ``broker_stop_settle_s``)
                         if runner.broker_stop_settled is False:
@@ -2106,3 +2133,5 @@ def run(
                         "leaving it open to avoid a close-while-running crash.",
                         shutdown_timeout,
                     )
+        if restart_after_quarantine_resume:
+            _restart_in_place()

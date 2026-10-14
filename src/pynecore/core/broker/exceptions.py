@@ -27,6 +27,7 @@ __all__ = [
     'OrderSyncError',
     'SpotInventoryConflictError',
     'UnexpectedCancelError',
+    'VenueWritesQuarantinedError',
 ]
 
 
@@ -67,6 +68,25 @@ class ExchangeConnectionError(BrokerError):
     The Order Sync Engine is expected to reconnect and then reconcile state
     before resuming normal operation.
     """
+
+
+class VenueWritesQuarantinedError(ExchangeConnectionError):
+    """A venue write was refused locally: an external-intervention quarantine is latched.
+
+    Raised before anything is sent, by the sync engine's write runners and by
+    each plugin's transport chokepoint. It is an :class:`ExchangeConnectionError`
+    on purpose: every write path already treats that as "the request never left
+    the client — keep the state and retry later", which is exactly what a write
+    deferred by the quarantine needs. After the operator resumes, the deferred
+    work runs on the next sync.
+    """
+
+    def __init__(self, what: str = "venue write") -> None:
+        super().__init__(
+            f"{what} blocked: the bot is quarantined after an external "
+            f"intervention and leaves the venue untouched until an operator "
+            f"resume"
+        )
 
 
 class ExchangeOrderRejectedError(BrokerError):

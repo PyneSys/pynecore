@@ -28,7 +28,6 @@ __all__ = [
 
 VALID_UNEXPECTED_CANCEL_POLICIES = frozenset({
     "stop",
-    "stop_and_cancel",
     "re_place",
     "ignore",
     "halt",
@@ -53,12 +52,11 @@ class BrokerDefaults:
     on_unexpected_cancel: str = "stop"
     """Policy when a bot-owned order disappears without the bot cancelling it.
 
-    ``"stop"`` (default) — quarantine: trading stops (no new or
-    exposure-increasing dispatch) but the process stays alive — event
-    ingestion, cancels and closes keep working and observability can
-    page. Resumed by an operator restart.
-    ``"stop_and_cancel"`` — quarantine plus a best-effort cancel pass
-    over the remaining bot-owned orders.
+    ``"stop"`` (default) — quarantine: someone else acted on a bot-owned
+    order, so the bot leaves the venue exactly as it is (no order, amend,
+    cancel or close) while the process stays alive and keeps ingesting
+    events. The latch survives restarts; resume it with
+    ``pyne broker resume <run_id> <quarantine_id>``.
     ``"re_place"`` — no-op on the cancel; the sync engine re-dispatches
     the protective order on the next diff cycle.
     ``"ignore"`` — silently continue. Only safe when manual external

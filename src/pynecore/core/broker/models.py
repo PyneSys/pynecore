@@ -30,6 +30,7 @@ __all__ = [
     'OcaType',
     'OcaPartialFillPolicy',
     'CapabilityLevel',
+    'QuarantineKind',
     'ExchangeOrder',
     'OrderEvent',
     'CANCEL_REASON_VENUE_REDUCE_ONLY',
@@ -56,6 +57,7 @@ __all__ = [
     'BracketReconstructedEvent',
     'ManualInterventionRequiredEvent',
     'QuarantineEnteredEvent',
+    'QuarantineResumedEvent',
     'ProtectionDegradedEvent',
     'NativeFailsafeStateTransitionEvent',
     'PartialBracketBlockedDegradedFailsafeEvent',
@@ -118,6 +120,25 @@ class OrderType(StrEnum):
     LIMIT = "limit"
     STOP = "stop"
     TRAILING_STOP = "trailing_stop"
+
+
+class QuarantineKind(StrEnum):
+    """What a latched quarantine still lets the bot do on the venue.
+
+    ``ENTRY_BLOCK``: the bot's own venue-side trouble (a protective exit or
+    a close the venue keeps refusing, a spot inventory conflict). Nobody
+    touched the account, so protection keeps working: exits, closes and
+    cancels flow, only new exposure is blocked.
+
+    ``EXTERNAL_INTERVENTION``: someone else (the operator or another bot)
+    changed a bot-owned order or position. The operator knows something the
+    bot does not, so the bot writes NOTHING to the venue: no entry, exit,
+    close, cancel, amend or protection re-arm. Ingestion and booking keep
+    running. The latch is persisted and survives restarts; only an explicit
+    operator resume (``pyne broker resume``) clears it.
+    """
+    ENTRY_BLOCK = "entry_block"
+    EXTERNAL_INTERVENTION = "external_intervention"
 
 
 class LegType(StrEnum):
@@ -1693,18 +1714,26 @@ class ManualInterventionRequiredEvent(BrokerEvent):
 
 @dataclass
 class QuarantineEnteredEvent(BrokerEvent):
-    """Emitted once when the sync engine latches its quarantine state.
+    """Emitted when the sync engine latches (or escalates) its quarantine.
 
-    Quarantine stops trading without stopping the bot: new and
-    exposure-increasing dispatches (entry orders, entry amends) are
-    blocked, while event ingestion, protective exits, cancels and closes
-    keep working — the process stays a live observer of its open
-    exposure. The operator resolves the underlying cause and restarts the
-    strategy; the engine never leaves quarantine on its own.
+    Quarantine stops trading without stopping the bot: the process stays a
+    live observer of its open exposure. What it still does on the venue
+    depends on ``kind`` (see :class:`QuarantineKind`). The engine never
+    leaves quarantine on its own; the operator resumes it with
+    ``pyne broker resume <run_id> <quarantine_id>``.
     """
     reason: str
     intent_key: str | None = None
     context: dict | None = None
+    quarantine_id: str = ''
+    kind: QuarantineKind = QuarantineKind.ENTRY_BLOCK
+
+
+@dataclass
+class QuarantineResumedEvent(BrokerEvent):
+    """Emitted when an operator resume request cleared the quarantine latch."""
+    quarantine_id: str
+    kind: QuarantineKind
 
 
 @dataclass

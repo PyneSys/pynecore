@@ -25,6 +25,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeCapabilityError,
     ExchangeConnectionError,
     OrderDispositionUnknownError,
+    VenueWritesQuarantinedError,
 )
 from pynecore.core.broker.idempotency import CLIENT_ORDER_ID_MAX_LEN
 from pynecore.core.broker.models import (
@@ -271,10 +272,9 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     """
     Policy for bot-owned orders that disappear without the bot cancelling them.
 
-    One of ``"stop"`` (quarantine: trading stops, the process stays
-    alive as a live observer — default), ``"stop_and_cancel"``
-    (quarantine + cancel remaining bot orders), ``"re_place"``
-    (auto-replace protective orders), ``"ignore"`` (continue), or
+    One of ``"stop"`` (external-intervention quarantine: the bot leaves the
+    venue untouched, the process stays alive as a live observer — default),
+    ``"re_place"`` (auto-replace protective orders), ``"ignore"`` (continue), or
     ``"halt"`` (exit the process via the graceful manual-intervention
     path).  The class-level default is the quarantining fallback used by
     test paths that construct plugins without the CLI.  In production
@@ -362,15 +362,31 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     The plugin's disappearance tracking (typically a
     :class:`~pynecore.core.broker.disappearance.DisappearanceTracker`
     constructed with this as its ``request_quarantine`` hook) calls it when
-    the ``stop`` / ``stop_and_cancel`` policy fires: trading stops (the
-    engine blocks new entry dispatch and entry amends) while the process —
-    including the plugin's own event stream — keeps running, so the bot
-    stays a live observer of its open exposure instead of dying on a live
-    market. ``None`` when the runner has not wired it (state-only test
-    paths); the tracker then falls back to the process-exiting halt, which
-    is fail-safe, never fail-open.
+    the ``stop`` policy fires: trading stops while the process — including
+    the plugin's own event stream — keeps running, so the bot stays a live
+    observer of its open exposure instead of dying on a live market. A
+    detected external intervention (someone else changed a bot-owned order
+    or position) passes ``kind=QuarantineKind.EXTERNAL_INTERVENTION``: from
+    then on the engine and the plugin's transport refuse every venue write
+    (see :attr:`venue_writes_blocked`). The default ``ENTRY_BLOCK`` kind only
+    blocks new exposure. ``None`` when the runner has not wired it
+    (state-only test paths); the tracker then falls back to the
+    process-exiting halt, which is fail-safe, never fail-open.
 
-    Signature: ``sink(reason: str, context: dict | None = None)``.
+    Signature: ``sink(reason: str, context: dict | None = None, *,
+    kind: QuarantineKind = QuarantineKind.ENTRY_BLOCK)``.
+    """
+
+    venue_writes_blocked: Callable[[], bool] | None = None
+    """Optional read hook: does an external-intervention quarantine forbid venue writes?
+
+    The :class:`~pynecore.core.script_runner.ScriptRunner` wires this to the
+    engine's :attr:`~pynecore.core.broker.sync_engine.OrderSyncEngine.venue_writes_blocked`.
+    Every plugin calls :meth:`ensure_venue_writes_allowed` at its transport
+    chokepoint, before any order-mutating request leaves the client (create,
+    amend, cancel, close, position SL/TP). That covers the plugin's own
+    background writes too, which never pass through the engine. ``None``
+    (state-only test paths) allows every write.
     """
 
     native_cancel_all_expected_sink: Callable[..., None] | None = None
@@ -434,6 +450,22 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     stays ``None`` for netting accounts and for plugins that do not emulate,
     leaving their existing dispatch path untouched.
     """
+
+    def ensure_venue_writes_allowed(self, what: str = "venue write") -> None:
+        """Refuse an order-mutating request while the quarantine forbids venue writes.
+
+        Call it at the transport chokepoint, before the request leaves the
+        client. The raised error is an
+        :class:`~pynecore.core.broker.exceptions.ExchangeConnectionError`, so
+        every caller keeps its state and retries after the operator resume.
+
+        :param what: Short description of the refused request, for the log.
+        :raises VenueWritesQuarantinedError: While :attr:`venue_writes_blocked`
+            reports a latched external-intervention quarantine.
+        """
+        hook = self.venue_writes_blocked
+        if hook is not None and hook():
+            raise VenueWritesQuarantinedError(what)
 
     # === High-level order intents ===
     #

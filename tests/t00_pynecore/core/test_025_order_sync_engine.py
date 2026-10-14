@@ -32,6 +32,7 @@ from pynecore.core.broker.exceptions import (
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
     UnexpectedCancelError,
+    VenueWritesQuarantinedError,
 )
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.sync_engine import (
@@ -42,6 +43,7 @@ from pynecore.core.broker.sync_engine import (
     _SEEN_FILL_IDS_CAP,
     _SETTLED_DEFENSIVE_CLOSE_IDS_CAP,
     _BoundedIdSet,
+    _CancelTentativeMeta,
     _OPPOSITE_ENTRY_FILL_WAIT_S,
 )
 from pynecore.core.plugin import ProviderError, TransientProviderError
@@ -49,6 +51,8 @@ from pynecore.core.broker.models import (
     CANCEL_REASON_VENUE_REDUCE_ONLY,
     INTENT_KEY_SEP,
     BrokerEvent,
+    QuarantineEnteredEvent,
+    QuarantineKind,
     CancelDispositionOutcome,
     CapabilityLevel,
     CloseIntent,
@@ -14548,61 +14552,6 @@ def __test_tracker_synthesized_cancel_does_not_reapply_policy__():
     assert engine.halted is False
 
 
-def __test_push_external_cancel_stop_and_cancel_sweeps_siblings__():
-    """Under 'stop_and_cancel' a push-detected external cancel latches the
-    quarantine AND best-effort cancels the remaining bot-owned working
-    orders — the engine-side analogue of the tracker's sibling sweep, which
-    never runs on a reliable-push venue."""
-    b = MockBroker()
-    b.on_unexpected_cancel = "stop_and_cancel"
-    engine, pos = _mk_engine(b)
-    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
-    pos.entry_orders["M"] = _entry_order("M", 1.0, limit=49_000.0)
-    engine.sync(BAR_TS)
-    assert len(b.entry_calls) == 2
-    deal_id = engine.order_mapping["L"][0]
-
-    engine._route_event(_cancelled_event(deal_id))
-
-    assert engine.quarantined is True
-    assert engine.halted is False
-    assert "L" not in engine.order_mapping
-    # The sibling's working order received a best-effort broker cancel...
-    assert len(b.cancel_calls) == 1
-    assert b.cancel_calls[0].intent.pine_id == "M"
-    # ...and its slot stays active (tracker-path parity), so the unchanged
-    # Pine book diffs to no-op instead of re-placing the swept order.
-    assert "M" in engine.active_intents
-    engine.sync(BAR_TS + 60_000)
-    assert len(b.entry_calls) == 2
-
-
-def __test_push_external_cancel_stop_and_cancel_spares_filled_entry__():
-    """The stop_and_cancel sweep leaves an entry with filled exposure for
-    the operator — cancelling its residual working order would strand real
-    broker exposure without tracking."""
-    b = MockBroker()
-    b.on_unexpected_cancel = "stop_and_cancel"
-    engine, pos = _mk_engine(b)
-    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
-    pos.entry_orders["M"] = _entry_order("M", 2.0, limit=49_000.0)
-    engine.sync(BAR_TS)
-    deal_id = engine.order_mapping["L"][0]
-    sibling_id = engine.order_mapping["M"][0]
-    # M partially fills — real exposure with a residual still working.
-    engine._route_event(_fill_event(
-        "buy", 1.0, 49_000.0, pine_id="M", xchg_id=sibling_id,
-        event_type='partial', filled_qty=1.0, remaining_qty=1.0,
-    ))
-
-    engine._route_event(_cancelled_event(deal_id))
-
-    assert engine.quarantined is True
-    # The partially filled sibling was spared by the sweep.
-    assert len(b.cancel_calls) == 0
-    assert "M" in engine.order_mapping
-
-
 def __test_parked_modify_predecessor_cancel_is_not_unexpected__():
     """The default plugin modify is cancel + re-execute. When the
     REPLACEMENT submission parks (unknown disposition), the predecessor's
@@ -16559,3 +16508,152 @@ def __test_hedging_exit_cancel_bridge_timeout_does_not_crash__(tmp_path):
             assert engine._cancel_disposition_pending == {}
     finally:
         _stop_test_loop(loop, release)
+
+
+# --- External-intervention quarantine -------------------------------------------
+
+
+def _venue_write_counts(b: MockBroker) -> tuple[int, ...]:
+    return (
+        len(b.entry_calls), len(b.exit_calls), len(b.close_calls),
+        len(b.cancel_calls), len(b.modify_entry_calls), len(b.modify_exit_calls),
+    )
+
+
+def __test_an_operator_cancel_quarantines_and_the_bot_never_rebuilds_the_leg__():
+    """An operator deleting the bot's TP leaves the venue exactly as they left it.
+
+    The unexpected-cancel teardown drops the exit's tracking but Pine still
+    declares the exit; with an entry-only quarantine the next sync re-dispatched
+    the deleted leg. The operator's change must stand: no write of any kind.
+    """
+    b = MockBroker()
+    engine, pos, tp_id = _mk_bracket_with_inflight_close(b)
+    engine._active_intents.pop("L", None)
+    before = _venue_write_counts(b)
+
+    engine._route_event(_reduce_only_cancel_event(tp_id))
+
+    assert engine.quarantine_kind is QuarantineKind.EXTERNAL_INTERVENTION
+    assert engine.venue_writes_blocked
+    assert ("TP", "L") in pos.exit_orders, "Pine still declares the deleted exit"
+    pos.entry_orders["L2"] = _entry_order("L2", 1.0)
+    reads_before = b.get_position_calls
+    for i in range(3):
+        engine.sync(BAR_TS + (i + 1) * 60_000)
+    engine.reconcile()
+    assert _venue_write_counts(b) == before
+    assert b.get_position_calls == reads_before, "no reconcile repair under the latch"
+
+
+def __test_an_event_drained_under_the_latch_is_booked_without_its_follow_up_write__():
+    """A fill that arrives during the quarantine is booked; nothing is dispatched for it."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+    before = _venue_write_counts(b)
+    engine.record_quarantine("operator edit", kind=QuarantineKind.EXTERNAL_INTERVENTION)
+
+    engine.on_order_event(_fill_event("buy", 1.0, 50_000.0, pine_id="L"))
+    engine.sync(BAR_TS + 60_000)
+
+    assert pos.size == 1.0
+    assert _venue_write_counts(b) == before
+
+
+def __test_a_cancel_tentative_oca_entry_filling_under_the_latch_is_booked__():
+    """The OCA sibling cancel the late fill triggers is refused, the fill is still booked.
+
+    The cancel-tentative restore runs the OCA cascade BEFORE ``record_fill``;
+    a refused sibling cancel there must not drop the fill on the floor.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine_with_policy(b)
+    pos.entry_orders["A"] = _oca_entry(
+        "A", 1.0, oca_name="G", oca_type=_oca.cancel, limit=50_000.0,
+    )
+    pos.entry_orders["B"] = _oca_entry(
+        "B", 1.0, oca_name="G", oca_type=_oca.cancel, limit=49_000.0,
+    )
+    engine.sync(BAR_TS)
+    engine._cancel_disposition_pending["A"] = _CancelTentativeMeta(  # noqa
+        since_ts_ms=BAR_TS, reason='broker_timeout',
+    )
+    before = _venue_write_counts(b)
+    engine.record_quarantine("operator edit", kind=QuarantineKind.EXTERNAL_INTERVENTION)
+
+    engine.on_order_event(_fill_event(
+        "buy", 1.0, 50_000.0, pine_id="A", xchg_id=engine.order_mapping["A"][0],
+    ))
+    engine.sync(BAR_TS + 60_000)
+
+    assert pos.size == 1.0
+    assert "A" not in engine._cancel_disposition_pending  # noqa
+    assert _venue_write_counts(b) == before
+
+
+def __test_every_write_runner_refuses_and_closes_the_coroutine_under_the_latch__():
+    b = MockBroker()
+    engine, _pos = _mk_engine(b)
+    engine.record_quarantine("operator edit", kind=QuarantineKind.EXTERNAL_INTERVENTION)
+    sent: list[str] = []
+
+    async def _write(name: str) -> None:
+        sent.append(name)
+
+    runners = (engine._run_async, engine._run_async_write, engine._run_async_recovery)  # noqa
+    for runner in runners:
+        coro = _write(runner.__name__)
+        with pytest.raises(VenueWritesQuarantinedError):
+            runner(coro)
+        assert coro.cr_frame is None, "the refused coroutine is closed, not leaked"
+    assert sent == []
+
+
+def __test_an_entry_block_escalates_on_the_same_id_and_never_downgrades__():
+    b = MockBroker()
+    events: list[BrokerEvent] = []
+    engine, _pos = _mk_engine(b)
+    engine._broker_event_sink = events.append  # noqa
+
+    engine.record_quarantine("close_rejected_repeatedly")
+    first_id = engine.quarantine_id
+    assert engine.quarantined and not engine.venue_writes_blocked
+
+    engine.record_quarantine("operator edit", kind=QuarantineKind.EXTERNAL_INTERVENTION)
+    assert engine.quarantine_id == first_id
+    assert engine.venue_writes_blocked
+
+    engine.record_quarantine("protective_exit_rejected")
+    assert engine.quarantine_kind is QuarantineKind.EXTERNAL_INTERVENTION
+    entered = [e for e in events if isinstance(e, QuarantineEnteredEvent)]
+    assert [e.kind for e in entered] == [
+        QuarantineKind.ENTRY_BLOCK, QuarantineKind.EXTERNAL_INTERVENTION,
+    ]
+    assert {e.quarantine_id for e in entered} == {first_id}
+
+
+def __test_an_entry_block_quarantine_keeps_protection_running__():
+    """A venue-trouble quarantine blocks new exposure only; exits still go out."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    engine.on_order_event(_fill_event("buy", 1.0, 50_000.0, pine_id="L"))
+    engine.sync(BAR_TS + 60_000)
+    engine.record_quarantine("close_rejected_repeatedly")
+    entries_before = len(b.entry_calls)
+
+    pos.entry_orders["L2"] = _entry_order("L2", 1.0)
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS + 120_000)
+
+    assert len(b.entry_calls) == entries_before
+    assert len(b.exit_calls) == 1
+

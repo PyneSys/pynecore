@@ -46,10 +46,10 @@ that core:
   close AND yielded as a synthesised ``cancelled`` :class:`OrderEvent`
   (the engine's router cleans its tracking — essential under the
   non-halting policies), while the configured ``on_unexpected_cancel``
-  policy separately decides the operational reaction. ``stop`` /
-  ``stop_and_cancel`` QUARANTINE through the ``request_quarantine`` hook:
-  trading stops (the engine blocks new / exposure-increasing dispatch)
-  but the process — and this tracker's ingestion loop — stays alive;
+  policy separately decides the operational reaction. ``stop``
+  QUARANTINES through the ``request_quarantine`` hook as an external
+  intervention: the engine stops writing to the venue altogether, but the
+  process — and this tracker's ingestion loop — stays alive;
   raising here instead would tear down the very event stream the
   quarantine invariant requires to keep running. Only the explicit
   ``halt`` policy (or a quarantining policy with no hook wired — the
@@ -86,6 +86,7 @@ from pynecore.core.broker.models import (
     OrderEvent,
     OrderStatus,
     OrderType,
+    QuarantineKind,
 )
 
 if TYPE_CHECKING:
@@ -109,7 +110,7 @@ MISSING_PENDING_EXTRA = 'missing_pending_since'
 
 #: Valid ``on_unexpected_cancel`` policies (see ``BrokerDefaults``).
 UNEXPECTED_CANCEL_POLICIES = (
-    'stop', 'stop_and_cancel', 're_place', 'ignore', 'halt',
+    'stop', 're_place', 'ignore', 'halt',
 )
 
 #: Float comparison slack for fill quantities, matching the reconcile
@@ -127,7 +128,7 @@ def resolve_unexpected_cancel_policy(
         *,
         reason: str,
         context: dict[str, Any],
-        request_quarantine: Callable[[str, dict[str, Any]], None] | None,
+        request_quarantine: Callable[..., None] | None,
         log_event: Callable[..., None] | None,
         client_order_id: str | None,
         exchange_order_id: str | None,
@@ -139,15 +140,16 @@ def resolve_unexpected_cancel_policy(
     (:meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine._apply_unexpected_cancel_policy`).
 
     Applies the ``ignore`` / ``re_place`` audit-only logging and the
-    ``stop`` / ``stop_and_cancel`` quarantine latch, and RETURNS the halt
-    the caller must arm its own way (the tracker parks it on
-    :attr:`pending_halt`; the engine records + raises it) — or ``None``
-    when the outcome needed no halt (ignored, re-placed, or quarantined).
-    The fail-closed rule lives here: a ``stop`` / ``stop_and_cancel``
-    whose ``request_quarantine`` sink is missing or raises falls back to
-    the halt, never to continued trading. The caller owns the
-    ``stop_and_cancel`` sibling sweep — it is async and shaped differently
-    per path.
+    ``stop`` quarantine latch, and RETURNS the halt the caller must arm its
+    own way (the tracker parks it on :attr:`pending_halt`; the engine
+    records + raises it) — or ``None`` when the outcome needed no halt
+    (ignored, re-placed, or quarantined). An unexpected cancel is someone
+    else acting on a bot-owned order, so ``stop`` latches an
+    :attr:`~pynecore.core.broker.models.QuarantineKind.EXTERNAL_INTERVENTION`
+    quarantine: the bot leaves the venue exactly as the operator left it.
+    The fail-closed rule lives here: a ``stop`` whose ``request_quarantine``
+    sink is missing or raises falls back to the halt, never to continued
+    trading.
 
     :param policy: The configured ``on_unexpected_cancel`` policy name
         (one of :data:`UNEXPECTED_CANCEL_POLICIES`).
@@ -177,11 +179,12 @@ def resolve_unexpected_cancel_policy(
         _log('unexpected_cancel_re_place')
         return None
     quarantined = False
-    if (policy in ('stop', 'stop_and_cancel')
-            and request_quarantine is not None):
+    if policy == 'stop' and request_quarantine is not None:
         # noinspection PyBroadException
         try:
-            request_quarantine(reason, context)
+            request_quarantine(
+                reason, context, kind=QuarantineKind.EXTERNAL_INTERVENTION,
+            )
         except Exception:
             logger.exception(
                 "request_quarantine hook failed for %r; falling back "
@@ -306,16 +309,12 @@ class DisappearanceTracker:
         :class:`MissingConfirmation`, mutates nothing.
     :param is_exempt: Optional extra exemption (e.g. rows already flagged
         as naturally closed). Checked on every pass, both phases.
-    :param cancel_siblings: Async best-effort cancel sweep over the
-        origin row's sibling orders; required by (and only used for) the
-        ``stop_and_cancel`` policy. Best-effort — a raising sweep is
-        logged and does not swallow the armed quarantine / halt.
     :param request_quarantine: Sink that latches the engine's quarantine
-        state (``(reason, context)``); the runner wires it to
-        ``OrderSyncEngine.record_quarantine``. Used by the ``stop`` and
-        ``stop_and_cancel`` policies. When it is missing (or raises),
-        those policies fall back to arming the process-exiting halt —
-        fail-safe, never fail-open into continued trading.
+        state (``(reason, context, *, kind)``); the runner wires it to
+        ``OrderSyncEngine.record_quarantine``. Used by the ``stop`` policy.
+        When it is missing (or raises), the policy falls back to arming the
+        process-exiting halt — fail-safe, never fail-open into continued
+        trading.
     :param sibling_coids: Maps a :data:`MissingResolution.CLOSED` row to
         the client-order-ids of live sibling rows sharing its position
         (a netting account merges pyramid entries onto one position id);
@@ -345,8 +344,7 @@ class DisappearanceTracker:
             tracked_refs: Callable[['OrderRow'], Set[tuple[str, str]]],
             confirm_missing: Callable[['OrderRow'], Awaitable[MissingConfirmation]],
             is_exempt: Callable[['OrderRow'], bool] | None = None,
-            cancel_siblings: Callable[['OrderRow'], Awaitable[None]] | None = None,
-            request_quarantine: Callable[[str, dict[str, Any]], None] | None = None,
+            request_quarantine: Callable[..., None] | None = None,
             sibling_coids: Callable[
                 ['OrderRow', MissingConfirmation], Iterable[str]] | None = None,
             register_executions: Callable[
@@ -362,18 +360,12 @@ class DisappearanceTracker:
                 f"DisappearanceTracker: unknown policy {policy!r}; "
                 f"expected one of {UNEXPECTED_CANCEL_POLICIES}"
             )
-        if policy == 'stop_and_cancel' and cancel_siblings is None:
-            raise ValueError(
-                "DisappearanceTracker: policy 'stop_and_cancel' requires "
-                "a cancel_siblings hook"
-            )
         self._store = store_ctx
         self._grace_s = grace_s
         self._policy = policy
         self._tracked_refs = tracked_refs
         self._confirm_missing = confirm_missing
         self._is_exempt = is_exempt
-        self._cancel_siblings = cancel_siblings
         self._request_quarantine = request_quarantine
         self._sibling_coids = sibling_coids
         self._register_executions = register_executions
@@ -449,7 +441,7 @@ class DisappearanceTracker:
                 row, since_ts, confirmation, now_ts,
             )
             # The post-commit hooks must see the row as it stands after the
-            # fill slice was booked — a stale pre-fill row would let a sweep
+            # fill slice was booked — a stale pre-fill row would let a hook
             # miss the recovered quantity / promotion metadata.
             hook_row = applied_row if applied_row is not None else row
             if applied and register_ids and self._register_executions is not None:
@@ -469,7 +461,7 @@ class DisappearanceTracker:
                 # A fully filled row was retired as a benign post-fill
                 # close by ``_apply_confirmation`` (same predicate) — the
                 # unexpected-cancel policy must not fire for it.
-                await self._apply_policy(hook_row)
+                self._apply_policy(hook_row)
             for event in events:
                 yield event
             halt = self._take_pending_halt()
@@ -590,7 +582,7 @@ class DisappearanceTracker:
         the dedup channel: the evidence may still need to book later.
         ``applied_row`` is the row re-read *after* the fill slice was
         booked (``None`` on a dropped or no-op outcome); the caller feeds
-        it to the post-commit hooks so a sweep never sees a stale pre-fill
+        it to the post-commit hooks so none of them sees a stale pre-fill
         quantity.
         """
         resolution = confirmation.resolution
@@ -853,20 +845,18 @@ class DisappearanceTracker:
 
     # --- Policy ---------------------------------------------------------------
 
-    async def _apply_policy(self, row: 'OrderRow') -> None:
+    def _apply_policy(self, row: 'OrderRow') -> None:
         """Apply the ``on_unexpected_cancel`` policy for a confirmed cancel.
 
-        Runs BEFORE the cancelled event is yielded: the sweep and the
-        quarantine / halt decision must not depend on the consumer pulling
-        further elements. ``stop`` and ``stop_and_cancel`` latch the
-        engine's quarantine through the ``request_quarantine`` hook — the
-        process (and this observation loop) keeps running; a missing or
-        raising hook falls back to arming the halt, never to continued
-        trading. ``halt`` always arms :attr:`pending_halt`. Either signal
-        is armed BEFORE the best-effort sweep, so a raising sweep can
-        never swallow it; a pending halt is raised after the row's events
-        were yielded (or at the top of the next pass, when the generator
-        was abandoned).
+        Runs BEFORE the cancelled event is yielded: the quarantine / halt
+        decision must not depend on the consumer pulling further elements.
+        ``stop`` latches the engine's external-intervention quarantine
+        through the ``request_quarantine`` hook — the process (and this
+        observation loop) keeps running; a missing or raising hook falls
+        back to arming the halt, never to continued trading. ``halt``
+        always arms :attr:`pending_halt`; it is raised after the row's
+        events were yielded (or at the top of the next pass, when the
+        generator was abandoned).
         """
         reason = (
             f"Bot-owned order disappeared unexpectedly: "
@@ -890,21 +880,6 @@ class DisappearanceTracker:
         )
         if halt is not None:
             self._pending_halt = halt
-        if self._policy == 'stop_and_cancel' and self._cancel_siblings is not None:
-            # noinspection PyBroadException
-            try:
-                await self._cancel_siblings(row)
-            except Exception:
-                logger.exception(
-                    "cancel_siblings sweep failed for %r; quarantine/halt "
-                    "stays armed",
-                    row.client_order_id,
-                )
-                self._store.log_event(
-                    'unexpected_cancel_sweep_failed',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=row.exchange_order_id,
-                )
 
     # --- Default event builders ------------------------------------------------
 
