@@ -118,10 +118,12 @@ from pynecore.core.broker.models import (
     PendingDefensiveClose,
     ProtectionRearmedUnverifiedEvent,
     QuarantineEnteredEvent,
+    UnattributedPositionChangeEvent,
     QuarantineKind,
     QuarantineResumedEvent,
     format_intent_key,
 )
+from pynecore.core.broker.protection_guard import rebaseline_after_resume
 from pynecore.core.broker.native_failsafe_manager import (
     FailsafeHealth,
     FailsafeOwner,
@@ -1404,6 +1406,10 @@ class OrderSyncEngine:
         # L2-X and L3-X, cancel and sibling fill stamped the same second).
         self._drain_batch: list[OrderEvent | _NativeCancelAllExpected] = []
         self._drain_batch_pos: int = 0
+        # The not-yet-routed rest of a batch whose routing raised (a policy
+        # halt on one of its events). The next drain routes it first, ahead
+        # of anything queued since, so no event behind the raising one is lost.
+        self._drain_carry: list[OrderEvent | _NativeCancelAllExpected] = []
         # §2.6.7 broker-native fail-safe recovery feed. The plugin's reconcile
         # pass runs on the broker event-loop thread and enqueues observed
         # bracket triples here; they are applied to the manager on the MAIN
@@ -1790,6 +1796,9 @@ class OrderSyncEngine:
         self._halted_reason: str | None = None
         self._halted_intent_key: str | None = None
         self._halted_context: dict = {}
+        # Latched by :meth:`finalize_halt`: the halted run books what is
+        # queued and never writes to the venue again.
+        self._halt_finalized: bool = False
 
         # Quarantine latch. Unlike the halt above, quarantine stops TRADING
         # without stopping the BOT: the process stays a live observer of its
@@ -2384,12 +2393,15 @@ class OrderSyncEngine:
 
     @property
     def venue_writes_blocked(self) -> bool:
-        """``True`` while an external-intervention quarantine forbids every venue write.
+        """``True`` while every venue write is forbidden.
 
-        Read by the engine's write runners and, through the plugin's
-        ``venue_writes_blocked`` hook, by every plugin's transport chokepoint.
+        That is the case under an external-intervention quarantine, and once
+        :meth:`finalize_halt` has run for a halted run. Read by the engine's
+        write runners and, through the plugin's ``venue_writes_blocked`` hook,
+        by every plugin's transport chokepoint.
         """
-        return self._quarantine_kind is QuarantineKind.EXTERNAL_INTERVENTION
+        return (self._quarantine_kind is QuarantineKind.EXTERNAL_INTERVENTION
+                or self._halt_finalized)
 
     @property
     def quarantine_resume_restart(self) -> bool:
@@ -2528,6 +2540,7 @@ class OrderSyncEngine:
         for row in store_ctx.iter_open_quarantines():
             if row.resume_requested_ts_ms is not None:
                 store_ctx.end_quarantine(row.quarantine_id, 'operator_resume')
+                rebaseline_after_resume(store_ctx)
                 _blog_info(
                     "quarantine %s was resumed by the operator while the bot was "
                     "down", row.quarantine_id,
@@ -2590,6 +2603,9 @@ class OrderSyncEngine:
         kind = self._quarantine_kind or QuarantineKind.ENTRY_BLOCK
         if self._store_ctx is not None:
             self._store_ctx.end_quarantine(quarantine_id, 'operator_resume')
+            # The operator accepted the venue as it stands: the restarted
+            # plugins take their protection baselines from it.
+            rebaseline_after_resume(self._store_ctx)
         self._quarantine_resume_restart = True
         _blog_warning(
             "quarantine %s resumed by the operator — stopping the run and "
@@ -2625,7 +2641,7 @@ class OrderSyncEngine:
 
     def _raise_if_venue_writes_blocked(self, coro: Coroutine[Any, Any, Any]) -> None:
         """Refuse a venue write before it is scheduled, while the latch forbids writes."""
-        if self._quarantine_kind is QuarantineKind.EXTERNAL_INTERVENTION:
+        if self.venue_writes_blocked:
             coro.close()
             raise VenueWritesQuarantinedError()
 
@@ -2722,6 +2738,35 @@ class OrderSyncEngine:
         """
         self.raise_if_halted()
         self._drain_events()
+
+    @critical_section
+    def finalize_halt(self) -> None:
+        """Book the events queued before a latched halt, writing nothing to the venue.
+
+        A halt raised on the broker event loop (a plugin's
+        ``report_external_intervention`` under the ``halt`` policy, an
+        :class:`UnexpectedCancelError`) can follow events
+        :meth:`run_event_stream` already queued -- typically the fill of the
+        very manual close that caused it. :meth:`apply_async_events` and
+        :meth:`sync` refuse to run once halted, so the runner calls this while
+        it unwinds from the halt, before its teardown writes the trades and
+        closes the journal. From here on every venue write is refused (see
+        :attr:`venue_writes_blocked`): a follow-up write the booking would
+        trigger is skipped exactly as under the external-intervention
+        quarantine. An event that raises another halt while being booked does
+        not end the booking: the first halt stands and the events behind it
+        are booked too. A no-op unless halted.
+        """
+        if not self._halted:
+            return
+        self._halt_finalized = True
+        while True:
+            try:
+                self._drain_events()
+                return
+            except BrokerManualInterventionError as error:
+                self._record_halt(error)
+                _blog_warning("further halt while booking the queued events: %s", error.reason)
 
     @critical_section
     def settle_restart_state(self, bar_ts_ms: int) -> None:
@@ -5082,11 +5127,16 @@ class OrderSyncEngine:
             # next ``record_fill`` runs (FIFO close against trades that no
             # longer exist on the broker).
             if not is_nontradable_spot_dust:
-                _blog_warning(
-                    "exchange shows flat, internal=%s — external close detected, "
+                _blog_error(
+                    "exchange shows flat, internal=%s, and no fill explains it — "
+                    "a manual close, a liquidation or an unreported fill; "
                     "clearing position state",
                     self._position.size,
                 )
+                self._emit_broker_event(UnattributedPositionChangeEvent(
+                    symbol=self._symbol, change='flatten',
+                    book_size=self._position.size, venue_size=0.0,
+                ))
             # Retire the flattened entries' tracking BEFORE the clear:
             # leaving the slots would make the diff call Pine's next
             # re-emission of the same entry "unchanged" (signal swallowed)
@@ -5480,15 +5530,22 @@ class OrderSyncEngine:
             if not any(trade.entry_id == entry_id
                        for trade in self._position.open_trades)
         )
-        _blog_warning(
+        book_before = round(abs(self._position.size) + delta, 12)
+        _blog_error(
             "exchange holds %s but the book held %s for %.0fs with nothing of "
-            "ours in flight — external reduction of %s adopted as a %s at %s "
-            "(FIFO over entries %s; realized P&L on the adopted piece is "
-            "approximate), book now %s; fully consumed entries retired: %s",
-            venue_abs, round(abs(self._position.size) + delta, 12),
-            grace, delta, side, price,
+            "ours in flight and no fill explaining it (a manual close, a "
+            "liquidation or an unreported fill) — reduction of %s adopted as "
+            "a %s at %s (FIFO over entries %s; realized P&L on the adopted "
+            "piece is approximate), book now %s; fully consumed entries "
+            "retired: %s",
+            venue_abs, book_before, grace, delta, side, price,
             sorted(consumed), self._position.size, gone or 'none',
         )
+        self._emit_broker_event(UnattributedPositionChangeEvent(
+            symbol=self._symbol, change='reduce',
+            book_size=book_before if side == 'sell' else -book_before,
+            venue_size=venue_abs,
+        ))
         for entry_id in gone:
             for key, intent in list(self._active_intents.items()):
                 if isinstance(intent, ExitIntent) and intent.from_entry == entry_id:
@@ -5591,7 +5648,13 @@ class OrderSyncEngine:
         a position left without its stop is the larger risk.
 
         Position-attached brackets (NATIVE ``tp_sl_bracket``) never show up
-        in ``get_open_orders``, so the pass is inert there. A failed read
+        in ``get_open_orders``, so the pass is inert there. The same holds
+        per exit for a bracket attached as a position attribute through the
+        one-way emulator or a netting trading stop (only ``bracket:`` refs,
+        see :meth:`_exit_is_position_attached`): its stop is never a resting
+        order of the exit, so it is not judged missing. Neither is the stop of
+        an engine-trigger partial bracket: the engine watches its level and
+        sends the close itself. A failed read
         skips the pass — a live bot must not halt on a recoverable read.
         """
         if self._tp_sl_bracket_native or self._sync_count == 0:
@@ -5763,6 +5826,8 @@ class OrderSyncEngine:
         unprotected: list[tuple[str, ExitIntent]] = []
         for key, intent in list(self._active_intents.items()):
             if (isinstance(intent, ExitIntent) and intent.sl_price is not None
+                    and not self._exit_is_position_attached(key)
+                    and not self._partial_bracket_engine.has_active_legs_for_intent(key)
                     and self._parent_open_exposure(intent.from_entry)[0] > 0.0
                     and not any(leg.stop_price is not None
                                 for leg in legs_by_exit.get(key, []))):
@@ -5800,6 +5865,16 @@ class OrderSyncEngine:
                     payload={'held': held_abs, 'parent_held': parent_held},
                 )
         self._reduce_coverage_current = None
+
+    def _exit_is_position_attached(self, key: str) -> bool:
+        """Whether the exit's bracket is a venue position attribute.
+
+        The one-way emulator replicates a bracket onto the position-side legs
+        and a netting trading stop sets it on the position itself; both map
+        the exit to synthetic ``bracket:`` refs instead of venue order ids.
+        """
+        mapped = self._order_mapping.get(key)
+        return bool(mapped) and all(ref.startswith('bracket:') for ref in mapped)
 
     def _settle_stop_fates(
             self,
@@ -6219,7 +6294,8 @@ class OrderSyncEngine:
             # :meth:`_is_oca_sibling_fill_queued`). Events enqueued while a
             # batch routes are picked up by the next outer-loop snapshot,
             # preserving the old fully-drained postcondition.
-            batch: list[OrderEvent | _NativeCancelAllExpected] = []
+            batch: list[OrderEvent | _NativeCancelAllExpected] = self._drain_carry
+            self._drain_carry = []
             while True:
                 try:
                     batch.append(self._event_queue.get_nowait())
@@ -6251,6 +6327,11 @@ class OrderSyncEngine:
                         # rest of the batch.
                         _log.debug("follow-up write of %s deferred by quarantine", event)
                     drained_any = True
+            except BaseException:
+                # The raising event is routed (a policy halt raises after its
+                # bookkeeping); the events behind it wait for the next drain.
+                self._drain_carry = batch[self._drain_batch_pos:]
+                raise
             finally:
                 self._drain_batch = []
                 self._drain_batch_pos = 0
@@ -10254,11 +10335,11 @@ class OrderSyncEngine:
         elif isinstance(event, BrokerNativeFailsafeExternalEditEvent):
             _blog_warning(
                 "native fail-safe ownership -> UNKNOWN on %s (parent %r): "
-                "observed stop %s != desired %s with no PUT in flight — "
-                "manual reset required",
+                "observed stop %s != desired %s with no PUT in flight",
                 event.symbol, event.parent_entry_dispatch_ref,
                 event.actual_level, event.desired_level,
             )
+            self._apply_external_edit_policy(event)
         if self._broker_event_sink is None:
             _log.info("broker event (no sink): %r", event)
             return
@@ -10267,6 +10348,47 @@ class OrderSyncEngine:
             self._broker_event_sink(event)
         except Exception:  # pragma: no cover — defensive
             _log.exception("broker_event_sink raised for event %r", event)
+
+    def _apply_external_edit_policy(
+            self, event: BrokerNativeFailsafeExternalEditEvent,
+    ) -> None:
+        """Apply ``on_unexpected_cancel`` to a native fail-safe stop someone else moved.
+
+        The same reaction as
+        :meth:`~pynecore.core.plugin.broker.BrokerPlugin.report_external_intervention`
+        gives a plugin-detected edit: ``stop`` latches the external-intervention
+        quarantine, ``ignore`` / ``re_place`` only write an
+        ``external_intervention_*`` audit event, ``halt`` (or a quarantine that
+        could not latch) records the halt. The halt is not raised: the event
+        arrives inside the fail-safe manager's observation, and the runner
+        surfaces it through :meth:`raise_if_halted`.
+        """
+        policy = self._broker.on_unexpected_cancel
+        halt = resolve_unexpected_cancel_policy(
+            policy,
+            reason=(
+                f"native fail-safe stop of {event.parent_entry_dispatch_ref!r} on "
+                f"{event.symbol} changed on the venue by someone else "
+                f"({event.desired_level} -> {event.actual_level})"
+            ),
+            context={
+                'parent_entry_dispatch_ref': event.parent_entry_dispatch_ref,
+                'symbol': event.symbol,
+                'desired_level': event.desired_level,
+                'actual_level': event.actual_level,
+                'policy': policy,
+            },
+            request_quarantine=self.record_quarantine,
+            log_event=(
+                self._store_ctx.log_event
+                if self._store_ctx is not None else None
+            ),
+            client_order_id=None,
+            exchange_order_id=None,
+            audit_prefix='external_intervention',
+        )
+        if halt is not None:
+            self._record_halt(halt)
 
     # === §2.6 / §2.6.7 broker-native fail-safe wiring =====================
 
@@ -17692,7 +17814,7 @@ class OrderSyncEngine:
         mapped = self._order_mapping.get(key, [])
         if not mapped:
             return False
-        if all(ref.startswith('bracket:') for ref in mapped):
+        if self._exit_is_position_attached(key):
             return True
         try:
             orders = self._run_async_read(self._broker.get_open_orders(self._symbol))

@@ -20,6 +20,7 @@ from typing import Any, Coroutine
 import pytest
 
 from pynecore.core.broker.exceptions import SpotInventoryConflictError
+from pynecore.core.broker.models import QuarantineKind
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.spot_inventory import (
     SpotExecution,
@@ -841,6 +842,126 @@ def __test_reconcile_in_flight_order_never_excuses_a_larger_drift__(tmp_path: Pa
     _run(mgr.reconcile(T0_MS + 60_000 + 31_000))
     assert mgr.quarantined
     assert not _read_events(ctx, 'spot_inventory_conflict_held')
+    store.close()
+
+
+def __test_reconcile_sale_of_bot_inventory_is_external_intervention__(tmp_path: Path):
+    """An unexplained sale that leaves less base than the bot holds.
+
+    Someone else sold (or withdrew) the bot's own inventory: past the
+    settlement grace the conflict latches the external-intervention
+    quarantine, not the restart-recoverable entry block.
+    """
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    port = FakeSpotPort(balance=Decimal('0'))
+    calls: list = []
+    mgr = _manager(ctx, port,
+                   hook=lambda r, c, **kw: calls.append((r, c, kw.get('kind'))))
+    assert not _run(mgr.startup()).quarantined
+    port.balance = Decimal('1')
+    mgr.record_live_fill(_fill("own-1", base='1', price='100'))
+    _run(mgr.reconcile(T0_MS))
+    assert not mgr.quarantined
+
+    # A foreign sell of 0.6: the account now holds 0.4 of the bot's 1.
+    port.balance = Decimal('0.4')
+    _run(mgr.reconcile(T0_MS + 60_000))
+    assert not mgr.quarantined, "the settlement grace comes first"
+    _run(mgr.reconcile(T0_MS + 60_000 + 31_000))
+    assert mgr.quarantined
+    assert len(calls) == 1
+    reason, context, kind = calls[0]
+    assert kind is QuarantineKind.EXTERNAL_INTERVENTION
+    assert 'spot_inventory_taken' in reason
+    assert context['bot_inventory'] == '1'
+    assert context['current_total'] == '0.4'
+    quarantines = _read_events(ctx, 'spot_inventory_quarantine')
+    assert quarantines[-1]['kind'] == QuarantineKind.EXTERNAL_INTERVENTION.value
+    store.close()
+
+
+def __test_reconcile_inconclusive_history_never_reports_a_taken_inventory__(tmp_path: Path):
+    """An incomplete execution history cannot rule out an own fill.
+
+    The balance is below the bot's inventory, but the catch-up could not
+    read the full history: past the grace it is the fail-closed entry block,
+    never the external-intervention quarantine.
+    """
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    port = FakeSpotPort(balance=Decimal('0'))
+    calls: list = []
+    mgr = _manager(ctx, port,
+                   hook=lambda r, c, **kw: calls.append((r, kw.get('kind'))))
+    assert not _run(mgr.startup()).quarantined
+    port.balance = Decimal('1')
+    mgr.record_live_fill(_fill("own-1", base='1', price='100'))
+    _run(mgr.reconcile(T0_MS))
+
+    port.batches["anchor-0"] = SpotExecutionBatch(conclusive=False)
+    port.balance = Decimal('0.4')
+    _run(mgr.reconcile(T0_MS + 60_000))
+    _run(mgr.reconcile(T0_MS + 60_000 + 31_000))
+    assert "anchor-0" in port.fetch_calls
+    assert mgr.quarantined
+    assert len(calls) == 1
+    reason, kind = calls[0]
+    assert 'spot_inventory_conflict' in reason
+    assert kind is None, "the entry block is the hook's default kind"
+    store.close()
+
+
+def __test_reconcile_sale_of_foreign_holdings_stays_an_entry_block__(tmp_path: Path):
+    """A sale out of the foreign holdings leaves the bot's inventory intact.
+
+    The balance stays above the bot's own inventory: an ordinary attribution
+    conflict, latched as the entry block exactly as before.
+    """
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    port = FakeSpotPort(balance=Decimal('10'))
+    calls: list = []
+    mgr = _manager(ctx, port,
+                   hook=lambda r, c, **kw: calls.append((r, kw.get('kind'))))
+    assert not _run(mgr.startup()).quarantined
+    port.balance = Decimal('11')
+    mgr.record_live_fill(_fill("own-1", base='1', price='100'))
+    _run(mgr.reconcile(T0_MS))
+
+    port.balance = Decimal('10.4')
+    _run(mgr.reconcile(T0_MS + 60_000))
+    _run(mgr.reconcile(T0_MS + 60_000 + 31_000))
+    assert mgr.quarantined
+    assert len(calls) == 1
+    reason, kind = calls[0]
+    assert 'spot_inventory_conflict' in reason
+    assert kind is None, "the entry block is the hook's default kind"
+    store.close()
+
+
+def __test_reconcile_own_sell_in_flight_never_reports_a_taken_inventory__(tmp_path: Path):
+    """The bot's own unbooked sell explains a balance below its inventory."""
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    port = FakeSpotPort(balance=Decimal('0'))
+    calls: list = []
+    mgr = _manager(ctx, port, hook=lambda r, c, **kw: calls.append(kw.get('kind')))
+    assert not _run(mgr.startup()).quarantined
+    port.balance = Decimal('1')
+    mgr.record_live_fill(_fill("own-1", base='1', price='100'))
+    _run(mgr.reconcile(T0_MS))
+
+    ctx.upsert_order(
+        "close-1", symbol="BTCUSD", side="sell", qty=1.0, filled_qty=0.0,
+        state=STATE_CONFIRMED, intent_key="L", exchange_order_id="X1",
+        extras={},
+    )
+    port.balance = Decimal('0')
+    _run(mgr.reconcile(T0_MS + 60_000))
+    _run(mgr.reconcile(T0_MS + 60_000 + 31_000))
+    assert not mgr.quarantined
+    assert calls == []
     store.close()
 
 

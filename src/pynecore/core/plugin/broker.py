@@ -27,6 +27,7 @@ from pynecore.core.broker.exceptions import (
     OrderDispositionUnknownError,
     VenueWritesQuarantinedError,
 )
+from pynecore.core.broker.disappearance import resolve_unexpected_cancel_policy
 from pynecore.core.broker.idempotency import CLIENT_ORDER_ID_MAX_LEN
 from pynecore.core.broker.models import (
     CancelDispositionOutcome,
@@ -466,6 +467,48 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
         hook = self.venue_writes_blocked
         if hook is not None and hook():
             raise VenueWritesQuarantinedError(what)
+
+    def report_external_intervention(
+            self,
+            reason: str,
+            context: dict | None = None,
+            *,
+            client_order_id: str | None = None,
+            exchange_order_id: str | None = None,
+    ) -> None:
+        """Report that someone else changed a bot-owned order or position.
+
+        Call it when the venue proves an intervention the bot did not make: a
+        moved or removed SL/TP, a manual close of a bot position. Venue-caused
+        changes (a TP/SL fill, a stop-out, a liquidation, a reduce-only
+        squeeze) and the bot's own writes must never be reported. The
+        configured :attr:`on_unexpected_cancel` policy decides the reaction,
+        exactly as for an unexpected cancel: ``stop`` latches the
+        external-intervention quarantine through :attr:`quarantine_sink`,
+        ``ignore`` / ``re_place`` only write an ``external_intervention_*``
+        audit event, ``halt`` (or a quarantining policy without a working sink)
+        raises.
+
+        :param reason: Human-readable description, shown to the operator.
+        :param context: Structured details for the quarantine record.
+        :param client_order_id: The affected row's COID, for the audit event.
+        :param exchange_order_id: The affected venue ref, for the audit event.
+        :raises UnexpectedCancelError: When the policy requires the
+            process-exiting halt.
+        """
+        store_ctx = self.store_ctx
+        halt = resolve_unexpected_cancel_policy(
+            self.on_unexpected_cancel,
+            reason=reason,
+            context={**(context or {}), 'policy': self.on_unexpected_cancel},
+            request_quarantine=self.quarantine_sink,
+            log_event=store_ctx.log_event if store_ctx is not None else None,
+            client_order_id=client_order_id,
+            exchange_order_id=exchange_order_id,
+            audit_prefix='external_intervention',
+        )
+        if halt is not None:
+            raise halt
 
     # === High-level order intents ===
     #

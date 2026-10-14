@@ -61,6 +61,7 @@ __all__ = [
     'QuarantineResumedEvent',
     'ProtectionDegradedEvent',
     'ProtectionRearmedUnverifiedEvent',
+    'UnattributedPositionChangeEvent',
     'NativeFailsafeStateTransitionEvent',
     'PartialBracketBlockedDegradedFailsafeEvent',
     'EntryBlockedDegradedFailsafeEvent',
@@ -1724,6 +1725,27 @@ class ProtectionRearmedUnverifiedEvent(BrokerEvent):
 
 
 @dataclass
+class UnattributedPositionChangeEvent(BrokerEvent):
+    """The venue position shrank or vanished and no fill explains it.
+
+    A manual close, a liquidation, an auto-deleverage, a stop-out or an own
+    fill the venue never reported all look the same from the position alone,
+    so the engine does not quarantine: it adopts the venue size into the book
+    and reports the change loudly. A plugin that can tell a manual close apart
+    reports it itself (:meth:`~pynecore.core.plugin.broker.BrokerPlugin.report_external_intervention`).
+
+    :ivar symbol: The chart symbol.
+    :ivar change: ``'flatten'`` (the venue is flat) or ``'reduce'``.
+    :ivar book_size: Signed book size before the adoption.
+    :ivar venue_size: Absolute venue size the book adopted.
+    """
+    symbol: str
+    change: str
+    book_size: float
+    venue_size: float
+
+
+@dataclass
 class ManualInterventionRequiredEvent(BrokerEvent):
     """Emitted when the sync engine halts because the plugin raised
     :class:`~pynecore.core.broker.exceptions.BrokerManualInterventionError`.
@@ -1835,8 +1857,10 @@ class BrokerNativeFailsafeUnavailableEvent(BrokerEvent):
 @dataclass
 class BrokerNativeFailsafeExternalEditEvent(BrokerEvent):
     """Snapshot diff detected ``actual_level != desired_level`` with no
-    pending PUT in flight (§2.6.7). Owner flipped to ``unknown`` — the
-    engine will not overwrite until the user explicitly resets ownership.
+    pending PUT in flight (§2.6.7). Owner flipped to ``unknown`` and the
+    engine applies the plugin's ``on_unexpected_cancel`` policy: someone else
+    moved the stop, so under ``stop`` the external-intervention quarantine
+    leaves the venue as they set it.
     """
     parent_entry_dispatch_ref: str
     symbol: str

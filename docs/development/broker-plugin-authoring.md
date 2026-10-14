@@ -202,6 +202,48 @@ A quarantine your plugin requests for its own venue trouble (for example
 a spot inventory conflict) keeps the default `QuarantineKind.ENTRY_BLOCK`:
 new exposure is blocked, protection keeps working.
 
+### 1b. Report a moved SL/TP and a manual close — and nothing else
+
+Only the plugin can see who changed a bot-owned order or position, so it
+must report it: call `self.report_external_intervention(reason, context)`.
+It applies the `on_unexpected_cancel` policy exactly like an unexpected
+cancel (`stop` latches the external-intervention quarantine, `halt` raises).
+
+**Moved or removed SL/TP.** Use a
+`pynecore.core.broker.protection_guard.ProtectionLevelGuard` with
+`report=self.report_external_intervention`:
+
+- Before every request that sets protection — attach, amend, trailing
+  activation, fail-safe stop, clear — call `guard.expect(key, levels,
+  row_coid=...)`; when the venue answered, `guard.settle(key, confirmed,
+  write=write_id)` with the id `expect()` returned, so overlapping writes of
+  the same levels are settled exactly. A write the venue definitively refused
+  settles as `guard.settle(key, None, rejected=levels, write=write_id)` and
+  stops being acceptable at once; an unknown outcome settles as
+  `guard.settle(key, None, write=write_id)` and stays
+  acceptable until the venue is seen carrying it, or two consecutive fresh
+  snapshots show another own level. Writes the plugin makes on its own count
+  too: any write missing here becomes a false quarantine.
+- Feed every venue observation of the protection (an order push, a
+  position push, a polled snapshot) to `guard.observe(key, levels,
+  tick=..., read_started_at=..., immediate=...)`. A polled mismatch needs
+  two consecutive observations; a push for this exact order may pass
+  `immediate=True`. A snapshot read that started before the last own write
+  is skipped through `read_started_at`.
+- Under a venue-side trailing stop only the trailing flag, the distance and
+  the take-profit are compared.
+- `guard.forget(key)` when the protection or its position is gone.
+- The levels persist on the named journal row; an operator resume makes
+  the next observation the new baseline.
+
+**Manual close.** Report a close only when the venue proves it was neither
+the bot's nor the venue's: not a fill of the bot's own close order, not a
+TP/SL trigger, not a stop-out, liquidation, auto-deleverage, settlement or
+dealing-desk close. Book the fill as usual so the book matches the venue,
+then report. A position change no fill explains is ambiguous; the engine
+adopts it with an ERROR and an `UnattributedPositionChangeEvent`, never a
+quarantine.
+
 ### 2. `OrderEvent.fill_qty` is INCREMENTAL; `fill_id` must be stable
 
 `fill_qty` is the quantity of *this* fill event, not a running total —

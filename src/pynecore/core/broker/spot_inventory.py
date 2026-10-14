@@ -32,7 +32,11 @@ core bookkeeping a spot broker plugin needs:
   trading via the engine quarantine latch (process stays alive as an
   observer); the explicit ``halt`` policy exits instead. Recovery is a
   restart: the fresh startup retires the corrupt ledger stretch and
-  re-anchors a fresh epoch on the venue's measured balance.
+  re-anchors a fresh epoch on the venue's measured balance. A confirmed
+  runtime conflict that left the balance below the bot's own inventory —
+  someone sold or withdrew what the bot holds — latches the
+  external-intervention quarantine instead, which only an operator resume
+  lifts.
 
 The manager takes explicit ``now_ms`` timestamps so reconciliation
 timing is fully deterministic under test, mirroring
@@ -45,7 +49,7 @@ from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from pynecore.core.broker.exceptions import SpotInventoryConflictError
-from pynecore.core.broker.models import ExchangePosition
+from pynecore.core.broker.models import ExchangePosition, QuarantineKind
 from pynecore.core.plugin import is_retryable_provider_error
 
 if TYPE_CHECKING:
@@ -468,7 +472,7 @@ class SpotInventoryManager:
             *,
             account_id: str,
             symbol: str,
-            request_quarantine: 'Callable[[str, dict[str, Any]], None] | None' = None,
+            request_quarantine: 'Callable[..., None] | None' = None,
             on_inventory_conflict: str = 'quarantine',
     ) -> None:
         """
@@ -481,7 +485,10 @@ class SpotInventoryManager:
             carries (not necessarily ``port.product_id``).
         :param request_quarantine: The engine quarantine latch, normally
             the plugin's
-            :attr:`~pynecore.core.plugin.broker.BrokerPlugin.quarantine_sink`.
+            :attr:`~pynecore.core.plugin.broker.BrokerPlugin.quarantine_sink`:
+            called as ``(reason, context)``, plus
+            ``kind=QuarantineKind.EXTERNAL_INTERVENTION`` when the bot's own
+            inventory was taken.
         :param on_inventory_conflict: ``'quarantine'`` (default) or
             ``'halt'``.
         """
@@ -1136,7 +1143,19 @@ class SpotInventoryManager:
                         port.product_id, context['drift'], sorted(explaining),
                     )
                 return delivered
-            self._enter_quarantine('spot_inventory_conflict', context)
+            if conclusive and balance < self._fold.net_base - port.base_tolerance:
+                # The account holds less base than the bot's own inventory,
+                # and neither a complete execution history nor an own order
+                # explains it: someone else sold or withdrew what the bot
+                # holds. A sale out of foreign holdings keeps the balance at
+                # or above the bot's inventory, and an incomplete history
+                # cannot rule out an own fill: both stay an ordinary conflict.
+                self._enter_quarantine(
+                    'spot_inventory_taken', context,
+                    kind=QuarantineKind.EXTERNAL_INTERVENTION,
+                )
+            else:
+                self._enter_quarantine('spot_inventory_conflict', context)
         return delivered
 
     def _in_flight_orders_explaining(self, drift: Decimal) -> frozenset[str]:
@@ -1460,7 +1479,10 @@ class SpotInventoryManager:
             )
         return rows
 
-    def _enter_quarantine(self, reason: str, context: dict[str, Any]) -> None:
+    def _enter_quarantine(
+            self, reason: str, context: dict[str, Any], *,
+            kind: QuarantineKind = QuarantineKind.ENTRY_BLOCK,
+    ) -> None:
         """Latch the conflict — dual signal, mirroring the tracker.
 
         Persists the epoch's ``quarantined`` state (when an epoch
@@ -1468,6 +1490,11 @@ class SpotInventoryManager:
         hook latches the engine and the process stays alive; ``halt`` —
         or a missing / raising hook — arms :attr:`pending_halt`. Never
         fail-open.
+
+        :param kind: The quarantine the hook latches. ``ENTRY_BLOCK`` is the
+            manager's own bookkeeping trouble; ``EXTERNAL_INTERVENTION``
+            (someone took the bot's inventory) freezes every venue write
+            until the operator resumes the run.
         """
         if self._quarantined:
             return
@@ -1484,17 +1511,27 @@ class SpotInventoryManager:
                 )
             self._store.log_event(
                 'spot_inventory_quarantine',
-                payload={'reason': reason, **context},
+                payload={'reason': reason, 'kind': kind.value, **context},
             )
-        message = (
-            f"spot inventory conflict ({reason}): trading stops; "
-            f"restart the run to recover on a fresh venue-balance baseline"
-        )
+        if kind is QuarantineKind.EXTERNAL_INTERVENTION:
+            message = (
+                f"spot inventory taken ({reason}): the account holds less "
+                f"base than the bot's own inventory; every venue write stops "
+                f"until the operator resumes the run"
+            )
+        else:
+            message = (
+                f"spot inventory conflict ({reason}): trading stops; "
+                f"restart the run to recover on a fresh venue-balance baseline"
+            )
         quarantined = False
         if self._policy == 'quarantine' and self._request_quarantine is not None:
             # noinspection PyBroadException
             try:
-                self._request_quarantine(message, dict(context))
+                if kind is QuarantineKind.ENTRY_BLOCK:
+                    self._request_quarantine(message, dict(context))
+                else:
+                    self._request_quarantine(message, dict(context), kind=kind)
             except Exception:
                 logger.exception(
                     "request_quarantine hook failed for %r; falling back "

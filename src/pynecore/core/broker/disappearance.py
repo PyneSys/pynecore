@@ -140,6 +140,7 @@ def resolve_unexpected_cancel_policy(
         log_event: Callable[..., None] | None,
         client_order_id: str | None,
         exchange_order_id: str | None,
+        audit_prefix: str = 'unexpected_cancel',
 ) -> UnexpectedCancelError | None:
     """Resolve the ``on_unexpected_cancel`` policy for a confirmed
     unexpected cancel — the mapping shared by the grace-window tracker path
@@ -171,6 +172,10 @@ def resolve_unexpected_cancel_policy(
     :param client_order_id: The affected row's COID, stamped on audit events.
     :param exchange_order_id: The affected row's venue ref, stamped on
         audit events.
+    :param audit_prefix: Prefix of the audit event kinds
+        (``<prefix>_ignored`` / ``_re_place`` / ``_quarantine``); other kinds
+        of external intervention (a moved SL/TP, a manual close) name
+        themselves.
     """
     def _log(kind: str) -> None:
         if log_event is not None:
@@ -181,10 +186,10 @@ def resolve_unexpected_cancel_policy(
             )
 
     if policy == 'ignore':
-        _log('unexpected_cancel_ignored')
+        _log(f'{audit_prefix}_ignored')
         return None
     if policy == 're_place':
-        _log('unexpected_cancel_re_place')
+        _log(f'{audit_prefix}_re_place')
         return None
     quarantined = False
     if policy == 'stop' and request_quarantine is not None:
@@ -200,7 +205,7 @@ def resolve_unexpected_cancel_policy(
             )
         else:
             quarantined = True
-            _log('unexpected_cancel_quarantine')
+            _log(f'{audit_prefix}_quarantine')
     if not quarantined:
         # 'halt', or a quarantining policy whose hook is missing / raised:
         # arm the process-exiting manual-intervention signal.

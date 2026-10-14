@@ -6557,6 +6557,8 @@ def __test_reconcile_spot_dust_clears_without_external_close_warning__(caplog):
         position_dust_threshold=Decimal("0.00001"),
     )
     engine, pos = _mk_engine(b)
+    events: list[BrokerEvent] = []
+    engine._broker_event_sink = events.append  # type: ignore[attr-defined]
     engine._sync_count = 1
     pos.size = 0.000007
     pos.sign = 1.0
@@ -6571,13 +6573,20 @@ def __test_reconcile_spot_dust_clears_without_external_close_warning__(caplog):
 
     assert pos.size == 0.0
     assert not any(
-        "external close detected" in rec.getMessage()
+        "no fill explains it" in rec.getMessage()
         for rec in caplog.records
     )
+    assert events == []
 
 
 def __test_reconcile_spot_position_above_dust_threshold_warns_external_close__(caplog):
-    """A tradable spot position disappearing at the venue remains actionable."""
+    """A tradable spot position disappearing at the venue is reported loudly.
+
+    Nothing tells a manual close from a liquidation or an unreported fill, so
+    the book adopts the flat venue with an ERROR and an
+    UnattributedPositionChangeEvent instead of a quarantine.
+    """
+    from pynecore.core.broker.models import UnattributedPositionChangeEvent
     from decimal import Decimal
     import logging
     from types import SimpleNamespace
@@ -6588,6 +6597,8 @@ def __test_reconcile_spot_position_above_dust_threshold_warns_external_close__(c
         position_dust_threshold=Decimal("0.00001"),
     )
     engine, pos = _mk_engine(b)
+    events: list[BrokerEvent] = []
+    engine._broker_event_sink = events.append  # type: ignore[attr-defined]
     engine._sync_count = 1
     pos.size = 0.00002
     pos.sign = 1.0
@@ -6602,9 +6613,12 @@ def __test_reconcile_spot_position_above_dust_threshold_warns_external_close__(c
 
     assert pos.size == 0.0
     assert any(
-        "external close detected" in rec.getMessage()
+        rec.levelno == logging.ERROR and "no fill explains it" in rec.getMessage()
         for rec in caplog.records
     )
+    assert events == [UnattributedPositionChangeEvent(
+        symbol=SYMBOL, change='flatten', book_size=0.00002, venue_size=0.0)]
+    assert not engine.quarantined
 
 
 def __test_close_fill_books_subdust_residual_flat_and_retires_the_bracket__():
@@ -6924,6 +6938,71 @@ def __test_stop_coverage_is_judged_per_exit_under_pyramiding__():
     assert cancelled == [("L3-X", "L3")]
     assert l2_key in engine.active_intents
     assert l3_key not in engine.active_intents
+
+
+def __test_stop_coverage_leaves_position_attached_brackets_alone__(caplog):
+    """A bracket set on the position is not a missing stop.
+
+    Measured live (bybit cycles 265–270, 2026-10-13/14): the hedge account's
+    one-way emulator attaches every bracket as a trading stop on the
+    position-side legs, mapped to ``bracket:`` refs. No open order carries
+    such an exit's stop, so the guard cancelled and re-sent every bracket
+    — and, waiting on the journal row, re-armed it with an ERROR.
+    """
+    b = MockBroker(two_leg_exits=True)
+    engine, _pos = _spot_like_pyramid(b)
+    l2_key, l3_key = f"L2-X{chr(0)}L2", f"L3-X{chr(0)}L3"
+    engine._order_mapping[l2_key] = ["bracket:0:coid-l2:tp", "bracket:0:coid-l2:sl"]  # noqa
+    engine._order_mapping[l3_key] = ["bracket:1"]  # noqa
+    b.open_orders = []
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.01999, entry_price=2489.5,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cash",
+    )
+    n_cancels = len(b.cancel_calls)
+    with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+        engine.reconcile()
+        engine.reconcile()
+    assert len(b.cancel_calls) == n_cancels
+    assert l2_key in engine.active_intents
+    assert l3_key in engine.active_intents
+    assert not [r for r in caplog.records if "stop-coverage" in r.getMessage()]
+
+
+def __test_stop_coverage_leaves_engine_trigger_partial_brackets_alone__(caplog):
+    """An engine-trigger partial bracket's stop is not a missing stop.
+
+    Measured live (bybit-inverse cycle 226, 2026-10-14): an exit converted
+    to an engine-trigger partial bracket keeps its stop as an engine-watched
+    leg that never rests on the venue. The guard waited on the leg's journal
+    row, re-armed the bracket with an ERROR and repeated it every pass.
+    """
+    from pynecore.core.broker.software_partial_bracket_engine import PartialBracketLeg
+    from pynecore.core.broker.store_helpers import LEG_KIND_SL_PARTIAL, LEG_STATE_ARMED
+    b = MockBroker(two_leg_exits=True)
+    engine, _pos = _spot_like_pyramid(b)
+    l2_key, l3_key = f"L2-X{chr(0)}L2", f"L3-X{chr(0)}L3"
+    engine._order_mapping[l2_key] = ["bracket:0"]  # noqa
+    engine._order_mapping[l3_key] = ["coid-l3-p0", "coid-l3-q0"]  # noqa
+    engine._partial_bracket_engine.register_leg(PartialBracketLeg(  # noqa
+        coid='coid-l3-q0', symbol=SYMBOL, pine_id='L3-X', from_entry='L3',
+        leg_kind=LEG_KIND_SL_PARTIAL, leg_state=LEG_STATE_ARMED,
+        side='sell', qty=0.00999, intent_key=l3_key, parent_pine_entry_id='L3',
+        parent_entry_dispatch_ref='coid-l3', intent_partial_qty=0.00999,
+        trigger_level=2480.0,
+    ))
+    b.open_orders = []
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.01999, entry_price=2489.5,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cash",
+    )
+    n_cancels = len(b.cancel_calls)
+    with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+        engine.reconcile()
+        engine.reconcile()
+    assert len(b.cancel_calls) == n_cancels
+    assert l3_key in engine.active_intents
+    assert not [r for r in caplog.records if "stop-coverage" in r.getMessage()]
 
 
 def _l3_stop_gone(b, engine, ctx):
@@ -12061,11 +12140,12 @@ def __test_record_native_bracket_observed_recovers_degrading_to_healthy__():
 
 
 def __test_record_native_bracket_observed_external_edit_flips_owner_unknown__():
-    """A mismatching observed stop (operator edit) flips fail-safe ownership to UNKNOWN."""
-    # A mismatching observation (operator edited the stop at the broker) must
-    # flip ownership to UNKNOWN — the engine must NOT silently resend its now
-    # stale desired level over a manual edit. UNKNOWN also blocks new brackets
-    # until a user reset, same as DEGRADED.
+    """A mismatching observed stop (operator edit) quarantines the run.
+
+    Ownership flips to UNKNOWN and the engine latches an external-intervention
+    quarantine: it must NOT resend its now stale desired level over a manual
+    edit, nor write anything else to the venue until the operator resumes.
+    """
     engine, _ = _mk_engine(MockBroker())
     mgr = engine._native_failsafe_manager
     ref = "run-pi-bar-e0"
@@ -12082,6 +12162,91 @@ def __test_record_native_bracket_observed_external_edit_flips_owner_unknown__():
         now_ms=2000.0,
     )
     assert mgr.get_state(ref).owner is FailsafeOwner.UNKNOWN
+    assert engine.quarantined
+    assert engine.venue_writes_blocked
+
+
+@pytest.mark.parametrize('policy', ['ignore', 're_place', 'halt'])
+def __test_native_failsafe_external_edit_follows_the_unexpected_cancel_policy__(policy):
+    """A moved fail-safe stop gets the configured policy, like any external edit.
+
+    ``ignore`` / ``re_place`` leave the run trading (ownership still flips to
+    UNKNOWN, so the edit is not overwritten); ``halt`` records the
+    process-exiting halt instead of a quarantine.
+    """
+    b = MockBroker()
+    b.on_unexpected_cancel = policy
+    engine, _ = _mk_engine(b)
+    mgr = engine._native_failsafe_manager
+    ref = "run-pi-bar-e0"
+    mgr.register_parent(parent_entry_dispatch_ref=ref, symbol=SYMBOL,
+                        parent_side='long', mintick=1.0)
+    mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
+                           active_sl_levels=[90.0], now_ms=1000.0)
+    engine.set_native_bracket_dispatcher(lambda _snap: None)
+    engine.drive_native_failsafe(now_ms=1000.0)
+
+    engine.record_native_bracket_observed(
+        ref, stop_level=80.0, profit_level=None, trailing_stop=None,
+        now_ms=2000.0,
+    )
+    assert mgr.get_state(ref).owner is FailsafeOwner.UNKNOWN
+    assert not engine.quarantined
+    assert not engine.venue_writes_blocked
+    if policy == 'halt':
+        with pytest.raises(BrokerManualInterventionError, match="someone else"):
+            engine.raise_if_halted()
+    else:
+        engine.raise_if_halted()
+
+
+def __test_finalize_halt_books_the_queued_close_without_venue_writes__():
+    """A fill queued before an async halt is booked while the run unwinds.
+
+    The reported shape: a plugin yields the fill of a manual close, then its
+    ``report_external_intervention`` raises the ``halt``. The fill sits in the
+    queue, and ``apply_async_events`` refuses to drain a halted engine, so the
+    runner's halt unwind books it through ``finalize_halt`` -- without letting
+    the booking cancel the now orphaned stop, or write anything else.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+    writes_before = (len(b.entry_calls), len(b.exit_calls), len(b.close_calls),
+                     len(b.cancel_calls))
+
+    engine.on_order_event(replace(
+        _fill_event('sell', 1.0, 49_500.0, pine_id="", leg=LegType.CLOSE,
+                    xchg_id="manual-1"),
+        pine_id=None, from_entry="L",
+    ))
+    engine._record_halt(BrokerManualInterventionError(  # type: ignore[attr-defined]
+        "position closed by someone else"))
+    with pytest.raises(BrokerManualInterventionError):
+        engine.apply_async_events()
+    assert pos.size == 1.0
+
+    engine.finalize_halt()
+    assert pos.size == 0.0
+    assert engine.venue_writes_blocked
+    assert (len(b.entry_calls), len(b.exit_calls), len(b.close_calls),
+            len(b.cancel_calls)) == writes_before
+    with pytest.raises(BrokerManualInterventionError):
+        engine.raise_if_halted()
+
+
+def __test_finalize_halt_is_a_no_op_without_a_halt__():
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+    engine.on_order_event(replace(
+        _fill_event('sell', 1.0, 49_500.0, pine_id="", leg=LegType.CLOSE,
+                    xchg_id="manual-1"),
+        pine_id=None, from_entry="L",
+    ))
+    engine.finalize_halt()
+    assert pos.size == 1.0
+    assert not engine.venue_writes_blocked
 
 
 def __test_enqueue_native_bracket_observed_recovers_on_drive__():
@@ -16170,6 +16335,29 @@ def __test_exit_modify_reject_with_the_old_legs_still_listed_keeps_them__():
     assert b.close_calls == []
 
 
+def __test_exit_modify_reject_on_a_position_attached_bracket_keeps_it__():
+    """A refused amend of a bracket set on the position leaves it armed.
+
+    No open order lists such a bracket (``bracket:`` refs), so the venue
+    read cannot be the proof; the refused amend changed nothing on the
+    position.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    key = _open_long_with_tp(b, engine, pos)
+    engine._order_mapping[key] = ["bracket:1"]  # noqa
+    b.open_orders = []
+
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X", limit=52_000.0)
+    b.raise_on_next_modify_exit = ExchangeOrderRejectedError("venue reject")
+    n_exits = len(b.exit_calls)
+    engine.sync(BAR_TS + 60_000)  # must not raise
+
+    assert len(b.exit_calls) == n_exits
+    assert engine.active_intents[key].tp_price == 51_000.0
+    assert engine.order_mapping[key] == ["bracket:1"]
+
+
 def __test_exit_modify_reject_with_the_old_legs_gone_redispatches_fresh__():
     """A refused amend that already tore the old legs down re-arms the exit fresh.
 
@@ -16824,3 +17012,54 @@ def __test_an_entry_block_quarantine_keeps_protection_running__():
     assert len(b.entry_calls) == entries_before
     assert len(b.exit_calls) == 1
 
+
+
+def _halt_cancel_then_fill_queued(b):
+    """Resting entries L and L2; the venue queues an external cancel of L, then L2's fill."""
+    b.on_unexpected_cancel = "halt"
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    pos.entry_orders["L2"] = _entry_order("L2", 1.0, limit=49_000.0)
+    engine.sync(BAR_TS)
+    deal_l = engine.order_mapping["L"][0]
+    deal_l2 = engine.order_mapping["L2"][0]
+    engine.on_order_event(_cancelled_event(deal_l, pine_id="L"))
+    engine.on_order_event(_fill_event('buy', 1.0, 49_000.0, pine_id="L2", xchg_id=deal_l2))
+    return engine, pos
+
+
+def __test_a_halt_mid_batch_keeps_the_rest_of_the_batch_for_finalize_halt__():
+    """The fill queued behind a halting cancel is booked by the halt unwind."""
+    b = MockBroker()
+    engine, pos = _halt_cancel_then_fill_queued(b)
+    writes_before = (len(b.entry_calls), len(b.exit_calls), len(b.close_calls),
+                     len(b.cancel_calls))
+    with pytest.raises(UnexpectedCancelError):
+        engine.apply_async_events()
+    assert engine.halted
+    assert pos.size == 0.0
+
+    engine.finalize_halt()
+    assert pos.size == 1.0
+    assert (len(b.entry_calls), len(b.exit_calls), len(b.close_calls),
+            len(b.cancel_calls)) == writes_before
+    engine.finalize_halt()
+    assert pos.size == 1.0
+
+
+def __test_finalize_halt_books_past_a_further_halting_event__():
+    """Already halted: a halting cancel met while finalizing does not end the booking."""
+    b = MockBroker()
+    engine, pos = _halt_cancel_then_fill_queued(b)
+    writes_before = (len(b.entry_calls), len(b.exit_calls), len(b.close_calls),
+                     len(b.cancel_calls))
+    engine._record_halt(BrokerManualInterventionError(  # type: ignore[attr-defined]
+        "position closed by someone else"))
+
+    engine.finalize_halt()
+    assert pos.size == 1.0
+    assert "L" not in engine.order_mapping
+    assert (len(b.entry_calls), len(b.exit_calls), len(b.close_calls),
+            len(b.cancel_calls)) == writes_before
+    with pytest.raises(BrokerManualInterventionError, match="someone else"):
+        engine.raise_if_halted()

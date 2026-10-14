@@ -27,7 +27,7 @@ from pynecore.core import script as script_mod
 from pynecore.lib import timeframe as timeframe_lib
 from pynecore.lib.log import (broker_debug, broker_info, broker_warning, ohlcv_info, sim_info,
                               logger)
-from pynecore.core.broker.exceptions import ExchangeConnectionError
+from pynecore.core.broker.exceptions import BrokerManualInterventionError, ExchangeConnectionError
 from pynecore.types.ohlcv import OHLCV
 from pynecore.types.na import na_float, set_bool_na
 from pynecore.core.syminfo import SymInfo, mintick_decimals
@@ -1885,6 +1885,24 @@ class ScriptRunner:
     def drawings() -> dict:
         """Full snapshot of the live drawing objects (lines/labels/boxes/...)."""
         return viz.drawings_snapshot()
+
+    def _finalize_broker_halt(self) -> None:
+        """Book the broker events queued before a halt, before the teardown.
+
+        Runs while the run is unwinding from the halt, while the position, the
+        journal and the trade output are still open; the halt itself still
+        propagates. A failure here is logged, never raised over the halt: the
+        next run reconciles whatever stayed unbooked from the venue.
+        """
+        if self._order_sync_engine is None:
+            return
+        try:
+            cast('OrderSyncEngine', self._order_sync_engine).finalize_halt()
+        except Exception as exc:  # noqa: BLE001 - the halt must propagate unmasked
+            broker_warning(
+                "could not book every broker event queued before the halt (%s); "
+                "the next run reconciles them from the venue", exc,
+            )
 
     def _settle_broker_stop(self) -> None:
         """Ingest the fills of already-dispatched market orders at a stop.
@@ -4029,6 +4047,10 @@ class ScriptRunner:
 
         except KeyboardInterrupt:
             self._settle_broker_stop()
+            raise
+
+        except BrokerManualInterventionError:
+            self._finalize_broker_halt()
             raise
 
         finally:  # Python reference counter will close this even if the iterator is not exhausted

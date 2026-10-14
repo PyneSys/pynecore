@@ -41,6 +41,7 @@ from pynecore.core.broker.models import (
 )
 from pynecore.core.broker.exceptions import (
     AuthenticationError,
+    BrokerManualInterventionError,
     ExchangeCapabilityError,
     ExchangeConnectionError,
 )
@@ -942,6 +943,22 @@ def __test_stop_waits_for_the_fill_before_the_teardown__(tmp_path):
     assert runner.broker_stop_settled is True
     assert not engine.awaiting_market_fills()
     assert runner.script.position.size == pytest.approx(1.0)
+    assert [r[2] for r in _read_trade_rows(trade_path)][:1] == ["Entry long"]
+
+
+def __test_a_halt_books_the_fill_queued_before_it__(tmp_path):
+    """A fill queued before an async halt is booked while the run unwinds
+    from the halt, before the teardown closes the position and the output."""
+    runner, it, trade_path = _stopped_after_entry_dispatch(tmp_path, 0.0)
+    engine = runner._order_sync_engine
+    assert engine is not None
+    engine.on_order_event(_entry_fill(engine._order_mapping["L"][0]))
+    engine._record_halt(BrokerManualInterventionError("halted by the plugin"))
+    with pytest.raises(BrokerManualInterventionError):
+        for _ in it:
+            pass
+    assert runner.script.position.size == pytest.approx(1.0)
+    assert engine.venue_writes_blocked
     assert [r[2] for r in _read_trade_rows(trade_path)][:1] == ["Entry long"]
 
 
