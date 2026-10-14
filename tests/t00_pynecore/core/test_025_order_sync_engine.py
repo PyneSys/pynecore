@@ -340,7 +340,8 @@ def _exit_order(from_entry, size, exit_id, **kw) -> Order:
     return Order(from_entry, size, order_type=_order_type_close, exit_id=exit_id, **kw)
 
 
-def _mk_engine(broker, mintick: float = 1.0) -> tuple[OrderSyncEngine, BrokerPosition]:
+def _mk_engine(broker, mintick: float = 1.0,
+               store_ctx=None) -> tuple[OrderSyncEngine, BrokerPosition]:
     pos = BrokerPosition()
     engine = OrderSyncEngine(
         broker=broker,  # type: ignore[arg-type]
@@ -348,6 +349,7 @@ def _mk_engine(broker, mintick: float = 1.0) -> tuple[OrderSyncEngine, BrokerPos
         symbol=SYMBOL,
         run_tag=RUN_TAG,
         mintick=mintick,
+        store_ctx=store_ctx,
     )
     return engine, pos
 
@@ -6744,14 +6746,16 @@ def _resting_leg(order: ExchangeOrder, *, qty: float, stop: float | None = None,
     )
 
 
-def _spot_like_pyramid(b: MockBroker) -> tuple[OrderSyncEngine, BrokerPosition]:
+def _spot_like_pyramid(
+        b: MockBroker, store_ctx=None,
+) -> tuple[OrderSyncEngine, BrokerPosition]:
     """Two fee-netted entries (0.009995 each) with two-leg software brackets."""
     from decimal import Decimal
 
     b.spot_inventory_port = SimpleNamespace(
         position_dust_threshold=Decimal("0.00001"),
     )
-    engine, pos = _mk_engine(b, mintick=0.01)
+    engine, pos = _mk_engine(b, mintick=0.01, store_ctx=store_ctx)
     for i, (pine_id, price) in enumerate([("L2", 2489.0), ("L3", 2490.0)], start=1):
         pos.entry_orders[pine_id] = _entry_order(pine_id, 0.009995)
         pos.exit_orders[(f"{pine_id}-X", pine_id)] = _exit_order(
@@ -6882,10 +6886,8 @@ def __test_reconcile_rearms_missing_stop_protection__(caplog):
     assert cancelled == [("L2-X", "L2"), ("L3-X", "L3")]
     assert not any(isinstance(i, ExitIntent) for i in engine.active_intents.values())
     assert pos.size == pytest.approx(0.01999)
-    # Pine re-emits both exits: fresh two-leg brackets go out.
-    for pine_id in ("L2", "L3"):
-        pos.exit_orders[(f"{pine_id}-X", pine_id)] = _exit_order(
-            pine_id, 0.009995, f"{pine_id}-X", limit=2492.0, stop=2488.5)
+    # The script placed its exits once and does not re-emit them: the kept
+    # Pine orders alone bring fresh two-leg brackets back on the next sync.
     engine.sync(BAR_TS + 10 * 60_000)
     assert len(b.exit_calls) == n_exits + 2
     assert all(len(ids) == 2 for key, ids in engine.order_mapping.items()
@@ -6922,6 +6924,171 @@ def __test_stop_coverage_is_judged_per_exit_under_pyramiding__():
     assert cancelled == [("L3-X", "L3")]
     assert l2_key in engine.active_intents
     assert l3_key not in engine.active_intents
+
+
+def _l3_stop_gone(b, engine, ctx):
+    """Both exits rest a TP, only L2 its SL; L3's SL row is still live in the journal."""
+    template = b._mk_order(b.exit_calls[0], 't')
+    l2_key, l3_key = f"L2-X{chr(0)}L2", f"L3-X{chr(0)}L3"
+    l2_tp, l2_sl = engine.order_mapping[l2_key]
+    l3_tp, l3_sl = engine.order_mapping[l3_key]
+    b.open_orders = [
+        _resting_leg(replace(template, id=l2_tp, side="sell"), qty=0.00999, price=2492.0),
+        _resting_leg(replace(template, id=l2_sl, side="sell"), qty=0.00999, stop=2488.5),
+        _resting_leg(replace(template, id=l3_tp, side="sell"), qty=0.00999, price=2492.0),
+    ]
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.01999, entry_price=2489.5,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cash",
+    )
+    ctx.upsert_order(
+        "sl-L3", symbol=SYMBOL, side="sell", qty=0.00999, state="confirmed",
+        intent_key=l3_key, exchange_order_id=l3_sl, from_entry="L3",
+        pine_entry_id="L3-X", extras={},
+    )
+    return l2_key, l3_key
+
+
+def _stop_coverage_store(tmp_path):
+    from pynecore.core.broker.run_identity import RunIdentity
+    from pynecore.core.broker.storage import BrokerStore
+
+    store = BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker")
+    ctx = store.open_run(
+        RunIdentity(strategy_id="t025", symbol=SYMBOL, timeframe="60",
+                    account_id="testbroker-demo", label=None),
+        script_source="src", script_path="t025.py",
+    )
+    return store, ctx
+
+
+def __test_stop_rearm_waits_for_the_verdict_on_a_live_stop_row__(tmp_path, caplog):
+    """A missing stop whose journal row is still live is not re-armed yet.
+
+    The venue has not said why the stop vanished: its row is live, so the
+    disappearance tracker is still checking it, and an external cancel must
+    quarantine the run instead of being overridden. Once the verdict closes
+    the row (a venue-driven or the bot's own cancel), the absence is
+    explained and the regular two-pass re-arm follows.
+    """
+    store, ctx = _stop_coverage_store(tmp_path)
+    with store:
+        b = MockBroker(two_leg_exits=True)
+        engine, _pos = _spot_like_pyramid(b, store_ctx=ctx)
+        l2_key, l3_key = _l3_stop_gone(b, engine, ctx)
+        n_cancels = len(b.cancel_calls)
+        with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+            for _ in range(4):
+                engine.reconcile()
+        assert len(b.cancel_calls) == n_cancels
+        waits = [r for r in caplog.records if "waiting for the venue's verdict" in r.getMessage()]
+        assert len(waits) == 1 and "sl-L3" in waits[0].getMessage()
+        assert l3_key in engine.active_intents
+
+        ctx.close_order("sl-L3")
+        engine.reconcile()  # first explained observation
+        assert len(b.cancel_calls) == n_cancels
+        engine.reconcile()
+        cancelled = [(c.intent.pine_id, c.intent.from_entry) for c in b.cancel_calls[n_cancels:]]
+        assert cancelled == [("L3-X", "L3")]
+        assert l2_key in engine.active_intents
+        assert l3_key not in engine.active_intents
+
+        # The script does not re-emit its exit: the next sync re-arms the
+        # full bracket from the kept Pine order.
+        n_exits = len(b.exit_calls)
+        engine.sync(BAR_TS + 10 * 60_000)
+        rearmed = b.exit_calls[n_exits:]
+        assert [(e.intent.pine_id, e.intent.from_entry) for e in rearmed] == [("L3-X", "L3")]
+        assert rearmed[0].intent.sl_price is not None
+        assert len(engine.order_mapping[l3_key]) == 2
+
+
+def __test_stop_rearm_without_a_verdict_is_loud_after_the_ceiling__(tmp_path, caplog):
+    """A verdict that never comes re-arms the stop after the ceiling, loudly.
+
+    A lost cancel push with an unreadable order history leaves the row live
+    for good; the position must not stay without its stop, so past
+    STOP_FATE_VERDICT_CEILING_S the exit is retired for a fresh bracket with
+    an ERROR, an audit event and a ProtectionRearmedUnverifiedEvent.
+    """
+    from pynecore.core.broker.models import ProtectionRearmedUnverifiedEvent
+    from pynecore.core.broker.sync_engine import STOP_FATE_VERDICT_CEILING_S
+
+    store, ctx = _stop_coverage_store(tmp_path)
+    with store:
+        b = MockBroker(two_leg_exits=True)
+        engine, _pos = _spot_like_pyramid(b, store_ctx=ctx)
+        events: list[BrokerEvent] = []
+        engine._broker_event_sink = events.append  # type: ignore[attr-defined]
+        l2_key, l3_key = _l3_stop_gone(b, engine, ctx)
+        n_cancels = len(b.cancel_calls)
+        engine.reconcile()
+        assert len(b.cancel_calls) == n_cancels
+        engine._stop_fate_pending_since[l3_key] -= STOP_FATE_VERDICT_CEILING_S  # type: ignore[attr-defined]
+        with caplog.at_level(logging.ERROR, logger="pyne_core_logger"):
+            engine.reconcile()
+        cancelled = [(c.intent.pine_id, c.intent.from_entry) for c in b.cancel_calls[n_cancels:]]
+        assert cancelled == [("L3-X", "L3")]
+        assert l3_key not in engine.active_intents
+        assert l2_key in engine.active_intents
+        assert [r for r in caplog.records
+                if r.levelno == logging.ERROR and "no verdict on the missing stop" in r.getMessage()]
+        rearmed = [e for e in events if isinstance(e, ProtectionRearmedUnverifiedEvent)]
+        assert len(rearmed) == 1
+        assert rearmed[0].intent_key == l3_key and rearmed[0].from_entry == "L3"
+        audit = ctx._store._conn.execute(  # type: ignore[attr-defined]
+            "SELECT intent_key FROM events WHERE kind = 'stop_coverage_rearm_unverified'",
+        ).fetchall()
+        assert [row['intent_key'] for row in audit] == [l3_key]
+
+        # A same-bar sync (calc_on_every_tick) re-arms the bracket from the
+        # kept Pine order under a fresh client order id: the old bracket's id
+        # is spent at the venue.
+        spent = b.exit_calls[1]
+        assert spent.intent.from_entry == "L3"
+        n_exits = len(b.exit_calls)
+        engine.sync(spent.bar_ts_ms)
+        rearmed = b.exit_calls[n_exits:]
+        assert [(e.intent.pine_id, e.intent.from_entry) for e in rearmed] == [("L3-X", "L3")]
+        assert rearmed[0].intent.sl_price is not None
+        assert (rearmed[0].bar_ts_ms, rearmed[0].retry_seq) != (spent.bar_ts_ms, spent.retry_seq)
+
+
+def __test_stop_rearm_after_a_delayed_cancel_mints_fresh_ids__(tmp_path):
+    """A re-arm cancel that lands only on retry still spends the old ids.
+
+    ``execute_cancel`` returns ``False`` first: the exit stays parked and no
+    bracket goes out beside the surviving TP. The next sync's retry lands the
+    cancel and re-arms in the same pass; on the original bracket's bar the
+    replacement must not reuse its client order id.
+    """
+    from pynecore.core.broker.sync_engine import STOP_FATE_VERDICT_CEILING_S
+
+    store, ctx = _stop_coverage_store(tmp_path)
+    with store:
+        b = MockBroker(two_leg_exits=True)
+        engine, _pos = _spot_like_pyramid(b, store_ctx=ctx)
+        _l2_key, l3_key = _l3_stop_gone(b, engine, ctx)
+        engine.reconcile()
+        engine._stop_fate_pending_since[l3_key] -= STOP_FATE_VERDICT_CEILING_S  # type: ignore[attr-defined]
+        b.false_on_next_cancel = True
+        n_cancels = len(b.cancel_calls)
+        engine.reconcile()
+        assert len(b.cancel_calls) == n_cancels + 1
+        assert l3_key in engine._forced_cancel_pending  # type: ignore[attr-defined]
+        assert l3_key not in engine.active_intents
+
+        spent = b.exit_calls[1]
+        assert spent.intent.from_entry == "L3"
+        n_exits = len(b.exit_calls)
+        engine.sync(spent.bar_ts_ms)
+        assert l3_key not in engine._forced_cancel_pending  # type: ignore[attr-defined]
+        rearmed = b.exit_calls[n_exits:]
+        assert [(e.intent.pine_id, e.intent.from_entry) for e in rearmed] == [("L3-X", "L3")]
+        assert rearmed[0].intent.sl_price is not None
+        assert (rearmed[0].bar_ts_ms, rearmed[0].retry_seq) != (spent.bar_ts_ms, spent.retry_seq)
+        assert len(engine.order_mapping[l3_key]) == 2
 
 
 def _list_resting_stops(b, engine, pos) -> None:

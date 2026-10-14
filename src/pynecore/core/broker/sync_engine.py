@@ -116,6 +116,7 @@ from pynecore.core.broker.models import (
     PartialBracketCancelTentativeResolvedEvent,
     PartialBracketCancelTentativeStartedEvent,
     PendingDefensiveClose,
+    ProtectionRearmedUnverifiedEvent,
     QuarantineEnteredEvent,
     QuarantineKind,
     QuarantineResumedEvent,
@@ -219,6 +220,18 @@ _WRITE_CLASSIFICATION_GRACE_MULT = 3.0
 #: is an external flatten and the book must stop trading on a position
 #: that no longer exists.
 EXTERNAL_FLATTEN_CONFIRM_GRACE_S = 120.0
+
+#: Seconds the stop-coverage guard (:meth:`OrderSyncEngine._check_reduce_coverage`)
+#: waits for the venue's verdict on a missing stop leg whose journal row is still
+#: live — its disappearance is under investigation, or its dispatch is still in
+#: flight — before re-arming the stop anyway. A stop someone else removed must
+#: quarantine the bot, never be rebuilt, so the guard first waits for the
+#: plugin's disappearance tracker (Bybit: a 25 s grace plus one reconcile pass,
+#: with retries on a failed history read). A verdict that never comes — the
+#: cancel push was lost and the order history cannot be read — must not leave
+#: the position without a stop for good: past this ceiling the stop is re-armed
+#: with an ERROR and a :class:`ProtectionRearmedUnverifiedEvent`.
+STOP_FATE_VERDICT_CEILING_S = 120.0
 
 #: Seconds the broker view may stay unconfirmed before a read outage is
 #: escalated. While the view cannot be refreshed the engine already refuses to
@@ -1654,6 +1667,10 @@ class OrderSyncEngine:
         # logged, so a persisting condition is reported once, not per pass.
         self._reduce_coverage_warned: tuple[Any, ...] | None = None
         self._reduce_coverage_current: tuple[Any, ...] | None = None
+        # Exit intents whose missing stop leg still has a live journal row,
+        # with the ``time.monotonic()`` the guard first saw them: the wait
+        # for the venue's verdict, bounded by STOP_FATE_VERDICT_CEILING_S.
+        self._stop_fate_pending_since: dict[str, float] = {}
         # Venue size observed BELOW the book on the book's own side, with the
         # monotonic time it was first seen at that size — the confirmation
         # window of :meth:`_adopt_external_shrink`.
@@ -5559,6 +5576,20 @@ class OrderSyncEngine:
         open-orders snapshot, and retiring it there would double the
         bracket.
 
+        Only an EXPLAINED absence is re-armed: someone else removing the
+        bot's stop must quarantine the bot, never be overridden. While a
+        journal row of the exit is still live but not resting on the venue,
+        the leg's fate is not known yet — its disappearance is being
+        investigated (the push was lost; the plugin's tracker is checking the
+        order history) or its dispatch is still in flight — so the guard
+        waits for the verdict: an external cancel quarantines the run, a
+        venue-driven cancel closes the row and the re-arm follows. Without a
+        live row the absence is explained (the bot's own cancel, a
+        venue-driven trim, a dispatch that never landed). A verdict still
+        missing after :data:`STOP_FATE_VERDICT_CEILING_S` re-arms the stop
+        anyway, with an ERROR and a :class:`ProtectionRearmedUnverifiedEvent`:
+        a position left without its stop is the larger risk.
+
         Position-attached brackets (NATIVE ``tp_sl_bracket``) never show up
         in ``get_open_orders``, so the pass is inert there. A failed read
         skips the pass — a live bot must not halt on a recoverable read.
@@ -5737,6 +5768,10 @@ class OrderSyncEngine:
                                 for leg in legs_by_exit.get(key, []))):
                 unprotected.append((key, intent))
         if held_abs <= 0.0 or not unprotected:
+            self._stop_fate_pending_since.clear()
+            return
+        unprotected = self._settle_stop_fates(unprotected, orders, held_abs)
+        if not unprotected:
             return
         state = ('unprotected', tuple(sorted(key for key, _intent in unprotected)))
         self._reduce_coverage_current = state
@@ -5756,7 +5791,8 @@ class OrderSyncEngine:
                 "the exit so the next sync re-arms its full bracket",
                 format_intent_key(key), intent.from_entry, parent_held,
             )
-            self._cancel_and_retire_exit_leg(key, intent)
+            if not self._retire_exit_for_rearm(key, intent):
+                continue
             if self._store_ctx is not None:
                 self._store_ctx.log_event(
                     'stop_coverage_rearm',
@@ -5764,6 +5800,106 @@ class OrderSyncEngine:
                     payload={'held': held_abs, 'parent_held': parent_held},
                 )
         self._reduce_coverage_current = None
+
+    def _settle_stop_fates(
+            self,
+            unprotected: list[tuple[str, ExitIntent]],
+            orders: list[ExchangeOrder],
+            held_abs: float,
+    ) -> list[tuple[str, ExitIntent]]:
+        """Keep the exits whose missing stop is explained; wait on the rest.
+
+        An exit whose journal still holds a live row that does not rest on
+        the venue waits for that row's verdict (see
+        :meth:`_enforce_reduce_coverage_invariant`). Once the wait passes
+        :data:`STOP_FATE_VERDICT_CEILING_S` the exit is re-armed right here,
+        loudly. Returns the exits with an explained absence, which go on to
+        the regular two-pass re-arm.
+        """
+        pending = self._exits_with_unresolved_legs(
+            [key for key, _intent in unprotected], orders,
+        )
+        now = time.monotonic()
+        for key in list(self._stop_fate_pending_since):
+            if key not in pending:
+                del self._stop_fate_pending_since[key]
+        explained: list[tuple[str, ExitIntent]] = []
+        for key, intent in unprotected:
+            if key not in pending:
+                explained.append((key, intent))
+                continue
+            since = self._stop_fate_pending_since.get(key)
+            if since is None:
+                self._stop_fate_pending_since[key] = now
+                _blog_warning(
+                    "stop-coverage invariant: exit %s declares a stop but no "
+                    "stop leg rests on the venue, and its order %s is not "
+                    "resolved yet — waiting for the venue's verdict before "
+                    "re-arming (an external cancel quarantines the run)",
+                    format_intent_key(key), ", ".join(pending[key]),
+                )
+                continue
+            waited = now - since
+            if waited < STOP_FATE_VERDICT_CEILING_S:
+                continue
+            if not self._retire_exit_for_rearm(key, intent):
+                continue
+            del self._stop_fate_pending_since[key]
+            parent_held = self._parent_open_exposure(intent.from_entry)[0]
+            reason = (
+                f"no verdict on the missing stop of exit {format_intent_key(key)} "
+                f"(order {', '.join(pending[key])}) after {waited:.0f} s — "
+                f"re-arming it so the position does not stay unprotected; if "
+                f"someone removed it on purpose, the bot is putting it back"
+            )
+            _blog_error("stop-coverage invariant: %s", reason)
+            if self._store_ctx is not None:
+                self._store_ctx.log_event(
+                    'stop_coverage_rearm_unverified',
+                    client_order_id=None, intent_key=key,
+                    payload={'held': held_abs, 'parent_held': parent_held,
+                             'waited_s': waited, 'unresolved': pending[key]},
+                )
+            self._emit_broker_event(ProtectionRearmedUnverifiedEvent(
+                intent_key=key, from_entry=intent.from_entry, reason=reason,
+            ))
+        return explained
+
+    def _exits_with_unresolved_legs(
+            self, keys: list[str], orders: list[ExchangeOrder],
+    ) -> dict[str, list[str]]:
+        """Map each exit to its live journal rows that do not rest on the venue.
+
+        A row belongs to the exit when the engine maps its venue id to the
+        exit or the row names the exit's intent key. A live row the
+        open-orders view does not show is a leg whose fate the venue has not
+        settled for the engine yet. Without a store there is no journal and
+        no disappearance tracker, so every absence counts as explained.
+        """
+        if self._store_ctx is None or not keys:
+            return {}
+        resting: set[str] = set()
+        for order in orders:
+            resting.add(order.id)
+            if order.client_order_id:
+                resting.add(order.client_order_id)
+        owner_of_order: dict[str, str] = {}
+        for key in keys:
+            for oid in self._order_mapping.get(key, []):
+                owner_of_order[oid] = key
+        wanted = set(keys)
+        pending: dict[str, list[str]] = {}
+        for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+            key = owner_of_order.get(row.exchange_order_id or '')
+            if key is None and row.intent_key in wanted:
+                key = row.intent_key
+            if key is None:
+                continue
+            if row.client_order_id in resting or (
+                    row.exchange_order_id and row.exchange_order_id in resting):
+                continue
+            pending.setdefault(key, []).append(row.client_order_id)
+        return pending
 
     def _cancel_owned_venue_order(
             self, order: ExchangeOrder, coid: str | None, event_kind: str,
@@ -7668,6 +7804,50 @@ class OrderSyncEngine:
         self._active_intents.pop(key, None)
         self._drop_envelope(key)
         self._remove_pine_order_for_intent(intent)
+
+    def _retire_exit_for_rearm(self, key: str, intent: ExitIntent) -> bool:
+        """Cancel an unprotected exit's surviving legs so the next sync re-arms it.
+
+        The stop-coverage guard's repair. Unlike
+        :meth:`_cancel_and_retire_exit_leg` the exit is not spent: its Pine
+        order stays in ``position.exit_orders`` (a script places its
+        ``strategy.exit`` once and need not re-emit it), so the next
+        :meth:`sync` finds the exit without an active intent and dispatches a
+        fresh, full bracket for what the parent holds.
+
+        The old bracket's client order ids are spent at the venue, so a
+        settled cancel retires the envelope through
+        :meth:`_reanchor_envelope_after_reject`: a re-arm on the same bar
+        mints ``retry_seq + 1`` instead of an id an idempotency-caching venue
+        would dedupe into the dead bracket. A cancel whose ``execute_cancel``
+        returned ``False`` stays parked in ``_forced_cancel_pending`` with its
+        envelope and durable journal row untouched, and the diff defers the
+        re-dispatch until the retry lands — the surviving TP and the new
+        bracket never rest together; :meth:`_retry_forced_cancels` bumps the
+        spent anchor the same way once the cancel lands.
+
+        :return: ``False`` when the cancel raised: nothing is retired and a
+            later pass retries the repair.
+        """
+        spent_envelope = self._envelopes.get(key)
+        settled = True
+        if self._order_mapping.get(key):
+            # noinspection PyBroadException
+            try:
+                settled = self._dispatch_cancel(intent)
+            except Exception:
+                _log.exception(
+                    "stop-coverage re-arm: cancel of %s failed; the next pass "
+                    "retries", format_intent_key(key),
+                )
+                return False
+        self._active_intents.pop(key, None)
+        if settled:
+            self._order_mapping.pop(key, None)
+            if spent_envelope is not None:
+                self._envelopes.setdefault(key, spent_envelope)
+            self._reanchor_envelope_after_reject(key)
+        return True
 
     def _retire_spent_software_bracket(self, event: OrderEvent) -> None:
         """Retire a whole-row exit whose venue leg just filled in full.
@@ -15820,7 +16000,8 @@ class OrderSyncEngine:
         after every event drain that routed something — on every venue, for
         short-gate and general parks alike. A cancel that now lands cleanly
         retires its mapping / envelope / journal row and leaves
-        ``_forced_cancel_pending``; one that still errors or returns
+        ``_forced_cancel_pending`` with a bumped retry anchor (see
+        :meth:`_reanchor_envelope_after_reject`); one that still errors or returns
         ``False`` stays parked for the next attempt. Never halts (the same
         non-halting strict path as the initial attempt). No-op when nothing
         is parked.
@@ -15828,6 +16009,8 @@ class OrderSyncEngine:
         if not self._forced_cancel_pending:
             return
         for key, old in list(self._forced_cancel_pending.items()):
+            spent_envelope = self._envelopes.get(key)
+            spent_anchor = self._persisted_envelope_anchors.get(key)
             try:
                 landed = self._dispatch_cancel_strict(old)
             except (ExchangeConnectionError, OrderDispositionUnknownError) as e:
@@ -15846,6 +16029,16 @@ class OrderSyncEngine:
                 )
                 continue
             self._forced_cancel_pending.pop(key, None)
+            # The landed order's client order ids are spent at the venue: keep
+            # the identity the strict path just dropped and bump it, so a
+            # same-bar re-dispatch of the key mints ``retry_seq + 1`` instead
+            # of an id an idempotency-caching venue dedupes into the dead
+            # order. A later bar mints fresh as usual.
+            if spent_envelope is not None:
+                self._envelopes.setdefault(key, spent_envelope)
+            elif spent_anchor is not None:
+                self._persisted_envelope_anchors.setdefault(key, spent_anchor)
+            self._reanchor_envelope_after_reject(key)
             _blog_info(
                 "parked forced cancel for %r landed; released",
                 format_intent_key(key),

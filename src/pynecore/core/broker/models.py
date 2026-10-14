@@ -36,6 +36,7 @@ __all__ = [
     'CANCEL_REASON_VENUE_REDUCE_ONLY',
     'CANCEL_REASON_VENUE_OCA',
     'CANCEL_REASON_VENUE_POSITION_CLEARED',
+    'CANCEL_REASON_VENUE_REJECTED',
     'VENUE_DRIVEN_CANCEL_REASONS',
     'ExchangePosition',
     'PositionLeg',
@@ -59,6 +60,7 @@ __all__ = [
     'QuarantineEnteredEvent',
     'QuarantineResumedEvent',
     'ProtectionDegradedEvent',
+    'ProtectionRearmedUnverifiedEvent',
     'NativeFailsafeStateTransitionEvent',
     'PartialBracketBlockedDegradedFailsafeEvent',
     'EntryBlockedDegradedFailsafeEvent',
@@ -269,10 +271,15 @@ CANCEL_REASON_VENUE_OCA = 'venue_oca'
 """The sibling leg of a venue-linked TP/SL pair triggered."""
 CANCEL_REASON_VENUE_POSITION_CLEARED = 'venue_position_cleared'
 """Position-attached protection dropped because the position was cleared."""
+CANCEL_REASON_VENUE_REJECTED = 'venue_rejected'
+"""The venue rejected the order itself, e.g. a triggered conditional order the
+matching engine refused. Only the venue can reject an order; an operator's
+cancel never ends in this state."""
 VENUE_DRIVEN_CANCEL_REASONS = frozenset({
     CANCEL_REASON_VENUE_REDUCE_ONLY,
     CANCEL_REASON_VENUE_OCA,
     CANCEL_REASON_VENUE_POSITION_CLEARED,
+    CANCEL_REASON_VENUE_REJECTED,
 })
 
 
@@ -1693,6 +1700,27 @@ class ProtectionDegradedEvent(BrokerEvent):
     from_entry: str
     reason: str
     policy_action: str
+
+
+@dataclass
+class ProtectionRearmedUnverifiedEvent(BrokerEvent):
+    """A missing stop was re-armed although nobody could say why it vanished.
+
+    The stop-coverage guard re-arms a stop leg only when its disappearance is
+    explained (the bot's own cancel, a venue-driven cancel, or a dispatch that
+    never landed); a stop someone else removed quarantines the bot instead.
+    When the venue never delivers a verdict — the cancel event was lost and the
+    order history cannot be read — the guard waits for
+    :data:`~pynecore.core.broker.sync_engine.STOP_FATE_VERDICT_CEILING_S` and
+    then re-arms anyway, because a position left without its stop is the
+    larger risk. The event is emitted when the guard commits to the re-arm:
+    the exit's surviving legs are cancelled and the next sync dispatches its
+    full bracket again. It tells the operator that the bot may be overriding a
+    manual change.
+    """
+    intent_key: str
+    from_entry: str
+    reason: str
 
 
 @dataclass

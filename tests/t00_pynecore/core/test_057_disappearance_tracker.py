@@ -28,7 +28,12 @@ from pynecore.core.broker.disappearance import (
     MissingResolution,
 )
 from pynecore.core.broker.exceptions import UnexpectedCancelError
-from pynecore.core.broker.models import OrderEvent, OrderStatus, QuarantineKind
+from pynecore.core.broker.models import (
+    CANCEL_REASON_VENUE_REDUCE_ONLY,
+    OrderEvent,
+    OrderStatus,
+    QuarantineKind,
+)
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import (
     BrokerStore,
@@ -391,6 +396,83 @@ def __test_policy_stop_with_quarantine_hook_does_not_halt__(
         # re-fires the already-latched quarantine for the retired row.
         assert _run(_drain(tracker, {'working': set()}, T_EXPIRED + 1.0)) == []
         assert len(latched) == 1
+
+
+def __test_venue_driven_cancel_retires_with_reason_and_no_policy__(
+        tmp_path: Path,
+) -> None:
+    """A cancel the venue's history attributes to itself is no intervention.
+
+    The push of a venue-driven cancel (reduce-only squeeze, OCA trigger) can
+    be lost like any other; the grace-expiry verdict then names the cause.
+    The row retires, the cancelled event carries the reason so the engine
+    trims the leg, and neither the quarantine nor the halt fires — even
+    under the halting policies.
+    """
+    for policy in ('stop', 'halt'):
+        path = tmp_path / f"{policy}.sqlite"
+        with BrokerStore(path, plugin_name=PLUGIN) as store:
+            ctx = _open_run(store)
+            _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
+            latched: list[Any] = []
+            tracker = _make_tracker(
+                ctx, policy=policy,
+                confirm=_confirm_const(MissingConfirmation(
+                    MissingResolution.CANCELLED,
+                    cancel_reason=CANCEL_REASON_VENUE_REDUCE_ONLY,
+                )),
+                request_quarantine=lambda r, c, *, kind: latched.append(kind),
+            )
+            events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
+            assert [ev.event_type for ev in events] == ['cancelled']
+            assert events[0].cancel_reason == CANCEL_REASON_VENUE_REDUCE_ONLY
+            assert events[0].from_disappearance_tracker
+            assert tracker.pending_halt is None
+            assert latched == []
+            row = ctx.get_order("c1")
+            assert row is not None and row.closed_ts_ms is not None
+            assert row.state == 'closed'
+            assert _read_events(ctx, 'venue_driven_cancel_recovered') == [
+                ("c1", {'missing_since': T0, 'grace': GRACE,
+                        'cancel_reason': CANCEL_REASON_VENUE_REDUCE_ONLY}),
+            ]
+            assert _read_events(ctx, 'unexpected_cancel') == []
+
+
+def __test_retire_hook_keeps_a_partially_filled_row_live__(tmp_path: Path) -> None:
+    """A wired ``retire_cancelled_row`` decides the row's fate on CANCELLED.
+
+    A venue whose entry rows own the exposure of a partial fill keeps the row
+    live; the tracker still writes the audit, yields the cancelled event and
+    applies the policy, and drops the stamp so the next pass does not confirm
+    the same cancel again.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", filled=0.4, extras={MISSING_PENDING_EXTRA: T0})
+        retired: list[str] = []
+
+        def _keep_live(row: OrderRow) -> None:
+            retired.append(row.client_order_id)
+            ctx.upsert_order(row.client_order_id, qty=row.filled_qty)
+
+        latched: list[QuarantineKind] = []
+        tracker = _make_tracker(
+            ctx, policy='stop', retire_cancelled_row=_keep_live,
+            request_quarantine=lambda r, c, *, kind: latched.append(kind),
+        )
+        events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
+        assert [ev.event_type for ev in events] == ['cancelled']
+        assert retired == ["c1"]
+        assert latched == [QuarantineKind.EXTERNAL_INTERVENTION]
+        row = ctx.get_order("c1")
+        assert row is not None and row.closed_ts_ms is None
+        assert row.qty == pytest.approx(0.4)
+        assert MISSING_PENDING_EXTRA not in (row.extras or {})
+        assert _read_events(ctx, 'unexpected_cancel') == [
+            ("c1", {'missing_since': T0, 'grace': GRACE})]
+        assert _run(_drain(tracker, {'working': {"D1"}}, T_EXPIRED + 1.0)) == []
+        assert latched == [QuarantineKind.EXTERNAL_INTERVENTION]
 
 
 def __test_policy_halt_raises_process_exit_signal__(tmp_path: Path) -> None:

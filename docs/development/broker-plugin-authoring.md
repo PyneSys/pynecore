@@ -158,6 +158,24 @@ venue respectively):
    quarantine** (wire the runner-injected `quarantine_sink` into the
    tracker's `request_quarantine`), while `halt` raises
    `UnexpectedCancelError` for a process exit.
+5. When the evidence shows the **venue** terminated the order itself
+   (a reduce-only squeeze, an OCA sibling trigger, a cleared position),
+   return `CANCELLED` with `cancel_reason` set to one of
+   `VENUE_DRIVEN_CANCEL_REASONS`. The push of such a cancel can be lost
+   too, and the history is then the only thing that tells it apart from
+   an operator's cancel: the tracker retires the row and yields the
+   `cancelled` event with that reason, and no policy fires. Leave
+   `cancel_reason` at `None` when the venue does not name the cause.
+
+The engine's stop-coverage guard depends on these verdicts. A missing
+stop leg whose journal row is still live is not re-armed while its fate
+is open: an external cancel must quarantine the run, not be overridden.
+Only a closed row (the bot's own cancel, a venue-driven cancel, a
+dispatch that never landed) lets the re-arm go ahead. If no verdict
+arrives within `STOP_FATE_VERDICT_CEILING_S` (120 s), the engine re-arms
+the stop anyway and reports it with an ERROR and a
+`ProtectionRearmedUnverifiedEvent`, so retire every row whose fate you
+know instead of leaving it live.
 
 ### 1a. An external intervention freezes every venue write — including yours
 

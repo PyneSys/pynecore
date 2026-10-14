@@ -59,6 +59,13 @@ that core:
   halt survives an abandoned generator and re-raises on the next
   :meth:`DisappearanceTracker.observe` call. The halt is delivered
   exactly once — each raise site consumes it.
+- **Venue-driven cancels are not interventions.** A confirmation that
+  names a :data:`~pynecore.core.broker.models.VENUE_DRIVEN_CANCEL_REASONS`
+  cause (the venue terminated the order itself, e.g. a reduce-only squeeze
+  or an OCA sibling trigger whose push was lost) retires the row and
+  yields the ``cancelled`` event carrying that reason, but never applies
+  the ``on_unexpected_cancel`` policy: nobody else touched the order, so
+  the engine trims the leg and its stop-coverage guard may re-arm it.
 """
 import logging
 import math
@@ -81,6 +88,7 @@ from pynecore.core.broker.journal import (
     ReconcileReason,
 )
 from pynecore.core.broker.models import (
+    VENUE_DRIVEN_CANCEL_REASONS,
     ExchangeOrder,
     LegType,
     OrderEvent,
@@ -267,6 +275,12 @@ class MissingConfirmation:
         discovered fill (e.g. ``{'position_id': ...}``).
     :ivar executed_ts: Broker-reported execution time (unix seconds) for
         the fill event; falls back to the observation time.
+    :ivar cancel_reason: On :data:`MissingResolution.CANCELLED`, the venue's
+        own cancel cause when the evidence names one of
+        :data:`~pynecore.core.broker.models.VENUE_DRIVEN_CANCEL_REASONS`. Such
+        a cancel retires the row and is yielded with this reason, but the
+        ``on_unexpected_cancel`` policy is not applied — the venue, not an
+        operator, terminated the order. ``None`` means an unexplained cancel.
     """
     resolution: MissingResolution
     cumulative_filled_qty: float | None = None
@@ -276,6 +290,7 @@ class MissingConfirmation:
     position_ref: str | None = None
     extras_patch: Mapping[str, Any] | None = None
     executed_ts: float | None = None
+    cancel_reason: str | None = None
 
     def __post_init__(self) -> None:
         # Coerce a plain string (or reject an invalid value at construction
@@ -333,6 +348,15 @@ class DisappearanceTracker:
         construction. Receives ``(row, confirmation, cumulative,
         fill_qty, now_ts)``. The default builder is entry-shaped as
         above; a non-entry row MUST supply a custom factory.
+    :param retire_cancelled_row: Retires the row of a confirmed
+        :data:`MissingResolution.CANCELLED` in place of the default
+        terminal close, inside the same store transaction. For a venue
+        whose entry rows keep owning the exposure a partially filled
+        order left behind — the cancel ended only the unfilled remainder,
+        so closing the row would drop that ownership. The tracker still
+        writes the audit event and yields the cancelled event; it clears
+        the stamp of a row the hook kept live, so the row is not
+        re-confirmed.
     """
 
     def __init__(
@@ -354,6 +378,7 @@ class DisappearanceTracker:
             fill_event_factory: Callable[
                 ['OrderRow', MissingConfirmation, float, float, float],
                 OrderEvent] | None = None,
+            retire_cancelled_row: Callable[['OrderRow'], None] | None = None,
     ) -> None:
         if policy not in UNEXPECTED_CANCEL_POLICIES:
             raise ValueError(
@@ -371,6 +396,7 @@ class DisappearanceTracker:
         self._register_executions = register_executions
         self._cancelled_event_factory = cancelled_event_factory
         self._fill_event_factory = fill_event_factory
+        self._retire_cancelled_row = retire_cancelled_row
         #: Halt decided by a halting policy but not yet delivered to the
         #: consumer. Survives an abandoned generator: re-raised at the top
         #: of the next :meth:`observe` call. Consumed (cleared) by whichever
@@ -457,10 +483,12 @@ class DisappearanceTracker:
                     )
             if (applied
                     and confirmation.resolution is MissingResolution.CANCELLED
+                    and confirmation.cancel_reason not in VENUE_DRIVEN_CANCEL_REASONS
                     and not _is_fully_filled(hook_row)):
                 # A fully filled row was retired as a benign post-fill
-                # close by ``_apply_confirmation`` (same predicate) — the
-                # unexpected-cancel policy must not fire for it.
+                # close by ``_apply_confirmation`` (same predicate), and a
+                # venue-driven cancel is nobody's intervention — the
+                # unexpected-cancel policy must not fire for either.
                 self._apply_policy(hook_row)
             for event in events:
                 yield event
@@ -736,8 +764,34 @@ class DisappearanceTracker:
                         events.append(fill_event)
                     self._forget_deferred(updated.client_order_id)
                     return events, True, register_ids, updated
-                DispatchJournal(self._store).apply_reconcile_outcome(
-                    updated.client_order_id,
+                if confirmation.cancel_reason in VENUE_DRIVEN_CANCEL_REASONS:
+                    # The venue terminated the order itself and its push was
+                    # lost: retire the row and hand the engine the reason, so
+                    # it trims the leg instead of treating the cancel as an
+                    # intervention.
+                    self._retire_cancelled(
+                        updated,
+                        ReconcileOutcome(
+                            kind='terminal_close',
+                            reason='missing_pending_grace_expired',
+                            new_state='closed',
+                            audit_event='venue_driven_cancel_recovered',
+                            close_row=True,
+                            audit_payload={'missing_since': since,
+                                           'grace': self._grace_s,
+                                           'cancel_reason': confirmation.cancel_reason},
+                            exchange_order_id=updated.exchange_order_id,
+                        ),
+                    )
+                    if fill_event is not None:
+                        events.append(fill_event)
+                    events.append(self._build_cancelled_event(
+                        updated, now_ts, confirmation.cancel_reason,
+                    ))
+                    self._forget_deferred(updated.client_order_id)
+                    return events, True, register_ids, updated
+                self._retire_cancelled(
+                    updated,
                     ReconcileOutcome(
                         kind='terminal_close',
                         reason='missing_pending_grace_expired',
@@ -756,6 +810,30 @@ class DisappearanceTracker:
                 return events, True, register_ids, updated
 
             raise AssertionError(f"unhandled resolution {resolution!r}")
+
+    def _retire_cancelled(self, row: 'OrderRow', outcome: ReconcileOutcome) -> None:
+        """Retire a confirmed-cancelled row, through the plugin hook when wired.
+
+        Runs inside the caller's transaction. Without the hook the journal
+        closes the row; with it the audit event is written here and the hook
+        decides the row's fate, and a row it kept live loses its stamp.
+        """
+        if self._retire_cancelled_row is None:
+            DispatchJournal(self._store).apply_reconcile_outcome(
+                row.client_order_id, outcome,
+            )
+            return
+        self._store.log_event(
+            outcome.audit_event,
+            client_order_id=row.client_order_id,
+            exchange_order_id=outcome.exchange_order_id,
+            payload=(dict(outcome.audit_payload)
+                     if outcome.audit_payload is not None else None),
+        )
+        self._retire_cancelled_row(row)
+        fresh = self._store.get_order(row.client_order_id)
+        if fresh is not None and fresh.closed_ts_ms is None:
+            self._clear_stamp(row.client_order_id)
 
     @staticmethod
     def _clamped_cumulative(
@@ -884,7 +962,7 @@ class DisappearanceTracker:
     # --- Default event builders ------------------------------------------------
 
     def _build_cancelled_event(
-            self, row: 'OrderRow', now_ts: float,
+            self, row: 'OrderRow', now_ts: float, cancel_reason: str | None = None,
     ) -> OrderEvent:
         if self._cancelled_event_factory is not None:
             event = self._cancelled_event_factory(row, now_ts)
@@ -910,6 +988,7 @@ class DisappearanceTracker:
         # :meth:`_apply_policy` before this event is emitted, so the sync
         # engine's WS-push handler must NOT re-apply it.
         event.from_disappearance_tracker = True
+        event.cancel_reason = cancel_reason
         return event
 
     @staticmethod
