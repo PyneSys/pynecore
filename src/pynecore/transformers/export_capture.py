@@ -1,8 +1,9 @@
 """Validate library exports before closure and state lowering.
 
-An exported function may use constants from the library's module/main scope,
-but not objects or per-bar values created there, even through a helper. Local
-state created inside the exported call remains valid and belongs to its caller.
+An exported function may read immutable scalar bindings from library main scope,
+including per-bar values. Objects, inputs and reassigned bindings remain private.
+Captured per-bar scalars use the library's state slots so exports defined on the
+first bar keep reading current values on subsequent bars.
 """
 import ast
 from importlib.machinery import PathFinder
@@ -12,6 +13,7 @@ from pathlib import Path
 from . import ast_walk
 from .pine_qualifier import CONST, lib_call_qualifier, lib_value_qualifier, builtin_call_qualifier
 from .pine_type_infer import lib_types
+from .pine_type_rules import BUILTIN_CALL_TYPES, SCALARS, UNKNOWN, annotation_type
 
 __all__ = ['ExportCaptureTransformer']
 
@@ -196,7 +198,7 @@ class _EnumResolver:
 
 
 class ExportCaptureTransformer(ast_walk.NodeTransformer):
-    """Reject captures of non-constant library globals in every Pyne profile."""
+    """Validate export captures and retain per-bar scalar captures in library state."""
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
         main_nodes = [statement for statement in node.body
@@ -288,12 +290,13 @@ class ExportCaptureTransformer(ast_walk.NodeTransformer):
                 if owner is not None and owner is not scope:
                     owner.bindings[name].extend(scope.bindings.get(name, ()))
 
-        def constant(value: ast.AST, scope: _Scope, visiting: set[tuple[_Scope, str]]) -> bool:
+        def constant(value: ast.AST, scope: _Scope, visiting: set[tuple[_Scope, str]],
+                     allow_series: bool = False) -> bool:
             if isinstance(value, ast.Constant):
                 return True
             if isinstance(value, ast.Name):
                 owner = scope.resolve(value.id)
-                return owner is not None and constant_binding(owner, value.id, visiting)
+                return owner is not None and constant_binding(owner, value.id, visiting, allow_series)
             if isinstance(value, ast.Attribute):
                 path = _path(value)
                 if path.startswith('lib.'):
@@ -301,7 +304,8 @@ class ExportCaptureTransformer(ast_walk.NodeTransformer):
                     entry = lib_types().get(key)
                     if entry is not None:
                         return (entry['kind'] == 'value' and not entry.get('callable', False)
-                                and lib_value_qualifier(key, entry['ty']) == CONST)
+                                and (lib_value_qualifier(key, entry['ty']) == CONST
+                                     or allow_series and entry['ty'] in SCALARS))
                 owner = scope.resolve(path.split('.')[0])
                 if owner is not None and any(
                     isinstance(binding, ast.ClassDef)
@@ -311,22 +315,42 @@ class ExportCaptureTransformer(ast_walk.NodeTransformer):
                     return True
                 return enums.member(path, scope)
             if isinstance(value, (ast.UnaryOp, ast.BinOp, ast.BoolOp, ast.Compare, ast.IfExp)):
-                return all(constant(child, scope, visiting) for child in ast_walk.iter_child_nodes(value)
+                return all(constant(child, scope, visiting, allow_series)
+                           for child in ast_walk.iter_child_nodes(value)
                            if isinstance(child, ast.expr))
+            if allow_series and isinstance(value, ast.Subscript):
+                return (constant(value.value, scope, visiting, True)
+                        and constant(value.slice, scope, visiting, True))
             if isinstance(value, ast.Call):
                 path = _path(value.func)
                 arguments = [*value.args, *(kw.value for kw in value.keywords)]
                 if path in namespace_names:
                     return all(isinstance(arg, (ast.Name, ast.Attribute)) for arg in arguments)
-                if not all(constant(arg, scope, visiting) for arg in arguments):
+                if not all(constant(arg, scope, visiting, allow_series) for arg in arguments):
                     return False
                 if path.startswith('lib.'):
-                    return lib_call_qualifier(path[4:], [CONST] * len(arguments), len(arguments)) == CONST
-                return (scope.resolve(path) is None
+                    key = path[4:]
+                    if lib_call_qualifier(key, [CONST] * len(arguments), len(arguments)) == CONST:
+                        return True
+                    entry = lib_types().get(key, {})
+                    returns = ([impl.get('ret') for impl in entry['impls']]
+                               if entry.get('kind') == 'overloads' else [entry.get('ret')])
+                    return allow_series and all(isinstance(ret, str) and ret in SCALARS for ret in returns)
+                owner = scope.resolve(path)
+                result = BUILTIN_CALL_TYPES.get(path)
+                if allow_series and isinstance(result, str) and result in SCALARS:
+                    if owner is None or all(
+                            isinstance(binding, ast.ImportFrom)
+                            and binding.module == 'pynecore.core.pine_cast'
+                            for binding in owner.bindings[path]):
+                        return True
+                return (owner is None
                         and builtin_call_qualifier(path, [CONST] * len(arguments)) == CONST)
             return False
 
-        def constant_binding(scope: _Scope, name: str, visiting: set[tuple[_Scope, str]]) -> bool:
+        def constant_binding(scope: _Scope, name: str, visiting: set[tuple[_Scope, str]],
+                             allow_series: bool = False) -> bool:
+            allow_series = allow_series and scope in mains
             key = (scope, name)
             if key in visiting:
                 return False
@@ -338,15 +362,23 @@ class ExportCaptureTransformer(ast_walk.NodeTransformer):
                 return True
             if not isinstance(binding, (ast.Assign, ast.AnnAssign)) or binding.value is None:
                 return False
+            if allow_series and isinstance(binding, ast.Assign) and (
+                    len(binding.targets) != 1 or not isinstance(binding.targets[0], ast.Name)):
+                return False
             if isinstance(binding, ast.AnnAssign):
+                type_ = annotation_type(binding.annotation)
+                if allow_series and type_ != UNKNOWN and type_ not in SCALARS:
+                    return False
                 annotation = binding.annotation
                 if isinstance(annotation, ast.Subscript):
                     annotation = annotation.value
-                if _path(annotation).split('.')[-1] in (
+                if not allow_series and _path(annotation).split('.')[-1] in (
                         'Series', 'PersistentSeries', 'IBPersistentSeries'):
                     return False
-            return constant(binding.value, scope, visiting | {key})
+            return constant(binding.value, scope, visiting | {key}, allow_series)
 
+        default_reads = {id(read) for scope in scopes.values() for read in scope.defaults}
+        captures: dict[tuple[_Scope, str], ast.Assign | ast.AnnAssign] = {}
         for scope in scopes.values():
             function = scope.node
             if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -383,12 +415,62 @@ class ExportCaptureTransformer(ast_walk.NodeTransformer):
                         continue
                     if constant_binding(owner, read.id, set()):
                         continue
+                    if (id(read) not in default_reads
+                            and constant_binding(owner, read.id, set(), allow_series=True)):
+                        captures[owner, read.id] = bindings[0]
+                        continue
                     path = getattr(node, '_module_file_path', '<pyne>')
                     raise SyntaxError(
                         f'Exported function "{function.name}" cannot capture '
                         f'non-constant library global "{read.id}".',
                         (path, read.lineno, read.col_offset + 1, None),
                     )
+        # Export definitions survive across bars. A scalar held only in a Python
+        # closure would freeze at its first-bar value, so read its library slot.
+        declarations: dict[int, ast.AnnAssign] = {}
+        retained: set[tuple[_Scope, str]] = set()
+        for key, binding in captures.items():
+            if isinstance(binding, ast.AnnAssign):
+                wrapper = binding.annotation
+                if isinstance(wrapper, ast.Subscript):
+                    wrapper = wrapper.value
+                if _path(wrapper).split('.')[-1] in (
+                        'Persistent', 'IBPersistent', 'PersistentSeries', 'IBPersistentSeries'):
+                    continue
+                annotation = (binding.annotation if _path(wrapper) == 'Series' else ast.Subscript(
+                    value=ast.Name(id='Series', ctx=ast.Load()),
+                    slice=binding.annotation, ctx=ast.Load()))
+                target = binding.target
+            else:
+                annotation = ast.Name(id='Series', ctx=ast.Load())
+                target, = binding.targets
+            declarations[id(binding)] = ast.copy_location(ast.AnnAssign(
+                target=target, annotation=annotation, value=binding.value, simple=1), binding)
+            retained.add(key)
+        reads = {id(read) for scope in scopes.values() for read in scope.reads
+                 if (scope.resolve(read.id), read.id) in retained
+                 and scope is not scope.resolve(read.id)}
+
+        class RetainCaptures(ast_walk.NodeTransformer):
+            def visit_Name(self, read: ast.Name) -> ast.AST:
+                if id(read) in reads:
+                    return ast.copy_location(ast.Subscript(
+                        value=read, slice=ast.Constant(value=0), ctx=ast.Load()), read)
+                return read
+
+            def visit_Subscript(self, read: ast.Subscript) -> ast.AST:
+                if id(read.value) in reads:
+                    read.slice = self.visit(read.slice)
+                    return read
+                return self.generic_visit(read)
+
+            def visit_Assign(self, binding: ast.Assign) -> ast.AST:
+                return self.generic_visit(declarations.get(id(binding), binding))
+
+            def visit_AnnAssign(self, binding: ast.AnnAssign) -> ast.AST:
+                return self.generic_visit(declarations.get(id(binding), binding))
+
+        node = RetainCaptures().visit(node)
         setattr(node, '_export_capture_deps', tuple((path, *fingerprint)
                                                    for path, fingerprint in sorted(enums.sources.items())))
         return node

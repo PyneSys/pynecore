@@ -14,9 +14,9 @@ from pynecore.types.ohlcv import OHLCV
 
 
 HEAD = '''
-from pynecore.lib import script, label, close, color
+from pynecore.lib import script, label, close, color, high, low, math, ta
 from pynecore.core.pine_export import export, Exported
-from pynecore.types import Persistent
+from pynecore.types import Persistent, IBPersistent, Series
 getObject = Exported()
 '''
 
@@ -39,11 +39,111 @@ def main():
     def getObject():
         return {result}
 '''
-    if value.startswith('color.'):
+    if value.startswith('color.') or value == 'close':
         check(source)
     else:
         with pytest.raises(SyntaxError, match='cannot capture non-constant library global "obj"'):
             check(source)
+
+
+@pytest.mark.parametrize('declaration', [
+    'obj = math.abs(high - low)',
+    'obj = ta.ema(close, 14)',
+    'obj = int(5 / 100) * (high - low)',
+    'obj: Series[float] = high - low',
+    'obj: Persistent[float] = close',
+    'obj: IBPersistent[float] = close',
+])
+@pytest.mark.parametrize('indirect', [False, True])
+def __test_read_only_scalar_capture__(declaration, indirect):
+    helper = '    def capture():\n        return obj\n' if indirect else ''
+    result = 'capture()' if indirect else 'obj'
+    check(f'''@script.library("Probe")
+def main():
+    {declaration}
+{helper}    @export
+    def getObject():
+        return {result}
+''')
+
+
+def __test_compiled_cast_scalar_capture__():
+    check('''from pynecore.core.pine_cast import cast_int
+@script.library("Probe")
+def main():
+    obj = cast_int(5 / 100) * (high - low)
+    @export
+    def getObject():
+        return obj
+''')
+
+
+@pytest.mark.parametrize('declaration', [
+    'obj = close\n    obj = close + 1',
+    'obj = close\n    if close > 0:\n        obj = close + 1\n    alias = obj * 2',
+    'obj = input.int(5)',
+])
+def __test_scalar_capture_rejects_mutation_and_inputs__(declaration):
+    result = 'alias' if 'alias =' in declaration else 'obj'
+    with pytest.raises(SyntaxError, match='cannot capture non-constant library global'):
+        check(f'''from pynecore.lib import input
+@script.library("Probe")
+def main():
+    {declaration}
+    @export
+    def getObject():
+        return {result}
+''')
+
+
+@pytest.mark.parametrize('mode', ['', ' edge'])
+@pytest.mark.parametrize('annotation, read', [
+    ('', 'spread'),
+    (': Series[float]', 'spread'),
+    (': Persistent[float]', 'spread'),
+    (': IBPersistent[float]', 'spread'),
+    (': Series[float]', 'spread[1]'),
+])
+@pytest.mark.parametrize('indirect', [False, True])
+def __test_scalar_capture_updates_across_bars__(
+        tmp_path, monkeypatch, syminfo, mode, annotation, read, indirect):
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(script_mod, '_registered_libraries', [])
+    helper = f'    def capture():\n        return {read}\n' if indirect else ''
+    result = 'capture()' if indirect else read
+    (tmp_path / 'capture_scalar_library.py').write_text(f'"""@pyne{mode}"""\n' + HEAD + f'''
+@script.library("Probe")
+def main():
+    spread{annotation} = math.abs(high - low)
+{helper}    @export
+    def getObject():
+        return {result}
+''')
+    path = tmp_path / 'capture_scalar_script.py'
+    path.write_text(f'"""@pyne{mode}"""\n' + '''
+import capture_scalar_library as captured
+from pynecore.lib import script, plot, bar_index
+@script.indicator("Probe")
+def main():
+    plot(captured.getObject(), "spread")
+    delayed = 0.0
+    if bar_index > 0:
+        delayed = captured.getObject()
+    plot(delayed, "delayed")
+''')
+    bars = [OHLCV(timestamp=1_735_689_600_000 + bar * 300_000,
+                  open=10, high=12 + bar * 2, low=9, close=11, volume=1) for bar in range(3)]
+    expected = [3, 3, 3] if 'Persistent' in annotation else [3, 5, 7]
+    try:
+        rows = list(ScriptRunner(path, bars, syminfo).run_iter())
+        if read == 'spread[1]':
+            assert [row[1]['spread'] for row in rows[1:]] == [3, 5]
+            assert [row[1]['delayed'] for row in rows] == [0, 3, 5]
+        else:
+            assert [row[1]['spread'] for row in rows] == expected
+            assert [row[1]['delayed'] for row in rows] == [0, *expected[1:]]
+    finally:
+        sys.modules.pop('capture_scalar_library', None)
 
 
 @pytest.mark.parametrize('source', [
