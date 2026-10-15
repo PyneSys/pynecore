@@ -94,7 +94,7 @@ __all__ = [
 
     # Module properties
     'dayofmonth', 'dayofweek', 'hour', 'minute', 'month', 'second', 'weekofyear', 'year',
-    'time', 'time_close', 'time_tradingday', 'timenow', 'na',
+    'time', 'time_close', 'time_tradingday', 'timenow', 'updatetime', 'na',
 ]
 
 #
@@ -2912,6 +2912,35 @@ def timenow() -> PyneInt:
         return pine_int(_timenow_ms)
     # Get current UTC time and convert to milliseconds since Unix epoch
     return pine_int(int(datetime.now(UTC).timestamp() * 1000))
+
+
+# The runner installs a fresh datetime object on every feed update, including
+# ticks of the same bar. All readers of updatetime share one clock snapshot for
+# that update, so repeated reads cannot drift within a script execution.
+_updatetime_dt: datetime | None = None
+_updatetime_ms: float = 0.0
+
+
+@module_property
+def updatetime() -> float:
+    """Return the bar update timestamp in Unix milliseconds.
+
+    Historical bars use their opening timestamp. Realtime updates use the clock
+    at the first read, including sub-millisecond precision, and keep that value
+    for the remainder of the update. A replay's clock pin takes precedence over
+    the system clock on realtime bars.
+
+    :return: The update timestamp as a Pine float.
+    """
+    if not barstate.isrealtime:
+        return float(_time)
+    if _timenow_ms:
+        return float(_timenow_ms)
+    global _updatetime_dt, _updatetime_ms
+    if _updatetime_dt is not _datetime:
+        _updatetime_dt = _datetime
+        _updatetime_ms = datetime.now(UTC).timestamp() * 1000.0
+    return _updatetime_ms
 
 
 # ``time_tradingday`` cache. The strategy engine calls the property on every bar

@@ -183,6 +183,9 @@
     "timestamp": {
       "type": "variable"
     },
+    "updatetime": {
+      "type": "property"
+    },
     "volume": {
       "type": "variable"
     },

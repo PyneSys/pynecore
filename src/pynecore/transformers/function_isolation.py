@@ -171,7 +171,7 @@ NON_TRANSFORMABLE_FUNCTIONS = {
     # Other builtin functions
     'lib.dayofmonth', 'lib.dayofweek.dayofweek', 'lib.hour', 'lib.minute', 'lib.month',
     'lib.second', 'lib.weekofyear', 'lib.year', 'lib.time', 'lib.time_close', 'lib.time_tradingday',
-    'lib.timenow', 'lib.is_na', 'lib.nz',
+    'lib.timenow', 'lib.updatetime', 'lib.is_na', 'lib.nz',
 
     # Strategy
     'lib.strategy.entry', 'lib.strategy.order', 'lib.strategy.exit', 'lib.strategy.close',

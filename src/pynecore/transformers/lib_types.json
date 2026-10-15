@@ -9224,6 +9224,11 @@
    ],
    "kind": "overloads"
   },
+  "updatetime": {
+   "callable": true,
+   "kind": "value",
+   "ty": "f"
+  },
   "volume": {
    "kind": "value",
    "ty": "f"
@@ -9500,6 +9505,7 @@
   "lib.timeframe.multiplier": "skip",
   "lib.timeframe.period": "skip",
   "lib.timenow": "skip",
+  "lib.updatetime": "skip",
   "lib.weekofyear": "skip",
   "lib.year": "skip"
  },
@@ -9592,6 +9598,7 @@
    "time_tradingday",
    "timenow",
    "timestamp",
+   "updatetime",
    "volume",
    "weekofyear",
    "year"
