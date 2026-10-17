@@ -204,7 +204,7 @@ NON_TRANSFORMABLE_FUNCTIONS = {
     'lib.input.source', 'lib.input.color',
 
     # Timeframe functions
-    'lib.timeframe.in_seconds', 'lib.timeframe.from_seconds',
+    'lib.timeframe.in_seconds', 'lib.timeframe.from_seconds', 'lib.timeframe._last_session_start',
 
     # Logging
     'lib.log.info', 'lib.log.error', 'lib.log.warning',

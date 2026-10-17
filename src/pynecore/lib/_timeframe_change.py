@@ -63,8 +63,17 @@ def change(timeframe: str = "") -> bool:
 
         if last_dt is None:
             last_dt = dt - timedelta(seconds=xchg_tf_sec)
-            last_signal = last_dt
+            # The anchor point is the session start, even when the data starts mid-session
+            session_start = _timeframe._last_session_start(dt)
+            if session_start is not None:
+                last_signal = session_start.replace(minute=0, second=0, microsecond=0)
+            else:
+                last_signal = last_dt
 
+        # Every virtual candle up to the current bar is replayed, so a session
+        # start inside a gap moves the anchor even if an earlier candle of the
+        # gap already starts a new period
+        is_change = False
         while last_dt < dt:
             prev_dt = last_dt
             last_dt = last_dt + timedelta(seconds=xchg_tf_sec)
@@ -73,13 +82,16 @@ def change(timeframe: str = "") -> bool:
             if _timeframe._is_new_session(last_dt, prev_dt, xchg_tf_sec):
                 # We need to round the session start to the nearest hour
                 last_signal = last_dt.replace(minute=0, second=0, microsecond=0)
-            seconds_since_last_session = (last_dt - last_signal).total_seconds()
 
-            if seconds_since_last_session % tf_sec == 0:
-                last_dt = dt
-                return lib.bar_index > 0
+            # A virtual candle starts a new period when a period boundary lies in
+            # (prev_dt, last_dt], also when the requested timeframe is not a
+            # multiple of the chart's and no candle opens on the boundary itself
+            if ((last_dt - last_signal).total_seconds() // tf_sec
+                    != (prev_dt - last_signal).total_seconds() // tf_sec):
+                is_change = True
 
-        return False
+        last_dt = dt
+        return is_change and lib.bar_index > 0
 
     # Daily/Weekly/Monthly: true on the first chart bar of a new period of
     # the scheduled grid — the period identity changing is exactly

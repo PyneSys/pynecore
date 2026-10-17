@@ -141,6 +141,35 @@ def _is_new_session(current_dt: datetime, prev_dt: datetime | None = None, tf_se
     return False
 
 
+def _last_session_start(dt: datetime) -> datetime | None:
+    """
+    Find the latest session start at or before a datetime.
+
+    :param dt: Datetime in the local exchange timezone
+    :return: The latest session start not after ``dt``, or None if the symbol has no session starts
+    """
+    session_starts = _syminfo._session_starts
+    if not session_starts:
+        return None
+
+    # A week back always reaches a session start of the weekly template
+    for days_back in range(8):
+        day_dt = dt - timedelta(days=days_back)
+        weekday = day_dt.weekday()
+        latest = None
+        for day, start_time in session_starts:
+            if day != weekday:
+                continue
+            start = day_dt.replace(hour=start_time.hour, minute=start_time.minute,
+                                   second=start_time.second, microsecond=0)
+            if start <= dt and (latest is None or start > latest):
+                latest = start
+        if latest is not None:
+            return latest
+
+    return None
+
+
 @lru_cache(maxsize=128)
 def from_seconds(seconds: int) -> str:
     """
