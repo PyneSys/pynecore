@@ -49,6 +49,7 @@ from typing import Any, Final
 
 from pynecore.core.broker.models import QuarantineKind
 from pynecore.core.broker.run_identity import RunIdentity
+from pynecore.core.broker.store_helpers import STATE_REJECTED
 
 __all__ = [
     'BrokerStore',
@@ -721,10 +722,14 @@ class BrokerStore:
 
     def _configure_pragmas(self) -> None:
         """Configure WAL + crash-safety + FK + busy-timeout."""
-        # WAL: concurrent read + single writer; crash-safe under power loss.
+        # WAL: concurrent read + single writer.
         self._conn.execute("PRAGMA journal_mode=WAL")
-        # NORMAL: crash-safe with WAL, faster than FULL.
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+        # FULL: every commit is synced before it returns. Under NORMAL a WAL
+        # commit is durable only after the next checkpoint, so a host crash
+        # loses the newest commits — among them the persist-first row of an
+        # order already sent to the venue, which then lives on as an
+        # exposure no journal owns.
+        self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         # 5 s wait on lock collision — rare with a single writer, but
         # parallel debug-CLI invocations can trigger it.
@@ -1009,7 +1014,9 @@ class BrokerStore:
         finalised it. ``order_refs`` rows for adopted COIDs follow the
         same migration; refs for already-closed orders are left alone
         (they will be cleaned up by the standard
-        :meth:`RunContext.close_order` path).
+        :meth:`RunContext.close_order` path). A live row already in the
+        terminal :data:`STATE_REJECTED` is closed in its prior instance
+        (``order_adopt_terminal_closed`` audit event) instead of adopted.
 
         :return: Count of adopted COIDs (useful for tests / diagnostics).
         """
@@ -1038,11 +1045,20 @@ class BrokerStore:
         # ``closed_ts_ms`` so they vanish from recovery's view.
         adopted_rows: list = []
         superseded_rows: list = []
+        terminal_rows: list = []
         seen_coids: set[str] = set()
         for row in all_orphan_rows:
             coid = row['client_order_id']
             if coid in seen_coids:
                 superseded_rows.append(row)
+            elif row['state'] == STATE_REJECTED:
+                # A definitively rejected dispatch is terminal: nothing of it
+                # can land on the venue any more. Carried into the new
+                # instance as a live row it would read as an entry still
+                # awaiting its fill and defer the run's exits for good, so it
+                # is closed where it is instead.
+                seen_coids.add(coid)
+                terminal_rows.append(row)
             else:
                 seen_coids.add(coid)
                 adopted_rows.append(row)
@@ -1058,7 +1074,10 @@ class BrokerStore:
         # ``order_refs`` rows — leaving them attached to the closed prior
         # instance would still collide with the canonical refs once they
         # land on ``new_run_instance_id`` (PK includes ``ref_value``).
-        for row in superseded_rows:
+        # Terminal rows are closed the same way, under their own audit kind.
+        retired = [(row, 'order_adopt_superseded') for row in superseded_rows]
+        retired += [(row, 'order_adopt_terminal_closed') for row in terminal_rows]
+        for row, event_kind in retired:
             self._conn.execute(
                 "UPDATE orders SET closed_ts_ms = ?, updated_ts_ms = ? "
                 "WHERE run_instance_id = ? AND client_order_id = ? "
@@ -1078,7 +1097,7 @@ class BrokerStore:
                 ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_run_instance_id, now, self._plugin_name,
-                    'order_adopt_superseded',
+                    event_kind,
                     row['client_order_id'],
                     row['exchange_order_id'],
                     row['intent_key'],
@@ -1089,14 +1108,12 @@ class BrokerStore:
                 ),
             )
             # Forensic only — the operator has nothing to do with this.
-            # Full audit row lands in the ``events`` table as
-            # ``order_adopt_superseded``.
+            # Full audit row lands in the ``events`` table.
             _log.debug(
-                "broker storage: superseded orphan order coid=%r from "
-                "run_instance_id=%d (state=%r) — newer prior instance "
-                "exists for the same run_id; closed to resolve ambiguity",
+                "broker storage: closed orphan order coid=%r of "
+                "run_instance_id=%d (state=%r) instead of adopting it (%s)",
                 row['client_order_id'], row['prior_run_instance_id'],
-                row['state'],
+                row['state'], event_kind,
             )
 
         # Migrate the canonical orders rows.

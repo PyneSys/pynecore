@@ -955,6 +955,7 @@ def __test_journal_submit_reject_persists_rejected__(tmp_path: Path) -> None:
             kinds = [k for (k, _) in _read_events(ctx, coid)]
             assert kinds == [
                 'dispatch_submitted',
+                'order_closed',
                 'rejected',
             ]
             # The rejected event payload tags the submit phase.
@@ -1160,6 +1161,132 @@ def __test_open_run_does_not_adopt_closed_orders__(tmp_path: Path) -> None:
             assert owner['run_instance_id'] == prior_run_instance_id
         finally:
             ctx_b.close()
+
+
+def __test_rejected_dispatch_leaves_the_live_set__(tmp_path: Path) -> None:
+    """A rejected entry is closed, so no later instance owns it as live.
+
+    A rejected MARKET entry left live read as an entry still awaiting its
+    fill: every restart adopted it again, and once a position opened on its
+    side the one-way emulator deferred that position's exit bracket for good.
+    """
+    db = tmp_path / "broker.sqlite"
+    with BrokerStore(db, plugin_name=PLUGIN) as store_a:
+        ctx_a = _open_run(store_a)
+        coid = _coid(ctx_a, "Short")
+        hooks = _FakeEntryHooks(
+            submit_action=ExchangeOrderRejectedError("MARKET_CLOSED"),
+        )
+        try:
+            _run(DispatchJournal(ctx_a).run_entry(
+                coid=coid, intent=_make_intent(pine_id="Short", side="sell"),
+                qty=1.0, kind=ENTRY_KIND_POSITION, hooks=hooks,
+            ))
+        except ExchangeOrderRejectedError:
+            pass
+        else:
+            raise AssertionError("expected ExchangeOrderRejectedError")
+        row = ctx_a.get_order(coid)
+        assert row is not None
+        assert row.state == STATE_REJECTED
+        assert row.closed_ts_ms is not None
+        assert list(ctx_a.iter_live_orders()) == []
+        store_a._conn.execute(
+            "UPDATE runs SET last_heartbeat_ts_ms = 1 WHERE run_instance_id = ?",
+            (ctx_a.run_instance_id,),
+        )
+        store_a._conn.commit()
+
+    with BrokerStore(db, plugin_name=PLUGIN) as store_b:
+        ctx_b = _open_run(store_b)
+        try:
+            assert list(ctx_b.iter_live_orders()) == []
+        finally:
+            ctx_b.close()
+
+
+def __test_open_run_closes_open_rejected_rows_instead_of_adopting__(
+        tmp_path: Path,
+) -> None:
+    """A rejected row a writer left open is closed at adoption, not carried on.
+
+    The live row beside it is still adopted, and a prior instance holding
+    nothing but rejected rows leaves the new instance empty.
+    """
+    db = tmp_path / "broker.sqlite"
+    with BrokerStore(db, plugin_name=PLUGIN) as store_a:
+        ctx_a = _open_run(store_a)
+        rejected = _coid(ctx_a, "S1")
+        live = _coid(ctx_a, "L")
+        for coid, state, pine_id in ((rejected, STATE_REJECTED, "S1"),
+                                     (live, STATE_CONFIRMED, "L")):
+            ctx_a.upsert_order(
+                coid, symbol="EURUSD", side="sell", qty=1.0, state=state,
+                intent_key=pine_id, pine_entry_id=pine_id,
+                extras={'kind': ENTRY_KIND_POSITION, 'order_type': 'market'},
+            )
+        store_a._conn.execute(
+            "UPDATE runs SET last_heartbeat_ts_ms = 1 WHERE run_instance_id = ?",
+            (ctx_a.run_instance_id,),
+        )
+        store_a._conn.commit()
+        prior_run_instance_id = ctx_a.run_instance_id
+
+    with BrokerStore(db, plugin_name=PLUGIN) as store_b:
+        ctx_b = _open_run(store_b)
+        try:
+            assert [r.client_order_id for r in ctx_b.iter_live_orders()] == [live]
+            owner = store_b._conn.execute(
+                "SELECT run_instance_id, closed_ts_ms FROM orders "
+                "WHERE client_order_id = ?",
+                (rejected,),
+            ).fetchone()
+            assert owner['run_instance_id'] == prior_run_instance_id
+            assert owner['closed_ts_ms'] is not None
+            ev = store_b._conn.execute(
+                "SELECT payload FROM events WHERE run_instance_id = ? "
+                "AND client_order_id = ? AND kind = 'order_adopt_terminal_closed'",
+                (ctx_b.run_instance_id, rejected),
+            ).fetchone()
+            assert ev is not None
+            assert json.loads(ev['payload'])['prior_state'] == STATE_REJECTED
+            ctx_b.close_order(live)
+            store_b._conn.execute(
+                "UPDATE runs SET last_heartbeat_ts_ms = 1 WHERE run_instance_id = ?",
+                (ctx_b.run_instance_id,),
+            )
+            store_b._conn.commit()
+        finally:
+            ctx_b.close()
+
+    with BrokerStore(db, plugin_name=PLUGIN) as store_c:
+        ctx_c = _open_run(store_c)
+        try:
+            ctx_c.upsert_order(
+                rejected, symbol="EURUSD", side="sell", qty=1.0,
+                state=STATE_REJECTED, intent_key="S1", pine_entry_id="S1",
+                extras={'kind': ENTRY_KIND_POSITION, 'order_type': 'market'},
+            )
+            store_c._conn.execute(
+                "UPDATE runs SET last_heartbeat_ts_ms = 1 WHERE run_instance_id = ?",
+                (ctx_c.run_instance_id,),
+            )
+            store_c._conn.commit()
+        finally:
+            ctx_c.close()
+
+    with BrokerStore(db, plugin_name=PLUGIN) as store_d:
+        ctx_d = _open_run(store_d)
+        try:
+            assert list(ctx_d.iter_live_orders()) == []
+        finally:
+            ctx_d.close()
+
+
+def __test_store_syncs_every_commit__(tmp_path: Path) -> None:
+    """Every commit is synced: a host crash must not lose a persist-first row."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        assert store._conn.execute("PRAGMA synchronous").fetchone()[0] == 2
 
 
 def __test_adopt_orphans_emits_single_summary_info__(

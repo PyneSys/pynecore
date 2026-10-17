@@ -559,6 +559,57 @@ def __test_a_confirmed_re_assert_survives_a_restart__(tmp_path: Path):
         assert len(reports) == 1
 
 
+def __test_an_unseen_confirmed_re_assert_survives_a_restart__(tmp_path: Path):
+    """A restart before any view showed the re-assert keeps a late push unjudged."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx, guard, _reports, _clock = _resumed_guard(tmp_path, store)
+        _place(guard, "p1", BRACKET)
+        restarted, reports, clock = _guard(ctx)
+        # Pushes of the operator's levels may predate the re-assert.
+        assert not restarted.observe("p1", OPERATOR, tick=TICK)
+        assert not restarted.observe("p1", OPERATOR, tick=TICK)
+        assert reports == []
+        # A snapshot read after the write decides.
+        clock.now += 1.0
+        assert not restarted.observe("p1", OPERATOR, tick=TICK, read_started_at=clock.now)
+        assert restarted.observe("p1", OPERATOR, tick=TICK, read_started_at=clock.now)
+        assert len(reports) == 1
+
+    # Once a view showed the re-assert, a restart judges a push again.
+    with BrokerStore(tmp_path / "broker-seen.sqlite", plugin_name="testbroker") as store:
+        ctx, guard, _reports, _clock = _resumed_guard(tmp_path, store)
+        _place(guard, "p1", BRACKET)
+        assert not guard.observe("p1", BRACKET, tick=TICK)
+        restarted, reports, _clock = _guard(ctx)
+        assert not restarted.observe("p1", OPERATOR, tick=TICK)
+        assert restarted.observe("p1", OPERATOR, tick=TICK)
+        assert len(reports) == 1
+
+
+def __test_a_view_older_than_the_first_write_precedes_it__(tmp_path: Path):
+    """The venue's state before the bot's first write of a key stays the bot's own."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "leg-1")
+        guard, reports, _clock = _guard(ctx)
+        _place(guard, "p1", BRACKET, row_coid="leg-1")
+        bare = ProtectionLevels()
+        assert guard.precede("p1", bare, tick=TICK)
+        assert not guard.precede("p1", BRACKET, tick=TICK), "a recorded write explains it"
+        assert not guard.precede("p2", bare, tick=TICK), "an unknown key"
+        # Persisted with the writes: a restarted guard accepts it too.
+        restarted, reports, _clock = _guard(ctx)
+        for _ in range(3):
+            assert not restarted.observe("p1", bare, tick=TICK)
+        assert reports == []
+        # Once the venue is seen carrying the bot's write, the older state is history.
+        assert not restarted.observe("p1", BRACKET, tick=TICK)
+        assert not restarted.observe("p1", bare, tick=TICK)
+        assert restarted.observe("p1", bare, tick=TICK)
+        assert len(reports) == 1
+        assert reports[0][1]['expected'] == BRACKET.as_list()
+
+
 def __test_a_guard_of_the_stopped_process_cannot_undo_a_later_rebaseline__(tmp_path: Path):
     """The resume is applied by the new process: whatever the old guard persisted is voided."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:

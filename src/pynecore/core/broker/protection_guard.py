@@ -21,7 +21,9 @@ venue and judges every venue observation against them:
   :meth:`~ProtectionLevelGuard.expect` returned (``write=``); without it an
   answer closes the one open write of those levels. While several writes of
   the same levels are open, an answer without ``write=`` cannot tell them
-  apart: they all stay unknown and the venue decides, as below.
+  apart: they all stay unknown and the venue decides, as below. A late view
+  of what the venue carried before the bot's first write of a key can be
+  ranked below that write (:meth:`~ProtectionLevelGuard.precede`).
 - **Unconfirmed writes resolve.** A write the venue refused
   (``settle(key, None, rejected=levels)``) stops being acceptable at once. A
   write whose outcome is unknown stays acceptable until the venue decides
@@ -31,7 +33,8 @@ venue and judges every venue observation against them:
   venue's current protection.
 - **Persisted.** The accepted levels live in the extras of a journal row the
   plugin names, so a restart restores them (on first use) and a crash in the
-  middle of a write leaves both the old and the new levels acceptable.
+  middle of a write leaves both the old and the new levels acceptable. A
+  confirmed post-resume re-assert no view showed yet stays unseen across it.
 - **Rebaselined on an operator resume.** :func:`rebaseline_after_resume`
   voids every level written before the resume: the operator accepted the
   venue as it stands. The first judged observation after it becomes the
@@ -245,6 +248,7 @@ class ProtectionLevelGuard:
                 next_gen=max([next_gen, *(w.gen + 1 for w in writes)]),
                 written_at=float(saved.get('written_at') or 0.0),
                 rebaseline=bool(saved.get('rebaseline')),
+                unseen_reassert=bool(saved.get('unseen_reassert')),
             ))
 
     def known(self, key: str) -> bool:
@@ -298,6 +302,35 @@ class ProtectionLevelGuard:
         entry.mismatch = None
         entry.mismatch_count = 0
         self._persist(key, entry)
+
+    def precede(self, key: str, levels: ProtectionLevels, *, tick: float) -> bool:
+        """Accept ``levels`` as what the venue carried before every recorded write.
+
+        For a venue view that may predate the bot's first write of ``key``:
+        the bot wrote the protection before any view of what the venue
+        carried until then arrived, so a late view of that older state is
+        the venue's own, not an edit. The levels are ranked older than the
+        recorded writes and stay acceptable until the venue is seen carrying
+        the confirmed write (:meth:`observe`). A view one of the recorded
+        writes explains is left to :meth:`observe`.
+
+        :param key: The protection key.
+        :param levels: What the view shows.
+        :param tick: The instrument's price tick, as for :meth:`observe`.
+        :return: Whether ``levels`` was added.
+        """
+        self._restore()
+        entry = self._entries.get(key)
+        if entry is None or entry.reported:
+            return False
+        tolerance = self._tolerance(levels, tick)
+        if any(w.levels.matches(levels, tolerance) for w in entry.writes):
+            return False
+        self._adopt_baseline(entry, levels)
+        entry.mismatch = None
+        entry.mismatch_count = 0
+        self._persist(key, entry)
+        return True
 
     def settle(
             self,
@@ -395,8 +428,7 @@ class ProtectionLevelGuard:
             return False
         if read_started_at is not None and read_started_at < entry.written_at:
             return False
-        tolerance = 0.5 * tick if tick > 0.0 and math.isfinite(tick) else 0.0
-        tolerance += 1e-12 * max(1.0, abs(venue.stop or 0.0), abs(venue.limit or 0.0))
+        tolerance = self._tolerance(venue, tick)
         matching = [w.gen for w in entry.writes if w.levels.matches(venue, tolerance)]
         if entry.rebaseline:
             # The operator resumed the run: the venue as it stands is accepted.
@@ -413,10 +445,12 @@ class ProtectionLevelGuard:
             self._persist(key, entry)
             return False
         if matching:
+            seen_reassert = entry.unseen_reassert
             entry.unseen_reassert = False
             entry.mismatch = None
             entry.mismatch_count = 0
-            if self._resolve(entry, matching, snapshot=read_started_at is not None):
+            if self._resolve(entry, matching, snapshot=read_started_at is not None) \
+                    or seen_reassert:
                 self._persist(key, entry)
             return False
         if entry.unseen_reassert and read_started_at is None:
@@ -445,6 +479,12 @@ class ProtectionLevelGuard:
             'client_order_id': entry.row_coid,
         })
         return True
+
+    @staticmethod
+    def _tolerance(venue: ProtectionLevels, tick: float) -> float:
+        """Half a price tick, widened by the float noise of ``venue``'s levels."""
+        tolerance = 0.5 * tick if tick > 0.0 and math.isfinite(tick) else 0.0
+        return tolerance + 1e-12 * max(1.0, abs(venue.stop or 0.0), abs(venue.limit or 0.0))
 
     @staticmethod
     def _adopt_baseline(entry: _Entry, venue: ProtectionLevels) -> None:
@@ -545,6 +585,7 @@ class ProtectionLevelGuard:
             'next_gen': entry.next_gen,
             'written_at': entry.written_at,
             'rebaseline': entry.rebaseline,
+            'unseen_reassert': entry.unseen_reassert,
         })
 
     def _write_extra(self, coid: str, value: dict | None) -> None:

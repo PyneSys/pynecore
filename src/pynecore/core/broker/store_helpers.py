@@ -822,15 +822,18 @@ def mark_rejected(
         *,
         coid: str,
 ) -> None:
-    """Flip the row to :data:`STATE_REJECTED` (terminal).
+    """Flip the row to :data:`STATE_REJECTED` (terminal) and close it.
 
     Used when the exchange returns a definitive reject — confirm
     ``REJECTED``, a 4xx response, or a synchronous reason string the
     plugin maps to ``ExchangeOrderRejectedError``. The row stays in
-    place for audit; the engine clears its intent slot on the next
-    sync.
+    the table for audit, but leaves the live set: nothing of a rejected
+    dispatch can land on the venue, and a live row reads as an order
+    the run still owns (an entry awaiting its fill defers every exit on
+    its side). The engine clears its intent slot on the next sync.
     """
     store.set_order_state(coid, STATE_REJECTED)
+    store.close_order(coid)
 
 
 # === Recovery query ========================================================
