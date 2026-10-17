@@ -45,7 +45,10 @@ from pynecore.core.broker.models import (
 
 __all__ = [
     'FailsafeHealth',
+    'FailsafeObservation',
     'FailsafeOwner',
+    'NATIVE_FAILSAFE_LEVELS_EXTRA',
+    'NATIVE_FAILSAFE_LEVELS_PERSISTED_CAP',
     'NativeBracketSnapshot',
     'OutstandingLevel',
     'NativeStopState',
@@ -81,6 +84,18 @@ this window flips to ``degraded`` (reason ``confirmation-timeout``). Same
 business question — "how long may we run without verified broker
 protection" — so the same default value is reused."""
 
+NATIVE_FAILSAFE_LEVELS_EXTRA = 'native_failsafe_levels'
+"""Parent entry row ``extras`` key holding the bracket triples the engine may
+legitimately leave on the broker: ``{'levels': [...], 'confirmed': [...]}``, each
+triple ``[stop, profit, trailing]``. Written before every PUT, on every
+confirmation (which leaves only the confirmed triple on record) and when a
+first observation is accepted as the baseline, read at a restart
+(:meth:`NativeFailsafeManager.seed_restart_levels`). The engine also records
+there the operator resume after which the bracket was judged."""
+
+NATIVE_FAILSAFE_LEVELS_PERSISTED_CAP: int = 16
+"""How many of the newest outstanding triples are persisted per parent."""
+
 _OUTSTANDING_LEVELS_CAP: int = 256
 """Hard backstop on the per-parent outstanding-levels list length. The list
 only grows via genuine new-desired dispatches (never retries), and the
@@ -104,6 +119,21 @@ class FailsafeOwner(StrEnum):
     ENGINE_FAILSAFE = 'engine-failsafe'
     USER_NATIVE = 'user-native'
     UNKNOWN = 'unknown'
+
+
+class FailsafeObservation(StrEnum):
+    """How :meth:`NativeFailsafeManager.on_native_bracket_observed` judged a snapshot."""
+    CONFIRMED = 'confirmed'
+    """The broker carries the latest desired triple."""
+    ACCEPTED_BASELINE = 'accepted-baseline'
+    """A level no own record explains, accepted as the broker's baseline
+    (the first observation after a restart without a record, or after an
+    operator resume)."""
+    EXTERNAL_EDIT = 'external-edit'
+    """Someone else changed the bracket: ownership left the engine."""
+    NOT_JUDGED = 'not-judged'
+    """Untracked parent, a PUT in flight, a retry pending, or a level an
+    outstanding own dispatch explains."""
 
 
 @dataclass(frozen=True)
@@ -264,6 +294,12 @@ class NativeStopState:
     # until the engine passes real symbol values via :meth:`register_parent`.
     minmove: float = 0.0
     pricescale: int = 0
+    # Set at a restart whose own dispatched levels cannot vouch for the
+    # broker's current level (no persisted record, or an operator resume that
+    # accepted the venue as it stands): the first observation no own level
+    # explains is accepted as the broker's baseline instead of being judged an
+    # external edit. Cleared by the first decisive observation.
+    accept_first_observation: bool = False
     # Stale-window override (None = use manager default).
     stale_window_ms: float | None = None
     # SL leg-kind set tracked for `degrading → healthy` recovery telemetry.
@@ -391,6 +427,55 @@ class NativeFailsafeManager:
 
     def get_state(self, parent_entry_dispatch_ref: str) -> NativeStopState | None:
         return self._states.get(parent_entry_dispatch_ref)
+
+    def seed_restart_levels(
+            self,
+            parent_entry_dispatch_ref: str,
+            levels: Iterable[tuple[float | None, float | None, float | None]],
+            *,
+            now_ms: float,
+    ) -> None:
+        """Seed the bracket triples the previous process dispatched, before the first recompute.
+
+        After a restart the broker may still carry any level the bot itself
+        sent before it stopped: a PUT a crash interrupted, the last level a
+        DEGRADED parent kept while its trail legs ratcheted on, a coalesced
+        trail never flushed. Recorded before each PUT, they become the oldest
+        outstanding entries, so an observation of one of them is a stale own
+        level, never an external edit; a level outside them still is.
+
+        :param parent_entry_dispatch_ref: A registered parent.
+        :param levels: ``(stop, profit, trailing)`` triples, oldest first.
+        :param now_ms: Batch-start anchor for the confirmation window.
+        """
+        state = self._states.get(parent_entry_dispatch_ref)
+        if state is None:
+            return
+        seeded = [
+            OutstandingLevel(
+                sl=self._round_to_tick(sl, state),
+                profit_level=self._round_to_tick(tp, state),
+                trailing_stop=self._round_to_tick(trail, state),
+                generation=state.generation, dispatch_ts_ms=now_ms,
+            )
+            for sl, tp, trail in levels
+        ]
+        if not seeded:
+            return
+        state.outstanding[:0] = seeded
+        if state.outstanding_since_ts_ms is None:
+            state.outstanding_since_ts_ms = now_ms
+
+    def accept_next_observation(self, parent_entry_dispatch_ref: str) -> None:
+        """Accept the parent's next unexplained observation as the broker's baseline.
+
+        For a restart where no own record can vouch for the broker's level,
+        or an operator resume that accepted the venue as it stands. The
+        engine's next PUT re-asserts the desired worst-SL either way.
+        """
+        state = self._states.get(parent_entry_dispatch_ref)
+        if state is not None:
+            state.accept_first_observation = True
 
     def pop_pending(
             self, parent_entry_dispatch_ref: str,
@@ -806,7 +891,7 @@ class NativeFailsafeManager:
             profit_level: float | None,
             trailing_stop: float | None,
             now_ms: float,
-    ) -> None:
+    ) -> FailsafeObservation:
         """Reconcile callback for an observed broker-side bracket snapshot.
 
         Drives three transitions:
@@ -814,12 +899,16 @@ class NativeFailsafeManager:
         - ``degrading → healthy`` when ``actual_level == desired_level``
           and no PUT is in flight (§2.6.7 automatic recovery).
         - ``engine-failsafe → unknown`` when ``actual_level != desired_level``
-          with no PUT in flight (external manual edit).
+          with no PUT in flight (external manual edit) — unless the parent
+          accepts its first observation (:meth:`accept_next_observation`):
+          the level then joins the outstanding list as the broker's baseline.
         - ``healthy`` confirmation timestamp refresh on every match.
+
+        :return: How the snapshot was judged.
         """
         state = self._states.get(parent_entry_dispatch_ref)
         if state is None:
-            return
+            return FailsafeObservation.NOT_JUDGED
         # Snap observed broker levels onto the tick grid the desired snapshot
         # already lives on, so confirmation / external-edit detection compares
         # like-for-like. The broker reports its stored, tick-aligned levels,
@@ -847,9 +936,10 @@ class NativeFailsafeManager:
         )
         if state.pending_put:
             # Confirmation must wait for the in-flight PUT result.
-            return
+            return FailsafeObservation.NOT_JUDGED
 
         if match:
+            state.accept_first_observation = False
             state.last_confirm_ts_ms = now_ms
             # The broker now carries the LATEST desired triple — every
             # outstanding entry (baseline + all dispatched levels) is consumed
@@ -897,13 +987,13 @@ class NativeFailsafeManager:
                         queued.stop_level, stop_level,
                 ):
                     self._pending.pop(parent_entry_dispatch_ref, None)
-            return
+            return FailsafeObservation.CONFIRMED
 
         # Mismatch with no PUT in flight → either retry-pending (covered
         # below), engine-throttled trail (covered next), or external edit
         # (owner flip).
         if state.pending_retry:
-            return
+            return FailsafeObservation.NOT_JUDGED
         # A lifecycle / trail recompute may have already moved ``desired_level``
         # and pushed one or more fresh PUTs whose results the broker has not
         # reflected back yet. While those are unconfirmed the broker still
@@ -927,8 +1017,9 @@ class NativeFailsafeManager:
             state, stop_level, profit_level, trailing_stop,
         )
         if matched_idx is not None:
+            state.accept_first_observation = False
             del state.outstanding[:matched_idx]
-            return
+            return FailsafeObservation.NOT_JUDGED
         # §2.6.5 trail coalesce / step-threshold: when `recompute_worst_sl`
         # was called with ``trigger_kind='trail'`` and the dispatch was
         # suppressed by the coalesce window or the step threshold, the
@@ -962,7 +1053,20 @@ class NativeFailsafeManager:
                 and self._levels_equal(stop_level, state.last_trail_dispatched_level)
                 and self._levels_equal(profit_level, state.desired_profit_level)
                 and self._levels_equal(trailing_stop, state.desired_trailing_stop)):
-            return
+            return FailsafeObservation.NOT_JUDGED
+        if state.accept_first_observation:
+            # No own record vouches for the broker's level (or the operator
+            # accepted the venue as it stands): it becomes the baseline. The
+            # queued PUT re-asserts the desired worst-SL; until a snapshot
+            # confirms it, this level stays a legitimate stale reading.
+            state.accept_first_observation = False
+            state.outstanding.insert(0, OutstandingLevel(
+                sl=stop_level, profit_level=profit_level, trailing_stop=trailing_stop,
+                generation=state.generation, dispatch_ts_ms=now_ms,
+            ))
+            if state.outstanding_since_ts_ms is None:
+                state.outstanding_since_ts_ms = now_ms
+            return FailsafeObservation.ACCEPTED_BASELINE
         if state.owner is FailsafeOwner.ENGINE_FAILSAFE:
             state.owner = FailsafeOwner.UNKNOWN
             # Ownership left the engine because the broker carries an operator's
@@ -987,6 +1091,8 @@ class NativeFailsafeManager:
                 desired_level=state.desired_level,
                 actual_level=stop_level,
             ))
+            return FailsafeObservation.EXTERNAL_EDIT
+        return FailsafeObservation.NOT_JUDGED
 
     # noinspection PyUnusedLocal
     def on_deal_id_disappeared(

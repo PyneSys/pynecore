@@ -3436,6 +3436,10 @@
    "kind": "value",
    "ty": "i"
   },
+  "log.SINGLE_LINE_EXTRA": {
+   "kind": "value",
+   "ty": "s"
+  },
   "log.broker_debug": {
    "defaults": 0,
    "kind": "function",

@@ -22,6 +22,7 @@ from pynecore.core.broker.models import (
 )
 from pynecore.core.broker.native_failsafe_manager import (
     FailsafeHealth,
+    FailsafeObservation,
     FailsafeOwner,
     NativeBracketSnapshot,
     NativeFailsafeManager,
@@ -1384,3 +1385,64 @@ def __test_one_tick_trail_move_flushed_on_awkward_grid__():
     released = manager.flush_coalesced_trails(now_ms=2000.0)
     assert len(released) == 1
     assert released[0].stop_level == 0.075
+
+
+# ---------------------------------------------------------------------
+# Restart: the previous process's own levels and unverified levels
+# ---------------------------------------------------------------------
+
+def _restarted_long(manager: NativeFailsafeManager) -> None:
+    manager.register_parent(
+        parent_entry_dispatch_ref=PARENT_REF, symbol=SYMBOL, parent_side='long',
+        mintick=MINTICK, pending_confirmation=True, now_ms=0.0,
+    )
+
+
+def _observe(manager: NativeFailsafeManager, stop: float | None) -> FailsafeObservation:
+    return manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=stop, profit_level=None, trailing_stop=None, now_ms=10.0,
+    )
+
+
+def __test_an_older_own_level_recorded_before_the_restart_is_not_an_edit__():
+    """A crash in the middle of a PUT, a DEGRADED parent's ratcheted trail: still the bot's."""
+    manager, events = _make_manager()
+    _restarted_long(manager)
+    manager.seed_restart_levels(PARENT_REF, [(None, None, None), (95.0, None, None)],
+                                now_ms=0.0)
+    manager.recompute_worst_sl(parent_entry_dispatch_ref=PARENT_REF,
+                               active_sl_levels=[97.0], now_ms=0.0)
+
+    assert _observe(manager, 95.0) is FailsafeObservation.NOT_JUDGED
+    state = manager.get_state(PARENT_REF)
+    assert state is not None and state.owner is FailsafeOwner.ENGINE_FAILSAFE
+    assert not any(isinstance(e, BrokerNativeFailsafeExternalEditEvent) for e in events)
+    assert _observe(manager, 97.0) is FailsafeObservation.CONFIRMED
+
+
+def __test_a_level_outside_the_recorded_own_levels_is_an_edit__():
+    manager, events = _make_manager()
+    _restarted_long(manager)
+    manager.seed_restart_levels(PARENT_REF, [(95.0, None, None)], now_ms=0.0)
+    manager.recompute_worst_sl(parent_entry_dispatch_ref=PARENT_REF,
+                               active_sl_levels=[97.0], now_ms=0.0)
+
+    assert _observe(manager, 90.0) is FailsafeObservation.EXTERNAL_EDIT
+    assert any(isinstance(e, BrokerNativeFailsafeExternalEditEvent) for e in events)
+
+
+def __test_an_accepted_first_observation_becomes_the_baseline__():
+    """No record (or an operator resume): the first unexplained level is accepted once."""
+    manager, events = _make_manager()
+    _restarted_long(manager)
+    manager.accept_next_observation(PARENT_REF)
+    manager.recompute_worst_sl(parent_entry_dispatch_ref=PARENT_REF,
+                               active_sl_levels=[97.0], now_ms=0.0)
+
+    assert _observe(manager, 90.0) is FailsafeObservation.ACCEPTED_BASELINE
+    assert _observe(manager, 90.0) is FailsafeObservation.NOT_JUDGED, \
+        "a stale reading of the accepted level stays legitimate until the PUT is seen"
+    assert _observe(manager, 97.0) is FailsafeObservation.CONFIRMED
+    assert not any(isinstance(e, BrokerNativeFailsafeExternalEditEvent) for e in events)
+    # Once the bot's level is confirmed, a further foreign level is an edit again.
+    assert _observe(manager, 90.0) is FailsafeObservation.EXTERNAL_EDIT

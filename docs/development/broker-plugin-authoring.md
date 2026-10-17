@@ -5,7 +5,7 @@ title: "Broker Plugin Authoring Guide"
 description: "The full contract a live broker plugin must uphold"
 icon: "account_balance"
 date: "2026-07-12"
-lastmod: "2026-10-14"
+lastmod: "2026-10-15"
 draft: false
 toc: true
 categories: ["Development"]
@@ -157,15 +157,27 @@ venue respectively):
    default `stop` latches the engine's **external-intervention
    quarantine** (wire the runner-injected `quarantine_sink` into the
    tracker's `request_quarantine`), while `halt` raises
-   `UnexpectedCancelError` for a process exit.
+   `UnexpectedCancelError` for a process exit. The sink returns `False`
+   when the held latch already noted the same intervention (the same
+   order, protection key or reason); the tracker then skips its audit
+   event, and a plugin that calls the sink itself can do the same.
 5. When the evidence shows the **venue** terminated the order itself
    (a reduce-only squeeze, an OCA sibling trigger, a cleared position),
    return `CANCELLED` with `cancel_reason` set to one of
    `VENUE_DRIVEN_CANCEL_REASONS`. The push of such a cancel can be lost
    too, and the history is then the only thing that tells it apart from
    an operator's cancel: the tracker retires the row and yields the
-   `cancelled` event with that reason, and no policy fires. Leave
-   `cancel_reason` at `None` when the venue does not name the cause.
+   `cancelled` event with that reason, and no policy fires. Stamp the
+   same reason on a `cancelled` event you push from the private stream:
+   the engine honours it for every bot order — an exit leg is trimmed
+   (whatever its `reduce_only` flag, so a spot leg counts too), an
+   unfilled entry or a close order is retired like a reject, and a
+   partially filled entry is consumed at its filled quantity (the
+   remainder is not placed again) — with a `venue_driven_cancel` audit
+   and no policy. Repeated venue cancels of the same entry count towards
+   the entry reject-retry cap, so the engine stops re-placing it until
+   the script changes or re-issues it. Leave `cancel_reason` at `None`
+   when the venue does not name the cause.
 
 The engine's stop-coverage guard depends on these verdicts. A missing
 stop leg whose journal row is still live is not re-armed while its fate
@@ -187,7 +199,9 @@ to the venue — no entry, exit, close, cancel, amend, SL/TP update or
 protection re-arm — until the operator runs
 `pyne broker resume <run_id> <quarantine_id>`. The latch is stored in
 the broker store and survives every restart. A resume restarts the run in
-place, so the bot re-syncs through the regular startup path.
+place, so the bot re-syncs through the regular startup path. The latch
+holds in the stopping process until it exits; the restarted process ends
+it before your plugin is started.
 
 The engine stops its own writes. Your plugin must stop the writes it
 starts on its own (sibling cancels, trailing-stop activation, deferred
@@ -196,7 +210,10 @@ single transport chokepoint every order-mutating request passes through,
 before anything leaves the client. It raises `VenueWritesQuarantinedError`,
 an `ExchangeConnectionError`, so every caller keeps its state and retries
 after the resume. Never treat it as "order not found" or as a settled
-outcome, and never retire a journal row because of it.
+outcome, and never retire a journal row because of it. A protection write
+it stopped never left the client: settle its guard expectation as refused
+(`guard.settle(key, None, rejected=levels, write=write_id)`, see 1b), not
+as an unknown outcome, or the unsent levels stay acceptable on the venue.
 
 A quarantine your plugin requests for its own venue trouble (for example
 a spot inventory conflict) keeps the default `QuarantineKind.ENTRY_BLOCK`:
@@ -233,8 +250,52 @@ cancel (`stop` latches the external-intervention quarantine, `halt` raises).
 - Under a venue-side trailing stop only the trailing flag, the distance and
   the take-profit are compared.
 - `guard.forget(key)` when the protection or its position is gone.
-- The levels persist on the named journal row; an operator resume makes
-  the next observation the new baseline.
+- The levels persist on the named journal row, so a restarted process
+  judges the venue against the levels the previous process wrote.
+- An operator resume voids every persisted write: the first observation of
+  each key after the resume becomes its baseline, unless it shows a level
+  the restarted bot wrote itself. The engine then re-asserts the
+  strategy's own exits once through your regular amend path; expect and
+  settle those writes like any other. A re-assert the venue confirms
+  becomes the new baseline, a refused one leaves the operator's levels as
+  the baseline, and neither is reported as an intervention. Once the venue
+  confirmed the re-assert, a snapshot read after it that shows other levels
+  is an edit; a push that does not match it is not judged until a view
+  shows the re-assert, since it may still carry the operator's levels. When the
+  restarted process stops before it completed the resume, the next one
+  applies the resume again without voiding the baselines the stopped one
+  adopted: only keys it never observed accept their next observation.
+
+**After an operator resume.** The operator accepted the venue as it stood,
+so nothing that changed before the resume may be reported. The guard and
+the disappearance tracker handle this themselves. A row your plugin stamps
+`missing_pending_since` on its own (outside the tracker's presence feed)
+counts as cancelled before the resume when the stamp is written within
+`RESUME_FIRST_ABSENCE_WINDOW_S` (5 minutes) of it; the tracker settles the
+`missing_accepted_by_resume` mark on its next pass, so read that mark only
+after the pass. A `cancelled` event your plugin reports itself for a mapped
+order (an activity catch-up replaying a deletion after the restart) gets
+the same verdict from the same marks: the engine audits it as
+`cancel_accepted_by_resume` and applies no `on_unexpected_cancel` policy
+when the row's absence stamp is the one the resume accepted, or when the
+row is still marked for its first absence and the event comes within the
+window. A row the engine's first open-orders read after the restart
+(`get_open_orders`) lists loses that mark: the order was still on the venue
+after the resume, so its later cancel is judged as usual. Return your
+working orders there with their client order ids. Every other judge of
+your plugin must handle it too: a quantity check of a resting order, a
+close found at startup, an activity or deal-history catch-up. The runner
+sets `self.operator_resume_ts_ms` (wall-clock ms, `None` without a
+resume) before `connect()`. Pass the change's venue time to
+`report_external_intervention(..., changed_at_ms=...)`: a change dated at
+or before the resume is logged, audited as
+`external_intervention_accepted_by_resume` and not quarantined. It is the
+time the resume was first applied: a process that applies the same resume
+again passes the same time, so a change made while no process ran is
+judged. A judge that has no change time takes its first view after the
+resume as its baseline, the way the guard does; keep that baseline on a
+journal row, as the guard does, or a process that applies the resume again
+accepts a change made while no process ran.
 
 **Manual close.** Report a close only when the venue proves it was neither
 the bot's nor the venue's: not a fill of the bot's own close order, not a
@@ -242,7 +303,15 @@ TP/SL trigger, not a stop-out, liquidation, auto-deleverage, settlement or
 dealing-desk close. Book the fill as usual so the book matches the venue,
 then report. A position change no fill explains is ambiguous; the engine
 adopts it with an ERROR and an `UnattributedPositionChangeEvent`, never a
-quarantine.
+quarantine. A late fill of an order that was live when such a reduction
+was adopted (your stream lost or delayed it) is held out of the book until
+the venue position shows whether it was that reduction (dropped, never
+booked twice) or a new one (booked); new entries wait meanwhile. An order
+your `get_open_orders()` showed resting at the adoption, with no fill
+beyond what its journal row records, cannot be in the reduction: its later
+fill is booked at once, whatever other runs' exposure does to the venue
+net. Keep the order's venue id on its `ExchangeOrder` and its cumulative
+`filled_qty` current, so the engine can match it.
 
 ### 2. `OrderEvent.fill_qty` is INCREMENTAL; `fill_id` must be stable
 
@@ -346,6 +415,46 @@ dangerous direction: the engine would book a change that the late fill
 then books a second time. The startup contract probe rejects anything but
 `None` or a positive, finite number.
 
+**Flag a refusal of a crossed level.** When the venue refuses an exit, an
+exit amend (`modify_exit`) or a bracket because the market already trades
+through its level (a long's stop at or above the bid, a take-profit
+already reached), raise the refusal with `level_crossed=True`
+(`ExchangeOrderRejectedError(message, level_crossed=True)`, or pass it
+through from a subclass). The engine then closes the parent at market,
+which is what Pine's exit would have done, instead of treating the
+refusal as venue trouble (a defensive close plus an `entry_block`
+quarantine after the retry, or, for a refused amend, keeping the old
+levels armed). The engine also checks the last price it saw, so an
+unflagged refusal is still recognised when that price shows the crossing.
+A `PositionPort.amend_bracket` refusal carries the flag the same way.
+
+**Attribute reductions in your journal.** When the venue position shrinks
+and no fill of the bot explains it, the engine books the venue size into
+the book and reports it, but it leaves the journal alone. Only the plugin
+knows which rows the reduction hit, so it attributes the reduction to
+them (lower the owned exposure, or raise the row's
+`journal_exposure_retired` counter). The engine reads the journal's owned
+net at startup: a venue position below it with no fill in flight is
+logged as an ERROR and audited once. After an operator resume it is a
+WARNING, unless a process that already applied the same resume saw a
+larger position: a reduction beyond that view happened while no bot ran
+and stays an ERROR. An exit fill of the bot the startup drain holds
+unbooked (a TP/SL fill replayed after the restart) delays that comparison
+until it settles, so net your journal for it by then. While no plugin
+attributed a reported reduction, a restart does not adopt a venue position
+above the one the report saw: the excess is someone else's.
+
+**Mark a journal in wire units.** A row whose `qty` / `filled_qty` are in
+the venue's contract units instead of the book's units (inverse
+contracts) records the conversion price under the `anchor` extra
+(`pynecore.types.strategy.JOURNAL_WIRE_QTY_ANCHOR_EXTRA_KEY`). The engine
+then skips that startup comparison, since the journal and the venue are
+in different units, and adopts the venue position at startup as one
+parent trade instead of splitting it per entry. Startup adoption still
+takes only the run's own share: the run's owned wire quantity converts to
+base at the venue position's entry price (`base = wire / price`), so
+`get_position()` must report such a position in base at that price.
+
 ## Capabilities: declare what you deliver end-to-end
 
 Every `ExchangeCapabilities` field is a `CapabilityLevel`
@@ -424,9 +533,15 @@ accounts), and implement the six `PositionPort` primitives
 (`fetch_raw_positions`, `get_volume_quantizer`, `close_leg`,
 `reject_out_of_range`, `place_leg`, `amend_bracket`). Each primitive
 touches exactly ONE broker entity; the emulator owns all FIFO/netting and
-crash-replay logic. The optional `supports_partial_leg_close = False`
-attribute makes the emulator atomically skip plans containing partial leg
-slices on venues whose position close is full-row only (Capital.com).
+crash-replay logic.
+
+On a hedging account `fetch_raw_positions()` returns the legs this run
+opened, and `get_position()` their net. Another party's leg on the same
+symbol is not the bot's position and not an intervention; counted in, its
+close would read as a reduction of the bot's share. The optional
+`supports_partial_leg_close = False` attribute makes the emulator
+atomically skip plans containing partial leg slices on venues whose
+position close is full-row only (Capital.com).
 
 ## Spot venues: opt into the core inventory layer
 
@@ -531,26 +646,50 @@ position that has been open longer than the retention window. The
 open position stays reconstructible for as long as it is open, however
 old its fills are.
 
-### The balance is pooled — the invariant fails closed
+### The balance is pooled — the bot's own share decides
 
 The venue balance does not separate the bot's inventory from
 pre-existing holdings, manual trades or deposits. The ledger is
 authoritative for the bot's inventory; the venue balance is checked
 against `expected_total = foreign_baseline + bot_inventory(ledger)`,
-where the baseline was frozen at epoch creation. Any unexplainable drift
-in **either** direction is an attribution conflict — a positive drift
-can mask an external sale netted against a deposit, so warn-and-continue
-is not an option. The numeric tolerance (`base_tolerance`) covers ONLY
-asset quantization; settlement lag is a *temporal* state (a persisted
-pending-conflict grace re-checked with fresh executions and balance),
-never a wider tolerance. External intervention in the bot's inventory is
-not supported: the manager detects it and stops trading (quarantine, or
-process exit under the `halt` policy); there is no adoption path.
-Recovery is an operator `rebaseline()` — a new epoch generation frozen
-in one transaction, refused while unresolved dispatches remain (and
-refused when the account balance is below the ledger's bot inventory,
-which would freeze a negative baseline and launder the very withdrawal
-that triggered the conflict) — plus a restart.
+where the baseline was frozen at epoch creation. The numeric tolerance
+(`base_tolerance`) covers ONLY asset quantization; settlement lag is a
+*temporal* state (a persisted pending-conflict grace re-checked with
+fresh executions and balance), never a wider tolerance. While the bot's
+own live orders cover a drift, the verdict waits for their fills.
+
+A drift still unexplained past the grace is judged against the bot's
+**own** inventory, because base is fungible:
+
+- **The balance still holds at least the bot's inventory** (a deposit, a
+  foreign buy, a sale out of the foreign holdings): someone else's
+  separate activity left the bot's share intact. The manager logs an
+  ERROR, writes a durable `spot_foreign_holdings_reanchored` audit event,
+  re-anchors the foreign baseline on the balance (a new epoch, the bot's
+  ledger untouched) and the bot keeps trading. No quarantine.
+- **The balance is below the bot's inventory and the history read was
+  complete**: someone sold or withdrew what the bot holds. The manager
+  latches the `EXTERNAL_INTERVENTION` quarantine (or exits under the
+  `halt` policy); there is no adoption path. After the operator resume
+  the first start keeps the part of the bot's inventory the account still
+  holds.
+- **The balance is below the bot's inventory but the history read was
+  incomplete** (`conclusive=False`): a fill of the bot's own cannot be
+  ruled out. The manager logs an ERROR and writes a durable
+  `spot_inventory_shortfall_unverified` audit event once, books nothing,
+  latches nothing, and keeps the conflict pending until a complete read
+  decides it — booking the shortfall now would take an own fill the
+  history returns later from the bot's inventory a second time.
+
+The startup does not judge a drift. The venue can index a fill of the
+bot's own (an order that rested while the bot was down) behind its
+balance, and the startup cannot wait for it, so it adopts the ledger,
+keeps the execution cursor where its catch-up began (the next read
+returns such a fill), writes a durable `spot_startup_drift_pending` event,
+and leaves the verdict to the runtime reconcile: the same grace and the
+same three outcomes as above. Its history read is settled against the
+balance read: the history is read again after the balance, so an own fill
+landing between the two is in both.
 
 ### One position asset, one bot
 

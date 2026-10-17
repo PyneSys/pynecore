@@ -260,10 +260,11 @@ class ExchangeOrder:
 
 #: Venue-side cancel reasons a plugin may stamp on a ``cancelled``
 #: :class:`OrderEvent` when the venue itself terminated the order as a
-#: deterministic consequence of the position / sibling orders it protects —
-#: never an operator or foreign actor. The sync engine trims such a leg and
-#: keeps running; an unclassified cancel of a bot-owned order still routes
-#: through the ``on_unexpected_cancel`` policy.
+#: deterministic consequence of the position / sibling orders it protects, or
+#: refused it itself — never an operator or foreign actor. The sync engine
+#: trims such an exit leg, retires such an entry or close order, and keeps
+#: running; an unclassified cancel of a bot-owned order still routes through
+#: the ``on_unexpected_cancel`` policy.
 CANCEL_REASON_VENUE_REDUCE_ONLY = 'venue_reduce_only'
 """A reduce-only order shrunk to nothing because the net position it could
 reduce fell below the summed reduce-only quantity (Bybit

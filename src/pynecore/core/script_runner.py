@@ -1557,6 +1557,10 @@ class ScriptRunner:
             # transport chokepoint, so an external-intervention quarantine also
             # stops the plugin's own background writes.
             broker_plugin.venue_writes_blocked = lambda: engine.venue_writes_blocked
+            # The operator-resume boundary for the plugin's own intervention
+            # judges: the engine applied the resume at construction, before the
+            # plugin connects.
+            broker_plugin.operator_resume_ts_ms = engine.operator_resume_ts_ms
 
             # Native bulk-cancel expected-cancel arm. A plugin whose
             # ``execute_cancel_all`` calls a single native endpoint (e.g. Bybit

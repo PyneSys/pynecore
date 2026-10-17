@@ -49,6 +49,7 @@ from pynecore.core.broker.sync_engine import (
 from pynecore.core.plugin import ProviderError, TransientProviderError
 from pynecore.core.broker.models import (
     CANCEL_REASON_VENUE_REDUCE_ONLY,
+    CANCEL_REASON_VENUE_REJECTED,
     INTENT_KEY_SEP,
     BrokerEvent,
     QuarantineEnteredEvent,
@@ -4338,6 +4339,63 @@ def __test_exit_rejected_twice_over_a_live_parent_closes_it_defensively__():
     n_entries = len(b.entry_calls)
     engine.sync(BAR_TS + 120_000)
     assert len(b.entry_calls) == n_entries
+
+
+def __test_an_exit_refused_over_a_level_the_market_crossed_closes_without_quarantine__():
+    """A stop the current price already traded through is Pine's immediate exit.
+
+    The exit reaches the venue on a path that did not judge the price itself
+    (here: a sync without a price, the last one seen being below the stop);
+    the venue refuses it because the market went through the level. That is
+    not a venue refusing to protect the position: the parent is closed at
+    market at once, with no retry and no entry block.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long(b, engine, pos)
+    engine.sync(BAR_TS + 30_000, last_price=48_500.0)
+
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", -1.0, "L-X", stop=49_000.0)
+    b.always_raise_on_exit = ExchangeOrderRejectedError("stop above the market")
+    engine.sync(BAR_TS + 60_000)  # must not raise
+
+    assert len(b.exit_calls) == 1, "a crossed level is not retried"
+    assert len(b.close_calls) == 1
+    close = b.close_calls[0].intent
+    assert isinstance(close, CloseIntent) and close.synthetic_kind == 'defensive_close'
+    assert close.side == 'sell' and close.qty == 1.0
+    assert not engine.quarantined
+    assert engine.halted is False
+
+
+def __test_an_exit_refusal_flagged_level_crossed_closes_without_quarantine__():
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long(b, engine, pos)
+
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", -1.0, "L-X", stop=49_000.0)
+    b.always_raise_on_exit = ExchangeOrderRejectedError(
+        "trigger price crossed", level_crossed=True)
+    engine.sync(BAR_TS + 60_000)
+
+    assert len(b.close_calls) == 1
+    assert not engine.quarantined
+
+
+def __test_a_stop_ratcheted_above_the_fill_but_not_crossed_is_a_genuine_refusal__():
+    """The crossed check reads the current price, not the parent's fill price."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long(b, engine, pos, price=50_000.0)
+
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", -1.0, "L-X", stop=50_500.0)
+    b.always_raise_on_exit = ExchangeOrderRejectedError("venue reject")
+    engine.sync(BAR_TS + 60_000, last_price=51_000.0)
+
+    assert len(b.exit_calls) == 2, "not crossed: one retry first"
+    assert len(b.close_calls) == 1
+    assert engine.quarantined
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
 
 
 def __test_exit_reject_while_the_parent_is_unfilled_waits_for_the_fill__():
@@ -16393,6 +16451,104 @@ def __test_exit_modify_reject_with_the_old_legs_gone_redispatches_fresh__():
     assert engine.halted is False
 
 
+def _native_bracket_long_with_stop(stop: float) -> tuple[MockBroker, OrderSyncEngine,
+                                                          BrokerPosition, str]:
+    """A long whose stop rests on the position as a native bracket (the old level stays armed)."""
+    b = MockBroker()
+    b.capabilities = ExchangeCapabilities(
+        short_selling=CapabilityLevel.NATIVE, tp_sl_bracket=CapabilityLevel.NATIVE,
+    )
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L1"] = _entry_order("L1", 1.0)
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X", stop=stop)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L1"))
+    assert any(trade.entry_id == "L1" for trade in pos.open_trades)
+    return b, engine, pos, f"L1-X{INTENT_KEY_SEP}L1"
+
+
+def __test_an_exit_amend_refused_over_a_level_the_market_crossed_closes_at_market__():
+    """A crossed level is Pine's immediate exit on the amend path too.
+
+    The script tightens the stop to a level the market already trades below;
+    the venue refuses the amend and the old stop is still armed. Keeping the
+    old stop would leave the bot holding a position its own stop already
+    closed: the parent is closed at market, with no entry block, and the
+    refused spec is not parked.
+    """
+    b, engine, pos, key = _native_bracket_long_with_stop(49_000.0)
+
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X", stop=49_500.0)
+    b.raise_on_next_modify_exit = ExchangeOrderRejectedError("venue reject")
+    engine.sync(BAR_TS + 60_000, last_price=49_400.0)  # must not raise
+
+    assert len(b.modify_exit_calls) == 1
+    assert len(b.close_calls) == 1
+    close = b.close_calls[0].intent
+    assert isinstance(close, CloseIntent) and close.synthetic_kind == 'defensive_close'
+    assert close.side == 'sell' and close.qty == 1.0
+    assert "L1" in engine.pending_defensive_close
+    assert key not in engine._rejected_exit_modifies  # noqa: SLF001
+    assert not engine.quarantined
+    assert engine.halted is False
+
+
+def __test_an_exit_amend_refusal_flagged_level_crossed_closes_at_market__():
+    """The venue's own crossed verdict needs no price of ours."""
+    b, engine, pos, key = _native_bracket_long_with_stop(49_000.0)
+
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X", stop=49_500.0)
+    b.raise_on_next_modify_exit = ExchangeOrderRejectedError(
+        "trigger price crossed", level_crossed=True)
+    engine.sync(BAR_TS + 60_000)
+
+    assert len(b.close_calls) == 1
+    assert key not in engine._rejected_exit_modifies  # noqa: SLF001
+    assert not engine.quarantined
+
+
+def __test_an_exit_amend_refused_short_of_the_market_keeps_the_old_stop__():
+    """Not crossed: the old stop stays in charge and the refused spec is parked."""
+    b, engine, pos, key = _native_bracket_long_with_stop(49_000.0)
+
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X", stop=49_500.0)
+    b.raise_on_next_modify_exit = ExchangeOrderRejectedError("venue reject")
+    engine.sync(BAR_TS + 60_000, last_price=49_800.0)
+
+    assert b.close_calls == []
+    assert key in engine._rejected_exit_modifies  # noqa: SLF001
+    assert engine.active_intents[key].sl_price == 49_000.0
+    assert not engine.quarantined
+
+
+@pytest.mark.parametrize("last_price", [49_400.0, 49_800.0],
+                         ids=["level-beyond-the-last-close", "level-short-of-it"])
+def __test_an_exit_amend_declined_by_a_closed_market_keeps_the_old_stop_and_retries__(
+        last_price: float):
+    """A session pause changes nothing on the venue, so no level counts as crossed.
+
+    The old stop stays armed, nothing is closed, the run never halts, and the
+    amend is not parked: it goes out again on a later sync.
+    """
+    b, engine, pos, key = _native_bracket_long_with_stop(49_000.0)
+
+    pos.exit_orders[("L1-X", "L1")] = _exit_order("L1", 1.0, "L1-X", stop=49_500.0)
+    b.raise_on_next_modify_exit = MarketClosedError("market closed")
+    b.raise_on_next_close = MarketClosedError("market closed")
+    engine.sync(BAR_TS + 60_000, last_price=last_price)
+
+    assert engine.halted is False
+    assert b.close_calls == []
+    assert key not in engine._rejected_exit_modifies  # noqa: SLF001
+    assert engine.active_intents[key].sl_price == 49_000.0
+    assert not engine.quarantined
+
+    engine.sync(BAR_TS + 120_000, last_price=last_price)
+    assert len(b.modify_exit_calls) == 2, "re-sent once the market reopens"
+    assert engine.active_intents[key].sl_price == 49_500.0
+
+
 def _software_partial_native_exit_broker():
     """SOFTWARE partial-qty brackets with the plain ``execute_entry`` / ``execute_exit``
     surface (no one-way position port), so the mock's call lists record dispatches."""
@@ -16664,6 +16820,145 @@ def __test_venue_reduce_only_cancel_with_reason_is_trimmed_not_quarantined__():
     assert not engine._quarantined
     assert engine.order_mapping.get("TP\0L") == [sl_id]
     assert "TP\0L" in engine.active_intents
+
+
+def __test_venue_driven_cancel_of_a_spot_exit_leg_is_trimmed_not_quarantined__():
+    """A spot exit leg is a plain sell on the venue, never a reduce-only order.
+
+    The plugin enforces reduce-only in software on spot, so the venue's cancel
+    push carries ``reduce_only=False``. The venue's own reason still decides:
+    the dead leg is trimmed and its live sibling keeps the intent, exactly as
+    the disappearance tracker would retire it.
+    """
+    b = MockBroker()
+    engine, _, tp_id, sl_id = _mk_two_leg_bracket_without_close(b)
+    spot_cancel = _reduce_only_cancel_event(tp_id)
+    spot_cancel = replace(
+        spot_cancel,
+        order=replace(spot_cancel.order, reduce_only=False),
+        cancel_reason=CANCEL_REASON_VENUE_REJECTED,
+    )
+
+    engine._route_event(spot_cancel)
+
+    assert not engine._quarantined
+    assert engine.order_mapping.get("TP\0L") == [sl_id]
+    assert "TP\0L" in engine.active_intents
+
+
+def __test_venue_driven_cancel_of_a_resting_entry_retires_it_without_policy__(tmp_path):
+    """The venue refusing a resting entry is nobody's intervention.
+
+    A ``CancelByCannotAffordOrderCost``-style cancel arrives on the private
+    stream before the tracker ever sees the order missing. It retires the entry
+    like a reject, is audited, and leaves the run free to place the entry again.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    b = MockBroker()  # on_unexpected_cancel == "stop"
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        engine, pos = _mk_engine(b, store_ctx=ctx)
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+        engine.sync(BAR_TS)
+        assert len(b.entry_calls) == 1
+        deal_id = engine.order_mapping["L"][0]
+
+        engine._route_event(replace(
+            _cancelled_event(deal_id), cancel_reason=CANCEL_REASON_VENUE_REJECTED,
+        ))
+
+        assert engine.quarantined is False
+        assert engine.halted is False
+        assert "L" not in engine.order_mapping
+        assert "L" not in engine.active_intents
+        audited = list(ctx.iter_events_by_kind_since('venue_driven_cancel', 0))
+        assert [e['cancel_reason'] for e in audited] == [CANCEL_REASON_VENUE_REJECTED]
+        engine.sync(BAR_TS + 60_000)
+        assert len(b.entry_calls) == 2, "the strategy's entry is placed again"
+        ctx.close()
+
+
+def __test_venue_driven_cancel_of_a_partially_filled_entry_consumes_it__(tmp_path):
+    """The venue cancels the unfilled remainder of a partially filled resting entry.
+
+    The entry is consumed at its filled quantity like a fully filled one: no
+    quarantine, the position keeps the 0.4, and neither the remainder nor the
+    whole entry is placed again — the sentinel was dropped with the cancel, so
+    the next sync re-placed the full 1.0 and the venue held 1.4 where the
+    script asked for 1.0. A same-parameter re-issue of the entry while the
+    position is open stops at the pyramiding gate.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    b = MockBroker()  # on_unexpected_cancel == "stop"
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        engine, pos = _mk_engine(b, store_ctx=ctx)
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+        engine.sync(BAR_TS)
+        deal_id = engine.order_mapping["L"][0]
+        engine._route_event(_fill_event(
+            "buy", 0.4, 50_000.0, pine_id="L", xchg_id=deal_id,
+            event_type='partial', filled_qty=0.4, remaining_qty=0.6,
+        ))
+        assert pos.size == 0.4
+
+        engine._route_event(replace(
+            _cancelled_event(deal_id, filled_qty=0.4),
+            cancel_reason=CANCEL_REASON_VENUE_REJECTED,
+        ))
+
+        assert engine.quarantined is False
+        assert engine.halted is False
+        assert "L" not in engine.order_mapping
+        assert engine.active_intents["L"].qty == 0.4
+        audited = list(ctx.iter_events_by_kind_since('venue_driven_cancel', 0))
+        assert [(e['cancel_reason'], e['filled_qty']) for e in audited] \
+            == [(CANCEL_REASON_VENUE_REJECTED, 0.4)]
+        engine.sync(BAR_TS + 60_000)
+        engine.sync(BAR_TS + 120_000)
+        assert len(b.entry_calls) == 1, "the truncated entry was placed again"
+        assert pos.size == 0.4
+
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+        engine.sync(BAR_TS + 180_000)
+        assert len(b.entry_calls) == 1, "a re-issue passed the pyramiding cap"
+        ctx.close()
+
+
+def __test_venue_driven_cancels_of_an_entry_stop_at_the_retry_cap__():
+    """A venue that keeps cancelling the same accepted entry does not get it re-placed forever.
+
+    Each venue-driven cancel retires the entry and the next sync re-places it,
+    a dispatch that succeeds and so used to reset the reject memory: under
+    ``calc_on_every_tick`` the identical order was re-posted on every tick.
+    The cancels count towards the entry retry cap; a re-placement on the bar
+    of the cancel mints a fresh client order id, and a re-issue of the entry
+    on a later bar is a new signal that is placed again.
+    """
+    from pynecore.core.broker.idempotency import KIND_ENTRY
+    from pynecore.core.broker.sync_engine import _ENTRY_REJECT_RETRY_CAP
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+    for _ in range(8):
+        mapped = engine.order_mapping.get("L")
+        if mapped is None:
+            break
+        engine._route_event(replace(
+            _cancelled_event(mapped[0]), cancel_reason=CANCEL_REASON_VENUE_REJECTED,
+        ))
+        engine.sync(BAR_TS)
+    assert len(b.entry_calls) == _ENTRY_REJECT_RETRY_CAP
+    coids = [envelope.client_order_id(KIND_ENTRY) for envelope in b.entry_calls]
+    assert len(set(coids)) == len(coids), "a same-bar re-placement reused a spent id"
+    assert engine.quarantined is False
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == _ENTRY_REJECT_RETRY_CAP
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.entry_calls) == _ENTRY_REJECT_RETRY_CAP + 1
 
 
 def __test_restart_partial_bracket_of_a_rotated_bot_is_adopted_not_cancelled__(tmp_path):

@@ -19,6 +19,7 @@ the two layers.
 """
 import asyncio
 import signal
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,8 +28,19 @@ import pytest
 from typer import Exit
 
 from pynecore import lib
+from pynecore.core.broker import disappearance as disappearance_module
+from pynecore.core.broker.disappearance import (
+    MISSING_ACCEPTED_BY_RESUME_EXTRA,
+    MISSING_PENDING_EXTRA,
+    RESUME_FIRST_ABSENCE_WINDOW_S,
+)
 from pynecore.core.broker.exceptions import OrderDispositionUnknownError
 from pynecore.core.broker.position import BrokerPosition
+from pynecore.core.broker.protection_guard import (
+    PROTECTION_LEVELS_EXTRA,
+    ProtectionLevelGuard,
+    ProtectionLevels,
+)
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore, RunContext
 from pynecore.core.broker import sync_engine as sync_engine_module
@@ -44,6 +56,7 @@ from pynecore.core.broker.models import (
     ExchangeOrder,
     ExchangePosition,
     ExitIntent,
+    OrderEvent,
     OrderStatus,
     OrderType,
 )
@@ -1668,10 +1681,16 @@ if CapitalCom is not None:
 
         def __init__(self, *, config, responses=None):
             super().__init__(config=config)
+            # The plugin refuses a position write until authentication
+            # resolved the account identity; the stubbed REST never logs in.
+            self._account_id = 'capitalcom-demo-core-integration'
             self._responses: dict = responses or {}
             self._calls: list = []
 
-        async def _call(self, endpoint, *, data=None, method='post'):
+        def __call__(self, endpoint, *, data=None, method='post', _level=0):
+            # The one REST entry point: the async ``_call`` and the
+            # serialized position writes both end here, so nothing reaches
+            # the network.
             self._calls.append((endpoint, method, data))
             err = self._responses.get(('error', endpoint, method))
             if err is not None:
@@ -1679,6 +1698,9 @@ if CapitalCom is not None:
                 del self._responses[('error', endpoint, method)]
                 raise err
             return self._responses.get((endpoint, method), {})
+
+        async def _call(self, endpoint, *, data=None, method='post'):
+            return self(endpoint, data=data, method=method)
 
 
 _CAP_SYMBOL = "EURUSD"
@@ -2645,7 +2667,68 @@ def __test_a_resume_requested_while_the_bot_was_down_starts_it_normally__(
         engine, _pos = _mk_engine(_MockBroker(), restarted)
         assert not engine.quarantined
         row = restarted.get_quarantine(quarantine_id)
+        assert row is not None and row.ended_ts_ms is None, "open until the resume completed"
+        engine.sync(BAR_TS)
+        row = restarted.get_quarantine(quarantine_id)
         assert row is not None and row.end_reason == 'operator_resume'
+
+
+def __test_a_resume_is_applied_again_when_its_process_stopped_before_the_first_sync__(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed connect or a crash right after the resume must not lose it."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        first = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), first)
+        quarantine_id = _latch_external(engine)
+        first.close()
+        store.request_quarantine_resume(first.run_id, quarantine_id)
+
+        died = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), died)
+        assert engine.resumed_from_quarantine
+        died.close()
+
+        caplog.clear()
+        again = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), again)
+        assert engine.resumed_from_quarantine
+        assert engine.operator_resume_ts_ms is not None
+        assert any("sync engine quarantine resumed (again:" in r.getMessage()
+                   for r in caplog.records)
+        engine.sync(BAR_TS)
+        row = again.get_quarantine(quarantine_id)
+        assert row is not None and row.end_reason == 'operator_resume'
+        again.close()
+
+        plain = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), plain)
+        assert not engine.resumed_from_quarantine, "a completed resume is never applied again"
+        plain.close()
+
+
+def __test_a_new_intervention_completes_a_pending_resume__(tmp_path: Path) -> None:
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        first = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), first)
+        quarantine_id = _latch_external(engine)
+        first.close()
+        store.request_quarantine_resume(first.run_id, quarantine_id)
+
+        resumed = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), resumed)
+        engine.record_quarantine("operator cancelled the stop",
+                                 kind=QuarantineKind.EXTERNAL_INTERVENTION)
+        row = resumed.get_quarantine(quarantine_id)
+        assert row is not None and row.end_reason == 'operator_resume'
+        newer = engine.quarantine_id
+        resumed.close()
+
+        restarted = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), restarted)
+        assert engine.venue_writes_blocked and engine.quarantine_id == newer
+        assert not engine.resumed_from_quarantine
+        restarted.close()
 
 
 def __test_a_resume_request_must_name_the_open_latch_of_that_run__(tmp_path: Path) -> None:
@@ -2661,14 +2744,24 @@ def __test_a_resume_request_must_name_the_open_latch_of_that_run__(tmp_path: Pat
         assert row is not None and row.resume_requested_ts_ms is not None
 
 
-def __test_the_resume_watch_ends_the_latch_and_stops_the_run_for_a_restart__(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+def __test_the_resume_watch_stops_the_run_and_the_restarted_process_ends_the_latch__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A running bot picks the resume up by itself and stops through the stop-signal path."""
+    """A running bot picks the resume up by itself and stops through the stop-signal path.
+
+    The stopping process keeps the latch: the restarted one ends it and voids
+    the protection baselines, so nothing the stopping process still writes can
+    undo the resume.
+    """
     signals: list[int] = []
     monkeypatch.setattr(sync_engine_module._thread, 'interrupt_main', signals.append)  # noqa
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_ctx(store)
+        ctx.upsert_order("leg-1", symbol=SYMBOL, side="sell", qty=1.0,
+                         state="confirmed", extras={})
+        old_guard = ProtectionLevelGuard(lambda *_a: None, store_ctx=ctx)
+        old_guard.expect("p1", ProtectionLevels(stop=95.0), row_coid="leg-1")
+        old_guard.settle("p1", ProtectionLevels(stop=95.0))
         engine, _pos = _mk_engine(_MockBroker(), ctx)
         quarantine_id = _latch_external(engine)
         store.request_quarantine_resume(ctx.run_id, quarantine_id)
@@ -2677,8 +2770,30 @@ def __test_the_resume_watch_ends_the_latch_and_stops_the_run_for_a_restart__(
 
         assert engine.quarantine_resume_restart
         assert signals == [signal.SIGTERM]
+        assert engine.venue_writes_blocked, "the stopping process never writes again"
         row = ctx.get_quarantine(quarantine_id)
-        assert row is not None and row.end_reason == 'operator_resume'
+        assert row is not None and row.ended_ts_ms is None
+        assert row.resume_requested_ts_ms is not None
+        # The stopping process's guard still persists its own levels...
+        old_guard.expect("p1", ProtectionLevels(stop=96.0))
+        old_guard.settle("p1", ProtectionLevels(stop=96.0))
+        ctx.close()
+
+        restarted = _open_ctx(store)
+        caplog.clear()
+        engine, _pos = _mk_engine(_MockBroker(), restarted)
+        assert not engine.quarantined
+        assert engine.resumed_from_quarantine
+        row = restarted.get_quarantine(quarantine_id)
+        assert row is not None and row.ended_ts_ms is None, "open until the resume completed"
+        leg = restarted.get_order("leg-1")
+        assert leg is not None
+        saved = (leg.extras or {})[PROTECTION_LEVELS_EXTRA]
+        assert saved['rebaseline'] is True and saved['writes'] == []
+        resumed = [r.getMessage() for r in caplog.records
+                   if "sync engine quarantine resumed:" in r.getMessage()]
+        assert len(resumed) == 1
+        assert f"kind=external_intervention quarantine_id={quarantine_id}" in resumed[0]
 
 
 def __test_the_resume_watch_persists_a_latch_whose_store_write_failed__(
@@ -2728,6 +2843,169 @@ def __test_the_resume_command_stamps_the_request_and_lists_open_latches_on_a_mis
         row = ctx.get_quarantine(quarantine_id)
         assert row is not None and row.resume_requested_ts_ms is not None
 
+
+
+@pytest.mark.parametrize(
+    "case", ["first-absence", "stamped-before-the-resume", "past-the-window", "plain-restart",
+             "seen-after-the-resume"])
+def __test_a_cancel_the_operator_resume_accepted_is_no_new_intervention__(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture, case: str,
+) -> None:
+    """A venue ``cancelled`` event for an order cancelled before the resume does not quarantine.
+
+    The bot was down while quarantined; the operator deleted its resting
+    order, resumed and started it. A plugin that replays the venue's history
+    after the restart (Capital.com's activity catch-up) reports the deletion
+    as a plain ``cancelled`` event of a mapped order. The resume accepted it,
+    exactly as the disappearance tracker accepts the same row; a cancel the
+    resume did not accept is judged as usual, and so is the cancel of an order
+    the restarted engine's first open-orders read still listed after the resume.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        first = _open_ctx(store)
+        broker = _MockBroker()
+        engine, pos = _mk_engine(broker, first)
+        pos.entry_orders["L"] = Order("L", 1.0, order_type=_order_type_entry, limit=50_000.0)
+        engine.sync(BAR_TS)
+        intent = engine.active_intents["L"]
+        coid = broker.entry_calls[0].client_order_id('e')
+        first.upsert_order(
+            coid, symbol=SYMBOL, side="buy", qty=1.0, state="confirmed",
+            pine_entry_id="L", exchange_order_id="xchg-1",
+            extras=({MISSING_PENDING_EXTRA: time.time() - 60.0}
+                    if case == "stamped-before-the-resume" else {}),
+        )
+        quarantine_id = _latch_external(engine)
+        first.close()
+        if case != "plain-restart":
+            store.request_quarantine_resume(first.run_id, quarantine_id)
+
+        restarted = _open_ctx(store)
+        restarted_broker = _MockBroker()
+        engine, _pos = _mk_engine(restarted_broker, restarted)
+        row = restarted.get_order(coid)
+        assert row is not None
+        if case == "seen-after-the-resume":
+            restarted_broker.open_orders = [ExchangeOrder(
+                id="xchg-1", symbol=SYMBOL, side="buy", order_type=OrderType.LIMIT,
+                qty=1.0, filled_qty=0.0, remaining_qty=1.0, price=50_000.0,
+                stop_price=None, average_fill_price=None, status=OrderStatus.OPEN,
+                timestamp=time.time(), fee=0.0, fee_currency="", client_order_id=coid,
+            )]
+            engine._scan_live_entry_anchors_for_restart()  # noqa: SLF001
+            row = restarted.get_order(coid)
+            assert row is not None and MISSING_ACCEPTED_BY_RESUME_EXTRA not in (row.extras or {})
+        if case == "past-the-window":
+            resumed_at_key = disappearance_module._MISSING_RESUMED_AT_EXTRA  # noqa: SLF001
+            extras = dict(row.extras or {})
+            extras[resumed_at_key] -= RESUME_FIRST_ABSENCE_WINDOW_S + 1.0
+            restarted.upsert_order(coid, extras=extras)
+        engine._order_mapping["L"] = ["xchg-1"]  # noqa: SLF001 -- the restored resting entry
+        engine._active_intents["L"] = intent  # noqa: SLF001
+        caplog.clear()
+        engine._route_event(OrderEvent(  # noqa: SLF001
+            order=ExchangeOrder(
+                id="xchg-1", symbol=SYMBOL, side="buy", order_type=OrderType.LIMIT,
+                qty=1.0, filled_qty=0.0, remaining_qty=1.0, price=50_000.0,
+                stop_price=None, average_fill_price=None, status=OrderStatus.CANCELLED,
+                timestamp=time.time(), fee=0.0, fee_currency="", client_order_id=coid,
+            ),
+            event_type='cancelled', fill_price=None, fill_qty=None,
+            timestamp=time.time(), pine_id="L",
+        ))
+
+        assert "L" not in engine.order_mapping
+        accepted = [coid for _key, coid, _xid, _payload
+                    in restarted.iter_events_by_kind_for_run_id('cancel_accepted_by_resume')]
+        if case in ("first-absence", "stamped-before-the-resume"):
+            assert not engine.quarantined
+            assert engine.resumed_from_quarantine
+            assert accepted == [coid]
+            assert any(r.levelname == "WARNING" and "the resume accepted it" in r.getMessage()
+                       for r in caplog.records)
+            latch = restarted.get_quarantine(quarantine_id)
+            assert latch is not None and latch.ended_ts_ms is None, "the resume is still pending"
+            row = restarted.get_order(coid)
+            assert row is not None and MISSING_ACCEPTED_BY_RESUME_EXTRA in (row.extras or {}), (
+                "the tracker accepts the same absence")
+        else:
+            assert engine.venue_writes_blocked
+            assert accepted == []
+            if case in ("past-the-window", "seen-after-the-resume"):
+                assert engine.quarantine_id != quarantine_id, "a new intervention"
+        restarted.close()
+
+
+@pytest.mark.parametrize("when", ["before-the-watch", "while-stopping", "write-failed"])
+def __test_an_entry_block_resume_never_resumes_the_intervention_it_escalated_to__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+        when: str,
+) -> None:
+    """The operator lifted an entry block; the intervention after it is not lifted with it.
+
+    The escalation keeps the latch id, so the store must drop the pending
+    resume request when it rewrites the kind: before the resume watch saw the
+    request, while the process stops for it, or once a failed escalation
+    write lands at last (the watch never consumes a request while its own
+    latch is not on disk). The restarted bot then holds the intervention.
+    """
+    signals: list[int] = []
+    monkeypatch.setattr(sync_engine_module._thread, 'interrupt_main', signals.append)  # noqa
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), ctx)
+        engine.record_quarantine("close_rejected_repeatedly")
+        quarantine_id = engine.quarantine_id
+        assert quarantine_id is not None
+        assert store.request_quarantine_resume(ctx.run_id, quarantine_id) is not None
+
+        async def _watch(ticks: int) -> None:
+            task = asyncio.create_task(engine.run_quarantine_resume_watch(interval_s=0.0))
+            for _ in range(ticks):
+                await asyncio.sleep(0)
+                if task.done():
+                    break
+            task.cancel()
+
+        def _escalate() -> None:
+            engine.record_quarantine("operator moved the stop",
+                                     kind=QuarantineKind.EXTERNAL_INTERVENTION)
+
+        if when == "while-stopping":
+            asyncio.run(_watch(10))
+            assert engine.quarantine_resume_restart
+            _escalate()
+        elif when == "write-failed":
+            original = ctx.record_quarantine
+
+            def _failing(*_args, **_kwargs):
+                raise OSError("disk full")
+
+            monkeypatch.setattr(ctx, 'record_quarantine', _failing)
+            _escalate()
+            asyncio.run(_watch(10))
+            assert not engine.quarantine_resume_restart, "its own latch is not on disk yet"
+            monkeypatch.setattr(ctx, 'record_quarantine', original)
+            asyncio.run(_watch(10))
+            assert not engine.quarantine_resume_restart
+        else:
+            _escalate()
+            asyncio.run(_watch(10))
+            assert not engine.quarantine_resume_restart
+        row = ctx.get_quarantine(quarantine_id)
+        assert row is not None and row.kind == QuarantineKind.EXTERNAL_INTERVENTION
+        assert row.resume_requested_ts_ms is None
+        ctx.close()
+
+        caplog.clear()
+        restarted = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), restarted)
+        assert engine.venue_writes_blocked and engine.quarantine_id == quarantine_id
+        assert not engine.resumed_from_quarantine
+        assert any(r.levelname == "ERROR" and "(restored at startup" in r.getMessage()
+                   and "kind=external_intervention" in r.getMessage()
+                   for r in caplog.records)
+        restarted.close()
 
 
 def __test_a_late_entry_block_write_never_downgrades_a_persisted_escalation__(

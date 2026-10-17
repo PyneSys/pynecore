@@ -42,7 +42,7 @@ import logging
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -214,10 +214,12 @@ class SpotEpochRow:
     foreign_baseline: str
     cursor_scope: str | None
     exec_cursor: str | None
-    state: str  # "active" | "quarantined" | "closed"
+    state: str  # "active" | "quarantined" | "taken" | "closed"
     created_ts_ms: int
     pending_conflict_ts_ms: int | None = None
     pending_conflict: dict | None = None
+    reread_cursor: str | None = None
+    reread_until_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -532,6 +534,19 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         );
         CREATE INDEX idx_quarantines_open
             ON quarantines (run_id) WHERE ended_ts_ms IS NULL;
+    """),
+    (9, "spot_inventory_epoch reread window columns", """
+        -- The execution span a foreign-holdings re-anchor kept its cursor
+        -- on: every reconcile reads the history again from
+        -- ``reread_cursor`` until ``reread_until_ms``, so a fill of the
+        -- bot's own the venue indexes late is still booked. Persisted with
+        -- the epoch the re-anchor creates, so a restart inside the window
+        -- keeps reading the span instead of advancing past it. NULL
+        -- ``reread_until_ms`` = no window.
+        ALTER TABLE spot_inventory_epoch
+            ADD COLUMN reread_cursor TEXT;
+        ALTER TABLE spot_inventory_epoch
+            ADD COLUMN reread_until_ms INTEGER;
     """),
 ]
 
@@ -2010,6 +2025,27 @@ class RunContext:
         for row in rows:
             yield _row_to_order(row)
 
+    def iter_orders_in_state_for_run_id(self, state: str) -> Iterator[OrderRow]:
+        """Iterate every order row in ``state`` of this logical run, live or closed.
+
+        Scoped to ``runs.run_id`` like :meth:`iter_events_by_kind_for_run_id`:
+        the rows of every process instance of the run, the closed ones
+        included, until the retention purge removes them
+        (:meth:`BrokerStore.cleanup_old_data`). Oldest first. Read-only.
+
+        :param state: The ``orders.state`` value to match.
+        """
+        with self._store.read_lock() as conn:
+            rows = conn.execute(
+                "SELECT o.* FROM orders AS o "
+                "JOIN runs AS r ON o.run_instance_id = r.run_instance_id "
+                "WHERE r.run_id = ? AND o.state = ? "
+                "ORDER BY o.created_ts_ms",
+                (self.run_id, state),
+            ).fetchall()
+        for row in rows:
+            yield _row_to_order(row)
+
     def foreign_live_exchange_order_ids(self, *, symbol: str) -> set[str]:
         """Return physical order ids claimed by another run on this account.
 
@@ -2171,6 +2207,45 @@ class RunContext:
                 row['exchange_order_id'],
                 payload,
             )
+
+    def latest_event_for_run_id(
+            self, kinds: Iterable[str],
+    ) -> tuple[str, dict] | None:
+        """Return the most recently written event of any of ``kinds`` for this logical run.
+
+        Scoped to ``runs.run_id`` like :meth:`iter_events_by_kind_for_run_id`
+        and ordered by insertion, so events of different kinds written by
+        different process instances compare in the order they happened.
+
+        :param kinds: The event kinds to consider.
+        :return: ``(kind, payload)``, the payload an empty dict when it is
+            missing or malformed; ``None`` when no such event exists.
+        """
+        kind_list = list(kinds)
+        if not kind_list:
+            return None
+        placeholders = ', '.join('?' for _ in kind_list)
+        with self._store.read_lock() as conn:
+            row = conn.execute(
+                "SELECT e.kind, e.payload "
+                "FROM events AS e "
+                "JOIN runs AS r ON e.run_instance_id = r.run_instance_id "
+                f"WHERE r.run_id = ? AND e.kind IN ({placeholders}) "
+                "ORDER BY e.id DESC LIMIT 1",
+                (self.run_id, *kind_list),
+            ).fetchone()
+        if row is None:
+            return None
+        payload: dict = {}
+        raw = row['payload']
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                payload = parsed
+        return row['kind'], payload
 
     # --- Spot inventory: execution ledger ----------------------------------
 
@@ -2384,6 +2459,7 @@ class RunContext:
             cursor_scope: str | None,
             exec_cursor: str | None,
             state: str = 'active',
+            reread_until_ms: int | None = None,
     ) -> SpotEpochRow:
         """Insert the next epoch generation for a product.
 
@@ -2391,6 +2467,10 @@ class RunContext:
         (1 for the first). Runs inside the caller's transaction when one
         is open — the recovery path relies on this to make "write new
         epoch + activate" a single atomic span.
+
+        :param reread_until_ms: When set, the epoch opens a reread window:
+            reconciles read the history again from ``exec_cursor`` (kept as
+            ``reread_cursor``) until this time.
 
         :return: The freshly inserted row.
         """
@@ -2408,12 +2488,14 @@ class RunContext:
                 "INSERT INTO spot_inventory_epoch ("
                 "  run_id, plugin_name, account_id, base_asset, product_id,"
                 "  epoch_seq, foreign_baseline, cursor_scope, exec_cursor,"
-                "  state, created_ts_ms"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  state, created_ts_ms, reread_cursor, reread_until_ms"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     self.run_id, self._store._plugin_name, account_id,
                     base_asset, product_id, epoch_seq, foreign_baseline,
                     cursor_scope, exec_cursor, state, now,
+                    exec_cursor if reread_until_ms is not None else None,
+                    reread_until_ms,
                 ),
             )
         return SpotEpochRow(
@@ -2427,6 +2509,8 @@ class RunContext:
             exec_cursor=exec_cursor,
             state=state,
             created_ts_ms=now,
+            reread_cursor=exec_cursor if reread_until_ms is not None else None,
+            reread_until_ms=reread_until_ms,
         )
 
     # noinspection SqlResolve
@@ -2458,6 +2542,17 @@ class RunContext:
                 "UPDATE spot_inventory_epoch SET exec_cursor = ? "
                 "WHERE run_id = ? AND product_id = ? AND epoch_seq = ?",
                 (exec_cursor, self.run_id, product_id, epoch_seq),
+            )
+
+    # noinspection SqlResolve
+    def clear_spot_epoch_reread(self, product_id: str, epoch_seq: int) -> None:
+        """Close an epoch's reread window: the history's cursor advances freely again."""
+        with self._store.transaction():
+            self._store._conn.execute(
+                "UPDATE spot_inventory_epoch "
+                "SET reread_cursor = NULL, reread_until_ms = NULL "
+                "WHERE run_id = ? AND product_id = ? AND epoch_seq = ?",
+                (self.run_id, product_id, epoch_seq),
             )
 
     # noinspection SqlResolve
@@ -2687,9 +2782,13 @@ class RunContext:
         recorded on the same id, together with the escalation's reason. The
         update is monotonic: an ``external_intervention`` row is never
         rewritten, so a late ``entry_block`` write of the same id (one that
-        raced the escalation on another thread) cannot downgrade it.
+        raced the escalation on another thread) cannot downgrade it. The
+        escalation drops a resume requested for the entry block: the operator
+        lifted an entry block and never saw the intervention, so it must be
+        resumed on its own.
         """
         context_json = json.dumps(context, default=str) if context else None
+        external = str(QuarantineKind.EXTERNAL_INTERVENTION)
         with self._store.transaction() as conn:
             conn.execute(
                 "INSERT INTO quarantines ("
@@ -2698,10 +2797,12 @@ class RunContext:
                 ") VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT (quarantine_id) DO UPDATE SET"
                 "  kind = excluded.kind, reason = excluded.reason,"
-                "  intent_key = excluded.intent_key, context = excluded.context "
+                "  intent_key = excluded.intent_key, context = excluded.context,"
+                "  resume_requested_ts_ms = CASE WHEN excluded.kind = ? THEN NULL"
+                "    ELSE quarantines.resume_requested_ts_ms END "
                 "WHERE quarantines.kind != ?",
                 (quarantine_id, self.run_id, kind, reason, intent_key,
-                 context_json, entered_ts_ms, str(QuarantineKind.EXTERNAL_INTERVENTION)),
+                 context_json, entered_ts_ms, external, external),
             )
 
     def get_quarantine(self, quarantine_id: str) -> QuarantineRow | None:
@@ -2783,7 +2884,7 @@ class RunContext:
 
 # === Private helpers =======================================================
 
-_SPOT_EPOCH_STATES = ('active', 'quarantined', 'closed')
+_SPOT_EPOCH_STATES = ('active', 'quarantined', 'taken', 'closed')
 
 
 def _validate_spot_epoch_state(state: str) -> None:
@@ -2840,6 +2941,10 @@ def _row_to_spot_epoch(row: sqlite3.Row) -> SpotEpochRow:
             else int(row['pending_conflict_ts_ms'])
         ),
         pending_conflict=conflict,
+        reread_cursor=row['reread_cursor'],
+        reread_until_ms=(
+            None if row['reread_until_ms'] is None else int(row['reread_until_ms'])
+        ),
     )
 
 

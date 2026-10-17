@@ -31,9 +31,18 @@ venue and judges every venue observation against them:
   venue's current protection.
 - **Persisted.** The accepted levels live in the extras of a journal row the
   plugin names, so a restart restores them (on first use) and a crash in the
-  middle of a write leaves both the old and the new levels acceptable. An
-  operator resume (:func:`rebaseline_after_resume`) accepts the venue as the
-  operator left it: the first observation after it becomes the new baseline.
+  middle of a write leaves both the old and the new levels acceptable.
+- **Rebaselined on an operator resume.** :func:`rebaseline_after_resume`
+  voids every level written before the resume: the operator accepted the
+  venue as it stands. The first judged observation after it becomes the
+  baseline. Writes the bot sends after the resume (re-asserting its own
+  levels) stay acceptable on top of it, whatever their outcome: a refused or
+  unknown re-assert never turns the operator's levels into an edit, and the
+  key stays guarded even when its only post-resume write is refused. A
+  re-assert the venue confirms ends the rebaseline: the venue carries the
+  bot's levels again, and a snapshot read after it that shows other levels
+  is an edit. Until the venue is seen carrying the re-assert, a push that
+  does not match it may predate it and is not judged.
 - **Tolerant.** Levels match within half a price tick. Under a trailing stop
   the stop level is the venue's to move: only the trailing flag, the trail
   distance and the take-profit are compared.
@@ -147,6 +156,9 @@ class _Entry:
     mismatch_count: int = 0
     reported: bool = False
     rebaseline: bool = False
+    unseen_reassert: bool = False
+    """A post-resume write was confirmed, but no view showed it yet: a push
+    that does not match a write may still carry the operator's older levels."""
 
     def add(self, levels: ProtectionLevels) -> int:
         """Append a new write of ``levels`` and return its ``gen``."""
@@ -254,7 +266,6 @@ class ProtectionLevelGuard:
         """
         self._restore()
         entry = self._entry_on_row(key, row_coid)
-        entry.rebaseline = False
         gen = entry.add(levels)
         entry.unresolved.append(gen)
         entry.resolve_count = 0
@@ -283,6 +294,7 @@ class ProtectionLevelGuard:
         entry.unresolved = []
         entry.resolve_count = 0
         entry.rebaseline = False
+        entry.unseen_reassert = False
         entry.mismatch = None
         entry.mismatch_count = 0
         self._persist(key, entry)
@@ -316,6 +328,12 @@ class ProtectionLevelGuard:
         entry.in_flight = max(0, entry.in_flight - 1)
         entry.written_at = self._clock()
         if confirmed is not None:
+            if entry.rebaseline:
+                # The venue took the bot's re-assert after the resume: it no
+                # longer carries the operator's levels, so the next view is
+                # judged against the bot's own.
+                entry.rebaseline = False
+                entry.unseen_reassert = True
             open_gens = [write] if entry.get(write) is not None else entry.open_writes(confirmed)
             if not open_gens:
                 entry.promote(entry.add(confirmed))
@@ -334,9 +352,11 @@ class ProtectionLevelGuard:
                 if gen in entry.unresolved:
                     entry.unresolved.remove(gen)
                 entry.writes = [w for w in entry.writes if w.gen != gen]
-            if not entry.writes:
+            if not entry.writes and not entry.rebaseline:
                 # The refused write was the key's first: the guard knows no
-                # protection of the bot's on the venue.
+                # protection of the bot's on the venue. After a resume the
+                # venue still carries the operator's accepted protection, which
+                # the next observation adopts as the baseline.
                 self.forget(key)
                 return
         self._persist(key, entry)
@@ -375,24 +395,33 @@ class ProtectionLevelGuard:
             return False
         if read_started_at is not None and read_started_at < entry.written_at:
             return False
-        if entry.rebaseline:
-            # The operator resumed the run: what the venue carries now is the
-            # accepted state until the bot writes its own levels again.
-            entry.rebaseline = False
-            entry.writes = []
-            entry.confirmed = entry.add(venue)
-            entry.unresolved = []
-            entry.resolve_count = 0
-            self._persist(key, entry)
-            return False
         tolerance = 0.5 * tick if tick > 0.0 and math.isfinite(tick) else 0.0
         tolerance += 1e-12 * max(1.0, abs(venue.stop or 0.0), abs(venue.limit or 0.0))
         matching = [w.gen for w in entry.writes if w.levels.matches(venue, tolerance)]
+        if entry.rebaseline:
+            # The operator resumed the run: the venue as it stands is accepted.
+            # A view one of the bot's post-resume writes explains resolves that
+            # write as usual; any other view is the operator's accepted
+            # protection and becomes the baseline, older than those writes.
+            entry.rebaseline = False
+            entry.mismatch = None
+            entry.mismatch_count = 0
+            if matching:
+                self._resolve(entry, matching, snapshot=read_started_at is not None)
+            else:
+                self._adopt_baseline(entry, venue)
+            self._persist(key, entry)
+            return False
         if matching:
+            entry.unseen_reassert = False
             entry.mismatch = None
             entry.mismatch_count = 0
             if self._resolve(entry, matching, snapshot=read_started_at is not None):
                 self._persist(key, entry)
+            return False
+        if entry.unseen_reassert and read_started_at is None:
+            # A push of the levels the operator left may still arrive after the
+            # bot's confirmed re-assert; a snapshot read after the write decides.
             return False
         entry.resolve_count = 0
         if entry.mismatch is not None and entry.mismatch.matches(venue, tolerance):
@@ -403,7 +432,8 @@ class ProtectionLevelGuard:
         if not immediate and entry.mismatch_count < _CONFIRMATIONS:
             return False
         entry.reported = True
-        expected = entry.confirmed_levels() or entry.writes[-1].levels
+        expected = entry.confirmed_levels() or (
+            entry.writes[-1].levels if entry.writes else ProtectionLevels())
         reason = (
             f"bot protection {key!r} changed on the venue by someone else: "
             f"expected {_describe(expected)}, found {_describe(venue)}"
@@ -415,6 +445,26 @@ class ProtectionLevelGuard:
             'client_order_id': entry.row_coid,
         })
         return True
+
+    @staticmethod
+    def _adopt_baseline(entry: _Entry, venue: ProtectionLevels) -> None:
+        """Accept ``venue`` as the levels the venue carried before every recorded write.
+
+        The baseline is ranked older than the writes still recorded (the bot's
+        own writes after a resume), so a later view of one of them still
+        resolves it. It is the venue's protection known to have landed unless a
+        recorded write already is.
+        """
+        if not entry.writes:
+            entry.confirmed = entry.add(venue)
+            entry.unresolved = []
+            entry.resolve_count = 0
+            return
+        baseline = _Write(entry.writes[0].gen - 1, venue)
+        entry.writes.insert(0, baseline)
+        if entry.get(entry.confirmed) is None:
+            entry.confirmed = baseline.gen
+        entry.resolve_count = 0
 
     @staticmethod
     def _resolve(entry: _Entry, matching: list[int], *, snapshot: bool) -> bool:
@@ -514,21 +564,31 @@ class ProtectionLevelGuard:
 
 
 def rebaseline_after_resume(store_ctx: 'RunContext') -> None:
-    """Make every persisted protection baseline adopt the venue's next view.
+    """Void every persisted protection baseline: the venue's next view is accepted.
 
     An operator resume accepts the venue as the operator left it. Without this
     the restarted bot would judge the operator's levels against its own
-    pre-quarantine ones and quarantine again at once.
+    pre-quarantine ones and quarantine again at once. The pre-resume writes
+    are dropped, not kept beside the operator's levels: they no longer
+    describe anything the venue is expected to carry.
+
+    Must run in the process that uses the guard after the resume, before the
+    plugin first touches it (the engine calls it while it restores the latch
+    at construction), so nothing written by a guard of the stopped process can
+    undo it.
 
     :param store_ctx: The resumed run's journal.
     """
     with store_ctx.transaction():
         for row in store_ctx.iter_live_orders():
             saved = (row.extras or {}).get(PROTECTION_LEVELS_EXTRA)
-            if not isinstance(saved, dict) or saved.get('rebaseline'):
+            if not isinstance(saved, dict):
                 continue
             extras = dict(row.extras or {})
-            extras[PROTECTION_LEVELS_EXTRA] = {**saved, 'rebaseline': True}
+            extras[PROTECTION_LEVELS_EXTRA] = {
+                **saved, 'writes': [], 'confirmed': None, 'unresolved': [],
+                'rebaseline': True,
+            }
             store_ctx.upsert_order(row.client_order_id, extras=extras)
 
 

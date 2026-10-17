@@ -243,6 +243,42 @@ def __test_broker_mode_swaps_position_to_broker_position__(tmp_path):
     assert runner._order_sync_engine is not None
 
 
+@pytest.mark.parametrize("resumed", [False, True], ids=["plain-start", "after-resume"])
+def __test_the_plugin_gets_the_operator_resume_boundary_before_it_connects__(
+        tmp_path, resumed: bool,
+):
+    """The plugin's own intervention judges accept what changed before a resume."""
+    from pynecore.core.broker.models import QuarantineKind
+    from pynecore.core.broker.run_identity import RunIdentity
+    from pynecore.core.broker.storage import BrokerStore
+
+    script_path = __test_helper_write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
+    identity = RunIdentity(strategy_id="t026", symbol="BTCUSDT", timeframe="1",
+                           account_id="test-account", label=None)
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="mock") as store:
+        if resumed:
+            ctx = store.open_run(identity, script_source="// t026")
+            ctx.record_quarantine("q1", kind=str(QuarantineKind.EXTERNAL_INTERVENTION),
+                                  reason="SL moved", intent_key=None, context={},
+                                  entered_ts_ms=1)
+            store.request_quarantine_resume(ctx.run_id, "q1")
+            ctx.close()
+        ctx = store.open_run(identity, script_source="// t026")
+        plugin = MockBrokerPlugin(capabilities=ExchangeCapabilities())
+        runner = ScriptRunner(
+            script_path=script_path,
+            ohlcv_iter=_make_bars(1),
+            syminfo=_make_syminfo(),
+            broker_plugin=plugin,  # type: ignore[arg-type]
+            broker_store_ctx=ctx,
+        )
+        engine = runner._order_sync_engine
+        assert engine is not None
+        assert plugin.operator_resume_ts_ms == engine.operator_resume_ts_ms
+        assert (plugin.operator_resume_ts_ms is not None) is resumed
+        ctx.close()
+
+
 def __test_startup_reconcile_seeds_broker_position_from_exchange__(tmp_path):
     """Startup reconcile adopts a pre-existing exchange position into ``BrokerPosition``.
 

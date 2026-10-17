@@ -23,9 +23,13 @@ import pytest
 
 from pynecore.core.broker.disappearance import (
     MISSING_PENDING_EXTRA,
+    RESUME_FIRST_ABSENCE_WINDOW_S,
     DisappearanceTracker,
     MissingConfirmation,
     MissingResolution,
+    accept_missing_before_resume,
+    note_seen_after_resume,
+    resume_accepts_cancel,
 )
 from pynecore.core.broker.exceptions import UnexpectedCancelError
 from pynecore.core.broker.models import (
@@ -1121,3 +1125,250 @@ def __test_store_transaction_unswallowed_nested_propagates_original__(
         row = ctx.get_order("c1")
         assert row is not None
         assert row.filled_qty == pytest.approx(0.1)
+
+
+# === Operator resume ==========================================================
+
+def __test_a_cancel_stamped_before_a_resume_is_retired_without_the_policy__(
+        tmp_path: Path) -> None:
+    """The operator accepted the venue as it stands, including that cancel."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1")
+        latched: list = []
+        tracker = _make_tracker(
+            ctx, request_quarantine=lambda *a, **k: latched.append(a))
+        _run(_drain(tracker, {'working': set()}, T0))
+        assert accept_missing_before_resume(ctx) == 1
+
+        events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
+
+        assert latched == []
+        assert [e.event_type for e in events] == ['cancelled']
+        row = ctx.get_order("c1")
+        assert row is not None and row.closed_ts_ms is not None
+        assert [cid for cid, _ in _read_events(ctx, 'cancel_accepted_by_resume')] == ["c1"]
+        assert _read_events(ctx, 'unexpected_cancel') == []
+        assert _read_events(ctx, 'unexpected_cancel_quarantine') == []
+
+
+def __test_a_cancel_stamped_again_after_a_resume_applies_the_policy__(
+        tmp_path: Path) -> None:
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1")
+        latched: list = []
+        tracker = _make_tracker(
+            ctx, request_quarantine=lambda *a, **k: latched.append(a))
+        _run(_drain(tracker, {'working': set()}, T0))
+        accept_missing_before_resume(ctx)
+        # The order comes back, then vanishes again after the resume.
+        _run(_drain(tracker, {'working': {"D1"}}, T0 + 1.0))
+        row = ctx.get_order("c1")
+        assert row is not None and not (row.extras or {})
+        _run(_drain(tracker, {'working': set()}, T0 + 2.0))
+
+        _run(_drain(tracker, {'working': set()}, T0 + 2.0 + GRACE + 1.0))
+
+        assert len(latched) == 1
+        assert [cid for cid, _ in _read_events(ctx, 'unexpected_cancel')] == ["c1"]
+
+
+def __test_a_cancel_first_seen_after_a_resume_is_accepted__(tmp_path: Path) -> None:
+    """Cancelled while no process watched, resumed while down: not a new intervention."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1")
+        latched: list = []
+        tracker = _make_tracker(
+            ctx, request_quarantine=lambda *a, **k: latched.append(a))
+        assert accept_missing_before_resume(ctx) == 1
+
+        _run(_drain(tracker, {'working': set()}, T0))
+        events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
+
+        assert latched == []
+        assert [e.event_type for e in events] == ['cancelled']
+        assert [cid for cid, _ in _read_events(ctx, 'cancel_accepted_by_resume')] == ["c1"]
+        assert _read_events(ctx, 'unexpected_cancel_quarantine') == []
+
+
+def __test_a_row_seen_after_a_resume_loses_the_acceptance__(tmp_path: Path) -> None:
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1")
+        latched: list = []
+        tracker = _make_tracker(
+            ctx, request_quarantine=lambda *a, **k: latched.append(a))
+        accept_missing_before_resume(ctx)
+        # An incomplete snapshot proves nothing: the acceptance survives it.
+        _run(_drain(tracker, {}, T0))
+        row = ctx.get_order("c1")
+        assert row is not None and (row.extras or {}) != {}
+
+        _run(_drain(tracker, {'working': {"D1"}}, T0 + 1.0))
+        row = ctx.get_order("c1")
+        assert row is not None and not (row.extras or {})
+        _run(_drain(tracker, {'working': set()}, T0 + 2.0))
+        _run(_drain(tracker, {'working': set()}, T0 + 2.0 + GRACE + 1.0))
+
+        assert len(latched) == 1
+        assert _read_events(ctx, 'cancel_accepted_by_resume') == []
+
+
+def _plugin_stamp(ctx: RunContext, coid: str, since: float) -> None:
+    """A plugin stamping the row on its own evidence, past the presence feed."""
+    row = ctx.get_order(coid)
+    assert row is not None
+    ctx.upsert_order(coid, extras={**(row.extras or {}), MISSING_PENDING_EXTRA: since})
+
+
+def _plugin_clear(ctx: RunContext, coid: str) -> None:
+    row = ctx.get_order(coid)
+    assert row is not None
+    ctx.upsert_order(coid, extras={k: v for k, v in (row.extras or {}).items()
+                                   if k != MISSING_PENDING_EXTRA})
+
+
+def __test_a_plugin_stamp_right_after_a_resume_is_the_accepted_first_absence__(
+        tmp_path: Path) -> None:
+    """A working order the plugin itself proves gone (no presence ref): it was
+    cancelled while the bot was down, so the resume accepted it."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", eoid=None)
+        latched: list = []
+        tracker = _make_tracker(
+            ctx, request_quarantine=lambda *a, **k: latched.append(a))
+        accept_missing_before_resume(ctx, resumed_at=T0)
+        _plugin_stamp(ctx, "c1", T0 + 20.0)
+
+        events = _run(_drain(tracker, {'working': None}, T0 + 20.0 + GRACE + 1.0))
+
+        assert latched == []
+        assert [e.event_type for e in events] == ['cancelled']
+        assert [cid for cid, _ in _read_events(ctx, 'cancel_accepted_by_resume')] == ["c1"]
+        assert _read_events(ctx, 'unexpected_cancel') == []
+
+
+def __test_a_plugin_stamp_long_after_a_resume_is_judged_as_usual__(tmp_path: Path) -> None:
+    """The order rested on after the resume; someone cancelled it later."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", eoid=None)
+        latched: list = []
+        tracker = _make_tracker(
+            ctx, request_quarantine=lambda *a, **k: latched.append(a))
+        accept_missing_before_resume(ctx, resumed_at=T0)
+        _run(_drain(tracker, {'working': None}, T0 + 1.0))
+        row = ctx.get_order("c1")
+        assert row is not None and (row.extras or {}) != {}, "still within the window"
+
+        late = T0 + RESUME_FIRST_ABSENCE_WINDOW_S + 1.0
+        _run(_drain(tracker, {'working': None}, late))
+        row = ctx.get_order("c1")
+        assert row is not None and not (row.extras or {}), "the mark expired unstamped"
+        _plugin_stamp(ctx, "c1", late + 1.0)
+        _run(_drain(tracker, {'working': None}, late + 1.0 + GRACE + 1.0))
+
+        assert len(latched) == 1
+        assert [cid for cid, _ in _read_events(ctx, 'unexpected_cancel')] == ["c1"]
+        assert _read_events(ctx, 'cancel_accepted_by_resume') == []
+
+
+def __test_a_late_plugin_stamp_within_an_unexpired_mark_is_judged_as_usual__(
+        tmp_path: Path) -> None:
+    """No tracker pass ran in between: the stamp's own time decides."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", eoid=None)
+        latched: list = []
+        tracker = _make_tracker(
+            ctx, request_quarantine=lambda *a, **k: latched.append(a))
+        accept_missing_before_resume(ctx, resumed_at=T0)
+        late = T0 + RESUME_FIRST_ABSENCE_WINDOW_S + 1.0
+        _plugin_stamp(ctx, "c1", late)
+
+        _run(_drain(tracker, {'working': None}, late + GRACE + 1.0))
+
+        assert len(latched) == 1
+        assert _read_events(ctx, 'cancel_accepted_by_resume') == []
+
+
+def __test_an_accepted_stamp_the_plugin_cleared_loses_the_acceptance__(
+        tmp_path: Path) -> None:
+    """The order came back: a later disappearance is a new one."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", eoid=None, extras={MISSING_PENDING_EXTRA: T0})
+        latched: list = []
+        tracker = _make_tracker(
+            ctx, request_quarantine=lambda *a, **k: latched.append(a))
+        accept_missing_before_resume(ctx, resumed_at=T0 + 1.0)
+        _plugin_clear(ctx, "c1")
+        _run(_drain(tracker, {'working': None}, T0 + 2.0))
+        row = ctx.get_order("c1")
+        assert row is not None and not (row.extras or {})
+
+        _plugin_stamp(ctx, "c1", T0 + 3.0)
+        _run(_drain(tracker, {'working': None}, T0 + 3.0 + GRACE + 1.0))
+
+        assert len(latched) == 1
+        assert [cid for cid, _ in _read_events(ctx, 'unexpected_cancel')] == ["c1"]
+
+
+@pytest.mark.parametrize(
+    ("stamp", "reported", "accepted"),
+    [(None, T0 + 10.0, True),
+     (None, T0 + RESUME_FIRST_ABSENCE_WINDOW_S + 1.0, False),
+     (T0 + 10.0, T0 + RESUME_FIRST_ABSENCE_WINDOW_S + 1.0, True),
+     (T0 + RESUME_FIRST_ABSENCE_WINDOW_S + 1.0, T0 + RESUME_FIRST_ABSENCE_WINDOW_S + 2.0, False),
+     ("before", T0 + RESUME_FIRST_ABSENCE_WINDOW_S * 10.0, True)],
+    ids=["first-absence", "reported-past-the-window", "stamped-within-the-window",
+         "stamped-past-the-window", "stamped-before-the-resume"],
+)
+def __test_a_cancel_a_plugin_reports_itself_gets_the_trackers_resume_verdict__(
+        tmp_path: Path, stamp: float | str | None, reported: float, accepted: bool,
+) -> None:
+    """A plugin's own ``cancelled`` event for a marked row: the absence the resume accepted."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", eoid=None,
+                  extras={MISSING_PENDING_EXTRA: T0 - 5.0} if stamp == "before" else None)
+        accept_missing_before_resume(ctx, resumed_at=T0)
+        if isinstance(stamp, float):
+            _plugin_stamp(ctx, "c1", stamp)
+        row = ctx.get_order("c1")
+        assert row is not None
+
+        assert resume_accepts_cancel(row, now_ts=reported) is accepted
+
+
+def __test_a_row_no_resume_marked_never_accepts_a_cancel__(tmp_path: Path) -> None:
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", eoid=None, extras={MISSING_PENDING_EXTRA: T0})
+        row = ctx.get_order("c1")
+        assert row is not None
+
+        assert resume_accepts_cancel(row, now_ts=T0 + 1.0) is False
+
+
+def __test_an_order_listed_after_a_resume_loses_its_first_absence_acceptance__(
+        tmp_path: Path) -> None:
+    """The venue listed it after the resume: a later cancel is judged as usual."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "listed", eoid=None)
+        _seed_row(ctx, "unlisted", eoid=None)
+        _seed_row(ctx, "stamped", eoid=None, extras={MISSING_PENDING_EXTRA: T0 - 5.0})
+        accept_missing_before_resume(ctx, resumed_at=T0)
+
+        assert note_seen_after_resume(ctx, ["listed", "stamped", "foreign"]) == 1
+
+        verdicts = {}
+        for coid in ("listed", "unlisted", "stamped"):
+            row = ctx.get_order(coid)
+            assert row is not None
+            verdicts[coid] = resume_accepts_cancel(row, now_ts=T0 + 10.0)
+        assert verdicts == {"listed": False, "unlisted": True, "stamped": True}

@@ -461,6 +461,120 @@ def __test_a_resume_adopts_the_venue_view_as_the_new_baseline__(tmp_path: Path):
         assert len(reports) == 1
 
 
+OPERATOR = ProtectionLevels(stop=90.0, limit=None)
+
+
+def _resumed_guard(tmp_path: Path, store: BrokerStore):
+    """A guard over a row whose pre-resume levels were rebaselined, in a 'new process'."""
+    ctx = _open_run(store)
+    _seed_row(ctx, "leg-1")
+    guard, _reports, _clock = _guard(ctx)
+    _place(guard, "p1", BRACKET, row_coid="leg-1")
+    rebaseline_after_resume(ctx)
+    restarted, reports, clock = _guard(ctx)
+    return ctx, restarted, reports, clock
+
+
+def __test_a_resume_voids_the_persisted_pre_resume_writes__(tmp_path: Path):
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx, _guard_after, _reports, _clock = _resumed_guard(tmp_path, store)
+        row = ctx.get_order("leg-1")
+        assert row is not None
+        saved = (row.extras or {})[PROTECTION_LEVELS_EXTRA]
+        assert saved['writes'] == [] and saved['confirmed'] is None
+        assert saved['unresolved'] == [] and saved['rebaseline'] is True
+
+
+def __test_a_refused_re_assert_after_a_resume_keeps_the_operator_levels__(tmp_path: Path):
+    """The bot re-asserts its own levels after the resume; the venue refuses it."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        _ctx, guard, reports, clock = _resumed_guard(tmp_path, store)
+        write = guard.expect("p1", BRACKET)
+        guard.settle("p1", None, rejected=BRACKET, write=write)
+        assert guard.known("p1"), "the key stays guarded: the venue carries the operator's levels"
+        clock.now += 1.0
+        for _ in range(3):
+            assert not guard.observe("p1", OPERATOR, tick=TICK, read_started_at=clock.now)
+        assert reports == []
+        # Once the operator's levels are the baseline, a further edit reports.
+        moved = ProtectionLevels(stop=93.0, limit=None)
+        assert not guard.observe("p1", moved, tick=TICK, read_started_at=clock.now)
+        assert guard.observe("p1", moved, tick=TICK, read_started_at=clock.now)
+        assert len(reports) == 1
+
+
+def __test_an_unknown_re_assert_after_a_resume_never_reports_the_operator_levels__(
+        tmp_path: Path):
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        _ctx, guard, reports, clock = _resumed_guard(tmp_path, store)
+        guard.expect("p1", BRACKET)
+        guard.settle("p1", None)
+        clock.now += 1.0
+        for _ in range(4):
+            assert not guard.observe("p1", OPERATOR, tick=TICK, read_started_at=clock.now)
+        assert reports == []
+
+
+def __test_a_confirmed_re_assert_after_a_resume_is_accepted_with_a_stale_push__(
+        tmp_path: Path):
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        _ctx, guard, reports, clock = _resumed_guard(tmp_path, store)
+        _place(guard, "p1", BRACKET)
+        # A late push of the operator's levels, then the venue carrying the re-assert.
+        assert not guard.observe("p1", OPERATOR, tick=TICK, immediate=True)
+        clock.now += 1.0
+        for _ in range(3):
+            assert not guard.observe("p1", BRACKET, tick=TICK, read_started_at=clock.now)
+        assert reports == []
+        # The venue carries the bot's levels again: the operator's are history.
+        assert guard.observe("p1", OPERATOR, tick=TICK, immediate=True)
+        assert len(reports) == 1
+
+
+def __test_an_edit_after_a_confirmed_re_assert_is_reported__(tmp_path: Path):
+    """The venue took the bot's re-assert: a later edit is not the operator's baseline."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        _ctx, guard, reports, clock = _resumed_guard(tmp_path, store)
+        _place(guard, "p1", BRACKET)
+        moved = ProtectionLevels(stop=93.0, limit=110.0)
+        # A push may still predate the re-assert: not judged until a snapshot decides.
+        assert not guard.observe("p1", moved, tick=TICK, immediate=True)
+        clock.now += 1.0
+        assert not guard.observe("p1", moved, tick=TICK, read_started_at=clock.now)
+        assert guard.observe("p1", moved, tick=TICK, read_started_at=clock.now)
+        assert len(reports) == 1
+        assert reports[0][1]['expected'] == BRACKET.as_list()
+
+
+def __test_a_confirmed_re_assert_survives_a_restart__(tmp_path: Path):
+    """The rebaseline the confirmed re-assert ended stays ended in the next process."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx, guard, _reports, _clock = _resumed_guard(tmp_path, store)
+        _place(guard, "p1", BRACKET)
+        restarted, reports, clock = _guard(ctx)
+        moved = ProtectionLevels(stop=93.0, limit=110.0)
+        clock.now += 1.0
+        assert not restarted.observe("p1", moved, tick=TICK, read_started_at=clock.now)
+        assert restarted.observe("p1", moved, tick=TICK, read_started_at=clock.now)
+        assert len(reports) == 1
+
+
+def __test_a_guard_of_the_stopped_process_cannot_undo_a_later_rebaseline__(tmp_path: Path):
+    """The resume is applied by the new process: whatever the old guard persisted is voided."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "leg-1")
+        old_guard, _reports, _clock = _guard(ctx)
+        _place(old_guard, "p1", BRACKET, row_coid="leg-1")
+        # The stopping process keeps writing its own levels...
+        _place(old_guard, "p1", ProtectionLevels(stop=96.0, limit=110.0))
+        # ...then the new process applies the resume before its plugin uses the guard.
+        rebaseline_after_resume(ctx)
+        new_guard, reports, _clock = _guard(ctx)
+        assert not new_guard.observe("p1", OPERATOR, tick=TICK, immediate=True)
+        assert reports == []
+
+
 # === BrokerPlugin.report_external_intervention =============================
 
 def _plugin(policy: str, sink=None, store_ctx=None):
@@ -502,3 +616,63 @@ def __test_report_external_intervention_only_audits_under_ignore__(tmp_path: Pat
             "SELECT kind FROM events WHERE run_instance_id = ?",
             (ctx.run_instance_id,)).fetchall()]
         assert 'external_intervention_ignored' in kinds
+
+
+def __test_a_change_dated_before_the_operator_resume_is_accepted__(tmp_path: Path):
+    """The operator accepted the venue as it stood: no new quarantine for older changes."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_run(store)
+        latched: list = []
+        plugin = _plugin('stop', lambda reason, context, *, kind: latched.append(reason), ctx)
+        plugin.operator_resume_ts_ms = 1_700_000_000_000
+
+        BrokerPlugin.report_external_intervention(  # type: ignore[arg-type]
+            plugin, "position closed by hand", {'deal_id': 'd1'}, client_order_id="row-1",
+            changed_at_ms=1_699_999_999_000)
+        assert latched == []
+        payloads = [p for _k, _c, _x, p in ctx.iter_events_by_kind_for_run_id(
+            'external_intervention_accepted_by_resume')]
+        assert payloads == [{'reason': "position closed by hand",
+                             'changed_at_ms': 1_699_999_999_000,
+                             'resume_ts_ms': 1_700_000_000_000,
+                             'context': {'deal_id': 'd1'}}]
+
+        BrokerPlugin.report_external_intervention(  # type: ignore[arg-type]
+            plugin, "position closed by hand", {'deal_id': 'd2'},
+            changed_at_ms=1_700_000_001_000)
+        assert latched == ["position closed by hand"], "a later change is judged as usual"
+
+        plugin.operator_resume_ts_ms = None
+        BrokerPlugin.report_external_intervention(  # type: ignore[arg-type]
+            plugin, "stop moved", changed_at_ms=1_600_000_000_000)
+        assert len(latched) == 2, "without a resume the time changes nothing"
+
+
+def __test_the_engine_exposes_the_resume_it_applied__(tmp_path: Path):
+    from pynecore.core.broker.models import ExchangeCapabilities
+    from pynecore.core.broker.position import BrokerPosition
+    from pynecore.core.broker.sync_engine import OrderSyncEngine
+
+    def _engine(ctx: RunContext) -> OrderSyncEngine:
+        broker = SimpleNamespace(client_order_id_max_len=30, on_unexpected_cancel='stop',
+                                 get_capabilities=ExchangeCapabilities)
+        return OrderSyncEngine(broker=broker, position=BrokerPosition(),  # type: ignore[arg-type]
+                               symbol="BTCUSDT", run_tag=ctx.run_tag, store_ctx=ctx)
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_run(store)
+        engine = _engine(ctx)
+        assert engine.operator_resume_ts_ms is None
+        engine.record_quarantine("SL moved", kind=QuarantineKind.EXTERNAL_INTERVENTION)
+        assert engine.quarantine_id is not None
+        store.request_quarantine_resume(ctx.run_id, engine.quarantine_id)
+        ctx.close()
+
+        resumed = _open_run(store)
+        engine = _engine(resumed)
+        assert engine.operator_resume_ts_ms is not None
+        assert not engine.venue_writes_blocked
+        payload = next(p for _k, _c, _x, p in resumed.iter_events_by_kind_for_run_id(
+            'quarantine_resumed'))
+        assert payload['resume_ts_ms'] == engine.operator_resume_ts_ms
+        resumed.close()

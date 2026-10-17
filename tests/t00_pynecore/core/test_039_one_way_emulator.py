@@ -885,6 +885,127 @@ def __test_restart_replay_clear_timeout_does_not_abort_startup__(tmp_path):
     store.close()
 
 
+class _RefusingPort(_FakePort):
+    """A port whose next bracket amends raise the given errors, in order."""
+
+    def __init__(self, legs, refusals: list[Exception]) -> None:
+        super().__init__(legs)
+        self.refusals = list(refusals)
+
+    async def amend_bracket(self, symbol, leg_id, **kwargs) -> None:
+        if self.refusals:
+            raise self.refusals.pop(0)
+        await super().amend_bracket(symbol, leg_id, **kwargs)
+
+
+def __test_a_refused_bracket_re_assert_never_aborts_the_replay__(tmp_path):
+    """The venue refusing a journaled bracket (a crossed level) is recorded, not raised."""
+    from pynecore.core.broker.exceptions import ExchangeOrderRejectedError as Rejected
+
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20, sl=1.00), port))
+
+    refusing = _RefusingPort([_leg("10", "buy", 2.0)],
+                             [Rejected("stop above the market", level_crossed=True)])
+    assert _run(eng.restart_replay(refusing)) is True
+    refusals = eng.take_replay_refusals()
+    assert [(r.intent_key, r.leg_id, r.sl_price) for r in refusals] == [
+        ("TP\x00Long", "10", 1.00)]
+    assert refusals[0].error.level_crossed
+    assert eng.take_replay_refusals() == []
+    assert [row.extras[EXTRAS_KEY_BRACKET_OWN_STATE]
+            for row in iter_active_bracket_ownerships(ctx)] == ["active"]
+    store.close()
+
+
+def __test_the_re_arm_after_a_refused_replay_rewrites_the_same_ownership_row__(tmp_path):
+    """A refused row is never left behind next to a second row for the same leg.
+
+    The engine re-arms the refused exit through the regular dispatch, under
+    a later bar's attach coid; the ownership row is keyed by exit and leg
+    only, so the re-arm rewrites the refused row instead of adding one, and
+    the next restart replays exactly the re-armed levels.
+    """
+    from pynecore.core.broker.exceptions import ExchangeOrderRejectedError as Rejected
+
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20, sl=1.00), port))
+
+    refusing = _RefusingPort([_leg("10", "buy", 2.0)],
+                             [Rejected("stop above the market", level_crossed=True)])
+    assert _run(eng.restart_replay(refusing)) is True
+    assert len(eng.take_replay_refusals()) == 1
+
+    rearm = _exit_env("TP", "Long", tp=1.20, sl=0.98)
+    rearm = DispatchEnvelope(intent=rearm.intent, run_tag="t000", bar_ts_ms=2000)
+    _run(eng.run_exit_bracket(rearm, refusing))
+    rows = list(iter_active_bracket_ownerships(ctx))
+    assert len(rows) == 1, "one leg, one ownership row"
+    assert rows[0].extras[EXTRAS_KEY_BRACKET_OWN_STATE] == "active"
+
+    replay_port = _FakePort([_leg("10", "buy", 2.0)])
+    assert _run(eng.restart_replay(replay_port)) is True
+    assert _amended_levels(replay_port) == [("10", 1.20, 0.98)]
+    store.close()
+
+
+def __test_a_crossed_refusal_of_a_bracket_attach_keeps_the_crossed_verdict__(tmp_path):
+    """The engine tells Pine's crossed-level exit from a venue refusing protection."""
+    from pynecore.core.broker.exceptions import (
+        BracketAttachAfterFillRejectedError,
+        ExchangeOrderRejectedError as Rejected,
+    )
+
+    store, ctx = _make_store(tmp_path)
+    port = _RefusingPort([_leg("10", "buy", 2.0)],
+                         [Rejected("stop above the market", level_crossed=True)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    with pytest.raises(BracketAttachAfterFillRejectedError) as raised:
+        _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20, sl=1.00), port))
+    assert raised.value.level_crossed
+    assert list(iter_active_bracket_ownerships(ctx)) == [], "the refused row is released"
+    store.close()
+
+
+def __test_a_bracket_re_assert_into_a_closed_market_retries_the_replay__(tmp_path):
+    from pynecore.core.broker.exceptions import MarketClosedError
+
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20, sl=1.00), port))
+
+    closed = _RefusingPort([_leg("10", "buy", 2.0)], [MarketClosedError("market closed")])
+    assert _run(eng.restart_replay(closed)) is False
+    assert eng.take_replay_refusals() == []
+    assert _run(eng.restart_replay(closed)) is True
+    assert _amended_levels(closed) == [("10", 1.20, 1.00)]
+    store.close()
+
+
+def __test_a_refused_re_clear_on_restart_keeps_the_row_clearing__(tmp_path):
+    from pynecore.core.broker.exceptions import MarketClosedError
+
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20, sl=1.00), port))
+    port.fail_amend_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_exit_bracket_clear(_cancel_env("TP", from_entry="Long"), port))
+
+    refusing = _RefusingPort([_leg("10", "buy", 2.0)], [MarketClosedError("closed")])
+    assert _run(eng.restart_replay(refusing)) is True  # must not raise
+    rows = list(iter_active_bracket_ownerships(ctx))
+    assert [row.extras[EXTRAS_KEY_BRACKET_OWN_STATE] for row in rows] == [
+        BRACKET_OWN_STATE_CLEARING]
+    store.close()
+
+
 # === Reversal residual-open replay (2.7) ================================
 
 def _seed_residual(ctx, *, entry_coid, qty=2.0, side="buy"):

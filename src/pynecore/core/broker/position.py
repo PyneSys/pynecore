@@ -7,13 +7,16 @@ prices, fees, and margin state.
 """
 from __future__ import annotations
 
+import copy
 from collections import deque
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from pynecore import lib
 from pynecore.core.broker.intent_builder import CLOSE_ALL_EXIT_ID, CLOSE_EXIT_ID_PREFIX
 from pynecore.core.broker.models import LegType
 from pynecore.core.closed_trade_stats import ClosedTradeStats
+from pynecore.lib.log import broker_error as _blog_error
 from pynecore.lib.log import broker_warning as _blog_warning
 from pynecore.lib.strategy import PositionBase, Trade
 from pynecore.types.na import na_float
@@ -25,13 +28,41 @@ if TYPE_CHECKING:
     from pynecore.types.strategy import QtyType
     from pynecore.core.broker.models import OrderEvent
 
-__all__ = ['BrokerPosition']
+__all__ = ['BrokerPosition', 'ProvisionalClose']
 
 # Legs that only ever reduce exposure: the plugin contract requires reduce-only
 # delivery for them (``ExchangeCapabilities.reduce_only``)
 _EXIT_LEG_TYPES = frozenset((
     LegType.CLOSE, LegType.TAKE_PROFIT, LegType.STOP_LOSS, LegType.TRAILING_STOP,
 ))
+
+
+@dataclass(slots=True)
+class ProvisionalClose:
+    """A close booked at an estimated price, with no fill of its own.
+
+    The sync engine books a venue reduction nobody reported this way
+    (:meth:`BrokerPosition.record_provisional_close`). A late fill that turns
+    out to be that reduction moves the booked trades to its own price
+    (:meth:`BrokerPosition.reprice_provisional_closes`).
+
+    :ivar price: The estimated exit price the close was booked at.
+    :ivar trades: The closed trades it booked, FIFO order.
+    :ivar unpriced: Per trade, the quantity still booked at :attr:`price`.
+    :ivar entry_commissions: Per trade, its entry commission (the close itself
+        carries no fee).
+    :ivar profit: The realized profit the close is counted with in the win /
+        loss counters, re-priced parts included.
+    :ivar stats_base: The closed-trade statistics before the close.
+    :ivar count_base: :attr:`BrokerPosition.closed_trades_count` before the close.
+    """
+    price: float
+    trades: list[Trade]
+    unpriced: list[float]
+    entry_commissions: list[float]
+    profit: float
+    stats_base: ClosedTradeStats
+    count_base: int
 
 
 class BrokerPosition(PositionBase):
@@ -662,20 +693,145 @@ class BrokerPosition(PositionBase):
                 )
                 self.open_trades.append(flipped)
 
-        # Update running stats
-        self.netprofit += closed_profit
-        if closed_profit > 0.0:
-            self.grossprofit += closed_profit
-            self.wintrades += 1
-        elif closed_profit < 0.0:
-            self.grossloss += closed_profit
-            self.losstrades += 1
-        else:
-            self.eventrades += 1
+        self._count_close_profit(closed_profit, 1)
 
         self.open_commission = float(sum(t.commission for t in self.open_trades))
 
         return self.sign != old_sign
+
+    def record_provisional_close(self, event: 'OrderEvent') -> ProvisionalClose:
+        """
+        Record a closing fill whose price is only an estimate.
+
+        Booked like :meth:`record_fill`; the returned record lets
+        :meth:`reprice_provisional_closes` move it to a real fill's price later.
+
+        :param event: A fee-free closing fill at the estimated price.
+        :return: The booked close.
+        :raises ValueError: When the event carries a fee.
+        """
+        if event.fee:
+            raise ValueError("a provisional close carries no fee")
+        stats_base = copy.deepcopy(self._closed_trade_stats)
+        count_base = self.closed_trades_count
+        closed_before = len(self.new_closed_trades)
+        self.record_fill(event)
+        trades = self.new_closed_trades[closed_before:]
+        return ProvisionalClose(
+            price=event.fill_price or 0.0, trades=trades,
+            unpriced=[abs(trade.size) for trade in trades],
+            entry_commissions=[trade.commission for trade in trades],
+            profit=sum(trade.profit for trade in trades),
+            stats_base=stats_base, count_base=count_base,
+        )
+
+    def reprice_provisional_closes(
+            self, closes: list[ProvisionalClose], qty: float, event: 'OrderEvent',
+    ) -> float:
+        """
+        Move ``qty`` of provisionally booked closes to the price of ``event``'s fill.
+
+        The trades keep their FIFO attribution, which is what the same fill
+        reported on time books as well. Walked oldest first, each trade takes
+        the fill's price, exit id, exit time and its share of the fill's fee,
+        and the P&L, the win / loss counters, the percent sums and the exit
+        equity of every later closed trade move with it; the closed-trade
+        statistics are rebuilt from the state before the oldest close. A trade
+        the fill explains only in part stays one record whose exit price is
+        the quantity-weighted blend of the fill's and the estimate.
+
+        :param closes: The provisional closes, oldest first.
+        :param qty: The quantity of ``event``'s fill the closes contain.
+        :param event: The fill, its ``fill_qty`` the whole fill its fee is for.
+        :return: The quantity re-priced (less than ``qty`` when the closes
+            hold less still at their estimate).
+        """
+        fill_qty = event.fill_qty or 0.0
+        fill_price = event.fill_price or 0.0
+        if qty <= 0.0 or fill_qty <= 0.0 or fill_price <= 0.0 or not closes:
+            return 0.0
+        fee_rate = event.fee / fill_qty
+        remaining = qty
+        shifts: dict[int, float] = {}
+        for close in closes:
+            if remaining <= 1e-12:
+                break
+            old_profit = close.profit
+            for i, trade in enumerate(close.trades):
+                if remaining <= 1e-12:
+                    break
+                unpriced = close.unpriced[i]
+                if unpriced <= 1e-12:
+                    continue
+                part = unpriced if unpriced <= remaining + 1e-12 else remaining
+                trade_profit = trade.profit
+                base_equity = trade.exit_equity - trade_profit
+                self._book_profit_ratio(trade, -1)
+                trade.exit_price += (fill_price - close.price) * part / abs(trade.size)
+                trade.exit_id = event.pine_id or ""
+                trade.exit_time = int(event.timestamp * 1000.0)
+                trade.commission += fee_rate * part
+                trade.profit = (trade.exit_price - trade.entry_price) * trade.size - trade.commission
+                entry_cost = abs(trade.size) * trade.entry_price + close.entry_commissions[i]
+                trade.profit_percent = (trade.profit / entry_cost * 100.0) if entry_cost else 0.0
+                self._book_profit_ratio(trade, 1)
+                trade.exit_equity = base_equity + trade.profit
+                shifts[id(trade)] = trade.profit - trade_profit
+                close.profit += trade.profit - trade_profit
+                close.unpriced[i] = round(unpriced - part, 12)
+                remaining = round(remaining - part, 12)
+            if close.profit != old_profit:
+                self._count_close_profit(old_profit, -1)
+                self._count_close_profit(close.profit, 1)
+        if shifts:
+            self._replay_closed_since(closes[0], shifts)
+        return round(qty - max(remaining, 0.0), 12)
+
+    def _replay_closed_since(self, close: ProvisionalClose, shifts: dict[int, float]) -> None:
+        """Carry re-priced profits into the trades closed since ``close`` and the statistics.
+
+        :param close: The oldest provisional close.
+        :param shifts: The profit change of each re-priced trade, by ``id``.
+        """
+        since = self.closed_trades_count - close.count_base
+        tail = list(self.closed_trades)[-since:] if since > 0 else []
+        stats: ClosedTradeStats | None = copy.deepcopy(close.stats_base)
+        if since > len(tail):
+            _blog_error(
+                "re-priced closed trades: %s trades closed since the estimate, more than "
+                "the %s kept — the cumulative closed-trade statistics keep the estimate",
+                since, len(tail),
+            )
+            stats = None
+        shift = 0.0
+        for trade in tail:
+            trade.exit_equity += shift
+            shift += shifts.get(id(trade), 0.0)
+            if stats is not None:
+                stats.add(trade)
+        if stats is not None:
+            self._closed_trade_stats = stats
+
+    def _count_close_profit(self, profit: float, sign: int) -> None:
+        """Book (``sign`` 1) or unbook (-1) a closing fill's realized profit and its counter."""
+        self.netprofit += sign * profit
+        if profit > 0.0:
+            self.grossprofit += sign * profit
+            self.wintrades += sign
+        elif profit < 0.0:
+            self.grossloss += sign * profit
+            self.losstrades += sign
+        else:
+            self.eventrades += sign
+
+    def _book_profit_ratio(self, trade: Trade, sign: int) -> None:
+        """Book (``sign`` 1) or unbook (-1) a closed trade in the percent sums."""
+        ratio = trade.profit_percent / 100.0
+        self.sum_profit_ratio += sign * ratio
+        if trade.profit > 0.0:
+            self.sum_win_profit_ratio += sign * ratio
+        elif trade.profit < 0.0:
+            self.sum_loss_profit_ratio += sign * ratio
 
     def flatten_nontradable_dust(
             self, fill_price: float, event: 'OrderEvent',

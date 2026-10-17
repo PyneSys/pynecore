@@ -15,6 +15,7 @@ design, in particular the rationale for the high-level intent API.
 """
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Protocol, TypeVar
@@ -48,6 +49,8 @@ if TYPE_CHECKING:
     )
 
 __all__ = ['BrokerPlugin', 'PositionPort']
+
+logger = logging.getLogger(__name__)
 
 
 class PositionPort(Protocol):
@@ -355,7 +358,7 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     trailing_stop)`` — pass ``None`` for fields the broker is not carrying.
     """
 
-    quarantine_sink: Callable[..., None] | None = None
+    quarantine_sink: Callable[..., bool | None] | None = None
     """Optional quarantine latch into the Order Sync Engine.
 
     The :class:`~pynecore.core.script_runner.ScriptRunner` wires this to
@@ -388,6 +391,29 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     amend, cancel, close, position SL/TP). That covers the plugin's own
     background writes too, which never pass through the engine. ``None``
     (state-only test paths) allows every write.
+    """
+
+    operator_resume_ts_ms: int | None = None
+    """Wall-clock time (ms) at which an operator resume this process applies was first applied.
+
+    ``None`` without a resume. A process that applies the same resume again
+    (the previous one stopped before it completed it) gets the same time, so
+    a change made while no process ran is judged, not accepted.
+
+    The :class:`~pynecore.core.script_runner.ScriptRunner` copies it from
+    :attr:`~pynecore.core.broker.sync_engine.OrderSyncEngine.operator_resume_ts_ms`
+    before :meth:`connect`. The operator accepted the venue as it stood, so a
+    change the venue made before this moment is no external intervention any
+    more: a close a startup pass or an activity catch-up finds, an order
+    quantity amended while the bot was quarantined. The core already applies
+    the boundary to the protection guard (the first observation after the
+    resume is the baseline) and to the disappearance tracker. A judge of the
+    plugin's own must apply it too: pass the change's venue time as
+    ``changed_at_ms`` to :meth:`report_external_intervention`, which accepts
+    a change dated before the boundary instead of applying the policy; a
+    judge that has no change time takes its first view after the resume as
+    its new baseline, kept on a journal row so a process applying the resume
+    again judges against it.
     """
 
     native_cancel_all_expected_sink: Callable[..., None] | None = None
@@ -475,6 +501,7 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
             *,
             client_order_id: str | None = None,
             exchange_order_id: str | None = None,
+            changed_at_ms: int | None = None,
     ) -> None:
         """Report that someone else changed a bot-owned order or position.
 
@@ -489,14 +516,43 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
         audit event, ``halt`` (or a quarantining policy without a working sink)
         raises.
 
+        A change the venue dates at or before :attr:`operator_resume_ts_ms` was
+        accepted by the operator's resume: it is logged as a WARNING and
+        audited (``external_intervention_accepted_by_resume``), and no policy
+        applies. The boundary is local wall-clock time, so a change made within
+        the clock skew of the resume is judged by the venue's own clock.
+
         :param reason: Human-readable description, shown to the operator.
         :param context: Structured details for the quarantine record.
         :param client_order_id: The affected row's COID, for the audit event.
         :param exchange_order_id: The affected venue ref, for the audit event.
+        :param changed_at_ms: The venue's time of the change (Unix ms), when
+            known.
         :raises UnexpectedCancelError: When the policy requires the
             process-exiting halt.
         """
         store_ctx = self.store_ctx
+        resume_ts_ms = self.operator_resume_ts_ms if changed_at_ms is not None else None
+        if (changed_at_ms is not None and resume_ts_ms is not None
+                and changed_at_ms <= resume_ts_ms):
+            logger.warning(
+                "external intervention dated %s, before the operator resume at %s, "
+                "accepted: %s", changed_at_ms, resume_ts_ms, reason,
+            )
+            if store_ctx is not None:
+                # noinspection PyBroadException
+                try:
+                    store_ctx.log_event(
+                        'external_intervention_accepted_by_resume',
+                        client_order_id=client_order_id,
+                        exchange_order_id=exchange_order_id,
+                        payload={'reason': reason, 'changed_at_ms': changed_at_ms,
+                                 'resume_ts_ms': resume_ts_ms,
+                                 'context': dict(context or {})},
+                    )
+                except Exception:
+                    logger.exception("audit of an intervention accepted by the resume failed")
+            return
         halt = resolve_unexpected_cancel_policy(
             self.on_unexpected_cancel,
             reason=reason,

@@ -39,6 +39,7 @@ from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
+    MarketClosedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
@@ -103,9 +104,27 @@ __all__ = [
     'CloseFanResult',
     'ReversalFanResult',
     'BracketFanResult',
+    'BracketReplayRefusal',
     'ClearFanResult',
     'OneWayEmulator',
 ]
+
+
+@dataclass(frozen=True)
+class BracketReplayRefusal:
+    """A bracket the venue definitively refused to re-assert on a restart.
+
+    :ivar intent_key: The exit's diff key.
+    :ivar leg_id: The position leg the bracket was re-asserted on.
+    :ivar tp_price: The journaled take-profit level that was refused.
+    :ivar sl_price: The journaled stop-loss level that was refused.
+    :ivar error: The venue's refusal.
+    """
+    intent_key: str
+    leg_id: str
+    tp_price: float | None
+    sl_price: float | None
+    error: ExchangeOrderRejectedError
 
 
 @dataclass(frozen=True)
@@ -204,6 +223,15 @@ class OneWayEmulator:
         #: but the reopen is withheld and its breadcrumb stays live, so the
         #: committed reversal finishes after the operator restart.
         self._block_exposure_reopens = block_exposure_reopens
+        #: Brackets the venue refused to re-assert during the last restart
+        #: replay; the engine takes them (:meth:`take_replay_refusals`) and
+        #: re-arms the exits through its regular dispatch path.
+        self._replay_refusals: list[BracketReplayRefusal] = []
+
+    def take_replay_refusals(self) -> list[BracketReplayRefusal]:
+        """Hand over (and forget) the brackets the restart replay could not re-assert."""
+        refusals, self._replay_refusals = self._replay_refusals, []
+        return refusals
 
     def _trail_price_distance(self, trail_offset: float | None) -> float | None:
         """Convert Pine trailing-offset ticks to the PositionPort price unit."""
@@ -703,6 +731,7 @@ class OneWayEmulator:
                     position_deal_id=leg.leg_id,
                     from_entry=intent.from_entry,
                     exit_id=intent.pine_id,
+                    level_crossed=exc.level_crossed,
                 ) from exc
             replicated.append(leg.leg_id)
         return BracketFanResult(legs=tuple(replicated), skipped=False)
@@ -1008,20 +1037,24 @@ class OneWayEmulator:
         bracket-ownership rows are re-asserted on still-open legs (idempotent on
         the per-leg coid) and released when their leg has vanished.
 
+        A bracket the venue refuses to re-assert never ends the run: a closed
+        market leaves its row active and the replay reports itself incomplete,
+        any other definitive refusal is recorded for the engine
+        (:meth:`take_replay_refusals`), which re-arms the exit through its
+        regular dispatch path.
+
         :return: ``True`` when every pass ran to completion. ``False`` when a
-            re-dispatched close leg was definitively refused by the exchange
-            (a closed market, a symbol holiday): its row stays pending, the
-            residual-open pass — which must not re-open before the closes are
-            resolved — is not reached, and the caller runs the replay again on
-            its next sync.
+            re-dispatched close leg or a bracket re-assert was refused because
+            the market is closed (or a close leg was refused definitively): the
+            row stays as it is, the later passes are not reached, and the
+            caller runs the replay again on its next sync.
         """
         if self._store_ctx is None:
             return True
         if not await self._replay_close_legs(port):
             return False
         await self._replay_residual_opens(port)
-        await self._replay_bracket_ownership(port)
-        return True
+        return await self._replay_bracket_ownership(port)
 
     async def _replay_close_legs(self, port: 'PositionPort') -> bool:
         """Reconcile + re-dispatch any pending close-leg rows (first replay pass).
@@ -1226,7 +1259,7 @@ class OneWayEmulator:
             return
         clear_residual_open_row(self._store_ctx, row.client_order_id)
 
-    async def _replay_bracket_ownership(self, port: 'PositionPort') -> None:
+    async def _replay_bracket_ownership(self, port: 'PositionPort') -> bool:
         """Re-assert / finish live bracket-ownership rows (second replay pass).
 
         For every live ownership row: if its leg is still open, an ``active`` row
@@ -1235,27 +1268,37 @@ class OneWayEmulator:
         finished by re-clearing then releasing it; if the leg has vanished, the
         bracket it carried is moot — release the orphan row so it leaves the live
         index.
+
+        :return: ``False`` when a re-assert met a closed market (its row stays
+            active for the next replay), ``True`` otherwise.
         """
         if self._store_ctx is None:
-            return
+            return True
         rows = list(iter_active_bracket_ownerships(self._store_ctx))
         if not rows:
-            return
+            return True
         by_symbol: dict[str, list] = {}
         for row in rows:
             by_symbol.setdefault(row.symbol, []).append(row)
+        complete = True
         for symbol, srows in by_symbol.items():
             legs = await port.fetch_raw_positions(symbol)
             live_ids = {leg.leg_id for leg in legs}
             for row in srows:
-                await self._replay_bracket_one(row, symbol, live_ids, port)
+                if not await self._replay_bracket_one(row, symbol, live_ids, port):
+                    complete = False
+        return complete
 
     async def _replay_bracket_one(
             self, row, symbol: str, live_ids: set, port: 'PositionPort',
-    ) -> None:
-        """Re-assert / finish one bracket-ownership row, or release a vanished leg."""
+    ) -> bool:
+        """Re-assert / finish one bracket-ownership row, or release a vanished leg.
+
+        :return: ``False`` when the venue refused the re-assert because the
+            market is closed, ``True`` otherwise.
+        """
         if self._store_ctx is None:
-            return
+            return True
         extras = row.extras or {}
         leg_id: str | None = extras.get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
         if leg_id is None or leg_id not in live_ids:
@@ -1263,7 +1306,7 @@ class OneWayEmulator:
                 self._store_ctx, coid=row.client_order_id,
                 new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
             )
-            return
+            return True
         if extras.get(EXTRAS_KEY_BRACKET_OWN_STATE) == BRACKET_OWN_STATE_CLEARING:
             # A clear interrupted before it confirmed (crash or ambiguous
             # timeout): finish it. Amending to None is idempotent — an already
@@ -1279,25 +1322,48 @@ class OneWayEmulator:
                     coid=extras.get(EXTRAS_KEY_BRACKET_OWN_CLEAR_COID)
                     or row.client_order_id,
                 )
-            except OrderDispositionUnknownError:
-                # The re-clear did not confirm. ``restart_replay`` runs inside the
-                # sync startup wrapper, which only catches ``ExchangeConnectionError``;
-                # propagating this sibling error would abort startup on a recoverable
-                # ambiguous round-trip. Leave the row ``clearing`` (NOT released) so
-                # the next ``drain_clearing_rows`` / replay retries the idempotent
+            except (OrderDispositionUnknownError, ExchangeOrderRejectedError) as e:
+                # The re-clear did not confirm, or the venue refused it (a closed
+                # market). ``restart_replay`` runs inside the sync startup
+                # wrapper, which only catches ``ExchangeConnectionError``;
+                # propagating would abort startup on a recoverable round-trip.
+                # Leave the row ``clearing`` (NOT released) so the next
+                # ``drain_clearing_rows`` / replay retries the idempotent
                 # re-clear, mirroring ``drain_clearing_rows``.
-                return
+                if isinstance(e, ExchangeOrderRejectedError):
+                    _blog_warning(
+                        "one-way bracket re-clear of %r refused on restart (%s: %s) — "
+                        "the clear is retried", row.client_order_id,
+                        type(e).__name__, e,
+                    )
+                return True
             update_bracket_ownership_state(
                 self._store_ctx, coid=row.client_order_id,
                 new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
             )
-            return
-        await port.amend_bracket(
-            symbol, leg_id, side=row.side,
-            tp_price=extras.get(EXTRAS_KEY_BRACKET_OWN_TP),
-            sl_price=extras.get(EXTRAS_KEY_BRACKET_OWN_SL),
-            trail_offset=self._trail_price_distance(
-                extras.get(EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET)
-            ),
-            coid=extras.get(EXTRAS_KEY_BRACKET_OWN_ATTACH_COID) or row.client_order_id,
-        )
+            return True
+        tp_price = extras.get(EXTRAS_KEY_BRACKET_OWN_TP)
+        sl_price = extras.get(EXTRAS_KEY_BRACKET_OWN_SL)
+        try:
+            await port.amend_bracket(
+                symbol, leg_id, side=row.side,
+                tp_price=tp_price,
+                sl_price=sl_price,
+                trail_offset=self._trail_price_distance(
+                    extras.get(EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET)
+                ),
+                coid=extras.get(EXTRAS_KEY_BRACKET_OWN_ATTACH_COID) or row.client_order_id,
+            )
+        except MarketClosedError as e:
+            _blog_warning(
+                "one-way bracket re-assert of %r on leg %s declined: the market is "
+                "closed (%s) — retried on the next sync", row.client_order_id,
+                leg_id, e,
+            )
+            return False
+        except ExchangeOrderRejectedError as e:
+            self._replay_refusals.append(BracketReplayRefusal(
+                intent_key=row.intent_key or row.client_order_id,
+                leg_id=leg_id, tp_price=tp_price, sl_price=sl_price, error=e,
+            ))
+        return True

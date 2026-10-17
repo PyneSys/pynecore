@@ -41,6 +41,20 @@ close reduced. Run-ownership reconstruction
 (:meth:`OrderSyncEngine._durable_owned_signed_size`) subtracts it, clamped into
 ``[0, filled_qty]``, so the owned net reflects the venue's remaining exposure
 while the watermark semantics of ``filled_qty`` stay intact.
+
+Only the plugin writes it, since only the plugin attributes a reduction to its
+rows; a second writer would subtract the same reduction twice.
+"""
+
+JOURNAL_WIRE_QTY_ANCHOR_EXTRA_KEY = "anchor"
+"""``OrderRow.extras`` key of the price a row's quantity was converted at.
+
+A plugin that journals a row's ``qty`` / ``filled_qty`` in a venue wire unit
+instead of the engine's base unit (Bybit inverse contracts) records the
+conversion price here (``base = wire / price``). The sync engine compares
+journal quantities with the book and the venue only when no owned row carries
+it; startup adoption converts the run's owned wire quantity at the venue
+position's entry price, the price such a venue reports its position at.
 """
 
 

@@ -12,6 +12,12 @@ from pathlib import Path
 #: A wide virtual console keeps identifier-bearing lines on a single line.
 DURABLE_LOG_WIDTH = 200
 
+#: ``extra`` key of a log record that must stay on ONE physical line in every
+#: sink, whatever its length: the handler neither wraps nor folds it. Meant for
+#: records a supervisor parses line by line (the quarantine records carry a
+#: resume command with a run id that can be well over 100 characters).
+SINGLE_LINE_EXTRA = 'pyne_single_line'
+
 from .string import format as _format
 from ..core.format_args import check_format_args as _check_format_args
 from .. import lib
@@ -20,8 +26,14 @@ from .. import lib
 try:
     import rich
     import rich.logging
+    from rich._null_file import NullFile as _RichNullFile
+    from rich.text import Text as _RichText
 except ImportError:
     rich = None
+
+# The handler class exists whenever rich is installed, even with colored logging
+# turned off below, so the single-line rendering can be exercised in tests
+_RichHandlerBase = rich.logging.RichHandler if rich else None
 
 
 __all__ = (
@@ -82,9 +94,43 @@ def _resolve_log_time(record: logging.LogRecord) -> datetime:
     return dt
 
 # Custom RichHandler that uses Pine Script time and timezone
-if rich:
-    class PineRichHandler(rich.logging.RichHandler):
+if _RichHandlerBase is not None:
+    class PineRichHandler(_RichHandlerBase):
         """Custom RichHandler that formats time using syminfo.timezone"""
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """Render a :data:`SINGLE_LINE_EXTRA` record on one physical line.
+
+            Every other record goes through the regular table rendering, which
+            folds a message longer than the console's message column onto
+            continuation lines.
+            """
+            if not getattr(record, SINGLE_LINE_EXTRA, False):
+                super().emit(record)
+                return
+            message = " ".join(self.format(record).splitlines())
+            log_time = _resolve_log_time(record)
+            time_format = None if self.formatter is None else self.formatter.datefmt
+            parts: list[Any] = [
+                _RichText(log_time.strftime(time_format or "[%Y-%m-%d %H:%M:%S]"),
+                          style="log.time"),
+                " ",
+            ]
+            if hasattr(lib, 'bar_index') and lib.bar_index is not None:
+                parts += [_RichText(f"bar: {int(lib.bar_index):6}", style="cyan"), " "]
+            rendered = self.render_message(record, message)
+            parts += [
+                self.get_level_text(record), " ",
+                rendered if isinstance(rendered, _RichText) else message,
+            ]
+            if isinstance(self.console.file, _RichNullFile):
+                self.handleError(record)
+                return
+            try:
+                # Soft wrap: no wrapping, no folding, no cropping at the console width
+                self.console.print(_RichText.assemble(*parts), soft_wrap=True)
+            except Exception:  # noqa: BLE001 -- the logging contract: report, never raise
+                self.handleError(record)
 
         def render(self, *, record, traceback, message_renderable):
             """Override render to use Pine Script time and timezone"""
@@ -331,9 +377,14 @@ def error(formatString: str, *args: Any, **kwargs: Any) -> None:
 # module, not one per subsystem.
 #
 
-def _emit_tagged(level: int, prefix: str, message: str, args: tuple) -> None:
+def _emit_tagged(
+        level: int, prefix: str, message: str, args: tuple, *, single_line: bool = False,
+) -> None:
     text = prefix + (message % args if args else message)
-    logger.log(level, text)
+    if single_line:
+        logger.log(level, " ".join(text.splitlines()), extra={SINGLE_LINE_EXTRA: True})
+    else:
+        logger.log(level, text)
 
 
 def broker_debug(message: str, *args: Any) -> None:
@@ -346,19 +397,31 @@ def broker_debug(message: str, *args: Any) -> None:
     _emit_tagged(logging.DEBUG, "[BROKER] ", message, args)
 
 
-def broker_info(message: str, *args: Any) -> None:
-    """Emit an INFO-level broker event (``[BROKER]`` tag)."""
-    _emit_tagged(logging.INFO, "[BROKER] ", message, args)
+def broker_info(message: str, *args: Any, single_line: bool = False) -> None:
+    """Emit an INFO-level broker event (``[BROKER]`` tag).
+
+    :param single_line: Keep the record on one physical line in every sink
+        (see :data:`SINGLE_LINE_EXTRA`); line breaks in the message become spaces.
+    """
+    _emit_tagged(logging.INFO, "[BROKER] ", message, args, single_line=single_line)
 
 
-def broker_warning(message: str, *args: Any) -> None:
-    """Emit a WARNING-level broker event (``[BROKER]`` tag)."""
-    _emit_tagged(logging.WARNING, "[BROKER] ", message, args)
+def broker_warning(message: str, *args: Any, single_line: bool = False) -> None:
+    """Emit a WARNING-level broker event (``[BROKER]`` tag).
+
+    :param single_line: Keep the record on one physical line in every sink
+        (see :data:`SINGLE_LINE_EXTRA`); line breaks in the message become spaces.
+    """
+    _emit_tagged(logging.WARNING, "[BROKER] ", message, args, single_line=single_line)
 
 
-def broker_error(message: str, *args: Any) -> None:
-    """Emit an ERROR-level broker event (``[BROKER]`` tag)."""
-    _emit_tagged(logging.ERROR, "[BROKER] ", message, args)
+def broker_error(message: str, *args: Any, single_line: bool = False) -> None:
+    """Emit an ERROR-level broker event (``[BROKER]`` tag).
+
+    :param single_line: Keep the record on one physical line in every sink
+        (see :data:`SINGLE_LINE_EXTRA`); line breaks in the message become spaces.
+    """
+    _emit_tagged(logging.ERROR, "[BROKER] ", message, args, single_line=single_line)
 
 
 def ohlcv_info(message: str, *args: Any) -> None:

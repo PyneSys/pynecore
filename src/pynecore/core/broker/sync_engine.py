@@ -38,11 +38,18 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Coroutine, Iterable, Iterator
 from concurrent import futures
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, overload
 
 from pynecore import lib
-from pynecore.core.broker.disappearance import resolve_unexpected_cancel_policy
+from pynecore.core.broker.disappearance import (
+    accept_missing_before_resume,
+    note_seen_after_resume,
+    renew_resume_first_absence,
+    resolve_unexpected_cancel_policy,
+    resume_accepts_cancel,
+)
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
     BrokerManualInterventionError,
@@ -125,7 +132,10 @@ from pynecore.core.broker.models import (
 )
 from pynecore.core.broker.protection_guard import rebaseline_after_resume
 from pynecore.core.broker.native_failsafe_manager import (
+    NATIVE_FAILSAFE_LEVELS_EXTRA,
+    NATIVE_FAILSAFE_LEVELS_PERSISTED_CAP,
     FailsafeHealth,
+    FailsafeObservation,
     FailsafeOwner,
     NativeBracketSnapshot,
     NativeFailsafeManager,
@@ -177,10 +187,11 @@ from pynecore.types.strategy import (
     ADOPTED_STARTUP_ENTRY_ID,
     ADOPTED_STARTUP_EXTRA_KEY,
     JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY,
+    JOURNAL_WIRE_QTY_ANCHOR_EXTRA_KEY,
 )
 
 if TYPE_CHECKING:
-    from pynecore.core.broker.position import BrokerPosition
+    from pynecore.core.broker.position import BrokerPosition, ProvisionalClose
     from pynecore.core.plugin.broker import BrokerPlugin, PositionPort
 
 __all__ = ['OrderSyncEngine']
@@ -188,6 +199,19 @@ __all__ = ['OrderSyncEngine']
 _log = logging.getLogger(__name__)
 
 _T = TypeVar('_T')
+
+
+def _intervention_key(reason: str, context: dict | None) -> str:
+    """Identity of a reported intervention, for deduplication under a held latch.
+
+    The protection key a guard reports, else the affected order's id, else the
+    reason itself.
+    """
+    for field_name in ('protection_key', 'client_order_id', 'parent_entry_dispatch_ref'):
+        value = (context or {}).get(field_name)
+        if isinstance(value, str) and value:
+            return f"{field_name}:{value}"
+    return f"reason:{reason}"
 
 Intent = EntryIntent | ExitIntent | CloseIntent
 
@@ -222,6 +246,43 @@ _WRITE_CLASSIFICATION_GRACE_MULT = 3.0
 #: is an external flatten and the book must stop trading on a position
 #: that no longer exists.
 EXTERNAL_FLATTEN_CONFIRM_GRACE_S = 120.0
+
+#: Seconds between the quarantine reminders the resume watch logs while an
+#: operator has not resumed the latch (a supervisor reading only the recent log
+#: tail still sees the latch and its resume command).
+QUARANTINE_REMINDER_INTERVAL_S = 1800.0
+
+#: Key, inside a parent row's :data:`NATIVE_FAILSAFE_LEVELS_EXTRA` record, of the
+#: operator resume (its ``resume_ts_ms``) after which a process judged the
+#: parent's broker bracket: a process applying the same resume again judges the
+#: broker against the record instead of accepting its next observation.
+_NATIVE_FAILSAFE_RESUME_EXTRA_KEY = 'resume_ts_ms'
+
+#: Audit kinds of a reported unexplained position change. Each payload carries
+#: the run's journal-owned exposure (``journal_owned``), the journal rows behind
+#: it (``journal_rows``: client order id -> owned exposure) and the venue
+#: position (``venue_signed``) the report saw, all signed, so a later startup
+#: whose difference the latest report already covers does not report the same
+#: change again (:meth:`OrderSyncEngine._unattributed_state_reported`), and
+#: does not adopt exposure in place of the reduced one
+#: (:meth:`OrderSyncEngine._reported_unattributed_loss`). The last kind carries
+#: a reported difference over to the journal rows the bot's own later fills
+#: changed (:meth:`OrderSyncEngine._carry_unattributed_view_over`).
+UNATTRIBUTED_CHANGE_EVENT_KINDS = (
+    'startup_unattributed_reduce',
+    'resume_venue_position_accepted',
+    'external_reduce_adopted',
+    'external_flatten_adopted',
+    'unattributed_view_carried_over',
+)
+
+#: Audit kind of the venue view (venue position and journal rows, like
+#: :data:`UNATTRIBUTED_CHANGE_EVENT_KINDS`, plus the ``resume_ts_ms`` of the
+#: operator resume) the first process that judged the venue after an operator
+#: resume saw at its startup: the position the resume accepted. A process
+#: applying the same resume again judges the venue against it
+#: (:meth:`OrderSyncEngine._resume_venue_view`).
+RESUME_VENUE_VIEW_EVENT_KIND = 'resume_venue_view'
 
 #: Seconds the stop-coverage guard (:meth:`OrderSyncEngine._check_reduce_coverage`)
 #: waits for the venue's verdict on a missing stop leg whose journal row is still
@@ -556,6 +617,14 @@ def _is_composed_leg_coid(event_coid: str, parent_coid: str | None) -> bool:
     return (len(event_coid) > len(parent_coid)
             and event_coid.startswith(parent_coid)
             and event_coid[len(parent_coid)] in (':', '_'))
+
+
+def _retired_exposure(extras: dict, filled: float) -> float:
+    """A journal row's retired exposure, clamped into ``[0, filled]``."""
+    retired_raw = extras.get(JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY)
+    if not isinstance(retired_raw, (int, float)):
+        return 0.0
+    return max(0.0, min(filled, float(retired_raw)))
 
 
 def _sizes_match(actual: float, expected: float) -> bool:
@@ -982,6 +1051,17 @@ class _RejectedModifyDeferred(Exception):
     """
 
 
+class _MarketClosedModifyDeferred(_RejectedModifyDeferred):
+    """An exit amend the venue declined because its market is closed.
+
+    Nothing changed on the venue. The caller keeps the OLD intent active like
+    for a refused amend, but the spec is not remembered: a later sync re-sends
+    it, so the amend goes out once the market reopens.
+
+    Module-private — never propagates outside :mod:`sync_engine`.
+    """
+
+
 @dataclasses.dataclass(frozen=True)
 class _EngineTriggerLegSpec:
     """Per-leg spec produced by :meth:`OrderSyncEngine._enumerate_engine_trigger_legs`.
@@ -1232,6 +1312,17 @@ class OrderSyncEngine:
         # new signal) releases the suppression even with value-equal
         # parameters, because funds / risk vetoes clear over time.
         self._rejected_entry_intents: dict[str, _RejectedEntry] = {}
+        # The same bounded memory for entries the venue accepted and then
+        # cancelled itself (:data:`~pynecore.core.broker.models.VENUE_DRIVEN_CANCEL_REASONS`).
+        # Kept apart because the re-placement that precedes every such cancel
+        # is a dispatch that SUCCEEDS, which resets the reject memory above.
+        self._venue_cancelled_entry_intents: dict[str, _RejectedEntry] = {}
+        # Entries the venue cancelled after a partial fill, consumed at the
+        # filled quantity: key -> (the intent as placed, the consumed sentinel
+        # standing in ``_active_intents``). The retained Pine order still
+        # derives the placed intent, which the diff matches here instead of
+        # amending or re-placing a dead order (:meth:`_retire_venue_cancelled_entry`).
+        self._truncated_entries: dict[str, tuple[EntryIntent, EntryIntent]] = {}
         # Venue-refused protective dispatches (:meth:`_recover_rejected_exit`,
         # :meth:`_recover_rejected_exit_modify`, :meth:`_recover_rejected_close`).
         # ``_rejected_exit_intents``: a bracket refused while its parent is still
@@ -1681,6 +1772,31 @@ class OrderSyncEngine:
         # monotonic time it was first seen at that size — the confirmation
         # window of :meth:`_adopt_external_shrink`.
         self._shrink_observed: tuple[float, float] | None = None
+        # The reduction :meth:`_adopt_external_shrink` booked without a fill
+        # that a late fill may still explain: its unexplained quantity, the
+        # side that reduces the book, and the venue ids of the orders that
+        # were live when it was booked (only their fills can be in it).
+        self._adopted_reduction_qty = 0.0
+        self._adopted_reduction_side = ''
+        self._adopted_reduction_order_ids: frozenset[str] = frozenset()
+        # Every venue id of the bot known when it was booked: an order among
+        # them the open orders proved resting unfilled is not in it.
+        self._adopted_reduction_known_ids: frozenset[str] = frozenset()
+        # ``(pine_id, from_entry)`` of the exits live when it was booked whose
+        # protection may be in it: a position-attached bracket has no venue
+        # order id until it fires, so its fill is matched by the exit instead.
+        self._adopted_reduction_exits: frozenset[tuple[str, str | None]] = frozenset()
+        # Whether the open-orders view could not narrow the orders down yet:
+        # every later pass reads it again until it can.
+        self._adopted_reduction_view_unverified = False
+        # The synthetic closes it was booked as, oldest first: a late fill
+        # settled as part of it re-prices them at its own price.
+        self._adopted_reduction_closes: list[ProvisionalClose] = []
+        # Fills of those orders the book holds back until the venue settles
+        # them (:meth:`_settle_held_reduction_fills`), and the venue size seen
+        # while they wait with the monotonic time it was first seen at that size.
+        self._held_reduction_fills: list[OrderEvent] = []
+        self._held_reduction_observed: tuple[float | None, float] | None = None
         # Exit-leg fills the book did not take because they did not reduce it
         # (:meth:`BrokerPosition.is_non_reducing_exit`), waiting for
         # :meth:`_settle_unbooked_exit_fills`: their summed signed quantity, the
@@ -1689,6 +1805,16 @@ class OrderSyncEngine:
         self._unbooked_exit_delta = 0.0
         self._unbooked_exit_ids: list[str] = []
         self._unbooked_exit_observed: tuple[float | None, float] | None = None
+        # The startup comparison of the venue with the journal waits for the
+        # exit fills held at startup (:meth:`_report_startup_reduction`).
+        self._startup_reduction_deferred = False
+        # The latest recorded view of an unexplained position change
+        # (:data:`UNATTRIBUTED_CHANGE_EVENT_KINDS`), loaded on first use, and the
+        # book size it was last carried over at
+        # (:meth:`_carry_unattributed_view_over`).
+        self._unattributed_view: dict | None = None
+        self._unattributed_view_loaded = False
+        self._unattributed_view_book: float | None = None
 
         # Intent keys whose ``_order_mapping`` entry was seeded from a
         # recovered close-park anchor (see :meth:`_verify_pending_dispatches`).
@@ -1827,6 +1953,42 @@ class OrderSyncEngine:
         # Set once an operator resume was consumed: the runner stops and
         # re-executes the process so the bot re-syncs through the startup path.
         self._quarantine_resume_restart: bool = False
+        # Persistent Pine exits the first post-resume diff adopted from the
+        # venue (key -> the adopted venue mapping), re-asserted to the bot's
+        # own levels once; ``None`` until that diff ran.
+        self._resume_reassert: dict[str, tuple[str, ...]] | None = None
+        # The exit whose re-assert amend is being dispatched: the protection it
+        # replaces is the operator's, not the bot's.
+        self._reasserting_exit_key: str | None = None
+        # Why a rehydrated native fail-safe parent accepts its first
+        # unexplained observation ('resume' or 'no_record'), for the log.
+        self._native_failsafe_accept_reasons: dict[str, str] = {}
+        # Exits whose bracket the restart replay could not re-assert on the
+        # venue: rebuilt without their live mapping so the diff re-arms them.
+        self._replay_refused_exit_keys: set[str] = set()
+        # The last market price a sync saw (the script's close), for judging
+        # whether a refused protective level is already crossed.
+        self._last_price: float | None = None
+        # Set when this process started right after an operator resume: the
+        # venue as the operator left it is accepted (protection baselines,
+        # native fail-safe levels, the position) and the bot re-asserts its
+        # own exits once.
+        self._resumed_from_quarantine: bool = False
+        # Wall-clock time (ms) the resume was first applied at: every venue
+        # change dated before it was accepted by the operator.
+        self._operator_resume_ts_ms: int | None = None
+        # Latches whose resume this process applied but has not completed yet:
+        # they stay open in the store until the first post-resume diff ran (and
+        # its re-assert went out), so a process that stops earlier leaves the
+        # resume for the next start to apply again.
+        self._resume_pending_ids: tuple[str, ...] = ()
+        # Further interventions already noted under the held latch (by their
+        # protection key / order id / reason), so a plugin re-reporting the
+        # same edit after every restart neither logs nor audits it again.
+        self._quarantine_noted_keys: set[str] = set()
+        # Monotonic time of the last quarantine record or reminder, for the
+        # periodic reminder the resume watch logs while the latch holds.
+        self._quarantine_reminded_at: float = 0.0
         # Serializes the latch transition (record_quarantine runs on the
         # broker event-loop thread, the gates read on the main thread):
         # check-and-set under the lock keeps the latch + its one event
@@ -2408,6 +2570,24 @@ class OrderSyncEngine:
         """``True`` once an operator resume was consumed and the run must re-execute."""
         return self._quarantine_resume_restart
 
+    @property
+    def resumed_from_quarantine(self) -> bool:
+        """``True`` when this process started right after an operator resume."""
+        return self._resumed_from_quarantine
+
+    @property
+    def operator_resume_ts_ms(self) -> int | None:
+        """Wall-clock time (ms) the operator resume this process applies was first applied at.
+
+        ``None`` without a resume. The operator accepted the venue as it stood:
+        a venue change dated before this moment is no external intervention.
+        A process applying the same resume again keeps the first time, so a
+        change made while no process ran is judged. The runner hands it to
+        the plugin (:attr:`~pynecore.core.plugin.broker.BrokerPlugin.operator_resume_ts_ms`)
+        for the judges the core does not run itself.
+        """
+        return self._operator_resume_ts_ms
+
     def record_quarantine(
             self,
             reason: str,
@@ -2415,14 +2595,17 @@ class OrderSyncEngine:
             *,
             intent_key: str | None = None,
             kind: QuarantineKind = QuarantineKind.ENTRY_BLOCK,
-    ) -> None:
+    ) -> bool:
         """Latch the quarantine state, persist it and emit the operator event.
 
         The first call latches under a fresh quarantine id and emits one
-        :class:`QuarantineEnteredEvent`. A later call is a no-op, except that an
-        ``EXTERNAL_INTERVENTION`` request escalates a latched ``ENTRY_BLOCK`` on
-        the same id (and emits the event again with the new kind). The engine
-        never leaves quarantine on its own: the operator resumes it with
+        :class:`QuarantineEnteredEvent`. An ``EXTERNAL_INTERVENTION`` request
+        escalates a latched ``ENTRY_BLOCK`` on the same id (and emits the event
+        again with the new kind). A further ``EXTERNAL_INTERVENTION`` under an
+        external-intervention latch is logged as a WARNING and audited once per
+        protection key (or order id, or reason) for the life of the latch,
+        across restarts; any other request under a held latch is a no-op. The
+        engine never leaves quarantine on its own: the operator resumes it with
         ``pyne broker resume``.
 
         ``ENTRY_BLOCK`` blocks new entry orders and entry amends while
@@ -2438,24 +2621,46 @@ class OrderSyncEngine:
         boundary is admission-time: a dispatch that already passed its gate when
         the latch flipped is allowed to complete (its exposure predates the
         intervention); no write is admitted after the latch is observable.
+
+        :return: ``False`` when the request repeats an intervention already
+            recorded under the held latch, so the caller skips its own audit
+            event; ``True`` otherwise.
         """
+        further = False
         with self._quarantine_lock:
             if self._quarantined and not (
                     kind is QuarantineKind.EXTERNAL_INTERVENTION
                     and self._quarantine_kind is QuarantineKind.ENTRY_BLOCK):
-                return
+                if (kind is not QuarantineKind.EXTERNAL_INTERVENTION
+                        or self._quarantine_kind is not QuarantineKind.EXTERNAL_INTERVENTION):
+                    return True
+                noted_key = _intervention_key(reason, context)
+                if noted_key in self._quarantine_noted_keys:
+                    return False
+                self._quarantine_noted_keys.add(noted_key)
+                further = True
             escalated = self._quarantined
-            if not escalated:
-                self._quarantine_id = secrets.token_hex(4)
-                self._quarantine_entered_ts_ms = int(time.time() * 1000)
-            self._quarantine_reason = reason
-            self._quarantine_context = dict(context or {})
-            self._quarantine_intent_key = intent_key
-            self._quarantine_kind = kind
-            self._quarantine_persisted = False
-            self._quarantine_generation += 1
-            self._quarantined = True
+            if not further:
+                if not escalated:
+                    self._quarantine_id = secrets.token_hex(4)
+                    self._quarantine_entered_ts_ms = int(time.time() * 1000)
+                self._quarantine_reason = reason
+                self._quarantine_context = dict(context or {})
+                self._quarantine_intent_key = intent_key
+                self._quarantine_kind = kind
+                self._quarantine_persisted = False
+                self._quarantine_generation += 1
+                self._quarantined = True
+                if kind is QuarantineKind.EXTERNAL_INTERVENTION:
+                    self._quarantine_noted_keys.add(_intervention_key(reason, context))
+            quarantine_id = self._quarantine_id
+        if further:
+            self._note_further_intervention(quarantine_id, reason, context, kind)
+            return True
         self._persist_quarantine()
+        if kind is QuarantineKind.EXTERNAL_INTERVENTION:
+            # A new intervention holds now: a resume this process applied is spent.
+            self._complete_operator_resume()
         if kind is QuarantineKind.EXTERNAL_INTERVENTION:
             behaviour = (
                 "the bot leaves the venue untouched (no order, amend, cancel "
@@ -2466,12 +2671,11 @@ class OrderSyncEngine:
                 "entry dispatch is blocked while ingestion/exits/cancels/"
                 "closes keep running"
             )
-        _blog_error(
-            "sync engine %s: %s (kind=%s, intent_key=%s, context=%r) — trading "
-            "stopped, process stays alive; %s. Resume with: %s",
-            "quarantine escalated" if escalated else "quarantined",
-            reason, kind, format_intent_key(intent_key), context, behaviour,
-            self._quarantine_resume_command(),
+        self._log_quarantine_record(
+            " (escalated from entry_block)" if escalated else "",
+            f"{reason} (intent_key={format_intent_key(intent_key)}, "
+            f"context={context!r}) — trading stopped, process stays alive; "
+            f"{behaviour}",
         )
         self._emit_broker_event(QuarantineEnteredEvent(
             reason=reason,
@@ -2480,12 +2684,97 @@ class OrderSyncEngine:
             quarantine_id=self._quarantine_id or '',
             kind=kind,
         ))
+        return True
+
+    def _note_further_intervention(
+            self,
+            quarantine_id: str | None,
+            reason: str,
+            context: dict | None,
+            kind: QuarantineKind,
+    ) -> None:
+        """Log and audit an intervention reported while the latch already holds.
+
+        The latch already holds, so nothing here may fail the report: a failed
+        audit write is logged, never raised (the caller would take the raise
+        for a failed quarantine and stop the process).
+        """
+        _blog_warning(
+            "sync engine quarantine %s further intervention: kind=%s — %s "
+            "(context=%r); the latch already holds, the bot keeps the venue "
+            "untouched", quarantine_id, kind.value, reason, context,
+            single_line=True,
+        )
+        if self._store_ctx is None:
+            return
+        try:
+            self._store_ctx.log_event(
+                'quarantine_further_intervention', client_order_id=None,
+                intent_key=None,
+                payload={'quarantine_id': quarantine_id,
+                         'key': _intervention_key(reason, context),
+                         'reason': reason, 'context': dict(context or {})},
+            )
+        except Exception as exc:  # noqa: BLE001 -- the held latch must not depend on the disk
+            _blog_warning(
+                "sync engine quarantine %s: the further intervention could not be "
+                "audited (%s); a restart may log it again", quarantine_id, exc,
+            )
+
+    def _log_quarantine_record(
+            self, status: str, detail: str, *, error: bool = True,
+    ) -> None:
+        """Log the held latch as two stable one-line records.
+
+        The first record carries the ``sync engine quarantined`` token, the
+        kind value and the quarantine id ahead of the free text; the second
+        carries the exact resume command. Both stay on one physical line in
+        every log sink (:data:`~pynecore.lib.log.SINGLE_LINE_EXTRA`), so a
+        supervisor can grep them line by line.
+
+        :param status: Inserted after the token: ``""`` for a fresh latch, or a
+            parenthesized note (escalated, restored, reminder).
+        :param detail: Free text: the reason and what the bot still does.
+        :param error: ERROR record when ``True``, WARNING otherwise.
+        """
+        log = _blog_error if error else _blog_warning
+        kind = self._quarantine_kind or QuarantineKind.ENTRY_BLOCK
+        self._quarantine_reminded_at = time.monotonic()
+        log(
+            "sync engine quarantined%s: kind=%s quarantine_id=%s — %s",
+            status, kind.value, self._quarantine_id, detail, single_line=True,
+        )
+        if self._store_ctx is None:
+            log(
+                "sync engine quarantine %s resume: %s",
+                self._quarantine_id, self._quarantine_resume_command(),
+                single_line=True,
+            )
+        else:
+            log(
+                "sync engine quarantine %s resume command: %s",
+                self._quarantine_id, self._quarantine_resume_command(),
+                single_line=True,
+            )
+
+    def _quarantine_entered_utc(self) -> str:
+        """The latch's entry time as an ISO-8601 UTC timestamp."""
+        return datetime.fromtimestamp(
+            self._quarantine_entered_ts_ms / 1000.0, UTC,
+        ).strftime('%Y-%m-%dT%H:%M:%SZ')
 
     def _quarantine_resume_command(self) -> str:
-        """The operator command that resumes the latched quarantine."""
+        """The operator command that resumes the latched quarantine.
+
+        The run id is always single-quoted, so a supervisor can read it
+        between the quotes; a quote inside it (a script name or a run label
+        can carry one) is spelled ``'\\''``, which keeps the command valid
+        shell.
+        """
         if self._store_ctx is None:
             return "restart the strategy (no broker store to persist the latch)"
-        return f"pyne broker resume '{self._store_ctx.run_id}' {self._quarantine_id}"
+        run_id = self._store_ctx.run_id.replace("'", "'\\''")
+        return f"pyne broker resume '{run_id}' {self._quarantine_id}"
 
     def _persist_quarantine(self) -> None:
         """Write the latch into the store; a failed write is retried by the resume watch.
@@ -2528,63 +2817,210 @@ class OrderSyncEngine:
                 self._quarantine_persisted = True
 
     def _restore_quarantine(self, store_ctx: RunContext) -> None:
-        """Restore a persisted external-intervention latch at construction.
+        """Restore a persisted external-intervention latch, or apply a resume, at construction.
 
         Runs before any venue I/O, so a restarted bot (systemd, crash, deploy,
         node move) never writes to the venue while an operator has not resumed
         the intervention. An ``ENTRY_BLOCK`` latch of an earlier process is ended
-        here: it never survived a restart. A latch whose resume was requested
-        while the bot was down is ended as resumed.
+        here: it never survived a restart. A resume requested for it changes
+        nothing else: the latch blocked entries over the bot's own venue
+        trouble, so the operator accepted no venue change by lifting it, and
+        the restart judges the venue as usual.
+
+        An external-intervention latch whose resume was requested is resumed
+        here, whether the request came while the bot was down or while the
+        previous process ran (that process only stopped itself for the
+        restart). The resume takes effect in THIS process, before any plugin
+        touches its protection guard: the protection baselines are voided so
+        the venue's next view is accepted, and the run is flagged as resumed
+        for the startup adoption, the native fail-safe and the one-time
+        re-assert of the bot's own exits. The latch is ended only once this
+        process completed the resume (:meth:`_complete_operator_resume`): a
+        process that stops before its first post-resume diff (a failed
+        connect, a crash) leaves it open, and the next start applies the
+        resume again instead of judging the venue the operator accepted as a
+        fresh intervention, keeping what the stopped process judged since
+        (:meth:`_apply_operator_resume`).
         """
         latest: QuarantineRow | None = None
+        resumed: list[QuarantineRow] = []
         for row in store_ctx.iter_open_quarantines():
-            if row.resume_requested_ts_ms is not None:
-                store_ctx.end_quarantine(row.quarantine_id, 'operator_resume')
-                rebaseline_after_resume(store_ctx)
-                _blog_info(
-                    "quarantine %s was resumed by the operator while the bot was "
-                    "down", row.quarantine_id,
+            if row.kind != QuarantineKind.EXTERNAL_INTERVENTION:
+                store_ctx.end_quarantine(
+                    row.quarantine_id,
+                    'restart' if row.resume_requested_ts_ms is None else 'operator_resume',
                 )
-            elif row.kind != QuarantineKind.EXTERNAL_INTERVENTION:
-                store_ctx.end_quarantine(row.quarantine_id, 'restart')
+            elif row.resume_requested_ts_ms is not None:
+                resumed.append(row)
             else:
                 if latest is not None:
                     store_ctx.end_quarantine(latest.quarantine_id, 'superseded')
                 latest = row
+        if resumed:
+            self._apply_operator_resume(store_ctx, resumed)
         if latest is None:
             return
+        # A newer intervention holds: the resume of the older latch is spent.
+        self._complete_operator_resume()
         self._quarantine_id = latest.quarantine_id
         self._quarantine_kind = QuarantineKind.EXTERNAL_INTERVENTION
         self._quarantine_reason = latest.reason
         self._quarantine_context = dict(latest.context or {})
         self._quarantine_intent_key = latest.intent_key
         self._quarantine_entered_ts_ms = latest.entered_ts_ms
+        self._quarantine_noted_keys = {
+            _intervention_key(latest.reason, latest.context),
+            *self._noted_further_interventions(store_ctx, latest.quarantine_id),
+        }
         self._quarantined = True
-        _blog_error(
-            "starting in quarantine %s (%s) — an external intervention was "
-            "detected before the restart; the bot leaves the venue untouched. "
-            "Resume with: %s",
-            latest.quarantine_id, latest.reason, self._quarantine_resume_command(),
+        self._log_quarantine_record(
+            f" (restored at startup, entered {self._quarantine_entered_utc()})",
+            f"{latest.reason} — an external intervention was detected before "
+            f"the restart and no operator resume followed; the bot leaves the "
+            f"venue untouched and its book is not adopted from the venue",
         )
 
-    async def run_quarantine_resume_watch(self, interval_s: float = 5.0) -> None:
+    def _apply_operator_resume(
+            self, store_ctx: RunContext, rows: list[QuarantineRow],
+    ) -> None:
+        """Apply the operator resume of ``rows`` in this process.
+
+        The latches stay open until :meth:`_complete_operator_resume`. A fresh
+        resume accepts the venue as it stands now: the protection baselines
+        are voided and the orders missing so far are accepted as cancelled.
+
+        A resume an earlier process already applied but never completed is
+        applied again only for what no process has judged since: the resume
+        boundary stays the first application's, and what the earlier process
+        confirmed after it stands (a protection baseline it adopted, an order
+        it saw on the venue, a fail-safe level it accepted), so a change made
+        while no process ran is judged instead of accepted. What it did not
+        judge yet keeps the acceptance the first application gave it (see
+        :func:`renew_resume_first_absence`). The one-time re-assert of the
+        bot's own exits runs again either way.
+        """
+        first_applied: dict[str, int] = {}
+        for _key, _coid, _xid, payload in store_ctx.iter_events_by_kind_for_run_id(
+                'quarantine_resumed'):
+            quarantine_id = payload.get('quarantine_id')
+            resume_ts_ms = payload.get('resume_ts_ms')
+            if isinstance(quarantine_id, str) and isinstance(resume_ts_ms, int):
+                first_applied[quarantine_id] = min(
+                    resume_ts_ms, first_applied.get(quarantine_id, resume_ts_ms))
+        again = all(row.quarantine_id in first_applied for row in rows)
+        now_ms = int(time.time() * 1000)
+        self._resumed_from_quarantine = True
+        if again:
+            self._operator_resume_ts_ms = min(first_applied[row.quarantine_id] for row in rows)
+            renew_resume_first_absence(store_ctx, resumed_at=now_ms / 1000.0)
+        else:
+            self._operator_resume_ts_ms = now_ms
+            rebaseline_after_resume(store_ctx)
+            accept_missing_before_resume(store_ctx, resumed_at=now_ms / 1000.0)
+        for row in rows:
+            _blog_warning(
+                "sync engine quarantine resumed%s: kind=%s quarantine_id=%s — the "
+                "operator accepted the venue as it stands; the bot takes its position "
+                "and protection from the venue and re-asserts its own exits",
+                " (again: the previous process stopped before it completed the resume; "
+                "what it judged since the resume stands)"
+                if again else "", row.kind, row.quarantine_id, single_line=True,
+            )
+            store_ctx.log_event(
+                'quarantine_resumed', client_order_id=None, intent_key=None,
+                payload={'quarantine_id': row.quarantine_id, 'kind': row.kind,
+                         'reason': row.reason, 'again': again,
+                         'resume_ts_ms': self._operator_resume_ts_ms},
+            )
+        self._resume_pending_ids = tuple(row.quarantine_id for row in rows)
+
+    def _complete_operator_resume(self) -> None:
+        """End the latches whose resume this process applied.
+
+        Called once the first post-resume diff ran and the re-assert of the
+        bot's own exits was handled (nothing left to retry), or when a newer
+        intervention latch takes over. From then on a restart is a plain one.
+
+        Never raises: it runs while a new latch is being recorded, which must
+        not depend on the disk. A latch the store could not end stays pending;
+        the next sync retries it, and a restart before that applies the resume
+        again (:meth:`_apply_operator_resume`), which is safe.
+        """
+        with self._quarantine_lock:
+            pending = self._resume_pending_ids
+            self._resume_pending_ids = ()
+        if not pending or self._store_ctx is None:
+            return
+        ended: list[str] = []
+        failed: list[str] = []
+        for quarantine_id in pending:
+            try:
+                self._store_ctx.end_quarantine(quarantine_id, 'operator_resume')
+            except Exception as exc:  # noqa: BLE001 -- a latch must not depend on the disk
+                failed.append(quarantine_id)
+                _blog_warning(
+                    "sync engine quarantine %s: the completed resume could not be "
+                    "recorded (%s) — retried on the next sync", quarantine_id, exc,
+                )
+            else:
+                ended.append(quarantine_id)
+        if failed:
+            with self._quarantine_lock:
+                self._resume_pending_ids = (*failed, *self._resume_pending_ids)
+        if ended:
+            _blog_info(
+                "sync engine quarantine %s resume completed: the bot took the venue over",
+                ', '.join(ended),
+            )
+
+    @staticmethod
+    def _noted_further_interventions(store_ctx: RunContext, quarantine_id: str) -> set[str]:
+        """Keys of the further interventions audited under ``quarantine_id`` by any process."""
+        keys: set[str] = set()
+        for _key, _coid, _xid, payload in store_ctx.iter_events_by_kind_for_run_id(
+                'quarantine_further_intervention'):
+            if payload.get('quarantine_id') == quarantine_id and isinstance(
+                    payload.get('key'), str):
+                keys.add(payload['key'])
+        return keys
+
+    async def run_quarantine_resume_watch(
+            self, interval_s: float = 5.0,
+            reminder_interval_s: float = QUARANTINE_REMINDER_INTERVAL_S,
+    ) -> None:
         """Watch the store for an operator resume of the latched quarantine.
 
         Long-lived task on the broker event loop (it keeps running while the
         main thread waits for market data, so a resume is picked up even on a
-        closed market). It also re-asserts a latch whose store write failed.
-        On a resume request it ends the latch, emits
-        :class:`QuarantineResumedEvent` and asks the main thread to stop the
-        run through the regular stop-signal path; the runner then re-executes
-        the process, which re-syncs with the venue through the startup path
-        (adoption, replay, reconcile) exactly like a fresh start.
+        closed market). It also re-asserts a latch whose store write failed,
+        and repeats the quarantine record every ``reminder_interval_s`` while
+        the latch holds. On a resume request it asks the main thread to stop
+        the run through the regular stop-signal path and emits
+        :class:`QuarantineResumedEvent`; the runner then re-executes the
+        process, whose engine ends the latch and re-syncs with the venue
+        through the startup path (adoption, replay, reconcile) exactly like a
+        fresh start (see :meth:`_restore_quarantine`).
         """
         while not self._quarantine_resume_restart:
             await asyncio.sleep(interval_s)
-            if not self._quarantined or self._store_ctx is None:
+            if not self._quarantined:
+                continue
+            if time.monotonic() - self._quarantine_reminded_at >= reminder_interval_s:
+                self._log_quarantine_record(
+                    f" (reminder, entered {self._quarantine_entered_utc()})",
+                    f"{self._quarantine_reason} — still waiting for an operator resume",
+                    error=False,
+                )
+            if self._store_ctx is None:
                 continue
             if not self._quarantine_persisted:
                 self._persist_quarantine()
+                if not self._quarantine_persisted:
+                    # The store still holds an older state of the latch (an
+                    # entry block the operator may have resumed before it
+                    # escalated): a request read from it must not lift the
+                    # latch this process holds.
+                    continue
             quarantine_id = self._quarantine_id
             if quarantine_id is None:
                 continue
@@ -2600,16 +3036,19 @@ class OrderSyncEngine:
             return
 
     def _consume_quarantine_resume(self, quarantine_id: str) -> None:
+        """Stop the run for the in-place restart that applies an operator resume.
+
+        The latch stays held in this process and open in the store: the
+        restarted process ends it and rebaselines (:meth:`_restore_quarantine`),
+        so a protection write of this stopping process can never undo the
+        resume, and no venue write slips through before the restart.
+        """
         kind = self._quarantine_kind or QuarantineKind.ENTRY_BLOCK
-        if self._store_ctx is not None:
-            self._store_ctx.end_quarantine(quarantine_id, 'operator_resume')
-            # The operator accepted the venue as it stands: the restarted
-            # plugins take their protection baselines from it.
-            rebaseline_after_resume(self._store_ctx)
         self._quarantine_resume_restart = True
         _blog_warning(
-            "quarantine %s resumed by the operator — stopping the run and "
-            "restarting it in place to re-sync with the venue", quarantine_id,
+            "sync engine quarantine %s resume requested by the operator — "
+            "stopping the run and restarting it in place to re-sync with the "
+            "venue", quarantine_id, single_line=True,
         )
         self._emit_broker_event(QuarantineResumedEvent(
             quarantine_id=quarantine_id, kind=kind,
@@ -2848,11 +3287,12 @@ class OrderSyncEngine:
             if not replayed:
                 _blog_warning(
                     "restart settle skipped: one-way emulation replay could not "
-                    "complete (the exchange refused a replayed close) — retrying "
-                    "next bar",
+                    "complete (the exchange refused a replayed close, or the "
+                    "market is closed) — retrying next bar",
                 )
                 return
             self._one_way_replay_done = True
+            self._note_bracket_replay_refusals()
         try:
             self._verify_pending_dispatches()
         except ExchangeConnectionError as e:
@@ -2922,6 +3362,8 @@ class OrderSyncEngine:
             self._persisted_pending_anchors = self._unresolved_pending(pending)
             self._prune_orphaned_pending(pending)
         self._current_bar_ts_ms = bar_ts_ms
+        if last_price is not None and math.isfinite(last_price):
+            self._last_price = last_price
         # Re-apply reject-bumped retry anchors that the wholesale replay above
         # just dropped. These bumps are intentionally never journaled (a
         # restart must re-evaluate the rejected signal fresh — see
@@ -2998,11 +3440,12 @@ class OrderSyncEngine:
         # ``_drive_entry_stop_triggers`` can both open new exposure and must
         # obey it too.
         may_open_exposure = self._guard_stuck_reads()
-        # A held exit fill (:meth:`_note_unbooked_exit_fill`) leaves the book
+        # A held exit fill (:meth:`_note_unbooked_exit_fill`,
+        # :meth:`_hold_fill_against_adopted_reduction`) leaves the book
         # either right or off by that fill until the venue settles it, so an
         # entry sized against it could open the wrong exposure. Fills, exits
         # and closes keep flowing; only new exposure waits for the settlement.
-        if self._unbooked_exit_ids:
+        if self._unbooked_exit_ids or self._held_reduction_fills:
             may_open_exposure = False
         if may_open_exposure:
             self._outage_deferred_entries.clear()
@@ -3047,10 +3490,12 @@ class OrderSyncEngine:
             if not replayed:
                 _blog_warning(
                     "sync skipped: one-way emulation replay could not complete "
-                    "(the exchange refused a replayed close) — retrying next sync",
+                    "(the exchange refused a replayed close, or the market is "
+                    "closed) — retrying next sync",
                 )
                 return
             self._one_way_replay_done = True
+            self._note_bracket_replay_refusals()
         try:
             self._verify_pending_dispatches()
         except ExchangeConnectionError as e:
@@ -3121,7 +3566,18 @@ class OrderSyncEngine:
         # leave an obsolete resting entry live and block a requested flatten
         # for the whole grace window. Only the exposure-opening branches inside
         # it obey ``may_open_exposure``.
+        resume_baseline = (
+            ({key: tuple(ids) for key, ids in self._order_mapping.items()},
+             dict(self._persisted_envelope_anchors))
+            if self._resume_reassert is None and self._resumed_from_quarantine else None
+        )
         self._diff_and_dispatch(dispatchable, may_open_exposure=may_open_exposure)
+        if resume_baseline is not None:
+            self._resume_reassert = self._exits_adopted_by_diff(*resume_baseline)
+        if self._resume_reassert:
+            self._reassert_exits_after_resume()
+        if self._resume_pending_ids and self._resume_reassert == {}:
+            self._complete_operator_resume()
         # Fill-time short-gate safety net AFTER the diff: a cross-restart
         # recovered resting sell lands in ``_order_mapping`` (via
         # :meth:`_verify_pending_dispatches`) but NOT ``_active_intents`` — the
@@ -3180,6 +3636,273 @@ class OrderSyncEngine:
             except ExchangeConnectionError as e:
                 self._warn_read_outage(
                     "periodic reconcile skipped after connection error: %s", e,
+                )
+
+    def _exits_adopted_by_diff(
+            self,
+            mapping_before: dict[str, tuple[str, ...]],
+            anchors_before: dict[str, EnvelopeRecord],
+    ) -> dict[str, tuple[str, ...]]:
+        """The exits the diff took over from the venue as they were, with their mapping.
+
+        Two kinds of exit carry whatever the venue holds instead of the
+        strategy's levels:
+
+        - an exit the restart mapped before the diff (a reconstructed
+          bracket, a recovered dispatch), which the diff adopted unchanged;
+        - an exit the previous process journaled, which the diff dispatched
+          again under its journaled client order id: a venue that already
+          knows that id may hand back the bot's order or bracket as the
+          operator left it, without writing anything.
+
+        An exit dispatched under a fresh id goes out with the strategy's
+        levels and needs no re-assert.
+
+        :param mapping_before: ``_order_mapping`` right before the diff.
+        :param anchors_before: The journaled dispatch anchors right before
+            the diff, by intent key.
+        """
+        adopted: dict[str, tuple[str, ...]] = {}
+        for key, intent in self._active_intents.items():
+            if not isinstance(intent, ExitIntent):
+                continue
+            mapped = tuple(self._order_mapping.get(key, ()))
+            if not mapped:
+                continue
+            before = mapping_before.get(key)
+            if before:
+                if mapped == before:
+                    adopted[key] = mapped
+                continue
+            anchor = anchors_before.get(key)
+            envelope = self._envelopes.get(key)
+            if (anchor is not None and envelope is not None
+                    and envelope.bar_ts_ms == anchor.bar_ts_ms
+                    and envelope.retry_seq == anchor.retry_seq
+                    and anchor.run_tag in (None, envelope.run_tag)):
+                adopted[key] = mapped
+        return adopted
+
+    def _reassert_exits_after_resume(self) -> None:
+        """Put the bot's own levels back on every persistent exit after an operator resume.
+
+        The operator may have moved or removed the bot's stop-loss or
+        take-profit while the bot was quarantined; the resume accepted the
+        venue as it stood, and the bot now restores its own protection from
+        the strategy's persistent exits (the levels Pine still declares):
+
+        - a position-attached bracket on an account-net view (a trading stop,
+          a position SL/TP) is amended in place to the exit's levels;
+        - order-based legs are cancelled and re-armed as a fresh full bracket
+          in the same sync, right after the cancel settled (new client order
+          ids; a leg the operator cancelled comes back too), so the position
+          is never left without the bot's levels until the next bar;
+        - hedged emulated brackets were already re-asserted from the journal
+          by the restart replay, and software partial brackets are the
+          engine's own (their venue-side stop is the native fail-safe, which
+          the restart re-PUTs).
+
+        An exit whose parent holds nothing is left to the diff's own sweeps.
+        What cannot go out yet keeps the exit queued for the next sync, and
+        the resume completes only once it went out: a connection loss, a
+        market that is closed, a parent entry whose dispatch is unresolved.
+        Only a write that went out is logged and audited as re-asserted
+        (``amend`` / ``rearm``); an amend or a re-arm sent without a known
+        outcome is audited as ``amend_unconfirmed`` / ``rearm_unconfirmed``
+        (the pending-dispatch verification settles it like any parked
+        dispatch). An amend the plugin skips is audited as ``amend_skipped``
+        and a re-arm that waits for a cancel or a close as ``rearm_deferred``:
+        the venue does not carry the bot's levels then, and the regular
+        dispatch of a later sync puts them back. An amend the venue refuses is
+        dispatched fresh at once: the venue then carries the bot's levels, or
+        it refuses them again and the parent is closed defensively with new
+        entries quarantined (``defensive_close``), as for any exit the venue
+        refuses to place; a re-arm the venue refuses twice ends the same way.
+        A level the market already trades through closes the parent at market,
+        Pine's exit for a crossed level (``crossed_close``, WARNING).
+        """
+        pending = self._resume_reassert
+        if not pending:
+            return
+        port: PositionPort | None = getattr(self._broker, 'position_port', None)
+        for key, mapped in list(pending.items()):
+            intent = self._active_intents.get(key)
+            if (not isinstance(intent, ExitIntent)
+                    or tuple(self._order_mapping.get(key, ())) != mapped
+                    or self._parent_open_exposure(intent.from_entry)[0] <= 0.0
+                    or self._partial_bracket_engine.has_active_legs_for_intent(key)):
+                pending.pop(key, None)
+                continue
+            attached = self._exit_is_position_attached(key)
+            if attached and port is not None:
+                pending.pop(key, None)
+                continue
+            not_applied: str | None = None
+            if attached:
+                mode = 'amend'
+                parked_before = self._parked_dispatch_coids(key)
+                self._reasserting_exit_key = key
+                try:
+                    self._dispatch_modify(intent, intent)
+                except (ExchangeConnectionError, _MarketClosedModifyDeferred,
+                        _ParentEntryParkedModifyDeferred) as e:
+                    _blog_warning(
+                        "re-assert of exit %s after the resume did not go out (%s: %s) — "
+                        "retried on the next sync", format_intent_key(key),
+                        type(e).__name__, e,
+                    )
+                    continue
+                except OrderSkippedByPlugin as e:
+                    self._log_plugin_skip(e)
+                    self._active_intents.pop(key, None)
+                    if e.reason == 'protective_level_crossed_at_fill':
+                        mode = 'crossed_close'
+                    elif e.reason == 'bracket_reject_defensive_close':
+                        mode = 'defensive_close'
+                    else:
+                        # Unmapped, so the next diff dispatches the exit instead
+                        # of adopting the bracket the operator left.
+                        self._order_mapping.pop(key, None)
+                        mode = 'amend_skipped'
+                        not_applied = (f"the amend was not applied ({e}); the next "
+                                       f"sync dispatches the exit afresh")
+                else:
+                    if self._parked_dispatch_coids(key) - parked_before:
+                        mode = 'amend_unconfirmed'
+                        not_applied = (
+                            "the venue's answer is unknown and it may still carry the "
+                            "levels the operator left; the pending-dispatch verification "
+                            "settles the amend"
+                        )
+                finally:
+                    self._reasserting_exit_key = None
+            else:
+                if not self._retire_exit_for_rearm(key, intent):
+                    continue
+                mode, not_applied = self._rearm_retired_exit(key, intent)
+            pending.pop(key, None)
+            if mode == 'crossed_close':
+                _blog_warning(
+                    "exit %s after the operator resume: the market already trades "
+                    "through its level (tp=%s sl=%s) — the parent is closed at market",
+                    format_intent_key(key), intent.tp_price, intent.sl_price,
+                )
+            elif mode == 'defensive_close':
+                _blog_warning(
+                    "exit %s after the operator resume: the venue refused its levels "
+                    "(tp=%s sl=%s) twice — the parent is closed defensively",
+                    format_intent_key(key), intent.tp_price, intent.sl_price,
+                )
+            elif not_applied is None:
+                _blog_info(
+                    "exit %s re-asserted after the operator resume (%s): tp=%s sl=%s",
+                    format_intent_key(key), mode, intent.tp_price, intent.sl_price,
+                )
+            else:
+                _blog_warning(
+                    "re-assert of exit %s after the resume not applied (%s): %s",
+                    format_intent_key(key), mode, not_applied,
+                )
+            if self._store_ctx is not None:
+                self._store_ctx.log_event(
+                    'resume_exit_reasserted', client_order_id=None, intent_key=key,
+                    payload={'mode': mode, 'tp_price': intent.tp_price,
+                             'sl_price': intent.sl_price},
+                )
+
+    def _parked_dispatch_coids(self, key: str) -> set[str]:
+        """Client order ids of the dispatches of ``key`` parked with an unknown outcome."""
+        return {coid for coid, envelope in self._pending_verification.items()
+                if envelope.intent.intent_key == key}
+
+    def _rearm_retired_exit(self, key: str, intent: ExitIntent) -> tuple[str, str | None]:
+        """Arm the fresh bracket of an exit the resume re-assert just cancelled.
+
+        Left to the next sync's diff, the position would go without the bot's
+        stop-loss and take-profit for up to a bar. Only a settled cancel
+        qualifies (a cancel still retrying must land first, or the old and the
+        new legs would rest together), and only for a parent nothing else is
+        closing. Otherwise, and when the dispatch is declined or interrupted,
+        the next diff arms the exit like any exit without an active intent.
+
+        :return: ``(mode, not_applied)``: ``('rearm', None)`` when the bracket
+            was dispatched, ``('rearm_unconfirmed', why)`` when its dispatch
+            went out without a known outcome, ``('crossed_close', None)`` when
+            its level was already crossed and the parent is being closed at
+            market, ``('defensive_close', None)`` when the venue refused it
+            twice and the parent is being closed defensively, else
+            ``('rearm_deferred', why the bracket did not go out)``.
+        """
+        from_entry = intent.from_entry
+        next_sync = "; the next sync arms the exit"
+        if key in self._order_mapping or key in self._forced_cancel_pending:
+            return 'rearm_deferred', f"the cancel of its old legs has not settled{next_sync}"
+        if from_entry is not None and (
+                from_entry in self._cancel_disposition_pending
+                or from_entry in self._pending_defensive_close
+                or from_entry in self._defensively_closed_entries_this_sync):
+            return ('rearm_deferred',
+                    f"its parent is being closed or its cancel is unresolved{next_sync}")
+        parked_before = self._parked_dispatch_coids(key)
+        try:
+            self._dispatch_new(intent)
+        except OrderSkippedByPlugin as e:
+            self._log_plugin_skip(e)
+            if e.reason == 'protective_level_crossed_at_fill':
+                return 'crossed_close', None
+            if e.reason == 'bracket_reject_defensive_close':
+                return 'defensive_close', None
+            return 'rearm_deferred', f"the plugin skipped the dispatch ({e}){next_sync}"
+        except ExchangeConnectionError as e:
+            return 'rearm_deferred', f"the dispatch was interrupted ({e}){next_sync}"
+        self._active_intents[key] = intent
+        if self._parked_dispatch_coids(key) - parked_before:
+            return 'rearm_unconfirmed', (
+                "the venue's answer to the fresh bracket is unknown; the "
+                "pending-dispatch verification settles the dispatch"
+            )
+        return 'rearm', None
+
+    def _note_bracket_replay_refusals(self) -> None:
+        """Re-arm, through the regular dispatch path, the brackets the replay could not re-assert.
+
+        The venue refused to put a journaled bracket back on its leg, so the
+        venue does not carry that protection. Its exit is rebuilt without its
+        live mapping (:meth:`_reconstruct_one_way_bracket_exits`), and the diff
+        dispatches it afresh, where a refusal is judged like any other: a
+        level the market already crossed closes the parent at market (Pine's
+        exit), a venue that keeps refusing closes it defensively and blocks
+        entries. A refusal the venue flags as a crossed level is explained by
+        the market, and after an operator resume the operator accepted the
+        venue as it stands: both are WARNINGs. Any other refusal leaves the
+        venue without the bot's protection for no known reason (ERROR). All
+        are audited.
+
+        The refused ownership row stays ``active``: the re-arm keys its row by
+        exit and leg (:meth:`OneWayEmulator._ownership_coid`), so it rewrites
+        that same row, and a re-arm the venue refuses again releases it.
+        """
+        for refusal in self._one_way_emulator.take_replay_refusals():
+            self._replay_refused_exit_keys.add(refusal.intent_key)
+            explained = self._resumed_from_quarantine or refusal.error.level_crossed
+            log = _blog_warning if explained else _blog_error
+            log(
+                "restart: the venue refused to re-assert bracket %s on leg %s "
+                "(tp=%s sl=%s): %s: %s — the venue does not carry this protection; "
+                "the exit is re-armed through the regular dispatch",
+                format_intent_key(refusal.intent_key), refusal.leg_id,
+                refusal.tp_price, refusal.sl_price, type(refusal.error).__name__,
+                refusal.error, single_line=True,
+            )
+            if self._store_ctx is not None:
+                self._store_ctx.log_event(
+                    'bracket_replay_refused', client_order_id=None,
+                    intent_key=refusal.intent_key,
+                    payload={'leg_id': refusal.leg_id, 'tp_price': refusal.tp_price,
+                             'sl_price': refusal.sl_price,
+                             'level_crossed': refusal.error.level_crossed,
+                             'error': str(refusal.error),
+                             'resumed': self._resumed_from_quarantine},
                 )
 
     def _verify_pending_dispatches(self) -> None:
@@ -4793,9 +5516,25 @@ class OrderSyncEngine:
 
         Pure-local: read-only over the persisted journal.
         """
-        if self._store_ctx is None:
-            return 0.0
+        return self._owned_total(self._durable_owned_rows())
+
+    @staticmethod
+    def _owned_total(rows: dict[str, float]) -> float:
+        """The net of :meth:`_durable_owned_rows`, summed in journal order."""
         owned = 0.0
+        for size in rows.values():
+            owned += size
+        return owned
+
+    def _durable_owned_rows(self) -> dict[str, float]:
+        """The live journal rows behind :meth:`_durable_owned_signed_size`.
+
+        :return: Client order id -> the row's owned exposure, signed, for every
+            row that owns any; empty without a store.
+        """
+        if self._store_ctx is None:
+            return {}
+        rows: dict[str, float] = {}
         for row in self._store_ctx.iter_live_orders():
             filled = row.filled_qty
             if filled == 0.0:
@@ -4803,13 +5542,346 @@ class OrderSyncEngine:
             extras = row.extras or {}
             if extras.get(ADOPTED_STARTUP_EXTRA_KEY):
                 continue
-            retired_raw = extras.get(JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY)
-            if isinstance(retired_raw, (int, float)):
-                filled = max(0.0, filled - min(filled, float(retired_raw)))
-                if filled == 0.0:
-                    continue
-            owned += filled if row.side == 'buy' else -filled
-        return owned
+            filled -= _retired_exposure(extras, filled)
+            if filled == 0.0:
+                continue
+            rows[row.client_order_id] = filled if row.side == 'buy' else -filled
+        return rows
+
+    def _journal_in_book_units(self) -> bool:
+        """Whether this run's owned journal quantities share the book's unit.
+
+        ``False`` without a store, or when a live owned row is journaled in a
+        venue wire unit (:data:`JOURNAL_WIRE_QTY_ANCHOR_EXTRA_KEY`): its
+        quantity cannot be compared with the book or the venue position.
+        """
+        if self._store_ctx is None:
+            return False
+        return not any(
+            row.filled_qty > 0.0
+            and (row.extras or {}).get(JOURNAL_WIRE_QTY_ANCHOR_EXTRA_KEY) is not None
+            for row in self._store_ctx.iter_live_orders()
+        )
+
+    def _report_startup_reduction(self, broker_signed: float, owned_signed: float) -> None:
+        """Report a venue position below this run's journal at startup, once.
+
+        The journal owns more than the venue holds on its side (or the venue
+        is flat or on the other side) and no fill of ours is known to be in
+        flight: the reduction happened while the bot was down or quarantined.
+        After an operator resume the operator accepted the venue as it stood
+        when the resume was first applied (WARNING); otherwise nobody's fill
+        explains it (ERROR). A resume applied again judges the venue against
+        the view the first process recorded (:meth:`_resume_venue_view`): a
+        reduction beyond it happened after the resume, while no bot ran, and
+        is an ERROR too. Either way it is audited. The book takes the venue
+        position through the caller's clamp. The journal is left to the
+        plugin: it attributes a reduction to its own rows (each plugin nets
+        them its own way), and a second writer would subtract the same
+        reduction twice. A later startup whose difference this report already
+        covers (nothing attributed it since, the bot's own later fills aside)
+        does not report it twice (:meth:`_unattributed_state_reported`).
+
+        An exit fill of ours the startup drain holds unbooked
+        (:meth:`_note_unbooked_exit_fill`, a TP/SL fill replayed after the
+        restart) may not be netted in the journal yet, so the comparison waits
+        until those fills settle (:meth:`_settle_unbooked_exit_fills`) and the
+        journal is final; nothing is recorded before.
+
+        A spot run is skipped: its journal counts gross executed quantities
+        while the venue position is the fee-net inventory, and the spot
+        inventory manager owns its ownership conflicts.
+
+        :param broker_signed: The venue position, signed.
+        :param owned_signed: This run's journal-owned exposure, signed.
+        """
+        store_ctx = self._store_ctx
+        if (store_ctx is None
+                or getattr(self._broker, 'spot_inventory_port', None) is not None
+                or not self._journal_in_book_units()):
+            return
+        if self._unbooked_exit_ids:
+            self._startup_reduction_deferred = True
+            _blog_info(
+                "startup: exit fill(s) of ours for %s are held unbooked — the venue "
+                "position is compared with this run's journal once they settle",
+                sorted(set(self._unbooked_exit_ids)),
+            )
+            return
+        journal_rows = self._durable_owned_rows()
+        resume_view = (self._resume_venue_view(store_ctx, journal_rows, broker_signed)
+                       if self._resumed_from_quarantine else None)
+        if owned_signed == 0.0:
+            return
+        if (broker_signed != 0.0 and (broker_signed > 0.0) == (owned_signed > 0.0)
+                and (abs(broker_signed) >= abs(owned_signed)
+                     or _sizes_match(abs(broker_signed), abs(owned_signed)))):
+            return
+        if self._position_work_in_flight() or self.awaiting_market_fills():
+            _blog_info(
+                "startup: the venue holds %s against this run's journal-owned %s while "
+                "work of ours is in flight — its fills settle the difference",
+                broker_signed, owned_signed,
+            )
+            return
+        if self._unattributed_state_reported(journal_rows, broker_signed):
+            _blog_info(
+                "startup: the venue holds %s against this run's journal-owned %s — "
+                "reported before and not attributed to journal rows since; the book "
+                "takes the venue position", broker_signed, owned_signed,
+            )
+            return
+        if self._resumed_from_quarantine and (
+                resume_view is None
+                or self._report_covers(resume_view, journal_rows, broker_signed)):
+            kind = 'resume_venue_position_accepted'
+            _blog_warning(
+                "startup after an operator resume: the venue holds %s of this run's "
+                "journal-owned %s — the operator's change is accepted, the book takes "
+                "the venue position", broker_signed, owned_signed, single_line=True,
+            )
+        else:
+            kind = 'startup_unattributed_reduce'
+            _blog_error(
+                "startup: the venue holds %s but this run's journal owns %s and no "
+                "fill explains the difference (a manual close while the bot was down, "
+                "a liquidation or an unreported fill) — the book takes the venue "
+                "position", broker_signed, owned_signed, single_line=True,
+            )
+        self._log_unattributed_view(
+            kind, {'journal_owned': owned_signed, 'venue_signed': broker_signed,
+                   'journal_rows': journal_rows},
+        )
+
+    def _log_unattributed_view(self, kind: str, payload: dict) -> None:
+        """Audit a view of an unexplained position change and keep it as the latest.
+
+        :param kind: One of :data:`UNATTRIBUTED_CHANGE_EVENT_KINDS`.
+        :param payload: The view: ``journal_owned``, ``journal_rows`` and
+            ``venue_signed``, plus whatever the kind records besides.
+        """
+        assert self._store_ctx is not None
+        self._store_ctx.log_event(kind, client_order_id=None, intent_key=None,
+                                  payload=payload)
+        self._unattributed_view = payload
+        self._unattributed_view_loaded = True
+        self._unattributed_view_book = None
+
+    def _latest_unattributed_view(self) -> dict | None:
+        """The latest recorded view of an unexplained position change of this run."""
+        if not self._unattributed_view_loaded and self._store_ctx is not None:
+            latest = self._store_ctx.latest_event_for_run_id(UNATTRIBUTED_CHANGE_EVENT_KINDS)
+            self._unattributed_view = latest[1] if latest is not None else None
+            self._unattributed_view_loaded = True
+        return self._unattributed_view
+
+    def _resume_venue_view(
+            self, store_ctx: RunContext, journal_rows: dict[str, float], venue_signed: float,
+    ) -> dict | None:
+        """The venue view the operator resume this process applies was first judged on.
+
+        The first process that compares the venue with its journal after an
+        operator resume records what it saw (the venue position and the
+        journal rows, :data:`RESUME_VENUE_VIEW_EVENT_KIND`) under the resume's
+        :attr:`operator_resume_ts_ms`: that is the venue the resume accepted.
+        A process applying the same resume again finds the record and judges
+        the venue against it, so a change made after it, while no bot ran, is
+        not accepted by the old resume.
+
+        :return: The recorded view (a payload :meth:`_report_covers` reads),
+            or ``None`` when no process judged the venue under this resume
+            yet: this process records its own view and the resume accepts it.
+        """
+        resume_ts_ms = self._operator_resume_ts_ms
+        for _key, _coid, _xid, payload in store_ctx.iter_events_by_kind_for_run_id(
+                RESUME_VENUE_VIEW_EVENT_KIND):
+            if payload.get('resume_ts_ms') == resume_ts_ms:
+                return payload
+        store_ctx.log_event(
+            RESUME_VENUE_VIEW_EVENT_KIND, client_order_id=None, intent_key=None,
+            payload={'resume_ts_ms': resume_ts_ms, 'venue_signed': venue_signed,
+                     'journal_owned': self._owned_total(journal_rows),
+                     'journal_rows': journal_rows},
+        )
+        return None
+
+    def _unattributed_state_reported(
+            self, journal_rows: dict[str, float], venue_signed: float,
+    ) -> bool:
+        """Whether the latest report of this run already covers this journal and venue.
+
+        Every report of an unexplained position change records the venue size
+        and the journal rows (owned exposure per row) it saw
+        (:data:`UNATTRIBUTED_CHANGE_EVENT_KINDS`); the latest one is judged
+        with :meth:`_report_covers`.
+        """
+        view = self._latest_unattributed_view()
+        if view is None:
+            return False
+        return self._report_covers(view, journal_rows, venue_signed)
+
+    @staticmethod
+    def _rows_unchanged(payload: dict, journal_rows: dict[str, float]) -> bool:
+        """Whether every journal row a recorded view saw still owns the same exposure.
+
+        Nothing attributed a change to those rows since: the difference the
+        view recorded still stands in the journal.
+        """
+        reported = payload.get('journal_rows')
+        if not isinstance(reported, dict):
+            return False
+        for coid, size in reported.items():
+            if (coid not in journal_rows or not isinstance(size, (int, float))
+                    or not _sizes_match(journal_rows[coid], float(size))):
+                return False
+        return True
+
+    def _reported_unattributed_loss(self, journal_rows: dict[str, float]) -> float:
+        """Exposure of the journal rows that a still-standing report says is gone.
+
+        The latest report of an unexplained reduction recorded the rows and the
+        venue position it saw. While those rows are unchanged (no plugin
+        attributed the reduction to them), the journal still counts the
+        reduced exposure, and a later venue position above the venue the
+        report saw is someone else's (a separate position on an account-net
+        view), not this run's.
+
+        :return: The reported rows' exposure the venue no longer held at the
+            report, signed on their side; ``0.0`` without such a report.
+        """
+        view = self._latest_unattributed_view()
+        if view is None or not self._rows_unchanged(view, journal_rows):
+            return 0.0
+        venue_raw = view.get('venue_signed')
+        reported = view.get('journal_rows')
+        if not isinstance(venue_raw, (int, float)) or not isinstance(reported, dict):
+            return 0.0
+        total = sum(float(size) for size in reported.values())
+        if total == 0.0:
+            return 0.0
+        venue = float(venue_raw)
+        same_side = venue != 0.0 and (venue > 0.0) == (total > 0.0)
+        kept = min(abs(venue), abs(total)) if same_side else 0.0
+        loss = max(0.0, abs(total) - kept)
+        return loss if total > 0.0 else -loss
+
+    def _adoptable_owned_size(
+            self, owned_signed: float, venue_entry_price: float,
+    ) -> float | None:
+        """The run-owned exposure startup adoption may take, in the book's unit.
+
+        The journal-owned exposure, less a reduction a still-standing report
+        recorded on its rows (:meth:`_reported_unattributed_loss`). A journal
+        in a venue wire unit (:data:`JOURNAL_WIRE_QTY_ANCHOR_EXTRA_KEY`,
+        inverse contracts) converts at the venue position's entry price
+        (``base = wire / price``), the conversion such a venue reports its
+        position at, so a run that holds the whole venue position adopts all
+        of it and a run sharing it with another party adopts only its share.
+
+        :param owned_signed: :meth:`_durable_owned_signed_size`.
+        :param venue_entry_price: The venue position's entry price.
+        :return: The adoptable exposure, signed; ``None`` when a wire-unit
+            journal cannot be converted (no venue entry price).
+        """
+        if not self._journal_in_book_units():
+            if not (venue_entry_price > 0.0 and math.isfinite(venue_entry_price)):
+                return None
+            return owned_signed / venue_entry_price
+        loss = self._reported_unattributed_loss(self._durable_owned_rows())
+        if loss == 0.0 or owned_signed == 0.0 or (loss > 0.0) != (owned_signed > 0.0):
+            return owned_signed
+        remaining = max(0.0, abs(owned_signed) - abs(loss))
+        return remaining if owned_signed > 0.0 else -remaining
+
+    def _carry_unattributed_view_over(self, exch_pos: ExchangePosition | None) -> None:
+        """Move a still-standing report onto the journal rows the bot's own fills changed.
+
+        A report covers a later startup only while the rows it recorded keep
+        their exposure (:meth:`_report_covers`). A plugin that books the bot's
+        own close on the entry row it reduced (a retired exposure, a lowered
+        cursor) changes such a row although the reported difference stands as
+        it was. Whenever the book moved since the last check, nothing of ours is
+        in flight and the venue holds exactly the book, a recorded view whose
+        rows changed (some of them still live) while the journal's surplus over
+        the venue stayed the same is recorded again over the current rows
+        (``unattributed_view_carried_over``). Only own fills move the venue
+        with the book: a plugin attributing the reported reduction lowers the
+        surplus instead, and the next startup judges it as usual.
+
+        :param exch_pos: The venue position this reconcile pass read.
+        """
+        book = self._position.size
+        if (self._store_ctx is None or self._unattributed_view_book == book
+                or getattr(self._broker, 'spot_inventory_port', None) is not None):
+            return
+        view = self._latest_unattributed_view()
+        if view is None:
+            self._unattributed_view_book = book
+            return
+        if (self._position_work_in_flight() or self.awaiting_market_fills()
+                or self._unbooked_exit_ids):
+            return
+        venue = self._venue_signed_size(exch_pos)
+        if venue is None or not _sizes_match(venue, book):
+            return
+        self._unattributed_view_book = book
+        if not self._journal_in_book_units():
+            return
+        journal_rows = self._durable_owned_rows()
+        if self._rows_unchanged(view, journal_rows):
+            return
+        reported = view.get('journal_rows')
+        reported_venue = view.get('venue_signed')
+        if (not isinstance(reported, dict) or not isinstance(reported_venue, (int, float))
+                or not any(coid in journal_rows for coid in reported)):
+            # Every reported row is gone: a later position, not the reported one.
+            return
+        reported_gap = sum(float(size) for size in reported.values()) - float(reported_venue)
+        current_gap = self._owned_total(journal_rows) - venue
+        if reported_gap == 0.0 or not _sizes_match(current_gap, reported_gap):
+            return
+        _blog_info(
+            "the unexplained difference reported before (journal over venue by %s) "
+            "stands after the bot's own fills changed its journal rows — carried over",
+            round(reported_gap, 12),
+        )
+        self._log_unattributed_view(
+            'unattributed_view_carried_over',
+            {'journal_owned': self._owned_total(journal_rows), 'venue_signed': venue,
+             'journal_rows': journal_rows},
+        )
+        self._unattributed_view_book = book
+
+    @staticmethod
+    def _report_covers(
+            payload: dict, journal_rows: dict[str, float], venue_signed: float,
+    ) -> bool:
+        """Whether a recorded journal-and-venue view covers the current difference.
+
+        It covers it when every row the view saw is still in the journal with
+        the same exposure (nothing attributed a change to journal rows since)
+        and the journal's surplus over the venue is, on the same side, no
+        larger than the one the view saw: whatever the rows added since (the
+        bot's own later fills, entries and exits alike) hold is on the venue,
+        so nothing was reduced again. A reduction of a later position has
+        other rows behind it, the recorded ones are gone, and it is not
+        covered even when it has the same size.
+
+        :param payload: The recorded view: ``venue_signed`` and
+            ``journal_rows`` (client order id -> owned exposure, signed).
+        :param journal_rows: The journal's owned rows now.
+        :param venue_signed: The venue position now, signed.
+        """
+        venue = payload.get('venue_signed')
+        reported = payload.get('journal_rows')
+        if (not isinstance(venue, (int, float)) or not isinstance(reported, dict)
+                or not OrderSyncEngine._rows_unchanged(payload, journal_rows)):
+            return False
+        reported_gap = sum(float(size) for size in reported.values()) - float(venue)
+        current_gap = sum(journal_rows.values()) - venue_signed
+        if _sizes_match(current_gap, reported_gap):
+            return True
+        return (current_gap > 0.0) == (reported_gap > 0.0) and abs(current_gap) < abs(reported_gap)
 
     @staticmethod
     def _clamp_adoption_to_owned(
@@ -4824,7 +5896,9 @@ class OrderSyncEngine:
         - Nothing owned, or a flat venue → adopt nothing.
         - Owned and venue agree in direction → adopt the smaller magnitude
           (the run cannot own more than the venue currently shows, and must
-          not absorb another run's slice beyond its own).
+          not absorb another run's slice beyond its own); sizes equal up to
+          float noise (a venue size converted from another unit) adopt the
+          venue's.
         - Opposite directions (the run's owned history disagrees with the
           venue's net sign) → adopt nothing rather than guess.
         """
@@ -4832,6 +5906,8 @@ class OrderSyncEngine:
             return 0.0
         if (owned_signed > 0.0) != (broker_signed > 0.0):
             return 0.0
+        if _sizes_match(broker_signed, owned_signed):
+            return broker_signed
         magnitude = min(abs(broker_signed), abs(owned_signed))
         return magnitude if broker_signed > 0.0 else -magnitude
 
@@ -5016,6 +6092,7 @@ class OrderSyncEngine:
             if m.entry_id in self._replayed_defensive_close_entry_ids
         ]
         self._settle_unbooked_exit_fills(exch_pos)
+        self._settle_held_reduction_fills(exch_pos)
         if is_startup and drained_mutated_position:
             _blog_info(
                 "skipping startup size adoption (exchange=%s, internal=%s) "
@@ -5068,16 +6145,17 @@ class OrderSyncEngine:
             # unconditional adoption.
             if adopt_known and self._store_ctx is not None:
                 owned_signed = self._durable_owned_signed_size()
-                clamped = self._clamp_adoption_to_owned(
-                    broker_signed, owned_signed,
-                )
+                self._report_startup_reduction(broker_signed, owned_signed)
+                adoptable = self._adoptable_owned_size(owned_signed, broker_entry_price)
+                clamped = (broker_signed if adoptable is None
+                           else self._clamp_adoption_to_owned(broker_signed, adoptable))
                 if clamped != broker_signed:
                     _blog_warning(
                         "startup adoption limited to run-owned exposure "
                         "(exchange=%s, owned=%s, internal=%s) — the "
-                        "remaining venue net belongs to another run on "
-                        "this account+symbol",
-                        broker_signed, owned_signed, self._position.size,
+                        "remaining venue net is not this run's (another "
+                        "run's or party's exposure on this account+symbol)",
+                        broker_signed, adoptable, self._position.size,
                     )
                     broker_signed = clamped
                     if broker_signed == 0.0:
@@ -5088,8 +6166,27 @@ class OrderSyncEngine:
                     "adopting exchange",
                     broker_signed, self._position.size,
                 )
-                self._adopt_signed_size(broker_signed, broker_entry_price)
-        elif not is_startup and new_size == 0.0 and self._position.size != 0.0:
+                self._adopt_signed_size(broker_signed, broker_entry_price, fifo_trim=True)
+        elif (not is_startup and self._position.size != 0.0
+              and (new_size == 0.0 or self._venue_on_opposite_side(exch_pos))):
+            if self._held_reduction_fills:
+                # A held exit fill of ours may be what took the venue flat or
+                # across: :meth:`_settle_held_reduction_fills` books it against
+                # this venue first, and only what it leaves unexplained is
+                # judged here afterwards.
+                self._flat_observed_since = 0.0
+                return
+            # The opposite side on an account-net view is the book's side
+            # gone just like a flat venue — but an own reversal still waiting
+            # for its fill looks the same (a market one in flight, or a
+            # resting one the venue already filled), so it must not age the
+            # confirmation clock.
+            reversed_side = new_size != 0.0
+            if reversed_side and (self._position_work_in_flight()
+                                  or self.awaiting_market_fills()
+                                  or self._own_resting_entry_may_have_filled(exch_pos)):
+                self._flat_observed_since = 0.0
+                return
             # A flat venue next to a holding book proves nothing on its own:
             # every fill of ours flattens /positions before its OrderEvent is
             # booked. The plugin delivers the event within its fill-report
@@ -5126,16 +6223,27 @@ class OrderSyncEngine:
             # ``open_trades`` would corrupt P&L bookkeeping the moment the
             # next ``record_fill`` runs (FIFO close against trades that no
             # longer exist on the broker).
+            book_before = self._position.size
+            venue_side = (exch_pos.side or '').lower() if exch_pos is not None else 'flat'
             if not is_nontradable_spot_dust:
-                _blog_error(
-                    "exchange shows flat, internal=%s, and no fill explains it — "
-                    "a manual close, a liquidation or an unreported fill; "
-                    "clearing position state",
-                    self._position.size,
-                )
+                if reversed_side:
+                    _blog_error(
+                        "exchange shows the opposite side (%s %s), internal=%s, and "
+                        "no fill explains it — someone closed the bot's position and "
+                        "opened the other side, or an unreported fill; clearing "
+                        "position state, the opposite exposure is not adopted",
+                        venue_side, new_size, book_before,
+                    )
+                else:
+                    _blog_error(
+                        "exchange shows flat, internal=%s, and no fill explains it — "
+                        "a manual close, a liquidation or an unreported fill; "
+                        "clearing position state",
+                        book_before,
+                    )
                 self._emit_broker_event(UnattributedPositionChangeEvent(
                     symbol=self._symbol, change='flatten',
-                    book_size=self._position.size, venue_size=0.0,
+                    book_size=book_before, venue_size=0.0,
                 ))
             # Retire the flattened entries' tracking BEFORE the clear:
             # leaving the slots would make the diff call Pine's next
@@ -5155,6 +6263,19 @@ class OrderSyncEngine:
             self._position.open_trades.clear()
             self._position.openprofit = 0.0
             self._position.open_commission = 0.0
+            if not is_nontradable_spot_dust and self._store_ctx is not None:
+                venue_signed = (-float(new_size) if venue_side == 'short'
+                                else float(new_size))
+                journal_rows = self._durable_owned_rows()
+                self._log_unattributed_view(
+                    'external_flatten_adopted',
+                    {'book_size': book_before, 'venue_side': venue_side,
+                     'venue_size': new_size,
+                     'cleared': sorted(cleared_entry_ids),
+                     'journal_owned': self._owned_total(journal_rows),
+                     'journal_rows': journal_rows,
+                     'venue_signed': venue_signed},
+                )
             for entry_id in cleared_entry_ids:
                 self._external_flatten_cleared_entry_ids.add(entry_id)
                 self._cleanup_position_tracking(entry_id)
@@ -5167,6 +6288,8 @@ class OrderSyncEngine:
             # flat or shrink observation is obsolete.
             self._flat_observed_since = 0.0
             self._shrink_observed = None
+            if not is_startup:
+                self._carry_unattributed_view_over(exch_pos)
         self._enforce_reduce_coverage_invariant(exch_pos)
 
     def _note_unbooked_exit_fill(self, event: OrderEvent) -> None:
@@ -5313,6 +6436,12 @@ class OrderSyncEngine:
                          'delta': delta, 'entry_ids': entry_ids,
                          'book_size_after': self._position.size},
             )
+        if self._startup_reduction_deferred and not self._unbooked_exit_ids:
+            # The journal now holds whatever the plugin netted for the fills
+            # held at startup: the startup comparison runs on it.
+            self._startup_reduction_deferred = False
+            if venue is not None and self._store_ctx is not None:
+                self._report_startup_reduction(venue, self._durable_owned_signed_size())
 
     @staticmethod
     def _venue_signed_size(exch_pos: ExchangePosition | None) -> float | None:
@@ -5350,12 +6479,17 @@ class OrderSyncEngine:
         )
 
     def _adopt_signed_size(
-            self, broker_signed: float, broker_entry_price: float,
+            self, broker_signed: float, broker_entry_price: float, *,
+            fifo_trim: bool = False,
     ) -> bool:
         """Set the book to a venue-derived net size and seed its parent trades.
 
         :param broker_signed: Signed size to adopt (positive long, negative short).
         :param broker_entry_price: The venue's average entry price for it.
+        :param fifo_trim: The size is below the order ledger's for a reduction
+            no fill attributes (startup adoption): trim the ledger's entries
+            oldest first instead of falling back to one parent
+            (:meth:`_recover_adopted_parent_trades`).
         :return: Whether the parent trades are exact: the size is flat, or the
             order ledger accounts for it per entry id. ``False`` when one
             fallback parent carries the whole size, so the ledger could not say
@@ -5401,7 +6535,7 @@ class OrderSyncEngine:
             # / opposing exposure, or a durable sum that disagrees with
             # the adopted net).
             adopted_trades = self._recover_adopted_parent_trades(
-                broker_signed,
+                broker_signed, fifo_trim=fifo_trim,
             )
             if adopted_trades:
                 for entry_id, trade_size in adopted_trades:
@@ -5430,14 +6564,79 @@ class OrderSyncEngine:
             )
             return False
 
+    def _venue_on_opposite_side(self, exch_pos: ExchangePosition | None) -> bool:
+        """Whether an account-net venue position sits on the side opposite the book.
+
+        Only an account-net view (no position port: a one-way or netting
+        account) proves the book's side is gone this way. A hedged account's
+        view is a per-run or aggregated projection: an opposite-side reading
+        there may be another party's separate position, which never touches
+        the bot's own legs.
+        """
+        if exch_pos is None or getattr(self._broker, 'position_port', None) is not None:
+            return False
+        book = self._position.size
+        side = (exch_pos.side or '').lower()
+        if book == 0.0 or float(exch_pos.size) == 0.0 or side not in ('long', 'short'):
+            return False
+        return (side == 'long') != (book > 0.0)
+
+    def _own_resting_entry_may_have_filled(self, exch_pos: ExchangePosition | None) -> bool:
+        """Whether a resting entry of ours on the venue's side may have filled unreported.
+
+        A resting limit / stop entry on the side the venue now holds (a
+        reversal the strategy placed in advance) puts the venue on that side
+        the moment it fills, and its fill report can arrive after the
+        confirmation grace (a stream gap the reconnect backfills). The
+        opposite side is unexplained only while every such order still rests
+        on the venue with no fill beyond what the book took: one gone from the
+        open orders, or showing more fill than booked, may be the cause. An
+        unreadable open-orders view proves nothing, so it counts as a possible
+        cause too.
+        """
+        if exch_pos is None:
+            return False
+        order_side = 'buy' if (exch_pos.side or '').lower() == 'long' else 'sell'
+        keys = [
+            key for key, intent in self._active_intents.items()
+            if isinstance(intent, EntryIntent) and intent.side == order_side
+            and intent.order_type is not OrderType.MARKET and self._order_mapping.get(key)
+        ]
+        if not keys:
+            return False
+        try:
+            orders = self._run_async_read(self._broker.get_open_orders(self._symbol))
+        except (ExchangeConnectionError, ExchangeRateLimitError,
+                OrderDispositionUnknownError) as e:
+            _blog_warning(
+                "venue on the opposite side of the book: open-orders read failed (%s) "
+                "— a resting reversal of ours may have filled, judged on a later pass",
+                e,
+            )
+            return True
+        resting = {order.id: order for order in orders if order.remaining_qty > 0.0}
+        for key in keys:
+            filled_on_venue = 0.0
+            for order_id in self._order_mapping.get(key, ()):
+                order = resting.get(order_id)
+                if order is None:
+                    return True
+                filled_on_venue += order.filled_qty
+            if filled_on_venue > self._active_entry_filled_qty.get(key, 0.0) + 1e-12:
+                return True
+        return False
+
     def _external_shrink_delta(self, exch_pos: ExchangePosition) -> float:
         """How far the venue holds BELOW the book on the book's own side.
 
         ``0.0`` when the venue holds at least the book, when the venue side
         is the opposite of the book (a flip is foreign exposure, not a
-        reduction of ours) or carries an unrecognised label, and when the
-        difference is below the venue's dust threshold (spot fee residuals
-        off the qty grid are not an external trade).
+        reduction of ours) or carries an unrecognised label, when the two
+        sizes are equal up to float noise (a venue size converted from
+        another unit, or summed from fills in another order, misses the book
+        by a few ulps: never a trade), and when the difference is below the
+        venue's dust threshold (spot fee residuals off the qty grid are not
+        an external trade).
         """
         book = self._position.size
         if book == 0.0:
@@ -5445,8 +6644,9 @@ class OrderSyncEngine:
         side = (exch_pos.side or '').lower()
         if side not in ('long', 'short') or (side == 'long') != (book > 0.0):
             return 0.0
-        delta = round(abs(book) - abs(float(exch_pos.size)), 12)
-        if delta <= 0.0:
+        venue_abs = abs(float(exch_pos.size))
+        delta = round(abs(book) - venue_abs, 12)
+        if delta <= 0.0 or _sizes_match(venue_abs, abs(book)):
             return 0.0
         spot_port = getattr(self._broker, 'spot_inventory_port', None)
         dust_threshold = getattr(spot_port, 'position_dust_threshold', Decimal(0))
@@ -5476,15 +6676,24 @@ class OrderSyncEngine:
         surplus closes, a dispatched close). The reduction is then booked as
         a synthetic closing fill at the venue's average entry price (the mark
         is not in the snapshot, so the realized P&L on the adopted piece is
-        approximate — stated in the log) and walked through the FIFO exactly
+        approximate — stated in the log — until a late fill of the bot's own
+        turns out to be this reduction and re-prices it) and walked through the FIFO exactly
         like a real close: a parent consumed in full has its exits cancelled
         and its tracking retired, a parent that survives keeps its exit and
-        the next diff amends the bracket to the new size.
+        the next diff amends the bracket to the new size. The adopted
+        quantity stays expected: a late fill of an order live at this moment
+        is held until the venue shows whether it was this reduction
+        (:meth:`_hold_fill_against_adopted_reduction`).
         """
         delta = self._external_shrink_delta(exch_pos)
         venue_abs = abs(float(exch_pos.size))
         now = time.monotonic()
         grace = self._fill_report_grace_s()
+        if self._held_reduction_fills:
+            # A held fill may be exactly this reduction; the venue settles it
+            # first (:meth:`_settle_held_reduction_fills`).
+            self._shrink_observed = None
+            return
         observed = self._shrink_observed
         if observed is None or observed[0] != venue_abs:
             self._shrink_observed = (venue_abs, now)
@@ -5518,8 +6727,18 @@ class OrderSyncEngine:
             event_type='filled', fill_price=price, fill_qty=delta, timestamp=ts,
             leg_type=LegType.CLOSE,
         )
+        # The bot's own fill the venue already netted but the stream has not
+        # delivered yet looks exactly like this reduction: remember what may
+        # still arrive for it, so that fill is not booked a second time, and
+        # the close it is booked as, so that fill re-prices it.
+        if self._adopted_reduction_side != side:
+            self._clear_adopted_reduction()
         closed_before = len(self._position.new_closed_trades)
-        self._position.record_fill(synthetic)
+        self._adopted_reduction_closes.append(
+            self._position.record_provisional_close(synthetic))
+        self._adopted_reduction_qty = round(self._adopted_reduction_qty + delta, 12)
+        self._adopted_reduction_side = side
+        self._note_orders_possibly_in_reduction()
         consumed = {
             trade.entry_id
             for trade in self._position.new_closed_trades[closed_before:]
@@ -5552,12 +6771,420 @@ class OrderSyncEngine:
                     self._cancel_and_retire_exit_leg(key, intent)
             self._cleanup_position_tracking(entry_id, cascade_reason='external_reduce')
         if self._store_ctx is not None:
-            self._store_ctx.log_event(
-                'external_reduce_adopted', client_order_id=None, intent_key=None,
-                payload={'venue_size': venue_abs, 'delta': delta, 'price': price,
-                         'consumed': sorted(consumed), 'retired': gone,
-                         'book_size': self._position.size},
+            journal_rows = self._durable_owned_rows()
+            self._log_unattributed_view(
+                'external_reduce_adopted',
+                {'venue_size': venue_abs, 'delta': delta, 'price': price,
+                 'consumed': sorted(consumed), 'retired': gone,
+                 'book_size': self._position.size,
+                 'journal_owned': self._owned_total(journal_rows),
+                 'journal_rows': journal_rows,
+                 'venue_signed': venue_abs if side == 'sell' else -venue_abs},
             )
+
+    def _live_bot_order_ids(self) -> frozenset[str]:
+        """Venue ids of the bot's orders that may still be working.
+
+        Every order an intent maps, plus every live journal row of this run
+        (an adopted or orphaned leg no intent maps can fill as well).
+        """
+        ids = {oid for oids in self._order_mapping.values() for oid in oids}
+        if self._store_ctx is not None:
+            for row in self._store_ctx.iter_live_orders():
+                if row.exchange_order_id:
+                    ids.add(row.exchange_order_id)
+        return frozenset(ids)
+
+    def _orders_proven_resting_unfilled(self, ids: frozenset[str]) -> frozenset[str] | None:
+        """Those of ``ids`` the venue's open orders show resting with no unreported fill.
+
+        An order resting with no fill beyond what its journal row already
+        recorded holds nothing a late report could still add: no unreported
+        fill of it happened before this read. A fill is compared with the
+        journal only where the row counts in the book's unit; any other row
+        must show no fill at all.
+
+        :param ids: Venue order ids of the bot.
+        :return: The proven ids, or ``None`` when the open orders are unreadable
+            (nothing is proven then).
+        """
+        try:
+            orders = self._run_async_read(self._broker.get_open_orders(self._symbol))
+        except (ExchangeConnectionError, ExchangeRateLimitError,
+                OrderDispositionUnknownError) as e:
+            _blog_warning(
+                "adopted reduction: open-orders read failed (%s) — a late fill of any "
+                "live order of ours is held until the venue position settles it", e,
+            )
+            return None
+        known: dict[str, float] = {}
+        if self._store_ctx is not None:
+            for row in self._store_ctx.iter_live_orders():
+                if not row.exchange_order_id:
+                    continue
+                in_book_unit = (row.extras or {}).get(JOURNAL_WIRE_QTY_ANCHOR_EXTRA_KEY) is None
+                known[row.exchange_order_id] = row.filled_qty if in_book_unit else 0.0
+        resting = {order.id: order for order in orders if order.remaining_qty > 0.0}
+        return frozenset(
+            order_id for order_id in ids
+            if order_id in resting
+            and resting[order_id].filled_qty <= known.get(order_id, 0.0) + 1e-12
+        )
+
+    def _exits_mapped_to(self, refs: frozenset[str]) -> frozenset[tuple[str, str | None]]:
+        """``(pine_id, from_entry)`` of the live exits any of whose mapped refs is in ``refs``."""
+        return frozenset(
+            (intent.pine_id, intent.from_entry)
+            for key, intent in self._active_intents.items()
+            if isinstance(intent, ExitIntent)
+            and any(ref in refs for ref in self._order_mapping.get(key, ()))
+        )
+
+    def _note_orders_possibly_in_reduction(self) -> None:
+        """Remember the bot's orders whose unreported fill the reduction adopted now may be.
+
+        Every order of :meth:`_live_bot_order_ids` except one the open orders
+        prove resting with no unreported fill
+        (:meth:`_orders_proven_resting_unfilled`): a fill of it reported later
+        happened after the reduction and is booked as usual. The venue net
+        alone cannot tell that apart once another run's or party's exposure on
+        it moves. A position-attached bracket (a synthetic leg ref, never a
+        resting order) gets its venue order id only when it fires, so its exit
+        is remembered too. An unreadable open-orders view proves nothing:
+        every live order may then be in the reduction, and later passes read
+        the view again (:meth:`_narrow_orders_possibly_in_reduction`).
+        """
+        ids = self._live_bot_order_ids()
+        proven = self._orders_proven_resting_unfilled(ids) if ids else frozenset()
+        possible = ids if proven is None else ids - proven
+        self._adopted_reduction_order_ids |= possible
+        self._adopted_reduction_known_ids |= ids
+        self._adopted_reduction_exits |= self._exits_mapped_to(possible)
+        if proven is None:
+            self._adopted_reduction_view_unverified = True
+
+    def _narrow_orders_possibly_in_reduction(self) -> None:
+        """Read the open orders the adoption could not, and drop the orders they prove.
+
+        Fills only accumulate: an order resting now with no unreported fill had
+        none when the reduction was adopted either, so it cannot be in it.
+        Without this, an open-orders read failing at the adoption left every
+        order of the bot held: on a venue net another run trades, the
+        settlement then measured that run's exposure as the bot's and dropped
+        the bot's real exit fill as already booked.
+        """
+        ids = self._adopted_reduction_order_ids
+        if not ids:
+            self._adopted_reduction_view_unverified = False
+            return
+        proven = self._orders_proven_resting_unfilled(ids)
+        if proven is None:
+            return
+        self._adopted_reduction_view_unverified = False
+        if not proven:
+            return
+        self._adopted_reduction_order_ids = ids - proven
+        self._adopted_reduction_exits = (
+            self._exits_mapped_to(self._adopted_reduction_order_ids)
+            & self._adopted_reduction_exits
+        )
+
+    def _clear_adopted_reduction(self) -> None:
+        """Forget the reduction :meth:`_adopt_external_shrink` booked without a fill."""
+        self._adopted_reduction_qty = 0.0
+        self._adopted_reduction_side = ''
+        self._adopted_reduction_order_ids = frozenset()
+        self._adopted_reduction_known_ids = frozenset()
+        self._adopted_reduction_exits = frozenset()
+        self._adopted_reduction_view_unverified = False
+        self._adopted_reduction_closes = []
+
+    def _fill_possibly_in_adopted_reduction(self, event: OrderEvent) -> bool:
+        """Whether ``event`` may be a late report of the adopted reduction.
+
+        A fill of an order that was live and not proven resting at the
+        adoption may be. So may a fired position-attached bracket's: its venue
+        order id is new to the bot, and it belongs to an exit whose bracket was
+        live then. An order the bot learned of after the adoption was not part
+        of it.
+        """
+        order_id = event.order.id
+        if order_id in self._adopted_reduction_order_ids:
+            return True
+        if order_id in self._adopted_reduction_known_ids or order_id in self._live_bot_order_ids():
+            return False
+        return (event.leg_type in (LegType.TAKE_PROFIT, LegType.STOP_LOSS,
+                                   LegType.TRAILING_STOP)
+                and (event.pine_id, event.from_entry) in self._adopted_reduction_exits)
+
+    def _hold_fill_against_adopted_reduction(self, event: OrderEvent) -> bool:
+        """Hold back a fill that the adopted external reduction may already contain.
+
+        :meth:`_adopt_external_shrink` books a venue reduction nobody reported
+        as a synthetic close. The usual cause is the bot's own resting exit
+        leg filling while its fill report was lost or late (a stream gap, a
+        reconnect backfill): when that fill arrives afterwards, booking it
+        would subtract the same quantity a second time, and the venue being
+        above the book is never adopted back. The event alone cannot tell
+        whether it is that fill or a newer one, so a reducing exit-leg fill
+        that may be in it (:meth:`_fill_possibly_in_adopted_reduction`) is held
+        out of the book and :meth:`_settle_held_reduction_fills` lets the venue
+        decide. That holds for a book gone flat too: the rest of the position
+        may have closed before the late fill arrived, whose price and fee the
+        adopted reduction's synthetic close still waits for. Everything else
+        about the fill (intent bookkeeping, spent brackets) proceeds as usual:
+        the leg did fill on the venue.
+
+        :param event: A fill event about to be booked.
+        :return: ``True`` when the fill was held and must not be booked now.
+        """
+        qty = event.fill_qty or 0.0
+        if (self._adopted_reduction_qty <= 0.0
+                or event.leg_type not in (LegType.TAKE_PROFIT, LegType.STOP_LOSS,
+                                          LegType.TRAILING_STOP, LegType.CLOSE)
+                or qty <= 0.0 or (event.fill_price or 0.0) <= 0.0
+                or event.order.side != self._adopted_reduction_side
+                or not self._fill_possibly_in_adopted_reduction(event)):
+            return False
+        # A flat book reduces nothing, but the fill may still be the adopted
+        # reduction reported late: held, it re-prices that reduction's close.
+        if self._position.size != 0.0 and self._position.is_non_reducing_exit(event):
+            return False
+        self._held_reduction_fills.append(event)
+        self._held_reduction_observed = None
+        _blog_warning(
+            "exit fill (leg=%s qty=%s pine=%r from_entry=%r) of an order that was live "
+            "when an unexplained reduction of %s was adopted — not booked yet; the "
+            "venue position decides whether it is that reduction, new entries wait",
+            event.leg_type, qty, event.pine_id, event.from_entry,
+            self._adopted_reduction_qty,
+        )
+        if self._store_ctx is not None:
+            self._store_ctx.log_event(
+                'adopted_reduction_fill_held',
+                client_order_id=event.order.client_order_id,
+                exchange_order_id=event.order.id, intent_key=None,
+                payload={'leg_type': str(event.leg_type), 'qty': qty,
+                         'side': event.order.side, 'pine_id': event.pine_id,
+                         'from_entry': event.from_entry,
+                         'book_size': self._position.size,
+                         'adopted_reduction': self._adopted_reduction_qty},
+            )
+        return True
+
+    def _settle_held_reduction_fills(self, exch_pos: ExchangePosition | None) -> None:
+        """Book the held fills (:meth:`_hold_fill_against_adopted_reduction`) the venue proves new.
+
+        Once no fill has routed for :meth:`_fill_report_grace_s`, nothing of
+        ours is in flight, and the venue has reported the same size for that
+        long, the venue's distance below the book (a flat venue: the whole
+        book; one across zero: the book plus its opposite exposure) is the
+        part of the held fills that happened after the adopted reduction. That
+        part is booked (oldest held fill first, at its own price, through the
+        FIFO like any fill; a parent it consumes has its exits and tracking
+        retired), and the rest was the adopted reduction itself: it is not
+        booked again and no longer expected, and the synthetic close the
+        reduction was booked as takes that fill's price, exit id and fee
+        (:meth:`BrokerPosition.reprice_provisional_closes`) — the book ends
+        where the fill reported on time would have left it.
+
+        The held fills are the bot's own executions, so the venue only decides
+        within two bounds. At most the adopted reduction can be one of them
+        reported late: the rest is new whatever the venue shows (another run's
+        or party's exposure on the same venue net, someone adding to it). And
+        never more is booked than the fills or the book hold: a venue further
+        below than the fills explain leaves that remainder, unexplained, to
+        the regular shrink / flatten reconcile, which reports it once it is
+        confirmed — never the bot's own fills with it. A venue with an
+        unrecognised side label settles nothing: the fills are dropped and the
+        book stays as it is. A book gone flat books nothing either: with the
+        venue flat too, every held fill was the adopted reduction (re-priced,
+        not booked). A venue still holding exposure the fills do not explain
+        (another run's on a shared net) changes only the bound: up to the
+        adopted reduction the fills are re-priced into it, the excess is left
+        to the unbooked-exit settlement (:meth:`_settle_unbooked_exit_fills`).
+        That settlement takes them all when the venue holds exactly what they
+        would have left the flat book with on a net only this run trades (an
+        earlier fill booked out of order), or when its side is unreadable.
+
+        :param exch_pos: The venue position this reconcile pass read.
+        """
+        if not self._held_reduction_fills:
+            if self._adopted_reduction_view_unverified:
+                self._narrow_orders_possibly_in_reduction()
+            return
+        now = time.monotonic()
+        grace = self._fill_report_grace_s()
+        if (now - self._last_position_fill_monotonic < grace
+                or self._position_work_in_flight()):
+            self._held_reduction_observed = None
+            return
+        venue = self._venue_signed_size(exch_pos)
+        observed = self._held_reduction_observed
+        if observed is None or observed[0] != venue:
+            self._held_reduction_observed = (venue, now)
+            return
+        if now - observed[1] < grace:
+            return
+        held = self._held_reduction_fills
+        self._held_reduction_fills = []
+        self._held_reduction_observed = None
+        held_qty = round(sum(event.fill_qty or 0.0 for event in held), 12)
+        book = self._position.size
+        expected = self._adopted_reduction_qty
+        # The open orders never proved which of the bot's orders rested through
+        # the adoption, and another run trades the same venue net: the distance
+        # below the book may be that run's exposure moving, not the bot's.
+        unverified_shared = (self._adopted_reduction_view_unverified
+                             and self._venue_shared_with_other_runs())
+        if book == 0.0 and (venue is None or not _sizes_match(venue, 0.0)):
+            signed_held = round(sum(
+                (event.fill_qty or 0.0) * (1.0 if event.order.side == 'buy' else -1.0)
+                for event in held), 12)
+            if venue is None or (_sizes_match(venue, signed_held)
+                                 and not self._venue_shared_with_other_runs()):
+                # The venue holds exactly what the fills would have left the
+                # flat book with (or no readable side): whether the book booked
+                # an earlier fill out of order is the unbooked-exit settlement's
+                # question.
+                for event in held:
+                    self._note_unbooked_exit_fill(event)
+                return
+            # The book went flat while the venue holds exposure the fills do not
+            # explain (another run's on a shared net, or a party's): up to the
+            # adopted reduction they are that reduction reported late and
+            # re-price its close; only the excess is left to the unbooked-exit
+            # settlement.
+            held, excess = self._split_held_at(held, expected)
+            for event in excess:
+                self._note_unbooked_exit_fill(event)
+            if not held:
+                return
+            held_qty = round(sum(event.fill_qty or 0.0 for event in held), 12)
+        new: float | None = None
+        if book == 0.0:
+            # Flat book: what the held fills reduced is gone from it, so the
+            # fills kept here can only be the adopted reduction reported late;
+            # its synthetic close takes their price.
+            new = 0.0
+        elif venue is not None:
+            toward = abs(venue) if (venue > 0.0) == (book > 0.0) else -abs(venue)
+            distance = abs(book) - toward
+            floor = max(0.0, held_qty - expected)
+            ceiling = min(held_qty, abs(book))
+            new = round(min(max(distance, floor), ceiling), 12)
+            if _sizes_match(new, 0.0):
+                new = 0.0
+            elif _sizes_match(new, held_qty):
+                new = held_qty
+        entry_ids = sorted({event.from_entry or event.pine_id or '' for event in held})
+        repriced = 0.0
+        if new is None:
+            outcome = 'unattributed'
+            _blog_warning(
+                "held exit fill(s) of %s dropped: the venue holds %s and the book %s — "
+                "no position they could still reduce; the book stays as it is",
+                entry_ids, venue, book,
+            )
+        else:
+            repeated = round(held_qty - new, 12)
+            consumed: set[str] = set()
+            remaining = new
+            for event in held:
+                qty = event.fill_qty or 0.0
+                part = 0.0
+                if remaining > 0.0:
+                    part = qty if qty <= remaining or _sizes_match(qty, remaining) else remaining
+                    remaining = round(remaining - part, 12)
+                if part > 0.0:
+                    slice_event = event if part == qty else dataclasses.replace(
+                        event, fill_qty=part, fee=event.fee * part / qty)
+                    closed_before = len(self._position.new_closed_trades)
+                    self._position.record_fill(slice_event)
+                    consumed.update(
+                        trade.entry_id
+                        for trade in self._position.new_closed_trades[closed_before:]
+                        if trade.entry_id is not None
+                    )
+                in_reduction = round(qty - part, 12)
+                if in_reduction > 0.0 and not _sizes_match(in_reduction, 0.0):
+                    # This much of the fill was the adopted reduction: the
+                    # synthetic close booked for it takes the fill's own price.
+                    repriced += self._position.reprice_provisional_closes(
+                        self._adopted_reduction_closes, in_reduction, event,
+                    )
+            self._adopted_reduction_qty = round(max(0.0, expected - repeated), 12)
+            if self._adopted_reduction_qty <= 0.0 or _sizes_match(
+                    self._adopted_reduction_qty, 0.0):
+                self._clear_adopted_reduction()
+            gone = sorted(
+                entry_id for entry_id in consumed
+                if not any(trade.entry_id == entry_id for trade in self._position.open_trades)
+            )
+            for entry_id in gone:
+                for key, intent in list(self._active_intents.items()):
+                    if isinstance(intent, ExitIntent) and intent.from_entry == entry_id:
+                        self._cancel_and_retire_exit_leg(key, intent)
+                self._cleanup_position_tracking(
+                    entry_id, cascade_reason='held_reduction_settled',
+                )
+            if repeated > 0.0 and new > 0.0:
+                outcome = 'split'
+            elif new > 0.0:
+                outcome = 'booked'
+            else:
+                outcome = 'already_booked'
+            (_blog_error if unverified_shared else _blog_warning)(
+                "held exit fill(s) of %s settled: the venue holds %s — %s of their %s "
+                "was the reduction adopted earlier without a fill (not booked again, "
+                "%s of its estimate re-priced at the fill), %s is new and booked; book "
+                "now %s%s",
+                entry_ids, venue, repeated, held_qty, repriced, new, self._position.size,
+                " (UNVERIFIED: the open orders were unreadable since the adoption and "
+                "another run trades this venue net, so its exposure may have moved the "
+                "venue size the split is measured on)" if unverified_shared else "",
+            )
+        if self._store_ctx is not None:
+            self._store_ctx.log_event(
+                'adopted_reduction_fill_settled', client_order_id=None, intent_key=None,
+                payload={'outcome': outcome, 'venue_size': venue, 'book_size': book,
+                         'held_qty': held_qty, 'adopted_reduction': expected,
+                         'repriced': repriced,
+                         'entry_ids': entry_ids, 'book_size_after': self._position.size,
+                         'unverified_shared_net': unverified_shared},
+            )
+
+    @staticmethod
+    def _split_held_at(held: list[OrderEvent], qty: float,
+                       ) -> tuple[list[OrderEvent], list[OrderEvent]]:
+        """Split held fills, oldest first, into the first ``qty`` and the rest.
+
+        A fill straddling the bound is sliced into two events, each with its
+        share of the fill's fee.
+
+        :param held: The held fills, oldest first.
+        :param qty: The quantity the first part takes.
+        :return: The fills within ``qty`` and the fills beyond it.
+        """
+        within: list[OrderEvent] = []
+        beyond: list[OrderEvent] = []
+        remaining = qty
+        for event in held:
+            fill_qty = event.fill_qty or 0.0
+            if remaining <= 0.0 or _sizes_match(remaining, 0.0):
+                beyond.append(event)
+                continue
+            if fill_qty <= remaining or _sizes_match(fill_qty, remaining):
+                within.append(event)
+                remaining = round(remaining - fill_qty, 12)
+                continue
+            rest = round(fill_qty - remaining, 12)
+            within.append(dataclasses.replace(
+                event, fill_qty=remaining, fee=event.fee * remaining / fill_qty))
+            beyond.append(dataclasses.replace(
+                event, fill_qty=rest, fee=event.fee * rest / fill_qty))
+            remaining = 0.0
+        return within, beyond
 
     def _fill_report_grace_s(self) -> float:
         """Seconds a venue position change may precede the fill event explaining it.
@@ -7012,10 +8639,11 @@ class OrderSyncEngine:
             # length here so the post-FILL slice gives us the exact set
             # of entry ids the FIFO walk consumed.
             closed_count_before = len(self._position.new_closed_trades)
-            if ((event.fill_qty or 0.0) > 0.0 and (event.fill_price or 0.0) > 0.0
-                    and self._position.is_non_reducing_exit(event)):
-                self._note_unbooked_exit_fill(event)
-            self._position.record_fill(event)
+            if not self._hold_fill_against_adopted_reduction(event):
+                if ((event.fill_qty or 0.0) > 0.0 and (event.fill_price or 0.0) > 0.0
+                        and self._position.is_non_reducing_exit(event)):
+                    self._note_unbooked_exit_fill(event)
+                self._position.record_fill(event)
             self._last_position_fill_monotonic = time.monotonic()
             # The book moved, so a running external-flatten confirmation no
             # longer measures an unmoved book: a later flat snapshot starts a
@@ -7481,24 +9109,26 @@ class OrderSyncEngine:
                 return
             if (key is not None
                     and event.cancel_reason in VENUE_DRIVEN_CANCEL_REASONS
-                    and event.order.reduce_only
                     and isinstance(self._active_intents.get(key), ExitIntent)):
-                # The venue says so itself: it terminated this reduce-only
-                # leg as fallout of the position it protects — a reduce-only
-                # cap squeeze after ANOTHER bracket's leg shrank the shared
-                # net position (measured live: bybit-inverse cycle 53, the
-                # L2-X TP was amended to the residual and then
+                # The venue says so itself: it terminated this exit leg as
+                # fallout of the position it protects — a reduce-only cap
+                # squeeze after ANOTHER bracket's leg shrank the shared net
+                # position (measured live: bybit-inverse cycle 53, the L2-X
+                # TP was amended to the residual and then
                 # ``CancelByReduceOnly``-cancelled in the batch of the L3-X
                 # SL fill — no sibling fill of its OWN intent to match, so
                 # the batch classifiers below could not clear it and the
-                # run was quarantined for the rest of the cycle), or the
-                # sibling leg of a venue-linked pair triggered. Not an
+                # run was quarantined for the rest of the cycle), the
+                # sibling leg of a venue-linked pair triggered, or the venue
+                # refused the leg itself. A spot exit leg is a plain sell on
+                # the venue (reduce-only is the plugin's software contract
+                # there), so the order's own flag does not decide. Not an
                 # external cancel: trim the dead leg, keep the intent on its
                 # live sibling (or retire it when this was the last leg, so
                 # the next sync re-arms the protection), no quarantine.
                 _blog_warning(
-                    "reduce-only bracket leg %s cancelled by the venue itself "
-                    "(%s) — trimming the dead leg, no quarantine",
+                    "exit leg %s cancelled by the venue itself (%s) — trimming "
+                    "the dead leg, no quarantine",
                     format_intent_key(key), event.cancel_reason,
                 )
                 self._trim_cancelled_bracket_leg(event, key)
@@ -7560,10 +9190,29 @@ class OrderSyncEngine:
                             intent_key=key,
                         )
                     return
-                _blog_error(
-                    "unexpected cancel for intent %s (%s)",
-                    format_intent_key(key), event,
-                )
+                # The venue terminated the order itself (a refused or
+                # unaffordable entry, a self-trade cancel, a liquidation
+                # sweep): nobody else touched the bot's order, so no
+                # ``on_unexpected_cancel`` policy applies. An entry is retired
+                # or consumed at its filled quantity
+                # (:meth:`_retire_venue_cancelled_entry`), any other order is
+                # retired like a ``rejected`` one. Exit legs were trimmed above.
+                venue_driven = event.cancel_reason in VENUE_DRIVEN_CANCEL_REASONS
+                active_entry = self._active_intents.get(key)
+                if venue_driven and isinstance(active_entry, EntryIntent):
+                    self._retire_venue_cancelled_entry(event, key, active_entry)
+                    return
+                if venue_driven:
+                    _blog_warning(
+                        "order of intent %s cancelled by the venue itself (%s) — "
+                        "retiring it, no quarantine",
+                        format_intent_key(key), event.cancel_reason,
+                    )
+                else:
+                    _blog_error(
+                        "unexpected cancel for intent %s (%s)",
+                        format_intent_key(key), event,
+                    )
                 # §2.6.7: retire the parent's native fail-safe state BEFORE the
                 # teardown below evicts the legs / envelope used to resolve its
                 # COID — but ONLY when the cancelled order IS the parent entry
@@ -7599,6 +9248,15 @@ class OrderSyncEngine:
                 self._order_mapping.pop(key, None)
                 self._active_intents.pop(key, None)
                 self._drop_envelope(key)
+                if venue_driven:
+                    if self._store_ctx is not None:
+                        self._store_ctx.log_event(
+                            'venue_driven_cancel',
+                            client_order_id=event.order.client_order_id,
+                            intent_key=key,
+                            payload={'cancel_reason': event.cancel_reason},
+                        )
+                    return
                 # A bot-owned order the engine still maps was cancelled out
                 # from under us — the same unexpected-cancel the grace-window
                 # tracker guards, but observed first on the private stream.
@@ -7674,6 +9332,82 @@ class OrderSyncEngine:
                     "order rejected (%s)", event,
                 )
 
+    def _retire_venue_cancelled_entry(
+            self, event: OrderEvent, key: str, intent: EntryIntent,
+    ) -> None:
+        """Retire a bot entry the venue cancelled itself, with no policy.
+
+        Nobody else touched the order (a refused or unaffordable entry, a
+        self-trade or risk cancel), so ``on_unexpected_cancel`` does not apply.
+
+        - **Unfilled**: retired like a reject. The client order id is spent at
+          the venue, so a re-placement on the same bar mints a fresh one, and
+          the cancel counts towards :data:`_ENTRY_REJECT_RETRY_CAP`: a venue
+          that keeps cancelling the identical entry does not get it re-placed
+          on every sync.
+        - **Partially filled**: the entry is consumed at its filled quantity,
+          like a fully filled one. Its sentinel stays in ``_active_intents`` at
+          that quantity and the retained Pine order is pinned, so the diff
+          neither re-places the remainder nor the whole entry; a fresh
+          ``strategy.entry`` call is a new cycle that passes the pyramiding
+          gate of :meth:`_maybe_redispatch_reissued_entry`.
+
+        :param event: The ``cancelled`` event carrying the venue's reason.
+        :param key: The entry's intent key.
+        :param intent: The active entry intent.
+        """
+        filled = event.order.filled_qty
+        self._abort_pending_partial_legs_for_dead_entry(key, reason='parent_cancelled')
+        self._entry_stop_engine.mark_aborted(key, reason='parent_cancelled')
+        self._order_mapping.pop(key, None)
+        if filled > 0.0:
+            sentinel = dataclasses.replace(intent, qty=filled)
+            self._active_intents[key] = sentinel
+            self._truncated_entries[key] = (intent, sentinel)
+            pine_order = self._position.entry_orders.get(intent.pine_id)
+            if pine_order is not None:
+                self._entry_backing_orders[key] = pine_order
+            _blog_warning(
+                "entry %s: the venue cancelled its unfilled remainder itself (%s) "
+                "after %s of %s filled — the entry is consumed at the filled "
+                "quantity, the remainder is not placed again, no quarantine",
+                format_intent_key(key), event.cancel_reason, filled, intent.qty,
+            )
+        else:
+            self._retire_native_failsafe_for_entry(key)
+            self._active_intents.pop(key, None)
+            self._reanchor_envelope_after_reject(key)
+            count = self._record_venue_entry_cancel(key, intent)
+            _blog_warning(
+                "entry %s cancelled by the venue itself (%s) — retiring it, no "
+                "quarantine%s",
+                format_intent_key(key), event.cancel_reason,
+                (" (the identical entry is not placed again until the script "
+                 "changes or re-issues it)") if count >= _ENTRY_REJECT_RETRY_CAP else "",
+            )
+        if self._store_ctx is not None:
+            self._store_ctx.log_event(
+                'venue_driven_cancel',
+                client_order_id=event.order.client_order_id,
+                intent_key=key,
+                payload={'cancel_reason': event.cancel_reason, 'filled_qty': filled},
+            )
+
+    def _record_venue_entry_cancel(self, key: str, intent: EntryIntent) -> int:
+        """Count a venue-driven cancel of an unfilled entry towards the retry cap.
+
+        :param key: The entry's intent key.
+        :param intent: The cancelled entry intent.
+        :return: The consecutive count for this intent.
+        """
+        marker = self._venue_cancelled_entry_intents.get(key)
+        count = marker.count + 1 if marker is not None and marker.intent == intent else 1
+        self._venue_cancelled_entry_intents[key] = _RejectedEntry(
+            intent, count, self._position.entry_orders.get(intent.pine_id),
+            self._current_bar_ts_ms,
+        )
+        return count
+
     def _apply_unexpected_cancel_policy(
             self, event: OrderEvent, key: str,
     ) -> None:
@@ -7698,6 +9432,9 @@ class OrderSyncEngine:
           its graceful stop.
         - ``ignore`` / ``re_place`` only audit-log.
 
+        A cancel an operator resume accepted (the order was cancelled before
+        the resume, :meth:`_cancel_accepted_by_resume`) applies no policy.
+
         Tracker-synthesised ``cancelled`` events
         (:attr:`OrderEvent.from_disappearance_tracker`) are skipped: the
         tracker already applied the policy before emitting them, so
@@ -7715,6 +9452,8 @@ class OrderSyncEngine:
         order = event.order
         coid = order.client_order_id if order is not None else None
         exchange_order_id = order.id if order is not None else None
+        if self._cancel_accepted_by_resume(coid, exchange_order_id, key):
+            return
         reason = (
             f"Bot-owned order cancelled unexpectedly on the venue: "
             f"coid={coid!r} ref={exchange_order_id!r} intent={key!r}"
@@ -7741,6 +9480,37 @@ class OrderSyncEngine:
         if halt is not None:
             self._record_halt(halt)
             raise halt
+
+    def _cancel_accepted_by_resume(
+            self, coid: str | None, exchange_order_id: str | None, key: str,
+    ) -> bool:
+        """Whether an operator resume accepted this venue-reported cancel; audit it when so.
+
+        The disappearance tracker retires a row whose absence the resume
+        covered without applying the policy. A plugin that reports the same
+        cancel itself, as a ``cancelled`` event (an activity catch-up replaying
+        the venue's history after the restart), gets the same verdict from the
+        same row marks (:func:`~pynecore.core.broker.disappearance.resume_accepts_cancel`).
+        The journal row stays the plugin's to retire (it may have closed it
+        already); its mark stays, so the tracker accepts its absence too.
+        """
+        store_ctx = self._store_ctx
+        if store_ctx is None or not coid:
+            return False
+        row = store_ctx.get_order(coid)
+        if row is None or not resume_accepts_cancel(row):
+            return False
+        _blog_warning(
+            "bot-owned order %r (ref %r, intent %s) was cancelled before the operator "
+            "resume — the resume accepted it, no intervention",
+            coid, exchange_order_id, format_intent_key(key), single_line=True,
+        )
+        store_ctx.log_event(
+            'cancel_accepted_by_resume', client_order_id=coid,
+            exchange_order_id=exchange_order_id, intent_key=key,
+            payload={'source': 'venue_event'},
+        )
+        return True
 
     def _bot_close_in_flight_for(self, from_entry: str) -> bool:
         """True when a bot-initiated close/reduce for ``from_entry`` is live.
@@ -7874,7 +9644,8 @@ class OrderSyncEngine:
         if self._order_mapping.get(key):
             # noinspection PyBroadException
             try:
-                self._dispatch_cancel(intent)
+                with self._follow_up_write_deferred(f"cancel of {format_intent_key(key)}"):
+                    self._dispatch_cancel(intent)
             except Exception:
                 _log.exception(
                     "expected bracket close sweep: cancel of %s failed; "
@@ -8410,9 +10181,12 @@ class OrderSyncEngine:
         the exact intent) is never suppressed; the stale marker is dropped by
         the start-of-cycle pruning pass.
         """
-        marker = self._rejected_entry_intents.get(key)
-        return (marker is not None and marker.intent == intent
-                and marker.count >= _ENTRY_REJECT_RETRY_CAP)
+        for markers in (self._rejected_entry_intents, self._venue_cancelled_entry_intents):
+            marker = markers.get(key)
+            if (marker is not None and marker.intent == intent
+                    and marker.count >= _ENTRY_REJECT_RETRY_CAP):
+                return True
+        return False
 
     def _record_entry_reject(
             self, key: str, intent: EntryIntent, exc: OrderSkippedByPlugin,
@@ -10014,7 +11788,9 @@ class OrderSyncEngine:
             # its cancel would orphan the reduce-only sibling. Native-OCA
             # venues own this sweep themselves.
             if not self._oca_cancel_native:
-                self._dispatch_cancel(intent)
+                with self._follow_up_write_deferred(
+                        f"cancel of {format_intent_key(key)}"):
+                    self._dispatch_cancel(intent)
             self._active_intents.pop(key, None)
             self._order_mapping.pop(key, None)
             self._drop_envelope(key)
@@ -10545,14 +12321,128 @@ class OrderSyncEngine:
             except queue.Empty:
                 break
             latest[ref] = (stop_level, profit_level, trailing_stop)
+        manager = self._native_failsafe_manager
         for ref, (stop_level, profit_level, trailing_stop) in latest.items():
-            self._native_failsafe_manager.on_native_bracket_observed(
+            state = manager.get_state(ref)
+            accepting = state is not None and state.accept_first_observation
+            verdict = manager.on_native_bracket_observed(
                 ref,
                 stop_level=stop_level,
                 profit_level=profit_level,
                 trailing_stop=trailing_stop,
                 now_ms=now_ms,
             )
+            state = manager.get_state(ref)
+            if state is None:
+                continue
+            if (verdict is FailsafeObservation.CONFIRMED
+                    and state.owner is FailsafeOwner.ENGINE_FAILSAFE):
+                self._persist_native_failsafe_levels(ref, confirmed=True)
+            elif verdict is FailsafeObservation.ACCEPTED_BASELINE:
+                self._note_native_failsafe_level_accepted(ref, stop_level, state.desired_level)
+                self._persist_native_failsafe_levels(ref)
+            elif accepting and not state.accept_first_observation:
+                # An own level explained the first observation: it is judged.
+                self._persist_native_failsafe_levels(ref)
+
+    def _note_native_failsafe_level_accepted(
+            self, ref: str, observed: float | None, desired: float | None,
+    ) -> None:
+        """Log and audit a broker fail-safe level accepted as the restart baseline.
+
+        After an operator resume the operator accepted the venue as it stands
+        (WARNING). Without a resume, no own record of the previous process
+        vouches for the level, so it cannot be told apart from an edit made
+        while the bot was down: it is not judged an external intervention,
+        but reported (ERROR) and audited.
+        """
+        resumed = self._native_failsafe_accept_reasons.pop(ref, None) == 'resume'
+        if resumed:
+            kind = 'native_failsafe_resume_level_accepted'
+            _blog_warning(
+                "native fail-safe of parent %r: the venue carries stop %s after the "
+                "operator resume — accepted, the bot re-asserts its worst-SL %s",
+                ref, observed, desired, single_line=True,
+            )
+        else:
+            kind = 'native_failsafe_restart_unverified_level'
+            _blog_error(
+                "native fail-safe of parent %r: the venue carries stop %s and no own "
+                "record of the previous process vouches for it — accepted as the "
+                "baseline, not judged an external intervention; the bot re-asserts "
+                "its worst-SL %s", ref, observed, desired, single_line=True,
+            )
+        if self._store_ctx is not None:
+            self._store_ctx.log_event(
+                kind, client_order_id=ref, intent_key=None,
+                payload={'observed_stop': observed, 'desired_stop': desired},
+            )
+
+    def _persist_native_failsafe_levels(self, ref: str, *, confirmed: bool = False) -> None:
+        """Record the bracket triples the broker may carry for ``ref`` on its parent row.
+
+        Every write records the outstanding triples (the batch baseline, an
+        accepted baseline and each level dispatched since): before a PUT, so a
+        restart after a crash in the middle of the PUT still knows both. On a
+        confirmation the broker carries the latest desired triple, which is
+        recorded as the confirmed one; the outstanding list is empty then, so
+        no older level stays on record as the bot's own.
+
+        Once this parent's first observation after an operator resume has been
+        judged, the record carries that resume's time
+        (:data:`_NATIVE_FAILSAFE_RESUME_EXTRA_KEY`): a process that applies the
+        same resume again judges the broker against the record instead of
+        accepting its next observation.
+        """
+        state = self._native_failsafe_manager.get_state(ref)
+        if self._store_ctx is None or state is None:
+            return
+        with self._store_ctx.transaction():
+            row = self._store_ctx.get_order(ref)
+            if row is None or row.closed_ts_ms is not None:
+                return
+            extras = dict(row.extras or {})
+            saved = dict(extras.get(NATIVE_FAILSAFE_LEVELS_EXTRA) or {})
+            saved['levels'] = [
+                [o.sl, o.profit_level, o.trailing_stop] for o in state.outstanding
+            ][-NATIVE_FAILSAFE_LEVELS_PERSISTED_CAP:]
+            if confirmed:
+                saved['confirmed'] = [state.desired_level, state.desired_profit_level,
+                                      state.desired_trailing_stop]
+            if self._operator_resume_ts_ms is not None and not state.accept_first_observation:
+                saved[_NATIVE_FAILSAFE_RESUME_EXTRA_KEY] = self._operator_resume_ts_ms
+            if saved == extras.get(NATIVE_FAILSAFE_LEVELS_EXTRA):
+                return
+            extras[NATIVE_FAILSAFE_LEVELS_EXTRA] = saved
+            self._store_ctx.upsert_order(ref, extras=extras)
+
+    def _saved_native_failsafe_record(self, ref: str) -> dict:
+        """The bracket record of ``ref``'s parent row; empty when there is none."""
+        if self._store_ctx is None:
+            return {}
+        row = self._store_ctx.get_order(ref)
+        saved = (row.extras or {}).get(NATIVE_FAILSAFE_LEVELS_EXTRA) if row is not None else None
+        return saved if isinstance(saved, dict) else {}
+
+    def _native_failsafe_judged_since_resume(self, ref: str) -> bool:
+        """Whether a process judged ``ref``'s broker bracket after this process's resume."""
+        resume_ts_ms = self._saved_native_failsafe_record(ref).get(
+            _NATIVE_FAILSAFE_RESUME_EXTRA_KEY)
+        return resume_ts_ms is not None and resume_ts_ms == self._operator_resume_ts_ms
+
+    def _persisted_native_failsafe_levels(
+            self, ref: str,
+    ) -> list[tuple[float | None, float | None, float | None]]:
+        """The bracket triples the previous process recorded for ``ref``, oldest first."""
+        saved = self._saved_native_failsafe_record(ref)
+        triples: list[tuple[float | None, float | None, float | None]] = []
+        for raw in [*(saved.get('levels') or []), saved.get('confirmed')]:
+            if not isinstance(raw, list) or len(raw) != 3:
+                continue
+            triple = (raw[0], raw[1], raw[2])
+            if triple not in triples:
+                triples.append(triple)
+        return triples
 
     def _rehydrate_native_failsafe_from_replayed_legs(self) -> None:
         """Seed :class:`NativeFailsafeManager` state from replayed legs.
@@ -10675,6 +12565,23 @@ class OrderSyncEngine:
                 pending_confirmation=ref in expects_native_sl,
                 now_ms=now_ms,
             )
+            # The broker may still carry any level the previous process sent:
+            # those are the bot's own, never an edit. Without a record (or
+            # after an operator resume, which accepted the venue as it stands,
+            # unless a process already judged the bracket since that resume)
+            # the first observation becomes the baseline instead of being
+            # judged against levels nothing vouches for.
+            saved_levels = self._persisted_native_failsafe_levels(ref)
+            self._native_failsafe_manager.seed_restart_levels(
+                ref, saved_levels, now_ms=now_ms,
+            )
+            if (self._resumed_from_quarantine
+                    and not self._native_failsafe_judged_since_resume(ref)):
+                self._native_failsafe_manager.accept_next_observation(ref)
+                self._native_failsafe_accept_reasons[ref] = 'resume'
+            elif not saved_levels and ref in expects_native_sl:
+                self._native_failsafe_manager.accept_next_observation(ref)
+                self._native_failsafe_accept_reasons[ref] = 'no_record'
             sl_levels: list[float] = []
             for leg in self._partial_bracket_engine.iter_legs():
                 if leg.parent_entry_dispatch_ref != ref:
@@ -11507,6 +13414,9 @@ class OrderSyncEngine:
             manager.mark_dispatch_in_flight(
                 snapshot.parent_entry_dispatch_ref, now_ms=now_ms,
             )
+            # Recorded BEFORE the PUT: a crash before its answer still leaves
+            # every level the broker may carry on record for the restart.
+            self._persist_native_failsafe_levels(snapshot.parent_entry_dispatch_ref)
             try:
                 self._native_bracket_dispatcher(snapshot)
             except BrokerManualInterventionError as halt:
@@ -12601,7 +14511,7 @@ class OrderSyncEngine:
     # === Restart-time Pine-side bracket reconstruction ===
 
     def _recover_adopted_parent_trades(
-            self, broker_signed: float,
+            self, broker_signed: float, *, fifo_trim: bool = False,
     ) -> list[tuple[str, float]]:
         """Reconstruct the per-entry FIFO parent trades for a startup adoption.
 
@@ -12624,34 +14534,55 @@ class OrderSyncEngine:
         sharing one id collapse to a single summed trade, distinct ids stay
         separate.
 
+        With ``fifo_trim`` (startup adoption) the adopted net may sit BELOW the
+        durable sum on the same side: someone reduced the position while the
+        bot was down or quarantined, and no plugin attributed the reduction to
+        journal rows yet. Nothing names the entries it closed, so the excess
+        is trimmed from the oldest rows, Pine's FIFO for a close that names no
+        entry (in memory only: the journal stays the plugin's to net), and the
+        surviving entries keep their own ids. Without it (a settlement whose
+        fills name their entries) such a sum falls back like any mismatch.
+
         Returns an EMPTY list (caller falls back to the single synthetic-parent
         seed) whenever the ledger cannot faithfully account for the adopted net:
 
         * a live row carries no real entry id (``None`` or the synthetic
           :data:`ADOPTED_STARTUP_ENTRY_ID`) — the exposure is unmapped;
+        * a live owned row is journaled in a venue wire unit
+          (:data:`JOURNAL_WIRE_QTY_ANCHOR_EXTRA_KEY`) — its quantity does not
+          share the adopted net's unit;
         * any owned exposure opposes the adopted net's sign;
-        * the signed durable sum disagrees with ``broker_signed`` (an external
-          partial close / concurrent-run clamp shrank the adoptable net below
-          what the rows show) — reconstructing per-entry there would overstate
-          the position.
+        * the adopted net exceeds the signed durable sum — reconstructing
+          per-entry there would leave exposure without an entry;
+        * the adopted net is below it without ``fifo_trim``.
 
         Rows a plugin synthesized for an untracked venue leg (flagged
-        :data:`ADOPTED_STARTUP_EXTRA_KEY`) are excluded, mirroring
-        :meth:`_durable_owned_signed_size`.
+        :data:`ADOPTED_STARTUP_EXTRA_KEY`) are excluded and retired exposure
+        (:data:`JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY`) is subtracted, mirroring
+        :meth:`_durable_owned_signed_size`: a partially closed pyramid keeps
+        one trade per entry id.
 
         Pure-local: read-only over the persisted journal.
         """
         if self._store_ctx is None or broker_signed == 0.0:
             return []
         want_buy = broker_signed > 0.0
-        by_id: dict[str, float] = {}
-        order: list[str] = []
+        owned: list[tuple[str, float]] = []
         total = 0.0
-        for row in self._store_ctx.iter_live_orders():
+        rows = sorted(self._store_ctx.iter_live_orders(), key=lambda r: r.created_ts_ms)
+        for row in rows:
             filled = row.filled_qty
             if filled <= 0.0:
                 continue
-            if (row.extras or {}).get(ADOPTED_STARTUP_EXTRA_KEY):
+            extras = row.extras or {}
+            if extras.get(ADOPTED_STARTUP_EXTRA_KEY):
+                continue
+            if extras.get(JOURNAL_WIRE_QTY_ANCHOR_EXTRA_KEY) is not None:
+                # Journaled in a venue wire unit (inverse contracts): its
+                # quantity cannot be compared with the adopted base-unit net.
+                return []
+            filled -= _retired_exposure(extras, filled)
+            if filled <= 0.0:
                 continue
             entry_id = row.pine_entry_id or ''
             if not entry_id or entry_id == ADOPTED_STARTUP_ENTRY_ID:
@@ -12663,20 +14594,27 @@ class OrderSyncEngine:
                 # Durable exposure opposing the adopted net sign — a hedged
                 # both-sides book the net scalar cannot represent faithfully.
                 return []
-            signed = filled if is_buy else -filled
-            if entry_id not in by_id:
-                order.append(entry_id)
-            by_id[entry_id] = by_id.get(entry_id, 0.0) + signed
-            total += signed
-        if not order:
+            owned.append((entry_id, filled))
+            total += filled
+        if not owned:
             return []
-        if abs(total - broker_signed) > 1e-9:
-            # The durable sum disagrees with the adopted net (external partial
-            # close, or a concurrent-run ownership clamp). Seeding per-entry
-            # trades here would restore more (or less) than actually rests on
-            # the venue — let the caller seed the single clamped aggregate.
+        excess = total - abs(broker_signed)
+        if excess < -1e-9 or (excess > 1e-9 and not fifo_trim):
+            # The durable sum disagrees with the adopted net: exposure no
+            # journal row accounts for, or a reduction whose entries only the
+            # caller's fills could name. Seeding per-entry trades here would
+            # misplace it — let the caller seed the single aggregate.
             return []
-        return [(entry_id, by_id[entry_id]) for entry_id in order]
+        by_id: dict[str, float] = {}
+        for entry_id, size in owned:
+            if excess > 1e-9:
+                trimmed = min(size, excess)
+                excess -= trimmed
+                size -= trimmed
+            if size <= 1e-12:
+                continue
+            by_id[entry_id] = by_id.get(entry_id, 0.0) + (size if want_buy else -size)
+        return list(by_id.items())
 
     def _recover_adopted_parent_entry_id(self) -> str | None:
         """Recover the single real Pine parent entry id for a startup adoption.
@@ -12950,6 +14888,10 @@ class OrderSyncEngine:
                 for r in rows
             ]
             leg_ids = [lid for lid in leg_ids if lid is not None]
+            if ikey in self._replay_refused_exit_keys:
+                # The venue refused to put this bracket back: rebuild the Pine
+                # exit without its live mapping, so the diff dispatches it again.
+                leg_ids = []
             self._position.reconstruct_exit_order(
                 pine_id=rep.pine_entry_id,
                 from_entry=rep.from_entry,
@@ -12962,6 +14904,13 @@ class OrderSyncEngine:
                 oca_name=oca_name,
                 oca_type=oca_type,
             )
+            if not leg_ids:
+                _blog_info(
+                    "reconstructed one-way bracket exit %r after restart without "
+                    "live protection — the next diff re-arms it",
+                    format_intent_key(ikey),
+                )
+                continue
             self._order_mapping[ikey] = [f"bracket:{lid}" for lid in leg_ids]
             _blog_info(
                 "reconstructed one-way bracket exit %r after restart "
@@ -13456,12 +15405,12 @@ class OrderSyncEngine:
         # refusal bar itself is consumed into the marker instead, so a script
         # that re-calls ``strategy.entry`` on every tick gets one reject
         # budget per bar, not one per tick.
-        if self._rejected_entry_intents:
-            for rkey in list(self._rejected_entry_intents):
-                marker = self._rejected_entry_intents[rkey]
+        for markers in (self._rejected_entry_intents, self._venue_cancelled_entry_intents):
+            for rkey in list(markers):
+                marker = markers[rkey]
                 desired = new_map.get(rkey)
                 if desired != marker.intent:
-                    del self._rejected_entry_intents[rkey]
+                    del markers[rkey]
                     continue
                 if marker.order is None:
                     continue
@@ -13469,9 +15418,12 @@ class OrderSyncEngine:
                 if current is marker.order:
                     continue
                 if self._current_bar_ts_ms > marker.bar_ts_ms:
-                    del self._rejected_entry_intents[rkey]
+                    del markers[rkey]
                 else:
-                    self._rejected_entry_intents[rkey] = marker._replace(order=current)
+                    markers[rkey] = marker._replace(order=current)
+        for tkey in list(self._truncated_entries):
+            if self._active_intents.get(tkey) is not self._truncated_entries[tkey][1]:
+                del self._truncated_entries[tkey]
         # Same release rule for the venue-refused exits and amends.
         for refused in (self._rejected_exit_intents, self._rejected_exit_modifies):
             for rkey in list(refused):
@@ -13934,7 +15886,8 @@ class OrderSyncEngine:
                         "retrying on every sync",
                         format_intent_key(key),
                         "has an exit fill awaiting settlement"
-                        if self._unbooked_exit_ids else "view unconfirmed",
+                        if self._unbooked_exit_ids or self._held_reduction_fills
+                        else "view unconfirmed",
                     )
                 if key not in self._active_intents:
                     # A never-dispatched entry has no exchange-side parent,
@@ -14749,6 +16702,17 @@ class OrderSyncEngine:
                         )
                         self._active_intents[key] = intent
                         continue
+                truncated = self._truncated_entries.get(key)
+                if (truncated is not None and truncated[1] is active_intent
+                        and intent == truncated[0]):
+                    # The retained Pine order of an entry the venue truncated
+                    # after a partial fill derives the entry as placed: the
+                    # sticky re-emission of the consumed sentinel, or a
+                    # same-parameter re-issue (:meth:`_retire_venue_cancelled_entry`).
+                    self._maybe_redispatch_reissued_entry(
+                        key, intent, skipped_entry_ids_this_sync,
+                    )
+                    continue
                 if (isinstance(intent, EntryIntent)
                         and isinstance(active_intent, EntryIntent)):
                     # A consumed market entry stays in ``_active_intents`` as
@@ -15213,11 +17177,21 @@ class OrderSyncEngine:
         same pinned ``(bar_ts_ms, retry_seq)``, so they collapse to a single
         tuple and are NOT ambiguous.
 
+        After an operator resume the read is also the first proof that an
+        order of the bot was still on the venue after the resume: a later
+        cancel of it is not one the resume accepted
+        (:func:`~pynecore.core.broker.disappearance.note_seen_after_resume`).
+
         Propagates :class:`ExchangeConnectionError` to the caller in
         :meth:`sync`, which skips the cycle and retries next sync so the scan
         completes before any fresh entry dispatch can mint a colliding COID.
         """
         orders = self._run_async_read(self._broker.get_open_orders(self._symbol))
+        if self._resumed_from_quarantine and self._store_ctx is not None:
+            note_seen_after_resume(
+                self._store_ctx,
+                (order.client_order_id for order in orders if order.client_order_id),
+            )
         owned_tags = self._journaled_run_tags()
         by_pid: dict[str, set[tuple[int, int, str]]] = {}
         order_ids_by_pid: dict[str, list[str]] = {}
@@ -17675,6 +19649,10 @@ class OrderSyncEngine:
           bracket-reject recovery (:meth:`_handle_bracket_attach_after_fill_reject`)
           and new entries are quarantined: the operator must look before more
           exposure is opened on a venue that refuses protection.
+        - **The parent is held and the level is crossed** — the venue flagged
+          the refusal as a crossed level, or the current market price already
+          trades through it: Pine's immediate exit. The parent is closed at
+          market at once, without an entry block.
 
         Every branch but the immediate retry raises :class:`OrderSkippedByPlugin`
         so the callers run their usual bookkeeping.
@@ -17714,7 +19692,8 @@ class OrderSyncEngine:
                 context={'symbol': intent.symbol, 'pine_id': intent.pine_id,
                          'from_entry': intent.from_entry},
             ) from error
-        if attempt == 0:
+        crossed = error.level_crossed or self._exit_level_crossed_by_market(intent, sign)
+        if attempt == 0 and not crossed:
             _blog_warning(
                 "exit %s rejected by the venue over live parent %r holding %s "
                 "(%s: %s) — re-dispatching once under a fresh client order id",
@@ -17723,14 +19702,11 @@ class OrderSyncEngine:
             self._reanchor_envelope_after_reject(key)
             self._dispatch_new(intent, _reject_retry=attempt + 1)
             return
-        position_coid = (
-            self._resolve_parent_opening_ref(intent.from_entry) or intent.from_entry
-        )
-        deal_id: str | None = None
-        if self._store_ctx is not None:
-            row = self._store_ctx.get_order(position_coid)
-            if row is not None:
-                deal_id = row.exchange_order_id
+        if crossed:
+            self._reanchor_envelope_after_reject(key)
+            self._close_parent_at_crossed_level(intent, error, held=held, sign=sign)
+            return
+        position_coid, deal_id = self._parent_position_refs(intent.from_entry)
         qty = min(abs(intent.qty), held)
         _blog_error(
             "exit %s rejected by the venue twice over live parent %r holding %s "
@@ -17760,6 +19736,86 @@ class OrderSyncEngine:
         )
         unprotected.__cause__ = error
         self._handle_bracket_attach_after_fill_reject(intent, unprotected)
+
+    def _parent_position_refs(self, from_entry: str | None) -> tuple[str, str | None]:
+        """The parent's opening client order id and its venue deal id, for a close.
+
+        :return: ``(position_coid, deal_id)``; the deal id is ``None`` when no
+            journal row records it.
+        """
+        position_coid = self._resolve_parent_opening_ref(from_entry) or from_entry or ''
+        deal_id: str | None = None
+        if self._store_ctx is not None:
+            row = self._store_ctx.get_order(position_coid)
+            if row is not None:
+                deal_id = row.exchange_order_id
+        return position_coid, deal_id
+
+    def _close_parent_at_crossed_level(
+            self, intent: ExitIntent, error: ExchangeOrderRejectedError, *,
+            held: float, sign: float,
+    ) -> None:
+        """Close the parent at market because the market already crossed the exit's level.
+
+        Pine exits at once when the price trades through a stop or a
+        take-profit, so the refused level is the exit itself, not a venue
+        that refuses to protect the position: no retry and no entry block.
+        Runs the defensive-close path of
+        :meth:`_handle_bracket_attach_after_fill_reject`, which raises
+        :class:`OrderSkippedByPlugin` (reason
+        ``protective_level_crossed_at_fill``) once the close is on its way.
+
+        :param intent: The exit whose level is crossed.
+        :param error: The venue's refusal.
+        :param held: The parent's open quantity.
+        :param sign: ``+1.0`` for a long parent, ``-1.0`` for a short.
+        """
+        key = intent.intent_key
+        _blog_warning(
+            "exit %s refused by the venue over live parent %r holding %s: "
+            "the market (last %s) already trades through its level (%s: %s) "
+            "— closing the parent at market, the exit Pine books for a "
+            "crossed level", intent, intent.from_entry, held, self._last_price,
+            type(error).__name__, error,
+        )
+        position_coid, deal_id = self._parent_position_refs(intent.from_entry)
+        crossed_close = BracketAttachAfterFillRejectedError(
+            f"protective exit {format_intent_key(key)} level crossed by the "
+            f"market: {error}",
+            position_coid=position_coid,
+            symbol=intent.symbol,
+            position_side='buy' if sign > 0.0 else 'sell',
+            qty=min(abs(intent.qty), held),
+            position_deal_id=deal_id,
+            from_entry=intent.from_entry,
+            exit_id=intent.pine_id,
+            error_message=str(error),
+            level_crossed=True,
+        )
+        crossed_close.__cause__ = error
+        self._handle_bracket_attach_after_fill_reject(intent, crossed_close)
+
+    def _exit_level_crossed_by_market(self, intent: ExitIntent, sign: float) -> bool:
+        """Whether the last market price already trades through the exit's level.
+
+        Judged against the CURRENT price (the last sync's close), not the
+        parent's fill price: a stop ratcheted above the fill is not crossed
+        until the market reaches it. A long's stop is crossed at or below it,
+        its take-profit at or above it; a short mirrors both. A trailing stop
+        is the venue's to move and never counts.
+
+        :param intent: The refused exit.
+        :param sign: ``+1.0`` for a long parent, ``-1.0`` for a short.
+        """
+        price = self._last_price
+        if price is None or sign == 0.0:
+            return False
+        long_parent = sign > 0.0
+        sl = intent.sl_price
+        if sl is not None and (price <= sl if long_parent else price >= sl):
+            return True
+        tp = intent.tp_price
+        return tp is not None and (price >= tp if long_parent else price <= tp)
 
     def _recover_rejected_close(
             self, intent: CloseIntent, error: ExchangeOrderRejectedError,
@@ -17834,28 +19890,67 @@ class OrderSyncEngine:
     ) -> None:
         """Keep a live parent protected after the venue refused an exit amend.
 
-        When the previous legs are still armed the position is as protected as
+        An amend declined because the market is closed changed nothing: while
+        the previous legs are still armed the OLD intent stays active and a
+        later sync re-sends the amend (:class:`_MarketClosedModifyDeferred`);
+        no level is judged crossed, as nothing can trade while the market is
+        closed. A refused level the market already trades through (the venue
+        flagged it, or the last price is beyond it) is Pine's immediate exit,
+        the same as on a fresh dispatch: the parent is closed at market, no
+        entry block (:meth:`_close_parent_at_crossed_level`). Otherwise, when
+        the previous legs are still armed the position is as protected as
         before the amend: the OLD intent stays active
         (:class:`_RejectedModifyDeferred`) and the refused spec is suppressed
         until Pine changes it. When the amend already tore the previous legs
         down the replacement goes out as a fresh dispatch; a refusal there
         closes the parent defensively through :meth:`_recover_rejected_exit`.
+
+        The re-assert of an exit after an operator resume
+        (:meth:`_reassert_exits_after_resume`) amends a protection the bot did
+        not set: the levels the operator left are not the bot's, so a refusal
+        dispatches the exit fresh as if no legs were armed, and a closed market
+        defers the re-assert to a later sync.
         """
         key = new.intent_key
-        if self._old_exit_protection_still_armed(key):
-            self._rejected_exit_modifies[key] = new
+        reasserting = key == self._reasserting_exit_key
+        if isinstance(error, MarketClosedError):
+            if reasserting:
+                raise _MarketClosedModifyDeferred(f"the market is closed ({error})")
+            if self._old_exit_protection_still_armed(key):
+                _blog_warning(
+                    "exit amend %s -> %s declined: the market is closed (%s) — the "
+                    "venue keeps the levels it holds; the amend is re-sent on a later "
+                    "sync", old, new, error,
+                )
+                raise _MarketClosedModifyDeferred(key)
+        else:
+            held, sign = self._parent_open_exposure(new.from_entry)
+            if held > 0.0 and (error.level_crossed
+                               or self._exit_level_crossed_by_market(new, sign)):
+                self._rejected_exit_modifies.pop(key, None)
+                self._close_parent_at_crossed_level(new, error, held=held, sign=sign)
+                return
+            if not reasserting and self._old_exit_protection_still_armed(key):
+                self._rejected_exit_modifies[key] = new
+                _blog_warning(
+                    "exit amend %s -> %s rejected by the venue (%s: %s) — the previous "
+                    "protection stays armed; the refused levels are not re-sent until "
+                    "the script changes them",
+                    old, new, type(error).__name__, error,
+                )
+                raise _RejectedModifyDeferred(key)
+        if reasserting:
             _blog_warning(
-                "exit amend %s -> %s rejected by the venue (%s: %s) — the previous "
-                "protection stays armed; the refused levels are not re-sent until "
-                "the script changes them",
+                "re-assert of exit %s after the resume refused by the venue (%s: %s) — "
+                "the venue does not carry the bot's levels; dispatching the exit fresh",
+                new, type(error).__name__, error,
+            )
+        else:
+            _blog_warning(
+                "exit amend %s -> %s rejected by the venue after the previous legs "
+                "were taken down (%s: %s) — dispatching the replacement fresh",
                 old, new, type(error).__name__, error,
             )
-            raise _RejectedModifyDeferred(key)
-        _blog_warning(
-            "exit amend %s -> %s rejected by the venue after the previous legs "
-            "were taken down (%s: %s) — dispatching the replacement fresh",
-            old, new, type(error).__name__, error,
-        )
         self._order_mapping.pop(key, None)
         self._reanchor_envelope_after_reject(key)
         self._dispatch_new(new, _reject_retry=1)

@@ -59,16 +59,34 @@ that core:
   halt survives an abandoned generator and re-raises on the next
   :meth:`DisappearanceTracker.observe` call. The halt is delivered
   exactly once — each raise site consumes it.
+- **Cancels before an operator resume are accepted.** A disappearance under
+  investigation when the operator resumed the run, or a row's first absence
+  after the resume (:func:`accept_missing_before_resume`), retires its row on
+  a CANCELLED verdict with a ``cancel_accepted_by_resume`` audit event and no
+  policy. The first absence is the one the presence feed stamps before any
+  complete snapshot shows the row again, or, for a row the plugin stamps
+  itself, a stamp it writes within :data:`RESUME_FIRST_ABSENCE_WINDOW_S` of
+  the resume. A row the venue lists among its open orders after the resume
+  (the sync engine's first open-orders read, :func:`note_seen_after_resume`)
+  was still there then: its later cancel is judged as usual. A resume
+  applied again after a restart keeps what the earlier process settled and
+  restarts the window only for the rows it never judged
+  (:func:`renew_resume_first_absence`). The sync engine gives a
+  ``cancelled`` event the plugin reports itself the same verdict
+  (:func:`resume_accepts_cancel`).
 - **Venue-driven cancels are not interventions.** A confirmation that
   names a :data:`~pynecore.core.broker.models.VENUE_DRIVEN_CANCEL_REASONS`
   cause (the venue terminated the order itself, e.g. a reduce-only squeeze
   or an OCA sibling trigger whose push was lost) retires the row and
   yields the ``cancelled`` event carrying that reason, but never applies
   the ``on_unexpected_cancel`` policy: nobody else touched the order, so
-  the engine trims the leg and its stop-coverage guard may re-arm it.
+  the engine trims an exit leg (its stop-coverage guard may re-arm it) or
+  retires an entry / close order, exactly as for the same cancel pushed on
+  the private stream.
 """
 import logging
 import math
+import time
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -79,7 +97,7 @@ from collections.abc import (
 )
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 from pynecore.core.broker.exceptions import UnexpectedCancelError
 from pynecore.core.broker.journal import (
@@ -101,12 +119,18 @@ if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow, RunContext
 
 __all__ = [
+    'MISSING_ACCEPTED_BY_RESUME_EXTRA',
     'MISSING_PENDING_EXTRA',
+    'RESUME_FIRST_ABSENCE_WINDOW_S',
     'UNEXPECTED_CANCEL_POLICIES',
     'DisappearanceTracker',
     'MissingConfirmation',
     'MissingResolution',
+    'accept_missing_before_resume',
+    'note_seen_after_resume',
+    'renew_resume_first_absence',
     'resolve_unexpected_cancel_policy',
+    'resume_accepts_cancel',
 ]
 
 logger = logging.getLogger(__name__)
@@ -115,6 +139,36 @@ logger = logging.getLogger(__name__)
 #: same key both reference plugins already use, so a refactor onto the
 #: tracker inherits stamps persisted by earlier plugin versions.
 MISSING_PENDING_EXTRA = 'missing_pending_since'
+
+#: ``OrderRow.extras`` key holding the ``missing_pending_since`` stamp an
+#: operator resume accepted: the disappearance under that stamp happened before
+#: the resume, so a CANCELLED verdict on it retires the row without the
+#: ``on_unexpected_cancel`` policy.
+MISSING_ACCEPTED_BY_RESUME_EXTRA = 'missing_accepted_by_resume'
+
+#: :data:`MISSING_ACCEPTED_BY_RESUME_EXTRA` value of a row that was live and not
+#: stamped at an operator resume: its first absence after the resume, when no
+#: complete snapshot showed it in between, is accepted too. A restarted
+#: process cannot tell an order cancelled before the resume (while it was down)
+#: from one cancelled right after it, and the operator accepted the venue as it
+#: stood; the first complete snapshot that shows the row clears the mark, and so
+#: does an open-orders read that lists it (:func:`note_seen_after_resume`).
+_RESUME_ACCEPTS_NEXT_ABSENCE = 'next_absence'
+
+#: ``OrderRow.extras`` key holding the resume time (unix seconds) of a row
+#: marked :data:`_RESUME_ACCEPTS_NEXT_ABSENCE`, which bounds the acceptance of a
+#: stamp the tracker did not write itself.
+_MISSING_RESUMED_AT_EXTRA = 'missing_resumed_at'
+
+#: Seconds after an operator resume within which a ``missing_pending_since``
+#: stamp that a plugin wrote itself (not through the presence feed) still marks
+#: the first absence the resume accepted. Such a plugin stamps on its own
+#: evidence (a working order that left the venue with no fill in its history),
+#: so the tracker never sees a complete snapshot show the row: the window covers
+#: the restarted process's connect and its first reconcile passes, including a
+#: few retries of an inconclusive history read. A later stamp is a fresh absence
+#: and is judged as usual.
+RESUME_FIRST_ABSENCE_WINDOW_S = 300.0
 
 #: Valid ``on_unexpected_cancel`` policies (see ``BrokerDefaults``).
 UNEXPECTED_CANCEL_POLICIES = (
@@ -131,12 +185,164 @@ def _is_fully_filled(row: 'OrderRow') -> bool:
     return row.qty > 0.0 and row.filled_qty >= row.qty - _QTY_EPS
 
 
+def _is_stamp(value: Any) -> TypeGuard[float]:
+    """Whether an extras value is a stamp (unix seconds)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _accepted_by_resume(row: 'OrderRow', since: float) -> bool:
+    """Whether an operator resume accepted the disappearance stamped at ``since``."""
+    return (row.extras or {}).get(MISSING_ACCEPTED_BY_RESUME_EXTRA) == since
+
+
+def _without_resume_mark(extras: Mapping[str, Any]) -> dict[str, Any]:
+    """``extras`` without the resume acceptance and its resume time."""
+    return {k: v for k, v in extras.items()
+            if k not in (MISSING_ACCEPTED_BY_RESUME_EXTRA, _MISSING_RESUMED_AT_EXTRA)}
+
+
+def accept_missing_before_resume(
+        store_ctx: 'RunContext', *, resumed_at: float | None = None,
+) -> int:
+    """Accept every disappearance that happened before an operator resume.
+
+    The operator resumed the run and so accepted the venue as it stands,
+    including an order someone cancelled before the resume. A stamped row
+    remembers the stamp it was accepted under; a row not stamped yet (the
+    cancel happened while no process observed the venue) has its first
+    absence after the resume accepted: the one the presence feed stamps before
+    a complete snapshot shows the row again, or a stamp the plugin writes
+    itself within :data:`RESUME_FIRST_ABSENCE_WINDOW_S` of ``resumed_at``. A
+    later CANCELLED verdict for an accepted stamp retires the row with a
+    ``cancel_accepted_by_resume`` audit event and no policy. A row that a
+    complete snapshot shows again, or whose stamp the plugin cleared, loses
+    the acceptance: when it vanishes later, it is stamped anew and judged as
+    usual.
+
+    :param store_ctx: The resumed run's journal.
+    :param resumed_at: The time the resume was applied (unix seconds); now
+        when omitted.
+    :return: The number of live rows marked.
+    """
+    if resumed_at is None:
+        resumed_at = time.time()
+    accepted = 0
+    with store_ctx.transaction():
+        for row in store_ctx.iter_live_orders():
+            extras = _without_resume_mark(row.extras or {})
+            since = extras.get(MISSING_PENDING_EXTRA)
+            if _is_stamp(since):
+                extras[MISSING_ACCEPTED_BY_RESUME_EXTRA] = since
+            else:
+                extras[MISSING_ACCEPTED_BY_RESUME_EXTRA] = _RESUME_ACCEPTS_NEXT_ABSENCE
+                extras[_MISSING_RESUMED_AT_EXTRA] = resumed_at
+            store_ctx.upsert_order(row.client_order_id, extras=extras)
+            accepted += 1
+    return accepted
+
+
+def note_seen_after_resume(store_ctx: 'RunContext', client_order_ids: Iterable[str]) -> int:
+    """Drop the first-absence acceptance of rows the venue showed after the resume.
+
+    A row marked for its first absence after an operator resume
+    (:func:`accept_missing_before_resume`) was still on the venue when a read
+    made after the resume listed it, so whatever removes it later happened
+    after the resume and is judged as usual. A stamped absence the resume
+    accepted is the tracker's to settle and is left alone.
+
+    :param store_ctx: The resumed run's journal.
+    :param client_order_ids: Client order ids of the orders the venue listed.
+    :return: The number of rows whose acceptance was dropped.
+    """
+    seen = set(client_order_ids)
+    if not seen:
+        return 0
+    dropped = 0
+    with store_ctx.transaction():
+        for row in store_ctx.iter_live_orders():
+            if row.client_order_id not in seen:
+                continue
+            extras = row.extras or {}
+            if (extras.get(MISSING_ACCEPTED_BY_RESUME_EXTRA) != _RESUME_ACCEPTS_NEXT_ABSENCE
+                    or _is_stamp(extras.get(MISSING_PENDING_EXTRA))):
+                continue
+            store_ctx.upsert_order(row.client_order_id, extras=_without_resume_mark(extras))
+            dropped += 1
+    return dropped
+
+
+def resume_accepts_cancel(row: 'OrderRow', *, now_ts: float | None = None) -> bool:
+    """Whether an operator resume accepted the cancel of ``row`` reported now.
+
+    For a ``cancelled`` event a plugin reports itself instead of through the
+    tracker (an activity catch-up replaying the venue's history after the
+    restart): it gets the verdict the tracker gives the same row's absence. An
+    absence stamp the resume accepted is this cancel. A row still marked for
+    its first absence after the resume (no complete snapshot showed it since)
+    accepts a cancel reported within :data:`RESUME_FIRST_ABSENCE_WINDOW_S` of
+    the resume, the window of a stamp a plugin writes itself; a later one is
+    a fresh absence.
+
+    :param row: The cancelled order's live journal row.
+    :param now_ts: The time the cancel is reported (unix seconds); now when
+        omitted.
+    """
+    extras = row.extras or {}
+    mark = extras.get(MISSING_ACCEPTED_BY_RESUME_EXTRA)
+    since = extras.get(MISSING_PENDING_EXTRA)
+    if mark == _RESUME_ACCEPTS_NEXT_ABSENCE:
+        resumed_at = extras.get(_MISSING_RESUMED_AT_EXTRA)
+        if not _is_stamp(resumed_at):
+            return False
+        if _is_stamp(since):
+            absent_since = since
+        else:
+            absent_since = time.time() if now_ts is None else now_ts
+        return absent_since <= resumed_at + RESUME_FIRST_ABSENCE_WINDOW_S
+    return _is_stamp(mark) and mark == since
+
+
+def renew_resume_first_absence(
+        store_ctx: 'RunContext', *, resumed_at: float | None = None,
+) -> int:
+    """Restart the first-absence window of the rows a resume still has to judge.
+
+    For a resume applied again by a process that restarted before the first
+    one completed it (:func:`accept_missing_before_resume` ran in that first
+    process). A row still marked for its first absence and not stamped since
+    was judged by no process after the resume: whether it vanished before the
+    resume or while no process ran cannot be told apart, so its acceptance
+    window starts again at ``resumed_at``. Every other row keeps what the
+    earlier process settled: a row it saw on the venue lost its acceptance, a
+    stamp it accepted stays accepted, and a stamp it wrote keeps the window of
+    the first application.
+
+    :param store_ctx: The resumed run's journal.
+    :param resumed_at: The time this process applies the resume (unix
+        seconds); now when omitted.
+    :return: The number of live rows whose window restarted.
+    """
+    if resumed_at is None:
+        resumed_at = time.time()
+    renewed = 0
+    with store_ctx.transaction():
+        for row in store_ctx.iter_live_orders():
+            extras = dict(row.extras or {})
+            if (extras.get(MISSING_ACCEPTED_BY_RESUME_EXTRA) != _RESUME_ACCEPTS_NEXT_ABSENCE
+                    or _is_stamp(extras.get(MISSING_PENDING_EXTRA))):
+                continue
+            extras[_MISSING_RESUMED_AT_EXTRA] = resumed_at
+            store_ctx.upsert_order(row.client_order_id, extras=extras)
+            renewed += 1
+    return renewed
+
+
 def resolve_unexpected_cancel_policy(
         policy: str,
         *,
         reason: str,
         context: dict[str, Any],
-        request_quarantine: Callable[..., None] | None,
+        request_quarantine: Callable[..., bool | None] | None,
         log_event: Callable[..., None] | None,
         client_order_id: str | None,
         exchange_order_id: str | None,
@@ -166,7 +372,9 @@ def resolve_unexpected_cancel_policy(
         carried into the halt / quarantine request.
     :param context: Structured payload passed to the quarantine sink.
     :param request_quarantine: Quarantine latch sink; ``None`` (an unwired
-        sink under a quarantining policy) triggers the fail-closed halt.
+        sink under a quarantining policy) triggers the fail-closed halt. A sink
+        that returns ``False`` already recorded this intervention under its
+        held latch (a re-report after a restart): no audit event is written.
     :param log_event: Audit sink (``RunContext.log_event``); ``None`` skips
         audit persistence (a store-less engine on the push path).
     :param client_order_id: The affected row's COID, stamped on audit events.
@@ -195,7 +403,7 @@ def resolve_unexpected_cancel_policy(
     if policy == 'stop' and request_quarantine is not None:
         # noinspection PyBroadException
         try:
-            request_quarantine(
+            noted = request_quarantine(
                 reason, context, kind=QuarantineKind.EXTERNAL_INTERVENTION,
             )
         except Exception:
@@ -205,7 +413,8 @@ def resolve_unexpected_cancel_policy(
             )
         else:
             quarantined = True
-            _log(f'{audit_prefix}_quarantine')
+            if noted is not False:
+                _log(f'{audit_prefix}_quarantine')
     if not quarantined:
         # 'halt', or a quarantining policy whose hook is missing / raised:
         # arm the process-exiting manual-intervention signal.
@@ -373,7 +582,7 @@ class DisappearanceTracker:
             tracked_refs: Callable[['OrderRow'], Set[tuple[str, str]]],
             confirm_missing: Callable[['OrderRow'], Awaitable[MissingConfirmation]],
             is_exempt: Callable[['OrderRow'], bool] | None = None,
-            request_quarantine: Callable[..., None] | None = None,
+            request_quarantine: Callable[..., bool | None] | None = None,
             sibling_coids: Callable[
                 ['OrderRow', MissingConfirmation], Iterable[str]] | None = None,
             register_executions: Callable[
@@ -489,11 +698,13 @@ class DisappearanceTracker:
             if (applied
                     and confirmation.resolution is MissingResolution.CANCELLED
                     and confirmation.cancel_reason not in VENUE_DRIVEN_CANCEL_REASONS
-                    and not _is_fully_filled(hook_row)):
+                    and not _is_fully_filled(hook_row)
+                    and not _accepted_by_resume(row, since_ts)):
                 # A fully filled row was retired as a benign post-fill
-                # close by ``_apply_confirmation`` (same predicate), and a
-                # venue-driven cancel is nobody's intervention — the
-                # unexpected-cancel policy must not fire for either.
+                # close by ``_apply_confirmation`` (same predicate), a
+                # venue-driven cancel is nobody's intervention, and a cancel
+                # an operator resume accepted is no longer one — the
+                # unexpected-cancel policy must not fire for any of them.
                 self._apply_policy(hook_row)
             for event in events:
                 yield event
@@ -539,6 +750,7 @@ class DisappearanceTracker:
             now_ts: float,
     ) -> None:
         refs = self._tracked_refs(row)
+        self._settle_resume_mark(row, now_ts, presence_tracked=bool(refs))
         if not refs:
             return
         visible = False
@@ -553,7 +765,7 @@ class DisappearanceTracker:
                 break
         extras = row.extras or {}
         if visible:
-            if MISSING_PENDING_EXTRA in extras:
+            if MISSING_PENDING_EXTRA in extras or MISSING_ACCEPTED_BY_RESUME_EXTRA in extras:
                 self._clear_stamp(row.client_order_id)
             return
         if not all_fetched:
@@ -578,17 +790,63 @@ class DisappearanceTracker:
             if MISSING_PENDING_EXTRA in extras:
                 return
             extras[MISSING_PENDING_EXTRA] = now_ts
+            if extras.get(MISSING_ACCEPTED_BY_RESUME_EXTRA) == _RESUME_ACCEPTS_NEXT_ABSENCE:
+                extras[MISSING_ACCEPTED_BY_RESUME_EXTRA] = now_ts
+                extras.pop(_MISSING_RESUMED_AT_EXTRA, None)
             self._store.upsert_order(coid, extras=extras)
 
+    def _settle_resume_mark(
+            self, row: 'OrderRow', now_ts: float, *, presence_tracked: bool,
+    ) -> None:
+        """Bind an operator resume's acceptance to a stamp the plugin wrote itself.
+
+        The presence feed converts the first-absence mark when it stamps the
+        row (:meth:`_stamp`) and drops it when a complete snapshot shows the
+        row. A plugin that stamps a row on its own evidence bypasses both, so
+        the mark is settled here instead: a stamp written within
+        :data:`RESUME_FIRST_ABSENCE_WINDOW_S` of the resume becomes the
+        accepted one; a later stamp, a mark of a row the presence feed does not
+        track that is still unstamped past the window, and an accepted stamp the
+        plugin cleared or replaced all lose the acceptance. Re-reads the live
+        row and rewrites only the mark keys.
+        """
+        if MISSING_ACCEPTED_BY_RESUME_EXTRA not in (row.extras or {}):
+            return
+        with self._store.transaction():
+            fresh = self._store.get_order(row.client_order_id)
+            if fresh is None or fresh.closed_ts_ms is not None:
+                return
+            extras = fresh.extras or {}
+            mark = extras.get(MISSING_ACCEPTED_BY_RESUME_EXTRA)
+            if mark is None:
+                return
+            since = extras.get(MISSING_PENDING_EXTRA)
+            settled: float | None = None
+            if mark == _RESUME_ACCEPTS_NEXT_ABSENCE:
+                resumed_at = extras.get(_MISSING_RESUMED_AT_EXTRA)
+                if _is_stamp(resumed_at):
+                    deadline = resumed_at + RESUME_FIRST_ABSENCE_WINDOW_S
+                    if _is_stamp(since):
+                        settled = since if since <= deadline else None
+                    elif presence_tracked or now_ts <= deadline:
+                        return
+            elif _is_stamp(since) and mark == since:
+                return
+            merged = _without_resume_mark(extras)
+            if settled is not None:
+                merged[MISSING_ACCEPTED_BY_RESUME_EXTRA] = settled
+            self._store.upsert_order(fresh.client_order_id, extras=merged)
+
     def _clear_stamp(self, coid: str) -> None:
-        """Remove ``missing_pending_since`` atomically, preserving extras."""
+        """Remove ``missing_pending_since`` (and its resume acceptance) atomically."""
+        stamp_keys = (MISSING_PENDING_EXTRA, MISSING_ACCEPTED_BY_RESUME_EXTRA,
+                      _MISSING_RESUMED_AT_EXTRA)
         with self._store.transaction():
             fresh = self._store.get_order(coid)
             if fresh is not None:
                 extras = fresh.extras or {}
-                if MISSING_PENDING_EXTRA in extras:
-                    merged = {k: v for k, v in extras.items()
-                              if k != MISSING_PENDING_EXTRA}
+                if any(key in extras for key in stamp_keys):
+                    merged = {k: v for k, v in extras.items() if k not in stamp_keys}
                     self._store.upsert_order(coid, extras=merged)
         self._forget_deferred(coid)
 
@@ -795,13 +1053,21 @@ class DisappearanceTracker:
                     ))
                     self._forget_deferred(updated.client_order_id)
                     return events, True, register_ids, updated
+                accepted = _accepted_by_resume(fresh, since)
+                if accepted:
+                    logger.warning(
+                        "bot-owned order %r (ref %r) was cancelled before the operator "
+                        "resume — the resume accepted it, no intervention",
+                        updated.client_order_id, updated.exchange_order_id,
+                    )
                 self._retire_cancelled(
                     updated,
                     ReconcileOutcome(
                         kind='terminal_close',
                         reason='missing_pending_grace_expired',
                         new_state='rejected',
-                        audit_event='unexpected_cancel',
+                        audit_event=('cancel_accepted_by_resume' if accepted
+                                     else 'unexpected_cancel'),
                         close_row=True,
                         audit_payload={'missing_since': since,
                                        'grace': self._grace_s},

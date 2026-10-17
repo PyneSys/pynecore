@@ -94,11 +94,24 @@ class ExchangeOrderRejectedError(BrokerError):
 
     :ivar order: The rejected order as it is known locally, or ``None`` if the
         order never made it far enough to have an exchange representation.
+    :ivar level_crossed: ``True`` when the venue refused a protective level
+        (stop-loss / take-profit) because the market had already traded
+        through it. For an exit the refusal is then Pine's immediate exit
+        for a crossed level, not a venue that refuses to protect the
+        position: the engine closes the parent at market without
+        quarantining.
     """
 
-    def __init__(self, message: str, order: 'ExchangeOrder | None' = None) -> None:
+    def __init__(
+            self,
+            message: str,
+            order: 'ExchangeOrder | None' = None,
+            *,
+            level_crossed: bool = False,
+    ) -> None:
         super().__init__(message)
         self.order = order
+        self.level_crossed = level_crossed
 
 
 class InsufficientMarginError(ExchangeOrderRejectedError):
@@ -191,10 +204,10 @@ class BracketAttachAfterFillRejectedError(ExchangeOrderRejectedError):
         reject. ``None`` falls back to ``qty`` (conservative).
     :ivar error_code: Exchange-side error code, if any.
     :ivar error_message: Exchange-side error message, if any.
-    :ivar level_crossed: ``True`` when the venue refused the level because
-        the market had already traded through it. The defensive close is then
-        the exit Pine books for a crossed level, not a failed protection, and
-        the engine logs it as such.
+
+    ``level_crossed`` (see :class:`ExchangeOrderRejectedError`): the defensive
+    close is then the exit Pine books for a crossed level, not a failed
+    protection, and the engine logs it as such.
     """
 
     def __init__(
@@ -213,7 +226,7 @@ class BracketAttachAfterFillRejectedError(ExchangeOrderRejectedError):
             error_message: str | None = None,
             level_crossed: bool = False,
     ) -> None:
-        super().__init__(message)
+        super().__init__(message, level_crossed=level_crossed)
         self.position_coid = position_coid
         self.symbol = symbol
         self.position_side = position_side
@@ -224,7 +237,6 @@ class BracketAttachAfterFillRejectedError(ExchangeOrderRejectedError):
         self.filled_qty = filled_qty
         self.error_code = error_code
         self.error_message = error_message
-        self.level_crossed = level_crossed
 
 
 class ExchangeRateLimitError(BrokerError):
