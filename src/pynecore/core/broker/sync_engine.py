@@ -1249,9 +1249,7 @@ class OrderSyncEngine:
         self._native_failsafe_manager = NativeFailsafeManager(
             event_sink=self._emit_broker_event,
         )
-        self._native_bracket_dispatcher: (
-            Callable[[NativeBracketSnapshot], None] | None
-        ) = None
+        self._native_bracket_dispatcher: Callable[[NativeBracketSnapshot], None] | None = None
         # Engine-trigger partial bracket state machine. The state
         # machine itself is cheap to keep around (empty ledger when the
         # mode is UNSUPPORTED), so it is constructed unconditionally —
@@ -6833,12 +6831,13 @@ class OrderSyncEngine:
 
     def _exits_mapped_to(self, refs: frozenset[str]) -> frozenset[tuple[str, str | None]]:
         """``(pine_id, from_entry)`` of the live exits any of whose mapped refs is in ``refs``."""
-        return frozenset(
-            (intent.pine_id, intent.from_entry)
-            for key, intent in self._active_intents.items()
-            if isinstance(intent, ExitIntent)
-            and any(ref in refs for ref in self._order_mapping.get(key, ()))
-        )
+        exits: set[tuple[str, str | None]] = set()
+        for key, intent in self._active_intents.items():
+            if not isinstance(intent, ExitIntent):
+                continue
+            if any(ref in refs for ref in self._order_mapping.get(key, ())):
+                exits.add((intent.pine_id, intent.from_entry))
+        return frozenset(exits)
 
     def _note_orders_possibly_in_reduction(self) -> None:
         """Remember the bot's orders whose unreported fill the reduction adopted now may be.
@@ -13408,9 +13407,11 @@ class OrderSyncEngine:
         self._drain_native_bracket_observed(now_ms=now_ms)
         manager.tick_stale_window(now_ms=now_ms)
         manager.flush_coalesced_trails(now_ms)
+        dispatcher: Callable[[NativeBracketSnapshot], None] | None = (
+            self._native_bracket_dispatcher)
+        if dispatcher is None:
+            return  # Slice A without plugin opt-in: state-only run
         for snapshot in manager.pending_dispatch():
-            if self._native_bracket_dispatcher is None:
-                continue  # Slice A without plugin opt-in: state-only run
             manager.mark_dispatch_in_flight(
                 snapshot.parent_entry_dispatch_ref, now_ms=now_ms,
             )
@@ -13418,7 +13419,7 @@ class OrderSyncEngine:
             # every level the broker may carry on record for the restart.
             self._persist_native_failsafe_levels(snapshot.parent_entry_dispatch_ref)
             try:
-                self._native_bracket_dispatcher(snapshot)
+                dispatcher(snapshot)
             except BrokerManualInterventionError as halt:
                 # A dispatcher raising the manual-intervention signal means
                 # automated execution can no longer continue safely (e.g. the
@@ -18765,6 +18766,12 @@ class OrderSyncEngine:
         """
         key = old.intent_key
         outcome = CancelDispositionOutcome.UNKNOWN
+        # The sweep drops the leg's mapping, so the venue's ``CANCELLED``
+        # echo matches no intent: marked expected, it is logged as the
+        # engine's own cancel, not an external one.
+        for order_id in self._order_mapping.get(key, ()):
+            if order_id:
+                self._strategy_cancel_expected_ids.add(order_id)
         if not self._partial_bracket_engine.has_active_legs_for_intent(key):
             cancel = CancelIntent(
                 pine_id=old.pine_id, symbol=self._symbol, from_entry=old.from_entry,

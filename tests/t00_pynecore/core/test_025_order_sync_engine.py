@@ -5017,15 +5017,43 @@ def __test_spot_close_withhold_releases_after_the_wait_bound__(monkeypatch):
     assert not engine._pre_clear_filled_entries  # noqa
 
 
-def __test_spot_full_close_dispatches_after_a_confirmed_pre_clear_cancel__():
-    """A confirmed pre-clear cancel lets the close go out, with no second cancel."""
+def __test_spot_full_close_dispatches_after_a_confirmed_pre_clear_cancel__(caplog):
+    """A confirmed pre-clear cancel lets the close go out, with no second cancel.
+
+    The venue's ``CANCELLED`` echo of the swept leg is the engine's own
+    cancel, not an external one.
+    """
     b, engine, outcome_calls = _spot_long_with_exit(CancelDispositionOutcome.CANCEL_CONFIRMED)
+    leg_ids = [
+        order_id
+        for key, intent in engine.active_intents.items() if isinstance(intent, ExitIntent)
+        for order_id in engine._order_mapping[key]  # type: ignore[attr-defined]
+    ]
+    assert leg_ids
 
     engine.sync(BAR_TS + 120_000)
 
     assert len(outcome_calls) == 1
     assert len(b.cancel_calls) == 0
     assert len(b.close_calls) == 1
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        for order_id in leg_ids:
+            engine._route_event(OrderEvent(  # type: ignore[attr-defined]
+                order=ExchangeOrder(
+                    id=order_id, symbol=SYMBOL, side='sell',
+                    order_type=OrderType.STOP, qty=1.0, filled_qty=0.0,
+                    remaining_qty=1.0, price=None, stop_price=49_000.0,
+                    average_fill_price=None, status=OrderStatus.CANCELLED,
+                    timestamp=0.0, fee=0.0, fee_currency="",
+                ),
+                event_type='cancelled', fill_price=None, fill_qty=None,
+                timestamp=0.0, pine_id="L1-X", from_entry="L1",
+            ))
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any("external cancel observed" in m for m in messages), messages
+    assert sum("strategy cancel confirmed" in m for m in messages) == len(leg_ids)
 
 
 def __test_spot_partial_close_keeps_the_resting_exits_armed__():
