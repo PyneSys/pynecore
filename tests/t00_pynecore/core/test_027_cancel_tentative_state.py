@@ -39,6 +39,7 @@ from pynecore.core.broker.models import (
     PartialBracketCancelTentativeResolvedEvent,
     PartialBracketCancelTentativeStartedEvent,
 )
+from pynecore.core.broker.native_failsafe_manager import FailsafeHealth
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.software_partial_bracket_engine import (
     PartialBracketLeg,
@@ -800,6 +801,58 @@ def __test_clear_already_filled_resolves_trigger_level_via_open_trades__():
                 if isinstance(e, PartialBracketCancelTentativeResolvedEvent)]
     assert len(resolved) == 1
     assert resolved[0].outcome is CancelDispositionOutcome.ALREADY_FILLED
+
+
+@pytest.mark.parametrize(
+    ("with_actuator", "leg_kind", "trigger_level"),
+    [
+        (False, LEG_KIND_TP_PARTIAL, 110.0),
+        (False, LEG_KIND_SL_PARTIAL, 90.0),
+        (True, LEG_KIND_TP_PARTIAL, 110.0),
+        (True, LEG_KIND_SL_PARTIAL, 90.0),
+    ],
+    ids=["state-only-tp", "state-only-sl", "actuator-tp", "actuator-sl"],
+)
+def __test_clear_already_filled_awaits_a_confirmation_only_when_one_can_come__(
+        with_actuator: bool, leg_kind: str, trigger_level: float,
+):
+    """The restored parent waits for a broker confirmation only when one can come.
+
+    A confirmation needs a native fail-safe actuator AND an SL / trail leg
+    seeding a worst-SL: without either no PUT is ever sent and no
+    observation confirms anything, so a ``DEGRADING`` start would escalate
+    to ``DEGRADED`` and block every entry on the symbol until the position
+    is gone (a Bybit lane after a rotation, 2026-10-18).
+    """
+    broker = _MockBroker(cancel_outcomes=[CancelDispositionOutcome.ALREADY_FILLED])
+    engine = _mk_engine(broker)
+    if with_actuator:
+        engine.set_native_bracket_dispatcher(lambda _snapshot: None)
+    intent = _seed_parent_intent_and_leg(engine, with_leg=False)
+    leg = _mk_leg(from_entry=intent.intent_key, leg_kind=leg_kind,
+                  trigger_level=trigger_level)
+    engine._partial_bracket_engine.register_leg(leg)
+    engine._position.open_trades.append(Trade(
+        size=1.0, entry_id=intent.intent_key, entry_bar_index=0, entry_time=BAR_TS,
+        entry_price=100.0, commission=0.0,
+    ))
+    engine._cancel_disposition_pending[intent.intent_key] = _CancelTentativeMeta(
+        since_ts_ms=BAR_TS, reason='broker_timeout',
+    )
+    engine._partial_bracket_engine.mark_legs_cancel_tentative(
+        intent.intent_key, reason='broker_timeout', now_ms=BAR_TS,
+    )
+    engine._drive_cancel_tentative(now_ms=BAR_TS + 1_000)
+    manager = engine._native_failsafe_manager
+    state = manager.get_state(leg.parent_entry_dispatch_ref)
+    assert state is not None
+    expects_confirmation = with_actuator and leg_kind == LEG_KIND_SL_PARTIAL
+    expected = FailsafeHealth.DEGRADING if expects_confirmation else FailsafeHealth.HEALTHY
+    assert state.health is expected
+    if not expects_confirmation:
+        engine.drive_native_failsafe(now_ms=BAR_TS + 3_600_000)
+        assert state.health is FailsafeHealth.HEALTHY
+        assert not manager.block_new_entry(symbol=SYMBOL, pine_id='next', bar_ts_ms=BAR_TS)
 
 
 def __test_clear_already_filled_leaves_pending_when_parent_not_in_open_trades__():

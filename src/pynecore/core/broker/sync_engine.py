@@ -12443,6 +12443,50 @@ class OrderSyncEngine:
                 triples.append(triple)
         return triples
 
+    def _parent_expects_native_sl(self, parent_entry_dispatch_ref: str) -> bool:
+        """Whether a parent has a leg that seeds a broker-native worst-SL.
+
+        Only an active, post-fill SL / trail leg contributes (the same
+        legs :meth:`_recompute_native_failsafe_for_parent` feeds). A
+        TP-only or still-pending-entry bracket never queues a PUT, so a
+        ``DEGRADING`` registration for it could never be confirmed back
+        to ``HEALTHY``.
+
+        :param parent_entry_dispatch_ref: The parent entry's dispatch ref
+        :return: True if a broker-native SL is expected on the parent
+        """
+        for leg in self._partial_bracket_engine.iter_legs():
+            if leg.parent_entry_dispatch_ref != parent_entry_dispatch_ref:
+                continue
+            if leg.leg_state not in LEG_STATE_ACTIVE:
+                continue
+            if leg.leg_kind == LEG_KIND_TP_PARTIAL:
+                # TP legs never contribute to the worst-SL set.
+                continue
+            if leg.leg_state == LEG_STATE_PENDING_ENTRY:
+                # Pre-fill SL/trail leg: no broker dealId exists yet, so the
+                # recompute intentionally skips this leg (mirrors
+                # :meth:`_recompute_native_failsafe_for_parent`). Forcing
+                # ``pending_confirmation=True`` for it would arm
+                # ``DEGRADING`` without queueing any PUT, so no
+                # :meth:`on_native_bracket_observed` snapshot can ever
+                # confirm the state back to ``HEALTHY`` — the stale
+                # window then escalates the parent to ``DEGRADED`` and
+                # later :meth:`on_parent_entry_filled` recomputes are
+                # rejected by :meth:`recompute_worst_sl` (``DEGRADED``
+                # early-returns), leaving the eventual fill without a
+                # broker-native fail-safe and poisoning the symbol-level
+                # entry gate. The leg's contribution is restored when
+                # :meth:`SoftwarePartialBracketEngine.on_parent_entry_filled`
+                # promotes it to ``armed`` and fires the listener; at
+                # that point the live ``register_parent`` /
+                # ``recompute_worst_sl`` path takes over.
+                continue
+            # Currently armed (or higher) SL/trail leg: a broker-native SL
+            # is expected on this parent.
+            return True
+        return False
+
     def _rehydrate_native_failsafe_from_replayed_legs(self) -> None:
         """Seed :class:`NativeFailsafeManager` state from replayed legs.
 
@@ -12472,7 +12516,6 @@ class OrderSyncEngine:
         # ``recompute_worst_sl`` would compare ``None`` desired against
         # the existing ``None`` desired and queue no PUT, leaving no
         # confirmation path to flip the state back to ``HEALTHY``.
-        expects_native_sl: set[str] = set()
         for leg in self._partial_bracket_engine.iter_legs():
             ref = leg.parent_entry_dispatch_ref
             if not ref or ref in seen:
@@ -12484,39 +12527,8 @@ class OrderSyncEngine:
             else:
                 continue
             seen[ref] = (leg.symbol, parent_side)
-        for leg in self._partial_bracket_engine.iter_legs():
-            ref = leg.parent_entry_dispatch_ref
-            if not ref or ref not in seen:
-                continue
-            if leg.leg_state not in LEG_STATE_ACTIVE:
-                continue
-            if leg.leg_kind == LEG_KIND_TP_PARTIAL:
-                # TP legs never contribute to the worst-SL set.
-                continue
-            if leg.leg_state == LEG_STATE_PENDING_ENTRY:
-                # Pre-fill SL/trail leg: no broker dealId exists yet, so the
-                # recompute below intentionally skips this leg (mirrors
-                # :meth:`_recompute_native_failsafe_for_parent`). Forcing
-                # ``pending_confirmation=True`` here would arm
-                # ``DEGRADING`` without queueing any PUT, so no
-                # :meth:`on_native_bracket_observed` snapshot can ever
-                # confirm the state back to ``HEALTHY`` — the stale
-                # window then escalates the parent to ``DEGRADED`` and
-                # later :meth:`on_parent_entry_filled` recomputes are
-                # rejected by :meth:`recompute_worst_sl` (``DEGRADED``
-                # early-returns), leaving the eventual fill without a
-                # broker-native fail-safe and poisoning the symbol-level
-                # entry gate. The leg's contribution is restored when
-                # :meth:`SoftwarePartialBracketEngine.on_parent_entry_filled`
-                # promotes it to ``armed`` and fires the listener; at
-                # that point the live ``register_parent`` /
-                # ``recompute_worst_sl`` path takes over.
-                continue
-            # Currently armed (or higher) SL/trail leg signals that a
-            # broker-native SL is expected on this parent, so the
-            # restart-replay state must enter ``DEGRADING`` until the
-            # broker confirms the PUT.
-            expects_native_sl.add(ref)
+        expects_native_sl = {
+            ref for ref in seen if self._parent_expects_native_sl(ref)}
         if not seen:
             return
         # ``_current_bar_ts_ms`` is the first sync's bar timestamp:
@@ -12553,7 +12565,11 @@ class OrderSyncEngine:
             # never matches a non-existent stop). Such parents start
             # ``HEALTHY`` immediately — the live path treats them the
             # same way (``register_parent`` is called there without
-            # ``pending_confirmation``).
+            # ``pending_confirmation``). The same holds for every parent
+            # of a plugin without a native fail-safe actuator (no
+            # dispatcher): no PUT is ever sent, so nothing can confirm a
+            # ``DEGRADING`` start, and the stale window would drop every
+            # entry on the symbol while the position stays open.
             self._native_failsafe_manager.register_parent(
                 parent_entry_dispatch_ref=ref,
                 symbol=symbol,
@@ -12561,7 +12577,8 @@ class OrderSyncEngine:
                 mintick=self._mintick,
                 minmove=self._minmove,
                 pricescale=self._pricescale,
-                pending_confirmation=ref in expects_native_sl,
+                pending_confirmation=(ref in expects_native_sl
+                                      and self._native_bracket_dispatcher is not None),
                 now_ms=now_ms,
             )
             # The broker may still carry any level the previous process sent:
@@ -12966,9 +12983,11 @@ class OrderSyncEngine:
                         resolver=TickOffsetResolver(self._mintick),
                     )
             # Re-register the parent with the §2.6 manager:
-            # ``pending_confirmation=True`` mirrors the restart-replay
+            # ``pending_confirmation`` mirrors the restart-replay
             # path's ``DEGRADING`` start until a broker snapshot
-            # confirms the desired SL is in place. Iterate the legs
+            # confirms the desired SL is in place (only with a native
+            # actuator and an SL / trail leg seeding a worst-SL: without
+            # either no PUT is queued, so nothing could confirm it). Iterate the legs
             # we just restored (each carries the
             # :attr:`parent_entry_dispatch_ref` regardless of whether the
             # subsequent promotion fired); the ``register_parent`` call
@@ -12993,7 +13012,9 @@ class OrderSyncEngine:
                     mintick=self._mintick,
                     minmove=self._minmove,
                     pricescale=self._pricescale,
-                    pending_confirmation=True,
+                    pending_confirmation=(
+                        self._native_bracket_dispatcher is not None
+                        and self._parent_expects_native_sl(ref)),
                     now_ms=float(now_ms),
                 )
                 self._recompute_native_failsafe_for_parent(

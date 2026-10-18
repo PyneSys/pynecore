@@ -134,8 +134,12 @@ def _seed_parent(ctx: RunContext, saved: dict | None) -> None:
                      state="confirmed", pine_entry_id="L", extras=extras)
 
 
-def _rehydrate(engine: OrderSyncEngine, puts: list[NativeBracketSnapshot]) -> None:
-    """What the first post-restart sync does for a replayed partial-bracket SL leg."""
+def _rehydrate(engine: OrderSyncEngine, puts: list[NativeBracketSnapshot] | None) -> None:
+    """What the first post-restart sync does for a replayed partial-bracket SL leg.
+
+    :param puts: Collects the native fail-safe PUTs; ``None`` runs without an
+        actuator (a plugin that places no native fail-safe).
+    """
     leg = PartialBracketLeg(
         coid="leg-sl", symbol=SYMBOL, pine_id="L-X1", from_entry="L",
         leg_kind=LEG_KIND_SL_PARTIAL, leg_state=LEG_STATE_ARMED, side="sell", qty=0.5,
@@ -145,7 +149,8 @@ def _rehydrate(engine: OrderSyncEngine, puts: list[NativeBracketSnapshot]) -> No
     pbe = engine._partial_bracket_engine  # noqa: SLF001
     pbe._legs[leg.key] = leg  # noqa: SLF001
     pbe._legs_by_parent.setdefault((SYMBOL, "L"), set()).add(leg.key)  # noqa: SLF001
-    engine.set_native_bracket_dispatcher(puts.append)
+    if puts is not None:
+        engine.set_native_bracket_dispatcher(puts.append)
     engine._current_bar_ts_ms = BAR_TS  # noqa: SLF001
     engine._rehydrate_native_failsafe_from_replayed_legs()  # noqa: SLF001
 
@@ -160,6 +165,32 @@ def _events(ctx: RunContext, kind: str) -> list[dict]:
 
 
 # --- native fail-safe -------------------------------------------------------------
+
+
+def __test_a_restart_without_a_native_actuator_never_blocks_entries__(tmp_path: Path) -> None:
+    # Measured on Bybit (no native fail-safe actuator) after a rotation with
+    # an open partial bracket, 2026-10-17/18: the replayed parent started
+    # DEGRADING, nothing could confirm it, and 30 s later DEGRADED dropped
+    # every entry signal until the position was gone.
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        _seed_parent(ctx, None)
+        engine = _engine(ctx)
+        _rehydrate(engine, None)
+        manager = engine._native_failsafe_manager  # noqa: SLF001
+        state = manager.get_state(PARENT)
+        assert state is not None and state.health is FailsafeHealth.HEALTHY
+        engine.drive_native_failsafe(now_ms=BAR_TS + 3_600_000)
+        assert state.health is FailsafeHealth.HEALTHY
+        assert not manager.block_new_entry(symbol=SYMBOL, pine_id="L", bar_ts_ms=BAR_TS)
+
+    with BrokerStore(tmp_path / "actuated.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        _seed_parent(ctx, None)
+        engine = _engine(ctx)
+        _rehydrate(engine, [])
+        state = engine._native_failsafe_manager.get_state(PARENT)  # noqa: SLF001
+        assert state is not None and state.health is FailsafeHealth.DEGRADING
 
 
 @pytest.mark.parametrize("observed_first", [True, False],
