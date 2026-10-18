@@ -9,7 +9,7 @@ date: "2026-03-28"
 lastmod: "2026-09-26"
 draft: false
 toc: true
-categories: ["Overview", "Compatibility"]
+categories: ["Overview"]
 tags: ["pine-script", "compatibility", "features", "status", "tradingview", "validation"]
 ---
 -->

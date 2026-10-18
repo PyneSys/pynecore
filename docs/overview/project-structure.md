@@ -8,7 +8,7 @@ date: "2025-04-03"
 lastmod: "2026-09-28"
 draft: false
 toc: true
-categories: ["Overview", "Architecture"]
+categories: ["Overview"]
 tags: ["project-structure", "architecture", "organization", "components", "modules"]
 ---
 -->

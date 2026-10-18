@@ -8,7 +8,7 @@ date: "2026-07-24"
 lastmod: "2026-07-24"
 draft: false
 toc: true
-categories: ["Overview", "Configuration"]
+categories: ["Overview"]
 tags: ["symbol-map", "request-security", "configuration", "toml", "workdir", "providers"]
 ---
 -->

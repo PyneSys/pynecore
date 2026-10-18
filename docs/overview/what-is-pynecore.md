@@ -5,7 +5,7 @@ title: "What is PyneCore"
 description: "Introduction to PyneCore and its core concepts"
 icon: "code"
 date: "2025-03-31"
-lastmod: "2026-09-26"
+lastmod: "2026-10-18"
 draft: false
 toc: true
 categories: ["Overview"]
@@ -17,7 +17,11 @@ tags: ["introduction", "pine-script", "python"]
 
 ## The Python-Powered Trading Framework
 
-PyneCore is an innovative, open-source framework that brings the power of TradingView's Pine Script paradigm to the Python ecosystem. It's not just a tool that runs Pine Script code — it's a complete reimagining of the Pine Script concept, natively implemented in Python, with results that match TradingView.
+PyneCore is the open-source runtime for [Pyne code](./pyne-code.md), a
+domain-specific language for market data, indicators, and trading strategies.
+Pyne uses Python syntax and defines bar-by-bar execution, series history, and
+persistent state. PyneCore implements those language rules in Python and provides
+a Pine Script-compatible calculation and strategy library.
 
 PyneCore is validated against TradingView on <!--wild:scripts_total-->1,000<!--/wild--> published
 TradingView scripts (Pine Script v4–v6, converted to Pyne code with [PyneComp](https://pynesys.io)):
@@ -58,7 +62,7 @@ PyneCore is the foundation of the PyneSys project, which consists of these compo
 - **PyneComp**: A Pine Script to Pyne Code compiler (closed source, accessible through the Pyne API)
 - More is coming soon!
 
-More about the PyneSys ecosystem can be found in the [Ecosystem](/docs/overview/ecosystem/) page.
+More about the PyneSys ecosystem can be found in the [Ecosystem](./ecosystem.md) page.
 
 ## Technical Innovation
 
@@ -66,7 +70,11 @@ What makes PyneCore truly groundbreaking is its approach to implementing Pine Sc
 
 ### Unique Architecture
 
-Unlike other systems that might attempt to replicate Pine Script's functionality through object-oriented wrappers or by creating a new language, PyneCore takes a fundamentally different approach. It transforms regular Python code to behave like Pine Script while maintaining Python's syntax, tools, and ecosystem.
+PyneCore parses marked Pyne modules with Python's parser, transforms their abstract
+syntax trees, and executes the result in Python. The syntax is Python-compatible;
+the transformations implement Pyne's time-series and state semantics. The
+`@pyne edge` profile restricts the language features a program can use, while plain
+`@pyne` supports broader Python integration.
 
 ### AST Transformation Magic
 
@@ -79,7 +87,7 @@ Rather than creating yet another object-oriented framework, PyneCore uses Python
 This approach means:
 - You write clean, pythonic code with minimal boilerplate
 - The transformations handle all the complexity behind the scenes
-- Your code runs with Pine Script semantics but with Python's full power
+- Your code runs with Pyne's execution rules, with Python integration available outside the edge profile
 
 More about this in the [AST Transformations](../advanced/ast-transformations.md) documentation.
 
@@ -156,4 +164,4 @@ Learn more about the NA system in the [Core Concepts](./core-concepts.md#5-na-no
 
 ## Getting Started
 
-Ready to explore PyneCore? Continue to the [Getting Started](/docs/getting-started/) section to install PyneCore and write your first script!
+Ready to explore PyneCore? Continue to the [Getting Started](../getting-started/README.md) section to install PyneCore and write your first script!

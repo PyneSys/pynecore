@@ -8,7 +8,7 @@ date: "2025-03-31"
 lastmod: "2026-10-03"
 draft: false
 toc: true
-categories: ["Programmatic", "API"]
+categories: ["Programmatic"]
 tags: ["script-runner", "run-iter", "indicators", "strategies", "trades", "inputs", "settings"]
 ---
 -->

@@ -8,7 +8,7 @@ date: "2026-07-19"
 lastmod: "2026-07-19"
 draft: false
 toc: true
-categories: ["Programmatic", "API"]
+categories: ["Programmatic"]
 tags: ["viz", "plot", "drawings", "ndjson", "plot-styles"]
 ---
 -->

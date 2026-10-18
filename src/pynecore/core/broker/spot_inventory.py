@@ -359,10 +359,16 @@ class SpotInventoryPort(Protocol):
     it is confirmed as a conflict. Venue settlement latency, not a
     tuning knob for hiding drift."""
 
-    position_dust_threshold: Decimal
-    """Positive base quantity below which the venue intentionally exposes
-    no engine position. This is normally the product's minimum quantity
-    increment. A zero value disables dust-to-flat reconciliation."""
+    @property
+    def position_dust_threshold(self) -> Decimal:
+        """Positive base quantity below which the venue intentionally exposes
+        no engine position: the least quantity a sell would be accepted at
+        (the bound :meth:`min_sellable_base` returns, which may move with the
+        price), so the engine books a smaller remainder flat instead of
+        taking the plugin's flat report for an external close. A plain
+        attribute satisfies it. A zero value disables dust-to-flat
+        reconciliation."""
+        ...
 
     async def min_sellable_base(self) -> Decimal | None:
         """Smallest base quantity the venue would accept as a sell NOW.

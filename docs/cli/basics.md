@@ -8,8 +8,8 @@ date: "2025-03-31"
 lastmod: "2026-09-28"
 draft: false
 toc: true
-categories: ["Usage", "CLI"]
-tags: ["cli", "command-line", "basics", "workdir", "commands"]
+categories: ["CLI"]
+tags: ["cli", "basics", "workdir", "commands"]
 ---
 -->
 

@@ -8,8 +8,8 @@ date: "2025-03-31"
 lastmod: "2026-06-10"
 draft: false
 toc: true
-categories: ["Overview", "Fundamentals"]
-tags: ["ast", "series", "persistent", "function-isolation", "na-values", "core-concepts"]
+categories: ["Overview"]
+tags: ["ast", "series", "persistent", "function-isolation", "na-values", "core-concepts", "ibpersistent", "varip"]
 ---
 -->
 

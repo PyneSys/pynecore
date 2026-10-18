@@ -20,6 +20,7 @@ PyneCore overview and main concepts
 ## In this section
 
 - [What is PyneCore](./what-is-pynecore.md) - Introduction to PyneCore
+- [What is Pyne code?](./pyne-code.md) - The language, its Python syntax, and the edge subset
 - [Ecosystem](./ecosystem.md) - Pyne ecosystem components
 - [Core Concepts](./core-concepts.md) - Fundamental concepts and mechanisms
 - [Differences](./differences.md) - Key differences from Pine Script and compatibility notes

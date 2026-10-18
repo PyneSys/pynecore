@@ -9,7 +9,7 @@ lastmod: "2026-04-05"
 draft: false
 toc: true
 categories: ["Reference"]
-tags: ["reference", "api", "functions", "variables", "constants", "types"]
+tags: ["api", "functions", "variables", "constants", "types"]
 ---
 -->
 

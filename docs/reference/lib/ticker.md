@@ -8,8 +8,8 @@ date: "2026-08-04"
 lastmod: "2026-08-04"
 draft: false
 toc: true
-categories: ["Reference", "Library"]
-tags: ["ticker", "request.security", "heikinashi", "library", "reference"]
+categories: ["Reference"]
+tags: ["ticker", "request-security", "heikinashi"]
 ---
 -->
 

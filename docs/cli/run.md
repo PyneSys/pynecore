@@ -8,8 +8,8 @@ date: "2025-03-31"
 lastmod: "2026-09-28"
 draft: false
 toc: true
-categories: ["Usage", "CLI", "Scripting"]
-tags: ["run", "scripts", "execution", "backtesting", "command-line"]
+categories: ["CLI"]
+tags: ["run", "scripts", "execution", "backtesting", "cli"]
 ---
 -->
 

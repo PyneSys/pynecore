@@ -8,7 +8,7 @@ date: "2026-03-27"
 lastmod: "2026-10-08"
 draft: false
 toc: true
-categories: ["Advanced", "Technical Implementation"]
+categories: ["Advanced"]
 tags: ["request-security", "multiprocessing", "shared-memory", "ipc", "ast"]
 ---
 -->

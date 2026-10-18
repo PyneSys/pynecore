@@ -8,6 +8,8 @@ date: "2025-07-05"
 lastmod: "2026-06-10"
 draft: false
 toc: true
+categories: ["Support"]
+tags: ["debugging", "troubleshooting", "series"]
 ---
 -->
 

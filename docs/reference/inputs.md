@@ -9,7 +9,7 @@ lastmod: "2026-04-05"
 draft: false
 toc: true
 categories: ["Reference"]
-tags: ["input", "parameters", "configuration", "settings", "toml"]
+tags: ["inputs", "parameters", "configuration", "settings", "toml"]
 ---
 -->
 

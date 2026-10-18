@@ -8,7 +8,7 @@ date: "2026-03-27"
 lastmod: "2026-03-28"
 draft: false
 toc: true
-categories: ["Library", "API Reference"]
+categories: ["Reference"]
 tags: ["request-security", "multi-symbol", "multi-timeframe"]
 ---
 -->

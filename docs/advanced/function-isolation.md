@@ -9,7 +9,7 @@ lastmod: "2026-10-09"
 draft: false
 toc: true
 categories: ["Advanced"]
-tags: ["function-isolation", "ast", "persistence", "series", "state-vector"]
+tags: ["function-isolation", "ast", "persistence", "series", "state-vector", "persistent"]
 ---
 -->
 

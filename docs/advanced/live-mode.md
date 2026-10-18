@@ -8,8 +8,8 @@ date: "2026-04-08"
 lastmod: "2026-10-03"
 draft: false
 toc: true
-categories: ["Advanced", "Strategy", "Live"]
-tags: ["live", "streaming", "intra-bar", "varip", "paper-trading", "real-time"]
+categories: ["Live Trading"]
+tags: ["live", "streaming", "intrabar", "varip", "paper-trading", "real-time", "ibpersistent"]
 ---
 -->
 

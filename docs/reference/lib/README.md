@@ -8,8 +8,8 @@ date: "2026-03-28"
 lastmod: "2026-08-04"
 draft: false
 toc: true
-categories: ["Reference", "Library"]
-tags: ["library", "functions", "variables", "constants", "ta", "math", "strategy"]
+categories: ["Reference"]
+tags: ["functions", "variables", "constants", "ta", "math", "strategies"]
 ---
 -->
 

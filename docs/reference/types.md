@@ -8,8 +8,8 @@ date: "2026-03-28"
 lastmod: "2026-09-05"
 draft: false
 toc: true
-categories: ["Reference", "Types"]
-tags: ["types", "series", "persistent", "ibpersistent", "na", "int", "float", "bool", "string", "color", "array", "matrix", "map", "udt", "enum"]
+categories: ["Reference"]
+tags: ["types", "series", "persistent", "ibpersistent", "na-values", "int", "float", "bool", "string", "color", "array", "matrix", "map", "udt", "enum", "varip"]
 ---
 -->
 

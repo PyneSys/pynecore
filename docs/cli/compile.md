@@ -8,8 +8,8 @@ date: "2025-08-03"
 lastmod: "2026-09-26"
 draft: false
 toc: true
-categories: ["Usage", "CLI", "Compilation"]
-tags: ["compile", "pine-script", "python", "pynesys", "api", "command-line"]
+categories: ["CLI"]
+tags: ["compile", "pine-script", "python", "pynesys", "api", "cli"]
 ---
 -->
 

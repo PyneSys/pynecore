@@ -8,8 +8,8 @@ date: "2025-07-24"
 lastmod: "2026-09-28"
 draft: false
 toc: true
-categories: ["Advanced", "Strategy"]
-tags: ["bar-magnifier", "backtesting", "order-fills", "intrabar", "timeframe"]
+categories: ["Strategy"]
+tags: ["bar-magnifier", "backtesting", "order-fills", "intrabar", "timeframe", "strategies"]
 ---
 -->
 

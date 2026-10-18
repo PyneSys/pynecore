@@ -8,8 +8,8 @@ date: "2026-10-14"
 lastmod: "2026-10-15"
 draft: false
 toc: true
-categories: ["Usage", "CLI", "Live Trading"]
-tags: ["broker", "live-trading", "quarantine", "resume"]
+categories: ["CLI"]
+tags: ["broker", "live-trading", "quarantine", "resume", "cli"]
 ---
 -->
 

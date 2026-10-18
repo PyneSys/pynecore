@@ -8,8 +8,8 @@ date: "2026-03-28"
 lastmod: "2026-08-06"
 draft: false
 toc: true
-categories: ["Reference", "Library"]
-tags: ["strategy.opentrades", "library", "reference"]
+categories: ["Reference"]
+tags: ["strategy.opentrades", "strategies"]
 ---
 -->
 

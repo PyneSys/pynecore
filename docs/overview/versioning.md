@@ -8,7 +8,7 @@ date: "2025-03-31"
 lastmod: "2026-09-28"
 draft: false
 toc: true
-categories: ["Overview", "Development"]
+categories: ["Overview"]
 tags: ["versioning", "releases", "compatibility", "pine-script", "semver"]
 ---
 -->

@@ -8,7 +8,7 @@ date: "2025-03-31"
 lastmod: "2026-09-28"
 draft: false
 toc: true
-categories: ["Getting Started", "Development Environment"]
+categories: ["Getting Started"]
 tags: ["ide", "setup", "pycharm", "vs-code", "pylance", "type-checking", "development-environment"]
 ---
 -->

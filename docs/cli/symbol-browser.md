@@ -8,7 +8,7 @@ date: "2026-05-17"
 lastmod: "2026-05-17"
 draft: false
 toc: true
-categories: ["Usage", "CLI", "Data Handling"]
+categories: ["CLI"]
 tags: ["cli", "tui", "data", "download", "symbols"]
 ---
 -->

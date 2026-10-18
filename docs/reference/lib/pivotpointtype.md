@@ -8,8 +8,8 @@ date: "2026-04-05"
 lastmod: "2026-04-05"
 draft: false
 toc: true
-categories: ["Reference", "Library"]
-tags: ["pivotpointtype", "library", "reference"]
+categories: ["Reference"]
+tags: ["pivotpointtype"]
 ---
 -->
 

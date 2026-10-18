@@ -8,8 +8,8 @@ date: "2026-08-04"
 lastmod: "2026-08-04"
 draft: false
 toc: true
-categories: ["Reference", "Library"]
-tags: ["splits", "request", "library", "reference"]
+categories: ["Reference"]
+tags: ["splits", "request", "corporate-events"]
 ---
 -->
 

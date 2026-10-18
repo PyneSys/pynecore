@@ -8,7 +8,7 @@ date: "2025-03-31"
 lastmod: "2026-07-28"
 draft: false
 toc: true
-categories: ["Advanced", "Data Handling"]
+categories: ["Data"]
 tags: ["ohlcv", "data", "performance", "memory-mapping", "binary-format", "io"]
 ---
 -->

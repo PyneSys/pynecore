@@ -8654,12 +8654,13 @@ class OrderSyncEngine:
                 for trade in self._position.new_closed_trades[closed_count_before:]
                 if trade.entry_id is not None
             ]
-            # A closing fill can leave a sub-step residual on the LAST FIFO
+            # A closing fill can leave an unsellable residual on the LAST FIFO
             # trade: spot entries are fee-netted (off the venue's qty grid)
-            # while the close order is grid-quantized, so a full close of a
-            # pyramid floors away up to one step of exposure (measured on the
-            # Bybit spot lane: 3 x 0.009995 entries, close floored to
-            # 0.02998, 5e-06 left on the newest entry). The venue cannot
+            # while the close order is grid-quantized, so every close floors
+            # away part of a step, and the floors add up over a pyramid
+            # (measured on the Bybit spot lane: 3 x 0.009995 entries, close
+            # floored to 0.02998, 5e-06 left on the newest entry; three
+            # brackets of 0.00999 left 1.5e-05). The venue cannot
             # trade the residual — but the surviving trade keeps its entry
             # out of the closed-entry cleanup below, so the entry's FULL-size
             # protective legs stay resting and a later trigger sells
@@ -8687,9 +8688,11 @@ class OrderSyncEngine:
                     for entry_id in dust_consumed:
                         if entry_id not in self._last_fifo_closed_entry_ids:
                             self._last_fifo_closed_entry_ids.append(entry_id)
-                    _blog_warning(
-                        "closing fill left non-tradable dust %s (< step %s) — "
-                        "booked flat, retiring entries %s",
+                    # The fee-netted residue every spot round trip leaves:
+                    # expected, not a fault.
+                    _blog_info(
+                        "closing fill left non-tradable dust %s (below the least "
+                        "sellable %s) — booked flat, retiring entries %s",
                         dust_size, dust_threshold, dust_consumed,
                     )
             # Accumulate the fill against the in-flight ``CloseIntent`` ledger so

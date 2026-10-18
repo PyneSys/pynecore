@@ -8,7 +8,7 @@ date: "2025-03-31"
 lastmod: "2026-10-03"
 draft: false
 toc: true
-categories: ["Programmatic", "Integration"]
+categories: ["Programmatic"]
 tags: ["freqtrade", "live-trading", "integration", "pandas", "dataframe"]
 ---
 -->

@@ -8,7 +8,7 @@ date: "2025-03-31"
 lastmod: "2026-09-28"
 draft: false
 toc: true
-categories: ["Getting Started", "Migration"]
+categories: ["Getting Started"]
 tags: ["conversion", "pine-script", "migration", "examples", "syntax", "translation"]
 ---
 -->
@@ -471,4 +471,3 @@ Pine Script's `:=` reassignment operator becomes `=` in Python.
 3. **Use type annotations**: Be explicit about Series and Persistent variables
 4. **Leverage Python features**: Take advantage of Python's richer features during conversion
 5. **Keep organized**: Break complex scripts into functions or modules
-

@@ -5,11 +5,11 @@ title: "FAQ"
 description: "Frequently asked questions about PyneCore"
 icon: "psychology"
 date: "2025-03-31"
-lastmod: "2026-09-26"
+lastmod: "2026-10-18"
 draft: false
 toc: true
 categories: ["Support"]
-tags: ["faq", "troubleshooting", "installation", "configuration"]
+tags: ["faq", "troubleshooting", "installation", "configuration", "pyne-code", "dsl", "pyne-edge", "ide", "viz"]
 ---
 -->
 
@@ -21,7 +21,47 @@ This section contains frequently asked questions about PyneCore.
 
 ### What is PyneCore?
 
-PyneCore is an open-source framework that implements TradingView's Pine Script paradigm in Python. It brings the intuitive bar-by-bar execution model of Pine Script into Python while leveraging the vast Python ecosystem. PyneCore is not a tool that simply runs Pine Script code, but a complete reimagining of the Pine Script concept natively in Python.
+PyneCore is the open-source runtime for **Pyne code**, a domain-specific language for
+market data, indicators, and trading strategies. It executes programs bar by bar and
+provides the time-series, persistent-state, technical-analysis, and strategy machinery.
+Its current implementation runs in Python.
+
+### What is Pyne code? Is it a separate language?
+
+Yes. Pyne is a domain-specific language (DSL) with **Python syntax** and its own
+execution rules. You use familiar Python notation to describe calculations for the
+current candle, while PyneCore manages series history, retained state, and stateful
+function calls. A Pyne file uses the `.py` extension and begins with an `@pyne` module
+docstring; running the same statements as ordinary Python does not provide Pyne's
+behavior automatically.
+
+The [Pyne code overview](./overview/pyne-code.md) explains the language and includes
+a complete example.
+
+### What is the difference between Pyne code, PyneCore, PyneIDE, and PyneComp?
+
+- **Pyne code** is the language you write.
+- **PyneCore** prepares and executes it.
+- **PyneIDE** is the Visual Studio Code extension, currently in preview, for editing,
+  running, charting, and debugging programs.
+- **PyneComp** converts existing Pine Script into Pyne code through a separate service.
+
+You can write Pyne directly without using Pine Script or PyneComp.
+
+### What does `@pyne edge` mean?
+
+It selects a restricted Pyne language profile with defined syntax, imports, and calls.
+PyneIDE reports code outside that profile. The beginner's book uses `@pyne edge`;
+it does not allow arbitrary Python packages or every Python language feature.
+Plain `@pyne` allows broader Python integration in PyneCore. See
+[Pyne code — edge](./overview/pyne-code.md#what-does-edge-mean).
+
+### Do I need to know Python or Pine Script first?
+
+No. The [beginner's book](https://pynecore.org/learn/en/) teaches Pyne code from the beginning through
+PyneIDE, including the Python syntax used by its examples. If you already have a
+Pine Script, you can instead follow the
+[conversion guide](./getting-started/converting-from-pine.md).
 
 ### How does PyneCore relate to TradingView?
 
@@ -30,7 +70,10 @@ implements Pine Script's functionality and execution model in Python. PyneCore i
 
 ### Is PyneCore free to use?
 
-Yes, the core PyneCore functionality is open-source and free to use under the [Apache 2.0 license](https://www.apache.org/licenses/LICENSE-2.0). The PyneComp compiler (which converts Pine Script to Python) is a separate closed-source component that's available as a (affordable) SaaS offering.
+Yes. PyneCore is open-source under the [Apache 2.0 license](https://www.apache.org/licenses/LICENSE-2.0).
+Writing and running Pyne code locally does not require a PyneSys API key. Converting
+Pine Script through PyneComp is a separate service and requires a PyneSys API key;
+see [Compiling Pine Scripts](./cli/compile.md) for configuration.
 
 ### What are the system requirements for PyneCore?
 
@@ -47,7 +90,7 @@ You can report bugs and request features through the project's [GitHub repositor
 The recommended way to install PyneCore is using pip:
 
 ```bash
-pip install pynesys-pynecore[cli]  # With user-friendly CLI
+pip install "pynesys-pynecore[cli]"  # With user-friendly CLI
 ```
 
 For additional features, you can specify optional dependencies:
@@ -78,7 +121,7 @@ The PyneCore CLI will create this structure automatically if it doesn't exist.
 PyneCore supports importing data from various formats:
 
 ```bash
-pyne data convert-from path/to/your/data.csv --symbol "BTCUSDT" --timeframe 1D
+pyne data convert-from path/to/your/data.csv --symbol "BTCUSDT"
 ```
 
 You can also download data from supported providers:
@@ -87,7 +130,9 @@ You can also download data from supported providers:
 pyne data download ccxt:BYBIT:BTC/USDT:USDT@1D
 ```
 
-More providers could be added in the future by the community as plugins.
+The built-in CCXT provider requires the `providers` or `ccxt` extra. Additional data
+providers and brokers are available as [plugins](https://pynecore.org/plugins/). See
+[Data Management](./cli/data.md) for supported formats and symbol metadata.
 
 ## Writing Scripts
 
@@ -101,24 +146,25 @@ Every PyneCore script must begin with a module docstring whose first non-whitesp
 """
 ```
 
-After this comment, you can import from PyneCore libraries and define your main function:
+After this docstring, import from PyneCore and define the script's main function:
 
 ```python
 from pynecore.lib import script, close
 
 @script.indicator("My Indicator")
 def main():
-    # Your code here
+    return {"Close": close}
 ```
 
-### What's the difference between PyneCore and regular Python code?
+### What's the difference between Pyne code and regular Python code?
 
-PyneCore applies AST transformations to your Python code, enabling it to behave like Pine Script while maintaining Python syntax. Key differences include:
+PyneCore transforms marked Pyne modules before execution. Python supplies the syntax
+and runtime, while Pyne supplies additional semantics:
 
 - Series variables that track historical values
 - Persistent variables that maintain state across bars
 - Bar-by-bar execution model
-- Function isolation (each function call gets its own state)
+- Function isolation (stateful call sites maintain separate state)
 - Special handling for NA (Not Available) values
 
 ### How do I access historical values in a series?
@@ -149,9 +195,12 @@ def main(
 
 ### How do I plot indicators?
 
-Actually, PyneCore will never plot anything, it just gives you the data to plot. By default it saves the data to the `output/` folder in the working directory as CSV files. In the future we'll develop a separate PynePlot plotting library.
+PyneCore produces calculation results and visual output; **PyneIDE displays them on
+a chart**, including supported plot styles and drawing objects. CLI users can save
+plot values as CSV and enable `--viz` for visual metadata and drawing data in NDJSON.
+See [Visual Output](./programmatic/visual-output.md).
 
-Though the syntax is there. PyneCore offers two ways to "plot" indicators:
+You can emit numeric plot values in two ways:
 
 1. Using the plot function (similar to Pine Script):
 ```python
@@ -191,10 +240,11 @@ See [Compatibility](./overview/compatibility.md) for details.
 
 ### Is PyneCore 100% compatible with Pine Script?
 
-The calculations and strategy results match TradingView, as measured above. There are some
-intentional differences in the programming model to make the experience more Pythonic and to
-leverage Python's strengths. These differences are documented in the
+The measured outputs match on the published validation corpus above. This does not
+mean every Pine Script feature, external data feed, or future script is supported.
+There are also intentional differences in the language and execution model, documented in the
 [Differences from Pine Script](./overview/differences.md) page.
+See [Compatibility](./overview/compatibility.md) for the feature-by-feature status.
 
 ### How does PyneCore handle NA values?
 
@@ -207,22 +257,21 @@ if na(value):
     # Handle NA case
 ```
 
-NA values behave safely in all contexts — no special handling needed in most cases:
+Use `na(value)` to test availability rather than equality or formatting. Floating-point
+missing values use `nan`; Pyne's predicate also treats positive and negative infinity
+as unavailable. NaN propagates through arithmetic and its ordered comparisons are
+false, but infinity follows normal floating-point comparison rules. Do not assume
+all values recognized by `na()` behave identically in a comparison.
 
-- **Comparisons** return `False`: `NA < 30`, `NA > 70`, `NA == x`
-- **Arithmetic** propagates: `NA + 1` → `NA`, `NA * 2.0` → `NA`
-- **Format strings** work: `f"{na_value:.2f}"` → `"NaN"`
-- **bool()** returns `False`
-
-```python
-rsi = plot_data.get("RSI")
-if rsi > 70:                    # False when rsi is NA — no crash
-    print(f"Overbought: {rsi:.2f}")  # NA prints as "NaN"
-```
+Use `nz(value, replacement)` when a calculation needs a replacement value. See
+[Core Concepts](./overview/core-concepts.md#5-na-not-available-system) for details.
 
 ### How do Series variables work in PyneCore?
 
-Series variables in PyneCore store historical data points. Behind the scenes, they are implemented as global circular buffers that maintain historical values. When you declare a variable as a Series, PyneCore's AST transformations handle the proper creation and access to these buffers automatically.
+Series variables retain previous calculation values in circular buffers. A declaration
+such as `average: Series[float] = ta.sma(close, 20)` enables history access through
+`average[1]`. PyneCore manages that history in the relevant execution context and
+call-site state. See [Series variables](./overview/core-concepts.md#3-series-variables).
 
 ### What's the performance like compared to Pine Script?
 
@@ -230,7 +279,11 @@ PyneCore is designed for high performance while maintaining the intuitive bar-by
 
 ### Can I use external Python libraries with PyneCore?
 
-Yes! One of the main advantages of PyneCore is the ability to leverage the vast Python ecosystem. You can import and use any Python library in your PyneCore scripts. This allows you to combine technical analysis with data science, machine learning, and more.
+Plain `@pyne` programs can use external Python libraries in PyneCore's Python runtime.
+You are responsible for their dependencies and how their operations interact with
+bar-by-bar execution. **`@pyne edge` restricts imports and calls**, so arbitrary Python
+libraries are outside that profile. You can also keep general Python integration
+outside a script and embed it through [ScriptRunner](./programmatic/script-runner.md).
 
 ### Why doesn't division by zero raise an exception in PyneCore?
 
@@ -240,15 +293,11 @@ PyneCore automatically handles division by zero to match Pine Script behavior. W
 result = numerator / denominator
 ```
 
-PyneCore's AST transformation system converts this to:
-
-```python
-result = safe_convert.safe_div(numerator, denominator)
-```
-
-This function returns `NA(float)` instead of raising a `ZeroDivisionError` when the denominator is zero or NA, which matches how Pine Script handles division by zero. This transformation only applies to dynamic divisions (not literal values like `1/2`), ensuring both Pine Script compatibility and optimal performance.
-
-This is part of PyneCore's "it just works" philosophy - your Pine Script logic will behave exactly as expected without requiring explicit error handling for common edge cases.
+PyneCore transforms numeric division to follow Pine-style floating-point behavior.
+A nonzero numerator divided by zero produces signed infinity; `0 / 0` produces `nan`.
+The `na()` predicate recognizes these non-finite results, so you can test them without
+catching a Python `ZeroDivisionError`. A missing input propagates a missing result.
+The generated implementation can inline the common case or use a runtime helper.
 
 ## Programmatic Usage
 
@@ -303,14 +352,16 @@ NA values can propagate through calculations just like in Pine Script. If any in
 
 PyneCore's results match TradingView on the public validation corpus (see
 [How reliable is PyneCore compared to TradingView?](#how-reliable-is-pynecore-compared-to-tradingview)).
-When a result differs, the most common causes are:
+When a result differs, check:
 
 1. Different input data: TradingView and your data source may have different bars, and a
    comparison is only meaningful on identical OHLCV data
 2. Data feeds PyneCore has no source for: `request.dividends()`, `request.splits()`,
-   `request.earnings()` and `request.financial()` return `na` when called with
-   `ignore_invalid_symbol=True` and raise an error otherwise; `request.economic()` and
-   `request.quandl()` always raise an error
+   `request.earnings()` have no corporate-event feed and return `na` with
+   `ignore_invalid_symbol=True`; they also return `na` when requesting the current
+   crypto symbol. Other calls raise an error. `request.financial()` returns `na`
+   only with `ignore_invalid_symbol=True`; `request.economic()` and
+   `request.quandl()` raise an error. See [Request data](./lib/request-data.md).
 3. An intentional difference from Pine Script (see
    [Differences from Pine Script](./overview/differences.md))
 

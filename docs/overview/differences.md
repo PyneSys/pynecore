@@ -5,17 +5,20 @@ title: "Differences from Pine Script"
 description: "Key differences between PyneCore and TradingView Pine Script"
 icon: "compare"
 date: "2025-03-31"
-lastmod: "2026-09-05"
+lastmod: "2026-10-18"
 draft: false
 toc: true
-categories: ["Overview", "Comparisons"]
-tags: ["pine-script", "differences", "comparison", "python", "syntax", "types"]
+categories: ["Overview"]
+tags: ["pine-script", "comparison", "python", "syntax", "types"]
 ---
 -->
 
 # Differences from Pine Script
 
-1st and most important, it is Python ;)
+Pyne is a [domain-specific language with Python syntax](./pyne-code.md).
+It shares Pine Script's bar-by-bar approach while using its own script structure
+and explicit state annotations. Plain `@pyne` also supports broader Python
+integration; the `@pyne edge` profile uses a restricted subset.
 
 ## Structure differences
 
@@ -309,7 +312,7 @@ as `na` is the text `na`, just as on TradingView.
 
 Although we implemented all the array functions in array module, we decided to not implement Pine's `array` class and
 its methods. Instead, we use Python's builtin `list`, because it is almost the same
-and Pyne is just a Python framework after all.
+in PyneCore's Python runtime.
 
 This means if you see something like this in Pine:
 

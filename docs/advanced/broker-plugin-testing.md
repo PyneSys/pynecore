@@ -8,7 +8,7 @@ date: "2026-09-28"
 lastmod: "2026-09-28"
 draft: false
 toc: true
-categories: ["Advanced", "Live Trading"]
+categories: ["Development"]
 tags: ["broker", "plugins", "testing", "live-trading", "reliability", "reconciliation"]
 ---
 -->

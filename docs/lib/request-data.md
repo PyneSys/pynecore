@@ -8,8 +8,8 @@ date: "2026-03-28"
 lastmod: "2026-07-28"
 draft: false
 toc: true
-categories: ["Library", "API Reference"]
-tags: ["request", "currency", "dividends", "splits", "earnings"]
+categories: ["Reference"]
+tags: ["request", "currency", "dividends", "splits", "earnings", "corporate-events"]
 ---
 -->
 

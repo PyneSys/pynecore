@@ -8,7 +8,7 @@ date: "2025-03-31"
 lastmod: "2026-10-09"
 draft: false
 toc: true
-categories: ["Advanced", "Technical Implementation"]
+categories: ["Advanced"]
 tags: ["ast", "python", "transformations", "internals"]
 ---
 -->

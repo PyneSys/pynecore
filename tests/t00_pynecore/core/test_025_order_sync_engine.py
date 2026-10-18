@@ -6707,7 +6707,7 @@ def __test_reconcile_spot_position_above_dust_threshold_warns_external_close__(c
     assert not engine.quarantined
 
 
-def __test_close_fill_books_subdust_residual_flat_and_retires_the_bracket__():
+def __test_close_fill_books_subdust_residual_flat_and_retires_the_bracket__(caplog):
     """A grid-floored full close must not leave a dust-kept bracket resting.
 
     Spot entries are fee-netted (off the venue's qty grid) while the close
@@ -6741,12 +6741,18 @@ def __test_close_fill_books_subdust_residual_flat_and_retires_the_bracket__():
     assert {"L1", "L2", "L3"} <= set(engine.active_intents)
 
     # Flat signal: the venue floors the close to the qty grid.
-    engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('sell', 0.02998, 1920.53, pine_id="",
-                    leg=LegType.CLOSE, xchg_id="xchg-close"))
+    import logging
+    with caplog.at_level(logging.INFO, logger="pyne_core_logger"):
+        engine._route_event(  # type: ignore[attr-defined]
+            _fill_event('sell', 0.02998, 1920.53, pine_id="",
+                        leg=LegType.CLOSE, xchg_id="xchg-close"))
 
     assert pos.size == 0.0
     assert pos.open_trades == []
+    # The residue every spot round trip leaves is expected: no warning.
+    dust_records = [rec for rec in caplog.records
+                    if "non-tradable dust" in rec.getMessage()]
+    assert [rec.levelno for rec in dust_records] == [logging.INFO]
     assert "L3" not in engine.active_intents
     assert not any(
         isinstance(intent, ExitIntent) and intent.from_entry == "L3"

@@ -8,7 +8,7 @@ date: "2025-03-31"
 lastmod: "2026-06-10"
 draft: false
 toc: true
-categories: ["Development", "Testing"]
+categories: ["Development"]
 tags: ["testing", "pytest", "infrastructure", "quality-assurance", "ast", "reference-data"]
 ---
 -->
@@ -214,4 +214,3 @@ def runner(script_path, module_key, syminfo):
 ```
 
 This allows tests to execute scripts bar-by-bar, just as they would run in a real trading environment.
-

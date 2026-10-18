@@ -8,8 +8,8 @@ date: "2025-03-31"
 lastmod: "2026-09-28"
 draft: false
 toc: true
-categories: ["Usage", "Scripting"]
-tags: ["scripting", "python", "indicators", "strategies", "patterns", "practices"]
+categories: ["Scripting"]
+tags: ["scripting", "python", "indicators", "strategies", "patterns", "best-practices", "persistent", "ibpersistent", "varip"]
 ---
 -->
 
