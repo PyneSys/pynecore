@@ -2235,17 +2235,6 @@ class SimPosition(PositionBase):
                 self._remove_order(order)
                 return False
 
-            if order.order_type == _order_type_entry:
-                # If we have an existing position
-                if self.size != 0.0:
-                    # Check if the order has the same direction
-                    if self.sign == order.sign:
-                        # Check pyramiding limit for entry orders adding to existing position
-                        if lib._script.pyramiding <= self._pyramid_count():
-                            # Pyramiding limit reached - don't fill the entry order
-                            self._remove_order(order)
-                            return False
-
             # A ``strategy.order`` knows no pyramiding limit, but it is margined
             # like any other order: TV rejects it whole when the position it would
             # leave behind cannot be margined -- from flat, stacked on a position,
@@ -2260,7 +2249,8 @@ class SimPosition(PositionBase):
             # 1.02x and 1.8x of equity (246/246 each) and the margin call trims
             # it, while 2.5x never fills (275/275), nor 1.8x from a flat bar start
             # (MEASURED, BINANCE:BTCUSDT 30m, 2026-10-02, mc8 probes).
-            elif self._order_opens_exposure(order) and \
+            if order.order_type == _order_type_normal and \
+                    self._order_opens_exposure(order) and \
                     self._entry_exceeds_margin_after_fill(order, price) and \
                     (self.size == self._bar_start_size
                      or self._entry_exceeds_margin_after_fill(
@@ -7217,11 +7207,21 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     # 2.10875 short rather than the 30.31189 the first call's flip would open.
     # The flip quantity stays price-order-only: a market order gets it at
     # processing time.
+    # This is the only pyramiding gate a price-based entry passes: one placed while
+    # the limit still had room fills whenever it triggers, even after a sibling has
+    # opened the position. A rejected call still MODIFIES the pending order of the
+    # same id: that order is gone, not left resting. MEASURED on CAPITALCOM:EURUSD
+    # 30m (pyramiding=1, probe "PYR fill probe", 1191 cycles): of two long stops A
+    # and B placed together while flat, B fills when it triggers on a later bar
+    # with A open (529/529), and never fills once the same strategy.entry("B")
+    # call is repeated on A's fill bar (0/529).
     flip_extra = 0.0
     if not skip_flip and position._pyramid_sign_for_entry() == direction_sign:
         # Check pyramiding limit for entry orders adding to existing position
         if lib._script.pyramiding <= position._pyramid_count():
             # Pyramiding limit reached - don't add the order
+            if existing_entry is not None:
+                position._remove_order(existing_entry)
             return
 
     elif limit is not None or stop is not None:
