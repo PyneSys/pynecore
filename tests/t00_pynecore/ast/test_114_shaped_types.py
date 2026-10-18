@@ -789,6 +789,25 @@ def main():
     assert (types['i'], types['w']) == (INT, INT)
 
 
+def __test_a_for_loop_over_a_matrix_takes_the_row_type__():
+    """``for row in m`` binds one ROW of the matrix, an array of its element type"""
+    types = _types(UDT_SETUP + '''
+def main():
+    m = matrix.new(2, 3, 0.0)
+    total = 0.0
+    for row in m:
+        cell = array.get(row, 0)
+        total = cell
+    for i, r in enumerate(m):
+        width = array.size(r)
+    return total
+''', 'main')
+    assert types['m'] == matrix_of(FLOAT)
+    assert types['row'] == array_of(FLOAT)
+    assert types['cell'] == FLOAT
+    assert (types['i'], types['r']) == (INT, array_of(FLOAT))
+
+
 # --- 6. end to end ---------------------------------------------------------
 
 def __test_an_element_read_pins_the_call_it_feeds__(tmp_path, monkeypatch):

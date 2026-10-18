@@ -36,6 +36,10 @@ from .instance_state import _configure, _make_state, register_shared_cache  # no
 from .pine_export import Exported, in_module_bool_mode
 
 
+#: Runtime classes of Pine scalar receivers
+_PINE_SCALAR_TYPES: frozenset[type] = frozenset({str, int, float, bool})
+
+
 def method(func: Callable) -> Callable:
     """
     Decorator to mark a function as a Pine method.
@@ -253,11 +257,20 @@ def _dispatcher(cache: dict[str, tuple[Any, list | None, Callable]],
             if _method is not None:
                 return _method(var, *args, **kwargs)
 
-            # Modules
-            try:
-                return getattr(var, method)(*args, **kwargs)
-            except AttributeError:
-                pass
+            # Modules. A Pine scalar has no builtin methods, so a Python ``str`` /
+            # number attribute (``str.replace``, ``str.format``, ...) must never
+            # answer a library method of the same name. An na receiver answers every
+            # attribute with itself, so it would swallow the call: its exported method
+            # is looked up by its DECLARED type instead.
+            receiver_type = type(var)
+            if receiver_type is NA:
+                declared = var.type
+                receiver_type = declared if isinstance(declared, type) else type(declared)
+            elif receiver_type not in _PINE_SCALAR_TYPES:
+                try:
+                    return getattr(var, method)(*args, **kwargs)
+                except AttributeError:
+                    pass
 
             # Methods exported by a compiled library are module-level Exported proxies.
             # Try the module that defines the receiver's UDT class first, then the
@@ -271,7 +284,7 @@ def _dispatcher(cache: dict[str, tuple[Any, list | None, Callable]],
             # this Pine name (a Pine ``x__ren__`` compiles to ``x__ren____ren__``),
             # so the retry can never hit a wrong export.
             caller_globals = sys._getframe(1).f_globals
-            mod = sys.modules.get(type(var).__module__)
+            mod = sys.modules.get(receiver_type.__module__)
             for lookup_name in (method, method + '__ren__'):
                 _method = getattr(mod, lookup_name, None) if mod is not None else None
                 if not isinstance(_method, Exported):

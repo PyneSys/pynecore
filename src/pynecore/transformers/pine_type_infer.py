@@ -2065,7 +2065,9 @@ class _Inference:
         arguments yields an int.
 
         Iterating a CONTAINER is the other half: ``for x in arr`` gives ``x``
-        the array's element type, which is the shape's whole point.
+        the array's element type, which is the shape's whole point. A matrix
+        iterates its ROWS (``Matrix.__iter__``), so ``for row in m`` gives an
+        array of the matrix's element type.
         """
         if isinstance(iter_node, ast.Call):
             callee = _dotted(iter_node.func)
@@ -2074,6 +2076,8 @@ class _Inference:
                 if bounds and all(b in NUMERIC for b in bounds):
                     return INT if all(b == INT for b in bounds) else FLOAT
                 return UNKNOWN
+        if is_matrix(iter_ty):
+            return array_of(element_of(iter_ty))
         return element_of(iter_ty)
 
     def _store_iteration(self, stmt: ast.For | ast.AsyncFor, iter_ty: str) -> None:

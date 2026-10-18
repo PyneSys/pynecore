@@ -17,6 +17,7 @@ import pytest
 from pynecore.core.instance_state import reset
 from pynecore.core.pine_export import Exported
 from pynecore.core.pine_method import method_call
+from pynecore.types.na import NA
 
 LAYOUT = {
     'init': (0.0,),
@@ -106,6 +107,41 @@ def __test_exported_method_via_receiver_module__():
         assert method_call('mymethod', point, 1.0) == 6.0
     finally:
         del sys.modules['fake_udt_t017']
+
+
+def __test_exported_method_on_na_receiver__(monkeypatch):
+    """ A string method on an na of a UDT reaches the export of the module that
+    defines the DECLARED type, instead of na answering the call with itself """
+    mod = types.ModuleType('fake_na_udt_t017')
+    exec('class Point:\n    pass', mod.__dict__)
+    exported = Exported()
+
+    def tag(this):
+        return 'handled', this
+    tag.__module__ = 'fake_na_udt_t017'
+    tag.__qualname__ = 'tag'
+    exported.set(tag)
+    mod.tag = exported
+    monkeypatch.setitem(sys.modules, 'fake_na_udt_t017', mod)
+    receiver = NA(mod.Point)
+    assert method_call('tag', receiver) == ('handled', receiver)
+
+
+@pytest.mark.parametrize('name', ['replace', 'format', 'split'])
+def __test_exported_string_method_wins_over_python_str__(name, monkeypatch):
+    """ A library method on a ``string`` receiver named like a Python ``str``
+    method reaches the export, never ``str.replace`` / ``str.format`` / ... """
+    lib_mod = types.ModuleType('lib.fake_strings_t017')
+    exported = Exported()
+
+    def impl(this, mapping):
+        return this + '|' + ','.join(sorted(mapping))
+    impl.__module__ = 'lib.fake_strings_t017'
+    impl.__qualname__ = name
+    exported.set(impl)
+    setattr(lib_mod, name, exported)
+    monkeypatch.setitem(globals(), '_fake_strings_t017', lib_mod)
+    assert method_call(name, 'a b', {'x': 1.0, 'y': 2.0}) == 'a b|x,y'
 
 
 def __test_closure_converted_method__():
