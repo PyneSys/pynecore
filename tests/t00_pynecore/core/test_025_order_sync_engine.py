@@ -6586,6 +6586,34 @@ def __test_record_fill_partial_exit_leg_keeps_residual_size__():
     assert flipped is False  # side did NOT change (long -> long)
 
 
+def __test_record_fill_float_residue_of_the_fifo_walk_is_no_exposure__(caplog):
+    """The remainder a full FIFO walk leaves by float subtraction is no exposure.
+
+    ``0.1 + 0.2`` closed against trades of 0.1 and 0.2 leaves 5.6e-17 after
+    the walk. Read as leftover qty, the close warned of an over-close
+    (measured live: 8.7e-19 on a bybit-inverse reversal close).
+    """
+    from pynecore.lib.strategy import Trade
+    pos = BrokerPosition()
+    for entry_id, size in (("L1", 0.1), ("L2", 0.2)):
+        pos.open_trades.append(Trade(
+            size=size, entry_id=entry_id, entry_bar_index=0, entry_time=0,
+            entry_price=100.0, commission=0.0, entry_comment=None,
+            entry_equity=1_000_000.0,
+        ))
+    pos.size = 0.1 + 0.2
+    pos.sign = 1.0
+    pos.avg_price = 100.0
+
+    with caplog.at_level(logging.WARNING):
+        pos.record_fill(
+            _fill_event("sell", 0.1 + 0.2, 101.0, pine_id="S", leg=LegType.CLOSE))
+
+    assert pos.size == 0.0
+    assert pos.open_trades == []
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 def __test_record_fill_entry_leg_still_flips_for_reversal__():
     """An ENTRY leg may still flip the side (stop-and-reverse) — the clamp only blocks exit legs."""
     from pynecore.lib.strategy import Trade
@@ -12131,6 +12159,46 @@ def __test_drive_native_failsafe_dispatches_and_records_success__():
     # A second drive does not re-dispatch — nothing is pending.
     engine.drive_native_failsafe(now_ms=1000.0)
     assert len(received) == 1
+
+
+def __test_failsafe_confirmation_window_runs_on_the_wall_clock__(monkeypatch):
+    """A PUT acked at a bar's close is not judged a full bar old on the next tick.
+
+    The bar-open clock stands still for a whole bar and then jumps by the
+    timeframe. Measured live (Capital.com cycles 294 and 297, a
+    ``calc_on_every_tick`` strategy on a 1-minute chart): the fail-safe PUT
+    acked at the bar's close was escalated to a confirmation-timeout
+    DEGRADED one second later, on the next bar's first tick, before any
+    reconcile could confirm it.
+    """
+    wall = [float(BAR_TS) + 59_000.0]
+    monkeypatch.setattr(
+        OrderSyncEngine, '_native_failsafe_now_ms', staticmethod(lambda: wall[0]))
+    engine, pos = _mk_engine(_software_partial_broker())
+    dispatched: list[float | None] = []
+    engine.set_native_bracket_dispatcher(
+        lambda snap: dispatched.append(snap.stop_level))
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("X", "L")] = _exit_order("L", 0.4, "X", limit=120.0, stop=90.0)
+    engine.sync(BAR_TS)
+    engine._route_event(
+        _fill_event('buy', 1.0, 100.0, pine_id="L"))
+    engine.sync(BAR_TS)
+    assert dispatched == [90.0]
+    ref = engine._resolve_parent_opening_ref("L")
+    mgr = engine._native_failsafe_manager
+    assert mgr.get_state(ref).batch_put_acked
+
+    # Next bar's first tick, one second later: still inside the window.
+    wall[0] += 1_000.0
+    engine.sync(BAR_TS + 60_000)
+    assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
+
+    # A confirmation that never arrives within the window still escalates.
+    wall[0] += 30_000.0
+    engine.sync(BAR_TS + 60_000)
+    assert mgr.get_state(ref).health is FailsafeHealth.DEGRADED
+    assert mgr.get_state(ref).degraded_reason == 'confirmation-timeout'
 
 
 def __test_drive_native_failsafe_records_single_failure_per_dispatch__():

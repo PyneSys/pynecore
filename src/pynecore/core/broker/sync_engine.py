@@ -1517,15 +1517,10 @@ class OrderSyncEngine:
         # Set during ``__init__`` when the persisted partial-bracket leg
         # ledger contains active rows: defers
         # :meth:`_rehydrate_native_failsafe_from_replayed_legs` to the
-        # first :meth:`sync` call. ``_current_bar_ts_ms`` is still ``0``
-        # at construction time, so anchoring ``register_parent``'s
-        # ``degrading_since_ts_ms`` / ``recompute_worst_sl``'s
-        # ``last_desired_change_ts_ms`` here would let the first real
-        # :meth:`drive_native_failsafe` tick the stale window from epoch
-        # zero and immediately promote the freshly rehydrated state to
-        # ``DEGRADED`` — dropping the queued reattach PUT. Running the
-        # rehydrate after :meth:`sync` assigns a real ``bar_ts_ms``
-        # gives the stale-window timer a sane anchor.
+        # first :meth:`sync` call: the rehydrate registers a parent as
+        # awaiting confirmation only when a native bracket dispatcher can
+        # deliver one, and the runner installs that dispatcher after
+        # construction (:meth:`set_native_bracket_dispatcher`).
         self._pending_native_failsafe_rehydrate: bool = False
         # Cancel-tentative state machine shadow map. Keyed by
         # ``intent_key``; each entry tracks one envelope whose broker
@@ -2149,14 +2144,11 @@ class OrderSyncEngine:
             # worst-SL recompute so the safety state machine reflects
             # the persisted partial bracket.
             #
-            # Defer the work to the first :meth:`sync`: at construction
-            # time ``_current_bar_ts_ms`` is still ``0``, and running
-            # rehydrate with that anchor would let the first real
-            # :meth:`drive_native_failsafe` tick the stale window from
-            # epoch zero and immediately demote the freshly rehydrated
-            # state to ``DEGRADED``. The deferred flag is only set when
-            # there is something to rehydrate (active legs present); a
-            # restart without partial brackets is a no-op.
+            # Defer the work to the first :meth:`sync`: the native bracket
+            # dispatcher the rehydrate depends on is installed after
+            # construction. The deferred flag is only set when there is
+            # something to rehydrate (active legs present); a restart
+            # without partial brackets is a no-op.
             self._pending_native_failsafe_rehydrate = any(
                 True for _ in self._partial_bracket_engine.iter_legs()
             )
@@ -3391,15 +3383,11 @@ class OrderSyncEngine:
                     if self._store_ctx is not None:
                         self._store_ctx.record_complete(key)
         # Restart-replay native fail-safe rehydrate: deferred from
-        # ``__init__`` so ``_current_bar_ts_ms`` carries a real epoch-ms
-        # anchor before any :meth:`register_parent` /
-        # :meth:`recompute_worst_sl` call. Running it here — after the
-        # assignment above and before any state mutation — guarantees
-        # that the stale-window timer in :meth:`drive_native_failsafe`
-        # (called at the end of this ``sync``) measures from the bar
-        # timestamp, not from epoch zero, so the freshly rehydrated
-        # ``DEGRADING`` state stays in ``DEGRADING`` long enough for the
-        # queued reattach PUT to dispatch.
+        # ``__init__`` so the native bracket dispatcher the runner installs
+        # after construction decides whether a parent awaits confirmation.
+        # Running it here, before any state mutation, queues the reattach
+        # PUT for the :meth:`drive_native_failsafe` at the end of this
+        # ``sync``.
         if self._pending_native_failsafe_rehydrate:
             self._pending_native_failsafe_rehydrate = False
             self._rehydrate_native_failsafe_from_replayed_legs()
@@ -3617,7 +3605,7 @@ class OrderSyncEngine:
         # placed or refreshed in live runs. Idempotent — a no-op when
         # no plugin dispatcher is installed or the manager has nothing
         # queued.
-        self.drive_native_failsafe(now_ms=float(self._current_bar_ts_ms))
+        self.drive_native_failsafe(now_ms=self._native_failsafe_now_ms())
         # End-of-sync clear: the defensive-close markers populated during
         # this sync (whether by an ``apply_async_events`` drain on this
         # bar or by the in-line ``_drain_events`` above) have now been
@@ -11644,7 +11632,7 @@ class OrderSyncEngine:
         )
         for stale_ref in stale_refs:
             self._native_failsafe_manager.on_deal_id_disappeared(
-                stale_ref, now_ms=float(self._current_bar_ts_ms),
+                stale_ref, now_ms=self._native_failsafe_now_ms(),
             )
         for ikey in {leg.intent_key for leg in aborted}:
             if self._partial_bracket_engine.has_active_legs_for_intent(ikey):
@@ -11684,7 +11672,7 @@ class OrderSyncEngine:
             retired_refs.add(opening_ref)
         for ref in retired_refs:
             self._native_failsafe_manager.on_deal_id_disappeared(
-                ref, now_ms=float(self._current_bar_ts_ms),
+                ref, now_ms=self._native_failsafe_now_ms(),
             )
 
     def _cleanup_position_tracking(
@@ -12495,8 +12483,8 @@ class OrderSyncEngine:
 
         Scheduled by ``__init__`` (via
         ``_pending_native_failsafe_rehydrate``) and actually executed
-        at the top of the first :meth:`sync` once ``_current_bar_ts_ms``
-        has been set to a real bar timestamp. Walks the ledger,
+        at the top of the first :meth:`sync`, once the runner has
+        installed the native bracket dispatcher. Walks the ledger,
         deduplicates per ``parent_entry_dispatch_ref``, registers each
         parent with the manager, and triggers the worst-SL recompute
         so the §2.6 broker-native fail-safe state machine has an
@@ -12534,14 +12522,7 @@ class OrderSyncEngine:
             ref for ref in seen if self._parent_expects_native_sl(ref)}
         if not seen:
             return
-        # ``_current_bar_ts_ms`` is the first sync's bar timestamp:
-        # ``__init__`` defers this call via
-        # ``_pending_native_failsafe_rehydrate`` so the value below is a
-        # real epoch-ms anchor, not zero. That keeps the stale-window
-        # timer in :meth:`NativeFailsafeManager.tick_stale_window` from
-        # measuring against epoch zero and immediately demoting the
-        # freshly rehydrated state to ``DEGRADED``.
-        now_ms = float(self._current_bar_ts_ms)
+        now_ms = self._native_failsafe_now_ms()
         for ref, (symbol, parent_side) in seen.items():
             # Restart-replay safety (§2.6.7): the previous process may
             # have transitioned this parent to ``DEGRADED`` / ``UNKNOWN``
@@ -13410,9 +13391,25 @@ class OrderSyncEngine:
         manager.recompute_worst_sl(
             parent_entry_dispatch_ref=parent_entry_dispatch_ref,
             active_sl_levels=sl_levels,
-            now_ms=float(self._current_bar_ts_ms),
+            now_ms=self._native_failsafe_now_ms(),
             trigger_kind=trigger_kind,
         )
+
+    @staticmethod
+    def _native_failsafe_now_ms() -> float:
+        """Wall-clock time (epoch ms) every native fail-safe timer runs on.
+
+        The confirmation window, the retry stale window and the trail
+        coalesce window are real-time durations, so they are measured on
+        real elapsed time, never on the bar-open timestamp: that one stands
+        still for a whole bar and then jumps by the timeframe.
+        """
+        # On the bar clock a PUT acked at a bar's close was judged one second
+        # later, on the next bar's first tick, as a full bar old: past the 30s
+        # window before any reconcile could confirm it (measured live:
+        # Capital.com cycles 294 and 297, a ``calc_on_every_tick`` strategy on
+        # a 1-minute chart).
+        return time.time() * 1000.0
 
     def drive_native_failsafe(self, *, now_ms: float) -> None:
         """Drain the manager's pending dispatches into the plugin
@@ -16159,7 +16156,7 @@ class OrderSyncEngine:
                         for stale_ref in stale_refs:
                             self._native_failsafe_manager.on_deal_id_disappeared(
                                 stale_ref,
-                                now_ms=float(self._current_bar_ts_ms),
+                                now_ms=self._native_failsafe_now_ms(),
                             )
                         self._order_mapping.pop(key, None)
                         self._drop_envelope(key)
@@ -18211,7 +18208,7 @@ class OrderSyncEngine:
             self._drop_envelope(key)
             self._remove_pine_order_for_intent(old)
         manager = self._native_failsafe_manager
-        now_ms = float(self._current_bar_ts_ms)
+        now_ms = self._native_failsafe_now_ms()
         for pine_entry_id in consumed_ids:
             ref = self._resolve_parent_opening_ref(pine_entry_id)
             if ref is None:

@@ -626,6 +626,11 @@ class BrokerPosition(PositionBase):
                 trade.size -= closed_piece.size
                 trade.commission -= closed_entry_commission
                 remaining = 0.0
+        # A trade within 1e-12 of the remainder closes in full, so the
+        # subtraction can leave float residue behind: no leftover exposure
+        # (measured live: 8.7e-19 after an inverse close, bybit-inverse cycle 249).
+        if remaining < 1e-12:
+            remaining = 0.0
 
         self.size += signed_delta
         # Clamp tiny residuals to zero
