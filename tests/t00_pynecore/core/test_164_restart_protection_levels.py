@@ -15,7 +15,12 @@ from types import SimpleNamespace
 import pytest
 
 from pynecore import lib
-from pynecore.core.broker.idempotency import KIND_CLOSE, KIND_EXIT_SL
+from pynecore.core.broker.idempotency import (
+    KIND_CLOSE,
+    KIND_EXIT_SL,
+    KIND_EXIT_TP,
+    build_client_order_id,
+)
 from pynecore.core.broker.models import (
     DispatchEnvelope,
     ExchangeCapabilities,
@@ -555,11 +560,31 @@ class _JournalingBroker(_Broker):
 
     refs: tuple[str, ...] = ("xchg-sl",)
     close_calls: list[DispatchEnvelope] = field(default_factory=list)
+    journal: RunContext | None = None
+    """Journals the exit's TP / SL leg rows the way a native-bracket plugin does."""
+    leg_keys: bool = False
+    """The leg rows name their leg after the exit key, as Capital.com's do."""
+    trailing: bool = False
+    leg_qty: float | None = None
+    """The qty the venue rounded the legs to, as Bybit spot's lot step does."""
 
     async def execute_exit(self, envelope):
         self.exit_calls.append(envelope)
         if self.exit_errors and (error := self.exit_errors.pop(0)) is not None:
             raise error
+        intent = envelope.intent
+        if self.journal is not None and isinstance(intent, ExitIntent):
+            for kind, leg, tp, sl in ((KIND_EXIT_TP, "TP", intent.tp_price, None),
+                                      (KIND_EXIT_SL, "SL", None, intent.sl_price)):
+                self.journal.upsert_order(
+                    envelope.client_order_id(kind), symbol=SYMBOL, side=intent.side,
+                    qty=intent.qty if self.leg_qty is None else self.leg_qty,
+                    state="confirmed",
+                    intent_key=(f"{intent.intent_key}{INTENT_KEY_SEP}{leg}"
+                                if self.leg_keys else intent.intent_key),
+                    from_entry=intent.from_entry, tp_level=tp, sl_level=sl,
+                    trailing_stop=self.trailing and kind == KIND_EXIT_SL,
+                    extras={"kind": "exit_leg"})
         return [ExchangeOrder(
             id=ref, symbol=SYMBOL, side="sell", order_type=OrderType.STOP, qty=1.0,
             filled_qty=0.0, remaining_qty=1.0, price=None, stop_price=1.0900,
@@ -596,23 +621,44 @@ def _strategy_exit(engine: OrderSyncEngine) -> None:
 
 
 def _restart_with_a_journaled_exit(
-        store: BrokerStore, *, refs: tuple[str, ...], resumed: bool,
+        store: BrokerStore, *, refs: tuple[str, ...], resumed: bool, declared: bool = True,
+        leg_keys: bool = False, trailing: bool = False, leg_qty: float | None = None,
+        cancelled: str | None = None,
 ) -> tuple[RunContext, OrderSyncEngine, _JournalingBroker, DispatchEnvelope]:
     """The previous process dispatched the exit; the next one starts over it.
 
     Nothing seeds the restarted engine's order mapping: what it does with the
     exit is what a real restart does.
+
+    :param declared: The restarted script declares the exit again. A script
+        that places it only on its signal bar does not.
+    :param cancelled: The leg kind of the order the operator cancelled: its
+        leg row is closed in the previous process. A cancelled take-profit is
+        closed after the take-profit row of an earlier dispatch of the exit.
     """
     first = _open_ctx(store)
     first.upsert_order("row-l", symbol=SYMBOL, side="buy", qty=1.0, filled_qty=1.0,
                        state="confirmed", pine_entry_id="L", extras={"kind": "position"})
-    previous_broker = _JournalingBroker(position=_long(1.0), refs=refs)
+    previous_broker = _JournalingBroker(position=_long(1.0), refs=refs, journal=first,
+                                        leg_keys=leg_keys, trailing=trailing,
+                                        leg_qty=leg_qty)
     previous = _engine(first, previous_broker)
+    # An earlier dispatch of the same exit, released no sooner than the cancelled leg
+    earlier = build_client_order_id(run_tag=first.run_tag, pine_id="L-X",
+                                    bar_ts_ms=BAR_TS - 60_000, kind=KIND_EXIT_TP)
+    if cancelled == KIND_EXIT_TP:
+        first.upsert_order(earlier, symbol=SYMBOL, side="sell", qty=1.0, state="confirmed",
+                           intent_key=f"L-X{INTENT_KEY_SEP}L", from_entry="L",
+                           tp_level=1.1500, extras={"kind": "exit_leg"})
     previous.reconcile()
     _strategy_exit(previous)
     previous.sync(BAR_TS, last_price=1.1000)
     assert len(previous_broker.exit_calls) == 1
     journaled = previous_broker.exit_calls[0]
+    if cancelled is not None:
+        first.close_order(journaled.client_order_id(cancelled))
+    if cancelled == KIND_EXIT_TP:
+        first.close_order(earlier)
     if resumed:
         previous.record_quarantine("operator moved the stop-loss",
                                    kind=QuarantineKind.EXTERNAL_INTERVENTION)
@@ -624,7 +670,8 @@ def _restart_with_a_journaled_exit(
     broker = _JournalingBroker(position=_long(1.0), refs=refs)
     engine = _engine(ctx, broker)
     engine.reconcile()
-    _strategy_exit(engine)
+    if declared:
+        _strategy_exit(engine)
     return ctx, engine, broker, journaled
 
 
@@ -687,6 +734,97 @@ def __test_a_plain_restart_never_re_asserts_a_journaled_exit__(
         assert len(broker.exit_calls) == 1
         assert broker.cancel_calls == [] and broker.modify_exit_calls == []
         assert _events(ctx, 'resume_exit_reasserted') == []
+        ctx.close()
+
+
+@pytest.mark.parametrize(("refs", "leg_keys"), [
+    (("xchg-tp", "xchg-sl"), False),
+    (("pos-1:tp", "pos-1:sl"), True),
+], ids=["order-legs", "legs-keyed-by-leg"])
+def __test_a_resume_re_arms_a_journaled_exit_the_restarted_script_does_not_declare__(
+        tmp_path: Path, refs: tuple[str, ...], leg_keys: bool) -> None:
+    """The exit was placed on a signal bar of the previous process: the journal rebuilds it.
+
+    Measured live: Capital.com cycle 300 -- the operator removed the stop-loss,
+    resumed, and the position stayed without the bot's stop for the rest of the
+    round.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx, engine, broker, journaled = _restart_with_a_journaled_exit(
+            store, refs=refs, resumed=True, declared=False, leg_keys=leg_keys)
+
+        engine.sync(BAR_TS + 60_000, last_price=1.1000)
+
+        redispatched, rearmed = broker.exit_calls
+        assert (redispatched.client_order_id(KIND_EXIT_SL)
+                == journaled.client_order_id(KIND_EXIT_SL))
+        assert [c.intent.pine_id for c in broker.cancel_calls] == ["L-X"]
+        assert isinstance(rearmed.intent, ExitIntent)
+        assert (rearmed.intent.tp_price, rearmed.intent.sl_price) == (1.1200, 1.0900)
+        assert [e['mode'] for e in _events(ctx, 'resume_exit_reasserted')] == ['rearm']
+        assert store.open_quarantines() == []
+        ctx.close()
+
+
+def __test_a_resume_restores_the_cancelled_leg_of_an_undeclared_exit_over_the_full_trade__(
+        tmp_path: Path) -> None:
+    """The operator cancelled the take-profit order; the venue rounded the legs' qty.
+
+    Measured live: Bybit spot cycle 316 -- the cancelled take-profit's leg row
+    was closed, the rebuilt exit came back without it, and its lot-rounded qty
+    made it a partial exit armed beside the stop the venue still held.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx, engine, broker, journaled = _restart_with_a_journaled_exit(
+            store, refs=("xchg-tp", "xchg-sl"), resumed=True, declared=False,
+            leg_qty=0.999, cancelled=KIND_EXIT_TP)
+
+        engine.sync(BAR_TS + 60_000, last_price=1.1000)
+
+        redispatched, rearmed = broker.exit_calls
+        assert (redispatched.client_order_id(KIND_EXIT_SL)
+                == journaled.client_order_id(KIND_EXIT_SL))
+        assert isinstance(rearmed.intent, ExitIntent)
+        assert (rearmed.intent.tp_price, rearmed.intent.sl_price) == (1.1200, 1.0900)
+        assert rearmed.intent.qty == 1.0
+        assert [e['mode'] for e in _events(ctx, 'resume_exit_reasserted')] == ['rearm']
+        assert store.open_quarantines() == []
+        ctx.close()
+
+
+@pytest.mark.parametrize("cancelled", [None, KIND_EXIT_SL], ids=["as-armed", "trail-cancelled"])
+def __test_a_resume_leaves_an_undeclared_trailing_exit_as_the_venue_shows_it__(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture, cancelled: str | None) -> None:
+    """The leg rows keep no activation level, so no faithful trailing exit can be rebuilt.
+
+    Nor can it from its take-profit leg once the operator cancelled the trailing stop.
+    """
+    import logging
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx, engine, broker, _journaled = _restart_with_a_journaled_exit(
+            store, refs=("xchg-sl",), resumed=True, declared=False, trailing=True,
+            cancelled=cancelled)
+        caplog.clear()
+
+        engine.sync(BAR_TS + 60_000, last_price=1.1000)
+
+        assert broker.exit_calls == [] and broker.cancel_calls == []
+        assert any(r.levelno == logging.WARNING and "trailing exit" in r.getMessage()
+                   for r in caplog.records)
+        ctx.close()
+
+
+def __test_a_plain_restart_rebuilds_no_undeclared_journaled_exit__(tmp_path: Path) -> None:
+    """Without a resume the next cycle's script owns the book: the legs stay journal-only."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx, engine, broker, _journaled = _restart_with_a_journaled_exit(
+            store, refs=("xchg-sl",), resumed=False, declared=False)
+
+        engine.sync(BAR_TS + 60_000, last_price=1.1000)
+
+        assert broker.exit_calls == [] and broker.cancel_calls == []
+        assert ("L-X", "L") not in engine._position.exit_orders  # noqa: SLF001
         ctx.close()
 
 

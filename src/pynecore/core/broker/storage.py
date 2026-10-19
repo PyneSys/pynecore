@@ -1340,6 +1340,7 @@ class BrokerStore:
 
     # --- Quarantine latches (operator CLI) -------------------------------
 
+    # noinspection SqlResolve
     def open_quarantines(self) -> list[QuarantineRow]:
         """Every quarantine latch not yet ended, across all runs, oldest first."""
         with self.read_lock() as conn:
@@ -1349,6 +1350,7 @@ class BrokerStore:
             ).fetchall()
         return [_row_to_quarantine(row) for row in rows]
 
+    # noinspection SqlResolve
     def request_quarantine_resume(
             self, run_id: str, quarantine_id: str,
     ) -> QuarantineRow | None:
@@ -2059,6 +2061,28 @@ class RunContext:
                 "WHERE r.run_id = ? AND o.state = ? "
                 "ORDER BY o.created_ts_ms",
                 (self.run_id, state),
+            ).fetchall()
+        for row in rows:
+            yield _row_to_order(row)
+
+    def iter_closed_orders_for_run_id(self, *, from_entry: str) -> Iterator[OrderRow]:
+        """Iterate the closed order rows of this logical run under one parent entry.
+
+        Scoped to ``runs.run_id`` like :meth:`iter_orders_in_state_for_run_id`:
+        a restart re-homes only the live rows into the new instance, so a row
+        closed before it stays with the instance that closed it. Oldest first.
+        Read-only.
+
+        :param from_entry: The parent entry id the rows protect.
+        """
+        with self._store.read_lock() as conn:
+            rows = conn.execute(
+                "SELECT o.* FROM orders AS o "
+                "JOIN runs AS r ON o.run_instance_id = r.run_instance_id "
+                "WHERE r.run_id = ? AND o.from_entry = ? "
+                "AND o.closed_ts_ms IS NOT NULL "
+                "ORDER BY o.created_ts_ms",
+                (self.run_id, from_entry),
             ).fetchall()
         for row in rows:
             yield _row_to_order(row)
@@ -2783,6 +2807,7 @@ class RunContext:
 
     # --- Quarantine latches -----------------------------------------------
 
+    # noinspection SqlResolve
     def record_quarantine(
             self, quarantine_id: str, *,
             kind: str,
@@ -2822,6 +2847,7 @@ class RunContext:
                  context_json, entered_ts_ms, external, external),
             )
 
+    # noinspection SqlResolve
     def get_quarantine(self, quarantine_id: str) -> QuarantineRow | None:
         """Return one latch of this logical run, ended or not."""
         with self._store.read_lock() as conn:
@@ -2831,6 +2857,7 @@ class RunContext:
             ).fetchone()
         return None if row is None else _row_to_quarantine(row)
 
+    # noinspection SqlResolve
     def iter_open_quarantines(self) -> list[QuarantineRow]:
         """Every latch of this logical run not yet ended, oldest first."""
         with self._store.read_lock() as conn:
@@ -2841,6 +2868,7 @@ class RunContext:
             ).fetchall()
         return [_row_to_quarantine(row) for row in rows]
 
+    # noinspection SqlResolve
     def end_quarantine(self, quarantine_id: str, end_reason: str) -> None:
         """Mark a latch of this logical run ended (no-op when already ended)."""
         with self._store.transaction() as conn:

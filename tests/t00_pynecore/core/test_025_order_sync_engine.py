@@ -4212,6 +4212,51 @@ def __test_settle_in_flight_fills_waits_for_the_market_fill__():
     assert not engine.awaiting_market_fills()
 
 
+@pytest.mark.parametrize("event_type", ["partial", "filled"])
+def __test_a_market_entry_filled_net_of_a_base_fee_is_not_awaited_once_complete__(
+        event_type: str):
+    """A spot buy is booked net of its base-coin fee: the fills never add up to the qty.
+
+    Measured live: every stop of a Bybit spot run with an open position waited
+    out the settle bound and warned of a market order still waiting for its fill.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 0.01)
+    engine.sync(BAR_TS)
+    (ref,) = engine.order_mapping["L"]
+
+    engine.on_order_event(_fill_event(
+        'buy', 0.009995, 2419.39, pine_id="L", xchg_id=ref, event_type=event_type,
+        filled_qty=0.01 if event_type == "filled" else 0.005,
+        remaining_qty=0.0 if event_type == "filled" else 0.005,
+    ))
+    engine.apply_async_events()
+
+    assert engine.awaiting_market_fills() is (event_type == "partial")
+
+
+def __test_a_market_re_entry_after_a_completed_one_is_awaited__():
+    """The completion of an earlier entry under the same id says nothing of the next one."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", -1.0, "L-X", stop=45_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L", xchg_id="xchg-L", fill_id="f-L"))
+    sl = _fill_event('sell', 1.0, 45_000.0, pine_id="L-X", leg=LegType.STOP_LOSS,
+                     xchg_id="xchg-SL", fill_id="f-SL")
+    engine._route_event(replace(sl, from_entry="L"))  # type: ignore[attr-defined]
+    assert pos.size == 0.0
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS + 60_000)
+
+    assert [call.intent.pine_id for call in b.entry_calls] == ["L", "L"]
+    assert engine.awaiting_market_fills()
+
+
 def __test_settle_in_flight_fills_gives_up_at_the_timeout__():
     """No fill arriving within the bound ends the wait with ``False``."""
     b = MockBroker()
@@ -10682,6 +10727,46 @@ def __test_bracket_reject_of_a_level_crossed_at_fill_is_an_immediate_exit__(capl
         OrderSyncEngine._log_plugin_skip(OrderSkippedByPlugin(  # noqa
             "below grid", intent_key="k", reason="below_min_volume"))
     assert [rec.levelno for rec in caplog.records] == [logging.INFO, logging.WARNING]
+
+
+@pytest.mark.parametrize(("reason", "level"), [
+    ("reversal_close_pending", logging.INFO),
+    ("reversal_close_in_flight", logging.INFO),
+    ("no_position_to_protect", logging.INFO),
+    ("spot_full_close_pre_clear", logging.INFO),
+    ("pre_clear_leg_fill_pending", logging.INFO),
+    ("pre_clear_leg_filled", logging.INFO),
+    ("position_book_incomplete", logging.WARNING),
+    ("parent_entry_disposition_pending", logging.WARNING),
+])
+def __test_the_bots_own_protocol_steps_are_logged_as_info__(caplog, reason, level):
+    """A stop-and-reverse or a flat book is routine; an unprotected or unknown state is not.
+
+    Measured live: every reversal on every lane logged its parked entry and
+    its held-back exits as WARNINGs (some 2300 lines across the lanes).
+    """
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        OrderSyncEngine._log_plugin_skip(OrderSkippedByPlugin(  # noqa
+            "skipped", intent_key="k", reason=reason))
+    assert [rec.levelno for rec in caplog.records] == [level]
+
+
+def __test_a_reversal_parks_its_entry_without_a_warning__(caplog):
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(_fill_event('sell', 1.0, 50_000.0, pine_id="S"))  # noqa: SLF001
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    caplog.clear()
+
+    with caplog.at_level(logging.INFO):
+        engine.sync(BAR_TS + 60_000)
+
+    parked = [r for r in caplog.records if "Reversal entry L parked" in r.getMessage()]
+    assert [r.levelno for r in parked] == [logging.INFO]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 def __test_bracket_reject_of_a_level_the_market_crossed_is_an_immediate_exit__(caplog):

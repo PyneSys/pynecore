@@ -70,7 +70,9 @@ from pynecore.core.broker.idempotency import (
     KIND_ENTRY,
     KIND_ENTRY_STOP,
     KIND_ENTRY_STOP_WATCH,
+    KIND_EXIT_SL,
     KIND_EXIT_SL_PARTIAL,
+    KIND_EXIT_TP,
     KIND_EXIT_TP_PARTIAL,
     KIND_EXIT_TRAIL_PARTIAL,
     build_client_order_id,
@@ -459,6 +461,15 @@ modifies old can never miss a real straggler. In-memory only.
 """
 
 
+_FILLED_ENTRY_ORDER_IDS_CAP = 8192
+"""Upper bound on the filled-entry-order-id ring
+(:attr:`OrderSyncEngine._filled_entry_order_ids`).
+
+Only the entries still in flight at a stop are looked up, so evicting ids
+thousands of entries old never misses one. In-memory only.
+"""
+
+
 _SETTLED_DEFENSIVE_CLOSE_IDS_CAP = 8192
 """Upper bound on each settled-defensive-close identity cache
 (:attr:`OrderSyncEngine._settled_defensive_close_pine_ids` /
@@ -750,6 +761,16 @@ _OPPOSITE_ENTRY_FILL_WAIT_S = 600.0
 _INFO_SKIP_REASONS = frozenset({
     'protective_level_crossed_at_fill',
     'opposite_entry_fill_pending',
+    # The bot's own protocol steps, with no exposure left unprotected: a
+    # stop-and-reverse flattening the book, an exit of a flat book, an exit
+    # held back behind the bot's own close or own filled leg. Their failure
+    # paths log a WARNING of their own.
+    'reversal_close_pending',
+    'reversal_close_in_flight',
+    'no_position_to_protect',
+    'spot_full_close_pre_clear',
+    'pre_clear_leg_fill_pending',
+    'pre_clear_leg_filled',
 })
 
 
@@ -1396,6 +1417,11 @@ class OrderSyncEngine:
         # conservatively reserves the full quantity — the safe direction on a
         # short-incapable venue.
         self._active_entry_filled_qty: dict[str, float] = {}
+        # Venue order ids of entries that reported their terminal fill. The
+        # ledger above can stay short of the qty for good (a spot buy booked
+        # net of a base-coin fee), so :meth:`awaiting_market_fills` keys off
+        # the venue's completion instead; a fresh dispatch carries fresh ids.
+        self._filled_entry_order_ids = _BoundedIdSet(_FILLED_ENTRY_ORDER_IDS_CAP)
         # In-flight flip-fold surplus corrections replayed from a PRIOR
         # process run: close ``intent_key`` ->
         # :class:`_PendingFlipSurplusClose`. Runs on the current code never
@@ -3095,7 +3121,9 @@ class OrderSyncEngine:
         """Whether a dispatched market entry or close still waits for its fill.
 
         A resting limit / stop entry is not counted: it may rest for hours, and
-        its journal row already owns whatever it later fills into.
+        its journal row already owns whatever it later fills into. An entry
+        whose venue order reported its terminal fill is done, even when its
+        booked fills stay short of the qty (a spot buy net of a base-coin fee).
 
         A defensive close after a bracket-attach reject is dispatched outside
         :attr:`_active_intents` and lives only as a
@@ -3108,6 +3136,9 @@ class OrderSyncEngine:
         for key, intent in self._active_intents.items():
             if isinstance(intent, EntryIntent):
                 if intent.order_type is not OrderType.MARKET:
+                    continue
+                refs = self._order_mapping.get(key)
+                if refs and all(ref in self._filled_entry_order_ids for ref in refs):
                     continue
                 filled = self._active_entry_filled_qty.get(key, 0.0)
             elif isinstance(intent, CloseIntent):
@@ -8792,6 +8823,8 @@ class OrderSyncEngine:
                         if total > active_entry.qty:
                             total = active_entry.qty
                         self._active_entry_filled_qty[event.pine_id] = total
+                    if event.event_type == "filled":
+                        self._filled_entry_order_ids.add(event.order.id)
             # Feed the must-settle marker of a flip-fold surplus correction
             # with this slice. Every partial counts towards the dispatched
             # quantity and the marker is retired only when they add up (see
@@ -14728,6 +14761,7 @@ class OrderSyncEngine:
         self._reconstruct_one_way_bracket_exits()
         self._reconstruct_partial_bracket_exits()
         self._reconstruct_pine_entry_orders()
+        self._reconstruct_journal_exits_after_resume()
         # A book that is ALREADY flat at restart gets the same sweep the
         # flat close-fill runs: the prior process may have died between a
         # venue-side exit fill and the cancel of its OCA sibling, leaving
@@ -14837,6 +14871,94 @@ class OrderSyncEngine:
                 "(bound for strategy cancel / adoption)",
                 order_id, format_intent_key(pine_id),
             )
+
+    def _reconstruct_journal_exits_after_resume(self) -> None:
+        """Rebuild the whole-row exits an operator resume takes over from the journal.
+
+        The resume re-asserts the bot's own exits, and only an exit in
+        ``position.exit_orders`` is one: a script places ``strategy.exit``
+        once, on its signal bar, so the restarted process never declares the
+        exit the previous one armed, and its venue legs live on only as
+        journal rows. Each such exit -- a native TP / SL leg row of it still
+        live, its parent trade held by the book -- is rebuilt here with the
+        levels its rows carry. The diff then dispatches it under the
+        journaled envelope, and :meth:`_reassert_exits_after_resume` puts
+        the bot's levels back on the venue: a level the operator removed
+        comes back too, and a level moved by the operator is reset.
+
+        A leg the operator cancelled has its row closed already; its level
+        comes from that row when it belongs to the same dispatch as the
+        live legs. A whole-row leg covers the parent trade, so the rebuilt
+        exit does too: the rows' qty is the venue's lot-rounded one, and
+        taken as the exit's qty it would turn the exit into a partial one.
+
+        A trailing exit is left as the venue shows it: its rows keep the
+        trail offset but not the activation level, so no faithful exit can
+        be rebuilt from them.
+        """
+        if not self._resumed_from_quarantine or self._store_ctx is None:
+            return
+        groups: dict[tuple[str, str], list[OrderRow]] = {}
+        for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+            leg = self._journal_exit_leg(row)
+            if leg is not None:
+                groups.setdefault((leg[0], row.from_entry or ''), []).append(row)
+        held = {trade.entry_id for trade in self._position.open_trades}
+        for (pine_id, from_entry), rows in groups.items():
+            key = f"{pine_id}{INTENT_KEY_SEP}{from_entry}"
+            if (key in self._active_intents
+                    or (pine_id, from_entry) in self._position.exit_orders
+                    or from_entry not in held):
+                continue
+            dispatches = {leg[1] for leg in map(self._journal_exit_leg, rows) if leg is not None}
+            released = [
+                r for r in self._store_ctx.iter_closed_orders_for_run_id(from_entry=from_entry)
+                if r.symbol == self._symbol
+                and (leg := self._journal_exit_leg(r)) is not None
+                and leg[0] == pine_id and leg[1] in dispatches
+            ]
+            if any(r.trailing_stop for r in rows + released):
+                _blog_warning(
+                    "operator resume: trailing exit %s is left as the venue shows it — "
+                    "its journal rows do not carry the trail's activation level",
+                    format_intent_key(key),
+                )
+                continue
+            # Newest first, the live legs ahead of the released ones
+            ordered = (sorted(rows, key=lambda r: r.updated_ts_ms, reverse=True)
+                       + sorted(released, key=lambda r: r.updated_ts_ms, reverse=True))
+            tp_price = next((r.tp_level for r in ordered if r.tp_level is not None), None)
+            sl_price = next((r.sl_level for r in ordered if r.sl_level is not None), None)
+            self._position.reconstruct_exit_order(
+                pine_id=pine_id, from_entry=from_entry, side=ordered[0].side,
+                qty=self._parent_open_exposure(from_entry)[0],
+                tp_price=tp_price, sl_price=sl_price, trail_price=None, trail_offset=None,
+            )
+            _blog_info(
+                "operator resume: rebuilt exit %s from the journal (tp=%s sl=%s) — "
+                "the bot re-asserts it on the venue",
+                format_intent_key(key), tp_price, sl_price,
+            )
+
+    @staticmethod
+    def _journal_exit_leg(row: OrderRow) -> tuple[str, tuple[str, int]] | None:
+        """The exit id and the dispatch ``(run_tag, bar_ts_ms)`` of a whole-row TP / SL leg row.
+
+        ``None`` for any other row: a row of another kind, one without a
+        level, or one whose intent key does not name its parent entry.
+        """
+        if (row.from_entry is None or row.intent_key is None
+                or (row.tp_level is None and row.sl_level is None)):
+            return None
+        parsed = (parse_client_order_id(row.client_order_id)
+                  or parse_wire_client_order_id(row.client_order_id))
+        if parsed is None or parsed.kind not in (KIND_EXIT_TP, KIND_EXIT_SL):
+            return None
+        # A leg row may name its leg after the exit key (``id\0from\0SL``)
+        pine_id, *rest = row.intent_key.split(INTENT_KEY_SEP)
+        if not pine_id or not rest or rest[0] != row.from_entry:
+            return None
+        return pine_id, (parsed.run_tag, parsed.bar_ts_ms)
 
     def _reconstruct_one_way_bracket_exits(self) -> None:
         """Re-install one-way (hedging-emulated) native brackets after a restart.
@@ -19416,7 +19538,7 @@ class OrderSyncEngine:
                             # out of ``_active_intents`` and the next bar
                             # re-evaluates (run_exit_bracket is idempotent).
                             raise OrderSkippedByPlugin(
-                                f"Exit {intent.intent_key} skipped: "
+                                f"Exit {format_intent_key(intent.intent_key)} skipped: "
                                 f"{bracket.skip_reason or 'no open position-side legs to attach a bracket to'}; "
                                 f"re-evaluating next bar.",
                                 intent_key=intent.intent_key,
@@ -22928,7 +23050,7 @@ class OrderSyncEngine:
                     )
                     if bracket.skipped:
                         raise OrderSkippedByPlugin(
-                            f"Exit modify {new.intent_key} skipped: "
+                            f"Exit modify {format_intent_key(new.intent_key)} skipped: "
                             f"{bracket.skip_reason or 'no open position-side legs to attach a bracket to'}; "
                             f"re-evaluating next bar.",
                             intent_key=new.intent_key,
