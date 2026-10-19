@@ -299,6 +299,12 @@ def _dispatcher(cache: dict[str, tuple[Any, list | None, Callable]],
                     return _bound_method(_method, cache)(
                         var, *args, **_adapt_exported_kwargs(_method, kwargs))
 
+            # A method no export answers is a no-op on na, with an na result: an
+            # untyped na (e.g. an element of a typeless array, a UDT field default)
+            # or one whose declared type has no such method
+            if type(var) is NA:
+                return var
+
             assert False, f'No such method: {var}->{method}'
 
         # It is a local method, it should be a local function

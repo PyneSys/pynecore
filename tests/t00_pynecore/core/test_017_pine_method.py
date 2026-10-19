@@ -127,6 +127,14 @@ def __test_exported_method_on_na_receiver__(monkeypatch):
     assert method_call('tag', receiver) == ('handled', receiver)
 
 
+@pytest.mark.parametrize('receiver', [NA(None), NA(_Receiver)])
+def __test_unanswered_method_on_na_receiver_is_noop__(receiver):
+    """ A string method no export answers on an untyped na, or on an na whose
+    declared type has no such method, is a no-op returning the na """
+    assert method_call('set_top', receiver, 1.0) is receiver
+    assert method_call('delete', receiver) is receiver
+
+
 @pytest.mark.parametrize('name', ['replace', 'format', 'split'])
 def __test_exported_string_method_wins_over_python_str__(name, monkeypatch):
     """ A library method on a ``string`` receiver named like a Python ``str``
