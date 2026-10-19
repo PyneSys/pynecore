@@ -456,3 +456,119 @@ def main(r: int):
     ns, _ = _transform(source, 'instance_pin_rebound')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
     assert ns['main'](state, 14) == ((1.0, 1.0), (2.0, 2.0), (1.0, 1.0), (2.0, 2.0))
+
+
+#: A container group, told apart by element type only: on an empty list the
+#: values say nothing, so only a pin handed down picks the right one.
+CONTAINER_GROUP = '''
+from pynecore.core.overload import overload
+from pynecore.types.chart import Label
+
+@overload
+def clear(xs: list[float]) -> float:
+    return 1.0
+
+@overload
+def clear(xs: list[int]) -> float:
+    return 2.0
+
+@overload
+def clear(xs: list[Label]) -> float:
+    return 3.0
+
+def helper(xs):
+    return clear(xs)
+'''
+
+
+def __test_a_call_out_of_an_overload_implementation_gets_its_vector__():
+    """
+    A site inside an implementation is owned by that implementation.
+
+    The untyped ``helper`` is instantiated once per ``push`` implementation, and
+    each implementation's call to it is analysed in the implementation's own
+    context, never the module's. The vector is the pin that context justified;
+    the drawing implementation pins nothing, and the all-None vector is the
+    layout default, so it is not stamped. The group's own call site still
+    gets none: the dispatcher creates the implementations' state itself.
+    """
+    tree = ast.parse(CONTAINER_GROUP + '''
+@overload
+def push(xs: list[float]) -> float:
+    return helper(xs)
+
+@overload
+def push(xs: list[int]) -> float:
+    return helper(xs)
+
+@overload
+def push(xs: list[Label]) -> float:
+    return helper(xs)
+
+def main(a: list[float]):
+    return push(a)
+''')
+    infer_module(tree, 'test')
+    impls = [node for node in tree.body
+             if isinstance(node, ast.FunctionDef) and node.name == 'push']
+    vectors = [get_vector(node) for impl in impls for node in ast.walk(impl)
+               if isinstance(node, ast.Call) and ast.unparse(node.func) == 'helper']
+    assert vectors == [('F',), ('I',), None]
+    group_sites = [node for node in ast.walk(tree)
+                   if isinstance(node, ast.Call) and ast.unparse(node.func) == 'push']
+    assert [get_vector(node) for node in group_sites] == [None]
+
+
+def __test_an_implementation_with_no_varying_callee_gets_no_vector__():
+    """Owning the implementation's sites stamps nothing where no callee varies"""
+    tree = ast.parse(CONTAINER_GROUP + '''
+def plain(x):
+    return x + 1
+
+@overload
+def push(xs: list[float]) -> float:
+    return plain(1.0)
+
+@overload
+def push(xs: list[int]) -> float:
+    return plain(1)
+
+def main(a: list[float]):
+    return push(a)
+''')
+    infer_module(tree, 'test')
+    assert all(get_vector(node) is None for node in ast.walk(tree)
+               if isinstance(node, ast.Call))
+
+
+def __test_an_implementation_hands_its_pin_to_an_empty_container__():
+    """End to end: on empty lists only the handed-down pin tells the groups apart"""
+    ns, dump = _transform('''
+from pynecore.core.overload import overload
+
+@overload
+def clear(xs: list[float]) -> float:
+    return 1.0
+
+@overload
+def clear(xs: list[int]) -> float:
+    return 2.0
+
+def helper(xs):
+    return clear(xs)
+
+@overload
+def push(xs: list[float]) -> float:
+    return helper(xs)
+
+@overload
+def push(xs: list[int]) -> float:
+    return helper(xs)
+
+def main(a: list[float], b: list[int]):
+    return push(a), push(b)
+''', 'ipin_mod_impl_out')
+    assert "__resolve_slot·__(__state__, 0, helper, ('F',))" in dump
+    assert "__resolve_slot·__(__state__, 0, helper, ('I',))" in dump
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert ns['main'](state, [], []) == (1.0, 2.0)

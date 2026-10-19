@@ -4957,15 +4957,22 @@ class _Inference:
         An overload GROUP is left out entirely. Its implementations are
         per-signature already, they are reached through a dispatcher that
         creates their state vectors itself (``overload._anchored``), and no
-        call site of the group can hand that dispatcher anything.
+        call site of the group can hand that dispatcher anything. The calls OUT
+        of an implementation are ordinary sites, though: each is analysed in the
+        contexts of its own implementation (the memo key names that definition),
+        so it is owned by the implementation and gets a vector like any other.
 
         :param tree: The module being stamped
         """
         targets = {key: defs[-1] for key, defs in self._defs.items()
                    if key not in self._overload_groups and defs}
+        impls = [node for key in self._overload_groups for node in self._defs.get(key, ())]
         cids: dict[str, list[int]] = {}
-        for result in self.table.contexts.values():
+        impl_cids: dict[int, list[int]] = {}
+        for memo_key, result in self.table.contexts.items():
             cids.setdefault(result.key, []).append(result.cid)
+            if result.key in self._overload_groups and memo_key[3] is not None:
+                impl_cids.setdefault(memo_key[3], []).append(result.cid)
         own = {key: _own_calls(node) for key, node in targets.items()}
         owner: dict[int, str] = {}
         for key, calls in own.items():
@@ -4973,6 +4980,15 @@ class _Inference:
                 nid = node_id(call)
                 if nid is not None:
                     owner[nid] = key
+        impl_owner: dict[int, int] = {}
+        for impl in impls:
+            impl_nid = node_id(impl)
+            if impl_nid is None:
+                continue
+            for call in _own_calls(impl):
+                nid = node_id(call)
+                if nid is not None:
+                    impl_owner[nid] = impl_nid
         varying: dict[str, list[ast.Call]] = {
             key: [call for call in calls if _per_context(call)]
             for key, calls in own.items()}
@@ -5041,7 +5057,12 @@ class _Inference:
             if callee is None or not varying.get(callee):
                 continue
             key = owner.get(nid)
-            callers = cids.get(key, ()) if key is not None else (0,)
+            if key is not None:
+                callers = cids.get(key, ())
+            elif nid in impl_owner:
+                callers = impl_cids.get(impl_owner[nid], ())
+            else:
+                callers = (0,)
             seen = {entry_of(node, cid, frozenset()) for cid in callers}
             if len(seen) != 1:
                 continue
