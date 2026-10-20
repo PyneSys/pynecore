@@ -25,9 +25,17 @@ literal. One that goes where a float or an int goes -- a numeric variable, field
 parameter or declared return, a ternary arm or an arithmetic operand next to a number,
 an element of a numeric container -- is the numeric na: it becomes ``lib._na_float``,
 the NaN that ``NA(float)`` and ``NA(int)`` both are, so a container, an overload
-dispatch or a library receives the na the way Pine typed it. Passed as compile-time
-text of the study (a plot title, a ``plotchar`` char, an ``alertcondition`` message,
-see ``NA_TEXT_PARAMS``) it is the text ``na`` instead.
+dispatch or a library receives the na the way Pine typed it. One that goes where an
+object of a class goes -- a UDT or drawing variable, field, parameter or declared
+return, a ternary arm next to such an object, an element of a container of them -- is
+the na OF that class: it becomes ``lib.na(<class>)``, the class spelled the way the
+module names it (``get_na_class``), so an overload dispatch on the value sees the
+class Pine typed it with and not a typeless na that answers every candidate. A field
+default runs while its class body does, so where the class it names is not bound yet
+-- the class itself, one the module defines later -- the default is deferred to the
+creation of the object, ``field(default_factory=lambda: lib.na(<class>))``. Passed as
+compile-time text of the study (a plot title, a ``plotchar`` char, an
+``alertcondition`` message, see ``NA_TEXT_PARAMS``) it is the text ``na`` instead.
 
 A signed ``-na`` is the typeless ``na`` too, and is replaced the same way. A value
 that holds it without spelling it -- a parameter defaulted to it, a variable -- is
@@ -45,16 +53,17 @@ the function isolation pass replaces the None with the entry of the instance vec
 that belongs to it, so each instance converts the value the way its own context
 needs.
 """
+from collections import Counter
 from typing import cast
 import ast
 
 from . import ast_walk
 from .pine_type_rules import (
     FLOAT, STR, WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_NA_TEXT, WIDEN_NUMBER_NA,
-    WIDEN_STRING_NA, array_of,
+    WIDEN_STRING_NA, array_of, class_of, get_na_class,
     get_ty,
-    get_widen, get_widen_site, is_na_literal, matrix_of, set_ty, set_widen, set_widen_site,
-    stamp_lowering,
+    get_widen, get_widen_site, is_na_literal, is_na_widen, matrix_of, set_ty, set_widen,
+    set_widen_site, stamp_lowering,
 )
 
 __all__ = ['ImplicitConversionTransformer']
@@ -71,8 +80,23 @@ class ImplicitConversionTransformer(ast_walk.NodeTransformer):
 
     def __init__(self) -> None:
         self._needs_import = False
+        #: The classes the module defines at its top level
+        self._module_classes: set[str] = set()
+        #: The module's classes whose definition has run before the statement visited
+        self._defined_classes: set[str] = set()
+        #: The direct field defaults of the class bodies being visited, by node id
+        self._field_defaults: set[int] = set()
+        #: The name ``dataclasses.field`` is called by in a deferred field default
+        self._field_alias: str | None = None
+        #: Whether the module has to import ``dataclasses.field`` under that name
+        self._needs_field_import = False
+        #: How many times the module binds each name, imports and definitions included
+        self._bindings: Counter[str] = Counter()
+        #: The names a ``from dataclasses import field`` ahead of every class binds
+        self._field_imports: set[str] = set()
 
     def visit(self, node: ast.AST) -> ast.AST:
+        original = node
         node = super().visit(node)
         if not isinstance(node, ast.expr):
             return node
@@ -88,13 +112,24 @@ class ImplicitConversionTransformer(ast_walk.NodeTransformer):
             return node
         # Converted once: a clone of this node (a security slice) must not convert again
         set_widen(node, None)
-        if kind in (WIDEN_STRING_NA, WIDEN_NUMBER_NA, WIDEN_NA_TEXT) and not is_na_literal(node):
+        if is_na_widen(kind) and not is_na_literal(node):
             self._needs_import = True
-            return stamp_lowering(ast.copy_location(ast.Call(
+            if class_of(kind) is not None:
+                # The na of a class: the conversion is handed the class itself
+                converted, result = _class_expr(node), kind
+            else:
+                converted = ast.Constant(value=kind)
+                result = FLOAT if kind == WIDEN_NUMBER_NA else STR
+            converted_value = stamp_lowering(ast.copy_location(ast.Call(
                 func=ast.Attribute(value=ast.Name(id='safe_convert', ctx=ast.Load()),
                                    attr='implicit_convert', ctx=ast.Load()),
-                args=[node, ast.Constant(value=kind)], keywords=[]), node),
-                FLOAT if kind == WIDEN_NUMBER_NA else STR)
+                args=[node, converted], keywords=[]), node), result)
+            return self._field_default(original, converted_value, result)
+        if class_of(kind) is not None:
+            return self._field_default(original, stamp_lowering(ast.copy_location(ast.Call(
+                func=ast.Attribute(value=ast.Name(id='lib', ctx=ast.Load()), attr='na',
+                                   ctx=ast.Load()),
+                args=[_class_expr(node)], keywords=[]), node), kind), kind)
         if kind == WIDEN_STRING_NA:
             return set_ty(ast.copy_location(ast.Constant(value=''), node), STR)
         if kind == WIDEN_NUMBER_NA:
@@ -116,19 +151,122 @@ class ImplicitConversionTransformer(ast_walk.NodeTransformer):
                                ctx=ast.Load()),
             args=[node], keywords=[]), node), result)
 
-    def visit_Module(self, node: ast.Module) -> ast.Module:
-        node = cast(ast.Module, self.generic_visit(node))
-        if self._needs_import and not _binds_safe_convert(node):
-            position = 0
-            if node.body and isinstance(node.body[0], ast.Expr) \
-                    and isinstance(cast(ast.Expr, node.body[0]).value, ast.Constant):
-                position = 1
-            while position < len(node.body) \
-                    and isinstance(node.body[position], (ast.Import, ast.ImportFrom)):
-                position += 1
-            node.body.insert(position, ast.ImportFrom(
-                module='pynecore.core', names=[ast.alias(name='safe_convert')], level=0))
+    def _field_default(self, original: ast.expr, value: ast.expr, result: str) -> ast.expr:
+        """
+        Defer a field default that names a class its class body cannot reach yet.
+
+        A class's body runs before the class is bound, and before every class the
+        module defines after it: a default naming one of those raises NameError
+        where the body runs. The dataclass builds such a default for each object
+        it creates instead, from a factory that names the class once it is bound.
+
+        :param original: The default as the type pass stamped it
+        :param value: Its conversion into the na of a class
+        :param result: The Pine type of the conversion
+        :return: ``value``, or the deferred field built from it
+        """
+        spelled = get_na_class(original)
+        if id(original) not in self._field_defaults or spelled not in self._module_classes \
+                or spelled in self._defined_classes:
+            return value
+        if self._field_alias is None:
+            self._field_alias = self._dataclass_field_alias()
+        factory = ast.Lambda(args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[],
+                                                kw_defaults=[], defaults=[]), body=value)
+        return stamp_lowering(ast.copy_location(ast.Call(
+            func=ast.Name(id=self._field_alias, ctx=ast.Load()), args=[],
+            keywords=[ast.keyword(arg='default_factory', value=ast.copy_location(
+                factory, original))]), original), result)
+
+    def _dataclass_field_alias(self) -> str:
+        """
+        The name a deferred field default calls ``dataclasses.field`` by.
+
+        A top-level ``from dataclasses import field`` the module binds no other way
+        is reused; otherwise the name is imported under an alias no binding of the
+        module takes, the way the compiler names it.
+
+        :return: The name, imported by the module when ``_needs_field_import`` is set
+        """
+        alias = '_dataclass_field'
+        while True:
+            if alias in self._field_imports and self._bindings[alias] == 1:
+                return alias
+            if not self._bindings[alias]:
+                self._needs_field_import = True
+                return alias
+            alias += '_'
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
+        fields = {id(stmt.value) for stmt in node.body
+                  if isinstance(stmt, ast.AnnAssign) and stmt.value is not None}
+        self._field_defaults |= fields
+        try:
+            node = cast(ast.ClassDef, self.generic_visit(node))
+        finally:
+            self._field_defaults -= fields
         return node
+
+    def visit_Module(self, node: ast.Module) -> ast.Module:
+        for stmt in node.body:
+            if isinstance(stmt, ast.ClassDef):
+                self._module_classes.add(stmt.name)
+            elif isinstance(stmt, ast.ImportFrom) and stmt.module == 'dataclasses' \
+                    and not stmt.level and not self._module_classes:
+                self._field_imports.update(alias.asname or alias.name for alias in stmt.names
+                                           if alias.name == 'field')
+        for child in ast.walk(node):
+            if isinstance(child, ast.Name) and not isinstance(child.ctx, ast.Load):
+                self._bindings[child.id] += 1
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                self._bindings[child.name] += 1
+            elif isinstance(child, ast.alias):
+                self._bindings[(child.asname or child.name).split('.')[0]] += 1
+        body: list[ast.stmt] = []
+        for stmt in node.body:
+            body.append(cast(ast.stmt, self.visit(stmt)))
+            if isinstance(stmt, ast.ClassDef):
+                self._defined_classes.add(stmt.name)
+        node.body = body
+        if self._needs_import and not _binds_safe_convert(node):
+            node.body.insert(_import_position(node), ast.ImportFrom(
+                module='pynecore.core', names=[ast.alias(name='safe_convert')], level=0))
+        if self._needs_field_import:
+            node.body.insert(_import_position(node), ast.ImportFrom(
+                module='dataclasses', names=[ast.alias(name='field', asname=self._field_alias)],
+                level=0))
+        return node
+
+
+def _import_position(module: ast.Module) -> int:
+    """
+    Where a generated import goes: after the docstring and the module's own imports.
+
+    :param module: The module
+    :return: The index of the statement the import is inserted in front of
+    """
+    position = 0
+    if module.body and isinstance(module.body[0], ast.Expr) \
+            and isinstance(cast(ast.Expr, module.body[0]).value, ast.Constant):
+        position = 1
+    while position < len(module.body) \
+            and isinstance(module.body[position], (ast.Import, ast.ImportFrom)):
+        position += 1
+    return position
+
+
+def _class_expr(node: ast.expr) -> ast.expr:
+    """
+    The expression naming the class whose na a typeless ``na`` becomes.
+
+    :param node: The na value, stamped with the class's spelling (``get_na_class``)
+    :return: The spelling as a name or attribute chain, at the value's location
+    """
+    head, *attrs = (get_na_class(node) or '').split('.')
+    expr: ast.expr = ast.Name(id=head, ctx=ast.Load())
+    for attr in attrs:
+        expr = ast.Attribute(value=expr, attr=attr, ctx=ast.Load())
+    return ast.copy_location(expr, node)
 
 
 def _int_literal(node: ast.expr) -> int | None:

@@ -147,7 +147,7 @@ def safe_float_matrix(matrix: Matrix[PyneInt] | NA) -> Matrix[float] | NA:
     return result
 
 
-def implicit_convert(value: Any, kind: str | None) -> Any:
+def implicit_convert(value: Any, kind: str | type | None) -> Any:
     """
     The implicit conversion one instance of a shared function body applies to a value.
 
@@ -160,12 +160,13 @@ def implicit_convert(value: Any, kind: str | None) -> Any:
     the string na, the numeric na or the text ``na``, None converts nothing.
 
     A value that holds the typeless na without spelling it -- a defaulted parameter, a
-    variable -- is wrapped in this call with its conversion character as a constant. The
+    variable -- is wrapped in this call with its conversion character as a constant, or
+    with the class whose na it becomes where it goes as an object of that class. The
     same body can be reached with a value of its own, so the na conversions leave every
     value but the typeless na as it is.
 
     :param value: The value on its way into the container
-    :param kind: The conversion character, or None
+    :param kind: The conversion character, the class whose na the typeless na is, or None
     :return: The value as the container receives it
     """
     if kind is None:
@@ -182,6 +183,8 @@ def implicit_convert(value: Any, kind: str | None) -> Any:
         return na_float
     if kind == 't':
         return 'na'
+    if isinstance(kind, type):
+        return NA(kind)
     return ''
 
 

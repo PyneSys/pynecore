@@ -40,11 +40,12 @@ __all__ = [
     'PIN_ATTR', 'PINS_ATTR', 'PINNABLE', 'PIN_CONTAINERS', 'PIN_ANY', 'get_pin', 'set_pin', 'get_pins', 'set_pins',
     'VECTOR_ATTR', 'VARYING_ATTR', 'get_vector', 'set_vector', 'get_varying', 'set_varying',
     'WIDEN_ATTR', 'WIDEN_FLOAT', 'WIDEN_ITEMS', 'WIDEN_MATRIX', 'WIDEN_STRING_NA', 'WIDEN_NUMBER_NA',
-    'WIDEN_NA_TEXT', 'NA_LITERALS', 'is_na_literal',
+    'WIDEN_NA_TEXT', 'NA_LITERALS', 'is_na_literal', 'is_na_widen',
+    'NA_CLASS_ATTR', 'get_na_class', 'set_na_class',
     'NA_TEXT_PARAMS', 'NOT_PINE_STRINGS', 'get_widen',
     'set_widen', 'WIDEN_SITE_ATTR', 'WIDENS_ATTR', 'get_widen_site', 'set_widen_site',
     'get_widens', 'set_widens',
-    'pin_for', 'overload_result', 'ImplSig', 'overload_pick',
+    'pin_chars', 'pin_for', 'overload_result', 'ImplSig', 'overload_pick',
     'FactoryFields',
     'TYPELESS', 'NONE_DEFAULT', 'FIT_OMISSIBLE', 'FIT_REQUIRED', 'FIT_UNSURE',
     'default_fit', 'annotation_takes_none', 'impl_sig', 'param_fit', 'default_ty',
@@ -76,8 +77,9 @@ VECTOR_ATTR: Final = '_pine_vector'
 VARYING_ATTR: Final = '_pine_varying'
 
 #: Attribute a value carries when Pine converts it implicitly where it goes: an
-#: int into a float-element container, a typeless ``na`` into a string or a number
-#: (see ``implicit_conversion.py``). Present only where every context agrees on it.
+#: int into a float-element container, a typeless ``na`` into a string, a number
+#: or the na of a class (see ``implicit_conversion.py``). Present only where every
+#: context agrees on it.
 WIDEN_ATTR: Final = '_pine_widen'
 
 #: The value is one int element: it is converted to float
@@ -100,6 +102,14 @@ WIDEN_NUMBER_NA: Final = 'n'
 #: The value is a typeless ``na`` passed as compile-time text of the study
 #: (``NA_TEXT_PARAMS``): TradingView writes it out as the text ``na``
 WIDEN_NA_TEXT: Final = 't'
+
+#: A typeless ``na`` that goes where an object of a class goes -- a UDT, a drawing
+#: -- is the na OF that class, and its conversion kind is the object type itself
+#: (``o:<class id>``), so two contexts agree on it only when they agree on the
+#: class. The value then carries the class's spelling in this attribute: the
+#: expression, valid at the module's top level, that names the class in value
+#: position (``Pivot``, ``chr.SessionTimeRange``, the ``Line`` an import binds)
+NA_CLASS_ATTR: Final = '_pine_na_class'
 
 #: The spellings of Pine's typeless ``na`` in value position: the name itself, and
 #: what ``module_property`` rewrites it to. One of these, signed or not, is replaced by
@@ -256,7 +266,8 @@ def get_widen(node) -> str | None:
 
     :param node: The value node
     :return: ``WIDEN_FLOAT``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX``, ``WIDEN_STRING_NA``,
-             ``WIDEN_NUMBER_NA`` or ``WIDEN_NA_TEXT``, or None
+             ``WIDEN_NUMBER_NA``, ``WIDEN_NA_TEXT`` or an object type (the na of that
+             class), or None
     """
     return getattr(node, WIDEN_ATTR, None)
 
@@ -268,10 +279,44 @@ def set_widen(node, kind: str | None):
 
     :param node: The value node
     :param kind: ``WIDEN_FLOAT``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX``, ``WIDEN_STRING_NA``,
-                 ``WIDEN_NUMBER_NA``, ``WIDEN_NA_TEXT`` or None
+                 ``WIDEN_NUMBER_NA``, ``WIDEN_NA_TEXT``, an object type or None
     :return: ``node``
     """
     setattr(node, WIDEN_ATTR, kind)
+    return node
+
+
+def is_na_widen(kind: str | None) -> bool:
+    """
+    Whether a conversion turns Pine's typeless ``na`` into the na of a type.
+
+    :param kind: A conversion kind, or None
+    :return: True for the string na, the numeric na, the text ``na`` and the na of a
+             class (an object type)
+    """
+    return kind in (WIDEN_STRING_NA, WIDEN_NUMBER_NA, WIDEN_NA_TEXT) \
+        or (kind is not None and kind.startswith(_OBJ))
+
+
+def get_na_class(node) -> str | None:
+    """
+    Read how the module spells the class whose na a typeless ``na`` becomes.
+
+    :param node: The value node
+    :return: The class's spelling in value position, or None
+    """
+    return getattr(node, NA_CLASS_ATTR, None)
+
+
+def set_na_class(node, spelled: str):
+    """
+    Stamp the spelling of the class whose na a typeless ``na`` becomes.
+
+    :param node: The value node
+    :param spelled: The class's spelling in value position, valid at module level
+    :return: ``node``
+    """
+    setattr(node, NA_CLASS_ATTR, spelled)
     return node
 
 
@@ -1411,10 +1456,26 @@ def pin_for(arg_types: list[str]) -> str | None:
     :param arg_types: Type of each positional argument, in order
     :return: One character per argument, or None when the site is not pinnable
     """
-    chars = [PIN_CONTAINERS.get(t) or (t if t in PINNABLE else PIN_ANY) for t in arg_types]
+    chars = pin_chars(arg_types)
     if INT not in chars and not any(c in _PIN_CONTAINER_CHARS for c in chars):
         return None
-    return ''.join(chars)
+    return chars
+
+
+def pin_chars(arg_types: Sequence[str]) -> str:
+    """
+    A call site's argument types as the selector's exact pass reads them.
+
+    One character per argument: the witness character of a scalar or of a
+    scalar container, ``PIN_ANY`` for every position the runtime has no witness
+    for. ``pin_for`` emits these only where they are worth a pin; the static
+    selection (``overload_pick``) reads them at every positional call site.
+
+    :param arg_types: Type of each positional argument, in order
+    :return: One character per argument
+    """
+    return ''.join(PIN_CONTAINERS.get(t) or (t if t in PINNABLE else PIN_ANY)
+                   for t in arg_types)
 
 
 def overload_result(returns: list[str]) -> str:
@@ -1572,7 +1633,8 @@ class ImplSig(NamedTuple):
     names: tuple[str, ...] = ()
 
 
-def overload_pick(impls: list[ImplSig], pin: str) -> str | None:
+def overload_pick(impls: list[ImplSig], pin: str,
+                  shapes: Sequence[str] = ()) -> str | None:
     """
     Return type of the implementation a PINNED call site selects.
 
@@ -1594,21 +1656,32 @@ def overload_pick(impls: list[ImplSig], pin: str) -> str | None:
     unannotated parameter takes anything) makes the site unanswerable rather
     than overruling the runtime's own choice.
 
+    A position the pin carries no witness for (``PIN_ANY``) is read from the
+    argument's static type where that is an object of a known class: the
+    selector checks an object against the parameter's class
+    (``_check_type``), so only an implementation declaring that class, or none,
+    can take it. Any other such position -- a container, a bare object, a type
+    not known here -- may be taken by anything, which leaves the site
+    unanswerable unless an earlier implementation rules it out.
+
     :param impls: Every implementation of the group, in declaration order
     :param pin: The call site's pin, one character per positional argument
+    :param shapes: The static type of each positional argument, where the caller
+                   has them; empty when it does not
     :return: The selected implementation's return type, or None
     """
     wanted = tuple(pin)
     for exact_arity in (True, False):
         for impl in impls:
-            verdict = _takes(impl, wanted, exact_arity)
+            verdict = _takes(impl, wanted, exact_arity, shapes)
             if verdict == _NO:
                 continue
             return impl.ret if verdict == _YES else None
     return None
 
 
-def _takes(impl: ImplSig, wanted: tuple[str, ...], exact_arity: bool) -> int:
+def _takes(impl: ImplSig, wanted: tuple[str, ...], exact_arity: bool,
+           shapes: Sequence[str] = ()) -> int:
     """
     How one implementation answers a pin in one half of the exact pass.
 
@@ -1616,6 +1689,7 @@ def _takes(impl: ImplSig, wanted: tuple[str, ...], exact_arity: bool) -> int:
     :param wanted: The pin, one character per positional argument
     :param exact_arity: The positional half, which only reaches an
                         implementation whose every parameter the call fills
+    :param shapes: The static type of each positional argument, or nothing
     :return: ``_YES``, ``_MAYBE`` or ``_NO``
     """
     if impl.open_ended:
@@ -1629,7 +1703,17 @@ def _takes(impl: ImplSig, wanted: tuple[str, ...], exact_arity: bool) -> int:
     elif not impl.required <= len(wanted) <= len(impl.params):
         return _NO
     verdict = _YES
-    for declared, want in zip(impl.params, wanted):
+    for index, (declared, want) in enumerate(zip(impl.params, wanted)):
+        if want == PIN_ANY:
+            # No witness: an object of a known class is taken by its class
+            # alone, anything else by whatever declares the position
+            given = shapes[index] if index < len(shapes) else UNKNOWN
+            if class_of(given) is not None and declared not in (UNKNOWN, OBJECT):
+                if declared != given:
+                    return _NO
+                continue
+            verdict = _MAYBE
+            continue
         shaped = _PIN_CONTAINER_TYPES.get(want)
         if shaped is not None:
             # The witness is a one-element container, which the selector takes

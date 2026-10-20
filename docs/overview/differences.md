@@ -308,6 +308,12 @@ as well. The one exception is text Pine compiles into the indicator's metadata: 
 a `plotchar` char or text, a `plotshape` text or an `alertcondition` title or message given
 as `na` is the text `na`, just as on TradingView.
 
+The same holds for the other types: a bare `na` written where a float or an int goes is the
+numeric na, `float('nan')`, and one written where an object of a user type or a drawing goes
+(`p: Pivot = na`, `Pivot(1.0) if c else na`, `array.push(pivots, na)`, a `Pivot` parameter or
+field) is the na of that class, `na(Pivot)`, so an overloaded function or method sees the
+class the value was typed with, as it does on TradingView.
+
 ### Array
 
 Although we implemented all the array functions in array module, we decided to not implement Pine's `array` class and

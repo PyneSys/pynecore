@@ -48,9 +48,9 @@ from pynecore.transformers.module_interface import (
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
     BOOL, FLOAT, INT, OBJECT, PIN_ANY, PINE_LOOP, STR, TYPELESS, UNKNOWN, VOID,
-    annotation_type, array_of, builtin_class_id, class_id, class_of, element_of, get_pin,
-    get_ty, head, is_int_typed, is_shaped, join, key_of, map_of, matrix_of, object_ty, pin_for,
-    render_ty, shape_mismatch, tuple_of, value_of,
+    annotation_type, array_of, builtin_class_id, class_id, class_of, element_of,
+    get_pin, get_ty, head, is_int_typed, is_shaped, join, key_of, map_of, matrix_of,
+    object_ty, pin_for, render_ty, shape_mismatch, tuple_of, value_of,
 )
 from pynecore.transformers.pine_type_table import PineTypeTable
 from pynecore.transformers.pine_type_transformer import PineTypeTransformer
@@ -2618,3 +2618,192 @@ p = Pivot()
 q = udt_copy(p, price=2.0)
 ''')
     assert types['q'] == PIVOT
+
+
+# --- an overload group told apart by a class ---------------------------------
+
+#: A group whose implementations differ in the CLASS of a position, the way a
+#: library spells ``init`` once per UDT: no witness value tells them apart at
+#: run time, but the static type of the argument does
+CLASSED_GROUP = '''
+from pynecore.core.overload import overload
+from pynecore.core.pine_method import method, method_call
+from pynecore.core.pine_udt import udt
+from pynecore import lib
+from pynecore.lib import na
+
+
+@udt
+class Win:
+    a: int = 0
+
+
+@udt
+class Tm:
+    h: int = 0
+
+
+@overload
+@method
+def init(this: Win, x: int, y: int):
+    this.a = x
+    return this
+
+
+@overload
+@method
+def init(this: Tm, h: int, m: int):
+    this.h = h
+    return this
+
+
+@overload
+@method
+def init(this: Tm, h: int, m: int, tz: str):
+    return init(this, h, m)
+
+
+@overload
+@method
+def parse(this: Tm, sess: str):
+    return init(this, 1, 2)
+
+
+@overload
+@method
+def parse(this: Win, sess: str):
+    return init(this, 1, 2)
+'''
+
+WIN = object_ty(class_id('test', 'Win'))
+TM = object_ty(class_id('test', 'Tm'))
+
+
+def __test_a_group_call_is_typed_by_the_class_of_its_argument__():
+    """
+    ``init(Tm(), 1, 2)`` runs the ``Tm`` implementation: the selector checks the
+    object against the class each one declares, so the static pass reads the
+    position by its class where the pin has no witness for it -- on a pinned
+    site (``*ii``) and on an unpinned one (``parse(Tm(), "x")``) alike, and
+    through a composed call whose inner group is settled the same way
+    """
+    tree, table = _infer(CLASSED_GROUP + '''
+def main():
+    t = init(Tm(), 1, 2)
+    u = init(Tm(), 1, 2, "x")
+    p = parse(Tm(), "0930")
+    q = parse(Win(), "0930")
+    v = parse(Tm(), "0930") if lib.bar_index > 0 else na
+    return t
+''')
+    types = {name: binding.ty for name, binding in table.bindings['main'].items()}
+    assert (types['t'], types['u'], types['p'], types['q']) == (TM, TM, TM, WIN)
+    assert types['v'] == TM
+    calls = {ast.unparse(node): node for node in ast.walk(tree)
+             if isinstance(node, ast.Call) and ast.unparse(node.func) in ('init', 'parse')}
+    assert get_pin(calls['init(Tm(), 1, 2)']) == '*ii'
+    assert get_pin(calls["parse(Tm(), '0930')"]) is None
+    assert get_ty(calls["parse(Win(), '0930')"]) == WIN
+    assert table.diags == []
+
+
+def __test_a_float_position_of_an_unpinned_site_says_nothing__():
+    """
+    An unpinned site dispatches on its values, and a float-typed value may be a
+    Python int there, so the class settles the receiver and the float position
+    is left to the values: the two ``Tm`` implementations disagree, so the call
+    has no type
+    """
+    _, table = _infer(CLASSED_GROUP + '''
+@overload
+@method
+def scale(this: Tm, by: float):
+    return this
+
+
+@overload
+@method
+def scale(this: Tm, by: str):
+    return by
+
+
+def main(f: float):
+    s = scale(Tm(), f)
+    return s
+''')
+    types = {name: binding.ty for name, binding in table.bindings['main'].items()}
+    assert types['s'] == UNKNOWN
+
+
+def __test_a_method_called_by_name_answers_for_its_receivers_class__(tmp_path, monkeypatch):
+    """
+    A library's ``init`` group, one implementation per UDT, reached by name on
+    a ``ns.Tm`` receiver is the ``Tm`` implementation's return: the runtime
+    checks the receiver against the class each implementation declares. A
+    typeless ``na`` next to such a call is the na of that class, spelled the
+    way the module reaches it.
+    """
+    monkeypatch.syspath_prepend(tmp_path)
+    lib = _write(tmp_path, 'shp_recv_lib', '''"""
+@pyne
+"""
+from pynecore.core.overload import overload
+from pynecore.core.pine_export import Exported, export
+from pynecore.core.pine_method import method
+from pynecore.core.pine_udt import udt
+
+__all__ = ['Win', 'Tm', 'init']
+init = Exported()
+
+
+@udt
+class Win:
+    a: int = 0
+
+
+@udt
+class Tm:
+    h: int = 0
+
+
+def setup():
+    @export
+    @overload
+    @method
+    def init(this: Win, x: int):
+        this.a = x
+        return this
+
+    @export
+    @overload
+    @method
+    def init(this: Tm, x: int):
+        this.h = x
+        return this
+''')
+    app = _write(tmp_path, 'shp_recv_app', '''"""
+@pyne
+"""
+from pynecore.core.pine_method import method_call
+from pynecore.lib import na
+import shp_recv_lib as ns
+
+
+def main():
+    t = method_call('init', ns.Tm.new(), 1)
+    w = method_call('init', ns.Win.new(), 1)
+    held = method_call('init', ns.Tm.new(), 1) if t.h > 0 else na
+    return held
+''')
+
+    tree, table = _analysed(app)
+
+    tm = object_ty(class_id(str(lib.resolve()), 'Tm'))
+    types = {name: binding.ty for name, binding in table.bindings['main'].items()}
+    assert types['t'] == tm
+    assert types['w'] == object_ty(class_id(str(lib.resolve()), 'Win'))
+    assert types['held'] == tm
+    arm = next(node for node in ast.walk(tree) if isinstance(node, ast.IfExp)).orelse
+    assert ast.unparse(arm) == 'lib.na(ns.Tm)'
+    assert get_ty(arm) == tm
+    assert table.diags == []

@@ -24,8 +24,8 @@ from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
 from pynecore.transformers.persistent import PersistentTransformer
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
-    FIT_OMISSIBLE, FIT_REQUIRED, ImplSig, NONE_DEFAULT, TYPELESS, annotation_takes_none,
-    default_fit, get_pin, get_ty, overload_pick,
+    FIT_OMISSIBLE, FIT_REQUIRED, INT, ImplSig, NONE_DEFAULT, OBJECT, TYPELESS,
+    annotation_takes_none, class_id, default_fit, get_pin, get_ty, object_ty, overload_pick,
 )
 from pynecore.transformers.pine_type_transformer import PineTypeTransformer
 from pynecore.transformers.series import SeriesTransformer
@@ -717,3 +717,38 @@ plain = f(R * 1.0)
     assert 'plain = f(R * 1.0)' in dump
     assert ns['pinned'] == 1.0
     assert ns['plain'] == 2.0
+
+
+#: Two classes a group may tell apart at a position the pin has no witness for
+PIVOT_TY = object_ty(class_id('test', 'Pivot'))
+HOLDER_TY = object_ty(class_id('test', 'Holder'))
+
+
+@pytest.mark.parametrize("impls,pin,shapes,expected", [
+    # An object of a known class is taken only by the implementation declaring
+    # its class: the selector checks the object against the parameter's class
+    ([ImplSig((HOLDER_TY, 'i'), 2, False, 'A', 'nn'),
+      ImplSig((PIVOT_TY, 'i'), 2, False, 'B', 'nn')], '*i', [PIVOT_TY, INT], 'B'),
+    # ... or by one declaring nothing there, which may take anything: an earlier
+    # such one leaves the site unanswerable, a later one is never reached
+    ([ImplSig(('?', 'i'), 2, False, 'A', 'nn'),
+      ImplSig((PIVOT_TY, 'i'), 2, False, 'B', 'nn')], '*i', [PIVOT_TY, INT], None),
+    ([ImplSig((PIVOT_TY, 'i'), 2, False, 'B', 'nn'),
+      ImplSig(('?', 'i'), 2, False, 'A', 'nn')], '*i', [PIVOT_TY, INT], 'B'),
+    # A position of no known class says nothing, so the first implementation
+    # that could take it leaves the site unanswerable
+    ([ImplSig((HOLDER_TY, 'i'), 2, False, 'A', 'nn'),
+      ImplSig((PIVOT_TY, 'i'), 2, False, 'B', 'nn')], '*i', [OBJECT, INT], None),
+    ([ImplSig((PIVOT_TY, 'i'), 2, False, 'B', 'nn')], '*i', [], None),
+    # Two classed positions both have to match
+    ([ImplSig((PIVOT_TY, HOLDER_TY), 2, False, 'A', 'nn'),
+      ImplSig((PIVOT_TY, PIVOT_TY), 2, False, 'B', 'nn')], '**', [PIVOT_TY, PIVOT_TY], 'B'),
+    # The second half of the pass reads a classed position the same way
+    ([ImplSig((HOLDER_TY, 'i'), 1, False, 'A', 'ny'),
+      ImplSig((PIVOT_TY, 'i'), 1, False, 'B', 'ny')], '*', [PIVOT_TY], 'B'),
+])
+def __test_the_static_selection_reads_an_object_by_its_class__(impls: list[ImplSig], pin: str,
+                                                               shapes: list[str],
+                                                               expected: str | None):
+    """A position the pin has no witness for is read from the argument's class"""
+    assert overload_pick(impls, pin, shapes) == expected

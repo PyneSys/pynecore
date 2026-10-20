@@ -62,11 +62,12 @@ from .pine_type_rules import (
     join, binop_type, unaryop_type, compare_type, annotation_type, bare_wrapper,
     LIB_TYPE_OVERRIDES, OVERRIDE_PARAM_NAMES, BUILTIN_CALL_TYPES, BUILTIN_NAME_TYPES,
     TY_ATTR, get_ty, set_ty, inherit_ty,
-    constant_type, pin_for, get_pins, set_pin, set_pins, set_vector, get_varying, set_varying,
+    constant_type, PIN_ANY, pin_chars, pin_for, get_pins, set_pin, set_pins, set_vector,
+    get_varying, set_varying,
     WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_STRING_NA, WIDEN_NUMBER_NA, WIDEN_NA_TEXT,
     NA_TEXT_PARAMS,
     NOT_PINE_STRINGS, set_widen, get_widen_site,
-    set_widen_site, get_widens, set_widens,
+    set_widen_site, get_widens, set_widens, is_na_widen, set_na_class,
     overload_result, ImplSig, overload_pick, default_fit, FIT_REQUIRED, FactoryFields,
     impl_sig, _param_defaults, _dotted, _DYN_DEFAULT,  # noqa: internal API
     CLASS_SEP, LIB_MODULE, SCALARS, PINE_LOOP, array_of, builtin_class_id, class_id, class_of,
@@ -355,6 +356,9 @@ class _Frame:
     declared_nonlocal: set[str] = field(default_factory=set)
     #: Names a bare ``x: Series`` declared before anything was assigned to them
     declared_series: set[str] = field(default_factory=set)
+    #: Names a statement of the function binds anywhere in its body: local for
+    #: the whole body, so they hide the module's names before the binding runs too
+    local_names: set[str] = field(default_factory=set)
     #: Name of a ``pine_loop(...)`` counter object -> the type its counter
     #: has, the join of the bounds it was built and stepped with
     loop_counters: dict[str, str] = field(default_factory=dict)
@@ -557,6 +561,14 @@ class _Inference:
         #: id, its own and its imports' alike; filled in before anything reads
         #: an annotation
         self._classes: dict[str, str] = {}
+        #: Class id -> how this module spells the class in value position: its
+        #: own classes by name, an imported one by the path that reached it
+        #: (an annotation's spelling, a constructor's callee). It is what the na
+        #: OF a class is built with where a typeless ``na`` goes as one
+        self._class_spellings: dict[str, str] = {}
+        #: Lib class name -> the name a ``pynecore.types`` import binds it to,
+        #: the one spelling of a builtin class (``Line``) this module has
+        self._type_imports: dict[str, str] = {}
         #: Class id -> what that class declares. Its own classes are here, and
         #: so is every class of every interface this module consulted: a value
         #: reaching this module from another one carries its class id, and a
@@ -1025,6 +1037,8 @@ class _Inference:
                 for alias in stmt.names:
                     self._add_import(alias.asname or alias.name,
                                      _Import(stmt.module, (alias.name,)), alias)
+                    if stmt.module == 'pynecore.types' or stmt.module.startswith('pynecore.types.'):
+                        self._type_imports[alias.name] = alias.asname or alias.name
         for stmt in statements:
             self._add_shadowed(stmt)
 
@@ -1099,6 +1113,7 @@ class _Inference:
                 imported[spelled] = found
         self._classes = {**{name: sig.id for name, sig in imported.items()}, **names}
         self.table.classes = self._classes
+        self._class_spellings = {cid: spelled for spelled, cid in self._classes.items()}
         for sig in imported.values():
             self._class_sigs.setdefault(sig.id, sig)
         self._declare_classes(tree, own, names)
@@ -1653,7 +1668,9 @@ class _Inference:
         self._in_progress.add(guard)
         facts = self._scope_facts(node)
         self._frames = env + [_Frame(key, declared_global=facts.declared_global,
-                                     declared_nonlocal=facts.declared_nonlocal)]
+                                     declared_nonlocal=facts.declared_nonlocal,
+                                     local_names=facts.bound - facts.declared_global
+                                     - facts.declared_nonlocal)]
         self._contexts.append(cid)
         self._pin_sink.append(result.pins)
         self._pending.append([])
@@ -3099,11 +3116,21 @@ class _Inference:
         instance-varying site once every context has been walked.
 
         :param node: The value node
-        :param kind: What this context decided (``WIDEN_*``, ``_WIDEN_HARMLESS``),
-                     or None when the value must stay as it is
+        :param kind: What this context decided (``WIDEN_*``, ``_WIDEN_HARMLESS``, an
+                     object type for the na of that class), or None when the value
+                     must stay as it is
         """
-        if kind in (WIDEN_STRING_NA, WIDEN_NUMBER_NA, WIDEN_NA_TEXT) and not _holds_na(node):
+        if is_na_widen(kind) and not _holds_na(node):
             kind = None
+        cid = class_of(kind) if kind is not None else None
+        if cid is not None:
+            # The na of a class is built from the class's spelling here, which a
+            # name the enclosing scopes bind would read as their own value
+            spelled = self._class_spelling(cid)
+            if spelled is None or self._hides_module_name(spelled.partition('.')[0]):
+                kind = None
+            else:
+                set_na_class(node, spelled)
         nid = node_id(node)
         if nid is None:
             set_widen(node, None if kind == _WIDEN_HARMLESS else kind)
@@ -3126,7 +3153,11 @@ class _Inference:
         instance needs (``WIDEN_*``), or None for none, and the isolation pass
         hands the call that entry in place of the None. A float that goes into
         a float container needs nothing, the way it has no say in the constant
-        stamp.
+        stamp. The na of a class has no conversion character either: the class
+        is named where the value stands, and the class one context needs may be
+        spelled nowhere in the body's module, so such a context configures
+        nothing and the typeless na goes on as it is
+        (:meth:`_report_unhandled_widens` reports it).
         """
         for nid, seen in self._widens.items():
             node = self._widen_nodes.get(nid)
@@ -3139,8 +3170,7 @@ class _Inference:
                 func=ast.Attribute(value=ast.Name(id='safe_convert', ctx=ast.Load()),
                                    attr='implicit_convert', ctx=ast.Load()),
                 args=[node, ast.Constant(value=None)], keywords=[]), node)
-            set_widens(site, {cid: None if kind == _WIDEN_HARMLESS else kind
-                              for cid, kind in seen.items()})
+            set_widens(site, {cid: _vector_widen(kind) for cid, kind in seen.items()})
             set_widen_site(node, site)
 
     def _report_unhandled_widens(self) -> None:
@@ -3159,6 +3189,13 @@ class _Inference:
         first kind is dropped, so the value goes in unconverted everywhere; one
         of the second kind still converts in every instance that is handed its
         vector. Both are reported.
+
+        A context that needs the na of a class has no vector entry to be handed
+        at all: the vector carries conversion characters, and the class that
+        context needs may be spelled nowhere in the body's module. That instance
+        goes on with the typeless na, which an overload group answers with its
+        first implementation rather than the one declaring the class, so such a
+        site is reported as well.
         """
         placed: set[int] = set()
         varying_sites: set[int] = set()
@@ -3184,8 +3221,10 @@ class _Inference:
                 continue
             if id(site) not in placed:
                 set_widen_site(node, None)
-            elif not any(kind is not None for cid, kind in (get_widens(site) or {}).items()
-                         if cid in unvectored):
+            elif not (any(kind is not None for cid, kind in (get_widens(site) or {}).items()
+                          if cid in unvectored)
+                      or any(kind is not None and class_of(kind) is not None
+                             for kind in self._widens.get(nid, {}).values())):
                 continue
             self._diag(
                 'the implicit conversion of a value differs per call context, and not '
@@ -3284,15 +3323,15 @@ class _Inference:
             return entry['ty']
         if entry['kind'] == 'function':
             return entry['ret']
-        # An overload group: a pin names one implementation outright, and
-        # otherwise only the implementations this arity can reach speak, with
-        # the call's type being what they agree on
+        # An overload group: the argument types name one implementation
+        # outright, and otherwise only the implementations this arity can
+        # reach speak, with the call's type being what they agree on
         if argc is None:
             return UNKNOWN
-        if pin is not None:
-            picked = overload_pick([_lib_impl_sig(impl) for impl in entry['impls']], pin)
-            if picked is not None:
-                return picked
+        picked = self._picked([_lib_impl_sig(impl) for impl in entry['impls']], pin,
+                              self._shapes(args, keywords))
+        if picked is not None:
+            return picked
         return overload_result([impl['ret'] for impl in entry['impls']
                                 if _arity_fits(impl, argc)])
 
@@ -3705,7 +3744,7 @@ class _Inference:
                 return UNKNOWN
         pin = self._pin(node, is_group)
         if is_group:
-            ty = self._group_type(key, pin)
+            ty = self._group_type(key, pin, self._shapes(node.args, node.keywords))
         else:
             ty = self._call_context(key, node, frame)
         self.table.calls.append(CallSite(
@@ -3820,6 +3859,9 @@ class _Inference:
                 self._bad_call(node, name, f"'{sig.name}.{field_name}' holds "
                                            f"{render_ty(declared)}, {render_ty(given)} passed")
                 return False
+            if given == TYPELESS:
+                # A typeless na passed for a field is the na of what the field holds
+                self._record_widen(passed, _na_widen(declared))
         return True
 
     def _class_named(self, parts: tuple[str, ...], node: ast.AST) -> str | None:
@@ -3844,6 +3886,21 @@ class _Inference:
             # under a parameter ``Pivot`` calls the value, ``bogus.Pivot.new``
             # reads a field of it
             return None
+        cid = self._class_behind(parts, node)
+        if cid is not None:
+            # The path that reached the class is how this module names it in
+            # value position, which the na of the class is built with
+            self._class_spellings.setdefault(cid, '.'.join(parts))
+        return cid
+
+    def _class_behind(self, parts: tuple[str, ...], node: ast.AST) -> str | None:
+        """
+        The class a dotted path names, the shadowing value already ruled out.
+
+        :param parts: The dotted path, split, its head bound to no value
+        :param node: The node the question is asked for, for the cycle diagnostic
+        :return: The class id, or None when the path names no class
+        """
         leaf = parts[-1]
         if len(parts) == 1:
             own = self._classes.get(leaf)
@@ -3868,6 +3925,42 @@ class _Inference:
             return None
         found = interface.classes.get(leaf)
         return None if found is None else found.id
+
+    def _hides_module_name(self, name: str) -> bool:
+        """
+        Whether a scope the walk stands in binds a name, hiding the module's.
+
+        The spelling of a class is valid at the module's top level, and a
+        function that binds its head -- a parameter, a local assigned anywhere
+        in the body -- or a class body that bound it as a field before reads
+        its own value under it instead.
+
+        :param name: The head of a class's spelling
+        :return: True when the name does not reach the module here
+        """
+        return any(name in frame.names or name in frame.local_names
+                   for frame in self._frames[1:])
+
+    def _class_spelling(self, cid: str) -> str | None:
+        """
+        How this module spells a class in value position, for the na of it.
+
+        A typeless ``na`` that goes where an object of the class goes becomes
+        ``lib.na(<class>)``, and the class has to be named where the value
+        stands. The module's own class is its bare name; an imported one is
+        the path an annotation or a constructor reached it by
+        (``chr.SessionTimeRange``); a lib class is the name a ``pynecore.types``
+        import binds it to. A class this module spells nowhere has no na this
+        module can build, and the typeless na stays.
+
+        :param cid: The class id
+        :return: The spelling, valid at the module's top level, or None
+        """
+        spelled = self._class_spellings.get(cid)
+        if spelled is not None:
+            return spelled
+        module, _, name = cid.rpartition(CLASS_SEP)
+        return self._type_imports.get(name) if module == LIB_MODULE else None
 
     def _method_call(self, node: ast.Call) -> str | None:
         """
@@ -4022,11 +4115,10 @@ class _Inference:
             if not self._group_call_fits(key, name, node, args):
                 self._record_pin(node, None)
                 return UNKNOWN
-            pin = None
-            if not node.keywords and not any(isinstance(a, ast.Starred) for a in args):
-                pin = pin_for([self._ty_of(a) for a in args])
+            shapes = self._shapes(args, node.keywords)
+            pin = None if shapes is None else pin_for(shapes)
             self._record_pin(node, pin)
-            return self._group_type(key, pin)
+            return self._group_type(key, pin, shapes)
         # The method handed over as a function is the one the call site's dispatch
         # entry binds, so the instance vector stamped here configures it
         # (``core/pine_method``)
@@ -4254,7 +4346,10 @@ class _Inference:
         into another module is; the declared return is the answer only
         where the parameters are annotated. A method spelled by name is never
         pinned (the runtime selects from the values), so a group answers only
-        where its implementations agree on the return.
+        where its implementations agree on the return -- the implementations
+        the receiver can reach, that is: the selector checks an object against
+        the class its parameter declares, so a receiver of a known class is
+        taken only by the implementations declaring that class, or none.
 
         :param sig: The published signature
         :param name: The method name
@@ -4265,7 +4360,9 @@ class _Inference:
         if not self._export_call_fits(node, name, sig, args):
             return UNKNOWN
         if sig.kind == 'group':
-            return overload_result([impl.ret for impl in sig.impls])
+            receiver = self._ty_of(args[0]) if args else UNKNOWN
+            return overload_result([impl.ret for impl in sig.impls
+                                    if _takes_receiver(impl, receiver)])
         return sig.ret if sig.annotated else UNKNOWN
 
     def _library_method(self, name: str, node: ast.Call,
@@ -4419,26 +4516,67 @@ class _Inference:
             if nid is None or nid not in self._walked:
                 self._analyse(key, impl, self._declared_params(impl), parents)
 
-    def _group_type(self, key: str, pin: str | None) -> str:
+    def _group_type(self, key: str, pin: str | None,
+                    shapes: Sequence[str] | None = None) -> str:
         """
         Type of a call to a user overload group.
 
         The group's own type is what its implementations AGREE on, which is
-        nothing where they return different types -- but a pinned call site
-        has already settled which implementation runs, and that one's return
-        IS the call's type. Without this a composed group (``g(h(1))``) loses
-        the pin the inner call earned: the outer site would read UNKNOWN and
-        dispatch on the value ``h`` happens to produce.
+        nothing where they return different types -- but a positional call site
+        whose argument types settle which implementation runs (the selector's
+        exact pass, read statically) has that one's return as the call's type.
+        Without this a composed group (``g(h(1))``) loses the pin the inner
+        call earned: the outer site would read UNKNOWN and dispatch on the
+        value ``h`` happens to produce.
 
         :param key: Scope-qualified id of the group
         :param pin: The pin this call site justified, when it has one
+        :param shapes: The static type of each positional argument, or None
+                       where the call is not positional
         :return: The type the call evaluates to
         """
-        if pin is not None:
-            picked = overload_pick(self._impl_sigs(key), pin)
-            if picked is not None:
-                return picked
-        return self.table.funcs[key].ret
+        picked = self._picked(self._impl_sigs(key), pin, shapes)
+        return picked if picked is not None else self.table.funcs[key].ret
+
+    def _shapes(self, args: Sequence[ast.expr],
+                keywords: Sequence[ast.keyword]) -> list[str] | None:
+        """
+        The static type of each argument of a positional call, in order.
+
+        :param args: The positional arguments, typed already
+        :param keywords: The keyword arguments
+        :return: One type per argument, or None when a keyword or an unpacked
+                 argument makes the call one the exact pass does not read
+        """
+        if keywords or any(isinstance(arg, ast.Starred) for arg in args):
+            return None
+        return [self._ty_of(arg) for arg in args]
+
+    @staticmethod
+    def _picked(impls: Sequence[ImplSig], pin: str | None,
+                shapes: Sequence[str] | None) -> str | None:
+        """
+        The return type the selector's exact pass settles on for a call site.
+
+        The pin is read where the site has one: the runtime selects by the pin's
+        witnesses, so what the pin says runs. An unpinned site (nothing in it
+        worth a pin) dispatches on its values, and the characters are read off
+        the argument types only where a value is what its type says: a string,
+        a bool, an object of a known class. A float-typed value may be a Python
+        int at run time (``float x = 1``), which the exact pass takes for an int,
+        so a float position of an unpinned site says nothing; an int position
+        never reaches here unpinned.
+
+        :param impls: The group's implementations, in declaration order
+        :param pin: The pin the site justified, when it has one
+        :param shapes: The static type of each positional argument, or None
+                       where the call is not positional
+        :return: The selected implementation's return type, or None
+        """
+        if shapes is None:
+            return None
+        chars = pin if pin is not None else pin_chars(shapes).replace(FLOAT, PIN_ANY)
+        return overload_pick(list(impls), chars, shapes)
 
     def _impl_sigs(self, key: str) -> list[ImplSig]:
         """
@@ -4749,7 +4887,7 @@ class _Inference:
             return UNKNOWN
         pin = self._pin(node, is_group)
         if is_group:
-            picked = None if pin is None else overload_pick(list(sig.impls), pin)
+            picked = self._picked(sig.impls, pin, self._shapes(node.args, node.keywords))
             ty = sig.ret if picked is None else picked
         elif sig.annotated:
             ty = sig.ret
@@ -5304,17 +5442,34 @@ def _na_widen(ty: str) -> str | None:
     The conversion a typeless ``na`` literal needs where a value of a type goes.
 
     Pine has no typeless na at run time: where a string goes it is the string na,
-    where a float or an int goes the numeric na. Anywhere else (a bool, an object,
-    a type this pass does not know) it stays as it is.
+    where a float or an int goes the numeric na, where an object of a class goes
+    the na of that class. Anywhere else (a bool, a container, a bare object, a
+    type this pass does not know) it stays as it is.
 
     :param ty: The type the na takes there
-    :return: ``WIDEN_STRING_NA``, ``WIDEN_NUMBER_NA`` or None
+    :return: ``WIDEN_STRING_NA``, ``WIDEN_NUMBER_NA``, the object type itself, or None
     """
     if ty == STR:
         return WIDEN_STRING_NA
     if ty in NUMERIC:
         return WIDEN_NUMBER_NA
+    if class_of(ty) is not None:
+        return ty
     return None
+
+
+def _vector_widen(kind: str | None) -> str | None:
+    """
+    What an instance vector carries for one context's conversion verdict.
+
+    :param kind: The context's verdict (``WIDEN_*``, ``_WIDEN_HARMLESS``, an object
+                 type), or None
+    :return: The conversion character, or None where the context configures
+             nothing: no conversion, a harmless one, or the na of a class
+    """
+    if kind is None or kind == _WIDEN_HARMLESS or class_of(kind) is not None:
+        return None
+    return kind
 
 
 def _widen_for(kind: str, element: str, other: str) -> str | None:
@@ -6204,6 +6359,26 @@ _VARARG_NAMES: Final[dict[str, Callable[[Sequence[ast.expr], Callable[[ast.expr]
     'fill': _fill_arg_name,
     'alertcondition': _alertcondition_arg_name,
 }
+
+
+def _takes_receiver(impl: ImplSig, receiver: str) -> bool:
+    """
+    Whether a method implementation can take a receiver of a type.
+
+    Only an object of a known class rules anything out: the selector checks
+    it against the class the first parameter declares, so an implementation
+    declaring another class never runs for it. Any other receiver -- a scalar,
+    a container, one of no known class -- is left to every implementation.
+
+    :param impl: The implementation's shape, its receiver the first parameter
+    :param receiver: The receiver's type
+    :return: True when the implementation may run for the receiver
+    """
+    if class_of(receiver) is None:
+        return True
+    if not impl.params:
+        return impl.open_ended
+    return impl.params[0] in (receiver, UNKNOWN, OBJECT)
 
 
 def _arity_fits(impl: dict[str, Any], argc: int) -> bool:

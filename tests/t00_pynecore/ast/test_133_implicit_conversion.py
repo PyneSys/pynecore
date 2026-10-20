@@ -4,6 +4,8 @@ na that goes where a string goes, and ImplicitConversion converts them there; a 
 argument of an overload group pins its element type.
 """
 import ast
+import sys
+import types
 from typing import cast
 
 import pytest
@@ -18,10 +20,28 @@ __test_helper_PRELUDE = '''from pynecore import lib
 from pynecore.types import Matrix
 '''
 
+#: The prelude with a user type and a lib class in scope, the way a compiled
+#: script binds them: a ``@udt`` at module level, ``Line`` imported from the types
+__test_helper_UDT_PRELUDE = __test_helper_PRELUDE + '''from pynecore.core.pine_udt import udt
+from pynecore.types import Line
 
-def __test_helper_widen(body: str) -> tuple[str, list[str]]:
+
+@udt
+class Pivot:
+    price: float = 0.0
+    idx: int = 0
+    tag: str = ""
+
+
+@udt
+class Holder:
+    top: Pivot = lib.na(Pivot)
+'''
+
+
+def __test_helper_widen(body: str, prelude: str = __test_helper_PRELUDE) -> tuple[str, list[str]]:
     """Infer and widen ``main``'s body; return the emitted body and the diagnostics."""
-    source = __test_helper_PRELUDE + 'def main():\n' + ''.join(
+    source = prelude + 'def main():\n' + ''.join(
         f'    {line}\n' for line in body.strip().splitlines())
     tree = ast.parse(source)
     table = infer_module(tree, 'test')
@@ -398,6 +418,47 @@ def main():
     assert reasons.count('context-dependent-widen') == 1
 
 
+def __test_a_class_na_that_differs_per_context_is_reported__():
+    """
+    A generic body whose typeless na goes out as a different class in each context
+    has no vector entry for the na of a class, so the instances keep the typeless na
+    and the drop is reported rather than silently reaching the wrong overload
+    """
+    source = __test_helper_UDT_PRELUDE + '''from pynecore.core.overload import overload
+
+
+@udt
+class Other:
+    x: float = 0.0
+
+
+@overload
+def describe(o: Other) -> str:
+    return 'OTHER'
+
+
+@overload
+def describe(p: Pivot) -> str:
+    return 'PIVOT'
+
+
+def pick(value, flag: bool):
+    return value if flag else lib._na_none
+
+
+def main(flag: bool):
+    return describe(pick(Pivot(1.0), flag)), describe(pick(Other(1.0), flag))
+'''
+    tree = ast.parse(source)
+    table = infer_module(tree, 'test')
+    pick = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                and node.name == 'pick')
+    returned = cast(ast.IfExp, cast(ast.Return, pick.body[0]).value)
+    assert get_widen_site(returned.orelse) is not None
+    reasons = [d.origin.reason for d in table.diags if d.origin is not None]
+    assert reasons.count('context-dependent-widen') == 1
+
+
 def __test_a_container_argument_pins_its_element_type__():
     """The pin of an overload site carries the element type of a scalar array or matrix"""
     source = __test_helper_PRELUDE + '''from pynecore.core.overload import overload
@@ -467,3 +528,165 @@ def main():
     outer = cast(ast.Call, cast(ast.Assign, main.body[0]).value)
     assert get_pin(outer.args[0]) == 'I'
     assert get_pin(outer) == 'i'
+
+
+@pytest.mark.parametrize("body,expected", [
+    # a ternary arm next to an object of a class is the na of that class
+    ('w = Pivot(1.0) if lib.bar_index < 0 else lib._na_none',
+     'w = Pivot(1.0) if lib.bar_index < 0 else lib.na(Pivot)'),
+    # a declared variable, and a later store into a variable holding an object
+    ('p: Pivot = lib._na_none', 'p: Pivot = lib.na(Pivot)'),
+    ('p: Pivot = Pivot(1.0)\np = lib._na_none', 'p = lib.na(Pivot)'),
+    # a field holding an object
+    ('h = Holder(Pivot(1.0))\nh.top = lib._na_none', 'h.top = lib.na(Pivot)'),
+    # an element of a container of objects: built with, pushed, declared
+    ('a = lib.array.from_items(Pivot(1.0), lib._na_none)',
+     'a = lib.array.from_items(Pivot(1.0), lib.na(Pivot))'),
+    ('a: list[Pivot] = lib.array.new(0)\nlib.array.push(a, lib._na_none)',
+     'lib.array.push(a, lib.na(Pivot))'),
+    ('a: list[Pivot] = lib.array.from_items(lib._na_none)',
+     'a: list[Pivot] = lib.array.from_items(lib.na(Pivot))'),
+    # a parameter and a declared return
+    ('def tail(p: Pivot) -> Pivot:\n    return p\nx = tail(lib._na_none)', 'x = tail(lib.na(Pivot))'),
+    ('def missing() -> Pivot:\n    return lib._na_none', '    return lib.na(Pivot)'),
+    # a constructor argument is the na of what the field holds: an object, a
+    # number, a string
+    ('h = Holder(lib._na_none)', 'h = Holder(lib.na(Pivot))'),
+    ('p = Pivot(1.0, lib._na_none, lib._na_none)', "p = Pivot(1.0, lib._na_float, '')"),
+    ('p = Pivot(lib._na_none)', 'p = Pivot(lib._na_float)'),
+    ('p = Pivot(tag=lib._na_none)', "p = Pivot(tag='')"),
+    # a lib class is spelled the way the module imports it
+    ('x: Line = lib._na_none', 'x: Line = lib.na(Line)'),
+    # a held typeless na is converted at run time, with the class
+    ('def pick(v=lib._na_none):\n    return Pivot(1.0) if lib.bar_index < 0 else v\nx = pick()',
+     '    return Pivot(1.0) if lib.bar_index < 0 else safe_convert.implicit_convert(v, Pivot)'),
+    # a bool keeps the typeless na
+    ('b: bool = lib._na_none', 'b: bool = lib._na_none'),
+])
+def __test_typeless_na_where_an_object_goes_is_the_na_of_its_class__(body, expected):
+    emitted, diags = __test_helper_widen(body, __test_helper_UDT_PRELUDE)
+    assert expected in emitted.splitlines()
+    assert not diags
+
+
+def __test_the_na_of_a_class_reaches_the_overload_of_that_class__():
+    """
+    An element put in as a typeless na next to an object reaches the implementation
+    declaring the object's class, not the first one a typeless na would answer: the
+    shape a library's ``to_string(timezone: Timezone)`` / ``to_string(range: Range)``
+    group has, where the value dispatch took the enum overload for a typeless na
+    """
+    source = __test_helper_UDT_PRELUDE + '''from enum import StrEnum
+from pynecore.core.overload import overload
+
+
+class Zone(StrEnum):
+    exchange = 'Exchange'
+
+
+@overload
+def describe(zone: Zone) -> str:
+    return 'ZONE'
+
+
+@overload
+def describe(p: Pivot) -> str:
+    return 'PIVOT'
+
+
+def pick(flag: bool) -> Pivot:
+    return Pivot(1.0) if flag else lib._na_none
+
+
+def main(flag: bool):
+    xs = lib.array.from_items(pick(flag))
+    ys: list[Pivot] = lib.array.new(0)
+    lib.array.push(ys, lib._na_none)
+    return describe(lib.array.get(xs, 0)), describe(lib.array.get(ys, 0))
+'''
+    tree = ast.parse(source)
+    table = infer_module(tree, 'test')
+    assert not table.diags, [d.message for d in table.diags]
+    tree = ast.fix_missing_locations(cast(ast.Module, ImplicitConversionTransformer().visit(tree)))
+    namespace: dict = {'__name__': 'object_na_dispatch'}
+    exec(compile(tree, 'test', 'exec'), namespace)
+    assert namespace['main'](False) == ('PIVOT', 'PIVOT')
+    assert namespace['main'](True) == ('PIVOT', 'PIVOT')
+    assert namespace['pick'](False).type is namespace['Pivot']
+
+
+def __test_a_held_typeless_na_becomes_the_na_of_the_class_it_goes_as__():
+    """A defaulted parameter returned as an object goes out as the na of the class"""
+    source = __test_helper_UDT_PRELUDE + '''
+def missing(value=lib._na_none) -> Pivot:
+    return value
+
+
+def main():
+    return missing()
+'''
+    tree = ast.parse(source)
+    infer_module(tree, 'test')
+    tree = ast.fix_missing_locations(cast(ast.Module, ImplicitConversionTransformer().visit(tree)))
+    namespace: dict = {'__name__': 'held_object_na'}
+    exec(compile(tree, 'test', 'exec'), namespace)
+    assert namespace['main']().type is namespace['Pivot']
+    made = namespace['Pivot'](2.0)
+    assert namespace['missing'](made) is made
+
+
+def __test_a_field_default_naming_an_unbound_class_is_deferred__():
+    """
+    A field default runs while its class body does: the na of the class itself or of
+    a class defined later is built for each object, once the class is bound
+    """
+    source = __test_helper_UDT_PRELUDE + '''
+
+@udt
+class Node:
+    value: float = 0.0
+    next: 'Node' = lib._na_none
+    later: 'Later' = lib._na_none
+    top: Pivot = lib._na_none
+
+
+@udt
+class Later:
+    x: float = 0.0
+'''
+    tree = ast.parse(source)
+    table = infer_module(tree, 'test')
+    assert not table.diags, [d.message for d in table.diags]
+    tree = ast.fix_missing_locations(cast(ast.Module, ImplicitConversionTransformer().visit(tree)))
+    emitted = ast.unparse(tree).splitlines()
+    assert 'from dataclasses import field as _dataclass_field' in emitted
+    assert "    next: 'Node' = _dataclass_field(default_factory=lambda: lib.na(Node))" in emitted
+    assert "    later: 'Later' = _dataclass_field(default_factory=lambda: lib.na(Later))" in emitted
+    assert '    top: Pivot = lib.na(Pivot)' in emitted
+    # The dataclass reads a string annotation's module, so the module is registered
+    module = types.ModuleType('deferred_field_default')
+    sys.modules[module.__name__] = module
+    try:
+        exec(compile(tree, 'test', 'exec'), module.__dict__)
+        node = module.Node(1.0)
+        assert node.next.type is module.Node
+        assert node.later.type is module.Later
+        assert node.top.type is module.Pivot
+    finally:
+        del sys.modules[module.__name__]
+
+
+@pytest.mark.parametrize("definition", [
+    # a parameter, a local bound after the na and a class-body field hide the class
+    'def f(Pivot: int) -> Pivot:\n    return lib._na_none',
+    'def f() -> Pivot:\n    p: Pivot = lib._na_none\n    Pivot = 3\n    return p',
+    '@udt\nclass Shadow:\n    Pivot: int = 0\n    top: Pivot = lib._na_none',
+])
+def __test_a_class_whose_name_a_scope_binds_keeps_the_typeless_na__(definition):
+    """The class's spelling would read the scope's own value, so nothing is converted"""
+    tree = ast.parse(__test_helper_UDT_PRELUDE + definition + '\n')
+    infer_module(tree, 'test')
+    tree = cast(ast.Module, ImplicitConversionTransformer().visit(tree))
+    emitted = ast.unparse(tree.body[-1])
+    assert 'lib._na_none' in emitted
+    assert 'lib.na(' not in emitted
