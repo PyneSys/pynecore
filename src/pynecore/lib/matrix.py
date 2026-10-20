@@ -7,22 +7,21 @@ from ..types.na import NA, na_float, na_int
 from ..types.pine_types import PyneInt, pine_int
 if TYPE_CHECKING:
     from ..types.pine_types import PyneFloat
-from . import array as _array
 
 T = TypeVar('T')
 
 _registry: list[Matrix] = []
 
 
-# noinspection PyShadowingBuiltins,PyProtectedMember
+# noinspection PyShadowingBuiltins
 def _na_element(id: Matrix) -> Any:
     """
     Return an na value matching the matrix's element type.
 
     :param id: A matrix object
-    :return: na of the matrix's element type, typeless na for an empty matrix
+    :return: na of the matrix's element type, also for a matrix without cells
     """
-    return _array._na_element(id.data[0] if id.data else [])
+    return id.na_element
 
 
 # noinspection PyShadowingNames

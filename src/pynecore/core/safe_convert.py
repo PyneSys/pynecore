@@ -90,7 +90,7 @@ def safe_float(value: PyneFloat) -> float:
         return na_float
 
 
-def safe_mod(a: PyneFloat, b: PyneFloat) -> PyneFloat:
+def safe_mod(a: PyneFloat | PyneInt, b: PyneFloat | PyneInt) -> PyneFloat | PyneInt:
     """
     Pine's ``%``: the truncated remainder, which takes the sign of the dividend.
 
@@ -142,7 +142,7 @@ def safe_float_matrix(matrix: Matrix[PyneInt] | NA) -> Matrix[float] | NA:
     """
     if isinstance(matrix, NA):
         return matrix
-    result: Matrix[float] = Matrix(matrix.rows, matrix.cols)
+    result: Matrix[float] = Matrix(matrix.rows, matrix.cols, na_float)
     result.data = [[safe_float(item) for item in row] for row in matrix.data]
     return result
 

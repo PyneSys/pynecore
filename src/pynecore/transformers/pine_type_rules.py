@@ -2000,13 +2000,19 @@ LIB_TYPE_OVERRIDES: Final[dict[str, object]] = {
     'matrix.col': 'array_of_elem0',
     'matrix.remove_row': 'array_of_elem0',
     'matrix.remove_col': 'array_of_elem0',
-    'matrix.eigenvalues': 'array_of_elem0',
     'matrix.copy': 'same_matrix0',
     'matrix.transpose': 'same_matrix0',
     'matrix.inv': 'same_matrix0',
     'matrix.pinv': 'same_matrix0',
     'matrix.pow': 'same_matrix0',
     'matrix.submatrix': 'same_matrix0',
+    # MEASURED (CAPITALCOM:EURUSD@60, a ``matrix<int>`` [[1, 2], [3, 4]]): the
+    # eigen results keep the INT element type while holding fractional values.
+    # ``array<float> v = matrix.eigenvalues(mi)`` and ``matrix<float> e =
+    # matrix.eigenvectors(mi)`` are rejected with CE10173 as ``array<int>`` and
+    # ``matrix<int>``, and ``array<int> v = mi.eigenvalues()`` compiles and
+    # holds [-0.3722813233, 5.3722813233]
+    'matrix.eigenvalues': 'array_of_elem0',
     'matrix.eigenvectors': 'same_matrix0',
     'matrix.kron': 'merge_matrix',
     'matrix.concat': 'merge_matrix',

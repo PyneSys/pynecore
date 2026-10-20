@@ -667,6 +667,9 @@ free_by_ref = method_call(tag, b)
     # 'array_of_elem0': a row of a matrix is an array of its elements
     ('matrix.row(mi, 0)', array_of(INT)),
     ('matrix.eigenvalues(mf)', array_of(FLOAT)),
+    # The eigen results of an int matrix stay int-typed, whatever values they hold
+    ('matrix.eigenvalues(mi)', array_of(INT)),
+    ('matrix.eigenvectors(mi)', matrix_of(INT)),
     # 'matrix_mult': matrix x matrix is a matrix, matrix x array is an array,
     # matrix x scalar is a matrix
     ('matrix.mult(mi, mi)', matrix_of(INT)),

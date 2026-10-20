@@ -5,7 +5,7 @@ title: "matrix"
 description: "Two-dimensional matrix operations"
 icon: "grid_on"
 date: "2026-03-28"
-lastmod: "2026-08-05"
+lastmod: "2026-10-20"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -614,7 +614,10 @@ Calculate the inverse of a square matrix.
 |-----------|------|-------------|
 | `id` | matrix | Square matrix |
 
-**Returns:** New matrix
+**Returns:** New matrix — The inverse, solved from the LU decomposition with partial pivoting.
+
+A singular matrix is a runtime error, and so is one whose LU decomposition meets a pivot smaller
+than `1e-11` in magnitude.
 
 ```python
 m_inv = matrix.inv(m)
@@ -628,10 +631,18 @@ Calculate the pseudo-inverse (Moore-Penrose inverse) of a matrix.
 |-----------|------|-------------|
 | `id` | matrix | Matrix object |
 
-**Returns:** New matrix
+**Returns:** New matrix of `columns × rows` cells — The pseudoinverse. A square matrix that
+[`inv()`](#inv) can invert returns its inverse, and a matrix with fewer rows than columns returns
+`Aᵀ(AAᵀ)⁻¹` while `AAᵀ` can be inverted. Every other matrix, including a singular or otherwise
+rank-deficient one, returns the pseudoinverse of its singular value decomposition, in which a
+singular value up to `max(rows, columns) × s_max × 2⁻⁵²` counts as zero.
 
 ```python
-m_pinv = matrix.pinv(m)
+m = matrix.new(2, 2, 1.0)
+matrix.set(m, 0, 1, 2.0)
+matrix.set(m, 1, 0, 2.0)
+matrix.set(m, 1, 1, 4.0)
+m_pinv = matrix.pinv(m)  # [[0.04, 0.08], [0.08, 0.16]]
 ```
 
 ### rank()
@@ -668,12 +679,21 @@ Calculate the eigenvalues of a square matrix.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `id` | matrix | Square matrix |
+| `id` | matrix | Square `int` or `float` matrix without `na` elements |
 
-**Returns:** `list` — Array of eigenvalues
+**Returns:** `list` — Array of eigenvalues, with the element type of the matrix: an `int` matrix
+gives an `int` array that still holds the fractional eigenvalues. A symmetric matrix returns them
+in descending order. Any other matrix returns them in the order they take on the
+diagonal of its real Schur form, which is not sorted. A complex conjugate pair `a ± bi`
+contributes its real part `a` twice.
+
+An empty matrix, a matrix with an `na` element and a non-square matrix are runtime errors.
 
 ```python
-evals: list = matrix.eigenvalues(m)
+m = matrix.new(2, 2, 1.0)
+matrix.set(m, 0, 0, 2.0)
+matrix.set(m, 1, 1, 2.0)
+evals: list[float] = matrix.eigenvalues(m)  # [3.0, 1.0000000000000002]
 ```
 
 ### eigenvectors()
@@ -682,12 +702,19 @@ Calculate the eigenvectors of a square matrix.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `id` | matrix | Square matrix |
+| `id` | matrix | Square `int` or `float` matrix without `na` elements |
 
-**Returns:** New matrix — Each column is an eigenvector
+**Returns:** New matrix of the type of `id` (an `int` matrix gives an `int` matrix that still holds
+fractional values) — Column `i` is the eigenvector of the `i`-th element of
+[`eigenvalues()`](#eigenvalues). The eigenvectors of a symmetric matrix are orthonormal. Those of
+any other matrix are not normalized. The two columns of a complex conjugate pair hold the real and
+the imaginary part of the complex eigenvector of the eigenvalue with the positive imaginary part;
+its conjugate is the eigenvector of the other eigenvalue of the pair.
+
+The same inputs are runtime errors as for `eigenvalues()`.
 
 ```python
-evecs = matrix.eigenvectors(m)
+evecs = matrix.eigenvectors(m)  # columns [0.7071…, 0.7071…] and [0.7071…, -0.7071…]
 ```
 
 ## Matrix Transformations
@@ -794,4 +821,7 @@ m_kron = matrix.kron(m1, m2)
 - NA (not available) values are handled automatically; operations on an NA matrix return NA or do
   nothing, depending on whether the operation returns a value or mutates the matrix
 - Linear algebra functions (inv, eigenvalues, etc.) require square or compatible matrices
+- `eigenvalues()` and `eigenvectors()` give TradingView's results to the last bit, including the
+  order of the eigenvalues and the scale and sign of the eigenvectors
+- `inv()` and `pinv()` give TradingView's results to the last bit
 - For very large matrices, performance depends on matrix size and operation complexity

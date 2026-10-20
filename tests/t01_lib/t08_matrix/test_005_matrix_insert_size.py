@@ -9,12 +9,18 @@ takes its first dimension from the array; omitting the array inserts na cells.
 import pytest
 
 from pynecore.lib import matrix
+from pynecore.types.line import Line
 from pynecore.types.na import NA
 
 
 def main():
     """Dummy main to satisfy the @pyne script loader."""
     pass
+
+
+def __test_helper_is_float_na(value) -> bool:
+    """Whether a cell is the float na (NaN), not an na object."""
+    return isinstance(value, float) and value != value
 
 
 @pytest.mark.parametrize("size", [0, 1, 2, 4])
@@ -125,10 +131,10 @@ def __test_omitted_array_inserts_na_cells__():
     m = matrix.new(2, 3, 0.0)
     matrix.add_row(m)
     assert matrix.rows(m) == 3 and matrix.columns(m) == 3
-    assert all(isinstance(value, NA) for value in m.data[2])
+    assert all(__test_helper_is_float_na(value) for value in m.data[2])
     matrix.add_col(m)
     assert matrix.rows(m) == 3 and matrix.columns(m) == 4
-    assert all(isinstance(row[3], NA) for row in m.data)
+    assert all(__test_helper_is_float_na(row[3]) for row in m.data)
     empty_row = matrix.new()
     matrix.add_row(empty_row)
     assert matrix.rows(empty_row) == 1 and matrix.columns(empty_row) == 0
@@ -141,3 +147,50 @@ def __test_omitted_array_inserts_na_cells__():
     cols_only = matrix.new(0, 3, 0.0)
     matrix.add_col(cols_only)
     assert matrix.rows(cols_only) == 0 and matrix.columns(cols_only) == 4
+
+
+def __test_added_cells_are_the_na_of_the_element_type__():
+    """A matrix created without cells pads with the na of its initial value's type."""
+    floats = matrix.new(0, 2, NA(float))
+    matrix.add_row(floats)
+    matrix.add_col(floats)
+    assert all(__test_helper_is_float_na(value) for value in floats.data[0])
+    # The padded cells compare like the cells the matrix was created with
+    seeded = matrix.new(1, 2, NA(float))
+    matrix.add_row(seeded)
+    assert [value != 0.0 for value in seeded.data[1]] == [value != 0.0 for value in seeded.data[0]]
+    texts = matrix.new(0, 2, '')
+    matrix.add_row(texts)
+    assert texts.data == [['', '']]
+    lines = matrix.new(0, 2, NA(Line))
+    matrix.add_row(lines)
+    assert all(value is NA(Line) for value in lines.data[0])
+
+
+def __test_derived_matrix_keeps_the_na_element__():
+    """A copy, transpose or submatrix still pads with its source's na."""
+    source = matrix.new(0, 2, NA(float))
+    copied = matrix.copy(source)
+    matrix.add_row(copied)
+    assert len(copied.data[0]) == 2
+    assert all(__test_helper_is_float_na(value) for value in copied.data[0])
+    transposed = matrix.transpose(source)
+    matrix.add_col(transposed)
+    assert len(transposed.data) == 2
+    assert all(__test_helper_is_float_na(row[0]) for row in transposed.data)
+    texts = matrix.new(2, 2, 'x')
+    part = matrix.submatrix(texts, 0, 1, 0, 1)
+    matrix.add_col(part)
+    assert part.data == [['x', '']]
+
+
+def __test_na_index_on_a_matrix_without_cells_is_its_element_na__():
+    """An na index reads the matrix's element na even when there is no cell to sample."""
+    assert __test_helper_is_float_na(matrix.get(matrix.new(0, 2, NA(float)), NA(int), 0))
+    assert matrix.get(matrix.new(0, 2, ''), NA(int), 0) == ''
+
+
+def __test_zeroth_power_is_the_identity__():
+    """The zeroth power has zeros off the diagonal, not na cells (TV-measured: 1.0 / 0.0)."""
+    m = matrix.new(2, 2, 3.0)
+    assert matrix.pow(m, 0).data == [[1, 0], [0, 1]]
