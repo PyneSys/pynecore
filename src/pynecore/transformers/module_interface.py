@@ -172,6 +172,10 @@ def build_interface(tree: ast.Module, table: PineTypeTable, path: str,
     definitions: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, str, str]] = []
     _collect_defs(tree, '', definitions)
 
+    # Whether each export ends up bound to its proxy: an ``@export`` definition
+    # hands itself to the proxy and binds the proxy back, any other module-level
+    # definition binds the plain function over it
+    proxied: dict[str, bool] = {}
     # Module level first, so a proxy's nested definition overrules a same-named
     # module-level one -- the proxy IS what the name is bound to at import time
     for node, key, scope in definitions:
@@ -179,11 +183,13 @@ def build_interface(tree: ast.Module, table: PineTypeTable, path: str,
             sig = _export_sig(node, key, table)
             if sig is not None:
                 exports[node.name] = sig
+                proxied[node.name] = node.name in proxies and _is_exported(node)
     for node, key, scope in definitions:
         if scope != '' and node.name in proxies and _is_exported(node):
             sig = _export_sig(node, key, table)
             if sig is not None:
                 exports[node.name] = sig
+                proxied[node.name] = True
 
     if fingerprint is None:
         fingerprint = _fingerprint(path)
@@ -195,7 +201,9 @@ def build_interface(tree: ast.Module, table: PineTypeTable, path: str,
                                 digest='', deps=dict(table.deps),
                                 mtime_ns=fingerprint[0], size=fingerprint[1],
                                 suppressed=table.pins_suppressed.message
-                                if table.pins_suppressed is not None else '')
+                                if table.pins_suppressed is not None else '',
+                                proxies=tuple(sorted(name for name, bound in proxied.items()
+                                                     if bound)))
     return replace(interface, digest=interface_digest(interface))
 
 
@@ -421,9 +429,10 @@ def interface_digest(interface: ModuleInterface) -> str:
     The line numbers are left out on purpose: a body edit moves every
     definition below it, and a dependent has no business being invalidated by
     that. What IS in here is every signature, every implementation of every
-    group, ``__all__``, the published classes and the methods this module adds
-    to another module's class -- adding or removing one changes what a
-    dependent's annotations, and its method calls, resolve to.
+    group, ``__all__``, the published classes, the methods this module adds
+    to another module's class and the exports a method call can reach by name
+    -- adding or removing one changes what a dependent's annotations, and its
+    method calls, resolve to.
 
     :param interface: The interface to digest
     :return: A short hex digest
@@ -450,6 +459,9 @@ def interface_digest(interface: ModuleInterface) -> str:
         # Whether the module's pins were given up is part of what a dependent
         # resolves to: its own pins follow
         'suppressed': interface.suppressed,
+        # Which library answers a method called by name on a receiver without a
+        # class is decided among these
+        'proxies': list(interface.proxies),
     }
     return _digest(_canonical(payload).encode('utf-8'))
 
@@ -984,6 +996,7 @@ def interface_payload(interface: ModuleInterface) -> bytes:
         'exports': {name: _export_json(sig) for name, sig in interface.exports.items()},
         'suppressed': interface.suppressed,
         'routes': interface.routes,
+        'proxies': list(interface.proxies),
     }).encode('utf-8'))
 
 
@@ -1024,7 +1037,8 @@ def interface_from_payload(path: str, payload: bytes, deps: dict[str, DepRecord]
         classes=classes, extensions=extensions, digest='', deps=dict(deps),
         mtime_ns=fingerprint[0], size=fingerprint[1],
         suppressed=str(published.get('suppressed') or ''),
-        routes=str(published.get('routes') or ''))
+        routes=str(published.get('routes') or ''),
+        proxies=tuple(published.get('proxies') or ()))
     return replace(interface, digest=interface_digest(interface))
 
 

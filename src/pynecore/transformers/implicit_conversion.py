@@ -21,8 +21,20 @@ A typeless ``na`` literal that goes where a string goes -- a string variable or
 field, a string parameter, a ternary arm next to a string, an element of a string
 container, the key of a string-keyed map, a string parameter of a lib function -- is
 the string na, which TradingView does not tell from ``""``: it becomes the empty string
-literal. Passed as compile-time text of the study (a plot title, a ``plotchar`` char,
-an ``alertcondition`` message, see ``NA_TEXT_PARAMS``) it is the text ``na`` instead.
+literal. One that goes where a float or an int goes -- a numeric variable, field,
+parameter or declared return, a ternary arm or an arithmetic operand next to a number,
+an element of a numeric container -- is the numeric na: it becomes ``lib._na_float``,
+the NaN that ``NA(float)`` and ``NA(int)`` both are, so a container, an overload
+dispatch or a library receives the na the way Pine typed it. Passed as compile-time
+text of the study (a plot title, a ``plotchar`` char, an ``alertcondition`` message,
+see ``NA_TEXT_PARAMS``) it is the text ``na`` instead.
+
+A signed ``-na`` is the typeless ``na`` too, and is replaced the same way. A value
+that holds it without spelling it -- a parameter defaulted to it, a variable -- is
+converted the same way, at run time: it is wrapped in
+``safe_convert.implicit_convert(value, kind)``, which turns the typeless na into the
+na it goes in as and passes any other value through, so a call site that hands the
+function a value of its own gets that value back.
 
 A generic body is shared by every context it is instantiated in, and one value in it
 can need a conversion in one context and none in another: ``array.push(a, v)`` into a
@@ -38,9 +50,11 @@ import ast
 
 from . import ast_walk
 from .pine_type_rules import (
-    FLOAT, STR, WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_NA_TEXT, WIDEN_STRING_NA, array_of,
+    FLOAT, STR, WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_NA_TEXT, WIDEN_NUMBER_NA,
+    WIDEN_STRING_NA, array_of,
     get_ty,
-    get_widen, get_widen_site, matrix_of, set_ty, set_widen, set_widen_site, stamp_lowering,
+    get_widen, get_widen_site, is_na_literal, matrix_of, set_ty, set_widen, set_widen_site,
+    stamp_lowering,
 )
 
 __all__ = ['ImplicitConversionTransformer']
@@ -74,8 +88,19 @@ class ImplicitConversionTransformer(ast_walk.NodeTransformer):
             return node
         # Converted once: a clone of this node (a security slice) must not convert again
         set_widen(node, None)
+        if kind in (WIDEN_STRING_NA, WIDEN_NUMBER_NA, WIDEN_NA_TEXT) and not is_na_literal(node):
+            self._needs_import = True
+            return stamp_lowering(ast.copy_location(ast.Call(
+                func=ast.Attribute(value=ast.Name(id='safe_convert', ctx=ast.Load()),
+                                   attr='implicit_convert', ctx=ast.Load()),
+                args=[node, ast.Constant(value=kind)], keywords=[]), node),
+                FLOAT if kind == WIDEN_NUMBER_NA else STR)
         if kind == WIDEN_STRING_NA:
             return set_ty(ast.copy_location(ast.Constant(value=''), node), STR)
+        if kind == WIDEN_NUMBER_NA:
+            return set_ty(ast.copy_location(ast.Attribute(
+                value=ast.Name(id='lib', ctx=ast.Load()), attr='_na_float', ctx=ast.Load()),
+                node), FLOAT)
         if kind == WIDEN_NA_TEXT:
             return set_ty(ast.copy_location(ast.Constant(value='na'), node), STR)
         if kind == WIDEN_FLOAT:

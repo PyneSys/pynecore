@@ -307,8 +307,8 @@ class ModuleInterface:
     #: library modules -- so what a receiver of that class resolves to depends
     #: on this module too, and it is part of the contract
     extensions: dict[str, dict[str, ExportSig]]
-    #: Digest of ``exports``, ``all``, ``classes`` and ``extensions``, blind to
-    #: every body
+    #: Digest of ``exports``, ``all``, ``classes``, ``extensions`` and
+    #: ``proxies``, blind to every body
     digest: str
     #: Every module this one's types were derived from or that it imports, its own
     #: dependencies' dependencies included. An interface can be INFERRED from a third
@@ -340,6 +340,13 @@ class ModuleInterface:
     #: and a module's signatures do not move because a body started keeping
     #: state -- but a dependent's emission does
     routes: str = ''
+    #: The exports the module binds to an ``Exported`` proxy, sorted. A method
+    #: called by NAME on a receiver without a class (a string, a number, an
+    #: array) is found by the runtime among exactly these, in the library modules
+    #: the caller imports (``core/pine_method.method_call``); a plain module-level
+    #: function of the same name is passed by. Part of the contract: which
+    #: library answers such a call depends on it
+    proxies: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)

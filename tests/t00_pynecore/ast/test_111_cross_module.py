@@ -26,7 +26,7 @@ from pynecore.core.instance_state import _make_state  # noqa: internal API
 from pynecore.transformers import module_interface
 from pynecore.transformers.module_interface import interface_digest, registered
 from pynecore.transformers.pine_type_rules import (
-    FLOAT, INT, OBJECT, UNKNOWN, get_pin, get_ty, tuple_of,
+    FLOAT, INT, UNKNOWN, get_pin, get_ty, tuple_of,
 )
 from pynecore.transformers.pine_type_table import PineTypeTable
 
@@ -764,10 +764,12 @@ def __test_a_call_into_another_module_is_held_to_its_signature__(tmp_path, monke
 METHOD_LIB = '''"""
 @pyne
 """
+from pynecore.core.pine_export import Exported, export
 from pynecore.core.pine_method import method
 from pynecore.core.pine_udt import udt
 
 __all__ = ['Cfg', 'bump']
+bump = Exported()
 
 
 @udt
@@ -776,6 +778,7 @@ class Cfg:
     tag: str = "x"
 
 
+@export
 @method
 def bump(this: Cfg, by: int) -> int:
     return this.level + by

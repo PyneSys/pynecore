@@ -63,7 +63,8 @@ from .pine_type_rules import (
     LIB_TYPE_OVERRIDES, OVERRIDE_PARAM_NAMES, BUILTIN_CALL_TYPES, BUILTIN_NAME_TYPES,
     TY_ATTR, get_ty, set_ty, inherit_ty,
     constant_type, pin_for, get_pins, set_pin, set_pins, set_vector, get_varying, set_varying,
-    WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_STRING_NA, WIDEN_NA_TEXT, NA_TEXT_PARAMS,
+    WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_STRING_NA, WIDEN_NUMBER_NA, WIDEN_NA_TEXT,
+    NA_TEXT_PARAMS,
     NOT_PINE_STRINGS, set_widen, get_widen_site,
     set_widen_site, get_widens, set_widens,
     overload_result, ImplSig, overload_pick, default_fit, FIT_REQUIRED, FactoryFields,
@@ -104,6 +105,20 @@ _MAX_CONTEXTS = 500
 #: one of them, or one they all answer the same way, is answerable statically.
 _METHOD_NAMESPACES: Final = ('array', 'matrix', 'map', 'line', 'box', 'label',
                              'table', 'linefill', 'polyline')
+
+#: The receivers ``core.pine_method.method_call`` never asks for a Python attribute
+#: of their own: a Pine scalar has no methods, so a library method of the name of a
+#: ``str`` / number attribute (``replace``, ``format``) still reaches the library
+_SCALAR_RECEIVERS: Final = frozenset({INT, FLOAT, BOOL, STR})
+
+#: The Python attributes of the objects an array and a map are, which answer a
+#: method called by name before any library does
+_LIST_ATTRS: Final = frozenset(dir(list))
+_DICT_ATTRS: Final = frozenset(dir(dict))
+
+#: What ``core.pine_udt.udt`` gives every user class besides its fields, which
+#: answers a method called by name before any library does
+_UDT_ATTRS: Final = frozenset({'copy', 'new'})
 
 #: How each shape-reading override form derives its answer from the type of
 #: the argument it names. Each one DECLINES -- answers UNKNOWN or a bare
@@ -529,6 +544,9 @@ class _Inference:
         #: the definition -- and one in a branch the call cannot share reaches
         #: it wherever it stands
         self._module_rebinds: dict[str, list[tuple[tuple[int, int], _BranchPath]]] = {}
+        #: Module-scope name -> the position of every ``def`` that binds it, the
+        #: stores ``_module_rebinds`` leaves out
+        self._module_def_positions: dict[str, list[tuple[int, int]]] = {}
         #: The branch path of every module statement, for the same question
         self._branches = _BranchIndex(())
         #: The loop statements the walk is inside, outermost first. A loop
@@ -902,6 +920,9 @@ class _Inference:
         self._module_rebinds = {
             name: [(position, self._branches.of(position)) for position in positions]
             for name, positions in _bound_positions(tree.body).items()}
+        self._module_def_positions = {
+            name: [position for position, _ in defs]
+            for name, defs in _module_defs(tree.body).items()}
         self._rebound[''] = set(self._module_rebinds)
         annotations, self._sec_writes = _scan_tree(tree)
         self._collect_imports(tree)
@@ -1641,6 +1662,13 @@ class _Inference:
             self._bind_params(node, params, quals)
             self._function_body(node.body)
             declared = annotation_type(node.returns, self._classes)
+            if declared != UNKNOWN:
+                # A caller reads the call as the declared type and converts nothing,
+                # so a typeless na returned here goes out as that type's na
+                kind = _na_widen(declared)
+                for stmt in self._returns(node):
+                    if stmt.value is not None and self._ty_of(stmt.value) == TYPELESS:
+                        self._record_widen(stmt.value, kind)
             result.ret = declared if declared != UNKNOWN else self._return_type(node)
             result.ret_qual = self._return_qual(node)
             self._flush_pending()
@@ -2589,7 +2617,16 @@ class _Inference:
         self._diag(message, node, self._unknown(reason, node, detail), fix=fix)
 
     def _e_binop(self, node: ast.BinOp) -> str:
-        return binop_type(node.op, self._expr(node.left), self._expr(node.right))
+        left = self._expr(node.left)
+        right = self._expr(node.right)
+        result = binop_type(node.op, left, right)
+        # A typeless na operand takes the other operand's type (``binop_type``), so it
+        # is the na of that type: ``na * x`` of a float is the float na, not the
+        # typeless one the na object's own arithmetic would hand on
+        for operand, operand_ty in ((node.left, left), (node.right, right)):
+            if operand_ty == TYPELESS:
+                self._record_widen(operand, _na_widen(result))
+        return result
 
     def _e_unaryop(self, node: ast.UnaryOp) -> str:
         return unaryop_type(node.op, self._expr(node.operand))
@@ -2613,10 +2650,11 @@ class _Inference:
         body = self._expr(node.body)
         orelse = self._expr(node.orelse)
         joined = self._joined(body, orelse, node, 'the ternary')
-        # A typeless na arm next to a string is the string na
+        # A typeless na arm next to a string is the string na, next to a number the
+        # numeric na
         for arm, arm_ty in ((node.body, body), (node.orelse, orelse)):
             if arm_ty == TYPELESS:
-                self._record_widen(arm, WIDEN_STRING_NA if joined == STR else None)
+                self._record_widen(arm, _na_widen(joined))
         return joined
 
     def _e_namedexpr(self, node: ast.NamedExpr) -> str:
@@ -2780,6 +2818,15 @@ class _Inference:
             self._record_window(node, callee)
         if isinstance(entry, dict):
             self._record_lib_na_args(callee, entry, node.args, node.keywords)
+        positions = _FILL_POSITIONS.get(callee)
+        if positions is not None and (is_array(ty) or is_matrix(ty)) \
+                and element_of(ty) in NUMERIC:
+            # The value a numeric container is filled with goes in as one of its
+            # elements: a typeless na there is the numeric na, the same NaN the
+            # constructor fills it with when the value is left out
+            for arg in _element_args(callee, node, positions):
+                if self._ty_of(arg) == TYPELESS:
+                    self._record_widen(arg, WIDEN_NUMBER_NA)
         return ty
 
     def _record_lib_na_args(self, callee: str, entry: dict[str, Any], args: Sequence[ast.expr],
@@ -3055,9 +3102,7 @@ class _Inference:
         :param kind: What this context decided (``WIDEN_*``, ``_WIDEN_HARMLESS``),
                      or None when the value must stay as it is
         """
-        if kind in (WIDEN_STRING_NA, WIDEN_NA_TEXT) and not _is_na_literal(node):
-            # Only Pine's own ``na`` is replaced by a text: a typeless parameter or
-            # the dynamic-default marker holds a value of its own
+        if kind in (WIDEN_STRING_NA, WIDEN_NUMBER_NA, WIDEN_NA_TEXT) and not _holds_na(node):
             kind = None
         nid = node_id(node)
         if nid is None:
@@ -3157,40 +3202,39 @@ class _Inference:
         spelling of ``matrix.new<float>(1, 1, -3)``, whose template it cannot
         emit -- reads as a matrix of ints. The declaration is the template: the
         int initial value is converted to the float the container holds, and
-        the constructor builds the declared type.
+        the constructor builds the declared type. A typeless ``na`` initial value
+        (``matrix.new<float>(2, 2, na)``) is the na of the declared element type.
 
-        A typeless ``na`` assigned to a string is the string na, the empty string.
+        A typeless ``na`` assigned to a string is the string na, the empty string;
+        assigned to a float or an int, it is the numeric na, NaN.
 
         :param declared: The declared type of the target
         :param value: The assigned value
         :param value_ty: The type the value was inferred to
-        :return: ``declared`` when the value is such a constructor or a string na,
+        :return: ``declared`` when the value is such a constructor or a typed na,
                  else ``value_ty``
         """
         if value_ty == TYPELESS:
-            self._record_widen(value, WIDEN_STRING_NA if declared == STR else None)
-            return STR if declared == STR and _is_na_literal(value) else value_ty
-        if value_ty == declared or element_of(declared) != FLOAT \
-                or element_of(value_ty) != INT or not isinstance(value, ast.Call) \
+            kind = _na_widen(declared)
+            self._record_widen(value, kind)
+            return declared if kind is not None and _holds_na(value) else value_ty
+        held = element_of(value_ty)
+        if value_ty == declared or not isinstance(value, ast.Call) \
+                or not ((held == INT and element_of(declared) == FLOAT)
+                        or (held == TYPELESS and _na_widen(element_of(declared)) is not None)) \
                 or not ((is_array(declared) and is_array(value_ty))
                         or (is_matrix(declared) and is_matrix(value_ty))):
             return value_ty
         callee = self._lib_name(value.func)
         positions = _CONSTRUCTOR_ELEMENTS.get(callee) if callee is not None else None
-        if positions is None:
+        if callee is None or positions is None:
             return value_ty
-        if positions == ():
-            elements = [arg for arg in value.args if not isinstance(arg, ast.Starred)]
-        else:
-            entry = lib_types().get(callee)
-            names = entry.get('names') if isinstance(entry, dict) else None
-            if names is None:
-                names = OVERRIDE_PARAM_NAMES.get(callee)
-            elements = [arg for arg in (_bound_arg(value.args, value.keywords, at, names)
-                                        for at in positions) if arg is not None]
-        for arg in elements:
-            if self._ty_of(arg) == INT:
+        for arg in _element_args(callee, value, positions):
+            arg_ty = self._ty_of(arg)
+            if arg_ty == INT:
                 self._record_widen(arg, WIDEN_FLOAT)
+            elif arg_ty == TYPELESS:
+                self._record_widen(arg, _na_widen(element_of(declared)))
         nid = node_id(value)
         if nid is not None:
             self._ty[nid] = declared
@@ -3833,16 +3877,16 @@ class _Inference:
         and now the receiver's TYPE carries it: an ``array<int>`` sends
         ``'get'`` to ``array.get`` and answers int, a ``Box`` sends
         ``'get_top'`` to ``box.get_top``, and a UDT sends the name to the
-        method its own class declares. The receiver decides, exactly as the
-        runtime's own dispatch does -- and in its order, which puts the BUILTIN
-        namespace the receiver's shape reaches ahead of everything a script
-        declared (``core/pine_method.method_call`` calls
+        library export the runtime's search reaches. The receiver decides,
+        exactly as the runtime's own dispatch does -- and in its order, which
+        puts the BUILTIN namespace the receiver's shape reaches ahead of
+        everything a script declared (``core/pine_method.method_call`` calls
         ``_get_builtin_method`` first, in both of its branches).
 
-        Two shapes reach here. The compiled form spells a USER method by the
-        function itself (``method_call(bump, x, 1)``) and a builtin one by its
-        name (``method_call('get', a, 0)``); a name is only a user method's
-        when the receiver's class declares it.
+        Two shapes reach here. The compiled form spells a LOCAL method by the
+        function itself (``method_call(bump, x, 1)``), and a builtin or a
+        library one by its name (``method_call('get', a, 0)``); a name reaches
+        a user method only through a library's ``Exported`` proxy.
 
         Where the receiver's class is not known the old rule still stands: the
         answer is claimed only where every builtin namespace the name could
@@ -3870,11 +3914,15 @@ class _Inference:
             return self._builtin_method(f'{namespace}.{name}', node, args)
         cid = class_of(receiver_ty)
         if cid is not None:
-            found = self._method_result(cid, name, node, args)
-            if found is not None:
-                return found
+            # No other builtin namespace is ever asked for an object of a known
+            # class: ``_get_builtin_method`` answers only from the receiver's own
+            return self._method_result(cid, name, node, args)
         if self._resolve_func(name, node) is not None:
             return None
+        if _reaches_library_methods(receiver_ty, name):
+            published = self._library_method(name, node)
+            if published is not None:
+                return self._published_result(published, name, node, args)
         returns: list[str] = []
         for candidate in _METHOD_NAMESPACES:
             entry = lib_types().get(f'{candidate}.{name}')
@@ -4015,11 +4063,41 @@ class _Inference:
                 f"here, so its method '{spelled}' has no type", node, 'unknown-class', spelled,
                 fix='annotate the receiver with the type it holds')
             return UNKNOWN
+        cid = class_of(receiver_ty)
+        if isinstance(selector, ast.Constant) and cid is not None \
+                and self._declares_method(cid, spelled, node):
+            self._node_diag(
+                f"'{spelled}' is declared on {render_ty(receiver_ty)}, but no export the "
+                f"runtime searches by name holds it", node, 'unknown-method', spelled,
+                fix=f"pass the method itself: 'method_call({spelled}, ...)'")
+            return UNKNOWN
         self._node_diag(
             f"'{spelled}' is not a method of {render_ty(receiver_ty)} here", node,
             'unknown-method', spelled,
             fix=f"declare '{spelled}' on the receiver's class, or call a method its shape has")
         return UNKNOWN
+
+    def _declares_method(self, cid: str, name: str, node: ast.AST) -> bool:
+        """
+        Whether a module within reach declares a ``@method`` of that name on a class.
+
+        :param cid: The class id
+        :param name: The method name
+        :param node: The node the question is asked for, for the cycle diagnostic
+        :return: True when this module, the class's own one or an import declares one
+        """
+        if name in self._class_methods.get(cid, ()):
+            return True
+        sig = self._class_sig(cid, node)
+        if sig is not None and name in sig.methods:
+            return True
+        for _, binding in self._import_sources():
+            # ``import m`` names the module itself, ``from m import x`` a name in it
+            for hops in {binding.attrs, binding.attrs[:-1]}:
+                interface = self._interface_of(binding.module, hops, node)
+                if interface is not None and name in interface.extensions.get(cid, {}):
+                    return True
+        return False
 
     def _imported_selector(self, spelled: str) -> tuple[_Import, tuple[str, ...]] | None:
         """
@@ -4122,20 +4200,23 @@ class _Inference:
     def _method_result(self, cid: str, name: str, node: ast.Call,
                        args: Sequence[ast.expr]) -> str | None:
         """
-        Type one call to a method of a known class.
+        Type one call to a method of a known class, spelled by its name.
 
-        A method this module declares is analysed like any other call, with
-        the RECEIVER bound to its first parameter -- which is what makes
-        ``this.price`` inside it read the class's own field type. One a
-        dependency declares is typed from what that module publishes, the same
-        way an imported function is.
+        The runtime's own search (``core/pine_method.method_call``), past the
+        receiver's builtin namespace: the receiver object answers first, with a
+        field or with what ``@udt`` gives every class, and the exports only
+        after it. Of those, the module that DECLARES the receiver's class comes
+        first, whatever it is named, and then the caller's globals and the
+        ``lib.*`` libraries among them -- the search a receiver without a class
+        gets too (``_library_method``). A library may declare a method on
+        another library's UDT, so the search does not stop at the class's own
+        module.
 
-        Three modules may hold a method of this name, and the order between
-        them is the runtime's (``core/pine_method.method_call``): the module
-        that DECLARES the receiver's class first, then the calling module
-        itself, then every library the caller imports -- a library may declare
-        a method on another library's UDT, so the search does not stop at the
-        class's own module.
+        Only an ``Exported`` proxy answers a name, so a ``@method`` is reached
+        this way only where its module exports it. A compiled script spells a
+        call to its own method by the function itself; a plain ``@method``
+        called by name ends in "No such method", whether this module, the
+        class's own one or a library declares it.
 
         :param cid: The receiver's class id
         :param name: The method name
@@ -4144,23 +4225,24 @@ class _Inference:
         :return: The type the call evaluates to, or None when there is none
         """
         sig = self._class_sig(cid, node)
-        published = None if sig is None else sig.methods.get(name)
-        if published is not None and cid not in self.table.class_sigs:
-            # Declared by the class's own module, which the runtime reaches
-            # before it looks at anything of ours
-            return self._published_result(published, name, node, args)
-        if name in self._class_methods.get(cid, ()):
-            resolved = self._resolve_func(name, node)
-            if resolved is not None:
-                key, frame, shadowed = resolved
-                if not shadowed and key not in self._overload_groups:
-                    return self._call_context(key, node, frame, args, record=False)
-        if published is not None:
-            return self._published_result(published, name, node, args)
-        extension = self._imported_extension(cid, name, node)
-        if extension is None:
+        source = cid.rpartition(CLASS_SEP)[0]
+        builtin = not source or source == LIB_MODULE
+        if sig is None or name.startswith('_') or name in sig.fields \
+                or (not builtin and name in _UDT_ATTRS):
+            # The receiver's own attribute, which the runtime calls before it
+            # looks for an export at all
             return None
-        return self._published_result(extension, name, node, args)
+        home = None
+        if not builtin and cid not in self.table.class_sigs:
+            # This module's own globals are the caller's, which the search
+            # asks next anyway; a builtin class's module exports nothing
+            home = self._interface_at(source, source, node)
+            if home is None:
+                return None
+        published = self._library_method(name, node, home)
+        if published is None:
+            return None
+        return self._published_result(published, name, node, args)
 
     def _published_result(self, sig: ExportSig, name: str, node: ast.Call,
                           args: Sequence[ast.expr]) -> str:
@@ -4170,7 +4252,9 @@ class _Inference:
         The receiver is the first positional argument of the published
         signature, and the call is held to that signature the way any call
         into another module is; the declared return is the answer only
-        where the parameters are annotated.
+        where the parameters are annotated. A method spelled by name is never
+        pinned (the runtime selects from the values), so a group answers only
+        where its implementations agree on the return.
 
         :param sig: The published signature
         :param name: The method name
@@ -4180,62 +4264,82 @@ class _Inference:
         """
         if not self._export_call_fits(node, name, sig, args):
             return UNKNOWN
+        if sig.kind == 'group':
+            return overload_result([impl.ret for impl in sig.impls])
         return sig.ret if sig.annotated else UNKNOWN
 
-    def _imported_extension(self, cid: str, name: str, node: ast.AST) -> ExportSig | None:
+    def _library_method(self, name: str, node: ast.Call,
+                        home: ModuleInterface | None = None) -> ExportSig | None:
         """
-        A method one of the imported modules declares on another's class.
+        The library export a method called by name reaches.
 
-        The last place the runtime looks: after the receiver's own module and
-        the caller's globals it scans the library MODULES it finds in those
-        globals, because one library extending another's UDT is a shape Pine
-        allows.
+        The runtime's own search (``core/pine_method.method_call``), in its order:
+        the module that declares the receiver's class, when it has one, then the
+        caller's global of that name, then every library module among the
+        caller's globals -- the ones named ``lib.*`` -- in the order they are
+        bound, and the whole search once more under PyneComp's ``__ren__``
+        spelling. Only the last step asks for a module's name. Only an
+        ``Exported`` proxy answers any of them (``ModuleInterface.proxies``); a
+        plain function, a module object or a merged namespace bound under the
+        name is passed by, and a merged namespace answers only what it took over
+        from its library.
 
-        Which modules those are is what the import spelling decides, and it is
-        not every module named in one: ``import ext`` and ``from pkg import
-        mod`` put a module object there, while ``from ext import helper`` puts
-        one name there and leaves the rest of ``ext`` out of reach. A binding
-        of that second kind answers only for the selector it is bound as.
+        A global bound more than once holds whatever was stored last, so the
+        search cannot be followed past one -- nor past a value the module stores
+        under the name itself, its own proxy included, or a ``def`` of the name,
+        which is a store like any other; a library that cannot be read could
+        hold the answer, so the search cannot be followed past that either.
 
-        And it is the globals as they STAND that are searched: a name the
-        module assigns to holds that value instead of the import. A local of
-        the calling scope is another matter -- the search is over
-        ``f_globals``, which a local never reaches into.
-
-        :param cid: The receiver's class id
         :param name: The method name
-        :param node: The node the question is asked for, for the cycle diagnostic
-        :return: The published signature, or None when no import declares one
+        :param node: The ``method_call`` node, for the dependencies it creates
+        :param home: The interface of the module that declares the receiver's
+                     class, when that is another module
+        :return: The published signature, or None when no import answers or the
+                 answer cannot be known
         """
-        for bound, binding in self._import_sources():
-            if bound in self._multi_imports or self._import_rebound(bound):
-                # The globals hold whatever was stored last, and what a second
-                # import or an assignment stored is not this library -- an
-                # alias assigned over is not even a module any more, so the
-                # runtime's scan passes it by
-                continue
-            interface = self._interface_of(binding.module, binding.attrs, node)
-            if interface is not None:
-                # ``import m``, ``import m as x`` and ``from pkg import mod``
-                # all put a MODULE in the caller's globals, which is what the
-                # runtime scans for a method it has not found anywhere else
-                found = interface.extensions.get(cid, {}).get(name)
-                if found is not None:
-                    return found
-                continue
-            if not binding.attrs or bound != name:
-                # ``from m import helper`` binds a NAME, not the module: the
-                # rest of what ``m`` declares never reaches these globals, so
-                # such a binding answers only for the selector it is bound as
-                continue
-            interface = self._interface_of(binding.module, binding.attrs[:-1], node)
-            if interface is None:
-                continue
-            # The alias is what the selector matched; the extension is keyed by
-            # the name it was declared under
-            found = interface.extensions.get(cid, {}).get(binding.attrs[-1])
-            if found is not None:
-                return found
+        sources = self._import_sources()
+        for lookup in (name, name + '__ren__'):
+            if home is not None and lookup in home.proxies:
+                return home.exports.get(lookup)
+            if lookup in self._multi_imports or self._import_rebound(lookup) \
+                    or (lookup in self._module_def_positions
+                        and (lookup in self._imports or lookup in self._shadowed)):
+                return None
+            for bound, binding in sources:
+                if bound != lookup or bound in self._shadowed:
+                    continue
+                if not binding.attrs:
+                    continue
+                if self._interface_of(binding.module, binding.attrs, node) is not None:
+                    # ``from pkg import mod`` binds a module object
+                    continue
+                owner = self._interface_of(binding.module, binding.attrs[:-1], node)
+                if owner is None:
+                    return None
+                if binding.attrs[-1] in owner.proxies:
+                    return owner.exports.get(binding.attrs[-1])
+            for bound, binding in sources:
+                if bound in self._multi_imports or self._import_rebound(bound) \
+                        or bound in self._module_def_positions:
+                    # What was stored last stands where the name was first stored,
+                    # so it may be the library this scan reaches first
+                    return None
+                if not '.'.join((binding.module,) + binding.attrs).startswith('lib.'):
+                    continue
+                interface = self._interface_of(binding.module, binding.attrs, node)
+                if interface is None:
+                    if binding.attrs and self._interface_of(
+                            binding.module, binding.attrs[:-1], node) is not None:
+                        # ``from m import helper`` binds a name, not a module
+                        continue
+                    return None
+                if lookup not in interface.proxies:
+                    continue
+                if bound in self._shadowed and lookup not in (
+                        interface.all if interface.all is not None
+                        else [n for n in interface.exports if not n.startswith('_')]):
+                    continue
+                return interface.exports.get(lookup)
         return None
 
     def _import_sources(self) -> list[tuple[str, _Import]]:
@@ -4250,7 +4354,11 @@ class _Inference:
         import like any other -- what it wraps is the module whose methods
         matter here.
 
-        :return: (the name it binds, what it names), in the order recorded
+        The order is the one the runtime's search walks the globals in: a name
+        takes its place at its FIRST store, which a rebinding never moves, and
+        which an assignment or a ``def`` above the import moves up.
+
+        :return: (the name it binds, what it names), in the order of the globals
         """
         out: list[tuple[str, _Import]] = []
         seen: set[tuple[str, str, tuple[str, ...]]] = set()
@@ -4261,7 +4369,13 @@ class _Inference:
                 continue
             seen.add(key)
             out.append((name, binding))
-        return out
+
+        def first_store(source: tuple[str, _Import]) -> tuple[int, int]:
+            stores = [position for position, _ in self._module_rebinds.get(source[0], ())] \
+                + self._module_def_positions.get(source[0], [])
+            return min(stores) if stores else (0, 0)
+
+        return sorted(out, key=first_store)
 
     def _security_read(self, node: ast.Call) -> str:
         """
@@ -4481,9 +4595,9 @@ class _Inference:
                                     f"'{arg.arg}', {render_ty(given)} passed")
                     return None
                 if report and given == TYPELESS:
-                    # A typeless na passed (or defaulted) to a string is the string na
-                    self._record_widen(given_node,
-                                       WIDEN_STRING_NA if annotated == STR else None)
+                    # A typeless na passed (or defaulted) to a string is the string na,
+                    # to a float or an int the numeric na
+                    self._record_widen(given_node, _na_widen(annotated))
                 out.append(annotated)
             elif passed is None:
                 out.append(self._ty_of(default))
@@ -4492,7 +4606,7 @@ class _Inference:
             else:
                 joined = join(self._ty_of(default), self._ty_of(passed))
                 if report and self._ty_of(passed) == TYPELESS:
-                    self._record_widen(passed, WIDEN_STRING_NA if joined == STR else None)
+                    self._record_widen(passed, _na_widen(joined))
                 out.append(joined)
         return tuple(out)
 
@@ -5103,6 +5217,35 @@ _CONSTRUCTOR_ELEMENTS: dict[str, tuple[int, ...]] = {
     'array.from_items': (),
 }
 
+#: Constructors that fill the container they build with one value, by its
+#: position; ``array.from`` places its items through its own override
+_FILL_POSITIONS: Final[dict[str, tuple[int, ...]]] = {
+    'array.new': (1,),
+    'array.new_float': (1,),
+    'array.new_int': (1,),
+    'matrix.new': (2,),
+}
+
+
+def _element_args(callee: str, call: ast.Call, positions: tuple[int, ...]) -> list[ast.expr]:
+    """
+    The arguments a container constructor places as elements.
+
+    :param callee: The constructor's registry key
+    :param call: The constructor call
+    :param positions: Where the elements are passed; ``()`` is every positional
+                      argument
+    :return: The element arguments the call passes
+    """
+    if positions == ():
+        return [arg for arg in call.args if not isinstance(arg, ast.Starred)]
+    entry = lib_types().get(callee)
+    names = entry.get('names') if isinstance(entry, dict) else None
+    if names is None:
+        names = OVERRIDE_PARAM_NAMES.get(callee)
+    return [arg for arg in (_bound_arg(call.args, call.keywords, at, names)
+                            for at in positions) if arg is not None]
+
 
 #: The map calls that look a key up: the key goes where a string-keyed map's keys
 #: are, so a typeless ``na`` key converts there the way it does in ``map.put``
@@ -5112,14 +5255,66 @@ _MAP_KEY_LOOKUPS: Final = frozenset({'map.get', 'map.contains', 'map.remove'})
 #: container as a float already, so converting it would change nothing
 _WIDEN_HARMLESS: Final = '='
 
-#: The spellings of Pine's typeless ``na`` in value position: the name itself, and
-#: what ``module_property`` rewrites it to
-_NA_LITERALS: Final = frozenset({'na', 'lib.na', '_na_none', 'lib._na_none'})
+def _holds_na(node: ast.AST) -> bool:
+    """
+    Whether a typeless value is Pine's typeless ``na``, which a conversion turns into
+    the na of the type it goes in as.
+
+    Every typeless value is, but the dynamic-default marker: that one stands for "no
+    argument passed", and the prologue that tests for it gives the parameter its real
+    default. A value other than the ``na`` literal itself (``is_na_literal``) -- a
+    defaulted parameter, a variable -- is converted at run time (``implicit_conversion``),
+    so a call site the analysis never saw, which passes a value of its own, gets that
+    value through.
+
+    :param node: A value the type pass found typeless
+    :return: True when a typed na may take its place
+    """
+    return not (isinstance(node, ast.Name) and node.id == _DYN_DEFAULT)
 
 
-def _is_na_literal(node: ast.AST) -> bool:
-    """Whether a value is Pine's typeless ``na`` itself."""
-    return isinstance(node, (ast.Name, ast.Attribute)) and _dotted(node) in _NA_LITERALS
+def _reaches_library_methods(receiver: str, name: str) -> bool:
+    """
+    Whether the runtime looks a method name up among the libraries' exports for a
+    receiver of this type, once the receiver's builtin namespace has answered no.
+
+    ``core/pine_method.method_call`` asks the receiver object for a Python
+    attribute of that name first -- every receiver but a Pine scalar. An array is a
+    ``list`` and a map a ``dict``, whose attributes answer before any library; a
+    matrix has no public attribute outside its builtin namespace. A receiver of no
+    known type could be any of them, and an object's class decides on its own.
+
+    :param receiver: The receiver's type
+    :param name: The method name
+    :return: True when the libraries are where the name is looked up
+    """
+    if receiver in _SCALAR_RECEIVERS:
+        return True
+    if name.startswith('_'):
+        return False
+    if is_array(receiver):
+        return name not in _LIST_ATTRS
+    if is_map(receiver):
+        return name not in _DICT_ATTRS
+    return is_matrix(receiver)
+
+
+def _na_widen(ty: str) -> str | None:
+    """
+    The conversion a typeless ``na`` literal needs where a value of a type goes.
+
+    Pine has no typeless na at run time: where a string goes it is the string na,
+    where a float or an int goes the numeric na. Anywhere else (a bool, an object,
+    a type this pass does not know) it stays as it is.
+
+    :param ty: The type the na takes there
+    :return: ``WIDEN_STRING_NA``, ``WIDEN_NUMBER_NA`` or None
+    """
+    if ty == STR:
+        return WIDEN_STRING_NA
+    if ty in NUMERIC:
+        return WIDEN_NUMBER_NA
+    return None
 
 
 def _widen_for(kind: str, element: str, other: str) -> str | None:
@@ -5137,12 +5332,12 @@ def _widen_for(kind: str, element: str, other: str) -> str | None:
     :param element: The container's element (or map value) type
     :param other: The value's type
     :return: ``WIDEN_FLOAT``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX``, ``_WIDEN_HARMLESS``
-             when the value is a float (or holds floats) already, ``WIDEN_STRING_NA`` for
-             a typeless na element of a string container, or None
+             when the value is a float (or holds floats) already, ``WIDEN_STRING_NA`` /
+             ``WIDEN_NUMBER_NA`` for a typeless na element of a string / numeric
+             container, or None
     """
-    if element == STR:
-        return WIDEN_STRING_NA if kind in ('array', 'map', 'matrix') and other == TYPELESS \
-            else None
+    if other == TYPELESS:
+        return _na_widen(element) if kind in ('array', 'map', 'matrix') else None
     if element != FLOAT:
         return None
     if kind in ('array', 'map', 'matrix'):

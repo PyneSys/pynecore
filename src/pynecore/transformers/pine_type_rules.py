@@ -39,7 +39,8 @@ __all__ = [
     'constant_type', 'stamp_lowering', 'BUILTIN_CALL_TYPES', 'BUILTIN_NAME_TYPES',
     'PIN_ATTR', 'PINS_ATTR', 'PINNABLE', 'PIN_CONTAINERS', 'PIN_ANY', 'get_pin', 'set_pin', 'get_pins', 'set_pins',
     'VECTOR_ATTR', 'VARYING_ATTR', 'get_vector', 'set_vector', 'get_varying', 'set_varying',
-    'WIDEN_ATTR', 'WIDEN_FLOAT', 'WIDEN_ITEMS', 'WIDEN_MATRIX', 'WIDEN_STRING_NA', 'WIDEN_NA_TEXT',
+    'WIDEN_ATTR', 'WIDEN_FLOAT', 'WIDEN_ITEMS', 'WIDEN_MATRIX', 'WIDEN_STRING_NA', 'WIDEN_NUMBER_NA',
+    'WIDEN_NA_TEXT', 'NA_LITERALS', 'is_na_literal',
     'NA_TEXT_PARAMS', 'NOT_PINE_STRINGS', 'get_widen',
     'set_widen', 'WIDEN_SITE_ATTR', 'WIDENS_ATTR', 'get_widen_site', 'set_widen_site',
     'get_widens', 'set_widens',
@@ -75,8 +76,8 @@ VECTOR_ATTR: Final = '_pine_vector'
 VARYING_ATTR: Final = '_pine_varying'
 
 #: Attribute a value carries when Pine converts it implicitly where it goes: an
-#: int into a float-element container, a typeless ``na`` into a string (see
-#: ``implicit_conversion.py``). Present only where every context agrees on it.
+#: int into a float-element container, a typeless ``na`` into a string or a number
+#: (see ``implicit_conversion.py``). Present only where every context agrees on it.
 WIDEN_ATTR: Final = '_pine_widen'
 
 #: The value is one int element: it is converted to float
@@ -88,13 +89,24 @@ WIDEN_ITEMS: Final = 'a'
 #: The value is an int matrix whose elements are copied in: they are converted
 WIDEN_MATRIX: Final = 'm'
 
-#: The value is a typeless ``na`` literal that goes where a string goes: it is the
-#: string na, the empty string
+#: The value is a typeless ``na`` that goes where a string goes: it is the string na,
+#: the empty string
 WIDEN_STRING_NA: Final = 's'
 
-#: The value is a typeless ``na`` literal passed as compile-time text of the study
+#: The value is a typeless ``na`` that goes where a float or an int goes: it is the
+#: numeric na, NaN (what ``NA(float)`` and ``NA(int)`` both are)
+WIDEN_NUMBER_NA: Final = 'n'
+
+#: The value is a typeless ``na`` passed as compile-time text of the study
 #: (``NA_TEXT_PARAMS``): TradingView writes it out as the text ``na``
 WIDEN_NA_TEXT: Final = 't'
+
+#: The spellings of Pine's typeless ``na`` in value position: the name itself, and
+#: what ``module_property`` rewrites it to. One of these, signed or not, is replaced by
+#: the na it is converted to; any other value that holds the typeless na -- a defaulted
+#: parameter, a variable -- is converted at run time, which leaves every other value as
+#: it is
+NA_LITERALS: Final = frozenset({'na', 'lib.na', '_na_none', 'lib._na_none'})
 
 #: The parameters whose value TradingView compiles into the study's metadata rather
 #: than evaluating at run time, per lib callee. A typeless ``na`` there is not the
@@ -243,8 +255,8 @@ def get_widen(node) -> str | None:
     Read the implicit conversion a value needs where it goes.
 
     :param node: The value node
-    :return: ``WIDEN_FLOAT``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX``, ``WIDEN_STRING_NA`` or
-             ``WIDEN_NA_TEXT``, or None
+    :return: ``WIDEN_FLOAT``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX``, ``WIDEN_STRING_NA``,
+             ``WIDEN_NUMBER_NA`` or ``WIDEN_NA_TEXT``, or None
     """
     return getattr(node, WIDEN_ATTR, None)
 
@@ -256,7 +268,7 @@ def set_widen(node, kind: str | None):
 
     :param node: The value node
     :param kind: ``WIDEN_FLOAT``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX``, ``WIDEN_STRING_NA``,
-                 ``WIDEN_NA_TEXT`` or None
+                 ``WIDEN_NUMBER_NA``, ``WIDEN_NA_TEXT`` or None
     :return: ``node``
     """
     setattr(node, WIDEN_ATTR, kind)
@@ -978,6 +990,9 @@ BUILTIN_CALL_TYPES: Final[dict[str, object]] = {
     # ``inline_series(expr, n)`` is ``expr[n]``, type-preserving
     'pine_loop': PINE_LOOP,
     'inline_series': 'arg0',
+    # ``core/pine_udt.udt_copy``: what ``x.copy()`` of a user type compiles to.
+    # The copy is of the value's own type
+    'udt_copy': 'arg0',
     # ``core/pine_export.Exported()``: the module-level proxy a compiled
     # library binds every export to, which ``@export`` fills in at run time.
     # A callable reference, like a bare function name
@@ -1760,6 +1775,19 @@ def _param_defaults(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, a
     return out
 
 
+def is_na_literal(node: ast.AST) -> bool:
+    """
+    Whether a value spells Pine's typeless ``na``: the name itself (``NA_LITERALS``), a
+    signed one included -- the na object's negation hands the na itself back.
+
+    :param node: An expression
+    :return: True when the value is the typeless na whatever runs
+    """
+    while isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        node = node.operand
+    return isinstance(node, (ast.Name, ast.Attribute)) and _dotted(node) in NA_LITERALS
+
+
 def _dotted(node: ast.expr) -> str | None:
     """Render a dotted name expression, or None when it is not one."""
     parts: list[str] = []
@@ -1865,6 +1893,9 @@ LIB_TYPE_OVERRIDES: Final[dict[str, object]] = {
     # declared type -- so joining it with a type must yield that type, not the
     # UNKNOWN a void would give
     '_na_none': TYPELESS,
+    # The numeric na a typeless ``na`` becomes where a float or an int goes
+    # (``implicit_conversion``)
+    '_na_float': FLOAT,
     # MEASURED: ``int a = ta.change(bar_index)``, ``float b = ta.change(close)``
     # and ``bool c = ta.change(close > open)`` all compile, so the result is the
     # source's own type

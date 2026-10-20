@@ -26,6 +26,8 @@ types in Pine's own spelling -- never a silent widening to "some object",
 which would throw away exactly the element type the next read needs.
 """
 import ast
+import dataclasses
+import importlib
 import json
 import os
 import sys
@@ -486,7 +488,10 @@ by_name = method_call('bump', p, 1.0)
 '''
     _, table = _infer(source)
     types = {name: binding.ty for name, binding in table.bindings[''].items()}
-    assert types['direct'] == types['by_ref'] == types['by_name'] == INT
+    assert types['direct'] == types['by_ref'] == INT
+    # By its NAME the runtime reaches only an ``Exported`` proxy, which a plain
+    # ``@method`` is not: that call ends in "No such method"
+    assert types['by_name'] == UNKNOWN
 
     sig = table.class_sigs[class_id('test', 'Pivot')]
     assert sig.fields == {'price': FLOAT, 'idx': INT, 'tag': STR}
@@ -618,8 +623,9 @@ free_by_name = method_call('tag', b)
 free_by_ref = method_call(tag, b)
 ''')
     assert (types['by_name'], types['by_ref']) == (VOID, VOID)
-    # ... while a name the namespace does NOT have is the user's, in both forms
-    assert (types['free_by_name'], types['free_by_ref']) == (STR, STR)
+    # ... while a name the namespace does NOT have is the user's -- through the
+    # function itself, since by name only a library's export proxy is reached
+    assert (types['free_by_name'], types['free_by_ref']) == (UNKNOWN, STR)
 
 
 # --- 5. containers ---------------------------------------------------------
@@ -935,10 +941,12 @@ def main(flag: bool):
 SHAPED_LIB = '''"""
 @pyne
 """
+from pynecore.core.pine_export import Exported, export
 from pynecore.core.pine_method import method
 from pynecore.core.pine_udt import udt
 
 __all__ = ['Settings', 'build', 'bump']
+bump = Exported()
 
 
 @udt
@@ -951,6 +959,7 @@ def build() -> Settings:
     return Settings(10, [])
 
 
+@export
 @method
 def bump(self: Settings, amt: int) -> int:
     self.depth += amt
@@ -1087,7 +1096,8 @@ def take(a: shp_coll_one.Settings, b: shp_coll_two.Settings):
 
 #: A library that declares a UDT, and one that declares a METHOD on it. Pine
 #: lets a library extend another library's type, and the runtime finds such a
-#: method by searching the modules the script imports.
+#: method by searching the ``lib.*`` modules the script imports for an
+#: ``Exported`` proxy -- the shape PyneComp compiles an exported method to.
 BASE_LIB = '''"""
 @pyne
 """
@@ -1105,22 +1115,27 @@ def build() -> Pivot:
     return Pivot(1.0)
 '''
 
+#: What a module declaring an exported method imports
+_METHOD_IMPORTS = ('from pynecore.core.pine_export import Exported, export\n'
+                   'from pynecore.core.pine_method import method\n')
+
 EXTENSION_LIB = '''"""
 @pyne
 """
-from pynecore.core.pine_method import method
-from shp_ext_base import Pivot
+''' + _METHOD_IMPORTS + '''from shp_ext_base import Pivot
 
 __all__ = ['tag']
+tag = Exported()
 
 
+@export
 @method
 def tag(self: Pivot, extra: int) -> str:
     return "x"
 '''
 
 
-def __test_a_library_may_extend_another_librarys_class__(tmp_path, monkeypatch):
+def __test_a_library_may_extend_another_librarys_class__(tmp_path, _lib_package):
     """
     The receiver's class is not always where its methods live.
 
@@ -1130,14 +1145,13 @@ def __test_a_library_may_extend_another_librarys_class__(tmp_path, monkeypatch):
     part of what the declaring module publishes, and a third module calling it
     resolves through that.
     """
-    monkeypatch.syspath_prepend(tmp_path)
     base = _write(tmp_path, 'shp_ext_base', BASE_LIB)
-    extension = _write(tmp_path, 'shp_ext_lib', EXTENSION_LIB)
+    extension = _write(_lib_package, 'ext', EXTENSION_LIB)
     app = _write(tmp_path, 'shp_ext_app', '''"""
 @pyne
 """
 from pynecore.core.pine_method import method_call
-import shp_ext_lib
+import lib.shp_named.ext as ext
 from shp_ext_base import Pivot, build
 
 p: Pivot = build()
@@ -1160,7 +1174,12 @@ tagged = method_call('tag', p, 1)
 
 
 def __test_a_local_method_on_an_imported_class_is_an_extension__(tmp_path, monkeypatch):
-    """The calling module may declare one too, and it publishes it the same way"""
+    """
+    The calling module may declare one too, and it publishes it the same way.
+
+    A call reaches it through the function itself: by name the runtime asks for
+    an ``Exported`` proxy, and a plain ``@method`` is none.
+    """
     monkeypatch.syspath_prepend(tmp_path)
     base = _write(tmp_path, 'shp_loc_base', BASE_LIB.replace('shp_ext_base', 'shp_loc_base'))
     app = _write(tmp_path, 'shp_loc_app', '''"""
@@ -1176,7 +1195,8 @@ def scale(self: Pivot, by: int) -> bool:
 
 
 p: Pivot = build()
-scaled = method_call('scale', p, 2)
+scaled = method_call(scale, p, 2)
+by_name = method_call('scale', p, 2)
 ''')
 
     _, table = _analysed(app)
@@ -1184,6 +1204,96 @@ scaled = method_call('scale', p, 2)
     cid = class_id(str(base.resolve()), 'Pivot')
     assert list(table.extensions[cid]) == ['scale']
     assert table.bindings['']['scaled'].ty == BOOL
+    assert table.bindings['']['by_name'].ty == UNKNOWN
+    # ... and the report says why, rather than asking for a declaration it has
+    assert [(diag.message, diag.fix) for diag in table.diags] == [(
+        "'scale' is declared on Pivot, but no export the runtime searches by name holds it",
+        "pass the method itself: 'method_call(scale, ...)'")]
+
+
+def _method_def(name: str, ret: str, value: str, proxy: bool = True) -> str:
+    """One ``@method`` on ``Pivot``, bound to an ``Exported`` proxy or left bare."""
+    bound = f'{name} = Exported()\n\n\n@export\n' if proxy else '\n'
+    return f'{bound}@method\ndef {name}(self: Pivot) -> {ret}:\n    return {value}\n'
+
+
+#: A method library on the base library's ``Pivot``, before its methods
+_METHOD_LIB_HEAD = '"""\n@pyne\n"""\n' + _METHOD_IMPORTS + 'from shp_ext_base import Pivot\n\n'
+
+#: The base library with methods of its own, appended after it
+_BASE_WITH_IMPORTS = BASE_LIB.replace(
+    'from pynecore.core.pine_udt import udt',
+    _METHOD_IMPORTS + 'from pynecore.core.pine_udt import udt') + '\n\n'
+
+_IMPORT_LIB = 'import lib.shp_named.ext as ext'
+
+
+@pytest.mark.parametrize("base,extension,module,imports,app_code,method,expected,outcome", [
+    # The compiled shape: a proxy in a ``lib.*`` library the script imports
+    (BASE_LIB, _method_def('tag', 'str', '"x"'), 'lib.shp_named.ext', _IMPORT_LIB, '',
+     'tag', STR, 'str'),
+    # The module scan reads only modules named ``lib.*`` ...
+    (BASE_LIB, _method_def('tag', 'str', '"x"'), 'shp_ext', 'import shp_ext as ext', '',
+     'tag', UNKNOWN, 'AssertionError'),
+    # ... while the caller's global of the name is asked whatever module it came from
+    (BASE_LIB, _method_def('tag', 'str', '"x"'), 'shp_ext', 'from shp_ext import tag', '',
+     'tag', STR, 'str'),
+    # A plain ``@method`` answers no name: in a library, in the class's own module,
+    # or in the caller -- whose own global the search passes by
+    (BASE_LIB, _method_def('tag', 'str', '"x"', proxy=False), 'lib.shp_named.ext',
+     _IMPORT_LIB, '', 'tag', UNKNOWN, 'AssertionError'),
+    (_BASE_WITH_IMPORTS + _method_def('tag', 'int', '1', proxy=False), '', 'lib.shp_named.ext',
+     _IMPORT_LIB, '', 'tag', UNKNOWN, 'AssertionError'),
+    (BASE_LIB, _method_def('tag', 'str', '"x"'), 'lib.shp_named.ext', _IMPORT_LIB,
+     '\n@method\ndef tag(self: Pivot) -> int:\n    return 1\n\n\n', 'tag', STR, 'str'),
+    # The class's own module is asked first, whatever it is named
+    (_BASE_WITH_IMPORTS + _method_def('tag', 'int', '1'), _method_def('tag', 'str', '"x"'),
+     'lib.shp_named.ext', _IMPORT_LIB, '', 'tag', INT, 'int'),
+    # The receiver object answers before any export: a field of its class ...
+    (BASE_LIB, _method_def('price', 'str', '"x"'), 'lib.shp_named.ext', _IMPORT_LIB, '',
+     'price', UNKNOWN, 'TypeError'),
+    # ... and what ``@udt`` gives every class
+    (BASE_LIB, _method_def('copy', 'str', '"x"'), 'lib.shp_named.ext', _IMPORT_LIB, '',
+     'copy', UNKNOWN, 'Pivot'),
+    # A builtin namespace is never asked for an object of a user class
+    (BASE_LIB, _method_def('tag', 'str', '"x"'), 'lib.shp_named.ext', _IMPORT_LIB, '',
+     'get_top', UNKNOWN, 'AssertionError'),
+], ids=['lib-proxy', 'outside-lib', 'name-import', 'plain-in-lib', 'plain-in-home',
+        'plain-in-caller', 'home-first', 'field', 'udt-attribute', 'builtin-name'])
+def __test_a_named_method_on_a_class_follows_the_runtime_search__(
+        tmp_path, _lib_package, base, extension, module, imports, app_code, method,
+        expected, outcome):
+    """
+    ``method_call('<name>', obj)`` on a user class is typed by what the runtime calls.
+
+    ``core/pine_method.method_call`` asks the receiver object first, and then
+    only for an ``Exported`` proxy: in the module that declares the class, as the
+    caller's global of that name, and in the ``lib.*`` modules among the
+    caller's globals. Reading every ``@method`` any import declared on the class
+    instead -- a module outside ``lib.*``, a bare ``@method`` no proxy binds --
+    typed calls that end in "No such method". Every case is run as well: a typed
+    call has to produce that type, an untyped one must not reach the export.
+    """
+    _write(tmp_path, 'shp_ext_base', base)
+    _write(tmp_path.joinpath(*module.split('.')[:-1]), module.split('.')[-1],
+           _METHOD_LIB_HEAD + extension)
+    app = _write(tmp_path, 'shp_search_app', '"""\n@pyne\n"""\n'
+                 'from pynecore.core.pine_method import method, method_call\n'
+                 + imports + '\n'
+                 'from shp_ext_base import Pivot, build\n\n'
+                 + app_code +
+                 'p: Pivot = build()\n'
+                 f"out = method_call('{method}', p)\n")
+
+    _, table = _analysed(app)
+
+    assert table.bindings['']['out'].ty == expected
+    importlib.invalidate_caches()
+    try:
+        ran = type(importlib.import_module('shp_search_app').out).__name__
+    except (AssertionError, TypeError) as error:
+        ran = type(error).__name__
+    assert ran == outcome
 
 
 def __test_a_field_type_change_moves_the_digest__(tmp_path):
@@ -1268,20 +1378,19 @@ def helper(value: int) -> int:
 '''
 
 
-def __test_a_name_import_does_not_expose_a_librarys_extensions__(tmp_path, monkeypatch):
+def __test_a_name_import_does_not_expose_a_librarys_extensions__(tmp_path, _lib_package):
     """
     A library is within reach of a method call only where the import bound it.
 
     ``core/pine_method.method_call`` searches the caller's globals for the
-    method, and then the MODULE objects it finds there -- so ``import ext``
-    puts everything ``ext`` declares within reach, while ``from ext import
+    method, and then the ``lib.*`` MODULE objects it finds there -- so ``import
+    ext`` puts everything ``ext`` exports within reach, while ``from ext import
     helper`` puts ``helper`` there and nothing else. Reading every import as
     access to the whole module typed a call that ends in "No such method" at
     run time.
     """
-    monkeypatch.syspath_prepend(tmp_path)
     base = _write(tmp_path, 'shp_f5_base', BASE_LIB)
-    _write(tmp_path, 'shp_f5_ext', EXTENSION_WITH_HELPER)
+    _write(_lib_package, 'f5_ext', EXTENSION_WITH_HELPER)
     cid = class_id(str(base.resolve()), 'Pivot')
 
     def tagged(name: str, imports: str, call: str) -> str:
@@ -1298,26 +1407,25 @@ def __test_a_name_import_does_not_expose_a_librarys_extensions__(tmp_path, monke
         return types['out']
 
     # A name import binds the name, not the library behind it
-    assert tagged('shp_f5_name', 'from shp_f5_ext import helper',
+    assert tagged('shp_f5_name', 'from lib.shp_named.f5_ext import helper',
                   "method_call('tag', p, 1)") == UNKNOWN
     # The selector itself IS in the globals, under both spellings of the call
-    assert tagged('shp_f5_sel', 'from shp_f5_ext import tag',
+    assert tagged('shp_f5_sel', 'from lib.shp_named.f5_ext import tag',
                   'method_call(tag, p, 1)') == STR
-    assert tagged('shp_f5_str', 'from shp_f5_ext import tag',
+    assert tagged('shp_f5_str', 'from lib.shp_named.f5_ext import tag',
                   "method_call('tag', p, 1)") == STR
     # A module import is what puts the whole library within reach
-    assert tagged('shp_f5_mod', 'import shp_f5_ext',
+    assert tagged('shp_f5_mod', 'import lib.shp_named.f5_ext as f5_ext',
                   "method_call('tag', p, 1)") == STR
 
 
 #: A library whose class carries a method of its own, and a wrapper that hands
 #: that class out without declaring -- or even re-exporting -- it. All the
 #: caller ever receives is the class id inside the factory's return type.
-BASE_WITH_METHOD = BASE_LIB.replace(
-    'from pynecore.core.pine_udt import udt',
-    'from pynecore.core.pine_method import method\n'
-    'from pynecore.core.pine_udt import udt') + '''
+BASE_WITH_METHOD = _BASE_WITH_IMPORTS + '''area = Exported()
 
+
+@export
 @method
 def area(self: Pivot, mult: int) -> int:
     return 1
@@ -1434,7 +1542,7 @@ free = method_call(t, b)
     assert types['free'] == STR
 
 
-def __test_a_rebound_import_is_no_longer_the_library__(tmp_path, monkeypatch):
+def __test_a_rebound_import_is_no_longer_the_library__(tmp_path, _lib_package):
     """
     What the globals hold AT THE CALL is what the runtime searches.
 
@@ -1445,9 +1553,8 @@ def __test_a_rebound_import_is_no_longer_the_library__(tmp_path, monkeypatch):
     never asking what became of the name typed such a call as though the
     library were still within reach.
     """
-    monkeypatch.syspath_prepend(tmp_path)
     base = _write(tmp_path, 'shp_f5_base', BASE_LIB)
-    _write(tmp_path, 'shp_f5_ext', EXTENSION_WITH_HELPER)
+    _write(_lib_package, 'f5_ext', EXTENSION_WITH_HELPER)
     cid = class_id(str(base.resolve()), 'Pivot')
 
     def tagged(name: str, imports: str) -> str:
@@ -1465,10 +1572,10 @@ def __test_a_rebound_import_is_no_longer_the_library__(tmp_path, monkeypatch):
 
     # The name the selector matched holds a number by the time the call runs
     assert tagged('shp_f5_reb_name',
-                  'from shp_f5_ext import tag\ntag = 0') == UNKNOWN
+                  'from lib.shp_named.f5_ext import tag\ntag = 0') == UNKNOWN
     # ... and an alias assigned over is not a module to be searched
     assert tagged('shp_f5_reb_mod',
-                  'import shp_f5_ext\nshp_f5_ext = 0') == UNKNOWN
+                  'import lib.shp_named.f5_ext as f5_ext\nf5_ext = 0') == UNKNOWN
 
 
 def __test_an_augmented_assignment_on_a_field_reads_the_field__():
@@ -2290,3 +2397,221 @@ def main():
                   if diag.origin is not None and diag.origin.reason == 'type-mismatch']
     assert [(diag.line, diag.col) for diag in mismatches] == [(10, 4), (11, 4)]
     assert all(diag.line for diag in table.diags)
+
+
+# --- library methods on a receiver without a class --------------------------
+
+#: A compiled library in the shape PyneComp emits: every export is an
+#: ``Exported()`` proxy its ``@export`` definition fills in, and ``plain`` is a
+#: module-level function bound under its own name, which no method call reaches.
+#: ``update`` is a method a map receiver's own ``dict`` answers first.
+NAMED_METHOD_LIB = '''"""
+@pyne
+"""
+from pynecore.core.overload import overload
+from pynecore.core.pine_export import Exported, export
+from pynecore.core.pine_method import method
+from pynecore.lib import script
+
+__all__ = ['replace', 'ceil', 'update', 'plain']
+replace = Exported()
+ceil = Exported()
+update = Exported()
+
+
+def plain(this: str) -> str:
+    return this
+
+
+@script.library(title='named')
+def main():
+    @export
+    @overload
+    @method
+    def replace(this: str, mapping: dict[str, str]) -> str:
+        return this
+
+    @export
+    @overload
+    @method
+    def replace(this: str, mapping: dict[str, float]) -> str:
+        return this
+
+    @export
+    @method
+    def ceil(this: float, digits: int) -> float:
+        return this
+
+    @export
+    @method
+    def update(this: dict[str, float]) -> int:
+        return 1
+'''
+
+
+@pytest.fixture
+def _lib_package(tmp_path, monkeypatch):
+    """A ``lib`` namespace package under ``tmp_path``: the runtime searches only the
+    library modules named ``lib.*`` for a method called by name"""
+    monkeypatch.syspath_prepend(tmp_path)
+    package = tmp_path / 'lib' / 'shp_named'
+    package.mkdir(parents=True)
+    before = set(sys.modules)
+    yield package
+    for name in set(sys.modules) - before:
+        if name == 'lib' or name.startswith('lib.'):
+            del sys.modules[name]
+
+
+def __test_a_named_method_on_a_scalar_or_container_reaches_the_library__(tmp_path, _lib_package):
+    """
+    ``method_call('replace', s, m)`` on a string runs the library's export.
+
+    A Pine scalar has no methods of its own and an array or a map none outside
+    its builtin namespace, so ``core/pine_method.method_call`` looks the name up
+    among the ``Exported`` proxies of the libraries the caller imports. The type
+    pass follows the same search -- a group answers where its implementations
+    agree on the return -- and passes by what the runtime passes by: a plain
+    function of the name, and a name the receiver's own Python object answers.
+    """
+    _write(_lib_package, 'strlib', NAMED_METHOD_LIB)
+    app = _write(tmp_path, 'shp_named_app', '''"""
+@pyne
+"""
+from pynecore import lib
+from pynecore.core.pine_method import method_call
+import lib.shp_named.strlib as su
+
+s: str = "a"
+m: dict[str, float] = lib.map.new()
+r = method_call('replace', s, m)
+c = method_call('ceil', 1.5, 2)
+p = method_call('plain', s)
+u = method_call('update', m)
+''')
+
+    _, table = _analysed(app)
+
+    types = {name: binding.ty for name, binding in table.bindings[''].items()}
+    assert types['r'] == STR
+    assert types['c'] == FLOAT
+    assert types['p'] == UNKNOWN
+    assert types['u'] == UNKNOWN
+    assert not any('replace' in diag.message or 'ceil' in diag.message for diag in table.diags)
+
+
+def __test_a_named_method_is_searched_only_in_lib_modules__(tmp_path, _lib_package):
+    """A module not named ``lib.*`` is not where the runtime looks a method name up"""
+    _write(tmp_path, 'shp_named_outside', NAMED_METHOD_LIB)
+    app = _write(tmp_path, 'shp_named_app2', '''"""
+@pyne
+"""
+from pynecore.core.pine_method import method_call
+import shp_named_outside as su
+
+r = method_call('ceil', 1.5, 2)
+''')
+
+    _, table = _analysed(app)
+
+    assert table.bindings['']['r'].ty == UNKNOWN
+
+
+#: A second library exporting ``ceil``, answering a string where ``strlib``'s
+#: answers a float
+OTHER_METHOD_LIB = '''"""
+@pyne
+"""
+from pynecore.core.pine_export import Exported, export
+from pynecore.core.pine_method import method
+from pynecore.lib import script
+
+__all__ = ['ceil']
+ceil = Exported()
+
+
+@script.library(title='other')
+def main():
+    @export
+    @method
+    def ceil(this: float, digits: int) -> str:
+        return 'x'
+'''
+
+
+@pytest.mark.parametrize("imports,expected", [
+    # imported twice: the global keeps the place of its first import
+    ('import lib.shp_named.strlib as su\nimport lib.shp_named.otherlib as other\n'
+     'import lib.shp_named.strlib as su', UNKNOWN),
+    # assigned before it is imported: the place is the assignment's
+    ('su = 0\nimport lib.shp_named.otherlib as other\nimport lib.shp_named.strlib as su',
+     UNKNOWN),
+    # a global the scan reaches only after the library that answers changes nothing
+    ('import lib.shp_named.strlib as su\nimport lib.shp_named.otherlib as other\nother = 0',
+     FLOAT),
+    # a definition is a store too: one below the import leaves a function there
+    ('import lib.shp_named.strlib as su\nimport lib.shp_named.otherlib as other\n'
+     'def su():\n    pass', UNKNOWN),
+    # one above the import keeps the global's place ahead of the other library
+    ('def su():\n    pass\nimport lib.shp_named.otherlib as other\n'
+     'import lib.shp_named.strlib as su', UNKNOWN),
+])
+def __test_a_named_method_is_not_followed_past_a_rebound_library_global__(
+        tmp_path, _lib_package, imports, expected):
+    """
+    The runtime scans the caller's globals in the order they were first stored, and a
+    global bound more than once may hold the library found first. A later library is
+    not the answer while such a global stands before it.
+    """
+    _write(_lib_package, 'strlib', NAMED_METHOD_LIB)
+    _write(_lib_package, 'otherlib', OTHER_METHOD_LIB)
+    app = _write(tmp_path, 'shp_named_app_rebound', '"""\n@pyne\n"""\n'
+                 'from pynecore.core.pine_method import method_call\n'
+                 + imports + '\n\n'
+                 "c = method_call('ceil', 1.5, 2)\n")
+
+    _, table = _analysed(app)
+
+    assert table.bindings['']['c'].ty == expected
+
+
+def __test_the_interface_publishes_its_proxies__(tmp_path, _lib_package):
+    """Which exports a method call reaches is part of the contract and of the payload"""
+    path = _write(_lib_package, 'strlib', NAMED_METHOD_LIB)
+    tree, table = _analysed(path)
+    interface = build_interface(tree, table, str(path.resolve()))
+
+    assert interface.proxies == ('ceil', 'replace', 'update')
+    assert 'plain' in interface.exports
+
+    payload = interface_payload(interface)
+    stat = os.stat(path)
+    restored = interface_from_payload(interface.path, payload, interface.deps,
+                                      (stat.st_mtime_ns, stat.st_size))
+    assert restored is not None
+    assert restored.proxies == interface.proxies
+    assert restored.digest == interface.digest
+
+    # The same signatures, with ``plain`` bound to a proxy: a method call reaches it now
+    module_interface._registry.clear()
+    proxied = _write(_lib_package, 'strlib', NAMED_METHOD_LIB.replace(
+        "update = Exported()\n", "update = Exported()\nplain = Exported()\n").replace(
+        "\ndef plain(", "\n@export\ndef plain("))
+    moved_tree, moved_table = _analysed(proxied)
+    moved = build_interface(moved_tree, moved_table, str(proxied.resolve()))
+    assert moved.proxies == ('ceil', 'plain', 'replace', 'update')
+    # Line numbers aside (the digest leaves them out), what the module exports is unchanged
+    assert {name: dataclasses.replace(sig, line=0) for name, sig in moved.exports.items()} \
+        == {name: dataclasses.replace(sig, line=0) for name, sig in interface.exports.items()}
+    assert moved.digest != interface.digest
+
+
+def __test_a_udt_copy_is_of_the_copied_type__():
+    """``x.copy()`` of a user type compiles to ``udt_copy(x)``, a value of x's class"""
+    types = _types(UDT_SETUP + '''
+from pynecore.core.pine_udt import udt_copy
+
+p = Pivot()
+q = udt_copy(p, price=2.0)
+''')
+    assert types['q'] == PIVOT

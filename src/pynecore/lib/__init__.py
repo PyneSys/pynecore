@@ -58,6 +58,11 @@ from ..core.resampler import (
 # ``is_na()`` on every bar, so its result must be a constant, not an allocation
 _na_none: NA = NA(None)
 
+# The numeric na: a typeless ``na`` that the type pass knows goes where a float or an
+# int goes is rewritten to it (``implicit_conversion``) -- the value ``NA(float)`` and
+# ``NA(int)`` both are
+_na_float: float = NA(float)
+
 # One full Gregorian leap cycle in milliseconds -- the period ``timestamp()``
 # folds by to reach dates datetime cannot represent -- and the span it folds
 # into: the 400 years starting at 2000-01-01

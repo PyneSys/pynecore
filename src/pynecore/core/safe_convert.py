@@ -8,6 +8,9 @@ from ..types.pine_types import pine_int
 
 _NEG_INF = -inf
 
+# Pine's typeless na. ``NA(None)`` is interned, so an identity test finds every one
+_NA_NONE = NA(None)
+
 
 class _ZeroDivisor:
     """
@@ -153,8 +156,13 @@ def implicit_convert(value: Any, kind: str | None) -> Any:
     property of the instance. The transform wraps such a value in this call and
     hands it the instance's own vector entry, one of the type pass's conversion
     characters: ``'f'`` converts one int to float, ``'a'`` / ``'m'`` copy an int
-    array / matrix as floats, ``'s'`` is the string na (the value is Pine's typeless
-    na), None converts nothing.
+    array / matrix as floats, ``'s'`` / ``'n'`` / ``'t'`` turn Pine's typeless na into
+    the string na, the numeric na or the text ``na``, None converts nothing.
+
+    A value that holds the typeless na without spelling it -- a defaulted parameter, a
+    variable -- is wrapped in this call with its conversion character as a constant. The
+    same body can be reached with a value of its own, so the na conversions leave every
+    value but the typeless na as it is.
 
     :param value: The value on its way into the container
     :param kind: The conversion character, or None
@@ -168,6 +176,12 @@ def implicit_convert(value: Any, kind: str | None) -> Any:
         return safe_float_items(value)
     if kind == 'm':
         return safe_float_matrix(value)
+    if value is not _NA_NONE:
+        return value
+    if kind == 'n':
+        return na_float
+    if kind == 't':
+        return 'na'
     return ''
 
 

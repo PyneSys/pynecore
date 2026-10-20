@@ -73,17 +73,144 @@ def __test_ints_into_float_containers_are_converted__(body, expected):
      "lib.map.put(m, 'k', '')"),
     ('a = lib.array.from_items("a", lib._na_none)', "a = lib.array.from_items('a', '')"),
     ('def tail(p: str) -> str:\n    return p\nx = tail(lib._na_none)', "x = tail('')"),
-    # anywhere else na stays the typeless na
-    ('x: float = lib._na_none', 'x: float = lib._na_none'),
-    ('w = 1.5 if lib.bar_index < 0 else lib._na_none',
-     'w = 1.5 if lib.bar_index < 0 else lib._na_none'),
-    ('a: list[float] = lib.array.new_float(0)\nlib.array.push(a, lib._na_none)',
-     'lib.array.push(a, lib._na_none)'),
+    ('def label() -> str:\n    return lib._na_none', "    return ''"),
+    # one the function holds rather than spells is converted where it is the na
+    ('def label(value=lib._na_none) -> str:\n    return value\nx = label()',
+     "    return safe_convert.implicit_convert(value, 's')"),
 ])
 def __test_typeless_na_where_a_string_goes_is_empty__(body, expected):
     emitted, diags = __test_helper_widen(body)
     assert expected in emitted.splitlines()
     assert not diags
+
+
+@pytest.mark.parametrize("body,expected", [
+    # a typeless na where a float or an int goes is the numeric na
+    ('x: float = lib._na_none', 'x: float = lib._na_float'),
+    ('x: float = 1.0\nx = lib._na_none', 'x = lib._na_float'),
+    ('i: int = lib._na_none', 'i: int = lib._na_float'),
+    ('w = 1.5 if lib.bar_index < 0 else lib._na_none',
+     'w = 1.5 if lib.bar_index < 0 else lib._na_float'),
+    ('w = lib.close * 2.0 if lib.bar_index < 0 else lib._na_none * lib.close',
+     'w = lib.close * 2.0 if lib.bar_index < 0 else lib._na_float * lib.close'),
+    ('a: list[float] = lib.array.new_float(0)\nlib.array.push(a, lib._na_none)',
+     'lib.array.push(a, lib._na_float)'),
+    ('a: list[int] = lib.array.new_int(0)\nlib.array.set(a, 0, lib._na_none)',
+     'lib.array.set(a, 0, lib._na_float)'),
+    ('m: dict[str, float] = lib.map.new()\nlib.map.put(m, "k", lib._na_none)',
+     "lib.map.put(m, 'k', lib._na_float)"),
+    ('m: dict[str, float] = lib.map.new()\n'
+     'lib.map.put(m, "k", lib.close if lib.bar_index > 1 else lib._na_none)',
+     "lib.map.put(m, 'k', lib.close if lib.bar_index > 1 else lib._na_float)"),
+    ('def tail(p: float) -> float:\n    return p\nx = tail(lib._na_none)', 'x = tail(lib._na_float)'),
+    ('def missing() -> float:\n    return lib._na_none', '    return lib._na_float'),
+    ('def missing(p: int) -> int:\n    if p > 0:\n        return p\n    return lib._na_none',
+     '    return lib._na_float'),
+    # a signed na is spelled too: the na object's sign hands the na itself back
+    ('e: int = -lib._na_none', 'e: int = lib._na_float'),
+    ('def missing() -> float:\n    return -lib._na_none\nx = missing()', '    return lib._na_float'),
+    # a typeless na held rather than spelled -- a defaulted parameter, a variable -- is
+    # converted where it is the na, and any other value goes through unchanged
+    ('def missing(value=lib._na_none) -> float:\n    return value\nx = missing()',
+     "    return safe_convert.implicit_convert(value, 'n')"),
+    ('def missing(value=lib._na_none) -> float:\n    return -value\nx = missing()',
+     "    return safe_convert.implicit_convert(-value, 'n')"),
+    ('def tail(p: float) -> float:\n    return p\ndef pass_on(v=lib._na_none):\n'
+     '    return tail(v)\nx = pass_on()', "    return tail(safe_convert.implicit_convert(v, 'n'))"),
+    ('def pick(v=lib._na_none):\n    return 1.5 if lib.bar_index < 0 else v\nx = pick()',
+     "    return 1.5 if lib.bar_index < 0 else safe_convert.implicit_convert(v, 'n')"),
+    ('v = -lib._na_none\nx: float = v', "x: float = safe_convert.implicit_convert(v, 'n')"),
+    ('a: list[float] = lib.array.new_float(0)\nv = -lib._na_none\nlib.array.push(a, v)',
+     "lib.array.push(a, safe_convert.implicit_convert(v, 'n'))"),
+    # the dynamic-default marker is no na: the prologue gives the parameter its default
+    ('def f(p: float = __dyn_default__) -> float:\n    if p is __dyn_default__:\n'
+     '        p = lib.close\n    return p\nx = f()', 'def f(p: float=__dyn_default__) -> float:'),
+    # the value a numeric container is built from or filled with
+    ('a = lib.array.from_items(1.5, lib._na_none)', 'a = lib.array.from_items(1.5, lib._na_float)'),
+    ('a = lib.array.new_float(3, lib._na_none)', 'a = lib.array.new_float(3, lib._na_float)'),
+    ('a = lib.array.new_int(3, initial_value=lib._na_none)',
+     'a = lib.array.new_int(3, initial_value=lib._na_float)'),
+    ('m: Matrix[float] = lib.matrix.new(2, 2, lib._na_none)',
+     'm: Matrix[float] = lib.matrix.new(2, 2, lib._na_float)'),
+    ('a = lib.array.new_bool(3, lib._na_none)', 'a = lib.array.new_bool(3, lib._na_none)'),
+    # a bool has no numeric na, and a NaN map key would never find itself again
+    ('b: bool = lib._na_none', 'b: bool = lib._na_none'),
+    ('def flag() -> bool:\n    return lib._na_none', '    return lib._na_none'),
+    ('m: dict[float, str] = lib.map.new()\nlib.map.put(m, lib._na_none, "v")',
+     "lib.map.put(m, lib._na_none, 'v')"),
+    # a lib parameter keeps its na: there it is the absent value the lib tests for
+    ('x = lib.nz(lib._na_none)', 'x = lib.nz(lib._na_none)'),
+])
+def __test_typeless_na_where_a_number_goes_is_the_numeric_na__(body, expected):
+    emitted, diags = __test_helper_widen(body)
+    assert expected in emitted.splitlines()
+    assert not diags
+
+
+@pytest.mark.parametrize("helper,first", [
+    ('def missing() -> float:\n    return lib._na_none', 'lib._na_none'),
+    ('def missing() -> float:\n    return lib._na_none', 'missing()'),
+    ('def missing(value=lib._na_none) -> float:\n    return value', 'missing()'),
+    ('def missing() -> float:\n    return -lib._na_none', 'missing()'),
+])
+def __test_a_numeric_na_map_dispatches_to_the_float_overload__(helper, first):
+    """
+    A float map whose first value is a typeless na reaches the float overload, whether
+    the na is put in as the literal or returned by a function declared to return a float,
+    spelled there (signed or not) or held
+    """
+    source = __test_helper_PRELUDE + '''from pynecore.core.overload import overload
+import pynecore.lib.map
+
+@overload
+def f(m: dict[str, str]) -> str:
+    return 'STR'
+
+@overload
+def f(m: dict[str, float]) -> str:
+    return 'FLOAT'
+
+''' + helper + '''
+
+def main():
+    m: dict[str, float] = lib.map.new()
+    lib.map.put(m, "a", ''' + first + ''')
+    lib.map.put(m, "b", 1.5)
+    return f(m)
+'''
+    tree = ast.parse(source)
+    infer_module(tree, 'test')
+    tree = ast.fix_missing_locations(cast(ast.Module, ImplicitConversionTransformer().visit(tree)))
+    namespace: dict = {'__name__': 'numeric_na_map'}
+    exec(compile(tree, 'test', 'exec'), namespace)
+    assert namespace['main']() == 'FLOAT'
+
+
+def __test_a_held_typeless_na_is_converted_and_any_other_value_kept__():
+    """
+    A defaulted parameter returned as a float goes out as the numeric na where it holds
+    the typeless na, and as itself where a call site the analysis never saw passes a value
+    """
+    source = __test_helper_PRELUDE + '''
+def missing(value=lib._na_none) -> float:
+    return value
+
+def label(value=lib._na_none) -> str:
+    return value
+
+def main():
+    return missing(), label()
+'''
+    tree = ast.parse(source)
+    infer_module(tree, 'test')
+    tree = ast.fix_missing_locations(cast(ast.Module, ImplicitConversionTransformer().visit(tree)))
+    namespace: dict = {'__name__': 'held_typeless_na'}
+    exec(compile(tree, 'test', 'exec'), namespace)
+    number, text = namespace['main']()
+    assert type(number) is float and number != number
+    assert text == ''
+    assert namespace['missing'](2) == 2 and type(namespace['missing'](2)) is int
+    assert namespace['label']('x') == 'x'
 
 
 @pytest.mark.parametrize("body,expected", [
