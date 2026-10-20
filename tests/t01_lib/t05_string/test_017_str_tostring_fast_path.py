@@ -12,9 +12,8 @@ path produces the very same string the general path does.
 
 The value grid is deterministic (seeded) and deliberately loaded with the shapes
 where a digit-string rounder could drift from ``Decimal.quantize``: exact half-way
-digits, carries across the decimal point, the 16-fraction-digit cap at
-``|value| >= 1e-3``, the boundaries where ``repr`` switches to exponential notation
-(below 1e-4 and from 1e16), and negative zero.
+digits, carries across the decimal point, the boundaries where ``repr`` switches to
+exponential notation (below 1e-4 and from 1e16), and negative zero.
 """
 import random
 
@@ -183,7 +182,7 @@ def __test_native_float_dispatch__():
 @pytest.mark.parametrize("value,mask,expected", [
     (2.675, '#.##', '2.68'),
     (0.1, '#.####################', '0.1'),
-    (0.1 + 0.2, '#.####################', '0.3'),
+    (0.1 + 0.2, '#.####################', '0.30000000000000004'),
     (123456789.123456789, '#.##########', '123456789.12345679'),
     (9.999, '#', '10'),
     (1200.0, '#.##########', '1200'),

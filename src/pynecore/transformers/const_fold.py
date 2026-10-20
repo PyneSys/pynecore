@@ -2,7 +2,7 @@ import ast
 import builtins
 import math
 from collections import Counter
-from decimal import Decimal, ROUND_HALF_EVEN, localcontext
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_EVEN, localcontext
 
 from pynecore.core import fdlibm
 from pynecore.core.safe_convert import safe_mod
@@ -90,18 +90,29 @@ _BIN_OPS = {
 }
 
 
+#: The place a constant float is rounded at when it is embedded
+_EMBED_QUANTUM = Decimal('1e-16')
+
+
 def quantize_embed(v: int | float) -> int | float:
     """
-    TradingView's parse-time embedding quantization.
+    The value a folded constant or a source literal is embedded with.
 
-    When the parser embeds a folded constant (or a source literal) into the
-    runtime program it caps the value at 16 decimal *places*, rounding
-    half-even on the shortest decimal representation -- but only while
-    ``|v| >= 1e-3``; below that the exact double is embedded. Constant
-    chains keep exact doubles internally: this cap applies exactly once,
-    at the runtime embedding site. Measured over 60+ anchored delta probes
-    (probe_fold_* series, 2026-08). A zero is embedded unsigned, as ``0.0``.
+    A float is rounded to 16 decimal *places* while ``|v| >= 1e-3``; below
+    that the exact double is embedded. The rounding starts from the shortest
+    decimal digits of the double, and a tie at the 17th decimal is decided
+    on the double's exact binary value: it rounds up when the exact value
+    lies above the digits, down when below, and half-even only when the
+    digits are exact. Constant chains keep exact doubles internally: the
+    rounding applies exactly once, at the runtime embedding site. A zero is
+    embedded unsigned, as ``0.0``; an int is embedded unchanged.
     """
+    # The 16-place cap and the 1e-3 floor: 60+ anchored delta probes (probe_fold_*
+    # series, 2026-08). The tie rule is Java DecimalFormat's, measured 2026-10-20 (probes
+    # fmt3, fmt5, CAPITALCOM:EURUSD 60): literal 0.21402930929524275 (exactly
+    # 0.21402930929524274783...) embeds as 0.2140293092952427, where half-even on the
+    # shortest digits would give ...428; 0.27161597376132945 (exactly
+    # 0.27161597376132945447...) embeds as 0.2716159737613295
     if type(v) is int:
         return v
     # Measured 2026-10-12 through ``1 / (x * close)``: ``-0.0``, ``0.0 * -1``, ``-0.0 / 1``,
@@ -110,13 +121,29 @@ def quantize_embed(v: int | float) -> int | float:
     # operands keeps the IEEE -0.0
     if v == 0.0:
         return 0.0
-    if builtins.abs(v) < 1e-3:
+    magnitude = builtins.abs(v)
+    if magnitude < 1e-3:
         return v
     # A double can carry ~309 integer digits in front of the 16 capped
     # decimal places; the default 28-digit context would overflow on them
     with localcontext() as ctx:
         ctx.prec = 340
-        return float(Decimal(repr(v)).quantize(Decimal('1e-16'), rounding=ROUND_HALF_EVEN))
+        digits = Decimal(repr(magnitude))
+        down = digits.quantize(_EMBED_QUANTUM, rounding=ROUND_DOWN)
+        tail = (digits - down) * 2
+        if tail > _EMBED_QUANTUM:
+            rounded = down + _EMBED_QUANTUM
+        elif tail < _EMBED_QUANTUM:
+            rounded = down
+        else:
+            exact = Decimal(magnitude)
+            if exact > digits:
+                rounded = down + _EMBED_QUANTUM
+            elif exact < digits:
+                rounded = down
+            else:
+                rounded = digits.quantize(_EMBED_QUANTUM, rounding=ROUND_HALF_EVEN)
+    return math.copysign(float(rounded), v)
 
 
 def _is_literal(node: ast.expr, value: int | float) -> bool:
@@ -580,7 +607,7 @@ class ConstFoldTransformer:
 
     TradingView evaluates every maximal constant subtree once, at parse time,
     with StrictMath (fdlibm) transcendentals, and embeds the result into the
-    runtime program through the 16-decimal-place half-even cap of
+    runtime program through the 16-decimal-place cap of
     :func:`quantize_embed`. Constant chains -- plain declarations,
     ``var``-declared variables and ``:=`` lines whose right side is constant
     -- carry exact doubles between each other; only the embedding into a

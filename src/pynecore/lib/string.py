@@ -84,10 +84,8 @@ def _round_digits(value: float, decimals: int, decimal_format: bool) -> str:
     Both formatters start from the digits Java's ``Double.toString`` produces -- the
     shortest decimal that reads back as the same double -- not from the double's exact
     binary expansion: ``str.tostring(0.1, '#.####################')`` is ``0.1``, not
-    ``0.10000000000000000555``. While that representation stays in plain notation
-    (``|value| >= 1e-3``) it never carries more than 16 fraction digits, so a mask asking
-    for more gets zeros; below 1e-3 ``Double.toString`` switches to exponential notation
-    and the cap is gone (measured: ``1e-17`` prints all 17 decimals).
+    ``0.10000000000000000555``. A mask with enough places prints all of those digits,
+    whatever the magnitude: ``0.015721813265222873`` keeps its 18 decimals.
 
     ``str.tostring`` with a mask then rounds those digits half-up, while ``str.format`` is
     Java's DecimalFormat (see :func:`_decimal_format_quantize`), which breaks a tie on the
@@ -99,8 +97,6 @@ def _round_digits(value: float, decimals: int, decimal_format: bool) -> str:
     :param decimal_format: True for ``str.format()``, False for ``str.tostring()``
     :return: The rounded value in plain decimal notation
     """
-    if value >= 1e-3:
-        decimals = min(decimals, 16)
     d = Decimal(repr(value))
     quantum = Decimal(1).scaleb(-decimals)
     with localcontext() as ctx:
@@ -248,8 +244,7 @@ def _round_digits_fast(value: float, decimals: int, pad: bool) -> str | None:
     ``repr(value)`` already IS the digit string ``Decimal(repr(value))`` would carry -- the
     shortest decimal that reads back as the same double, the same thing Java's
     ``Double.toString`` produces -- so the half-up decision and the carry can be done with
-    plain integer arithmetic on those digits. The 16-fraction-digit cap at ``|value| >= 1e-3``
-    is applied exactly as in :func:`_round_digits`.
+    plain integer arithmetic on those digits.
 
     The caller must pass a non-negative finite double. A ``repr`` in exponential notation
     (``|value| < 1e-4`` or ``>= 1e16``) and negative zero are not handled here and answer
@@ -271,8 +266,6 @@ def _round_digits_fast(value: float, decimals: int, pad: bool) -> str | None:
     else:
         int_part = r[:dot]
         frac = r[dot + 1:]
-    if decimals > 16 and value >= 1e-3:
-        decimals = 16
 
     n_frac = len(frac)
     if n_frac <= decimals:
@@ -301,8 +294,7 @@ def _round_digits_exact(value: float, decimals: int) -> str | None:
     inside them, and there the shortest digits and the exact value round alike, ties
     included (a tie on the shortest digits is decided on the exact value: 2.675, which is
     really 2.67499..., rounds down), so Python's fixed-point float formatting, correctly
-    rounded from the exact value, yields the same digits. The 16-fraction-digit cap at
-    ``|value| >= 1e-3`` applies here as well.
+    rounded from the exact value, yields the same digits.
 
     Values below 1e-3, where Java's ``DigitList`` has its own tie rule (see
     :func:`_decimal_format_quantize`), and negative zero are not covered and answer ``None``.
@@ -315,8 +307,6 @@ def _round_digits_exact(value: float, decimals: int) -> str | None:
     if value < 1e-3 and (value != 0.0 or _copysign(1.0, value) < 0.0):
         return None
     r = repr(value)
-    if decimals > 16 and value >= 1e-3:
-        decimals = 16
     int_part, _, frac = r.partition('.')
     if len(frac) <= decimals:
         if decimals == 0:
