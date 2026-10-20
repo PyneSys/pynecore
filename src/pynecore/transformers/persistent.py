@@ -112,11 +112,17 @@ class PersistentTransformer(ast_walk.NodeTransformer):
         return isinstance(node, ast.Name) and node.id == 'na'
 
     @staticmethod
-    def _is_numeric_type(annotation: ast.expr) -> bool:
+    def _declared_elem(annotation: ast.expr) -> str | None:
+        """The scalar a persistent declares (``Persistent[int]`` -> ``'int'``), else None."""
+        if (isinstance(annotation, ast.Subscript) and isinstance(annotation.slice, ast.Name)
+                and annotation.slice.id in ('int', 'float', 'bool', 'str')):
+            return annotation.slice.id
+        return None
+
+    @classmethod
+    def _is_numeric_type(cls, annotation: ast.expr) -> bool:
         """Check if the annotation declares an int or float element (``Persistent[int]``)."""
-        return (isinstance(annotation, ast.Subscript)
-                and isinstance(annotation.slice, ast.Name)
-                and annotation.slice.id in ('int', 'float'))
+        return cls._declared_elem(annotation) in ('int', 'float')
 
     def _numeric_init(self, annotation: ast.expr, value: ast.expr) -> ast.expr:
         """The initializer of a numeric persistent, as the value the slot must hold.
@@ -209,13 +215,14 @@ class PersistentTransformer(ast_walk.NodeTransformer):
         self.persistent_declarations[self.current_scope].add(var_name)
         self.local_vars[self.current_scope].add(var_name)
         varip = self._is_varip_type(node.annotation)
+        elem = self._declared_elem(node.annotation)
         scope_layout = self.layout.scope(self.current_scope)
 
         if node.value is not None:
             node.value = self._numeric_init(node.annotation, node.value)
         if node.value is not None and not self._is_literal_or_na(node.value):
             # Lazy pattern: value slot + flag slot, initializer runs on first call
-            slot = scope_layout.add_var(var_name, ast.Constant(value=None), varip=varip)
+            slot = scope_layout.add_var(var_name, ast.Constant(value=None), varip=varip, elem=elem)
             self.var_slots.setdefault(self.current_scope, {})[var_name] = slot
             self._slot_names.add(var_name)
             flag = scope_layout.add_flag(var_name, varip=varip)
@@ -237,7 +244,7 @@ class PersistentTransformer(ast_walk.NodeTransformer):
             func=ast.Attribute(value=ast.Name(id='lib', ctx=ast.Load()), attr='na', ctx=ast.Load()),
             args=[], keywords=[])
         init = node.value if node.value is not None else na_init
-        slot = scope_layout.add_var(var_name, init, varip=varip)
+        slot = scope_layout.add_var(var_name, init, varip=varip, elem=elem)
         self.var_slots.setdefault(self.current_scope, {})[var_name] = slot
         self._slot_names.add(var_name)
         return None

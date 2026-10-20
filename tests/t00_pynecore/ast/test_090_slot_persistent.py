@@ -265,3 +265,29 @@ from pynecore import Persistent
 
 p: Persistent[int] = 0
 ''')
+
+
+def __test_var_slot_records_declared_scalar__():
+    """ A var slot carries the declared scalar the init literal does not tell """
+    layout = ModuleLayout()
+    PersistentTransformer(layout).visit(ast.parse('''
+from pynecore import Persistent
+from pynecore.types import IBPersistent
+
+def main(seed):
+    counter: Persistent[int] = 0
+    level: Persistent[float] = seed
+    label: Persistent[str] = ''
+    flag: IBPersistent[bool] = False
+    plain: Persistent = 0
+'''))
+    slots = {slot.name: slot for slot in layout.scopes['main'].slots}
+    # An int persistent starts at a float literal, so only the declaration says int
+    counter = slots['counter']
+    assert isinstance(counter.init, ast.Constant) and type(counter.init.value) is float
+    assert counter.var_elem == 'int'
+    assert slots['level'].var_elem == 'float'
+    assert slots['level·flag'].kind == 'flag' and slots['level·flag'].var_elem is None
+    assert slots['label'].var_elem == 'str'
+    assert slots['flag'].var_elem == 'bool'
+    assert slots['plain'].var_elem is None

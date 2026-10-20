@@ -114,6 +114,7 @@ class _Slot:
     init: ast.expr  # template expression for the layout 'init' tuple
     max_bars_back: ast.expr | None = None  # series slots only
     series_elem: str | None = None  # series slots only: element type name ('float'/'int') or None
+    var_elem: str | None = None  # var slots only: the declared scalar type name or None
     call_id: str | None = None  # child/anchor slots only
     in_loop: bool = False  # child slots only
     varip: bool = False  # var and flag slots only
@@ -134,7 +135,8 @@ class ScopeLayout:
         self.slots.append(slot)
         return slot.index
 
-    def add_var(self, name: str, init: ast.expr, *, varip: bool = False) -> int:
+    def add_var(self, name: str, init: ast.expr, *, varip: bool = False,
+                elem: str | None = None) -> int:
         """Allocate a slot for a persistent variable.
 
         :param name: Source-level variable name (debug only).
@@ -142,9 +144,14 @@ class ScopeLayout:
             lazy-initialized variables pass ``Constant(None)`` and pair this
             slot with :meth:`add_flag`).
         :param varip: Whether the variable is ``varip`` (excluded from var rollback).
+        :param elem: The declared scalar type (``int`` for ``Persistent[int]``),
+            which the init literal alone does not tell: a Pine int is a double
+            at runtime, so an int-typed persistent starts at a FLOAT literal
+            (``PersistentTransformer._numeric_init``), and a consumer that types
+            the slot statically reads the declaration here.
         :return: The allocated slot index.
         """
-        return self._add(_Slot(len(self.slots), 'var', name, init, varip=varip))
+        return self._add(_Slot(len(self.slots), 'var', name, init, varip=varip, var_elem=elem))
 
     def add_flag(self, name: str, *, varip: bool = False) -> int:
         """Allocate a lazy-init flag slot (init ``False``).
