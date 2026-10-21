@@ -79,6 +79,12 @@ pub enum Value {
     Dict(Vec<(Value, Value)>),
     /// A reference to another node of the same tree
     Node(NodeId),
+    /// An object of the host that no native step looks into (the Python type
+    /// pass's `PineTypeTable`): an index into the object list of the bridge that
+    /// converted the tree, which hands the very same object back. Only that
+    /// bridge makes one; a step may move, share or drop it, never build one.
+    /// Two of them are equal when they hold the same object.
+    Opaque(u32),
 }
 
 /// Source location attributes; `None` is an attribute the node does not carry.

@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from pynecore.core import import_hook
-from pynecore.transformers import native
+from pynecore.transformers import native, pipeline
 
 #: A module exercising every branch of the ported steps
 __test_helper_SOURCE = '''"""
@@ -53,6 +53,54 @@ def main():
     from pynecore.lib import ta as indicators
     return helper(close) + indicators.ema(close, 3) + smoothed() + Flag().f
 '''
+
+#: A module the type pass stamps every per-context and per-instance attribute on: an
+#: overload pin that differs per context, an int put into a float array in one
+#: context and an int array in another, a window length const in one and series in
+#: the other
+__test_helper_STAMPS = '''"""
+@pyne
+"""
+from pynecore import lib
+from pynecore.lib import script, ta, low, bar_index
+from pynecore.core.overload import overload
+
+
+@overload
+def g(x: int) -> str:
+    return 'int-impl'
+
+
+@overload
+def g(x: float) -> str:
+    return 'float-impl'
+
+
+def wrapper(v):
+    return g(v)
+
+
+def put(a, v):
+    lib.array.push(a, v)
+
+
+def lowest(n):
+    return ta.lowest(low, n)
+
+
+@script.indicator(title="stamps")
+def main():
+    wrapper(1)
+    wrapper(2.0)
+    put(lib.array.new_float(0), 1)
+    put(lib.array.new_int(0), 1)
+    s = 8 if bar_index >= 0 else 9
+    a = lowest(8)
+    b = lowest(s)
+'''
+
+#: The analysis steps after which the tree carries what the type pass stamped
+__test_helper_TYPED_STEPS = ('PineType', 'ImplicitConversion', 'SecuritySlice')
 
 _TESTS = Path(__file__).resolve().parents[2]
 _LIB = Path(import_hook.__file__).resolve().parent.parent / 'lib'
@@ -121,6 +169,104 @@ def __test_native_steps_match_python__(source, monkeypatch):
             continue
         analysed = import_hook._analyse_tree(tree, text, path.resolve(), mode)
         import_hook._lower_tree(analysed, path.resolve(), mode)
+
+
+def __test_helper_extras(tree: ast.AST) -> list[tuple[str, object]]:
+    """Every value stamped on a tree as an attribute of its own, containers and the
+    values inside them included, each node visited once, in a stable order. The
+    operator and context objects are left out, as ``native.describe`` leaves them:
+    one instance stands for every occurrence, so what is stamped on it means nothing."""
+    out: list[tuple[str, object]] = []
+    seen: set[int] = set()
+    fieldless = (ast.expr_context, ast.operator, ast.unaryop, ast.cmpop, ast.boolop)
+
+    def value(name: str, item: object) -> None:
+        out.append((name, item))
+        if isinstance(item, ast.AST):
+            node(item)
+        elif isinstance(item, (list, tuple)) and type(item) in (list, tuple):
+            for element in item:
+                value(name, element)
+        elif isinstance(item, dict) and type(item) is dict:
+            for key, element in item.items():
+                value(name, key)
+                value(name, element)
+
+    def node(item: ast.AST) -> None:
+        if id(item) in seen or isinstance(item, fieldless):
+            return
+        seen.add(id(item))
+        for child in ast.iter_child_nodes(item):
+            node(child)
+        for name, item_value in sorted(vars(item).items()):
+            if name not in item._fields and name not in item._attributes:
+                value(name, item_value)
+
+    node(tree)
+    return out
+
+
+def __test_helper_check_roundtrip(tree: ast.Module, where: str) -> set[str]:
+    """Round-trip a tree through the native bridge and check what came back.
+
+    :return: The names of the stamped attributes the tree carries.
+    """
+    from pynecore.transformers import _native
+
+    back = _native.roundtrip(tree)
+    assert native.describe(back) == native.describe(tree), where
+    before = __test_helper_extras(tree)
+    after = __test_helper_extras(back)
+    assert [name for name, _ in after] == [name for name, _ in before], where
+    for (name, old), (_, new) in zip(before, after):
+        if isinstance(old, ast.AST) or type(old) in (list, dict):
+            # Converted into the arena and built anew
+            assert new is not old, (where, name)
+        elif old is not None and type(old) not in (bool, int, float, str, tuple):
+            # Handed through: the very object, not a copy
+            assert new is old, (where, name, type(old).__name__)
+    assert back._pine_types is tree._pine_types, where
+    return {name for name, _ in before}
+
+
+def __test_typed_tree_crosses_the_bridge__(monkeypatch):
+    """
+    What the type pass stamps survives the native bridge: plain values and node
+    references as values, the ``PineTypeTable`` as the very same object -- after the
+    type pass and after the later analysis steps, for every module of the corpus.
+    """
+    __test_helper_require_native()
+    monkeypatch.setenv('PYNE_AST_BACKEND', 'python')
+    checked: dict[str, int] = dict.fromkeys(__test_helper_TYPED_STEPS, 0)
+    names: dict[str, set[str]] = {}
+    run = pipeline._run
+
+    def checking(name, ctx, fn, *args):
+        tree = run(name, ctx, fn, *args)
+        if name in checked:
+            found = __test_helper_check_roundtrip(tree, f'{ctx.path.name} after {name}')
+            names.setdefault(ctx.path.name, set()).update(found)
+            checked[name] += 1
+        return tree
+
+    monkeypatch.setattr(pipeline, '_run', checking)
+    items = [(Path('native_parity.py'), __test_helper_SOURCE),
+             (Path('native_stamps.py'), __test_helper_STAMPS)]
+    items += [(path, path.read_text()) for path in __test_helper_inputs()]
+    modules = 0
+    for path, text in items:
+        tree = ast.parse(text)
+        user, mode = import_hook._module_mode(tree)
+        if not user:
+            continue
+        modules += 1
+        import_hook._analyse_tree(tree, text, path.resolve(), mode)
+    assert checked['PineType'] == checked['SecuritySlice'] == modules
+    assert checked['ImplicitConversion'] > 0
+    assert names['native_stamps.py'] >= {
+        '_pine_types', '_pine_pin', '_pine_pins', '_pine_varying', '_pine_vector',
+        '_pine_widen_site', '_pine_widens', '_pine_series_lens',
+    }
 
 
 def __test_helper_emission(backend: str, monkeypatch) -> str:

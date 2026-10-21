@@ -38,7 +38,7 @@ fn parse<'py>(py: Python<'py>, source: &str) -> PyResult<Bound<'py, PyAny>> {
 fn roundtrip<'py>(py: Python<'py>, tree: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let mut from = FromPython::new();
     let root = from.node(tree)?;
-    ToPython::new(py)?.node(&from.ast, root)
+    ToPython::new(py)?.with_objects(from.objects).node(&from.ast, root)
 }
 
 /// ``ast.dump(tree, include_attributes=...)`` written by the native side.
@@ -147,7 +147,7 @@ fn run<'py>(
             pyne_transform::Error::Unsupported(message) => Unsupported::new_err(message),
             pyne_transform::Error::Rejected(message) => Rejected::new_err(message),
         })?;
-    ToPython::new(py)?.node(&ast, root)
+    ToPython::new(py)?.with_objects(from.objects).node(&ast, root)
 }
 
 /// The ``ported.json`` manifest the extension was built with.

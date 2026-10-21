@@ -22,7 +22,9 @@ A node is addressed by a `NodeId`, the way a Python pass holds a reference to an
 `ast.AST` object, so a port can keep ids in sets and maps, share a node between
 two parents and mutate nodes it reached elsewhere, as the Python passes do. What
 a pass stamps on a node (`_pine_ty`, `pine_exact`, ...) is kept in the node's
-`extra` map under the same attribute name. The traversal helpers in
+`extra` map under the same attribute name; an object no step looks into (the
+type pass's `PineTypeTable`) is a `Value::Opaque` the Python bridge resolves to
+the very object it was handed. The traversal helpers in
 `pyne_ast::walk` visit in the same order as `transformers/ast_walk.py`.
 
 ## Which backend runs a step

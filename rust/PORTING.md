@@ -20,13 +20,15 @@ pointers.
   (`stamp_lowering`). Hermetic.
 - **F2.** `pine_qualifier.py` is hermetic; `data.rs` must also carry the `names`,
   `classes`, `scalar_classes` and `routes` sections of `lib_types.json`.
-- **F3.** After the Python PineType step the module carries `_pine_types`, a
-  `PineTypeTable` dataclass, which the bridge cannot convert, so every later
-  native step answers `Unsupported`. Either pass the object through opaquely
-  (a `Value` holding a Python reference in the bridge) or convert the table both
-  ways; a native PineType needs the second, because `function_isolation`,
-  `module_interface.build_interface` and `import_hook` read the table as Python
-  dataclasses.
+- **F3.** Done for the steps after PineType: the module's `_pine_types` (a
+  `PineTypeTable` dataclass) and any other stamp that is no plain builtin value
+  cross the bridge as `Value::Opaque`, the very Python object handed back; the
+  other stamps (`_pine_ty`, `_pine_pin(s)`, `_pine_vector`, `_pine_varying`,
+  `_pine_widen*`, `_pine_series_len(s)`) are plain values and node references.
+  `native.describe` compares a dataclass field by field. A native PineType still
+  needs the table converted both ways, because `function_isolation`,
+  `module_interface.build_interface` and `import_hook` read it as Python
+  dataclasses, and the WASM host has no Python object to hand through.
 - **Digest closures.** `native._closure` follows `transformers` imports
   transitively. Before porting, cut couplings that would stale a port on
   unrelated edits:

@@ -4,6 +4,14 @@
 //! [`NodeId`], and one id becomes one Python object, so a tree that shares a node
 //! between two parents, or an attribute that references a node of the tree
 //! (`_pine_widen_site`), crosses the boundary as it is.
+//!
+//! A stamped attribute crosses as a [`Value`] when it is plain data of the exact
+//! builtin types (`None`, `bool`, `int`, `float`, `str`, `tuple`, `list`, `dict`)
+//! or a node. Any other object (the type pass's `PineTypeTable`, a subclass of
+//! a builtin such as a `NamedTuple`) becomes a [`Value::Opaque`]: the object is
+//! kept in a per-conversion list, and [`ToPython`] given that list puts the very
+//! same object back, so it survives a native step unchanged and with its
+//! identity.
 
 use std::collections::HashMap;
 
@@ -28,14 +36,24 @@ fn unsupported(message: impl Into<String>) -> PyErr {
 /// Python objects into one arena.
 pub struct FromPython<'py> {
     pub ast: Ast,
+    /// The objects the [`Value::Opaque`] values of `ast` index, for [`ToPython::with_objects`]
+    pub objects: Vec<Bound<'py, PyAny>>,
     memo: HashMap<usize, NodeId>,
+    /// Object address -> its index in `objects`, so one object is one opaque value
+    object_memo: HashMap<usize, u32>,
     /// The converted objects, kept alive so their addresses stay unique
     keep: Vec<Bound<'py, PyAny>>,
 }
 
 impl<'py> FromPython<'py> {
     pub fn new() -> FromPython<'py> {
-        FromPython { ast: Ast::new(), memo: HashMap::new(), keep: Vec::new() }
+        FromPython {
+            ast: Ast::new(),
+            objects: Vec::new(),
+            memo: HashMap::new(),
+            object_memo: HashMap::new(),
+            keep: Vec::new(),
+        }
     }
 
     pub fn node(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<NodeId> {
@@ -198,30 +216,32 @@ impl<'py> FromPython<'py> {
         if let Ok(flag) = value.cast::<PyBool>() {
             return Ok(Value::Bool(flag.is_true()));
         }
-        if value.is_instance_of::<PyInt>() {
+        // Exact types only: a subclass (an `IntEnum`, a `NamedTuple`) would come
+        // back as its base class
+        if value.is_exact_instance_of::<PyInt>() {
             return Ok(Value::Int(int(value)?));
         }
-        if let Ok(number) = value.cast::<PyFloat>() {
+        if let Ok(number) = value.cast_exact::<PyFloat>() {
             return Ok(Value::Float(number.value()));
         }
-        if value.is_instance_of::<PyString>() {
+        if value.is_exact_instance_of::<PyString>() {
             return Ok(Value::Str(string(value)?));
         }
-        if let Ok(items) = value.cast::<PyTuple>() {
+        if let Ok(items) = value.cast_exact::<PyTuple>() {
             let mut out = Vec::new();
             for item in items.iter() {
                 out.push(self.value(&item)?);
             }
             return Ok(Value::Tuple(out));
         }
-        if let Ok(items) = value.cast::<PyList>() {
+        if let Ok(items) = value.cast_exact::<PyList>() {
             let mut out = Vec::new();
             for item in items.iter() {
                 out.push(self.value(&item)?);
             }
             return Ok(Value::List(out));
         }
-        if let Ok(items) = value.cast::<PyDict>() {
+        if let Ok(items) = value.cast_exact::<PyDict>() {
             let mut out = Vec::new();
             for (key, item) in items.iter() {
                 out.push((self.value(&key)?, self.value(&item)?));
@@ -232,7 +252,20 @@ impl<'py> FromPython<'py> {
         if value.is_instance(&ast.getattr("AST")?)? {
             return Ok(Value::Node(self.node(value)?));
         }
-        Err(unsupported(format!("value of type {}", value.get_type().name()?)))
+        Ok(Value::Opaque(self.object(value)?))
+    }
+
+    /// The index of an object handed through as a [`Value::Opaque`].
+    fn object(&mut self, value: &Bound<'py, PyAny>) -> PyResult<u32> {
+        let key = value.as_ptr() as usize;
+        if let Some(&index) = self.object_memo.get(&key) {
+            return Ok(index);
+        }
+        let index = u32::try_from(self.objects.len())
+            .map_err(|_| unsupported("more opaque objects than a u32 counts"))?;
+        self.object_memo.insert(key, index);
+        self.objects.push(value.clone());
+        Ok(index)
     }
 }
 
@@ -294,6 +327,8 @@ fn constant(value: &Bound<'_, PyAny>) -> PyResult<Constant> {
 pub struct ToPython<'py> {
     py: Python<'py>,
     ast_module: Bound<'py, PyModule>,
+    /// What the [`Value::Opaque`] values index (see [`ToPython::with_objects`])
+    objects: Vec<Bound<'py, PyAny>>,
     memo: HashMap<NodeId, Bound<'py, PyAny>>,
     /// Per class index: the class object, and which of its fields this Python has
     classes: HashMap<usize, (Bound<'py, PyAny>, Vec<bool>)>,
@@ -306,10 +341,17 @@ impl<'py> ToPython<'py> {
         Ok(ToPython {
             py,
             ast_module: py.import("ast")?,
+            objects: Vec::new(),
             memo: HashMap::new(),
             classes: HashMap::new(),
             singletons: HashMap::new(),
         })
+    }
+
+    /// Resolve the opaque values of a tree [`FromPython`] converted: its `objects`.
+    pub fn with_objects(mut self, objects: Vec<Bound<'py, PyAny>>) -> ToPython<'py> {
+        self.objects = objects;
+        self
     }
 
     fn class(&mut self, index: usize) -> PyResult<(Bound<'py, PyAny>, Vec<bool>)> {
@@ -489,6 +531,11 @@ impl<'py> ToPython<'py> {
                 dict.into_any()
             }
             Value::Node(id) => self.node(ast, *id)?,
+            Value::Opaque(index) => self
+                .objects
+                .get(*index as usize)
+                .ok_or_else(|| unsupported(format!("opaque value {index} of another conversion")))?
+                .clone(),
         })
     }
 }

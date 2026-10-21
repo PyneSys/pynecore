@@ -31,6 +31,7 @@ only where it is computed. A native step that finds the module invalid raises
 ``verify`` the two must agree on that verdict as well.
 """
 import ast
+import dataclasses
 import hashlib
 import json
 import os
@@ -242,7 +243,13 @@ def run(names: list[str], tree: ast.Module, ctx: Any) -> ast.Module | Rejection 
 
 def _describe(node: Any, path: str, seen: dict[int, str], out: list[str]) -> None:
     """Flatten a tree into ``path: value`` lines; a node reached a second time is
-    written as a reference to the path it was first seen at."""
+    written as a reference to the path it was first seen at.
+
+    An object the native side hands through without looking into it (the type
+    pass's ``PineTypeTable``) is written by VALUE, field by field for a dataclass,
+    the way a node is: the bridge gives back the very object it was handed, but a
+    native copy of a subtree shares it where ``copy.deepcopy`` copies it, and the
+    two are the same result."""
     if isinstance(node, (ast.expr_context, ast.operator, ast.unaryop, ast.cmpop, ast.boolop)):
         # Fieldless: whether two of them are one shared instance means nothing
         out.append(f'{path}: {type(node).__name__}')
@@ -268,6 +275,14 @@ def _describe(node: Any, path: str, seen: dict[int, str], out: list[str]) -> Non
         out.append(f'{path}: dict[{len(node)}]')
         for key, item in node.items():
             _describe(item, f'{path}[{key!r}]', seen, out)
+    elif isinstance(node, (set, frozenset)):
+        # Iteration order follows the insertion history, which equal sets need not share
+        out.append(f'{path}: {type(node).__name__}[{len(node)}]')
+        out.extend(f'{path}{{}} = {item}' for item in sorted(repr(item) for item in node))
+    elif dataclasses.is_dataclass(node) and not isinstance(node, type):
+        out.append(f'{path}: {type(node).__name__}')
+        for item in dataclasses.fields(node):
+            _describe(getattr(node, item.name), f'{path}.{item.name}', seen, out)
     elif isinstance(node, float):
         # ``repr`` tells -0.0 from 0.0; NaN compares by spelling
         out.append(f'{path} = float {node!r}')

@@ -29,9 +29,9 @@ fn is_bool_valued(ast: &Ast, id: NodeId) -> bool {
     }
 }
 
-/// Python's truth value of a stamped attribute.
-fn truthy(value: &Value) -> bool {
-    match value {
+/// Python's truth value of a stamped attribute; None for an object only the host can ask.
+fn truthy(value: &Value) -> Option<bool> {
+    Some(match value {
         Value::None => false,
         Value::Bool(flag) => *flag,
         Value::Int(Int::Small(number)) => *number != 0,
@@ -41,7 +41,8 @@ fn truthy(value: &Value) -> bool {
         Value::Tuple(items) | Value::List(items) => !items.is_empty(),
         Value::Dict(items) => !items.is_empty(),
         Value::Node(_) => true,
-    }
+        Value::Opaque(_) => return None,
+    })
 }
 
 fn not(ast: &mut Ast, operand: NodeId) -> NodeId {
@@ -71,6 +72,8 @@ impl Reference {
 
 struct PineTruthiness {
     temp_counter: usize,
+    /// Why the pass cannot answer for the module, once it met such a construct
+    unsupported: Option<String>,
 }
 
 impl PineTruthiness {
@@ -123,20 +126,26 @@ impl PineTruthiness {
     }
 
     /// Force an `and` / `or` operand to a real bool where it could still be na.
-    fn bool_value(ast: &mut Ast, id: NodeId) -> NodeId {
+    fn bool_value(&mut self, ast: &mut Ast, id: NodeId) -> NodeId {
         if let &Kind::IfExp { body, orelse, .. } = ast.kind(id) {
-            let body = Self::bool_value(ast, body);
+            let body = self.bool_value(ast, body);
             let Kind::IfExp { body: slot, .. } = ast.kind_mut(id) else { unreachable!() };
             *slot = body;
-            let orelse = Self::bool_value(ast, orelse);
+            let orelse = self.bool_value(ast, orelse);
             let Kind::IfExp { orelse: slot, .. } = ast.kind_mut(id) else { unreachable!() };
             *slot = orelse;
             return id;
         }
-        if !matches!(ast.kind(id), Kind::Compare { .. })
-            || ast.extra(id, "pine_bool").is_some_and(truthy)
-        {
+        if !matches!(ast.kind(id), Kind::Compare { .. }) {
             return id;
+        }
+        match ast.extra(id, "pine_bool").map(truthy) {
+            Some(Some(true)) => return id,
+            Some(None) => {
+                self.unsupported = Some("an opaque pine_bool stamp".into());
+                return id;
+            }
+            Some(Some(false)) | None => {}
         }
         let inner = not(ast, id);
         not(ast, inner)
@@ -168,7 +177,7 @@ impl Transformer for PineTruthiness {
                     .into_iter()
                     .map(|value| {
                         let converted = self.convert(ast, value);
-                        Self::bool_value(ast, converted)
+                        self.bool_value(ast, converted)
                     })
                     .collect();
                 let Kind::BoolOp { values, .. } = ast.kind_mut(id) else { unreachable!() };
@@ -189,7 +198,46 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
     if !matches!(ast.kind(module), Kind::Module { .. }) {
         return Err(Error::Unsupported("PineTruthiness on a non-module".into()));
     }
-    let mut pass = PineTruthiness { temp_counter: 0 };
+    let mut pass = PineTruthiness { temp_counter: 0, unsupported: None };
     generic_visit(&mut pass, ast, module);
-    Ok(module)
+    match pass.unsupported {
+        Some(message) => Err(Error::Unsupported(message)),
+        None => Ok(module),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::NoHost;
+
+    /// `a == 1 or b`, the comparison stamped `pine_bool`.
+    fn module(ast: &mut Ast, pine_bool: Value) -> NodeId {
+        let a = ast.add(Kind::Name { id: "a".into(), ctx: ExprContext::Load });
+        let one = ast.add(Kind::Constant { value: Constant::Int(Int::Small(1)), kind: None });
+        let compare =
+            ast.add(Kind::Compare { left: a, ops: vec![CmpOperator::Eq], comparators: vec![one] });
+        ast.set_extra(compare, "pine_bool", pine_bool);
+        let b = ast.add(Kind::Name { id: "b".into(), ctx: ExprContext::Load });
+        let test = ast.add(Kind::BoolOp { op: BoolOperator::Or, values: vec![compare, b] });
+        let statement = ast.add(Kind::Expr { value: test });
+        ast.add(Kind::Module { body: vec![statement], type_ignores: vec![] })
+    }
+
+    #[test]
+    fn an_opaque_pine_bool_is_left_to_python() {
+        let ctx = Context {
+            path: String::new(),
+            pyne_mode: None,
+            source: String::new(),
+            user_code: true,
+            host: &NoHost,
+        };
+        let mut ast = Ast::new();
+        let root = module(&mut ast, Value::Opaque(0));
+        assert!(matches!(run(&mut ast, root, &ctx), Err(Error::Unsupported(_))));
+        let mut ast = Ast::new();
+        let root = module(&mut ast, Value::Bool(true));
+        assert!(run(&mut ast, root, &ctx).is_ok());
+    }
 }
