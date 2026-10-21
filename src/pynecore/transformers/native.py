@@ -37,6 +37,8 @@ from pathlib import Path
 from typing import Any
 
 from .builtin_shadow import Library, import_library, library_serves
+from .lib_registry import lib_star_exports
+from .module_property import module_properties
 
 try:
     from . import _native
@@ -183,6 +185,18 @@ class _Host:
 
     def library_serves(self, name: str, attr: str) -> bool:
         return library_serves(self._libraries[name], attr)
+
+    @staticmethod
+    def has_module_properties(module: str) -> bool:
+        return module in module_properties()
+
+    @staticmethod
+    def module_property(module: str, name: str) -> bool:
+        return name in module_properties()[module]
+
+    @staticmethod
+    def star_exports(module: str) -> list[str] | None:
+        return lib_star_exports().get(module)
 
 
 def _context(ctx: Any) -> dict[str, Any]:

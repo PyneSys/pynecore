@@ -119,7 +119,7 @@ from ..utils.stdlib_checker import is_stdlib
 from . import ast_walk
 from . import module_interface
 from .call_inline import SUPPORT_ALIAS_PREFIX
-from .pine_type_infer import lib_routes
+from .lib_registry import lib_routes
 from .pine_type_rules import (get_pin, get_pins, get_ty, get_varying, get_vector, get_widens,
                               stamp_lowering)
 from .pine_qualifier import SERIES_LENGTH_KEYWORD, get_series_len, get_series_lens

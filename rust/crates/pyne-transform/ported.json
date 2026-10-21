@@ -14,5 +14,9 @@
   "BuiltinShadow": {
     "module": "builtin_shadow",
     "digest": "630a4341411d8403bcb03bc4d112ee91f0083ebd62d77492c6214e6d8bfef25f"
+  },
+  "ImportNormalizer": {
+    "module": "import_normalizer",
+    "digest": "9bae877506af524053e3315717d6b51da0b0104eeea03a3eab593286b708f9f4"
   }
 }

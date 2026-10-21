@@ -16,6 +16,10 @@ use pyne_ast::{Ast, NodeId};
 /// the pipeline: the Python host from the live interpreter, a browser host from
 /// data it was handed. Each question is asked exactly where the Python step reads
 /// the live object, so a host that imports (Python) does so at the same moment.
+///
+/// The registry questions default to the data files compiled in (see [`data`]);
+/// the Python host answers them from the registries the Python steps read, so a
+/// registry a test patches reaches both backends alike.
 pub trait Host {
     /// Import a library module whose alias shadows a builtin namespace
     /// (`builtin_shadow.import_library`); false when it cannot be imported.
@@ -27,6 +31,23 @@ pub trait Host {
     /// Whether an imported library module serves a name (`builtin_shadow.library_serves`).
     fn library_serves(&self, module: &str, attr: &str) -> Result<bool, Unsupported> {
         Err(Unsupported(format!("no host to ask whether {module} serves {attr}")))
+    }
+
+    /// Whether `module_properties.json` has an entry for a module
+    /// (`module in module_property.module_properties()`).
+    fn has_module_properties(&self, module: &str) -> Result<bool, Unsupported> {
+        Ok(data::module_properties().contains_key(module))
+    }
+
+    /// Whether a module's `module_properties.json` entry names a member
+    /// (`name in module_property.module_properties()[module]`).
+    fn module_property(&self, module: &str, name: &str) -> Result<bool, Unsupported> {
+        Ok(data::module_properties().get(module).is_some_and(|members| members.contains(name)))
+    }
+
+    /// The `__all__` of a lib module (`lib_registry.lib_star_exports().get(module)`).
+    fn star_exports(&self, module: &str) -> Result<Option<Vec<String>>, Unsupported> {
+        Ok(data::star_exports().get(module).cloned())
     }
 }
 
@@ -71,6 +92,7 @@ pub static STEPS: &[Step] = &[
     Step { name: "TypeCheckingStripper", run: steps::type_checking_stripper::run },
     Step { name: "TypeErasure", run: steps::type_erasure::run },
     Step { name: "BuiltinShadow", run: steps::builtin_shadow::run },
+    Step { name: "ImportNormalizer", run: steps::import_normalizer::run },
 ];
 
 /// The native port of a step, if there is one.

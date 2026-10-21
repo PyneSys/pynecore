@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use pyne_ast::walk::{Transformer, Visited, copy_location, generic_visit};
 use pyne_ast::{Ast, ExprContext, Kind, NodeId};
 
-use crate::data::module_properties;
 use crate::{Context, Host, Unsupported};
 
 /// Pine namespaces whose pynecore module has a different name
@@ -73,18 +72,18 @@ impl BuiltinShadow<'_> {
 
         // Built-in namespace fallback -> canonical lib.<namespace>.<attr> form; the
         // nested-key check covers sub-namespaces (e.g. strategy.commission)
-        let registry = module_properties();
-        let members = &registry[&format!("lib.{namespace}")];
-        let known = |attr: &str| {
-            members.contains(attr) || registry.contains_key(&format!("lib.{namespace}.{attr}"))
+        let module = format!("lib.{namespace}");
+        let known = |attr: &str| -> Result<bool, Unsupported> {
+            Ok(self.host.module_property(&module, attr)?
+                || self.host.has_module_properties(&format!("{module}.{attr}"))?)
         };
         let mut attr = attr;
-        if !known(&attr) && attr.ends_with("__ren__") {
+        if !known(&attr)? && attr.ends_with("__ren__") {
             // A trigger-named member is emitted under its canonical image; when the
             // library does not serve it, the built-in namespace knows the bare name only
             attr.truncate(attr.len() - "__ren__".len());
         }
-        if !known(&attr) {
+        if !known(&attr)? {
             // In neither -> leave it to fail at runtime, as before
             return Ok(id);
         }
@@ -116,7 +115,6 @@ impl Transformer for BuiltinShadow<'_> {
 }
 
 pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, Unsupported> {
-    let registry = module_properties();
     let Kind::Module { body, .. } = ast.kind(module) else {
         return Err(Unsupported("BuiltinShadow on a non-module".into()));
     };
@@ -141,7 +139,7 @@ pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, U
                 name = stripped;
             }
             let namespace = namespace_rename(name);
-            if !registry.contains_key(&format!("lib.{namespace}")) {
+            if !ctx.host.has_module_properties(&format!("lib.{namespace}"))? {
                 continue;
             }
             if !ctx.host.import_library(module_name)? {

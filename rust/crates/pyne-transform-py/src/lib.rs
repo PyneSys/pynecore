@@ -74,6 +74,24 @@ impl pyne_transform::Host for PyHost<'_> {
     fn library_serves(&self, module: &str, attr: &str) -> Result<bool, pyne_ast::Unsupported> {
         self.ask("library_serves", (module, attr))
     }
+
+    fn has_module_properties(&self, module: &str) -> Result<bool, pyne_ast::Unsupported> {
+        self.ask("has_module_properties", (module,))
+    }
+
+    fn module_property(&self, module: &str, name: &str) -> Result<bool, pyne_ast::Unsupported> {
+        self.ask("module_property", (module, name))
+    }
+
+    fn star_exports(&self, module: &str) -> Result<Option<Vec<String>>, pyne_ast::Unsupported> {
+        let Some(object) = &self.object else {
+            return Err(pyne_ast::Unsupported("no host for star_exports".into()));
+        };
+        object
+            .call_method1("star_exports", (module,))
+            .and_then(|answer| answer.extract::<Option<Vec<String>>>())
+            .map_err(|err| pyne_ast::Unsupported(format!("host star_exports: {err}")))
+    }
 }
 
 /// Run native steps over a module, in order.

@@ -43,7 +43,6 @@ nothing. That keeps it testable one rule at a time, and keeps the rules
 """
 import ast
 import importlib.util
-import json
 from bisect import bisect_right
 from collections import deque
 from collections.abc import Callable, Container, Iterator, Mapping, Sequence
@@ -55,6 +54,7 @@ from ..utils.stdlib_checker import is_stdlib
 from . import ast_walk
 from . import module_interface
 from .dynamic_default import is_script_entry
+from .lib_registry import lib_registry, lib_routes, lib_star_exports
 from .node_ids import ID_ATTR, assign_node_ids, node_id
 from .pine_type_report import unknown_diags
 from .pine_type_rules import (
@@ -189,23 +189,10 @@ def _walker_rule(rule: Callable[[Any], str]) -> Callable[..., str]:
     """
     return lambda walker, node: rule(node)
 
-_LIB_TYPES_PATH = Path(__file__).parent / 'lib_types.json'
-_LIB_REGISTRY: dict[str, Any] = {}
 _LIB_TYPES: dict[str, dict[str, Any]] = {}
 _LIB_CLASSES: dict[str, 'ClassSig'] = {}
 _LIB_SCALARS: dict[str, str] = {}
 _LIB_NAMESPACES: set[str] = set()
-
-
-def _lib_registry() -> dict[str, Any]:
-    """
-    The generated lib registry file, parsed once for every view of it below.
-
-    :return: Its top-level sections
-    """
-    if not _LIB_REGISTRY:
-        _LIB_REGISTRY.update(json.loads(_LIB_TYPES_PATH.read_text()))
-    return _LIB_REGISTRY
 
 
 def lib_types() -> dict[str, dict[str, Any]]:
@@ -220,7 +207,7 @@ def lib_types() -> dict[str, dict[str, Any]]:
     :return: name -> entry mapping
     """
     if not _LIB_TYPES:
-        _LIB_TYPES.update(_lib_registry()['names'])
+        _LIB_TYPES.update(lib_registry()['names'])
     return _LIB_TYPES
 
 
@@ -236,7 +223,7 @@ def lib_classes() -> dict[str, ClassSig]:
     :return: Class id -> what that class declares
     """
     if not _LIB_CLASSES:
-        published = _lib_registry()['classes']
+        published = lib_registry()['classes']
         for name, fields in published.items():
             cid = builtin_class_id(name)
             _LIB_CLASSES[cid] = ClassSig(name=name, id=cid, fields=dict(fields), methods={})
@@ -255,35 +242,10 @@ def lib_scalar_classes() -> dict[str, str]:
     :return: Class id -> the scalar it is
     """
     if not _LIB_SCALARS:
-        published = _lib_registry().get('scalar_classes') or {}
+        published = lib_registry().get('scalar_classes') or {}
         _LIB_SCALARS.update({object_ty(builtin_class_id(name)): scalar
                              for name, scalar in published.items()})
     return _LIB_SCALARS
-
-
-def lib_routes() -> dict[str, str]:
-    """
-    The call-site route of every lib callee path that does not route uniform.
-
-    ``FunctionIsolationTransformer`` reads a ``pynecore.lib`` callee's route
-    here instead of importing and inspecting the object; the generator computed
-    each entry with the transformer's own ``classify_callee``.
-
-    :return: Callee path as a script spells it (``lib.ta.sma``) -> route
-    """
-    return _lib_registry()['routes']
-
-
-def lib_star_exports() -> dict[str, list[str]]:
-    """
-    The ``__all__`` of every lib module that defines one.
-
-    ``ImportNormalizerTransformer`` expands ``from pynecore.lib... import *``
-    from here instead of importing the module.
-
-    :return: Module name (``pynecore.lib.ta``) -> its ``__all__``, sorted
-    """
-    return _lib_registry()['star_exports']
 
 
 def lib_namespaces() -> set[str]:

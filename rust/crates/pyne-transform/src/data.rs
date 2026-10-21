@@ -22,3 +22,15 @@ pub fn module_properties() -> &'static HashMap<String, HashSet<String>> {
             .collect()
     })
 }
+
+/// `lib_types.json`'s `star_exports`: lib module -> its `__all__` (`lib_registry.lib_star_exports`).
+pub fn star_exports() -> &'static HashMap<String, Vec<String>> {
+    static EXPORTS: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
+    EXPORTS.get_or_init(|| {
+        let text = include_str!("../../../../src/pynecore/transformers/lib_types.json");
+        let mut document: HashMap<String, Value> =
+            serde_json::from_str(text).expect("lib_types.json");
+        serde_json::from_value(document.remove("star_exports").expect("star_exports"))
+            .expect("star_exports")
+    })
+}
