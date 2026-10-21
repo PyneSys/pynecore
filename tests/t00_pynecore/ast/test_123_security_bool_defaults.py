@@ -43,11 +43,11 @@ def main():
 
 
 @pytest.mark.parametrize('call, expected', [
-    ('request.security(syminfo.tickerid, "60", close)', 'lib._na_none'),
+    ('request.security(syminfo.tickerid, "60", close)', 'lib._na_float'),
     ('request.security_lower_tf(syminfo.tickerid, "1", close > open)', '[]'),
 ])
 def __test_non_bool_and_lower_timeframe_defaults_are_preserved__(tmp_path, call, expected):
-    """Numeric missing values and lower-timeframe empty arrays keep their existing contract."""
+    """A numeric missing value is the numeric na; a lower-timeframe one stays the empty array."""
     source = f'''"""@pyne"""
 from pynecore.lib import close, open, request, script, syminfo
 @script.indicator("Test")

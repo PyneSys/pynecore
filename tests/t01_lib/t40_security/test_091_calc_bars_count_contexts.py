@@ -59,7 +59,7 @@ def __test_calc_bars_count_cuts_every_context__(runner, log):
     import tempfile
     from pathlib import Path
     from pynecore.types.ohlcv import OHLCV
-    from pynecore.types.na import NA
+    from pynecore.lib import na
 
     os.environ['PYNE_SAVE_SCRIPT_TOML'] = '0'
     chart = [OHLCV(timestamp=__test_helper_ts0 + i * 30 * __test_helper_minute,
@@ -75,7 +75,7 @@ def __test_calc_bars_count_cuts_every_context__(runner, log):
 
     assert len(rows) == 10
     # The 10:00 hourly bar is the context's first: it confirms on the 10:30 chart bar
-    h_bi = [None if isinstance(row["h_bi"], NA) else row["h_bi"] for row in rows]
+    h_bi = [None if na(row["h_bi"]) else row["h_bi"] for row in rows]
     assert h_bi == [None, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0]
     # The 09:45 intrabar is the LTF context's bar 0, so the 10:00 chart bar holds 1 and 2
     assert [row["ltf_n"] for row in rows] == [2.0] * 10

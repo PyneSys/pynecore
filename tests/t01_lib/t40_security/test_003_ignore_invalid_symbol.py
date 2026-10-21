@@ -13,9 +13,7 @@ def main():
 
 
 def __test_ignore_invalid_symbol__(csv_reader, runner, log):
-    """ignore_invalid_symbol=True returns na for non-existent symbols without error"""
-    from pynecore.types.na import NA
-
+    """ignore_invalid_symbol=True returns the float na for non-existent symbols without error"""
     with csv_reader('advance_decline_ratio.csv', subdir="data") as cr:
         r = runner(
             cr,
@@ -24,8 +22,7 @@ def __test_ignore_invalid_symbol__(csv_reader, runner, log):
 
         for i, (candle, plot_values) in enumerate(r.run_iter()):
             sec_val = plot_values.get('SecVal')
-            assert isinstance(sec_val, NA), \
-                f"bar {i}: expected na but got {sec_val}"
+            assert na(sec_val), f"bar {i}: expected na but got {sec_val}"
 
     log.info("ignore_invalid_symbol test passed — na returned for missing symbol")
 

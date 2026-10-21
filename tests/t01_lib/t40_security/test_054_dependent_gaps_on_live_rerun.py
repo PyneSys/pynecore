@@ -101,7 +101,7 @@ def __test_gaps_on_consumer_is_stable_across_developing_reruns__(script_path, mo
     from pathlib import Path
 
     from pynecore.core.script_runner import ScriptRunner, LIVE_TRANSITION
-    from pynecore.types.na import NA
+    from pynecore.lib import na
 
     sys.modules.pop(Path(__file__).stem, None)
     sys.modules.pop(module_key, None)
@@ -138,8 +138,8 @@ def __test_gaps_on_consumer_is_stable_across_developing_reruns__(script_path, mo
             # with a single plain context). That belongs to the live HTF
             # transport, not to the gaps_on read state this file guards.
             continue
-        if isinstance(a, NA):
-            assert isinstance(b, NA), f"hour {hour}: a is na but b={b}"
+        if na(a):
+            assert na(b), f"hour {hour}: a is na but b={b}"
             continue
         if hour % 2 == 1:
             # This chart bar opens a fresh 120-minute period: the producer bar
@@ -147,7 +147,7 @@ def __test_gaps_on_consumer_is_stable_across_developing_reruns__(script_path, mo
             assert b == a + 1000.0, f"hour {hour}: b={b} != a+1000={a + 1000.0}"
             checked += 1
         else:
-            assert isinstance(b, NA), \
+            assert na(b), \
                 f"hour {hour}: gaps_on returned {b} on a bar with no new producer bar"
     assert checked > 4, f"only {checked} gaps_on values seen"
     log.info("gaps_on dependent consumer stayed stable across developing re-runs")

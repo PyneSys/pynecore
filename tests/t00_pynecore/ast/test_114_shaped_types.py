@@ -1731,6 +1731,25 @@ def main():
     assert 'array.get' in table.diags[0].fix
 
 
+def __test_a_series_of_containers_has_a_history__():
+    """``prices[1]`` on a series of arrays reads the bar before's array, not an element"""
+    types = _types(UDT_SETUP + '''
+from pynecore.types import PersistentSeries, Series
+
+
+def main():
+    prices: PersistentSeries[list[float]] = array.new_float(3, na)
+    sizes: Series[dict[str, int]] = map.new()
+    before = prices[1]
+    first = array.get(prices[1], 0)
+    older = sizes[2]
+    return before, first, older
+''', scope='main')
+    assert types['before'] == array_of(FLOAT)
+    assert types['first'] == FLOAT
+    assert types['older'] == map_of(STR, INT)
+
+
 def __test_a_scalar_is_not_iterable__():
     """A for loop walks a range or an array, never a number"""
     _, table = _infer(UDT_SETUP + '''

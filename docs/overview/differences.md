@@ -316,8 +316,11 @@ class the value was typed with, as it does on TradingView. One written where an 
 or a matrix goes is the na of that container, `na(list)`, `na(dict)` or `na(Matrix)`, the way
 a compiled `array<float> a = na` reads. A variable that starts as a bare `na` and is assigned
 a value later (`result = na`, then `result = compute()` in a branch) takes the type of its
-assignments, and the `na` it starts as is that type's na; assignments of two different types
-(`"s"` in one branch, `2` in another) are reported as the error they are in Pine.
+assignments, and the `na` it starts as is that type's na, a tuple that starts as `[na, na]`
+per position; assignments of two different types (`"s"` in one branch, `2` in another) are
+reported as the error they are in Pine, a tuple's positions one by one. The `na` a
+`request.security` call yields on a bar with no value is the na of the requested expression's
+type, per position for a tuple.
 
 ### Array
 

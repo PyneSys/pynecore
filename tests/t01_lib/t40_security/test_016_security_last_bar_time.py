@@ -57,7 +57,7 @@ def __test_security_last_bar_time_anchored__(runner, log):
     on every chart bar — not the child's per-bar current time."""
     import tempfile
     from pathlib import Path
-    from pynecore.types.na import NA
+    from pynecore.lib import na
 
     with tempfile.TemporaryDirectory() as td:
         htf_path = _write_htf(Path(td), [_TS0, _TS0 + _HTF_STEP])
@@ -68,7 +68,7 @@ def __test_security_last_bar_time_anchored__(runner, log):
         for _candle, pv in r.run_iter():
             rows.append(pv["htf_lbt"])
 
-    values = [v for v in rows if not isinstance(v, NA)]
+    values = [v for v in rows if not na(v)]
     assert values, "security never returned a value"
     assert all(int(v) == file_final_ms for v in values), \
         f"expected constant {file_final_ms}, got {sorted(set(values))}"

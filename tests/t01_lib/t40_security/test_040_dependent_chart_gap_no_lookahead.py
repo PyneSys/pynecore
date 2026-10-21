@@ -80,7 +80,7 @@ def __test_chart_data_gap_does_not_advance_the_daily_peer__(runner, log):
     import sys
     import tempfile
     from pathlib import Path
-    from pynecore.types.na import NA
+    from pynecore.lib import na
 
     sys.modules.pop(Path(__file__).stem, None)
 
@@ -117,7 +117,7 @@ def __test_chart_data_gap_does_not_advance_the_daily_peer__(runner, log):
 
     # The dependent context pairs identically — one rule for the chart and the child.
     for key, (direct, dependent) in rows.items():
-        if direct is None or isinstance(direct, NA):
+        if direct is None or na(direct):
             continue
         assert dependent == direct + 0.5, \
             f"{key}: dependent={dependent} != direct+0.5={direct + 0.5}"

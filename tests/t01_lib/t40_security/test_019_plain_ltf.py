@@ -81,16 +81,16 @@ def _chart_bars():
 
 def _assert_column(rows, key, expected, log):
     import math
-    from pynecore.types.na import NA
+    from pynecore.lib import na
 
     assert len(rows) == len(expected), f"bar count {len(rows)} != {len(expected)}"
     for i, row in enumerate(rows):
         value = row[key]
         want = expected[i]
         if want is None:
-            assert isinstance(value, NA), f"{key} bar {i}: expected na, got {value!r}"
+            assert na(value), f"{key} bar {i}: expected na, got {value!r}"
         else:
-            assert not isinstance(value, NA), f"{key} bar {i}: expected {want}, got na"
+            assert not na(value), f"{key} bar {i}: expected {want}, got na"
             assert math.isclose(float(value), want, abs_tol=1e-9), (
                 f"{key} bar {i}: {value} != {want}"
             )

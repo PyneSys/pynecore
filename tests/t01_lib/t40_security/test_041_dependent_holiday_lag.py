@@ -88,7 +88,7 @@ def __test_weekly_bar_appears_a_bar_late_after_a_holiday_friday__(runner, log):
     import sys
     import tempfile
     from pathlib import Path
-    from pynecore.types.na import NA
+    from pynecore.lib import na
     from pynecore.types.ohlcv import OHLCV
 
     sys.modules.pop(Path(__file__).stem, None)
@@ -130,7 +130,7 @@ def __test_weekly_bar_appears_a_bar_late_after_a_holiday_friday__(runner, log):
 
     # The dependent context pairs identically.
     for ts, (direct, dependent) in rows.items():
-        if direct is None or isinstance(direct, NA):
+        if direct is None or na(direct):
             continue
         assert dependent == direct + 0.25, \
             f"ts={ts}: dependent={dependent} != direct+0.25"

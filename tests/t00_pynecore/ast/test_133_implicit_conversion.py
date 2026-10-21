@@ -898,3 +898,50 @@ def __test_branches_assigning_different_types_are_reported__(body, message):
     """Pine rejects a variable whose assignments disagree; the walk names the pair"""
     emitted, diags = __test_helper_widen(body, __test_helper_UDT_PRELUDE)
     assert message in diags
+
+
+@pytest.mark.parametrize("body,expected", [
+    # a tuple's start: each position is the na of the type its assignments join to
+    ('pair = (lib._na_none, lib._na_none)\nif lib.bar_index > 0:\n    pair = (1, "a")\n'
+     'else:\n    pair = (2.5, "b")\nn, s = pair', "pair = (lib._na_float, '')"),
+    ('box = (lib._na_none, lib._na_none)\nif lib.bar_index > 0:\n'
+     '    box = (Pivot(1.0), lib.array.new_float(0))\nx = box',
+     'box = (lib.na(Pivot), lib.na(list))'),
+    # a position a bool is assigned to keeps the typeless na
+    ('mixed = (lib._na_none, lib._na_none)\nif lib.bar_index > 0:\n'
+     '    mixed = (True, lib.close)\nx = mixed', 'mixed = (lib._na_none, lib._na_float)'),
+])
+def __test_a_tuple_a_name_starts_as_is_the_na_of_each_position_assigned_later__(body,
+                                                                                 expected):
+    emitted, diags = __test_helper_widen(body, __test_helper_UDT_PRELUDE)
+    assert expected in emitted.splitlines()
+    assert not diags
+
+
+def __test_tuple_positions_assigned_different_types_are_reported_one_by_one__():
+    """A conflict sits at a position, and every position that disagrees is named"""
+    body = ('bad = (lib._na_none, lib._na_none)\nif lib.bar_index > 0:\n    bad = (1, "a")\n'
+            'else:\n    bad = ("x", 2)')
+    _, diags = __test_helper_widen(body)
+    assert "element 1 of 'bad' gets both int and string, which are different types" in diags
+    assert "element 2 of 'bad' gets both string and int, which are different types" in diags
+
+
+@pytest.mark.parametrize("body,expected", [
+    ("__sec_write__('sec-1', lib.close)\nvalue = __sec_read__('sec-1', lib._na_none)",
+     "value = __sec_read__('sec-1', lib._na_float)"),
+    ("__sec_write__('sec-2', (lib.high, 'tag', Pivot(1.0)))\n"
+     "hi, tag, top = __sec_read__('sec-2', (lib._na_none, lib._na_none, lib._na_none))",
+     "hi, tag, top = __sec_read__('sec-2', (lib._na_float, '', lib.na(Pivot)))"),
+    # a bool position, and an id nothing writes, keep the typeless na
+    ("__sec_write__('sec-3', (lib.close > lib.open, lib.close))\n"
+     "up, c = __sec_read__('sec-3', (lib._na_none, lib._na_none))",
+     "up, c = __sec_read__('sec-3', (lib._na_none, lib._na_float))"),
+    ("value = __sec_read__('sec-4', lib._na_none)",
+     "value = __sec_read__('sec-4', lib._na_none)"),
+])
+def __test_a_security_read_falls_back_to_the_na_of_what_its_write_publishes__(body,
+                                                                               expected):
+    """The default of the read the security transform emits is the write's na, per position"""
+    emitted, _ = __test_helper_widen(body, __test_helper_UDT_PRELUDE)
+    assert expected in emitted.splitlines()

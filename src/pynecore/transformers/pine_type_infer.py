@@ -364,9 +364,11 @@ class _Frame:
     #: Name of a ``pine_loop(...)`` counter object -> the type its counter
     #: has, the join of the bounds it was built and stepped with
     loop_counters: dict[str, str] = field(default_factory=dict)
-    #: Name -> every typeless ``na`` stored into it: the na of whatever type the
-    #: name's assignments join to, re-decided on each assignment
-    na_stores: dict[str, list[ast.expr]] = field(default_factory=dict)
+    #: Name -> every typeless ``na`` stored into it, with its position inside the
+    #: stored value (empty for the value itself, an index path into a tuple
+    #: literal): the na of whatever type the name's assignments join to at that
+    #: position, re-decided on each assignment
+    na_stores: dict[str, list[tuple[ast.expr, tuple[int, ...]]]] = field(default_factory=dict)
 
 
 @dataclass(slots=True, frozen=True)
@@ -585,10 +587,11 @@ class _Inference:
         #: resolved through the ordinary scope search on that name; the node is
         #: what the published signature is derived from
         self._class_methods: dict[str, dict[str, ast.FunctionDef]] = {}
-        #: Nodes a shape complaint was already reported for. A body is walked
-        #: once per context and again per loop pass, and one mismatch is one
-        #: complaint however many walks find it
-        self._shape_diags: set[int] = set()
+        #: Nodes a shape complaint was already reported for, a join conflict
+        #: keyed with the name of what it joined. A body is walked once per
+        #: context and again per loop pass, and one mismatch is one complaint
+        #: however many walks find it
+        self._shape_diags: set[int | tuple[int, str]] = set()
         #: The ``field(default_factory=...)`` calls that stand as UDT field defaults
         self._factory_fields: set[int] = set()
         self._factory = FactoryFields(ast.Module(body=[], type_ignores=[]))
@@ -823,21 +826,22 @@ class _Inference:
     def _note_na_store(self, bindings: dict[str, Binding], name: str, ty: str,
                        node: ast.AST) -> None:
         """
-        Remember a typeless ``na`` stored into a name.
+        Remember every typeless ``na`` a value stored into a name holds.
 
         :param bindings: The names of the scope the store binds in
         :param name: The name stored
         :param ty: The type stored
         :param node: The value stored
         """
-        if ty != TYPELESS or not isinstance(node, ast.expr) or not _holds_na(node):
+        if not isinstance(node, ast.expr):
             return
         frame = self._frame_of(bindings)
         if frame is None:
             return
         stored = frame.na_stores.setdefault(name, [])
-        if not any(value is node for value in stored):
-            stored.append(node)
+        for value, path in _typeless_nas(node, ty):
+            if not any(found is value for found, _ in stored):
+                stored.append((value, path))
 
     def _settle_na_stores(self, bindings: dict[str, Binding], name: str, ty: str) -> None:
         """
@@ -848,7 +852,8 @@ class _Inference:
         the na it started as is the na of that type -- the way the declared
         ``float result = na`` the compiler would spell it reads. It is re-decided
         on every assignment, so a later branch that moves the join, or breaks it,
-        has the last word.
+        has the last word. A tuple's ``[na, na]`` start is the same per position:
+        each element is the na of the type its position joins to.
 
         :param bindings: The names of the scope the store binds in
         :param name: The name stored
@@ -857,9 +862,8 @@ class _Inference:
         frame = self._frame_of(bindings)
         if frame is None:
             return
-        kind = _na_widen(ty)
-        for value in frame.na_stores.get(name, ()):
-            self._record_widen(value, kind)
+        for value, path in frame.na_stores.get(name, ()):
+            self._record_widen(value, _na_widen(_element_at(ty, path)))
 
     def _joined(self, left: str, right: str, node: ast.AST, what: str) -> str:
         """
@@ -884,6 +888,15 @@ class _Inference:
         :return: The joined type
         """
         joined = join(left, right)
+        if is_tuple(left) and is_tuple(right) \
+                and len(elements_of(left)) == len(elements_of(right)):
+            # Two tuples of one arity join position by position, and so are
+            # they reported: a conflict in one position leaves the others
+            # typed, which is what the unpack that follows needs, and each
+            # pair that disagrees is named with its position
+            for index, (item, other) in enumerate(zip(elements_of(left), elements_of(right))):
+                self._joined(item, other, node, f'element {index + 1} of {what}')
+            return joined
         conflict = shape_conflict(left, right)
         if conflict is None and joined == UNKNOWN \
                 and left not in _UNCHECKED and right not in _UNCHECKED:
@@ -891,13 +904,15 @@ class _Inference:
         if conflict is None:
             return joined
         nid = node_id(node)
-        if nid is not None and nid in self._shape_diags:
+        # One node is one complaint per named thing, however many walks find it;
+        # the positions of a tuple are as many things
+        key = (nid, what)
+        if nid is not None and key in self._shape_diags:
             return joined
         if nid is not None:
-            self._shape_diags.add(nid)
-        # A conflict inside a tuple leaves the other positions typed, which
-        # is what the unpack that follows needs; the DIAGNOSTIC is what marks
-        # the program wrong, and it points at the pair that disagrees
+            self._shape_diags.add(key)
+        # The DIAGNOSTIC is what marks the program wrong, and it points at the
+        # pair that disagrees
         self._diag(
             f'{what} gets both {render_ty(conflict[0])} and {render_ty(conflict[1])}, '
             f'which are different types', node,
@@ -2770,9 +2785,12 @@ class _Inference:
                     and 0 <= index < len(elements):
                 return elements[index]
             return UNKNOWN
-        if is_array(base) or is_matrix(base) or is_map(base):
+        if (is_array(base) or is_matrix(base) or is_map(base)) \
+                and not self._is_series(node.value):
             # An element read is ``array.get``: a Python index on the
-            # container is not the Pine form
+            # container is not the Pine form. A SERIES of containers has a
+            # history like any other series, and ``prices[1]`` reads the
+            # container of the bar before
             self._node_diag(
                 f'indexing {render_ty(base)} is not Pine', node, 'not-pine', 'Subscript',
                 fix='read elements with array.get / matrix.get / map.get')
@@ -4592,17 +4610,24 @@ class _Inference:
         :return: The type the read evaluates to
         """
         sec_id = node.args[0] if node.args else None
+        default = node.args[1] if len(node.args) > 1 else None
         parts: list[str] = []
         if isinstance(sec_id, ast.Constant) and isinstance(sec_id.value, str):
             parts += [self._ty_of(written)
                       for written in self._sec_writes.get(sec_id.value, ())]
-        if len(node.args) > 1 and _dotted(node.args[1]) != 'lib._na_none':
-            parts.append(self._ty_of(node.args[1]))
-        if not parts:
-            return UNKNOWN
-        result = parts[0]
-        for ty in parts[1:]:
-            result = join(result, ty)
+        if default is not None and _dotted(default) != 'lib._na_none':
+            parts.append(self._ty_of(default))
+        result = UNKNOWN
+        if parts:
+            result = parts[0]
+            for ty in parts[1:]:
+                result = join(result, ty)
+        if default is not None:
+            # The typeless na the read falls back to -- one per position of a
+            # tuple -- is the na of what the write puts there, the way the
+            # declared variable the read lands in would type it
+            for value, path in _typeless_nas(default, self._ty_of(default)):
+                self._record_widen(value, _na_widen(_element_at(result, path)))
         return result
 
     def _ensure_group(self, key: str, frame: int) -> None:
@@ -5568,6 +5593,46 @@ def _holds_na(node: ast.AST) -> bool:
     :return: True when a typed na may take its place
     """
     return not (isinstance(node, ast.Name) and node.id == _DYN_DEFAULT)
+
+
+def _typeless_nas(node: ast.expr, ty: str, path: tuple[int, ...] = ()
+                  ) -> Iterator[tuple[ast.expr, tuple[int, ...]]]:
+    """
+    The typeless ``na`` values a stored value holds, each with its position in it.
+
+    A scalar is the value itself. A tuple literal holds one per element that is a
+    typeless na -- the ``[na, na]`` a block result starts as, the default a security
+    read of a tuple falls back to -- and the position is what picks the element's
+    type out of the tuple type the value is later matched against.
+
+    :param node: The value stored
+    :param ty: The type the value was found to have
+    :param path: The position of ``node`` inside the value stored
+    :return: (the na node, its index path) pairs
+    """
+    if isinstance(node, (ast.Tuple, ast.List)):
+        elements = elements_of(ty)
+        if len(elements) == len(node.elts):
+            for index, (element, item) in enumerate(zip(node.elts, elements)):
+                yield from _typeless_nas(element, item, path + (index,))
+    elif ty == TYPELESS and _holds_na(node):
+        yield node, path
+
+
+def _element_at(ty: str, path: Sequence[int]) -> str:
+    """
+    The type at a position of a tuple type.
+
+    :param ty: A type, a tuple for a non-empty path
+    :param path: Index path into the tuple's elements
+    :return: The element type there, or UNKNOWN past the tuple's shape
+    """
+    for index in path:
+        elements = elements_of(ty)
+        if index >= len(elements):
+            return UNKNOWN
+        ty = elements[index]
+    return ty
 
 
 def _reaches_library_methods(receiver: str, name: str) -> bool:

@@ -149,8 +149,8 @@ def __test_a_traced_run_names_every_missing_feed__(runner, tmp_path, log):
         os.environ.pop('PYNE_SECURITY_TRACE', None)
 
     assert len(rows) == 48
-    from pynecore.types.na import NA
-    assert all(isinstance(row["first"], NA) for row in rows)
+    from pynecore.lib import na
+    assert all(na(row["first"]) for row in rows)
     traced = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
     assert [(row["timeframe"], row["missing"]) for row in traced] == \
            [("60", True), ("5", False), ("120", True)]

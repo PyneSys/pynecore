@@ -109,7 +109,7 @@ def __test_intraday_multiperiod_aggregates_and_holds__(runner, log):
     import sys
     import tempfile
     from pathlib import Path
-    from pynecore.types.na import NA
+    from pynecore.lib import na
 
     sys.modules.pop(Path(__file__).stem, None)
 
@@ -156,7 +156,7 @@ def __test_intraday_multiperiod_aggregates_and_holds__(runner, log):
                     cell(day, hour, 3), cell(day, hour, 4))
             exp = expected_3d(day, hour)
             if exp is None:
-                assert isinstance(ohlc[3], NA), \
+                assert na(ohlc[3]), \
                     f"3D day {day} h{hour}: c3={ohlc[3]} should be na (period developing)"
             else:
                 assert ohlc == exp, f"3D day {day} h{hour}: ohlc={ohlc} != {exp}"
@@ -176,7 +176,7 @@ def __test_intraday_multiperiod_aggregates_and_holds__(runner, log):
             cd = cell(day, hour, 5)
             exp_cd = expected_d(day, hour)
             if exp_cd is None:
-                assert isinstance(cd, NA), f"D day {day} h{hour}: cd={cd} should be na"
+                assert na(cd), f"D day {day} h{hour}: cd={cd} should be na"
             else:
                 assert cd == exp_cd, f"D day {day} h{hour}: cd={cd} != {exp_cd}"
 
@@ -194,7 +194,7 @@ def __test_intraday_multiperiod_aggregates_and_holds__(runner, log):
             c5 = cell(day, hour, 6)
             exp_c5 = expected_5d(day, hour)
             if exp_c5 is None:
-                assert isinstance(c5, NA), f"5D day {day} h{hour}: c5={c5} should be na (developing)"
+                assert na(c5), f"5D day {day} h{hour}: c5={c5} should be na (developing)"
             else:
                 assert c5 == exp_c5, f"5D day {day} h{hour}: c5={c5} != {exp_c5}"
 
@@ -207,7 +207,7 @@ def __test_intraday_multiperiod_aggregates_and_holds__(runner, log):
     for (day, hour), vals in rows.items():
         for idx, name, confirm in ((4, "3D", confirm_3d), (6, "5D", confirm_5d)):
             v = vals[idx]
-            if not isinstance(v, NA) and (day, hour) not in confirm:
+            if not na(v) and (day, hour) not in confirm:
                 assert v != vals[0], f"{name} day {day} h{hour}: tracks developing close {vals[0]}"
 
     log.info("intraday 3D/5D/D request.security exposes the last confirmed period aggregate")

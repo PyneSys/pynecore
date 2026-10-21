@@ -232,5 +232,5 @@ def __test_taken_branch_matches_the_statement_form__(runner, log):
 
 
 def __test_helper_is_na(value):
-    from pynecore.types.na import NA
-    return isinstance(value, NA)
+    from pynecore.lib import na
+    return na(value)
