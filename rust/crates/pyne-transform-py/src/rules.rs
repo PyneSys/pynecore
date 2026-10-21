@@ -162,11 +162,12 @@ fn value<'py>(
             dict.into_any()
         }
         Value::Node(id) => original(from, *id)?,
+        Value::Opaque(index) => from.objects[*index as usize].clone(),
     })
 }
 
 fn original<'py>(from: &FromPython<'py>, id: NodeId) -> PyResult<Bound<'py, PyAny>> {
-    from.object(id).cloned().ok_or_else(|| PyKeyError::new_err("a node built natively"))
+    from.source(id).cloned().ok_or_else(|| PyKeyError::new_err("a node built natively"))
 }
 
 fn context_map<'py>(

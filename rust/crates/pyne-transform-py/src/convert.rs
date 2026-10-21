@@ -57,7 +57,7 @@ impl<'py> FromPython<'py> {
     }
 
     /// The Python object a node was converted from.
-    pub fn object(&self, id: NodeId) -> Option<&Bound<'py, PyAny>> {
+    pub fn source(&self, id: NodeId) -> Option<&Bound<'py, PyAny>> {
         let (&key, _) = self.memo.iter().find(|&(_, &known)| known == id)?;
         self.keep.iter().find(|object| object.as_ptr() as usize == key)
     }
