@@ -424,6 +424,7 @@ name = "pyne-transform"
 version = "0.1.0"
 dependencies = [
  "pyne-ast",
+ "pyne-parse",
  "serde_json",
 ]
 

@@ -10,6 +10,7 @@
 //! shows the message).
 
 pub mod data;
+pub mod pine_type_rules;
 pub mod steps;
 
 use std::fmt;

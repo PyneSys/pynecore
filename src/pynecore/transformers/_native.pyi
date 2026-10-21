@@ -35,3 +35,7 @@ def steps() -> list[str]:
 
 def ported_json() -> str:
     """The ``ported.json`` manifest the extension was built with."""
+
+
+def _rules(name: str, *args: Any) -> Any:
+    """One function of the native ``pine_type_rules`` port, by its Python name (tests only)."""

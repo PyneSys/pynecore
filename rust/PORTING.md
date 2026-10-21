@@ -17,7 +17,9 @@ pointers.
   `a:` / `m:` / `M:` / `T:` / `o:<module>#Name`. Port `join`, `binop_type`,
   `unaryop_type`, `compare_type`, the `annotation_type` family,
   `LIB_TYPE_OVERRIDES`, `BUILTIN_CALL_TYPES` and the stamp accessors
-  (`stamp_lowering`). Hermetic.
+  (`stamp_lowering`). Hermetic. Ported as `crates/pyne-transform/src/pine_type_rules.rs`,
+  gated against the Python module by `tests/t00_pynecore/ast/test_136_native_type_rules.py`
+  through `_native._rules`.
 - **F2.** `pine_qualifier.py` is hermetic; `data.rs` must also carry the `names`,
   `classes`, `scalar_classes` and `routes` sections of `lib_types.json`.
 - **F3.** Done for the steps after PineType: the module's `_pine_types` (a

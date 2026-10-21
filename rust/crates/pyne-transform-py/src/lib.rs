@@ -1,6 +1,7 @@
 //! `pynecore.transformers._native`: the native transform, called from the Python pipeline.
 
 mod convert;
+mod rules;
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -173,5 +174,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(steps, m)?)?;
     m.add_function(wrap_pyfunction!(ported_json, m)?)?;
+    m.add_function(wrap_pyfunction!(rules::call, m)?)?;
     Ok(())
 }

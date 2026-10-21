@@ -56,6 +56,12 @@ impl<'py> FromPython<'py> {
         }
     }
 
+    /// The Python object a node was converted from.
+    pub fn object(&self, id: NodeId) -> Option<&Bound<'py, PyAny>> {
+        let (&key, _) = self.memo.iter().find(|&(_, &known)| known == id)?;
+        self.keep.iter().find(|object| object.as_ptr() as usize == key)
+    }
+
     pub fn node(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<NodeId> {
         let key = obj.as_ptr() as usize;
         if let Some(&id) = self.memo.get(&key) {
@@ -285,7 +291,7 @@ fn enum_member<T>(value: &Bound<'_, PyAny>, from_name: fn(&str) -> Option<T>) ->
     from_name(&name).ok_or_else(|| unsupported(format!("operator class {name}")))
 }
 
-fn constant(value: &Bound<'_, PyAny>) -> PyResult<Constant> {
+pub fn constant(value: &Bound<'_, PyAny>) -> PyResult<Constant> {
     if value.is_none() {
         return Ok(Constant::None);
     }

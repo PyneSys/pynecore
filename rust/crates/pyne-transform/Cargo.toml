@@ -9,4 +9,5 @@ authors.workspace = true
 
 [dependencies]
 pyne-ast.workspace = true
+pyne-parse.workspace = true
 serde_json.workspace = true
