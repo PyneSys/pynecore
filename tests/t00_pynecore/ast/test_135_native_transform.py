@@ -137,3 +137,16 @@ def __test_stale_port_runs_in_python__(monkeypatch):
     monkeypatch.setattr(native, 'source_digest', lambda module: 'edited')
     assert native.current_steps() == frozenset()
     assert __test_helper_emission('native', monkeypatch) == expected
+
+
+@pytest.mark.parametrize('backend', ['native', 'verify'])
+def __test_native_rejection_matches_python__(backend, monkeypatch):
+    """A module the Python step rejects is rejected natively too, with Python's error."""
+    __test_helper_require_native()
+    monkeypatch.setenv('PYNE_AST_BACKEND', backend)
+    source = '"""\n@pyne\n"""\nfrom pynecore.lib import plot, close\n\n\ndef main():\n' \
+             '    if close > 1:\n        plot(close)\n'
+    tree = ast.parse(source)
+    mode = import_hook._module_mode(tree)[1]
+    with pytest.raises(SyntaxError, match='plot'):
+        import_hook._analyse_tree(tree, source, Path('rejected.py').resolve(), mode)

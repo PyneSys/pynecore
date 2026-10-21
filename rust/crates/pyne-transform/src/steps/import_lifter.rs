@@ -4,7 +4,7 @@
 use pyne_ast::walk::{Transformer, Visited, generic_visit, walk_statements};
 use pyne_ast::{Ast, Kind, NodeId};
 
-use crate::{Context, Unsupported};
+use crate::{Context, Error};
 
 fn is_lib_import(ast: &Ast, id: NodeId) -> bool {
     match ast.kind(id) {
@@ -60,7 +60,7 @@ impl Transformer for ImportLifter {
     }
 }
 
-pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, Unsupported> {
+pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, Error> {
     // Only a lib import standing directly in a function body is lifted: without
     // one there is nothing to visit
     let candidate = walk_statements(ast, module).into_iter().any(|stmt| match ast.kind(stmt) {
@@ -76,7 +76,7 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
         return Ok(module);
     }
     let Kind::Module { body, .. } = ast.kind(module) else {
-        return Err(Unsupported("ImportLifter on a non-module".into()));
+        return Err(Error::Unsupported("ImportLifter on a non-module".into()));
     };
     // Insert the lifted imports after the docstring, if there is one
     let docstring = body.first().is_some_and(|&first| match ast.kind(first) {

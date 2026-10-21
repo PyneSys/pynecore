@@ -4,13 +4,45 @@
 //! every step here is a port of the Python step of the same name and must
 //! produce the same tree for the same input, which the host checks
 //! (`PYNE_AST_BACKEND=verify`). A step meeting something its port does not
-//! cover answers [`Unsupported`], and the host runs the Python step instead.
+//! cover answers [`Error::Unsupported`], and the host runs the Python step
+//! instead; a step that finds the module invalid answers [`Error::Rejected`], and
+//! the host lets the Python step raise the error the author sees (a browser host
+//! shows the message).
 
 pub mod data;
 pub mod steps;
 
+use std::fmt;
+
 pub use pyne_ast::Unsupported;
 use pyne_ast::{Ast, NodeId};
+
+/// Why a native step did not hand back a tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Error {
+    /// A construct the port does not cover: the Python step runs instead
+    Unsupported(String),
+    /// The module is invalid where the Python step raises (a `SyntaxError` on
+    /// a plot call outside the entry, a wildcard import without `__all__`, ...)
+    Rejected(String),
+}
+
+impl From<Unsupported> for Error {
+    fn from(err: Unsupported) -> Error {
+        Error::Unsupported(err.0)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Unsupported(message) => write!(f, "unsupported: {message}"),
+            Error::Rejected(message) => write!(f, "rejected: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 /// What a step needs to know that the tree does not say, answered by whoever runs
 /// the pipeline: the Python host from the live interpreter, a browser host from
@@ -72,7 +104,7 @@ pub struct Context<'h> {
 }
 
 /// One step: transforms the module and returns the (possibly replaced) module node.
-pub type StepFn = fn(&mut Ast, NodeId, &Context<'_>) -> Result<NodeId, Unsupported>;
+pub type StepFn = fn(&mut Ast, NodeId, &Context<'_>) -> Result<NodeId, Error>;
 
 /// A native step, by the name `pipeline.py` declares it under.
 pub struct Step {
@@ -93,6 +125,7 @@ pub static STEPS: &[Step] = &[
     Step { name: "TypeErasure", run: steps::type_erasure::run },
     Step { name: "BuiltinShadow", run: steps::builtin_shadow::run },
     Step { name: "ImportNormalizer", run: steps::import_normalizer::run },
+    Step { name: "PlotScope", run: steps::plot_scope::run },
 ];
 
 /// The native port of a step, if there is one.
@@ -106,9 +139,10 @@ pub fn run_steps(
     mut module: NodeId,
     names: &[&str],
     ctx: &Context<'_>,
-) -> Result<NodeId, Unsupported> {
+) -> Result<NodeId, Error> {
     for name in names {
-        let step = step(name).ok_or_else(|| Unsupported(format!("no native step {name}")))?;
+        let step =
+            step(name).ok_or_else(|| Error::Unsupported(format!("no native step {name}")))?;
         module = (step.run)(ast, module, ctx)?;
     }
     Ok(module)

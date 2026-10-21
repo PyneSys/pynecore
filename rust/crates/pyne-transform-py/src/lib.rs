@@ -15,6 +15,12 @@ create_exception!(
     PyException,
     "A construct the native transform does not handle; the Python path runs instead."
 );
+create_exception!(
+    _native,
+    Rejected,
+    PyException,
+    "The module is invalid; the Python step raises the error the author sees."
+);
 
 fn unsupported(err: pyne_ast::Unsupported) -> PyErr {
     Unsupported::new_err(err.0)
@@ -101,6 +107,7 @@ impl pyne_transform::Host for PyHost<'_> {
 /// :param context: ``path``, ``pyne_mode``, ``source``, ``user_code``, ``host``.
 /// :return: A new module object; the input tree is left as it was.
 /// :raises Unsupported: When a step meets something its port does not handle.
+/// :raises Rejected: When a step finds the module invalid.
 #[pyfunction]
 fn run<'py>(
     py: Python<'py>,
@@ -133,7 +140,11 @@ fn run<'py>(
     let root = from.node(tree)?;
     let mut ast = from.ast;
     let names: Vec<&str> = steps.iter().map(String::as_str).collect();
-    let root = pyne_transform::run_steps(&mut ast, root, &names, &ctx).map_err(unsupported)?;
+    let root =
+        pyne_transform::run_steps(&mut ast, root, &names, &ctx).map_err(|err| match err {
+            pyne_transform::Error::Unsupported(message) => Unsupported::new_err(message),
+            pyne_transform::Error::Rejected(message) => Rejected::new_err(message),
+        })?;
     ToPython::new(py)?.node(&ast, root)
 }
 
@@ -153,6 +164,7 @@ fn steps() -> Vec<&'static str> {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("Unsupported", m.py().get_type::<Unsupported>())?;
+    m.add("Rejected", m.py().get_type::<Rejected>())?;
     m.add_function(wrap_pyfunction!(parse, m)?)?;
     m.add_function(wrap_pyfunction!(roundtrip, m)?)?;
     m.add_function(wrap_pyfunction!(dump, m)?)?;

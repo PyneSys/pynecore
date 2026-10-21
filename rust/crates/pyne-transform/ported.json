@@ -18,5 +18,9 @@
   "ImportNormalizer": {
     "module": "import_normalizer",
     "digest": "9bae877506af524053e3315717d6b51da0b0104eeea03a3eab593286b708f9f4"
+  },
+  "PlotScope": {
+    "module": "plot_scope",
+    "digest": "4a613c28550724dcdcce1d0b3f4c70e6c3c598da5fbf2dba8d29f6e33ce8e3c7"
   }
 }

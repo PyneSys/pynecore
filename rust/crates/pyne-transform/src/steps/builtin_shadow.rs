@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use pyne_ast::walk::{Transformer, Visited, copy_location, generic_visit};
 use pyne_ast::{Ast, ExprContext, Kind, NodeId};
 
-use crate::{Context, Host, Unsupported};
+use crate::{Context, Error, Host, Unsupported};
 
 /// Pine namespaces whose pynecore module has a different name
 fn namespace_rename(name: &str) -> &str {
@@ -114,9 +114,9 @@ impl Transformer for BuiltinShadow<'_> {
     }
 }
 
-pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, Unsupported> {
+pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, Error> {
     let Kind::Module { body, .. } = ast.kind(module) else {
-        return Err(Unsupported("BuiltinShadow on a non-module".into()));
+        return Err(Error::Unsupported("BuiltinShadow on a non-module".into()));
     };
     let mut aliases = HashMap::new();
     for &stmt in body {
@@ -154,7 +154,7 @@ pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, U
     let mut shadow = BuiltinShadow { host: ctx.host, aliases, error: None };
     generic_visit(&mut shadow, ast, module);
     match shadow.error {
-        Some(err) => Err(err),
+        Some(err) => Err(err.into()),
         None => Ok(module),
     }
 }

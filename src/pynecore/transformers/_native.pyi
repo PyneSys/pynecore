@@ -9,6 +9,10 @@ class Unsupported(Exception):
     """A construct the native transform does not handle; the Python path runs instead."""
 
 
+class Rejected(Exception):
+    """The module is invalid; the Python step raises the error the author sees."""
+
+
 def parse(source: str) -> ast.Module:
     """Parse a module with the native parser into Python ``ast`` objects."""
 

@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use pyne_ast::walk::{Transformer, Visited, copy_location, generic_visit, walk};
 use pyne_ast::{Ast, ExprContext, Kind, NodeId};
 
-use crate::{Context, Host, Unsupported};
+use crate::{Context, Error, Host};
 
 /// Attributes of `lib` that are classes, not submodules
 const NON_MODULE_ATTRS: [&str; 2] = ["input", "script"];
@@ -124,12 +124,13 @@ struct ImportNormalizer<'h> {
 }
 
 impl ImportNormalizer<'_> {
-    fn handle_wildcard_import(&mut self, module: &str) -> Result<(), Unsupported> {
+    fn handle_wildcard_import(&mut self, module: &str) -> Result<(), Error> {
         let exposed: HashSet<String> =
             self.host.star_exports(module)?.unwrap_or_default().into_iter().collect();
         if exposed.is_empty() {
-            // The Python step raises the SyntaxError
-            return Err(Unsupported(format!("wildcard import of {module} without __all__")));
+            return Err(Error::Rejected(format!(
+                "Cannot use wildcard import: module {module} has no __all__ defined"
+            )));
         }
         let mut path: Vec<String> = vec!["lib".into()];
         path.extend(module.split('.').skip(2).map(str::to_string));
@@ -147,7 +148,7 @@ impl ImportNormalizer<'_> {
         Ok(())
     }
 
-    fn handle_import_from(&mut self, ast: &Ast, stmt: NodeId) -> Result<(), Unsupported> {
+    fn handle_import_from(&mut self, ast: &Ast, stmt: NodeId) -> Result<(), Error> {
         if !is_lib_import(ast, stmt) {
             return Ok(());
         }
@@ -330,9 +331,9 @@ impl Transformer for ImportNormalizer<'_> {
     }
 }
 
-pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, Unsupported> {
+pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, Error> {
     let Kind::Module { body, .. } = ast.kind(module) else {
-        return Err(Unsupported("ImportNormalizer on a non-module".into()));
+        return Err(Error::Unsupported("ImportNormalizer on a non-module".into()));
     };
     let body = body.clone();
     let mut normalizer = ImportNormalizer {
@@ -363,8 +364,9 @@ pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, U
                         alias == "lib" && asname.is_some()
                     })
                 {
-                    // The Python step raises the SyntaxError
-                    return Err(Unsupported("'lib' imported as an alias".into()));
+                    return Err(Error::Rejected(
+                        "'lib' must be imported as itself, not as an alias".into(),
+                    ));
                 }
                 normalizer.handle_import_from(ast, stmt)?;
             }
@@ -409,7 +411,9 @@ pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, U
         normalizer.stmt_index = index;
         match normalizer.visit(ast, stmt) {
             Visited::Node(new) => visited_body.push(new),
-            other => return Err(Unsupported(format!("a statement visit answered {other:?}"))),
+            other => {
+                return Err(Error::Unsupported(format!("a statement visit answered {other:?}")));
+            }
         }
     }
 

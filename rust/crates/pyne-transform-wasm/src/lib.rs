@@ -12,7 +12,8 @@
 //! Python host's imports: a library is importable when it is listed, and serves
 //! the names listed for it.
 //! Response: `{"dump": str}` (the `ast.dump` of the transformed module), or
-//! `{"unsupported": str}`, or `{"error": str}`.
+//! `{"rejected": str}` (the module is invalid), `{"unsupported": str}` (the
+//! native port does not cover it) or `{"error": str}` (a malformed request).
 
 use std::collections::{HashMap, HashSet};
 
@@ -83,7 +84,11 @@ fn transform(request: &str) -> Result<Value, Value> {
         request.get("include_attributes").and_then(Value::as_bool).unwrap_or(false);
     let unsupported = |err: Unsupported| json!({ "unsupported": err.0 });
     let (mut ast, module) = pyne_parse::parse_module(&source).map_err(unsupported)?;
-    let module = pyne_transform::run_steps(&mut ast, module, &steps, &ctx).map_err(unsupported)?;
+    let module =
+        pyne_transform::run_steps(&mut ast, module, &steps, &ctx).map_err(|err| match err {
+            pyne_transform::Error::Unsupported(message) => json!({ "unsupported": message }),
+            pyne_transform::Error::Rejected(message) => json!({ "rejected": message }),
+        })?;
     Ok(json!({ "dump": pyne_ast::dump::dump(&ast, module, include_attributes) }))
 }
 

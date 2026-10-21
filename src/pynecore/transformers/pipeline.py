@@ -328,10 +328,13 @@ def run_steps(steps: Sequence[Step | Phase], tree: ast.Module, ctx: PipelineCont
             else:
                 # Native first: it reads the input and leaves it as it is, while
                 # the Python step transforms it in place
-                native_tree = native.run([step.name], tree, ctx)
-                tree = _run(step.name, ctx, step.run, tree, ctx)
-                if native_tree is not None:
-                    native.verify(step.name, tree, native_tree, ctx)
+                native_result = native.run([step.name], tree, ctx)
+                try:
+                    tree = _run(step.name, ctx, step.run, tree, ctx)
+                except Exception as exc:
+                    native.verify_rejection(step.name, native_result, exc, ctx)
+                    raise
+                native.verify(step.name, tree, native_result, ctx)
     return _run_native(batch, tree, ctx)
 
 
@@ -343,7 +346,7 @@ def _run_native(batch: list[Step], tree: ast.Module, ctx: PipelineContext) -> as
     steps = list(batch)
     batch.clear()
     result = _run('+'.join(names) + ' (native)', ctx, native.run, names, tree, ctx)
-    if result is not None:
+    if isinstance(result, ast.Module):
         return result
     for step in steps:
         tree = _run(step.name, ctx, step.run, tree, ctx)

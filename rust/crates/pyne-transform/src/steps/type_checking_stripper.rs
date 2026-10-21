@@ -13,7 +13,7 @@ use pyne_ast::walk::{
 };
 use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId};
 
-use crate::{Context, Unsupported};
+use crate::{Context, Error};
 
 type Names = HashSet<String>;
 
@@ -498,7 +498,7 @@ impl Transformer for Stripper {
     }
 }
 
-pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, Unsupported> {
+pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, Error> {
     let mut stripper = Stripper {
         names: Names::from(["TYPE_CHECKING".to_string()]),
         tracked: Names::from(["TYPE_CHECKING".to_string(), TYPING.to_string()]),
@@ -535,7 +535,7 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
     stripper.tracked.insert(TYPING.to_string());
     // A name the module binds itself is not (only) the flag
     let Kind::Module { body, .. } = ast.kind(module) else {
-        return Err(Unsupported("TypeCheckingStripper on a non-module".into()));
+        return Err(Error::Unsupported("TypeCheckingStripper on a non-module".into()));
     };
     let (mut bound, _, _) = scope_bindings(ast, &body.clone());
     for stmt in walk_statements(ast, module) {

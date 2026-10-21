@@ -26,7 +26,9 @@ warning per process -- instead of letting the two drift apart silently.
 
 A native step that meets something its port does not handle raises
 ``Unsupported``; the step then runs in Python. Neither case changes the result,
-only where it is computed.
+only where it is computed. A native step that finds the module invalid raises
+``Rejected``, and the Python step runs to raise the error the author sees; under
+``verify`` the two must agree on that verdict as well.
 """
 import ast
 import hashlib
@@ -46,7 +48,7 @@ except ImportError:
     _native = None
 
 __all__ = ['available', 'backend', 'current_steps', 'source_digest', 'run', 'verify',
-           'NativeMismatch']
+           'verify_rejection', 'Rejection', 'NativeMismatch']
 
 _TRANSFORMERS = Path(__file__).parent
 _PACKAGE = _TRANSFORMERS.parent
@@ -204,18 +206,31 @@ def _context(ctx: Any) -> dict[str, Any]:
             'user_code': ctx.user_code, 'host': _Host()}
 
 
-def run(names: list[str], tree: ast.Module, ctx: Any) -> ast.Module | None:
+class Rejection:
+    """A native step found the module invalid: the Python step raises the error the
+    author sees."""
+
+    __slots__ = ('message',)
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+
+def run(names: list[str], tree: ast.Module, ctx: Any) -> ast.Module | Rejection | None:
     """Run native steps in order over a module.
 
     :param names: Step names, each in :func:`current_steps`.
     :param tree: The module; it is not changed.
     :param ctx: The pipeline context.
-    :return: The transformed module, a new object; None when a step does not
-        handle the module (the caller then runs the Python steps).
+    :return: The transformed module, a new object; a :class:`Rejection` when a step
+        finds the module invalid; None when a step does not handle the module. In
+        both latter cases the caller runs the Python steps.
     """
     assert _native is not None
     try:
         return _native.run(tree, names, _context(ctx))
+    except _native.Rejected as exc:
+        return Rejection(str(exc))
     except _native.Unsupported:
         return None
 
@@ -262,8 +277,20 @@ def describe(tree: ast.AST) -> list[str]:
     return out
 
 
-def verify(name: str, expected: ast.Module, actual: ast.Module, ctx: Any) -> None:
-    """Raise :class:`NativeMismatch` unless the native result equals the Python one."""
+def verify(name: str, expected: ast.Module, actual: ast.Module | Rejection | None,
+           ctx: Any) -> None:
+    """Raise :class:`NativeMismatch` unless the native result equals the Python one.
+
+    :param name: The step.
+    :param expected: What the Python step produced.
+    :param actual: What :func:`run` answered for the same input.
+    :param ctx: The pipeline context.
+    """
+    if actual is None:
+        return
+    if isinstance(actual, Rejection):
+        raise NativeMismatch(f'native {name} rejects {ctx.path}, which Python accepts: '
+                             f'{actual.message}')
     want = describe(expected)
     got = describe(actual)
     if want == got:
@@ -277,3 +304,17 @@ def verify(name: str, expected: ast.Module, actual: ast.Module, ctx: Any) -> Non
                         for w, g in zip(want[index:index + 3], got[index:index + 3]))
     raise NativeMismatch(f'native {name} differs from Python on {ctx.path} at line {index} '
                          f'of the description:\n{context}')
+
+
+def verify_rejection(name: str, actual: ast.Module | Rejection | None, error: BaseException,
+                     ctx: Any) -> None:
+    """Raise :class:`NativeMismatch` when the Python step raised and the native one accepted.
+
+    :param name: The step.
+    :param actual: What :func:`run` answered for the same input.
+    :param error: What the Python step raised.
+    :param ctx: The pipeline context.
+    """
+    if isinstance(actual, ast.Module):
+        raise NativeMismatch(f'native {name} accepts {ctx.path}, which Python rejects: '
+                             f'{error!r}') from error

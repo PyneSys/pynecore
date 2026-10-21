@@ -11,7 +11,7 @@ use pyne_ast::walk::{
 };
 use pyne_ast::{Ast, ExprContext, Kind, NodeId, Operator};
 
-use crate::{Context, Unsupported};
+use crate::{Context, Error};
 
 /// Whether evaluating an expression can have no effect worth keeping: names,
 /// attributes, subscripts, constants, tuples, lists and `|` unions only.
@@ -166,9 +166,9 @@ impl Transformer for TypeErasure {
     }
 }
 
-pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, Unsupported> {
+pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, Error> {
     let Kind::Module { body, .. } = ast.kind(module) else {
-        return Err(Unsupported("TypeErasure on a non-module".into()));
+        return Err(Error::Unsupported("TypeErasure on a non-module".into()));
     };
     let mut cast_names: HashMap<String, usize> = HashMap::new();
     let mut flag_names: HashMap<String, usize> = HashMap::new();
