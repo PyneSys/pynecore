@@ -56,3 +56,6 @@ src/pynecore/core/_native_color.c
 *.so
 *.pyd
 wheelhouse/
+
+# Rust build output
+rust/target/

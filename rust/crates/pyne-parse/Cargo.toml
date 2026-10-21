@@ -1,0 +1,14 @@
+[package]
+name = "pyne-parse"
+description = "Python source to the CPython-shaped pyne-ast tree, positions as CPython reports them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+pyne-ast.workspace = true
+ruff_python_parser.workspace = true
+ruff_python_ast.workspace = true
+ruff_text_size.workspace = true

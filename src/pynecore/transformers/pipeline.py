@@ -41,7 +41,7 @@ from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
 from pynecore.transformers.inline_series_hoist import InlineSeriesHoistTransformer
 from pynecore.transformers.input_transformer import InputTransformer
 from pynecore.transformers.lib_series import LibrarySeriesTransformer
-from pynecore.transformers import locations
+from pynecore.transformers import locations, native
 from pynecore.transformers.module_property import ModulePropertyTransformer
 from pynecore.transformers.outer_write import OuterWriteTransformer
 from pynecore.transformers.persistent import PersistentTransformer
@@ -305,8 +305,13 @@ def run_steps(steps: Sequence[Step | Phase], tree: ast.Module, ctx: PipelineCont
     :param ctx: What the steps share besides the tree.
     :return: The transformed module.
     """
+    mode = native.backend()
+    ported = native.current_steps() if mode != 'python' else frozenset()
+    # The native steps waiting to run as one native call (``native`` backend)
+    batch: list[Step] = []
     for step in steps:
         if isinstance(step, Phase):
+            tree = _run_native(batch, tree, ctx)
             rules = [(rule.name, rule.make(ctx)) for rule in step.rules
                      if ctx.user_code or not rule.user_code_only]
             if _SEQUENTIAL:
@@ -315,7 +320,33 @@ def run_steps(steps: Sequence[Step | Phase], tree: ast.Module, ctx: PipelineCont
             else:
                 tree = _run(step.name, ctx, run_phase, [rule for _, rule in rules], tree)
         elif ctx.user_code or not step.user_code_only:
-            tree = _run(step.name, ctx, step.run, tree, ctx)
+            if step.name not in ported:
+                tree = _run_native(batch, tree, ctx)
+                tree = _run(step.name, ctx, step.run, tree, ctx)
+            elif mode == 'native':
+                batch.append(step)
+            else:
+                # Native first: it reads the input and leaves it as it is, while
+                # the Python step transforms it in place
+                native_tree = native.run([step.name], tree, ctx)
+                tree = _run(step.name, ctx, step.run, tree, ctx)
+                if native_tree is not None:
+                    native.verify(step.name, tree, native_tree, ctx)
+    return _run_native(batch, tree, ctx)
+
+
+def _run_native(batch: list[Step], tree: ast.Module, ctx: PipelineContext) -> ast.Module:
+    """Run the batched native steps, in Python where the native port declines; empties the batch."""
+    if not batch:
+        return tree
+    names = [step.name for step in batch]
+    steps = list(batch)
+    batch.clear()
+    result = _run('+'.join(names) + ' (native)', ctx, native.run, names, tree, ctx)
+    if result is not None:
+        return result
+    for step in steps:
+        tree = _run(step.name, ctx, step.run, tree, ctx)
     return tree
 
 
