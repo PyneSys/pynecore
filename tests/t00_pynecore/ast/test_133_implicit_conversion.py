@@ -13,7 +13,7 @@ import pytest
 from pynecore.transformers.implicit_conversion import ImplicitConversionTransformer
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
-    get_pin, get_varying, get_vector, get_widen, get_widen_site, get_widens,
+    get_pin, get_ty, get_varying, get_vector, get_widen, get_widen_site, get_widens,
 )
 
 __test_helper_PRELUDE = '''from pynecore import lib
@@ -690,3 +690,160 @@ def __test_a_class_whose_name_a_scope_binds_keeps_the_typeless_na__(definition):
     emitted = ast.unparse(tree.body[-1])
     assert 'lib._na_none' in emitted
     assert 'lib.na(' not in emitted
+
+
+#: The user-type prelude with a class holding a container of objects
+__test_helper_BAG_PRELUDE = __test_helper_UDT_PRELUDE + '''
+
+@udt
+class Bag:
+    items: list[Pivot] = lib.na(list)
+'''
+
+
+@pytest.mark.parametrize("body,expected", [
+    # a declared variable, and a later store into a variable holding a container
+    ('a: list[float] = lib._na_none', 'a: list[float] = lib.na(list)'),
+    ('m: dict[str, float] = lib._na_none', 'm: dict[str, float] = lib.na(dict)'),
+    ('x: Matrix[float] = lib._na_none', 'x: Matrix[float] = lib.na(Matrix)'),
+    ('a: list[float] = lib.array.new_float(0)\na = lib._na_none', 'a = lib.na(list)'),
+    # a ternary arm next to a container
+    ('a = lib.array.new_float(0)\nb = a if lib.bar_index < 0 else lib._na_none',
+     'b = a if lib.bar_index < 0 else lib.na(list)'),
+    # a field holding a container: stored, and passed to the constructor
+    ('b = Bag()\nb.items = lib._na_none', 'b.items = lib.na(list)'),
+    ('b = Bag(lib._na_none)', 'b = Bag(lib.na(list))'),
+    # a parameter and a declared return
+    ('def size(a: list[float]) -> int:\n    return lib.array.size(a)\nn = size(lib._na_none)',
+     'n = size(lib.na(list))'),
+    ('def missing() -> dict[str, float]:\n    return lib._na_none', '    return lib.na(dict)'),
+    # a held typeless na is converted at run time
+    ('def pick(v=lib._na_none) -> list[float]:\n    return v\nx = pick()',
+     "    return safe_convert.implicit_convert(v, 'A')"),
+])
+def __test_typeless_na_where_a_container_goes_is_the_na_of_that_container__(body, expected):
+    emitted, diags = __test_helper_widen(body, __test_helper_BAG_PRELUDE)
+    assert expected in emitted.splitlines()
+    assert not diags
+
+
+def __test_a_matrix_the_module_spells_nowhere_keeps_the_typeless_na__():
+    """A matrix na is ``lib.na(<Matrix>)``, which needs the class the module imports"""
+    emitted, diags = __test_helper_widen(
+        'm = lib.matrix.new(1, 1, 0.0) if lib.bar_index < 0 else lib._na_none',
+        'from pynecore import lib\n')
+    assert emitted == 'm = lib.matrix.new(1, 1, 0.0) if lib.bar_index < 0 else lib._na_none'
+    assert not diags
+
+
+def __test_a_held_typeless_na_becomes_the_na_of_the_container_it_goes_as__():
+    """A defaulted parameter returned as a container goes out as the na of the container"""
+    source = __test_helper_PRELUDE + '''
+def items(value=lib._na_none) -> list[float]:
+    return value
+
+
+def cells(value=lib._na_none) -> Matrix[float]:
+    return value
+
+
+def main():
+    return items(), cells()
+'''
+    tree = ast.parse(source)
+    infer_module(tree, 'test')
+    tree = ast.fix_missing_locations(cast(ast.Module, ImplicitConversionTransformer().visit(tree)))
+    namespace: dict = {'__name__': 'held_container_na'}
+    exec(compile(tree, 'test', 'exec'), namespace)
+    array, matrix = namespace['main']()
+    assert array.type is list
+    assert matrix.type is namespace['Matrix']
+    made = [1.0]
+    assert namespace['items'](made) is made
+
+
+def __test_a_typeless_na_handed_to_an_overload_group_is_the_na_its_choice_declares__():
+    """
+    A typeless na passed to a group is taken by the first implementation the other
+    arguments let through, as at run time, and goes in as the na of what that
+    implementation declares there -- an object, a container -- so the dispatch on
+    the value selects the same one. A numeric position keeps the typeless na: the
+    numeric na is a float the selector's exact pass would not take for an int
+    """
+    source = __test_helper_UDT_PRELUDE + '''from pynecore.core.overload import overload
+
+
+@overload
+def describe(p: Pivot, other: Pivot) -> str:
+    return 'PIVOT'
+
+
+@overload
+def describe(h: Holder, items: list[Pivot]) -> str:
+    return 'ITEMS'
+
+
+@overload
+def describe(h: Holder, name: str) -> str:
+    return 'NAME'
+
+
+@overload
+def count(p: Pivot, n: int) -> str:
+    return 'INT'
+
+
+@overload
+def count(p: Pivot, n: float) -> str:
+    return 'FLOAT'
+
+
+def main():
+    h = Holder(Pivot(1.0))
+    return describe(Pivot(1.0), lib._na_none), describe(h, lib._na_none), \\
+        describe(h, name=lib._na_none), count(Pivot(1.0), lib._na_none)
+'''
+    tree = ast.parse(source)
+    table = infer_module(tree, 'test')
+    assert not table.diags, [d.message for d in table.diags]
+    tree = ast.fix_missing_locations(cast(ast.Module, ImplicitConversionTransformer().visit(tree)))
+    emitted = ast.unparse(tree.body[-1])
+    assert 'describe(Pivot(1.0), lib.na(Pivot))' in emitted
+    assert 'describe(h, lib.na(list))' in emitted
+    assert "describe(h, name='')" in emitted
+    assert 'count(Pivot(1.0), lib._na_none)' in emitted
+    namespace: dict = {'__name__': 'group_na'}
+    exec(compile(tree, 'test', 'exec'), namespace)
+    assert namespace['main']() == ('PIVOT', 'ITEMS', 'NAME', 'INT')
+
+
+def __test_a_defaulted_implementation_the_walk_has_not_reached_is_selected__():
+    """
+    A body calls the group with fewer arguments than a LATER implementation
+    declares: the call gets ahead of that definition, and the selection checks
+    its defaults against the parameters the call omits, so they are typed before
+    the body is read -- the shape of a library whose ``init`` implementations
+    call each other
+    """
+    source = __test_helper_UDT_PRELUDE + '''from pynecore.core.overload import overload
+
+
+@overload
+def wrap(p: Pivot) -> Pivot:
+    return wrap(Holder(p)).top
+
+
+@overload
+def wrap(box: Holder, flag: bool = True) -> Holder:
+    return box
+
+
+def main():
+    return wrap(Pivot(1.0))
+'''
+    tree = ast.parse(source)
+    table = infer_module(tree, 'test')
+    assert not table.diags, [d.message for d in table.diags]
+    inner = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and ast.unparse(node) == 'wrap(Holder(p))')
+    assert get_ty(inner).endswith('#Holder')

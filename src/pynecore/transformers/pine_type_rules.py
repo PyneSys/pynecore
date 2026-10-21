@@ -40,12 +40,14 @@ __all__ = [
     'PIN_ATTR', 'PINS_ATTR', 'PINNABLE', 'PIN_CONTAINERS', 'PIN_ANY', 'get_pin', 'set_pin', 'get_pins', 'set_pins',
     'VECTOR_ATTR', 'VARYING_ATTR', 'get_vector', 'set_vector', 'get_varying', 'set_varying',
     'WIDEN_ATTR', 'WIDEN_FLOAT', 'WIDEN_ITEMS', 'WIDEN_MATRIX', 'WIDEN_STRING_NA', 'WIDEN_NUMBER_NA',
-    'WIDEN_NA_TEXT', 'NA_LITERALS', 'is_na_literal', 'is_na_widen',
+    'WIDEN_NA_TEXT', 'WIDEN_ARRAY_NA', 'WIDEN_MAP_NA', 'WIDEN_MATRIX_NA', 'CONTAINER_NA_WIDENS',
+    'NA_LITERALS', 'is_na_literal', 'is_na_widen',
     'NA_CLASS_ATTR', 'get_na_class', 'set_na_class',
     'NA_TEXT_PARAMS', 'NOT_PINE_STRINGS', 'get_widen',
     'set_widen', 'WIDEN_SITE_ATTR', 'WIDENS_ATTR', 'get_widen_site', 'set_widen_site',
     'get_widens', 'set_widens',
     'pin_chars', 'pin_for', 'overload_result', 'ImplSig', 'overload_pick', 'overload_bind',
+    'overload_choice', 'overload_binding',
     'FactoryFields',
     'TYPELESS', 'NONE_DEFAULT', 'FIT_OMISSIBLE', 'FIT_REQUIRED', 'FIT_UNSURE',
     'default_fit', 'annotation_takes_none', 'impl_sig', 'param_fit', 'default_ty',
@@ -103,12 +105,29 @@ WIDEN_NUMBER_NA: Final = 'n'
 #: (``NA_TEXT_PARAMS``): TradingView writes it out as the text ``na``
 WIDEN_NA_TEXT: Final = 't'
 
+#: The value is a typeless ``na`` that goes where an array goes: it is the na of an
+#: array, ``NA(list)``
+WIDEN_ARRAY_NA: Final = 'A'
+
+#: The value is a typeless ``na`` that goes where a map goes: it is the na of a map,
+#: ``NA(dict)``
+WIDEN_MAP_NA: Final = 'M'
+
+#: The value is a typeless ``na`` that goes where a matrix goes: it is the na of a
+#: matrix, ``NA(Matrix)``
+WIDEN_MATRIX_NA: Final = 'X'
+
+#: The conversions of a typeless ``na`` into the na of a container
+CONTAINER_NA_WIDENS: Final = frozenset({WIDEN_ARRAY_NA, WIDEN_MAP_NA, WIDEN_MATRIX_NA})
+
 #: A typeless ``na`` that goes where an object of a class goes -- a UDT, a drawing
 #: -- is the na OF that class, and its conversion kind is the object type itself
 #: (``o:<class id>``), so two contexts agree on it only when they agree on the
 #: class. The value then carries the class's spelling in this attribute: the
 #: expression, valid at the module's top level, that names the class in value
-#: position (``Pivot``, ``chr.SessionTimeRange``, the ``Line`` an import binds)
+#: position (``Pivot``, ``chr.SessionTimeRange``, the ``Line`` an import binds).
+#: One that becomes the na of a container (``CONTAINER_NA_WIDENS``) carries the
+#: container's class the same way (``list``, ``dict``, the ``Matrix`` an import binds)
 NA_CLASS_ATTR: Final = '_pine_na_class'
 
 #: The spellings of Pine's typeless ``na`` in value position: the name itself, and
@@ -291,10 +310,11 @@ def is_na_widen(kind: str | None) -> bool:
     Whether a conversion turns Pine's typeless ``na`` into the na of a type.
 
     :param kind: A conversion kind, or None
-    :return: True for the string na, the numeric na, the text ``na`` and the na of a
-             class (an object type)
+    :return: True for the string na, the numeric na, the text ``na``, the na of a
+             container and the na of a class (an object type)
     """
     return kind in (WIDEN_STRING_NA, WIDEN_NUMBER_NA, WIDEN_NA_TEXT) \
+        or kind in CONTAINER_NA_WIDENS \
         or (kind is not None and kind.startswith(_OBJ))
 
 
@@ -1636,7 +1656,22 @@ class ImplSig(NamedTuple):
 def overload_pick(impls: list[ImplSig], pin: str,
                   shapes: Sequence[str] = ()) -> str | None:
     """
-    Return type of the implementation a PINNED call site selects.
+    Return type of the implementation a PINNED call site selects (``overload_choice``).
+
+    :param impls: Every implementation of the group, in declaration order
+    :param pin: The call site's pin, one character per positional argument
+    :param shapes: The static type of each positional argument, where the caller
+                   has them; empty when it does not
+    :return: The selected implementation's return type, or None
+    """
+    choice = overload_choice(impls, pin, shapes)
+    return None if choice is None else choice.ret
+
+
+def overload_choice(impls: list[ImplSig], pin: str,
+                    shapes: Sequence[str] = ()) -> ImplSig | None:
+    """
+    The implementation a PINNED call site selects.
 
     The runtime resolves a pin by turning its characters back into witness
     values and running the ordinary selector, whose first pass is EXACT -- no
@@ -1662,13 +1697,15 @@ def overload_pick(impls: list[ImplSig], pin: str,
     (``_check_type``), so only an implementation declaring that class, or none,
     can take it. Any other such position -- a container, a bare object, a type
     not known here -- may be taken by anything, which leaves the site
-    unanswerable unless an earlier implementation rules it out.
+    unanswerable unless an earlier implementation rules it out. A typeless
+    ``na`` at such a position is taken for whatever the implementation
+    declares there, the way the selector takes it.
 
     :param impls: Every implementation of the group, in declaration order
     :param pin: The call site's pin, one character per positional argument
     :param shapes: The static type of each positional argument, where the caller
                    has them; empty when it does not
-    :return: The selected implementation's return type, or None
+    :return: The selected implementation, or None
     """
     wanted = tuple(pin)
     for exact_arity in (True, False):
@@ -1676,7 +1713,7 @@ def overload_pick(impls: list[ImplSig], pin: str,
             verdict = _takes(impl, wanted, exact_arity, shapes)
             if verdict == _NO:
                 continue
-            return impl.ret if verdict == _YES else None
+            return impl if verdict == _YES else None
     return None
 
 
@@ -1728,6 +1765,11 @@ def _takes_position(declared: str, want: str, given: str) -> int:
     :return: ``_YES``, ``_MAYBE`` or ``_NO``
     """
     if want == PIN_ANY:
+        if given == TYPELESS:
+            # A typeless na: the selector takes it for whatever the position
+            # declares (``_check_type``), so the first implementation the other
+            # positions let through runs, exactly as at run time
+            return _MAYBE if declared == UNKNOWN else _YES
         # No witness: an object of a known class is taken by its class
         # alone, anything else by whatever declares the position
         if class_of(given) is not None and declared not in (UNKNOWN, OBJECT):
@@ -1755,7 +1797,25 @@ def _takes_position(declared: str, want: str, given: str) -> int:
 def overload_bind(impls: list[ImplSig], chars: str, shapes: Sequence[str],
                   kw_chars: Mapping[str, str], kw_shapes: Mapping[str, str]) -> str | None:
     """
-    Return type of the implementation a call WITH KEYWORD ARGUMENTS selects.
+    Return type of the implementation a call WITH KEYWORD ARGUMENTS selects
+    (``overload_binding``).
+
+    :param impls: Every implementation of the group, in declaration order
+    :param chars: One pin character per positional argument
+    :param shapes: The static type of each positional argument
+    :param kw_chars: Parameter name -> the keyword argument's pin character
+    :param kw_shapes: Parameter name -> the keyword argument's static type
+    :return: The selected implementation's return type, or None
+    """
+    choice = overload_binding(impls, chars, shapes, kw_chars, kw_shapes)
+    return None if choice is None else choice.ret
+
+
+def overload_binding(impls: list[ImplSig], chars: str, shapes: Sequence[str],
+                     kw_chars: Mapping[str, str],
+                     kw_shapes: Mapping[str, str]) -> ImplSig | None:
+    """
+    The implementation a call WITH KEYWORD ARGUMENTS selects.
 
     Such a call is never pinned; the selector binds its arguments to each
     implementation's parameters in declaration order, applies the defaults, and
@@ -1770,13 +1830,13 @@ def overload_bind(impls: list[ImplSig], chars: str, shapes: Sequence[str],
     :param shapes: The static type of each positional argument
     :param kw_chars: Parameter name -> the keyword argument's pin character
     :param kw_shapes: Parameter name -> the keyword argument's static type
-    :return: The selected implementation's return type, or None
+    :return: The selected implementation, or None
     """
     for impl in impls:
         verdict = _binds(impl, chars, shapes, kw_chars, kw_shapes)
         if verdict == _NO:
             continue
-        return impl.ret if verdict == _YES else None
+        return impl if verdict == _YES else None
     return None
 
 

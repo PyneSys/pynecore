@@ -33,7 +33,11 @@ module names it (``get_na_class``), so an overload dispatch on the value sees th
 class Pine typed it with and not a typeless na that answers every candidate. A field
 default runs while its class body does, so where the class it names is not bound yet
 -- the class itself, one the module defines later -- the default is deferred to the
-creation of the object, ``field(default_factory=lambda: lib.na(<class>))``. Passed as
+creation of the object, ``field(default_factory=lambda: lib.na(<class>))``. One that
+goes where an array, a map or a matrix goes -- a container variable, field, parameter
+or declared return, a ternary arm next to a container, a constructor argument for such
+a field -- is the na of that container, ``lib.na(list)``, ``lib.na(dict)`` or
+``lib.na(<Matrix>)``, the way a compiled container declaration spells it. Passed as
 compile-time text of the study (a plot title, a ``plotchar`` char, an
 ``alertcondition`` message, see ``NA_TEXT_PARAMS``) it is the text ``na`` instead.
 
@@ -59,7 +63,8 @@ import ast
 
 from . import ast_walk
 from .pine_type_rules import (
-    FLOAT, STR, WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_NA_TEXT, WIDEN_NUMBER_NA,
+    CONTAINER_NA_WIDENS, FLOAT, OBJECT, STR, WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX,
+    WIDEN_NA_TEXT, WIDEN_NUMBER_NA,
     WIDEN_STRING_NA, array_of, class_of, get_na_class,
     get_ty,
     get_widen, get_widen_site, is_na_literal, is_na_widen, matrix_of, set_ty, set_widen,
@@ -119,17 +124,20 @@ class ImplicitConversionTransformer(ast_walk.NodeTransformer):
                 converted, result = _class_expr(node), kind
             else:
                 converted = ast.Constant(value=kind)
-                result = FLOAT if kind == WIDEN_NUMBER_NA else STR
+                result = FLOAT if kind == WIDEN_NUMBER_NA \
+                    else OBJECT if kind in CONTAINER_NA_WIDENS else STR
             converted_value = stamp_lowering(ast.copy_location(ast.Call(
                 func=ast.Attribute(value=ast.Name(id='safe_convert', ctx=ast.Load()),
                                    attr='implicit_convert', ctx=ast.Load()),
                 args=[node, converted], keywords=[]), node), result)
             return self._field_default(original, converted_value, result)
-        if class_of(kind) is not None:
+        if class_of(kind) is not None or kind in CONTAINER_NA_WIDENS:
+            # The na of a class or of a container: ``lib.na(<class>)``
+            result = OBJECT if kind in CONTAINER_NA_WIDENS else kind
             return self._field_default(original, stamp_lowering(ast.copy_location(ast.Call(
                 func=ast.Attribute(value=ast.Name(id='lib', ctx=ast.Load()), attr='na',
                                    ctx=ast.Load()),
-                args=[_class_expr(node)], keywords=[]), node), kind), kind)
+                args=[_class_expr(node)], keywords=[]), node), result), result)
         if kind == WIDEN_STRING_NA:
             return set_ty(ast.copy_location(ast.Constant(value=''), node), STR)
         if kind == WIDEN_NUMBER_NA:

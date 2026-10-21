@@ -65,10 +65,11 @@ from .pine_type_rules import (
     constant_type, PIN_ANY, pin_chars, pin_for, get_pins, set_pin, set_pins, set_vector,
     get_varying, set_varying,
     WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_STRING_NA, WIDEN_NUMBER_NA, WIDEN_NA_TEXT,
+    WIDEN_ARRAY_NA, WIDEN_MAP_NA, WIDEN_MATRIX_NA, CONTAINER_NA_WIDENS,
     NA_TEXT_PARAMS,
     NOT_PINE_STRINGS, set_widen, get_widen_site,
     set_widen_site, get_widens, set_widens, is_na_widen, set_na_class,
-    overload_result, ImplSig, overload_pick, overload_bind, default_fit, FIT_REQUIRED,
+    overload_result, ImplSig, overload_choice, overload_binding, default_fit, FIT_REQUIRED,
     FactoryFields,
     impl_sig, _param_defaults, _dotted, _DYN_DEFAULT,  # noqa: internal API
     CLASS_SEP, LIB_MODULE, SCALARS, PINE_LOOP, array_of, builtin_class_id, class_id, class_of,
@@ -1513,11 +1514,7 @@ class _Inference:
         waits -- if nothing ever calls it, the pending flush walks it at the
         end of this scope, which is the only case where UNKNOWN is the truth.
         """
-        for default in node.args.defaults:
-            self._expr(default)
-        for kw_default in node.args.kw_defaults:
-            if kw_default is not None:
-                self._expr(kw_default)
+        self._type_defaults(node)
 
         key = self._qualify(self._scope, node.name)
         if key in self._overload_groups or is_script_entry(node):
@@ -1598,6 +1595,27 @@ class _Inference:
             default = defaults.get(arg.arg)
             out.append(SERIES if default is None else self._qual(default))
         return tuple(out)
+
+    def _type_defaults(self, node: ast.FunctionDef | ast.AsyncFunctionDef,
+                       frames: list[_Frame] | None = None) -> None:
+        """
+        Type a definition's defaults, which belong to the ENCLOSING scope.
+
+        :param node: The definition
+        :param frames: The enclosing scopes to type them under, where the walk
+                       is not standing in them (``_ensure_group``)
+        """
+        outer = self._frames
+        if frames is not None:
+            self._frames = frames
+        try:
+            for default in node.args.defaults:
+                self._expr(default)
+            for kw_default in node.args.kw_defaults:
+                if kw_default is not None:
+                    self._expr(kw_default)
+        finally:
+            self._frames = outer
 
     def _declaration_context(self, key: str,
                              node: ast.FunctionDef | ast.AsyncFunctionDef) -> ContextResult | None:
@@ -3123,11 +3141,11 @@ class _Inference:
         """
         if is_na_widen(kind) and not _holds_na(node):
             kind = None
-        cid = class_of(kind) if kind is not None else None
-        if cid is not None:
-            # The na of a class is built from the class's spelling here, which a
-            # name the enclosing scopes bind would read as their own value
-            spelled = self._class_spelling(cid)
+        if kind is not None and (class_of(kind) is not None or kind in CONTAINER_NA_WIDENS):
+            # The na of a class or of a container is built from the class's
+            # spelling here, which a name the enclosing scopes bind would read
+            # as their own value
+            spelled = self._na_spelling(kind)
             if spelled is None or self._hides_module_name(spelled.partition('.')[0]):
                 kind = None
             else:
@@ -3329,10 +3347,10 @@ class _Inference:
         # reach speak, with the call's type being what they agree on
         if argc is None:
             return UNKNOWN
-        picked = self._picked([_lib_impl_sig(impl) for impl in entry['impls']], pin,
+        choice = self._choice([_lib_impl_sig(impl) for impl in entry['impls']], pin,
                               self._shapes(args), self._keyword_shapes(keywords))
-        if picked is not None:
-            return picked
+        if choice is not None:
+            return choice.ret
         return overload_result([impl['ret'] for impl in entry['impls']
                                 if _arity_fits(impl, argc)])
 
@@ -3745,8 +3763,7 @@ class _Inference:
                 return UNKNOWN
         pin = self._pin(node, is_group)
         if is_group:
-            ty = self._group_type(key, pin, self._shapes(node.args),
-                                  self._keyword_shapes(node.keywords))
+            ty = self._group_type(key, pin, node.args, node.keywords)
         else:
             ty = self._call_context(key, node, frame)
         self.table.calls.append(CallSite(
@@ -3943,6 +3960,24 @@ class _Inference:
         return any(name in frame.names or name in frame.local_names
                    for frame in self._frames[1:])
 
+    def _na_spelling(self, kind: str) -> str | None:
+        """
+        How this module spells the class whose na a conversion builds.
+
+        :param kind: An object type, or the conversion into the na of a container
+                     (``CONTAINER_NA_WIDENS``)
+        :return: The spelling, valid at the module's top level, or None where the
+                 module spells the class nowhere
+        """
+        cid = class_of(kind)
+        if cid is not None:
+            return self._class_spelling(cid)
+        if kind == WIDEN_ARRAY_NA:
+            return 'list'
+        if kind == WIDEN_MAP_NA:
+            return 'dict'
+        return self._type_imports.get('Matrix')
+
     def _class_spelling(self, cid: str) -> str | None:
         """
         How this module spells a class in value position, for the na of it.
@@ -4120,7 +4155,7 @@ class _Inference:
             shapes = self._shapes(args)
             pin = None if shapes is None or node.keywords else pin_for(shapes)
             self._record_pin(node, pin)
-            return self._group_type(key, pin, shapes, self._keyword_shapes(node.keywords))
+            return self._group_type(key, pin, args, node.keywords)
         # The method handed over as a function is the one the call site's dispatch
         # entry binds, so the instance vector stamped here configures it
         # (``core/pine_method``)
@@ -4511,15 +4546,22 @@ class _Inference:
         return result
 
     def _ensure_group(self, key: str, frame: int) -> None:
-        """Walk any implementation of a group the call got ahead of."""
+        """
+        Walk any implementation of a group the call got ahead of.
+
+        Its defaults are typed first, in the scope they belong to: the selection
+        checks them against the parameters a call omits (``impl_sig``), and the
+        walk that types them where the definition stands has not reached it.
+        """
         parents = self._frames[:frame + 1]
         for impl in self._defs.get(key, ()):
             nid = node_id(impl)
             if nid is None or nid not in self._walked:
+                self._type_defaults(impl, parents)
                 self._analyse(key, impl, self._declared_params(impl), parents)
 
-    def _group_type(self, key: str, pin: str | None, shapes: Sequence[str] | None = None,
-                    kw_shapes: Mapping[str, str] | None = None) -> str:
+    def _group_type(self, key: str, pin: str | None, args: Sequence[ast.expr],
+                    keywords: Sequence[ast.keyword]) -> str:
         """
         Type of a call to a user overload group.
 
@@ -4533,15 +4575,42 @@ class _Inference:
 
         :param key: Scope-qualified id of the group
         :param pin: The pin this call site justified, when it has one
-        :param shapes: The static type of each positional argument, or None
-                       where an unpacked argument hides them
-        :param kw_shapes: Parameter name -> the static type of the keyword
-                          argument passed for it, or None where an unpacked
-                          mapping hides them
+        :param args: The positional arguments, typed already
+        :param keywords: The keyword arguments, typed already
         :return: The type the call evaluates to
         """
-        picked = self._picked(self._impl_sigs(key), pin, shapes, kw_shapes)
-        return picked if picked is not None else self.table.funcs[key].ret
+        choice = self._choice(self._impl_sigs(key), pin, self._shapes(args),
+                              self._keyword_shapes(keywords))
+        if choice is None:
+            return self.table.funcs[key].ret
+        self._widen_group_nas(choice, args, keywords)
+        return choice.ret
+
+    def _widen_group_nas(self, impl: ImplSig, args: Sequence[ast.expr],
+                         keywords: Sequence[ast.keyword]) -> None:
+        """
+        Convert the typeless ``na`` arguments of a call the exact pass settled.
+
+        The selected implementation declares what each position holds, so a
+        typeless na passed there is the na of that type: of a string, of a
+        class, of a container. A numeric position keeps the typeless na: the
+        numeric na is a float, which the selector's exact pass does not take
+        for an int parameter, while the typeless na it takes for an int and a
+        float parameter alike -- converting it there could hand the call to
+        another implementation than the one selected here.
+
+        :param impl: The selected implementation
+        :param args: The positional arguments, typed already
+        :param keywords: The keyword arguments, typed already
+        """
+        bound = [(impl.params[index], arg) for index, arg in enumerate(args)
+                 if index < len(impl.params)]
+        for keyword in keywords:
+            if keyword.arg in impl.names:
+                bound.append((impl.params[impl.names.index(keyword.arg)], keyword.value))
+        for declared, value in bound:
+            if self._ty_of(value) == TYPELESS and declared not in NUMERIC:
+                self._record_widen(value, _na_widen(declared))
 
     def _shapes(self, args: Sequence[ast.expr]) -> list[str] | None:
         """
@@ -4569,10 +4638,10 @@ class _Inference:
                 for keyword in keywords if keyword.arg is not None}
 
     @staticmethod
-    def _picked(impls: Sequence[ImplSig], pin: str | None, shapes: Sequence[str] | None,
-                kw_shapes: Mapping[str, str] | None = None) -> str | None:
+    def _choice(impls: Sequence[ImplSig], pin: str | None, shapes: Sequence[str] | None,
+                kw_shapes: Mapping[str, str] | None = None) -> ImplSig | None:
         """
-        The return type the selector's exact pass settles on for a call site.
+        The implementation the selector's exact pass settles on for a call site.
 
         The pin is read where the site has one: the runtime selects by the pin's
         witnesses, so what the pin says runs. An unpinned site (nothing in it
@@ -4583,7 +4652,7 @@ class _Inference:
         which the exact pass takes for an int, so a float position of an
         unpinned site says nothing; an int position never reaches here unpinned.
         A call with keyword arguments is bound to each implementation's
-        parameters by name (``overload_bind``).
+        parameters by name (``overload_binding``).
 
         :param impls: The group's implementations, in declaration order
         :param pin: The pin the site justified, when it has one
@@ -4591,7 +4660,7 @@ class _Inference:
                        where an unpacked argument hides them
         :param kw_shapes: Parameter name -> the keyword argument's static type,
                           or None where an unpacked mapping hides them
-        :return: The selected implementation's return type, or None
+        :return: The selected implementation, or None
         """
         if shapes is None or kw_shapes is None:
             return None
@@ -4599,9 +4668,9 @@ class _Inference:
             chars = pin_chars(shapes).replace(FLOAT, PIN_ANY)
             kw_chars = {name: pin_chars([ty]).replace(FLOAT, PIN_ANY)
                         for name, ty in kw_shapes.items()}
-            return overload_bind(list(impls), chars, shapes, kw_chars, kw_shapes)
+            return overload_binding(list(impls), chars, shapes, kw_chars, kw_shapes)
         chars = pin if pin is not None else pin_chars(shapes).replace(FLOAT, PIN_ANY)
-        return overload_pick(list(impls), chars, shapes)
+        return overload_choice(list(impls), chars, shapes)
 
     def _impl_sigs(self, key: str) -> list[ImplSig]:
         """
@@ -4912,9 +4981,13 @@ class _Inference:
             return UNKNOWN
         pin = self._pin(node, is_group)
         if is_group:
-            picked = self._picked(sig.impls, pin, self._shapes(node.args),
+            choice = self._choice(sig.impls, pin, self._shapes(node.args),
                                   self._keyword_shapes(node.keywords))
-            ty = sig.ret if picked is None else picked
+            if choice is None:
+                ty = sig.ret
+            else:
+                self._widen_group_nas(choice, node.args, node.keywords)
+                ty = choice.ret
         elif sig.annotated:
             ty = sig.ret
         else:
@@ -5469,11 +5542,13 @@ def _na_widen(ty: str) -> str | None:
 
     Pine has no typeless na at run time: where a string goes it is the string na,
     where a float or an int goes the numeric na, where an object of a class goes
-    the na of that class. Anywhere else (a bool, a container, a bare object, a
-    type this pass does not know) it stays as it is.
+    the na of that class, where an array, a map or a matrix goes the na of that
+    container. Anywhere else (a bool, a bare object, a type this pass does not
+    know) it stays as it is.
 
     :param ty: The type the na takes there
-    :return: ``WIDEN_STRING_NA``, ``WIDEN_NUMBER_NA``, the object type itself, or None
+    :return: ``WIDEN_STRING_NA``, ``WIDEN_NUMBER_NA``, the object type itself, one of
+             ``CONTAINER_NA_WIDENS``, or None
     """
     if ty == STR:
         return WIDEN_STRING_NA
@@ -5481,6 +5556,12 @@ def _na_widen(ty: str) -> str | None:
         return WIDEN_NUMBER_NA
     if class_of(ty) is not None:
         return ty
+    if is_array(ty):
+        return WIDEN_ARRAY_NA
+    if is_map(ty):
+        return WIDEN_MAP_NA
+    if is_matrix(ty):
+        return WIDEN_MATRIX_NA
     return None
 
 

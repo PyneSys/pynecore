@@ -26,7 +26,7 @@ from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
     FIT_OMISSIBLE, FIT_REQUIRED, INT, ImplSig, NONE_DEFAULT, OBJECT, TYPELESS,
     annotation_takes_none, class_id, default_fit, get_pin, get_ty, object_ty, overload_bind,
-    overload_pick,
+    overload_binding, overload_choice, overload_pick,
 )
 from pynecore.transformers.pine_type_transformer import PineTypeTransformer
 from pynecore.transformers.series import SeriesTransformer
@@ -747,12 +747,25 @@ HOLDER_TY = object_ty(class_id('test', 'Holder'))
     # The second half of the pass reads a classed position the same way
     ([ImplSig((HOLDER_TY, 'i'), 1, False, 'A', 'ny'),
       ImplSig((PIVOT_TY, 'i'), 1, False, 'B', 'ny')], '*', [PIVOT_TY], 'B'),
+    # A typeless na is taken for whatever a position declares -- a class, a
+    # string, a container -- so the first implementation the other positions
+    # let through runs; a position declaring nothing still says nothing
+    ([ImplSig((HOLDER_TY, 'i'), 2, False, 'A', 'nn'),
+      ImplSig((PIVOT_TY, 'i'), 2, False, 'B', 'nn')], '*i', [TYPELESS, INT], 'A'),
+    ([ImplSig((PIVOT_TY, 'i'), 2, False, 'A', 'nn'),
+      ImplSig((PIVOT_TY, 's'), 2, False, 'B', 'nn')], '**', [PIVOT_TY, TYPELESS], 'A'),
+    ([ImplSig((HOLDER_TY, 'a:' + PIVOT_TY), 2, False, 'A', 'nn'),
+      ImplSig((PIVOT_TY, 's'), 2, False, 'B', 'nn')], '**', [PIVOT_TY, TYPELESS], 'B'),
+    ([ImplSig((PIVOT_TY, '?'), 2, False, 'A', 'nn'),
+      ImplSig((PIVOT_TY, 's'), 2, False, 'B', 'nn')], '**', [PIVOT_TY, TYPELESS], None),
 ])
 def __test_the_static_selection_reads_an_object_by_its_class__(impls: list[ImplSig], pin: str,
                                                                shapes: list[str],
                                                                expected: str | None):
     """A position the pin has no witness for is read from the argument's class"""
     assert overload_pick(impls, pin, shapes) == expected
+    choice = overload_choice(impls, pin, shapes)
+    assert choice is (None if expected is None else next(i for i in impls if i.ret == expected))
 
 
 @pytest.mark.parametrize("impls,chars,shapes,kw_chars,kw_shapes,expected", [
@@ -787,6 +800,10 @@ def __test_the_static_selection_reads_an_object_by_its_class__(impls: list[ImplS
     # A keyword of no witness and no class says nothing
     ([ImplSig((PIVOT_TY, 's'), 2, False, 'A', 'nn', ('this', 'sess'))],
      '*', [PIVOT_TY], {'sess': '*'}, {'sess': OBJECT}, None),
+    # A typeless na keyword is taken by whatever its parameter declares
+    ([ImplSig((PIVOT_TY, 's'), 2, False, 'A', 'nn', ('this', 'sess')),
+      ImplSig((PIVOT_TY, HOLDER_TY), 2, False, 'B', 'nn', ('this', 'top'))],
+     '*', [PIVOT_TY], {'top': '*'}, {'top': TYPELESS}, 'B'),
 ])
 def __test_a_call_with_keywords_is_bound_by_name__(impls: list[ImplSig], chars: str,
                                                    shapes: list[str], kw_chars: dict[str, str],
@@ -794,3 +811,5 @@ def __test_a_call_with_keywords_is_bound_by_name__(impls: list[ImplSig], chars: 
                                                    expected: str | None):
     """A keyword call is the selector's bind-and-check pass, read statically"""
     assert overload_bind(impls, chars, shapes, kw_chars, kw_shapes) == expected
+    choice = overload_binding(impls, chars, shapes, kw_chars, kw_shapes)
+    assert choice is (None if expected is None else next(i for i in impls if i.ret == expected))

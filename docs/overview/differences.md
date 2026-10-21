@@ -312,7 +312,9 @@ The same holds for the other types: a bare `na` written where a float or an int 
 numeric na, `float('nan')`, and one written where an object of a user type or a drawing goes
 (`p: Pivot = na`, `Pivot(1.0) if c else na`, `array.push(pivots, na)`, a `Pivot` parameter or
 field) is the na of that class, `na(Pivot)`, so an overloaded function or method sees the
-class the value was typed with, as it does on TradingView.
+class the value was typed with, as it does on TradingView. One written where an array, a map
+or a matrix goes is the na of that container, `na(list)`, `na(dict)` or `na(Matrix)`, the way
+a compiled `array<float> a = na` reads.
 
 ### Array
 
