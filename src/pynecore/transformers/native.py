@@ -133,7 +133,8 @@ def source_digest(module: str) -> str:
         for path in _closure(module):
             hasher.update(path.relative_to(_PACKAGE).as_posix().encode('utf-8'))
             hasher.update(b'\0')
-            hasher.update(path.read_bytes())
+            # A checkout with CRLF line ends (Windows) has the same sources
+            hasher.update(path.read_bytes().replace(b'\r\n', b'\n'))
             hasher.update(b'\0')
         digest = _digests[module] = hasher.hexdigest()
     return digest
