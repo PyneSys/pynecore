@@ -31,6 +31,18 @@
     "module": "security_drawings",
     "digest": "64892477cd07e415baa1c773a2a0d5972aea4808b13c59f189a47dc3c7182aa7"
   },
+  "DynamicDefault": {
+    "module": "dynamic_default",
+    "digest": "0e564e878dd24c901137fe8d172ad0941ccffe38d687c51dba7f12e47c96a675"
+  },
+  "InlineSeriesHoist": {
+    "module": "inline_series_hoist",
+    "digest": "dc6f9b2b3bfe6ee22f58aa06580359916335b2d94a3c8bff5b48c6a4dfee3456"
+  },
+  "PineTruthiness": {
+    "module": "pine_truthiness",
+    "digest": "417f5698dbe278f19faebf083dab5c361494e1e2e441eb1ac0d15c951eeb2de3"
+  },
   "PersistentSeries": {
     "module": "persistent_series",
     "digest": "b43507e10d5b6fde5ebd3acb74bc5d8f17c5937d0816cc54c9249c77784e935a"

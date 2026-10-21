@@ -15,6 +15,7 @@
 #[rustfmt::skip]
 mod nodes;
 pub mod dump;
+pub mod locations;
 pub mod walk;
 
 use std::collections::BTreeMap;

@@ -128,6 +128,9 @@ pub static STEPS: &[Step] = &[
     Step { name: "PlotScope", run: steps::plot_scope::run },
     Step { name: "OuterWrite", run: steps::outer_write::run },
     Step { name: "SecurityDrawings", run: steps::security_drawings::run },
+    Step { name: "DynamicDefault", run: steps::dynamic_default::run },
+    Step { name: "InlineSeriesHoist", run: steps::inline_series_hoist::run },
+    Step { name: "PineTruthiness", run: steps::pine_truthiness::run },
     Step { name: "PersistentSeries", run: steps::persistent_series::run },
     Step { name: "LibrarySeries", run: steps::lib_series::run },
 ];
