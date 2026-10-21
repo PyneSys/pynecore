@@ -126,6 +126,10 @@ pub static STEPS: &[Step] = &[
     Step { name: "BuiltinShadow", run: steps::builtin_shadow::run },
     Step { name: "ImportNormalizer", run: steps::import_normalizer::run },
     Step { name: "PlotScope", run: steps::plot_scope::run },
+    Step { name: "OuterWrite", run: steps::outer_write::run },
+    Step { name: "SecurityDrawings", run: steps::security_drawings::run },
+    Step { name: "PersistentSeries", run: steps::persistent_series::run },
+    Step { name: "LibrarySeries", run: steps::lib_series::run },
 ];
 
 /// The native port of a step, if there is one.

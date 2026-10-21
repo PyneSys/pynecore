@@ -22,5 +22,21 @@
   "PlotScope": {
     "module": "plot_scope",
     "digest": "4a613c28550724dcdcce1d0b3f4c70e6c3c598da5fbf2dba8d29f6e33ce8e3c7"
+  },
+  "OuterWrite": {
+    "module": "outer_write",
+    "digest": "823ef37ed6c5fd8481c6d955152fc408cf80fc7a68d2493bcea9da9c682ac0cc"
+  },
+  "SecurityDrawings": {
+    "module": "security_drawings",
+    "digest": "64892477cd07e415baa1c773a2a0d5972aea4808b13c59f189a47dc3c7182aa7"
+  },
+  "PersistentSeries": {
+    "module": "persistent_series",
+    "digest": "b43507e10d5b6fde5ebd3acb74bc5d8f17c5937d0816cc54c9249c77784e935a"
+  },
+  "LibrarySeries": {
+    "module": "lib_series",
+    "digest": "9cb05cf050f56a88494b9a82baf1636f536dfdb8d021738cd1e677424c6599c9"
   }
 }
