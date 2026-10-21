@@ -17,7 +17,19 @@ from pynecore.transformers import native
 __test_helper_SOURCE = '''"""
 @pyne
 """
-from pynecore.lib import close
+from pynecore.core.pine_udt import udt
+from pynecore.lib import close, hl2, na
+
+
+@udt
+class Flag:
+    f: bool = na(bool)
+
+
+def smoothed(source: float = hl2, length: int = 2):
+    """Averaged"""
+    from pynecore.lib import ta
+    return ta.sma(source, length)
 
 
 def helper(x):
@@ -39,7 +51,7 @@ async def ignored():
 
 def main():
     from pynecore.lib import ta as indicators
-    return helper(close) + indicators.ema(close, 3)
+    return helper(close) + indicators.ema(close, 3) + smoothed() + Flag().f
 '''
 
 _TESTS = Path(__file__).resolve().parents[2]

@@ -12,7 +12,11 @@ else
 fi
 for lib in target/$profile/lib_native.dylib target/$profile/lib_native.so; do
     if [ -f "$lib" ]; then
-        cp "$lib" ../src/pynecore/transformers/_native.abi3.so
+        # A new file, not an overwrite: macOS kills a process that maps a binary
+        # rewritten in place
+        cp "$lib" ../src/pynecore/transformers/_native.abi3.so.tmp
+        mv -f ../src/pynecore/transformers/_native.abi3.so.tmp \
+            ../src/pynecore/transformers/_native.abi3.so
         echo "installed $lib"
     fi
 done
