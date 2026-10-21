@@ -847,3 +847,54 @@ def main():
     inner = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
                  and ast.unparse(node) == 'wrap(Holder(p))')
     assert get_ty(inner).endswith('#Holder')
+
+
+@pytest.mark.parametrize("body,expected", [
+    # the hand-written shape: a variable starts as a typeless na and a branch gives
+    # it a value -- the na is the na of the type the assignments join to
+    ('result = lib._na_none\nif lib.bar_index > 0:\n    result = lib.close\nx = result',
+     'result = lib._na_float'),
+    ('result = lib._na_none\nif lib.bar_index > 0:\n    result = 1\nelse:\n    result = 2.5',
+     'result = lib._na_float'),
+    ('label = lib._na_none\nif lib.bar_index > 0:\n    label = "up"', "label = ''"),
+    ('top = lib._na_none\nif lib.bar_index > 0:\n    top = Pivot(1.0)', 'top = lib.na(Pivot)'),
+    ('xs = lib._na_none\nif lib.bar_index > 0:\n    xs = lib.array.new_float(0)',
+     'xs = lib.na(list)'),
+    # a value the function computes decides it too
+    ('def half(v):\n    return v / 2\nresult = lib._na_none\nif lib.bar_index > 0:\n'
+     '    result = half(lib.close)', 'result = lib._na_float'),
+    # a bool, and a name nothing else assigns, keep the typeless na
+    ('flag = lib._na_none\nif lib.bar_index > 0:\n    flag = True', 'flag = lib._na_none'),
+    ('nothing = lib._na_none\nx = nothing', 'nothing = lib._na_none'),
+])
+def __test_a_typeless_na_a_name_starts_as_is_the_na_of_what_it_is_assigned_later__(body,
+                                                                                      expected):
+    emitted, diags = __test_helper_widen(body, __test_helper_UDT_PRELUDE)
+    assert expected in emitted.splitlines()
+    assert not diags
+
+
+def __test_a_typeless_na_a_name_starts_as_follows_the_context_it_is_assigned_in__():
+    """
+    The same body gives the name a float in one context and a string in another:
+    the na it starts as is converted per instance, the way any other value is (the
+    parameter's stamp, the join over both contexts, is what the report calls unknown)
+    """
+    body = ('def pick(v):\n    out = lib._na_none\n    if lib.bar_index > 0:\n        out = v\n'
+            '    return out\na = pick(lib.close)\nb = pick("s")')
+    emitted, _ = __test_helper_widen(body)
+    assert '    out = safe_convert.implicit_convert(lib._na_none, None)' in emitted.splitlines()
+
+
+@pytest.mark.parametrize("body,message", [
+    ('x = 1.0\nif lib.bar_index > 0:\n    x = "s"',
+     "'x' gets both float and string, which are different types"),
+    ('result = lib._na_none\nif lib.bar_index > 0:\n    result = "s"\nelse:\n    result = 2',
+     "'result' gets both string and int, which are different types"),
+    ('x = True\nif lib.bar_index > 0:\n    x = Pivot(1.0)',
+     "'x' gets both bool and Pivot, which are different types"),
+])
+def __test_branches_assigning_different_types_are_reported__(body, message):
+    """Pine rejects a variable whose assignments disagree; the walk names the pair"""
+    emitted, diags = __test_helper_widen(body, __test_helper_UDT_PRELUDE)
+    assert message in diags

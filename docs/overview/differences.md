@@ -314,7 +314,10 @@ numeric na, `float('nan')`, and one written where an object of a user type or a 
 field) is the na of that class, `na(Pivot)`, so an overloaded function or method sees the
 class the value was typed with, as it does on TradingView. One written where an array, a map
 or a matrix goes is the na of that container, `na(list)`, `na(dict)` or `na(Matrix)`, the way
-a compiled `array<float> a = na` reads.
+a compiled `array<float> a = na` reads. A variable that starts as a bare `na` and is assigned
+a value later (`result = na`, then `result = compute()` in a branch) takes the type of its
+assignments, and the `na` it starts as is that type's na; assignments of two different types
+(`"s"` in one branch, `2` in another) are reported as the error they are in Pine.
 
 ### Array
 

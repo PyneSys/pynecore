@@ -364,6 +364,9 @@ class _Frame:
     #: Name of a ``pine_loop(...)`` counter object -> the type its counter
     #: has, the join of the bounds it was built and stepped with
     loop_counters: dict[str, str] = field(default_factory=dict)
+    #: Name -> every typeless ``na`` stored into it: the na of whatever type the
+    #: name's assignments join to, re-decided on each assignment
+    na_stores: dict[str, list[ast.expr]] = field(default_factory=dict)
 
 
 @dataclass(slots=True, frozen=True)
@@ -791,6 +794,7 @@ class _Inference:
             bindings[name] = Binding(name=name, ty=ty, line=line, unknown=unknown, series=series,
                                      qual=qual, depth=len(self._conds), persistent=persistent,
                                      decl=decl)
+            self._note_na_store(bindings, name, ty, node)
             return
         # A series declaration holds for the name, whatever is assigned later
         existing.series = existing.series or series
@@ -809,6 +813,53 @@ class _Inference:
         if joined == UNKNOWN and existing.unknown is None:
             existing.unknown = self._shape_unknown(before, ty, node) or unknown \
                 or self._unknown('joined-branches', node, name)
+        self._note_na_store(bindings, name, ty, node)
+        self._settle_na_stores(bindings, name, joined)
+
+    def _frame_of(self, bindings: dict[str, Binding]) -> _Frame | None:
+        """The live frame whose names these are, if it is one of the walk's."""
+        return next((frame for frame in reversed(self._frames) if frame.names is bindings), None)
+
+    def _note_na_store(self, bindings: dict[str, Binding], name: str, ty: str,
+                       node: ast.AST) -> None:
+        """
+        Remember a typeless ``na`` stored into a name.
+
+        :param bindings: The names of the scope the store binds in
+        :param name: The name stored
+        :param ty: The type stored
+        :param node: The value stored
+        """
+        if ty != TYPELESS or not isinstance(node, ast.expr) or not _holds_na(node):
+            return
+        frame = self._frame_of(bindings)
+        if frame is None:
+            return
+        stored = frame.na_stores.setdefault(name, [])
+        if not any(value is node for value in stored):
+            stored.append(node)
+
+    def _settle_na_stores(self, bindings: dict[str, Binding], name: str, ty: str) -> None:
+        """
+        Convert every typeless ``na`` stored into a name to the na of the name's type.
+
+        A hand-written ``result = na`` followed by ``result = f()`` in a branch
+        declares nothing: the variable's type is the join of its assignments, and
+        the na it started as is the na of that type -- the way the declared
+        ``float result = na`` the compiler would spell it reads. It is re-decided
+        on every assignment, so a later branch that moves the join, or breaks it,
+        has the last word.
+
+        :param bindings: The names of the scope the store binds in
+        :param name: The name stored
+        :param ty: The type the name's assignments join to now
+        """
+        frame = self._frame_of(bindings)
+        if frame is None:
+            return
+        kind = _na_widen(ty)
+        for value in frame.na_stores.get(name, ()):
+            self._record_widen(value, kind)
 
     def _joined(self, left: str, right: str, node: ast.AST, what: str) -> str:
         """
@@ -820,7 +871,11 @@ class _Inference:
         So the join is UNKNOWN -- widening them to "some object" would throw
         away exactly the element type the next read needs -- and the walker
         says so, because ``join`` is a pure function on strings and has no
-        node to point at.
+        node to point at. Two known types that do not join at all -- a string
+        against a number, a bool against an object -- are the same error, and
+        are reported the same way; only a side that is unknown, typeless or a
+        bare object says nothing, since it may be the cascade of something
+        reported already.
 
         :param left: The type established so far
         :param right: The type the new branch produces
@@ -830,6 +885,9 @@ class _Inference:
         """
         joined = join(left, right)
         conflict = shape_conflict(left, right)
+        if conflict is None and joined == UNKNOWN \
+                and left not in _UNCHECKED and right not in _UNCHECKED:
+            conflict = (left, right)
         if conflict is None:
             return joined
         nid = node_id(node)
@@ -843,7 +901,9 @@ class _Inference:
         self._diag(
             f'{what} gets both {render_ty(conflict[0])} and {render_ty(conflict[1])}, '
             f'which are different types', node,
-            self._shape_unknown(conflict[0], conflict[1], node),
+            self._shape_unknown(conflict[0], conflict[1], node)
+            or self._unknown('joined-branches', node,
+                             f'{render_ty(conflict[0])} vs {render_ty(conflict[1])}'),
             fix='make both branches the same type')
         return joined
 
