@@ -40,7 +40,7 @@ from collections.abc import Callable, Coroutine, Iterable, Iterator
 from concurrent import futures
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, overload
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, TypeVar, overload
 
 from pynecore import lib
 from pynecore.core.broker.disappearance import (
@@ -10045,28 +10045,46 @@ class OrderSyncEngine:
         re-emit is a clean fresh evaluation that deliberately gets a current
         anchor.
         """
+        anchor = self._envelope_anchor(key)
+        self._drop_envelope(key)
+        self._seed_bumped_anchor(anchor)
+
+    def _envelope_anchor(self, key: str) -> EnvelopeRecord:
+        """The dispatch anchor ``key``'s next client order id is built from.
+
+        The in-memory envelope first, then the replayed persisted anchor; a
+        key with neither anchors on the current bar.
+        """
         envelope = self._envelopes.get(key)
         if envelope is not None:
-            bar_ts_ms = envelope.bar_ts_ms
-            retry_seq = envelope.retry_seq
-            run_tag: str | None = envelope.run_tag
-        else:
-            anchor = self._persisted_envelope_anchors.get(key)
-            if anchor is not None:
-                bar_ts_ms = anchor.bar_ts_ms
-                retry_seq = anchor.retry_seq
-                run_tag = anchor.run_tag
-            else:
-                bar_ts_ms = self._current_bar_ts_ms
-                retry_seq = 0
-                run_tag = self._run_tag
-        self._drop_envelope(key)
-        next_retry_seq = retry_seq + 1
+            return EnvelopeRecord(
+                key=key,
+                bar_ts_ms=envelope.bar_ts_ms,
+                retry_seq=envelope.retry_seq,
+                run_tag=envelope.run_tag,
+            )
+        anchor = self._persisted_envelope_anchors.get(key)
+        if anchor is not None:
+            return anchor
+        return EnvelopeRecord(
+            key=key,
+            bar_ts_ms=self._current_bar_ts_ms,
+            retry_seq=0,
+            run_tag=self._run_tag,
+        )
+
+    def _seed_bumped_anchor(self, anchor: EnvelopeRecord) -> None:
+        """Make the next dispatch of ``anchor.key`` mint a fresh client order id.
+
+        The id ``anchor`` names is spent at the broker, so the next build on
+        the same bar takes ``retry_seq + 1``; a later bar discards the bump.
+        """
+        key = anchor.key
         bumped = EnvelopeRecord(
             key=key,
-            bar_ts_ms=bar_ts_ms,
-            retry_seq=next_retry_seq,
-            run_tag=run_tag,
+            bar_ts_ms=anchor.bar_ts_ms,
+            retry_seq=anchor.retry_seq + 1,
+            run_tag=anchor.run_tag,
         )
         self._persisted_envelope_anchors[key] = bumped
         # Record the bumped anchor in the dedicated in-memory map. This serves
@@ -10077,9 +10095,10 @@ class OrderSyncEngine:
         # after each start-of-cycle ``store_ctx.replay()`` — which would
         # otherwise wipe it (the bump is intentionally never journaled, so
         # ``replay()`` cannot reconstruct it). Both are in-memory only — the
-        # journal row was already DELETEd by ``_drop_envelope`` above and is
+        # caller already DELETEd the journal row (``_drop_envelope``) and it is
         # intentionally not re-written, so a restart re-evaluates the signal
-        # fresh (see docstring and the :attr:`_reject_anchor_bars` comment).
+        # fresh (see :meth:`_reanchor_envelope_after_reject` and the
+        # :attr:`_reject_anchor_bars` comment).
         self._reject_anchor_bars[key] = bumped
 
     def _find_key_for_order_id(self, order_id: str) -> str | None:
@@ -18253,7 +18272,8 @@ class OrderSyncEngine:
             spent_anchor = self._persisted_envelope_anchors.get(key)
             try:
                 landed = self._dispatch_cancel_strict(old)
-            except (ExchangeConnectionError, OrderDispositionUnknownError) as e:
+            except (ExchangeConnectionError, OrderDispositionUnknownError,
+                    ExchangeOrderRejectedError) as e:
                 _blog_warning(
                     "forced cancel retry for %r still pending (%s); will "
                     "retry next sync", format_intent_key(key), e,
@@ -20034,6 +20054,56 @@ class OrderSyncEngine:
             return True
         live = {order.id for order in orders}
         return any(ref in live for ref in mapped)
+
+    def _recover_rejected_entry_modify(
+            self, old: EntryIntent, new: EntryIntent, error: ExchangeOrderRejectedError,
+    ) -> NoReturn:
+        """Answer the venue's refusal of an entry amend without halting the run.
+
+        A refused in-place amend leaves the working order on its old terms, a
+        refused cancel+recreate leaves none: either way the order Pine wants
+        is not the one at the venue. The working order is cancelled (a no-op
+        when the venue holds none) and the entry leaves the active set
+        (:class:`OrderSkippedByPlugin`); Pine's entry is dispatched afresh
+        once the venue provably holds no order for it, and a repeated refusal
+        is handled like any rejected entry. A cancel that does not land, or
+        is refused, stays parked and is retried on every sync, and the diff
+        holds the fresh dispatch back until it lands. Only a cancel nothing
+        retries keeps the OLD intent active, and the amend is retried on the
+        next sync (:class:`_PartialBracketModifyDeferred`).
+        """
+        key = old.intent_key
+        spent_anchor = self._envelope_anchor(key)
+        prev_entry_ids = list(self._order_mapping.get(key, []))
+        try:
+            landed = self._dispatch_cancel(old)
+        except ExchangeOrderRejectedError as cancel_error:
+            _blog_warning(
+                "cancel of %s after its refused amend was refused too (%s)",
+                format_intent_key(key), cancel_error,
+            )
+            landed = False
+        retried = key in self._forced_cancel_pending or key in self._cancel_disposition_pending
+        if not landed and not retried:
+            raise _PartialBracketModifyDeferred(
+                "rejected entry modify: cancel of the working order not landed"
+            )
+        if landed and not retried:
+            for stale_id in prev_entry_ids:
+                self._retired_entry_order_ids.add(stale_id)
+            self._seed_bumped_anchor(spent_anchor)
+        raise OrderSkippedByPlugin(
+            f"Entry modify {format_intent_key(key)} rejected by exchange "
+            f"({type(error).__name__}: {error}); the working order is cancelled "
+            f"and the entry dispatched afresh once the venue holds none.",
+            intent_key=key,
+            reason="broker_rejected_entry_modify",
+            context={
+                'symbol': new.symbol,
+                'pine_id': new.pine_id,
+                'reject_type': type(error).__name__,
+            },
+        ) from error
 
     def _recover_rejected_exit_modify(
             self, old: Intent, new: ExitIntent, error: ExchangeOrderRejectedError,
@@ -22972,8 +23042,15 @@ class OrderSyncEngine:
         old_env = self._build_envelope(old)
         new_env = self._build_envelope(new)
         _blog_info("modifying %s -> %s", old, new)
+        # An amend changes a working order's price and size, never its type: a
+        # LIMIT / STOP turned into another type (a MARKET above all) is no
+        # amend at any venue, so it is replaced like a mismatched kind below
+        # (measured live: cTrader refused such an amend, c285 2026-10-21).
+        amends_entry = (isinstance(new, EntryIntent) and isinstance(old, EntryIntent)
+                        and new.order_type is old.order_type)
         try:
-            if isinstance(new, EntryIntent) and isinstance(old, EntryIntent):
+            if amends_entry:
+                assert isinstance(new, EntryIntent)
                 prev_order_ids = list(self._order_mapping.get(new.intent_key, []))
                 orders = self._run_async_write(self._broker.modify_entry(old_env, new_env))
                 new_order_ids = [o.id for o in orders]
@@ -23067,7 +23144,8 @@ class OrderSyncEngine:
                     orders = self._run_async_write(self._broker.modify_exit(old_env, new_env))
                     self._order_mapping[new.intent_key] = [o.id for o in orders]
             else:
-                # CloseIntent or mismatched kinds — cancel + re-execute.
+                # CloseIntent, mismatched kinds or an entry of another order
+                # type — cancel + re-execute.
                 # A keyed ``strategy.close(entry_id)`` shares its intent key
                 # with the consumed parent EntryIntent. Once that entry is
                 # fully filled there is no resting order left to cancel, and
@@ -23112,6 +23190,11 @@ class OrderSyncEngine:
                         "cancel+re-execute modify deferred — forced cancel "
                         "pending"
                     )
+                replaced_entry = isinstance(old, EntryIntent) and isinstance(new, EntryIntent)
+                spent_anchor = (self._envelope_anchor(old.intent_key)
+                                if replaced_entry else None)
+                prev_entry_ids = (list(self._order_mapping.get(old.intent_key, []))
+                                  if replaced_entry else [])
                 landed = self._dispatch_cancel(old)
                 # If the cancel landed in cancel-tentative (default cancel
                 # path swallowed an ``OrderDispositionUnknownError`` and
@@ -23151,6 +23234,14 @@ class OrderSyncEngine:
                         "cancel+re-execute modify deferred — cancel did "
                         "not land"
                     )
+                if spent_anchor is not None:
+                    # The replacement entry shares the cancelled one's key: a
+                    # late fill of the cancelled order must not be credited
+                    # to the replacement's fill ledger, and its client order
+                    # id is spent, so a same-bar replacement takes a fresh one.
+                    for stale_id in prev_entry_ids:
+                        self._retired_entry_order_ids.add(stale_id)
+                    self._seed_bumped_anchor(spent_anchor)
                 self._dispatch_new(new)
         except OrderDispositionUnknownError as e:
             _blog_warning(
@@ -23274,6 +23365,8 @@ class OrderSyncEngine:
             if isinstance(new, ExitIntent):
                 self._recover_rejected_exit_modify(old, new, e)
                 return
+            if isinstance(new, EntryIntent) and isinstance(old, EntryIntent):
+                self._recover_rejected_entry_modify(old, new, e)
             if isinstance(new, CloseIntent) and new.synthetic_kind is None:
                 self._recover_rejected_close(new, e)
             _blog_error(

@@ -4587,6 +4587,132 @@ def __test_entry_modify_spent_coid_dispatches_replacement_fresh__():
     assert engine.order_mapping["L"] == ["xchg-2"]
 
 
+@pytest.mark.parametrize("bar_ts, retry_seq", [
+    # Same bar: the cancelled limit's id is spent, so the market takes a fresh one.
+    (BAR_TS, 1),
+    # A later bar mints its own id anyway.
+    (BAR_TS + 60_000, 0),
+])
+def __test_an_entry_turned_market_is_replaced_not_amended__(bar_ts, retry_seq):
+    """A working limit entry Pine turns into a market one is cancelled and
+    the market entry dispatched fresh: an amend cannot change an order's type
+    (measured live: cTrader refused the amend with ``limitPrice`` 0)."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(bar_ts)
+
+    assert b.modify_entry_calls == []
+    assert len(b.cancel_calls) == 1
+    assert len(b.entry_calls) == 2
+    replacement = b.entry_calls[1]
+    assert replacement.intent.order_type is OrderType.MARKET
+    assert (replacement.bar_ts_ms, replacement.retry_seq) == (bar_ts, retry_seq)
+    assert replacement.client_order_id('e') != b.entry_calls[0].client_order_id('e')
+    assert engine.active_intents["L"].order_type is OrderType.MARKET
+    assert engine.order_mapping["L"] == ["xchg-2"]
+    assert engine.halted is False
+    # A fill the cancelled limit still reports is not the market entry's.
+    engine.on_order_event(_fill_event(
+        'buy', 0.4, 50_000.0, pine_id="L", xchg_id="xchg-1", event_type='partial',
+        filled_qty=0.4, remaining_qty=0.6,
+    ))
+    engine.apply_async_events()
+    assert engine._active_entry_filled_qty.get("L", 0.0) == 0.0
+
+
+def __test_an_entry_type_change_waits_for_its_cancel_to_land__():
+    """The market replacement goes out only once the limit's cancel landed:
+    a still-working limit beside it would open the position twice."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    b.false_on_next_cancel = True
+    engine.sync(BAR_TS + 60_000)
+
+    assert len(b.entry_calls) == 1
+    assert engine.active_intents["L"].limit == 50_000.0
+
+    engine.sync(BAR_TS + 120_000)
+
+    assert len(b.entry_calls) == 2
+    assert b.entry_calls[1].intent.order_type is OrderType.MARKET
+    assert engine.active_intents["L"].order_type is OrderType.MARKET
+
+
+def __test_a_refused_entry_amend_cancels_and_dispatches_afresh__():
+    """The venue refusing an entry amend does not halt the run: the working
+    order is cancelled and the next sync dispatches Pine's entry afresh."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=49_500.0)
+    b.raise_on_next_modify_entry = ExchangeOrderRejectedError("illegal value of limitPrice")
+    engine.sync(BAR_TS)
+
+    assert engine.halted is False
+    assert len(b.modify_entry_calls) == 1
+    assert len(b.cancel_calls) == 1
+    assert "L" not in engine.active_intents
+
+    engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == 2
+    fresh = b.entry_calls[1]
+    assert fresh.intent.limit == 49_500.0
+    assert (fresh.bar_ts_ms, fresh.retry_seq) == (BAR_TS, 1)
+    assert engine.active_intents["L"].limit == 49_500.0
+    engine.on_order_event(_fill_event(
+        'buy', 0.4, 50_000.0, pine_id="L", xchg_id="xchg-1", event_type='partial',
+        filled_qty=0.4, remaining_qty=0.6,
+    ))
+    engine.apply_async_events()
+    assert engine._active_entry_filled_qty.get("L", 0.0) == 0.0
+
+
+def __test_a_refused_entry_amend_waits_for_its_cancel_to_land__():
+    """While the cancel after a refused amend is refused, or does not land,
+    it is retried every sync and Pine's entry is not dispatched beside the
+    still-working order; it goes out once the cancel lands."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    engine.sync(BAR_TS)
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=49_500.0)
+    b.raise_on_next_modify_entry = ExchangeOrderRejectedError("illegal value of limitPrice")
+    b.raise_on_next_cancel = ExchangeOrderRejectedError("cancel refused")
+    engine.sync(BAR_TS + 60_000)
+
+    assert engine.halted is False
+    assert "L" not in engine.active_intents
+    assert engine.order_mapping["L"] == ["xchg-1"]
+
+    b.raise_on_next_cancel = ExchangeOrderRejectedError("cancel refused")
+    engine.sync(BAR_TS + 120_000)
+    b.false_on_next_cancel = True
+    engine.sync(BAR_TS + 180_000)
+
+    assert engine.halted is False
+    assert len(b.entry_calls) == 1
+    assert len(b.modify_entry_calls) == 1
+
+    engine.sync(BAR_TS + 240_000)
+
+    assert len(b.entry_calls) == 2
+    fresh = b.entry_calls[1]
+    assert (fresh.intent.limit, fresh.bar_ts_ms) == (49_500.0, BAR_TS + 240_000)
+    assert engine.active_intents["L"].limit == 49_500.0
+
+
 def __test_exit_modify_spent_coid_dispatches_replacement_fresh__():
     """A spent id from an exit-bracket modify re-dispatches the bracket fresh."""
     # Same recovery on the bracket path: the position must not be left
