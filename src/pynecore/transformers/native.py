@@ -152,8 +152,9 @@ def current_steps() -> frozenset[str]:
             return _current
         current = set()
         stale = []
+        registered = set(_native.steps())
         for name, entry in json.loads(_native.ported_json()).items():
-            if source_digest(entry['module']) == entry['digest']:
+            if name in registered and source_digest(entry['module']) == entry['digest']:
                 current.add(name)
             else:
                 stale.append(name)

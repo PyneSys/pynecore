@@ -2,5 +2,9 @@
   "ImportLifter": {
     "module": "import_lifter",
     "digest": "c2b44f129b3d49e6c6c2c0f731703069fddfd8fe3cc6f83ef11282525164fd90"
+  },
+  "TypeCheckingStripper": {
+    "module": "type_checking_stripper",
+    "digest": "517fe9479ae624bbf03f985f89d97702b3f2b9c0f33d165519dfb7542df4dd99"
   }
 }
