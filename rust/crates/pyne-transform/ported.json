@@ -50,5 +50,17 @@
   "LibrarySeries": {
     "module": "lib_series",
     "digest": "9cb05cf050f56a88494b9a82baf1636f536dfdb8d021738cd1e677424c6599c9"
+  },
+  "ModuleProperty": {
+    "module": "module_property",
+    "digest": "b108145ef2d2b5ddd0a26b98a79fd092eb6c04911f9468be87c75f22487d5296"
+  },
+  "TaVariableHoist": {
+    "module": "ta_variable_hoist",
+    "digest": "f11d7293604da975a3da945d54b6c45c50621b029de738f3739a2cc38b5e3280"
+  },
+  "ClosureArguments": {
+    "module": "closure_arguments_transformer",
+    "digest": "db60671d52f9994ecf5fbb565a3250abe5cdbe760bfd1358e4481d1cc8aed05e"
   }
 }

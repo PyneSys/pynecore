@@ -74,7 +74,18 @@ pub trait Host {
     /// Whether a module's `module_properties.json` entry names a member
     /// (`name in module_property.module_properties()[module]`).
     fn module_property(&self, module: &str, name: &str) -> Result<bool, Unsupported> {
-        Ok(data::module_properties().get(module).is_some_and(|members| members.contains(name)))
+        Ok(data::module_properties().get(module).is_some_and(|members| members.contains_key(name)))
+    }
+
+    /// The `"type"` of a module's `module_properties.json` entry for a member, `None`
+    /// when the module's entry does not name it
+    /// (`module_property.module_properties()[module].get(name)["type"]`).
+    fn module_property_type(
+        &self,
+        module: &str,
+        name: &str,
+    ) -> Result<Option<String>, Unsupported> {
+        Ok(data::module_properties().get(module).and_then(|members| members.get(name)).cloned())
     }
 
     /// The `__all__` of a lib module (`lib_registry.lib_star_exports().get(module)`).
@@ -133,6 +144,9 @@ pub static STEPS: &[Step] = &[
     Step { name: "PineTruthiness", run: steps::pine_truthiness::run },
     Step { name: "PersistentSeries", run: steps::persistent_series::run },
     Step { name: "LibrarySeries", run: steps::lib_series::run },
+    Step { name: "ModuleProperty", run: steps::module_property::run },
+    Step { name: "TaVariableHoist", run: steps::ta_variable_hoist::run },
+    Step { name: "ClosureArguments", run: steps::closure_arguments::run },
 ];
 
 /// The native port of a step, if there is one.

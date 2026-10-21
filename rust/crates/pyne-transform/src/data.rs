@@ -4,21 +4,28 @@
 //! regenerated file changes the digest of every step that reads it, so a binary
 //! built with the old copy is out of use until it is rebuilt.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use serde_json::Value;
 
-/// `module_properties.json`: module -> its member names (`module_property.module_properties`).
-pub fn module_properties() -> &'static HashMap<String, HashSet<String>> {
-    static REGISTRY: OnceLock<HashMap<String, HashSet<String>>> = OnceLock::new();
+/// `module_properties.json`: module -> member name -> its `"type"` (`"property"` or
+/// `"variable"`; `module_property.module_properties`).
+pub fn module_properties() -> &'static HashMap<String, HashMap<String, String>> {
+    static REGISTRY: OnceLock<HashMap<String, HashMap<String, String>>> = OnceLock::new();
     REGISTRY.get_or_init(|| {
         let text = include_str!("../../../../src/pynecore/transformers/module_properties.json");
-        let document: HashMap<String, HashMap<String, Value>> =
+        let document: HashMap<String, HashMap<String, HashMap<String, String>>> =
             serde_json::from_str(text).expect("module_properties.json");
         document
             .into_iter()
-            .map(|(module, members)| (module, members.into_keys().collect()))
+            .map(|(module, members)| {
+                let members = members
+                    .into_iter()
+                    .map(|(name, mut entry)| (name, entry.remove("type").expect("type")))
+                    .collect();
+                (module, members)
+            })
             .collect()
     })
 }

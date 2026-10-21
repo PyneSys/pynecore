@@ -197,6 +197,11 @@ class _Host:
         return name in module_properties()[module]
 
     @staticmethod
+    def module_property_type(module: str, name: str) -> str | None:
+        entry = module_properties()[module].get(name)
+        return None if entry is None else entry["type"]
+
+    @staticmethod
     def star_exports(module: str) -> list[str] | None:
         return lib_star_exports().get(module)
 

@@ -57,17 +57,17 @@ struct PyHost<'py> {
 }
 
 impl PyHost<'_> {
-    fn ask(
+    fn ask<T: for<'a> FromPyObject<'a, 'a>>(
         &self,
         method: &str,
         args: impl for<'a> pyo3::call::PyCallArgs<'a>,
-    ) -> Result<bool, pyne_ast::Unsupported> {
+    ) -> Result<T, pyne_ast::Unsupported> {
         let Some(object) = &self.object else {
             return Err(pyne_ast::Unsupported(format!("no host for {method}")));
         };
         object
             .call_method1(method, args)
-            .and_then(|answer| answer.extract::<bool>())
+            .and_then(|answer| answer.extract::<T>().map_err(Into::into))
             .map_err(|err| pyne_ast::Unsupported(format!("host {method}: {err}")))
     }
 }
@@ -89,14 +89,16 @@ impl pyne_transform::Host for PyHost<'_> {
         self.ask("module_property", (module, name))
     }
 
+    fn module_property_type(
+        &self,
+        module: &str,
+        name: &str,
+    ) -> Result<Option<String>, pyne_ast::Unsupported> {
+        self.ask("module_property_type", (module, name))
+    }
+
     fn star_exports(&self, module: &str) -> Result<Option<Vec<String>>, pyne_ast::Unsupported> {
-        let Some(object) = &self.object else {
-            return Err(pyne_ast::Unsupported("no host for star_exports".into()));
-        };
-        object
-            .call_method1("star_exports", (module,))
-            .and_then(|answer| answer.extract::<Option<Vec<String>>>())
-            .map_err(|err| pyne_ast::Unsupported(format!("host star_exports: {err}")))
+        self.ask("star_exports", (module,))
     }
 }
 
