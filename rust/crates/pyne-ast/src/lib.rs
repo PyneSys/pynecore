@@ -14,6 +14,7 @@
 
 #[rustfmt::skip]
 mod nodes;
+pub mod dump;
 pub mod walk;
 
 use std::collections::BTreeMap;
@@ -126,11 +127,7 @@ impl Ast {
 
     pub fn add_at(&mut self, kind: Kind, loc: Loc) -> NodeId {
         let id = NodeId(u32::try_from(self.nodes.len()).expect("arena overflow"));
-        self.nodes.push(Node {
-            kind,
-            loc,
-            extra: BTreeMap::new(),
-        });
+        self.nodes.push(Node { kind, loc, extra: BTreeMap::new() });
         id
     }
 

@@ -37,10 +37,7 @@ pub fn parse_module_into(ast: &mut Ast, source: &str) -> Result<NodeId> {
     let module = parsed.into_syntax();
     let mut lower = Lowerer::new(ast, source);
     let body = lower.suite(&module.body)?;
-    Ok(lower.ast.add(Kind::Module {
-        body,
-        type_ignores: Vec::new(),
-    }))
+    Ok(lower.ast.add(Kind::Module { body, type_ignores: Vec::new() }))
 }
 
 /// Parse a single expression (`ast.parse(source, mode='eval').body`).
@@ -77,11 +74,7 @@ impl<'a> Lowerer<'a> {
             }
             index += 1;
         }
-        Lowerer {
-            ast,
-            source,
-            line_starts,
-        }
+        Lowerer { ast, source, line_starts }
     }
 
     /// The 1-based line and the byte column of an offset.
@@ -132,10 +125,7 @@ impl<'a> Lowerer<'a> {
     }
 
     fn decorators(&mut self, decorators: &[ra::Decorator]) -> Result<Vec<NodeId>> {
-        decorators
-            .iter()
-            .map(|decorator| self.expr(&decorator.expression))
-            .collect()
+        decorators.iter().map(|decorator| self.expr(&decorator.expression)).collect()
     }
 
     fn stmt(&mut self, stmt: &ra::Stmt) -> Result<NodeId> {
@@ -191,12 +181,8 @@ impl<'a> Lowerer<'a> {
                 };
                 return Ok(self.add(kind, TextRange::new(start, range.end())));
             }
-            ra::Stmt::Return(node) => Kind::Return {
-                value: self.opt_expr(node.value.as_deref())?,
-            },
-            ra::Stmt::Delete(node) => Kind::Delete {
-                targets: self.exprs(&node.targets)?,
-            },
+            ra::Stmt::Return(node) => Kind::Return { value: self.opt_expr(node.value.as_deref())? },
+            ra::Stmt::Delete(node) => Kind::Delete { targets: self.exprs(&node.targets)? },
             ra::Stmt::TypeAlias(node) => Kind::TypeAlias {
                 name: self.expr(&node.name)?,
                 type_params: self.type_params(node.type_params.as_deref())?,
@@ -224,21 +210,9 @@ impl<'a> Lowerer<'a> {
                 let body = self.suite(&node.body)?;
                 let orelse = self.suite(&node.orelse)?;
                 if node.is_async {
-                    Kind::AsyncFor {
-                        target,
-                        iter,
-                        body,
-                        orelse,
-                        type_comment: None,
-                    }
+                    Kind::AsyncFor { target, iter, body, orelse, type_comment: None }
                 } else {
-                    Kind::For {
-                        target,
-                        iter,
-                        body,
-                        orelse,
-                        type_comment: None,
-                    }
+                    Kind::For { target, iter, body, orelse, type_comment: None }
                 }
             }
             ra::Stmt::While(node) => Kind::While {
@@ -259,25 +233,14 @@ impl<'a> Lowerer<'a> {
                     .map(|item| {
                         let context_expr = self.expr(&item.context_expr)?;
                         let optional_vars = self.opt_expr(item.optional_vars.as_deref())?;
-                        Ok(self.ast.add(Kind::WithItem {
-                            context_expr,
-                            optional_vars,
-                        }))
+                        Ok(self.ast.add(Kind::WithItem { context_expr, optional_vars }))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let body = self.suite(&node.body)?;
                 if node.is_async {
-                    Kind::AsyncWith {
-                        items,
-                        body,
-                        type_comment: None,
-                    }
+                    Kind::AsyncWith { items, body, type_comment: None }
                 } else {
-                    Kind::With {
-                        items,
-                        body,
-                        type_comment: None,
-                    }
+                    Kind::With { items, body, type_comment: None }
                 }
             }
             ra::Stmt::Match(node) => {
@@ -289,11 +252,7 @@ impl<'a> Lowerer<'a> {
                         let pattern = self.pattern(&case.pattern)?;
                         let guard = self.opt_expr(case.guard.as_deref())?;
                         let body = self.suite(&case.body)?;
-                        Ok(self.ast.add(Kind::MatchCase {
-                            pattern,
-                            guard,
-                            body,
-                        }))
+                        Ok(self.ast.add(Kind::MatchCase { pattern, guard, body }))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Kind::Match { subject, cases }
@@ -318,19 +277,9 @@ impl<'a> Lowerer<'a> {
                 let orelse = self.suite(&node.orelse)?;
                 let finalbody = self.suite(&node.finalbody)?;
                 if node.is_star {
-                    Kind::TryStar {
-                        body,
-                        handlers,
-                        orelse,
-                        finalbody,
-                    }
+                    Kind::TryStar { body, handlers, orelse, finalbody }
                 } else {
-                    Kind::Try {
-                        body,
-                        handlers,
-                        orelse,
-                        finalbody,
-                    }
+                    Kind::Try { body, handlers, orelse, finalbody }
                 }
             }
             ra::Stmt::Assert(node) => Kind::Assert {
@@ -341,9 +290,7 @@ impl<'a> Lowerer<'a> {
                 if node.is_lazy {
                     return Err(Unsupported("lazy import".into()));
                 }
-                Kind::Import {
-                    names: self.aliases(&node.names),
-                }
+                Kind::Import { names: self.aliases(&node.names) }
             }
             ra::Stmt::ImportFrom(node) => {
                 if node.is_lazy {
@@ -355,15 +302,13 @@ impl<'a> Lowerer<'a> {
                     level: Some(i64::from(node.level)),
                 }
             }
-            ra::Stmt::Global(node) => Kind::Global {
-                names: node.names.iter().map(|name| name.id.to_string()).collect(),
-            },
+            ra::Stmt::Global(node) => {
+                Kind::Global { names: node.names.iter().map(|name| name.id.to_string()).collect() }
+            }
             ra::Stmt::Nonlocal(node) => Kind::Nonlocal {
                 names: node.names.iter().map(|name| name.id.to_string()).collect(),
             },
-            ra::Stmt::Expr(node) => Kind::Expr {
-                value: self.expr(&node.value)?,
-            },
+            ra::Stmt::Expr(node) => Kind::Expr { value: self.expr(&node.value)? },
             ra::Stmt::Pass(_) => Kind::Pass,
             ra::Stmt::Break(_) => Kind::Break,
             ra::Stmt::Continue(_) => Kind::Continue,
@@ -406,16 +351,9 @@ impl<'a> Lowerer<'a> {
 
     fn arg(&mut self, parameter: &ra::Parameter) -> Result<NodeId> {
         let annotation = self.opt_expr(parameter.annotation.as_deref())?;
-        let kind = Kind::Arg {
-            arg: parameter.name.id.to_string(),
-            annotation,
-            type_comment: None,
-        };
+        let kind = Kind::Arg { arg: parameter.name.id.to_string(), annotation, type_comment: None };
         // CPython starts ``*args`` / ``**kwargs`` at the name, after the stars
-        Ok(self.add(
-            kind,
-            TextRange::new(parameter.name.range.start(), parameter.range.end()),
-        ))
+        Ok(self.add(kind, TextRange::new(parameter.name.range.start(), parameter.range.end())))
     }
 
     fn parameters(&mut self, parameters: Option<&ra::Parameters>) -> Result<NodeId> {
@@ -439,20 +377,12 @@ impl<'a> Lowerer<'a> {
                     defaults.push(self.expr(default)?);
                 }
             }
-            vararg = parameters
-                .vararg
-                .as_deref()
-                .map(|p| self.arg(p))
-                .transpose()?;
+            vararg = parameters.vararg.as_deref().map(|p| self.arg(p)).transpose()?;
             for parameter in &parameters.kwonlyargs {
                 kwonlyargs.push(self.arg(&parameter.parameter)?);
                 kw_defaults.push(self.opt_expr(parameter.default.as_deref())?);
             }
-            kwarg = parameters
-                .kwarg
-                .as_deref()
-                .map(|p| self.arg(p))
-                .transpose()?;
+            kwarg = parameters.kwarg.as_deref().map(|p| self.arg(p)).transpose()?;
         }
         Ok(self.ast.add(Kind::Arguments {
             posonlyargs,
@@ -552,10 +482,9 @@ impl<'a> Lowerer<'a> {
                 },
                 values: self.exprs(&node.values)?,
             },
-            ra::Expr::Named(node) => Kind::NamedExpr {
-                target: self.expr(&node.target)?,
-                value: self.expr(&node.value)?,
-            },
+            ra::Expr::Named(node) => {
+                Kind::NamedExpr { target: self.expr(&node.target)?, value: self.expr(&node.value)? }
+            }
             ra::Expr::BinOp(node) => Kind::BinOp {
                 left: self.expr(&node.left)?,
                 op: operator(node.op),
@@ -588,9 +517,7 @@ impl<'a> Lowerer<'a> {
                 }
                 Kind::Dict { keys, values }
             }
-            ra::Expr::Set(node) => Kind::Set {
-                elts: self.exprs(&node.elts)?,
-            },
+            ra::Expr::Set(node) => Kind::Set { elts: self.exprs(&node.elts)? },
             ra::Expr::ListComp(node) => Kind::ListComp {
                 elt: self.expr(&node.elt)?,
                 generators: self.comprehensions(&node.generators)?,
@@ -608,15 +535,9 @@ impl<'a> Lowerer<'a> {
                 generators: self.comprehensions(&node.generators)?,
             },
             ra::Expr::Generator(node) => return self.generator(node),
-            ra::Expr::Await(node) => Kind::Await {
-                value: self.expr(&node.value)?,
-            },
-            ra::Expr::Yield(node) => Kind::Yield {
-                value: self.opt_expr(node.value.as_deref())?,
-            },
-            ra::Expr::YieldFrom(node) => Kind::YieldFrom {
-                value: self.expr(&node.value)?,
-            },
+            ra::Expr::Await(node) => Kind::Await { value: self.expr(&node.value)? },
+            ra::Expr::Yield(node) => Kind::Yield { value: self.opt_expr(node.value.as_deref())? },
+            ra::Expr::YieldFrom(node) => Kind::YieldFrom { value: self.expr(&node.value)? },
             ra::Expr::Compare(node) => {
                 let (first, rest) = node.operands.split_first().expect("a comparison operand");
                 Kind::Compare {
@@ -628,11 +549,7 @@ impl<'a> Lowerer<'a> {
             ra::Expr::Call(node) => {
                 let func = self.expr(&node.func)?;
                 let (args, keywords) = self.call_arguments(&node.arguments)?;
-                Kind::Call {
-                    func,
-                    args,
-                    keywords,
-                }
+                Kind::Call { func, args, keywords }
             }
             ra::Expr::FString(_) => return Err(Unsupported("f-string".into())),
             ra::Expr::TString(_) => return Err(Unsupported("t-string".into())),
@@ -640,33 +557,26 @@ impl<'a> Lowerer<'a> {
                 value: Constant::Str(node.value.to_str().to_string()),
                 kind: node.value.is_unicode().then(|| "u".to_string()),
             },
-            ra::Expr::BytesLiteral(node) => Kind::Constant {
-                value: Constant::Bytes(node.value.bytes().collect()),
-                kind: None,
-            },
+            ra::Expr::BytesLiteral(node) => {
+                Kind::Constant { value: Constant::Bytes(node.value.bytes().collect()), kind: None }
+            }
             ra::Expr::NumberLiteral(node) => Kind::Constant {
                 value: match &node.value {
                     ra::Number::Int(_) => Constant::Int(self.int_literal(range)?),
                     ra::Number::Float(value) => Constant::Float(*value),
-                    ra::Number::Complex { real, imag } => Constant::Complex {
-                        real: *real,
-                        imag: *imag,
-                    },
+                    ra::Number::Complex { real, imag } => {
+                        Constant::Complex { real: *real, imag: *imag }
+                    }
                 },
                 kind: None,
             },
-            ra::Expr::BooleanLiteral(node) => Kind::Constant {
-                value: Constant::Bool(node.value),
-                kind: None,
-            },
-            ra::Expr::NoneLiteral(_) => Kind::Constant {
-                value: Constant::None,
-                kind: None,
-            },
-            ra::Expr::EllipsisLiteral(_) => Kind::Constant {
-                value: Constant::Ellipsis,
-                kind: None,
-            },
+            ra::Expr::BooleanLiteral(node) => {
+                Kind::Constant { value: Constant::Bool(node.value), kind: None }
+            }
+            ra::Expr::NoneLiteral(_) => Kind::Constant { value: Constant::None, kind: None },
+            ra::Expr::EllipsisLiteral(_) => {
+                Kind::Constant { value: Constant::Ellipsis, kind: None }
+            }
             ra::Expr::Attribute(node) => Kind::Attribute {
                 value: self.expr(&node.value)?,
                 attr: node.attr.id.to_string(),
@@ -677,22 +587,16 @@ impl<'a> Lowerer<'a> {
                 slice: self.expr(&node.slice)?,
                 ctx: context(node.ctx)?,
             },
-            ra::Expr::Starred(node) => Kind::Starred {
-                value: self.expr(&node.value)?,
-                ctx: context(node.ctx)?,
-            },
-            ra::Expr::Name(node) => Kind::Name {
-                id: node.id.to_string(),
-                ctx: context(node.ctx)?,
-            },
-            ra::Expr::List(node) => Kind::List {
-                elts: self.exprs(&node.elts)?,
-                ctx: context(node.ctx)?,
-            },
-            ra::Expr::Tuple(node) => Kind::Tuple {
-                elts: self.exprs(&node.elts)?,
-                ctx: context(node.ctx)?,
-            },
+            ra::Expr::Starred(node) => {
+                Kind::Starred { value: self.expr(&node.value)?, ctx: context(node.ctx)? }
+            }
+            ra::Expr::Name(node) => Kind::Name { id: node.id.to_string(), ctx: context(node.ctx)? },
+            ra::Expr::List(node) => {
+                Kind::List { elts: self.exprs(&node.elts)?, ctx: context(node.ctx)? }
+            }
+            ra::Expr::Tuple(node) => {
+                Kind::Tuple { elts: self.exprs(&node.elts)?, ctx: context(node.ctx)? }
+            }
             ra::Expr::Slice(node) => Kind::Slice {
                 lower: self.opt_expr(node.lower.as_deref())?,
                 upper: self.opt_expr(node.upper.as_deref())?,
@@ -727,9 +631,7 @@ impl<'a> Lowerer<'a> {
     fn pattern(&mut self, pattern: &ra::Pattern) -> Result<NodeId> {
         let range = pattern.range();
         let kind = match pattern {
-            ra::Pattern::MatchValue(node) => Kind::MatchValue {
-                value: self.expr(&node.value)?,
-            },
+            ra::Pattern::MatchValue(node) => Kind::MatchValue { value: self.expr(&node.value)? },
             ra::Pattern::MatchSingleton(node) => Kind::MatchSingleton {
                 value: match node.value {
                     ra::Singleton::None => Constant::None,
@@ -738,19 +640,11 @@ impl<'a> Lowerer<'a> {
                 },
             },
             ra::Pattern::MatchSequence(node) => Kind::MatchSequence {
-                patterns: node
-                    .patterns
-                    .iter()
-                    .map(|p| self.pattern(p))
-                    .collect::<Result<_>>()?,
+                patterns: node.patterns.iter().map(|p| self.pattern(p)).collect::<Result<_>>()?,
             },
             ra::Pattern::MatchMapping(node) => Kind::MatchMapping {
                 keys: self.exprs(&node.keys)?,
-                patterns: node
-                    .patterns
-                    .iter()
-                    .map(|p| self.pattern(p))
-                    .collect::<Result<_>>()?,
+                patterns: node.patterns.iter().map(|p| self.pattern(p)).collect::<Result<_>>()?,
                 rest: node.rest.as_ref().map(|rest| rest.id.to_string()),
             },
             ra::Pattern::MatchClass(node) => Kind::MatchClass {
@@ -761,12 +655,7 @@ impl<'a> Lowerer<'a> {
                     .iter()
                     .map(|p| self.pattern(p))
                     .collect::<Result<_>>()?,
-                kwd_attrs: node
-                    .arguments
-                    .keywords
-                    .iter()
-                    .map(|k| k.attr.id.to_string())
-                    .collect(),
+                kwd_attrs: node.arguments.keywords.iter().map(|k| k.attr.id.to_string()).collect(),
                 kwd_patterns: node
                     .arguments
                     .keywords
@@ -774,23 +663,15 @@ impl<'a> Lowerer<'a> {
                     .map(|k| self.pattern(&k.pattern))
                     .collect::<Result<_>>()?,
             },
-            ra::Pattern::MatchStar(node) => Kind::MatchStar {
-                name: node.name.as_ref().map(|name| name.id.to_string()),
-            },
+            ra::Pattern::MatchStar(node) => {
+                Kind::MatchStar { name: node.name.as_ref().map(|name| name.id.to_string()) }
+            }
             ra::Pattern::MatchAs(node) => Kind::MatchAs {
-                pattern: node
-                    .pattern
-                    .as_deref()
-                    .map(|p| self.pattern(p))
-                    .transpose()?,
+                pattern: node.pattern.as_deref().map(|p| self.pattern(p)).transpose()?,
                 name: node.name.as_ref().map(|name| name.id.to_string()),
             },
             ra::Pattern::MatchOr(node) => Kind::MatchOr {
-                patterns: node
-                    .patterns
-                    .iter()
-                    .map(|p| self.pattern(p))
-                    .collect::<Result<_>>()?,
+                patterns: node.patterns.iter().map(|p| self.pattern(p)).collect::<Result<_>>()?,
             },
         };
         Ok(self.add(kind, range))

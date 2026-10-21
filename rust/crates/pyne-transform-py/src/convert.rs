@@ -35,11 +35,7 @@ pub struct FromPython<'py> {
 
 impl<'py> FromPython<'py> {
     pub fn new() -> FromPython<'py> {
-        FromPython {
-            ast: Ast::new(),
-            memo: HashMap::new(),
-            keep: Vec::new(),
-        }
+        FromPython { ast: Ast::new(), memo: HashMap::new(), keep: Vec::new() }
     }
 
     pub fn node(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<NodeId> {
@@ -114,11 +110,7 @@ impl<'py> FromPython<'py> {
     }
 
     fn opt_node(&mut self, value: &Bound<'py, PyAny>) -> PyResult<Option<NodeId>> {
-        if value.is_none() {
-            Ok(None)
-        } else {
-            self.node(value).map(Some)
-        }
+        if value.is_none() { Ok(None) } else { self.node(value).map(Some) }
     }
 
     fn field(
@@ -132,17 +124,13 @@ impl<'py> FromPython<'py> {
         match field_kind {
             FieldKind::Node => {
                 let id = self.node(value)?;
-                let FieldMut::Node(slot) = kind.field_mut(index) else {
-                    unreachable!()
-                };
+                let FieldMut::Node(slot) = kind.field_mut(index) else { unreachable!() };
                 *slot = id;
                 return Ok(());
             }
             FieldKind::OptNode => {
                 let id = self.opt_node(value)?;
-                let FieldMut::OptNode(slot) = kind.field_mut(index) else {
-                    unreachable!()
-                };
+                let FieldMut::OptNode(slot) = kind.field_mut(index) else { unreachable!() };
                 *slot = id;
                 return Ok(());
             }
@@ -151,9 +139,7 @@ impl<'py> FromPython<'py> {
                 for item in value.try_iter()? {
                     ids.push(self.node(&item?)?);
                 }
-                let FieldMut::Nodes(slot) = kind.field_mut(index) else {
-                    unreachable!()
-                };
+                let FieldMut::Nodes(slot) = kind.field_mut(index) else { unreachable!() };
                 *slot = ids;
                 return Ok(());
             }
@@ -162,9 +148,7 @@ impl<'py> FromPython<'py> {
                 for item in value.try_iter()? {
                     ids.push(self.opt_node(&item?)?);
                 }
-                let FieldMut::OptNodes(slot) = kind.field_mut(index) else {
-                    unreachable!()
-                };
+                let FieldMut::OptNodes(slot) = kind.field_mut(index) else { unreachable!() };
                 *slot = ids;
                 return Ok(());
             }
@@ -173,11 +157,7 @@ impl<'py> FromPython<'py> {
         match (field_kind, kind.field_mut(index)) {
             (_, FieldMut::Str(slot)) => *slot = string(value)?,
             (_, FieldMut::OptStr(slot)) => {
-                *slot = if value.is_none() {
-                    None
-                } else {
-                    Some(string(value)?)
-                }
+                *slot = if value.is_none() { None } else { Some(string(value)?) }
             }
             (_, FieldMut::Strs(slot)) => {
                 let mut items = Vec::new();
@@ -205,9 +185,7 @@ impl<'py> FromPython<'py> {
                 *slot = ops;
             }
             (kind, _) => {
-                return Err(PyTypeError::new_err(format!(
-                    "{type_name}: field kind {kind:?}"
-                )));
+                return Err(PyTypeError::new_err(format!("{type_name}: field kind {kind:?}")));
             }
         }
         Ok(())
@@ -254,17 +232,12 @@ impl<'py> FromPython<'py> {
         if value.is_instance(&ast.getattr("AST")?)? {
             return Ok(Value::Node(self.node(value)?));
         }
-        Err(unsupported(format!(
-            "value of type {}",
-            value.get_type().name()?
-        )))
+        Err(unsupported(format!("value of type {}", value.get_type().name()?)))
     }
 }
 
 fn string(value: &Bound<'_, PyAny>) -> PyResult<String> {
-    value
-        .extract::<String>()
-        .map_err(|_| unsupported("a string Rust cannot hold"))
+    value.extract::<String>().map_err(|_| unsupported("a string Rust cannot hold"))
 }
 
 fn int(value: &Bound<'_, PyAny>) -> PyResult<Int> {
@@ -293,10 +266,7 @@ fn constant(value: &Bound<'_, PyAny>) -> PyResult<Constant> {
         return Ok(Constant::Float(number.value()));
     }
     if let Ok(number) = value.cast::<PyComplex>() {
-        return Ok(Constant::Complex {
-            real: number.real(),
-            imag: number.imag(),
-        });
+        return Ok(Constant::Complex { real: number.real(), imag: number.imag() });
     }
     if value.is_instance_of::<PyString>() {
         return Ok(Constant::Str(string(value)?));
@@ -306,27 +276,18 @@ fn constant(value: &Bound<'_, PyAny>) -> PyResult<Constant> {
     }
     if let Ok(items) = value.cast::<PyTuple>() {
         return Ok(Constant::Tuple(
-            items
-                .iter()
-                .map(|item| constant(&item))
-                .collect::<PyResult<_>>()?,
+            items.iter().map(|item| constant(&item)).collect::<PyResult<_>>()?,
         ));
     }
     if let Ok(items) = value.cast::<PyFrozenSet>() {
         return Ok(Constant::FrozenSet(
-            items
-                .iter()
-                .map(|item| constant(&item))
-                .collect::<PyResult<_>>()?,
+            items.iter().map(|item| constant(&item)).collect::<PyResult<_>>()?,
         ));
     }
     if value.is(value.py().Ellipsis()) {
         return Ok(Constant::Ellipsis);
     }
-    Err(unsupported(format!(
-        "constant of type {}",
-        value.get_type().name()?
-    )))
+    Err(unsupported(format!("constant of type {}", value.get_type().name()?)))
 }
 
 /// The arena back into Python objects.
@@ -361,11 +322,8 @@ impl<'py> ToPython<'py> {
             .getattr(class.name)
             .map_err(|_| unsupported(format!("this Python has no ast.{}", class.name)))?;
         let fields: Vec<String> = object.getattr("_fields")?.extract()?;
-        let present = class
-            .fields
-            .iter()
-            .map(|field| fields.iter().any(|f| f == field.name))
-            .collect();
+        let present =
+            class.fields.iter().map(|field| fields.iter().any(|f| f == field.name)).collect();
         self.classes.insert(index, (object.clone(), present));
         Ok(self.classes[&index].clone())
     }
@@ -394,10 +352,7 @@ impl<'py> ToPython<'py> {
             if !present[field_index] {
                 // A field this Python does not have may only be at its default
                 let empty = value.is_none()
-                    || value
-                        .cast::<PyList>()
-                        .map(|list| list.is_empty())
-                        .unwrap_or(false);
+                    || value.cast::<PyList>().map(|list| list.is_empty()).unwrap_or(false);
                 if !empty {
                     return Err(unsupported(format!(
                         "{}.{} on this Python",
@@ -441,17 +396,13 @@ impl<'py> ToPython<'py> {
             FieldRef::Node(id) => self.node(ast, *id)?,
             FieldRef::OptNode(id) => self.opt_node(ast, *id)?,
             FieldRef::Nodes(ids) => {
-                let items = ids
-                    .iter()
-                    .map(|id| self.node(ast, *id))
-                    .collect::<PyResult<Vec<_>>>()?;
+                let items =
+                    ids.iter().map(|id| self.node(ast, *id)).collect::<PyResult<Vec<_>>>()?;
                 PyList::new(py, items)?.into_any()
             }
             FieldRef::OptNodes(ids) => {
-                let items = ids
-                    .iter()
-                    .map(|id| self.opt_node(ast, *id))
-                    .collect::<PyResult<Vec<_>>>()?;
+                let items =
+                    ids.iter().map(|id| self.opt_node(ast, *id)).collect::<PyResult<Vec<_>>>()?;
                 PyList::new(py, items)?.into_any()
             }
             FieldRef::Str(text) => PyString::new(py, text).into_any(),
@@ -471,10 +422,8 @@ impl<'py> ToPython<'py> {
             FieldRef::UnaryOperator(value) => self.singleton(value.name())?,
             FieldRef::BoolOperator(value) => self.singleton(value.name())?,
             FieldRef::CmpOperators(ops) => {
-                let items = ops
-                    .iter()
-                    .map(|op| self.singleton(op.name()))
-                    .collect::<PyResult<Vec<_>>>()?;
+                let items =
+                    ops.iter().map(|op| self.singleton(op.name())).collect::<PyResult<Vec<_>>>()?;
                 PyList::new(py, items)?.into_any()
             }
         })
@@ -502,17 +451,13 @@ impl<'py> ToPython<'py> {
             Constant::Bytes(bytes) => PyBytes::new(py, bytes).into_any(),
             Constant::Ellipsis => py.Ellipsis().into_bound(py),
             Constant::Tuple(items) => {
-                let items = items
-                    .iter()
-                    .map(|item| self.constant(item))
-                    .collect::<PyResult<Vec<_>>>()?;
+                let items =
+                    items.iter().map(|item| self.constant(item)).collect::<PyResult<Vec<_>>>()?;
                 PyTuple::new(py, items)?.into_any()
             }
             Constant::FrozenSet(items) => {
-                let items = items
-                    .iter()
-                    .map(|item| self.constant(item))
-                    .collect::<PyResult<Vec<_>>>()?;
+                let items =
+                    items.iter().map(|item| self.constant(item)).collect::<PyResult<Vec<_>>>()?;
                 PyFrozenSet::new(py, items)?.into_any()
             }
         })
@@ -527,17 +472,13 @@ impl<'py> ToPython<'py> {
             Value::Float(value) => PyFloat::new(py, *value).into_any(),
             Value::Str(text) => PyString::new(py, text).into_any(),
             Value::Tuple(items) => {
-                let items = items
-                    .iter()
-                    .map(|item| self.value(ast, item))
-                    .collect::<PyResult<Vec<_>>>()?;
+                let items =
+                    items.iter().map(|item| self.value(ast, item)).collect::<PyResult<Vec<_>>>()?;
                 PyTuple::new(py, items)?.into_any()
             }
             Value::List(items) => {
-                let items = items
-                    .iter()
-                    .map(|item| self.value(ast, item))
-                    .collect::<PyResult<Vec<_>>>()?;
+                let items =
+                    items.iter().map(|item| self.value(ast, item)).collect::<PyResult<Vec<_>>>()?;
                 PyList::new(py, items)?.into_any()
             }
             Value::Dict(items) => {

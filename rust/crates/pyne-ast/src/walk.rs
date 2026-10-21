@@ -9,10 +9,7 @@ use crate::{Ast, CLASSES, FieldKind, FieldMut, FieldRef, Kind, Loc, Node, NodeId
 
 /// Whether a field kind can hold a node: the fields a walk enters.
 fn holds_nodes(kind: FieldKind) -> bool {
-    matches!(
-        kind,
-        FieldKind::Node | FieldKind::OptNode | FieldKind::Nodes | FieldKind::OptNodes
-    )
+    matches!(kind, FieldKind::Node | FieldKind::OptNode | FieldKind::Nodes | FieldKind::OptNodes)
 }
 
 /// The fields that hold statement lists, or the handlers and cases holding statements.
@@ -53,9 +50,7 @@ pub struct Walk {
 
 impl Walk {
     pub fn new(root: NodeId) -> Walk {
-        Walk {
-            todo: VecDeque::from([root]),
-        }
+        Walk { todo: VecDeque::from([root]) }
     }
 
     pub fn next(&mut self, ast: &Ast) -> Option<NodeId> {
@@ -173,9 +168,7 @@ pub fn visit_field<T: Transformer + ?Sized>(t: &mut T, ast: &mut Ast, id: NodeId
         FieldRef::OptNode(Some(child)) => {
             let child = *child;
             let answer = t.visit(ast, child);
-            let FieldMut::OptNode(slot) = ast.kind_mut(id).field_mut(index) else {
-                unreachable!()
-            };
+            let FieldMut::OptNode(slot) = ast.kind_mut(id).field_mut(index) else { unreachable!() };
             match answer {
                 Visited::Node(new) => *slot = Some(new),
                 Visited::Remove => *slot = None,
@@ -192,9 +185,7 @@ pub fn visit_field<T: Transformer + ?Sized>(t: &mut T, ast: &mut Ast, id: NodeId
                     Visited::Many(many) => new_items.extend(many),
                 }
             }
-            let FieldMut::Nodes(slot) = ast.kind_mut(id).field_mut(index) else {
-                unreachable!()
-            };
+            let FieldMut::Nodes(slot) = ast.kind_mut(id).field_mut(index) else { unreachable!() };
             *slot = new_items;
         }
         FieldRef::OptNodes(items) => {
@@ -271,11 +262,7 @@ pub fn clone(ast: &mut Ast, id: NodeId, memo: &mut HashMap<NodeId, NodeId>) -> N
     }
     let placeholder = ast.add(Kind::Pass);
     memo.insert(id, placeholder);
-    let Node {
-        mut kind,
-        loc,
-        extra,
-    } = ast[id].clone();
+    let Node { mut kind, loc, extra } = ast[id].clone();
     let class = kind.class();
     for (index, field) in class.fields.iter().enumerate() {
         if !holds_nodes(field.kind) {
@@ -297,10 +284,8 @@ pub fn clone(ast: &mut Ast, id: NodeId, memo: &mut HashMap<NodeId, NodeId>) -> N
             _ => {}
         }
     }
-    let extra = extra
-        .into_iter()
-        .map(|(name, value)| (name, clone_value(ast, value, memo)))
-        .collect();
+    let extra =
+        extra.into_iter().map(|(name, value)| (name, clone_value(ast, value, memo))).collect();
     ast[placeholder] = Node { kind, loc, extra };
     placeholder
 }
@@ -308,18 +293,12 @@ pub fn clone(ast: &mut Ast, id: NodeId, memo: &mut HashMap<NodeId, NodeId>) -> N
 fn clone_value(ast: &mut Ast, value: Value, memo: &mut HashMap<NodeId, NodeId>) -> Value {
     match value {
         Value::Node(id) => Value::Node(clone(ast, id, memo)),
-        Value::Tuple(items) => Value::Tuple(
-            items
-                .into_iter()
-                .map(|v| clone_value(ast, v, memo))
-                .collect(),
-        ),
-        Value::List(items) => Value::List(
-            items
-                .into_iter()
-                .map(|v| clone_value(ast, v, memo))
-                .collect(),
-        ),
+        Value::Tuple(items) => {
+            Value::Tuple(items.into_iter().map(|v| clone_value(ast, v, memo)).collect())
+        }
+        Value::List(items) => {
+            Value::List(items.into_iter().map(|v| clone_value(ast, v, memo)).collect())
+        }
         Value::Dict(items) => Value::Dict(
             items
                 .into_iter()

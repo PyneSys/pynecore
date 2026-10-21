@@ -41,10 +41,7 @@ pub struct Step {
 pub const PORTED: &str = include_str!("../ported.json");
 
 /// Every step with a native port.
-pub static STEPS: &[Step] = &[Step {
-    name: "ImportLifter",
-    run: steps::import_lifter::run,
-}];
+pub static STEPS: &[Step] = &[Step { name: "ImportLifter", run: steps::import_lifter::run }];
 
 /// The native port of a step, if there is one.
 pub fn step(name: &str) -> Option<&'static Step> {

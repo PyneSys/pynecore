@@ -35,6 +35,15 @@ fn roundtrip<'py>(py: Python<'py>, tree: &Bound<'py, PyAny>) -> PyResult<Bound<'
     ToPython::new(py)?.node(&from.ast, root)
 }
 
+/// ``ast.dump(tree, include_attributes=...)`` written by the native side.
+#[pyfunction]
+#[pyo3(signature = (tree, include_attributes=false))]
+fn dump(tree: &Bound<'_, PyAny>, include_attributes: bool) -> PyResult<String> {
+    let mut from = FromPython::new();
+    let root = from.node(tree)?;
+    Ok(pyne_ast::dump::dump(&from.ast, root, include_attributes))
+}
+
 /// Run native steps over a module, in order.
 ///
 /// :param tree: The module.
@@ -94,6 +103,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("Unsupported", m.py().get_type::<Unsupported>())?;
     m.add_function(wrap_pyfunction!(parse, m)?)?;
     m.add_function(wrap_pyfunction!(roundtrip, m)?)?;
+    m.add_function(wrap_pyfunction!(dump, m)?)?;
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(steps, m)?)?;
     m.add_function(wrap_pyfunction!(ported_json, m)?)?;
