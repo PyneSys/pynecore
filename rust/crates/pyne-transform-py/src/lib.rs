@@ -44,11 +44,43 @@ fn dump(tree: &Bound<'_, PyAny>, include_attributes: bool) -> PyResult<String> {
     Ok(pyne_ast::dump::dump(&from.ast, root, include_attributes))
 }
 
+/// The host the Python pipeline provides: an object with the [`pyne_transform::Host`]
+/// methods (``native._Host``).
+struct PyHost<'py> {
+    object: Option<Bound<'py, PyAny>>,
+}
+
+impl PyHost<'_> {
+    fn ask(
+        &self,
+        method: &str,
+        args: impl for<'a> pyo3::call::PyCallArgs<'a>,
+    ) -> Result<bool, pyne_ast::Unsupported> {
+        let Some(object) = &self.object else {
+            return Err(pyne_ast::Unsupported(format!("no host for {method}")));
+        };
+        object
+            .call_method1(method, args)
+            .and_then(|answer| answer.extract::<bool>())
+            .map_err(|err| pyne_ast::Unsupported(format!("host {method}: {err}")))
+    }
+}
+
+impl pyne_transform::Host for PyHost<'_> {
+    fn import_library(&self, module: &str) -> Result<bool, pyne_ast::Unsupported> {
+        self.ask("import_library", (module,))
+    }
+
+    fn library_serves(&self, module: &str, attr: &str) -> Result<bool, pyne_ast::Unsupported> {
+        self.ask("library_serves", (module, attr))
+    }
+}
+
 /// Run native steps over a module, in order.
 ///
 /// :param tree: The module.
 /// :param steps: Step names as ``pipeline.py`` declares them.
-/// :param context: ``path``, ``pyne_mode``, ``source``, ``user_code``.
+/// :param context: ``path``, ``pyne_mode``, ``source``, ``user_code``, ``host``.
 /// :return: A new module object; the input tree is left as it was.
 /// :raises Unsupported: When a step meets something its port does not handle.
 #[pyfunction]
@@ -59,6 +91,7 @@ fn run<'py>(
     context: &Bound<'py, PyDict>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let get = |name: &str| context.get_item(name);
+    let host = PyHost { object: get("host")? };
     let ctx = pyne_transform::Context {
         path: match get("path")? {
             Some(value) => value.extract()?,
@@ -76,6 +109,7 @@ fn run<'py>(
             Some(value) => value.extract()?,
             None => true,
         },
+        host: &host,
     };
     let mut from = FromPython::new();
     let root = from.node(tree)?;

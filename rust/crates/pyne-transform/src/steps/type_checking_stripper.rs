@@ -498,7 +498,7 @@ impl Transformer for Stripper {
     }
 }
 
-pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context) -> Result<NodeId, Unsupported> {
+pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, Unsupported> {
     let mut stripper = Stripper {
         names: Names::from(["TYPE_CHECKING".to_string()]),
         tracked: Names::from(["TYPE_CHECKING".to_string(), TYPING.to_string()]),

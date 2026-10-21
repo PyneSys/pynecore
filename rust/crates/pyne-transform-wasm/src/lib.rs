@@ -7,11 +7,32 @@
 //! hands both buffers back with `pyne_free`.
 //!
 //! Request: `{"source": str, "path": str, "pyne_mode": str | null,
-//! "user_code": bool, "steps": [str], "include_attributes": bool}`.
+//! "user_code": bool, "steps": [str], "include_attributes": bool,
+//! "libraries": {module: [served name]}}`. `libraries` stands in for the
+//! Python host's imports: a library is importable when it is listed, and serves
+//! the names listed for it.
 //! Response: `{"dump": str}` (the `ast.dump` of the transformed module), or
 //! `{"unsupported": str}`, or `{"error": str}`.
 
+use std::collections::{HashMap, HashSet};
+
+use pyne_ast::Unsupported;
 use serde_json::{Value, json};
+
+/// The host of a request: what the browser was handed instead of an interpreter.
+struct RequestHost {
+    libraries: HashMap<String, HashSet<String>>,
+}
+
+impl pyne_transform::Host for RequestHost {
+    fn import_library(&self, module: &str) -> Result<bool, Unsupported> {
+        Ok(self.libraries.contains_key(module))
+    }
+
+    fn library_serves(&self, module: &str, attr: &str) -> Result<bool, Unsupported> {
+        Ok(self.libraries.get(module).is_some_and(|names| names.contains(attr)))
+    }
+}
 
 /// Parse, run the requested steps, dump: the whole request in one call.
 pub fn transform_json(request: &str) -> String {
@@ -27,11 +48,31 @@ fn transform(request: &str) -> Result<Value, Value> {
         serde_json::from_str(request).map_err(|err| json!({ "error": err.to_string() }))?;
     let text = |name: &str| request.get(name).and_then(Value::as_str).map(str::to_string);
     let source = text("source").ok_or_else(|| json!({ "error": "no source" }))?;
+    let libraries = request
+        .get("libraries")
+        .and_then(Value::as_object)
+        .map(|libraries| {
+            libraries
+                .iter()
+                .map(|(module, names)| {
+                    let names = names
+                        .as_array()
+                        .map(|names| {
+                            names.iter().filter_map(Value::as_str).map(str::to_string).collect()
+                        })
+                        .unwrap_or_default();
+                    (module.clone(), names)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let host = RequestHost { libraries };
     let ctx = pyne_transform::Context {
         path: text("path").unwrap_or_default(),
         pyne_mode: text("pyne_mode"),
         source: source.clone(),
         user_code: request.get("user_code").and_then(Value::as_bool).unwrap_or(true),
+        host: &host,
     };
     let steps: Vec<&str> = request
         .get("steps")
@@ -40,7 +81,7 @@ fn transform(request: &str) -> Result<Value, Value> {
         .unwrap_or_default();
     let include_attributes =
         request.get("include_attributes").and_then(Value::as_bool).unwrap_or(false);
-    let unsupported = |err: pyne_ast::Unsupported| json!({ "unsupported": err.0 });
+    let unsupported = |err: Unsupported| json!({ "unsupported": err.0 });
     let (mut ast, module) = pyne_parse::parse_module(&source).map_err(unsupported)?;
     let module = pyne_transform::run_steps(&mut ast, module, &steps, &ctx).map_err(unsupported)?;
     Ok(json!({ "dump": pyne_ast::dump::dump(&ast, module, include_attributes) }))

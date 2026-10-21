@@ -6,5 +6,13 @@
   "TypeCheckingStripper": {
     "module": "type_checking_stripper",
     "digest": "517fe9479ae624bbf03f985f89d97702b3f2b9c0f33d165519dfb7542df4dd99"
+  },
+  "TypeErasure": {
+    "module": "type_erasure",
+    "digest": "00153931d7ecb3c6b8c2b3c9903fa7e8501fb391440c9169f874c5c17a4b21d4"
+  },
+  "BuiltinShadow": {
+    "module": "builtin_shadow",
+    "digest": "630a4341411d8403bcb03bc4d112ee91f0083ebd62d77492c6214e6d8bfef25f"
   }
 }

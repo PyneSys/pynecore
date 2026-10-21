@@ -11,6 +11,31 @@ _NAMESPACE_RENAMES = {
 }
 
 
+#: What :func:`import_library` hands back: the module, and its ``__all__`` (None without one)
+Library = tuple[Any, frozenset[str] | None]
+
+
+def import_library(name: str) -> Library | None:
+    """Import a library module whose alias shadows a builtin namespace.
+
+    :param name: The module name (``lib.user.somelib.v1``).
+    :return: The module and its exported names, or None when it cannot be imported
+        (the script's own import statement then reports it).
+    """
+    try:
+        lib_module = importlib.import_module(name)
+    except Exception:  # noqa: BLE001 - the script's own import will report it
+        return None
+    exported = getattr(lib_module, '__all__', None)
+    return lib_module, frozenset(exported) if exported is not None else None
+
+
+def library_serves(library: Library, attr: str) -> bool:
+    """Whether a library serves a name: its ``__all__``, or its attributes without one."""
+    lib_module, members = library
+    return attr in members if members is not None else hasattr(lib_module, attr)
+
+
 class BuiltinShadowTransformer(ast_walk.NodeTransformer):
     """
     Resolve workdir library imports whose alias shadows a built-in namespace.
@@ -37,8 +62,8 @@ class BuiltinShadowTransformer(ast_walk.NodeTransformer):
         # Structure: module -> name -> {"type": "property"|"variable"}
         self.registry: dict[str, dict[str, Any]] = module_properties()
 
-        # alias -> (library module, exported names or None, builtin namespace)
-        self.aliases: dict[str, tuple[Any, frozenset[str] | None, str]] = {}
+        # alias -> (library, builtin namespace)
+        self.aliases: dict[str, tuple[Library, str]] = {}
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
         for stmt in node.body:
@@ -61,13 +86,10 @@ class BuiltinShadowTransformer(ast_walk.NodeTransformer):
                 namespace = _NAMESPACE_RENAMES.get(name, name)
                 if f'lib.{namespace}' not in self.registry:
                     continue
-                try:
-                    lib_module = importlib.import_module(alias.name)
-                except Exception:  # noqa: BLE001 - the script's own import will report it
+                library = import_library(alias.name)
+                if library is None:
                     continue
-                exported = getattr(lib_module, '__all__', None)
-                members = frozenset(exported) if exported is not None else None
-                self.aliases[alias.asname] = (lib_module, members, namespace)
+                self.aliases[alias.asname] = (library, namespace)
 
         if not self.aliases:
             return node
@@ -103,10 +125,10 @@ class BuiltinShadowTransformer(ast_walk.NodeTransformer):
         entry = self.aliases.get(node.value.id)
         if entry is None:
             return node
-        lib_module, members, namespace = entry
+        library, namespace = entry
 
         # The library serves the name -> the access stays on the library
-        if node.attr in members if members is not None else hasattr(lib_module, node.attr):
+        if library_serves(library, node.attr):
             return node
 
         # Built-in namespace fallback -> canonical lib.<namespace>.<attr> form;

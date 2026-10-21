@@ -36,6 +36,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .builtin_shadow import Library, import_library, library_serves
+
 try:
     from . import _native
 except ImportError:
@@ -165,9 +167,27 @@ def current_steps() -> frozenset[str]:
     return _current
 
 
+class _Host:
+    """What a native step asks the interpreter, answered by the very functions the
+    Python step uses, at the moment the Python step would use them."""
+
+    def __init__(self) -> None:
+        self._libraries: dict[str, Library] = {}
+
+    def import_library(self, name: str) -> bool:
+        library = import_library(name)
+        if library is None:
+            return False
+        self._libraries[name] = library
+        return True
+
+    def library_serves(self, name: str, attr: str) -> bool:
+        return library_serves(self._libraries[name], attr)
+
+
 def _context(ctx: Any) -> dict[str, Any]:
     return {'path': str(ctx.path), 'pyne_mode': ctx.pyne_mode, 'source': ctx.source,
-            'user_code': ctx.user_code}
+            'user_code': ctx.user_code, 'host': _Host()}
 
 
 def run(names: list[str], tree: ast.Module, ctx: Any) -> ast.Module | None:

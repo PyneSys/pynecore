@@ -60,7 +60,7 @@ impl Transformer for ImportLifter {
     }
 }
 
-pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context) -> Result<NodeId, Unsupported> {
+pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, Unsupported> {
     // Only a lib import standing directly in a function body is lifted: without
     // one there is nothing to visit
     let candidate = walk_statements(ast, module).into_iter().any(|stmt| match ast.kind(stmt) {
