@@ -2807,3 +2807,27 @@ def main():
     assert ast.unparse(arm) == 'lib.na(ns.Tm)'
     assert get_ty(arm) == tm
     assert table.diags == []
+
+
+def __test_a_keyword_call_to_a_classed_group_is_bound_by_name__():
+    """
+    ``init(Tm(), h=1, m=2)`` is never pinned (a keyword call dispatches on its
+    values), but the selector binds the keywords to each implementation's
+    parameters, and the receiver's class plus the bound types settle the ``Tm``
+    implementation statically the same way; a ``na`` arm next to it is the na
+    of ``Tm``
+    """
+    tree, table = _infer(CLASSED_GROUP + '''
+def main():
+    t = init(Tm(), h=1, m=2)
+    u = init(Tm(), 1, m=2, tz="x")
+    p = parse(Tm(), sess="0930") if lib.bar_index > 0 else na
+    w = init(Win(), x=1, y=2)
+    return t
+''')
+    types = {name: binding.ty for name, binding in table.bindings['main'].items()}
+    assert (types['t'], types['u'], types['p'], types['w']) == (TM, TM, TM, WIN)
+    calls = {ast.unparse(node): node for node in ast.walk(tree)
+             if isinstance(node, ast.Call) and ast.unparse(node.func) == 'init'}
+    assert get_pin(calls['init(Tm(), h=1, m=2)']) is None
+    assert table.diags == []

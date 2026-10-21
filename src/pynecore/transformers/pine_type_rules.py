@@ -45,7 +45,7 @@ __all__ = [
     'NA_TEXT_PARAMS', 'NOT_PINE_STRINGS', 'get_widen',
     'set_widen', 'WIDEN_SITE_ATTR', 'WIDENS_ATTR', 'get_widen_site', 'set_widen_site',
     'get_widens', 'set_widens',
-    'pin_chars', 'pin_for', 'overload_result', 'ImplSig', 'overload_pick',
+    'pin_chars', 'pin_for', 'overload_result', 'ImplSig', 'overload_pick', 'overload_bind',
     'FactoryFields',
     'TYPELESS', 'NONE_DEFAULT', 'FIT_OMISSIBLE', 'FIT_REQUIRED', 'FIT_UNSURE',
     'default_fit', 'annotation_takes_none', 'impl_sig', 'param_fit', 'default_ty',
@@ -1704,38 +1704,121 @@ def _takes(impl: ImplSig, wanted: tuple[str, ...], exact_arity: bool,
         return _NO
     verdict = _YES
     for index, (declared, want) in enumerate(zip(impl.params, wanted)):
-        if want == PIN_ANY:
-            # No witness: an object of a known class is taken by its class
-            # alone, anything else by whatever declares the position
-            given = shapes[index] if index < len(shapes) else UNKNOWN
-            if class_of(given) is not None and declared not in (UNKNOWN, OBJECT):
-                if declared != given:
-                    return _NO
-                continue
-            verdict = _MAYBE
-            continue
-        shaped = _PIN_CONTAINER_TYPES.get(want)
-        if shaped is not None:
-            # The witness is a one-element container, which the selector takes
-            # by its container and that element: exactly the declared shape
-            # takes it, a bare or element-unknown one of the same container may
-            if declared == shaped:
-                continue
-            if declared in (UNKNOWN, OBJECT) or (
-                    (is_array(declared) and is_array(shaped)
-                     or is_matrix(declared) and is_matrix(shaped))
-                    and element_of(declared) == UNKNOWN):
-                verdict = _MAYBE
-                continue
+        taken = _takes_position(declared, want, shapes[index] if index < len(shapes) else UNKNOWN)
+        if taken == _NO:
             return _NO
-        declared = head(declared)
-        if declared == UNKNOWN:
-            verdict = _MAYBE
-        elif declared != want:
-            return _NO
+        verdict = min(verdict, taken)
     if exact_arity:
         return verdict
     for fit in impl.fits[len(wanted):]:
+        if fit == FIT_REQUIRED:
+            return _NO
+        if fit == FIT_UNSURE:
+            verdict = _MAYBE
+    return verdict
+
+
+def _takes_position(declared: str, want: str, given: str) -> int:
+    """
+    How one parameter answers one argument of the exact pass.
+
+    :param declared: The parameter's type
+    :param want: The argument's pin character
+    :param given: The argument's static type, for a position without a witness
+    :return: ``_YES``, ``_MAYBE`` or ``_NO``
+    """
+    if want == PIN_ANY:
+        # No witness: an object of a known class is taken by its class
+        # alone, anything else by whatever declares the position
+        if class_of(given) is not None and declared not in (UNKNOWN, OBJECT):
+            return _YES if declared == given else _NO
+        return _MAYBE
+    shaped = _PIN_CONTAINER_TYPES.get(want)
+    if shaped is not None:
+        # The witness is a one-element container, which the selector takes
+        # by its container and that element: exactly the declared shape
+        # takes it, a bare or element-unknown one of the same container may
+        if declared == shaped:
+            return _YES
+        if declared in (UNKNOWN, OBJECT) or (
+                (is_array(declared) and is_array(shaped)
+                 or is_matrix(declared) and is_matrix(shaped))
+                and element_of(declared) == UNKNOWN):
+            return _MAYBE
+        return _NO
+    declared = head(declared)
+    if declared == UNKNOWN:
+        return _MAYBE
+    return _YES if declared == want else _NO
+
+
+def overload_bind(impls: list[ImplSig], chars: str, shapes: Sequence[str],
+                  kw_chars: Mapping[str, str], kw_shapes: Mapping[str, str]) -> str | None:
+    """
+    Return type of the implementation a call WITH KEYWORD ARGUMENTS selects.
+
+    Such a call is never pinned; the selector binds its arguments to each
+    implementation's parameters in declaration order, applies the defaults, and
+    takes the first implementation whose every bound value fits its parameter's
+    type in the exact pass (``core/overload._select``, the keyword path). This is
+    that pass read statically, with the positions read the way ``overload_pick``
+    reads them, so an implementation an earlier one could take too leaves the
+    site unanswerable.
+
+    :param impls: Every implementation of the group, in declaration order
+    :param chars: One pin character per positional argument
+    :param shapes: The static type of each positional argument
+    :param kw_chars: Parameter name -> the keyword argument's pin character
+    :param kw_shapes: Parameter name -> the keyword argument's static type
+    :return: The selected implementation's return type, or None
+    """
+    for impl in impls:
+        verdict = _binds(impl, chars, shapes, kw_chars, kw_shapes)
+        if verdict == _NO:
+            continue
+        return impl.ret if verdict == _YES else None
+    return None
+
+
+def _binds(impl: ImplSig, chars: str, shapes: Sequence[str],
+           kw_chars: Mapping[str, str], kw_shapes: Mapping[str, str]) -> int:
+    """
+    How one implementation answers a call with keyword arguments.
+
+    :param impl: The implementation's shape
+    :param chars: One pin character per positional argument
+    :param shapes: The static type of each positional argument
+    :param kw_chars: Parameter name -> the keyword argument's pin character
+    :param kw_shapes: Parameter name -> the keyword argument's static type
+    :return: ``_YES``, ``_MAYBE`` or ``_NO``
+    """
+    if impl.open_ended:
+        return _MAYBE
+    if len(chars) > len(impl.params):
+        return _NO
+    verdict = _YES
+    bound: set[int] = set(range(len(chars)))
+    for index, (declared, want) in enumerate(zip(impl.params, chars)):
+        taken = _takes_position(declared, want, shapes[index] if index < len(shapes) else UNKNOWN)
+        if taken == _NO:
+            return _NO
+        verdict = min(verdict, taken)
+    for name, want in kw_chars.items():
+        if name not in impl.names:
+            # A keyword-only parameter is not named in the shape: one may take
+            # the keyword, none means the bind fails
+            return _MAYBE if len(impl.fits) > len(impl.params) else _NO
+        index = impl.names.index(name)
+        if index in bound:
+            return _NO
+        bound.add(index)
+        taken = _takes_position(impl.params[index], want, kw_shapes.get(name, UNKNOWN))
+        if taken == _NO:
+            return _NO
+        verdict = min(verdict, taken)
+    for index, fit in enumerate(impl.fits):
+        if index in bound:
+            continue
         if fit == FIT_REQUIRED:
             return _NO
         if fit == FIT_UNSURE:

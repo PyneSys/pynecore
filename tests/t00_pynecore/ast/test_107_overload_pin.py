@@ -25,7 +25,8 @@ from pynecore.transformers.persistent import PersistentTransformer
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
     FIT_OMISSIBLE, FIT_REQUIRED, INT, ImplSig, NONE_DEFAULT, OBJECT, TYPELESS,
-    annotation_takes_none, class_id, default_fit, get_pin, get_ty, object_ty, overload_pick,
+    annotation_takes_none, class_id, default_fit, get_pin, get_ty, object_ty, overload_bind,
+    overload_pick,
 )
 from pynecore.transformers.pine_type_transformer import PineTypeTransformer
 from pynecore.transformers.series import SeriesTransformer
@@ -752,3 +753,44 @@ def __test_the_static_selection_reads_an_object_by_its_class__(impls: list[ImplS
                                                                expected: str | None):
     """A position the pin has no witness for is read from the argument's class"""
     assert overload_pick(impls, pin, shapes) == expected
+
+
+@pytest.mark.parametrize("impls,chars,shapes,kw_chars,kw_shapes,expected", [
+    # A keyword binds to the parameter of its name, and the first implementation
+    # whose every bound value fits is the one that runs
+    ([ImplSig((PIVOT_TY, 's'), 2, False, 'A', 'nn', ('this', 'sess')),
+      ImplSig((PIVOT_TY, 's', 's'), 3, False, 'B', 'nnn', ('this', 'sess', 'tz'))],
+     '*', [PIVOT_TY], {'sess': 's', 'tz': 's'}, {'sess': 's', 'tz': 's'}, 'B'),
+    ([ImplSig((PIVOT_TY, 's'), 2, False, 'A', 'nn', ('this', 'sess')),
+      ImplSig((PIVOT_TY, 's', 's'), 3, False, 'B', 'nnn', ('this', 'sess', 'tz'))],
+     '*', [PIVOT_TY], {'sess': 's'}, {'sess': 's'}, 'A'),
+    # The receiver's class rules an implementation out before its keywords are read
+    ([ImplSig((HOLDER_TY, 's'), 2, False, 'A', 'nn', ('this', 'sess')),
+      ImplSig((PIVOT_TY, 's'), 2, False, 'B', 'nn', ('this', 'sess'))],
+     '*', [PIVOT_TY], {'sess': 's'}, {'sess': 's'}, 'B'),
+    # A parameter left out has to have a default the exact pass accepts
+    ([ImplSig((PIVOT_TY, 's', 'i'), 2, False, 'A', 'nny', ('this', 'sess', 'n'))],
+     '*', [PIVOT_TY], {'sess': 's'}, {'sess': 's'}, 'A'),
+    ([ImplSig((PIVOT_TY, 's', 'i'), 3, False, 'A', 'nnn', ('this', 'sess', 'n'))],
+     '*', [PIVOT_TY], {'sess': 's'}, {'sess': 's'}, None),
+    # A keyword no parameter is named by fails the bind, unless a keyword-only
+    # parameter the shape does not name could take it
+    ([ImplSig((PIVOT_TY,), 1, False, 'A', 'n', ('this',)),
+      ImplSig((PIVOT_TY, 's'), 2, False, 'B', 'nn', ('this', 'sess'))],
+     '*', [PIVOT_TY], {'sess': 's'}, {'sess': 's'}, 'B'),
+    ([ImplSig((PIVOT_TY,), 1, False, 'A', 'ny', ('this',)),
+      ImplSig((PIVOT_TY, 's'), 2, False, 'B', 'nn', ('this', 'sess'))],
+     '*', [PIVOT_TY], {'sess': 's'}, {'sess': 's'}, None),
+    # A keyword for a position already filled fails the bind
+    ([ImplSig((PIVOT_TY, 's'), 2, False, 'A', 'nn', ('this', 'sess'))],
+     '*s', [PIVOT_TY, 's'], {'sess': 's'}, {'sess': 's'}, None),
+    # A keyword of no witness and no class says nothing
+    ([ImplSig((PIVOT_TY, 's'), 2, False, 'A', 'nn', ('this', 'sess'))],
+     '*', [PIVOT_TY], {'sess': '*'}, {'sess': OBJECT}, None),
+])
+def __test_a_call_with_keywords_is_bound_by_name__(impls: list[ImplSig], chars: str,
+                                                   shapes: list[str], kw_chars: dict[str, str],
+                                                   kw_shapes: dict[str, str],
+                                                   expected: str | None):
+    """A keyword call is the selector's bind-and-check pass, read statically"""
+    assert overload_bind(impls, chars, shapes, kw_chars, kw_shapes) == expected

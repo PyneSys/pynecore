@@ -46,7 +46,7 @@ import importlib.util
 import json
 from bisect import bisect_right
 from collections import deque
-from collections.abc import Callable, Container, Iterator, Sequence
+from collections.abc import Callable, Container, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -68,7 +68,8 @@ from .pine_type_rules import (
     NA_TEXT_PARAMS,
     NOT_PINE_STRINGS, set_widen, get_widen_site,
     set_widen_site, get_widens, set_widens, is_na_widen, set_na_class,
-    overload_result, ImplSig, overload_pick, default_fit, FIT_REQUIRED, FactoryFields,
+    overload_result, ImplSig, overload_pick, overload_bind, default_fit, FIT_REQUIRED,
+    FactoryFields,
     impl_sig, _param_defaults, _dotted, _DYN_DEFAULT,  # noqa: internal API
     CLASS_SEP, LIB_MODULE, SCALARS, PINE_LOOP, array_of, builtin_class_id, class_id, class_of,
     element_of, elements_of, is_array,
@@ -3329,7 +3330,7 @@ class _Inference:
         if argc is None:
             return UNKNOWN
         picked = self._picked([_lib_impl_sig(impl) for impl in entry['impls']], pin,
-                              self._shapes(args, keywords))
+                              self._shapes(args), self._keyword_shapes(keywords))
         if picked is not None:
             return picked
         return overload_result([impl['ret'] for impl in entry['impls']
@@ -3744,7 +3745,8 @@ class _Inference:
                 return UNKNOWN
         pin = self._pin(node, is_group)
         if is_group:
-            ty = self._group_type(key, pin, self._shapes(node.args, node.keywords))
+            ty = self._group_type(key, pin, self._shapes(node.args),
+                                  self._keyword_shapes(node.keywords))
         else:
             ty = self._call_context(key, node, frame)
         self.table.calls.append(CallSite(
@@ -4115,10 +4117,10 @@ class _Inference:
             if not self._group_call_fits(key, name, node, args):
                 self._record_pin(node, None)
                 return UNKNOWN
-            shapes = self._shapes(args, node.keywords)
-            pin = None if shapes is None else pin_for(shapes)
+            shapes = self._shapes(args)
+            pin = None if shapes is None or node.keywords else pin_for(shapes)
             self._record_pin(node, pin)
-            return self._group_type(key, pin, shapes)
+            return self._group_type(key, pin, shapes, self._keyword_shapes(node.keywords))
         # The method handed over as a function is the one the call site's dispatch
         # entry binds, so the instance vector stamped here configures it
         # (``core/pine_method``)
@@ -4516,8 +4518,8 @@ class _Inference:
             if nid is None or nid not in self._walked:
                 self._analyse(key, impl, self._declared_params(impl), parents)
 
-    def _group_type(self, key: str, pin: str | None,
-                    shapes: Sequence[str] | None = None) -> str:
+    def _group_type(self, key: str, pin: str | None, shapes: Sequence[str] | None = None,
+                    kw_shapes: Mapping[str, str] | None = None) -> str:
         """
         Type of a call to a user overload group.
 
@@ -4532,49 +4534,72 @@ class _Inference:
         :param key: Scope-qualified id of the group
         :param pin: The pin this call site justified, when it has one
         :param shapes: The static type of each positional argument, or None
-                       where the call is not positional
+                       where an unpacked argument hides them
+        :param kw_shapes: Parameter name -> the static type of the keyword
+                          argument passed for it, or None where an unpacked
+                          mapping hides them
         :return: The type the call evaluates to
         """
-        picked = self._picked(self._impl_sigs(key), pin, shapes)
+        picked = self._picked(self._impl_sigs(key), pin, shapes, kw_shapes)
         return picked if picked is not None else self.table.funcs[key].ret
 
-    def _shapes(self, args: Sequence[ast.expr],
-                keywords: Sequence[ast.keyword]) -> list[str] | None:
+    def _shapes(self, args: Sequence[ast.expr]) -> list[str] | None:
         """
-        The static type of each argument of a positional call, in order.
+        The static type of each positional argument of a call, in order.
 
         :param args: The positional arguments, typed already
-        :param keywords: The keyword arguments
-        :return: One type per argument, or None when a keyword or an unpacked
-                 argument makes the call one the exact pass does not read
+        :return: One type per argument, or None when an unpacked argument
+                 makes the call one the exact pass does not read
         """
-        if keywords or any(isinstance(arg, ast.Starred) for arg in args):
+        if any(isinstance(arg, ast.Starred) for arg in args):
             return None
         return [self._ty_of(arg) for arg in args]
 
+    def _keyword_shapes(self, keywords: Sequence[ast.keyword]) -> dict[str, str] | None:
+        """
+        The static type of each keyword argument of a call, by parameter name.
+
+        :param keywords: The keyword arguments, typed already
+        :return: Parameter name -> type, or None when an unpacked mapping makes
+                 the call one the exact pass does not read
+        """
+        if any(keyword.arg is None for keyword in keywords):
+            return None
+        return {keyword.arg: self._ty_of(keyword.value)
+                for keyword in keywords if keyword.arg is not None}
+
     @staticmethod
-    def _picked(impls: Sequence[ImplSig], pin: str | None,
-                shapes: Sequence[str] | None) -> str | None:
+    def _picked(impls: Sequence[ImplSig], pin: str | None, shapes: Sequence[str] | None,
+                kw_shapes: Mapping[str, str] | None = None) -> str | None:
         """
         The return type the selector's exact pass settles on for a call site.
 
         The pin is read where the site has one: the runtime selects by the pin's
         witnesses, so what the pin says runs. An unpinned site (nothing in it
-        worth a pin) dispatches on its values, and the characters are read off
-        the argument types only where a value is what its type says: a string,
-        a bool, an object of a known class. A float-typed value may be a Python
-        int at run time (``float x = 1``), which the exact pass takes for an int,
-        so a float position of an unpinned site says nothing; an int position
-        never reaches here unpinned.
+        worth a pin, or a keyword argument) dispatches on its values, and the
+        characters are read off the argument types only where a value is what
+        its type says: a string, a bool, an object of a known class. A
+        float-typed value may be a Python int at run time (``float x = 1``),
+        which the exact pass takes for an int, so a float position of an
+        unpinned site says nothing; an int position never reaches here unpinned.
+        A call with keyword arguments is bound to each implementation's
+        parameters by name (``overload_bind``).
 
         :param impls: The group's implementations, in declaration order
         :param pin: The pin the site justified, when it has one
         :param shapes: The static type of each positional argument, or None
-                       where the call is not positional
+                       where an unpacked argument hides them
+        :param kw_shapes: Parameter name -> the keyword argument's static type,
+                          or None where an unpacked mapping hides them
         :return: The selected implementation's return type, or None
         """
-        if shapes is None:
+        if shapes is None or kw_shapes is None:
             return None
+        if kw_shapes:
+            chars = pin_chars(shapes).replace(FLOAT, PIN_ANY)
+            kw_chars = {name: pin_chars([ty]).replace(FLOAT, PIN_ANY)
+                        for name, ty in kw_shapes.items()}
+            return overload_bind(list(impls), chars, shapes, kw_chars, kw_shapes)
         chars = pin if pin is not None else pin_chars(shapes).replace(FLOAT, PIN_ANY)
         return overload_pick(list(impls), chars, shapes)
 
@@ -4887,7 +4912,8 @@ class _Inference:
             return UNKNOWN
         pin = self._pin(node, is_group)
         if is_group:
-            picked = self._picked(sig.impls, pin, self._shapes(node.args, node.keywords))
+            picked = self._picked(sig.impls, pin, self._shapes(node.args),
+                                  self._keyword_shapes(node.keywords))
             ty = sig.ret if picked is None else picked
         elif sig.annotated:
             ty = sig.ret
