@@ -27,11 +27,10 @@ import ast
 from dataclasses import dataclass, field
 
 from . import ast_walk
+from .state_param import DEFAULT_STATE_PARAM
 
 __all__ = ['ModuleLayout', 'ScopeLayout', 'scope_for_function', 'collect_scope_segments',
            'DEFAULT_STATE_PARAM']
-
-DEFAULT_STATE_PARAM = '__state__'
 
 
 def _scope_defs(scope_node: ast.AST):

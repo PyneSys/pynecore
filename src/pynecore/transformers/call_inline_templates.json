@@ -1,0 +1,1736 @@
+{
+ "callees": {
+  "pynecore.lib.array.get": "pynecore.lib.array.get",
+  "pynecore.lib.array.size": "pynecore.lib.array.size",
+  "pynecore.lib.math.abs": "pynecore.lib.math.abs",
+  "pynecore.lib.math.acos": "pynecore.lib.math.acos",
+  "pynecore.lib.math.asin": "pynecore.lib.math.asin",
+  "pynecore.lib.math.atan": "pynecore.lib.math.atan",
+  "pynecore.lib.math.ceil": "pynecore.lib.math.ceil",
+  "pynecore.lib.math.cos": "pynecore.lib.math.cos",
+  "pynecore.lib.math.exp": "pynecore.lib.math.exp",
+  "pynecore.lib.math.floor": "pynecore.lib.math.floor",
+  "pynecore.lib.math.log": "pynecore.lib.math.log",
+  "pynecore.lib.math.log10": "pynecore.lib.math.log10",
+  "pynecore.lib.math.max": "pynecore.lib.math.max",
+  "pynecore.lib.math.min": "pynecore.lib.math.min",
+  "pynecore.lib.math.pow": "pynecore.lib.math.pow",
+  "pynecore.lib.math.sign": "pynecore.lib.math.sign",
+  "pynecore.lib.math.sin": "pynecore.lib.math.sin",
+  "pynecore.lib.math.sqrt": "pynecore.lib.math.sqrt",
+  "pynecore.lib.math.tan": "pynecore.lib.math.tan",
+  "pynecore.lib.math.todegrees": "pynecore.lib.math.todegrees",
+  "pynecore.lib.math.toradians": "pynecore.lib.math.toradians"
+ },
+ "functions": {
+  "pynecore.lib.array.get": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Call",
+     "args": [
+      {
+       "param": 0
+      }
+     ],
+     "func": {
+      "_type": "Name",
+      "ctx": "Load",
+      "id": "__inl·array_na_element__"
+     },
+     "keywords": [],
+     "loc": [
+      479,
+      23,
+      479,
+      38
+     ]
+    },
+    "orelse": {
+     "_type": "Subscript",
+     "ctx": "Load",
+     "loc": [
+      485,
+      11,
+      485,
+      25
+     ],
+     "slice": {
+      "_type": "Call",
+      "args": [
+       {
+        "param": 1
+       }
+      ],
+      "func": {
+       "_type": "Name",
+       "ctx": "Load",
+       "id": "__inl·py_int__"
+      },
+      "keywords": [],
+      "loc": [
+       485,
+       14,
+       485,
+       24
+      ]
+     },
+     "value": {
+      "param": 0
+     }
+    },
+    "test": {
+     "_type": "UnaryOp",
+     "loc": [
+      474,
+      7,
+      474,
+      27
+     ],
+     "op": "Not",
+     "operand": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "param": 1
+       }
+      ],
+      "left": {
+       "param": 1
+      },
+      "loc": [
+       474,
+       12,
+       474,
+       26
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "id",
+    "index"
+   ],
+   "text": "__inl·array_na_element__(id) if not index == index else id[__inl·py_int__(index)]"
+  },
+  "pynecore.lib.array.size": {
+   "body": {
+    "_type": "Call",
+    "args": [
+     {
+      "_type": "Call",
+      "args": [
+       {
+        "param": 0
+       }
+      ],
+      "func": {
+       "_type": "Name",
+       "ctx": "Load",
+       "id": "__inl·py_len__"
+      },
+      "keywords": [],
+      "loc": [
+       1244,
+       20,
+       1244,
+       27
+      ]
+     }
+    ],
+    "func": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·py_float__"
+    },
+    "keywords": [],
+    "loc": [
+     1244,
+     11,
+     1244,
+     28
+    ]
+   },
+   "kind": "derive",
+   "params": [
+    "id"
+   ],
+   "text": "__inl·py_float__(__inl·py_len__(id))"
+  },
+  "pynecore.lib.math.abs": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·na_float__"
+    },
+    "orelse": {
+     "_type": "Call",
+     "args": [
+      {
+       "param": 0
+      }
+     ],
+     "func": {
+      "_type": "Attribute",
+      "attr": "abs",
+      "ctx": "Load",
+      "loc": [
+       52,
+       21,
+       52,
+       33
+      ],
+      "value": {
+       "_type": "Name",
+       "ctx": "Load",
+       "id": "__inl·py_builtins__"
+      }
+     },
+     "keywords": [],
+     "loc": [
+      52,
+      21,
+      52,
+      41
+     ]
+    },
+    "test": {
+     "_type": "UnaryOp",
+     "loc": [
+      48,
+      7,
+      48,
+      29
+     ],
+     "op": "Not",
+     "operand": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "param": 0
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       48,
+       12,
+       48,
+       28
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "number"
+   ],
+   "text": "__inl·na_float__ if not number == number else __inl·py_builtins__.abs(number)"
+  },
+  "pynecore.lib.math.acos": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·na_float__"
+    },
+    "orelse": {
+     "_type": "Call",
+     "args": [
+      {
+       "param": 0
+      }
+     ],
+     "func": {
+      "_type": "Attribute",
+      "attr": "acos",
+      "ctx": "Load",
+      "loc": [
+       65,
+       11,
+       65,
+       22
+      ],
+      "value": {
+       "_type": "Name",
+       "ctx": "Load",
+       "id": "__inl·fdlibm__"
+      }
+     },
+     "keywords": [],
+     "loc": [
+      65,
+      11,
+      65,
+      29
+     ]
+    },
+    "test": {
+     "_type": "UnaryOp",
+     "loc": [
+      62,
+      7,
+      62,
+      27
+     ],
+     "op": "Not",
+     "operand": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "param": 0
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       62,
+       12,
+       62,
+       26
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "angle"
+   ],
+   "text": "__inl·na_float__ if not angle == angle else __inl·fdlibm__.acos(angle)"
+  },
+  "pynecore.lib.math.asin": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·na_float__"
+    },
+    "orelse": {
+     "_type": "Call",
+     "args": [
+      {
+       "param": 0
+      }
+     ],
+     "func": {
+      "_type": "Attribute",
+      "attr": "asin",
+      "ctx": "Load",
+      "loc": [
+       77,
+       11,
+       77,
+       22
+      ],
+      "value": {
+       "_type": "Name",
+       "ctx": "Load",
+       "id": "__inl·fdlibm__"
+      }
+     },
+     "keywords": [],
+     "loc": [
+      77,
+      11,
+      77,
+      29
+     ]
+    },
+    "test": {
+     "_type": "UnaryOp",
+     "loc": [
+      75,
+      7,
+      75,
+      27
+     ],
+     "op": "Not",
+     "operand": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "param": 0
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       75,
+       12,
+       75,
+       26
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "angle"
+   ],
+   "text": "__inl·na_float__ if not angle == angle else __inl·fdlibm__.asin(angle)"
+  },
+  "pynecore.lib.math.atan": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·na_float__"
+    },
+    "orelse": {
+     "_type": "Call",
+     "args": [
+      {
+       "param": 0
+      }
+     ],
+     "func": {
+      "_type": "Attribute",
+      "attr": "atan",
+      "ctx": "Load",
+      "loc": [
+       89,
+       11,
+       89,
+       22
+      ],
+      "value": {
+       "_type": "Name",
+       "ctx": "Load",
+       "id": "__inl·fdlibm__"
+      }
+     },
+     "keywords": [],
+     "loc": [
+      89,
+      11,
+      89,
+      29
+     ]
+    },
+    "test": {
+     "_type": "UnaryOp",
+     "loc": [
+      87,
+      7,
+      87,
+      27
+     ],
+     "op": "Not",
+     "operand": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "param": 0
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       87,
+       12,
+       87,
+       26
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "angle"
+   ],
+   "text": "__inl·na_float__ if not angle == angle else __inl·fdlibm__.atan(angle)"
+  },
+  "pynecore.lib.math.ceil": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·na_int__"
+    },
+    "orelse": {
+     "_type": "Call",
+     "args": [
+      {
+       "_type": "Call",
+       "args": [
+        {
+         "param": 0
+        }
+       ],
+       "func": {
+        "_type": "Attribute",
+        "attr": "ceil",
+        "ctx": "Load",
+        "loc": [
+         140,
+         20,
+         140,
+         29
+        ],
+        "value": {
+         "_type": "Name",
+         "ctx": "Load",
+         "id": "__inl·py_math__"
+        }
+       },
+       "keywords": [],
+       "loc": [
+        140,
+        20,
+        140,
+        37
+       ]
+      }
+     ],
+     "func": {
+      "_type": "Name",
+      "ctx": "Load",
+      "id": "__inl·py_float__"
+     },
+     "keywords": [],
+     "loc": [
+      140,
+      11,
+      140,
+      38
+     ]
+    },
+    "test": {
+     "_type": "UnaryOp",
+     "loc": [
+      138,
+      7,
+      138,
+      29
+     ],
+     "op": "Not",
+     "operand": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "param": 0
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       138,
+       12,
+       138,
+       28
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "number"
+   ],
+   "text": "__inl·na_int__ if not number == number else __inl·py_float__(__inl·py_math__.ceil(number))"
+  },
+  "pynecore.lib.math.cos": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·na_float__"
+    },
+    "orelse": {
+     "_type": "Call",
+     "args": [
+      {
+       "param": 0
+      }
+     ],
+     "func": {
+      "_type": "Attribute",
+      "attr": "cos",
+      "ctx": "Load",
+      "loc": [
+       155,
+       11,
+       155,
+       24
+      ],
+      "value": {
+       "_type": "Name",
+       "ctx": "Load",
+       "id": "__inl·pine_math__"
+      }
+     },
+     "keywords": [],
+     "loc": [
+      155,
+      11,
+      155,
+      31
+     ]
+    },
+    "test": {
+     "_type": "UnaryOp",
+     "loc": [
+      150,
+      7,
+      150,
+      27
+     ],
+     "op": "Not",
+     "operand": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "param": 0
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       150,
+       12,
+       150,
+       26
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "angle"
+   ],
+   "text": "__inl·na_float__ if not angle == angle else __inl·pine_math__.cos(angle)"
+  },
+  "pynecore.lib.math.exp": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·na_float__"
+    },
+    "orelse": {
+     "_type": "Call",
+     "args": [
+      {
+       "param": 0
+      }
+     ],
+     "func": {
+      "_type": "Attribute",
+      "attr": "exp",
+      "ctx": "Load",
+      "loc": [
+       167,
+       11,
+       167,
+       24
+      ],
+      "value": {
+       "_type": "Name",
+       "ctx": "Load",
+       "id": "__inl·pine_math__"
+      }
+     },
+     "keywords": [],
+     "loc": [
+      167,
+      11,
+      167,
+      32
+     ]
+    },
+    "test": {
+     "_type": "UnaryOp",
+     "loc": [
+      165,
+      7,
+      165,
+      29
+     ],
+     "op": "Not",
+     "operand": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "param": 0
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       165,
+       12,
+       165,
+       28
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "number"
+   ],
+   "text": "__inl·na_float__ if not number == number else __inl·pine_math__.exp(number)"
+  },
+  "pynecore.lib.math.floor": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·na_int__"
+    },
+    "orelse": {
+     "_type": "Call",
+     "args": [
+      {
+       "_type": "Call",
+       "args": [
+        {
+         "param": 0
+        }
+       ],
+       "func": {
+        "_type": "Attribute",
+        "attr": "floor",
+        "ctx": "Load",
+        "loc": [
+         180,
+         20,
+         180,
+         30
+        ],
+        "value": {
+         "_type": "Name",
+         "ctx": "Load",
+         "id": "__inl·py_math__"
+        }
+       },
+       "keywords": [],
+       "loc": [
+        180,
+        20,
+        180,
+        38
+       ]
+      }
+     ],
+     "func": {
+      "_type": "Name",
+      "ctx": "Load",
+      "id": "__inl·py_float__"
+     },
+     "keywords": [],
+     "loc": [
+      180,
+      11,
+      180,
+      39
+     ]
+    },
+    "test": {
+     "_type": "UnaryOp",
+     "loc": [
+      177,
+      7,
+      177,
+      29
+     ],
+     "op": "Not",
+     "operand": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "param": 0
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       177,
+       12,
+       177,
+       28
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "number"
+   ],
+   "text": "__inl·na_int__ if not number == number else __inl·py_float__(__inl·py_math__.floor(number))"
+  },
+  "pynecore.lib.math.log": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·na_float__"
+    },
+    "orelse": {
+     "_type": "Call",
+     "args": [
+      {
+       "param": 0
+      }
+     ],
+     "func": {
+      "_type": "Attribute",
+      "attr": "log",
+      "ctx": "Load",
+      "loc": [
+       192,
+       11,
+       192,
+       24
+      ],
+      "value": {
+       "_type": "Name",
+       "ctx": "Load",
+       "id": "__inl·pine_math__"
+      }
+     },
+     "keywords": [],
+     "loc": [
+      192,
+      11,
+      192,
+      32
+     ]
+    },
+    "test": {
+     "_type": "UnaryOp",
+     "loc": [
+      190,
+      7,
+      190,
+      29
+     ],
+     "op": "Not",
+     "operand": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "param": 0
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       190,
+       12,
+       190,
+       28
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "number"
+   ],
+   "text": "__inl·na_float__ if not number == number else __inl·pine_math__.log(number)"
+  },
+  "pynecore.lib.math.log10": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·na_float__"
+    },
+    "orelse": {
+     "_type": "Call",
+     "args": [
+      {
+       "param": 0
+      }
+     ],
+     "func": {
+      "_type": "Attribute",
+      "attr": "log10",
+      "ctx": "Load",
+      "loc": [
+       204,
+       11,
+       204,
+       26
+      ],
+      "value": {
+       "_type": "Name",
+       "ctx": "Load",
+       "id": "__inl·pine_math__"
+      }
+     },
+     "keywords": [],
+     "loc": [
+      204,
+      11,
+      204,
+      34
+     ]
+    },
+    "test": {
+     "_type": "UnaryOp",
+     "loc": [
+      202,
+      7,
+      202,
+      29
+     ],
+     "op": "Not",
+     "operand": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "param": 0
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       202,
+       12,
+       202,
+       28
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "number"
+   ],
+   "text": "__inl·na_float__ if not number == number else __inl·pine_math__.log10(number)"
+  },
+  "pynecore.lib.math.max": {
+   "builtin": "max",
+   "builtins_anchor": "py_builtins",
+   "kind": "varargs",
+   "na_anchor": "math_na_of_operands"
+  },
+  "pynecore.lib.math.min": {
+   "builtin": "min",
+   "builtins_anchor": "py_builtins",
+   "kind": "varargs",
+   "na_anchor": "math_na_of_operands"
+  },
+  "pynecore.lib.math.pow": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·na_float__"
+    },
+    "orelse": {
+     "_type": "IfExp",
+     "body": {
+      "_type": "BinOp",
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       304,
+       15,
+       304,
+       20
+      ],
+      "op": "Mult",
+      "right": {
+       "param": 0
+      }
+     },
+     "orelse": {
+      "_type": "Call",
+      "args": [
+       {
+        "param": 0
+       },
+       {
+        "param": 1
+       }
+      ],
+      "func": {
+       "_type": "Attribute",
+       "attr": "pow",
+       "ctx": "Load",
+       "loc": [
+        305,
+        11,
+        305,
+        24
+       ],
+       "value": {
+        "_type": "Name",
+        "ctx": "Load",
+        "id": "__inl·pine_math__"
+       }
+      },
+      "keywords": [],
+      "loc": [
+       305,
+       11,
+       305,
+       37
+      ]
+     },
+     "test": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "_type": "Constant",
+        "kind": null,
+        "loc": [
+         303,
+         19,
+         303,
+         20
+        ],
+        "value": [
+         "int",
+         "2"
+        ]
+       }
+      ],
+      "left": {
+       "param": 1
+      },
+      "loc": [
+       303,
+       7,
+       303,
+       20
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    },
+    "test": {
+     "_type": "BoolOp",
+     "loc": [
+      294,
+      7,
+      294,
+      55
+     ],
+     "op": "Or",
+     "values": [
+      {
+       "_type": "UnaryOp",
+       "loc": [
+        294,
+        7,
+        294,
+        25
+       ],
+       "op": "Not",
+       "operand": {
+        "_type": "Compare",
+        "comparators": [
+         {
+          "param": 0
+         }
+        ],
+        "left": {
+         "param": 0
+        },
+        "loc": [
+         294,
+         12,
+         294,
+         24
+        ],
+        "ops": [
+         "Eq"
+        ]
+       }
+      },
+      {
+       "_type": "UnaryOp",
+       "loc": [
+        294,
+        29,
+        294,
+        55
+       ],
+       "op": "Not",
+       "operand": {
+        "_type": "Compare",
+        "comparators": [
+         {
+          "param": 1
+         }
+        ],
+        "left": {
+         "param": 1
+        },
+        "loc": [
+         294,
+         34,
+         294,
+         54
+        ],
+        "ops": [
+         "Eq"
+        ]
+       }
+      }
+     ]
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "base",
+    "exponent"
+   ],
+   "text": "__inl·na_float__ if not base == base or not exponent == exponent else base * base if exponent == 2 else __inl·pine_math__.pow(base, exponent)"
+  },
+  "pynecore.lib.math.sign": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·na_float__"
+    },
+    "orelse": {
+     "_type": "IfExp",
+     "body": {
+      "_type": "Constant",
+      "kind": null,
+      "loc": [
+       464,
+       15,
+       464,
+       18
+      ],
+      "value": [
+       "float",
+       "0.0"
+      ]
+     },
+     "orelse": {
+      "_type": "IfExp",
+      "body": {
+       "_type": "Constant",
+       "kind": null,
+       "loc": [
+        466,
+        15,
+        466,
+        18
+       ],
+       "value": [
+        "float",
+        "1.0"
+       ]
+      },
+      "orelse": {
+       "_type": "UnaryOp",
+       "loc": [
+        467,
+        11,
+        467,
+        15
+       ],
+       "op": "USub",
+       "operand": {
+        "_type": "Constant",
+        "kind": null,
+        "loc": [
+         467,
+         12,
+         467,
+         15
+        ],
+        "value": [
+         "float",
+         "1.0"
+        ]
+       }
+      },
+      "test": {
+       "_type": "Compare",
+       "comparators": [
+        {
+         "_type": "Constant",
+         "kind": null,
+         "loc": [
+          465,
+          16,
+          465,
+          19
+         ],
+         "value": [
+          "float",
+          "0.0"
+         ]
+        }
+       ],
+       "left": {
+        "param": 0
+       },
+       "loc": [
+        465,
+        7,
+        465,
+        19
+       ],
+       "ops": [
+        "Gt"
+       ]
+      }
+     },
+     "test": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "_type": "Constant",
+        "kind": null,
+        "loc": [
+         463,
+         17,
+         463,
+         20
+        ],
+        "value": [
+         "float",
+         "0.0"
+        ]
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       463,
+       7,
+       463,
+       20
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    },
+    "test": {
+     "_type": "UnaryOp",
+     "loc": [
+      461,
+      7,
+      461,
+      29
+     ],
+     "op": "Not",
+     "operand": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "param": 0
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       461,
+       12,
+       461,
+       28
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "number"
+   ],
+   "text": "__inl·na_float__ if not number == number else 0.0 if number == 0.0 else 1.0 if number > 0.0 else -1.0"
+  },
+  "pynecore.lib.math.sin": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·na_float__"
+    },
+    "orelse": {
+     "_type": "Call",
+     "args": [
+      {
+       "param": 0
+      }
+     ],
+     "func": {
+      "_type": "Attribute",
+      "attr": "sin",
+      "ctx": "Load",
+      "loc": [
+       479,
+       11,
+       479,
+       24
+      ],
+      "value": {
+       "_type": "Name",
+       "ctx": "Load",
+       "id": "__inl·pine_math__"
+      }
+     },
+     "keywords": [],
+     "loc": [
+      479,
+      11,
+      479,
+      31
+     ]
+    },
+    "test": {
+     "_type": "UnaryOp",
+     "loc": [
+      477,
+      7,
+      477,
+      27
+     ],
+     "op": "Not",
+     "operand": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "param": 0
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       477,
+       12,
+       477,
+       26
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "angle"
+   ],
+   "text": "__inl·na_float__ if not angle == angle else __inl·pine_math__.sin(angle)"
+  },
+  "pynecore.lib.math.sqrt": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·na_float__"
+    },
+    "orelse": {
+     "_type": "IfExp",
+     "body": {
+      "_type": "Name",
+      "ctx": "Load",
+      "id": "__inl·na_float__"
+     },
+     "orelse": {
+      "_type": "Call",
+      "args": [
+       {
+        "param": 0
+       }
+      ],
+      "func": {
+       "_type": "Attribute",
+       "attr": "sqrt",
+       "ctx": "Load",
+       "loc": [
+        493,
+        11,
+        493,
+        20
+       ],
+       "value": {
+        "_type": "Name",
+        "ctx": "Load",
+        "id": "__inl·py_math__"
+       }
+      },
+      "keywords": [],
+      "loc": [
+       493,
+       11,
+       493,
+       28
+      ]
+     },
+     "test": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "_type": "Constant",
+        "kind": null,
+        "loc": [
+         491,
+         16,
+         491,
+         19
+        ],
+        "value": [
+         "float",
+         "0.0"
+        ]
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       491,
+       7,
+       491,
+       19
+      ],
+      "ops": [
+       "Lt"
+      ]
+     }
+    },
+    "test": {
+     "_type": "UnaryOp",
+     "loc": [
+      489,
+      7,
+      489,
+      29
+     ],
+     "op": "Not",
+     "operand": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "param": 0
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       489,
+       12,
+       489,
+       28
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "number"
+   ],
+   "text": "__inl·na_float__ if not number == number else __inl·na_float__ if number < 0.0 else __inl·py_math__.sqrt(number)"
+  },
+  "pynecore.lib.math.tan": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·na_float__"
+    },
+    "orelse": {
+     "_type": "Call",
+     "args": [
+      {
+       "param": 0
+      }
+     ],
+     "func": {
+      "_type": "Attribute",
+      "attr": "tan",
+      "ctx": "Load",
+      "loc": [
+       505,
+       11,
+       505,
+       24
+      ],
+      "value": {
+       "_type": "Name",
+       "ctx": "Load",
+       "id": "__inl·pine_math__"
+      }
+     },
+     "keywords": [],
+     "loc": [
+      505,
+      11,
+      505,
+      31
+     ]
+    },
+    "test": {
+     "_type": "UnaryOp",
+     "loc": [
+      503,
+      7,
+      503,
+      27
+     ],
+     "op": "Not",
+     "operand": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "param": 0
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       503,
+       12,
+       503,
+       26
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "angle"
+   ],
+   "text": "__inl·na_float__ if not angle == angle else __inl·pine_math__.tan(angle)"
+  },
+  "pynecore.lib.math.todegrees": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·na_float__"
+    },
+    "orelse": {
+     "_type": "Call",
+     "args": [
+      {
+       "param": 0
+      }
+     ],
+     "func": {
+      "_type": "Attribute",
+      "attr": "degrees",
+      "ctx": "Load",
+      "loc": [
+       517,
+       11,
+       517,
+       23
+      ],
+      "value": {
+       "_type": "Name",
+       "ctx": "Load",
+       "id": "__inl·py_math__"
+      }
+     },
+     "keywords": [],
+     "loc": [
+      517,
+      11,
+      517,
+      32
+     ]
+    },
+    "test": {
+     "_type": "UnaryOp",
+     "loc": [
+      515,
+      7,
+      515,
+      31
+     ],
+     "op": "Not",
+     "operand": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "param": 0
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       515,
+       12,
+       515,
+       30
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "radians"
+   ],
+   "text": "__inl·na_float__ if not radians == radians else __inl·py_math__.degrees(radians)"
+  },
+  "pynecore.lib.math.toradians": {
+   "body": {
+    "_type": "IfExp",
+    "body": {
+     "_type": "Name",
+     "ctx": "Load",
+     "id": "__inl·na_float__"
+    },
+    "orelse": {
+     "_type": "Call",
+     "args": [
+      {
+       "param": 0
+      }
+     ],
+     "func": {
+      "_type": "Attribute",
+      "attr": "radians",
+      "ctx": "Load",
+      "loc": [
+       529,
+       11,
+       529,
+       23
+      ],
+      "value": {
+       "_type": "Name",
+       "ctx": "Load",
+       "id": "__inl·py_math__"
+      }
+     },
+     "keywords": [],
+     "loc": [
+      529,
+      11,
+      529,
+      32
+     ]
+    },
+    "test": {
+     "_type": "UnaryOp",
+     "loc": [
+      527,
+      7,
+      527,
+      31
+     ],
+     "op": "Not",
+     "operand": {
+      "_type": "Compare",
+      "comparators": [
+       {
+        "param": 0
+       }
+      ],
+      "left": {
+       "param": 0
+      },
+      "loc": [
+       527,
+       12,
+       527,
+       30
+      ],
+      "ops": [
+       "Eq"
+      ]
+     }
+    }
+   },
+   "kind": "derive",
+   "params": [
+    "degrees"
+   ],
+   "text": "__inl·na_float__ if not degrees == degrees else __inl·py_math__.radians(degrees)"
+  }
+ },
+ "loop_ranges": [
+  "pynecore.core.pine_range.pine_range",
+  "pynecore.pine_range"
+ ],
+ "v": 1,
+ "varargs_arities": [
+  2,
+  3
+ ]
+}

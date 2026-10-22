@@ -101,15 +101,15 @@
   },
   "Series": {
     "module": "series",
-    "digest": "6ec8deabfdf8b7ca6ef5bca915121b99b62b144b1512d1be796fcd8c8f4d7db1"
+    "digest": "25532d119cf09c5d6d414e47ebaf6a51690812255f0a5c683f3a963afe951be6"
   },
   "VerifyClosedShift": {
     "module": "security_closed_shift_check",
-    "digest": "d80032808b504ba6c5ce1a667e208e080378e36c50575d60842dacf514425c7f"
+    "digest": "25cc4e9697e5cf23cbb78f6a704b92f5db6da3b65911cf29814f7cce3b4a42ce"
   },
   "Persistent": {
     "module": "persistent",
-    "digest": "fe0796a9cd474735a2db9b082d689304b7d37aa21f830b9d083166d0d905d3ca"
+    "digest": "67e53211d6c10fe883670a9aee5f0db1ebea2bf645fcf19d7fb95b09f05fb932"
   },
   "ScriptRequirements": {
     "module": "script_requirements",

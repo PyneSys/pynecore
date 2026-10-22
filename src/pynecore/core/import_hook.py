@@ -422,16 +422,15 @@ def _get_transform_pipeline_hash() -> str:
         # rest of that directory); ``pine_compare`` holds a constant the pipeline
         # bakes into the emitted bytecode
         files = [Path(__file__), Path(__file__).parent / "pine_compare.py"]
-        # The call-inlining pass copies these bodies into the emission, so a
-        # wrapper edit must invalidate cached script bytecode just like a
-        # transformer edit does (see transformers/call_inline.py)
-        lib_dir = Path(__file__).parent.parent / "lib"
-        files.extend([lib_dir / "math.py", lib_dir / "array.py",
-                      Path(__file__).parent / "inline_support.py"])
+        # The call-inlining pass copies wrapper bodies into the emission from its
+        # generated registry, hashed with the transformers below; the names those
+        # bodies reach resolve through this anchor module
+        files.append(Path(__file__).parent / "inline_support.py")
         # The constant-folding pass evaluates literal math calls through these
         # implementations and bakes the results into the emission; the native
         # twins are bit-exact to them, so the Python sources pin the values
-        files.extend([Path(__file__).parent / "fdlibm.py",
+        files.extend([Path(__file__).parent.parent / "lib" / "math.py",
+                      Path(__file__).parent / "fdlibm.py",
                       Path(__file__).parent / "pine_math.py"])
         # ... and a constant ``%`` through the runtime's own ``safe_mod``
         files.append(Path(__file__).parent / "safe_convert.py")
