@@ -94,6 +94,10 @@
     "pynecore",
     "lib"
   ],
+  "lib_builtin_names": {
+    "input": "script inputs",
+    "open": "the bar opening price"
+  },
   "nodes": [
     "AnnAssign",
     "Assert",
@@ -128,11 +132,11 @@
     "arg",
     "keyword"
   ],
-  "rules_version": "2026.09.2",
+  "rules_version": "2026.10.1",
   "unary_ops": [
     "Not",
     "UAdd",
     "USub"
   ],
-  "v": 1
+  "v": 2
 }

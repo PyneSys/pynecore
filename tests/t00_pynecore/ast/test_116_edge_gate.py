@@ -11,9 +11,9 @@ are a coverage meter and stop nothing, in an edge module under
 ``PYNE_EDGE_STRICT=1`` the first one is a ``PineTypeError`` with a real caret.
 """
 import ast
+import builtins
 import importlib.util
 import json
-import sys
 from pathlib import Path
 
 import pytest
@@ -25,7 +25,7 @@ from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
 from pynecore.transformers.pine_edge_gate import (
     EDGE_RULES_VERSION, DIAG_ENV, STRICT_ENV, edge_rules, gate_module, gated, render_diags,
 )
-from pynecore.transformers.pine_type_infer import infer_module
+from pynecore.transformers.pine_type_infer import infer_module, lib_star_exports
 from pynecore.transformers.pine_type_table import Diag, PineTypeError, PineTypeTable
 from pynecore.transformers.pine_type_report import unknown_diags
 
@@ -43,7 +43,7 @@ def _clean_registry():
 
 
 def _gate(source: str) -> list[Diag]:
-    return gate_module(ast.parse(source))
+    return gate_module(ast.parse(source), source)
 
 
 def _reasons(diags: list[Diag]) -> list[str]:
@@ -194,6 +194,103 @@ def __test_a_rejected_import_does_not_cascade_into_its_uses__():
     assert len(diags) == 1 and _reasons(diags) == ['edge-import']
 
 
+def __test_the_builtin_named_lib_names_are_every_collision__():
+    """A lib name Python's builtins would answer without its import is in the profile"""
+    exports = set(lib_star_exports()['pynecore.lib'])
+    assert set(edge_rules()['lib_builtin_names']) == exports & set(dir(builtins))
+
+
+@pytest.mark.parametrize("snippet,name", [
+    ('x = open[1]\n', 'open'),
+    ('def main():\n    return open + 1\n', 'open'),
+    ('def main():\n    open("prices.csv")\n', 'open'),
+    ('def main():\n    return input.int(14)\n', 'input'),
+    ('def main():\n    return input(1.0)\n', 'input'),
+    # Only a pynecore.lib import is lifted out of its function
+    ('def main():\n    return open\ndef helper():\n    from lib.Example.v1 import open\n'
+     '    return open\n', 'open'),
+    # ... and only a 'from' import standing directly in the function body
+    ('def main():\n    return open\ndef helper():\n    import pynecore.lib as open\n'
+     '    return open\n', 'open'),
+    ('def main():\n    return input\ndef helper():\n    import pynecore.lib.input\n'
+     '    return 1\n', 'input'),
+    ('def main():\n    return open\ndef helper(c: bool):\n    if c:\n'
+     '        from pynecore.lib import open\n    return 1.0\n', 'open'),
+    ('def main():\n    return open\ndef helper(open):\n    return open\n', 'open'),
+    # An annotation without a value declares the name and binds nothing
+    ('open: float\ndef main():\n    return open\n', 'open'),
+    ('open: float\nx = open\n', 'open'),
+    # The module is initialized top to bottom: a read that runs meanwhile sees
+    # only the bindings made ahead of it, its own assignment's not yet
+    ('open: float = open\ndef main():\n    return open + 1.0\n', 'open'),
+    ('open = open\n', 'open'),
+    ('x = open\nopen = 1.0\n', 'open'),
+    ('x = open\ndef open():\n    return 1.0\n', 'open'),
+    ('for open in open:\n    x = 1.0\n', 'open'),
+    ('while close > 0:\n    x = open\n    open = 1.0\n', 'open'),
+    ('def price(a: float = open):\n    return a\nopen = 1.0\n', 'open'),
+    ('@udt\nclass Bar:\n    mid: float = open\nopen = 1.0\n', 'open'),
+    ('def main():\n    from pynecore.lib import open as price\n    return price + open\n', 'open'),
+    # A default runs in the enclosing scope, before the parameter exists
+    ('def main(open: float = open):\n    return open\n', 'open'),
+    ('def main():\n    def price(open: float = open):\n        return open\n    return price()\n',
+     'open'),
+    ('@udt\nclass Bag:\n    first: float = field(default_factory=lambda: open)\n', 'open'),
+    # A class body reads its own field only once the field is assigned: ahead
+    # of it, Python looks the name up in the module and the builtins
+    ('@udt\nclass Bar:\n    open: float = open\n', 'open'),
+    ('@udt\nclass Bar:\n    input: int = input.int(14)\n', 'input'),
+    ('@udt\nclass Bar:\n    open: float\n    mid: float = open\n', 'open'),
+    ('def main():\n    open = 1.0\n    @udt\n    class Bar:\n        open: float = open\n'
+     '    return Bar()\n', 'open'),
+])
+def __test_a_lib_name_left_to_the_builtin_is_reported__(snippet: str, name: str):
+    diags = _gate(HEAD + snippet)
+    assert _reasons(diags) == ['edge-builtin'], [diag.message for diag in diags]
+    assert f"'{name}'" in diags[0].message and 'Pine' in diags[0].message
+    assert diags[0].fix is not None and f'from pynecore.lib import {name}' in diags[0].fix
+    assert diags[0].end_col - diags[0].col == len(name)
+
+
+@pytest.mark.parametrize("snippet", [
+    'from pynecore.lib import open, input\nx = open[1] + input.int(14)\n',
+    'def main(open: float = 1.0):\n    return open\n',
+    'def main():\n    open = 1.0\n    return open\n',
+    'def main():\n    open = 1.0\n    def price():\n        return open\n    return price()\n',
+    'def main():\n    from pynecore.lib import open\n    return open\n',
+    'def main():\n    return open\ndef helper():\n    from pynecore.lib import open\n    return open\n',
+    'def main():\n    for open in (1.0, 2.0):\n        x = open\n',
+    'def main():\n    import pynecore.lib as open\n    return open\n',
+    'open = 1.0\ndef main():\n    return open\n',
+    'open: float = 1.0\ndef main():\n    return open\n',
+    'open = 1.0\nx = open\n',
+    'open: float\nopen = 1.0\nx = open\n',
+    'if close > 0:\n    open = 1.0\n    x = open\n',
+    'for open in (1.0, 2.0):\n    x = open\n',
+    'def open():\n    return 1.0\nx = open\n',
+    # A function body is taken to run once the module is initialized
+    'def main():\n    return open\nopen = 1.0\n',
+    'open = 1.0\n@udt\nclass Bar:\n    open: float = open\n',
+    '@udt\nclass Bar:\n    open: float = 0.0\n    mid: float = open\n',
+    'def main():\n    open = 1.0\n    @udt\n    class Bar:\n        mid: float = open\n'
+    '    return Bar()\n',
+])
+def __test_a_bound_lib_name_is_let_through__(snippet: str):
+    diags = _gate(HEAD + snippet)
+    assert not diags, [diag.message for diag in diags]
+
+
+def __test_a_builtin_named_read_does_not_cascade_from_a_star_import__():
+    diags = _gate(HEAD + 'from pynecore.lib import *\nx = open[1] + input.int(14)\n')
+    assert _reasons(diags) == ['edge-import']
+
+
+def __test_an_error_only_the_symbol_table_raises_silences_the_builtin_rule__():
+    """``def f(a, a)`` parses, only Python's symbol table rejects it -- compiling reports it"""
+    assert not _gate(HEAD + 'def f(a, a):\n    return open\n')
+    assert _reasons(_gate(HEAD + 'def f():\n    nonlocal x\nx = open\n')) == ['edge-syntax']
+
+
 # --- 3. the type half: one cause, one report -------------------------------
 
 
@@ -334,6 +431,36 @@ def __test_without_strict_the_module_compiles_and_keeps_the_list__(tmp_path, mon
     # The structural half names the construct; the typed half of the same
     # node is not repeated behind it
     assert _reasons(analysed[1].diags) == ['edge-call']
+
+
+def __test_a_builtin_named_read_is_one_finding_through_the_hook__(tmp_path, monkeypatch):
+    monkeypatch.setenv(STRICT_ENV, '0')
+    path = _write(tmp_path, 'edge_builtin', EDGE_MODULE.replace(
+        '    a = getattr(close, "x")', '    a = input.int(14) + input + open'))
+    _compile(path)
+    analysed = analyse_module(str(path))
+    assert analysed is not None
+    # The typed half says the builtin has no type -- what the structural one said
+    assert _reasons(analysed[1].diags) == ['edge-builtin'] * 3
+
+
+@pytest.mark.parametrize("declaration,text", [
+    # ``open: float`` types the name, yet the read is still Python's builtin
+    ('open: float', 'a = open + 1.0'),
+    # The initializer reads the builtin before its assignment binds the name
+    ('open: float = open', 'open: float = open'),
+    ('x = open\nopen = 1.0', 'x = open'),
+])
+def __test_strict_rejects_a_builtin_read_ahead_of_the_module_binding__(
+        tmp_path, monkeypatch, declaration: str, text: str):
+    monkeypatch.setenv(STRICT_ENV, '1')
+    path = _write(tmp_path, 'edge_annotated_builtin', EDGE_MODULE.replace(
+        'close\n\n\n@script', f'close\n\n{declaration}\n\n\n@script').replace(
+        '    a = getattr(close, "x")', '    a = open + 1.0'))
+    with pytest.raises(PineTypeError) as caught:
+        _compile(path)
+    assert "builtin 'open'" in str(caught.value)
+    assert caught.value.text is not None and caught.value.text.strip() == text
 
 
 def __test_strict_is_off_when_unset__(tmp_path, monkeypatch):
