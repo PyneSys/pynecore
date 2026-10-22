@@ -5,6 +5,7 @@ and every port to be current. A source install without the extension skips the
 native checks.
 """
 import ast
+import functools
 import os
 import sys
 from pathlib import Path
@@ -266,9 +267,54 @@ def main():
     lib.plot(a + b + counter(close) + outer() + hi[1] + lo)
 '''
 
-#: The lowering steps the helper modules exercise natively, each changing the tree
+#: A strategy with source and value inputs, divisions, a remainder, a cast and
+#: comparisons, lowered as a three-state bool module
+__test_helper_STRATEGY = '''"""
+@pyne
+"""
+from pynecore import lib
+from pynecore.lib import script, strategy, input, close, high, low, hl2
+
+
+@script.strategy("parity strategy", overlay=True)
+def main(src=input.source(close, "Source"), length=input.int(5, "Length"),
+         level=input(hl2, "Level")):
+    total = 0.0
+    for i in range(length):
+        total += close[i] / length
+    ratio = high / low
+    ratio /= 2.0
+    half = int(total) % 3
+    if ratio > 1.01 and close >= src:
+        strategy.entry("long", strategy.long, limit=low)
+    if ratio < 0.99 or level != close:
+        strategy.entry("short", strategy.short)
+    strategy.exit("x", "long", qty=1, profit=10, loss=5, trail_points=3)
+    if close[half] == level:
+        strategy.close_all()
+'''
+
+#: The helper modules the lowering checks run: file name, source, three-state bool
+__test_helper_LOWERED = (('native_parity.py', __test_helper_SOURCE, False),
+                         ('native_exports.py', __test_helper_EXPORTS, False),
+                         ('native_slots.py', __test_helper_SLOTS, False),
+                         ('native_strategy.py', __test_helper_STRATEGY, True))
+
+#: The lowering passes the helper modules exercise natively, each changing the tree
 __test_helper_LOWERING_STEPS = ('SecurityDefault', 'ExportOnce', 'UnusedSeriesDetector', 'Series',
-                                'VerifyClosedShift', 'Persistent')
+                                'VerifyClosedShift', 'Persistent', 'ScriptRequirements', 'Input',
+                                'Expression', 'FixLocations')
+
+#: The same in sequential mode, where the rules of the phase run one by one
+__test_helper_SEQUENTIAL_STEPS = ('SecurityDefault', 'ExportOnce', 'UnusedSeriesDetector',
+                                  'Series', 'VerifyClosedShift', 'Persistent',
+                                  'ScriptRequirements', 'Input', 'SafeConvert', 'SafeDivision',
+                                  'FloatTolerance', 'FixLocations')
+
+#: The native calls of the lowering half under the native backend
+__test_helper_LOWERING_BATCHES = (
+    'SecurityDefault+ExportOnce+UnusedSeriesDetector+Series+VerifyClosedShift+Persistent',
+    'ScriptRequirements+Input+Expression', 'FixLocations')
 
 #: The analysis steps after which the tree carries what the type pass stamped
 __test_helper_TYPED_STEPS = ('PineType', 'ImplicitConversion', 'SecuritySlice')
@@ -475,29 +521,34 @@ def __test_typed_tree_crosses_the_bridge__(monkeypatch):
     }
 
 
-def __test_helper_emission(backend: str, monkeypatch) -> str:
-    """The lowered emission of the helper module under a backend."""
+def __test_helper_emission(backend: str, monkeypatch, name: str = 'native_parity.py',
+                           text: str = __test_helper_SOURCE, na_bool: bool = False) -> str:
+    """The lowered emission of a helper module under a backend."""
     monkeypatch.setenv('PYNE_AST_BACKEND', backend)
-    path = Path('native_parity.py').resolve()
-    tree = ast.parse(__test_helper_SOURCE)
+    path = Path(name).resolve()
+    tree = ast.parse(text)
     mode = import_hook._module_mode(tree)[1]
-    analysed = import_hook._analyse_tree(tree, __test_helper_SOURCE, path, mode)
-    lowered, _ = import_hook._lower_tree(analysed, path, mode)
+    analysed = import_hook._analyse_tree(tree, text, path, mode)
+    lowered, _ = import_hook._lower_tree(analysed, path, mode, na_bool=na_bool)
     return ast.dump(lowered, include_attributes=True)
 
 
-def __test_native_backend_emits_what_python_emits__(monkeypatch):
+@pytest.mark.parametrize('sequential', [False, True])
+def __test_native_backend_emits_what_python_emits__(sequential, monkeypatch):
     """The ``native`` backend's emission is the Python backend's, text and locations."""
     __test_helper_require_native()
-    assert (__test_helper_emission('native', monkeypatch)
-            == __test_helper_emission('python', monkeypatch))
+    monkeypatch.setattr(pipeline, '_SEQUENTIAL', sequential)
+    for name, text, na_bool in __test_helper_LOWERED:
+        assert (__test_helper_emission('native', monkeypatch, name, text, na_bool)
+                == __test_helper_emission('python', monkeypatch, name, text, na_bool)), name
 
 
 def __test_typed_steps_run_natively__(monkeypatch):
     """The type pass and the ported steps after it handle the helper module natively, in
     one native call, as does the batch holding the security lowering, rather than
-    declining it to Python."""
+    declining it to Python; the expression phase runs as one unit."""
     __test_helper_require_native()
+    monkeypatch.setattr(pipeline, '_SEQUENTIAL', False)
     answers: dict[str, object] = {}
     run = native.run
 
@@ -511,37 +562,40 @@ def __test_typed_steps_run_natively__(monkeypatch):
     batch = next(key for key in answers if 'ImplicitConversion' in key.split('+'))
     assert 'PineType' in batch.split('+')
     assert isinstance(answers[batch], ast.Module)
-    assert isinstance(answers['+'.join(__test_helper_LOWERING_STEPS)], ast.Module)
     security = [answer for names, answer in answers.items() if 'Security' in names.split('+')]
     assert len(security) == 1 and isinstance(security[0], ast.Module)
+    for batch in __test_helper_LOWERING_BATCHES:
+        assert isinstance(answers[batch], ast.Module), batch
 
 
-def __test_lowering_steps_run_natively__(monkeypatch):
+@pytest.mark.parametrize('sequential', [False, True])
+def __test_lowering_steps_run_natively__(sequential, monkeypatch):
     """Each ported lowering step handles a helper module natively and changes it, so
-    the verify backend compares a rewrite rather than an untouched tree."""
+    the verify backend compares a rewrite rather than an untouched tree: the phase as
+    one unit, and in sequential mode each of its rules."""
     __test_helper_require_native()
     monkeypatch.setenv('PYNE_AST_BACKEND', 'verify')
+    monkeypatch.setattr(pipeline, '_SEQUENTIAL', sequential)
+    steps = __test_helper_SEQUENTIAL_STEPS if sequential else __test_helper_LOWERING_STEPS
     changed: dict[str, bool] = {}
     run = native.run
 
     def recording(names, tree, ctx, layout=None):
         before = native.describe(tree)
         result = run(names, tree, ctx, layout)
-        if names[0] in __test_helper_LOWERING_STEPS:
+        if names[0] in steps:
             assert isinstance(result, ast.Module), names
             changed[names[0]] = changed.get(names[0], False) or native.describe(result) != before
         return result
 
     monkeypatch.setattr(native, 'run', recording)
-    for name, text in (('native_parity.py', __test_helper_SOURCE),
-                       ('native_exports.py', __test_helper_EXPORTS),
-                       ('native_slots.py', __test_helper_SLOTS)):
+    for name, text, na_bool in __test_helper_LOWERED:
         path = Path(name).resolve()
         tree = ast.parse(text)
         mode = import_hook._module_mode(tree)[1]
         analysed = import_hook._analyse_tree(tree, text, path, mode)
-        import_hook._lower_tree(analysed, path, mode)
-    assert changed == dict.fromkeys(__test_helper_LOWERING_STEPS, True)
+        import_hook._lower_tree(analysed, path, mode, na_bool=na_bool)
+    assert changed == dict.fromkeys(steps, True)
 
 
 def __test_stale_port_runs_in_python__(monkeypatch):
@@ -758,3 +812,260 @@ def __test_slot_steps_decline_what_they_cannot_model__():
     layout = ModuleLayout()
     assert native.run(['Persistent'], ast.parse(source), ctx, layout) is None
     assert not layout.scopes
+
+
+#: Modules for the rules of the expression phase. Every name listed beside a module is
+#: typed as given; every other int or float literal, arithmetic expression and
+#: ``int()`` cast is typed a Pine int. A comparison whose left operand is ``exact``
+#: carries ``pine_exact``, one whose left operand is ``inexact`` carries it False
+__test_helper_RULE_SOURCES: tuple[tuple[str, dict[str, str]], ...] = (
+    ('''"""Indexes"""
+from __future__ import annotations
+import os
+
+
+def f(lst, n, a, b, c, y, key, d, m, i, j):
+    x = lst[n] + lst[n + 1] + lst[int(y)] + lst[int(y) + 1] + lst[2.0] + lst[3]
+    x = lst[a:b:c] + lst[:b] + d[key] + m[i, j] + 'abc'[2.0] + lst[-0.0]
+    lst[n] = 1.0
+    z = __state__[3][n] + __state·f__[0][n]
+    for i in range(n):
+        x = lst[i]
+        for i in range(n, 2, *a):
+            x = lst[i]
+    y = lst[i] + float(n) + int(n) + float() + range(n, step=1)
+    for (k, v) in range(n):
+        x = lst[k]
+    for k in other(n):
+        x = lst[k]
+''', {'n': 'i', 'a': 'i', 'b': 'i', 'c': 'i', 'i': 'i', 'j': 'i', 'key': 's'}),
+    ('''from pynecore.lib.ta import range as range
+
+
+def f(n, lst):
+    for i in range(n):
+        x = lst[i]
+''', {'n': 'i', 'i': 'i'}),
+    ('''def range(n):
+    return n
+
+
+def f(n, lst):
+    for i in range(n):
+        x = lst[i]
+    y = int(n)
+''', {'n': 'i', 'i': 'i'}),
+    ('''import pynecore.core.safe_convert as safe_convert
+x = int(a) + a / b
+''', {}),
+    ('''from pynecore.core.safe_convert import native_int as safe_convert
+x = int(a) + a / b
+''', {}),
+    ('''from ..core import safe_convert
+from pynecore.core import safe_convert as sc
+x = int(a) + a / b
+''', {}),
+    ('''"""Divisions"""
+x = a / b
+x /= 2
+obj.attr /= n
+lst[i] /= n
+lst[i:j] /= n
+lst[f()] %= g()
+lst['k'] /= n
+3[n] /= 2
+
+
+class C:
+    y = a / b
+    obj.attr /= n
+
+    def m(self, a, b):
+        return a / b
+
+
+def f(a, b, obj, lst, s, n):
+    c = a / b + 1 / 2 + 1 / 0 + a / 0 + a / 2.0 + a / 1e999 + a / 0.0 + a / True + a / 'x'
+    d = (a + 1) / (b + 2) + a / b + 1 / b + a / (b + 1) + (a + 1) / b + a / s
+    e = lambda: a / b
+    g = [a / b for a in lst] + {a / b for a in lst} + [x for x in (a / b for a in lst)]
+    h = a % b + 'x %s' % a + s % b + f'{a}' % b + {a: a / b for a in lst}
+    obj.attr /= b
+    lst[a] %= b
+    lst[f(a)][g(b)] /= n
+    a /= b
+    a %= b
+    a += b
+
+    class Inner:
+        z = a / b
+
+        def deep(self):
+            return a / b
+
+    @decorate(a / b)
+    def nested(p=a / b) -> a / b:
+        return p / a
+''', {'s': 's', 'a': 'i', 'b': 'f', 'n': 'i'}),
+    ('''"""Comparisons"""
+from __future__ import annotations
+
+
+def f(a, b, c, s, obj):
+    r = a < b, a <= b, a > b >= c, a == b, a != b, g(a) == h(b) != c < obj.x
+    r = a == 'x', a is b, a in b, 1 < a <= 2.5, a < b == c, obj.x != g(), True == a
+    r = exact < a, inexact < a, a < 1, 1 == 2, a != 1.5, obj.x <= obj.y, g() >= a
+    r = a < b < c < g(), [x == y for x in a], lambda q: q != a
+''', {'a': 'f', 'b': 'f', 'c': 'i'}),
+)
+
+
+def __test_helper_stamped(source: str, names: dict[str, str]) -> ast.Module:
+    """A rule module parsed and stamped (see ``__test_helper_RULE_SOURCES``)."""
+    from pynecore.transformers.pine_type_rules import INT, set_ty
+
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in names:
+            set_ty(node, names[node.id])
+        elif isinstance(node, ast.BinOp) or isinstance(node, ast.Call) \
+                and isinstance(node.func, ast.Name) and node.func.id == 'int':
+            set_ty(node, INT)
+        elif isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            set_ty(node, INT)
+        elif isinstance(node, ast.Compare) and isinstance(node.left, ast.Name):
+            if node.left.id == 'exact':
+                setattr(node, 'pine_exact', True)
+            elif node.left.id == 'inexact':
+                setattr(node, 'pine_exact', False)
+    return tree
+
+
+def __test_helper_check_native(name: str, tree: ast.Module, ctx: pipeline.PipelineContext,
+                               python) -> None:
+    """Run a native unit and its Python reference on the same input: the native one
+    must handle it and produce Python's tree."""
+    answer = native.run([name], tree, ctx)
+    assert isinstance(answer, ast.Module), (name, answer)
+    native.verify(name, python(tree, ctx), answer, ctx)
+
+
+@pytest.mark.parametrize('sequential', [False, True])
+def __test_expression_rules_match_python__(sequential):
+    """Each rule of the expression phase, and the phase, natively equal Python's over
+    modules reaching every branch, under every context the rules read."""
+    __test_helper_require_native()
+    phase = next(step for step in pipeline.LOWERING if isinstance(step, pipeline.Phase))
+    for source, names in __test_helper_RULE_SOURCES:
+        for pyne_mode in (None, 'lib'):
+            for user_code in (True, False):
+                for na_bool in (False, True):
+                    ctx = pipeline.PipelineContext(
+                        path=Path('rules.py'), pyne_mode=pyne_mode, user_code=user_code,
+                        na_bool=na_bool, sequential=sequential)
+                    for rule in phase.rules:
+                        __test_helper_check_native(
+                            rule.name, __test_helper_stamped(source, names), ctx,
+                            lambda tree, c, rule=rule: rule.make(c).visit(tree))
+                    units = pipeline._units(phase, ctx)
+                    __test_helper_check_native(
+                        phase.name, __test_helper_stamped(source, names), ctx,
+                        lambda tree, c: functools.reduce(
+                            lambda module, unit: unit[1](module, c), units, tree))
+
+
+#: Modules for the strategy requirements and the input pass
+__test_helper_STEP_SOURCES = (
+    '''"""Strategy"""
+from pynecore.lib import script, strategy
+
+
+@script.strategy('S', _broker_requirements=None, overlay=True)
+def main():
+    strategy.entry('a', strategy.long, limit=1, stop=2)
+    strategy.entry('b', strategy.direction.short)
+    strategy.entry('c', direction=lib.strategy.short)
+    strategy.entry('d', strategy.short, direction=strategy.long)
+    strategy.entry(*args)
+    lib.strategy.order('e', strategy.long, stop=1)
+    strategy.order('f', direction=lib.strategy.direction.short, limit=1)
+    strategy.exit('x', limit=1, stop=2, qty=1)
+    strategy.exit('y', profit=1, trail_offset=2, **extra)
+    strategy.exit('z', loss=1, trail_price=1)
+    strategy.close('a')
+    lib.strategy.close_all()
+    strategy.cancel('a')
+    other.entry('q')
+    x.strategy.exit('q', limit=1)
+
+    @lib.script.strategy('inner')
+    def inner():
+        pass
+''',
+    '''from pynecore.core.broker.models import ScriptRequirements
+from pynecore import lib
+
+
+@lib.script.strategy('S')
+async def main():
+    lib.strategy.exit('x', limit=1)
+''',
+    '''from pynecore.lib import script
+
+
+@script.indicator('I')
+def main():
+    strategy.entry('a')
+''',
+    '''@script.strategy('S')
+def main():
+    pass
+''',
+    '''"""Inputs"""
+from __future__ import annotations
+from pynecore import lib
+
+
+def main(a, src=input.source(close), x=lib.input(lib.close), y=lib.input.float(1.0),
+         z=input(hl2), w=input(5), v=lib.input.source('high'), u=input.source(defval=lib.low),
+         t=input.source(''), s=foo.input(1), r=x.y.input(1), q=input.int(defval=close),
+         p=input.source(0), o=input(lib.na), n=input(defval=volume), m=lib.input(lib.time)):
+    def inner(p=input.source(open)):
+        pass
+
+    f = lambda k=input.source(close): k
+
+    async def coro(m=input.source(close)):
+        pass
+
+
+def main(a=input.source(volume), *, kw=input.source(close)):
+    pass
+
+
+def posonly(a=input.source(close), /, b=input.source(high)):
+    pass
+
+
+g = lambda k=input.source(close): k
+
+
+class C:
+    def method(self, s=lib.input.source(lib.close)):
+        pass
+''',
+    '''def main(length=input.int(5)):
+    pass
+''',
+)
+
+
+def __test_requirements_and_inputs_match_python__():
+    """ScriptRequirements and Input natively equal Python's over modules reaching every
+    branch."""
+    __test_helper_require_native()
+    steps = {step.name: step for step in pipeline.LOWERING if isinstance(step, pipeline.Step)}
+    ctx = pipeline.PipelineContext(path=Path('steps.py'), pyne_mode=None)
+    for source in __test_helper_STEP_SOURCES:
+        for name in ('ScriptRequirements', 'Input', 'FixLocations'):
+            __test_helper_check_native(name, ast.parse(source), ctx, steps[name].run)

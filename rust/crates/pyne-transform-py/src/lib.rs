@@ -194,10 +194,11 @@ impl pyne_transform::Host for PyHost<'_> {
 ///
 /// :param tree: The module.
 /// :param steps: Step names as ``pipeline.py`` declares them.
-/// :param context: ``path``, ``pyne_mode``, ``source``, ``user_code``, ``host``, and
-///     ``slot_layout``: the pipeline's ``ModuleLayout``, read when a step of the run
-///     uses it (a fresh one when the context has none). The layout such a run leaves
-///     is put into the context as ``slot_layout_result``, a new ``ModuleLayout``.
+/// :param context: ``path``, ``pyne_mode``, ``source``, ``user_code``, ``na_bool``,
+///     ``sequential``, ``host``, and ``slot_layout``: the pipeline's ``ModuleLayout``,
+///     read when a step of the run uses it (a fresh one when the context has none).
+///     The layout such a run leaves is put into the context as
+///     ``slot_layout_result``, a new ``ModuleLayout``.
 /// :return: A new module object; the input tree and layout are left as they were.
 /// :raises Unsupported: When a step meets something its port does not handle.
 /// :raises Rejected: When a step finds the module invalid.
@@ -245,6 +246,14 @@ fn run<'py>(
             Some(value) => value.extract()?,
             None => true,
         },
+        na_bool: match get("na_bool")? {
+            Some(value) => value.extract()?,
+            None => false,
+        },
+        sequential: match get("sequential")? {
+            Some(value) => value.extract()?,
+            None => false,
+        },
         host: &host,
         slot_layout: RefCell::new(layout),
     };
@@ -281,6 +290,18 @@ fn layout_steps() -> Vec<&'static str> {
     pyne_transform::SLOT_LAYOUT_STEPS.to_vec()
 }
 
+/// Per native phase, its rules in order, each with its ``user_code_only``.
+#[pyfunction]
+fn phases() -> std::collections::HashMap<&'static str, Vec<(&'static str, bool)>> {
+    pyne_transform::PHASES
+        .iter()
+        .map(|phase| {
+            let rules = phase.rules.iter().map(|rule| (rule.name, rule.user_code_only)).collect();
+            (phase.name, rules)
+        })
+        .collect()
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -292,6 +313,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(steps, m)?)?;
     m.add_function(wrap_pyfunction!(layout_steps, m)?)?;
+    m.add_function(wrap_pyfunction!(phases, m)?)?;
     m.add_function(wrap_pyfunction!(ported_json, m)?)?;
     m.add_function(wrap_pyfunction!(rules::call, m)?)?;
     m.add_function(wrap_pyfunction!(qualifier::call, m)?)?;

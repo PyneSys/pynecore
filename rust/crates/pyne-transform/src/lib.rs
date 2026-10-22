@@ -13,6 +13,7 @@ pub mod data;
 pub mod dynamic_default_guard;
 pub mod fdlibm;
 pub mod node_ids;
+pub mod phase;
 pub mod pine_qualifier;
 pub mod pine_type_rules;
 pub mod pine_type_table;
@@ -209,6 +210,10 @@ pub struct Context<'h> {
     pub source: String,
     /// Whether the module is user code rather than one of pynecore's own lib modules
     pub user_code: bool,
+    /// Whether the module keeps Pine's three-state bool (`FloatTolerance`)
+    pub na_bool: bool,
+    /// Whether the rules of a phase run as separate passes instead of in one traversal
+    pub sequential: bool,
     /// Answers what the tree does not say
     pub host: &'h dyn Host,
     /// The shared slot allocator of the lowering half (see [`slot_layout`]); the
@@ -261,6 +266,13 @@ pub static STEPS: &[Step] = &[
     Step { name: "Series", run: steps::series::run },
     Step { name: "VerifyClosedShift", run: steps::security_closed_shift_check::run },
     Step { name: "Persistent", run: steps::persistent::run },
+    Step { name: "ScriptRequirements", run: steps::script_requirements::run },
+    Step { name: "Input", run: steps::input::run },
+    // The rules of the phases, each on its own (sequential mode)
+    Step { name: "SafeConvert", run: steps::safe_convert::run },
+    Step { name: "SafeDivision", run: steps::safe_division::run },
+    Step { name: "FloatTolerance", run: steps::float_tolerance::run },
+    Step { name: "FixLocations", run: steps::locations::run },
 ];
 
 /// The steps whose port reads or fills the run's [`Context::slot_layout`]. A host
@@ -271,6 +283,19 @@ pub static SLOT_LAYOUT_STEPS: &[&str] = &["Series", "VerifyClosedShift", "Persis
 /// Whether a run of these steps reads or fills the slot layout.
 pub fn uses_slot_layout(names: &[&str]) -> bool {
     names.iter().any(|name| SLOT_LAYOUT_STEPS.contains(name))
+}
+
+/// Every phase with a native port: its rules run in one traversal under the
+/// phase's name. Each rule is a step of [`STEPS`] as well, ported from its own
+/// module, so a host runs the phase natively only while every rule is current.
+pub static PHASES: &[phase::Phase] = &[phase::Phase {
+    name: "Expression",
+    rules: &[steps::safe_convert::RULE, steps::safe_division::RULE, steps::float_tolerance::RULE],
+}];
+
+/// The native port of a phase, if there is one.
+pub fn phase(name: &str) -> Option<&'static phase::Phase> {
+    PHASES.iter().find(|phase| phase.name == name)
 }
 
 /// The steps whose port reads the module's
@@ -289,7 +314,7 @@ pub fn step(name: &str) -> Option<&'static Step> {
     STEPS.iter().find(|step| step.name == name)
 }
 
-/// Run named steps in order.
+/// Run named steps and phases in order.
 pub fn run_steps(
     ast: &mut Ast,
     mut module: NodeId,
@@ -297,9 +322,11 @@ pub fn run_steps(
     ctx: &Context<'_>,
 ) -> Result<NodeId, Error> {
     for name in names {
-        let step =
-            step(name).ok_or_else(|| Error::Unsupported(format!("no native step {name}")))?;
-        module = (step.run)(ast, module, ctx)?;
+        module = match (step(name), phase(name)) {
+            (Some(step), _) => (step.run)(ast, module, ctx)?,
+            (None, Some(phase)) => phase.run(ast, module, ctx)?,
+            (None, None) => return Err(Error::Unsupported(format!("no native step {name}"))),
+        };
     }
     Ok(module)
 }

@@ -3,7 +3,6 @@ import ast
 import os
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +12,7 @@ from pynecore.core.script_runner import ScriptRunner
 from pynecore.transformers import native
 from pynecore.transformers.export_capture import ExportCaptureTransformer
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
+from pynecore.transformers.pipeline import PipelineContext
 from pynecore.types.ohlcv import OHLCV
 
 
@@ -25,8 +25,7 @@ getObject = Exported()
 
 
 #: The pipeline context the native step is run with: a module without a source path
-NATIVE_CONTEXT = SimpleNamespace(path=Path('probe.py'), pyne_mode=None, source='', user_code=True,
-                                 analyse=None, pipeline_hash='')
+NATIVE_CONTEXT = PipelineContext(path=Path('probe.py'), pyne_mode=None)
 
 
 def check(source):

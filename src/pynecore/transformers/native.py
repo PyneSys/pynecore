@@ -24,6 +24,10 @@ sources as they are now is computed here. A Python edit that is not yet ported
 therefore takes the native step out of use -- the step runs in Python, with one
 warning per process -- instead of letting the two drift apart silently.
 
+A :class:`~pynecore.transformers.pipeline.Phase` runs natively as one unit under
+its own name, the rules that apply to the module in one traversal, while each of
+its rules is current; in sequential mode each rule runs as a step of its own.
+
 A native step that meets something its port does not handle raises
 ``Unsupported``; the step then runs in Python. Neither case changes the result,
 only where it is computed. A native step that finds the module invalid raises
@@ -36,6 +40,7 @@ import hashlib
 import json
 import os
 import sys
+from collections.abc import Iterable
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
@@ -57,8 +62,8 @@ try:
 except ImportError:
     _native = None
 
-__all__ = ['available', 'backend', 'current_steps', 'layout_steps', 'source_digest', 'run',
-           'verify', 'verify_rejection', 'Rejection', 'NativeMismatch']
+__all__ = ['available', 'backend', 'current_steps', 'current_phases', 'layout_steps',
+           'source_digest', 'run', 'verify', 'verify_rejection', 'Rejection', 'NativeMismatch']
 
 _TRANSFORMERS = Path(__file__).parent
 _PACKAGE = _TRANSFORMERS.parent
@@ -188,6 +193,27 @@ def layout_steps() -> frozenset[str]:
     return frozenset(_native.layout_steps())
 
 
+def current_phases(phases: Iterable[Any]) -> frozenset[str]:
+    """The phases that run natively as one unit.
+
+    A phase does while the native phase of its name declares the same rules, in the
+    same order and with the same ``user_code_only``, and every rule's port is
+    current (see :func:`current_steps`). A rule is a native step of its own as
+    well: in sequential mode it runs alone.
+
+    :param phases: The pipeline's phases (``pipeline.Phase``).
+    :return: The names of those that run natively.
+    """
+    if _native is None:
+        return frozenset()
+    declared = _native.phases()
+    current = current_steps()
+    return frozenset(
+        phase.name for phase in phases
+        if declared.get(phase.name) == [(rule.name, rule.user_code_only) for rule in phase.rules]
+        and all(rule.name in current for rule in phase.rules))
+
+
 class _Host:
     """What a native step asks the interpreter, answered by the very functions the
     Python step uses, at the moment the Python step would use them."""
@@ -283,7 +309,8 @@ class _Host:
 
 def _context(ctx: Any) -> dict[str, Any]:
     return {'path': str(ctx.path), 'pyne_mode': ctx.pyne_mode, 'source': ctx.source,
-            'user_code': ctx.user_code, 'host': _Host(ctx.analyse, ctx.pipeline_hash),
+            'user_code': ctx.user_code, 'na_bool': ctx.na_bool, 'sequential': ctx.sequential,
+            'host': _Host(ctx.analyse, ctx.pipeline_hash),
             'slot_layout': getattr(ctx, 'slot_layout', None)}
 
 
@@ -304,7 +331,8 @@ def run(names: list[str], tree: ast.Module, ctx: Any,
     A step of :func:`layout_steps` reads ``ctx.slot_layout`` as the Python steps
     would have left it, and fills a native copy of it.
 
-    :param names: Step names, each in :func:`current_steps`.
+    :param names: Step names, each in :func:`current_steps`, and phase names, each in
+        :func:`current_phases` (a phase runs the rules that apply to the module).
     :param tree: The module; it is not changed.
     :param ctx: The pipeline context; its slot layout is not changed either.
     :param layout: Where the slot layout the steps left is written when the steps

@@ -30,7 +30,7 @@ fn is_bool_valued(ast: &Ast, id: NodeId) -> bool {
 }
 
 /// Python's truth value of a stamped attribute; None for an object the step does not look into.
-fn truthy(value: &Value) -> Option<bool> {
+pub(crate) fn truthy(value: &Value) -> Option<bool> {
     Some(match value {
         Value::None => false,
         Value::Bool(flag) => *flag,
@@ -231,6 +231,8 @@ mod tests {
             pyne_mode: None,
             source: String::new(),
             user_code: true,
+            na_bool: false,
+            sequential: false,
             host: &NoHost,
             slot_layout: Default::default(),
         };

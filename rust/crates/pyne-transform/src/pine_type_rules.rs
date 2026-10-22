@@ -269,6 +269,17 @@ pub fn get_ty(ast: &Ast, id: NodeId) -> &str {
     extra_str(ast, id, TY_ATTR).unwrap_or(UNKNOWN)
 }
 
+/// A node's Pine type as [`get_ty`] reads it, for a pass that carries the stamp
+/// over to another node: a stamp that is no string is `Unsupported`, where the
+/// Python pass would carry that very value.
+pub fn ty_stamp(ast: &Ast, id: NodeId) -> Result<&str, Unsupported> {
+    match ast.extra(id, TY_ATTR) {
+        None => Ok(UNKNOWN),
+        Some(Value::Str(ty)) => Ok(ty),
+        Some(other) => Err(Unsupported(format!("a {TY_ATTR} stamp {other:?}"))),
+    }
+}
+
 /// Stamp a node's Pine type (`set_ty`).
 pub fn set_ty(ast: &mut Ast, id: NodeId, ty: &str) -> NodeId {
     ast.set_extra(id, TY_ATTR, Value::Str(ty.to_string()));

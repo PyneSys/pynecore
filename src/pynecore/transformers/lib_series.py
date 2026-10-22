@@ -3,13 +3,7 @@ from typing import cast
 
 from . import ast_walk
 from .lib_series_attrs import NON_SERIES_LIB_ATTRS
-
-# Builtin price series accepted by generic ``input()`` as source names.
-BUILTIN_PRICE_SERIES = frozenset({
-    'open', 'high', 'low', 'close', 'volume',
-    'bid', 'ask',
-    'hl2', 'hlc3', 'ohlc4', 'hlcc4',
-})
+from .price_series import BUILTIN_PRICE_SERIES
 
 # Builtin series that are always global (declared in main, not nested functions),
 # mapped to the element type their history buffer stores.

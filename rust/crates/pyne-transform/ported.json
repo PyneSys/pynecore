@@ -65,7 +65,7 @@
   },
   "LibrarySeries": {
     "module": "lib_series",
-    "digest": "f950d04e3f8d13544eae9df6afab85739ff901b91b77bf2bafa82d8fbdf09f88"
+    "digest": "87db356305983ddff67a4a82fec962b15b202125c5a4e79509ef7ab151fa0f78"
   },
   "ModuleProperty": {
     "module": "module_property",
@@ -110,5 +110,29 @@
   "Persistent": {
     "module": "persistent",
     "digest": "fe0796a9cd474735a2db9b082d689304b7d37aa21f830b9d083166d0d905d3ca"
+  },
+  "ScriptRequirements": {
+    "module": "script_requirements",
+    "digest": "6c4f1bd9db9b6fd743b9ab7dd079fee4ac3e68d04b62f9490d0bef7018e78671"
+  },
+  "Input": {
+    "module": "input_transformer",
+    "digest": "3a25a5ecd4a3d6e496b0b09d489c580d558a42d7bfbe2c07544f5e7f6998defb"
+  },
+  "SafeConvert": {
+    "module": "safe_convert_transformer",
+    "digest": "973e8f8412e46c5b7d52c9c48451d4406a76c0fba5501bf4c0dbeb8794694234"
+  },
+  "SafeDivision": {
+    "module": "safe_division_transformer",
+    "digest": "56a973b5c989090c936887a6755ea291d0d3198257dfb7b0bf6681dcdeffafd8"
+  },
+  "FloatTolerance": {
+    "module": "float_tolerance",
+    "digest": "a1d4d46cc4164f84cc615ac4d8619a87e119d1f40ad5d6acc9af976c3982ba04"
+  },
+  "FixLocations": {
+    "module": "locations",
+    "digest": "04f5fd0d9f2058047732518b71fba03f16cd4b1cbe91ca5ab542140b326001f5"
   }
 }

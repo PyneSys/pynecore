@@ -154,9 +154,22 @@ pointers.
 ## Lowering steps
 
 `pipeline.run_steps` dispatches a plain `Step` of `LOWERING` exactly as one of
-`ANALYSIS`: a `Phase` (its `RuleStep`s are not ported) runs in Python and closes
-the native batch before it. A step that reads `ctx.slot_layout` needs the
-layout across the boundary first; the first three steps do not read it.
+`ANALYSIS`. A `Phase` is dispatched the same way, as one unit under the phase's
+name (`Expression`): `crates/pyne-transform/src/phase.rs` ports `phase.py` (one
+post-order traversal, `enter` hooks in rule order, then the children, then the
+`leave` hooks, each handed what the previous one answered, the function-body
+hooks around a `def`'s `body`), and `PHASES` declares each phase's rules with
+their `user_code_only`. Every rule is also a step of `STEPS`, ported from its own
+module with its own `ported.json` entry. `native.current_phases` lets a phase run
+natively while the native phase declares the same rules (names, order,
+`user_code_only`) and every rule is current; otherwise the phase runs in Python.
+In sequential mode (`PYNE_AST_SEQUENTIAL`, `PipelineContext.sequential`) each rule
+is a unit of its own, so `verify` compares every rule separately; otherwise it
+compares the phase's result. The rule constructor arguments come from the context:
+`pyne_mode` (`lib`), `user_code` (`pine_mod`) and `na_bool`, which crosses the
+bridge with `sequential` (a phase name run with `sequential` runs its rules as
+separate passes, for a host without Python). The steps that read
+`ctx.slot_layout` get the layout across the boundary as described below.
 
 **The slot layout.** `crates/pyne-transform/src/slot_layout.rs` mirrors
 `slot_layout.py` (`ModuleLayout`, `ScopeLayout`, `_Slot` as `Slot` with a
@@ -205,3 +218,15 @@ request from `ModuleLayout::new(pyne_mode == "lib")`, as the import hook does.
    in a scope the pass never entered (a `KeyError` in Python), and an int
    persistent initializer beyond 64 bits (`float()` of a Python int).
    `Rejected`: a Series or Persistent declaration outside a function.
+3. **ScriptRequirements**, **Input**, the `Expression` phase (**SafeConvert**,
+   **SafeDivision**, **FloatTolerance**) and **FixLocations**. Ported as
+   `steps/script_requirements.rs`, `steps/input.rs`, `steps/safe_convert.rs`,
+   `steps/safe_division.rs`, `steps/float_tolerance.rs` and `steps/locations.rs`
+   (`pyne_ast::locations`); none reads the `PineTypeTable` or the slot layout.
+   `BUILTIN_PRICE_SERIES` moved into the leaf `price_series.py`, so Input's closure
+   no longer holds `lib_series.py`; FloatTolerance's holds `core/pine_compare.py`
+   (`EPSILON`), as PineTruthiness's does. `Unsupported`: a `_pine_ty` stamp that is
+   no string where a rule carries it over to a new node, an int index literal
+   beyond `i64` (`lst[1e300]` typed int), an opaque `pine_exact` stamp, a leave hook
+   handed a list by an earlier rule, and a node with a line but no column for
+   `fix_locations`.

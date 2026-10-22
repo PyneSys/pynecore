@@ -1,7 +1,7 @@
 import ast
 
 from . import ast_walk
-from .lib_series import BUILTIN_PRICE_SERIES
+from .price_series import BUILTIN_PRICE_SERIES
 
 
 class InputTransformer(ast_walk.NodeVisitor):

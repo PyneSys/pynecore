@@ -502,6 +502,8 @@ mod tests {
             pyne_mode: None,
             source: String::new(),
             user_code: true,
+            na_bool: false,
+            sequential: false,
             host: &NoHost,
             slot_layout: Default::default(),
         }

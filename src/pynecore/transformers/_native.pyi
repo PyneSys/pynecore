@@ -47,6 +47,10 @@ def ported_json() -> str:
     """The ``ported.json`` manifest the extension was built with."""
 
 
+def phases() -> dict[str, list[tuple[str, bool]]]:
+    """Per native phase, its rules in order, each with its ``user_code_only``."""
+
+
 def _rules(name: str, *args: Any) -> Any:
     """One function of the native ``pine_type_rules`` port, by its Python name (tests only)."""
 

@@ -34,7 +34,8 @@ a native step reads or builds) is a `Value::Native`. The traversal helpers in
 
 - `python` (default): every step runs in Python.
 - `native`: a step with a current native port runs natively; consecutive native
-  steps run in one call.
+  steps run in one call. A phase runs natively as one unit while every rule of it
+  is current (in sequential mode, rule by rule).
 - `verify`: every step runs in Python, and each step with a current port also runs
   natively on the same input; a difference raises `NativeMismatch`.
 
