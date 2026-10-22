@@ -505,6 +505,7 @@ mod tests {
             na_bool: false,
             sequential: false,
             security_slice_disabled: false,
+            emit_layout: true,
             host: &NoHost,
             slot_layout: Default::default(),
         }

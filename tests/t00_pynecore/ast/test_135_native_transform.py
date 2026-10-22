@@ -14,6 +14,7 @@ import pytest
 
 from pynecore.core import import_hook
 from pynecore.transformers import native, pipeline
+from pynecore.transformers.function_isolation import NON_TRANSFORMABLE_FUNCTIONS
 from pynecore.transformers.slot_layout import ModuleLayout
 
 #: A module exercising every branch of the ported steps
@@ -309,19 +310,21 @@ __test_helper_LOWERED = (('native_parity.py', __test_helper_SOURCE, False),
 #: The lowering passes the helper modules exercise natively, each changing the tree
 __test_helper_LOWERING_STEPS = ('SecurityDefault', 'ExportOnce', 'UnusedSeriesDetector', 'Series',
                                 'VerifyClosedShift', 'Persistent', 'CallInline',
-                                'ScriptRequirements', 'Input', 'Expression', 'FixLocations')
+                                'FunctionIsolation', 'ScriptRequirements', 'Input', 'Expression',
+                                'ApplyLayout', 'FixLocations')
 
 #: The same in sequential mode, where the rules of the phase run one by one
 __test_helper_SEQUENTIAL_STEPS = ('SecurityDefault', 'ExportOnce', 'UnusedSeriesDetector',
                                   'Series', 'VerifyClosedShift', 'Persistent', 'CallInline',
-                                  'ScriptRequirements', 'Input', 'SafeConvert', 'SafeDivision',
-                                  'FloatTolerance', 'FixLocations')
+                                  'FunctionIsolation', 'ScriptRequirements', 'Input',
+                                  'SafeConvert', 'SafeDivision', 'FloatTolerance', 'ApplyLayout',
+                                  'FixLocations')
 
-#: The native calls of the lowering half under the native backend
+#: The native calls of the lowering half under the native backend: all of it, in one
 __test_helper_LOWERING_BATCHES = (
     'SecurityDefault+ExportOnce+UnusedSeriesDetector+Series+VerifyClosedShift+Persistent'
-    '+CallInline',
-    'ScriptRequirements+Input+Expression+FinalizeCloneDefaults', 'FixLocations')
+    '+CallInline+FunctionIsolation+ScriptRequirements+Input+Expression+FinalizeCloneDefaults'
+    '+ApplyLayout+FixLocations',)
 
 #: The analysis steps after which the tree carries what the type pass stamped
 __test_helper_TYPED_STEPS = ('PineType', 'ImplicitConversion', 'SecuritySlice')
@@ -412,8 +415,8 @@ def __test_native_export_capture_reads_enum_sources__(tmp_path, monkeypatch):
     answers = []
     run = native.run
 
-    def recording(names, tree, ctx, layout=None):
-        answer = run(names, tree, ctx, layout)
+    def recording(names, tree, ctx, layout=None, table=False):
+        answer = run(names, tree, ctx, layout, table)
         if names == ['ExportCapture']:
             answers.append(answer)
         return answer
@@ -559,8 +562,8 @@ def __test_typed_steps_run_natively__(monkeypatch):
     answers: dict[str, object] = {}
     run = native.run
 
-    def recording(names, tree, ctx, layout=None):
-        result = run(names, tree, ctx, layout)
+    def recording(names, tree, ctx, layout=None, table=False):
+        result = run(names, tree, ctx, layout, table)
         answers['+'.join(names)] = result
         return result
 
@@ -587,9 +590,9 @@ def __test_lowering_steps_run_natively__(sequential, monkeypatch):
     changed: dict[str, bool] = {}
     run = native.run
 
-    def recording(names, tree, ctx, layout=None):
+    def recording(names, tree, ctx, layout=None, table=False):
         before = native.describe(tree)
-        result = run(names, tree, ctx, layout)
+        result = run(names, tree, ctx, layout, table)
         if names[0] in steps:
             assert isinstance(result, ast.Module), names
             changed[names[0]] = changed.get(names[0], False) or native.describe(result) != before
@@ -629,7 +632,8 @@ def __test_native_rejection_matches_python__(backend, monkeypatch):
 
 
 #: The steps that read or fill the slot layout, in pipeline order
-__test_helper_SLOT_STEPS = ('Series', 'VerifyClosedShift', 'Persistent')
+__test_helper_SLOT_STEPS = ('Series', 'VerifyClosedShift', 'Persistent', 'FunctionIsolation',
+                            'ApplyLayout')
 
 #: Modules for the slot steps alone, as the lowering half meets them, each reaching
 #: branches the pipeline helpers do not: Series-annotated parameters of every kind and
@@ -798,6 +802,13 @@ def __test_slot_steps_match_python__(name):
     answer = native.run([step.name for step in steps], ast.parse(source), batch, batch.slot_layout)
     assert isinstance(answer, ast.Module)
     assert native.describe(answer, batch.slot_layout) == native.describe(tree, ctx.slot_layout)
+
+
+def __test_isolation_calls_the_same_callees_plainly__():
+    """The native isolation step's list of the callees it calls plainly is Python's."""
+    __test_helper_require_native()
+    assert native._native is not None
+    assert sorted(native._native.plain_callees()) == sorted(NON_TRANSFORMABLE_FUNCTIONS)
 
 
 def __test_slot_steps_reject_what_python_rejects__():

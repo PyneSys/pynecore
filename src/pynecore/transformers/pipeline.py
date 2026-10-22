@@ -375,10 +375,10 @@ def _run_native(batch: list[_Unit], tree: ast.Module, ctx: PipelineContext) -> a
     units = list(batch)
     batch.clear()
     names = [name for name, _ in units]
-    # The layout the native steps leave replaces the pipeline's, as the Python
-    # steps would have filled it
+    # The layout and the type table the native steps leave replace the pipeline's,
+    # as the Python steps would have filled them
     result = _run('+'.join(names) + ' (native)', ctx, native.run, names, tree, ctx,
-                  ctx.slot_layout)
+                  ctx.slot_layout, True)
     if isinstance(result, ast.Module):
         return result
     for name, run in units:

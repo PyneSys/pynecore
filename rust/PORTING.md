@@ -264,3 +264,33 @@ request from `ModuleLayout::new(pyne_mode == "lib")`, as the import hook does.
    string nor `None`, and a literal comparison with an int beyond 64 bits.
 5. **FinalizeCloneDefaults**. Ported in `steps/security_slice/mod.rs` with the step
    it finishes; it shares SecuritySlice's module and digest.
+6. **FunctionIsolation** and **ApplyLayout**. Ported as `steps/function_isolation.rs`
+   and `steps/layout_emit.rs`; both read and fill the slot layout, and
+   FunctionIsolation is the first reader of the `PineTypeTable`
+   (`TYPE_TABLE_READERS`): the routes of imported callees extend the table's
+   `deps`. The native backend then writes the table the steps left back into the
+   module's own table object (`native.run(..., table=True)`), which the loader
+   holds and bakes. `emit_layout` is a context input (`Context::emit_layout`);
+   ApplyLayout hands the module back untouched without it. The isolation step was
+   made hermetic first, in Python with the same emission: a Pyne module's lowering
+   publishes how a call through each of its module-level names is routed
+   (`ModuleInterface.call_routes`, from `module_interface.call_plan` and the slot
+   layout) and where the imports it binds lead (`.reexports`), both covered by the
+   routes digest, and the isolation reads them through
+   `Host::call_interface` (`module_interface.lookup(..., settled=True)`) instead of
+   importing the module. Builtins, keywords and the standard library are the
+   generated `python_names.json` (`scripts/python_names_collector.py`, the union
+   over the supported interpreters; `test_143`); the lib routes come from the
+   compiled `routes` section (`Host::lib_route`). A module that publishes no
+   interface (plain Python, pynecore's own modules, a package's `__init__`, a Pyne
+   module without settled routes) is still classified by the object it binds,
+   through `Host::object_route` (`function_isolation.classify_imported`); the WASM
+   host answers that `Unsupported`, as it answers every interpreter question. The
+   dependency tracking asks `Host::source_key` and `Host::source_record`.
+   `NON_TRANSFORMABLE_FUNCTIONS` is mirrored in `function_isolation_plain.in`,
+   held equal by `test_135`. `Unsupported`: a callee copy the reparse fallback
+   would normalize (non-ASCII text), a close call in a module without a
+   `_module_file_path` or without a location, a stamp of an unexpected shape
+   (`_pine_pin`, `_pine_vector`, `_pine_varying`, `_pine_series_len`, a type that
+   is no string), a route word outside the five, and any failing host answer.
+   `Rejected`: a stateful call at module level.

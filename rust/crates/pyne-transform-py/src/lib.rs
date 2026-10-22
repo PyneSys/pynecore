@@ -188,6 +188,47 @@ impl pyne_transform::Host for PyHost<'_> {
     fn is_stdlib(&self, module: &str) -> Result<bool, pyne_ast::Unsupported> {
         self.ask("is_stdlib", (module,))
     }
+
+    fn lib_route(&self, path: &str) -> Result<Option<String>, pyne_ast::Unsupported> {
+        self.ask("lib_route", (path,))
+    }
+
+    fn call_interface(
+        &self,
+        path: &str,
+        settled: bool,
+    ) -> Result<Option<pyne_transform::pine_type_table::CallInterface>, pyne_ast::Unsupported> {
+        let text: Option<String> = self.ask("interface", (path, settled))?;
+        text.map(|text| {
+            pyne_transform::pine_type_table::CallInterface::from_json(&text)
+                .map_err(|err| pyne_ast::Unsupported(format!("interface of {path}: {err}")))
+        })
+        .transpose()
+    }
+
+    fn object_route(
+        &self,
+        module: &str,
+        names: &[String],
+        star: bool,
+    ) -> Result<(String, Vec<Option<String>>), pyne_ast::Unsupported> {
+        self.ask("object_route", (module, names.to_vec(), star))
+    }
+
+    fn source_key(&self, path: &str) -> Result<(String, bool), pyne_ast::Unsupported> {
+        self.ask("source_key", (path,))
+    }
+
+    fn source_record(
+        &self,
+        path: &str,
+    ) -> Result<Option<pyne_transform::pine_type_table::DepRecord>, pyne_ast::Unsupported> {
+        let record: Option<(String, i64, i64, String, String)> =
+            self.ask("source_record", (path,))?;
+        Ok(record.map(|(path, mtime_ns, size, digest, routes)| {
+            pyne_transform::pine_type_table::DepRecord { path, mtime_ns, size, digest, routes }
+        }))
+    }
 }
 
 /// Run native steps over a module, in order.
@@ -195,7 +236,8 @@ impl pyne_transform::Host for PyHost<'_> {
 /// :param tree: The module.
 /// :param steps: Step names as ``pipeline.py`` declares them.
 /// :param context: ``path``, ``pyne_mode``, ``source``, ``user_code``, ``na_bool``,
-///     ``sequential``, ``security_slice_disabled``, ``host``, and ``slot_layout``: the pipeline's ``ModuleLayout``,
+///     ``sequential``, ``security_slice_disabled``, ``emit_layout``, ``host``, and
+///     ``slot_layout``: the pipeline's ``ModuleLayout``,
 ///     read when a step of the run uses it (a fresh one when the context has none).
 ///     The layout such a run leaves is put into the context as
 ///     ``slot_layout_result``, a new ``ModuleLayout``.
@@ -258,6 +300,10 @@ fn run<'py>(
             Some(value) => value.extract()?,
             None => false,
         },
+        emit_layout: match get("emit_layout")? {
+            Some(value) => value.extract()?,
+            None => true,
+        },
         host: &host,
         slot_layout: RefCell::new(layout),
     };
@@ -294,6 +340,13 @@ fn layout_steps() -> Vec<&'static str> {
     pyne_transform::SLOT_LAYOUT_STEPS.to_vec()
 }
 
+/// The callees the native ``FunctionIsolation`` calls plainly
+/// (``function_isolation.NON_TRANSFORMABLE_FUNCTIONS``).
+#[pyfunction]
+fn plain_callees() -> Vec<&'static str> {
+    pyne_transform::steps::function_isolation::NON_TRANSFORMABLE_FUNCTIONS.to_vec()
+}
+
 /// Per native phase, its rules in order, each with its ``user_code_only``.
 #[pyfunction]
 fn phases() -> std::collections::HashMap<&'static str, Vec<(&'static str, bool)>> {
@@ -318,6 +371,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(steps, m)?)?;
     m.add_function(wrap_pyfunction!(layout_steps, m)?)?;
     m.add_function(wrap_pyfunction!(phases, m)?)?;
+    m.add_function(wrap_pyfunction!(plain_callees, m)?)?;
     m.add_function(wrap_pyfunction!(ported_json, m)?)?;
     m.add_function(wrap_pyfunction!(rules::call, m)?)?;
     m.add_function(wrap_pyfunction!(qualifier::call, m)?)?;

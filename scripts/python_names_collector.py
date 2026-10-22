@@ -20,7 +20,7 @@ rest. It imports nothing of pynecore, so a bare interpreter runs it::
     python3.12 scripts/python_names_collector.py
     ...
 
-``tests/t00_pynecore/ast/test_142_python_names_registry.py`` fails until the
+``tests/t00_pynecore/ast/test_143_python_names_registry.py`` fails until the
 running interpreter's names are in the file.
 """
 import builtins

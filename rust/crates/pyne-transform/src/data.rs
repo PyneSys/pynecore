@@ -4,7 +4,7 @@
 //! regenerated file changes the digest of every step that reads it, so a binary
 //! built with the old copy is out of use until it is rebuilt.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use serde_json::{Map, Value};
@@ -301,4 +301,48 @@ pub fn inline_templates() -> &'static InlineTemplates {
                 .expect("varargs_arities"),
         }
     })
+}
+
+/// `python_names.json` (`python_names`): the builtins, keywords and standard
+/// library modules of every supported interpreter.
+#[derive(Debug)]
+pub struct PythonNames {
+    pub builtins: HashSet<String>,
+    pub keywords: HashSet<String>,
+    pub stdlib: HashSet<String>,
+}
+
+/// The compiled-in `python_names.json`.
+pub fn python_names() -> &'static PythonNames {
+    static NAMES: OnceLock<PythonNames> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        let text = include_str!("../../../../src/pynecore/transformers/python_names.json");
+        let mut document: HashMap<String, HashSet<String>> =
+            serde_json::from_str(text).expect("python_names.json");
+        let mut section = |name: &str| document.remove(name).expect("python_names.json section");
+        PythonNames {
+            builtins: section("builtins"),
+            keywords: section("keywords"),
+            stdlib: section("stdlib"),
+        }
+    })
+}
+
+/// Whether a module's top-level package is part of the standard library
+/// (`python_names.is_stdlib`).
+pub fn is_stdlib(module: &str) -> bool {
+    python_names().stdlib.contains(module.split('.').next().unwrap_or(module))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_python_names_answer_like_an_interpreter() {
+        let names = python_names();
+        assert!(names.builtins.contains("len") && names.builtins.contains("__import__"));
+        assert!(names.keywords.contains("lambda") && !names.keywords.contains("match"));
+        assert!(is_stdlib("os.path") && is_stdlib("collections") && !is_stdlib("pynecore"));
+    }
 }

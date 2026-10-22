@@ -119,6 +119,10 @@
     "module": "call_inline",
     "digest": "669c6262d175b56a83835b633e96dabe02b44e1885e68614469820e1e5b82558"
   },
+  "FunctionIsolation": {
+    "module": "function_isolation",
+    "digest": "e0cc3074c85b51edaf7c07992aa93e6bae50930bed78363f05ea69e916f95fd1"
+  },
   "ScriptRequirements": {
     "module": "script_requirements",
     "digest": "6c4f1bd9db9b6fd743b9ab7dd079fee4ac3e68d04b62f9490d0bef7018e78671"
@@ -142,6 +146,10 @@
   "FinalizeCloneDefaults": {
     "module": "security_slice",
     "digest": "723e03051f7721671e76ccbaf39b5b9f31608fd813455d668883c4b86ce93988"
+  },
+  "ApplyLayout": {
+    "module": "layout_emit",
+    "digest": "558c60000a7d0c60f449e5dbe47e7fa947553bcbe0f9cbb70a304a9e19fac5cb"
   },
   "FixLocations": {
     "module": "locations",

@@ -179,6 +179,52 @@ pub trait Host {
     fn is_stdlib(&self, module: &str) -> Result<bool, Unsupported> {
         Err(Unsupported(format!("no host to ask whether {module} is stdlib")))
     }
+
+    /// The call-site route of a lib callee path as a script spells it (`lib.ta.sma`),
+    /// `None` when it routes uniform (`lib_registry.lib_routes().get(path)`).
+    fn lib_route(&self, path: &str) -> Result<Option<String>, Unsupported> {
+        Ok(data::routes().get(path).cloned())
+    }
+
+    /// What the call-site isolation reads of the interface an imported module
+    /// publishes, from its resolved source path (`module_interface.lookup(path,
+    /// analyse, pipeline_hash, settled)`); `None` when there is none to be had. With
+    /// `settled`, only an interface whose routes the module's lowering settled. The
+    /// host may analyse or transform the module to answer.
+    fn call_interface(
+        &self,
+        path: &str,
+        settled: bool,
+    ) -> Result<Option<pine_type_table::CallInterface>, Unsupported> {
+        let _ = settled;
+        Err(Unsupported(format!("no host for the interface of {path}")))
+    }
+
+    /// The route of a callee of a module that publishes no interface, read off the
+    /// object an import of the module binds, and the source files it holds while
+    /// (`function_isolation.classify_imported(module, names, star)`). Only a host
+    /// with an interpreter has such a module.
+    fn object_route(
+        &self,
+        module: &str,
+        names: &[String],
+        star: bool,
+    ) -> Result<(String, Vec<Option<String>>), Unsupported> {
+        let _ = (names, star);
+        Err(Unsupported(format!("no host to import {module}")))
+    }
+
+    /// A module file's resolved path, and whether it lies in pynecore's own package
+    /// (`str(Path(path).resolve())` and its `is_relative_to` the package directory).
+    fn source_key(&self, path: &str) -> Result<(String, bool), Unsupported> {
+        Err(Unsupported(format!("no host to resolve {path}")))
+    }
+
+    /// The dependency record of a plain Python module a route was read through
+    /// (`module_interface.source_record(path)`); `None` when it cannot be stat'ed.
+    fn source_record(&self, path: &str) -> Result<Option<pine_type_table::DepRecord>, Unsupported> {
+        Err(Unsupported(format!("no host to stat {path}")))
+    }
 }
 
 /// A source file as [`Host::read_source`] read it.
@@ -217,6 +263,8 @@ pub struct Context<'h> {
     /// Whether no backward slice of `main()` may be emitted for the security children
     /// (`emission_settings.security_slice_disabled()`, `PYNE_NO_SECURITY_SLICE`)
     pub security_slice_disabled: bool,
+    /// Whether `ApplyLayout` materializes the slot layout for CPython
+    pub emit_layout: bool,
     /// Answers what the tree does not say
     pub host: &'h dyn Host,
     /// The shared slot allocator of the lowering half (see [`slot_layout`]); the
@@ -271,6 +319,7 @@ pub static STEPS: &[Step] = &[
     Step { name: "VerifyClosedShift", run: steps::security_closed_shift_check::run },
     Step { name: "Persistent", run: steps::persistent::run },
     Step { name: "CallInline", run: steps::call_inline::run },
+    Step { name: "FunctionIsolation", run: steps::function_isolation::run },
     Step { name: "ScriptRequirements", run: steps::script_requirements::run },
     Step { name: "Input", run: steps::input::run },
     // The rules of the phases, each on its own (sequential mode)
@@ -278,13 +327,15 @@ pub static STEPS: &[Step] = &[
     Step { name: "SafeDivision", run: steps::safe_division::run },
     Step { name: "FloatTolerance", run: steps::float_tolerance::run },
     Step { name: "FinalizeCloneDefaults", run: steps::security_slice::finalize_clone_defaults },
+    Step { name: "ApplyLayout", run: steps::layout_emit::run },
     Step { name: "FixLocations", run: steps::locations::run },
 ];
 
 /// The steps whose port reads or fills the run's [`Context::slot_layout`]. A host
 /// hands the layout of its pipeline over before a run with one of these steps, and
 /// takes back the state they left.
-pub static SLOT_LAYOUT_STEPS: &[&str] = &["Series", "VerifyClosedShift", "Persistent"];
+pub static SLOT_LAYOUT_STEPS: &[&str] =
+    &["Series", "VerifyClosedShift", "Persistent", "FunctionIsolation", "ApplyLayout"];
 
 /// Whether a run of these steps reads or fills the slot layout.
 pub fn uses_slot_layout(names: &[&str]) -> bool {
@@ -308,7 +359,7 @@ pub fn phase(name: &str) -> Option<&'static phase::Phase> {
 /// [`PineTypeTable`](pine_type_table::PineTypeTable). A host hands the table of a
 /// run over to the tree natively ([`pyne_ast::Value::Native`]) when one of these
 /// steps is in the run, and through untouched otherwise.
-pub static TYPE_TABLE_READERS: &[&str] = &[];
+pub static TYPE_TABLE_READERS: &[&str] = &["FunctionIsolation"];
 
 /// Whether a run of these steps needs the module's type table natively.
 pub fn reads_type_table(names: &[&str]) -> bool {

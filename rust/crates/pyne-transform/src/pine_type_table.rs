@@ -446,6 +446,66 @@ impl ModuleInterface {
     }
 }
 
+/// What the call-site isolation reads of the interface an imported module
+/// publishes: where a call through its names goes, and the dependency record a
+/// route read off it keeps (`ModuleInterface.call_routes`, `.reexports`, `.deps`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallInterface {
+    /// Resolved source path of the module
+    pub path: String,
+    /// The module's literal `__all__`, `None` when it spells none
+    pub all: Option<Vec<String>>,
+    /// Dotted path -> route word
+    pub call_routes: IndexMap<String, String>,
+    /// Name -> (level, module, attribute) of the import binding it
+    pub reexports: IndexMap<String, (i64, String, String)>,
+    /// Every module this one's types were derived from or that it imports
+    pub deps: IndexMap<String, DepRecord>,
+    /// `module_interface.dep_record(interface)`
+    pub record: DepRecord,
+}
+
+impl CallInterface {
+    /// The interface a host serialized as for [`ModuleInterface::from_json`], read
+    /// for what the isolation needs.
+    pub fn from_json(text: &str) -> Result<CallInterface, String> {
+        let document: serde_json::Value =
+            serde_json::from_str(text).map_err(|err| err.to_string())?;
+        let interface = document.get("interface").ok_or("no interface")?;
+        let all = match interface.get("all") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(_) => Some(json_strs(interface, "all")?),
+        };
+        let call_routes = json_map(interface, "call_routes")?
+            .iter()
+            .map(|(path, route)| Ok((path.clone(), route.as_str().ok_or("route")?.to_string())))
+            .collect::<Result<IndexMap<_, _>, String>>()?;
+        let reexports = json_map(interface, "reexports")?
+            .iter()
+            .map(|(name, target)| {
+                let target = target.as_array().filter(|items| items.len() == 3);
+                let target = target.ok_or("reexport")?;
+                let level = target[0].as_i64().ok_or("reexport level")?;
+                let module = target[1].as_str().ok_or("reexport module")?.to_string();
+                let attr = target[2].as_str().ok_or("reexport attribute")?.to_string();
+                Ok((name.clone(), (level, module, attr)))
+            })
+            .collect::<Result<IndexMap<_, _>, String>>()?;
+        let deps = json_map(interface, "deps")?
+            .iter()
+            .map(|(path, record)| Ok((path.clone(), DepRecord::from_json(record)?)))
+            .collect::<Result<IndexMap<_, _>, String>>()?;
+        Ok(CallInterface {
+            path: json_str(interface, "path")?,
+            all,
+            call_routes,
+            reexports,
+            deps,
+            record: DepRecord::from_json(document.get("record").ok_or("no record")?)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +514,26 @@ mod tests {
     fn qualify_joins_with_the_scope_separator() {
         assert_eq!(qualify("", "x"), "x");
         assert_eq!(qualify("main", "x"), "main·x");
+    }
+
+    #[test]
+    fn a_call_interface_reads_the_routes_and_the_record() {
+        let record = r#"{"path": "/m.py", "mtime_ns": 1, "size": 2, "digest": "d", "routes": "r"}"#;
+        let text = format!(
+            r#"{{"interface": {{"path": "/m.py", "all": null, "exports": {{"g": {{"impls": [[]]}}}},
+                "call_routes": {{"f": "fast", "P.new": "skip"}},
+                "reexports": {{"g": [1, "leaf", "g"], "*": [0, "star", "*"]}},
+                "deps": {{"/d.py": {record}}}}}, "record": {record}}}"#
+        );
+        let interface = CallInterface::from_json(&text).expect("parses");
+        assert_eq!(interface.path, "/m.py");
+        assert_eq!(interface.all, None);
+        assert_eq!(interface.call_routes["P.new"], "skip");
+        assert_eq!(interface.reexports["g"], (1, "leaf".to_string(), "g".to_string()));
+        assert_eq!(interface.reexports["*"].2, "*");
+        assert_eq!(interface.deps["/d.py"].routes, "r");
+        assert_eq!(interface.record.digest, "d");
+        assert!(CallInterface::from_json(&text.replace(r#""call_routes""#, r#""other""#)).is_err());
     }
 
     #[test]

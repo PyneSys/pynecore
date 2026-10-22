@@ -49,10 +49,11 @@ from . import ast_walk
 from .builtin_shadow import Library, import_library, library_serves
 from .emission_settings import security_slice_disabled
 from .export_capture import module_origin
+from .function_isolation import classify_imported
 from . import module_interface
-from .lib_registry import lib_star_exports, lib_types
+from .lib_registry import lib_routes, lib_star_exports, lib_types
 from .module_paths import module_spec_origin, package_member
-from .pine_type_table import Analyser
+from .pine_type_table import TABLE_ATTR, Analyser, module_table
 from .source_read import stable_source
 from .module_property import module_properties
 from .slot_layout import ModuleLayout
@@ -274,10 +275,10 @@ class _Host:
         data, (mtime_ns, size) = loaded
         return str(source.resolve()), data, mtime_ns, size
 
-    def interface(self, path: str) -> str | None:
+    def interface(self, path: str, settled: bool = False) -> str | None:
         """The interface a module publishes and the record a dependency on it keeps, as JSON
-        in the dataclasses' own field order."""
-        found = module_interface.lookup(path, self._analyse, self._pipeline_hash)
+        in the dataclasses' own field order; with ``settled``, only one whose routes are."""
+        found = module_interface.lookup(path, self._analyse, self._pipeline_hash, settled)
         if found is None:
             return None
         return json.dumps({'interface': dataclasses.asdict(found),
@@ -307,12 +308,34 @@ class _Host:
     def is_stdlib(module: str) -> bool:
         return is_stdlib(module)
 
+    @staticmethod
+    def lib_route(path: str) -> str | None:
+        return lib_routes().get(path)
+
+    @staticmethod
+    def object_route(module: str, names: list[str],
+                     star: bool) -> tuple[str, tuple[str | None, ...]]:
+        return classify_imported(module, names, star)
+
+    @staticmethod
+    def source_key(path: str) -> tuple[str, bool]:
+        key = Path(path).resolve()
+        return str(key), key.is_relative_to(_PACKAGE.resolve())
+
+    @staticmethod
+    def source_record(path: str) -> tuple[str, int, int, str, str] | None:
+        record = module_interface.source_record(path)
+        if record is None:
+            return None
+        return record.path, record.mtime_ns, record.size, record.digest, record.routes
+
 
 def _context(ctx: Any) -> dict[str, Any]:
     return {'path': str(ctx.path), 'pyne_mode': ctx.pyne_mode, 'source': ctx.source,
             'user_code': ctx.user_code, 'na_bool': ctx.na_bool, 'sequential': ctx.sequential,
             # Read where the Python step reads it, so both backends slice alike
             'security_slice_disabled': security_slice_disabled(),
+            'emit_layout': getattr(ctx, 'emit_layout', True),
             'host': _Host(ctx.analyse, ctx.pipeline_hash),
             'slot_layout': getattr(ctx, 'slot_layout', None)}
 
@@ -327,8 +350,8 @@ class Rejection:
         self.message = message
 
 
-def run(names: list[str], tree: ast.Module, ctx: Any,
-        layout: ModuleLayout | None = None) -> ast.Module | Rejection | None:
+def run(names: list[str], tree: ast.Module, ctx: Any, layout: ModuleLayout | None = None,
+        table: bool = False) -> ast.Module | Rejection | None:
     """Run native steps in order over a module.
 
     A step of :func:`layout_steps` reads ``ctx.slot_layout`` as the Python steps
@@ -341,6 +364,10 @@ def run(names: list[str], tree: ast.Module, ctx: Any,
     :param layout: Where the slot layout the steps left is written when the steps
         answer a module and one of them uses the layout: its state is replaced
         field for field. None leaves the layout the steps left unread.
+    :param table: Whether the type table the steps left replaces the state of the
+        module's own table field for field, the answer then carrying that very
+        object: a step that extends the table (``TYPE_TABLE_READERS``) works on a
+        native copy, while the loader holds the module's table.
     :return: The transformed module, a new object; a :class:`Rejection` when a step
         finds the module invalid; None when a step does not handle the module. In
         both latter cases the caller runs the Python steps.
@@ -358,6 +385,11 @@ def run(names: list[str], tree: ast.Module, ctx: Any,
         state = vars(layout)
         state.clear()
         state.update(vars(left))
+    own, copy = module_table(tree), module_table(result)
+    if table and own is not None and copy is not None and copy is not own:
+        for item in dataclasses.fields(own):
+            setattr(own, item.name, getattr(copy, item.name))
+        setattr(result, TABLE_ATTR, own)
     return result
 
 
