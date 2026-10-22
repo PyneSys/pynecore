@@ -41,9 +41,9 @@ import hashlib
 import json
 import os
 import zlib
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -55,7 +55,8 @@ from .pine_type_table import (
 
 __all__ = [
     'NO_FINGERPRINT', 'build_interface', 'interface_digest',
-    'routes_shape', 'routes_digest',
+    'routes_shape', 'routes_digest', 'CallPlan', 'call_plan', 'call_routes', 'STAR',
+    'ROUTE_SKIP', 'ROUTE_DIRECT', 'ROUTE_FAST', 'ROUTE_FAST_SHARED', 'ROUTE_UNIFORM',
     'source_digest', 'register', 'registered', 'lookup',
     'closes_cycle', 'analysing_scope', 'Compile', 'compiling', 'reached_back',
     'SOURCE_DIGEST', 'dep_record', 'source_record', 'add_dep', 'dep_current', 'settle',
@@ -584,6 +585,354 @@ def _reachable_defs(node: ast.AST) -> Iterator[ast.FunctionDef | ast.AsyncFuncti
             yield from _reachable_defs(child)
 
 
+# --- the call routes ------------------------------------------------------
+
+#: The routes a dependent's lowering emits a call on, as ``function_isolation``
+#: spells them
+ROUTE_SKIP = 'skip'
+ROUTE_DIRECT = 'direct'
+ROUTE_FAST = 'fast'
+ROUTE_FAST_SHARED = 'fast-shared'
+ROUTE_UNIFORM = 'uniform'
+
+#: Where the ``udt`` decorator lives: the class it decorates is a dataclass that
+#: gains a ``new`` classmethod and a ``copy`` function of that module
+_UDT = (0, 'pynecore.core.pine_udt', 'udt')
+
+#: The marker of a state-carrying function whose one instance every call site in a
+#: loop shares without the same-bar rollback (``function_isolation._FAST_SHARED``)
+_SHARED_MARKER = '__pyne_shared_call_site__'
+
+#: The reexport key of the star import a name the module does not bind after it
+#: may come from
+STAR = '*'
+
+
+@dataclass(slots=True)
+class _Binding:
+    """One statement binding a name in a module or class body."""
+    #: Position of the body statement it stands in
+    index: int
+    #: The definition or class it binds, None for any other binding
+    node: ast.AST | None
+    #: Whether it may not run (it stands in a compound statement, a walrus, ...)
+    conditional: bool
+    #: For an import, where it leads: (level, module, attribute)
+    target: tuple[int, str, str] | None = None
+
+
+@dataclass(slots=True)
+class _AttributeStore:
+    """One store (or ``del``) of an attribute on a name of the body."""
+    index: int
+    attr: str
+    #: The value of a plain ``name.attr = value``, None for any other store
+    value: ast.expr | None
+    conditional: bool
+
+
+class _Bindings:
+    """What the statements of one body bind, in order: the names, the attributes
+    set on them, and the star imports."""
+
+    def __init__(self, body: list[ast.stmt]):
+        self.names: dict[str, list[_Binding]] = {}
+        self.attributes: dict[str, list[_AttributeStore]] = {}
+        #: (index, level, module, conditional) of every star import
+        self.stars: list[tuple[int, int, str, bool]] = []
+        for index, stmt in enumerate(body):
+            self._statement(stmt, index)
+
+    def _bind(self, name: str, binding: _Binding) -> None:
+        self.names.setdefault(name, []).append(binding)
+
+    def _statement(self, stmt: ast.stmt, index: int) -> None:
+        """A body statement: what it binds itself is unconditional, anything in it
+        that binds besides is not."""
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            self._bind(stmt.name, _Binding(index, stmt, False))
+            self._header(stmt, index)
+        elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            self._import(stmt, index, False)
+        elif isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                self._target(target, index, stmt.value if len(stmt.targets) == 1 else None)
+            self._scan(stmt.value, index)
+        elif isinstance(stmt, ast.AnnAssign):
+            if stmt.value is not None:
+                self._target(stmt.target, index, stmt.value)
+                self._scan(stmt.value, index)
+            self._scan(stmt.annotation, index)
+        elif isinstance(stmt, (ast.AugAssign, ast.Delete)):
+            for target in stmt.targets if isinstance(stmt, ast.Delete) else [stmt.target]:
+                self._target(target, index, None)
+            if isinstance(stmt, ast.AugAssign):
+                self._scan(stmt.value, index)
+        else:
+            # A compound statement runs its parts maybe, an expression binds by walrus
+            self._scan(stmt, index)
+
+    def _target(self, target: ast.expr, index: int, value: ast.expr | None) -> None:
+        """An assignment target of a body statement."""
+        if isinstance(target, ast.Name):
+            self._bind(target.id, _Binding(index, None, False))
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                self._target(element, index, None)
+        elif isinstance(target, ast.Starred):
+            self._target(target.value, index, None)
+        elif isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+            self.attributes.setdefault(target.value.id, []).append(
+                _AttributeStore(index, target.attr, value, False))
+        else:
+            self._scan(target, index)
+
+    def _import(self, stmt: ast.Import | ast.ImportFrom, index: int, conditional: bool) -> None:
+        if isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                # ``import a.b`` binds ``a``; ``import a.b as x`` binds ``a.b`` itself
+                module = alias.name if alias.asname else alias.name.split('.')[0]
+                self._bind(alias.asname or module,
+                           _Binding(index, stmt, conditional, (0, module, '')))
+            return
+        for alias in stmt.names:
+            if alias.name == '*':
+                self.stars.append((index, stmt.level, stmt.module or '', conditional))
+            else:
+                self._bind(alias.asname or alias.name,
+                           _Binding(index, stmt, conditional,
+                                    (stmt.level, stmt.module or '', alias.name)))
+
+    def _header(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+                index: int) -> None:
+        """What a definition evaluates in the body's scope: decorators, defaults,
+        annotations, bases."""
+        parts: list[ast.AST] = list(node.decorator_list)
+        if isinstance(node, ast.ClassDef):
+            parts.extend(node.bases)
+            parts.extend(keyword.value for keyword in node.keywords)
+        else:
+            parts.append(node.args)
+            if node.returns is not None:
+                parts.append(node.returns)
+        for part in parts:
+            self._scan(part, index)
+
+    def _scan(self, node: ast.AST, index: int) -> None:
+        """Every binding below a node that lands in the body's scope, as conditional."""
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            self._bind(node.name, _Binding(index, node, True))
+            self._header(node, index)
+            return
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            self._import(node, index, True)
+            return
+        if isinstance(node, ast.Lambda):
+            self._scan(node.args, index)
+            return
+        if isinstance(node, ast.comprehension):
+            # Its target is the comprehension's own
+            self._scan(node.iter, index)
+            for test in node.ifs:
+                self._scan(test, index)
+            return
+        if isinstance(node, ast.Name):
+            if not isinstance(node.ctx, ast.Load):
+                self._bind(node.id, _Binding(index, None, True))
+            return
+        if isinstance(node, ast.Attribute) and not isinstance(node.ctx, ast.Load) \
+                and isinstance(node.value, ast.Name):
+            self.attributes.setdefault(node.value.id, []).append(
+                _AttributeStore(index, node.attr, None, True))
+            return
+        if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            self._bind(node.name, _Binding(index, None, True))
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            self._bind(node.rest, _Binding(index, None, True))
+        for child in ast_walk.iter_child_nodes(node):
+            self._scan(child, index)
+
+
+@dataclass(slots=True)
+class CallPlan:
+    """
+    How a call through each module-level name of a module is routed, as far as
+    its analysed tree says: the lowering settles the rest, which definitions keep
+    state (see :func:`call_routes`).
+    """
+    #: Dotted path -> the route the tree alone proves
+    fixed: dict[str, str] = field(default_factory=dict)
+    #: Dotted path -> the plain function a call reaches, and whether it is
+    #: marked as sharing its call site
+    defs: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, bool]] = \
+        field(default_factory=dict)
+    #: ``ModuleInterface.reexports``
+    reexports: dict[str, tuple[int, str, str]] = field(default_factory=dict)
+
+
+def call_plan(tree: ast.Module) -> CallPlan:
+    """
+    How a call through each module-level name is routed, from the analysed tree.
+
+    A dependent's lowering routes a call by the object an import of the module
+    binds, without importing it: this is the object, told from the statements
+    that bind it. A name is only given a route when the statements prove it --
+    the last binding of the name is a statement that always runs, and nothing
+    the module does afterwards can rebind it -- and every other name takes the
+    uniform route, which is correct for any object, only slower:
+
+    * a plain ``def`` is called on the direct route, or the fast one when the
+      lowering gives it state (:func:`call_routes`); a decorated one is whatever
+      its decorators return, so it has no route here;
+    * a class is constructed raw, and so is a ``@udt`` class's ``new``; a
+      method a dependent reaches through the class is routed like a plain
+      function, a ``classmethod`` is not isolated;
+    * a name an import binds is where the import leads (``reexports``), and a
+      name only a star import can bind leads into that module.
+
+    Read off the ANALYSED tree, like :func:`routes_shape`: what the lowering
+    adds at module level is plumbing no dependent calls through. Everything it
+    reads is in the routes shape, and the carriers the lowering adds are in the
+    routes digest, so the routes digest moves whenever a route here does.
+
+    :param tree: The analysed module
+    :return: Its plan
+    """
+    found = _Bindings(tree.body)
+    plan = CallPlan()
+    last_star = max((star[0] for star in found.stars), default=-1)
+    # The one star import a name the module does not bind after it may come from;
+    # with more than one, or one that may not run, such a name has no route
+    star = found.stars[0] if len(found.stars) == 1 and not found.stars[0][3] else None
+    if star is not None:
+        plan.reexports[STAR] = (star[1], star[2], STAR)
+    for name, bindings in found.names.items():
+        final = bindings[-1]
+        if final.index < last_star:
+            # A star import after it may rebind the name
+            continue
+        node = final.node
+        if any(binding.conditional for binding in bindings):
+            pass
+        elif final.target is not None:
+            plan.reexports[name] = final.target
+            continue
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            shared = _shared(found.attributes.get(name, ()), final.index)
+            if not node.decorator_list and shared is not None:
+                plan.defs[name] = (node, shared)
+                continue
+        elif isinstance(node, ast.ClassDef):
+            decorators = node.decorator_list
+            udt = len(decorators) == 1 and isinstance(decorators[0], ast.Name) \
+                and _bound_to(found, decorators[0].id, _UDT, final.index)
+            if not decorators or udt:
+                _plan_class(plan, found, name, node, final.index, udt)
+                continue
+        if star is not None:
+            # Bound after the star import, so the star import does not answer for it
+            plan.fixed[name] = ROUTE_UNIFORM
+    return plan
+
+
+def _shared(stores: Sequence[_AttributeStore], index: int) -> bool | None:
+    """
+    Whether a function is marked as sharing its call site, from the attribute stores
+    on its name.
+
+    :param stores: Every attribute store on the name, in order
+    :param index: Position of the definition the name ends up bound to
+    :return: The marker's value; None when a store after the definition makes the
+             route unprovable (any attribute but the marker, set to a constant)
+    """
+    shared = False
+    for store in stores:
+        if store.index < index:
+            # It went to an object the definition replaced
+            continue
+        if store.conditional or store.attr != _SHARED_MARKER \
+                or not isinstance(store.value, ast.Constant):
+            return None
+        shared = bool(store.value.value)
+    return shared
+
+
+def _bound_to(found: _Bindings, name: str, target: tuple[int, str, str], index: int) -> bool:
+    """
+    Whether a name is an import of one particular object at a position of the body.
+
+    :param found: The body's bindings
+    :param name: The name
+    :param target: Where the import has to lead
+    :param index: The position: every binding of the name precedes it
+    :return: True when the name's one binding is that import, which always runs
+    """
+    bindings = found.names.get(name, ())
+    return len(bindings) == 1 and not bindings[0].conditional and bindings[0].index < index \
+        and bindings[0].target == target and not any(star[0] < index for star in found.stars)
+
+
+def _plan_class(plan: CallPlan, found: _Bindings, name: str, node: ast.ClassDef, index: int,
+                udt: bool) -> None:
+    """
+    The routes through a class: the class itself, and the methods reached through it.
+
+    :param plan: Extended in place
+    :param found: The module's bindings
+    :param name: The name the class is bound to
+    :param node: The class
+    :param index: Its position in the module
+    :param udt: Whether ``@udt`` decorates it
+    """
+    plan.fixed[name] = ROUTE_SKIP
+    # An attribute the module sets on the class afterwards is no longer what the
+    # body bound
+    replaced = {store.attr for store in found.attributes.get(name, ()) if store.index > index}
+    if udt:
+        # ``udt`` sets ``new`` (a classmethod) and ``copy`` (a plain function of its
+        # own module, which no route is proven for) over whatever the body bound
+        if 'new' not in replaced:
+            plan.fixed[f'{name}.new'] = ROUTE_SKIP
+        replaced |= {'new', 'copy'}
+    body = _Bindings(node.body)
+    # The decorators a method is told apart by, unless something rebinds them
+    builtins_free = not found.stars and not any(
+        decorator in found.names or decorator in body.names
+        for decorator in ('staticmethod', 'classmethod'))
+    for attr, bindings in body.names.items():
+        method = bindings[-1].node
+        if attr in replaced or attr in body.attributes \
+                or any(binding.conditional for binding in bindings) \
+                or not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        decorators = [decorator.id if isinstance(decorator, ast.Name) else None
+                      for decorator in method.decorator_list]
+        if decorators and not builtins_free:
+            continue
+        if decorators == ['classmethod']:
+            plan.fixed[f'{name}.{attr}'] = ROUTE_SKIP
+        elif decorators in ([], ['staticmethod']):
+            plan.defs[f'{name}.{attr}'] = (method, False)
+
+
+def call_routes(plan: CallPlan, layout: _Layout) -> dict[str, str]:
+    """
+    The call routes of a module, once its lowering settled which definitions keep state.
+
+    :param plan: :func:`call_plan` of the analysed tree
+    :param layout: The slot layout the lowering allocated
+    :return: ``ModuleInterface.call_routes``
+    """
+    routes = dict(plan.fixed)
+    for path, (node, shared) in plan.defs.items():
+        # Only a plain ``def`` is given a state parameter, as in ``routes_digest``
+        if isinstance(node, ast.FunctionDef) and layout.state_carrying(layout.scope_segment(node)):
+            routes[path] = ROUTE_FAST_SHARED if shared else ROUTE_FAST
+        else:
+            routes[path] = ROUTE_DIRECT
+    return routes
+
+
 # --- the registry ---------------------------------------------------------
 
 
@@ -965,6 +1314,8 @@ def interface_payload(interface: ModuleInterface) -> bytes:
         'suppressed': interface.suppressed,
         'routes': interface.routes,
         'proxies': list(interface.proxies),
+        'call_routes': interface.call_routes,
+        'reexports': {name: list(target) for name, target in interface.reexports.items()},
     }).encode('utf-8'))
 
 
@@ -1006,7 +1357,11 @@ def interface_from_payload(path: str, payload: bytes, deps: dict[str, DepRecord]
         mtime_ns=fingerprint[0], size=fingerprint[1],
         suppressed=str(published.get('suppressed') or ''),
         routes=str(published.get('routes') or ''),
-        proxies=tuple(published.get('proxies') or ()))
+        proxies=tuple(published.get('proxies') or ()),
+        call_routes={str(path): str(route)
+                     for path, route in (published.get('call_routes') or {}).items()},
+        reexports={str(name): (int(target[0]), str(target[1]), str(target[2]))
+                   for name, target in (published.get('reexports') or {}).items()})
     return replace(interface, digest=interface_digest(interface))
 
 

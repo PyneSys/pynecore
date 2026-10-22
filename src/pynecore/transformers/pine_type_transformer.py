@@ -23,12 +23,9 @@ the module publishes -- have the types without re-deriving them.
 import ast
 
 from .pine_type_infer import infer_module
-from .pine_type_table import Analyser, PineTypeTable
+from .pine_type_table import TABLE_ATTR, Analyser
 
-__all__ = ['PineTypeTransformer', 'TABLE_ATTR', 'module_table']
-
-#: Attribute the module node carries its type table under.
-TABLE_ATTR = '_pine_types'
+__all__ = ['PineTypeTransformer']
 
 
 class PineTypeTransformer:
@@ -70,12 +67,3 @@ class PineTypeTransformer:
         setattr(tree, TABLE_ATTR, table)
         return tree
 
-
-def module_table(tree: ast.Module) -> PineTypeTable | None:
-    """
-    Read the table this pass attached, if it ran.
-
-    :param tree: The module node
-    :return: The table, or None
-    """
-    return getattr(tree, TABLE_ATTR, None)

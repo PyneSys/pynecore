@@ -15,6 +15,7 @@ The diagnostics are the same information in both modes. A hand-written script
 collects them and keeps running with runtime dispatch; ``@pyne edge`` raises on
 the first one. One code path, one message; only the raising is conditional.
 """
+import ast
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -24,7 +25,7 @@ from .pine_qualifier import NOT_READ, SERIES
 __all__ = ['Unknown', 'Binding', 'FuncSig', 'CallSite', 'ContextKey',
            'ContextResult', 'Diag', 'DepRecord', 'ExportSig', 'ClassSig',
            'ModuleInterface', 'PineTypeTable', 'PineTypeError', 'Analyser',
-           'SCOPE_SEP', 'qualify']
+           'SCOPE_SEP', 'qualify', 'TABLE_ATTR', 'module_table']
 
 #: Separator the scope-qualified ids are spelled with. It is the same character
 #: the transformers reserve for their injected names, so a scope-qualified id
@@ -347,6 +348,21 @@ class ModuleInterface:
     #: function of the same name is passed by. Part of the contract: which
     #: library answers such a call depends on it
     proxies: tuple[str, ...] = ()
+    #: How a dependent's lowering routes a call through a module-level name, for
+    #: the names the module's own lowering proves a route of other than the
+    #: uniform one every other name takes: the dotted path after the module
+    #: (``f``, ``Point.new``) -> ``skip``, ``direct``, ``fast`` or ``fast-shared``
+    #: (the route words of ``function_isolation``). A module with a star import
+    #: lists what it binds after it without a provable route as ``uniform``
+    #: too: a name it does not bind there is the star import's to answer.
+    #: Settled with ``routes``, which digests everything it is derived from
+    call_routes: dict[str, str] = field(default_factory=dict)
+    #: The module-level names an import binds, where a call through them goes
+    #: on: name -> (level, module, attribute) as the import spells them. The
+    #: attribute is ``''`` for a name bound to the module itself (``import m``)
+    #: and ``'*'`` for a name only a star import of the module binds. Settled
+    #: with ``routes`` too
+    reexports: dict[str, tuple[int, str, str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -456,3 +472,17 @@ class PineTypeError(SyntaxError):
 #: describes whatever the file was then, and pairing it with signatures read
 #: afterwards records a state that never was.
 Analyser = Callable[[str, str], ModuleInterface | None]
+
+
+#: Attribute the module node carries its type table under (``PineTypeTransformer``).
+TABLE_ATTR = '_pine_types'
+
+
+def module_table(tree: ast.Module) -> PineTypeTable | None:
+    """
+    Read the table the type pass attached, if it ran.
+
+    :param tree: The module node
+    :return: The table, or None
+    """
+    return getattr(tree, TABLE_ATTR, None)

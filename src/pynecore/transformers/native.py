@@ -51,7 +51,7 @@ from .emission_settings import security_slice_disabled
 from .export_capture import module_origin
 from . import module_interface
 from .lib_registry import lib_star_exports, lib_types
-from .pine_type_infer import module_spec_origin, package_member
+from .module_paths import module_spec_origin, package_member
 from .pine_type_table import Analyser
 from .source_read import stable_source
 from .module_property import module_properties

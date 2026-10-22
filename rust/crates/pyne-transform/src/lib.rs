@@ -162,14 +162,14 @@ pub trait Host {
     }
 
     /// The `.py` source a dotted module name resolves to through `find_spec`
-    /// (`pine_type_infer.module_spec_origin(dotted)`); `None` when it is no readable
+    /// (`module_paths.module_spec_origin(dotted)`); `None` when it is no readable
     /// Python module.
     fn module_spec_origin(&self, dotted: &str) -> Result<Option<String>, Unsupported> {
         Err(Unsupported(format!("no host to find module {dotted}")))
     }
 
     /// The source of a module below a package directory
-    /// (`pine_type_infer.package_member(Path(directory), dotted)`).
+    /// (`module_paths.package_member(Path(directory), dotted)`).
     fn package_member(&self, directory: &str, dotted: &str) -> Result<Option<String>, Unsupported> {
         Err(Unsupported(format!("no host to find {dotted} below {directory}")))
     }

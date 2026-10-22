@@ -12,7 +12,7 @@ from pathlib import Path
 from pynecore.core import import_hook
 from pynecore.transformers.source_read import stable_source
 from pynecore.transformers.pine_type_table import PineTypeTable
-from pynecore.transformers.pine_type_transformer import module_table
+from pynecore.transformers.pine_type_table import module_table
 
 __all__ = ['analyse_module']
 

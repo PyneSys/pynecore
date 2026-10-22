@@ -765,7 +765,7 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
         diag_dump_enabled, gate_module, gated, render_diags, strict_enabled,
     )
     from pynecore.transformers.pine_type_table import PineTypeError
-    from pynecore.transformers.pine_type_transformer import module_table
+    from pynecore.transformers.pine_type_table import module_table
 
     edge = gated(pyne_mode)
     structural = gate_module(transformed) if edge else []
@@ -892,7 +892,7 @@ def _transform_module(tree: "ast.Module", source: str, path: Path, pyne_mode: st
     # through the hook itself, so importing it at module level would re-enter a
     # half-initialized package
     from pynecore.transformers.module_interface import reached_back
-    from pynecore.transformers.pine_type_transformer import module_table
+    from pynecore.transformers.pine_type_table import module_table
 
     analysed = _analyse_tree(tree, source, path, pyne_mode)
     table = module_table(analysed)
@@ -943,13 +943,17 @@ def _lower_published(analysed: "ast.Module", published: "ModuleInterface | None"
     :param na_bool: Whether the module keeps Pine's three-state bool.
     :return: The interface with its routes, registered again, and the lowered tree.
     """
-    from pynecore.transformers.module_interface import register, routes_digest, routes_shape
+    from pynecore.transformers.module_interface import (
+        call_plan, call_routes, register, routes_digest, routes_shape,
+    )
 
     # The routes follow the module as written, before the lowering adds plumbing
     shape = '' if published is None else routes_shape(analysed)
+    plan = None if published is None else call_plan(analysed)
     lowered, layout = _lower_tree(analysed, path, pyne_mode, na_bool=na_bool)
-    if published is not None:
-        published = replace(published, routes=routes_digest(shape, lowered, layout))
+    if published is not None and plan is not None:
+        published = replace(published, routes=routes_digest(shape, lowered, layout),
+                            call_routes=call_routes(plan, layout), reexports=plan.reexports)
         register(published)
     return published, lowered
 

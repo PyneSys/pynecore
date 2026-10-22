@@ -42,7 +42,6 @@ nothing. That keeps it testable one rule at a time, and keeps the rules
 (``pine_type_rules``) separable from the walking done here.
 """
 import ast
-import importlib.util
 from bisect import bisect_right
 from collections import deque
 from collections.abc import Callable, Container, Iterator, Mapping, Sequence
@@ -55,6 +54,7 @@ from . import ast_walk
 from . import module_interface
 from .factory_fields import FactoryFields, dotted_name
 from .lib_registry import lib_registry, lib_routes, lib_star_exports, lib_types
+from .module_paths import module_spec_origin, package_member
 from .node_ids import ID_ATTR, assign_node_ids, node_id
 from .pine_type_report import unknown_diags
 from .pine_type_rules import (
@@ -88,8 +88,7 @@ from .pine_qualifier import (
 from .script_entry import is_script_entry
 
 __all__ = ['infer_module', 'lib_classes', 'lib_namespaces', 'lib_routes',
-           'lib_star_exports', 'module_spec_origin', 'package_member', 'TY_ATTR', 'get_ty',
-           'set_ty', 'inherit_ty']
+           'lib_star_exports', 'TY_ATTR', 'get_ty', 'set_ty', 'inherit_ty']
 
 #: How many times a loop body is re-inferred before the types are declared
 #: stable. Both lattices are two high (int -> float -> unknown, const -> simple
@@ -6279,44 +6278,6 @@ def _publishes_nothing(module: str) -> bool:
     :return: True when the import is not worth an interface lookup
     """
     return module == 'pynecore' or module.startswith('pynecore.') or is_stdlib(module)
-
-
-def module_spec_origin(dotted: str) -> str | None:
-    """
-    The source file ``find_spec`` resolves a dotted module name to.
-
-    :param dotted: Dotted module name
-    :return: Its ``.py`` source path, or None when it is not a readable Python module
-    """
-    try:
-        spec = importlib.util.find_spec(dotted)
-    except Exception:  # noqa: any resolution failure means "not a module here"
-        return None
-    if spec is not None and spec.origin and spec.origin.endswith('.py'):
-        return spec.origin
-    return None
-
-
-def package_member(directory: Path, dotted: str) -> str | None:
-    """
-    The source of a module below a package directory, found without importing.
-
-    The candidates are tried in the import hook's order, ``name.py`` before
-    ``name/__init__.py``.
-
-    :param directory: The package directory the name is relative to
-    :param dotted: Dotted module name below it; empty for the package itself
-    :return: Its source path, or None when there is no such file
-    """
-    if dotted:
-        target = directory.joinpath(*dotted.split('.'))
-        candidates = (target.parent / f'{target.name}.py', target / '__init__.py')
-    else:
-        candidates = (directory / '__init__.py',)
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
-    return None
 
 
 def _line(node: ast.AST) -> int:

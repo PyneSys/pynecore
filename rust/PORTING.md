@@ -155,7 +155,7 @@ pointers.
    sent as the JSON of `dataclasses.asdict` of the interface and of its
    `dep_record`), `closes_cycle`, `begin_analysis` / `end_analysis`
    (`analysing_scope`), `module_spec_origin` and `package_member`
-   (`pine_type_infer`), `is_stdlib`. The WASM host answers them `Unsupported`, so
+   (`module_paths`), `is_stdlib`. The WASM host answers them `Unsupported`, so
    there a module that imports anything outside `pynecore` stays in Python.
    `_overload_groups` and the hops of `_declares_method` were sets whose order
    reached the table; they are ordered now. `module_interface` types the layout
