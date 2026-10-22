@@ -436,8 +436,8 @@ def __test_native_backend_emits_what_python_emits__(monkeypatch):
 
 
 def __test_typed_steps_run_natively__(monkeypatch):
-    """The ported steps after the type pass handle the helper module natively, rather
-    than declining it to Python."""
+    """The ported steps after the type pass, and the batch holding the security
+    lowering, handle the helper module natively, rather than declining it to Python."""
     __test_helper_require_native()
     answers: dict[str, object] = {}
     run = native.run
@@ -451,6 +451,8 @@ def __test_typed_steps_run_natively__(monkeypatch):
     __test_helper_emission('native', monkeypatch)
     assert isinstance(answers['ImplicitConversion'], ast.Module)
     assert isinstance(answers['+'.join(__test_helper_LOWERING_STEPS)], ast.Module)
+    security = [answer for names, answer in answers.items() if 'Security' in names.split('+')]
+    assert len(security) == 1 and isinstance(security[0], ast.Module)
 
 
 def __test_lowering_steps_run_natively__(monkeypatch):

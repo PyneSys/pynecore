@@ -101,13 +101,25 @@ pointers.
    by `test_138_native_const_fold`. `Unsupported`: an int literal or result beyond
    `i64`, an int true division with an operand beyond 2**53, and `math.round` with
    a positive precision.
-4. **Security** (XL, 4.4k lines). Split into predicates, collection, builders,
-   rewrite, groups, cross-function lift, module emission, and the
-   `_DependencyAnalyzer` (~1.5k lines, shared with SecuritySlice) as its own
-   module (`steps/security/`, where the call predicates already are).
-   Non-hermetic only through `sha1(module path)`.
-5. **SecuritySlice** (L, 2.8k lines). Needs Security's dependency analyzer, the
-   `_pine_ty` stamps and F3; `PYNE_NO_SECURITY_SLICE` becomes a context flag.
+4. **Security** (XL, 4.4k lines). Ported as `steps/security/`: `collection`
+   (call arguments, the simple-chain / hoistable-binding rules, the
+   history-reference rule behind `closed_shift`), `builders`, `rewrite` (the
+   per-function lowering), `lift` (the cross-function signal lift and the
+   reachability rules), `groups` (`always_read`, `signal_per_bar`, the feed
+   groups), the module visit with the registry in `mod.rs`, and `dependencies`,
+   the port of `security_dependencies.py` (`_DependencyAnalyzer`, which the slice
+   pass reuses). The sec id prefix is `sha1(module path)[:8]`, the path taken from
+   the module's `_module_file_path` stamp as in Python, the digest from
+   `crate::sha1` (written out: a few dozen lines, nothing extra for the WebAssembly
+   build; it covers F4's SHA-1). Its closure was cut to leaf modules
+   (`script_entry`, `factory_fields`, `lib_series_attrs`, `security_dependencies`).
+   Gated by `tests/t00_pynecore/ast/test_141_native_security.py`. `Unsupported`:
+   more than one write site the analysis's site walk never reaches (Python numbers
+   them in string-set order, which follows the hash seed), a `__hist_N__` temp
+   spelled with a non-ASCII digit, and a `_module_file_path` that is no str.
+5. **SecuritySlice** (L, 2.8k lines). Needs the dependency analyzer
+   (`steps/security/dependencies.rs`), the `_pine_ty` stamps and F3;
+   `PYNE_NO_SECURITY_SLICE` becomes a context flag.
 6. **PineType** (XXL, ~11k lines in its closure). `assign_node_ids` stamps
    `_pine_nid` in preorder on every node; `_Inference` (scopes, statements and
    the loop fixpoint, definitions and per-call-site contexts, expressions,

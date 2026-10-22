@@ -55,6 +55,10 @@
     "module": "security_instantiation",
     "digest": "be90a80f91f897f11e880ce9e9a476c8328b263e9346c649dc4f76b7ddd61305"
   },
+  "Security": {
+    "module": "security",
+    "digest": "0f5e0f153ecd0daf9d5792b755f7e1daf767f318f28d38f0fe60fe683eccdcaf"
+  },
   "PersistentSeries": {
     "module": "persistent_series",
     "digest": "b43507e10d5b6fde5ebd3acb74bc5d8f17c5937d0816cc54c9249c77784e935a"

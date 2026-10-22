@@ -15,6 +15,7 @@ pub mod node_ids;
 pub mod pine_qualifier;
 pub mod pine_type_rules;
 pub mod pine_type_table;
+pub mod sha1;
 pub mod steps;
 
 use std::fmt;
@@ -190,6 +191,7 @@ pub static STEPS: &[Step] = &[
     Step { name: "InlineSeriesHoist", run: steps::inline_series_hoist::run },
     Step { name: "PineTruthiness", run: steps::pine_truthiness::run },
     Step { name: "SecurityInstantiation", run: steps::security_instantiation::run },
+    Step { name: "Security", run: steps::security::run },
     Step { name: "PersistentSeries", run: steps::persistent_series::run },
     Step { name: "LibrarySeries", run: steps::lib_series::run },
     Step { name: "ModuleProperty", run: steps::module_property::run },
