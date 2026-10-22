@@ -17,7 +17,7 @@
   },
   "ImportNormalizer": {
     "module": "import_normalizer",
-    "digest": "9bae877506af524053e3315717d6b51da0b0104eeea03a3eab593286b708f9f4"
+    "digest": "eba3f1afe25a43d320f9bc033ddf1a14fabf6928cae0c931928061fdb63562d0"
   },
   "PlotScope": {
     "module": "plot_scope",
@@ -26,6 +26,10 @@
   "OuterWrite": {
     "module": "outer_write",
     "digest": "823ef37ed6c5fd8481c6d955152fc408cf80fc7a68d2493bcea9da9c682ac0cc"
+  },
+  "ExportCapture": {
+    "module": "export_capture",
+    "digest": "65302878fec5f83a12adfb21fc56324db0d3ba468c9aa1f01df66ddc3e720f48"
   },
   "SecurityDrawings": {
     "module": "security_drawings",

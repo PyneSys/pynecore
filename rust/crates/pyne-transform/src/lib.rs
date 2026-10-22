@@ -10,6 +10,7 @@
 //! shows the message).
 
 pub mod data;
+pub mod pine_qualifier;
 pub mod pine_type_rules;
 pub mod steps;
 
@@ -93,6 +94,46 @@ pub trait Host {
     fn star_exports(&self, module: &str) -> Result<Option<Vec<String>>, Unsupported> {
         Ok(data::star_exports().get(module).cloned())
     }
+
+    /// A lib name's registry entry (`lib_registry.lib_types().get(name)`), `None` when
+    /// the registry does not list it.
+    fn lib_name(&self, name: &str) -> Result<Option<data::LibName>, Unsupported> {
+        Ok(data::lib_names().get(name).cloned())
+    }
+
+    /// The `.py` source file of an imported module, found without executing anything
+    /// (`export_capture.module_origin(name, importer, level)`); `None` when the module
+    /// has no such source. `importer` is the importing module's path, read for a
+    /// relative import (`level` > 0) and empty otherwise.
+    fn module_origin(
+        &self,
+        name: &str,
+        importer: &str,
+        level: i64,
+    ) -> Result<Option<String>, Unsupported> {
+        let _ = (importer, level);
+        Err(Unsupported(format!("no host to locate module {name}")))
+    }
+
+    /// A source file's bytes with the fingerprint they belong to, and its resolved
+    /// path (`module_interface.stable_source(path)` and `path.resolve()`); `None` when
+    /// no such pair could be had.
+    fn read_source(&self, path: &str) -> Result<Option<SourceRead>, Unsupported> {
+        Err(Unsupported(format!("no host to read {path}")))
+    }
+}
+
+/// A source file as [`Host::read_source`] read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceRead {
+    /// The file's resolved path (`str(path.resolve())`)
+    pub resolved: String,
+    /// The bytes read
+    pub data: Vec<u8>,
+    /// `st_mtime_ns` of the file the bytes were read from
+    pub mtime_ns: i64,
+    /// `st_size` of the file the bytes were read from
+    pub size: i64,
 }
 
 /// A host that knows nothing: no library can be imported.
@@ -139,6 +180,7 @@ pub static STEPS: &[Step] = &[
     Step { name: "ImportNormalizer", run: steps::import_normalizer::run },
     Step { name: "PlotScope", run: steps::plot_scope::run },
     Step { name: "OuterWrite", run: steps::outer_write::run },
+    Step { name: "ExportCapture", run: steps::export_capture::run },
     Step { name: "SecurityDrawings", run: steps::security_drawings::run },
     Step { name: "DynamicDefault", run: steps::dynamic_default::run },
     Step { name: "InlineSeriesHoist", run: steps::inline_series_hoist::run },

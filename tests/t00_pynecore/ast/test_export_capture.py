@@ -2,12 +2,15 @@
 import ast
 import os
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from pynecore.core.import_hook import PyneLoader
 from pynecore.core import script as script_mod
 from pynecore.core.script_runner import ScriptRunner
+from pynecore.transformers import native
 from pynecore.transformers.export_capture import ExportCaptureTransformer
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
 from pynecore.types.ohlcv import OHLCV
@@ -21,9 +24,27 @@ getObject = Exported()
 '''
 
 
+#: The pipeline context the native step is run with: a module without a source path
+NATIVE_CONTEXT = SimpleNamespace(path=Path('probe.py'), pyne_mode=None, source='', user_code=True)
+
+
 def check(source):
+    """Run the step, and its native port on the same input wherever the port is current:
+    the native step must handle every case here, with Python's tree or verdict."""
     tree = ImportNormalizerTransformer().visit(ast.parse(HEAD + source))
-    return ExportCaptureTransformer().visit(tree)
+    ported = native.available() and 'ExportCapture' in native.current_steps()
+    native_result = native.run(['ExportCapture'], tree, NATIVE_CONTEXT) if ported else None
+    if ported:
+        assert native_result is not None, 'the native ExportCapture declined the module'
+    try:
+        result = ExportCaptureTransformer().visit(tree)
+    except SyntaxError as error:
+        native.verify_rejection('ExportCapture', native_result, error, NATIVE_CONTEXT)
+        if ported:
+            assert isinstance(native_result, native.Rejection)
+        raise
+    native.verify('ExportCapture', result, native_result, NATIVE_CONTEXT)
+    return result
 
 
 @pytest.mark.parametrize('value', ['label.new(0, 1)', 'label.all', 'close', '[1, 2]', 'color.new(color.red, 20)'])

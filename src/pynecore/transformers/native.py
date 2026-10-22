@@ -40,7 +40,9 @@ from pathlib import Path
 from typing import Any
 
 from .builtin_shadow import Library, import_library, library_serves
-from .lib_registry import lib_star_exports
+from .export_capture import module_origin
+from .lib_registry import lib_star_exports, lib_types
+from .module_interface import stable_source
 from .module_property import module_properties
 
 try:
@@ -205,6 +207,28 @@ class _Host:
     @staticmethod
     def star_exports(module: str) -> list[str] | None:
         return lib_star_exports().get(module)
+
+    @staticmethod
+    def lib_name(name: str) -> tuple[str, str | None, bool, str | None, list[str | None]] | None:
+        entry = lib_types().get(name)
+        if entry is None:
+            return None
+        return (entry['kind'], entry.get('ty'), bool(entry.get('callable', False)),
+                entry.get('ret'), [impl.get('ret') for impl in entry.get('impls', ())])
+
+    @staticmethod
+    def module_origin(name: str, importer: str, level: int) -> str | None:
+        path = module_origin(name, importer, level)
+        return None if path is None else str(path)
+
+    @staticmethod
+    def read_source(path: str) -> tuple[str, bytes, int, int] | None:
+        source = Path(path)
+        loaded = stable_source(source)
+        if loaded is None:
+            return None
+        data, (mtime_ns, size) = loaded
+        return str(source.resolve()), data, mtime_ns, size
 
 
 def _context(ctx: Any) -> dict[str, Any]:

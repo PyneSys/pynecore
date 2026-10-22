@@ -1,11 +1,13 @@
 //! `pynecore.transformers._native`: the native transform, called from the Python pipeline.
 
 mod convert;
+mod qualifier;
 mod rules;
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyDict;
 
 use convert::{FromPython, ToPython};
@@ -101,6 +103,43 @@ impl pyne_transform::Host for PyHost<'_> {
     fn star_exports(&self, module: &str) -> Result<Option<Vec<String>>, pyne_ast::Unsupported> {
         self.ask("star_exports", (module,))
     }
+
+    fn lib_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<pyne_transform::data::LibName>, pyne_ast::Unsupported> {
+        type Entry = (String, Option<String>, bool, Option<String>, Vec<Option<String>>);
+        let entry: Option<Entry> = self.ask("lib_name", (name,))?;
+        Ok(entry.map(|(kind, ty, callable, ret, impl_rets)| pyne_transform::data::LibName {
+            kind,
+            ty,
+            callable,
+            ret,
+            impl_rets,
+        }))
+    }
+
+    fn module_origin(
+        &self,
+        name: &str,
+        importer: &str,
+        level: i64,
+    ) -> Result<Option<String>, pyne_ast::Unsupported> {
+        self.ask("module_origin", (name, importer, level))
+    }
+
+    fn read_source(
+        &self,
+        path: &str,
+    ) -> Result<Option<pyne_transform::SourceRead>, pyne_ast::Unsupported> {
+        let read: Option<(String, PyBackedBytes, i64, i64)> = self.ask("read_source", (path,))?;
+        Ok(read.map(|(resolved, data, mtime_ns, size)| pyne_transform::SourceRead {
+            resolved,
+            data: data.to_vec(),
+            mtime_ns,
+            size,
+        }))
+    }
 }
 
 /// Run native steps over a module, in order.
@@ -175,5 +214,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(steps, m)?)?;
     m.add_function(wrap_pyfunction!(ported_json, m)?)?;
     m.add_function(wrap_pyfunction!(rules::call, m)?)?;
+    m.add_function(wrap_pyfunction!(qualifier::call, m)?)?;
+    m.add_function(wrap_pyfunction!(qualifier::registry, m)?)?;
     Ok(())
 }

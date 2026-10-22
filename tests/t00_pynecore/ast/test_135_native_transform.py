@@ -6,6 +6,7 @@ native checks.
 """
 import ast
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -151,6 +152,34 @@ def main():
     b = lowest(s)
 '''
 
+#: A library whose exports read enum members proven from the sources of a package that
+#: must not execute, through a relative and an absolute import, and a per-bar scalar
+#: retained in its library slot
+__test_helper_LIBRARY = '''"""
+@pyne
+"""
+from pynecore.lib import script, high, low, math
+from pynecore.core.pine_export import export
+from .definitions import Mode
+import capture_parity.definitions as definitions
+
+fixed = Mode.fixed
+
+
+@script.library("parity")
+def main():
+    spread = math.abs(high - low)
+    hexadecimal = definitions.Mode.hexadecimal
+
+    @export
+    def get_mode() -> str:
+        return fixed
+
+    @export
+    def get_spread() -> float:
+        return spread + 1 if hexadecimal == fixed else spread
+'''
+
 #: The analysis steps after which the tree carries what the type pass stamped
 __test_helper_TYPED_STEPS = ('PineType', 'ImplicitConversion', 'SecuritySlice')
 
@@ -221,6 +250,41 @@ def __test_native_steps_match_python__(source, monkeypatch):
             continue
         analysed = import_hook._analyse_tree(tree, text, path.resolve(), mode)
         import_hook._lower_tree(analysed, path.resolve(), mode)
+
+
+def __test_native_export_capture_reads_enum_sources__(tmp_path, monkeypatch):
+    """A library proving enum members from imported sources runs the native
+    ExportCapture, which reads the same files as Python and stamps the same deps."""
+    __test_helper_require_native()
+    package = tmp_path / 'capture_parity'
+    package.mkdir()
+    (package / '__init__.py').write_text('raise RuntimeError("must not execute")\n')
+    definitions = package / 'definitions.py'
+    definitions.write_text("from enum import StrEnum\n\n\nclass Mode(StrEnum):\n"
+                           "    fixed = 'FIXED'\n    hexadecimal = 'HEX'\n")
+    path = package / 'library.py'
+    path.write_text(__test_helper_LIBRARY)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv('PYNE_AST_BACKEND', 'verify')
+    answers = []
+    run = native.run
+
+    def recording(names, tree, ctx):
+        answer = run(names, tree, ctx)
+        if names == ['ExportCapture']:
+            answers.append(answer)
+        return answer
+
+    monkeypatch.setattr(native, 'run', recording)
+    tree = ast.parse(__test_helper_LIBRARY)
+    mode = import_hook._module_mode(tree)[1]
+    analysed = import_hook._analyse_tree(tree, __test_helper_LIBRARY, path, mode)
+    import_hook._lower_tree(analysed, path, mode)
+    assert len(answers) == 1 and isinstance(answers[0], ast.Module)
+    stat = definitions.stat()
+    assert answers[0]._export_capture_deps == (
+        (str(definitions.resolve()), stat.st_mtime_ns, stat.st_size),)
+    assert 'capture_parity' not in sys.modules
 
 
 def __test_helper_extras(tree: ast.AST) -> list[tuple[str, object]]:

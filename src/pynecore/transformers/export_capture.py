@@ -9,13 +9,15 @@ import ast
 from importlib.machinery import PathFinder
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 from . import ast_walk
+from .lib_registry import lib_types
+from .module_interface import stable_source
 from .pine_qualifier import CONST, lib_call_qualifier, lib_value_qualifier, builtin_call_qualifier
-from .pine_type_infer import lib_types
 from .pine_type_rules import BUILTIN_CALL_TYPES, SCALARS, UNKNOWN, annotation_type
 
-__all__ = ['ExportCaptureTransformer']
+__all__ = ['ExportCaptureTransformer', 'module_origin']
 
 
 @dataclass(eq=False)
@@ -53,6 +55,45 @@ def _path(node: ast.AST) -> str:
     return ''
 
 
+def module_origin(name: str, importer: str, level: int) -> Path | None:
+    """
+    The source file of an imported module, found without executing anything.
+
+    :param name: The module as the import spells it, empty for ``from . import x``
+    :param importer: Path of the importing module's source, read for a relative import
+    :param level: The import's level, 0 for an absolute import
+    :return: The ``.py`` file, or None when the module has no such source
+    """
+    search = None
+    if level:
+        if not importer:
+            return None
+        base = Path(importer).parent
+        for _ in range(level - 1):
+            base = base.parent
+        if not name:
+            return base / '__init__.py'
+        search = [str(base)]
+    spec = None
+    try:
+        segments = name.split('.')
+        for index in range(len(segments)):
+            # Resolve one component at a time: namespace packages need
+            # not exist in sys.modules for their source to be inspected.
+            spec = PathFinder.find_spec(segments[index], search)
+            if spec is None:
+                return None
+            locations = spec.submodule_search_locations
+            search = list(locations) if locations is not None else None
+            if index < len(segments) - 1 and search is None:
+                return None
+    except (ImportError, OSError, ValueError):
+        return None
+    if spec is None or not spec.origin or not spec.origin.endswith('.py'):
+        return None
+    return Path(spec.origin)
+
+
 class _EnumResolver:
     """Resolve enum declarations from source without executing imported modules."""
 
@@ -68,43 +109,16 @@ class _EnumResolver:
         if key in self.modules:
             return self.modules[key]
         self.modules[key] = None
-        search = None
-        package_init: Path | None = None
-        if level:
-            if not source:
-                return None
-            base = Path(source).parent
-            for _ in range(level - 1):
-                base = base.parent
-            search = [str(base)]
-            if not name:
-                package_init = base / '__init__.py'
-        spec = None
+        path = module_origin(name, source if level else '', level)
+        if path is None:
+            return None
         try:
-            if package_init is not None:
-                path = package_init
-            else:
-                segments = name.split('.')
-                for index in range(len(segments)):
-                    # Resolve one component at a time: namespace packages need
-                    # not exist in sys.modules for their source to be inspected.
-                    spec = PathFinder.find_spec(segments[index], search)
-                    if spec is None:
-                        return None
-                    locations = spec.submodule_search_locations
-                    search = list(locations) if locations is not None else None
-                    if index < len(segments) - 1 and search is None:
-                        return None
-                if spec is None or not spec.origin or not spec.origin.endswith('.py'):
-                    return None
-                path = Path(spec.origin)
-            from .module_interface import stable_source
             loaded = stable_source(path)
             if loaded is None:
                 return None
             data, fingerprint = loaded
             tree = ast.parse(data, filename=str(path))
-        except (ImportError, OSError, SyntaxError, ValueError):
+        except (OSError, SyntaxError, ValueError):
             return None
         module_path = str(path.resolve())
         setattr(tree, '_module_file_path', module_path)
@@ -443,7 +457,8 @@ class ExportCaptureTransformer(ast_walk.NodeTransformer):
                 target = binding.target
             else:
                 annotation = ast.Name(id='Series', ctx=ast.Load())
-                target, = binding.targets
+                # A captured plain assignment binds exactly one name (``constant_binding``)
+                target = cast(ast.Name, binding.targets[0])
             declarations[id(binding)] = ast.copy_location(ast.AnnAssign(
                 target=target, annotation=annotation, value=binding.value, simple=1), binding)
             retained.add(key)

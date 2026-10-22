@@ -54,7 +54,7 @@ from ..utils.stdlib_checker import is_stdlib
 from . import ast_walk
 from . import module_interface
 from .dynamic_default import is_script_entry
-from .lib_registry import lib_registry, lib_routes, lib_star_exports
+from .lib_registry import lib_registry, lib_routes, lib_star_exports, lib_types
 from .node_ids import ID_ATTR, assign_node_ids, node_id
 from .pine_type_report import unknown_diags
 from .pine_type_rules import (
@@ -87,7 +87,7 @@ from .pine_qualifier import (
     set_series_len, set_series_lens,
 )
 
-__all__ = ['infer_module', 'lib_types', 'lib_classes', 'lib_namespaces', 'lib_routes',
+__all__ = ['infer_module', 'lib_classes', 'lib_namespaces', 'lib_routes',
            'lib_star_exports', 'TY_ATTR', 'get_ty', 'set_ty', 'inherit_ty']
 
 #: How many times a loop body is re-inferred before the types are declared
@@ -189,26 +189,9 @@ def _walker_rule(rule: Callable[[Any], str]) -> Callable[..., str]:
     """
     return lambda walker, node: rule(node)
 
-_LIB_TYPES: dict[str, dict[str, Any]] = {}
 _LIB_CLASSES: dict[str, 'ClassSig'] = {}
 _LIB_SCALARS: dict[str, str] = {}
 _LIB_NAMESPACES: set[str] = set()
-
-
-def lib_types() -> dict[str, dict[str, Any]]:
-    """
-    The generated lib registry, loaded once.
-
-    Read from JSON rather than by importing the lib: this module is imported
-    by the import hook while it transforms pynecore's own lib modules, and an
-    import there would re-enter a half-initialized package (the same reason
-    ``const_fold`` defers its lib import).
-
-    :return: name -> entry mapping
-    """
-    if not _LIB_TYPES:
-        _LIB_TYPES.update(lib_registry()['names'])
-    return _LIB_TYPES
 
 
 def lib_classes() -> dict[str, ClassSig]:

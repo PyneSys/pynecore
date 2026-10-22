@@ -20,8 +20,12 @@ pointers.
   (`stamp_lowering`). Hermetic. Ported as `crates/pyne-transform/src/pine_type_rules.rs`,
   gated against the Python module by `tests/t00_pynecore/ast/test_136_native_type_rules.py`
   through `_native._rules`.
-- **F2.** `pine_qualifier.py` is hermetic; `data.rs` must also carry the `names`,
-  `classes`, `scalar_classes` and `routes` sections of `lib_types.json`.
+- **F2.** Ported as `crates/pyne-transform/src/pine_qualifier.rs`; `data.rs` carries
+  the `routes`, `classes` and `scalar_classes` sections of `lib_types.json` whole,
+  and of `names` the fields a native step reads so far (`data::LibName`: kind,
+  value type, callable, return types). Both are gated against Python by
+  `tests/t00_pynecore/ast/test_137_native_qualifier.py` through `_native._qualifier`
+  and `_native._data`. PineType needs the rest of `names` (parameters, defaults).
 - **F3.** Done for the steps after PineType: the module's `_pine_types` (a
   `PineTypeTable` dataclass) and any other stamp that is no plain builtin value
   cross the bridge as `Value::Opaque`, the very Python object handed back; the
@@ -34,7 +38,6 @@ pointers.
 - **Digest closures.** `native._closure` follows `transformers` imports
   transitively. Before porting, cut couplings that would stale a port on
   unrelated edits:
-  - `export_capture.py` imports `lib_types` from `pine_type_infer`;
   - ConstFold's closure covers `lib/math.py`, `core/fdlibm.py`,
     `core/safe_convert.py`, `pine_type_rules.py`: correct, those decide its output.
 
@@ -43,11 +46,12 @@ pointers.
 1. **ImplicitConversion** (S). Hermetic; reads `_pine_widen`, `_pine_widen_site`,
    `_pine_na_class`, `_pine_ty`. Needs F1, F3. Ported as `steps/implicit_conversion.rs`;
    it never reads the `PineTypeTable`.
-2. **ExportCapture** (M). Runs only for `@library` modules. Reads other modules'
-   sources to prove enum members constant: needs Host methods along the lines of
-   `find_spec(name, search) -> Option<Spec>` and
-   `read_source(path) -> Option<SourceRead { resolved, bytes, mtime_ns, size }>`.
-   Stamps `_export_capture_deps` on the module. Needs F1, F2.
+2. **ExportCapture** (M). Ported. The imported modules are located and read
+   through `Host::module_origin` (`export_capture.module_origin`) and
+   `Host::read_source` (`module_interface.stable_source` plus `path.resolve()`),
+   and parsed into the same arena; a source the native parser or the UTF-8 check
+   does not take answers `Unsupported`. The WASM host answers both `Unsupported`
+   until a request carries the sources of the modules a library imports.
 3. **ConstFold** (M-L). Bakes numerics into the tree:
    - `core/fdlibm.py` (all nine public functions and their kernels): port it, do
      not use the `libm` crate (musl's exp/log/pow are not fdlibm 5.3); gate against

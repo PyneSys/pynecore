@@ -39,3 +39,11 @@ def ported_json() -> str:
 
 def _rules(name: str, *args: Any) -> Any:
     """One function of the native ``pine_type_rules`` port, by its Python name (tests only)."""
+
+
+def _qualifier(name: str, *args: Any) -> Any:
+    """One function of the native ``pine_qualifier`` port, by its Python name (tests only)."""
+
+
+def _data(section: str) -> dict[str, Any]:
+    """A section of the registries compiled into the extension (tests only)."""
