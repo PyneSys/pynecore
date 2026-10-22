@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from . import ast_walk
-from .pine_type_rules import FactoryFields
+from .factory_fields import FactoryFields
 from .pine_type_table import Diag, Unknown
 
 __all__ = ['EDGE_RULES_VERSION', 'STRICT_ENV', 'DIAG_ENV', 'edge_rules', 'strict_enabled',

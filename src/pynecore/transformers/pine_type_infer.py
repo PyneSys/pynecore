@@ -53,7 +53,7 @@ from typing import Any, Final
 from ..utils.stdlib_checker import is_stdlib
 from . import ast_walk
 from . import module_interface
-from .dynamic_default import is_script_entry
+from .factory_fields import FactoryFields, dotted_name
 from .lib_registry import lib_registry, lib_routes, lib_star_exports, lib_types
 from .node_ids import ID_ATTR, assign_node_ids, node_id
 from .pine_type_report import unknown_diags
@@ -70,8 +70,7 @@ from .pine_type_rules import (
     NOT_PINE_STRINGS, set_widen, get_widen_site,
     set_widen_site, get_widens, set_widens, is_na_widen, set_na_class,
     overload_result, ImplSig, overload_choice, overload_binding, default_fit, FIT_REQUIRED,
-    FactoryFields,
-    impl_sig, _param_defaults, _dotted, _DYN_DEFAULT,  # noqa: internal API
+    impl_sig, _param_defaults, _DYN_DEFAULT,  # noqa: internal API
     CLASS_SEP, LIB_MODULE, SCALARS, PINE_LOOP, array_of, builtin_class_id, class_id, class_of,
     element_of, elements_of, is_array,
     is_map, is_matrix, is_tuple, key_of, matrix_of, namespace_of,
@@ -86,6 +85,7 @@ from .pine_qualifier import (
     lib_call_qualifier, builtin_call_qualifier, window_length, get_series_lens,
     set_series_len, set_series_lens,
 )
+from .script_entry import is_script_entry
 
 __all__ = ['infer_module', 'lib_classes', 'lib_namespaces', 'lib_routes',
            'lib_star_exports', 'TY_ATTR', 'get_ty', 'set_ty', 'inherit_ty']
@@ -1257,7 +1257,7 @@ class _Inference:
             return
         if not isinstance(value, ast.Call) or len(value.args) != 2:
             return
-        called = _dotted(value.func)
+        called = dotted_name(value.func)
         if called is None or called.split('.')[-1] != 'shadowed_namespace':
             return
         library = value.args[0]
@@ -2076,7 +2076,7 @@ class _Inference:
                 'unknown-field', node.attr, fix='assign a field of a @udt object')
         elif base == OBJECT and not self._is_reference(node.value):
             self._node_diag(
-                f"the class of '{_dotted(node.value) or ast.unparse(node.value)}' is not "
+                f"the class of '{dotted_name(node.value) or ast.unparse(node.value)}' is not "
                 f"known here, so its field '{node.attr}' cannot be checked", node,
                 'unknown-class', node.attr, fix='annotate the value with the type it holds')
 
@@ -2154,7 +2154,7 @@ class _Inference:
         array of the matrix's element type.
         """
         if isinstance(iter_node, ast.Call):
-            callee = _dotted(iter_node.func)
+            callee = dotted_name(iter_node.func)
             if callee in ('range', 'pine_range', 'lib.pine_range'):
                 bounds = [self._ty_of(a) for a in iter_node.args]
                 if bounds and all(b in NUMERIC for b in bounds):
@@ -2435,7 +2435,7 @@ class _Inference:
         """
         if not isinstance(node, ast.Attribute):
             return None
-        spelled = _dotted(node)
+        spelled = dotted_name(node)
         return None if spelled is None else self._class_named(tuple(spelled.split('.')), node)
 
     def _names_type(self, node: ast.expr) -> bool:
@@ -2529,7 +2529,7 @@ class _Inference:
             return UNKNOWN
         if base == OBJECT and not self._is_reference(node.value):
             self._node_diag(
-                f"the class of '{_dotted(node.value) or ast.unparse(node.value)}' is not "
+                f"the class of '{dotted_name(node.value) or ast.unparse(node.value)}' is not "
                 f"known here, so its field '{node.attr}' has no type", node,
                 'unknown-class', node.attr,
                 fix='annotate the value with the type it holds')
@@ -3137,7 +3137,7 @@ class _Inference:
             self._pin_diags.add(nid)
             self._diag(
                 f"overload pin differs per call context: {sorted(set(seen.values()), key=str)}",
-                node, self._unknown('context-dependent-pin', node, _dotted(node.func) or ''),
+                node, self._unknown('context-dependent-pin', node, dotted_name(node.func) or ''),
                 fix='annotate the parameters so every call site agrees')
         return pin
 
@@ -3724,7 +3724,7 @@ class _Inference:
         which names a class rather than a function and so resolves through
         neither map.
         """
-        name = _dotted(node.func) or ''
+        name = dotted_name(node.func) or ''
         if name == '__sec_read__':
             return self._security_read(node)
         if name == 'method_call':
@@ -4135,7 +4135,7 @@ class _Inference:
         :param args: The receiver and the arguments after it
         :return: The type the call evaluates to, or None
         """
-        spelled = _dotted(selector)
+        spelled = dotted_name(selector)
         if spelled is None:
             return None
         imported = self._imported_selector(spelled)
@@ -4205,13 +4205,13 @@ class _Inference:
         if isinstance(selector, ast.Constant) and isinstance(selector.value, str):
             spelled = selector.value
         else:
-            spelled = _dotted(selector) or ast.unparse(selector)
+            spelled = dotted_name(selector) or ast.unparse(selector)
         receiver_ty = self._ty_of(receiver)
         if receiver_ty == UNKNOWN:
             return UNKNOWN
         if receiver_ty == OBJECT:
             self._node_diag(
-                f"the class of '{_dotted(receiver) or ast.unparse(receiver)}' is not known "
+                f"the class of '{dotted_name(receiver) or ast.unparse(receiver)}' is not known "
                 f"here, so its method '{spelled}' has no type", node, 'unknown-class', spelled,
                 fix='annotate the receiver with the type it holds')
             return UNKNOWN
@@ -4560,7 +4560,7 @@ class _Inference:
         if isinstance(sec_id, ast.Constant) and isinstance(sec_id.value, str):
             parts += [self._ty_of(written)
                       for written in self._sec_writes.get(sec_id.value, ())]
-        if default is not None and _dotted(default) != 'lib._na_none':
+        if default is not None and dotted_name(default) != 'lib._na_none':
             parts.append(self._ty_of(default))
         result = UNKNOWN
         if parts:
@@ -4768,13 +4768,13 @@ class _Inference:
                 self._call_q[nid] = settled.ret_qual
             return settled.ret
         if (key, params, node_id(target)) in self._in_progress:
-            self._diag(f"'{_dotted(node.func)}' is re-entrant, so its result type is unknown",
+            self._diag(f"'{dotted_name(node.func)}' is re-entrant, so its result type is unknown",
                        node, self._unknown('recursion', node, key))
             return UNKNOWN
         result = self._analyse(key, target, params, parents, node,
                                self._call_quals(target, node, positional))
         if result is None:
-            self._diag(f"'{_dotted(node.func)}' hit the per-module context limit", node,
+            self._diag(f"'{dotted_name(node.func)}' hit the per-module context limit", node,
                        self._unknown('context-budget', node, key))
             return UNKNOWN
         if nid is not None:
@@ -5467,7 +5467,7 @@ class _Inference:
         if cached is not None and cached[0] is node:
             return cached[1]
         name = None
-        dotted = _dotted(node)
+        dotted = dotted_name(node)
         if dotted is not None:
             head, _, rest = dotted.partition('.')
             if head in self._lib_aliases and rest:
@@ -5713,7 +5713,7 @@ def _scan_tree(tree: ast.Module) -> tuple[dict[str, ast.expr], dict[str, list[as
     def take(expr: ast.expr, where: ast.expr) -> None:
         for child in ast_walk.walk(expr):
             if isinstance(child, (ast.Name, ast.Attribute)):
-                spelled = _dotted(child)
+                spelled = dotted_name(child)
                 if spelled is not None:
                     annotations.setdefault(spelled, where)
             elif isinstance(child, ast.Constant) and isinstance(child.value, str):
@@ -5732,7 +5732,7 @@ def _scan_tree(tree: ast.Module) -> tuple[dict[str, ast.expr], dict[str, list[as
     while todo:
         node = popleft()
         if isinstance(node, ast.Call):
-            if len(node.args) >= 2 and _dotted(node.func) == '__sec_write__':
+            if len(node.args) >= 2 and dotted_name(node.func) == '__sec_write__':
                 sec_id = node.args[0]
                 if isinstance(sec_id, ast.Constant) and isinstance(sec_id.value, str):
                     writes.setdefault(sec_id.value, []).append(node.args[1])
@@ -6622,4 +6622,4 @@ def _enumerated(node: ast.expr) -> ast.expr | None:
     """
     if not isinstance(node, ast.Call) or len(node.args) != 1:
         return None
-    return node.args[0] if _dotted(node.func) == 'enumerate' else None
+    return node.args[0] if dotted_name(node.func) == 'enumerate' else None

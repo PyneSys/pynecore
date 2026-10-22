@@ -49,11 +49,11 @@ from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 from . import ast_walk
-from .dynamic_default import is_script_entry
 from .emission_settings import PYNE_RESERVED_NAME_CHAR, security_slice_disabled
 from .persistent import VARIP_TYPES
 from .pine_type_rules import COLOR, OBJECT, SCALARS, STR, get_ty, stamp_lowering
-from .security import (
+from .script_entry import is_script_entry
+from .security_dependencies import (
     _COLLECTION_NAMESPACES, _COLLECTION_READERS, _DependencyAnalyzer, _UNMODELLED_NODES,
 )
 

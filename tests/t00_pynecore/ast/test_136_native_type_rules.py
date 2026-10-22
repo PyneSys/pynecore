@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from pynecore.core import import_hook
+from pynecore.transformers import factory_fields
 from pynecore.transformers import pine_type_rules as rules
 
 from .test_135_native_transform import __test_helper_inputs, __test_helper_require_native
@@ -503,11 +504,11 @@ def __test_native_definitions_match__():
                 for class_map, ty_of in ((classes, None), ({}, __test_helper_ty_by_shape)):
                     __test_helper_compare_definition(node, class_map, ty_of, stats, path)
             if isinstance(node, ast.expr):
-                assert __test_helper_native('dotted', node) == rules._dotted(node)  # noqa
+                assert __test_helper_native('dotted', node) == factory_fields.dotted_name(node)
                 assert __test_helper_native('is_na_literal', node) == rules.is_na_literal(node)
                 stats['expressions'] += 1
         class_defs = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
-        factories = rules.FactoryFields(tree)
+        factories = factory_fields.FactoryFields(tree)
         native = __test_helper_native('factory_fields', tree, class_defs)
         for cls, calls in zip(class_defs, native, strict=True):
             expected = factories.of(cls)
@@ -517,7 +518,7 @@ def __test_native_definitions_match__():
             stats['factory calls'] += len(calls)
     for source in __test_helper_EXPRESSIONS:
         node = ast.parse(source, mode='eval').body
-        assert __test_helper_native('dotted', node) == rules._dotted(node), source  # noqa
+        assert __test_helper_native('dotted', node) == factory_fields.dotted_name(node), source
         assert __test_helper_native('is_na_literal', node) == rules.is_na_literal(node), source
         assert __test_helper_native('bare_wrapper', node) == rules.bare_wrapper(node), source
     print(dict(stats))
@@ -569,7 +570,7 @@ __test_helper_RECORDED = (
 
 #: The functions over a tree the pipeline's calls are compared at the call
 __test_helper_LIVE = (
-    'annotation_type', 'annotation_takes_none', 'bare_wrapper', 'is_na_literal', '_dotted',
+    'annotation_type', 'annotation_takes_none', 'bare_wrapper', 'is_na_literal', 'dotted_name',
     'impl_sig', 'param_fit', 'default_ty', '_param_defaults', 'stamp_lowering',
 )
 
@@ -594,7 +595,7 @@ def __test_helper_compare_live(name, original, args, kwargs, state):
         assert native(name, node, classes) == original(node, classes), ast.dump(node)
     elif name in ('annotation_takes_none', 'bare_wrapper', 'is_na_literal'):
         assert native(name, call['node']) == original(call['node'])
-    elif name == '_dotted':
+    elif name == 'dotted_name':
         assert native('dotted', call['node']) == original(call['node'])
     elif name == '_param_defaults':
         expected = original(call['node'])

@@ -2,6 +2,7 @@ import ast
 from typing import cast
 
 from . import ast_walk
+from .lib_series_attrs import NON_SERIES_LIB_ATTRS
 
 # Builtin price series accepted by generic ``input()`` as source names.
 BUILTIN_PRICE_SERIES = frozenset({
@@ -16,11 +17,6 @@ BUILTIN_GLOBAL_SERIES = {
     **dict.fromkeys(BUILTIN_PRICE_SERIES, 'float'),
     'time': 'int',
 }
-
-# Lib attributes that are NOT Series — subscript access on these should not be transformed
-NON_SERIES_LIB_ATTRS = frozenset({
-    'extra_fields',
-})
 
 
 class LibrarySeriesTransformer(ast_walk.NodeTransformer):
