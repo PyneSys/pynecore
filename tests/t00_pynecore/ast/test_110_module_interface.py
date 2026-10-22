@@ -30,10 +30,11 @@ from ..pine_analysis import analyse_module
 from pynecore.transformers import module_interface
 from pynecore.transformers.module_interface import (
     NO_FINGERPRINT, build_interface, interface_digest, lookup, register, registered,
-    source_digest, stable_source,
+    source_digest,
 )
 from pynecore.transformers.pine_type_rules import FLOAT, INT, UNKNOWN
 from pynecore.transformers.pine_type_table import ModuleInterface
+from pynecore.transformers.source_read import stable_source
 
 
 @contextmanager

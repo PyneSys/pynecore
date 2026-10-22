@@ -42,7 +42,7 @@ from typing import Any
 from .builtin_shadow import Library, import_library, library_serves
 from .export_capture import module_origin
 from .lib_registry import lib_star_exports, lib_types
-from .module_interface import stable_source
+from .source_read import stable_source
 from .module_property import module_properties
 
 try:

@@ -48,7 +48,7 @@ pointers.
    it never reads the `PineTypeTable`.
 2. **ExportCapture** (M). Ported. The imported modules are located and read
    through `Host::module_origin` (`export_capture.module_origin`) and
-   `Host::read_source` (`module_interface.stable_source` plus `path.resolve()`),
+   `Host::read_source` (`source_read.stable_source` plus `path.resolve()`),
    and parsed into the same arena; a source the native parser or the UTF-8 check
    does not take answers `Unsupported`. The WASM host answers both `Unsupported`
    until a request carries the sources of the modules a library imports.

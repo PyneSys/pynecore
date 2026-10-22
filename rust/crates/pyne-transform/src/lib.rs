@@ -117,7 +117,7 @@ pub trait Host {
     }
 
     /// A source file's bytes with the fingerprint they belong to, and its resolved
-    /// path (`module_interface.stable_source(path)` and `path.resolve()`); `None` when
+    /// path (`source_read.stable_source(path)` and `path.resolve()`); `None` when
     /// no such pair could be had.
     fn read_source(&self, path: &str) -> Result<Option<SourceRead>, Unsupported> {
         Err(Unsupported(format!("no host to read {path}")))

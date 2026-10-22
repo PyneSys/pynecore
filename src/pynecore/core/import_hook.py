@@ -1335,9 +1335,8 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             # pairing below cannot be read any earlier than here: a module that
             # merely MENTIONS @pyne reaches this method while its own transform
             # is on the stack, and module_interface is one of them.
-            from pynecore.transformers.module_interface import (
-                interface_payload, stable_source,
-            )
+            from pynecore.transformers.module_interface import interface_payload
+            from pynecore.transformers.source_read import stable_source
 
             # The fingerprint the interface this transform publishes is derived
             # from, read together with the bytes it describes (see

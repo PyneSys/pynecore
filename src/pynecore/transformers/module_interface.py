@@ -56,7 +56,7 @@ from .slot_layout import ModuleLayout
 __all__ = [
     'NO_FINGERPRINT', 'build_interface', 'interface_digest',
     'routes_shape', 'routes_digest',
-    'source_digest', 'stable_source', 'register', 'registered', 'lookup',
+    'source_digest', 'register', 'registered', 'lookup',
     'closes_cycle', 'analysing_scope', 'Compile', 'compiling', 'reached_back',
     'SOURCE_DIGEST', 'dep_record', 'source_record', 'add_dep', 'dep_current', 'settle',
     'interface_payload', 'interface_from_payload',
@@ -77,11 +77,6 @@ NO_FINGERPRINT = (0, -1)
 #: publishes no interface to re-derive, so the record holds exactly as long as
 #: the file's stat does. No derived digest is spelled like it.
 SOURCE_DIGEST = 'source'
-
-#: How many times a stable read is retried before it gives up. A file being
-#: rewritten under the reader settles within a rename or two; anything past
-#: that is churn no number of retries would outlast.
-_STABLE_READ_ATTEMPTS = 3
 
 #: Resolved path -> the interface that module publishes, for this process.
 _registry: dict[str, ModuleInterface] = {}
@@ -229,45 +224,6 @@ def _fingerprint(path: str) -> tuple[int, int]:
     """
     stat = _stat(path)
     return NO_FINGERPRINT if stat is None else (stat.st_mtime_ns, stat.st_size)
-
-
-def stable_source(path: Path) -> tuple[bytes, tuple[int, int]] | None:
-    """
-    A source's bytes and the fingerprint they belong to, as one pair.
-
-    The fingerprint is what every later check compares against, so it may only
-    ever be paired with the bytes it actually describes. Stat'ing around a read
-    does NOT give that: an atomic replace landing between the read and the stat
-    pairs one version's bytes with another version's fingerprint, and an
-    interface built from that pairing is stale in a way the fingerprint check
-    then certifies as fresh. Every reader that publishes a fingerprint
-    alongside signatures it read goes through this -- the loader transforming
-    a module, the analyser deriving one's types, the enum capture proving an
-    imported constant.
-
-    The pairing is taken through ONE open file: ``fstat`` before the read and
-    again after it, both on the same descriptor, so a replacement is either
-    wholly outside the pair (the descriptor keeps reading the file it was
-    opened on, whose fingerprint is the one returned) or shows up as a
-    difference between the two stats, which is retried. A pair that never
-    settles, like a file that cannot be opened at all, has no fingerprint to
-    give -- see ``NO_FINGERPRINT``, which no real file's stat matches.
-
-    :param path: Path to the source file
-    :return: Its bytes and their ``(mtime_ns, size)``, or None when no such
-             pair could be had
-    """
-    for _ in range(_STABLE_READ_ATTEMPTS):
-        try:
-            with open(path, 'rb') as handle:
-                before = os.fstat(handle.fileno())
-                data = handle.read()
-                after = os.fstat(handle.fileno())
-        except OSError:
-            return None
-        if (before.st_mtime_ns, before.st_size) == (after.st_mtime_ns, after.st_size):
-            return data, (before.st_mtime_ns, before.st_size)
-    return None
 
 
 def _export_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, key: str,

@@ -13,7 +13,7 @@ from typing import cast
 
 from . import ast_walk
 from .lib_registry import lib_types
-from .module_interface import stable_source
+from .source_read import stable_source
 from .pine_qualifier import CONST, lib_call_qualifier, lib_value_qualifier, builtin_call_qualifier
 from .pine_type_rules import BUILTIN_CALL_TYPES, SCALARS, UNKNOWN, annotation_type
 
