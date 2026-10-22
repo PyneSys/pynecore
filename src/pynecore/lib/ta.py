@@ -275,6 +275,7 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB:
     assert length > 0, "Invalid length, length must be greater than 0!"
     length = int(length)
     capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
+    first_bar: Persistent[int] = -1
     # Grow the buffer so ``source[length]`` stays addressable for lengths beyond the
     # per-series default max_bars_back (500); otherwise it reads na and the change is na.
     # The resize is monotonic: a series ``length`` that dips low must not shrink the
@@ -282,6 +283,8 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB:
     if length > capacity:
         capacity = length
         max_bars_back(source, capacity)
+    if first_bar < 0:
+        first_bar = int(bar_index)
 
     prev_val = source[length]  # noqa
 
@@ -291,6 +294,15 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB:
     if not (prev_val == prev_val):
         return NA(type(source))
     if isinstance(source, bool):
+        # A bool history reads the bool na before the bar exists, and under the
+        # two-state bool that na is a plain false no na test can tell from a
+        # stored false. The missing bars are counted instead: TradingView
+        # answers false (v6) and na (v5) until ``source`` has ``length`` bars
+        # of history (measured, CAPITALCOM:EURUSD 60). The history is one
+        # entry per bar from the first call on, filled through skipped bars,
+        # so the bar distance is exactly the series' depth.
+        if int(bar_index) - first_bar < length:
+            return NA(bool)
         return source != prev_val
     return cast(TFIB, source - prev_val)  # noqa
 

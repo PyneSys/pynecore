@@ -68,7 +68,7 @@ The state-related AST transformers (see [AST Transformation](./ast-transformatio
 A layout is a plain dict with these keys:
 
 - `init` — template value for every slot; instantiation is essentially `list(init)`
-- `series` — `(slot, max_bars_back, elem)` triples; instantiation puts a fresh `SeriesImpl` circular buffer into these slots. `elem` is the statically known element type name (`'float'` selects the native `nan` as the series' out-of-range na value) or `None`
+- `series` — `(slot, max_bars_back, elem)` triples; instantiation puts a fresh `SeriesImpl` circular buffer into these slots. `elem` is the statically known element type name (`'float'` selects the native `nan` as the series' out-of-range na value) or `None`, in which case the buffer takes the na of the first typed value it stores when it is first read out of range (an `inline_series` buffer is built the same way, so `expr[n]` reads the na of `expr`'s type before its history exists)
 - `varip` — slot indexes excluded from the `var` rollback on intra-bar re-execution
 - `children` — `(slot, call_id, in_loop)` triples describing the function's isolated call sites
 - `names` — per-slot debug names (used only by debug tooling)

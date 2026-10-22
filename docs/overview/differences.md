@@ -320,7 +320,13 @@ assignments, and the `na` it starts as is that type's na, a tuple that starts as
 per position; assignments of two different types (`"s"` in one branch, `2` in another) are
 reported as the error they are in Pine, a tuple's positions one by one. The `na` a
 `request.security` call yields on a bar with no value is the na of the requested expression's
-type, per position for a tuple.
+type, per position for a tuple. A history read before the bar exists (`close[1]` on the first
+bar, `ta.ema(close, 20)[1]` or any other `expr[n]` with fewer than `n` bars behind it) is the
+na of the series' own type as well: the nan for a number, `""` for a string, the bool na the
+script runs with for a bool, `na(Pivot)` for an object. A series declared without a type
+takes it from the first typed value it stores. `ta.change(cond)` of a bool knows the missing
+bars apart from a stored `false`: it is `false` (or na, under the three-state bool) until
+`cond` has `length` bars of history, as on TradingView.
 
 ### Array
 
