@@ -2,6 +2,8 @@
 import ast
 from typing import Any
 
+from .pine_type_table import PineTypeTable
+
 __version__: str
 
 
@@ -61,3 +63,13 @@ def _quantize_embed(values: bytes) -> bytes:
 def _const_eval(expr: ast.expr) -> int | float | None:
     """The native ``quantize_embed(_try_eval(expr, {}))``, None where the fold leaves
     ``expr`` in place (tests only)."""
+
+
+def _type_table(table: PineTypeTable) -> PineTypeTable:
+    """A ``PineTypeTable`` converted to its native form and back, as the bridge converts
+    the table of a run whose steps read it (tests only)."""
+
+
+def _node_ids(tree: ast.AST, start: int = 0) -> tuple[ast.AST, int]:
+    """The tree numbered by the native ``assign_node_ids``, a new tree, and the next
+    unused id (tests only)."""

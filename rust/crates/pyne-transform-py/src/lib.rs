@@ -4,6 +4,7 @@ mod convert;
 mod fold;
 mod qualifier;
 mod rules;
+mod type_table;
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -179,10 +180,13 @@ fn run<'py>(
         },
         host: &host,
     };
+    let names: Vec<&str> = steps.iter().map(String::as_str).collect();
     let mut from = FromPython::new();
+    if pyne_transform::reads_type_table(&names) {
+        from = from.native_type_tables(py)?;
+    }
     let root = from.node(tree)?;
     let mut ast = from.ast;
-    let names: Vec<&str> = steps.iter().map(String::as_str).collect();
     let root =
         pyne_transform::run_steps(&mut ast, root, &names, &ctx).map_err(|err| match err {
             pyne_transform::Error::Unsupported(message) => Unsupported::new_err(message),
@@ -220,5 +224,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fold::fdlibm_call, m)?)?;
     m.add_function(wrap_pyfunction!(fold::quantize_embed, m)?)?;
     m.add_function(wrap_pyfunction!(fold::const_eval, m)?)?;
+    m.add_function(wrap_pyfunction!(type_table::round_trip, m)?)?;
+    m.add_function(wrap_pyfunction!(type_table::node_ids, m)?)?;
     Ok(())
 }

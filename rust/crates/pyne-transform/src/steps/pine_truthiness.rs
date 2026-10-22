@@ -29,7 +29,7 @@ fn is_bool_valued(ast: &Ast, id: NodeId) -> bool {
     }
 }
 
-/// Python's truth value of a stamped attribute; None for an object only the host can ask.
+/// Python's truth value of a stamped attribute; None for an object the step does not look into.
 fn truthy(value: &Value) -> Option<bool> {
     Some(match value {
         Value::None => false,
@@ -41,7 +41,7 @@ fn truthy(value: &Value) -> Option<bool> {
         Value::Tuple(items) | Value::List(items) => !items.is_empty(),
         Value::Dict(items) => !items.is_empty(),
         Value::Node(_) => true,
-        Value::Opaque(_) => return None,
+        Value::Opaque(_) | Value::Native(_) => return None,
     })
 }
 

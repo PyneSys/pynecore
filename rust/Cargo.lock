@@ -423,6 +423,7 @@ dependencies = [
 name = "pyne-transform"
 version = "0.1.0"
 dependencies = [
+ "indexmap",
  "pyne-ast",
  "pyne-parse",
  "serde_json",
@@ -432,6 +433,7 @@ dependencies = [
 name = "pyne-transform-py"
 version = "0.1.0"
 dependencies = [
+ "indexmap",
  "pyne-ast",
  "pyne-parse",
  "pyne-transform",

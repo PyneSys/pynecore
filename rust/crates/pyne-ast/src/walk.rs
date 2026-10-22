@@ -290,10 +290,10 @@ pub fn clone(ast: &mut Ast, id: NodeId, memo: &mut HashMap<NodeId, NodeId>) -> N
     placeholder
 }
 
-/// A stamped value of a copied node. A [`Value::Opaque`] stays the same object
-/// where `copy.deepcopy` would copy it: the native side cannot copy what it
-/// cannot see, and the copy is equal to the original, which is what a
-/// consumer of the tree compares.
+/// A stamped value of a copied node. A [`Value::Opaque`] or [`Value::Native`]
+/// stays the same object where `copy.deepcopy` would copy it: the native side
+/// cannot copy what it cannot see, and the copy is equal to the original, which
+/// is what a consumer of the tree compares.
 fn clone_value(ast: &mut Ast, value: Value, memo: &mut HashMap<NodeId, NodeId>) -> Value {
     match value {
         Value::Node(id) => Value::Node(clone(ast, id, memo)),

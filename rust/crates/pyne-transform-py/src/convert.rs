@@ -12,6 +12,12 @@
 //! kept in a per-conversion list, and [`ToPython`] given that list puts the very
 //! same object back, so it survives a native step unchanged and with its
 //! identity.
+//!
+//! The type pass's `PineTypeTable` is the exception when the steps of a run read
+//! it natively ([`FromPython::native_type_tables`]): it is converted into a
+//! [`PineTypeTable`] the tree owns ([`Value::Native`]). [`ToPython`] turns a
+//! native table, the converted one or one a native step built, into a real
+//! Python `PineTypeTable` (see [`crate::type_table`]).
 
 use std::collections::HashMap;
 
@@ -19,6 +25,7 @@ use pyne_ast::{
     Ast, BoolOperator, CLASSES, CmpOperator, Constant, ExprContext, FieldKind, FieldMut, FieldRef,
     Int, Kind, Loc, NodeId, Operator, UnaryOperator, Value, class_index,
 };
+use pyne_transform::pine_type_table::PineTypeTable;
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{
@@ -26,6 +33,7 @@ use pyo3::types::{
 };
 
 use crate::Unsupported;
+use crate::type_table::Classes;
 
 const LOCATIONS: [&str; 4] = ["lineno", "col_offset", "end_lineno", "end_col_offset"];
 
@@ -43,6 +51,10 @@ pub struct FromPython<'py> {
     object_memo: HashMap<usize, u32>,
     /// The converted objects, kept alive so their addresses stay unique
     keep: Vec<Bound<'py, PyAny>>,
+    /// Set when a `PineTypeTable` is converted rather than handed through
+    type_tables: Option<Classes<'py>>,
+    /// Table address -> its native value, so one table is one native object
+    native_memo: HashMap<usize, Value>,
 }
 
 impl<'py> FromPython<'py> {
@@ -53,7 +65,20 @@ impl<'py> FromPython<'py> {
             memo: HashMap::new(),
             object_memo: HashMap::new(),
             keep: Vec::new(),
+            type_tables: None,
+            native_memo: HashMap::new(),
         }
+    }
+
+    /// Convert every `PineTypeTable` into a native one instead of handing it through.
+    pub fn native_type_tables(mut self, py: Python<'py>) -> PyResult<FromPython<'py>> {
+        self.type_tables = Some(Classes::import(py)?);
+        Ok(self)
+    }
+
+    /// A stamped attribute's value, as a node's attribute converts.
+    pub fn stamp(&mut self, value: &Bound<'py, PyAny>) -> PyResult<Value> {
+        self.value(value)
     }
 
     /// The Python object a node was converted from.
@@ -258,6 +283,19 @@ impl<'py> FromPython<'py> {
         if value.is_instance(&ast.getattr("AST")?)? {
             return Ok(Value::Node(self.node(value)?));
         }
+        if let Some(classes) = &self.type_tables
+            && classes.is_table(value)
+        {
+            let key = value.as_ptr() as usize;
+            if let Some(native) = self.native_memo.get(&key) {
+                return Ok(native.clone());
+            }
+            let table = classes.table_from(value)?;
+            let native = self.ast.add_native(table);
+            self.native_memo.insert(key, native.clone());
+            self.keep.push(value.clone());
+            return Ok(native);
+        }
         Ok(Value::Opaque(self.object(value)?))
     }
 
@@ -340,6 +378,10 @@ pub struct ToPython<'py> {
     classes: HashMap<usize, (Bound<'py, PyAny>, Vec<bool>)>,
     /// One instance per operator class, as CPython's parser shares them
     singletons: HashMap<&'static str, Bound<'py, PyAny>>,
+    /// The table classes, imported when the first native table is converted
+    type_tables: Option<Classes<'py>>,
+    /// One Python object per [`Value::Native`]
+    natives: HashMap<u32, Bound<'py, PyAny>>,
 }
 
 impl<'py> ToPython<'py> {
@@ -351,6 +393,8 @@ impl<'py> ToPython<'py> {
             memo: HashMap::new(),
             classes: HashMap::new(),
             singletons: HashMap::new(),
+            type_tables: None,
+            natives: HashMap::new(),
         })
     }
 
@@ -542,6 +586,29 @@ impl<'py> ToPython<'py> {
                 .get(*index as usize)
                 .ok_or_else(|| unsupported(format!("opaque value {index} of another conversion")))?
                 .clone(),
+            Value::Native(index) => self.native(ast, *index, value)?,
         })
+    }
+
+    /// A stamped attribute's value, as a node's attribute converts.
+    pub fn stamp(&mut self, ast: &Ast, value: &Value) -> PyResult<Bound<'py, PyAny>> {
+        self.value(ast, value)
+    }
+
+    /// The Python object of a native one: the same object every time it is reached.
+    fn native(&mut self, ast: &Ast, index: u32, value: &Value) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(object) = self.natives.get(&index) {
+            return Ok(object.clone());
+        }
+        let table = ast
+            .native::<PineTypeTable>(value)
+            .ok_or_else(|| unsupported(format!("native object {index} of an unknown type")))?;
+        if self.type_tables.is_none() {
+            self.type_tables = Some(Classes::import(self.py)?);
+        }
+        let classes = self.type_tables.as_ref().expect("imported above");
+        let object = classes.table_to(table)?;
+        self.natives.insert(index, object.clone());
+        Ok(object)
     }
 }

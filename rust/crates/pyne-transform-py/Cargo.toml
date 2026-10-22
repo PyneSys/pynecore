@@ -12,6 +12,7 @@ name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]
+indexmap.workspace = true
 pyne-ast.workspace = true
 pyne-parse.workspace = true
 pyne-transform.workspace = true

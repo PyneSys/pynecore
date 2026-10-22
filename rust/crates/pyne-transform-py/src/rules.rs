@@ -163,6 +163,9 @@ fn value<'py>(
         }
         Value::Node(id) => original(from, *id)?,
         Value::Opaque(index) => from.objects[*index as usize].clone(),
+        Value::Native(index) => {
+            return Err(Unsupported::new_err(format!("native object {index}")));
+        }
     })
 }
 

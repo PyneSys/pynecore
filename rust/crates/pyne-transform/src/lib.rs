@@ -11,8 +11,10 @@
 
 pub mod data;
 pub mod fdlibm;
+pub mod node_ids;
 pub mod pine_qualifier;
 pub mod pine_type_rules;
+pub mod pine_type_table;
 pub mod steps;
 
 use std::fmt;
@@ -195,6 +197,17 @@ pub static STEPS: &[Step] = &[
     Step { name: "ClosureArguments", run: steps::closure_arguments::run },
     Step { name: "ImplicitConversion", run: steps::implicit_conversion::run },
 ];
+
+/// The steps whose port reads the module's
+/// [`PineTypeTable`](pine_type_table::PineTypeTable). A host hands the table of a
+/// run over to the tree natively ([`pyne_ast::Value::Native`]) when one of these
+/// steps is in the run, and through untouched otherwise.
+pub static TYPE_TABLE_READERS: &[&str] = &[];
+
+/// Whether a run of these steps needs the module's type table natively.
+pub fn reads_type_table(names: &[&str]) -> bool {
+    names.iter().any(|name| TYPE_TABLE_READERS.contains(name))
+}
 
 /// The native port of a step, if there is one.
 pub fn step(name: &str) -> Option<&'static Step> {

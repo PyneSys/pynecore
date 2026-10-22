@@ -26,15 +26,43 @@ pointers.
   value type, callable, return types). Both are gated against Python by
   `tests/t00_pynecore/ast/test_137_native_qualifier.py` through `_native._qualifier`
   and `_native._data`. PineType needs the rest of `names` (parameters, defaults).
-- **F3.** Done for the steps after PineType: the module's `_pine_types` (a
-  `PineTypeTable` dataclass) and any other stamp that is no plain builtin value
-  cross the bridge as `Value::Opaque`, the very Python object handed back; the
-  other stamps (`_pine_ty`, `_pine_pin(s)`, `_pine_vector`, `_pine_varying`,
-  `_pine_widen*`, `_pine_series_len(s)`) are plain values and node references.
-  `native.describe` compares a dataclass field by field. A native PineType still
-  needs the table converted both ways, because `function_isolation`,
-  `module_interface.build_interface` and `import_hook` read it as Python
-  dataclasses, and the WASM host has no Python object to hand through.
+- **F3.** The module's `_pine_types` (a `PineTypeTable` dataclass) crosses the
+  bridge one of two ways, chosen per run:
+  - **Handed through** (`Value::Opaque`), the very Python object handed back, when
+    no step of the run reads the table (every port so far). Any other stamp that is
+    no plain builtin value goes the same way; the rest (`_pine_ty`, `_pine_pin(s)`,
+    `_pine_vector`, `_pine_varying`, `_pine_widen*`, `_pine_series_len(s)`) are
+    plain values and node references.
+  - **Owned natively** (`Value::Native`): `crates/pyne-transform/src/pine_type_table.rs`
+    mirrors the table and every dataclass it holds (`Unknown`, `Binding`, `FuncSig`,
+    `ContextKey`, `ContextResult`, `CallSite`, `Diag`, `DepRecord`, `ExportSig`,
+    `ClassSig`, and `ImplSig` from `pine_type_rules.rs`) field for field; a `dict`
+    is an `IndexMap` (insertion order kept), a `frozenset` a `BTreeSet`. The tree
+    keeps the object in a type-erased slot of the arena (`Ast::add_native`,
+    `Ast::native::<PineTypeTable>`), so `pyne-ast` stays free of the transform's
+    types and the WASM host of Python. The bridge converts a Python table into
+    one when a step of the run is listed in `TYPE_TABLE_READERS`
+    (`FromPython::native_type_tables`: strict, an unexpected type answers
+    `Unsupported`), and turns any native table, converted or built by a native
+    step, into a real `PineTypeTable` of the same classes, values, container types
+    and order (`crates/pyne-transform-py/src/type_table.rs`), which
+    `function_isolation`, `module_interface.build_interface` and the import hook
+    read as they read the Python pass's own. `native.describe` writes a dataclass
+    field by field, so `verify` compares a native table by value. A native
+    PineType stamps the module with `Ast::add_native(table)`; a native reader
+    joins `TYPE_TABLE_READERS`.
+
+  `node_ids.rs` ports `assign_node_ids`: the operator and context objects take an
+  id from the count though they are no arena nodes. Both are gated against Python
+  by `tests/t00_pynecore/ast/test_140_native_type_table.py` (`_native._type_table`,
+  `_native._node_ids`) over the corpus and a two-module library that fills every
+  field. The interface payload (`module_interface.interface_payload`) is no shape
+  for the table: it serializes a `ModuleInterface`, which `build_interface`
+  derives from the tree and a projection of the table (exports, classes,
+  extensions, the suppression message); bindings, contexts, call sites,
+  diagnostics, groups, dependency records and call positions do not travel in it.
+  Its `ExportSig`/`ClassSig` JSON fits the native types as they are, for the Host
+  method that will hand an imported module's interface to a native PineType.
 - **Digest closures.** `native._closure` follows `transformers` imports
   transitively. Before porting, cut couplings that would stale a port on
   unrelated edits:

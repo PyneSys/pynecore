@@ -10,7 +10,9 @@
 //! CPython `ast` module (see `gen/gen_nodes.py`), so a port of a Python pass can
 //! read the same fields in the same order. What a pass stamps on a node besides
 //! its fields (`_pine_ty`, `pine_exact`, ...) lives in the node's
-//! [`Node::extra`] map under the same attribute name.
+//! [`Node::extra`] map under the same attribute name; an object that is no plain
+//! value (the type pass's `PineTypeTable`) is either a host object handed through
+//! ([`Value::Opaque`]) or an object the tree owns natively ([`Value::Native`]).
 
 #[rustfmt::skip]
 mod nodes;
@@ -18,6 +20,7 @@ pub mod dump;
 pub mod locations;
 pub mod walk;
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::{Index, IndexMut};
@@ -85,6 +88,44 @@ pub enum Value {
     /// bridge makes one; a step may move, share or drop it, never build one.
     /// Two of them are equal when they hold the same object.
     Opaque(u32),
+    /// An object the tree owns natively (a `PineTypeTable` the native type pass
+    /// built, or one the bridge converted for a native step that reads it): an
+    /// index into the tree's native objects ([`Ast::add_native`]). A copied node
+    /// shares it, as a Python pass sharing the object would. Two of them are
+    /// equal when they hold the same object.
+    Native(u32),
+}
+
+/// What [`Value::Native`] holds: any cloneable value, reached back through
+/// [`Ast::native`] by its concrete type.
+pub trait NativeObject: Any + fmt::Debug {
+    fn clone_object(&self) -> Box<dyn NativeObject>;
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+impl<T: Any + Clone + fmt::Debug> NativeObject for T {
+    fn clone_object(&self) -> Box<dyn NativeObject> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// One native object of an [`Ast`]; cloning the tree clones it.
+#[derive(Debug)]
+struct NativeSlot(Box<dyn NativeObject>);
+
+impl Clone for NativeSlot {
+    fn clone(&self) -> NativeSlot {
+        NativeSlot(self.0.clone_object())
+    }
 }
 
 /// Source location attributes; `None` is an attribute the node does not carry.
@@ -120,6 +161,8 @@ pub struct Node {
 #[derive(Clone, Debug, Default)]
 pub struct Ast {
     nodes: Vec<Node>,
+    /// What the [`Value::Native`] values of the nodes index
+    natives: Vec<NativeSlot>,
 }
 
 impl Ast {
@@ -167,6 +210,30 @@ impl Ast {
     /// The class name of a node.
     pub fn name(&self, id: NodeId) -> &'static str {
         self[id].kind.name()
+    }
+
+    /// Hand an object to the tree; the value to stamp it with.
+    pub fn add_native<T: NativeObject>(&mut self, object: T) -> Value {
+        let index = u32::try_from(self.natives.len()).expect("native object overflow");
+        self.natives.push(NativeSlot(Box::new(object)));
+        Value::Native(index)
+    }
+
+    /// The object a [`Value::Native`] holds, whatever its type.
+    pub fn native_object(&self, index: u32) -> Option<&dyn NativeObject> {
+        self.natives.get(index as usize).map(|slot| &*slot.0)
+    }
+
+    /// The object a value holds, when it is a [`Value::Native`] of type `T`.
+    pub fn native<T: Any>(&self, value: &Value) -> Option<&T> {
+        let Value::Native(index) = value else { return None };
+        self.native_object(*index)?.as_any().downcast_ref()
+    }
+
+    /// The object a value holds, mutably, when it is a [`Value::Native`] of type `T`.
+    pub fn native_mut<T: Any>(&mut self, value: &Value) -> Option<&mut T> {
+        let Value::Native(index) = value else { return None };
+        self.natives.get_mut(*index as usize)?.0.as_any_mut().downcast_mut()
     }
 }
 
