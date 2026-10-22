@@ -41,7 +41,7 @@
   },
   "DynamicDefault": {
     "module": "dynamic_default",
-    "digest": "0180d58d7d01dc03ed2d00d219a819b0f4a0190fba6c915ea31d14993dae6ccc"
+    "digest": "d3c3f5899755e224902c6e2e4544e151ad09ea1ca93a074cad331f9ff4471f3e"
   },
   "InlineSeriesHoist": {
     "module": "inline_series_hoist",
@@ -101,7 +101,7 @@
   },
   "Series": {
     "module": "series",
-    "digest": "8caf805c18b43e3c0046ba62d429c99e9fa58eeffd91614579d1510e02fc31e2"
+    "digest": "6ec8deabfdf8b7ca6ef5bca915121b99b62b144b1512d1be796fcd8c8f4d7db1"
   },
   "VerifyClosedShift": {
     "module": "security_closed_shift_check",
