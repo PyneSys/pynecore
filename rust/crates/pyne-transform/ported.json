@@ -87,6 +87,10 @@
     "module": "implicit_conversion",
     "digest": "9370cf1d5b191472b899aa14abcfafa95c5d4b87b07c2470106cd8bf53be7c53"
   },
+  "SecuritySlice": {
+    "module": "security_slice",
+    "digest": "723e03051f7721671e76ccbaf39b5b9f31608fd813455d668883c4b86ce93988"
+  },
   "SecurityDefault": {
     "module": "security_default",
     "digest": "b09fb76d2c35053888db3745dec8a18b9cc0f5875151f8abd42483d2c6284ffc"
@@ -109,7 +113,11 @@
   },
   "Persistent": {
     "module": "persistent",
-    "digest": "67e53211d6c10fe883670a9aee5f0db1ebea2bf645fcf19d7fb95b09f05fb932"
+    "digest": "431ce6ad3f4bfdafda0b8aea39830df8030e54f7aed63b36a288ec89e74b2f9f"
+  },
+  "CallInline": {
+    "module": "call_inline",
+    "digest": "669c6262d175b56a83835b633e96dabe02b44e1885e68614469820e1e5b82558"
   },
   "ScriptRequirements": {
     "module": "script_requirements",
@@ -131,12 +139,12 @@
     "module": "float_tolerance",
     "digest": "928b686c135f3db8931e7520ccb8d42722cb002c7ef86c22789cde7b724c81a4"
   },
+  "FinalizeCloneDefaults": {
+    "module": "security_slice",
+    "digest": "723e03051f7721671e76ccbaf39b5b9f31608fd813455d668883c4b86ce93988"
+  },
   "FixLocations": {
     "module": "locations",
     "digest": "04f5fd0d9f2058047732518b71fba03f16cd4b1cbe91ca5ab542140b326001f5"
-  },
-  "CallInline": {
-    "module": "call_inline",
-    "digest": "669c6262d175b56a83835b633e96dabe02b44e1885e68614469820e1e5b82558"
   }
 }

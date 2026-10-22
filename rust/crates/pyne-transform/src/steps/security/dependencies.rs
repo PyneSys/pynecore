@@ -455,6 +455,19 @@ impl<'a> DependencyAnalyzer<'a> {
         }
     }
 
+    /// The lexical half alone (`_SliceScopes`): the scope tree, name qualification
+    /// and call resolution, without running (or touching) the taint fixpoint.
+    pub(crate) fn scopes_only(ast: &'a Ast, module: NodeId) -> Self {
+        let mut analyzer = DependencyAnalyzer::new(ast, module, &[]);
+        for node in pyne_ast::walk::walk_statements(ast, module) {
+            if is_function(ast.kind(node)) {
+                analyzer.funcs.insert(function_name(ast, node).to_string(), node);
+            }
+        }
+        analyzer.build_scopes();
+        analyzer
+    }
+
     // --- scopes ---
 
     /// Build the lexical scope tree and each scope's set of bound names
@@ -645,7 +658,13 @@ impl<'a> DependencyAnalyzer<'a> {
 
     /// Scope key of the user function a name resolves to, if any (`_lookup_func`).
     fn lookup_func(&self, name: &str) -> Option<String> {
-        let mut key = Some(self.scope.clone());
+        self.lookup_func_from(name, &self.scope)
+    }
+
+    /// Scope key of the user function a name resolves to in a scope
+    /// (`_lookup_func` with `_scope` set to `scope_key`).
+    pub(crate) fn lookup_func_from(&self, name: &str, scope_key: &str) -> Option<String> {
+        let mut key = Some(scope_key.to_string());
         while let Some(current) = key {
             let Some(scope) = self.scopes.get(&current) else { break };
             if let Some(found) = scope.funcs.get(name) {

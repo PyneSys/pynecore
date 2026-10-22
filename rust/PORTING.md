@@ -117,9 +117,23 @@ pointers.
    more than one write site the analysis's site walk never reaches (Python numbers
    them in string-set order, which follows the hash seed), a `__hist_N__` temp
    spelled with a non-ASCII digit, and a `_module_file_path` that is no str.
-5. **SecuritySlice** (L, 2.8k lines). Needs the dependency analyzer
-   (`steps/security/dependencies.rs`), the `_pine_ty` stamps and F3;
-   `PYNE_NO_SECURITY_SLICE` becomes a context flag.
+5. **SecuritySlice** (L, 2.8k lines). Ported as `steps/security_slice/`: `facts`
+   (the reads / writes / mutations of `main()`'s statements and of the functions it
+   reaches, the alias classes, the slice), `reach` (whether a write runs on every
+   execution of the child's code, the `varip` scan behind `closed_shift`), `forcer`
+   (the rewrite making a guarded write unconditional) and the module visit in
+   `mod.rs`. It reuses the lexical half of the dependency analyzer
+   (`DependencyAnalyzer::scopes_only`, `lookup_func_from`) and reads `_pine_ty`
+   stamps only, never the `PineTypeTable`. `PYNE_NO_SECURITY_SLICE` crosses the
+   bridge as `Context::security_slice_disabled`, which `native._context` reads from
+   `emission_settings.security_slice_disabled()` where the Python step reads it.
+   The Python step builds several clones of one module from parts of `main()` copied
+   and located once (`_CloneSource`), which yields the clone `_build_clone` builds
+   whenever it is used, so the port always builds it the latter way. `VARIP_TYPES`
+   moved into the leaf `varip_types.py`, so the closure no longer holds
+   `persistent.py` and `slot_layout.py`. Gated by `test_141_native_security.py`
+   (typed and untyped inputs, the slicing on and off). Nothing answers
+   `Unsupported`.
 6. **PineType** (XXL, ~11k lines in its closure). `assign_node_ids` stamps
    `_pine_nid` in preorder on every node; `_Inference` (scopes, statements and
    the loop fixpoint, definitions and per-call-site contexts, expressions,
@@ -248,3 +262,5 @@ request from `ModuleLayout::new(pyne_mode == "lib")`, as the import hook does.
    `Unsupported`: an `_inl_argument` marker that is no bool, a `_pine_ty` stamp on
    the call that is no string or one in the inlined expression that is neither a
    string nor `None`, and a literal comparison with an int beyond 64 bits.
+5. **FinalizeCloneDefaults**. Ported in `steps/security_slice/mod.rs` with the step
+   it finishes; it shares SecuritySlice's module and digest.

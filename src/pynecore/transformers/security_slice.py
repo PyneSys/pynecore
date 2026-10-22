@@ -50,13 +50,13 @@ from typing import Any
 
 from . import ast_walk
 from .emission_settings import PYNE_RESERVED_NAME_CHAR, security_slice_disabled
-from .persistent import VARIP_TYPES
 from .pine_type_rules import COLOR, OBJECT, SCALARS, STR, get_ty, stamp_lowering
 from .script_entry import is_script_entry
 from .security_dependencies import (
     _COLLECTION_NAMESPACES, _COLLECTION_READERS, _DependencyAnalyzer, _UNMODELLED_NODES,
 )
 from .security_contexts import ctx_get as _ctx_get, iter_contexts as _iter_contexts
+from .varip_types import VARIP_TYPES
 
 __all__ = ['SecuritySliceTransformer', 'CLONE_PREFIX', 'CLONE_SUFFIX']
 

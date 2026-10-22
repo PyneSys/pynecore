@@ -28,11 +28,11 @@ import ast
 
 from . import ast_walk
 from .slot_layout import ModuleLayout, scope_for_function
+from .varip_types import VARIP_TYPES
 
-__all__ = ['PersistentTransformer', 'VARIP_TYPES']
+__all__ = ['PersistentTransformer']
 
 PERSISTENT_TYPES = ('Persistent', 'IBPersistent', 'IBPersistentSeries')
-VARIP_TYPES = ('IBPersistent', 'IBPersistentSeries')
 
 
 class PersistentTransformer(ast_walk.NodeTransformer):

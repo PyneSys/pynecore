@@ -195,7 +195,7 @@ impl pyne_transform::Host for PyHost<'_> {
 /// :param tree: The module.
 /// :param steps: Step names as ``pipeline.py`` declares them.
 /// :param context: ``path``, ``pyne_mode``, ``source``, ``user_code``, ``na_bool``,
-///     ``sequential``, ``host``, and ``slot_layout``: the pipeline's ``ModuleLayout``,
+///     ``sequential``, ``security_slice_disabled``, ``host``, and ``slot_layout``: the pipeline's ``ModuleLayout``,
 ///     read when a step of the run uses it (a fresh one when the context has none).
 ///     The layout such a run leaves is put into the context as
 ///     ``slot_layout_result``, a new ``ModuleLayout``.
@@ -251,6 +251,10 @@ fn run<'py>(
             None => false,
         },
         sequential: match get("sequential")? {
+            Some(value) => value.extract()?,
+            None => false,
+        },
+        security_slice_disabled: match get("security_slice_disabled")? {
             Some(value) => value.extract()?,
             None => false,
         },

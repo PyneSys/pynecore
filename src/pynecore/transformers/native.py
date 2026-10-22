@@ -47,6 +47,7 @@ from typing import Any
 
 from . import ast_walk
 from .builtin_shadow import Library, import_library, library_serves
+from .emission_settings import security_slice_disabled
 from .export_capture import module_origin
 from . import module_interface
 from .lib_registry import lib_star_exports, lib_types
@@ -310,6 +311,8 @@ class _Host:
 def _context(ctx: Any) -> dict[str, Any]:
     return {'path': str(ctx.path), 'pyne_mode': ctx.pyne_mode, 'source': ctx.source,
             'user_code': ctx.user_code, 'na_bool': ctx.na_bool, 'sequential': ctx.sequential,
+            # Read where the Python step reads it, so both backends slice alike
+            'security_slice_disabled': security_slice_disabled(),
             'host': _Host(ctx.analyse, ctx.pipeline_hash),
             'slot_layout': getattr(ctx, 'slot_layout', None)}
 

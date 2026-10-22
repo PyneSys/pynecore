@@ -7,7 +7,8 @@
 //! hands both buffers back with `pyne_free`.
 //!
 //! Request: `{"source": str, "path": str, "pyne_mode": str | null,
-//! "user_code": bool, "na_bool": bool, "sequential": bool, "steps": [str],
+//! "user_code": bool, "na_bool": bool, "sequential": bool,
+//! "security_slice_disabled": bool, "steps": [str],
 //! "include_attributes": bool, "libraries": {module: [served name]}}`. A step name
 //! may also be a phase's (its rules in one traversal, or one pass each with
 //! `sequential`) or one rule's. `libraries` stands in for the
@@ -79,6 +80,10 @@ fn transform(request: &str) -> Result<Value, Value> {
         user_code: request.get("user_code").and_then(Value::as_bool).unwrap_or(true),
         na_bool: request.get("na_bool").and_then(Value::as_bool).unwrap_or(false),
         sequential: request.get("sequential").and_then(Value::as_bool).unwrap_or(false),
+        security_slice_disabled: request
+            .get("security_slice_disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         host: &host,
         // A lib module's series are na-compacted windows, as the import hook sets it
         slot_layout: RefCell::new(ModuleLayout::new(text("pyne_mode").as_deref() == Some("lib"))),

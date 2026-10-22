@@ -233,6 +233,7 @@ mod tests {
             user_code: true,
             na_bool: false,
             sequential: false,
+            security_slice_disabled: false,
             host: &NoHost,
             slot_layout: Default::default(),
         };

@@ -321,7 +321,7 @@ __test_helper_SEQUENTIAL_STEPS = ('SecurityDefault', 'ExportOnce', 'UnusedSeries
 __test_helper_LOWERING_BATCHES = (
     'SecurityDefault+ExportOnce+UnusedSeriesDetector+Series+VerifyClosedShift+Persistent'
     '+CallInline',
-    'ScriptRequirements+Input+Expression', 'FixLocations')
+    'ScriptRequirements+Input+Expression+FinalizeCloneDefaults', 'FixLocations')
 
 #: The analysis steps after which the tree carries what the type pass stamped
 __test_helper_TYPED_STEPS = ('PineType', 'ImplicitConversion', 'SecuritySlice')
@@ -567,7 +567,7 @@ def __test_typed_steps_run_natively__(monkeypatch):
     monkeypatch.setattr(native, 'run', recording)
     __test_helper_emission('native', monkeypatch)
     batch = next(key for key in answers if 'ImplicitConversion' in key.split('+'))
-    assert 'PineType' in batch.split('+')
+    assert {'PineType', 'SecuritySlice'} <= set(batch.split('+'))
     assert isinstance(answers[batch], ast.Module)
     security = [answer for names, answer in answers.items() if 'Security' in names.split('+')]
     assert len(security) == 1 and isinstance(security[0], ast.Module)

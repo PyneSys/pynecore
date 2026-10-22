@@ -214,6 +214,9 @@ pub struct Context<'h> {
     pub na_bool: bool,
     /// Whether the rules of a phase run as separate passes instead of in one traversal
     pub sequential: bool,
+    /// Whether no backward slice of `main()` may be emitted for the security children
+    /// (`emission_settings.security_slice_disabled()`, `PYNE_NO_SECURITY_SLICE`)
+    pub security_slice_disabled: bool,
     /// Answers what the tree does not say
     pub host: &'h dyn Host,
     /// The shared slot allocator of the lowering half (see [`slot_layout`]); the
@@ -260,6 +263,7 @@ pub static STEPS: &[Step] = &[
     Step { name: "ClosureArguments", run: steps::closure_arguments::run },
     Step { name: "PineType", run: steps::pine_type::run },
     Step { name: "ImplicitConversion", run: steps::implicit_conversion::run },
+    Step { name: "SecuritySlice", run: steps::security_slice::run },
     Step { name: "SecurityDefault", run: steps::security_default::run },
     Step { name: "ExportOnce", run: steps::export_once::run },
     Step { name: "UnusedSeriesDetector", run: steps::unused_series_detector::run },
@@ -273,6 +277,7 @@ pub static STEPS: &[Step] = &[
     Step { name: "SafeConvert", run: steps::safe_convert::run },
     Step { name: "SafeDivision", run: steps::safe_division::run },
     Step { name: "FloatTolerance", run: steps::float_tolerance::run },
+    Step { name: "FinalizeCloneDefaults", run: steps::security_slice::finalize_clone_defaults },
     Step { name: "FixLocations", run: steps::locations::run },
 ];
 
