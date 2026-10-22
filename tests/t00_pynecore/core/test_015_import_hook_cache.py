@@ -16,7 +16,6 @@ import pytest
 import pynecore.core.import_hook as import_hook
 from pynecore.core.import_hook import (
     PyneLoader,
-    PYNE_RESERVED_NAME_CHAR,
     _baked_deps,
     _cache_from_source,
     _get_transform_pipeline_hash,
@@ -24,6 +23,7 @@ from pynecore.core.import_hook import (
     _PYNE_SENTINEL,
 )
 from pynecore.transformers import module_interface
+from pynecore.transformers.emission_settings import PYNE_RESERVED_NAME_CHAR
 from pynecore.transformers.module_interface import dep_record, lookup
 from pynecore.transformers.pine_type_transformer import PineTypeTransformer, module_table
 

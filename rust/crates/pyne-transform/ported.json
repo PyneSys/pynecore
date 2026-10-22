@@ -43,6 +43,10 @@
     "module": "pine_truthiness",
     "digest": "417f5698dbe278f19faebf083dab5c361494e1e2e441eb1ac0d15c951eeb2de3"
   },
+  "SecurityInstantiation": {
+    "module": "security_instantiation",
+    "digest": "0ce88d1787d15271f2e6bbf36e5dded3fb233eadc30244bf08c71cf1aaca94e9"
+  },
   "PersistentSeries": {
     "module": "persistent_series",
     "digest": "b43507e10d5b6fde5ebd3acb74bc5d8f17c5937d0816cc54c9249c77784e935a"

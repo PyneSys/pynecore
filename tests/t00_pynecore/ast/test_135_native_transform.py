@@ -18,7 +18,7 @@ __test_helper_SOURCE = '''"""
 @pyne
 """
 from pynecore.core.pine_udt import udt
-from pynecore.lib import close, hl2, na
+from pynecore.lib import close, hl2, na, request, syminfo, timeframe
 
 
 @udt
@@ -44,6 +44,14 @@ def helper(x):
     return ta.sma(x, 2) + absolute(x) + inner()
 
 
+def htf(tf, symbol=syminfo.tickerid):
+    return request.security(symbol, tf, close)
+
+
+def htf_trend(tf):
+    return htf(tf) - htf(timeframe.period)
+
+
 async def ignored():
     from pynecore.lib import ta
     return ta
@@ -51,7 +59,8 @@ async def ignored():
 
 def main():
     from pynecore.lib import ta as indicators
-    return helper(close) + indicators.ema(close, 3) + smoothed() + Flag().f
+    trend = htf_trend("60") + htf_trend(tf="D") + htf("W", symbol=syminfo.prefix)
+    return helper(close) + indicators.ema(close, 3) + smoothed() + Flag().f + trend
 '''
 
 #: A module the type pass stamps every per-context and per-instance attribute on: an

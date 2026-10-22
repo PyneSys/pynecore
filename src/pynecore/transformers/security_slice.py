@@ -48,9 +48,9 @@ import itertools
 from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
-from ..core.import_hook import PYNE_RESERVED_NAME_CHAR, security_slice_disabled
 from . import ast_walk
 from .dynamic_default import is_script_entry
+from .emission_settings import PYNE_RESERVED_NAME_CHAR, security_slice_disabled
 from .persistent import VARIP_TYPES
 from .pine_type_rules import COLOR, OBJECT, SCALARS, STR, get_ty, stamp_lowering
 from .security import (

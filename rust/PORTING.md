@@ -35,9 +35,9 @@ pointers.
   transitively. Before porting, cut couplings that would stale a port on
   unrelated edits:
   - `export_capture.py` imports `lib_types` from `pine_type_infer`;
-  - `security.py` and `security_slice.py` import `core.import_hook` for
-    `PYNE_RESERVED_NAME_CHAR` and `security_slice_disabled`; move both into a
-    small module;
+  - `security_instantiation.py` imports its call predicates from `security.py`,
+    so the ported SecurityInstantiation goes stale on every `security.py` edit
+    until the predicates move into a small module;
   - ConstFold's closure covers `lib/math.py`, `core/fdlibm.py`,
     `core/safe_convert.py`, `pine_type_rules.py`: correct, those decide its output.
 
@@ -45,14 +45,12 @@ pointers.
 
 1. **ImplicitConversion** (S). Hermetic; reads `_pine_widen`, `_pine_widen_site`,
    `_pine_na_class`, `_pine_ty`. Needs F1, F3.
-2. **SecurityInstantiation** (S). Hermetic fixpoint over the call graph; needs only
-   Security's `has_security_call` / `_is_security_call` predicates.
-3. **ExportCapture** (M). Runs only for `@library` modules. Reads other modules'
+2. **ExportCapture** (M). Runs only for `@library` modules. Reads other modules'
    sources to prove enum members constant: needs Host methods along the lines of
    `find_spec(name, search) -> Option<Spec>` and
    `read_source(path) -> Option<SourceRead { resolved, bytes, mtime_ns, size }>`.
    Stamps `_export_capture_deps` on the module. Needs F1, F2.
-4. **ConstFold** (M-L). Bakes numerics into the tree:
+3. **ConstFold** (M-L). Bakes numerics into the tree:
    - `core/fdlibm.py` (all nine public functions and their kernels): port it, do
      not use the `libm` crate (musl's exp/log/pow are not fdlibm 5.3); gate against
      Python over millions of arguments as `test_016_native_math_matches_python`
@@ -66,13 +64,14 @@ pointers.
      `Unsupported` on overflow or `Int::Big`;
    - `quantize_embed`: shortest digits, round-down at 1e-16 with an exact binary
      tie check (fits in `u128`), correctly rounded parse.
-5. **Security** (XL, 4.4k lines). Split into predicates, collection, builders,
+4. **Security** (XL, 4.4k lines). Split into predicates, collection, builders,
    rewrite, groups, cross-function lift, module emission, and the
    `_DependencyAnalyzer` (~1.5k lines, shared with SecuritySlice) as its own
-   module. Non-hermetic only through `sha1(module path)`.
-6. **SecuritySlice** (L, 2.8k lines). Needs Security's dependency analyzer, the
+   module (`steps/security/`, where the call predicates already are).
+   Non-hermetic only through `sha1(module path)`.
+5. **SecuritySlice** (L, 2.8k lines). Needs Security's dependency analyzer, the
    `_pine_ty` stamps and F3; `PYNE_NO_SECURITY_SLICE` becomes a context flag.
-7. **PineType** (XXL, ~11k lines in its closure). `assign_node_ids` stamps
+6. **PineType** (XXL, ~11k lines in its closure). `assign_node_ids` stamps
    `_pine_nid` in preorder on every node; `_Inference` (scopes, statements and
    the loop fixpoint, definitions and per-call-site contexts, expressions,
    qualifiers, lib / user / method calls and overload groups, cross-module calls,

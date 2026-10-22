@@ -143,6 +143,7 @@ pub static STEPS: &[Step] = &[
     Step { name: "DynamicDefault", run: steps::dynamic_default::run },
     Step { name: "InlineSeriesHoist", run: steps::inline_series_hoist::run },
     Step { name: "PineTruthiness", run: steps::pine_truthiness::run },
+    Step { name: "SecurityInstantiation", run: steps::security_instantiation::run },
     Step { name: "PersistentSeries", run: steps::persistent_series::run },
     Step { name: "LibrarySeries", run: steps::lib_series::run },
     Step { name: "ModuleProperty", run: steps::module_property::run },

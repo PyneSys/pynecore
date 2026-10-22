@@ -4,9 +4,9 @@ import re
 from collections.abc import Container, Iterator
 from typing import Any
 
-from ..core.import_hook import PYNE_RESERVED_NAME_CHAR
 from . import ast_walk
 from .dynamic_default import is_script_entry
+from .emission_settings import PYNE_RESERVED_NAME_CHAR
 from .lib_series import NON_SERIES_LIB_ATTRS
 from .pine_type_rules import FactoryFields
 
