@@ -79,9 +79,13 @@
     "module": "closure_arguments_transformer",
     "digest": "db60671d52f9994ecf5fbb565a3250abe5cdbe760bfd1358e4481d1cc8aed05e"
   },
+  "PineType": {
+    "module": "pine_type_transformer",
+    "digest": "7b59589e544be7cd729b3dfdeeecdea6d67e55550b8aecfb4d359f0d226b265a"
+  },
   "ImplicitConversion": {
     "module": "implicit_conversion",
-    "digest": "9370cf1d5b191472b899aa14abcfafa95c5d4b87b07c2470106cd8bf53be7c53"
+    "digest": "842c737775f12dcae99ef32f302eb7631b1fe9a3ddd1b755e97e3e924fa7f24e"
   },
   "SecurityDefault": {
     "module": "security_default",

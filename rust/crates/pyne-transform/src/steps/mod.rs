@@ -15,6 +15,7 @@ pub mod module_property;
 pub mod outer_write;
 pub mod persistent_series;
 pub mod pine_truthiness;
+pub mod pine_type;
 pub mod plot_scope;
 pub mod security;
 pub mod security_default;

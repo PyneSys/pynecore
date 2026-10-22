@@ -272,6 +272,180 @@ impl PineTypeTable {
     }
 }
 
+/// What the inference reads of the interface an imported module publishes
+/// (`ModuleInterface`), with the dependency record a dependent bakes for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleInterface {
+    /// Resolved source path of the module
+    pub path: String,
+    pub exports: IndexMap<String, ExportSig>,
+    /// The module's literal `__all__`, `None` when it spells none
+    pub all: Option<Vec<String>>,
+    /// The classes the module publishes, by name
+    pub classes: IndexMap<String, ClassSig>,
+    /// The methods it declares on another module's class, by class id and name
+    pub extensions: IndexMap<String, IndexMap<String, ExportSig>>,
+    /// Every module this one's types were derived from or that it imports
+    pub deps: IndexMap<String, DepRecord>,
+    /// Why no pin may be built on anything it publishes, `""` when nothing says so
+    pub suppressed: String,
+    /// The exports bound to an `Exported` proxy
+    pub proxies: Vec<String>,
+    /// `module_interface.dep_record(interface)`
+    pub record: DepRecord,
+}
+
+fn json_str(value: &serde_json::Value, field: &str) -> Result<String, String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("no string {field}"))
+}
+
+fn json_int(value: &serde_json::Value, field: &str) -> Result<i64, String> {
+    value.get(field).and_then(serde_json::Value::as_i64).ok_or_else(|| format!("no int {field}"))
+}
+
+fn json_bool(value: &serde_json::Value, field: &str) -> Result<bool, String> {
+    value.get(field).and_then(serde_json::Value::as_bool).ok_or_else(|| format!("no bool {field}"))
+}
+
+fn json_strs(value: &serde_json::Value, field: &str) -> Result<Vec<String>, String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("no list {field}"))?
+        .iter()
+        .map(|item| item.as_str().map(str::to_string).ok_or_else(|| format!("{field} item")))
+        .collect()
+}
+
+fn json_map<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, String> {
+    value.get(field).and_then(serde_json::Value::as_object).ok_or_else(|| format!("no map {field}"))
+}
+
+impl ExportSig {
+    /// An `ExportSig` as `dataclasses.asdict` writes it.
+    pub fn from_json(value: &serde_json::Value) -> Result<ExportSig, String> {
+        let impls = value
+            .get("impls")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("no impls")?
+            .iter()
+            .map(|item| {
+                Ok(ImplSig {
+                    params: json_strs(item, "params")?,
+                    required: usize::try_from(json_int(item, "required")?)
+                        .map_err(|_| "negative required")?,
+                    open_ended: json_bool(item, "open_ended")?,
+                    ret: json_str(item, "ret")?,
+                    fits: json_str(item, "fits")?,
+                    names: json_strs(item, "names")?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(ExportSig {
+            name: json_str(value, "name")?,
+            kind: json_str(value, "kind")?,
+            params: json_strs(value, "params")?,
+            required: json_int(value, "required")?,
+            open_ended: json_bool(value, "open_ended")?,
+            ret: json_str(value, "ret")?,
+            annotated: json_bool(value, "annotated")?,
+            impls,
+            line: json_int(value, "line")?,
+            names: json_strs(value, "names")?,
+        })
+    }
+}
+
+impl ClassSig {
+    /// A `ClassSig` as `dataclasses.asdict` writes it.
+    pub fn from_json(value: &serde_json::Value) -> Result<ClassSig, String> {
+        let fields = json_map(value, "fields")?
+            .iter()
+            .map(|(name, ty)| Ok((name.clone(), ty.as_str().ok_or("field type")?.to_string())))
+            .collect::<Result<IndexMap<_, _>, String>>()?;
+        let methods = json_map(value, "methods")?
+            .iter()
+            .map(|(name, sig)| Ok((name.clone(), ExportSig::from_json(sig)?)))
+            .collect::<Result<IndexMap<_, _>, String>>()?;
+        Ok(ClassSig {
+            name: json_str(value, "name")?,
+            id: json_str(value, "id")?,
+            fields,
+            required: json_int(value, "required")?,
+            methods,
+        })
+    }
+}
+
+impl DepRecord {
+    /// A `DepRecord` as `dataclasses.asdict` writes it.
+    pub fn from_json(value: &serde_json::Value) -> Result<DepRecord, String> {
+        Ok(DepRecord {
+            path: json_str(value, "path")?,
+            mtime_ns: json_int(value, "mtime_ns")?,
+            size: json_int(value, "size")?,
+            digest: json_str(value, "digest")?,
+            routes: json_str(value, "routes")?,
+        })
+    }
+}
+
+impl ModuleInterface {
+    /// The interface a host serialized as `{"interface": asdict(interface), "record":
+    /// asdict(dep_record(interface))}`, dict order kept.
+    pub fn from_json(text: &str) -> Result<ModuleInterface, String> {
+        let document: serde_json::Value =
+            serde_json::from_str(text).map_err(|err| err.to_string())?;
+        let interface = document.get("interface").ok_or("no interface")?;
+        let exports = json_map(interface, "exports")?
+            .iter()
+            .map(|(name, sig)| Ok((name.clone(), ExportSig::from_json(sig)?)))
+            .collect::<Result<IndexMap<_, _>, String>>()?;
+        let classes = json_map(interface, "classes")?
+            .iter()
+            .map(|(name, sig)| Ok((name.clone(), ClassSig::from_json(sig)?)))
+            .collect::<Result<IndexMap<_, _>, String>>()?;
+        let extensions = json_map(interface, "extensions")?
+            .iter()
+            .map(|(cid, methods)| {
+                let methods = methods
+                    .as_object()
+                    .ok_or("extension methods")?
+                    .iter()
+                    .map(|(name, sig)| Ok((name.clone(), ExportSig::from_json(sig)?)))
+                    .collect::<Result<IndexMap<_, _>, String>>()?;
+                Ok((cid.clone(), methods))
+            })
+            .collect::<Result<IndexMap<_, _>, String>>()?;
+        let deps = json_map(interface, "deps")?
+            .iter()
+            .map(|(path, record)| Ok((path.clone(), DepRecord::from_json(record)?)))
+            .collect::<Result<IndexMap<_, _>, String>>()?;
+        let all = match interface.get("all") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(_) => Some(json_strs(interface, "all")?),
+        };
+        Ok(ModuleInterface {
+            path: json_str(interface, "path")?,
+            exports,
+            all,
+            classes,
+            extensions,
+            deps,
+            suppressed: json_str(interface, "suppressed")?,
+            proxies: json_strs(interface, "proxies")?,
+            record: DepRecord::from_json(document.get("record").ok_or("no record")?)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

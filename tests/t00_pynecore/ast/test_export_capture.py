@@ -25,7 +25,8 @@ getObject = Exported()
 
 
 #: The pipeline context the native step is run with: a module without a source path
-NATIVE_CONTEXT = SimpleNamespace(path=Path('probe.py'), pyne_mode=None, source='', user_code=True)
+NATIVE_CONTEXT = SimpleNamespace(path=Path('probe.py'), pyne_mode=None, source='', user_code=True,
+                                 analyse=None, pipeline_hash='')
 
 
 def check(source):

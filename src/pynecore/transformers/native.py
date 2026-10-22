@@ -36,14 +36,19 @@ import hashlib
 import json
 import os
 import sys
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
 
 from .builtin_shadow import Library, import_library, library_serves
 from .export_capture import module_origin
+from . import module_interface
 from .lib_registry import lib_star_exports, lib_types
+from .pine_type_infer import module_spec_origin, package_member
+from .pine_type_table import Analyser
 from .source_read import stable_source
 from .module_property import module_properties
+from ..utils.stdlib_checker import is_stdlib
 
 try:
     from . import _native
@@ -178,8 +183,11 @@ class _Host:
     """What a native step asks the interpreter, answered by the very functions the
     Python step uses, at the moment the Python step would use them."""
 
-    def __init__(self) -> None:
+    def __init__(self, analyse: Analyser | None = None, pipeline_hash: str = '') -> None:
         self._libraries: dict[str, Library] = {}
+        self._analyse = analyse
+        self._pipeline_hash = pipeline_hash
+        self._analysing: list[AbstractContextManager[None]] = []
 
     def import_library(self, name: str) -> bool:
         library = import_library(name)
@@ -230,10 +238,43 @@ class _Host:
         data, (mtime_ns, size) = loaded
         return str(source.resolve()), data, mtime_ns, size
 
+    def interface(self, path: str) -> str | None:
+        """The interface a module publishes and the record a dependency on it keeps, as JSON
+        in the dataclasses' own field order."""
+        found = module_interface.lookup(path, self._analyse, self._pipeline_hash)
+        if found is None:
+            return None
+        return json.dumps({'interface': dataclasses.asdict(found),
+                           'record': dataclasses.asdict(module_interface.dep_record(found))})
+
+    @staticmethod
+    def closes_cycle(path: str) -> bool:
+        return module_interface.closes_cycle(path)
+
+    def begin_analysis(self, path: str) -> None:
+        scope = module_interface.analysing_scope(path)
+        scope.__enter__()
+        self._analysing.append(scope)
+
+    def end_analysis(self) -> None:
+        self._analysing.pop().__exit__(None, None, None)
+
+    @staticmethod
+    def module_spec_origin(dotted: str) -> str | None:
+        return module_spec_origin(dotted)
+
+    @staticmethod
+    def package_member(directory: str, dotted: str) -> str | None:
+        return package_member(Path(directory), dotted)
+
+    @staticmethod
+    def is_stdlib(module: str) -> bool:
+        return is_stdlib(module)
+
 
 def _context(ctx: Any) -> dict[str, Any]:
     return {'path': str(ctx.path), 'pyne_mode': ctx.pyne_mode, 'source': ctx.source,
-            'user_code': ctx.user_code, 'host': _Host()}
+            'user_code': ctx.user_code, 'host': _Host(ctx.analyse, ctx.pipeline_hash)}
 
 
 class Rejection:

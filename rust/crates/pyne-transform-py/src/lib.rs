@@ -142,6 +142,47 @@ impl pyne_transform::Host for PyHost<'_> {
             size,
         }))
     }
+
+    fn interface(
+        &self,
+        path: &str,
+    ) -> Result<Option<pyne_transform::pine_type_table::ModuleInterface>, pyne_ast::Unsupported>
+    {
+        let text: Option<String> = self.ask("interface", (path,))?;
+        text.map(|text| {
+            pyne_transform::pine_type_table::ModuleInterface::from_json(&text)
+                .map_err(|err| pyne_ast::Unsupported(format!("interface of {path}: {err}")))
+        })
+        .transpose()
+    }
+
+    fn closes_cycle(&self, path: &str) -> Result<bool, pyne_ast::Unsupported> {
+        self.ask("closes_cycle", (path,))
+    }
+
+    fn begin_analysis(&self, path: &str) -> Result<(), pyne_ast::Unsupported> {
+        self.ask::<Option<bool>>("begin_analysis", (path,)).map(|_| ())
+    }
+
+    fn end_analysis(&self) -> Result<(), pyne_ast::Unsupported> {
+        self.ask::<Option<bool>>("end_analysis", ()).map(|_| ())
+    }
+
+    fn module_spec_origin(&self, dotted: &str) -> Result<Option<String>, pyne_ast::Unsupported> {
+        self.ask("module_spec_origin", (dotted,))
+    }
+
+    fn package_member(
+        &self,
+        directory: &str,
+        dotted: &str,
+    ) -> Result<Option<String>, pyne_ast::Unsupported> {
+        self.ask("package_member", (directory, dotted))
+    }
+
+    fn is_stdlib(&self, module: &str) -> Result<bool, pyne_ast::Unsupported> {
+        self.ask("is_stdlib", (module,))
+    }
 }
 
 /// Run native steps over a module, in order.

@@ -45,13 +45,13 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Protocol
 
 from . import ast_walk
 from .pine_type_rules import UNKNOWN, ImplSig, annotation_type, impl_sig
 from .pine_type_table import (
     Analyser, ClassSig, DepRecord, ExportSig, ModuleInterface, PineTypeTable, qualify,
 )
-from .slot_layout import ModuleLayout
 
 __all__ = [
     'NO_FINGERPRINT', 'build_interface', 'interface_digest',
@@ -529,7 +529,19 @@ def _is_docstring(node: object) -> bool:
         and isinstance(node.value.value, str)
 
 
-def routes_digest(shape: str, tree: ast.Module, layout: ModuleLayout) -> str:
+class _Layout(Protocol):
+    """What :func:`routes_digest` reads of a ``slot_layout.ModuleLayout``.
+
+    Spelled out here rather than imported, so the type pass, which imports this
+    module, does not depend on the lowering's slot allocator.
+    """
+
+    def scope_segment(self, node: ast.FunctionDef) -> str: ...
+
+    def state_carrying(self, scope_id: str) -> bool: ...
+
+
+def routes_digest(shape: str, tree: ast.Module, layout: _Layout) -> str:
     """
     Digest of how every call into a module is routed, once its lowering settled it.
 

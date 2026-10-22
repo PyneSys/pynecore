@@ -1102,7 +1102,7 @@ const KEYWORDS: &[&str] = &[
 /// on one line, not indented, without the punctuation of statements, slices, stars,
 /// comments or line continuations, and without keywords. Everything else, and a
 /// spelling the parser refuses, answers `Unsupported`, so the Python step decides.
-fn forward_reference(text: &str) -> Result<(Ast, NodeId), Unsupported> {
+pub(crate) fn forward_reference(text: &str) -> Result<(Ast, NodeId), Unsupported> {
     let refuse = || Unsupported(format!("forward reference {text:?}"));
     if text.starts_with(' ')
         || !text

@@ -126,10 +126,30 @@ pointers.
    qualifiers, lib / user / method calls and overload groups, cross-module calls,
    instance vectors) stamps `_pine_ty`, `_pine_pin(s)`, `_pine_vector`,
    `_pine_varying`, `_pine_widen*`, `_pine_na_class`, `_pine_series_len(s)` and
-   builds the `PineTypeTable`. Cross-module analysis needs Host methods for the
-   module source of a dotted name, package members, path resolution, the stdlib
-   test, the analysis-in-progress set, cycle detection and an imported module's
-   interface (the `interface_payload` JSON).
+   builds the `PineTypeTable`. Ported as `steps/pine_type/`, one module per part
+   of `_Inference`: `mod` (the engine state, frames, stamping, the entry point),
+   `facts` (the module-level helpers of `pine_type_infer.py`), `collect` (imports,
+   classes, definitions), `stmts` (statements, the loop fixpoint, stores), `defs`
+   (definitions, call-site contexts, signatures), `exprs` (expressions and
+   qualifiers), `lib_calls`, `user_calls` (user and method calls, overload
+   groups), `imports` (imported callees and dependency records), `finish`
+   (instance vectors, window machines, widen sites, pin suppression) and `report`
+   (`pine_type_report.py`); `unparse.rs` is CPython 3.13's `ast.unparse` for
+   expressions. The lib names come from the compiled `lib_types.json`
+   (`data::lib_entries`). Cross-module analysis asks the Host, whose Python side
+   calls the functions the Python pass calls: `interface` (`module_interface.lookup`,
+   sent as the JSON of `dataclasses.asdict` of the interface and of its
+   `dep_record`), `closes_cycle`, `begin_analysis` / `end_analysis`
+   (`analysing_scope`), `module_spec_origin` and `package_member`
+   (`pine_type_infer`), `is_stdlib`. The WASM host answers them `Unsupported`, so
+   there a module that imports anything outside `pynecore` stays in Python.
+   `_overload_groups` and the hops of `_declares_method` were sets whose order
+   reached the table; they are ordered now. `module_interface` types the layout
+   `routes_digest` reads with a protocol, so `slot_layout.py` is out of the
+   closure. `Unsupported`: a string annotation the native expression parser
+   refuses (`""` among them), `ast.unparse` of a node outside the expression
+   subset, the `repr` of text beyond ASCII, Latin-1 and General Punctuation,
+   and any failing Host answer.
 
 ## Lowering steps
 

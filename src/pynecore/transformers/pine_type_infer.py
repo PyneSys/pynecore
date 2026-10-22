@@ -88,7 +88,8 @@ from .pine_qualifier import (
 from .script_entry import is_script_entry
 
 __all__ = ['infer_module', 'lib_classes', 'lib_namespaces', 'lib_routes',
-           'lib_star_exports', 'TY_ATTR', 'get_ty', 'set_ty', 'inherit_ty']
+           'lib_star_exports', 'module_spec_origin', 'package_member', 'TY_ATTR', 'get_ty',
+           'set_ty', 'inherit_ty']
 
 #: How many times a loop body is re-inferred before the types are declared
 #: stable. Both lattices are two high (int -> float -> unknown, const -> simple
@@ -412,8 +413,9 @@ class _Inference:
         #: Whether each function spelled its return type out
         self._annotated_returns: dict[str, bool] = {}
         #: Scope-qualified ids of the module's ``@overload`` groups -- the only
-        #: user callees where a call site has anything to choose between
-        self._overload_groups: set[str] = set()
+        #: user callees where a call site has anything to choose between; in
+        #: declaration order, which is the order the table publishes them in
+        self._overload_groups: dict[str, None] = {}
         #: Every implementation's return type per group, in declaration order.
         #: A group's own type is what they all agree on (``overload_result``),
         #: so the entries have to stay apart until the last one is known
@@ -1298,7 +1300,7 @@ class _Inference:
                 if _is_overload(stmt):
                     # One name, several implementations: each contributes its
                     # own return, and the group's type is what they agree on
-                    self._overload_groups.add(key)
+                    self._overload_groups[key] = None
                     returns = self._group_returns.setdefault(key, [])
                     nid = node_id(stmt)
                     if nid is not None:
@@ -4245,7 +4247,7 @@ class _Inference:
             return True
         for _, binding in self._import_sources():
             # ``import m`` names the module itself, ``from m import x`` a name in it
-            for hops in {binding.attrs, binding.attrs[:-1]}:
+            for hops in dict.fromkeys((binding.attrs, binding.attrs[:-1])):
                 interface = self._interface_of(binding.module, hops, node)
                 if interface is not None and name in interface.extensions.get(cid, {}):
                     return True
@@ -5218,7 +5220,7 @@ class _Inference:
                     directory = anchor
                     for _ in range(stmt.level - 1):
                         directory = directory.parent
-                    source = _package_member(directory, stmt.module or '')
+                    source = package_member(directory, stmt.module or '')
                     if not stmt.module:
                         # ``from . import x``: the names are the package's own,
                         # whether or not it has an ``__init__.py``
@@ -5235,7 +5237,7 @@ class _Inference:
                     continue
                 # A name a package hands out may be one of its submodules
                 for alias in stmt.names:
-                    member = None if alias.name == '*' else _package_member(package, alias.name)
+                    member = None if alias.name == '*' else package_member(package, alias.name)
                     if member is not None:
                         paths[member] = None
         for path in paths:
@@ -5261,13 +5263,7 @@ class _Inference:
         """
         if dotted in self._module_paths:
             return self._module_paths[dotted]
-        origin: str | None = None
-        try:
-            spec = importlib.util.find_spec(dotted)
-        except Exception:  # noqa: any resolution failure means "not a module here"
-            spec = None
-        if spec is not None and spec.origin and spec.origin.endswith('.py'):
-            origin = spec.origin
+        origin = module_spec_origin(dotted)
         self._module_paths[dotted] = origin
         return origin
 
@@ -6285,7 +6281,23 @@ def _publishes_nothing(module: str) -> bool:
     return module == 'pynecore' or module.startswith('pynecore.') or is_stdlib(module)
 
 
-def _package_member(directory: Path, dotted: str) -> str | None:
+def module_spec_origin(dotted: str) -> str | None:
+    """
+    The source file ``find_spec`` resolves a dotted module name to.
+
+    :param dotted: Dotted module name
+    :return: Its ``.py`` source path, or None when it is not a readable Python module
+    """
+    try:
+        spec = importlib.util.find_spec(dotted)
+    except Exception:  # noqa: any resolution failure means "not a module here"
+        return None
+    if spec is not None and spec.origin and spec.origin.endswith('.py'):
+        return spec.origin
+    return None
+
+
+def package_member(directory: Path, dotted: str) -> str | None:
     """
     The source of a module below a package directory, found without importing.
 

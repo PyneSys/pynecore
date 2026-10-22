@@ -136,3 +136,93 @@ pub fn lib_names() -> &'static HashMap<String, LibName> {
             .collect()
     })
 }
+
+/// A whole entry of `lib_types.json`'s `names` (`lib_registry.lib_types()[name]`), or one
+/// implementation of an overload group: every field the type pass reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibEntry {
+    /// `value`, `function` or `overloads`; empty for an implementation
+    pub kind: String,
+    /// A value's type (`entry.get('ty')`)
+    pub ty: Option<String>,
+    /// Whether a value can be called as well (`entry.get('callable', False)`)
+    pub callable: bool,
+    /// What a function or an implementation returns (`entry.get('ret')`)
+    pub ret: Option<String>,
+    /// Type of each positional parameter (`entry.get('params')`)
+    pub params: Option<Vec<String>>,
+    /// Name of each positional parameter (`entry.get('names')`)
+    pub names: Option<Vec<String>>,
+    /// How many trailing positional parameters have a default (`entry['defaults']`)
+    pub defaults: i64,
+    /// The type of each default (`entry.get('default_ty', ())`)
+    pub default_ty: Vec<String>,
+    /// Whether each literal-`None` default is taken by the annotation
+    /// (`entry.get('default_none_ok')`)
+    pub default_none_ok: Option<Vec<bool>>,
+    /// Whether a `*args` follows (`entry.get('vararg') is not None`)
+    pub vararg: bool,
+    /// Whether a `**kwargs` follows (`bool(entry.get('kwarg'))`)
+    pub kwarg: bool,
+    /// The implementations of an overload group, in order
+    pub impls: Vec<LibEntry>,
+}
+
+fn lib_entry(entry: &Value) -> LibEntry {
+    let text = |field: &str| entry.get(field).and_then(Value::as_str).map(str::to_string);
+    let texts = |field: &str| {
+        entry.get(field).and_then(Value::as_array).map(|items| {
+            items.iter().map(|item| item.as_str().unwrap_or("").to_string()).collect::<Vec<_>>()
+        })
+    };
+    LibEntry {
+        kind: text("kind").unwrap_or_default(),
+        ty: text("ty"),
+        callable: entry.get("callable").and_then(Value::as_bool).unwrap_or(false),
+        ret: text("ret"),
+        params: texts("params"),
+        names: texts("names"),
+        defaults: entry.get("defaults").and_then(Value::as_i64).unwrap_or(0),
+        default_ty: texts("default_ty").unwrap_or_default(),
+        default_none_ok: entry
+            .get("default_none_ok")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().map(|item| item.as_bool().unwrap_or(false)).collect()),
+        vararg: entry.get("vararg").is_some_and(|value| !value.is_null()),
+        kwarg: entry.get("kwarg").is_some_and(|value| match value {
+            Value::Null => false,
+            Value::Bool(flag) => *flag,
+            Value::String(text) => !text.is_empty(),
+            _ => true,
+        }),
+        impls: entry
+            .get("impls")
+            .and_then(Value::as_array)
+            .map(|impls| impls.iter().map(lib_entry).collect())
+            .unwrap_or_default(),
+    }
+}
+
+/// Every entry of `lib_types.json`'s `names`, whole (`lib_registry.lib_types`).
+pub fn lib_entries() -> &'static HashMap<String, LibEntry> {
+    static ENTRIES: OnceLock<HashMap<String, LibEntry>> = OnceLock::new();
+    ENTRIES.get_or_init(|| {
+        let Value::Object(names) = section("names") else { panic!("names") };
+        names.iter().map(|(name, entry)| (name.clone(), lib_entry(entry))).collect()
+    })
+}
+
+/// Every dotted path the registry's names hang off (`pine_type_infer.lib_namespaces`).
+pub fn lib_namespaces() -> &'static std::collections::HashSet<String> {
+    static NAMESPACES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    NAMESPACES.get_or_init(|| {
+        let mut out = std::collections::HashSet::new();
+        for key in lib_entries().keys() {
+            let parts: Vec<&str> = key.split('.').collect();
+            for depth in 1..parts.len() {
+                out.insert(parts[..depth].join("."));
+            }
+        }
+        out
+    })
+}

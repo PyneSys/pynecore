@@ -17,6 +17,7 @@ pub mod pine_type_rules;
 pub mod pine_type_table;
 pub mod sha1;
 pub mod steps;
+pub mod unparse;
 
 use std::fmt;
 
@@ -125,6 +126,54 @@ pub trait Host {
     fn read_source(&self, path: &str) -> Result<Option<SourceRead>, Unsupported> {
         Err(Unsupported(format!("no host to read {path}")))
     }
+
+    /// The interface an imported module publishes, from its resolved source path
+    /// (`module_interface.lookup(path, analyse, pipeline_hash)`); `None` when there is
+    /// none to be had. The host may analyse the module to answer.
+    fn interface(
+        &self,
+        path: &str,
+    ) -> Result<Option<pine_type_table::ModuleInterface>, Unsupported> {
+        Err(Unsupported(format!("no host for the interface of {path}")))
+    }
+
+    /// Whether reaching a module closes an import cycle: its analysis is on the stack
+    /// (`module_interface.closes_cycle(path)`).
+    fn closes_cycle(&self, path: &str) -> Result<bool, Unsupported> {
+        Err(Unsupported(format!("no host to ask whether {path} closes a cycle")))
+    }
+
+    /// Mark a module as being analysed until [`Host::end_analysis`]
+    /// (`module_interface.analysing_scope(path)` entered); a host without
+    /// cross-module analysis marks nothing.
+    fn begin_analysis(&self, path: &str) -> Result<(), Unsupported> {
+        let _ = path;
+        Ok(())
+    }
+
+    /// Leave the analysing scope the last [`Host::begin_analysis`] entered.
+    fn end_analysis(&self) -> Result<(), Unsupported> {
+        Ok(())
+    }
+
+    /// The `.py` source a dotted module name resolves to through `find_spec`
+    /// (`pine_type_infer.module_spec_origin(dotted)`); `None` when it is no readable
+    /// Python module.
+    fn module_spec_origin(&self, dotted: &str) -> Result<Option<String>, Unsupported> {
+        Err(Unsupported(format!("no host to find module {dotted}")))
+    }
+
+    /// The source of a module below a package directory
+    /// (`pine_type_infer.package_member(Path(directory), dotted)`).
+    fn package_member(&self, directory: &str, dotted: &str) -> Result<Option<String>, Unsupported> {
+        Err(Unsupported(format!("no host to find {dotted} below {directory}")))
+    }
+
+    /// Whether a module belongs to Python's standard library
+    /// (`utils.stdlib_checker.is_stdlib(module)`).
+    fn is_stdlib(&self, module: &str) -> Result<bool, Unsupported> {
+        Err(Unsupported(format!("no host to ask whether {module} is stdlib")))
+    }
 }
 
 /// A source file as [`Host::read_source`] read it.
@@ -197,6 +246,7 @@ pub static STEPS: &[Step] = &[
     Step { name: "ModuleProperty", run: steps::module_property::run },
     Step { name: "TaVariableHoist", run: steps::ta_variable_hoist::run },
     Step { name: "ClosureArguments", run: steps::closure_arguments::run },
+    Step { name: "PineType", run: steps::pine_type::run },
     Step { name: "ImplicitConversion", run: steps::implicit_conversion::run },
     Step { name: "SecurityDefault", run: steps::security_default::run },
     Step { name: "ExportOnce", run: steps::export_once::run },
