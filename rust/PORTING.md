@@ -41,7 +41,8 @@ pointers.
 ## Steps, in porting order
 
 1. **ImplicitConversion** (S). Hermetic; reads `_pine_widen`, `_pine_widen_site`,
-   `_pine_na_class`, `_pine_ty`. Needs F1, F3.
+   `_pine_na_class`, `_pine_ty`. Needs F1, F3. Ported as `steps/implicit_conversion.rs`;
+   it never reads the `PineTypeTable`.
 2. **ExportCapture** (M). Runs only for `@library` modules. Reads other modules'
    sources to prove enum members constant: needs Host methods along the lines of
    `find_spec(name, search) -> Option<Spec>` and

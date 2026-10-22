@@ -149,6 +149,7 @@ pub static STEPS: &[Step] = &[
     Step { name: "ModuleProperty", run: steps::module_property::run },
     Step { name: "TaVariableHoist", run: steps::ta_variable_hoist::run },
     Step { name: "ClosureArguments", run: steps::closure_arguments::run },
+    Step { name: "ImplicitConversion", run: steps::implicit_conversion::run },
 ];
 
 /// The native port of a step, if there is one.

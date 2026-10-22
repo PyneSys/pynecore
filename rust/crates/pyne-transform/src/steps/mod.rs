@@ -3,6 +3,7 @@
 pub mod builtin_shadow;
 pub mod closure_arguments;
 pub mod dynamic_default;
+pub mod implicit_conversion;
 pub mod import_lifter;
 pub mod import_normalizer;
 pub mod inline_series_hoist;

@@ -66,5 +66,9 @@
   "ClosureArguments": {
     "module": "closure_arguments_transformer",
     "digest": "db60671d52f9994ecf5fbb565a3250abe5cdbe760bfd1358e4481d1cc8aed05e"
+  },
+  "ImplicitConversion": {
+    "module": "implicit_conversion",
+    "digest": "842c737775f12dcae99ef32f302eb7631b1fe9a3ddd1b755e97e3e924fa7f24e"
   }
 }

@@ -17,13 +17,22 @@ from pynecore.transformers import native, pipeline
 __test_helper_SOURCE = '''"""
 @pyne
 """
+from pynecore import lib
 from pynecore.core.pine_udt import udt
-from pynecore.lib import close, hl2, na, request, syminfo, timeframe
+from pynecore.lib import close, hl2, na, plot, request, syminfo, timeframe
+from pynecore.types import Matrix
 
 
 @udt
 class Flag:
     f: bool = na(bool)
+
+
+@udt
+class Chain:
+    value: float = 0.0
+    next: 'Chain' = lib._na_none
+    top: Flag = lib._na_none
 
 
 def smoothed(source: float = hl2, length: int = 2):
@@ -57,8 +66,42 @@ async def ignored():
     return ta
 
 
+def label(value=lib._na_none) -> str:
+    return value
+
+
+def pick(v=lib._na_none):
+    return Flag() if lib.bar_index < 0 else v
+
+
+def bag(v=lib._na_none) -> list[float]:
+    return v
+
+
+def put(a, v):
+    lib.array.push(a, v)
+
+
 def main():
     from pynecore.lib import ta as indicators
+    a: list[float] = lib.array.new_float(0)
+    lib.array.push(a, 2)
+    lib.array.push(a, -3)
+    n = lib.bar_index
+    lib.array.set(a, 0, n)
+    lib.array.concat(a, lib.array.from_items(5, 6))
+    m: Matrix[float] = lib.matrix.new(1, 1, 0.0)
+    lib.matrix.concat(m, lib.matrix.new(1, 1, 3))
+    s: str = lib._na_none
+    x: float = lib._na_none
+    p: Flag = lib._na_none
+    b: list[float] = lib._na_none
+    put(lib.array.new_float(0), 1)
+    put(lib.array.new_int(0), 1)
+    plot(close, title=lib._na_none)
+    t = label()
+    q = pick()
+    r = bag()
     trend = htf_trend("60") + htf_trend(tf="D") + htf("W", symbol=syminfo.prefix)
     return helper(close) + indicators.ema(close, 3) + smoothed() + Flag().f + trend
 '''
@@ -294,6 +337,23 @@ def __test_native_backend_emits_what_python_emits__(monkeypatch):
     __test_helper_require_native()
     assert (__test_helper_emission('native', monkeypatch)
             == __test_helper_emission('python', monkeypatch))
+
+
+def __test_typed_steps_run_natively__(monkeypatch):
+    """The ported steps after the type pass handle the helper module natively, rather
+    than declining it to Python."""
+    __test_helper_require_native()
+    answers: dict[str, object] = {}
+    run = native.run
+
+    def recording(names, tree, ctx):
+        result = run(names, tree, ctx)
+        answers['+'.join(names)] = result
+        return result
+
+    monkeypatch.setattr(native, 'run', recording)
+    __test_helper_emission('native', monkeypatch)
+    assert isinstance(answers['ImplicitConversion'], ast.Module)
 
 
 def __test_stale_port_runs_in_python__(monkeypatch):
