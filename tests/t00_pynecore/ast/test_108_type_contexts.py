@@ -19,12 +19,13 @@ import pytest
 
 from pynecore.core.instance_state import _make_state
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
+from pynecore.transformers.layout_emit import apply_layout
 from pynecore.transformers.persistent import PersistentTransformer
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import get_pin, get_pins
 from pynecore.transformers.pine_type_transformer import PineTypeTransformer
 from pynecore.transformers.series import SeriesTransformer
-from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
+from pynecore.transformers.slot_layout import ModuleLayout
 
 
 def _types(source: str, scope: str = '') -> dict[str, str]:

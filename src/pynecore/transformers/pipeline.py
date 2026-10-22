@@ -40,6 +40,7 @@ from pynecore.transformers.import_lifter import ImportLifterTransformer
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
 from pynecore.transformers.inline_series_hoist import InlineSeriesHoistTransformer
 from pynecore.transformers.input_transformer import InputTransformer
+from pynecore.transformers.layout_emit import apply_layout
 from pynecore.transformers.lib_series import LibrarySeriesTransformer
 from pynecore.transformers import locations, native
 from pynecore.transformers.module_property import ModulePropertyTransformer
@@ -60,7 +61,7 @@ from pynecore.transformers.security_drawings import SecurityDrawingsTransformer
 from pynecore.transformers.security_instantiation import SecurityInstantiationTransformer
 from pynecore.transformers.security_slice import SecuritySliceTransformer, finalize_clone_defaults
 from pynecore.transformers.series import SeriesTransformer
-from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
+from pynecore.transformers.slot_layout import ModuleLayout
 from pynecore.transformers.ta_variable_hoist import TaVariableHoistTransformer
 from pynecore.transformers.type_checking_stripper import TypeCheckingStripperTransformer
 from pynecore.transformers.type_erasure import erase_type_calls
@@ -307,6 +308,7 @@ def run_steps(steps: Sequence[Step | Phase], tree: ast.Module, ctx: PipelineCont
     """
     mode = native.backend()
     ported = native.current_steps() if mode != 'python' else frozenset()
+    layout_steps = native.layout_steps() if mode != 'python' else frozenset()
     # The native steps waiting to run as one native call (``native`` backend)
     batch: list[Step] = []
     for step in steps:
@@ -327,14 +329,16 @@ def run_steps(steps: Sequence[Step | Phase], tree: ast.Module, ctx: PipelineCont
                 batch.append(step)
             else:
                 # Native first: it reads the input and leaves it as it is, while
-                # the Python step transforms it in place
-                native_result = native.run([step.name], tree, ctx)
+                # the Python step transforms it in place. A step that uses the slot
+                # layout leaves its own into a layout of its own
+                layout = ModuleLayout() if step.name in layout_steps else None
+                native_result = native.run([step.name], tree, ctx, layout)
                 try:
                     tree = _run(step.name, ctx, step.run, tree, ctx)
                 except Exception as exc:
                     native.verify_rejection(step.name, native_result, exc, ctx)
                     raise
-                native.verify(step.name, tree, native_result, ctx)
+                native.verify(step.name, tree, native_result, ctx, layout)
     return _run_native(batch, tree, ctx)
 
 
@@ -345,7 +349,10 @@ def _run_native(batch: list[Step], tree: ast.Module, ctx: PipelineContext) -> as
     names = [step.name for step in batch]
     steps = list(batch)
     batch.clear()
-    result = _run('+'.join(names) + ' (native)', ctx, native.run, names, tree, ctx)
+    # The layout the native steps leave replaces the pipeline's, as the Python
+    # steps would have filled it
+    result = _run('+'.join(names) + ' (native)', ctx, native.run, names, tree, ctx,
+                  ctx.slot_layout)
     if isinstance(result, ast.Module):
         return result
     for step in steps:

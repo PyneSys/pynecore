@@ -65,33 +65,16 @@ must participate in them like any other body statement).
 import ast
 
 from . import ast_walk
+from .dynamic_default_guard import SENTINEL_NAME
 from .script_entry import is_script_entry
 
-__all__ = ['DynamicDefaultTransformer', 'is_dynamic_default_guard']
+__all__ = ['DynamicDefaultTransformer']
 
-_SENTINEL_NAME = '__dyn_default__'
 #: The alias ``dataclasses.field`` is bound to for the lowered UDT defaults
 _FIELD_NAME = '__pyne_field·__'
 #: The alias the bool na factory (``pynecore.types.na.new_bool_na``) is bound to
 _BOOL_NA_NAME = '__pyne_bool_na·__'
 _UDT_DECORATORS = frozenset({'udt', 'dataclass'})
-
-
-def is_dynamic_default_guard(stmt: ast.stmt) -> bool:
-    """Whether a statement is one of this pass's parameter-default guards.
-
-    A later pass that prepends its own prologue has to land AFTER these: the
-    guard is what gives the parameter its value, so a statement placed above it
-    reads the sentinel instead.
-
-    :param stmt: A statement from a function body.
-    :return: True if the statement resolves a dynamic parameter default.
-    """
-    if not (isinstance(stmt, ast.If) and isinstance(stmt.test, ast.Compare)
-            and len(stmt.test.ops) == 1 and isinstance(stmt.test.ops[0], ast.Is)):
-        return False
-    right = stmt.test.comparators[0]
-    return isinstance(right, ast.Name) and right.id == _SENTINEL_NAME
 
 
 def _dotted_tail(node: ast.expr) -> str | None:
@@ -217,7 +200,7 @@ class DynamicDefaultTransformer(ast_walk.NodeTransformer):
             test=ast.Compare(
                 left=ast.Name(id=param_name, ctx=ast.Load()),
                 ops=[ast.Is()],
-                comparators=[ast.Name(id=_SENTINEL_NAME, ctx=ast.Load())],
+                comparators=[ast.Name(id=SENTINEL_NAME, ctx=ast.Load())],
             ),
             body=[ast.Assign(
                 targets=[ast.Name(id=param_name, ctx=ast.Store())],
@@ -264,14 +247,14 @@ class DynamicDefaultTransformer(ast_walk.NodeTransformer):
                 continue
             pname = positional[offset + i].arg
             prologue.append(self._prologue_if(pname, default))
-            defaults[i] = ast.Name(id=_SENTINEL_NAME, ctx=ast.Load())
+            defaults[i] = ast.Name(id=SENTINEL_NAME, ctx=ast.Load())
 
         for i, default in enumerate(node.args.kw_defaults):
             if default is None or not self._is_dynamic(default):
                 continue
             pname = node.args.kwonlyargs[i].arg
             prologue.append(self._prologue_if(pname, default))
-            node.args.kw_defaults[i] = ast.Name(id=_SENTINEL_NAME, ctx=ast.Load())
+            node.args.kw_defaults[i] = ast.Name(id=SENTINEL_NAME, ctx=ast.Load())
 
         if prologue:
             self._changed = True
@@ -320,7 +303,7 @@ class DynamicDefaultTransformer(ast_walk.NodeTransformer):
         if self._changed:
             _insert_import(node.body, ast.ImportFrom(
                 module='pynecore.core.instance_state',
-                names=[ast.alias(name=_SENTINEL_NAME, asname=None)],
+                names=[ast.alias(name=SENTINEL_NAME, asname=None)],
                 level=0,
             ))
         return node

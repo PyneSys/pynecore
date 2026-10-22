@@ -158,6 +158,29 @@ pointers.
 the native batch before it. A step that reads `ctx.slot_layout` needs the
 layout across the boundary first; the first three steps do not read it.
 
+**The slot layout.** `crates/pyne-transform/src/slot_layout.rs` mirrors
+`slot_layout.py` (`ModuleLayout`, `ScopeLayout`, `_Slot` as `Slot` with a
+`SlotKind`, the scope scan, `scope_for_function`); `Context::slot_layout` holds
+the run's layout (`RefCell`, the steps fill it in place). A slot's `init` and
+`max_bars_back` templates are nodes of the arena, and the definition caches
+(`_segments`, `_nests`, keyed by `id()` in Python) are keyed by the definition's
+`NodeId`. For a run with a step of `SLOT_LAYOUT_STEPS`, the bridge
+(`crates/pyne-transform-py/src/slot_layout.rs`) converts `context['slot_layout']`
+after the tree with the same `FromPython`, so a template that is a node of the
+tree stays one node (strict: exact classes and field types, a `_tree` cached for
+another module answers `Unsupported`), and converts the layout the steps left
+back with the same `ToPython` into a new `ModuleLayout`
+(`context['slot_layout_result']`); a cache entry of a definition the conversion
+does not reach is dropped, since no step can ask for it. `native.run(names, tree,
+ctx, layout)` replaces `layout`'s state field for field with it: the native
+backend passes `ctx.slot_layout`, `verify` a fresh layout per step, which
+`native.verify` compares with what the Python step left (`describe(tree,
+layout)`: the scopes slot by slot with node references shared with the tree, and
+what the layout answers for every definition of the tree). The WASM host starts a
+request from `ModuleLayout::new(pyne_mode == "lib")`, as the import hook does.
+`apply_layout` moved to `layout_emit.py`, so the layout model no longer imports
+`pine_type_rules.py`.
+
 1. **SecurityDefault**, **ExportOnce**, **UnusedSeriesDetector**. Ported as
    `steps/security_default.rs`, `steps/export_once.rs` and
    `steps/unused_series_detector.rs`; none reads the `PineTypeTable`.
@@ -166,3 +189,19 @@ layout across the boundary first; the first three steps do not read it.
    stamp on a security read that is no string, and a `Series[...]` annotation
    whose slice is neither a name nor a node with a node `value` field (the Python
    pass would put a constant's raw value or `None` into the annotation).
+2. **Series**, **VerifyClosedShift**, **Persistent**. Ported as `steps/series.rs`,
+   `steps/security_closed_shift_check.rs` and `steps/persistent.rs`; none reads
+   the `PineTypeTable`. Their closures were cut to what decides their output: the
+   dynamic-default guard predicate lives in `dynamic_default_guard.py` (Series no
+   longer covers DynamicDefault), and the `__security_contexts__` readers in
+   `security_contexts.py` (VerifyClosedShift no longer covers SecuritySlice,
+   Security, LibrarySeries and Persistent; ported as `steps/security/contexts.rs`).
+   Series' closure includes `pine_type_rules.py` (`get_ty`, `set_ty`,
+   `stamp_lowering` decide its output). `Unsupported`: a `_pine_ty` stamp that is
+   neither a string nor `None` where Series types the plumbing it builds (the
+   Python pass keeps such a stamp, the native `stamp_lowering` reads strings
+   only), a visit inside a dynamic-default guard that answers no single node (the
+   Python pass would put the answer into the body as it is), a series declaration
+   in a scope the pass never entered (a `KeyError` in Python), and an int
+   persistent initializer beyond 64 bits (`float()` of a Python int).
+   `Rejected`: a Series or Persistent declaration outside a function.

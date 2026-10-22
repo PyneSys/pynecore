@@ -15,9 +15,11 @@
 //! `{"rejected": str}` (the module is invalid), `{"unsupported": str}` (the
 //! native port does not cover it) or `{"error": str}` (a malformed request).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use pyne_ast::Unsupported;
+use pyne_transform::slot_layout::ModuleLayout;
 use serde_json::{Value, json};
 
 /// The host of a request: what the browser was handed instead of an interpreter.
@@ -74,6 +76,8 @@ fn transform(request: &str) -> Result<Value, Value> {
         source: source.clone(),
         user_code: request.get("user_code").and_then(Value::as_bool).unwrap_or(true),
         host: &host,
+        // A lib module's series are na-compacted windows, as the import hook sets it
+        slot_layout: RefCell::new(ModuleLayout::new(text("pyne_mode").as_deref() == Some("lib"))),
     };
     let steps: Vec<&str> = request
         .get("steps")

@@ -10,19 +10,23 @@
 //! shows the message).
 
 pub mod data;
+pub mod dynamic_default_guard;
 pub mod fdlibm;
 pub mod node_ids;
 pub mod pine_qualifier;
 pub mod pine_type_rules;
 pub mod pine_type_table;
 pub mod sha1;
+pub mod slot_layout;
 pub mod steps;
 pub mod unparse;
 
+use std::cell::RefCell;
 use std::fmt;
 
 pub use pyne_ast::Unsupported;
 use pyne_ast::{Ast, NodeId};
+use slot_layout::ModuleLayout;
 
 /// Why a native step did not hand back a tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,6 +211,9 @@ pub struct Context<'h> {
     pub user_code: bool,
     /// Answers what the tree does not say
     pub host: &'h dyn Host,
+    /// The shared slot allocator of the lowering half (see [`slot_layout`]); the
+    /// steps of [`SLOT_LAYOUT_STEPS`] read and fill it
+    pub slot_layout: RefCell<ModuleLayout>,
 }
 
 /// One step: transforms the module and returns the (possibly replaced) module node.
@@ -251,7 +258,20 @@ pub static STEPS: &[Step] = &[
     Step { name: "SecurityDefault", run: steps::security_default::run },
     Step { name: "ExportOnce", run: steps::export_once::run },
     Step { name: "UnusedSeriesDetector", run: steps::unused_series_detector::run },
+    Step { name: "Series", run: steps::series::run },
+    Step { name: "VerifyClosedShift", run: steps::security_closed_shift_check::run },
+    Step { name: "Persistent", run: steps::persistent::run },
 ];
+
+/// The steps whose port reads or fills the run's [`Context::slot_layout`]. A host
+/// hands the layout of its pipeline over before a run with one of these steps, and
+/// takes back the state they left.
+pub static SLOT_LAYOUT_STEPS: &[&str] = &["Series", "VerifyClosedShift", "Persistent"];
+
+/// Whether a run of these steps reads or fills the slot layout.
+pub fn uses_slot_layout(names: &[&str]) -> bool {
+    names.iter().any(|name| SLOT_LAYOUT_STEPS.contains(name))
+}
 
 /// The steps whose port reads the module's
 /// [`PineTypeTable`](pine_type_table::PineTypeTable). A host hands the table of a

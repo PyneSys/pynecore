@@ -232,6 +232,7 @@ mod tests {
             source: String::new(),
             user_code: true,
             host: &NoHost,
+            slot_layout: Default::default(),
         };
         let mut ast = Ast::new();
         let root = module(&mut ast, Value::Opaque(0));

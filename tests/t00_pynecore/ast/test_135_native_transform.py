@@ -13,6 +13,7 @@ import pytest
 
 from pynecore.core import import_hook
 from pynecore.transformers import native, pipeline
+from pynecore.transformers.slot_layout import ModuleLayout
 
 #: A module exercising every branch of the ported steps
 __test_helper_SOURCE = '''"""
@@ -209,8 +210,65 @@ def main():
         return x * 2
 '''
 
+#: A script whose series, persistents and security contexts exercise the slot steps:
+#: series parameters, declarations, writes and tuple unpacking, literal, lazy, varip and
+#: na persistents, a walrus write, a parent's slots read from a nested definition, and
+#: a ``closed_shift`` candidate whose lowered write indexes a list
+__test_helper_SLOTS = '''"""
+@pyne
+"""
+from pynecore import lib
+from pynecore.lib import close, high, low, na
+from pynecore.types import IBPersistent, Persistent, Series
+
+
+def pair():
+    return high, low
+
+
+def counter(src: Series[float], step: int = 1):
+    """Counts"""
+    total: Persistent[int] = 0
+    peak: Persistent[float] = -1
+    seen: IBPersistent[int] = +2
+    start: Persistent[float] = src
+    last: Persistent[float] = na
+    total += step
+    if (last := src) > peak:
+        peak = last
+    acc: Series[float] = 0.0
+    acc += src
+    acc = acc * 0.5
+    return total + peak + seen + start + acc[1] + src[2]
+
+
+def outer():
+    level: Persistent[float] = 0.0
+    hist: Series[float] = close
+
+    def inner():
+        return hist[1] + level
+
+    return inner()
+
+
+@lib.script.indicator("slots")
+def main():
+    data = [lib.close, lib.close]
+    a = lib.request.security(lib.syminfo.tickerid, "D", data[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    data: Series[float] = lib.close
+    b = lib.request.security(lib.syminfo.tickerid, "240", data[1],
+                             lookahead=lib.barmerge.lookahead_on)
+    hi: Series[float]
+    hi, lo = pair()
+    lib.max_bars_back(data, 100)
+    lib.plot(a + b + counter(close) + outer() + hi[1] + lo)
+'''
+
 #: The lowering steps the helper modules exercise natively, each changing the tree
-__test_helper_LOWERING_STEPS = ('SecurityDefault', 'ExportOnce', 'UnusedSeriesDetector')
+__test_helper_LOWERING_STEPS = ('SecurityDefault', 'ExportOnce', 'UnusedSeriesDetector', 'Series',
+                                'VerifyClosedShift', 'Persistent')
 
 #: The analysis steps after which the tree carries what the type pass stamped
 __test_helper_TYPED_STEPS = ('PineType', 'ImplicitConversion', 'SecuritySlice')
@@ -301,8 +359,8 @@ def __test_native_export_capture_reads_enum_sources__(tmp_path, monkeypatch):
     answers = []
     run = native.run
 
-    def recording(names, tree, ctx):
-        answer = run(names, tree, ctx)
+    def recording(names, tree, ctx, layout=None):
+        answer = run(names, tree, ctx, layout)
         if names == ['ExportCapture']:
             answers.append(answer)
         return answer
@@ -443,8 +501,8 @@ def __test_typed_steps_run_natively__(monkeypatch):
     answers: dict[str, object] = {}
     run = native.run
 
-    def recording(names, tree, ctx):
-        result = run(names, tree, ctx)
+    def recording(names, tree, ctx, layout=None):
+        result = run(names, tree, ctx, layout)
         answers['+'.join(names)] = result
         return result
 
@@ -466,9 +524,9 @@ def __test_lowering_steps_run_natively__(monkeypatch):
     changed: dict[str, bool] = {}
     run = native.run
 
-    def recording(names, tree, ctx):
+    def recording(names, tree, ctx, layout=None):
         before = native.describe(tree)
-        result = run(names, tree, ctx)
+        result = run(names, tree, ctx, layout)
         if names[0] in __test_helper_LOWERING_STEPS:
             assert isinstance(result, ast.Module), names
             changed[names[0]] = changed.get(names[0], False) or native.describe(result) != before
@@ -476,7 +534,8 @@ def __test_lowering_steps_run_natively__(monkeypatch):
 
     monkeypatch.setattr(native, 'run', recording)
     for name, text in (('native_parity.py', __test_helper_SOURCE),
-                       ('native_exports.py', __test_helper_EXPORTS)):
+                       ('native_exports.py', __test_helper_EXPORTS),
+                       ('native_slots.py', __test_helper_SLOTS)):
         path = Path(name).resolve()
         tree = ast.parse(text)
         mode = import_hook._module_mode(tree)[1]
@@ -506,3 +565,196 @@ def __test_native_rejection_matches_python__(backend, monkeypatch):
     mode = import_hook._module_mode(tree)[1]
     with pytest.raises(SyntaxError, match='plot'):
         import_hook._analyse_tree(tree, source, Path('rejected.py').resolve(), mode)
+
+
+#: The steps that read or fill the slot layout, in pipeline order
+__test_helper_SLOT_STEPS = ('Series', 'VerifyClosedShift', 'Persistent')
+
+#: Modules for the slot steps alone, as the lowering half meets them, each reaching
+#: branches the pipeline helpers do not: Series-annotated parameters of every kind and
+#: a dynamic-default guard, bare and repeated declarations, shadowing, overloads, an
+#: async definition; Persistent spelled every way, nonlocal stripping, walrus and tuple
+#: targets; the closed-shift verdicts over hand-lowered writes; a lib module, whose
+#: int persistents stay ints
+__test_helper_SLOT_SOURCES = {
+    'series': '''
+from pynecore.types import Series, Persistent
+from pynecore import Series as Other, lib
+from os import path
+
+
+def f(a: Series[float], b: Series, c: Series[str], *, d: Series[int] = 0, e=__dyn_default__):
+    """Docstring"""
+    if e is __dyn_default__:
+        e = a
+    if a is __dyn_default__:
+        a = lib.close
+    x: Series[int] = a
+    y: Series[float]
+    y, z = a, b
+    [y, w] = (1, 2)
+    p, q.r = 1, 2
+    x = x + 1
+    x += 2
+    z = x[1] + y[2] + a[1] + c[0]
+    lib.max_bars_back(x, 10)
+    lib.max_bars_back(unknown, 10)
+    lib.other(x, 10)
+    v: float = x[1]
+    t: int
+
+    def g():
+        x = 1
+        return a[1] + x
+
+    def h():
+        return x[1] + y[1]
+
+    async def k():
+        u: Series[float] = 1.0
+        return u[1]
+
+    return x
+
+
+def ov(x: Series[float]):
+    return x[1]
+
+
+def ov(x: Series[int]):
+    s: Series[bool] = x > 0
+    return s[1]
+''',
+    'persistent': '''
+from pynecore.types import Persistent, IBPersistent, IBPersistentSeries
+from pynecore import types, Persistent
+
+
+def main(seed):
+    a: Persistent[int] = 0
+    b: Persistent[float] = -3
+    c: Persistent[int] = +4
+    d: types.Persistent = seed
+    e: IBPersistent[int] = -seed
+    f: Persistent[bool] = na
+    g: Persistent[str]
+    h: IBPersistentSeries[float] = 1.5
+    a += 1
+    b = a + b
+    y = (c := c + 1) * 2
+    a, b = b, a
+    k: float = a
+    a.attr = 1
+
+    def inner():
+        nonlocal a, x
+        a = 1
+        return b + c
+
+    def inner2():
+        nonlocal b
+        b += 1
+        return b
+
+    for a in range(3):
+        pass
+    return a + b + c + d + e + f + g + h
+''',
+    'closed_shift': '''
+from pynecore.core.series import inline_series
+
+__security_contexts__ = {
+    's0': {'closed_shift': True, 'group': 1}, 's1': {'closed_shift': True, 'group': 1},
+    's2': {'closed_shift': True}, 's3': {'closed_shift': True, 'group': 2},
+    's4': {'closed_shift': True}, 's5': {'closed_shift': True}, 's6': {'closed_shift': False},
+    's7': {'closed_shift': True}, 's8': {'closed_shift': True, 'group': 3}, 7: {}, 's9': 3,
+    's10': {'closed_shift': True, 'group': 3},
+}
+
+
+def main(data):
+    __hist_0__ = inline_series(lib.close, 1)
+    __sec_write__('s0', __state__[0][1])
+    __sec_write__('s1', data[1])
+    __sec_write__('s2', (__state__[0][1], inline_series(x, 2)))
+    __sec_write__('s3', __hist_0__)
+    __sec_write__('s4', [])
+    __sec_write__('s7', inline_series(x, 0))
+    __sec_write__('s8', lib.ta.sma(lib.close, 3))
+    __sec_write__('s10', __state__[0][2])
+    s: Series[float] = lib.close
+
+
+def other():
+    __sec_write__('s2', __state·other__[3][1])
+
+    def nested():
+        return 1
+''',
+    'shadowed': '''
+__security_contexts__ = {'s0': {'closed_shift': True}}
+
+
+def inline_series(value, offset):
+    return value
+
+
+def main():
+    __sec_write__('s0', inline_series(x, 1))
+''',
+}
+
+
+@pytest.mark.parametrize('name', [*__test_helper_SLOT_SOURCES, 'lib'])
+def __test_slot_steps_match_python__(name):
+    """
+    The slot steps, each run natively on the input its Python step gets, leave the
+    tree and the slot layout Python leaves; and run as one native batch from the
+    first one's input, they hand back what the three Python steps leave together,
+    the layout written into the pipeline's object field for field.
+    """
+    __test_helper_require_native()
+    assert native.layout_steps() == frozenset(__test_helper_SLOT_STEPS)
+    source = __test_helper_SLOT_SOURCES['persistent' if name == 'lib' else name]
+    steps = [step for step in pipeline.LOWERING
+             if isinstance(step, pipeline.Step) and step.name in __test_helper_SLOT_STEPS]
+
+    def context() -> pipeline.PipelineContext:
+        return pipeline.PipelineContext(
+            path=Path(f'slot_{name}.py').resolve(), pyne_mode='lib' if name == 'lib' else None,
+            source=source, slot_layout=ModuleLayout(compacted_series=name == 'lib'))
+
+    ctx = context()
+    tree = ast.parse(source)
+    for step in steps:
+        layout = ModuleLayout()
+        answer = native.run([step.name], tree, ctx, layout)
+        assert isinstance(answer, ast.Module), step.name
+        tree = step.run(tree, ctx)
+        native.verify(step.name, tree, answer, ctx, layout)
+
+    batch = context()
+    answer = native.run([step.name for step in steps], ast.parse(source), batch, batch.slot_layout)
+    assert isinstance(answer, ast.Module)
+    assert native.describe(answer, batch.slot_layout) == native.describe(tree, ctx.slot_layout)
+
+
+def __test_slot_steps_reject_what_python_rejects__():
+    """A Series or Persistent declaration outside a function is rejected natively too."""
+    __test_helper_require_native()
+    for step, source in (('Series', 'from pynecore.types import Series\ns: Series[float] = 1.0\n'),
+                         ('Persistent', 'p: Persistent[int] = 0\n')):
+        ctx = pipeline.PipelineContext(path=Path('rejected.py'), pyne_mode=None, source=source)
+        assert isinstance(native.run([step], ast.parse(source), ctx, ModuleLayout()),
+                          native.Rejection)
+
+
+def __test_slot_steps_decline_what_they_cannot_model__():
+    """A persistent int literal beyond 64 bits is converted to float by Python's own
+    arithmetic; the native step declines it, and the pipeline runs the Python step."""
+    __test_helper_require_native()
+    source = 'def main():\n    p: Persistent[int] = 99999999999999999999\n    return p\n'
+    ctx = pipeline.PipelineContext(path=Path('big.py'), pyne_mode=None, source=source)
+    layout = ModuleLayout()
+    assert native.run(['Persistent'], ast.parse(source), ctx, layout) is None
+    assert not layout.scopes

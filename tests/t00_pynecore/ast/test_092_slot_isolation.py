@@ -15,10 +15,11 @@ import pytest
 
 from pynecore.core.instance_state import _make_state
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
+from pynecore.transformers.layout_emit import apply_layout
 from pynecore.transformers.persistent import PersistentTransformer
 from pynecore.transformers.safe_convert_transformer import SafeConvertTransformer
 from pynecore.transformers.series import SeriesTransformer
-from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
+from pynecore.transformers.slot_layout import ModuleLayout
 
 
 def _transform(source: str) -> tuple[dict, str]:

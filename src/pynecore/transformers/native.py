@@ -40,6 +40,7 @@ from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
 
+from . import ast_walk
 from .builtin_shadow import Library, import_library, library_serves
 from .export_capture import module_origin
 from . import module_interface
@@ -48,6 +49,7 @@ from .pine_type_infer import module_spec_origin, package_member
 from .pine_type_table import Analyser
 from .source_read import stable_source
 from .module_property import module_properties
+from .slot_layout import ModuleLayout
 from ..utils.stdlib_checker import is_stdlib
 
 try:
@@ -55,8 +57,8 @@ try:
 except ImportError:
     _native = None
 
-__all__ = ['available', 'backend', 'current_steps', 'source_digest', 'run', 'verify',
-           'verify_rejection', 'Rejection', 'NativeMismatch']
+__all__ = ['available', 'backend', 'current_steps', 'layout_steps', 'source_digest', 'run',
+           'verify', 'verify_rejection', 'Rejection', 'NativeMismatch']
 
 _TRANSFORMERS = Path(__file__).parent
 _PACKAGE = _TRANSFORMERS.parent
@@ -179,6 +181,13 @@ def current_steps() -> frozenset[str]:
     return _current
 
 
+def layout_steps() -> frozenset[str]:
+    """The ported steps that read or fill the pipeline's slot layout (``ctx.slot_layout``)."""
+    if _native is None:
+        return frozenset()
+    return frozenset(_native.layout_steps())
+
+
 class _Host:
     """What a native step asks the interpreter, answered by the very functions the
     Python step uses, at the moment the Python step would use them."""
@@ -274,7 +283,8 @@ class _Host:
 
 def _context(ctx: Any) -> dict[str, Any]:
     return {'path': str(ctx.path), 'pyne_mode': ctx.pyne_mode, 'source': ctx.source,
-            'user_code': ctx.user_code, 'host': _Host(ctx.analyse, ctx.pipeline_hash)}
+            'user_code': ctx.user_code, 'host': _Host(ctx.analyse, ctx.pipeline_hash),
+            'slot_layout': getattr(ctx, 'slot_layout', None)}
 
 
 class Rejection:
@@ -287,23 +297,37 @@ class Rejection:
         self.message = message
 
 
-def run(names: list[str], tree: ast.Module, ctx: Any) -> ast.Module | Rejection | None:
+def run(names: list[str], tree: ast.Module, ctx: Any,
+        layout: ModuleLayout | None = None) -> ast.Module | Rejection | None:
     """Run native steps in order over a module.
+
+    A step of :func:`layout_steps` reads ``ctx.slot_layout`` as the Python steps
+    would have left it, and fills a native copy of it.
 
     :param names: Step names, each in :func:`current_steps`.
     :param tree: The module; it is not changed.
-    :param ctx: The pipeline context.
+    :param ctx: The pipeline context; its slot layout is not changed either.
+    :param layout: Where the slot layout the steps left is written when the steps
+        answer a module and one of them uses the layout: its state is replaced
+        field for field. None leaves the layout the steps left unread.
     :return: The transformed module, a new object; a :class:`Rejection` when a step
         finds the module invalid; None when a step does not handle the module. In
         both latter cases the caller runs the Python steps.
     """
     assert _native is not None
+    context = _context(ctx)
     try:
-        return _native.run(tree, names, _context(ctx))
+        result = _native.run(tree, names, context)
     except _native.Rejected as exc:
         return Rejection(str(exc))
     except _native.Unsupported:
         return None
+    left = context.get('slot_layout_result')
+    if layout is not None and left is not None:
+        state = vars(layout)
+        state.clear()
+        state.update(vars(left))
+    return result
 
 
 def _describe(node: Any, path: str, seen: dict[int, str], out: list[str]) -> None:
@@ -355,29 +379,56 @@ def _describe(node: Any, path: str, seen: dict[int, str], out: list[str]) -> Non
         out.append(f'{path} = {type(node).__name__} {node!r}')
 
 
-def describe(tree: ast.AST) -> list[str]:
-    """Everything a step's result consists of, one line per value, in a stable order."""
+def _describe_layout(tree: ast.Module, layout: ModuleLayout, seen: dict[int, str],
+                     out: list[str]) -> None:
+    """Flatten a slot layout after the tree it was filled for, with the same node
+    references: a template expression that is also a node of the tree is written as
+    a reference to it. The definition caches are keyed by object identity, so they
+    are written as what the layout answers for each definition of the tree."""
+    out.append(f'<layout>.compacted_series = {layout.compacted_series!r}')
+    _describe(layout.scopes, '<layout>.scopes', seen, out)
+    out.append(f'<layout>.scanned = {layout.scanned(tree)!r}')
+    definitions = (node for node in ast_walk.walk(tree)
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    for index, node in enumerate(definitions):
+        out.append(f'<layout>.defs[{index}] = {layout.scope_segment(node)!r} '
+                   f'{layout.nests_definition(node)!r}')
+
+
+def describe(tree: ast.AST, layout: ModuleLayout | None = None) -> list[str]:
+    """Everything a step's result consists of, one line per value, in a stable order.
+
+    :param tree: The module a step answered.
+    :param layout: The slot layout the step left, for a step that uses it.
+    """
     out: list[str] = []
-    _describe(tree, '', {}, out)
+    seen: dict[int, str] = {}
+    _describe(tree, '', seen, out)
+    if layout is not None:
+        assert isinstance(tree, ast.Module)
+        _describe_layout(tree, layout, seen, out)
     return out
 
 
 def verify(name: str, expected: ast.Module, actual: ast.Module | Rejection | None,
-           ctx: Any) -> None:
+           ctx: Any, layout: ModuleLayout | None = None) -> None:
     """Raise :class:`NativeMismatch` unless the native result equals the Python one.
 
     :param name: The step.
     :param expected: What the Python step produced.
     :param actual: What :func:`run` answered for the same input.
     :param ctx: The pipeline context.
+    :param layout: For a step of :func:`layout_steps`, the slot layout the native
+        step left (the ``layout`` :func:`run` wrote), compared with the one the
+        Python step left in ``ctx.slot_layout``.
     """
     if actual is None:
         return
     if isinstance(actual, Rejection):
         raise NativeMismatch(f'native {name} rejects {ctx.path}, which Python accepts: '
                              f'{actual.message}')
-    want = describe(expected)
-    got = describe(actual)
+    want = describe(expected, None if layout is None else ctx.slot_layout)
+    got = describe(actual, layout)
     if want == got:
         return
     for index, (line_want, line_got) in enumerate(zip(want, got)):

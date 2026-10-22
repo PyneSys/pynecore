@@ -12,10 +12,10 @@ use std::collections::HashMap;
 use pyne_ast::walk::{Transformer, Visited, generic_visit, walk, walk_statements};
 use pyne_ast::{Ast, CmpOperator, Constant, ExprContext, Kind, NodeId};
 
+use crate::dynamic_default_guard::SENTINEL_NAME;
 use crate::{Context, Error};
 
 const SCRIPT_ENTRY_DECORATORS: [&str; 3] = ["indicator", "strategy", "library"];
-const SENTINEL_NAME: &str = "__dyn_default__";
 /// The alias `dataclasses.field` is bound to for the lowered UDT defaults
 const FIELD_NAME: &str = "__pyne_field·__";
 /// The alias the bool na factory (`pynecore.types.na.new_bool_na`) is bound to

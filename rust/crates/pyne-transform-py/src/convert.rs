@@ -81,6 +81,11 @@ impl<'py> FromPython<'py> {
         self.value(value)
     }
 
+    /// The node an object at this address (`id()`) was converted into, if one was.
+    pub fn converted(&self, address: usize) -> Option<NodeId> {
+        self.memo.get(&address).copied()
+    }
+
     /// The Python object a node was converted from.
     pub fn source(&self, id: NodeId) -> Option<&Bound<'py, PyAny>> {
         let (&key, _) = self.memo.iter().find(|&(_, &known)| known == id)?;
@@ -427,6 +432,11 @@ impl<'py> ToPython<'py> {
         let object = self.ast_module.getattr(name)?.call0()?;
         self.singletons.insert(name, object.clone());
         Ok(object)
+    }
+
+    /// The Python object a node has been converted into so far, if it has been.
+    pub fn converted(&self, id: NodeId) -> Option<&Bound<'py, PyAny>> {
+        self.memo.get(&id)
     }
 
     pub fn node(&mut self, ast: &Ast, id: NodeId) -> PyResult<Bound<'py, PyAny>> {

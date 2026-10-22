@@ -56,6 +56,7 @@ from .script_entry import is_script_entry
 from .security_dependencies import (
     _COLLECTION_NAMESPACES, _COLLECTION_READERS, _DependencyAnalyzer, _UNMODELLED_NODES,
 )
+from .security_contexts import ctx_get as _ctx_get, iter_contexts as _iter_contexts
 
 __all__ = ['SecuritySliceTransformer', 'CLONE_PREFIX', 'CLONE_SUFFIX']
 
@@ -788,22 +789,6 @@ def _find_contexts(module: ast.Module) -> ast.Dict | None:
         target = stmt.targets[0]
         if isinstance(target, ast.Name) and target.id == '__security_contexts__':
             return stmt.value
-    return None
-
-
-def _iter_contexts(contexts: ast.Dict):
-    """Yield ``(sid, context dict literal)`` pairs of ``__security_contexts__``."""
-    for key, value in zip(contexts.keys, contexts.values):
-        if (isinstance(key, ast.Constant) and isinstance(key.value, str)
-                and isinstance(value, ast.Dict)):
-            yield key.value, value
-
-
-def _ctx_get(ctx: ast.Dict, name: str) -> ast.expr | None:
-    """One entry of a context dict literal."""
-    for key, value in zip(ctx.keys, ctx.values):
-        if isinstance(key, ast.Constant) and key.value == name:
-            return value
     return None
 
 

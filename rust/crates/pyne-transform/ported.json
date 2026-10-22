@@ -41,7 +41,7 @@
   },
   "DynamicDefault": {
     "module": "dynamic_default",
-    "digest": "82a2b6e468bc1cea945b1376b54c1ff4293f906b29e362fde059f9fcb00b426e"
+    "digest": "0180d58d7d01dc03ed2d00d219a819b0f4a0190fba6c915ea31d14993dae6ccc"
   },
   "InlineSeriesHoist": {
     "module": "inline_series_hoist",
@@ -98,5 +98,17 @@
   "UnusedSeriesDetector": {
     "module": "unused_series_detector",
     "digest": "370bb221ea6bb5904fd34a2067d7f8320f4aa655f22ac972870a13740928f23b"
+  },
+  "Series": {
+    "module": "series",
+    "digest": "8caf805c18b43e3c0046ba62d429c99e9fa58eeffd91614579d1510e02fc31e2"
+  },
+  "VerifyClosedShift": {
+    "module": "security_closed_shift_check",
+    "digest": "d80032808b504ba6c5ce1a667e208e080378e36c50575d60842dacf514425c7f"
+  },
+  "Persistent": {
+    "module": "persistent",
+    "digest": "fe0796a9cd474735a2db9b082d689304b7d37aa21f830b9d083166d0d905d3ca"
   }
 }

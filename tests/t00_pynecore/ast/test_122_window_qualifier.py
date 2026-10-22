@@ -14,12 +14,13 @@ import pytest
 
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
+from pynecore.transformers.layout_emit import apply_layout
 from pynecore.transformers.persistent import PersistentTransformer
 from pynecore.transformers.pine_qualifier import get_series_len, get_series_lens
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_transformer import PineTypeTransformer
 from pynecore.transformers.series import SeriesTransformer
-from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
+from pynecore.transformers.slot_layout import ModuleLayout
 
 #: A script entry; ``{body}`` is indented into ``main``
 SCRIPT = '''

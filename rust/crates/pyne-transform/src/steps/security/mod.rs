@@ -21,10 +21,13 @@
 //! - [`dependencies`]: the taint analysis behind `depends` / `late_reads` /
 //!   `in_loop` (shared with the slice pass);
 //! - [`groups`]: `always_read`, `signal_per_bar` and the feed groups;
+//! - [`contexts`]: the reading of the `__security_contexts__` literal, for the
+//!   steps after this one;
 //! - this module: the module visit and the registry it emits.
 
 pub mod builders;
 pub mod collection;
+pub mod contexts;
 pub mod dependencies;
 pub mod groups;
 pub mod lift;

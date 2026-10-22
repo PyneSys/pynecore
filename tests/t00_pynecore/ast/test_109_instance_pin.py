@@ -24,12 +24,13 @@ from pynecore.core.instance_state import (
     RootVarSnapshot, __bind_any__, _make_state, _restore_collected, create_root, discard_root,
 )
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
+from pynecore.transformers.layout_emit import apply_layout
 from pynecore.transformers.persistent import PersistentTransformer
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import get_varying, get_vector
 from pynecore.transformers.pine_type_transformer import PineTypeTransformer
 from pynecore.transformers.series import SeriesTransformer
-from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
+from pynecore.transformers.slot_layout import ModuleLayout
 
 #: An overload group whose two implementations are told apart by their result:
 #: 1.0 is the int one, 2.0 the float one.

@@ -31,7 +31,7 @@ from typing import cast
 import ast
 
 from . import ast_walk
-from .dynamic_default import is_dynamic_default_guard
+from .dynamic_default_guard import is_dynamic_default_guard
 from .pine_type_rules import OBJECT, get_ty, set_ty, stamp_lowering
 from .slot_layout import ModuleLayout, scope_for_function
 

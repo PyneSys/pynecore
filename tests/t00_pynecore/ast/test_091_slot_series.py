@@ -17,11 +17,12 @@ import pytest
 from pynecore import lib
 from pynecore.core.instance_state import _make_state
 from pynecore.core.series import SeriesImpl
+from pynecore.transformers.layout_emit import apply_layout
 from pynecore.transformers.lib_series import LibrarySeriesTransformer
 from pynecore.transformers.persistent import PersistentTransformer
 from pynecore.transformers.persistent_series import PersistentSeriesTransformer
 from pynecore.transformers.series import SeriesTransformer
-from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
+from pynecore.transformers.slot_layout import ModuleLayout
 
 
 def _transform(source: str) -> tuple[dict, str]:

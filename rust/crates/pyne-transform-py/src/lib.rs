@@ -4,7 +4,10 @@ mod convert;
 mod fold;
 mod qualifier;
 mod rules;
+mod slot_layout;
 mod type_table;
+
+use std::cell::RefCell;
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -13,6 +16,8 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyDict;
 
 use convert::{FromPython, ToPython};
+use pyne_transform::slot_layout::ModuleLayout;
+use slot_layout::LayoutClasses;
 
 create_exception!(
     _native,
@@ -189,8 +194,11 @@ impl pyne_transform::Host for PyHost<'_> {
 ///
 /// :param tree: The module.
 /// :param steps: Step names as ``pipeline.py`` declares them.
-/// :param context: ``path``, ``pyne_mode``, ``source``, ``user_code``, ``host``.
-/// :return: A new module object; the input tree is left as it was.
+/// :param context: ``path``, ``pyne_mode``, ``source``, ``user_code``, ``host``, and
+///     ``slot_layout``: the pipeline's ``ModuleLayout``, read when a step of the run
+///     uses it (a fresh one when the context has none). The layout such a run leaves
+///     is put into the context as ``slot_layout_result``, a new ``ModuleLayout``.
+/// :return: A new module object; the input tree and layout are left as they were.
 /// :raises Unsupported: When a step meets something its port does not handle.
 /// :raises Rejected: When a step finds the module invalid.
 #[pyfunction]
@@ -202,6 +210,24 @@ fn run<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let get = |name: &str| context.get_item(name);
     let host = PyHost { object: get("host")? };
+    let names: Vec<&str> = steps.iter().map(String::as_str).collect();
+    let mut from = FromPython::new();
+    if pyne_transform::reads_type_table(&names) {
+        from = from.native_type_tables(py)?;
+    }
+    let root = from.node(tree)?;
+    // The layout's template expressions may be nodes of the tree: converted after it
+    let classes = if pyne_transform::uses_slot_layout(&names) {
+        Some(LayoutClasses::import(py)?)
+    } else {
+        None
+    };
+    let layout = match (&classes, get("slot_layout")?) {
+        (Some(classes), Some(object)) if !object.is_none() => {
+            classes.layout_from(&mut from, &object, tree, root)?
+        }
+        _ => ModuleLayout::default(),
+    };
     let ctx = pyne_transform::Context {
         path: match get("path")? {
             Some(value) => value.extract()?,
@@ -220,20 +246,21 @@ fn run<'py>(
             None => true,
         },
         host: &host,
+        slot_layout: RefCell::new(layout),
     };
-    let names: Vec<&str> = steps.iter().map(String::as_str).collect();
-    let mut from = FromPython::new();
-    if pyne_transform::reads_type_table(&names) {
-        from = from.native_type_tables(py)?;
-    }
-    let root = from.node(tree)?;
     let mut ast = from.ast;
     let root =
         pyne_transform::run_steps(&mut ast, root, &names, &ctx).map_err(|err| match err {
             pyne_transform::Error::Unsupported(message) => Unsupported::new_err(message),
             pyne_transform::Error::Rejected(message) => Rejected::new_err(message),
         })?;
-    ToPython::new(py)?.with_objects(from.objects).node(&ast, root)
+    let mut to = ToPython::new(py)?.with_objects(from.objects);
+    let module = to.node(&ast, root)?;
+    if let Some(classes) = classes {
+        let layout = classes.layout_to(&mut to, &ast, &ctx.slot_layout.borrow())?;
+        context.set_item("slot_layout_result", layout)?;
+    }
+    Ok(module)
 }
 
 /// The ``ported.json`` manifest the extension was built with.
@@ -248,6 +275,12 @@ fn steps() -> Vec<&'static str> {
     pyne_transform::STEPS.iter().map(|step| step.name).collect()
 }
 
+/// The names of the ported steps that read or fill the pipeline's slot layout.
+#[pyfunction]
+fn layout_steps() -> Vec<&'static str> {
+    pyne_transform::SLOT_LAYOUT_STEPS.to_vec()
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -258,6 +291,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dump, m)?)?;
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(steps, m)?)?;
+    m.add_function(wrap_pyfunction!(layout_steps, m)?)?;
     m.add_function(wrap_pyfunction!(ported_json, m)?)?;
     m.add_function(wrap_pyfunction!(rules::call, m)?)?;
     m.add_function(wrap_pyfunction!(qualifier::call, m)?)?;

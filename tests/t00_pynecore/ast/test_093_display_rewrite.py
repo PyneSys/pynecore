@@ -5,9 +5,10 @@ import ast
 
 from pynecore.transformers.display_rewrite import display_dump
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
+from pynecore.transformers.layout_emit import apply_layout
 from pynecore.transformers.persistent import PersistentTransformer
 from pynecore.transformers.series import SeriesTransformer
-from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
+from pynecore.transformers.slot_layout import ModuleLayout
 
 
 def _display(source: str) -> str:

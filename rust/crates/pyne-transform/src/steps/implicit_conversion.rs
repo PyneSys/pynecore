@@ -503,6 +503,7 @@ mod tests {
             source: String::new(),
             user_code: true,
             host: &NoHost,
+            slot_layout: Default::default(),
         }
     }
 

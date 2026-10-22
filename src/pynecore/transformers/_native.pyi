@@ -28,11 +28,19 @@ def dump(tree: ast.AST, include_attributes: bool = False) -> str:
 
 
 def run(tree: ast.Module, steps: list[str], context: dict[str, Any]) -> ast.Module:
-    """Run native steps over a module, in order; the input tree is left as it was."""
+    """Run native steps over a module, in order; the input tree is left as it was.
+
+    A run with a step of :func:`layout_steps` reads ``context['slot_layout']`` (the
+    pipeline's ``ModuleLayout``, left as it was) and puts the layout the steps left
+    into ``context['slot_layout_result']``, a new ``ModuleLayout``."""
 
 
 def steps() -> list[str]:
     """The names of the steps with a native port."""
+
+
+def layout_steps() -> list[str]:
+    """The names of the ported steps that read or fill the pipeline's slot layout."""
 
 
 def ported_json() -> str:

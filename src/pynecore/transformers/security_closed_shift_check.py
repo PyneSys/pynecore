@@ -45,7 +45,7 @@ candidate, this is the exact filter behind it.
 import ast
 
 from . import ast_walk
-from .security_slice import _ctx_get, _iter_contexts
+from .security_contexts import ctx_get, iter_contexts
 from .slot_layout import DEFAULT_STATE_PARAM, ModuleLayout
 
 __all__ = ['verify_closed_shift']
@@ -324,8 +324,8 @@ def _group_members(contexts: ast.Dict) -> tuple[dict[str, int], dict[int, set[st
     """
     group_of: dict[str, int] = {}
     members: dict[int, set[str]] = {}
-    for sid, ctx in _iter_contexts(contexts):
-        value = _ctx_get(ctx, 'group')
+    for sid, ctx in iter_contexts(contexts):
+        value = ctx_get(ctx, 'group')
         if (isinstance(value, ast.Constant) and isinstance(value.value, int)
                 and not isinstance(value.value, bool)):
             group_of[sid] = value.value
@@ -348,7 +348,7 @@ def verify_closed_shift(module: ast.Module, layout: ModuleLayout) -> ast.Module:
     contexts = _find_contexts(module)
     if contexts is None:
         return module
-    flagged = {sid for sid, ctx in _iter_contexts(contexts)
+    flagged = {sid for sid, ctx in iter_contexts(contexts)
                if _is_flag_true(ctx)}
     if not flagged:
         return module
@@ -372,10 +372,10 @@ def verify_closed_shift(module: ast.Module, layout: ModuleLayout) -> ast.Module:
         if group is not None:
             cleared |= members[group]
 
-    for sid, ctx in _iter_contexts(contexts):
+    for sid, ctx in iter_contexts(contexts):
         if sid not in cleared:
             continue
-        value = _ctx_get(ctx, 'closed_shift')
+        value = ctx_get(ctx, 'closed_shift')
         if isinstance(value, ast.Constant) and value.value is True:
             value.value = False
     return module
@@ -383,5 +383,5 @@ def verify_closed_shift(module: ast.Module, layout: ModuleLayout) -> ast.Module:
 
 def _is_flag_true(ctx: ast.Dict) -> bool:
     """Whether the context's ``closed_shift`` entry says True."""
-    value = _ctx_get(ctx, 'closed_shift')
+    value = ctx_get(ctx, 'closed_shift')
     return isinstance(value, ast.Constant) and value.value is True
