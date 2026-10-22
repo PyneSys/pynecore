@@ -266,6 +266,7 @@ pub static STEPS: &[Step] = &[
     Step { name: "Series", run: steps::series::run },
     Step { name: "VerifyClosedShift", run: steps::security_closed_shift_check::run },
     Step { name: "Persistent", run: steps::persistent::run },
+    Step { name: "CallInline", run: steps::call_inline::run },
     Step { name: "ScriptRequirements", run: steps::script_requirements::run },
     Step { name: "Input", run: steps::input::run },
     // The rules of the phases, each on its own (sequential mode)

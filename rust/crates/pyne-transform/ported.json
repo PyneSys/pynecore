@@ -134,5 +134,9 @@
   "FixLocations": {
     "module": "locations",
     "digest": "04f5fd0d9f2058047732518b71fba03f16cd4b1cbe91ca5ab542140b326001f5"
+  },
+  "CallInline": {
+    "module": "call_inline",
+    "digest": "669c6262d175b56a83835b633e96dabe02b44e1885e68614469820e1e5b82558"
   }
 }

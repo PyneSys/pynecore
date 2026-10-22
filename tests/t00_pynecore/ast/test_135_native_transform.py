@@ -268,11 +268,13 @@ def main():
 '''
 
 #: A strategy with source and value inputs, divisions, a remainder, a cast and
-#: comparisons, lowered as a three-state bool module
+#: comparisons, lowered as a three-state bool module, and inlined lib wrappers: a
+#: literal-decided guard, a forced argument order, an array read in a ``pine_range``
+#: loop
 __test_helper_STRATEGY = '''"""
 @pyne
 """
-from pynecore import lib
+from pynecore import lib, pine_range
 from pynecore.lib import script, strategy, input, close, high, low, hl2
 
 
@@ -285,6 +287,10 @@ def main(src=input.source(close, "Source"), length=input.int(5, "Length"),
     ratio = high / low
     ratio /= 2.0
     half = int(total) % 3
+    levels = lib.array.from_items(high, low)
+    for k in pine_range(0, 1):
+        total += lib.array.get(levels, k) + lib.math.pow(ratio, 2)
+    total += lib.math.max(level, lib.math.abs(close - src)) + lib.array.size(levels)
     if ratio > 1.01 and close >= src:
         strategy.entry("long", strategy.long, limit=low)
     if ratio < 0.99 or level != close:
@@ -302,18 +308,19 @@ __test_helper_LOWERED = (('native_parity.py', __test_helper_SOURCE, False),
 
 #: The lowering passes the helper modules exercise natively, each changing the tree
 __test_helper_LOWERING_STEPS = ('SecurityDefault', 'ExportOnce', 'UnusedSeriesDetector', 'Series',
-                                'VerifyClosedShift', 'Persistent', 'ScriptRequirements', 'Input',
-                                'Expression', 'FixLocations')
+                                'VerifyClosedShift', 'Persistent', 'CallInline',
+                                'ScriptRequirements', 'Input', 'Expression', 'FixLocations')
 
 #: The same in sequential mode, where the rules of the phase run one by one
 __test_helper_SEQUENTIAL_STEPS = ('SecurityDefault', 'ExportOnce', 'UnusedSeriesDetector',
-                                  'Series', 'VerifyClosedShift', 'Persistent',
+                                  'Series', 'VerifyClosedShift', 'Persistent', 'CallInline',
                                   'ScriptRequirements', 'Input', 'SafeConvert', 'SafeDivision',
                                   'FloatTolerance', 'FixLocations')
 
 #: The native calls of the lowering half under the native backend
 __test_helper_LOWERING_BATCHES = (
-    'SecurityDefault+ExportOnce+UnusedSeriesDetector+Series+VerifyClosedShift+Persistent',
+    'SecurityDefault+ExportOnce+UnusedSeriesDetector+Series+VerifyClosedShift+Persistent'
+    '+CallInline',
     'ScriptRequirements+Input+Expression', 'FixLocations')
 
 #: The analysis steps after which the tree carries what the type pass stamped

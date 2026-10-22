@@ -1,6 +1,7 @@
 //! The ported steps, one module per Python step module.
 
 pub mod builtin_shadow;
+pub mod call_inline;
 pub mod closure_arguments;
 pub mod const_fold;
 pub mod dynamic_default;

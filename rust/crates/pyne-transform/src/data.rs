@@ -226,3 +226,79 @@ pub fn lib_namespaces() -> &'static std::collections::HashSet<String> {
         out
     })
 }
+
+/// A function of `call_inline_templates.json` (`call_inline.inline_templates()['functions']`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum InlineFunction {
+    /// The body's own expression: the parameter names and the encoded expression
+    /// (`{"param": i}` for a read of the i-th parameter, `{"_type": class, field:
+    /// value, ..., "loc": [...], "arg": true}` for any other node)
+    Derive { params: Vec<String>, body: Value },
+    /// The fixed-arity expansion of `math.max` / `math.min`: the builtin the body
+    /// ends in, and the `inline_support` anchors of `_na_of_operands` and `builtins`
+    Varargs { builtin: String, na_anchor: String, builtins_anchor: String },
+}
+
+/// `call_inline_templates.json`, the generated inline template registry
+/// (`call_inline.inline_templates`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct InlineTemplates {
+    /// Function path (`pynecore.lib.math.abs`) -> its template
+    pub functions: HashMap<String, InlineFunction>,
+    /// Callee path, as the import map resolves it -> the function path
+    pub callees: HashMap<String, String>,
+    /// The paths of `pine_range`
+    pub loop_ranges: Vec<String>,
+    /// The positional arities the varargs expansion is written for
+    pub varargs_arities: Vec<usize>,
+}
+
+/// `call_inline_templates.json`, parsed once.
+pub fn inline_templates() -> &'static InlineTemplates {
+    static TEMPLATES: OnceLock<InlineTemplates> = OnceLock::new();
+    TEMPLATES.get_or_init(|| {
+        let text = include_str!("../../../../src/pynecore/transformers/call_inline_templates.json");
+        let document: Map<String, Value> =
+            serde_json::from_str(text).expect("call_inline_templates.json");
+        let section = |name: &str| {
+            document
+                .get(name)
+                .unwrap_or_else(|| panic!("call_inline_templates.json has no {name}"))
+                .clone()
+        };
+        let text = |entry: &Value, field: &str| {
+            entry
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("call_inline_templates.json: no {field}"))
+                .to_string()
+        };
+        let Value::Object(functions) = section("functions") else { panic!("functions") };
+        let functions = functions
+            .iter()
+            .map(|(name, entry)| {
+                let function = match entry.get("kind").and_then(Value::as_str) {
+                    Some("derive") => InlineFunction::Derive {
+                        params: serde_json::from_value(entry["params"].clone())
+                            .unwrap_or_else(|_| panic!("functions.{name}.params")),
+                        body: entry["body"].clone(),
+                    },
+                    Some("varargs") => InlineFunction::Varargs {
+                        builtin: text(entry, "builtin"),
+                        na_anchor: text(entry, "na_anchor"),
+                        builtins_anchor: text(entry, "builtins_anchor"),
+                    },
+                    other => panic!("functions.{name}.kind {other:?}"),
+                };
+                (name.clone(), function)
+            })
+            .collect();
+        InlineTemplates {
+            functions,
+            callees: serde_json::from_value(section("callees")).expect("callees"),
+            loop_ranges: serde_json::from_value(section("loop_ranges")).expect("loop_ranges"),
+            varargs_arities: serde_json::from_value(section("varargs_arities"))
+                .expect("varargs_arities"),
+        }
+    })
+}

@@ -230,3 +230,21 @@ request from `ModuleLayout::new(pyne_mode == "lib")`, as the import hook does.
    beyond `i64` (`lst[1e300]` typed int), an opaque `pine_exact` stamp, a leave hook
    handed a list by an earlier rule, and a node with a line but no column for
    `fix_locations`.
+4. **CallInline**. Hermetized first: the inline templates are the generated
+   registry `transformers/call_inline_templates.json`, written by
+   `scripts/call_inline_collector.py` (the body-shape derivation moved there from
+   the step) and guarded by `tests/t00_pynecore/ast/test_142_call_inline_templates.py`,
+   which names the function whose template changed. Per function the registry holds
+   its parameters and derived expression (a parameter read is `{"param": i}`, every
+   other node its class, fields and the wrapper-source location the emission
+   carries), or the builtin and anchors of the varargs expansion; plus the callee
+   paths (`callees`), the spellings of `pine_range` (`loop_ranges`) and the varargs
+   arities. The Python step builds its templates from it and proves a callee by the
+   path its import map resolves to, where it compared live objects before;
+   `DEFAULT_STATE_PARAM` moved into the leaf `state_param.py`, so the closure is the
+   step, its registry, `ast_walk.py`, `pine_type_rules.py` and `factory_fields.py`.
+   Ported as `steps/call_inline.rs`, reading the registry through
+   `data::inline_templates`; it never reads the `PineTypeTable` or the slot layout.
+   `Unsupported`: an `_inl_argument` marker that is no bool, a `_pine_ty` stamp on
+   the call that is no string or one in the inlined expression that is neither a
+   string nor `None`, and a literal comparison with an int beyond 64 bits.
