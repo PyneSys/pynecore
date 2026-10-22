@@ -78,5 +78,17 @@
   "ImplicitConversion": {
     "module": "implicit_conversion",
     "digest": "842c737775f12dcae99ef32f302eb7631b1fe9a3ddd1b755e97e3e924fa7f24e"
+  },
+  "SecurityDefault": {
+    "module": "security_default",
+    "digest": "a5bcd2c3c493243139c04ba40e22e8e001ce320dbfe14da2e1b6f3712ec9ccf7"
+  },
+  "ExportOnce": {
+    "module": "export_once",
+    "digest": "9a374b5653544369926ba507bc405c06207aadf96b39210365cac2cc870372cc"
+  },
+  "UnusedSeriesDetector": {
+    "module": "unused_series_detector",
+    "digest": "370bb221ea6bb5904fd34a2067d7f8320f4aa655f22ac972870a13740928f23b"
   }
 }

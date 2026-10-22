@@ -118,3 +118,19 @@ pointers.
    module source of a dotted name, package members, path resolution, the stdlib
    test, the analysis-in-progress set, cycle detection and an imported module's
    interface (the `interface_payload` JSON).
+
+## Lowering steps
+
+`pipeline.run_steps` dispatches a plain `Step` of `LOWERING` exactly as one of
+`ANALYSIS`: a `Phase` (its `RuleStep`s are not ported) runs in Python and closes
+the native batch before it. A step that reads `ctx.slot_layout` needs the
+layout across the boundary first; the first three steps do not read it.
+
+1. **SecurityDefault**, **ExportOnce**, **UnusedSeriesDetector**. Ported as
+   `steps/security_default.rs`, `steps/export_once.rs` and
+   `steps/unused_series_detector.rs`; none reads the `PineTypeTable`.
+   SecurityDefault's closure includes `pine_type_rules.py` (`get_ty`,
+   `elements_of`, `stamp_lowering` decide its output). `Unsupported`: a `_pine_ty`
+   stamp on a security read that is no string, and a `Series[...]` annotation
+   whose slice is neither a name nor a node with a node `value` field (the Python
+   pass would put a constant's raw value or `None` into the annotation).

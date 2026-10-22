@@ -196,6 +196,9 @@ pub static STEPS: &[Step] = &[
     Step { name: "TaVariableHoist", run: steps::ta_variable_hoist::run },
     Step { name: "ClosureArguments", run: steps::closure_arguments::run },
     Step { name: "ImplicitConversion", run: steps::implicit_conversion::run },
+    Step { name: "SecurityDefault", run: steps::security_default::run },
+    Step { name: "ExportOnce", run: steps::export_once::run },
+    Step { name: "UnusedSeriesDetector", run: steps::unused_series_detector::run },
 ];
 
 /// The steps whose port reads the module's

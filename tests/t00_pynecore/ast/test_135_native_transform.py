@@ -21,7 +21,7 @@ __test_helper_SOURCE = '''"""
 from pynecore import lib
 from pynecore.core.pine_udt import udt
 from pynecore.lib import close, hl2, na, plot, request, syminfo, timeframe
-from pynecore.types import Matrix
+from pynecore.types import Matrix, Series
 
 
 @udt
@@ -83,6 +83,10 @@ def put(a, v):
     lib.array.push(a, v)
 
 
+def pair():
+    return close > hl2, close
+
+
 def main():
     from pynecore.lib import ta as indicators
     a: list[float] = lib.array.new_float(0)
@@ -104,6 +108,11 @@ def main():
     q = pick()
     r = bag()
     trend = htf_trend("60") + htf_trend(tf="D") + htf("W", symbol=syminfo.prefix)
+    rising = request.security(syminfo.tickerid, "D", close > hl2)
+    above, level = request.security(syminfo.tickerid, "W", pair())
+    flat: Series[float] = close
+    prev: Series[float] = close
+    shift = prev[1]
     return helper(close) + indicators.ema(close, 3) + smoothed() + Flag().f + trend
 '''
 
@@ -179,6 +188,29 @@ def main():
     def get_spread() -> float:
         return spread + 1 if hexadecimal == fixed else spread
 '''
+
+#: A library whose ``main`` defines its export surface
+__test_helper_EXPORTS = '''"""
+@pyne
+"""
+from pynecore.lib import script, close
+from pynecore.core.pine_export import export
+
+
+@script.library("exports")
+def main():
+    """Exports"""
+    @export
+    def last() -> float:
+        return close
+
+    @export
+    def twice(x: float) -> float:
+        return x * 2
+'''
+
+#: The lowering steps the helper modules exercise natively, each changing the tree
+__test_helper_LOWERING_STEPS = ('SecurityDefault', 'ExportOnce', 'UnusedSeriesDetector')
 
 #: The analysis steps after which the tree carries what the type pass stamped
 __test_helper_TYPED_STEPS = ('PineType', 'ImplicitConversion', 'SecuritySlice')
@@ -418,6 +450,34 @@ def __test_typed_steps_run_natively__(monkeypatch):
     monkeypatch.setattr(native, 'run', recording)
     __test_helper_emission('native', monkeypatch)
     assert isinstance(answers['ImplicitConversion'], ast.Module)
+    assert isinstance(answers['+'.join(__test_helper_LOWERING_STEPS)], ast.Module)
+
+
+def __test_lowering_steps_run_natively__(monkeypatch):
+    """Each ported lowering step handles a helper module natively and changes it, so
+    the verify backend compares a rewrite rather than an untouched tree."""
+    __test_helper_require_native()
+    monkeypatch.setenv('PYNE_AST_BACKEND', 'verify')
+    changed: dict[str, bool] = {}
+    run = native.run
+
+    def recording(names, tree, ctx):
+        before = native.describe(tree)
+        result = run(names, tree, ctx)
+        if names[0] in __test_helper_LOWERING_STEPS:
+            assert isinstance(result, ast.Module), names
+            changed[names[0]] = changed.get(names[0], False) or native.describe(result) != before
+        return result
+
+    monkeypatch.setattr(native, 'run', recording)
+    for name, text in (('native_parity.py', __test_helper_SOURCE),
+                       ('native_exports.py', __test_helper_EXPORTS)):
+        path = Path(name).resolve()
+        tree = ast.parse(text)
+        mode = import_hook._module_mode(tree)[1]
+        analysed = import_hook._analyse_tree(tree, text, path, mode)
+        import_hook._lower_tree(analysed, path, mode)
+    assert changed == dict.fromkeys(__test_helper_LOWERING_STEPS, True)
 
 
 def __test_stale_port_runs_in_python__(monkeypatch):
