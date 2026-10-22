@@ -35,6 +35,10 @@
     "module": "security_drawings",
     "digest": "64892477cd07e415baa1c773a2a0d5972aea4808b13c59f189a47dc3c7182aa7"
   },
+  "ConstFold": {
+    "module": "const_fold",
+    "digest": "3c44abed2c4094e3808918b55f3e20db25628bcad3104c1a37b586e4dfc6d9e2"
+  },
   "DynamicDefault": {
     "module": "dynamic_default",
     "digest": "0e564e878dd24c901137fe8d172ad0941ccffe38d687c51dba7f12e47c96a675"

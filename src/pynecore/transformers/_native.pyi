@@ -47,3 +47,17 @@ def _qualifier(name: str, *args: Any) -> Any:
 
 def _data(section: str) -> dict[str, Any]:
     """A section of the registries compiled into the extension (tests only)."""
+
+
+def _fdlibm(name: str, x: bytes, y: bytes | None = None) -> bytes:
+    """One function of the native ``core.fdlibm`` port over packed float64 arguments
+    (``y``: the exponents of ``pow``), the results packed alike (tests only)."""
+
+
+def _quantize_embed(values: bytes) -> bytes:
+    """The native ``const_fold.quantize_embed`` of packed float64 values (tests only)."""
+
+
+def _const_eval(expr: ast.expr) -> int | float | None:
+    """The native ``quantize_embed(_try_eval(expr, {}))``, None where the fold leaves
+    ``expr`` in place (tests only)."""

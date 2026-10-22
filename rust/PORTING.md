@@ -66,6 +66,13 @@ pointers.
      `Unsupported` on overflow or `Int::Big`;
    - `quantize_embed`: shortest digits, round-down at 1e-16 with an exact binary
      tie check (fits in `u128`), correctly rounded parse.
+
+   Ported as `steps/const_fold.rs` with `fdlibm.rs`. The fdlibm port and
+   `quantize_embed` are gated bit for bit by `test_139_native_fdlibm`
+   (`PYNE_FDLIBM_SWEEP=2000000` for the full sweep), the evaluation and the step
+   by `test_138_native_const_fold`. `Unsupported`: an int literal or result beyond
+   `i64`, an int true division with an operand beyond 2**53, and `math.round` with
+   a positive precision.
 4. **Security** (XL, 4.4k lines). Split into predicates, collection, builders,
    rewrite, groups, cross-function lift, module emission, and the
    `_DependencyAnalyzer` (~1.5k lines, shared with SecuritySlice) as its own

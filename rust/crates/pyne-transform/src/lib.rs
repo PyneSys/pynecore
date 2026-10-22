@@ -10,6 +10,7 @@
 //! shows the message).
 
 pub mod data;
+pub mod fdlibm;
 pub mod pine_qualifier;
 pub mod pine_type_rules;
 pub mod steps;
@@ -182,6 +183,7 @@ pub static STEPS: &[Step] = &[
     Step { name: "OuterWrite", run: steps::outer_write::run },
     Step { name: "ExportCapture", run: steps::export_capture::run },
     Step { name: "SecurityDrawings", run: steps::security_drawings::run },
+    Step { name: "ConstFold", run: steps::const_fold::run },
     Step { name: "DynamicDefault", run: steps::dynamic_default::run },
     Step { name: "InlineSeriesHoist", run: steps::inline_series_hoist::run },
     Step { name: "PineTruthiness", run: steps::pine_truthiness::run },

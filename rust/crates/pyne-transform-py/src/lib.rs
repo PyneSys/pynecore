@@ -1,6 +1,7 @@
 //! `pynecore.transformers._native`: the native transform, called from the Python pipeline.
 
 mod convert;
+mod fold;
 mod qualifier;
 mod rules;
 
@@ -216,5 +217,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rules::call, m)?)?;
     m.add_function(wrap_pyfunction!(qualifier::call, m)?)?;
     m.add_function(wrap_pyfunction!(qualifier::registry, m)?)?;
+    m.add_function(wrap_pyfunction!(fold::fdlibm_call, m)?)?;
+    m.add_function(wrap_pyfunction!(fold::quantize_embed, m)?)?;
+    m.add_function(wrap_pyfunction!(fold::const_eval, m)?)?;
     Ok(())
 }

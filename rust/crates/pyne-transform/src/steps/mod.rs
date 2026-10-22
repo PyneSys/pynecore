@@ -2,6 +2,7 @@
 
 pub mod builtin_shadow;
 pub mod closure_arguments;
+pub mod const_fold;
 pub mod dynamic_default;
 pub mod export_capture;
 pub mod implicit_conversion;
