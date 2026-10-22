@@ -113,7 +113,7 @@
   },
   "Persistent": {
     "module": "persistent",
-    "digest": "431ce6ad3f4bfdafda0b8aea39830df8030e54f7aed63b36a288ec89e74b2f9f"
+    "digest": "aa88b217ab9cef0963761ec9d0217b302c9cc8fe1c73844238570ddba31c64ee"
   },
   "CallInline": {
     "module": "call_inline",
