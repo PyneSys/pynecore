@@ -37,7 +37,7 @@ Must run after ImportNormalizerTransformer (security calls are in their
 import ast
 
 from . import ast_walk
-from .security import SecurityTransformer, has_security_call
+from .security_calls import has_security_call, is_security_call, is_security_lower_tf_call
 
 __all__ = ['SecurityInstantiationTransformer']
 
@@ -118,10 +118,8 @@ class SecurityInstantiationTransformer:
 
     @staticmethod
     def _is_security_call(node: ast.AST) -> bool:
-        return isinstance(node, ast.Call) and (
-            SecurityTransformer._is_security_call(node)  # noqa
-            or SecurityTransformer._is_security_lower_tf_call(node)  # noqa
-        )
+        return isinstance(node, ast.Call) and (is_security_call(node)
+                                               or is_security_lower_tf_call(node))
 
     def _collect_functions(self, module: ast.Module) -> list[_FuncInfo]:
         """Every FunctionDef with its owner body and scope region. Class

@@ -35,9 +35,6 @@ pointers.
   transitively. Before porting, cut couplings that would stale a port on
   unrelated edits:
   - `export_capture.py` imports `lib_types` from `pine_type_infer`;
-  - `security_instantiation.py` imports its call predicates from `security.py`,
-    so the ported SecurityInstantiation goes stale on every `security.py` edit
-    until the predicates move into a small module;
   - ConstFold's closure covers `lib/math.py`, `core/fdlibm.py`,
     `core/safe_convert.py`, `pine_type_rules.py`: correct, those decide its output.
 

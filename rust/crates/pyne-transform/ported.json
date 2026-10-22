@@ -45,7 +45,7 @@
   },
   "SecurityInstantiation": {
     "module": "security_instantiation",
-    "digest": "0ce88d1787d15271f2e6bbf36e5dded3fb233eadc30244bf08c71cf1aaca94e9"
+    "digest": "be90a80f91f897f11e880ce9e9a476c8328b263e9346c649dc4f76b7ddd61305"
   },
   "PersistentSeries": {
     "module": "persistent_series",

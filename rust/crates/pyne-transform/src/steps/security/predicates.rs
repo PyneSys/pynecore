@@ -1,5 +1,5 @@
-//! The call predicates of `transformers/security.py`: `has_security_call` and
-//! `SecurityTransformer._is_security_call` / `_is_security_lower_tf_call`.
+//! Port of `transformers/security_calls.py`: `has_security_call`,
+//! `is_security_call` and `is_security_lower_tf_call`.
 
 use pyne_ast::walk::Walk;
 use pyne_ast::{Ast, Kind, NodeId};
@@ -20,14 +20,13 @@ fn is_lib_request(ast: &Ast, owner: NodeId) -> bool {
     attr == "request" && matches!(ast.kind(*value), Kind::Name { id, .. } if id == "lib")
 }
 
-/// Whether a call is `lib.request.security(...)`
-/// (`SecurityTransformer._is_security_call`); false for a node that is no call.
+/// Whether a call is `lib.request.security(...)`; false for a node that is no call.
 pub fn is_security_call(ast: &Ast, call: NodeId) -> bool {
     matches!(ast.kind(call), Kind::Call { func, .. } if is_request_attr(ast, *func, "security"))
 }
 
-/// Whether a call is `lib.request.security_lower_tf(...)`
-/// (`SecurityTransformer._is_security_lower_tf_call`); false for a node that is no call.
+/// Whether a call is `lib.request.security_lower_tf(...)`; false for a node that is no
+/// call.
 pub fn is_security_lower_tf_call(ast: &Ast, call: NodeId) -> bool {
     matches!(
         ast.kind(call),

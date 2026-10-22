@@ -9,6 +9,7 @@ from .dynamic_default import is_script_entry
 from .emission_settings import PYNE_RESERVED_NAME_CHAR
 from .lib_series import NON_SERIES_LIB_ATTRS
 from .pine_type_rules import FactoryFields
+from .security_calls import has_security_call, is_security_call, is_security_lower_tf_call
 
 
 # Strategy state accessors are meaningful only in the chart context — the
@@ -126,32 +127,6 @@ def _is_lib_series_chain(node: ast.expr) -> bool:
         return False
     chain.reverse()
     return not (chain and chain[0] in NON_SERIES_LIB_ATTRS)
-
-
-#: Attribute names of the ``lib.request`` functions the security passes lower
-_REQUEST_FUNCS = frozenset({'security', 'security_lower_tf'})
-
-
-def has_security_call(tree: ast.AST) -> bool:
-    """Whether ``tree`` holds a ``lib.request.security[_lower_tf](...)`` call.
-
-    Every rewrite of the security passes starts at such a call, and most scripts
-    have none: for them, this walk is all a security pass costs.
-
-    :param tree: The tree to search.
-    :return: True when at least one such call stands anywhere in it.
-    """
-    for node in ast_walk.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if not (isinstance(func, ast.Attribute) and func.attr in _REQUEST_FUNCS):
-            continue
-        owner = func.value
-        if (isinstance(owner, ast.Attribute) and owner.attr == 'request'
-                and isinstance(owner.value, ast.Name) and owner.value.id == 'lib'):
-            return True
-    return False
 
 
 #: Per function, the direct-``Name`` calls of its own body as ``(callee name,
@@ -350,26 +325,6 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         sec_id = f"sec\xb7{self._module_hash}\xb7{self._counter}"
         self._counter += 1
         return sec_id
-
-    @staticmethod
-    def _is_security_call(node: ast.Call) -> bool:
-        """Check if node is lib.request.security(...)."""
-        return (isinstance(node.func, ast.Attribute)
-                and node.func.attr == 'security'
-                and isinstance(node.func.value, ast.Attribute)
-                and node.func.value.attr == 'request'
-                and isinstance(node.func.value.value, ast.Name)
-                and node.func.value.value.id == 'lib')
-
-    @staticmethod
-    def _is_security_lower_tf_call(node: ast.Call) -> bool:
-        """Check if node is lib.request.security_lower_tf(...)."""
-        return (isinstance(node.func, ast.Attribute)
-                and node.func.attr == 'security_lower_tf'
-                and isinstance(node.func.value, ast.Attribute)
-                and node.func.value.attr == 'request'
-                and isinstance(node.func.value.value, ast.Name)
-                and node.func.value.value.id == 'lib')
 
     @staticmethod
     def _extract_ltf_args(call: ast.Call) -> tuple[
@@ -1125,11 +1080,11 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         calls = []
         for node in own_nodes:
             if isinstance(node, ast.Call):
-                if self._is_security_call(node):
+                if is_security_call(node):
                     sec_id = self._gen_id()
                     node._sec_id = sec_id  # type: ignore[attr-defined]
                     calls.append((node, sec_id, False))
-                elif self._is_security_lower_tf_call(node):
+                elif is_security_lower_tf_call(node):
                     sec_id = self._gen_id()
                     node._sec_id = sec_id  # type: ignore[attr-defined]
                     self._ltf_sec_ids.add(sec_id)
@@ -1584,9 +1539,9 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             for node in own_nodes:
                 if not isinstance(node, ast.Call):
                     continue
-                if self._is_security_call(node):
+                if is_security_call(node):
                     symbol, timeframe = self._extract_args(node)[:2]
-                elif self._is_security_lower_tf_call(node):
+                elif is_security_lower_tf_call(node):
                     symbol, timeframe = self._extract_ltf_args(node)[:2]
                 else:
                     continue
