@@ -53,6 +53,7 @@ uv.lock
 src/pynecore/core/_native_math.c
 src/pynecore/core/_native_rolling_sum.c
 src/pynecore/core/_native_color.c
+src/pynecore/core/_native_profiler.c
 *.so
 *.pyd
 wheelhouse/

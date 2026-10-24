@@ -5,12 +5,14 @@ extensions: ``pynecore.core._native_math``, the compiled twin of the pure-Python
 transcendental functions in ``core/pine_math.py`` and ``core/fdlibm.py``, and
 ``pynecore.core._native_rolling_sum``, the compiled twin of the ``math.sum`` machine in
 ``core/rolling_sum.py``, and ``pynecore.core._native_color``, the compiled twin of
-``lib.color.new``.
+``lib.color.new``, and ``pynecore.core._native_profiler``, the ``sys.monitoring``
+callbacks of the per-line profiler.
 
 The extensions are optional in every sense: a platform without a C compiler, or a
 compile that fails, still installs a working package that runs the pure-Python
 implementations, and ``PYNE_BUILD_PURE=1`` builds the pure wheel on purpose (the one
-WebAssembly runtimes and unlisted platforms install).
+WebAssembly runtimes and unlisted platforms install). The profiler is the exception:
+it has no pure-Python twin, so such an install runs scripts but cannot profile them.
 """
 import os
 import sys
@@ -66,7 +68,9 @@ def _extensions() -> list[Extension]:
         [Extension('pynecore.core._native_math', ['src/pynecore/core/_native_math.pyx']),
          Extension('pynecore.core._native_rolling_sum',
                    ['src/pynecore/core/_native_rolling_sum.pyx']),
-         Extension('pynecore.core._native_color', ['src/pynecore/core/_native_color.pyx'])],
+         Extension('pynecore.core._native_color', ['src/pynecore/core/_native_color.pyx']),
+         Extension('pynecore.core._native_profiler',
+                   ['src/pynecore/core/_native_profiler.pyx'])],
         compiler_directives={'language_level': 3},
     )
 

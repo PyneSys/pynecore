@@ -17,7 +17,8 @@ zip-safe = false  # Critical for import hooks
 [tool.setuptools.exclude-package-data]
 "pynecore.core" = ["_native_math.pyx", "_native_math.c",
                    "_native_rolling_sum.pyx", "_native_rolling_sum.c",
-                   "_native_color.pyx", "_native_color.c"]
+                   "_native_color.pyx", "_native_color.c",
+                   "_native_profiler.pyx", "_native_profiler.c"]
 
 [tool.distutils]
 egg_info.egg_base = "build"
@@ -99,7 +100,9 @@ replay = "pynecore.providers.replay:ReplayProvider"
 # ``pynecore.core._native_rolling_sum`` and ``pynecore.core._native_color``.
 # Every one is tested against the pure-Python code
 # it replaces, and must actually contain the extensions; the venue tests pin the
-# pure-Python code itself, which is the same on every platform.
+# pure-Python code itself, which is the same on every platform. The wheels also
+# carry ``pynecore.core._native_profiler``, which has no pure-Python twin: its test
+# checks it profiles a run (on Python 3.13+, the profiler's minimum).
 [tool.cibuildwheel]
 build = "cp311-* cp312-* cp313-* cp314-*"
 skip = "*-win32 *-manylinux_i686 *-musllinux_i686"
@@ -108,6 +111,7 @@ test-command = """\
 pytest -p no:cacheprovider \
 {project}/tests/t01_lib/t04_math/test_016_native_math_matches_python.py \
 {project}/tests/t01_lib/t04_math/test_022_native_rolling_sum_matches_python.py \
-{project}/tests/t00_pynecore/core/test_114_native_color_matches_python.py
+{project}/tests/t00_pynecore/core/test_114_native_color_matches_python.py \
+{project}/tests/t00_pynecore/core/test_166_profiler.py
 """
-test-environment = { PYNE_REQUIRE_NATIVE_MATH = "1", PYNE_REQUIRE_NATIVE_COLOR = "1" }
+test-environment = { PYNE_REQUIRE_NATIVE_MATH = "1", PYNE_REQUIRE_NATIVE_COLOR = "1", PYNE_REQUIRE_NATIVE_PROFILER = "1" }
