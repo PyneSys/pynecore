@@ -1,7 +1,8 @@
 """
-The type pass marks every int that goes into a float-element container and every typeless
-na that goes where a string goes, and ImplicitConversion converts them there; a container
-argument of an overload group pins its element type.
+The type pass marks every int that goes into a float-element container, every number that
+goes into a lib bool parameter and every typeless na that goes where a string goes, and
+ImplicitConversion converts them there; a container argument of an overload group pins its
+element type.
 """
 import ast
 import sys
@@ -278,6 +279,56 @@ def __test_typeless_na_lib_string_argument__(body, expected):
     emitted, diags = __test_helper_widen(body)
     assert expected in emitted.splitlines()
     assert not diags
+
+
+@pytest.mark.parametrize("body,expected", [
+    # a float that goes into a lib bool parameter is converted: inside the lib its na
+    # would be a nan, which Python's truthiness takes for true
+    ('z: float = lib.high if lib.bar_index % 2 == 0 else lib._na_none\n'
+     'v = lib.ta.valuewhen(z, z, 0)',
+     'v = lib.ta.valuewhen(safe_convert.safe_bool(z), z, 0)'),
+    ('z: float = lib.high\nv = lib.ta.valuewhen(condition=z, source=z, occurrence=1)',
+     'v = lib.ta.valuewhen(condition=safe_convert.safe_bool(z), source=z, occurrence=1)'),
+    # an int goes in the same way
+    ('n = lib.ta.barssince(lib.bar_index)',
+     'n = lib.ta.barssince(safe_convert.safe_bool(lib.bar_index))'),
+    # a bool goes in as it is
+    ('v = lib.ta.valuewhen(lib.close > lib.open, lib.close, 0)',
+     'v = lib.ta.valuewhen(lib.close > lib.open, lib.close, 0)'),
+])
+def __test_number_into_lib_bool_parameter_is_converted__(body, expected):
+    emitted, diags = __test_helper_widen(body)
+    assert expected in emitted.splitlines()
+    assert not diags
+
+
+def __test_a_generic_body_converts_the_number_it_is_reached_with__():
+    """A helper's parameter typed by its call converts where it goes into the lib"""
+    source = __test_helper_PRELUDE + '''
+def last(c, s):
+    return lib.ta.valuewhen(c, s, 0)
+
+def main():
+    a = last(lib.high - lib.low, lib.close)
+'''
+    tree = ast.parse(source)
+    table = infer_module(tree, 'test')
+    tree = cast(ast.Module, ImplicitConversionTransformer().visit(tree))
+    last = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                and node.name == 'last')
+    assert ast.unparse(last.body[0]) == 'return lib.ta.valuewhen(safe_convert.safe_bool(c), s, 0)'
+    assert not table.diags
+
+
+@pytest.mark.parametrize("value,expected", [
+    (float('nan'), False), (1e-10, False), (-1e-10, False), (1.000001e-10, True),
+    (-2.5, True), (0.0, False), (0, False), (3, True), (True, True), (False, False),
+])
+def __test_safe_bool_is_pine_float_to_bool__(value, expected):
+    from pynecore.core.safe_convert import safe_bool
+    from pynecore.types.na import NA
+    assert safe_bool(value) is expected
+    assert safe_bool(NA(float)) is False
 
 
 def __test_typeless_na_builtin_method_string_argument__():

@@ -64,8 +64,8 @@ from .pine_type_rules import (
     TY_ATTR, get_ty, set_ty, inherit_ty,
     constant_type, PIN_ANY, pin_chars, pin_for, get_pins, set_pin, set_pins, set_vector,
     get_varying, set_varying,
-    WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_STRING_NA, WIDEN_NUMBER_NA, WIDEN_NA_TEXT,
-    WIDEN_ARRAY_NA, WIDEN_MAP_NA, WIDEN_MATRIX_NA, CONTAINER_NA_WIDENS,
+    WIDEN_FLOAT, WIDEN_BOOL, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_STRING_NA, WIDEN_NUMBER_NA,
+    WIDEN_NA_TEXT, WIDEN_ARRAY_NA, WIDEN_MAP_NA, WIDEN_MATRIX_NA, CONTAINER_NA_WIDENS,
     NA_TEXT_PARAMS,
     NOT_PINE_STRINGS, set_widen, get_widen_site,
     set_widen_site, get_widens, set_widens, is_na_widen, set_na_class,
@@ -3072,7 +3072,8 @@ class _Inference:
         overload group records that per implementation. A call that fits no
         shape, names a parameter that does not exist, or passes a value the
         parameter's type does not take is a Pine error, and is reported once,
-        here, whatever becomes of its result.
+        here, whatever becomes of its result. A number passed to a ``bool``
+        parameter is not one: it is marked for the conversion (``WIDEN_BOOL``).
 
         :param callee: The registry key
         :param entry: Its registry entry
@@ -3123,6 +3124,14 @@ class _Inference:
                 # type the call has to meet
                 continue
             passed = get_ty(arg)
+            if declared == BOOL:
+                # A number goes into a bool parameter by Pine's tolerant
+                # float-to-bool rule, the one the truthiness rewrite gives the
+                # script's own bool contexts; the lib function itself tests the
+                # value with Python's truthiness, which takes a nan for true
+                self._record_widen(arg, WIDEN_BOOL if passed in NUMERIC else _WIDEN_HARMLESS)
+                if passed in NUMERIC:
+                    continue
             if passed in _UNCHECKED or _fits(declared, passed):
                 continue
             self._bad_call(node, callee, f"'{callee}' takes {render_ty(declared)} for "

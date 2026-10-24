@@ -39,7 +39,7 @@ __all__ = [
     'constant_type', 'stamp_lowering', 'BUILTIN_CALL_TYPES', 'BUILTIN_NAME_TYPES',
     'PIN_ATTR', 'PINS_ATTR', 'PINNABLE', 'PIN_CONTAINERS', 'PIN_ANY', 'get_pin', 'set_pin', 'get_pins', 'set_pins',
     'VECTOR_ATTR', 'VARYING_ATTR', 'get_vector', 'set_vector', 'get_varying', 'set_varying',
-    'WIDEN_ATTR', 'WIDEN_FLOAT', 'WIDEN_ITEMS', 'WIDEN_MATRIX', 'WIDEN_STRING_NA', 'WIDEN_NUMBER_NA',
+    'WIDEN_ATTR', 'WIDEN_FLOAT', 'WIDEN_BOOL', 'WIDEN_ITEMS', 'WIDEN_MATRIX', 'WIDEN_STRING_NA', 'WIDEN_NUMBER_NA',
     'WIDEN_NA_TEXT', 'WIDEN_ARRAY_NA', 'WIDEN_MAP_NA', 'WIDEN_MATRIX_NA', 'CONTAINER_NA_WIDENS',
     'NA_LITERALS', 'is_na_literal', 'is_na_widen',
     'NA_CLASS_ATTR', 'get_na_class', 'set_na_class',
@@ -79,13 +79,18 @@ VECTOR_ATTR: Final = '_pine_vector'
 VARYING_ATTR: Final = '_pine_varying'
 
 #: Attribute a value carries when Pine converts it implicitly where it goes: an
-#: int into a float-element container, a typeless ``na`` into a string, a number
-#: or the na of a class (see ``implicit_conversion.py``). Present only where every
+#: int into a float-element container, a number into a lib ``bool`` parameter, a
+#: typeless ``na`` into a string, a number or the na of a class (see
+#: ``implicit_conversion.py``). Present only where every
 #: context agrees on it.
 WIDEN_ATTR: Final = '_pine_widen'
 
 #: The value is one int element: it is converted to float
 WIDEN_FLOAT: Final = 'f'
+
+#: The value is a number passed to a ``bool`` parameter of a lib function: it is
+#: converted by Pine's tolerant float-to-bool rule, na included
+WIDEN_BOOL: Final = 'B'
 
 #: The value is an int array whose elements are copied in: they are converted
 WIDEN_ITEMS: Final = 'a'
@@ -297,8 +302,9 @@ def set_widen(node, kind: str | None):
     decides against it has to erase what an earlier one wrote).
 
     :param node: The value node
-    :param kind: ``WIDEN_FLOAT``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX``, ``WIDEN_STRING_NA``,
-                 ``WIDEN_NUMBER_NA``, ``WIDEN_NA_TEXT``, an object type or None
+    :param kind: ``WIDEN_FLOAT``, ``WIDEN_BOOL``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX``,
+                 ``WIDEN_STRING_NA``, ``WIDEN_NUMBER_NA``, ``WIDEN_NA_TEXT``, an object type
+                 or None
     :return: ``node``
     """
     setattr(node, WIDEN_ATTR, kind)

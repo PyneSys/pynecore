@@ -156,10 +156,10 @@ NON_TRANSFORMABLE_FUNCTIONS = {
     'collect_meta_changes',
     # The bool na factory reads only the script-wide mode, with no call-site state.
     '__sec_bool_na·__',
-    # The element conversions ImplicitConversion emits copy a container or select the
-    # conversion an instance vector entry names, with no state.
+    # The conversions ImplicitConversion emits copy a container, select the conversion
+    # an instance vector entry names or cast a number to bool, with no state.
     'safe_convert.safe_float_items', 'safe_convert.safe_float_matrix',
-    'safe_convert.implicit_convert',
+    'safe_convert.implicit_convert', 'safe_convert.safe_bool',
 
     # Plot and display related (function-and-namespace modules appear as their
     # self-named function after the module property rewrite, e.g. lib.plot.plot)
