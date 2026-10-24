@@ -79,6 +79,23 @@ class _Transformed:
                 for node in ast.walk(ast.parse(self.source))
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
+    def source_functions(self) -> dict[types.CodeType, ast.FunctionDef | ast.AsyncFunctionDef]:
+        """The source function each code object runs the code of.
+
+        A function the transform generated from one of the source (a
+        ``request.security`` slice of ``main``, a per-call-site instance) has a name
+        of its own but starts at the source function's ``def`` line.
+        """
+        functions = self.functions()
+        by_def_line = {node.lineno: node for node in functions.values()}
+        found = {}
+        for code in _code_objects(self.code):
+            function = (functions.get((code.co_name, code.co_firstlineno))
+                        or by_def_line.get(code.co_firstlineno))
+            if function is not None:
+                found[code] = function
+        return found
+
 
 def _transform(path: Path, source: str, monkeypatch: pytest.MonkeyPatch | None = None
                ) -> tuple[ast.Module, types.CodeType]:
@@ -145,13 +162,17 @@ def __test_function_code_stays_in_its_function__(corpus):
     """A function's code runs at lines of that function's own source span."""
     violations = []
     for module in corpus:
-        functions = module.functions()
-        for code in _code_objects(module.code):
-            function = functions.get((code.co_name, code.co_firstlineno))
-            if function is None:
-                continue
+        source_functions = module.source_functions()
+        for code, function in source_functions.items():
             first, last = _first_line(function), function.end_lineno
-            bad = [line for line in _lines(code) if not first <= line <= last]
+            # Defining a nested function runs at that function's header: a
+            # ``request.security`` slice defines copies of module-level helpers
+            defined = {line for nested in code.co_consts if isinstance(nested, types.CodeType)
+                       and nested in source_functions
+                       for line in range(_first_line(source_functions[nested]),
+                                         source_functions[nested].lineno + 1)}
+            bad = [line for line in _lines(code)
+                   if not first <= line <= last and line not in defined]
             if bad:
                 violations.append(f"{module.path}: {code.co_name} ({first}-{last}) "
                                   f"runs at line {bad[0]}")
@@ -166,11 +187,7 @@ def __test_prologue_never_returns_after_the_body__(corpus):
     """
     violations = []
     for module in corpus:
-        functions = module.functions()
-        for code in _code_objects(module.code):
-            function = functions.get((code.co_name, code.co_firstlineno))
-            if function is None:
-                continue
+        for code, function in module.source_functions().items():
             first, header_end = _first_line(function), _first_line(function.body[0]) - 1
             in_body = False
             for line in _lines(code):
@@ -298,4 +315,5 @@ def __test_generated_imports_follow_future_imports__(name, tmp_path, monkeypatch
               + FUTURE_SCRIPTS[name])
     path = tmp_path / f'future_{name}.py'
     tree, _ = _transform(path, source, monkeypatch)
-    assert isinstance(tree.body[1], ast.ImportFrom) and tree.body[1].module == '__future__'
+    future = tree.body[1]
+    assert isinstance(future, ast.ImportFrom) and future.module == '__future__'

@@ -51,6 +51,7 @@ from typing import Any
 from ..core.import_hook import PYNE_RESERVED_NAME_CHAR, security_slice_disabled
 from . import ast_walk
 from .dynamic_default import is_script_entry
+from .locations import fix_locations
 from .persistent import VARIP_TYPES
 from .pine_type_rules import COLOR, OBJECT, SCALARS, STR, get_ty, stamp_lowering
 from .security import (
@@ -2578,7 +2579,7 @@ def _force_conditional_writes(module: ast.Module, clone: ast.FunctionDef,
         # The clone comes located, and so does every node the forcing makes
         # (each takes the location of the statement it is lifted from); only
         # the copied module-level definitions may still lack one.
-        ast_walk.fix_missing_locations(clone)
+        fix_locations(clone)
     return forcer.changed or shared_forcer.changed
 
 
@@ -2610,12 +2611,12 @@ def _build_clone(main: ast.FunctionDef, kept: list[int], name: str) -> ast.Funct
     body = [ast_walk.clone(main.body[index], memo) for index in kept]
     clone.body = body or [ast.Pass()]
     ast.copy_location(clone, main)
-    ast_walk.fix_missing_locations(clone)
+    fix_locations(clone)
     return clone
 
 
 def _unlocated(node: ast.AST) -> bool:
-    """Whether :func:`ast_walk.fix_missing_locations` would fill a location of ``node``."""
+    """Whether :func:`locations.fix_locations` would fill a location of ``node``."""
     attributes = node._attributes
     return (('lineno' in attributes and not hasattr(node, 'lineno'))
             or ('end_lineno' in attributes and getattr(node, 'end_lineno', None) is None)
@@ -2635,7 +2636,7 @@ class _CloneSource:
     for the nodes the earlier passes left a field short of.
 
     The result is the clone :func:`_build_clone` builds:
-    :func:`ast_walk.fix_missing_locations` fills a node from its own ancestors,
+    :func:`locations.fix_locations` fills a node from its own ancestors,
     and every part is located under a root carrying what the clone's root
     carries. The one exception is an unlocated node standing in two parts:
     the part visited first decides its location, and which part that is
@@ -2657,7 +2658,7 @@ class _CloneSource:
             root.type_params = ast_walk.clone(type_params, self._memo)
         root.body = []
         ast.copy_location(root, main)
-        ast_walk.fix_missing_locations(root)
+        fix_locations(root)
         self._root = root
         # The root's location without its signature, to locate one statement
         # at a time under: the signature holds every input default and is
@@ -2698,7 +2699,7 @@ class _CloneSource:
         if stmt is None:
             stmt = ast_walk.clone(self._main.body[index], self._memo)
             self._holder.body = [stmt]
-            ast_walk.fix_missing_locations(self._holder)
+            fix_locations(self._holder)
             self._stmts[index] = stmt
         return stmt
 
@@ -2728,7 +2729,7 @@ class _CloneSource:
             clone.body = [ast_walk.clone(self._stmt(index), memo) for index in kept]
         if not clone.body:
             clone.body = [ast.Pass()]
-            ast_walk.fix_missing_locations(clone)
+            fix_locations(clone)
         return clone
 
 
@@ -2751,7 +2752,7 @@ def _bind_defaults(main_name: str, clone_name: str) -> list[ast.stmt]:
 
     stmts = [assign('__defaults__'), assign('__kwdefaults__')]
     for stmt in stmts:
-        ast_walk.fix_missing_locations(stmt)
+        fix_locations(stmt)
     return stmts
 
 

@@ -16,9 +16,8 @@ The replacements here produce the same trees:
   node that has no child and no visitor method of its own is not entered at
   all -- visiting it would do nothing but hand it back.
 - :func:`walk` and :func:`iter_child_nodes` yield what their ``ast``
-  namesakes yield, in the same order; :func:`walk_statements` yields the
-  statements among them without entering any expression, and
-  :func:`fix_missing_locations` fills what its ``ast`` namesake fills.
+  namesakes yield, in the same order, and :func:`walk_statements` yields the
+  statements among them without entering any expression.
 - :func:`clone` is ``copy.deepcopy`` for trees: same memo protocol, same
   result, attributes the passes stamp on nodes included.
 """
@@ -29,7 +28,7 @@ from collections.abc import Callable, Iterator
 from typing import Any, get_args
 
 __all__ = ['NodeVisitor', 'NodeTransformer', 'walk', 'iter_child_nodes', 'iter_descendants',
-           'iter_child_statements', 'walk_statements', 'fix_missing_locations', 'clone',
+           'iter_child_statements', 'walk_statements', 'clone',
            'docstring_end', 'future_end']
 
 _AST = ast.AST
@@ -376,47 +375,6 @@ def future_end(body: list[ast.stmt]) -> int:
            and getattr(body[index], 'module', None) == '__future__'):
         index += 1
     return index
-
-
-def fix_missing_locations(node: ast.AST) -> ast.AST:
-    """:func:`ast.fix_missing_locations` without the recursion.
-
-    Same nodes filled with the same values, in the same pre-order -- a node
-    shared between two parents keeps what the first visit gave it, as there.
-
-    :param node: Tree to fix in place
-    :return: The same tree
-    """
-    stack: list[tuple[ast.AST, Any, Any, Any, Any]] = [(node, 1, 0, 1, 0)]
-    pop = stack.pop
-    push = stack.append
-    while stack:
-        current, lineno, col_offset, end_lineno, end_col_offset = pop()
-        attributes = current._attributes
-        if 'lineno' in attributes:
-            if not hasattr(current, 'lineno'):
-                current.lineno = lineno  # type: ignore[attr-defined]
-            else:
-                lineno = current.lineno  # type: ignore[attr-defined]
-        if 'end_lineno' in attributes:
-            if getattr(current, 'end_lineno', None) is None:
-                current.end_lineno = end_lineno  # type: ignore[attr-defined]
-            else:
-                end_lineno = current.end_lineno  # type: ignore[attr-defined]
-        if 'col_offset' in attributes:
-            if not hasattr(current, 'col_offset'):
-                current.col_offset = col_offset  # type: ignore[attr-defined]
-            else:
-                col_offset = current.col_offset  # type: ignore[attr-defined]
-        if 'end_col_offset' in attributes:
-            if getattr(current, 'end_col_offset', None) is None:
-                current.end_col_offset = end_col_offset  # type: ignore[attr-defined]
-            else:
-                end_col_offset = current.end_col_offset  # type: ignore[attr-defined]
-        children = list(iter_child_nodes(current))
-        for child in reversed(children):
-            push((child, lineno, col_offset, end_lineno, end_col_offset))
-    return node
 
 
 #: Values ``copy.deepcopy`` hands back as they are

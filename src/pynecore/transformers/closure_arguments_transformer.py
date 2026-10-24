@@ -46,6 +46,7 @@ import ast
 from typing import Set, Dict, List, Optional, cast, Any
 
 from . import ast_walk
+from .locations import anchor_at, fix_locations
 
 
 def _is_persistent_annotation(annotation: ast.AST) -> bool:
@@ -223,12 +224,12 @@ class ClosureArgumentsTransformer(ast_walk.NodeTransformer):
                 # Add original args after closure vars
                 if node.name in self.method_functions and node.args.args:
                     node.args.args = node.args.args[:1] + new_args + node.args.args[1:]
-                    marker = ast.copy_location(ast.Assign(
+                    marker = anchor_at(ast.Assign(
                         targets=[ast.Attribute(value=ast.Name(id=node.name, ctx=ast.Load()),
                                                attr='__pyne_closure__', ctx=ast.Store())],
                         value=ast.Tuple(elts=[ast.Constant(value=var) for var in closure_vars],
                                         ctx=ast.Load())), node)
-                    ast.fix_missing_locations(marker)
+                    fix_locations(marker)
                 else:
                     new_args.extend(node.args.args)
                     node.args.args = new_args

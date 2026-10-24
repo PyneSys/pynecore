@@ -2,6 +2,7 @@ import ast
 from typing import cast
 
 from . import ast_walk
+from .locations import fix_locations
 
 
 #: Series-carrying persistent annotations mapped to their non-series half.
@@ -88,7 +89,7 @@ class PersistentSeriesTransformer(ast_walk.NodeTransformer):
         # The split stands where the declaration stood: a diagnostic on either
         # half has to point at the line the user wrote
         ast.copy_location(persistent_decl, node)
-        ast_walk.fix_missing_locations(persistent_decl)
+        fix_locations(persistent_decl)
 
         # 2. Series declaration
         series_decl = ast.AnnAssign(
@@ -102,6 +103,6 @@ class PersistentSeriesTransformer(ast_walk.NodeTransformer):
             simple=1
         )
         ast.copy_location(series_decl, node)
-        ast_walk.fix_missing_locations(series_decl)
+        fix_locations(series_decl)
 
         return [persistent_decl, series_decl]

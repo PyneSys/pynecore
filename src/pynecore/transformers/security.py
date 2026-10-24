@@ -8,7 +8,7 @@ from ..core.import_hook import PYNE_RESERVED_NAME_CHAR
 from . import ast_walk
 from .dynamic_default import is_script_entry
 from .lib_series import NON_SERIES_LIB_ATTRS
-from .locations import anchor_all_at, anchor_at
+from .locations import anchor_all_at, anchor_at, fix_locations
 from .pine_type_rules import FactoryFields
 
 
@@ -2458,7 +2458,7 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             )
             new_stmt = ast.Expr(value=new_call)
             ast.copy_location(new_stmt, call)
-            ast_walk.fix_missing_locations(new_stmt)
+            fix_locations(new_stmt)
             caller_block.body.append(new_stmt)
         if not sig_block.body:
             helper.body.remove(sig_block)
@@ -2531,7 +2531,7 @@ class SecurityTransformer(ast_walk.NodeTransformer):
                 '__sec_wait__', ast.Constant(value=sid)
             ))
             ast.copy_location(new_stmt, call)
-            ast_walk.fix_missing_locations(new_stmt)
+            fix_locations(new_stmt)
             caller_block.body.append(new_stmt)
 
     def _lift_helper_signals(
