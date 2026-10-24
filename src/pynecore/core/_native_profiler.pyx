@@ -82,6 +82,12 @@ cdef int64_t _cat_ns[N_CATEGORIES]
 cdef int _cur_cat = -1
 cdef int64_t _cat_start = 0
 
+# The time spent inside profiled code, callees included: from entering the
+# outermost profiled frame to leaving it
+cdef Py_ssize_t _code_depth = 0
+cdef int64_t _code_start = 0
+cdef int64_t _code_ns = 0
+
 # The frame stack: code identity, slot block (-1 for a region), block size,
 # category, current line, the start of the current line's slice and the furthest
 # line the frame got to since it last entered a loop
@@ -123,7 +129,7 @@ cdef inline void _switch(int64_t now, int cat) noexcept:
 
 
 cdef inline void _push(Py_ssize_t key, Py_ssize_t base, Py_ssize_t size, int cat) noexcept:
-    global _depth
+    global _depth, _code_depth, _code_start
     cdef int64_t now = pyne_profile_now()
     if _depth < MAX_DEPTH:
         _frame_code[_depth] = key
@@ -134,11 +140,15 @@ cdef inline void _push(Py_ssize_t key, Py_ssize_t base, Py_ssize_t size, int cat
         _frame_start[_depth] = now
         _frame_reach[_depth] = 0
         _switch(now, cat)
+        if base >= 0:
+            if _code_depth == 0:
+                _code_start = now
+            _code_depth += 1
     _depth += 1
 
 
 cdef inline void _pop() noexcept:
-    global _depth
+    global _depth, _code_depth, _code_ns
     cdef int64_t now
     cdef Py_ssize_t base
     cdef int line
@@ -150,8 +160,12 @@ cdef inline void _pop() noexcept:
     now = pyne_profile_now()
     base = _frame_base[_depth]
     line = _frame_line[_depth]
-    if base >= 0 and line:
-        _line_ns[base + line] += now - _frame_start[_depth]
+    if base >= 0:
+        if line:
+            _line_ns[base + line] += now - _frame_start[_depth]
+        _code_depth -= 1
+        if _code_depth == 0:
+            _code_ns += now - _code_start
     _switch(now, _frame_cat[_depth - 1] if _depth > 0 else -1)
 
 
@@ -253,6 +267,7 @@ def start(object files, object regions, int tool):
 cdef _start(object monitoring, object files, object regions, int tool):
     global _line_ns, _line_hits, _loop_head, _n_slots, _cur_cat, _depth, _thread
     global _tool, _DISABLE, _monitoring, _profiled_events, _region_events
+    global _code_depth, _code_ns
     events = monitoring.events
     _release()
     cdef Py_ssize_t total = 0, base
@@ -279,6 +294,8 @@ cdef _start(object monitoring, object files, object regions, int tool):
                 _loop_head[base + line] = min(max(end, line), line_count)
     for i in range(N_CATEGORIES):
         _cat_ns[i] = 0
+    _code_depth = 0
+    _code_ns = 0
 
     _tool = tool
     _monitoring = monitoring
@@ -313,11 +330,16 @@ def running():
 
 def stop():
     """Stop profiling and release the tool id. The results stay readable."""
-    global _running, _depth
+    global _running, _depth, _code_depth, _code_ns
+    cdef int64_t now
     if not _running:
         return
     _running = False
-    _switch(pyne_profile_now(), -1)
+    now = pyne_profile_now()
+    _switch(now, -1)
+    if _code_depth > 0:
+        _code_ns += now - _code_start
+        _code_depth = 0
     _teardown(_monitoring, _tool)
     _depth = 0
 
@@ -339,9 +361,10 @@ cdef _teardown(object monitoring, int tool):
 def results():
     """The measurements of the last run.
 
-    :return: ``(files, categories)``: per profiled file name a dict of line number to
-             ``(nanoseconds, executions)`` for every line that ran, and the
-             nanoseconds of each category.
+    :return: ``(files, categories, code)``: per profiled file name a dict of line
+             number to ``(nanoseconds, executions)`` for every line that ran, the
+             nanoseconds of each category, and the nanoseconds spent inside profiled
+             code, callees included.
     """
     cdef Py_ssize_t base, line_count, line
     files = {}
@@ -353,7 +376,7 @@ def results():
                 if _line_hits[base + line] or _line_ns[base + line]:
                     lines[line] = (_line_ns[base + line], _line_hits[base + line])
         files[filename] = lines
-    return files, [_cat_ns[i] for i in range(N_CATEGORIES)]
+    return files, [_cat_ns[i] for i in range(N_CATEGORIES)], _code_ns
 
 
 cdef void _release() noexcept:

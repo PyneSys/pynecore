@@ -123,6 +123,12 @@ def __test_profile_times_add_up__(csv_reader, runner, tmp_path):
     assert loop['hits'] == lines[header][1]
     assert loop['header_ns'] == lines[header][0]
     assert loop['ns'] == lines[header][0] + lines[header + 1][0]
+
+    # The script's time holds every line of main, the calls they make included
+    main_start = __test_helper_line("def main():")
+    main_block, = [block for block in file['blocks']
+                   if block['kind'] == 'def' and block['start'] == main_start]
+    assert main_block['ns'] <= profile['script_ns'] <= profile['wall_ns']
     assert sys.monitoring.get_tool(sys.monitoring.PROFILER_ID) is None
 
 

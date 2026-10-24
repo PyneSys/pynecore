@@ -29,6 +29,9 @@ What a number means
 - A strategy re-runs the script within a bar for some order features (``calc_on_order_fills``,
   ``calc_on_every_tick``); those runs count, so a line can run more times than there are
   bars.
+- The script's time (``script_ns``) runs from entering the script's or a library's code
+  to leaving it, everything they call included. It is the base a line's share is
+  given in: the script's lines and the libraries' lines are all parts of it.
 - Category times are exclusive and add up to the time the runner was running. The time
   the caller spends between two bars (writing to a terminal, streaming to an IDE) is not
   part of any of them.
@@ -253,7 +256,7 @@ class RunProfiler:
         self._path = path
         self._files = _profiled_files(runner)
         self._regions = _regions(runner)
-        self._results: tuple[dict[str, dict[int, tuple[int, int]]], list[int]] | None = None
+        self._results: tuple[dict[str, dict[int, tuple[int, int]]], list[int], int] | None = None
 
     def profile(self, results: Generator) -> Generator:
         """Measure the runner's iteration while passing its results through, then
@@ -295,7 +298,7 @@ class RunProfiler:
     def to_dict(self) -> dict[str, Any]:
         """The profile in the file format (see :data:`SCHEMA`)."""
         assert self._results is not None, "the profiler has not run"
-        file_lines, category_ns = self._results
+        file_lines, category_ns, script_ns = self._results
         files = []
         for file in self._files:
             lines = file_lines.get(file.co_filename, {})
@@ -313,6 +316,7 @@ class RunProfiler:
             'python': '.'.join(str(part) for part in sys.version_info[:3]),
             'bars': self._runner.bar_index + 1,
             'wall_ns': sum(categories.values()),
+            'script_ns': script_ns,
             'categories': categories,
             'files': files,
         }

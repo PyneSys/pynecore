@@ -36,6 +36,7 @@ all <!--wild:tv_verified-->1,353<!--/wild--> comparable outputs match, <!--wild:
 - [Strategy Development](./strategy.md) - Creating and testing trading strategies with PyneCore
 - [Programmatic Usage](./programmatic/README.md) - Using PyneCore from Python code (ScriptRunner, integrations)
 - [Debugging](./debugging.md) - Debugging techniques for PyneCore scripts
+- [Profiling](./profiling.md) - Finding the slow lines of a script with `pyne run --profile`
 - [Advanced](./advanced/README.md) - Advanced topics and features of PyneCore
 - [Development](./development/README.md) - Documentation for PyneCore developers
 - [FAQ](./faq.md) - Frequently asked questions about PyneCore

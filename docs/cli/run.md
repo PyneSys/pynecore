@@ -5,7 +5,7 @@ title: "Running Scripts"
 description: "Running PyneCore scripts from the command line"
 icon: "play_circle"
 date: "2025-03-31"
-lastmod: "2026-09-28"
+lastmod: "2026-10-24"
 draft: false
 toc: true
 categories: ["CLI"]
@@ -284,6 +284,21 @@ directory.
 To avoid passing `--security` on every run, map the symbols your script uses to your data in
 `config/symbol_map.toml`; see [Symbol Map](../overview/symbol-map.md).
 
+### Profiling Options
+
+- `--profile`: Profile the run: the time and execution count of every line, and the run's
+  time by category. Prints a summary after the run and writes `<script_name>_profile.json`.
+  Backtests only; needs Python 3.13 or newer.
+- `--profile-top N`: Number of lines listed in the summary (default: 15).
+
+Example:
+```bash
+# Show the 25 slowest lines of a strategy
+pyne run my_strategy.py EURUSD_5 --profile --profile-top 25
+```
+
+See [Profiling](../profiling.md) for how to read the numbers.
+
 ## Symbol Information
 
 When running a script, PyneCore needs symbol information to provide the script with details about the financial instrument being analyzed. This information is stored in a TOML file with the same name as the OHLCV file but with a `.toml` extension.
@@ -358,6 +373,13 @@ Only written with `--viz`, `--viz-path` or `--viz-journal`. Contains the plot an
 data of the script.
 
 **Default filename**: `<script_name>_viz.ndjson`
+
+### Profile (JSON)
+
+Only written with `--profile`. Contains the time and execution count of every line of the
+script and its libraries, and the run's time by category; see [Profiling](../profiling.md).
+
+**Default filename**: `<script_name>_profile.json`
 
 ## Examples
 
