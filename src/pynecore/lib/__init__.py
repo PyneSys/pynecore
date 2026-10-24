@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, TypeAlias, Any, TypeVar, \
 if TYPE_CHECKING:
     from pynecore.types.type_checker import *
     from ..types.session import SessionInfo
+    from ..core.script import script, input
 
 import math as _math
 from bisect import bisect_right as _bisect_right
@@ -21,7 +22,6 @@ from pynecore.types.source import Source
 
 from ..core.module_property import module_property, module_function_property
 from ..core.series import SeriesImpl as _SeriesImpl
-from ..core.script import script, input
 
 from ..types.color import Color as _Color
 from ..types.na import NA, na_int
@@ -164,7 +164,7 @@ _bar_opens: list[int] = [0] * _BAR_OPENS_SIZE
 _datetime: datetime = datetime.fromtimestamp(0, UTC)
 
 # Script settings from `script.indicator`, `script.strategy` or `script.library`
-_script: script = None  # type: ignore[assignment]
+_script: 'script' = None  # type: ignore[assignment]
 
 # Chart (main-series) timeframe, propagated into request.security children so
 # ``timeframe.main_period`` there reports the chart TF instead of the context's
@@ -222,6 +222,35 @@ if TYPE_CHECKING:
 #
 # Functions
 #
+
+# Runtime only: a type checker reading a module ``__getattr__`` would accept any attribute
+# of the lib, typos in scripts included. It sees ``script`` and ``input`` through the
+# TYPE_CHECKING import instead.
+if not TYPE_CHECKING:
+    def __getattr__(name: str) -> Any:
+        """
+        ``script`` and ``input``, bound on first access.
+
+        They live in :mod:`pynecore.core.script`, which imports submodules of this package
+        while it loads, so this package must not need it to finish loading: either one can
+        be imported first.
+
+        :param name: The attribute looked up.
+        :return: The attribute.
+        :raises AttributeError: If the package has no such attribute.
+        """
+        if name in ('script', 'input'):
+            # Imported here, not at the top: the top would close the import cycle
+            from ..core import script as _core_script
+            value = getattr(_core_script, name)
+            globals()[name] = value
+            return value
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    def __dir__() -> list[str]:
+        """The package's attributes, ``script`` and ``input`` included."""
+        return sorted({*globals(), 'script', 'input'})
+
 
 # noinspection PyUnusedLocal,unused-parameter
 def max_bars_back(var: Any, num: int) -> None:
