@@ -2,7 +2,7 @@
 ---
 weight: 105
 title: "Pine Script Compatibility"
-description: "PyneCore vs TradingView: 1,000 published TradingView scripts (Pine Script v4-v6, converted to Pyne code with PyneComp) validated, 99.770% of 132 million values bit-identical, 353,577 trades matched. Feature status of every Pine Script v6 module."
+description: "PyneCore vs TradingView: 1,000 published TradingView scripts (Pine Script v4-v6, converted to Pyne code with PyneComp) validated, 99.771% of 132 million values bit-identical, 353,577 trades matched. Feature status of every Pine Script v6 module."
 wildDescription: "PyneCore vs TradingView: {{scripts_total}} published TradingView scripts (Pine Script v4-v6, converted to Pyne code with PyneComp) validated, {{bars_exact_pct}}% of {{bars_compared_millions}} million values bit-identical, {{strategy_trades}} trades matched. Feature status of every Pine Script v6 module."
 icon: "checklist"
 date: "2026-03-28"
@@ -30,7 +30,7 @@ API is covered, how closely the results match, and where PyneCore differs on pur
 The match with TradingView is measured, not assumed: published TradingView scripts are converted
 with PyneComp, run by PyneCore, and every comparable output is compared with TradingView's own.
 
-> **Validation status** — snapshot <!--wild:generated_at-->2026-10-23<!--/wild-->, [Pyne in the Wild](https://wild.pynesys.io/)
+> **Validation status** — snapshot <!--wild:generated_at-->2026-10-24<!--/wild-->, [Pyne in the Wild](https://wild.pynesys.io/)
 >
 > - **<!--wild:scripts_total-->1,000<!--/wild-->** published open-source TradingView scripts (<!--wild:indicators-->502<!--/wild--> indicators,
 >   <!--wild:strategies-->498<!--/wild--> strategies; Pine Script v4: <!--wild:pine_v4-->329<!--/wild-->, v5: <!--wild:pine_v5-->364<!--/wild-->,
@@ -38,7 +38,7 @@ with PyneComp, run by PyneCore, and every comparable output is compared with Tra
 > - **<!--wild:tv_verified-->1,353<!--/wild--> / <!--wild:tv_comparable-->1,353<!--/wild-->** outputs comparable with
 >   TradingView verified (<!--wild:plot_outputs-->885<!--/wild--> plot outputs, <!--wild:trade_outputs-->468<!--/wild--> strategy trade
 >   lists)
-> - **<!--wild:bars_exact_pct-->99.770<!--/wild-->%** of <!--wild:bars_compared-->131,743,106<!--/wild--> plotted values identical to
+> - **<!--wild:bars_exact_pct-->99.771<!--/wild-->%** of <!--wild:bars_compared-->131,744,275<!--/wild--> plotted values identical to
 >   TradingView to the bit; the largest relative gap anywhere is <!--wild:max_rel-->6.3 × 10⁻¹²<!--/wild--> (about
 >   <!--wild:max_rel_sig_figures-->11<!--/wild--> significant figures)
 > - **<!--wild:strategy_trades-->353,577<!--/wild-->** strategy trades in <!--wild:strategies_compared-->468<!--/wild--> strategies:
@@ -308,10 +308,10 @@ the quirk needs a rule of its own for `time_close()` on that single bar.
 ## Precision
 
 What "matches TradingView" means, measured on the validation corpus (snapshot
-<!--wild:generated_at-->2026-10-23<!--/wild-->):
+<!--wild:generated_at-->2026-10-24<!--/wild-->):
 
-- **Plotted values**: <!--wild:bars_exact_pct-->99.770<!--/wild-->% of <!--wild:bars_compared-->131,743,106<!--/wild--> values are identical to
-  TradingView to the bit. In <!--wild:scripts_bit_exact-->865<!--/wild--> of the <!--wild:scripts_fidelity_compared-->884<!--/wild--> compared plot
+- **Plotted values**: <!--wild:bars_exact_pct-->99.771<!--/wild-->% of <!--wild:bars_compared-->131,744,275<!--/wild--> values are identical to
+  TradingView to the bit. In <!--wild:scripts_bit_exact-->866<!--/wild--> of the <!--wild:scripts_fidelity_compared-->884<!--/wild--> compared plot
   outputs every single value is bit-identical. The largest relative gap anywhere is
   <!--wild:max_rel-->6.3 × 10⁻¹²<!--/wild--> (about <!--wild:max_rel_sig_figures-->11<!--/wild--> significant figures).
 - **Strategy trades**: <!--wild:strategy_trades-->353,577<!--/wild--> trades in <!--wild:strategies_compared-->468<!--/wild--> strategies;
