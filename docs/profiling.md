@@ -82,6 +82,23 @@ The **categories** split the run's time without overlap:
 | request.security | Starting the `request.security` contexts and waiting for their results              |
 | Runner           | Everything else the runner does per bar                                             |
 
+## request.security Contexts
+
+Each `request.security` context runs the script, or the part of it the context needs, in a
+process of its own, on the context's own bars. That process is profiled too, and the
+summary lists each context with its data, timeframe, bars and the time its script code
+took:
+
+```
+request.security contexts (their own processes)
+  bybit_BTCUSDT_1D.ohlcv    D    352 bars    14.0 ms in the script's code
+```
+
+The script waits for a context's results, and that wait is what the `request.security`
+category and the time of a `request.security(...)` line hold. When the context's own script
+time is much smaller than the wait, the rest is spent outside the script: starting the
+context's process, reading its data and handing its values over.
+
 ## The Profile File
 
 `output/<script_name>_profile.json` holds the full measurement:
@@ -92,6 +109,10 @@ The **categories** split the run's time without overlap:
   source that was profiled, `lines` (line number → `[nanoseconds, executions]`) and
   `blocks` (every `def`, loop, `if`, `match`, `with` and `try` that ran, with the total time
   of its lines, the header line's own time and the header's executions).
+
+- `contexts`: one entry per `request.security` process that ran script code, with its
+  `sec_ids`, `timeframe`, `data` (the data file or symbol it read), `bars`, `script_ns`
+  and `files` (`path`, `lines` and `blocks` as above, measured in that process).
 
 The `sha256` tells whether a profile still belongs to the source: once the file is edited,
 its line numbers may no longer match.
@@ -104,8 +125,6 @@ its line numbers may no longer match.
 - Only backtests can be profiled: `--profile` is refused with `--live` and `--broker`.
 - Another tool that holds Python's profiler slot in the same process (another profiler)
   makes `--profile` fail with an error.
-- The code of a `request.security` context runs in a process of its own and is not
-  profiled line by line; its cost shows up as the time the script waits for its results.
 - The profiler slows a long backtest down by about 15%.
 - A loop header spanning several lines whose last line also holds the body
   (`for i in range(\n 3): x = i`) counts the header too many times; the times are still

@@ -75,6 +75,17 @@ def __test_marks_setup_and_keeps_code_literal__(tmp_path):
     assert f"Full profile: {path}" in text
 
 
+def __test_lists_security_contexts__(tmp_path):
+    """ Each ``request.security`` context gets a row: its data, timeframe and time """
+    profile, path = _profile(tmp_path)
+    profile['contexts'] = [{'sec_ids': ['sec·0'], 'timeframe': '1D', 'data': 'EURUSD_1D.ohlcv',
+                            'bars': 250, 'script_ns': 3_400_000, 'files': []}]
+    text = _render(profile, path, 0)
+
+    row, = [line for line in text.splitlines() if 'EURUSD_1D.ohlcv' in line]
+    assert '1D' in row and '250 bars' in row and '3.40 ms' in row
+
+
 def __test_categories_show_only_measured_time__(tmp_path):
     """ The summary names the run's categories that took time, with their share """
     profile, path = _profile(tmp_path)
@@ -84,4 +95,5 @@ def __test_categories_show_only_measured_time__(tmp_path):
     assert 'Script code' in text and '37.5%' in text
     assert 'Data feed' in text
     assert 'Strategy engine' not in text and 'request.security' not in text
+    assert 'contexts' not in text
     assert 'per-call setup' not in text

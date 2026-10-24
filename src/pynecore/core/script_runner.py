@@ -2753,6 +2753,14 @@ class ScriptRunner:
                         _chart_ring_capacity, _chart_ring_arena)
                     _registry_parent_conn, _registry_child_conn = mp_context.Pipe()
                     sec_registry_pipes[sid] = _registry_parent_conn
+                    # A profiled run profiles the child too: it sends what it measured
+                    # through a pipe of its own as it stops
+                    _profile_conn = None
+                    if self._profiler is not None:
+                        _profile_conn = cast('RunProfiler', self._profiler).open_context(
+                            sec_state.timeframe,
+                            data_source.symbol if isinstance(data_source, PluginSymbol)
+                            else Path(data_source).name)
                     proc = mp_context.Process(
                         target=security_process_main,
                         args=(
@@ -2790,13 +2798,16 @@ class ScriptRunner:
                         # have re-pinned ``timenow`` since. Kept out of ``args``
                         # because that tuple describes the CONTEXT, and its tail
                         # is what identifies a planned developing batch.
-                        kwargs={'run_env': child_run_env(), 'resolved_configs': resolved_configs},
+                        kwargs={'run_env': child_run_env(), 'resolved_configs': resolved_configs,
+                                'profile_conn': _profile_conn},
                         daemon=True,
                     )
                     proc.start()
                     # The child owns its end now; keeping the parent's copy of
                     # it open would stop the child from ever seeing EOF.
                     _registry_child_conn.close()
+                    if _profile_conn is not None:
+                        _profile_conn.close()
                     # Tell the children spawned EARLIER what this context is.
                     # Their snapshots either omitted it (runtime-resolved) or
                     # predate ``load_htf_bar_opens``, which is what fills the
@@ -4222,6 +4233,9 @@ class ScriptRunner:
                     # hygiene, and gives it an EOF either way.
                     _conn.close()
                 sec_registry_pipes.clear()
+                # A stopping child sends its profile before it exits
+                if self._profiler is not None:
+                    cast('RunProfiler', self._profiler).collect_contexts()
                 _join_security_processes(sec_processes)
                 if callable(sec_cleanup_fn):
                     sec_cleanup_fn: Callable
@@ -4767,7 +4781,8 @@ class ScriptRunner:
         if not want:
             return []
         out: list[str] = []
-        for toml_path in sorted(data_dir.glob('*.toml')):
+        toml_paths: list[Path] = sorted(data_dir.glob('*.toml'))
+        for toml_path in toml_paths:
             ohlcv_path = toml_path.with_suffix('.ohlcv')
             if not ohlcv_path.exists():
                 continue

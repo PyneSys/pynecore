@@ -43,9 +43,10 @@ import json
 import os
 import sys
 from importlib.metadata import PackageNotFoundError, version
+from multiprocessing.connection import Pipe
 from pathlib import Path
-from types import CodeType
-from typing import Any, Generator
+from types import CodeType, ModuleType
+from typing import TYPE_CHECKING, Any, Generator
 
 from . import script
 from .bar_magnifier import BarMagnifier
@@ -64,7 +65,12 @@ try:
 except ImportError:
     _native_profiler = None
 
-__all__ = ['CATEGORIES', 'SCHEMA', 'ProfilerUnavailable', 'RunProfiler']
+if TYPE_CHECKING:
+    # The common base of the connection classes ``Pipe`` makes on every platform
+    # noinspection PyProtectedMember
+    from multiprocessing.connection import _ConnectionBase
+
+__all__ = ['CATEGORIES', 'SCHEMA', 'ProfilerUnavailable', 'RunProfiler', 'ContextProfiler']
 
 #: The time categories, in the order the native module numbers them
 CATEGORIES = ('script', 'libraries', 'engine', 'output', 'data', 'security', 'runner')
@@ -193,12 +199,12 @@ def _regions(runner: Any) -> list[tuple[CodeType, int]]:
 
 
 # noinspection PyProtectedMember
-def _profiled_files(runner: Any) -> list[_ProfiledFile]:
+def _profiled_files(script_module: ModuleType) -> list[_ProfiledFile]:
     """The script's file and the files of the libraries it imported.
 
-    :param runner: The :class:`ScriptRunner` being profiled.
+    :param script_module: The imported script.
     """
-    script_file = _code_of(runner.script_module.main).co_filename
+    script_file = _code_of(script_module.main).co_filename
     files = {script_file: _ProfiledFile(script_file, _SCRIPT)}
     # The registry is process-wide: only libraries whose module is loaded now count
     for _title, library_main in script._registered_libraries:
@@ -235,6 +241,28 @@ def _blocks(tree: ast.Module, lines: dict[int, tuple[int, int]]) -> list[dict[st
     return blocks
 
 
+def _start(native: Any, files: list[_ProfiledFile],
+           regions: list[tuple[CodeType, int]]) -> None:
+    """Start the native profiler on ``files`` and ``regions``.
+
+    :raises ProfilerUnavailable: If the profiler tool id is taken.
+    """
+    try:
+        native.start([(file.co_filename, file.line_count, file.category, file.loop_headers)
+                      for file in files],
+                     regions, sys.monitoring.PROFILER_ID)
+    except ValueError as error:
+        raise ProfilerUnavailable(f"The profiler could not start: {error}") from error
+
+
+def _measured(tree: ast.Module, lines: dict[int, tuple[int, int]]) -> dict[str, Any]:
+    """The measured lines and blocks of one file, in the file format."""
+    return {
+        'lines': {str(line): [ns, hits] for line, (ns, hits) in sorted(lines.items())},
+        'blocks': _blocks(tree, lines),
+    }
+
+
 def _pynecore_version() -> str | None:
     try:
         return version('pynesys-pynecore')
@@ -254,9 +282,12 @@ class RunProfiler:
         self._native = _check_available()
         self._runner = runner
         self._path = path
-        self._files = _profiled_files(runner)
+        self._files = _profiled_files(runner.script_module)
         self._regions = _regions(runner)
         self._results: tuple[dict[str, dict[int, tuple[int, int]]], list[int], int] | None = None
+        # The request.security children to hear from, and what they sent
+        self._pending: list[tuple['_ConnectionBase', str, str]] = []
+        self._contexts: list[tuple[dict[str, Any], str, str]] = []
 
     def profile(self, results: Generator) -> Generator:
         """Measure the runner's iteration while passing its results through, then
@@ -279,14 +310,40 @@ class RunProfiler:
 
     def start(self) -> None:
         """Start measuring."""
-        try:
-            self._native.start(
-                [(file.co_filename, file.line_count, file.category, file.loop_headers)
-                 for file in self._files],
-                self._regions,
-                sys.monitoring.PROFILER_ID)
-        except ValueError as error:
-            raise ProfilerUnavailable(f"The profiler could not start: {error}") from error
+        _start(self._native, self._files, self._regions)
+
+    def open_context(self, timeframe: str, data: str) -> '_ConnectionBase':
+        """Open the profile pipe of a ``request.security`` child (see :class:`ContextProfiler`).
+
+        :param timeframe: The context's timeframe.
+        :param data: The context's data source, as the profile names it.
+        :return: The sending end, for the child. The caller closes its own copy once the
+                 child has started, so a child that dies is seen as gone.
+        """
+        receiving, sending = Pipe(duplex=False)
+        self._pending.append((receiving, timeframe, data))
+        return sending
+
+    def collect_contexts(self, timeout: float = 5.0) -> None:
+        """Receive the profiles of the stopped ``request.security`` children.
+
+        Called once the children were told to stop: each sends its profile on its way
+        out. A child that ran no script code, died or sent nothing in time adds no
+        context.
+
+        :param timeout: The longest wait for one child, in seconds.
+        """
+        for conn, timeframe, data in self._pending:
+            try:
+                if conn.poll(timeout):
+                    payload = conn.recv()
+                    if payload['script_ns']:
+                        self._contexts.append((payload, timeframe, data))
+            except EOFError:
+                pass
+            finally:
+                conn.close()
+        self._pending.clear()
 
     def stop(self) -> None:
         """Stop measuring and keep the results. Does nothing if measuring never started."""
@@ -300,15 +357,23 @@ class RunProfiler:
         assert self._results is not None, "the profiler has not run"
         file_lines, category_ns, script_ns = self._results
         files = []
+        trees = {str(file.path): file.tree for file in self._files}
         for file in self._files:
-            lines = file_lines.get(file.co_filename, {})
             files.append({
                 'path': str(file.path),
                 'sha256': hashlib.sha256(file.source.encode('utf-8')).hexdigest(),
                 'role': 'script' if file.category == _SCRIPT else 'library',
-                'lines': {str(line): [ns, hits] for line, (ns, hits) in sorted(lines.items())},
-                'blocks': _blocks(file.tree, lines),
+                **_measured(file.tree, file_lines.get(file.co_filename, {})),
             })
+        contexts = []
+        for payload, timeframe, data in self._contexts:
+            context_files = []
+            for path, lines in payload['files'].items():
+                tree = trees.get(path) or ast.parse(Path(path).read_text(encoding='utf-8'))
+                context_files.append({'path': path, **_measured(tree, lines)})
+            contexts.append({'sec_ids': payload['sec_ids'], 'timeframe': timeframe,
+                             'data': data, 'bars': payload['bars'],
+                             'script_ns': payload['script_ns'], 'files': context_files})
         categories = dict(zip(CATEGORIES, category_ns))
         return {
             'schema': SCHEMA,
@@ -319,6 +384,7 @@ class RunProfiler:
             'script_ns': script_ns,
             'categories': categories,
             'files': files,
+            'contexts': contexts,
         }
 
     def write(self) -> None:
@@ -328,3 +394,49 @@ class RunProfiler:
         partial = path.with_name(path.name + '.partial')
         partial.write_text(json.dumps(self.to_dict(), indent=1), encoding='utf-8')
         os.replace(partial, path)
+
+
+class ContextProfiler:
+    """The profiler of a ``request.security`` child process.
+
+    The child runs the script (or the context's slice of it) on the context's own bars.
+    It measures the lines of the script and its libraries there, and sends them to the
+    chart's :class:`RunProfiler` (:meth:`RunProfiler.collect_contexts`) as the child
+    stops.
+    """
+
+    def __init__(self, script_module: ModuleType, sec_ids: list[str],
+                 conn: '_ConnectionBase'):
+        """
+        :param script_module: The script the child imported.
+        :param sec_ids: The security contexts the child serves.
+        :param conn: The sending end of the profile pipe.
+        :raises ProfilerUnavailable: If profiling is not possible here.
+        """
+        self._native = _check_available()
+        self._files = _profiled_files(script_module)
+        self._sec_ids = sec_ids
+        self._conn = conn
+
+    def start(self) -> None:
+        """Start measuring."""
+        _start(self._native, self._files, [])
+
+    def send(self, bars: int) -> None:
+        """Stop measuring and send the profile.
+
+        :param bars: The number of the context's bars the child ran.
+        """
+        self._native.stop()
+        file_lines, _categories, script_ns = self._native.results()
+        payload = {
+            'sec_ids': self._sec_ids,
+            'bars': bars,
+            'script_ns': script_ns,
+            'files': {str(file.path): file_lines[file.co_filename] for file in self._files
+                      if file_lines.get(file.co_filename)},
+        }
+        try:
+            self._conn.send(payload)
+        finally:
+            self._conn.close()

@@ -77,6 +77,21 @@ def print_profile_report(profile: dict[str, Any], path: Path, top: int,
         categories.add_row(_CATEGORY_NAMES.get(key, key), _duration(ns), f"{share:.1f}%")
     console.print(categories)
 
+    contexts = profile.get('contexts') or []
+    if contexts:
+        console.print()
+        console.print("[bold]request.security contexts[/] (their own processes)")
+        table = Table(show_header=False, box=None, padding=(0, 2, 0, 2))
+        table.add_column(style="cyan")
+        table.add_column()
+        table.add_column(justify="right")
+        table.add_column(justify="right")
+        for context in contexts:
+            table.add_row(Text(context['data']), Text(context['timeframe']),
+                          f"{context['bars']:,} bars",
+                          f"{_duration(context['script_ns'])} in the script's code")
+        console.print(table)
+
     rows = []
     sources: dict[str, list[str]] = {}
     show_file = len(profile['files']) > 1
