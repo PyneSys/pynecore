@@ -13,7 +13,10 @@ from pynecore.core.broker.models import (
     CapabilityLevel,
     ExchangeCapabilities,
 )
+from pynecore.core.broker.disappearance import MISSING_PENDING_EXTRA
 from pynecore.core.broker.exceptions import VenueWritesQuarantinedError
+from pynecore.core.broker.run_identity import RunIdentity
+from pynecore.core.broker.storage import BrokerStore
 from pynecore.core.broker.validation import validate_plugin_contract
 from pynecore.core.plugin.broker import BrokerPlugin
 
@@ -156,6 +159,26 @@ def __test_ensure_venue_writes_allowed_follows_the_engine_latch__():
     latched[0] = True
     with pytest.raises(VenueWritesQuarantinedError, match="POST /v5/order/create blocked"):
         plugin.ensure_venue_writes_allowed("POST /v5/order/create")
+
+
+def __test_fill_recovery_pending_follows_the_disappearance_stamps__(tmp_path):
+    """By default a recovery is pending while a live row of one of the entries
+    is stamped missing: its disappearance confirmation has not concluded."""
+    plugin = _ConformingPlugin()
+    assert plugin.fill_recovery_pending({"L"}) is False
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="Conforming") as store:
+        ctx = store.open_run(RunIdentity(strategy_id="s", symbol="EURUSD", timeframe="60",
+                                         account_id="a"), script_source="// s")
+        plugin.store_ctx = ctx
+        ctx.upsert_order("c1", symbol="EURUSD", side="buy", qty=1.0, filled_qty=1.0,
+                         state="confirmed", pine_entry_id="L", extras={})
+        assert plugin.fill_recovery_pending({"L"}) is False
+        ctx.upsert_order("c1", extras={MISSING_PENDING_EXTRA: 1_000.0})
+        assert plugin.fill_recovery_pending({"L"}) is True
+        assert plugin.fill_recovery_pending({"S"}) is False
+        ctx.close_order("c1")
+        assert plugin.fill_recovery_pending({"L"}) is False
+        ctx.close()
 
 
 # === Capability declaration ===

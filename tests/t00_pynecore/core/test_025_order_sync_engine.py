@@ -37,6 +37,7 @@ from pynecore.core.broker.exceptions import (
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.sync_engine import (
     EXTERNAL_FLATTEN_CONFIRM_GRACE_S,
+    FILL_RECOVERY_HOLD_S,
     OrderSyncEngine,
     READ_OUTAGE_WARN_INTERVAL_S,
     READ_STUCK_GRACE_S,
@@ -148,6 +149,10 @@ class MockBroker:
     false_on_next_cancel: bool = False
     raise_on_next_get_open_orders: Exception | None = None
     raise_on_next_get_position: Exception | None = None
+    #: Entry ids the plugin reports a fill recovery for
+    #: (:meth:`fill_recovery_pending`), and an error the port raises instead.
+    recovering_entry_ids: set[str] = field(default_factory=set)
+    fill_recovery_error: Exception | None = None
     #: Number of ``get_position`` reads that actually reached the broker. Used to
     #: prove a rate-limit backoff parks the read locally instead of issuing it.
     get_position_calls: int = 0
@@ -281,6 +286,11 @@ class MockBroker:
             self.raise_on_next_get_open_orders = None
             raise err
         return list(self.open_orders)
+
+    def fill_recovery_pending(self, entry_ids) -> bool:
+        if self.fill_recovery_error is not None:
+            raise self.fill_recovery_error
+        return bool(self.recovering_entry_ids & set(entry_ids))
 
     async def get_position(self, symbol):
         self.get_position_calls += 1
@@ -2069,6 +2079,182 @@ def __test_external_flatten_is_detected_despite_an_armed_bracket__():
     engine._route_event(  # type: ignore[attr-defined]
         _fill_event('buy', 1.0, 50_200.0, pine_id="L", xchg_id="xchg-10"))
     assert pos.size == 1.0
+
+
+def __test_a_close_fill_recovered_within_the_grace_books_the_exit_not_a_flatten__(caplog):
+    """A venue SL fill whose push was lost, recovered by the plugin from the
+    venue's history while the flat venue is still under confirmation
+    (measured live: ctrader cycle 297), books the bracket's exit: no
+    unexplained flatten, no ERROR, the trade's P&L kept."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    engine.sync(BAR_TS)
+    engine._route_event(  # noqa: SLF001
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    assert pos.size == 1.0
+
+    b.position = None
+    with caplog.at_level(logging.WARNING):
+        engine.reconcile()
+        engine._route_event(replace(  # noqa: SLF001
+            _fill_event('sell', 1.0, 49_000.0, pine_id="", leg=LegType.CLOSE,
+                        xchg_id="deal-900"),
+            pine_id=None, from_entry="L",
+        ))
+        engine._flat_observed_since = (  # noqa: SLF001
+            time.monotonic() - EXTERNAL_FLATTEN_CONFIRM_GRACE_S - 1.0)
+        engine.reconcile()
+
+    assert pos.size == 0.0
+    assert [(t.entry_id, round(t.profit, 6)) for t in pos.closed_trades] == [("L", -1000.0)]
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.ERROR]
+
+
+def _flat_long(b) -> tuple[OrderSyncEngine, BrokerPosition]:
+    """A long 1.0 with an SL exit whose venue position is gone."""
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+    b.position = None
+    return engine, pos
+
+
+def _age_flat_observation(engine, seconds: float) -> None:
+    """Pretend the venue has shown flat for ``seconds``."""
+    engine._flat_observed_since = time.monotonic() - seconds  # noqa: SLF001
+
+
+def _recovered_sl_fill() -> OrderEvent:
+    return replace(_fill_event('sell', 1.0, 49_000.0, pine_id="", leg=LegType.CLOSE,
+                               xchg_id="deal-906"), pine_id=None, from_entry="L")
+
+
+def __test_a_pending_fill_recovery_holds_the_flat_verdict_past_the_grace__(caplog):
+    """Worst-case ordering: the flat venue is observed first and the plugin
+    delivers the recovered SL fill only after the fill-report grace. While the
+    plugin reports the recovery as pending the verdict is held, and the late
+    fill books the exit: no flatten, no ERROR."""
+    b = MockBroker(recovering_entry_ids={"L"})
+    engine, pos = _flat_long(b)
+    with caplog.at_level(logging.INFO):
+        engine.reconcile()
+        _age_flat_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 60.0)
+        engine.reconcile()
+        assert pos.size == 1.0, "the pending recovery holds the verdict"
+        engine.reconcile()
+        engine._route_event(_recovered_sl_fill())  # noqa: SLF001
+        b.recovering_entry_ids = set()
+        engine.reconcile()
+
+    assert pos.size == 0.0
+    assert [(t.entry_id, round(t.profit, 6)) for t in pos.closed_trades] == [("L", -1000.0)]
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.ERROR]
+    assert len([rec for rec in caplog.records if "holding the verdict" in rec.getMessage()]) == 1
+
+
+def __test_a_fill_recovery_that_outlasts_the_bound_ends_in_the_flatten_error__(caplog):
+    """A recovery still pending past the hold bound no longer holds the verdict:
+    the unexplained flatten is cleared with its ERROR."""
+    b = MockBroker(recovering_entry_ids={"L"})
+    engine, pos = _flat_long(b)
+    engine.reconcile()
+    _age_flat_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + FILL_RECOVERY_HOLD_S - 1.0)
+    engine.reconcile()
+    assert pos.size == 1.0
+
+    _age_flat_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + FILL_RECOVERY_HOLD_S + 1.0)
+    with caplog.at_level(logging.WARNING):
+        engine.reconcile()
+
+    assert pos.size == 0.0
+    assert any("no fill explains it" in rec.getMessage() and rec.levelno == logging.ERROR
+               for rec in caplog.records)
+
+
+def __test_a_recovery_of_another_entry_does_not_hold_the_flat_verdict__():
+    b = MockBroker(recovering_entry_ids={"S"})
+    engine, pos = _flat_long(b)
+    engine.reconcile()
+    _age_flat_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+    engine.reconcile()
+    assert pos.size == 0.0
+
+
+def __test_a_failing_fill_recovery_port_does_not_hold_the_flat_verdict__():
+    b = MockBroker(recovering_entry_ids={"L"}, fill_recovery_error=RuntimeError("boom"))
+    engine, pos = _flat_long(b)
+    engine.reconcile()
+    _age_flat_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+    engine.reconcile()
+    assert pos.size == 0.0
+
+
+def _shrunk_long(b) -> tuple[OrderSyncEngine, BrokerPosition]:
+    """A long 1.0 with an SL exit whose venue position holds 0.6."""
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+    _list_resting_stops(b, engine, pos)
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.6, entry_price=50_000.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cross",
+    )
+    return engine, pos
+
+
+def __test_a_pending_fill_recovery_holds_the_reduction_verdict__(caplog):
+    """The venue position shrank and the plugin still recovers the partial
+    close: the reduction is not adopted past the grace; the recovered fill
+    books it, without the unexplained-reduction ERROR."""
+    b = MockBroker(recovering_entry_ids={"L"})
+    engine, pos = _shrunk_long(b)
+    with caplog.at_level(logging.WARNING):
+        engine.reconcile()
+        _age_shrink_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 60.0)
+        engine.reconcile()
+        assert pos.size == 1.0, "the pending recovery holds the verdict"
+        engine._route_event(replace(  # noqa: SLF001
+            _fill_event('sell', 0.4, 49_500.0, pine_id="", leg=LegType.CLOSE,
+                        xchg_id="deal-903"), pine_id=None, from_entry="L"))
+        b.recovering_entry_ids = set()
+        engine.reconcile()
+
+    assert pos.size == pytest.approx(0.6)
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.ERROR]
+
+
+def __test_a_reduction_recovery_that_outlasts_the_bound_is_adopted__():
+    b = MockBroker(recovering_entry_ids={"L"})
+    engine, pos = _shrunk_long(b)
+    engine.reconcile()
+    _age_shrink_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + FILL_RECOVERY_HOLD_S - 1.0)
+    engine.reconcile()
+    assert pos.size == 1.0
+    _age_shrink_observation(engine, 2.0)
+    engine.reconcile()
+    assert pos.size == pytest.approx(0.6)
+
+
+def __test_a_trade_recovered_whole_against_a_flat_venue_books_entry_and_exit__(caplog):
+    """A working entry filled and its SL closed it while the stream was down;
+    the plugin delivers both fills after the venue is already flat. The book
+    takes the trade and ends flat: no position left, no ERROR."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=49_900.0)
+    engine.sync(BAR_TS)
+    b.position = None
+    with caplog.at_level(logging.WARNING):
+        engine.reconcile()
+        engine._route_event(  # noqa: SLF001
+            _fill_event('buy', 1.0, 49_900.0, pine_id="L", xchg_id="deal-905"))
+        engine._route_event(_recovered_sl_fill())  # noqa: SLF001
+        _age_flat_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+        engine.reconcile()
+
+    assert pos.size == 0.0 and pos.open_trades == []
+    assert [(t.entry_id, round(t.profit, 6)) for t in pos.closed_trades] == [("L", -900.0)]
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.ERROR]
 
 
 def __test_a_flat_snapshot_right_after_a_fill_only_starts_the_clock__():

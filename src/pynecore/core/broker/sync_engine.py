@@ -249,6 +249,13 @@ _WRITE_CLASSIFICATION_GRACE_MULT = 3.0
 #: that no longer exists.
 EXTERNAL_FLATTEN_CONFIRM_GRACE_S = 120.0
 
+#: Seconds past :meth:`OrderSyncEngine._fill_report_grace_s` the engine keeps
+#: holding the verdict of an external flatten or reduction while the plugin
+#: reports a fill recovery for one of the held entries as unresolved
+#: (:meth:`BrokerPlugin.fill_recovery_pending`). The hard bound: a recovery
+#: that never concludes still ends in the unexplained-change ERROR.
+FILL_RECOVERY_HOLD_S = 300.0
+
 #: Seconds between the quarantine reminders the resume watch logs while an
 #: operator has not resumed the latch (a supervisor reading only the recent log
 #: tail still sees the latch and its resume command).
@@ -1711,6 +1718,11 @@ class OrderSyncEngine:
         # gating the wait on ``_active_intents`` alone cleared the fresh
         # position instantly and left the venue leg unowned.
         self._last_position_fill_monotonic = 0.0
+
+        # Monotonic moment of the venue observation whose verdict a pending
+        # fill recovery currently holds (:meth:`_fill_recovery_holds`), so the
+        # hold is logged once per observation; ``None`` when nothing is held.
+        self._fill_recovery_hold_since: float | None = None
 
         # Entry ids whose tracking the external-flatten clear above retired.
         # Their close-leg fill may still arrive late (a reconnect backfill
@@ -6225,6 +6237,8 @@ class OrderSyncEngine:
                 self._flat_observed_since = now
             if now - self._flat_observed_since < self._fill_report_grace_s():
                 return
+            if self._fill_recovery_holds(self._flat_observed_since, now):
+                return
             self._flat_observed_since = 0.0
             spot_port = getattr(self._broker, 'spot_inventory_port', None)
             dust_threshold = getattr(
@@ -6725,6 +6739,8 @@ class OrderSyncEngine:
             return
         if self._position_work_in_flight():
             return
+        if self._fill_recovery_holds(observed[1], now):
+            return
         self._shrink_observed = None
         price = float(exch_pos.entry_price)
         if not price > 0.0:
@@ -7212,6 +7228,55 @@ class OrderSyncEngine:
         """
         grace = getattr(self._broker, 'fill_report_grace_s', None)
         return EXTERNAL_FLATTEN_CONFIRM_GRACE_S if grace is None else float(grace)
+
+    def _fill_recovery_holds(self, observed_since: float, now: float) -> bool:
+        """Whether a fill recovery of the plugin holds an external-change verdict.
+
+        The venue has differed from the book for longer than
+        :meth:`_fill_report_grace_s` since ``observed_since``. A plugin that
+        reconnected after an outage may still be recovering the fills that
+        explain it from the venue's history
+        (:meth:`BrokerPlugin.fill_recovery_pending`); booking the change as
+        external first would drop the bot's own exit when it arrives. The
+        verdict is held while the plugin reports such a recovery for one of
+        the held entries, until :data:`FILL_RECOVERY_HOLD_S` past the grace.
+        A plugin without the port, or one whose answer raises, holds nothing.
+
+        :param observed_since: Monotonic moment the venue was first seen
+            differing from the book.
+        :param now: The current monotonic time.
+        :return: ``True`` while the verdict is held.
+        """
+        entry_ids = {trade.entry_id for trade in self._position.open_trades
+                     if trade.entry_id is not None}
+        if not hasattr(self._broker, 'fill_recovery_pending') or not entry_ids:
+            return False
+        try:
+            unresolved = bool(self._broker.fill_recovery_pending(entry_ids))
+        except Exception as exc:  # noqa: BLE001 -- a faulty port must not block the verdict
+            _blog_warning("fill_recovery_pending failed (%s); not holding the verdict", exc)
+            return False
+        if not unresolved:
+            self._fill_recovery_hold_since = None
+            return False
+        bound = self._fill_report_grace_s() + FILL_RECOVERY_HOLD_S
+        if now - observed_since >= bound:
+            _blog_warning(
+                "the plugin still recovers fills for entries %s %.0fs after the venue "
+                "position changed; no longer holding the verdict",
+                sorted(entry_ids), now - observed_since,
+            )
+            self._fill_recovery_hold_since = None
+            return False
+        if self._fill_recovery_hold_since != observed_since:
+            self._fill_recovery_hold_since = observed_since
+            _blog_info(
+                "venue position differs from the book past the fill-report grace while "
+                "the plugin recovers fills for entries %s; holding the verdict for up "
+                "to %.0fs more",
+                sorted(entry_ids), bound - (now - observed_since),
+            )
+        return True
 
     def _position_work_in_flight(self) -> bool:
         """Whether work of ours that could still move the position is in flight.

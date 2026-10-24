@@ -437,8 +437,10 @@ class MissingResolution(StrEnum):
       path.
     - :data:`CLOSED` — the row filled and its position was then closed
       (native TP/SL fired, external close): retire the row (and its
-      position siblings) as a natural close — never a synthetic cancel,
-      and no fill event for exposure that no longer exists.
+      position siblings) as a natural close — never a synthetic cancel —
+      and yield the closing fills the venue evidence proved
+      (:attr:`MissingConfirmation.close_events`), so the engine books the
+      close it missed instead of finding an unexplained flat venue.
     - :data:`CANCELLED` — verified external cancel: terminal-close the
       row, emit the synthesised ``cancelled`` event and apply the
       ``on_unexpected_cancel`` policy.
@@ -495,6 +497,14 @@ class MissingConfirmation:
         a cancel retires the row and is yielded with this reason, but the
         ``on_unexpected_cancel`` policy is not applied — the venue, not an
         operator, terminated the order. ``None`` means an unexplained cancel.
+    :ivar close_events: On :data:`MissingResolution.CLOSED`, the closing
+        fills of the position the evidence proved and the event stream never
+        delivered, as close-leg :class:`OrderEvent` objects attributed to the
+        row's entry. They are yielded only when the row is actually retired,
+        after the retirement and the ``register_executions`` hook, so the
+        engine books the close before its venue-vs-book check would read the
+        flat venue as an unexplained flatten. Ignored on every other
+        resolution.
     """
     resolution: MissingResolution
     cumulative_filled_qty: float | None = None
@@ -505,6 +515,7 @@ class MissingConfirmation:
     extras_patch: Mapping[str, Any] | None = None
     executed_ts: float | None = None
     cancel_reason: str | None = None
+    close_events: tuple[OrderEvent, ...] = ()
 
     def __post_init__(self) -> None:
         # Coerce a plain string (or reject an invalid value at construction
@@ -958,14 +969,16 @@ class DisappearanceTracker:
                 return events, True, register_ids, updated
 
             if resolution is MissingResolution.CLOSED:
-                # Filled-then-closed: the exposure no longer exists, so no
-                # fill event is emitted for it (the engine's position
-                # reconcile owns the size side) — but any discovered fill
-                # progress was persisted above for bookkeeping. The
-                # retirement is concluded FROM the confirmation's execution
-                # evidence, so its ids are registered even without a fresh
-                # booked slice — a replayed push copy of an already-counted
-                # deal must not resurface as a new fill after the retire.
+                # Filled-then-closed: no entry fill event is emitted for
+                # exposure that no longer exists — any discovered fill
+                # progress was persisted above for bookkeeping — but the
+                # closing fills the evidence proved are yielded, or the
+                # engine would read the flat venue as an unexplained
+                # flatten. The retirement is concluded FROM the
+                # confirmation's execution evidence, so its ids are
+                # registered even without a fresh booked slice — a replayed
+                # push copy of an already-counted deal must not resurface as
+                # a new fill after the retire.
                 register_ids = confirmation.execution_ids
                 DispatchJournal(self._store).apply_reconcile_outcome(
                     updated.client_order_id,
@@ -988,7 +1001,7 @@ class DisappearanceTracker:
                     for sibling in self._sibling_coids(updated, confirmation):
                         self._store.close_order(sibling)
                 self._forget_deferred(updated.client_order_id)
-                return [], True, register_ids, updated
+                return list(confirmation.close_events), True, register_ids, updated
 
             if resolution is MissingResolution.CANCELLED:
                 # Terminal like CLOSED above: register the backing ids so
