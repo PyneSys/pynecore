@@ -2573,7 +2573,8 @@ def _force_conditional_writes(module: ast.Module, clone: ast.FunctionDef,
             node.body = forcer.func_body(node)
     clone.body = forcer.func_body(clone)
     if shared_forcer.changed:
-        clone.body[0:0] = copies
+        at = ast_walk.docstring_end(clone.body)
+        clone.body[at:at] = copies
         # The clone comes located, and so does every node the forcing makes
         # (each takes the location of the statement it is lifted from); only
         # the copied module-level definitions may still lack one.

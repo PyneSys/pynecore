@@ -184,11 +184,7 @@ class SeriesTransformer(ast_walk.NodeTransformer):
         node = cast(ast.FunctionDef, self.generic_visit(node))
 
         if param_inits:
-            insert_pos = 0
-            first = node.body[0] if node.body else None
-            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
-                    and isinstance(first.value.value, str)):
-                insert_pos = 1
+            insert_pos = ast_walk.docstring_end(node.body)
             # A parameter whose default is dynamic arrives as the sentinel and
             # gets its value in DynamicDefaultTransformer's guard block;
             # recording it above that would put the sentinel into the series.
@@ -224,10 +220,10 @@ class SeriesTransformer(ast_walk.NodeTransformer):
         slot = self._register(node.target.id, self._series_elem(node.annotation))
         if node.value is None:
             return None
-        return ast.Assign(
+        return ast.copy_location(ast.Assign(
             targets=[ast.Name(id=node.target.id, ctx=ast.Store())],
             value=self._buffer_call(self.current_scope, slot, 'add',
-                                    [cast(ast.expr, self.visit(node.value))]))
+                                    [cast(ast.expr, self.visit(node.value))])), node)
 
     def visit_If(self, node: ast.If) -> ast.AST:
         """Leave a parameter-default guard's own assignment alone.
@@ -258,10 +254,10 @@ class SeriesTransformer(ast_walk.NodeTransformer):
                 node.value = cast(ast.expr, self.visit(node.value))
                 return node
             if slots is not None and var_name in slots:
-                return ast.Assign(
+                return ast.copy_location(ast.Assign(
                     targets=[ast.Name(id=var_name, ctx=ast.Store())],
                     value=self._buffer_call(self.current_scope, slots[var_name], 'set',
-                                            [cast(ast.expr, self.visit(node.value))]))
+                                            [cast(ast.expr, self.visit(node.value))])), node)
             if self.current_scope:
                 self.local_vars.setdefault(self.current_scope, set()).add(var_name)
 
@@ -279,10 +275,10 @@ class SeriesTransformer(ast_walk.NodeTransformer):
             for elt in target.elts:
                 name = cast(ast.Name, elt).id
                 if name in slots:
-                    stmts.append(ast.Assign(
+                    stmts.append(ast.copy_location(ast.Assign(
                         targets=[ast.Name(id=name, ctx=ast.Store())],
                         value=self._buffer_call(self.current_scope, slots[name], 'add',
-                                                [ast.Name(id=name, ctx=ast.Load())])))
+                                                [ast.Name(id=name, ctx=ast.Load())])), node))
                 else:
                     self.local_vars.setdefault(self.current_scope, set()).add(name)
             return stmts if len(stmts) > 1 else node
@@ -302,10 +298,10 @@ class SeriesTransformer(ast_walk.NodeTransformer):
                                           augmented),
                               op=node.op,
                               right=cast(ast.expr, self.visit(node.value))), augmented)
-                return ast.Assign(
+                return ast.copy_location(ast.Assign(
                     targets=[ast.Name(id=node.target.id, ctx=ast.Store())],
                     value=self._buffer_call(self.current_scope, slots[node.target.id],
-                                            'set', [value]))
+                                            'set', [value])), node)
         return cast(ast.AST, self.generic_visit(node))
 
     def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
@@ -331,8 +327,8 @@ class SeriesTransformer(ast_walk.NodeTransformer):
             found = self._lookup(call.args[0].id)
             if found:
                 scope, slot = found
-                return ast.Assign(
+                return ast.copy_location(ast.Assign(
                     targets=[ast.Attribute(value=self._state_ref(scope, slot),
                                            attr=_BUFFER_SETTERS[call.func.attr], ctx=ast.Store())],
-                    value=cast(ast.expr, self.visit(call.args[1])))
+                    value=cast(ast.expr, self.visit(call.args[1]))), node)
         return cast(ast.AST, self.generic_visit(node))

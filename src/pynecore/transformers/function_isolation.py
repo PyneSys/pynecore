@@ -853,7 +853,9 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
         node of the copy is stamped with the original callee's location: the
         reparse alone puts ``lineno=1`` on them, and the lazy-resolve branch
         would then emit line-1 line events mid-statement (double breakpoint
-        hits and derailed step-over on the first bar)."""
+        hits and derailed step-over on the first bar). A callee another pass
+        built without a location yields an unlocated copy, which
+        ``fix_locations`` anchors with its statement."""
         location = [getattr(func, attr, None) for attr in _LOCATION_ATTRIBUTES]
         if None not in location:
             copy = _copy_name_chain(func, location)
@@ -861,7 +863,11 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
                 return copy
         copy = cast(ast.expr, ast.parse(ast.unparse(func), mode='eval').body)
         for node in ast_walk.walk(copy):
-            ast.copy_location(node, func)
+            if None in location:
+                for attr in _LOCATION_ATTRIBUTES:
+                    node.__dict__.pop(attr, None)
+            else:
+                ast.copy_location(node, func)
         return copy
 
     @staticmethod

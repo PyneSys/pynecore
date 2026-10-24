@@ -227,7 +227,7 @@ class PersistentTransformer(ast_walk.NodeTransformer):
             self._slot_names.add(var_name)
             flag = scope_layout.add_flag(var_name, varip=varip)
             value = cast(ast.expr, self.visit(node.value))
-            return ast.If(
+            return ast.copy_location(ast.If(
                 test=ast.UnaryOp(op=ast.Not(),
                                  operand=self._state_ref(self.current_scope, flag, ast.Load())),
                 body=[
@@ -236,7 +236,7 @@ class PersistentTransformer(ast_walk.NodeTransformer):
                     ast.Assign(targets=[self._state_ref(self.current_scope, flag, ast.Store())],
                                value=ast.Constant(value=True)),
                 ],
-                orelse=[])
+                orelse=[]), node)
 
         # A bare-``na`` default must be the na VALUE, not the ``na`` name — at module
         # level ``na`` resolves to the ``is_na`` function object. Emit ``lib.na()``.
@@ -260,9 +260,9 @@ class PersistentTransformer(ast_walk.NodeTransformer):
             found = self._lookup(var_name)
             if found:
                 scope, slot = found
-                return ast.Assign(
+                return ast.copy_location(ast.Assign(
                     targets=[self._state_ref(scope, slot, ast.Store())],
-                    value=cast(ast.expr, self.visit(node.value)))
+                    value=cast(ast.expr, self.visit(node.value))), node)
         node.targets = [cast(ast.expr, self.visit(t)) for t in node.targets]
         node.value = cast(ast.expr, self.visit(node.value))
         return node

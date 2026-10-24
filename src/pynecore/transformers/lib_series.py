@@ -94,8 +94,8 @@ class LibrarySeriesTransformer(ast_walk.NodeTransformer):
             return
         for stmt in ast_walk.walk_statements(node):
             if isinstance(stmt, ast.FunctionDef) and stmt.name in self.declarations_to_insert:
-                decls = self.declarations_to_insert[stmt.name]
-                stmt.body = decls + stmt.body
+                at = ast_walk.docstring_end(stmt.body)
+                stmt.body[at:at] = self.declarations_to_insert[stmt.name]
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
         """Track current function with parent tracking for nested functions"""

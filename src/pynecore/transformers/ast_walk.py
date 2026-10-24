@@ -29,7 +29,8 @@ from collections.abc import Callable, Iterator
 from typing import Any, get_args
 
 __all__ = ['NodeVisitor', 'NodeTransformer', 'walk', 'iter_child_nodes', 'iter_descendants',
-           'iter_child_statements', 'walk_statements', 'fix_missing_locations', 'clone']
+           'iter_child_statements', 'walk_statements', 'fix_missing_locations', 'clone',
+           'docstring_end', 'future_end']
 
 _AST = ast.AST
 
@@ -342,6 +343,39 @@ def walk_statements(node: ast.AST) -> Iterator[ast.AST]:
                     if isinstance(item, _AST):
                         append(item)
         yield node
+
+
+def docstring_end(body: list[ast.stmt]) -> int:
+    """Index of the first statement after a leading docstring of ``body``.
+
+    The place for code a transformer prepends to a module or function body: a
+    string constant is the docstring only while it stands first, so a statement
+    inserted above it drops ``__doc__`` and turns the string into an expression
+    statement evaluated on every call.
+
+    :param body: A module or function body.
+    :return: 1 when ``body`` starts with a docstring, else 0.
+    """
+    first = body[0] if body else None
+    return 1 if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                 and isinstance(first.value.value, str)) else 0
+
+
+def future_end(body: list[ast.stmt]) -> int:
+    """Index of the first statement after the docstring and the ``__future__`` block.
+
+    The place for a module-level statement a transformer prepends, a generated
+    import first of all: a ``from __future__`` import must lead the module, so
+    anything inserted above it fails compilation.
+
+    :param body: A module body.
+    :return: The insertion index.
+    """
+    index = docstring_end(body)
+    while (index < len(body) and isinstance(body[index], ast.ImportFrom)
+           and getattr(body[index], 'module', None) == '__future__'):
+        index += 1
+    return index
 
 
 def fix_missing_locations(node: ast.AST) -> ast.AST:

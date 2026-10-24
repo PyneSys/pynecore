@@ -183,15 +183,7 @@ class _NaBindings:
 
 def _insert_import(body: list[ast.stmt], stmt: ast.ImportFrom) -> None:
     """Insert a generated import after the docstring and the ``__future__`` block."""
-    insert_at = 0
-    first = body[0] if body else None
-    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) \
-            and isinstance(first.value.value, str):
-        insert_at = 1
-    while insert_at < len(body) and isinstance(body[insert_at], ast.ImportFrom) \
-            and getattr(body[insert_at], 'module', None) == '__future__':
-        insert_at += 1
-    body.insert(insert_at, stmt)
+    body.insert(ast_walk.future_end(body), stmt)
 
 
 def is_script_entry(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
@@ -299,12 +291,7 @@ class DynamicDefaultTransformer(ast_walk.NodeTransformer):
 
         if prologue:
             self._changed = True
-            # Keep a leading docstring first
-            insert_at = 0
-            if (node.body and isinstance(node.body[0], ast.Expr)
-                    and isinstance(node.body[0].value, ast.Constant)
-                    and isinstance(node.body[0].value.value, str)):
-                insert_at = 1
+            insert_at = ast_walk.docstring_end(node.body)
             node.body[insert_at:insert_at] = prologue
 
         self.generic_visit(node)

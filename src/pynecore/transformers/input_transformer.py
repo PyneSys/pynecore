@@ -152,7 +152,7 @@ class InputTransformer(ast_walk.NodeVisitor):
                     keywords=[]
                 )
             )
-            node.body.insert(0, assign)
+            node.body.insert(ast_walk.docstring_end(node.body), assign)
 
         # Restore previous function name
         self.current_function = previous_function
@@ -173,15 +173,6 @@ class InputTransformer(ast_walk.NodeVisitor):
             module='builtins',
             names=[ast.alias(name='getattr', asname='__pyne_getattr__')],
             level=0)
-        insert_pos = 0
-        first = node.body[0] if node.body else None
-        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
-                and isinstance(first.value.value, str)):
-            insert_pos = 1  # keep the module docstring first
-        while (insert_pos < len(node.body)
-               and isinstance(node.body[insert_pos], ast.ImportFrom)
-               and getattr(node.body[insert_pos], 'module', None) == '__future__'):
-            insert_pos += 1  # stay after any ``from __future__`` imports
-        node.body.insert(insert_pos, alias_import)
+        node.body.insert(ast_walk.future_end(node.body), alias_import)
 
         return node

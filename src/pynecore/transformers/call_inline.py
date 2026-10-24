@@ -373,6 +373,38 @@ class _BodySubstitutor(ast_walk.NodeTransformer):
         return ast.Name(id=_SUPPORT_ALIAS.format(anchor), ctx=ast.Load())
 
 
+def _stamp_emission(node: ast.AST, call: ast.Call) -> None:
+    """Anchor every node of the pass's own emission to the call site's point.
+
+    The template is copied from the wrapper's source, so its nodes carry line
+    numbers of ``lib/math.py`` or ``lib/array.py`` -- lines the script does
+    not have, or has with other code on them. Line events, tracebacks and
+    profiles must see the call's own line instead. The argument subtrees are
+    the user's code and keep their locations (a nested inlined call was
+    anchored when it was inlined). A call another pass built without a
+    location leaves the emission unlocated, for ``fix_locations`` to anchor
+    with the enclosing statement.
+
+    :param node: The emission root.
+    :param call: The call site being replaced.
+    """
+    line: int | None = getattr(call, 'lineno', None)
+    col: int = getattr(call, 'col_offset', 0)
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if getattr(current, _ARG_MARK, False):
+            continue
+        if 'lineno' in current._attributes:
+            if line is None:
+                for attribute in current._attributes:
+                    current.__dict__.pop(attribute, None)
+            else:
+                current.lineno = current.end_lineno = line  # type: ignore[attr-defined]
+                current.col_offset = current.end_col_offset = col  # type: ignore[attr-defined]
+        stack.extend(ast_walk.iter_child_nodes(current))
+
+
 def _deep_copy(node: ast.expr) -> ast.expr:
     """Structural deep copy of an expression node.
 
@@ -1353,6 +1385,7 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
             expression = _chain(probes, expression)
 
         self.inlined += 1
+        _stamp_emission(expression, node)
         return ast.copy_location(
             stamp_lowering(expression, get_ty(node)), node)
 

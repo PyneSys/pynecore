@@ -22,10 +22,13 @@ Points, not spans: a synthetic node stamped with a multi-line span would put
 its attribute-op line events on the span's end line, re-creating the bug.
 """
 import ast
+from typing import TypeVar
 
-__all__ = ('fix_locations',)
+__all__ = ('fix_locations', 'anchor_at', 'anchor_all_at')
 
 _AST = ast.AST
+
+_Node = TypeVar('_Node', bound=ast.AST)
 
 #: Node classes that carry neither a location nor a child (expression contexts
 #: and operators): there is nothing to fill in them and nothing below them
@@ -38,6 +41,48 @@ _INERT: frozenset[type] = frozenset(
 def _stamp_point(node: ast.AST, line: int, col: int) -> None:
     node.lineno = node.end_lineno = line  # type: ignore[attr-defined]
     node.col_offset = node.end_col_offset = col  # type: ignore[attr-defined]
+
+
+def anchor_at(node: _Node, source: ast.AST) -> _Node:
+    """Locate a synthetic statement at the start POINT of the node it serves.
+
+    For a statement that runs on behalf of a compound one (a nested ``def``):
+    copying that node's whole span would put attribute-op line events on the
+    span's last line, the body's last line.
+
+    :param node: The synthetic node.
+    :param source: The node it serves.
+    :return: ``node``.
+    """
+    _stamp_point(node, source.lineno, source.col_offset)  # type: ignore[attr-defined]
+    return node
+
+
+def anchor_all_at(node: _Node, source: ast.AST) -> _Node:
+    """Locate a synthetic subtree, every node of it, at the start POINT of ``source``.
+
+    For code cloned from elsewhere that now runs on behalf of ``source``: the
+    clone's own locations name the place it was copied from.
+
+    :param node: The synthetic subtree.
+    :param source: The node it runs for.
+    :return: ``node``.
+    """
+    line, col = source.lineno, source.col_offset  # type: ignore[attr-defined]
+    stack: list[ast.AST] = [node]
+    while stack:
+        current = stack.pop()
+        if 'lineno' in current._attributes:
+            _stamp_point(current, line, col)
+        for name in current._fields:
+            value = getattr(current, name, None)
+            if isinstance(value, _AST):
+                if value.__class__ not in _INERT:
+                    stack.append(value)
+            elif isinstance(value, list):
+                stack.extend(item for item in value
+                             if isinstance(item, _AST) and item.__class__ not in _INERT)
+    return node
 
 
 def _earliest_line(node: ast.AST) -> int | None:

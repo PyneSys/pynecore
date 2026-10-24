@@ -2,12 +2,13 @@ import ast
 import hashlib
 import re
 from collections.abc import Container, Iterator
-from typing import Any
+from typing import Any, TypeVar
 
 from ..core.import_hook import PYNE_RESERVED_NAME_CHAR
 from . import ast_walk
 from .dynamic_default import is_script_entry
 from .lib_series import NON_SERIES_LIB_ATTRS
+from .locations import anchor_all_at, anchor_at
 from .pine_type_rules import FactoryFields
 
 
@@ -223,6 +224,8 @@ _SUB_BODY_FIELDS = frozenset({'body', 'orelse', 'finalbody', 'handlers', 'cases'
 # has to exceed the deepest unconditional helper chain a script can have.
 _MAX_LIFT_ROUNDS = 16
 
+_Stmt = TypeVar('_Stmt', bound=ast.stmt)
+
 
 class _SignalArgSubstituter(ast_walk.NodeTransformer):
     """Rewrite one lifted ``__sec_signal__`` argument into the caller's scope.
@@ -326,7 +329,8 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         # Sids whose __sec_signal__ is emitted in the function's top block
         # (module-level or hoistable arguments). Only these may be depended on.
         self._top_sec_ids: set[str] = set()
-        self._sid_lineno: dict[str, int] = {}
+        #: The call each sid stands for: the blocks emitted for a sid run at its line
+        self._sid_call: dict[str, ast.Call] = {}
         # Runtime-resolved sids kept out of the top block because their call is
         # not reached on every run, and the ones that must stay there anyway
         # because another context reads them (see ``visit_Module``).
@@ -1006,16 +1010,33 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             orelse=[]
         )
 
+    def _at_call(self, stmt: _Stmt, sec_id: str) -> _Stmt:
+        """Locate a statement emitted for ``sec_id`` at its call's point.
+
+        The time a profile measures there, and the line a debugger stops on, is
+        the ``request.security`` call's. A call another pass built without a
+        location leaves the statement for ``fix_locations`` to anchor.
+        """
+        call = self._sid_call.get(sec_id)
+        if call is not None and getattr(call, 'lineno', None) is not None:
+            anchor_at(stmt, call)
+        return stmt
+
     def _wait_block(self, sec_ids: list[str]) -> ast.If:
-        """Build chart-context wait block for function end."""
-        return ast.If(
+        """Build chart-context wait block for function end.
+
+        Each wait stands at the line of the call whose round it settles: the
+        time spent waiting for a context is that call's cost.
+        """
+        return self._at_call(ast.If(
             test=self._is_none_check(),
             body=[
-                ast.Expr(value=self._func_call('__sec_wait__', ast.Constant(value=s)))
+                self._at_call(
+                    ast.Expr(value=self._func_call('__sec_wait__', ast.Constant(value=s))), s)
                 for s in sec_ids
             ],
             orelse=[]
-        )
+        ), sec_ids[0])
 
     @staticmethod
     def _in_same_context(sec_id: str) -> ast.Compare:
@@ -1198,10 +1219,10 @@ class SecurityTransformer(ast_walk.NodeTransformer):
                 for call_node in call_nodes_here:
                     sid = getattr(call_node, '_sec_id')
                     if sid in runtime_sec_ids:
-                        new_body.append(self._inline_signal(sid))
+                        new_body.append(self._at_call(self._inline_signal(sid), sid))
                     expr = ast_walk.clone(call_exprs[sid])
                     expr = replacer.visit(expr)
-                    new_body.append(self._write_block(sid, expr))
+                    new_body.append(self._at_call(self._write_block(sid, expr), sid))
                 new_body.append(self._replace_own_calls(replacer, stmt))
             else:
                 new_body.append(stmt)
@@ -1454,7 +1475,7 @@ class SecurityTransformer(ast_walk.NodeTransformer):
                         self._needs_barmerge = True
 
             self._all_contexts[sec_id] = ctx
-            self._sid_lineno[sec_id] = getattr(call, 'lineno', 0)
+            self._sid_call[sec_id] = call
             sec_ids.append(sec_id)
 
         # Separate top-block signals from runtime-dependent ones. A signal can
@@ -1501,11 +1522,18 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         hoisted = self._collect_hoisted(hoistable, needed_names)
         hoisted_ids = {id(stmt) for stmt in hoisted}
         original_body = [stmt for stmt in node.body if id(stmt) not in hoisted_ids]
-        top_block = [self._signal_block(top_sec_ids)] if top_sec_ids else []
+        # The top block runs at function entry, or right after the bindings
+        # hoisted for it: it belongs to that point, whatever lines its
+        # arguments were cloned from
+        top_block = [anchor_all_at(self._signal_block(top_sec_ids),
+                                   hoisted[-1] if hoisted else node)] \
+            if top_sec_ids else []
+        docstring = ast_walk.docstring_end(original_body)
         node.body = (
-                list(hoisted)
+                original_body[:docstring]
+                + list(hoisted)
                 + top_block
-                + self._transform_body(original_body, call_exprs, runtime_sec_ids)
+                + self._transform_body(original_body[docstring:], call_exprs, runtime_sec_ids)
                 + [self._wait_block(sec_ids)]
         )
 
@@ -2419,7 +2447,7 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         found_caller = self._find_guard_block(caller.body, '__sec_signal__')
         if found_caller is None:
             caller_block = ast.If(test=self._is_none_check(), body=[], orelse=[])
-            caller.body.insert(0, caller_block)
+            caller.body.insert(ast_walk.docstring_end(caller.body), caller_block)
         else:
             caller_block = found_caller[1]
 
@@ -2607,13 +2635,13 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             # Add barmerge import if needed (SecurityTransformer runs AFTER ImportNormalizer,
             # so we must add it ourselves)
             if self._needs_barmerge:
-                node.body.insert(0, ast.Import(
+                node.body.insert(ast_walk.future_end(node.body), ast.Import(
                     names=[ast.alias(name='pynecore.lib.barmerge', asname=None)]
                 ))
 
             # __ltf_unzip__ transposes tuple-valued security_lower_tf() results.
             if self._needs_ltf_unzip:
-                node.body.insert(0, ast.ImportFrom(
+                node.body.insert(ast_walk.future_end(node.body), ast.ImportFrom(
                     module='pynecore.core.security',
                     names=[ast.alias(name='__ltf_unzip__', asname=None)],
                     level=0,

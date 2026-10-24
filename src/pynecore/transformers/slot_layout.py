@@ -36,6 +36,7 @@ import ast
 from dataclasses import dataclass, field
 
 from . import ast_walk
+from .locations import anchor_at
 from .pine_type_rules import OBJECT, stamp_lowering
 
 __all__ = ['ModuleLayout', 'ScopeLayout', 'apply_layout', 'scope_for_function',
@@ -455,7 +456,7 @@ def _process_defs(body: list[ast.stmt], scope_prefix: str, layout: ModuleLayout,
                 stmt.decorator_list.append(_attach_decorator_ast(scope_id))
                 used_imports.add('__attach_layout__')
             else:
-                new_body.append(_attach_ast(stmt.name, scope_id))
+                new_body.append(anchor_at(_attach_ast(stmt.name, scope_id), stmt))
     return new_body
 
 
