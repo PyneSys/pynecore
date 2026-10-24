@@ -66,7 +66,7 @@ Pine Script, you can instead follow the
 ### How does PyneCore relate to TradingView?
 
 PyneCore is not affiliated with or endorsed by TradingView. It is an independent project that
-implements Pine Script's functionality and execution model in Python. PyneCore is validated against TradingView on <!--wild:scripts_total-->1,000<!--/wild--> published TradingView scripts (Pine Script v4–v6, converted to Pyne code with [PyneComp](https://pynesys.io)): all <!--wild:tv_verified-->1,353<!--/wild--> comparable outputs match, <!--wild:bars_exact_pct-->99.771<!--/wild-->% of <!--wild:bars_compared_millions-->132<!--/wild--> million plotted values are bit-identical, and <!--wild:strategy_trades-->353,577<!--/wild--> strategy trades match TradingView's timing (snapshot <!--wild:generated_at-->2026-10-13<!--/wild-->, [Pyne in the Wild](https://wild.pynesys.io/)). See [Compatibility](./overview/compatibility.md) for details.
+implements Pine Script's functionality and execution model in Python. PyneCore is validated against TradingView on <!--wild:scripts_total-->1,000<!--/wild--> published TradingView scripts (Pine Script v4–v6, converted to Pyne code with [PyneComp](https://pynesys.io)): all <!--wild:tv_verified-->1,353<!--/wild--> comparable outputs match, <!--wild:bars_exact_pct-->99.770<!--/wild-->% of <!--wild:bars_compared_millions-->132<!--/wild--> million plotted values are bit-identical, and <!--wild:strategy_trades-->353,577<!--/wild--> strategy trades match TradingView's timing (snapshot <!--wild:generated_at-->2026-10-23<!--/wild-->, [Pyne in the Wild](https://wild.pynesys.io/)). See [Compatibility](./overview/compatibility.md) for details.
 
 ### Is PyneCore free to use?
 
@@ -221,7 +221,7 @@ You can use either or both methods (even in the same script) based on your prefe
 ### How reliable is PyneCore compared to TradingView?
 
 PyneCore's results are measured against TradingView on a public validation corpus,
-[Pyne in the Wild](https://wild.pynesys.io/). The snapshot of <!--wild:generated_at-->2026-10-13<!--/wild--> covers
+[Pyne in the Wild](https://wild.pynesys.io/). The snapshot of <!--wild:generated_at-->2026-10-23<!--/wild--> covers
 <!--wild:scripts_total-->1,000<!--/wild--> published open-source TradingView scripts (<!--wild:indicators-->502<!--/wild--> indicators,
 <!--wild:strategies-->498<!--/wild--> strategies), written in Pine Script v4 (<!--wild:pine_v4-->329<!--/wild-->), v5 (<!--wild:pine_v5-->364<!--/wild-->) and v6
 (<!--wild:pine_v6-->307<!--/wild-->), converted to Pyne code with [PyneComp](https://pynesys.io) and tested on
@@ -230,9 +230,9 @@ PyneCore's results are measured against TradingView on a public validation corpu
 - All <!--wild:scripts_total-->1,000<!--/wild--> scripts run.
 - All <!--wild:tv_verified-->1,353<!--/wild--> outputs that can be compared with TradingView are verified
   (<!--wild:plot_outputs-->885<!--/wild--> plot outputs and <!--wild:trade_outputs-->468<!--/wild--> strategy trade lists).
-- Of <!--wild:bars_compared-->131,744,274<!--/wild--> plotted values, <!--wild:bars_exact_pct-->99.771<!--/wild-->% are identical to
+- Of <!--wild:bars_compared-->131,743,106<!--/wild--> plotted values, <!--wild:bars_exact_pct-->99.770<!--/wild-->% are identical to
   TradingView to the bit; the rest are within the published band. The largest relative gap
-  anywhere is <!--wild:max_rel-->1.2 × 10⁻¹⁰<!--/wild--> (about <!--wild:max_rel_sig_figures-->9<!--/wild--> significant figures).
+  anywhere is <!--wild:max_rel-->6.3 × 10⁻¹²<!--/wild--> (about <!--wild:max_rel_sig_figures-->11<!--/wild--> significant figures).
 - In all <!--wild:strategies_compared-->468<!--/wild--> strategies with trades, the <!--wild:strategy_trades-->353,577<!--/wild--> trades
   match TradingView's entry and exit timing, and the trade counts are identical.
 
