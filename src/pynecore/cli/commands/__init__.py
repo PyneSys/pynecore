@@ -87,7 +87,7 @@ def setup(
                 typer.echo("Recreating demo.py...")
             with demo_file.open('w') as f:
                 f.write('''"""
-@pyne
+@pyne edge
 Simple Pyne code Demo
 
 A basic demo showing a 12 and 26 period EMA crossover system.
