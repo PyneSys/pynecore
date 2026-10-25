@@ -126,7 +126,7 @@ impl Engine<'_, '_> {
         let ty = if is_group {
             self.group_type(&key, pin.as_deref(), &args, &keywords)?
         } else {
-            self.call_context(&key, node, frame, None)?
+            self.call_context(&key, node, frame, None, true)?
         };
         self.calls.push(CallSite { callee: name, line, col, argc, ty: ty.clone(), pin });
         Ok(ty)
@@ -431,7 +431,7 @@ impl Engine<'_, '_> {
             self.record_pin(node, pin.clone());
             return self.group_type(&key, pin.as_deref(), &args, &keywords).map(Some);
         }
-        self.call_context(&key, node, frame, Some(&args)).map(Some)
+        self.call_context(&key, node, frame, Some(&args), true).map(Some)
     }
 
     /// Report a `method_call` that reaches no method, naming the method
@@ -604,6 +604,9 @@ impl Engine<'_, '_> {
         node: NodeId,
         args: &[NodeId],
     ) -> R<Option<String>> {
+        if let Some(member) = self.member_result(cid, name, node, args)? {
+            return Ok(Some(member));
+        }
         let sig = self.class_sig(cid, node)?;
         let source = cid.rsplit_once('#').map_or("", |(source, _)| source).to_string();
         let builtin = source.is_empty() || source == "lib";
@@ -622,6 +625,33 @@ impl Engine<'_, '_> {
             }
         }
         let Some(published) = self.library_method(name, node, home)? else { return Ok(None) };
+        self.published_result(&published, name, node, args).map(Some)
+    }
+
+    /// Type a call to a method its class declares in its own body (`_member_result`):
+    /// one of this module's classes in the context the call describes, another
+    /// module's through the signature it publishes.
+    fn member_result(
+        &mut self,
+        cid: &str,
+        name: &str,
+        node: NodeId,
+        args: &[NodeId],
+    ) -> R<Option<String>> {
+        if let Some((key, scope)) =
+            self.members.get(cid).and_then(|members| members.get(name)).cloned()
+        {
+            let Some(frame) =
+                (0..self.stack.len()).rev().find(|&at| self.frames[self.stack[at]].scope == scope)
+            else {
+                return Ok(None);
+            };
+            let (func, _, _) = facts::call_parts(self.ast, node).expect("a call");
+            let record = self.dotted(func).as_deref() != Some("method_call");
+            return self.call_context(&key, node, frame, Some(args), record).map(Some);
+        }
+        let Some(sig) = self.class_sig(cid, node)? else { return Ok(None) };
+        let Some(published) = sig.members.get(name).cloned() else { return Ok(None) };
         self.published_result(&published, name, node, args).map(Some)
     }
 
@@ -773,12 +803,16 @@ impl Engine<'_, '_> {
 
     /// Analyse the callee in the context this call site describes, and type it
     /// (`_call_context`).
+    ///
+    /// A site with `record` false (a method a `method_call` finds by name on the
+    /// receiver's class) takes no part in the per-instance channel.
     fn call_context(
         &mut self,
         key: &str,
         node: NodeId,
         frame: usize,
         args: Option<&[NodeId]>,
+        record: bool,
     ) -> R<String> {
         let Some(definitions) = self.defs.get(key).filter(|defs| !defs.is_empty()).cloned() else {
             return Ok(self.funcs[key].ret.clone());
@@ -837,14 +871,16 @@ impl Engine<'_, '_> {
             let found = &self.results[result];
             (found.cid, found.ret.clone(), found.ret_qual)
         };
+        if let Some(nid) = nid {
+            self.call_q.insert(nid, ret_qual);
+        }
         match nid {
-            Some(nid) => {
-                self.call_q.insert(nid, ret_qual);
+            Some(nid) if record => {
                 let context = self.context();
                 self.call_ctx.entry(nid).or_default().insert(context, cid);
                 self.callee_key.insert(nid, key.to_string());
             }
-            None => {
+            _ => {
                 self.unvectored.insert(cid);
             }
         }

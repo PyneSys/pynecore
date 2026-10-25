@@ -247,6 +247,7 @@ pub fn call<'py>(
                 ("WIDEN_SITE_ATTR", rules::WIDEN_SITE_ATTR),
                 ("WIDENS_ATTR", rules::WIDENS_ATTR),
                 ("WIDEN_FLOAT", rules::WIDEN_FLOAT),
+                ("WIDEN_BOOL", rules::WIDEN_BOOL),
                 ("WIDEN_ITEMS", rules::WIDEN_ITEMS),
                 ("WIDEN_MATRIX", rules::WIDEN_MATRIX),
                 ("WIDEN_STRING_NA", rules::WIDEN_STRING_NA),

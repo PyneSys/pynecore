@@ -3,7 +3,8 @@
 //!
 //! An int that goes into a float container becomes a float literal or
 //! `float(...)`; an int container copied into a float one is wrapped in
-//! `safe_convert.safe_float_items` / `safe_float_matrix`. A typeless `na` becomes
+//! `safe_convert.safe_float_items` / `safe_float_matrix`; a number passed to a lib
+//! `bool` parameter in `safe_convert.safe_bool`. A typeless `na` becomes
 //! the na of the type it goes in as (`''`, `lib._na_float`, the text `'na'`,
 //! `lib.na(<class>)`); one held rather than spelled is wrapped in
 //! `safe_convert.implicit_convert(value, kind)`, and a value converted per
@@ -22,10 +23,10 @@ use pyne_ast::{
 };
 
 use crate::pine_type_rules::{
-    CONTAINER_NA_WIDENS, FLOAT, OBJECT, STR, WIDEN_ATTR, WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX,
-    WIDEN_NA_TEXT, WIDEN_NUMBER_NA, WIDEN_SITE_ATTR, WIDEN_STRING_NA, array_of, class_of,
-    get_na_class, get_ty, is_na_literal, is_na_widen, matrix_of, set_ty, set_widen, set_widen_site,
-    stamp_lowering,
+    BOOL, CONTAINER_NA_WIDENS, FLOAT, OBJECT, STR, WIDEN_ATTR, WIDEN_BOOL, WIDEN_FLOAT,
+    WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_NA_TEXT, WIDEN_NUMBER_NA, WIDEN_SITE_ATTR, WIDEN_STRING_NA,
+    array_of, class_of, get_na_class, get_ty, is_na_literal, is_na_widen, matrix_of, set_ty,
+    set_widen, set_widen_site, stamp_lowering,
 };
 use crate::{Context, Error};
 
@@ -178,6 +179,13 @@ impl ImplicitConversion {
                 let text = constant(ast, Constant::Str("na".to_string()));
                 let text = located(ast, text, node);
                 Ok(set_ty(ast, text, STR))
+            }
+            WIDEN_BOOL => {
+                self.needs_import = true;
+                let func = module_attr(ast, "safe_convert", "safe_bool");
+                let converted = call(ast, func, vec![node]);
+                let converted = located(ast, converted, node);
+                Ok(stamp_lowering(ast, converted, BOOL))
             }
             WIDEN_FLOAT => {
                 if let Some(literal) = int_literal(ast, node)? {

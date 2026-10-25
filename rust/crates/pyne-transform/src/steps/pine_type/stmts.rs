@@ -11,7 +11,7 @@ use crate::pine_type_rules::{
     FLOAT, INT, NUMERIC, OBJECT, PINE_LOOP, SCALARS, UNKNOWN, array_of, bare_wrapper, binop_type,
     class_of, element_of, elements_of, is_matrix, is_tuple, render_ty,
 };
-use crate::pine_type_table::Unknown;
+use crate::pine_type_table::{Unknown, qualify};
 
 /// One pass of a loop body.
 #[derive(Clone, Copy)]
@@ -235,8 +235,20 @@ impl Engine<'_, '_> {
         }
         let scope = self.scope();
         self.push_frame(Frame::new(&scope));
+        let class_name = facts::def_name(self.ast, stmt).to_string();
         let body = facts::def_body(self.ast, stmt).to_vec();
-        let walked = self.body(&body);
+        let walked = (|| {
+            for member in body {
+                if let Kind::FunctionDef { name, .. } = self.kind(member) {
+                    // A method is keyed under its class (see `collect_members`)
+                    let key = qualify(&self.scope(), &format!("{class_name}.{name}"));
+                    self.definition_keyed(member, key)?;
+                } else {
+                    self.stmt(member)?;
+                }
+            }
+            Ok(())
+        })();
         self.stack.pop();
         walked
     }

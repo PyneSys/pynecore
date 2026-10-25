@@ -48,6 +48,9 @@ pub const WIDENS_ATTR: &str = "_pine_widens";
 
 /// One int element, converted to float
 pub const WIDEN_FLOAT: &str = "f";
+/// A number passed to a `bool` parameter of a lib function, converted by Pine's
+/// tolerant float-to-bool rule, na included
+pub const WIDEN_BOOL: &str = "B";
 /// An int array whose elements are copied in, converted
 pub const WIDEN_ITEMS: &str = "a";
 /// An int matrix whose elements are copied in, converted

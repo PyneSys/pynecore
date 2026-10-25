@@ -14,12 +14,12 @@ use crate::data::{self, LibEntry};
 use crate::pine_qualifier::{SERIES, SERIES_LENGTH_KEYWORD, WINDOW_CALLS, window_length};
 use crate::pine_type_rules::{
     BOOL, CONTAINER_NA_WIDENS, CallRule, FIT_REQUIRED, FLOAT, INT, ImplSig, NUMERIC, OBJECT,
-    PIN_ANY, SCALARS, STR, TYPELESS, UNKNOWN, VOID, WIDEN_ARRAY_NA, WIDEN_FLOAT, WIDEN_MAP_NA,
-    WIDEN_NA_TEXT, WIDEN_NUMBER_NA, WIDEN_STRING_NA, array_of, class_of, default_fit, element_of,
-    get_ty, is_array, is_map, is_matrix, is_na_text_param, is_na_widen, is_not_pine_string, join,
-    key_of, lib_type_override, matrix_of, object_ty, overload_binding, overload_choice,
-    overload_result, override_param_names, pin_chars, pin_for, render_ty, set_na_class, set_pin,
-    set_pins, set_widen, shape_conflict, value_of,
+    PIN_ANY, SCALARS, STR, TYPELESS, UNKNOWN, VOID, WIDEN_ARRAY_NA, WIDEN_BOOL, WIDEN_FLOAT,
+    WIDEN_MAP_NA, WIDEN_NA_TEXT, WIDEN_NUMBER_NA, WIDEN_STRING_NA, array_of, class_of, default_fit,
+    element_of, get_ty, is_array, is_map, is_matrix, is_na_text_param, is_na_widen,
+    is_not_pine_string, join, key_of, lib_type_override, matrix_of, object_ty, overload_binding,
+    overload_choice, overload_result, override_param_names, pin_chars, pin_for, render_ty,
+    set_na_class, set_pin, set_pins, set_widen, shape_conflict, value_of,
 };
 use crate::pine_type_table::{CallSite, Diag, Unknown};
 
@@ -441,6 +441,17 @@ impl Engine<'_, '_> {
                 continue;
             }
             let passed = get_ty(self.ast, arg).to_string();
+            if declared == BOOL {
+                // A number goes into a bool parameter by Pine's tolerant
+                // float-to-bool rule; the lib function itself tests the value with
+                // Python's truthiness, which takes a nan for true
+                let numeric = NUMERIC.contains(&passed.as_str());
+                let kind = if numeric { WIDEN_BOOL } else { WIDEN_HARMLESS };
+                self.record_widen(arg, Some(kind.to_string()))?;
+                if numeric {
+                    continue;
+                }
+            }
             if unchecked(&passed) || fits(&declared, &passed) {
                 continue;
             }

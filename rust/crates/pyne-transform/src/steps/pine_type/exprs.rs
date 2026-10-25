@@ -316,8 +316,9 @@ impl Engine<'_, '_> {
                 return Ok(found.clone());
             }
             let declared_here =
-                self.class_methods.get(cid).is_some_and(|methods| methods.contains_key(&attr));
-            if sig.methods.contains_key(&attr) || declared_here {
+                self.class_methods.get(cid).is_some_and(|methods| methods.contains_key(&attr))
+                    || self.members.get(cid).is_some_and(|members| members.contains_key(&attr));
+            if sig.methods.contains_key(&attr) || sig.members.contains_key(&attr) || declared_here {
                 return Ok(OBJECT.to_string());
             }
             let name = sig.name.clone();

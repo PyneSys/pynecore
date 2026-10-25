@@ -223,6 +223,7 @@ impl<'py> Classes<'py> {
             fields: dict(&get("fields")?, string, string)?,
             required: int(&get("required")?)?,
             methods: dict(&get("methods")?, string, |item| self.export_sig_from(item))?,
+            members: dict(&get("members")?, string, |item| self.export_sig_from(item))?,
         })
     }
 
@@ -433,6 +434,7 @@ impl<'py> Classes<'py> {
         kwargs.set_item("fields", fields)?;
         kwargs.set_item("required", sig.required)?;
         kwargs.set_item("methods", self.export_sigs_to(&sig.methods)?)?;
+        kwargs.set_item("members", self.export_sigs_to(&sig.members)?)?;
         self.class_sig.call((), Some(&kwargs))
     }
 }

@@ -170,6 +170,9 @@ struct Engine<'a, 'h> {
     type_imports: HashMap<String, String>,
     class_sigs: HashMap<String, Rc<ClassSig>>,
     class_methods: IndexMap<String, IndexMap<String, NodeId>>,
+    /// Class id -> method name -> (its key in `funcs`, the scope the class stands in),
+    /// for the methods declared in this module's class bodies (`_members`)
+    members: IndexMap<String, IndexMap<String, (String, String)>>,
     shape_diags: HashSet<i64>,
     shape_diags_named: HashSet<(i64, String)>,
     factory_fields: HashSet<NodeId>,
@@ -255,6 +258,7 @@ impl<'a, 'h> Engine<'a, 'h> {
             type_imports: HashMap::new(),
             class_sigs,
             class_methods: IndexMap::new(),
+            members: IndexMap::new(),
             shape_diags: HashSet::new(),
             shape_diags_named: HashSet::new(),
             factory_fields: HashSet::new(),

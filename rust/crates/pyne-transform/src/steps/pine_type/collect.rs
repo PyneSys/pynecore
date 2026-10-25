@@ -7,8 +7,8 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use indexmap::IndexMap;
-use pyne_ast::walk::walk_statements;
-use pyne_ast::{Kind, NodeId};
+use pyne_ast::walk::{copy_location, walk_statements};
+use pyne_ast::{Constant, Kind, NodeId};
 
 use super::facts::{self, arg_parts, args_of, every_param, is_method, is_overload, pos};
 use super::{Engine, Import, R, Shadowed};
@@ -35,6 +35,7 @@ pub(super) fn lib_classes() -> &'static IndexMap<String, ClassSig> {
                     fields,
                     required: 0,
                     methods: IndexMap::new(),
+                    members: IndexMap::new(),
                 };
                 (cid, sig)
             })
@@ -229,6 +230,7 @@ impl Engine<'_, '_> {
                 fields,
                 required,
                 methods: IndexMap::new(),
+                members: IndexMap::new(),
             };
             self.class_sigs_table.insert(cid, sig);
         }
@@ -284,54 +286,99 @@ impl Engine<'_, '_> {
     /// Record every definition and its annotated signature (`_collect`).
     pub(super) fn collect(&mut self, body: &[NodeId], scope: &str) -> R<()> {
         for &stmt in body {
-            let (name, returns) = match self.kind(stmt) {
-                Kind::FunctionDef { name, returns, .. }
-                | Kind::AsyncFunctionDef { name, returns, .. } => (name.clone(), *returns),
+            match self.kind(stmt) {
+                Kind::FunctionDef { name, .. } | Kind::AsyncFunctionDef { name, .. } => {
+                    let key = qualify(scope, name);
+                    self.collect_def(stmt, key)?;
+                }
+                Kind::ClassDef { .. } => self.collect_members(stmt, scope)?,
                 _ => {
                     for nested in facts::statement_lists(self.ast, stmt) {
                         self.collect(&nested, scope)?;
                     }
-                    continue;
-                }
-            };
-            let key = qualify(scope, &name);
-            self.defs.entry(key.clone()).or_default().push(stmt);
-            let args = args_of(self.ast, stmt).map(|args| args.positional()).unwrap_or_default();
-            let mut params = Vec::with_capacity(args.len());
-            for arg in args {
-                params.push(self.annotation_type(arg_parts(self.ast, arg).1)?);
-            }
-            let mut declared = self.annotation_type(returns)?;
-            let mut annotated = declared != UNKNOWN;
-            if is_overload(self.ast, stmt) {
-                self.overload_groups.insert(key.clone());
-                let returns = self.group_returns.entry(key.clone()).or_default();
-                if let Some(nid) = facts::nid(self.ast, stmt) {
-                    self.group_slot.insert(nid, returns.len());
-                }
-                returns.push(declared);
-                declared = overload_result(returns).to_string();
-                annotated = annotated && self.annotated_returns.get(&key).copied().unwrap_or(true);
-            }
-            let line = facts::line(self.ast, stmt);
-            self.funcs
-                .insert(key.clone(), FuncSig { name: name.clone(), params, ret: declared, line });
-            self.annotated_returns.insert(key.clone(), annotated);
-            let mut own: Vec<String> = every_param(self.ast, stmt)
-                .into_iter()
-                .map(|arg| facts::arg_name(self.ast, arg))
-                .collect();
-            if let Some(args) = args_of(self.ast, stmt) {
-                for arg in [args.vararg, args.kwarg].into_iter().flatten() {
-                    own.push(facts::arg_name(self.ast, arg));
                 }
             }
-            let facts = self.scope_facts(stmt);
-            let entry = self.rebound.entry(key.clone()).or_default();
-            entry.extend(own);
-            entry.extend(facts.bound.iter().cloned());
-            let inner = facts::def_body(self.ast, stmt).to_vec();
-            self.collect(&inner, &key)?;
+        }
+        Ok(())
+    }
+
+    /// Record one definition and its annotated signature under its key (`_collect_def`).
+    fn collect_def(&mut self, stmt: NodeId, key: String) -> R<()> {
+        let (name, returns) = match self.kind(stmt) {
+            Kind::FunctionDef { name, returns, .. }
+            | Kind::AsyncFunctionDef { name, returns, .. } => (name.clone(), *returns),
+            _ => return Ok(()),
+        };
+        self.defs.entry(key.clone()).or_default().push(stmt);
+        let args = args_of(self.ast, stmt).map(|args| args.positional()).unwrap_or_default();
+        let mut params = Vec::with_capacity(args.len());
+        for arg in args {
+            params.push(self.annotation_type(arg_parts(self.ast, arg).1)?);
+        }
+        let mut declared = self.annotation_type(returns)?;
+        let mut annotated = declared != UNKNOWN;
+        if is_overload(self.ast, stmt) {
+            self.overload_groups.insert(key.clone());
+            let returns = self.group_returns.entry(key.clone()).or_default();
+            if let Some(nid) = facts::nid(self.ast, stmt) {
+                self.group_slot.insert(nid, returns.len());
+            }
+            returns.push(declared);
+            declared = overload_result(returns).to_string();
+            annotated = annotated && self.annotated_returns.get(&key).copied().unwrap_or(true);
+        }
+        let line = facts::line(self.ast, stmt);
+        self.funcs.insert(key.clone(), FuncSig { name, params, ret: declared, line });
+        self.annotated_returns.insert(key.clone(), annotated);
+        let mut own: Vec<String> = every_param(self.ast, stmt)
+            .into_iter()
+            .map(|arg| facts::arg_name(self.ast, arg))
+            .collect();
+        if let Some(args) = args_of(self.ast, stmt) {
+            for arg in [args.vararg, args.kwarg].into_iter().flatten() {
+                own.push(facts::arg_name(self.ast, arg));
+            }
+        }
+        let facts = self.scope_facts(stmt);
+        let entry = self.rebound.entry(key.clone()).or_default();
+        entry.extend(own);
+        entry.extend(facts.bound.iter().cloned());
+        let inner = facts::def_body(self.ast, stmt).to_vec();
+        self.collect(&inner, &key)
+    }
+
+    /// Record the methods a class body declares (`_collect_members`): each keyed under
+    /// its class (`Pair.m`), a plain one's unannotated receiver annotated with the
+    /// class name as a string.
+    fn collect_members(&mut self, stmt: NodeId, scope: &str) -> R<()> {
+        let class_name = facts::def_name(self.ast, stmt).to_string();
+        let cid = self.classes.get(&class_name).cloned();
+        for member in facts::def_body(self.ast, stmt).to_vec() {
+            let Kind::FunctionDef { name, .. } = self.kind(member) else { continue };
+            let name = name.clone();
+            let positional =
+                args_of(self.ast, member).map(|args| args.positional()).unwrap_or_default();
+            let plain = facts::decorators(self.ast, member).is_empty();
+            if plain
+                && let Some(&receiver) = positional.first()
+                && arg_parts(self.ast, receiver).1.is_none()
+            {
+                let annotation = self
+                    .ast
+                    .add(Kind::Constant { value: Constant::Str(class_name.clone()), kind: None });
+                copy_location(self.ast, annotation, receiver);
+                if let Kind::Arg { annotation: slot, .. } = self.ast.kind_mut(receiver) {
+                    *slot = Some(annotation);
+                }
+            }
+            let key = qualify(scope, &format!("{class_name}.{name}"));
+            self.collect_def(member, key.clone())?;
+            if plain
+                && let Some(cid) = &cid
+                && !name.starts_with('_')
+            {
+                self.members.entry(cid.clone()).or_default().insert(name, (key, scope.to_string()));
+            }
         }
         Ok(())
     }
@@ -348,36 +395,7 @@ impl Engine<'_, '_> {
         for (cid, methods) in self.class_methods.clone() {
             for (name, node) in methods {
                 let key = keys.get(&node).cloned().unwrap_or_default();
-                let Some(func) = self.funcs.get(&key) else { continue };
-                let ret = func.ret.clone();
-                let shape = impl_sig(
-                    self.ast,
-                    node,
-                    &ret,
-                    &|value| self.ty_of(value),
-                    &self.classes_lookup,
-                )?;
-                let positional =
-                    args_of(self.ast, node).map(|args| args.positional()).unwrap_or_default();
-                let mut annotated = true;
-                for arg in positional {
-                    if self.annotation_type(arg_parts(self.ast, arg).1)? == UNKNOWN {
-                        annotated = false;
-                        break;
-                    }
-                }
-                let published = ExportSig {
-                    name: name.clone(),
-                    kind: "function".into(),
-                    params: shape.params,
-                    required: shape.required as i64,
-                    open_ended: shape.open_ended,
-                    ret: shape.ret,
-                    annotated,
-                    impls: Vec::new(),
-                    line: facts::line(self.ast, node),
-                    names: shape.names,
-                };
+                let Some(published) = self.published_method(&name, node, &key)? else { continue };
                 match self.class_sigs_table.get_mut(&cid) {
                     Some(sig) => {
                         sig.methods.insert(name, published);
@@ -388,6 +406,49 @@ impl Engine<'_, '_> {
                 }
             }
         }
+        for (cid, members) in self.members.clone() {
+            if !self.class_sigs_table.contains_key(&cid) {
+                continue;
+            }
+            for (name, (key, _)) in members {
+                let Some(&node) = self.defs.get(&key).and_then(|defs| defs.last()) else {
+                    continue;
+                };
+                if let Some(published) = self.published_method(&name, node, &key)?
+                    && let Some(sig) = self.class_sigs_table.get_mut(&cid)
+                {
+                    sig.members.insert(name, published);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The signature a method is published with, receiver first (`_published_method`).
+    fn published_method(&self, name: &str, node: NodeId, key: &str) -> R<Option<ExportSig>> {
+        let Some(func) = self.funcs.get(key) else { return Ok(None) };
+        let ret = func.ret.clone();
+        let shape =
+            impl_sig(self.ast, node, &ret, &|value| self.ty_of(value), &self.classes_lookup)?;
+        let positional = args_of(self.ast, node).map(|args| args.positional()).unwrap_or_default();
+        let mut annotated = true;
+        for arg in positional {
+            if self.annotation_type(arg_parts(self.ast, arg).1)? == UNKNOWN {
+                annotated = false;
+                break;
+            }
+        }
+        Ok(Some(ExportSig {
+            name: name.to_string(),
+            kind: "function".into(),
+            params: shape.params,
+            required: shape.required as i64,
+            open_ended: shape.open_ended,
+            ret: shape.ret,
+            annotated,
+            impls: Vec::new(),
+            line: facts::line(self.ast, node),
+            names: shape.names,
+        }))
     }
 }

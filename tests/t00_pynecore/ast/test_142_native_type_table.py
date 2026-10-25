@@ -37,6 +37,9 @@ class Point:
     n: int = 0
     tag: str = ""
 
+    def moved(self, d: float) -> float:
+        return self.x + d
+
 
 @method
 def shift(self: Point, d: float) -> float:
@@ -58,7 +61,8 @@ def pick(x: float) -> float:
 '''
 
 #: A script importing it: dependency records, an imported class, a method on that
-#: class, and a spoiled container that takes every pin away
+#: class, a call to a method its body declares, and a spoiled container that takes
+#: every pin away
 __test_helper_APP = '''"""
 @pyne
 """
@@ -75,7 +79,7 @@ def grow(self: Point, d: int) -> int:
 def main(x: int):
     p = Point(1.0, 2, "a")
     y = grow(p, x)
-    z = pick(y) + scale(1.5)
+    z = pick(y) + scale(1.5) + p.moved(0.5)
     ai = array.new_int(1, x)
     alias = ai
     array.concat(alias, ("x",))
@@ -121,14 +125,18 @@ def __test_helper_check_table(table: PineTypeTable, where: str) -> None:
 
 
 def __test_helper_check_node_ids(before: ast.Module, after: ast.Module, where: str) -> None:
-    """The native numbering of the type pass's input is the one the pass stamped."""
+    """The native numbering of the type pass's input is the one the pass stamped. A node
+    the pass adds after the numbering (a class-body method's receiver annotation) has
+    no id, and no counterpart in the input."""
     from pynecore.transformers import _native
 
     numbered, next_native = _native._node_ids(copy.deepcopy(before))
     assert next_native == assign_node_ids(copy.deepcopy(before)), where
     fieldless = (ast.expr_context, ast.operator, ast.unaryop, ast.cmpop, ast.boolop)
+    stamped = [node for node in ast.walk(after)
+               if isinstance(node, fieldless) or hasattr(node, ID_ATTR)]
     compared = 0
-    for want, got in zip(ast.walk(after), ast.walk(numbered), strict=True):
+    for want, got in zip(stamped, ast.walk(numbered), strict=True):
         assert type(got) is type(want), where
         if not isinstance(want, fieldless):
             assert getattr(got, ID_ATTR) == getattr(want, ID_ATTR), (where, type(want).__name__)

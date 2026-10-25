@@ -231,6 +231,9 @@ pub struct ClassSig {
     pub required: i64,
     /// Method name -> its signature
     pub methods: IndexMap<String, ExportSig>,
+    /// Method name -> its signature, for the methods declared in the class body,
+    /// receiver first
+    pub members: IndexMap<String, ExportSig>,
 }
 
 /// Everything the inference learned about one module.
@@ -374,12 +377,17 @@ impl ClassSig {
             .iter()
             .map(|(name, sig)| Ok((name.clone(), ExportSig::from_json(sig)?)))
             .collect::<Result<IndexMap<_, _>, String>>()?;
+        let members = json_map(value, "members")?
+            .iter()
+            .map(|(name, sig)| Ok((name.clone(), ExportSig::from_json(sig)?)))
+            .collect::<Result<IndexMap<_, _>, String>>()?;
         Ok(ClassSig {
             name: json_str(value, "name")?,
             id: json_str(value, "id")?,
             fields,
             required: json_int(value, "required")?,
             methods,
+            members,
         })
     }
 }

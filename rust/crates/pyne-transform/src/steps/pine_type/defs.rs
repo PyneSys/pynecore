@@ -17,8 +17,14 @@ use crate::steps::dynamic_default::is_script_entry;
 impl Engine<'_, '_> {
     /// Type a definition's defaults, and decide when its body is walked (`_definition`).
     pub(super) fn definition(&mut self, node: NodeId) -> R<()> {
-        self.type_defaults(node, None)?;
         let key = crate::pine_type_table::qualify(&self.scope(), facts::def_name(self.ast, node));
+        self.definition_keyed(node, key)
+    }
+
+    /// [`Self::definition`] of a definition whose id is not its name in this scope
+    /// (a method, keyed under its class).
+    pub(super) fn definition_keyed(&mut self, node: NodeId, key: String) -> R<()> {
+        self.type_defaults(node, None)?;
         if self.overload_groups.contains(&key) || is_script_entry(self.ast, node) {
             self.declaration_context(&key, node)?;
             return Ok(());
