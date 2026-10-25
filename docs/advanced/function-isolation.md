@@ -155,6 +155,16 @@ Python forbids assignment expressions anywhere inside a comprehension's iterable
 
 Note: when the callee at a uniform site changes (`g = a if cond else b; g(x)`), the site is rebound with fresh state — state does not survive an `a -> b -> a` swap.
 
+### Methods declared in a class body
+
+A method written in a `@udt` class body is Pine's `method m(Type this)`, and its state belongs to the call site like any function's. It is a scope of its own, and a state-carrying one keeps the hidden state as its first parameter (`def m(__state__, self, x)`), so every binding, rollback and snapshot above treats it like any other definition. The class attribute is wrapped in the `__state_method__` descriptor:
+
+- through the class, `Pair.m` is the function itself, so `Pair.m(p, x)` is routed like a call to a same-module definition (`Pair.m(<state>, p, x)`);
+- through an instance, `p.m` is a binding whose call takes the state first and passes the receiver behind it. The site is uniform: `p.m` is a new object on every access, so the anchor rebinds on every call, keeping the state vector because the layout is the same, and a loop site still rolls the method's builtins back on every iteration of a bar;
+- `method_call('m', p)` finds the binding on the receiver and binds the function in the call site's dispatch entry, receiver first.
+
+A `@staticmethod` has no receiver and needs only its layout. Any other decorator on a state-carrying method is a transform-time error, because the decorator decides what the class attribute holds.
+
 ## Call Site Identifiers
 
 Each isolated call site gets an identifier built from the scope path, the callee path and an ordinal — for example `main·lib.ta.sma·0`. These appear in the layout's `children` tuple and in the debug `names`, so a state tree can be navigated by eye. The Unicode middle dot (`·`) separator prevents collisions with underscores in function names.
