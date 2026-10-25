@@ -10,6 +10,9 @@
 //! - a location-less statement anchors to the earliest line located inside it,
 //!   falling back to the innermost located ancestor's start;
 //! - every other location-less node anchors to its enclosing statement's point.
+//!
+//! [`anchor_at`] and [`anchor_all_at`] place synthetic code at the start point of
+//! the node it serves.
 
 use crate::walk::children;
 use crate::{Ast, Category, NodeId, Unsupported};
@@ -75,4 +78,42 @@ pub fn fix_locations(ast: &mut Ast, root: NodeId, line: i64, col: i64) -> Result
         }
     }
     Ok(())
+}
+
+fn stamp_point(ast: &mut Ast, id: NodeId, line: i64, col: i64) {
+    let loc = &mut ast[id].loc;
+    loc.lineno = Some(line);
+    loc.end_lineno = Some(line);
+    loc.col_offset = Some(col);
+    loc.end_col_offset = Some(col);
+}
+
+/// The start point of `source`; `Unsupported` where the Python helper fails on it.
+fn start_point(ast: &Ast, source: NodeId) -> Result<(i64, i64), Unsupported> {
+    let loc = ast[source].loc;
+    match (loc.lineno, loc.col_offset) {
+        (Some(line), Some(col)) => Ok((line, col)),
+        _ => Err(Unsupported(format!("anchoring at an unlocated {}", ast.name(source)))),
+    }
+}
+
+/// Locate a synthetic statement at the start POINT of the node it serves (`anchor_at`).
+pub fn anchor_at(ast: &mut Ast, node: NodeId, source: NodeId) -> Result<NodeId, Unsupported> {
+    let (line, col) = start_point(ast, source)?;
+    stamp_point(ast, node, line, col);
+    Ok(node)
+}
+
+/// Locate a synthetic subtree, every node of it, at the start POINT of `source`
+/// (`anchor_all_at`).
+pub fn anchor_all_at(ast: &mut Ast, node: NodeId, source: NodeId) -> Result<NodeId, Unsupported> {
+    let (line, col) = start_point(ast, source)?;
+    let mut stack = vec![node];
+    while let Some(id) = stack.pop() {
+        if ast.kind(id).class().located {
+            stamp_point(ast, id, line, col);
+        }
+        stack.extend(children(ast, id));
+    }
+    Ok(node)
 }

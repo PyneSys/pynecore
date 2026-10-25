@@ -253,6 +253,27 @@ pub fn fix_missing_locations(ast: &mut Ast, root: NodeId) {
     }
 }
 
+/// Index of the first statement after a leading docstring of `body` (`docstring_end`).
+pub fn docstring_end(ast: &Ast, body: &[NodeId]) -> usize {
+    usize::from(body.first().is_some_and(|&first| {
+        matches!(ast.kind(first), Kind::Expr { value }
+            if matches!(ast.kind(*value), Kind::Constant { value: crate::Constant::Str(_), .. }))
+    }))
+}
+
+/// Index of the first statement after the docstring and the `__future__` block
+/// (`future_end`).
+pub fn future_end(ast: &Ast, body: &[NodeId]) -> usize {
+    let mut index = docstring_end(ast, body);
+    while index < body.len()
+        && matches!(ast.kind(body[index]),
+            Kind::ImportFrom { module: Some(name), .. } if name == "__future__")
+    {
+        index += 1;
+    }
+    index
+}
+
 /// `copy.deepcopy` of a subtree: a node referenced twice within one copy (one
 /// `memo`) is copied once, and the stamped attributes are copied with the node,
 /// including the nodes they reference.
