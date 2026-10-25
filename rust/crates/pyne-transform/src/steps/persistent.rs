@@ -320,11 +320,9 @@ impl Persistent<'_> {
             let target = self.state_ref(ast, &scope, flag, ExprContext::Store);
             let done = constant(ast, Constant::Bool(true));
             let mark = assign(ast, target, done);
-            return Ok(Visited::Node(ast.add(Kind::If {
-                test,
-                body: vec![store, mark],
-                orelse: Vec::new(),
-            })));
+            let lazy = ast.add(Kind::If { test, body: vec![store, mark], orelse: Vec::new() });
+            copy_location(ast, lazy, id);
+            return Ok(Visited::Node(lazy));
         }
 
         // A bare-`na` default must be the na VALUE, not the `na` name -- at module
@@ -361,7 +359,9 @@ impl Persistent<'_> {
             if let Some((scope, slot)) = self.lookup(&var_name) {
                 let target = self.state_ref(ast, &scope, slot, ExprContext::Store);
                 let value = self.expr(ast, value);
-                return Visited::Node(assign(ast, target, value));
+                let assign = assign(ast, target, value);
+                copy_location(ast, assign, id);
+                return Visited::Node(assign);
             }
         }
         let new_targets: Vec<NodeId> =

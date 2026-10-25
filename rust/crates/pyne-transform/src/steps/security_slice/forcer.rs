@@ -15,10 +15,9 @@
 use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
-use pyne_ast::walk::{
-    children, clone, copy_location, fix_missing_locations, walk, walk_statements,
-};
-use pyne_ast::{Ast, Category, ExprContext, FieldMut, FieldRef, Kind, NodeId};
+use pyne_ast::locations::fix_locations;
+use pyne_ast::walk::{children, clone, copy_location, docstring_end, walk, walk_statements};
+use pyne_ast::{Ast, Category, ExprContext, FieldMut, FieldRef, Kind, NodeId, Unsupported};
 
 use super::{
     Aliases, CLONE_PREFIX, VARIP_TYPES, contains_write, is_def, is_dispatch_test, module_body,
@@ -75,7 +74,7 @@ pub(super) fn force_conditional_writes(
     module: NodeId,
     clone_id: NodeId,
     sids: &HashSet<String>,
-) -> bool {
+) -> Result<bool, Unsupported> {
     let hit = any_sid_write(sids);
     let mut outer: IndexMap<String, Vec<NodeId>> = IndexMap::new();
     for &node in module_body(ast, module) {
@@ -135,13 +134,14 @@ pub(super) fn force_conditional_writes(
     let body = forcer.func_body(ast, clone_id);
     *function_body_mut(ast, clone_id) = body;
     if shared_forcer.changed {
-        function_body_mut(ast, clone_id).splice(0..0, copies);
+        let at = docstring_end(ast, function_body(ast, clone_id));
+        function_body_mut(ast, clone_id).splice(at..at, copies);
         // The clone comes located, and so does every node the forcing makes (each
         // takes the location of the statement it is lifted from); only the copied
         // module-level definitions may still lack one.
-        fix_missing_locations(ast, clone_id);
+        fix_locations(ast, clone_id, 1, 0)?;
     }
-    forcer.changed || shared_forcer.changed
+    Ok(forcer.changed || shared_forcer.changed)
 }
 
 /// Names of the `def`s whose call can perform the target (`_reaching_defs`).

@@ -42,8 +42,9 @@ mod reach;
 
 use std::collections::{HashMap, HashSet};
 
-use pyne_ast::walk::{clone, copy_location, descendants, fix_missing_locations};
-use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId};
+use pyne_ast::locations::fix_locations;
+use pyne_ast::walk::{clone, copy_location, descendants};
+use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId, Unsupported};
 
 use self::facts::Collector;
 use self::reach::{Reach, declares_varip, pynecore_imported_names, rebound_names};
@@ -199,7 +200,7 @@ pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, E
         return Err(Error::Unsupported("SecuritySlice on a non-module".into()));
     }
     let mut reach = Reach::default();
-    let sliced = emit_clones(ast, module, &mut reach, ctx.security_slice_disabled);
+    let sliced = emit_clones(ast, module, &mut reach, ctx.security_slice_disabled)?;
     if let Some(contexts) = find_contexts(ast, module) {
         finalize_closed_shift(ast, module, contexts, &sliced, &mut reach);
     }
@@ -401,9 +402,9 @@ fn emit_clones(
     module: NodeId,
     reach: &mut Reach,
     disabled: bool,
-) -> HashMap<String, Vec<NodeId>> {
+) -> Result<HashMap<String, Vec<NodeId>>, Unsupported> {
     let (Some(contexts), Some(main)) = (find_contexts(ast, module), find_main(ast, module)) else {
-        return HashMap::new();
+        return Ok(HashMap::new());
     };
     let entries: Vec<(usize, String, NodeId)> = iter_contexts(ast, contexts)
         .into_iter()
@@ -453,15 +454,15 @@ fn emit_clones(
         // The unit's first member names the clone: its index is its own, so no
         // other unit can pick the same name.
         let name = format!("{CLONE_PREFIX}{}{CLONE_SUFFIX}", unit[0].0);
-        let clone = build_clone(ast, main, &main_body, &kept, &name);
+        let clone = build_clone(ast, main, &main_body, &kept, &name)?;
         let forced =
-            !guarded.is_empty() && forcer::force_conditional_writes(ast, module, clone, &guarded);
+            !guarded.is_empty() && forcer::force_conditional_writes(ast, module, clone, &guarded)?;
         if is_whole && !forced {
             // Nothing to gain: the clone would be ``main()`` itself.
             continue;
         }
         clones.push(clone);
-        clones.extend(bind_defaults(ast, "main", &name));
+        clones.extend(bind_defaults(ast, "main", &name)?);
         let body = match ast.kind(clone) {
             Kind::FunctionDef { body, .. } => body.clone(),
             _ => unreachable!(),
@@ -487,7 +488,7 @@ fn emit_clones(
         let insert_at = body.iter().position(|&stmt| stmt == main).expect("main in the module") + 1;
         body.splice(insert_at..insert_at, clones);
     }
-    sliced
+    Ok(sliced)
 }
 
 /// The units a backward slice serves, each with the statements it keeps
@@ -586,7 +587,7 @@ fn build_clone(
     main_body: &[NodeId],
     kept: &[usize],
     name: &str,
-) -> NodeId {
+) -> Result<NodeId, Unsupported> {
     let mut memo = HashMap::new();
     // ``copy.copy(main)``: the same fields and stamps, the stamped values shared
     let shallow = ast[main].clone();
@@ -624,15 +625,19 @@ fn build_clone(
     *slot_params = type_params;
     *slot_body = body;
     copy_location(ast, clone_id, main);
-    fix_missing_locations(ast, clone_id);
-    clone_id
+    fix_locations(ast, clone_id, 1, 0)?;
+    Ok(clone_id)
 }
 
 /// Statements rebinding the clone's parameter defaults to `main`'s
 /// (`_bind_defaults`). The values `main` was bound with include the configured
 /// inputs; the clone receives the same defaults without evaluating their
 /// expressions again.
-fn bind_defaults(ast: &mut Ast, main_name: &str, clone_name: &str) -> Vec<NodeId> {
+fn bind_defaults(
+    ast: &mut Ast,
+    main_name: &str,
+    clone_name: &str,
+) -> Result<Vec<NodeId>, Unsupported> {
     // The type pass is behind us, so every emitted expression carries its own
     // stamp; a function object's dunder is opaque runtime state.
     let place = |ast: &mut Ast, name: &str, attr: &str, ctx: ExprContext| {
@@ -646,8 +651,8 @@ fn bind_defaults(ast: &mut Ast, main_name: &str, clone_name: &str) -> Vec<NodeId
             let target = place(ast, clone_name, attr, ExprContext::Store);
             let value = place(ast, main_name, attr, ExprContext::Load);
             let stmt = ast.add(Kind::Assign { targets: vec![target], value, type_comment: None });
-            fix_missing_locations(ast, stmt);
-            stmt
+            fix_locations(ast, stmt, 1, 0)?;
+            Ok(stmt)
         })
         .collect()
 }

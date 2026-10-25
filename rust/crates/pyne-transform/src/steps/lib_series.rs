@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use pyne_ast::walk::{Transformer, Visited, generic_visit, walk_statements};
+use pyne_ast::walk::{Transformer, Visited, docstring_end, generic_visit, walk_statements};
 use pyne_ast::{Ast, ExprContext, Kind, NodeId};
 
 use crate::{Context, Error};
@@ -171,11 +171,12 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
     // Every function of a name gets the declarations collected under that name
     if !series.declarations_to_insert.is_empty() {
         for stmt in walk_statements(ast, module) {
-            let Kind::FunctionDef { name, .. } = ast.kind(stmt) else { continue };
+            let Kind::FunctionDef { name, body, .. } = ast.kind(stmt) else { continue };
             let Some(decls) = series.declarations_to_insert.get(name) else { continue };
             let decls = decls.clone();
+            let at = docstring_end(ast, body);
             let Kind::FunctionDef { body, .. } = ast.kind_mut(stmt) else { unreachable!() };
-            body.splice(0..0, decls);
+            body.splice(at..at, decls);
         }
     }
 

@@ -9,8 +9,10 @@
 
 use std::collections::HashMap;
 
-use pyne_ast::walk::{Transformer, Visited, generic_visit, walk, walk_statements};
-use pyne_ast::{Ast, CmpOperator, Constant, ExprContext, Kind, NodeId};
+use pyne_ast::walk::{
+    Transformer, Visited, docstring_end, future_end, generic_visit, walk, walk_statements,
+};
+use pyne_ast::{Ast, CmpOperator, ExprContext, Kind, NodeId};
 
 use crate::dynamic_default_guard::SENTINEL_NAME;
 use crate::{Context, Error};
@@ -26,14 +28,6 @@ const CONSTRUCTORS: [&str; 2] = ["pynecore.types.na.NA", "pynecore.lib.na"];
 
 fn name(ast: &mut Ast, id: &str, ctx: ExprContext) -> NodeId {
     ast.add(Kind::Name { id: id.to_string(), ctx })
-}
-
-fn is_str_constant(ast: &Ast, id: NodeId) -> bool {
-    matches!(ast.kind(id), Kind::Constant { value: Constant::Str(_), .. })
-}
-
-fn is_docstring(ast: &Ast, stmt: NodeId) -> bool {
-    matches!(ast.kind(stmt), Kind::Expr { value } if is_str_constant(ast, *value))
 }
 
 /// The last name of a `Name` / `Attribute` chain (the callee of a decorator call too).
@@ -152,13 +146,7 @@ impl NaBindings {
 /// Insert a generated import after the docstring and the `__future__` block.
 fn insert_import(ast: &mut Ast, module: NodeId, stmt: NodeId) {
     let Kind::Module { body, .. } = ast.kind(module) else { unreachable!() };
-    let mut insert_at = usize::from(body.first().is_some_and(|&first| is_docstring(ast, first)));
-    while insert_at < body.len()
-        && matches!(ast.kind(body[insert_at]),
-            Kind::ImportFrom { module: Some(name), .. } if name == "__future__")
-    {
-        insert_at += 1;
-    }
+    let insert_at = future_end(ast, body);
     let Kind::Module { body, .. } = ast.kind_mut(module) else { unreachable!() };
     body.insert(insert_at, stmt);
 }
@@ -332,9 +320,7 @@ impl DynamicDefault {
         if !prologue.is_empty() {
             self.changed = true;
             let (_, body, _) = function_parts(ast.kind(function)).expect("a function");
-            // Keep a leading docstring first
-            let insert_at =
-                usize::from(body.first().is_some_and(|&first| is_docstring(ast, first)));
+            let insert_at = docstring_end(ast, body);
             let (Kind::FunctionDef { body, .. } | Kind::AsyncFunctionDef { body, .. }) =
                 ast.kind_mut(function)
             else {

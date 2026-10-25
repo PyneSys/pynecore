@@ -3,12 +3,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use pyne_ast::walk::{Transformer, Visited, child_statements, clone, generic_visit, visit_field};
+use pyne_ast::locations::anchor_all_at;
+use pyne_ast::walk::{
+    Transformer, Visited, child_statements, clone, docstring_end, generic_visit, visit_field,
+};
 use pyne_ast::{Ast, Constant, FieldRef, Int, Kind, NodeId, Value};
 
 use super::builders::{
-    constant, default_gaps, lib_na, sec_read_call, sec_read_call_ltf, str_constant, wait_block,
-    write_block,
+    constant, default_gaps, lib_na, sec_read_call, sec_read_call_ltf, str_constant, write_block,
 };
 use super::collection::{
     binding_counts, collect_hoisted, extract_args, extract_ltf_args, find_forbidden_strategy_state,
@@ -237,16 +239,23 @@ impl Security {
                 }
             }
             let mut replacer = CallReplacer { ltf_sec_ids: &self.ltf_sec_ids };
+            // The blocks emitted for a sid, located at its call once the replacer is done
+            let mut emitted: Vec<(NodeId, String)> = Vec::new();
             for &call in &call_nodes_here {
                 let sid = sid_of(ast, call).to_string();
                 if runtime_sec_ids.contains(&sid) {
-                    new_body.push(self.inline_signal(ast, &sid));
+                    let signal = self.inline_signal(ast, &sid);
+                    emitted.push((signal, sid.clone()));
                 }
                 let expr = clone(ast, call_exprs[&sid], &mut HashMap::new());
                 let expr = replacer.replace(ast, expr);
-                new_body.push(write_block(ast, &sid, expr));
+                emitted.push((write_block(ast, &sid, expr), sid));
             }
-            new_body.push(replacer.replace_own_calls(ast, stmt));
+            let own = replacer.replace_own_calls(ast, stmt);
+            for (block, sid) in emitted {
+                new_body.push(self.at_call(ast, block, &sid));
+            }
+            new_body.push(own);
         }
         new_body
     }
@@ -455,6 +464,7 @@ impl Security {
             }
 
             self.all_contexts.insert(sec_id.clone(), entries);
+            self.sid_call.insert(sec_id.clone(), call);
             sec_ids.push(sec_id.clone());
         }
 
@@ -500,17 +510,28 @@ impl Security {
 
         let hoisted = collect_hoisted(ast, &hoistable, &needed_names);
         let hoisted_ids: HashSet<NodeId> = hoisted.iter().copied().collect();
-        let original_body: Vec<NodeId> = function_body(ast, node)
+        let mut original_body: Vec<NodeId> = function_body(ast, node)
             .iter()
             .copied()
             .filter(|stmt| !hoisted_ids.contains(stmt))
             .collect();
-        let mut new_body = hoisted;
+        let rest = original_body.split_off(docstring_end(ast, &original_body));
+        let mut new_body = original_body;
+        // The top block runs at function entry, or right after the bindings hoisted
+        // for it: it belongs to that point, whatever lines its arguments were cloned
+        // from
+        let anchor = hoisted.last().copied().unwrap_or(node);
+        new_body.extend(hoisted);
         if !top_sec_ids.is_empty() {
-            new_body.push(self.signal_block(ast, &top_sec_ids));
+            let block = self.signal_block(ast, &top_sec_ids);
+            if let Err(err) = anchor_all_at(ast, block, anchor) {
+                self.error.get_or_insert(err);
+            }
+            new_body.push(block);
         }
-        new_body.extend(self.transform_body(ast, original_body, &call_exprs, &runtime_sec_ids));
-        new_body.push(wait_block(ast, &sec_ids));
+        new_body.extend(self.transform_body(ast, rest, &call_exprs, &runtime_sec_ids));
+        let wait = self.wait_block(ast, &sec_ids);
+        new_body.push(wait);
         *function_body_mut(ast, node) = new_body;
 
         self.visit_nested_defs(ast, node)

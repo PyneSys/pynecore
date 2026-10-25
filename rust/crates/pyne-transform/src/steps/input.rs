@@ -4,7 +4,7 @@
 //! (`x = __pyne_getattr__(lib, x, lib.na)`), the reserved alias imported once.
 
 use indexmap::{IndexMap, IndexSet};
-use pyne_ast::walk::children;
+use pyne_ast::walk::{children, docstring_end, future_end};
 use pyne_ast::{Ast, Constant, ExprContext, Int, Kind, NodeId};
 
 use crate::{Context, Error};
@@ -147,8 +147,10 @@ impl Input {
             let value =
                 ast.add(Kind::Call { func, args: vec![lib, read, na], keywords: Vec::new() });
             let assign = ast.add(Kind::Assign { targets: vec![target], value, type_comment: None });
+            let Kind::FunctionDef { body, .. } = ast.kind(node) else { unreachable!() };
+            let at = docstring_end(ast, body);
             let Kind::FunctionDef { body, .. } = ast.kind_mut(node) else { unreachable!() };
-            body.insert(0, assign);
+            body.insert(at, assign);
         }
         self.current_function = previous;
     }
@@ -193,19 +195,7 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
         level: Some(0),
     });
     let Kind::Module { body, .. } = ast.kind(module) else { unreachable!() };
-    let mut position = 0;
-    if let Some(&first) = body.first()
-        && let Kind::Expr { value } = ast.kind(first)
-        && matches!(ast.kind(*value), Kind::Constant { value: Constant::Str(_), .. })
-    {
-        position = 1;
-    }
-    while position < body.len()
-        && matches!(ast.kind(body[position]),
-            Kind::ImportFrom { module: Some(name), .. } if name == "__future__")
-    {
-        position += 1;
-    }
+    let position = future_end(ast, body);
     let Kind::Module { body, .. } = ast.kind_mut(module) else { unreachable!() };
     body.insert(position, import);
     Ok(module)

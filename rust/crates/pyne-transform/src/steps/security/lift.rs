@@ -5,8 +5,9 @@
 use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
+use pyne_ast::locations::fix_locations;
 use pyne_ast::walk::{
-    Transformer, Visited, child_statements, children, clone, copy_location, fix_missing_locations,
+    Transformer, Visited, child_statements, children, clone, copy_location, docstring_end,
     generic_visit, walk,
 };
 use pyne_ast::{Ast, Category, CmpOperator, Constant, ExprContext, Kind, NodeId};
@@ -469,7 +470,8 @@ impl Security {
             Some((_, block)) => block,
             None => {
                 let block = guard_block(ast, Vec::new());
-                function_body_mut(ast, caller).insert(0, block);
+                let at = docstring_end(ast, function_body(ast, caller));
+                function_body_mut(ast, caller).insert(at, block);
                 block
             }
         };
@@ -481,7 +483,9 @@ impl Security {
             let new_call = func_call(ast, "__sec_signal__", call_args);
             let new_stmt = expr_stmt(ast, new_call);
             copy_location(ast, new_stmt, call);
-            fix_missing_locations(ast, new_stmt);
+            if let Err(err) = fix_locations(ast, new_stmt, 1, 0) {
+                self.error.get_or_insert(err);
+            }
             if_body_mut(ast, caller_block).push(new_stmt);
         }
         if if_body(ast, sig_block).is_empty() {
@@ -582,7 +586,9 @@ impl Security {
             let wait = func_call(ast, "__sec_wait__", vec![sid]);
             let new_stmt = expr_stmt(ast, wait);
             copy_location(ast, new_stmt, call);
-            fix_missing_locations(ast, new_stmt);
+            if let Err(err) = fix_locations(ast, new_stmt, 1, 0) {
+                self.error.get_or_insert(err);
+            }
             if_body_mut(ast, caller_block).push(new_stmt);
         }
     }

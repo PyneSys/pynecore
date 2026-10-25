@@ -37,8 +37,8 @@ pub mod rewrite;
 use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
-use pyne_ast::walk::clone;
-use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId, Value};
+use pyne_ast::walk::{clone, future_end};
+use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId, Unsupported, Value};
 
 use self::dependencies::DependencyAnalyzer;
 use self::predicates::has_security_call;
@@ -79,6 +79,8 @@ pub(crate) struct Security {
     module_hash: String,
     /// Sids whose `__sec_signal__` is emitted in the function's top block
     top_sec_ids: HashSet<String>,
+    /// The call each sid stands for: the blocks emitted for a sid run at its line
+    sid_call: HashMap<String, NodeId>,
     /// Runtime-resolved sids kept out of the top block because their call is not
     /// reached on every run
     deferred_by_reach: HashSet<String>,
@@ -88,6 +90,8 @@ pub(crate) struct Security {
     scopes: Vec<SeriesScope>,
     /// The binding counts [`Security::lowered_hoistable`] keeps per function
     binding_counts_memo: HashMap<NodeId, BindingCounts>,
+    /// A location the Python helpers fail on, answered `Unsupported`
+    error: Option<Unsupported>,
 }
 
 impl Security {
@@ -103,10 +107,12 @@ impl Security {
             hashed_file: None,
             module_hash: String::new(),
             top_sec_ids: HashSet::new(),
+            sid_call: HashMap::new(),
             deferred_by_reach: HashSet::new(),
             keep_top,
             scopes: Vec::new(),
             binding_counts_memo: HashMap::new(),
+            error: None,
         }
     }
 
@@ -151,6 +157,9 @@ impl Security {
             return Ok(node);
         }
         let (load_counts, signal_counts) = self.lift_helper_signals(ast, node);
+        if let Some(err) = self.error.take() {
+            return Err(err.into());
+        }
         self.analyze_dependencies(ast, node)?;
         // Dependencies are only known on the lowered module. A deferred signal
         // that turns out to be a producer must stay in the top block after all, so
@@ -188,7 +197,9 @@ impl Security {
         if self.needs_barmerge {
             let alias = ast.add(Kind::Alias { name: "pynecore.lib.barmerge".into(), asname: None });
             let import = ast.add(Kind::Import { names: vec![alias] });
-            module_body(ast, node).insert(0, import);
+            let Kind::Module { body, .. } = ast.kind(node) else { unreachable!() };
+            let at = future_end(ast, body);
+            module_body(ast, node).insert(at, import);
         }
         // __ltf_unzip__ transposes tuple-valued security_lower_tf() results
         if self.needs_ltf_unzip {
@@ -198,7 +209,9 @@ impl Security {
                 names: vec![alias],
                 level: Some(0),
             });
-            module_body(ast, node).insert(0, import);
+            let Kind::Module { body, .. } = ast.kind(node) else { unreachable!() };
+            let at = future_end(ast, body);
+            module_body(ast, node).insert(at, import);
         }
 
         let target =

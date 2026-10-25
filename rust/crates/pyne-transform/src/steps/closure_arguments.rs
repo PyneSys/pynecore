@@ -9,11 +9,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use pyne_ast::walk::{
-    Transformer, Visited, children, copy_location, fix_missing_locations, generic_visit, walk,
-    walk_statements,
-};
-use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId, Value};
+use pyne_ast::locations::{anchor_at, fix_locations};
+use pyne_ast::walk::{Transformer, Visited, children, generic_visit, walk, walk_statements};
+use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId, Unsupported, Value};
 
 use crate::{Context, Error};
 
@@ -240,6 +238,7 @@ struct ClosureArguments {
     closure_var_types: HashMap<String, NodeId>,
     /// Inner functions called as methods: their closure variables follow the receiver
     method_functions: HashSet<String>,
+    error: Option<Unsupported>,
 }
 
 /// The key of an inner function of `main`.
@@ -327,8 +326,11 @@ impl ClosureArguments {
                     let value = ast.add(Kind::Tuple { elts, ctx: ExprContext::Load });
                     let assign =
                         ast.add(Kind::Assign { targets: vec![target], value, type_comment: None });
-                    copy_location(ast, assign, id);
-                    fix_missing_locations(ast, assign);
+                    if let Err(err) = anchor_at(ast, assign, id)
+                        .and_then(|assign| fix_locations(ast, assign, 1, 0))
+                    {
+                        self.error.get_or_insert(err);
+                    }
                     marker = Some(assign);
                 } else {
                     let Kind::Arguments { args: positional, .. } = ast.kind_mut(args) else {
@@ -474,7 +476,11 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
         closure_vars,
         closure_var_types: collector.closure_var_types,
         method_functions,
+        error: None,
     };
     generic_visit(&mut transform, ast, module);
-    Ok(module)
+    match transform.error {
+        Some(err) => Err(err.into()),
+        None => Ok(module),
+    }
 }

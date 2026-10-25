@@ -4,7 +4,7 @@
 //! left, `==` / `!=` guarded by a runtime float test, and, in a module that keeps
 //! Pine's three-state bool, a tail that answers na for an na operand.
 
-use pyne_ast::walk::Visited;
+use pyne_ast::walk::{Visited, future_end};
 use pyne_ast::{
     Ast, BoolOperator, CmpOperator, Constant, ExprContext, Kind, NodeId, Operator, UnaryOperator,
     Value,
@@ -329,20 +329,7 @@ impl FloatTolerance {
             return;
         }
         let Kind::Module { body, .. } = ast.kind(node) else { return };
-        // After the docstring and the `__future__` block
-        let mut position = 0;
-        if let Some(&first) = body.first()
-            && let Kind::Expr { value } = ast.kind(first)
-            && matches!(ast.kind(*value), Kind::Constant { value: Constant::Str(_), .. })
-        {
-            position = 1;
-        }
-        while position < body.len()
-            && matches!(ast.kind(body[position]),
-                Kind::ImportFrom { module: Some(module), .. } if module == "__future__")
-        {
-            position += 1;
-        }
+        let position = future_end(ast, body);
         let alias =
             ast.add(Kind::Alias { name: "na_bool".into(), asname: Some(NA_BOOL_NAME.into()) });
         let import = ast.add(Kind::ImportFrom {

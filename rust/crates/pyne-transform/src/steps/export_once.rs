@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use pyne_ast::walk::children;
+use pyne_ast::walk::{children, docstring_end};
 use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId, UnaryOperator};
 
 use crate::{Context, Error};
@@ -136,12 +136,9 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
     let declaration =
         ast.add(Kind::AnnAssign { target, annotation, value: Some(value), simple: 1 });
 
-    // Keep the docstring first; the `global` must precede every use of its names
-    let docstring = body.first().is_some_and(|&first| {
-        matches!(ast.kind(first), Kind::Expr { value }
-            if matches!(ast.kind(*value), Kind::Constant { value: Constant::Str(_), .. }))
-    });
-    let insert_at = usize::from(docstring);
+    // A `global` must precede every use of the names it declares, so the prologue
+    // goes above any statement but the docstring
+    let insert_at = docstring_end(ast, &body);
     body.splice(insert_at..insert_at, [global, declaration]);
     let Kind::FunctionDef { body: main_body, .. } = ast.kind_mut(main) else { unreachable!() };
     *main_body = body;

@@ -4,7 +4,7 @@
 //! `_broker_requirements=ScriptRequirements(...)`, imported at the top of the module.
 
 use pyne_ast::locations::fix_locations;
-use pyne_ast::walk::{children, walk_statements};
+use pyne_ast::walk::{children, future_end, walk_statements};
 use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId};
 
 use crate::{Context, Error};
@@ -260,11 +260,7 @@ impl Requirements {
         if imported {
             return;
         }
-        // After the module docstring, which ImportLifter left the zeroth statement
-        let docstring = body.first().is_some_and(|&first| {
-            matches!(ast.kind(first), Kind::Expr { value }
-                if matches!(ast.kind(*value), Kind::Constant { value: Constant::Str(_), .. }))
-        });
+        let at = future_end(ast, body);
         let alias = ast.add(Kind::Alias { name: "ScriptRequirements".into(), asname: None });
         let import = ast.add(Kind::ImportFrom {
             module: Some("pynecore.core.broker.models".into()),
@@ -272,7 +268,7 @@ impl Requirements {
             level: Some(0),
         });
         let Kind::Module { body, .. } = ast.kind_mut(module) else { unreachable!() };
-        body.insert(usize::from(docstring), import);
+        body.insert(at, import);
     }
 }
 

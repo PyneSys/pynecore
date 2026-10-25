@@ -2,10 +2,9 @@
 //! `IBPersistentSeries` declaration into its persistent and `Series` halves, and drop
 //! the split types from the pynecore imports.
 
-use pyne_ast::walk::{
-    Transformer, Visited, copy_location, fix_missing_locations, generic_visit, walk_statements,
-};
-use pyne_ast::{Ast, ExprContext, Kind, NodeId};
+use pyne_ast::locations::fix_locations;
+use pyne_ast::walk::{Transformer, Visited, copy_location, generic_visit, walk_statements};
+use pyne_ast::{Ast, ExprContext, Kind, NodeId, Unsupported};
 
 use crate::{Context, Error};
 
@@ -36,7 +35,10 @@ fn is_pynecore(module: &Option<String>) -> bool {
     module.as_deref().is_some_and(|module| module.starts_with("pynecore"))
 }
 
-struct PersistentSeries;
+#[derive(Default)]
+struct PersistentSeries {
+    error: Option<Unsupported>,
+}
 
 impl PersistentSeries {
     /// Remove the split types from a pynecore import; an import left empty goes.
@@ -62,7 +64,7 @@ impl PersistentSeries {
     }
 
     /// Split a series-carrying persistent declaration into its two halves.
-    fn visit_ann_assign(ast: &mut Ast, id: NodeId) -> Visited {
+    fn visit_ann_assign(&mut self, ast: &mut Ast, id: NodeId) -> Visited {
         let Some(persistent) = persistent_half(ast, id) else { return Visited::Node(id) };
         let Kind::AnnAssign { target, annotation, value, .. } = ast.kind(id) else {
             unreachable!()
@@ -79,12 +81,16 @@ impl PersistentSeries {
         // The split stands where the declaration stood: a diagnostic on either half
         // has to point at the line the user wrote
         copy_location(ast, persistent_decl, id);
-        fix_missing_locations(ast, persistent_decl);
+        if let Err(err) = fix_locations(ast, persistent_decl, 1, 0) {
+            self.error.get_or_insert(err);
+        }
 
         let series_value = ast.add(Kind::Name { id: var_name.clone(), ctx: ExprContext::Load });
         let series_decl = declaration(ast, &var_name, "Series", series_type, Some(series_value));
         copy_location(ast, series_decl, id);
-        fix_missing_locations(ast, series_decl);
+        if let Err(err) = fix_locations(ast, series_decl, 1, 0) {
+            self.error.get_or_insert(err);
+        }
 
         Visited::Many(vec![persistent_decl, series_decl])
     }
@@ -112,7 +118,7 @@ impl Transformer for PersistentSeries {
     fn visit(&mut self, ast: &mut Ast, id: NodeId) -> Visited {
         match ast.kind(id) {
             Kind::ImportFrom { .. } => Self::visit_import_from(ast, id),
-            Kind::AnnAssign { .. } => Self::visit_ann_assign(ast, id),
+            Kind::AnnAssign { .. } => self.visit_ann_assign(ast, id),
             _ => {
                 generic_visit(self, ast, id);
                 Visited::Node(id)
@@ -141,6 +147,10 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
     if !candidate {
         return Ok(module);
     }
-    generic_visit(&mut PersistentSeries, ast, module);
-    Ok(module)
+    let mut transformer = PersistentSeries::default();
+    generic_visit(&mut transformer, ast, module);
+    match transformer.error {
+        Some(err) => Err(err.into()),
+        None => Ok(module),
+    }
 }

@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use pyne_ast::walk::{Transformer, Visited, children, generic_visit};
+use pyne_ast::walk::{Transformer, Visited, children, copy_location, docstring_end, generic_visit};
 use pyne_ast::{Ast, Category, Constant, ExprContext, Int, Kind, NodeId, Value};
 
 use crate::dynamic_default_guard::is_dynamic_default_guard;
@@ -92,6 +92,13 @@ fn assign(ast: &mut Ast, target: NodeId, value: NodeId) -> NodeId {
     ast.add(Kind::Assign { targets: vec![target], value, type_comment: None })
 }
 
+/// A buffer write standing in for the statement `source`, at its location.
+fn assign_at(ast: &mut Ast, target: NodeId, value: NodeId, source: NodeId) -> NodeId {
+    let assign = assign(ast, target, value);
+    copy_location(ast, assign, source);
+    assign
+}
+
 /// Whether a type annotation is `Series` or `Series[...]`.
 fn is_series_type(ast: &Ast, annotation: NodeId) -> bool {
     match ast.kind(annotation) {
@@ -113,11 +120,6 @@ fn series_elem(ast: &Ast, annotation: NodeId) -> Option<String> {
         }
         _ => None,
     }
-}
-
-fn is_docstring(ast: &Ast, stmt: NodeId) -> bool {
-    let Kind::Expr { value } = ast.kind(stmt) else { return false };
-    matches!(ast.kind(*value), Kind::Constant { value: Constant::Str(_), .. })
 }
 
 struct Series<'l> {
@@ -288,10 +290,7 @@ impl Series<'_> {
 
         if !param_inits.is_empty() {
             let Kind::FunctionDef { body, .. } = ast.kind(id) else { unreachable!() };
-            let mut insert_pos = 0;
-            if body.first().is_some_and(|&first| is_docstring(ast, first)) {
-                insert_pos = 1;
-            }
+            let mut insert_pos = docstring_end(ast, body);
             // A parameter whose default is dynamic arrives as the sentinel and gets
             // its value in the dynamic-default guard block; recording it above that
             // would put the sentinel into the series. The block is contiguous but
@@ -351,7 +350,7 @@ impl Series<'_> {
         let scope = self.current_scope.clone();
         let call = self.buffer_call(ast, &scope, slot, "add", vec![value])?;
         let target = name(ast, &var_name, ExprContext::Store);
-        Ok(Visited::Node(assign(ast, target, call)))
+        Ok(Visited::Node(assign_at(ast, target, call, id)))
     }
 
     /// Leave a parameter-default guard's own assignment alone: the guard gives a
@@ -399,7 +398,7 @@ impl Series<'_> {
                 let scope = self.current_scope.clone();
                 let call = self.buffer_call(ast, &scope, slot, "set", vec![value])?;
                 let target = name(ast, &var_name, ExprContext::Store);
-                return Ok(Visited::Node(assign(ast, target, call)));
+                return Ok(Visited::Node(assign_at(ast, target, call, id)));
             }
             if !self.current_scope.is_empty() {
                 self.local_vars.entry(self.current_scope.clone()).or_default().insert(var_name);
@@ -430,7 +429,7 @@ impl Series<'_> {
                         let read = name(ast, &elt_name, ExprContext::Load);
                         let call = self.buffer_call(ast, &scope, slot, "add", vec![read])?;
                         let target = name(ast, &elt_name, ExprContext::Store);
-                        stmts.push(assign(ast, target, call));
+                        stmts.push(assign_at(ast, target, call, id));
                     }
                     None => {
                         self.local_vars.entry(scope.clone()).or_default().insert(elt_name);
@@ -463,7 +462,7 @@ impl Series<'_> {
             let scope = self.current_scope.clone();
             let call = self.buffer_call(ast, &scope, slot, "set", vec![binop])?;
             let target = name(ast, &var_name, ExprContext::Store);
-            return Ok(Visited::Node(assign(ast, target, call)));
+            return Ok(Visited::Node(assign_at(ast, target, call, id)));
         }
         generic_visit(self, ast, id);
         Ok(Visited::Node(id))
@@ -508,7 +507,7 @@ impl Series<'_> {
                 ctx: ExprContext::Store,
             });
             let value = self.expr(ast, amount);
-            return Visited::Node(assign(ast, target, value));
+            return Visited::Node(assign_at(ast, target, value, id));
         }
         generic_visit(self, ast, id);
         Visited::Node(id)

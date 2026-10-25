@@ -6,8 +6,8 @@
 //! assigning each referenced cache from the real call. Which reads are rewired
 //! follows the measured TradingView scoping the Python module documents.
 
-use pyne_ast::walk::{Transformer, Visited, copy_location, generic_visit};
-use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId};
+use pyne_ast::walk::{Transformer, Visited, copy_location, docstring_end, generic_visit};
+use pyne_ast::{Ast, ExprContext, Kind, NodeId};
 
 use crate::{Context, Error};
 
@@ -147,13 +147,9 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
         prologue.push(ast.add(Kind::Assign { targets: vec![target], value, type_comment: None }));
     }
 
-    // Keep the docstring first; everything else in main may already read the caches
+    // Everything in main but the docstring may already read the caches
     let Kind::FunctionDef { body, .. } = ast.kind(main) else { unreachable!() };
-    let docstring = body.first().is_some_and(|&first| {
-        matches!(ast.kind(first), Kind::Expr { value }
-            if matches!(ast.kind(*value), Kind::Constant { value: Constant::Str(_), .. }))
-    });
-    let insert_at = usize::from(docstring);
+    let insert_at = docstring_end(ast, body);
     let Kind::FunctionDef { body, .. } = ast.kind_mut(main) else { unreachable!() };
     body.splice(insert_at..insert_at, prologue);
     Ok(module)

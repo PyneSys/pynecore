@@ -12,10 +12,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use pyne_ast::walk::{
-    clone, copy_location, descendants, fix_missing_locations, walk, walk_statements,
-};
-use pyne_ast::{Ast, ExprContext, FieldMut, FieldRef, Kind, NodeId};
+use pyne_ast::locations::anchor_all_at;
+use pyne_ast::walk::{clone, descendants, docstring_end, walk, walk_statements};
+use pyne_ast::{Ast, ExprContext, FieldMut, FieldRef, Kind, NodeId, Unsupported};
 
 use super::security::predicates::{has_security_call, is_security_call, is_security_lower_tf_call};
 use crate::{Context, Error};
@@ -260,7 +259,7 @@ fn is_static_arg(ast: &Ast, node: NodeId) -> bool {
 
 /// Pin a call site's static arguments as bindings at the top of the function
 /// (`_specialize`).
-fn specialize(ast: &mut Ast, function: NodeId, site: NodeId) {
+fn specialize(ast: &mut Ast, function: NodeId, site: NodeId) -> Result<(), Unsupported> {
     let (Kind::FunctionDef { args, .. } | Kind::AsyncFunctionDef { args, .. }) = ast.kind(function)
     else {
         unreachable!()
@@ -270,17 +269,17 @@ fn specialize(ast: &mut Ast, function: NodeId, site: NodeId) {
         unreachable!()
     };
     if vararg.is_some() || kwarg.is_some() || !posonlyargs.is_empty() {
-        return;
+        return Ok(());
     }
     let Kind::Call { args: site_args, keywords, .. } = ast.kind(site) else { unreachable!() };
     if site_args.iter().any(|&arg| matches!(ast.kind(arg), Kind::Starred { .. })) {
-        return;
+        return Ok(());
     }
     let mut named = Vec::with_capacity(keywords.len());
     for &keyword in keywords {
         let Kind::Keyword { arg, value } = ast.kind(keyword) else { unreachable!() };
         // A `**mapping` argument
-        let Some(arg) = arg else { return };
+        let Some(arg) = arg else { return Ok(()) };
         named.push((arg, *value));
     }
 
@@ -292,7 +291,7 @@ fn specialize(ast: &mut Ast, function: NodeId, site: NodeId) {
     let mut by_name = positional.clone();
     by_name.extend(kwonlyargs.iter().map(arg_name));
     if site_args.len() > positional.len() {
-        return;
+        return Ok(());
     }
     let mut bound: HashMap<&str, NodeId> = HashMap::new();
     for (index, &value) in site_args.iter().enumerate() {
@@ -300,7 +299,7 @@ fn specialize(ast: &mut Ast, function: NodeId, site: NodeId) {
     }
     for (arg, value) in named {
         if !by_name.contains(arg) {
-            return;
+            return Ok(());
         }
         bound.insert(arg, value);
     }
@@ -315,14 +314,16 @@ fn specialize(ast: &mut Ast, function: NodeId, site: NodeId) {
         let target = ast.add(Kind::Name { id: name, ctx: ExprContext::Store });
         let value = clone(ast, value, &mut HashMap::new());
         let assign = ast.add(Kind::Assign { targets: vec![target], value, type_comment: None });
-        copy_location(ast, assign, function);
-        fix_missing_locations(ast, assign);
-        pinned.push(assign);
+        // The value is cloned from the call site, but it is bound at the function's
+        // entry, as a parameter is
+        pinned.push(anchor_all_at(ast, assign, function)?);
     }
     if !pinned.is_empty() {
         let body = list_field(ast, function, "body").expect("a function has a body");
-        statements_mut(ast, body).splice(0..0, pinned);
+        let at = docstring_end(ast, statements(ast, body));
+        statements_mut(ast, body).splice(at..at, pinned);
     }
+    Ok(())
 }
 
 /// The whole-module fixpoint (`SecurityInstantiationTransformer`).
@@ -396,12 +397,13 @@ impl Instantiation {
     }
 
     /// Pin call-site constants into every single-site bearer (`_specialize_all`).
-    fn specialize_all(&mut self, ast: &mut Ast, module: NodeId) {
+    fn specialize_all(&mut self, ast: &mut Ast, module: NodeId) -> Result<(), Unsupported> {
         for (info, sites) in self.analyze(ast, module, 1) {
             if let [site] = sites[..] {
-                specialize(ast, info.node, site);
+                specialize(ast, info.node, site)?;
             }
         }
+        Ok(())
     }
 }
 
@@ -417,6 +419,6 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
             break;
         }
     }
-    pass.specialize_all(ast, module);
+    pass.specialize_all(ast, module)?;
     Ok(module)
 }

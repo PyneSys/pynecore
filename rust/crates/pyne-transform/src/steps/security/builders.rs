@@ -1,6 +1,7 @@
 //! The nodes the security protocol is written with (the builders of
 //! `SecurityTransformer`). They carry no location, as the Python builders.
 
+use pyne_ast::locations::anchor_at;
 use pyne_ast::walk::clone;
 use pyne_ast::{Ast, BoolOperator, CmpOperator, Constant, ExprContext, Int, Kind, NodeId};
 
@@ -130,6 +131,39 @@ impl Security {
         guard_block(ast, body)
     }
 
+    /// Locate a statement emitted for `sec_id` at its call's point (`_at_call`).
+    ///
+    /// The time a profile measures there, and the line a debugger stops on, is the
+    /// `request.security` call's. A call another pass built without a location
+    /// leaves the statement for `fix_locations` to anchor.
+    pub(crate) fn at_call(&mut self, ast: &mut Ast, stmt: NodeId, sec_id: &str) -> NodeId {
+        if let Some(&call) = self.sid_call.get(sec_id)
+            && ast[call].loc.lineno.is_some()
+            && let Err(err) = anchor_at(ast, stmt, call)
+        {
+            self.error.get_or_insert(err);
+        }
+        stmt
+    }
+
+    /// The chart-context wait block for function end (`_wait_block`). Each wait
+    /// stands at the line of the call whose round it settles: the time spent waiting
+    /// for a context is that call's cost.
+    pub(crate) fn wait_block(&mut self, ast: &mut Ast, sec_ids: &[String]) -> NodeId {
+        let test = is_none_check(ast);
+        let body = sec_ids
+            .iter()
+            .map(|sid| {
+                let constant = str_constant(ast, sid);
+                let call = func_call(ast, "__sec_wait__", vec![constant]);
+                let stmt = expr_stmt(ast, call);
+                self.at_call(ast, stmt, sid)
+            })
+            .collect();
+        let block = ast.add(Kind::If { test, body, orelse: Vec::new() });
+        self.at_call(ast, block, &sec_ids[0])
+    }
+
     /// A single inline signal for a runtime-dependent symbol / timeframe /
     /// lookahead (`_inline_signal`).
     pub(crate) fn inline_signal(&self, ast: &mut Ast, sec_id: &str) -> NodeId {
@@ -138,20 +172,6 @@ impl Security {
         let stmt = expr_stmt(ast, call);
         guard_block(ast, vec![stmt])
     }
-}
-
-/// The chart-context wait block for function end (`_wait_block`).
-pub(crate) fn wait_block(ast: &mut Ast, sec_ids: &[String]) -> NodeId {
-    let test = is_none_check(ast);
-    let body = sec_ids
-        .iter()
-        .map(|sid| {
-            let sid = str_constant(ast, sid);
-            let call = func_call(ast, "__sec_wait__", vec![sid]);
-            expr_stmt(ast, call)
-        })
-        .collect();
-    ast.add(Kind::If { test, body, orelse: Vec::new() })
 }
 
 /// The security-context write block (`_write_block`). It fires in the security
