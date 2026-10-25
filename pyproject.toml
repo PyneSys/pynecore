@@ -25,7 +25,7 @@ egg_info.egg_base = "build"
 
 [project]
 name = "pynesys-pynecore"
-version = "6.10.13" # PineVersion.Major.Minor
+version = "6.11.0" # PineVersion.Major.Minor
 description = "Pine Script-compatible Python runtime for indicators and strategies, validated against TradingView"
 authors = [{ name = "PYNESYS LLC", email = "hello@pynesys.com" }]
 readme = "README.md"
@@ -106,7 +106,7 @@ replay = "pynecore.providers.replay:ReplayProvider"
 [tool.cibuildwheel]
 build = "cp311-* cp312-* cp313-* cp314-*"
 skip = "*-win32 *-manylinux_i686 *-musllinux_i686"
-test-requires = ["pytest>=9.1", "pytest-spec"]
+test-requires = ["pytest>=9.1", "pytest-spec", "tzdata"]
 test-command = """\
 pytest -p no:cacheprovider \
 {project}/tests/t01_lib/t04_math/test_016_native_math_matches_python.py \
