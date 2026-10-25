@@ -5,7 +5,7 @@ title: "Data Management"
 description: "Managing OHLCV data with the PyneCore CLI"
 icon: "database"
 date: "2025-04-03"
-lastmod: "2026-07-28"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["CLI"]
@@ -315,17 +315,32 @@ pyne data aggregate /path/to/data_1D.ohlcv -tf 1M
 
 ### Supported Timeframe Combinations
 
-Only **upscaling** is supported — you can only aggregate from smaller to larger timeframes. The target timeframe must be evenly divisible by the source timeframe.
+Only **upscaling** is supported — you can only aggregate from smaller to larger timeframes, and
+every source bar has to fit inside a single target bar:
 
-| Source        | Valid Targets                              |
-|---------------|--------------------------------------------|
-| 1 (1 min)     | 5, 15, 30, 60, 240, 1D                    |
-| 5 (5 min)     | 15, 30, 60, 240, 1D                       |
-| 15 (15 min)   | 30, 60, 240, 1D                           |
-| 60 (1 hour)   | 240, 1D                                   |
-| 240 (4 hour)  | 1D                                        |
-| 1D (daily)    | 1W, 1M                                    |
-| 1W (weekly)   | 1M                                        |
+- **Intraday and daily targets** (`60`, `240`, `1D`, `3D`, …): the target's length must be an exact
+  multiple of the source's.
+- **Weekly and monthly targets** (`1W`, `2W`, `1M`, `3M`, …) are calendar periods without a fixed
+  length. The source must be an intraday timeframe that divides the day evenly, `1D`, or the same
+  calendar unit with a multiplier that divides the target's (`1M` → `3M`). Weekly bars cannot form
+  monthly ones, because a week can straddle two months.
+
+| Source        | Valid Targets                    |
+|---------------|----------------------------------|
+| 1 (1 min)     | 5, 15, 30, 60, 240, 1D, 1W, 1M   |
+| 5 (5 min)     | 15, 30, 60, 240, 1D, 1W, 1M      |
+| 15 (15 min)   | 30, 60, 240, 1D, 1W, 1M          |
+| 60 (1 hour)   | 240, 1D, 1W, 1M                  |
+| 240 (4 hour)  | 1D, 1W, 1M                       |
+| 1D (daily)    | 1W, 1M, 3M, 12M                  |
+| 1W (weekly)   | 2W, 4W                           |
+| 1M (monthly)  | 3M, 6M, 12M                      |
+
+Daily, weekly and monthly bars follow the trading day: on a market whose session opens the
+evening before (FX, futures), a daily bar belongs to the month of its trading day, and each monthly
+bar is stamped with the session open of its first trading day. An intraday source bar belongs to
+the trading day it ends in, so a bar that contains the session open already starts the new day; a
+session end inside the bar is where it ends.
 
 > **Note:** Downscaling (e.g., 1-hour to 5-minute) is not possible — it would require fabricating data that doesn't exist.
 
