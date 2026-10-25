@@ -9,11 +9,12 @@
 //! Request: `{"source": str, "path": str, "pyne_mode": str | null,
 //! "user_code": bool, "na_bool": bool, "sequential": bool,
 //! "security_slice_disabled": bool, "emit_layout": bool, "steps": [str],
-//! "include_attributes": bool, "libraries": {module: [served name]}}`. A step name
-//! may also be a phase's (its rules in one traversal, or one pass each with
-//! `sequential`) or one rule's. `libraries` stands in for the
-//! Python host's imports: a library is importable when it is listed, and serves
-//! the names listed for it.
+//! "include_attributes": bool, "libraries": {module: [served name]},
+//! "python": "major.minor"}`. A step name may also be a phase's (its rules in one
+//! traversal, or one pass each with `sequential`) or one rule's. `libraries` stands
+//! in for the Python host's imports: a library is importable when it is listed, and
+//! serves the names listed for it. `python` names the interpreter whose `repr` and
+//! `ast.unparse` the output follows, the newest one known when left out.
 //! Response: `{"dump": str}` (the `ast.dump` of the transformed module), or
 //! `{"rejected": str}` (the module is invalid), `{"unsupported": str}` (the
 //! native port does not cover it) or `{"error": str}` (a malformed request).
@@ -28,9 +29,14 @@ use serde_json::{Value, json};
 /// The host of a request: what the browser was handed instead of an interpreter.
 struct RequestHost {
     libraries: HashMap<String, HashSet<String>>,
+    python: (u32, u32),
 }
 
 impl pyne_transform::Host for RequestHost {
+    fn python(&self) -> (u32, u32) {
+        self.python
+    }
+
     fn import_library(&self, module: &str) -> Result<bool, Unsupported> {
         Ok(self.libraries.contains_key(module))
     }
@@ -72,7 +78,14 @@ fn transform(request: &str) -> Result<Value, Value> {
                 .collect()
         })
         .unwrap_or_default();
-    let host = RequestHost { libraries };
+    let python = match text("python") {
+        None => pyne_transform::data::newest_python(),
+        Some(version) => version
+            .split_once('.')
+            .and_then(|(major, minor)| Some((major.parse().ok()?, minor.parse().ok()?)))
+            .ok_or_else(|| json!({ "error": format!("python {version:?} is no major.minor") }))?,
+    };
+    let host = RequestHost { libraries, python };
     let ctx = pyne_transform::Context {
         path: text("path").unwrap_or_default(),
         pyne_mode: text("pyne_mode"),

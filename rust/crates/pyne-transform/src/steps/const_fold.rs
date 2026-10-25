@@ -8,9 +8,9 @@
 //!
 //! Python's numbers are modelled exactly where the port can: an int is an `i64`,
 //! and an int result that leaves it (or a literal that never fit) answers
-//! [`Error::Unsupported`], as does a `lib.math.round` with a positive precision
-//! (its scale is the platform `pow`) and an int true division with an operand
-//! beyond 2**53 (Python rounds the exact quotient).
+//! [`Error::Unsupported`], as does an int true division with an operand beyond
+//! 2**53 (Python rounds the exact quotient). A `lib.math.round` with a positive
+//! precision scales by the platform `pow`, as CPython's `math.pow` does.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -247,6 +247,132 @@ fn fold_round(number: Num) -> Eval {
     Ok(Some(Num::Float(if negative && units != 0.0 { -units } else { units })))
 }
 
+/// `lib.math.round(number, precision)` with a positive precision: the integer part
+/// kept, the fraction scaled by the reciprocal of `10**-precision` and rounded half
+/// away from zero, a near-tie decided on the exact product with a 1e-10 tolerance.
+fn fold_round_to(number: Num, precision: Num) -> Eval {
+    const MAX_PRECISION: f64 = 16.0;
+    let negative = compare(number, Num::Float(0.0)) == Ordering::Less;
+    let magnitude = number.float().abs();
+    let p = if compare(precision, Num::Float(MAX_PRECISION)) == Ordering::Greater {
+        MAX_PRECISION
+    } else {
+        precision.float()
+    };
+    let scale = 1.0 / platform_pow10(-p)?;
+    let fraction = magnitude % 1.0;
+    let scaled = fraction * scale;
+    let mut units = scaled.floor();
+    let offset = scaled - units - 0.5;
+    let slack = 1e-9 + scaled * 1.8e-15;
+    if -slack < offset && offset < slack {
+        if rounds_up_at_tie(fraction, scale, units) {
+            units += 1.0;
+        }
+    } else if offset > 0.0 {
+        units += 1.0;
+    }
+    let value = magnitude - fraction + units / scale;
+    // ``0.0 - value``: a negative number rounded away to nothing is 0, not -0
+    Ok(Some(Num::Float(if negative { 0.0 - value } else { value })))
+}
+
+/// `math.pow(10.0, y)`: the platform's own `pow`, as CPython calls it; WebAssembly
+/// has none, so it takes the correctly rounded power, what a good `pow` answers.
+#[cfg(not(target_arch = "wasm32"))]
+fn platform_pow10(y: f64) -> Result<f64, Error> {
+    Ok(10f64.powf(y))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn platform_pow10(y: f64) -> Result<f64, Error> {
+    crate::pow10::pow10(y).ok_or_else(|| unsupported("a power of ten too close to a tie"))
+}
+
+/// Whether the exact `fraction * scale - units` reaches the tie within 1e-10:
+/// `remainder * 10**10 >= (5 * 10**9 - 1) * denominator` over the exact ratios.
+fn rounds_up_at_tie(fraction: f64, scale: f64, units: f64) -> bool {
+    let (fraction_mantissa, fraction_exponent) = decompose(fraction);
+    let (scale_mantissa, scale_exponent) = decompose(scale);
+    // fraction * scale == product * 2**exponent exactly
+    let product = Big::from(u128::from(fraction_mantissa) * u128::from(scale_mantissa));
+    let exponent = fraction_exponent + scale_exponent;
+    // product * 2**exponent * 10**10 >= units * 10**10 + 5 * 10**9 - 1
+    let threshold = Big::from(units as u128 * 10_000_000_000 + 4_999_999_999);
+    let left = product.mul(10_000_000_000);
+    if exponent >= 0 {
+        left.shl(exponent as u32) >= threshold
+    } else {
+        left >= threshold.shl((-exponent) as u32)
+    }
+}
+
+/// A finite non-negative double as `mantissa * 2**exponent`.
+fn decompose(value: f64) -> (u64, i32) {
+    let bits = value.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1 << 52) - 1);
+    if biased == 0 { (fraction, -1074) } else { (fraction | (1 << 52), biased - 1075) }
+}
+
+/// An unsigned integer of any size, little-endian 64-bit limbs without leading zeros.
+#[derive(PartialEq, Eq)]
+struct Big(Vec<u64>);
+
+impl From<u128> for Big {
+    fn from(value: u128) -> Big {
+        Big(vec![value as u64, (value >> 64) as u64]).trimmed()
+    }
+}
+
+impl Big {
+    fn trimmed(mut self) -> Big {
+        while self.0.last() == Some(&0) {
+            self.0.pop();
+        }
+        self
+    }
+
+    fn mul(&self, factor: u64) -> Big {
+        let mut carry = 0u128;
+        let mut limbs = Vec::with_capacity(self.0.len() + 1);
+        for &limb in &self.0 {
+            let product = u128::from(limb) * u128::from(factor) + carry;
+            limbs.push(product as u64);
+            carry = product >> 64;
+        }
+        limbs.push(carry as u64);
+        Big(limbs).trimmed()
+    }
+
+    fn shl(&self, bits: u32) -> Big {
+        if self.0.is_empty() {
+            return Big(Vec::new());
+        }
+        let (words, bits) = ((bits / 64) as usize, bits % 64);
+        let mut limbs = vec![0u64; words];
+        let mut carry = 0u64;
+        for &limb in &self.0 {
+            limbs.push(if bits == 0 { limb } else { (limb << bits) | carry });
+            carry = if bits == 0 { 0 } else { limb >> (64 - bits) };
+        }
+        limbs.push(carry);
+        Big(limbs).trimmed()
+    }
+}
+
+impl PartialOrd for Big {
+    fn partial_cmp(&self, other: &Big) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Big {
+    fn cmp(&self, other: &Big) -> Ordering {
+        self.0.len().cmp(&other.0.len()).then_with(|| self.0.iter().rev().cmp(other.0.iter().rev()))
+    }
+}
+
 /// One of `_FOLD_EXACT`: the `lib.math` runtime function itself, `None` where
 /// it raises one of the errors the fold catches.
 fn fold_exact(name: &str, args: &[Num]) -> Eval {
@@ -302,7 +428,7 @@ fn fold_exact(name: &str, args: &[Num]) -> Eval {
             [number] => return fold_round(number),
             [number, precision] => {
                 if compare(precision, Num::Float(0.0)) == Ordering::Greater {
-                    return Err(unsupported("math.round with a positive precision"));
+                    return fold_round_to(number, precision);
                 }
                 return fold_round(number);
             }

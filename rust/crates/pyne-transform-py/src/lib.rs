@@ -64,6 +64,8 @@ fn dump(tree: &Bound<'_, PyAny>, include_attributes: bool) -> PyResult<String> {
 /// methods (``native._Host``).
 struct PyHost<'py> {
     object: Option<Bound<'py, PyAny>>,
+    /// The running interpreter's `(major, minor)`
+    python: (u32, u32),
 }
 
 impl PyHost<'_> {
@@ -82,7 +84,17 @@ impl PyHost<'_> {
     }
 }
 
+/// The running interpreter's `(major, minor)`.
+fn interpreter(py: Python<'_>) -> (u32, u32) {
+    let version = py.version_info();
+    (u32::from(version.major), u32::from(version.minor))
+}
+
 impl pyne_transform::Host for PyHost<'_> {
+    fn python(&self) -> (u32, u32) {
+        self.python
+    }
+
     fn import_library(&self, module: &str) -> Result<bool, pyne_ast::Unsupported> {
         self.ask("import_library", (module,))
     }
@@ -185,10 +197,6 @@ impl pyne_transform::Host for PyHost<'_> {
         self.ask("package_member", (directory, dotted))
     }
 
-    fn is_stdlib(&self, module: &str) -> Result<bool, pyne_ast::Unsupported> {
-        self.ask("is_stdlib", (module,))
-    }
-
     fn lib_route(&self, path: &str) -> Result<Option<String>, pyne_ast::Unsupported> {
         self.ask("lib_route", (path,))
     }
@@ -252,7 +260,7 @@ fn run<'py>(
     context: &Bound<'py, PyDict>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let get = |name: &str| context.get_item(name);
-    let host = PyHost { object: get("host")? };
+    let host = PyHost { object: get("host")?, python: interpreter(py) };
     let names: Vec<&str> = steps.iter().map(String::as_str).collect();
     let mut from = FromPython::new();
     if pyne_transform::reads_type_table(&names) {
@@ -322,6 +330,15 @@ fn run<'py>(
     Ok(module)
 }
 
+/// ``ast.unparse(node)`` of an expression written by the native side.
+#[pyfunction]
+#[pyo3(name = "_unparse")]
+fn unparse(node: &Bound<'_, PyAny>) -> PyResult<String> {
+    let mut from = FromPython::new();
+    let root = from.node(node)?;
+    pyne_transform::unparse::unparse(&from.ast, root, interpreter(node.py())).map_err(unsupported)
+}
+
 /// The ``ported.json`` manifest the extension was built with.
 #[pyfunction]
 fn ported_json() -> &'static str {
@@ -373,11 +390,13 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(phases, m)?)?;
     m.add_function(wrap_pyfunction!(plain_callees, m)?)?;
     m.add_function(wrap_pyfunction!(ported_json, m)?)?;
+    m.add_function(wrap_pyfunction!(unparse, m)?)?;
     m.add_function(wrap_pyfunction!(rules::call, m)?)?;
     m.add_function(wrap_pyfunction!(qualifier::call, m)?)?;
     m.add_function(wrap_pyfunction!(qualifier::registry, m)?)?;
     m.add_function(wrap_pyfunction!(fold::fdlibm_call, m)?)?;
     m.add_function(wrap_pyfunction!(fold::quantize_embed, m)?)?;
+    m.add_function(wrap_pyfunction!(fold::pow10, m)?)?;
     m.add_function(wrap_pyfunction!(fold::const_eval, m)?)?;
     m.add_function(wrap_pyfunction!(type_table::round_trip, m)?)?;
     m.add_function(wrap_pyfunction!(type_table::node_ids, m)?)?;

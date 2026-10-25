@@ -175,7 +175,7 @@ impl Engine<'_, '_> {
             return Ok(UNKNOWN.to_string());
         }
         let is_group = entry.is_some_and(|entry| entry.kind == "overloads");
-        let pin = self.pin(node, is_group);
+        let pin = self.pin(node, is_group)?;
         let (_, args, keywords) = facts::call_parts(self.ast, node).expect("a call");
         let (args, keywords) = (args.to_vec(), keywords.to_vec());
         let ty = self.lib_call_type(callee, &args, &keywords, argc, pin.as_deref())?;
@@ -470,7 +470,7 @@ impl Engine<'_, '_> {
     }
 
     /// The overload pin this call site justifies in the running context (`_pin`).
-    pub(super) fn pin(&mut self, node: NodeId, is_group: bool) -> Option<String> {
+    pub(super) fn pin(&mut self, node: NodeId, is_group: bool) -> R<Option<String>> {
         let mut pin = None;
         if let Some((_, args, keywords)) = facts::call_parts(self.ast, node)
             && is_group
@@ -485,11 +485,11 @@ impl Engine<'_, '_> {
 
     /// Merge this context's verdict into the node's pin and stamp both forms
     /// (`_record_pin`).
-    pub(super) fn record_pin(&mut self, node: NodeId, pin: Option<String>) -> Option<String> {
+    pub(super) fn record_pin(&mut self, node: NodeId, pin: Option<String>) -> R<Option<String>> {
         let Some(nid) = self.nid(node) else {
             set_pin(self.ast, node, pin.as_deref());
             set_pins(self.ast, node, None);
-            return pin;
+            return Ok(pin);
         };
         let at = (self.line(node), self.col(node));
         self.call_pos.insert(nid, at);
@@ -516,9 +516,7 @@ impl Engine<'_, '_> {
             for value in values {
                 rendered.push(match value {
                     None => "None".to_string(),
-                    Some(text) => {
-                        crate::unparse::str_repr(text).unwrap_or_else(|_| format!("{text:?}"))
-                    }
+                    Some(text) => crate::unparse::str_repr(text, self.host.python())?,
                 });
             }
             let func = facts::call_parts(self.ast, node).map(|(func, _, _)| func);
@@ -531,7 +529,7 @@ impl Engine<'_, '_> {
                 "annotate the parameters so every call site agrees",
             );
         }
-        pin
+        Ok(pin)
     }
 
     /// Merge this context's conversion verdict for a value into its stamp

@@ -355,18 +355,46 @@ def __test_native_ports_are_current__():
     assert native.current_steps() == frozenset(_native.steps())
 
 
+#: F-strings in the shapes and locations CPython 3.12+ gives them
+__test_helper_FSTRINGS = [
+    r"f'a{x}b'", r"f'{x!r:>{w}}'", r"'ab' f'{x}' 'cd'", r"f'{x=}'", r"f'{ x = !r:10}'",
+    r"f'\n{x}\t'", r"f'{{a}}{x}'", "f'''a\n{x}\nb'''", r"f''", r"f'a' '' f'{x}'",
+    r"u'' 'a' f'{x}'", r"'' u'a' f'{x}'", r"f'{x:}'", r"""f'{f"{x}"}'""", r"f'{x:{y}.{z}f}'",
+    "f'{\n x\n}'", "(f'{x}'\n 'a')", r"f'é{x}'", r"rf'\d{x}'", r"f'{x:{{}}}'",
+]
+
+
+def __test_helper_has_fstring(source: str) -> bool:
+    return any(isinstance(node, ast.JoinedStr) for node in ast.walk(ast.parse(source)))
+
+
 def __test_native_parse_matches_cpython__():
-    """The native parser builds CPython's tree, locations included."""
+    """The native parser builds CPython's tree, locations included. Its f-strings take
+    the shape of Python 3.12 and later, so a 3.11 interpreter compares the rest."""
     __test_helper_require_native()
     from pynecore.transformers import _native
 
     sources = [__test_helper_SOURCE] + [path.read_text() for path in __test_helper_inputs()]
+    sources += [f'x = {fstring}\n' for fstring in __test_helper_FSTRINGS]
     for source in sources:
-        try:
-            tree = _native.parse(source)
-        except _native.Unsupported:
+        if sys.version_info < (3, 12) and __test_helper_has_fstring(source):
             continue
+        tree = _native.parse(source)
         assert (ast.dump(tree, include_attributes=True)
+                == ast.dump(ast.parse(source), include_attributes=True)), source[:200]
+
+
+def __test_native_parse_defers_a_lone_surrogate__():
+    """A string literal spelling a lone surrogate, which a Rust string cannot hold, is
+    left to CPython rather than parsed into U+FFFD."""
+    __test_helper_require_native()
+    from pynecore.transformers import _native
+
+    for source in [r"x = '\ud800'", r"x = f'\udfff{y}'", r"x = 'a' '\U0000d800'"]:
+        with pytest.raises(_native.Unsupported):
+            _native.parse(source)
+    for source in [r"x = '\\ud800'", r"x = r'\ud800'", r"x = '�'"]:
+        assert (ast.dump(_native.parse(source), include_attributes=True)
                 == ast.dump(ast.parse(source), include_attributes=True))
 
 

@@ -63,6 +63,15 @@ pub fn fdlibm_call<'py>(
     Ok(packed(py, x.into_iter().map(function)))
 }
 
+/// The correctly rounded `10**y` of every packed float64 exponent, NaN where it is
+/// undecided (the power WebAssembly folds `math.round` with).
+#[pyfunction]
+#[pyo3(name = "_pow10")]
+pub fn pow10<'py>(py: Python<'py>, values: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+    let values = doubles(values)?;
+    Ok(packed(py, values.into_iter().map(|y| pyne_transform::pow10::pow10(y).unwrap_or(f64::NAN))))
+}
+
 /// `quantize_embed` of every packed float64 value.
 #[pyfunction]
 #[pyo3(name = "_quantize_embed")]

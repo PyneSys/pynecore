@@ -135,7 +135,7 @@ impl Engine<'_, '_> {
             });
             return Ok(UNKNOWN.to_string());
         }
-        let pin = self.pin(node, is_group);
+        let pin = self.pin(node, is_group)?;
         let ty = if is_group {
             let (_, args, keywords) = facts::call_parts(self.ast, node).expect("a call");
             let (args, keywords) = (args.to_vec(), keywords.to_vec());

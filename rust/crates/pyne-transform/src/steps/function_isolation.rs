@@ -807,7 +807,7 @@ impl FunctionIsolation<'_, '_> {
 
     /// Fresh, attribute-free copy of a callee expression located at the callee
     /// (`_copy_callee`).
-    fn copy_callee(ast: &mut Ast, func: NodeId) -> Result<NodeId, Error> {
+    fn copy_callee(ast: &mut Ast, func: NodeId, python: (u32, u32)) -> Result<NodeId, Error> {
         let loc = ast[func].loc;
         if let (Some(line), Some(col), Some(end_line), Some(end_col)) =
             (loc.lineno, loc.col_offset, loc.end_lineno, loc.end_col_offset)
@@ -815,7 +815,7 @@ impl FunctionIsolation<'_, '_> {
         {
             return Ok(copy);
         }
-        let text = crate::unparse::unparse(ast, func)?;
+        let text = crate::unparse::unparse(ast, func, python)?;
         if !text.is_ascii() {
             // The parser normalizes what is not ASCII
             return Err(Error::Unsupported(format!("reparsing the callee {text:?}")));
@@ -856,7 +856,7 @@ impl FunctionIsolation<'_, '_> {
     ) -> Result<NodeId, Error> {
         let param = self.state_param();
         let Kind::Call { func, .. } = ast.kind(node) else { unreachable!() };
-        let callee_copy = Self::copy_callee(ast, *func)?;
+        let callee_copy = Self::copy_callee(ast, *func, self.host.python())?;
         let state_expr = if in_loop || self.comp_iter_depth > 0 {
             let helper = if in_loop { "__loop_state__" } else { "__slot_state__" };
             let state = name(ast, &param, ExprContext::Load);
@@ -934,7 +934,7 @@ impl FunctionIsolation<'_, '_> {
             let callee_copy = name(ast, "__c·__", ExprContext::Load);
             (callee, callee_copy, Some(bind))
         } else {
-            (func, Self::copy_callee(ast, func)?, None)
+            (func, Self::copy_callee(ast, func, self.host.python())?, None)
         };
         let alias = self.helper("__bind_any__");
         let target = name(ast, "__b·__", ExprContext::Store);

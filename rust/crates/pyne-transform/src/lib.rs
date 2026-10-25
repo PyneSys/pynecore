@@ -17,6 +17,7 @@ pub mod phase;
 pub mod pine_qualifier;
 pub mod pine_type_rules;
 pub mod pine_type_table;
+pub mod pow10;
 pub mod sha1;
 pub mod slot_layout;
 pub mod steps;
@@ -65,6 +66,12 @@ impl std::error::Error for Error {}
 /// the Python host answers them from the registries the Python steps read, so a
 /// registry a test patches reaches both backends alike.
 pub trait Host {
+    /// The interpreter whose `repr` and `ast.unparse` the transform follows, as
+    /// `(major, minor)`; a host without one follows the newest it knows.
+    fn python(&self) -> (u32, u32) {
+        data::newest_python()
+    }
+
     /// Import a library module whose alias shadows a builtin namespace
     /// (`builtin_shadow.import_library`); false when it cannot be imported.
     fn import_library(&self, module: &str) -> Result<bool, Unsupported> {
@@ -172,12 +179,6 @@ pub trait Host {
     /// (`module_paths.package_member(Path(directory), dotted)`).
     fn package_member(&self, directory: &str, dotted: &str) -> Result<Option<String>, Unsupported> {
         Err(Unsupported(format!("no host to find {dotted} below {directory}")))
-    }
-
-    /// Whether a module belongs to Python's standard library
-    /// (`utils.stdlib_checker.is_stdlib(module)`).
-    fn is_stdlib(&self, module: &str) -> Result<bool, Unsupported> {
-        Err(Unsupported(format!("no host to ask whether {module} is stdlib")))
     }
 
     /// The call-site route of a lib callee path as a script spells it (`lib.ta.sma`),

@@ -24,8 +24,9 @@ def _section(name: str) -> frozenset[str]:
     :return: Its names
     """
     if not _NAMES:
-        _NAMES.update((section, frozenset(names))
-                      for section, names in json.loads(_PATH.read_text()).items())
+        document = json.loads(_PATH.read_text())
+        _NAMES.update((section, frozenset(document[section]))
+                      for section in ('builtins', 'keywords', 'stdlib'))
     return _NAMES[name]
 
 

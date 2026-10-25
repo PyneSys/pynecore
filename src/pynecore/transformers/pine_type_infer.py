@@ -49,7 +49,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
-from ..utils.stdlib_checker import is_stdlib
 from . import ast_walk
 from . import module_interface
 from .factory_fields import FactoryFields, dotted_name
@@ -85,6 +84,7 @@ from .pine_qualifier import (
     lib_call_qualifier, builtin_call_qualifier, window_length, get_series_lens,
     set_series_len, set_series_lens,
 )
+from .python_names import is_stdlib
 from .script_entry import is_script_entry
 
 __all__ = ['infer_module', 'lib_classes', 'lib_namespaces', 'lib_routes',

@@ -50,7 +50,7 @@ impl Engine<'_, '_> {
         if module == "pynecore" || module.starts_with("pynecore.") {
             return Ok(true);
         }
-        self.host.is_stdlib(module)
+        Ok(data::is_stdlib(module))
     }
 
     /// Record what the module's own imports bind (`_collect_imports`).

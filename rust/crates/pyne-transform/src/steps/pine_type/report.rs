@@ -448,7 +448,7 @@ impl<'e> Report<'e, '_, '_> {
                         Kind::Constant { value: Constant::Str(text), .. } => text.clone(),
                         _ => match dotted(ast, selector) {
                             Some(spelled) if !spelled.is_empty() => spelled,
-                            _ => crate::unparse::unparse(ast, selector)?,
+                            _ => crate::unparse::unparse(ast, selector, self.engine.host.python())?,
                         },
                     };
                     (
@@ -494,14 +494,16 @@ impl<'e> Report<'e, '_, '_> {
                 };
                 let over: Vec<String> =
                     operands.iter().map(|&operand| render_ty(get_ty(ast, operand))).collect();
-                let spelled = crate::unparse::unparse_prefix(ast, node, 40)?;
+                let spelled =
+                    crate::unparse::unparse_prefix(ast, node, 40, self.engine.host.python())?;
                 (
                     at("unknown-op", ast.name(node)),
                     format!("'{spelled}' has no known type over {}", over.join(", ")),
                 )
             }
             _ => {
-                let spelled = crate::unparse::unparse_prefix(ast, node, 40)?;
+                let spelled =
+                    crate::unparse::unparse_prefix(ast, node, 40, self.engine.host.python())?;
                 (at("not-pine", ast.name(node)), format!("'{spelled}' is not a Pine expression"))
             }
         };

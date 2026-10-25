@@ -11,6 +11,7 @@ import ast
 import math
 import random
 import struct
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 import pytest
@@ -366,11 +367,11 @@ def __test_native_const_eval_matches_python__():
 @pytest.mark.parametrize('source', [
     '9223372036854775807 + 1', '-(-9223372036854775807 - 1)', '3037000500 * 3037000500',
     '100000000000000000000', 'lib.math.abs(-9223372036854775807 - 1)',
-    '9007199254740993 / 1', 'lib.math.round(2.345, 2)', '-9223372036854775807 % 2 - 9',
+    '9007199254740993 / 1', '-9223372036854775807 % 2 - 9',
     'close + lib.math.sin(100000000000000000000)',
 ])
 def __test_native_const_eval_declines_beyond_its_model__(source):
-    """Python big ints, the round precision path and inexact int division stay Python's"""
+    """Python big ints and inexact int division stay Python's"""
     __test_helper_require_native()
     _native = __test_helper_native()
     node = ast.parse(source, mode='eval').body
@@ -412,3 +413,40 @@ def __test_native_const_fold_declines_a_big_int__():
     python_tree, native_tree = __test_helper_step('A = 2 ** 70\nB = 1180591620717411303424 + 1\n')
     assert native_tree is None
     assert isinstance(python_tree.body[1].value, ast.Constant)
+
+
+def __test_native_round_with_precision_folds_like_python__():
+    """``lib.math.round`` with a positive precision, ties and fractional precisions
+    included, folds to Python's value"""
+    __test_helper_require_native()
+    _native = __test_helper_native()
+    rnd = random.Random(20261025)
+    precisions = ['1', '2', '3', '5', '8', '16', '17', '400', '0.25', '0.75', '1.75', '2.5',
+                  '15.99', '16.001']
+    sources = [f'lib.math.round({number}, {precision})' for precision in precisions
+               for number in ('2.675', '-2.675', '13.887175', '63.986275', '0.149999999996838',
+                              '40000.0005', '99999.9995', '1e30', '0.0', '7', '-7')]
+    for _ in range(5_000):
+        number = rnd.choice((repr(round(rnd.uniform(-1e6, 1e6), rnd.randint(0, 8))),
+                             repr(rnd.uniform(-10.0, 10.0)), str(rnd.randint(-10 ** 6, 10 ** 6))))
+        precision = rnd.choice((str(rnd.randint(1, 18)), repr(round(rnd.uniform(0.01, 17), 3))))
+        sources.append(f'lib.math.round({number}, {precision})')
+    for source in sources:
+        node = ast.parse(source, mode='eval').body
+        got = _native._const_eval(node)
+        assert __test_helper_same(got, __test_helper_python_eval(node)), source
+
+
+def __test_native_pow10_is_correctly_rounded__():
+    """The power WebAssembly folds ``math.round`` with is the double nearest to 10**y"""
+    __test_helper_require_native()
+    _native = __test_helper_native()
+    rnd = random.Random(20261025)
+    exponents = [-rnd.uniform(0.0, 16.0) for _ in range(20_000)]
+    exponents += [-k / 1000 for k in range(16_001)]
+    packed = _native._pow10(struct.pack(f'<{len(exponents)}d', *exponents))
+    powers = struct.unpack(f'<{len(exponents)}d', packed)
+    with localcontext() as context:
+        context.prec = 60
+        for exponent, power in zip(exponents, powers):
+            assert power == float(Decimal(10) ** Decimal(exponent)), exponent

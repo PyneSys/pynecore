@@ -122,7 +122,7 @@ impl Engine<'_, '_> {
                 return Ok(UNKNOWN.to_string());
             }
         }
-        let pin = self.pin(node, is_group);
+        let pin = self.pin(node, is_group)?;
         let ty = if is_group {
             self.group_type(&key, pin.as_deref(), &args, &keywords)?
         } else {
@@ -418,7 +418,7 @@ impl Engine<'_, '_> {
         if self.overload_groups.contains(&key) {
             self.ensure_group(&key, frame)?;
             if !self.group_call_fits(&key, &name, node, Some(&args))? {
-                self.record_pin(node, None);
+                self.record_pin(node, None)?;
                 return Ok(Some(UNKNOWN.to_string()));
             }
             let (_, _, keywords) = facts::call_parts(self.ast, node).expect("a call");
@@ -428,7 +428,7 @@ impl Engine<'_, '_> {
                 Some(shapes) if keywords.is_empty() => pin_for(shapes),
                 _ => None,
             };
-            self.record_pin(node, pin.clone());
+            self.record_pin(node, pin.clone())?;
             return self.group_type(&key, pin.as_deref(), &args, &keywords).map(Some);
         }
         self.call_context(&key, node, frame, Some(&args), true).map(Some)

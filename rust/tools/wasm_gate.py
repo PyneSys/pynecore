@@ -67,7 +67,8 @@ def main() -> int:
         requests.append(json.dumps({'source': source, 'path': str(path),
                                     'pyne_mode': pyne_mode, 'user_code': user_code,
                                     'steps': [step.name for step in run],
-                                    'include_attributes': True}))
+                                    'include_attributes': True,
+                                    'python': f'{sys.version_info[0]}.{sys.version_info[1]}'}))
     result = subprocess.run(['node', str(RUST / 'tools' / 'wasm_gate.mjs'), str(WASM)],
                             input='\n'.join(requests) + '\n', capture_output=True, text=True,
                             check=True)

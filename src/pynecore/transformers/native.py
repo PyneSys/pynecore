@@ -57,7 +57,6 @@ from .pine_type_table import TABLE_ATTR, Analyser, module_table
 from .source_read import stable_source
 from .module_property import module_properties
 from .slot_layout import ModuleLayout
-from ..utils.stdlib_checker import is_stdlib
 
 try:
     from . import _native
@@ -303,10 +302,6 @@ class _Host:
     @staticmethod
     def package_member(directory: str, dotted: str) -> str | None:
         return package_member(Path(directory), dotted)
-
-    @staticmethod
-    def is_stdlib(module: str) -> bool:
-        return is_stdlib(module)
 
     @staticmethod
     def lib_route(path: str) -> str | None:

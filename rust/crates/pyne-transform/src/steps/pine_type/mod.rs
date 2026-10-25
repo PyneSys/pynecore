@@ -301,11 +301,11 @@ impl<'a, 'h> Engine<'a, 'h> {
     }
 
     fn unparse(&self, node: NodeId) -> R<String> {
-        crate::unparse::unparse(self.ast, node)
+        crate::unparse::unparse(self.ast, node, self.host.python())
     }
 
     fn unparse_prefix(&self, node: NodeId, limit: usize) -> R<String> {
-        crate::unparse::unparse_prefix(self.ast, node, limit)
+        crate::unparse::unparse_prefix(self.ast, node, limit, self.host.python())
     }
 
     /// `_dotted(node) or ast.unparse(node)`.

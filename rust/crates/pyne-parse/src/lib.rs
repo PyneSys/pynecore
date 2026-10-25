@@ -8,9 +8,9 @@
 //! parentheses, and so on. The parity gate compares the result with
 //! `ast.dump(ast.parse(source), include_attributes=True)` over the corpus.
 //!
-//! What this lowering does not reproduce yet is refused with [`Unsupported`]
-//! (f-strings and t-strings among them), so a host falls back to CPython's own
-//! parser for such a module.
+//! F-strings take the shape and the locations of CPython 3.12+ (PEP 701). What
+//! this lowering does not reproduce yet is refused with [`Unsupported`] (t-strings
+//! among them), so a host falls back to CPython's own parser for such a module.
 
 use pyne_ast::{
     Ast, BoolOperator, CmpOperator, Constant, ExprContext, Int, Kind, Loc, NodeId, Operator,
@@ -47,6 +47,12 @@ pub fn parse_expression_into(ast: &mut Ast, source: &str) -> Result<NodeId> {
     let expression = parsed.into_syntax();
     let mut lower = Lowerer::new(ast, source);
     lower.expr(&expression.body)
+}
+
+/// A piece of an f-string before the literal runs are merged.
+enum Piece {
+    Literal { value: String, range: TextRange, unicode: bool },
+    Value(NodeId),
 }
 
 struct Lowerer<'a> {
@@ -466,6 +472,133 @@ impl<'a> Lowerer<'a> {
             .collect()
     }
 
+    /// The value of a string literal; `Unsupported` for one that spells a lone
+    /// surrogate (`'\\ud800'`), which a Python string holds and a Rust one cannot: the
+    /// parser hands it over as U+FFFD.
+    fn string_value(&self, value: &str, range: TextRange) -> Result<String> {
+        if value.contains('\u{fffd}') && spells_surrogate(&self.source[range]) {
+            return Err(Unsupported("a string literal with a lone surrogate".into()));
+        }
+        Ok(value.to_string())
+    }
+
+    /// An f-string, implicitly concatenated parts included, as one `JoinedStr`.
+    ///
+    /// Every run of adjacent literal pieces -- string tokens, the literal text of an
+    /// f-string, the text of a `{x=}` -- becomes one `Constant` spanning the run, an
+    /// empty run none; the run is `u`-kinded when its first piece is a `u'...'` token.
+    fn fstring(&mut self, node: &ra::ExprFString) -> Result<NodeId> {
+        let mut pieces = Vec::new();
+        for part in node.value.iter() {
+            match part {
+                ra::FStringPartRef::Literal(literal) => pieces.push(Piece::Literal {
+                    value: self.string_value(&literal.value, literal.range)?,
+                    range: literal.range,
+                    unicode: literal.flags.prefix() == ra::str_prefix::StringLiteralPrefix::Unicode,
+                }),
+                ra::FStringPartRef::FString(fstring) => {
+                    self.interpolated_pieces(&fstring.elements, &mut pieces)?;
+                }
+            }
+        }
+        let values = self.joined_values(pieces);
+        Ok(self.add(Kind::JoinedStr { values }, node.range))
+    }
+
+    fn interpolated_pieces(
+        &mut self,
+        elements: &ra::InterpolatedStringElements,
+        pieces: &mut Vec<Piece>,
+    ) -> Result<()> {
+        for element in elements.iter() {
+            match element {
+                ra::InterpolatedStringElement::Literal(literal) => pieces.push(Piece::Literal {
+                    value: self.string_value(&literal.value, literal.range)?,
+                    range: literal.range,
+                    unicode: false,
+                }),
+                ra::InterpolatedStringElement::Interpolation(interpolation) => {
+                    if let Some(debug) = &interpolation.debug_text {
+                        // The text between the `{` and the conversion, spec or `}`
+                        let start = interpolation.range.start() + TextSize::from(1);
+                        let end = start + TextSize::try_from(debug.as_str().len()).unwrap();
+                        pieces.push(Piece::Literal {
+                            value: debug.as_str().to_string(),
+                            range: TextRange::new(start, end),
+                            unicode: false,
+                        });
+                    }
+                    pieces.push(Piece::Value(self.formatted_value(interpolation)?));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn formatted_value(&mut self, node: &ra::InterpolatedElement) -> Result<NodeId> {
+        let value = self.expr(&node.expression)?;
+        let mut conversion = node.conversion as i64;
+        // `{x=}` converts with `repr` unless it names a conversion or a format spec
+        if node.debug_text.is_some()
+            && node.conversion == ra::ConversionFlag::None
+            && node.format_spec.is_none()
+        {
+            conversion = i64::from(b'r');
+        }
+        let format_spec = match node.format_spec.as_deref() {
+            None => None,
+            Some(spec) => {
+                let mut pieces = Vec::new();
+                self.interpolated_pieces(&spec.elements, &mut pieces)?;
+                let values = self.joined_values(pieces);
+                // The spec starts at its `:`
+                let mut start = spec.range.start();
+                if start > TextSize::from(0) && self.source.as_bytes()[start.to_usize() - 1] == b':'
+                {
+                    start -= TextSize::from(1);
+                }
+                let range = TextRange::new(start, spec.range.end());
+                Some(self.add(Kind::JoinedStr { values }, range))
+            }
+        };
+        Ok(self.add(Kind::FormattedValue { value, conversion, format_spec }, node.range))
+    }
+
+    /// The values of a `JoinedStr`: each run of literal pieces merged into a `Constant`.
+    fn joined_values(&mut self, pieces: Vec<Piece>) -> Vec<NodeId> {
+        let mut values = Vec::new();
+        let mut run: Option<(String, TextRange, bool)> = None;
+        for piece in pieces {
+            match piece {
+                Piece::Literal { value, range, unicode } => match &mut run {
+                    Some((text, span, _)) => {
+                        text.push_str(&value);
+                        *span = TextRange::new(span.start(), range.end());
+                    }
+                    None => run = Some((value, range, unicode)),
+                },
+                Piece::Value(node) => {
+                    if let Some(run) = run.take() {
+                        values.extend(self.literal_run(run));
+                    }
+                    values.push(node);
+                }
+            }
+        }
+        if let Some(run) = run {
+            values.extend(self.literal_run(run));
+        }
+        values
+    }
+
+    fn literal_run(&mut self, (text, range, unicode): (String, TextRange, bool)) -> Option<NodeId> {
+        if text.is_empty() {
+            return None;
+        }
+        let kind = unicode.then(|| "u".to_string());
+        Some(self.add(Kind::Constant { value: Constant::Str(text), kind }, range))
+    }
+
     fn generator(&mut self, node: &ra::ExprGenerator) -> Result<NodeId> {
         let elt = self.expr(&node.elt)?;
         let generators = self.comprehensions(&node.generators)?;
@@ -551,10 +684,10 @@ impl<'a> Lowerer<'a> {
                 let (args, keywords) = self.call_arguments(&node.arguments)?;
                 Kind::Call { func, args, keywords }
             }
-            ra::Expr::FString(_) => return Err(Unsupported("f-string".into())),
+            ra::Expr::FString(node) => return self.fstring(node),
             ra::Expr::TString(_) => return Err(Unsupported("t-string".into())),
             ra::Expr::StringLiteral(node) => Kind::Constant {
-                value: Constant::Str(node.value.to_str().to_string()),
+                value: Constant::Str(self.string_value(node.value.to_str(), range)?),
                 kind: node.value.is_unicode().then(|| "u".to_string()),
             },
             ra::Expr::BytesLiteral(node) => {
@@ -750,6 +883,35 @@ fn cmp_operator(op: ra::CmpOp) -> CmpOperator {
         ra::CmpOp::In => CmpOperator::In,
         ra::CmpOp::NotIn => CmpOperator::NotIn,
     }
+}
+
+/// Whether string source spells a surrogate code point with a `\\u` or `\\U` escape.
+fn spells_surrogate(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            index += 1;
+            continue;
+        }
+        let digits = match bytes.get(index + 1) {
+            Some(b'u') => 4,
+            Some(b'U') => 8,
+            _ => {
+                // Skip the escaped character, a backslash included
+                index += 2;
+                continue;
+            }
+        };
+        let hex = text.get(index + 2..index + 2 + digits);
+        if let Some(code) = hex.and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            && (0xd800..=0xdfff).contains(&code)
+        {
+            return true;
+        }
+        index += 2;
+    }
+    false
 }
 
 fn context(ctx: ra::ExprContext) -> Result<ExprContext> {

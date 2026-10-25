@@ -304,28 +304,61 @@ pub fn inline_templates() -> &'static InlineTemplates {
 }
 
 /// `python_names.json` (`python_names`): the builtins, keywords and standard
-/// library modules of every supported interpreter.
+/// library modules of every supported interpreter, and per interpreter the code
+/// points `str.isprintable` rejects.
 #[derive(Debug)]
 pub struct PythonNames {
     pub builtins: HashSet<String>,
     pub keywords: HashSet<String>,
     pub stdlib: HashSet<String>,
+    /// Per interpreter, the code points `str.isprintable` rejects
+    pub unprintable: Vec<PrintTable>,
 }
+
+/// An interpreter's `(major, minor)` and the inclusive code point ranges, ascending,
+/// whose characters its `str.isprintable` rejects.
+pub type PrintTable = ((u32, u32), Vec<(u32, u32)>);
 
 /// The compiled-in `python_names.json`.
 pub fn python_names() -> &'static PythonNames {
     static NAMES: OnceLock<PythonNames> = OnceLock::new();
     NAMES.get_or_init(|| {
         let text = include_str!("../../../../src/pynecore/transformers/python_names.json");
-        let mut document: HashMap<String, HashSet<String>> =
+        let mut document: HashMap<String, serde_json::Value> =
             serde_json::from_str(text).expect("python_names.json");
         let mut section = |name: &str| document.remove(name).expect("python_names.json section");
-        PythonNames {
-            builtins: section("builtins"),
-            keywords: section("keywords"),
-            stdlib: section("stdlib"),
-        }
+        let names = |value: serde_json::Value| -> HashSet<String> {
+            serde_json::from_value(value).expect("python_names.json names")
+        };
+        let builtins = names(section("builtins"));
+        let keywords = names(section("keywords"));
+        let stdlib = names(section("stdlib"));
+        let tables: HashMap<String, Vec<(u32, u32)>> =
+            serde_json::from_value(section("unprintable")).expect("python_names.json unprintable");
+        let unprintable = tables
+            .into_iter()
+            .map(|(version, ranges)| {
+                let (major, minor) = version.split_once('.').expect("major.minor");
+                ((major.parse().expect("major"), minor.parse().expect("minor")), ranges)
+            })
+            .collect();
+        PythonNames { builtins, keywords, stdlib, unprintable }
     })
+}
+
+/// The newest interpreter `python_names.json` knows: the one a host without an
+/// interpreter of its own follows.
+pub fn newest_python() -> (u32, u32) {
+    python_names().unprintable.iter().map(|(version, _)| *version).max().expect("a version")
+}
+
+/// `str.isprintable` of one character under an interpreter; `None` for an
+/// interpreter `python_names.json` does not know.
+pub fn is_printable(c: char, python: (u32, u32)) -> Option<bool> {
+    let (_, ranges) = python_names().unprintable.iter().find(|(version, _)| *version == python)?;
+    let code = c as u32;
+    let index = ranges.partition_point(|&(_, last)| last < code);
+    Some(!ranges.get(index).is_some_and(|&(first, _)| first <= code))
 }
 
 /// Whether a module's top-level package is part of the standard library
@@ -344,5 +377,17 @@ mod tests {
         assert!(names.builtins.contains("len") && names.builtins.contains("__import__"));
         assert!(names.keywords.contains("lambda") && !names.keywords.contains("match"));
         assert!(is_stdlib("os.path") && is_stdlib("collections") && !is_stdlib("pynecore"));
+    }
+
+    #[test]
+    fn printability_follows_the_interpreter() {
+        let python = newest_python();
+        assert_eq!(is_printable('a', python), Some(true));
+        assert_eq!(is_printable(' ', python), Some(true));
+        assert_eq!(is_printable('\n', python), Some(false));
+        assert_eq!(is_printable('\u{a0}', python), Some(false));
+        assert_eq!(is_printable('\u{25b2}', python), Some(true));
+        assert_eq!(is_printable('\u{200b}', python), Some(false));
+        assert_eq!(is_printable('a', (2, 7)), None);
     }
 }

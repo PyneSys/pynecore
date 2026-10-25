@@ -6,7 +6,8 @@ a keyword it cannot rebuild from its spelling, a standard library import --
 and reads those name sets from the generated file, not from the interpreter it
 runs under (the native transform has none). The file holds the union over every
 supported interpreter, so the one running the tests must find all of its names
-there: ``scripts/python_names_collector.py`` adds them.
+there, and its own ``str.isprintable`` table, which the native ``repr`` and
+``ast.unparse`` of a string follow: ``scripts/python_names_collector.py`` adds them.
 """
 import builtins
 import importlib.util
@@ -44,9 +45,22 @@ def __test_the_running_interpreter_is_collected__():
 def __test_the_file_is_sorted_union_data__():
     """The sections are sorted and free of duplicates, as the collector writes them"""
     committed = json.loads(_JSON_PATH.read_text())
-    assert sorted(committed) == ['builtins', 'keywords', 'stdlib']
-    for names in committed.values():
+    assert sorted(committed) == ['builtins', 'keywords', 'stdlib', 'unprintable']
+    for section in ('builtins', 'keywords', 'stdlib'):
+        names = committed[section]
         assert names == sorted(set(names))
+    for ranges in committed['unprintable'].values():
+        assert all(first <= last for first, last in ranges)
+        assert all(ranges[index][1] + 1 < ranges[index + 1][0] for index in range(len(ranges) - 1))
+
+
+def __test_the_unprintable_ranges_answer_like_the_interpreter__():
+    """This interpreter's entry rejects exactly what ``str.isprintable`` rejects"""
+    committed = json.loads(_JSON_PATH.read_text())
+    ranges = committed['unprintable'][f'{sys.version_info[0]}.{sys.version_info[1]}']
+    unprintable = {code for first, last in ranges for code in range(first, last + 1)}
+    assert all(chr(code).isprintable() != (code in unprintable)
+               for code in range(sys.maxunicode + 1))
 
 
 def __test_the_lookups_answer_like_the_interpreter__():
