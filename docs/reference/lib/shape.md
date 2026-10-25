@@ -5,7 +5,7 @@ title: "shape"
 description: "plotshape marker shape constants"
 icon: "category"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -20,17 +20,17 @@ The `shape` namespace provides marker shape constants for use with `plotshape()`
 ## Quick Example
 
 ```python
-from pynecore.lib import script, plotshape, ta, close, high, low, shape, color
+from pynecore.lib import script, plotshape, ta, close, high, low, shape, color, location, size
 
 @script.indicator(title="Shape Demo", overlay=True)
 def main():
     cross_up = ta.crossover(close, ta.sma(close, 20))
     cross_down = ta.crossunder(close, ta.sma(close, 20))
 
-    plotshape(cross_up, style=shape.triangleup, location="belowbar",
-              color=color.green, size="small")
-    plotshape(cross_down, style=shape.triangledown, location="abovebar",
-              color=color.red, size="small")
+    plotshape(cross_up, style=shape.triangleup, location=location.belowbar,
+              color=color.green, size=size.small)
+    plotshape(cross_down, style=shape.triangledown, location=location.abovebar,
+              color=color.red, size=size.small)
 ```
 
 ## Constants

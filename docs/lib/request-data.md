@@ -5,7 +5,7 @@ title: "request.currency_rate() & Corporate Events"
 description: "Currency conversion rates and corporate event data (dividends, splits, earnings) in PyneCore"
 icon: "currency_exchange"
 date: "2026-03-28"
-lastmod: "2026-07-28"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -49,23 +49,33 @@ basecurrency = "EUR"
 
 When you call `request.currency_rate("EUR", "USD")`, PyneCore:
 
-1. Scans all TOML files in `security_data` for `basecurrency = "EUR"` and `currency = "USD"`
-2. Lazy-loads the matching OHLCV file on first access
-3. Uses binary search to find the close price at or before the current bar's timestamp
-4. Returns the close price as the exchange rate
-
-If the chart itself is a currency pair (e.g., EURUSD chart), it automatically serves as a rate
-source — no separate OHLCV file needed. PyneCore reads `lib.close` directly.
+1. Looks for a source whose metadata has `basecurrency = "EUR"` and `currency = "USD"`, in this
+   order of priority:
+   1. a rate-source feed that a data provider plugin supplies for this run (it runs as a hidden
+      security context) — the latest close it has published is used; ordinary
+      `request.security()` calls of the script are never read as rates;
+   2. an OHLCV file from `security_data` whose `.toml` matches (if several match, the one with
+      more bars wins);
+   3. the same lookups for the inverse pair (`USD`→`EUR`), returning `1.0 / rate`;
+   4. the chart itself, if it is the pair (or its inverse) — PyneCore reads `lib.close` directly.
+2. For a file source, lazy-loads the OHLCV file on first access
+3. For a file source, takes the close of the last rate bar that has **already closed** at the
+   current chart bar's open time. A rate bar opening at `t` closes at `t + period`, so on a chart
+   bar opening at `c` only rate bars with `t + period <= c` count. With an hourly rate file, the
+   bar that opened at 10:00 is first usable on a chart bar opening at 11:00; a chart bar opening at
+   10:30 gets the 09:00 bar's close. Reading the still-open bar would be lookahead.
+4. Returns that close as the exchange rate
 
 ### Special Cases
 
-| Condition                  | Result             |
-|----------------------------|--------------------|
-| `from == to`               | `1.0`              |
-| `from` or `to` is `NONE`  | `na`               |
-| No matching data           | `na`               |
-| Inverse pair available     | `1.0 / close`      |
-| Chart is the currency pair | `lib.close` direct |
+| Condition                    | Result             |
+|------------------------------|--------------------|
+| `from == to`                 | `1.0`              |
+| `from` or `to` is empty `""` | `1.0`              |
+| `from` or `to` is `NONE`     | `na`               |
+| No matching data             | `na`               |
+| Inverse pair available       | `1.0 / close`      |
+| Chart is the currency pair   | `lib.close` direct |
 
 ### Data Preparation
 
@@ -158,7 +168,9 @@ These functions request corporate event data (dividends, stock splits, earnings 
 In TradingView, they return values on bars where events occur and `na` on other bars.
 
 **Current status:** These functions are **not yet fully implemented** in PyneCore. However, they
-handle `ignore_invalid_symbol=True` gracefully by returning `na` instead of raising an error.
+handle `ignore_invalid_symbol=True` gracefully by returning `na` instead of raising an error. They
+also return `na` when they request the current crypto chart's own ticker (a crypto asset has no
+corporate events).
 This allows scripts like the TradingView VWAP indicator (which uses all three) to run without
 modification.
 
@@ -170,7 +182,7 @@ new_earnings = request.earnings(
     ignore_invalid_symbol=True  # Required for graceful fallback
 )
 
-# This still raises NotImplementedError
+# This still raises NotImplementedError (unless the chart is a crypto symbol)
 new_earnings = request.earnings(syminfo.tickerid, earnings.actual)
 ```
 

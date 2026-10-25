@@ -5,7 +5,7 @@ title: "earnings"
 description: "Earnings data field constants"
 icon: "trending_up"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -20,7 +20,7 @@ The `earnings` namespace provides access to earnings report data for the current
 ## Quick Example
 
 ```python
-from pynecore.lib import script, earnings, close, bar_index, label, color
+from pynecore.lib import script, earnings, close, bar_index, label, color, na
 
 @script.indicator(title="Earnings Monitor", overlay=True)
 def main():
@@ -28,7 +28,7 @@ def main():
     rev: float = earnings.future_revenue
     t: int = earnings.future_time
 
-    if eps != None:
+    if not na(eps):
         label.new(bar_index, close, f"EPS est: {eps:.2f}", color=color.blue)
 ```
 
@@ -93,6 +93,10 @@ These constants are passed to `request.earnings()` to specify which earnings val
 **Example usage with `request.earnings()`:**
 
 ```python
-eps_actual: float = request.earnings("AAPL", earnings.actual)
-eps_estimate: float = request.earnings("AAPL", earnings.estimate)
+eps_actual: float = request.earnings("AAPL", earnings.actual, ignore_invalid_symbol=True)
+eps_estimate: float = request.earnings("AAPL", earnings.estimate, ignore_invalid_symbol=True)
 ```
+
+PyneCore has no earnings data feed: `request.earnings()` returns `na` when
+`ignore_invalid_symbol=True` or when it requests the current crypto chart's own ticker, and
+raises `NotImplementedError` otherwise. The `earnings.future_*` variables are always `na`.

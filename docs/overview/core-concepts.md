@@ -5,7 +5,7 @@ title: "Core Concepts"
 description: "Fundamental concepts and mechanisms of PyneCore"
 icon: "psychology_alt"
 date: "2025-03-31"
-lastmod: "2026-06-10"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Overview"]
@@ -163,7 +163,7 @@ More details in the [Function Isolation](../advanced/function-isolation.md) page
 
 PyneCore fully implements Pine Script's `na` (Not Available) concept. `na` represents missing or undefined data points, often occurring at the beginning of calculations that require a certain lookback period (like moving averages).
 
-- **Propagation**: Operations involving `na` always result in `na`.
+- **Propagation**: Arithmetic involving `na` results in `na`, and every comparison with `na` is `False`.
 - **Checking**: Use the `na()` function (from `pynecore.lib`) to check if a value is `na`.
 - **Handling**: Use functions like `nz()` (replace `na` with zero or another value) or `fixnan()` (fill `na` with the last non-`na` value) for graceful handling.
 
@@ -185,15 +185,26 @@ def main():
     print(f"Safe SMA10 (na replaced with 0): {safe_sma10}")
 ```
 
-The `NA` class in PyneCore is a sophisticated implementation that:
+How an `na` is represented depends on its type:
 
-1. Maintains type information using Python's generics system (`NA[T]`).
-2. Overrides all operators and methods to return `NA` when operations involve `NA` values.
-3. Always evaluates to `False` in boolean contexts (just like in Pine Script).
-4. Caches NA instances by type to optimize memory usage.
-5. Enables built-in functions like `na()`, `nz()`, and `fixnan()` to work just like in Pine Script.
+1. **Numbers** (`float` and `int`): a numeric `na` is a native `float('nan')`. `na(float)` and
+   `NA(float)` return it, so arithmetic and comparisons run at native float speed: arithmetic
+   propagates the `nan` and every comparison with it is `False`.
+2. **Strings**: the string `na` is the empty string `""`, as on TradingView.
+3. **Bools**: in Pine v6 a bool is never `na`; an `na` assigned to a bool is `False`. Pine v4/v5
+   scripts (`na_bool=True` on the decorator) keep a three-state bool whose `na` is an `NA` object.
+4. **Everything else** (drawings, UDTs, collections): an interned `NA` object that returns itself
+   from every operation and answers `False` to every comparison.
 
-This system allows graceful handling of missing data in calculations, eliminating common errors like `IndexError` when accessing data that isn't available yet.
+`na()`, `nz()` and `fixnan()` work across all of these; `na(x)` is true for a `nan`, an infinite
+float, an `NA` object and the empty string. Reading history that does not exist yet (`close[500]`
+on bar 3) also yields `na` instead of raising `IndexError`.
+
+Inside a Pyne script the transformers keep Pine's truthiness rules: a numeric `na` used as a
+condition counts as `False`. Plain Python code that receives values from PyneCore (plot values from
+`ScriptRunner.run_iter()`, for example) sees an ordinary `nan`, and there Python's own rules apply:
+`bool(float('nan'))` is `True` and `f"{x:.2f}"` prints `nan`. Test such values with
+`math.isnan()` (or `pynecore.lib.na()`), never with `if x:`.
 
 ## How These Concepts Work Together
 

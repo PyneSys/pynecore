@@ -5,7 +5,7 @@ title: "ScriptRunner API"
 description: "Running PyneCore scripts programmatically from Python"
 icon: "play_circle"
 date: "2025-03-31"
-lastmod: "2026-10-24"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Programmatic"]
@@ -354,24 +354,29 @@ The copy costs a fraction of a microsecond per bar, which only shows on very lig
 
 ### NA Values During Warmup
 
-During the warmup period (first N bars where the indicator doesn't have enough data), plot values
-are `NA` objects — PyneCore's equivalent of Pine Script's `na`.
+During the warmup period (first N bars where the indicator doesn't have enough data), numeric
+plot values are `na`. A numeric `na` is a native `float('nan')`, so your code receives an ordinary
+Python float and Python's rules apply to it, not Pine's:
 
-`NA` works transparently — no special handling needed:
+- **Ordered comparisons** are `False`: `nan < 30` and `nan > 70` are both `False`
+- **`!=` is `True`**: `nan != 30` (and even `nan != nan`) is `True`
+- **Truthiness**: `bool(nan)` is `True`, so `if rsi:` does **not** skip a missing value
+- **Arithmetic** propagates: `nan + 1` is `nan`
+- **Formatting** prints `nan`: `f"{nan:.2f}"` is `"nan"`
 
-- **Comparisons** return `False`: `NA < 30`, `NA > 70`, `NA == x` → all `False`
-- **Arithmetic** propagates: `NA + 1` → `NA`, `NA * 2.0` → `NA`
-- **Format strings** work: `f"{na_value:.2f}"` → `"NaN"`
+Test for a missing value explicitly with `math.isnan()`:
 
 ```python
+import math
+
 for candle, plot_data in runner.run_iter():
     rsi = plot_data.get("RSI")
 
-    if rsi > 70:  # False when rsi is NA — no crash, no special check needed
-        print(f"Overbought: RSI={rsi:.2f}")
+    if math.isnan(rsi):  # warmup: the RSI has no value yet
+        continue
 
-    # NA values print as "NaN" in f-strings
-    print(f"RSI={rsi:.2f}")  # "RSI=NaN" during warmup, "RSI=65.32" after
+    if rsi > 70:
+        print(f"Overbought: RSI={rsi:.2f}")
 ```
 
 ## Live Mode

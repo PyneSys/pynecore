@@ -6,7 +6,7 @@ description: "PyneCore vs TradingView: 1,000 published TradingView scripts (Pine
 wildDescription: "PyneCore vs TradingView: {{scripts_total}} published TradingView scripts (Pine Script v4-v6, converted to Pyne code with PyneComp) validated, {{bars_exact_pct}}% of {{bars_compared_millions}} million values bit-identical, {{strategy_trades}} trades matched. Feature status of every Pine Script v6 module."
 icon: "checklist"
 date: "2026-03-28"
-lastmod: "2026-09-26"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Overview"]
@@ -88,7 +88,7 @@ with PyneComp, run by PyneCore, and every comparable output is compared with Tra
 | Risk management              | full         | `strategy.risk.*` functions                                                                                                                 |
 | `calc_on_order_fills`        | full         | Re-execution after fills, var rollback / varip persist                                                                                      |
 | `calc_on_every_tick`         | full         | Live mode only — no effect on historical bars                                                                                               |
-| `calc_on_every_history_tick` | no-lookahead | Four passes per bar (per sub-bar with the magnifier); each pass sees the bar as built so far — see [No lookahead, ever](#no-lookahead-ever) |
+| `calc_on_every_history_tick` | no-lookahead | Four passes per bar, or one at the end of each sub-bar with the magnifier; each sees the bar so far — [No lookahead](#no-lookahead-ever)    |
 
 ## Request Module
 
@@ -250,9 +250,9 @@ match, so this rule outranks TV parity everywhere it applies.
 | An intra-bar pass (`calc_on_order_fills`, `calc_on_every_history_tick`) | the bar's COMPLETED open/high/low/close/volume | the bar as built up to that pass's point in it             |
 
 Note what is *not* affected: the canonical daily-pivot idiom
-`request.security(sym, "D", close[1], lookahead_on)` lives entirely in `close[1]`, reads a period
-that has genuinely closed, and matches TradingView exactly. Only the bare form — which is future
-data on every chart bar except a period's last — differs.
+`request.security(sym, "D", close[1], lookahead=lookahead_on)` lives entirely in `close[1]`,
+reads a period that has genuinely closed, and matches TradingView exactly. Only the bare form —
+which is future data on every chart bar except a period's last — differs.
 
 `barmerge.lookahead_last_closed` is a PyneSys-native mode for stating "last closed" intent
 explicitly, without relying on the TV `close[1]` idiom at all.

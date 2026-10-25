@@ -5,7 +5,7 @@ title: "Function Isolation"
 description: "How function isolation works in PyneCore and why it's essential for Pine Script compatibility"
 icon: "privacy_tip"
 date: "2025-03-31"
-lastmod: "2026-10-09"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Advanced"]
@@ -48,7 +48,7 @@ plot(myFunc())
 plot(myFunc())
 ```
 
-In Pine Script, this would plot two different lines because each call to `myFunc()` has its own isolated state for the `count` variable. Without function isolation, both calls would share the same variable, resulting in identical values.
+In Pine Script, both lines plot the same values — 1, 2, 3, … — because each call to `myFunc()` has its own isolated `count` that advances once per bar. Without function isolation, both calls would share one `count` that advances twice per bar: the first line would plot 1, 3, 5, … and the second 2, 4, 6, ….
 
 ### 2. Correct Historical Behavior
 

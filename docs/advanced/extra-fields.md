@@ -5,7 +5,7 @@ title: "Extra Fields"
 description: "Accessing extra per-bar columns beyond OHLCV data in Pyne code"
 icon: "playlist_add"
 date: "2025-03-31"
-lastmod: "2026-07-28"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Data"]
@@ -60,7 +60,7 @@ Access extra fields through `lib.extra_fields`, which is a `dict[str, Any]` upda
 @pyne
 """
 from pynecore import Series
-from pynecore.lib import script, ta, close, extra_fields, plot
+from pynecore.lib import script, ta, close, extra_fields, plot, na
 
 
 @script.indicator(title="Extra Fields Example", overlay=True)
@@ -76,15 +76,15 @@ def main():
     # Use with built-in functions like any other Series
     rsi_sma = ta.sma(rsi, 14)
 
-    # Use string fields for conditional logic
-    if signal[0] == "buy":
-        plot(close, "Buy Signal", linewidth=2)
+    # Use string fields for conditional logic. plot() must run on every bar,
+    # so pick the value instead of guarding the call
+    plot(close if signal == "buy" else na, "Buy Signal", linewidth=2)
 ```
 
 ### Key Points
 
 - **Type annotation creates the Series**: Writing `rsi: Series[float] = extra_fields["rsi"]` makes `rsi` a proper Series with history. The `extra_fields["rsi"]` part just returns the current bar's value (a plain `float`).
-- **Supported types**: Numbers and text, detected automatically from the data. `CSVReader` converts each cell on its own — `int` when it parses as an integer, `float` when it parses as a decimal, otherwise the raw `str`. The binary + sidecar path classifies each column once, from its first usable value: numeric columns come back as `float`, everything else as `str`.
+- **Supported types**: Numbers and text, detected automatically from the data. `CSVReader` converts each cell on its own — `float` when it parses as a number (integers included, the way every Pine number is a double), otherwise the raw `str`. The binary + sidecar path classifies each column once, from its first usable value: numeric columns come back as `float`, everything else as `str`.
 - **Missing values**: Read via `CSVReader`, an empty cell appears as an empty string (`''`) and a `NaN`/`na`/`nan` cell as `na`. Read through the sidecar, an empty, `nan` or `na` cell in a numeric column becomes `NaN`, while in a text column the raw text is kept (an empty string for an empty cell).
 - **No AST magic needed**: The standard Series annotation mechanism handles everything — there is no special treatment for `extra_fields` in the AST transformers.
 

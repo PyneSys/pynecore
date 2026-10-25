@@ -5,7 +5,7 @@ title: "strategy"
 description: "Strategy order management — entry, exit, close, and order functions"
 icon: "trending_up"
 date: "2026-03-28"
-lastmod: "2026-08-06"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -23,11 +23,10 @@ Manage entries, exits, and track position metrics for backtesting strategies. Th
 from pynecore.lib import (
     close, high, low, strategy, ta, bar_index, script
 )
-from pynecore.types import Persistent
 
 @script.strategy(title="Simple Strategy", initial_capital=10000)
 def main():
-    sma20: Persistent[float] = ta.sma(close, 20)
+    sma20: float = ta.sma(close, 20)
     
     if bar_index == 20:
         strategy.entry("long", strategy.long, qty=1)
@@ -103,7 +102,20 @@ strategy.exit("trail", trail_points=50, comment="Trailing stop")
 
 ### strategy.close()
 
-Exit a position opened by entries with a specific id. Closes the position immediately at market price.
+Create a market order that exits the part of the position opened by entries with a specific id.
+The call places the order; when it fills depends on the arguments and the strategy settings:
+
+- By default the order fills at the **next bar's open**, like any market order placed during a
+  bar's calculation.
+- With `process_orders_on_close=True` on the `@script.strategy()` decorator, the order gets an
+  extra fill attempt at the **close of the bar** that placed it.
+- With `immediately=True` it fills at the **close of the bar** that placed it (slippage
+  applies), regardless of `process_orders_on_close`. The fill is applied after the script body
+  finishes, so `strategy.position_size` and the other `strategy.*` values still show the
+  pre-close position for the rest of that bar's calculation.
+
+These timings are for the backtest simulator. In broker mode the order is sent to the exchange
+and the exchange decides when it fills.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -112,7 +124,7 @@ Exit a position opened by entries with a specific id. Closes the position immedi
 | qty | float \| None | Partial close quantity (optional) |
 | qty_percent | float \| None | Partial close as % of position (optional) |
 | alert_message | str \| None | Alert text (optional) |
-| immediately | bool | Close at market immediately (optional) |
+| immediately | bool | Fill at the close of the bar that placed the order instead of the next bar's open (default `False`) |
 | disable_alert | bool | Suppress alerts if True (optional) |
 
 Returns: `None`
@@ -157,13 +169,16 @@ The switch only changes the backtest simulator.
 
 ### strategy.close_all()
 
-Close the entire open position immediately at market price, regardless of entry ids.
+Create a market order that closes the entire open position, regardless of entry ids. The fill
+timing follows the same rules as `strategy.close()`: next bar's open by default, the current
+bar's close with `process_orders_on_close=True` or `immediately=True`. The call does nothing
+when there is no open position.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | comment | str \| None | Order comment (optional) |
 | alert_message | str \| None | Alert text (optional) |
-| immediately | bool | Close immediately (optional) |
+| immediately | bool | Fill at the close of the bar that placed the order instead of the next bar's open (default `False`) |
 | disable_alert | bool | Suppress alerts if True (optional) |
 
 Returns: `None`

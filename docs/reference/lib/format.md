@@ -5,7 +5,7 @@ title: "format"
 description: "Number format constants for labels and tooltips"
 icon: "format_list_numbered"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -20,11 +20,11 @@ The `format` namespace provides named constants that control how script output v
 ## Quick Example
 
 ```python
-from pynecore.lib import script, close, str, format
+from pynecore.lib import script, close, string as pstr, format
 
 @script.indicator(title="Price Display", format=format.price, overlay=False)
 def main():
-    price_str: str = str.tostring(close, format.mintick)
+    price_str: str = pstr.tostring(close, format.mintick)
 ```
 
 ---

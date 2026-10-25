@@ -5,7 +5,7 @@ title: "session"
 description: "Trading session detection"
 icon: "access_time"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -20,17 +20,17 @@ Trading session detection and classification. The `session` namespace provides b
 ## Quick Example
 
 ```python
-from pynecore.lib import close, session, bar_index, label, strategy
+from pynecore.lib import close, session, bar_index, label, strategy, color, script
 
-@script.indicator(title="Session Detector", overlay=True)
+@script.strategy(title="Session Detector", overlay=True)
 def main():
     # Mark the first bar of each day's session
     if session.isfirstbar_regular:
-        label.new(bar_index, close, "Day start", textcolor="color.green")
-    
+        label.new(bar_index, close, "Day start", textcolor=color.green)
+
     # Mark the last bar of regular trading hours
     if session.islastbar_regular:
-        label.new(bar_index, close, "Regular close", textcolor="color.red")
+        label.new(bar_index, close, "Regular close", textcolor=color.red)
     
     # Trade only during market hours
     if session.ismarket:

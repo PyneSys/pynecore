@@ -5,7 +5,7 @@ title: "Live Mode"
 description: "Real-time data streaming with intra-bar updates, varip support, and paper trading"
 icon: "stream"
 date: "2026-04-08"
-lastmod: "2026-10-03"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Live Trading"]
@@ -37,11 +37,15 @@ The `-f` / `--from` parameter controls how many historical bars the script proce
 going live.  **Default: 500 bars** — enough for most scripts out of the box.
 
 Indicators need a warm-up period: `ta.sma(close, 200)` requires 200 bars before producing its
-first value, and the initial values are still distorted by limited lookback.  A good rule of
-thumb is **2× the largest `length` parameter** in your script:
+first value. Recursive indicators (`ta.ema`, `ta.rma`, `ta.rsi`, `ta.atr`, …) produce a value
+early, but it still carries the influence of the starting state, which fades gradually and never
+reaches exactly zero. How much history is enough therefore depends on how close to a fully warmed-up
+run your values need to be. A common starting point is **2× the largest `length` parameter**; give
+recursive indicators more when exact values matter, and compare a run against one with a longer
+history to check:
 
 ```bash
-# Script uses ta.ema(close, 50) and ta.atr(14) → largest length is 50 → -f -100 is enough
+# Script uses ta.ema(close, 50) and ta.atr(14) → largest length is 50 → start with -f -100
 pyne run my_strategy.py ccxt:BYBIT:BTC/USDT:USDT@1 --live -f -100
 
 # Script uses ta.sma(close, 200) → use -f -400

@@ -5,7 +5,7 @@ title: "Integration Patterns"
 description: "Real-world patterns for integrating PyneCore into trading systems"
 icon: "hub"
 date: "2025-03-31"
-lastmod: "2026-10-03"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Programmatic"]
@@ -121,20 +121,57 @@ class PyneIndicatorStrategy(IStrategy):
 
 ### Pattern 2: Strategy Signals
 
-Let a Pine Script strategy generate buy/sell signals, FreqTrade just executes them:
+Let a Pyne strategy decide when to trade, FreqTrade just executes. A signal must be known on the
+bar it is attached to, so the strategy plots it on the bar where it places its order:
+
+```python
+"""
+@pyne
+"""
+from pynecore.lib import script, ta, close, plot, strategy
+
+
+@script.strategy("SMA Cross Signals")
+def main():
+    fast = ta.sma(close, 9)
+    slow = ta.sma(close, 21)
+    enter_long = ta.crossover(fast, slow)
+    exit_long = ta.crossunder(fast, slow)
+
+    if enter_long:
+        strategy.entry("Long", strategy.long)
+    if exit_long:
+        strategy.close("Long")
+
+    # One column per signal, 1 on the bar the signal fires
+    plot(1 if enter_long else 0, "enter_long")
+    plot(1 if exit_long else 0, "exit_long")
+```
+
+FreqTrade reads those columns:
 
 ```python
 class PyneStrategySignals(IStrategy):
     def populate_indicators(self, dataframe, metadata):
-        _indicators, trades = run_strategy(dataframe, Path("scripts/sma_cross.py"), syminfo)
+        plots, _trades = run_strategy(dataframe, Path("scripts/sma_cross.py"), syminfo)
+        dataframe["pyne_enter_long"] = plots["enter_long"]
+        dataframe["pyne_exit_long"] = plots["exit_long"]
+        return dataframe
 
-        dataframe["pyne_enter_long"] = 0
-        for trade in trades:
-            if trade.size > 0 and trade.entry_bar_index < len(dataframe):
-                dataframe.iloc[trade.entry_bar_index,
-                               dataframe.columns.get_loc("pyne_enter_long")] = 1
+    def populate_entry_trend(self, dataframe, metadata):
+        dataframe.loc[dataframe["pyne_enter_long"] == 1, "enter_long"] = 1
+        return dataframe
+
+    def populate_exit_trend(self, dataframe, metadata):
+        dataframe.loc[dataframe["pyne_exit_long"] == 1, "exit_long"] = 1
         return dataframe
 ```
+
+Do not build signals from the `trades` list. `run_iter()` hands over a trade only on the bar where
+it **closes**, so writing a signal back to `trade.entry_bar_index` marks a bar with information that
+was not available yet on that bar: in a backtest the result looks better than anything the strategy
+could do live. Trades still open at the end of the run are not in the list either. The trades list
+is the right source for analysing a finished run, not for generating signals.
 
 > For complete, runnable FreqTrade examples, see
 > [pynecore-examples/05-freqtrade-indicators](https://github.com/PyneSys/pynecore-examples/tree/main/05-freqtrade-indicators)
@@ -194,7 +231,7 @@ runner = ScriptRunner(
 
 for candle, plot_data in runner.run_iter():
     rsi = plot_data.get("RSI")
-    if rsi < 30:  # NA values return False for all comparisons — no special handling needed
+    if rsi < 30:  # False while rsi is na (nan) during warmup; see the NA note in the ScriptRunner page
         print(f"RSI oversold: {rsi:.2f} at {candle.close}")
 ```
 

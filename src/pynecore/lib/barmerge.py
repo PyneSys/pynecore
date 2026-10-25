@@ -33,7 +33,7 @@ scripts; ``lookahead_last_closed`` is a PyneSys-native alternative.
 - ``lookahead_on``: the security subprocess steps into the containing HTF bar
   with ``barstate.isconfirmed=False`` and OHLCV aggregated from chart-timeframe
   data, in historical and live mode alike. The TV idiom
-  ``request.security(sym, tf, close[1], lookahead_on)`` returns the latest
+  ``request.security(sym, tf, close[1], lookahead=lookahead_on)`` returns the latest
   closed value exactly as it does on TV.
 
   A bare ``close`` reads the containing period as it has built up to the

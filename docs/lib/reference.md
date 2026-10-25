@@ -5,7 +5,7 @@ title: "Library Reference"
 description: "PyneCore library modules, types, and usage patterns"
 icon: "menu_book"
 date: "2025-03-31"
-lastmod: "2026-09-26"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -191,19 +191,26 @@ features. For more detailed differences, see the [Differences from Pine Script](
 """
 @pyne
 """
-from pynecore.lib import na
-from pynecore.types.na import NA
+from pynecore.lib import script, close, na, nz, plot
 
-# Creating NA values
-a = NA()  # or na()
 
-# Typed NA values
-f = NA(float)  # or na(float)
+@script.indicator(title="NA Handling")
+def main():
+    prev: float = close[1]  # na on the first bar
 
-# Checking for NA
-if isinstance(value, NA) or na(value):
-    print("Value is NA")
+    # na() is the test: true for a numeric na, an infinite float, an NA object or ""
+    if na(prev):
+        prev = close
+
+    change = nz(close - close[1])  # na replaced by 0.0
+    plot(change, "Change")
 ```
+
+A numeric `na` (`float` or `int`) is a native `float('nan')`; `na(float)` and `NA(float)` both
+return it. Arithmetic propagates it and every comparison with it is `False`, as in Pine. Inside
+Pyne code, `na(x)` is the correct test: `isinstance(x, NA)` is `False` for a numeric na, and
+`x == na` never matches. Outside the transformed script, in plain Python that consumes PyneCore
+results, the value is an ordinary `nan`: test it with `math.isnan()` (`bool(nan)` is `True`).
 
 ## More Complex Modules
 
@@ -214,10 +221,12 @@ various display options. These are typically accessible in a submodule structure
 """
 @pyne
 """
-from pynecore.lib import plot, plot_style
-from pynecore.lib.strategy import direction
+from pynecore.lib import script, close, volume, plot
 
-# Using different style elements
-plot(series, title="Line Type", style=plot_style.style_line)
-plot(series, title="Column Type", style=plot_style.style_columns)
+
+@script.indicator(title="Plot Styles")
+def main():
+    # Style constants live in the plot namespace
+    plot(close, title="Line Type", style=plot.style_line)
+    plot(volume, title="Column Type", style=plot.style_columns)
 ```

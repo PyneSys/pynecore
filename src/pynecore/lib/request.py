@@ -45,7 +45,7 @@ def security(symbol, timeframe, expression: T, *args, **kwargs) -> T:
       steps into the containing HTF bar, which runs with
       ``barstate.isconfirmed=False`` over OHLCV aggregated from the chart
       timeframe. Historical and live mode behave identically. The
-      daily-pivot idiom ``security(sym, "D", close[1], lookahead_on)`` reads
+      daily-pivot idiom ``security(sym, "D", close[1], lookahead=lookahead_on)`` reads
       the just-closed prior period, matching TradingView.
 
       A bare ``close`` reads the containing period AS BUILT SO FAR, which

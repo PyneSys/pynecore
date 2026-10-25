@@ -5,7 +5,7 @@ title: "matrix"
 description: "Two-dimensional matrix operations"
 icon: "grid_on"
 date: "2026-03-28"
-lastmod: "2026-10-20"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -69,6 +69,34 @@ remain shared with the original matrix.
 
 ```python
 m2 = matrix.copy(m1)  # independent matrix storage, shared reference-type elements
+```
+
+### delete()
+
+Delete a matrix object.
+
+| Parameter | Type   | Description      |
+|-----------|--------|------------------|
+| `id`      | matrix | Matrix to delete |
+
+**Returns:** None
+
+The matrix is removed from the list that `matrix.all` returns. Existing references to it stay
+usable. Deleting an `na` matrix, or one already deleted, does nothing.
+
+```python
+matrix.delete(m)
+```
+
+### all
+
+All matrix objects created with `matrix.new()` and not deleted, in creation order. Read it bare;
+it takes no arguments.
+
+**Type:** `list[matrix]`
+
+```python
+count: int = len(matrix.all)
 ```
 
 ## Dimensions and Properties

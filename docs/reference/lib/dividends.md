@@ -5,7 +5,7 @@ title: "dividends"
 description: "Dividend data field constants"
 icon: "account_balance"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -78,5 +78,9 @@ from pynecore.lib import script, dividends, request, close
 
 @script.indicator(title="Dividend Yield", overlay=False)
 def main():
-    div: float = request.dividends("AAPL", dividends.gross)
+    div: float = request.dividends("AAPL", dividends.gross, ignore_invalid_symbol=True)
 ```
+
+PyneCore has no dividend data feed: `request.dividends()` returns `na` when
+`ignore_invalid_symbol=True` or when it requests the current crypto chart's own ticker, and raises
+`NotImplementedError` otherwise. The `dividends.future_*` variables are always `na`.
