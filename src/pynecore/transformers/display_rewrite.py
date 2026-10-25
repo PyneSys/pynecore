@@ -22,6 +22,7 @@ from typing import cast
 import ast
 
 from . import ast_walk
+from .locations import fix_locations
 from .slot_layout import ModuleLayout, DEFAULT_STATE_PARAM, collect_scope_segments
 
 __all__ = ['display_dump']
@@ -137,5 +138,5 @@ def display_dump(tree: ast.Module, layout: ModuleLayout) -> str:
                 and isinstance(first.value.value, str)):
             pos = 1
         clean.body[pos:pos] = defs
-        ast_walk.fix_missing_locations(clean)
+        fix_locations(clean)
     return ast.unparse(clean)

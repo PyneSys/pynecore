@@ -533,6 +533,7 @@ def _module_mode(tree: "ast.Module") -> tuple[bool, str | None]:
 #: Which typed diagnostics a structural one already covers, by reason
 _STRUCTURAL_COVERS: dict[str, frozenset[str]] = {
     'edge-call': frozenset({'unknown-call', 'unknown-lib', 'unknown-return', 'bad-call'}),
+    'edge-builtin': frozenset({'unknown-call', 'unknown-name'}),
     'edge-name': frozenset({'unknown-name', 'function-value', 'unknown-lib-name',
                             'unknown-field', 'unknown-class'}),
     'edge-syntax': frozenset({'not-pine', 'unknown-op', 'unknown-index', 'not-series'}),
@@ -768,7 +769,7 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
     from pynecore.transformers.pine_type_table import module_table
 
     edge = gated(pyne_mode)
-    structural = gate_module(transformed) if edge else []
+    structural = gate_module(transformed, source) if edge else []
 
     # The steps, their order and the reason for it live in transformers/pipeline.py
     from pynecore.transformers.pipeline import ANALYSIS, PipelineContext, run_steps

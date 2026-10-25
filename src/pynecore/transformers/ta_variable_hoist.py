@@ -131,12 +131,8 @@ class TaVariableHoistTransformer(ast_walk.NodeTransformer):
                         attr=name, ctx=ast.Load()),
                     args=[], keywords=[])))
 
-        # Keep the docstring first; everything else in main may already read the caches
-        insert_at = 0
-        if (main.body and isinstance(main.body[0], ast.Expr)
-                and isinstance(main.body[0].value, ast.Constant)
-                and isinstance(main.body[0].value.value, str)):
-            insert_at = 1
+        # Everything in main but the docstring may already read the caches
+        insert_at = ast_walk.docstring_end(main.body)
         main.body[insert_at:insert_at] = prologue
         return node
 

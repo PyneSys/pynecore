@@ -26,7 +26,7 @@ from pynecore.transformers.security_slice import (
     CLONE_PREFIX, SecuritySliceTransformer, finalize_clone_defaults,
 )
 
-from .test_135_native_transform import __test_helper_require_native
+from .test_137_native_transform import __test_helper_require_native
 
 #: A module reaching every part of the step
 __test_helper_MODULE = '''

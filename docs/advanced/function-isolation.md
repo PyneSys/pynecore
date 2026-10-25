@@ -5,7 +5,7 @@ title: "Function Isolation"
 description: "How function isolation works in PyneCore and why it's essential for Pine Script compatibility"
 icon: "privacy_tip"
 date: "2025-03-31"
-lastmod: "2026-10-09"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Advanced"]
@@ -48,7 +48,7 @@ plot(myFunc())
 plot(myFunc())
 ```
 
-In Pine Script, this would plot two different lines because each call to `myFunc()` has its own isolated state for the `count` variable. Without function isolation, both calls would share the same variable, resulting in identical values.
+In Pine Script, both lines plot the same values — 1, 2, 3, … — because each call to `myFunc()` has its own isolated `count` that advances once per bar. Without function isolation, both calls would share one `count` that advances twice per bar: the first line would plot 1, 3, 5, … and the second 2, 4, 6, ….
 
 ### 2. Correct Historical Behavior
 
@@ -68,7 +68,7 @@ The state-related AST transformers (see [AST Transformation](./ast-transformatio
 A layout is a plain dict with these keys:
 
 - `init` — template value for every slot; instantiation is essentially `list(init)`
-- `series` — `(slot, max_bars_back, elem)` triples; instantiation puts a fresh `SeriesImpl` circular buffer into these slots. `elem` is the statically known element type name (`'float'` selects the native `nan` as the series' out-of-range na value) or `None`
+- `series` — `(slot, max_bars_back, elem)` triples; instantiation puts a fresh `SeriesImpl` circular buffer into these slots. `elem` is the statically known element type name (`'float'` selects the native `nan` as the series' out-of-range na value) or `None`, in which case the buffer takes the na of the first typed value it stores when it is first read out of range (an `inline_series` buffer is built the same way, so `expr[n]` reads the na of `expr`'s type before its history exists)
 - `varip` — slot indexes excluded from the `var` rollback on intra-bar re-execution
 - `children` — `(slot, call_id, in_loop)` triples describing the function's isolated call sites
 - `names` — per-slot debug names (used only by debug tooling)
@@ -154,6 +154,16 @@ When the callee is only known at runtime, the call site gets an **anchor slot** 
 Python forbids assignment expressions anywhere inside a comprehension's iterable, so a straight-line site under an iterable folds its guard into one helper call instead (`__slot_state·__` for the fast path, `__bind_slot·__` for the uniform path).
 
 Note: when the callee at a uniform site changes (`g = a if cond else b; g(x)`), the site is rebound with fresh state — state does not survive an `a -> b -> a` swap.
+
+### Methods declared in a class body
+
+A method written in a `@udt` class body is Pine's `method m(Type this)`, and its state belongs to the call site like any function's. It is a scope of its own, and a state-carrying one keeps the hidden state as its first parameter (`def m(__state__, self, x)`), so every binding, rollback and snapshot above treats it like any other definition. The class attribute is wrapped in the `__state_method__` descriptor:
+
+- through the class, `Pair.m` is the function itself, so `Pair.m(p, x)` is routed like a call to a same-module definition (`Pair.m(<state>, p, x)`);
+- through an instance, `p.m` is a binding whose call takes the state first and passes the receiver behind it. The site is uniform: `p.m` is a new object on every access, so the anchor rebinds on every call, keeping the state vector because the layout is the same, and a loop site still rolls the method's builtins back on every iteration of a bar;
+- `method_call('m', p)` finds the binding on the receiver and binds the function in the call site's dispatch entry, receiver first.
+
+A `@staticmethod` has no receiver and needs only its layout. Any other decorator on a state-carrying method is a transform-time error, because the decorator decides what the class attribute holds.
 
 ## Call Site Identifiers
 

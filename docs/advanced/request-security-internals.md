@@ -5,7 +5,7 @@ title: "request.security() Internals"
 description: "Technical deep-dive into the multiprocessing architecture behind request.security()"
 icon: "memory"
 date: "2026-03-27"
-lastmod: "2026-10-08"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Advanced"]
@@ -35,7 +35,7 @@ examples, and data preparation, see the [request.security() Library page](../lib
                               SharedMemory (SyncBlock + ResultBlocks)
                                     v    |
                           +----------------------------+
-                          |  Security Process (per ID) |
+                          |  Security Process          |
                           |    advance_event.wait()    |
                           |    run bars to target_time |
                           |      __sec_write__(id, v)  |-----> write to ResultBlock
@@ -43,6 +43,9 @@ examples, and data preparation, see the [request.security() Library page](../lib
                           |    done_event.set()        |
                           +----------------------------+
 ```
+
+The diagram shows one context's per-bar handshake. Which contexts get a process of their own is
+decided at run time; see [Processes and Context Groups](#processes-and-context-groups).
 
 ## AST Transformation
 
@@ -81,22 +84,49 @@ for conditionally-scoped variables.
 
 ## Shared Memory Layout
 
-**SyncBlock** — one per script run, contains metadata for all security slots:
+Three kinds of shared memory blocks carry the data between processes. The byte-level layout is
+defined, and documented field by field, at the top of `core/security_shm.py`; it changes with the
+protocol, so treat that file as the reference.
 
-| Field            | Type   | Offset | Description                              |
-|------------------|--------|--------|------------------------------------------|
-| `last_timestamp` | int64  | 0      | Last bar timestamp from security process |
-| `version`        | uint32 | 8      | ResultBlock version (reallocation count) |
-| `result_size`    | uint32 | 12     | Current pickle data size in bytes        |
-| `target_time`    | int64  | 16     | Time the process should advance to       |
-| `flags`          | uint8  | 24     | State flags                              |
+**SyncBlock** — one per script run. It holds a fixed-size slot per security context and, after
+the slots, a watermark matrix:
 
-**ResultBlock** — one per security context, holds pickled result. Auto-reallocates with doubled
-size when data outgrows the block.
+- per slot: the producer's **frontier close** (every bar of the context that closes at or before
+  this instant is already published), the result block version and size, the target time the
+  context should advance to, state flags, ring bookkeeping (entry count, head, version, bytes
+  used), the developing higher-timeframe bar's OHLCV and time (used by `lookahead_on`), and the
+  current round's tick instant, finished-round counter and park state;
+- the watermark matrix: for each consumer (one row per context, plus one for the chart) and each
+  producer, the oldest instant the consumer may still need. The ring garbage collector keeps
+  everything at or above the minimum over a producer's consumers.
+
+**ResultBlock** — one per security context, holds the pickled latest result. Reallocated with
+doubled size when the data outgrows the block.
+
+**RingBlock** — one per security context that has consumers (other contexts or the chart in a
+batch round): an append-only history of `(open, close, value)` entries ordered by close.
+Reallocated with doubled capacity when full; the version is part of the shared memory name, so
+readers notice and re-attach.
+
+## Processes and Context Groups
+
+A `request.security()` call does not always get a process of its own:
+
+- A context that resolves to the chart's own symbol and timeframe has no process; it is evaluated
+  inline in the chart process. So does a context whose symbol was dropped by
+  `ignore_invalid_symbol=True`.
+- The transformer marks contexts that are guaranteed to resolve to one and the same feed as a
+  group. Members that the script reads unconditionally may share **one** child process. The
+  member whose `__sec_signal__` runs first becomes the group's primary and is the only one the
+  chart schedules; every member keeps its own result block, ring, `data_ready` event and
+  `gaps`/`currency` handling. A member behind a branch that this run does not take is never
+  evaluated by the group's child; it starts alone at its first read, or not at all.
+- Every other context runs in its own process, started lazily at its first `__sec_signal__`.
 
 ## Security Process Lifecycle
 
-1. **Spawn** — `multiprocessing.Process` with `spawn` mode
+1. **Start** — `multiprocessing.Process` from the `forkserver` context where the platform has
+   it (Linux, macOS), `spawn` otherwise (Windows); see `core/security_mp.py`
 2. **Init** — re-register import hooks, open shared memory by name, load OHLCV + syminfo
 3. **Import** — re-import script module through the import hook (it loads the same transformed bytecode as the chart; fresh Series state)
 4. **Configure** — `lib._lib_semaphore = True`, `__active_security__` = the set of security IDs this process serves; if the context has a `slice_main` clone (`SecuritySlice`), the process runs that function instead of `main()`
@@ -136,15 +166,21 @@ is made when the context is prepared, so bytecode built with and without the swi
 
 ## Cross-Context Reads
 
-Security processes reading other contexts' values (nested dependencies) get **immediate** reads
-without waiting. This prevents deadlocks between security processes.
+A security process that reads another context's value (a nested dependency) reads it from that
+producer's ring. It first waits until the producer has published everything closing at or before
+the consumer's own as-of instant (`RingReader.wait_for_close`), then takes the last entry closing
+at or before it; a lower-timeframe producer yields the slice of intrabars that belongs to the
+consumer's bar. Before waiting, the consumer parks its watermark at that instant, which tells the
+producer whom a publication can release and which ring entries must be kept. A peer that nothing
+produces for (a dropped symbol) answers with the default value instead of waiting.
 
 ## File Reference
 
-| File                       | Purpose                                       |
-|----------------------------|-----------------------------------------------|
-| `transformers/security.py` | AST transformation (SecurityTransformer)      |
-| `core/security_shm.py`     | Shared memory: SyncBlock, ResultBlock, Reader |
-| `core/security.py`         | Runtime protocol, SecurityState, event logic  |
-| `core/security_process.py` | Security process entry point and bar loop     |
-| `core/script_runner.py`    | Integration: spawn, inject, cleanup           |
+| File                       | Purpose                                                   |
+|----------------------------|-----------------------------------------------------------|
+| `transformers/security.py` | AST transformation (SecurityTransformer)                  |
+| `core/security_shm.py`     | Shared memory: SyncBlock, ResultBlock, RingBlock, readers |
+| `core/security_mp.py`      | Process start method (forkserver / spawn) and its context |
+| `core/security.py`         | Runtime protocol, SecurityState, context groups           |
+| `core/security_process.py` | Security process entry point and bar loop                 |
+| `core/script_runner.py`    | Integration: spawn, inject, cleanup                       |

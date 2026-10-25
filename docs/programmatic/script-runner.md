@@ -5,7 +5,7 @@ title: "ScriptRunner API"
 description: "Running PyneCore scripts programmatically from Python"
 icon: "play_circle"
 date: "2025-03-31"
-lastmod: "2026-10-03"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Programmatic"]
@@ -76,6 +76,7 @@ ScriptRunner(
     magnifier_iter: Iterable[OHLCV] | None = None,
     magnifier_source_tf: str | None = None,
     config_dir: Path | None = None,
+    profile_path: Path | None = None,
     # ... plus the live / broker parameters, see below
 )
 ```
@@ -102,6 +103,7 @@ ScriptRunner(
 | `magnifier_iter`           | `Iterable \| None` | LTF OHLCV bars for bar magnifier mode (intrabar simulation)    |
 | `magnifier_source_tf`      | `str \| None`      | Timeframe of the `magnifier_iter` bars                         |
 | `config_dir`               | `Path \| None`     | Workdir `config/` folder, for its `symbol_map.toml`            |
+| `profile_path`             | `Path \| None`     | Profile the run and write the profile JSON here (see below)    |
 
 On historical bars Pine fixes `last_bar_index` and `last_bar_time` to the chart's final bar. With a
 list or tuple `ohlcv_iter` outside live mode the runner takes both from its last bar, so they need
@@ -114,6 +116,20 @@ The remaining keyword parameters (`broker_plugin`, `broker_event_loop`, `broker_
 `lossless_volume`, `lossless_prices`, `chart_bar_window`) wire up live data providers and broker
 trading for `pyne run`. A plain backtest from Python needs none of them; see
 [Live Mode](../advanced/live-mode.md) for how live runs work.
+
+### Profiling
+
+`profile_path` profiles a backtest and writes the time and execution count of every line, and
+the run's time by category, to that JSON file once the run completes (see
+[Profiling](../profiling.md)). It needs Python 3.13 or newer and the compiled profiler
+extension: without them, or while another profiler holds Python's profiler slot, the
+constructor raises `pynecore.core.profiler.ProfilerUnavailable`. A live or broker run with
+`profile_path` raises `ValueError`. A run that fails or is closed early writes no profile.
+
+```python
+runner = ScriptRunner(script_path, ohlcv, syminfo, profile_path=Path("output/my_profile.json"))
+runner.run()
+```
 
 ### Overriding Inputs
 
@@ -338,24 +354,29 @@ The copy costs a fraction of a microsecond per bar, which only shows on very lig
 
 ### NA Values During Warmup
 
-During the warmup period (first N bars where the indicator doesn't have enough data), plot values
-are `NA` objects — PyneCore's equivalent of Pine Script's `na`.
+During the warmup period (first N bars where the indicator doesn't have enough data), numeric
+plot values are `na`. A numeric `na` is a native `float('nan')`, so your code receives an ordinary
+Python float and Python's rules apply to it, not Pine's:
 
-`NA` works transparently — no special handling needed:
+- **Ordered comparisons** are `False`: `nan < 30` and `nan > 70` are both `False`
+- **`!=` is `True`**: `nan != 30` (and even `nan != nan`) is `True`
+- **Truthiness**: `bool(nan)` is `True`, so `if rsi:` does **not** skip a missing value
+- **Arithmetic** propagates: `nan + 1` is `nan`
+- **Formatting** prints `nan`: `f"{nan:.2f}"` is `"nan"`
 
-- **Comparisons** return `False`: `NA < 30`, `NA > 70`, `NA == x` → all `False`
-- **Arithmetic** propagates: `NA + 1` → `NA`, `NA * 2.0` → `NA`
-- **Format strings** work: `f"{na_value:.2f}"` → `"NaN"`
+Test for a missing value explicitly with `math.isnan()`:
 
 ```python
+import math
+
 for candle, plot_data in runner.run_iter():
     rsi = plot_data.get("RSI")
 
-    if rsi > 70:  # False when rsi is NA — no crash, no special check needed
-        print(f"Overbought: RSI={rsi:.2f}")
+    if math.isnan(rsi):  # warmup: the RSI has no value yet
+        continue
 
-    # NA values print as "NaN" in f-strings
-    print(f"RSI={rsi:.2f}")  # "RSI=NaN" during warmup, "RSI=65.32" after
+    if rsi > 70:
+        print(f"Overbought: RSI={rsi:.2f}")
 ```
 
 ## Live Mode

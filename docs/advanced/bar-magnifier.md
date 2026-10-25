@@ -5,7 +5,7 @@ title: "Bar Magnifier"
 description: "Accurate intrabar order fills using lower-timeframe data"
 icon: "zoom_in"
 date: "2025-07-24"
-lastmod: "2026-09-28"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Strategy"]
@@ -31,11 +31,12 @@ ohlc = (high - open) < (open - low)
 - If `True`: assumes the path was Open → High → Low → Close
 - If `False`: assumes the path was Open → Low → High → Close
 
-The intuition: if the open is closer to the high, reaching the high required less price movement, so
-it likely happened first — then the larger move to the low followed. This is a solid Bayesian
-inference, and over many trades the errors tend to cancel out. However, when both a take-profit and
-a stop-loss could fill within the same bar, the heuristic has a 50/50 chance of picking the wrong
-one for that specific bar — which is where the magnifier adds value.
+The assumption behind it: if the open is closer to the high, reaching the high required less price
+movement, so it is taken to have happened first, with the larger move to the low following. It is
+an assumption, not information about the bar: the OHLC values do not record the order, and the
+heuristic can be wrong on any given bar. The error matters most when both a take-profit and a
+stop-loss lie within the same bar, because the guessed order then decides which one fills — which
+is where the magnifier adds value.
 
 ### Example
 
@@ -47,7 +48,10 @@ Open=100, High=112, Low=88, Close=100
 
 Both TP and SL are within the bar's range. Which filled first? The heuristic guesses based on
 whether price moved up or down first — but it has no real information about this. With the bar
-magnifier, the actual 5-minute (or 1-minute) candles within this hour reveal the true price path.
+magnifier, the 5-minute (or 1-minute) candles within this hour show the price path at a much finer
+resolution. They do not show the complete path: inside each sub-bar the order of its own high and
+low is still estimated the same way, so the magnifier narrows the uncertainty to the cases where
+both levels are hit within one sub-bar.
 
 ## How It Works
 

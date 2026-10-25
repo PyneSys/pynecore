@@ -5,7 +5,7 @@ title: "request.security()"
 description: "Using request.security() for multi-symbol and multi-timeframe data in PyneCore"
 icon: "security"
 date: "2026-03-27"
-lastmod: "2026-03-28"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -322,10 +322,10 @@ subprocess is given the containing period **as aggregated up to the current char
 than being allowed to read that period's completed bar from its own data file. Historical and
 live mode take the same path — the `HTFAggregator` is fed on every chart bar, warmup included.
 
-The daily-pivot idiom `request.security(sym, "D", close[1], lookahead_on)` is **unaffected and
-TV-exact**: `close[1]` names a period that has genuinely closed. Only the bare `close[0]` form
-differs, and only inside an open period — on a period's last chart bar the developing bar and
-the closed bar are the same bar, so the values coincide there too.
+The daily-pivot idiom `request.security(sym, "D", close[1], lookahead=lookahead_on)` is
+**unaffected and TV-exact**: `close[1]` names a period that has genuinely closed. Only the bare
+`close[0]` form differs, and only inside an open period — on a period's last chart bar the
+developing bar and the closed bar are the same bar, so the values coincide there too.
 
 **Cross-symbol HTF** — the chart-side `HTFAggregator` aggregates the *chart* symbol's
 OHLCV; it cannot produce OHLCV for a different security symbol. Cross-symbol HTF

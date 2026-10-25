@@ -37,6 +37,7 @@ Must run after ImportNormalizerTransformer (security calls are in their
 import ast
 
 from . import ast_walk
+from .locations import anchor_all_at
 from .security_calls import has_security_call, is_security_call, is_security_lower_tf_call
 
 __all__ = ['SecurityInstantiationTransformer']
@@ -345,15 +346,15 @@ class SecurityInstantiationTransformer:
             value = bound.get(name)
             if value is None or not self._is_static_arg(value):
                 continue
-            assign = ast.Assign(
+            # The value is cloned from the call site, but it is bound at the
+            # function's entry, as a parameter is
+            pinned.append(anchor_all_at(ast.Assign(
                 targets=[ast.Name(id=name, ctx=ast.Store())],
                 value=ast_walk.clone(value),
-            )
-            ast.copy_location(assign, fn)
-            ast_walk.fix_missing_locations(assign)
-            pinned.append(assign)
+            ), fn))
         if pinned:
-            fn.body[0:0] = pinned
+            at = ast_walk.docstring_end(fn.body)
+            fn.body[at:at] = pinned
 
     def _specialize_all(self, module: ast.Module) -> None:
         """Pin call-site constants into every single-site security bearer."""

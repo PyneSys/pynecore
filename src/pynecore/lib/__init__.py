@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, TypeAlias, Any, TypeVar, \
 if TYPE_CHECKING:
     from pynecore.types.type_checker import *
     from ..types.session import SessionInfo
+    from ..core.script import script, input
 
 import math as _math
 from bisect import bisect_right as _bisect_right
@@ -21,7 +22,6 @@ from pynecore.types.source import Source
 
 from ..core.module_property import module_property, module_function_property
 from ..core.series import SeriesImpl as _SeriesImpl
-from ..core.script import script, input
 
 from ..types.color import Color as _Color
 from ..types.na import NA, na_int
@@ -164,7 +164,7 @@ _bar_opens: list[int] = [0] * _BAR_OPENS_SIZE
 _datetime: datetime = datetime.fromtimestamp(0, UTC)
 
 # Script settings from `script.indicator`, `script.strategy` or `script.library`
-_script: script = None  # type: ignore[assignment]
+_script: 'script' = None  # type: ignore[assignment]
 
 # Chart (main-series) timeframe, propagated into request.security children so
 # ``timeframe.main_period`` there reports the chart TF instead of the context's
@@ -222,6 +222,35 @@ if TYPE_CHECKING:
 #
 # Functions
 #
+
+# Runtime only: a type checker reading a module ``__getattr__`` would accept any attribute
+# of the lib, typos in scripts included. It sees ``script`` and ``input`` through the
+# TYPE_CHECKING import instead.
+if not TYPE_CHECKING:
+    def __getattr__(name: str) -> Any:
+        """
+        ``script`` and ``input``, bound on first access.
+
+        They live in :mod:`pynecore.core.script`, which imports submodules of this package
+        while it loads, so this package must not need it to finish loading: either one can
+        be imported first.
+
+        :param name: The attribute looked up.
+        :return: The attribute.
+        :raises AttributeError: If the package has no such attribute.
+        """
+        if name in ('script', 'input'):
+            # Imported here, not at the top: the top would close the import cycle
+            from ..core import script as _core_script
+            value = getattr(_core_script, name)
+            globals()[name] = value
+            return value
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    def __dir__() -> list[str]:
+        """The package's attributes, ``script`` and ``input`` included."""
+        return sorted({*globals(), 'script', 'input'})
+
 
 # noinspection PyUnusedLocal,unused-parameter
 def max_bars_back(var: Any, num: int) -> None:
@@ -2405,6 +2434,21 @@ def _dbt_rebuild(opening_hours: list | None, session_starts: list | None) -> Non
     _dbt_guard = (opening_hours, session_starts)
 
 
+def _is_scheduled_day(day: date) -> bool:
+    """
+    Whether the session template schedules trading day ``day``.
+
+    Without session starts there is no template to leave a day out, so every calendar day
+    is a trading day -- the same rule :func:`_scheduled_day_shift` and the midnight
+    fallback of ``trading_day_open_sec`` follow.
+
+    :param day: Trading day date
+    :return: True if ``day`` is a scheduled trading day
+    """
+    return not _dbt_starts or _scheduled_day_open_sec(day, _dbt_tz, _dbt_starts,
+                                                      _dbt_on) is not None
+
+
 def _scheduled_year_days(calendar_year: int) -> list[date]:
     """
     The trading days the session template schedules in ``calendar_year``, in order.
@@ -2419,7 +2463,7 @@ def _scheduled_year_days(calendar_year: int) -> list[date]:
         days = []
         day = date(calendar_year, 1, 1)
         while day.year == calendar_year:
-            if _scheduled_day_open_sec(day, _dbt_tz, _dbt_starts, _dbt_on) is not None:
+            if _is_scheduled_day(day):
                 days.append(day)
             day += timedelta(days=1)
         _dbt_years[calendar_year] = days
@@ -2591,7 +2635,7 @@ def _tv_day_walk(day: date, multiplier: int, steps: int) -> date:
         previous = _scheduled_year_days(calendar_year - 1)
         offset: timedelta = days[min(remaining, len(days)) - 1] - date(calendar_year, 1, 1)
         mirror: date = date(calendar_year - 1, 12, 31) - offset
-        while _scheduled_day_open_sec(mirror, _dbt_tz, _dbt_starts, _dbt_on) is None:
+        while not _is_scheduled_day(mirror):
             mirror += timedelta(days=1)
         if mirror.year == calendar_year:
             landing = len(previous) + _bisect_right(days, mirror) - 1

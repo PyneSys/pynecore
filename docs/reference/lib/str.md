@@ -5,7 +5,7 @@ title: "str"
 description: "String manipulation functions"
 icon: "text_fields"
 date: "2026-03-28"
-lastmod: "2026-08-05"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -116,7 +116,7 @@ Returns the number of characters in the string.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| source | str | The string to measure |
+| string | str | The string to measure |
 
 **Returns:** `int`
 

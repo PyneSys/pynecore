@@ -34,8 +34,11 @@ from pynecore.core.broker.disappearance import (
 from pynecore.core.broker.exceptions import UnexpectedCancelError
 from pynecore.core.broker.models import (
     CANCEL_REASON_VENUE_REDUCE_ONLY,
+    ExchangeOrder,
+    LegType,
     OrderEvent,
     OrderStatus,
+    OrderType,
     QuarantineKind,
 )
 from pynecore.core.broker.run_identity import RunIdentity
@@ -643,6 +646,79 @@ def __test_confirm_closed_retires_row_and_siblings_without_event__(
         assert sibling is not None and sibling.closed_ts_ms is not None
         retired = _read_events(ctx, 'reconcile_filled_then_closed_retired')
         assert len(retired) == 1
+
+
+def _close_event(deal_id: str, qty: float, price: float) -> OrderEvent:
+    """The venue SL fill that closed the ``Long`` entry while the stream was down."""
+    return OrderEvent(
+        order=ExchangeOrder(
+            id="SLTP-1", symbol="EURUSD", side="sell", order_type=OrderType.MARKET,
+            qty=qty, filled_qty=qty, remaining_qty=0.0, price=None, stop_price=None,
+            average_fill_price=price, status=OrderStatus.FILLED, timestamp=T0,
+            fee=0.0, fee_currency="", reduce_only=True,
+        ),
+        event_type='filled', fill_price=price, fill_qty=qty, timestamp=T0 + 1.0,
+        from_entry="Long", leg_type=LegType.CLOSE, fill_id=deal_id,
+    )
+
+
+def __test_confirm_closed_yields_the_proven_close_fills__(tmp_path: Path) -> None:
+    """CLOSED with closing fills the evidence proved: the row is retired and
+    registered first, then the close fills are yielded so the engine books
+    the close it missed instead of an unexplained flatten."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", filled=1.0,
+                  extras={MISSING_PENDING_EXTRA: T0, 'position_id': 'P1'})
+        close = _close_event('DEAL-SL', 1.0, 1.05)
+        order_of_work: list[str] = []
+
+        def _register(retired: OrderRow, ids: tuple[str, ...]) -> None:
+            fresh = ctx.get_order(retired.client_order_id)
+            assert fresh is not None and fresh.closed_ts_ms is not None
+            order_of_work.append(f"register:{','.join(ids)}")
+
+        tracker = _make_tracker(
+            ctx,
+            confirm=_confirm_const(MissingConfirmation(
+                MissingResolution.CLOSED, position_ref='P1',
+                execution_ids=('DEAL-OPEN', 'DEAL-SL'), close_events=(close,))),
+            register_executions=_register,
+        )
+
+        async def _collect() -> list[OrderEvent]:
+            out: list[OrderEvent] = []
+            async for event in tracker.observe({'working': set()}, T_EXPIRED):
+                order_of_work.append(f"event:{event.fill_id}")
+                out.append(event)
+            return out
+
+        events = _run(_collect())
+        assert events == [close]
+        assert order_of_work == ["register:DEAL-OPEN,DEAL-SL", "event:DEAL-SL"]
+        row = ctx.get_order("c1")
+        assert row is not None and row.state == 'closed'
+
+
+def __test_stale_closed_confirmation_yields_no_close_fills__(tmp_path: Path) -> None:
+    """A CLOSED outcome the stamp-version guard drops delivers none of its
+    close fills: the row was not retired, so nothing proves them yet."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", filled=1.0,
+                  extras={MISSING_PENDING_EXTRA: T0, 'position_id': 'P1'})
+
+        async def _confirm(confirmed_row: OrderRow) -> MissingConfirmation:
+            ctx.upsert_order(confirmed_row.client_order_id, extras={'position_id': 'P1'})
+            return MissingConfirmation(
+                MissingResolution.CLOSED, position_ref='P1',
+                close_events=(_close_event('DEAL-SL', 1.0, 1.05),))
+
+        tracker = _make_tracker(ctx, confirm=_confirm)
+        events = _run(_drain(tracker, {'working': None}, T_EXPIRED))
+        assert events == []
+        row = ctx.get_order("c1")
+        assert row is not None and row.closed_ts_ms is None
 
 
 def __test_terminal_resolution_registers_execution_ids_without_fill__(

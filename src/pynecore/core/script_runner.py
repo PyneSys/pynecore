@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from pynecore.core.broker.storage import RunContext
     from pynecore.core.broker.models import ScriptRequirements
     from pynecore.core.security import DevBatchSpec
+    from pynecore.core.profiler import RunProfiler
     from pynecore.core.symbol_map import MappedSymbol
 
 __all__ = [
@@ -1210,7 +1211,8 @@ class ScriptRunner:
                  '_round_decimals', '_lossless_volume', '_lossless_prices',
                  '_config_dir', '_symbol_map', '_script_timeframe',
                  '_chart_bar_window',
-                 'broker_balance', '_sim_logged_open_ids', '_inputs', '_settings', '_live')
+                 'broker_balance', '_sim_logged_open_ids', '_inputs', '_settings', '_live',
+                 '_profiler')
 
     # noinspection PyProtectedMember
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
@@ -1237,7 +1239,8 @@ class ScriptRunner:
                  lossless_volume: bool = False,
                  lossless_prices: bool = False,
                  chart_bar_window: 'ChartBarWindow | None' = None,
-                 config_dir: Path | None = None):
+                 config_dir: Path | None = None,
+                 profile_path: Path | None = None):
         """
         Initialize the script runner
 
@@ -1325,11 +1328,19 @@ class ScriptRunner:
                                 chart feed's :attr:`OHLCVReader.lossless_prices`;
                                 leave false when the source is unknown, which keeps
                                 the clean-up on (see :func:`_round_price`)
+        :param profile_path: Profile the run and write the per-line profile here (see
+                             :mod:`pynecore.core.profiler`). Backtests only.
         :raises ImportError: If the script does not have a 'main' function
         :raises ImportError: If the 'main' function is not decorated with @script.[indicator|strategy|library]
         :raises OSError: If the plot file could not be opened
+        :raises ValueError: If a live or broker run is to be profiled
+        :raises ProfilerUnavailable: If profiling is asked for but not possible here
         """
+        if profile_path is not None and (live or broker_plugin is not None):
+            raise ValueError("Profiling is available for backtests only, not for live or "
+                             "broker runs.")
         self._script_path = script_path
+        self._profiler: 'RunProfiler | None' = None
         self._security_data = security_data or {}
         self._magnifier_iter = magnifier_iter
         self._magnifier_source_tf = magnifier_source_tf
@@ -1420,6 +1431,12 @@ class ScriptRunner:
                               f"@script.[indicator|strategy|library] to run!")
 
         self.script: script = self.script_module.main.script
+
+        if profile_path is not None:
+            # Imported on demand: the profiler names lib internals, and the lib may
+            # only be imported once the import hook is in place
+            from .profiler import RunProfiler
+            self._profiler = RunProfiler(self, profile_path)
 
         # Broker (live trading) mode setup.
         # Done before ohlcv_iter is consumed so the engine is ready before run_iter.
@@ -1990,10 +2007,24 @@ class ScriptRunner:
         :return: Iterator over the per-bar results
         :raises AssertionError: If the 'main' function does not return a dictionary
         """
-        results = self._run_iter(on_progress, on_tick)
+        results = self._results(on_progress, on_tick)
         if not copy_results:
             return results
         return self._copy_results(results)
+
+    def _results(self, on_progress: Callable[[datetime], None] | None,
+                 on_tick: Callable[[OHLCV], None] | None) -> Generator:
+        """
+        The generator of :meth:`_run_iter`, under the profiler when the run has one.
+
+        :param on_progress: See :meth:`run_iter`
+        :param on_tick: See :meth:`run_iter`
+        :return: The per-bar results
+        """
+        results = self._run_iter(on_progress, on_tick)
+        if self._profiler is None:
+            return results
+        return cast('RunProfiler', self._profiler).profile(results)
 
     @staticmethod
     def _copy_results(results: Generator) -> Iterator:
@@ -2722,6 +2753,14 @@ class ScriptRunner:
                         _chart_ring_capacity, _chart_ring_arena)
                     _registry_parent_conn, _registry_child_conn = mp_context.Pipe()
                     sec_registry_pipes[sid] = _registry_parent_conn
+                    # A profiled run profiles the child too: it sends what it measured
+                    # through a pipe of its own as it stops
+                    _profile_conn = None
+                    if self._profiler is not None:
+                        _profile_conn = cast('RunProfiler', self._profiler).open_context(
+                            sec_state.timeframe,
+                            data_source.symbol if isinstance(data_source, PluginSymbol)
+                            else Path(data_source).name)
                     proc = mp_context.Process(
                         target=security_process_main,
                         args=(
@@ -2759,13 +2798,16 @@ class ScriptRunner:
                         # have re-pinned ``timenow`` since. Kept out of ``args``
                         # because that tuple describes the CONTEXT, and its tail
                         # is what identifies a planned developing batch.
-                        kwargs={'run_env': child_run_env(), 'resolved_configs': resolved_configs},
+                        kwargs={'run_env': child_run_env(), 'resolved_configs': resolved_configs,
+                                'profile_conn': _profile_conn},
                         daemon=True,
                     )
                     proc.start()
                     # The child owns its end now; keeping the parent's copy of
                     # it open would stop the child from ever seeing EOF.
                     _registry_child_conn.close()
+                    if _profile_conn is not None:
+                        _profile_conn.close()
                     # Tell the children spawned EARLIER what this context is.
                     # Their snapshots either omitted it (runtime-resolved) or
                     # predate ``load_htf_bar_opens``, which is what fills the
@@ -4191,6 +4233,9 @@ class ScriptRunner:
                     # hygiene, and gives it an EOF either way.
                     _conn.close()
                 sec_registry_pipes.clear()
+                # A stopping child sends its profile before it exits
+                if self._profiler is not None:
+                    cast('RunProfiler', self._profiler).collect_contexts()
                 _join_security_processes(sec_processes)
                 if callable(sec_cleanup_fn):
                     sec_cleanup_fn: Callable
@@ -4736,7 +4781,8 @@ class ScriptRunner:
         if not want:
             return []
         out: list[str] = []
-        for toml_path in sorted(data_dir.glob('*.toml')):
+        toml_paths: list[Path] = sorted(data_dir.glob('*.toml'))
+        for toml_path in toml_paths:
             ohlcv_path = toml_path.with_suffix('.ohlcv')
             if not ohlcv_path.exists():
                 continue
@@ -5283,7 +5329,7 @@ class ScriptRunner:
                         bid/ask in the progress spinner.
         :raises AssertionError: If the 'main' function does not return a dictionary
         """
-        results = self._run_iter(on_progress, on_tick)
+        results = self._results(on_progress, on_tick)
         try:
             for _ in results:
                 pass

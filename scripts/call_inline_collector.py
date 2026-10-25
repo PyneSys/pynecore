@@ -17,7 +17,7 @@ is the same function of the tree in every process (and in the native port,
 which compiles the same file in). The lib sources are not part of the pipeline
 hash and this file is, so an edit of an inlined body reaches cached script
 bytecode only through the regenerated file -- and
-``tests/t00_pynecore/ast/test_142_call_inline_templates.py`` fails, naming the
+``tests/t00_pynecore/ast/test_144_call_inline_templates.py`` fails, naming the
 function whose template changed, until it is regenerated.
 
 A body outside the shape is an error here, not a silent fallback: the

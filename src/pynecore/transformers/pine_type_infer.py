@@ -64,8 +64,8 @@ from .pine_type_rules import (
     TY_ATTR, get_ty, set_ty, inherit_ty,
     constant_type, PIN_ANY, pin_chars, pin_for, get_pins, set_pin, set_pins, set_vector,
     get_varying, set_varying,
-    WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_STRING_NA, WIDEN_NUMBER_NA, WIDEN_NA_TEXT,
-    WIDEN_ARRAY_NA, WIDEN_MAP_NA, WIDEN_MATRIX_NA, CONTAINER_NA_WIDENS,
+    WIDEN_FLOAT, WIDEN_BOOL, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_STRING_NA, WIDEN_NUMBER_NA,
+    WIDEN_NA_TEXT, WIDEN_ARRAY_NA, WIDEN_MAP_NA, WIDEN_MATRIX_NA, CONTAINER_NA_WIDENS,
     NA_TEXT_PARAMS,
     NOT_PINE_STRINGS, set_widen, get_widen_site,
     set_widen_site, get_widens, set_widens, is_na_widen, set_na_class,
@@ -533,6 +533,11 @@ class _Inference:
         #: resolved through the ordinary scope search on that name; the node is
         #: what the published signature is derived from
         self._class_methods: dict[str, dict[str, ast.FunctionDef]] = {}
+        #: Class id -> method name -> (its key in ``table.funcs``, the scope the
+        #: class stands in), for the methods declared IN the class bodies of
+        #: this module. Those are attributes of the receiver, so a call through
+        #: one reaches its definition directly
+        self._members: dict[str, dict[str, tuple[str, str]]] = {}
         #: Nodes a shape complaint was already reported for, a join conflict
         #: keyed with the name of what it joined. A body is walked once per
         #: context and again per loop pass, and one mismatch is one complaint
@@ -1006,23 +1011,47 @@ class _Inference:
         for cid, methods in self._class_methods.items():
             sig = self.table.class_sigs.get(cid)
             for name, node in methods.items():
-                func = self.table.funcs.get(keys.get(id(node), ''))
-                if func is None:
+                published = self._published_method(name, node, keys.get(id(node), ''))
+                if published is None:
                     continue
-                shape = impl_sig(node, func.ret, self._ty_of, self._classes)
-                positional = list(node.args.posonlyargs) + list(node.args.args)
-                published = ExportSig(
-                    name=name, kind='function', params=shape.params,
-                    required=shape.required, open_ended=shape.open_ended, ret=shape.ret,
-                    annotated=all(annotation_type(arg.annotation, self._classes) != UNKNOWN
-                                  for arg in positional),
-                    line=_line(node), names=shape.names)
                 if sig is not None:
                     sig.methods[name] = published
                 else:
                     # A method on a class another module declares: it belongs
                     # to no class of ours, and travels as an extension
                     self.table.extensions.setdefault(cid, {})[name] = published
+        for cid, members in self._members.items():
+            sig = self.table.class_sigs.get(cid)
+            if sig is None:
+                continue
+            for name, (key, _) in members.items():
+                definitions = self._defs.get(key)
+                published = None if not definitions \
+                    else self._published_method(name, definitions[-1], key)
+                if published is not None:
+                    sig.members[name] = published
+
+    def _published_method(self, name: str, node: ast.FunctionDef,
+                          key: str) -> ExportSig | None:
+        """
+        The signature a method is published with, receiver first.
+
+        :param name: The method name
+        :param node: Its definition
+        :param key: Its key in ``table.funcs``
+        :return: The signature, or None when the definition has none
+        """
+        func = self.table.funcs.get(key)
+        if func is None:
+            return None
+        shape = impl_sig(node, func.ret, self._ty_of, self._classes)
+        positional = list(node.args.posonlyargs) + list(node.args.args)
+        return ExportSig(
+            name=name, kind='function', params=shape.params,
+            required=shape.required, open_ended=shape.open_ended, ret=shape.ret,
+            annotated=all(annotation_type(arg.annotation, self._classes) != UNKNOWN
+                          for arg in positional),
+            line=_line(node), names=shape.names)
 
     def _collect_imports(self, tree: ast.Module) -> None:
         """
@@ -1290,37 +1319,83 @@ class _Inference:
         """
         for stmt in body:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                key = self._qualify(scope, stmt.name)
-                self._defs.setdefault(key, []).append(stmt)
-                params = [annotation_type(a.annotation, self._classes)
-                          for a in list(stmt.args.posonlyargs) + list(stmt.args.args)]
-                declared = annotation_type(stmt.returns, self._classes)
-                annotated = declared != UNKNOWN
-                if _is_overload(stmt):
-                    # One name, several implementations: each contributes its
-                    # own return, and the group's type is what they agree on
-                    self._overload_groups[key] = None
-                    returns = self._group_returns.setdefault(key, [])
-                    nid = node_id(stmt)
-                    if nid is not None:
-                        self._group_slot[nid] = len(returns)
-                    returns.append(declared)
-                    declared = overload_result(returns)
-                    annotated = annotated and self._annotated_returns.get(key, True)
-                self.table.funcs[key] = FuncSig(
-                    name=stmt.name, params=params, ret=declared, line=_line(stmt))
-                self._annotated_returns[key] = annotated
-                # A parameter binds its name in the body's own scope, so it
-                # shadows an outer definition of that name like an assignment
-                own = self._rebound.setdefault(key, set())
-                own.update(arg.arg for arg in _every_param(stmt))
-                own.update(arg.arg for arg in (stmt.args.vararg, stmt.args.kwarg)
-                           if arg is not None)
-                own.update(self._scope_facts(stmt).bound)
-                self._collect(stmt.body, key)
+                self._collect_def(stmt, self._qualify(scope, stmt.name))
+            elif isinstance(stmt, ast.ClassDef):
+                self._collect_members(stmt, scope)
             else:
                 for nested in _statement_lists(stmt):
                     self._collect(nested, scope)
+
+    def _collect_def(self, stmt: ast.FunctionDef | ast.AsyncFunctionDef, key: str) -> None:
+        """
+        Record one definition and its annotated signature under its key.
+
+        :param stmt: The definition
+        :param key: Its scope-qualified id
+        """
+        self._defs.setdefault(key, []).append(stmt)
+        params = [annotation_type(a.annotation, self._classes)
+                  for a in list(stmt.args.posonlyargs) + list(stmt.args.args)]
+        declared = annotation_type(stmt.returns, self._classes)
+        annotated = declared != UNKNOWN
+        if _is_overload(stmt):
+            # One name, several implementations: each contributes its
+            # own return, and the group's type is what they agree on
+            self._overload_groups[key] = None
+            returns = self._group_returns.setdefault(key, [])
+            nid = node_id(stmt)
+            if nid is not None:
+                self._group_slot[nid] = len(returns)
+            returns.append(declared)
+            declared = overload_result(returns)
+            annotated = annotated and self._annotated_returns.get(key, True)
+        self.table.funcs[key] = FuncSig(
+            name=stmt.name, params=params, ret=declared, line=_line(stmt))
+        self._annotated_returns[key] = annotated
+        # A parameter binds its name in the body's own scope, so it
+        # shadows an outer definition of that name like an assignment
+        own = self._rebound.setdefault(key, set())
+        own.update(arg.arg for arg in _every_param(stmt))
+        own.update(arg.arg for arg in (stmt.args.vararg, stmt.args.kwarg)
+                   if arg is not None)
+        own.update(self._scope_facts(stmt).bound)
+        self._collect(stmt.body, key)
+
+    def _collect_members(self, stmt: ast.ClassDef, scope: str) -> None:
+        """
+        Record the methods a class body declares.
+
+        A method is an attribute of its class, never a name of the scope the
+        class stands in, so it is keyed under the class -- ``Pair.m``, which is
+        also how a call through the class spells it, and that call resolves
+        through the ordinary search.
+
+        Its receiver is the class: a plain method's first parameter is given
+        the class as its annotation where it has none, which is what Pine's
+        ``method m(Pair this)`` spells out, so every reader of the parameter
+        types -- a call site, the declaration context, the published
+        signature -- sees the same receiver type. The annotation is a string,
+        which Python leaves unevaluated: the class is not bound yet while its
+        body runs.
+
+        :param stmt: The class statement
+        :param scope: Scope id the class stands in
+        """
+        cid = self._classes.get(stmt.name)
+        for member in stmt.body:
+            if not isinstance(member, ast.FunctionDef):
+                continue
+            positional = list(member.args.posonlyargs) + list(member.args.args)
+            plain = not member.decorator_list
+            if plain and positional and positional[0].annotation is None:
+                receiver = positional[0]
+                receiver.annotation = ast.copy_location(ast.Constant(value=stmt.name), receiver)
+            key = self._qualify(scope, f'{stmt.name}.{member.name}')
+            self._collect_def(member, key)
+            # A leading underscore is never a Pine method name -- a library
+            # export's ``__call__`` shim among them -- and no call reaches one
+            if plain and cid is not None and not member.name.startswith('_'):
+                self._members.setdefault(cid, {})[member.name] = (key, scope)
 
     # --- statements ------------------------------------------------------
 
@@ -1486,7 +1561,13 @@ class _Inference:
             self._factory_fields.add(id(value))
         self._frames.append(_Frame(self._frames[-1].scope))
         try:
-            self._body(stmt.body)
+            for member in stmt.body:
+                if isinstance(member, ast.FunctionDef):
+                    # A method is keyed under its class (see ``_collect_members``)
+                    self._definition(member, self._qualify(self._scope,
+                                                           f'{stmt.name}.{member.name}'))
+                else:
+                    self._stmt(member)
         finally:
             self._frames.pop()
 
@@ -1524,7 +1605,8 @@ class _Inference:
 
     # --- definitions and contexts ----------------------------------------
 
-    def _definition(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+    def _definition(self, node: ast.FunctionDef | ast.AsyncFunctionDef,
+                    key: str | None = None) -> None:
         """
         Type a definition's defaults, and decide when its body is walked.
 
@@ -1534,10 +1616,14 @@ class _Inference:
         every node a caller is about to type properly. So an ordinary function
         waits -- if nothing ever calls it, the pending flush walks it at the
         end of this scope, which is the only case where UNKNOWN is the truth.
+
+        :param node: The definition
+        :param key: Its id, when it is not its name in this scope (a method)
         """
         self._type_defaults(node)
 
-        key = self._qualify(self._scope, node.name)
+        if key is None:
+            key = self._qualify(self._scope, node.name)
         if key in self._overload_groups or is_script_entry(node):
             # An implementation of an overload group is already per-signature
             # -- the pin selects among them, so a call site has nothing to
@@ -2518,7 +2604,9 @@ class _Inference:
             found = sig.fields.get(node.attr)
             if found is not None:
                 return found
-            if node.attr in sig.methods or node.attr in self._class_methods.get(cid, ()):
+            if node.attr in sig.methods or node.attr in sig.members \
+                    or node.attr in self._class_methods.get(cid, ()) \
+                    or node.attr in self._members.get(cid, ()):
                 # ``p.bump`` under ``p.bump(2)``: a bound method, which is an
                 # object like any other callable reference. What the CALL
                 # evaluates to is the call's question, not the reference's
@@ -3018,7 +3106,8 @@ class _Inference:
         overload group records that per implementation. A call that fits no
         shape, names a parameter that does not exist, or passes a value the
         parameter's type does not take is a Pine error, and is reported once,
-        here, whatever becomes of its result.
+        here, whatever becomes of its result. A number passed to a ``bool``
+        parameter is not one: it is marked for the conversion (``WIDEN_BOOL``).
 
         :param callee: The registry key
         :param entry: Its registry entry
@@ -3069,6 +3158,14 @@ class _Inference:
                 # type the call has to meet
                 continue
             passed = get_ty(arg)
+            if declared == BOOL:
+                # A number goes into a bool parameter by Pine's tolerant
+                # float-to-bool rule, the one the truthiness rewrite gives the
+                # script's own bool contexts; the lib function itself tests the
+                # value with Python's truthiness, which takes a nan for true
+                self._record_widen(arg, WIDEN_BOOL if passed in NUMERIC else _WIDEN_HARMLESS)
+                if passed in NUMERIC:
+                    continue
             if passed in _UNCHECKED or _fits(declared, passed):
                 continue
             self._bad_call(node, callee, f"'{callee}' takes {render_ty(declared)} for "
@@ -4377,6 +4474,9 @@ class _Inference:
         :param args: The receiver followed by the arguments after it
         :return: The type the call evaluates to, or None when there is none
         """
+        member = self._member_result(cid, name, node, args)
+        if member is not None:
+            return member
         sig = self._class_sig(cid, node)
         source = cid.rpartition(CLASS_SEP)[0]
         builtin = not source or source == LIB_MODULE
@@ -4393,6 +4493,42 @@ class _Inference:
             if home is None:
                 return None
         published = self._library_method(name, node, home)
+        if published is None:
+            return None
+        return self._published_result(published, name, node, args)
+
+    def _member_result(self, cid: str, name: str, node: ast.Call,
+                       args: Sequence[ast.expr]) -> str | None:
+        """
+        Type a call to a method its class declares in its own body.
+
+        Such a method is an attribute of the receiver, which the runtime asks
+        before anything else, the ``method_call`` search by name included. One
+        of this module's classes is typed in the context the call describes,
+        like any call to a definition; another module's through the signature
+        it publishes.
+
+        A ``method_call`` by name binds the method in its dispatch entry, which
+        hands no instance vector over, so such a site takes no part in the
+        per-instance channel (see ``_call_context``).
+
+        :param cid: The receiver's class id
+        :param name: The method name
+        :param node: The call node
+        :param args: The receiver followed by the arguments after it
+        :return: The type the call evaluates to, or None when the class
+                 declares no such method
+        """
+        own = self._members.get(cid, {}).get(name)
+        if own is not None:
+            key, scope = own
+            for frame in range(len(self._frames) - 1, -1, -1):
+                if self._frames[frame].scope == scope:
+                    return self._call_context(key, node, frame, args,
+                                              record=dotted_name(node.func) != 'method_call')
+            return None
+        sig = self._class_sig(cid, node)
+        published = None if sig is None else sig.members.get(name)
         if published is None:
             return None
         return self._published_result(published, name, node, args)

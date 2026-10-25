@@ -5,7 +5,7 @@ title: "What is Pyne code?"
 description: "Pyne's domain-specific language for market data, indicators, and trading strategies: Python syntax, bar-by-bar semantics, and the edge subset."
 icon: "code"
 date: "2026-10-18"
-lastmod: "2026-10-18"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Overview"]
@@ -97,7 +97,9 @@ The profile limits available syntax, imports, and calls. It supports the Pyne
 calculation model without requiring arbitrary Python facilities. For example,
 general Python packages, comprehensions, and exception handling are outside the
 profile. This gives tooling a defined language contract without requiring a
-general-purpose Python environment.
+general-purpose Python environment. A class is a user-defined type: its body
+declares fields and methods, with no inheritance (see
+[Types and methods in the edge profile](../reference/script-format.md#types-and-methods-in-the-edge-profile)).
 
 Plain `@pyne` supports broader Python integration in the Python-based PyneCore
 runtime, including external libraries. Those programs still use Pyne's execution

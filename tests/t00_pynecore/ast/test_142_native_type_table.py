@@ -18,7 +18,7 @@ from pynecore.transformers import module_interface, pipeline
 from pynecore.transformers.node_ids import ID_ATTR, assign_node_ids
 from pynecore.transformers.pine_type_table import Binding, FuncSig, PineTypeTable
 
-from .test_135_native_transform import __test_helper_inputs, __test_helper_require_native
+from .test_137_native_transform import __test_helper_inputs, __test_helper_require_native
 
 #: A library publishing a class, a method on it and an overload group
 __test_helper_SHAPES = '''"""

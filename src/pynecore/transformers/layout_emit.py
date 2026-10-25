@@ -20,6 +20,7 @@ The runtime side of the contract (layout dict format, ``_make_state``,
 """
 import ast
 
+from .locations import anchor_at
 from .pine_type_rules import OBJECT, stamp_lowering
 from .slot_layout import ModuleLayout, ScopeLayout
 
@@ -131,12 +132,54 @@ def _process_nested_bodies(node: ast.AST, scope_prefix: str, layout: ModuleLayou
                 _process_nested_bodies(item, scope_prefix, layout, used_imports)
 
 
+def _is_staticmethod(decorator: ast.expr) -> bool:
+    """Whether a decorator is the builtin ``staticmethod``."""
+    return isinstance(decorator, ast.Name) and decorator.id == 'staticmethod'
+
+
+def _process_method(stmt: ast.FunctionDef, scope_id: str, used_imports: set[str]) -> None:
+    """Wire a state-carrying method of a class body to its layout.
+
+    The hidden state parameter stands first, like on every other definition,
+    so the class attribute is the plain function (``Pair.m(state, p)``). An
+    instance reaches it through the ``__state_method__`` descriptor, which
+    puts the receiver behind the state. A static method has no receiver and
+    needs only the layout. Any other decorator decides itself what the
+    attribute holds, so its state could not be routed.
+
+    :raises SyntaxError: For a state-carrying method with any other decorator
+    """
+    decorators = stmt.decorator_list
+    if not decorators:
+        stmt.decorator_list = [ast.Name(id='__state_method__', ctx=ast.Load()),
+                               _attach_decorator_ast(scope_id)]
+        used_imports.update(('__state_method__', '__attach_layout__'))
+        return
+    if len(decorators) == 1 and _is_staticmethod(decorators[0]):
+        decorators.append(_attach_decorator_ast(scope_id))
+        used_imports.add('__attach_layout__')
+        return
+    raise SyntaxError(
+        f"method '{stmt.name}' keeps state (a 'ta' call, a series or a persistent), "
+        f"which only a plain or a @staticmethod method can do (line {stmt.lineno})")
+
+
 def _process_defs(body: list[ast.stmt], scope_prefix: str, layout: ModuleLayout,
-                  used_imports: set[str]) -> list[ast.stmt]:
-    """Inject hidden state parameters and layout attaches into a statement list."""
+                  used_imports: set[str], in_class: bool = False) -> list[ast.stmt]:
+    """Inject hidden state parameters and layout attaches into a statement list.
+
+    :param in_class: Whether the list is a class body, whose definitions are
+        methods
+    """
     new_body: list[ast.stmt] = []
     for stmt in body:
         new_body.append(stmt)
+        if isinstance(stmt, ast.ClassDef):
+            # A class body is no scope of its own: its methods belong to the
+            # enclosing one, like the scope segments say
+            stmt.body = _process_defs(stmt.body, scope_prefix, layout, used_imports,
+                                      in_class=True)
+            continue
         if not isinstance(stmt, ast.FunctionDef):
             _process_nested_bodies(stmt, scope_prefix, layout, used_imports)
             continue
@@ -144,12 +187,16 @@ def _process_defs(body: list[ast.stmt], scope_prefix: str, layout: ModuleLayout,
         scope_id = f'{scope_prefix}·{segment}' if scope_prefix else segment
         stmt.body = _process_defs(stmt.body, scope_id, layout, used_imports)
         if layout.state_carrying(scope_id):
-            stmt.args.args.insert(0, ast.arg(arg=layout.state_param(scope_id)))
-            if stmt.decorator_list:
+            # First in the signature: positional-only parameters precede the rest
+            (stmt.args.posonlyargs or stmt.args.args).insert(
+                0, ast.arg(arg=layout.state_param(scope_id)))
+            if in_class:
+                _process_method(stmt, scope_id, used_imports)
+            elif stmt.decorator_list:
                 stmt.decorator_list.append(_attach_decorator_ast(scope_id))
                 used_imports.add('__attach_layout__')
             else:
-                new_body.append(_attach_ast(stmt.name, scope_id))
+                new_body.append(anchor_at(_attach_ast(stmt.name, scope_id), stmt))
     return new_body
 
 

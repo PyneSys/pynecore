@@ -81,9 +81,13 @@ from .security_mp import apply_child_run_env
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    # noinspection PyProtectedMember
+    from multiprocessing.connection import _ConnectionBase
     from multiprocessing.process import BaseProcess
     from multiprocessing.synchronize import Condition, Lock as LockType
     from .live_runner import LiveBarStreamer
+    # noinspection PyProtectedMember
+    from .script import ScriptConfig
     from .security import DevBatchSpec
     from ..types.ohlcv import OHLCV
 
@@ -438,7 +442,8 @@ def security_process_main(
         script_settings: 'dict[str, Any] | None' = None,
         dev_batch_spec: 'DevBatchSpec | None' = None,
         run_env: 'dict[str, str] | None' = None,
-        resolved_configs: 'dict[str, script_mod.ScriptConfig] | None' = None,
+        resolved_configs: 'dict[str, ScriptConfig] | None' = None,
+        profile_conn: '_ConnectionBase | None' = None,
 ):
     assert result_locks is not None, "result_locks must be provided by script_runner"
     """
@@ -524,6 +529,9 @@ def security_process_main(
         ``resolved_configs`` is absent.
     :param resolved_configs: The chart's resolved configuration per module. When provided,
         script and library inputs/settings use this snapshot instead of their TOML.
+    :param profile_conn: The sending end of the chart profiler's pipe when the run is
+        profiled: this process then profiles the script code it runs and sends the
+        result on its way out (``profiler.ContextProfiler``).
     :param dev_batch_spec: What to reproduce a historical DEVELOPING batch's
         round sequence from (see :func:`security.iter_dev_batch_records`), or
         ``None``. The chart launches ONE round for it
@@ -744,6 +752,7 @@ def security_process_main(
     from pynecore.lib import barstate
     from pynecore.core import instance_state, script as script_mod
     from ..types.ohlcv import OHLCV
+    from .profiler import ContextProfiler
 
     # Set syminfo BEFORE importing the script
     _set_lib_syminfo_properties(syminfo)
@@ -1596,6 +1605,11 @@ def security_process_main(
             finally:
                 sync_block.set_parked_until(sec_id, 0)
 
+    context_profiler = None
+    if profile_conn is not None:
+        context_profiler = ContextProfiler(script_module, sec_ids, profile_conn)
+        context_profiler.start()
+
     try:
         current_bar = 0
         if reader is not None:
@@ -1979,3 +1993,6 @@ def security_process_main(
         lib._lib_semaphore = False
         lib._in_lib_main = False
         lib._in_security = False
+        # Last, so a chart that is already gone cannot cut the cleanup above short
+        if context_profiler is not None:
+            context_profiler.send(int(lib.bar_index) + 1)

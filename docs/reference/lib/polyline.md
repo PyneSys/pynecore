@@ -5,7 +5,7 @@ title: "polyline"
 description: "Multi-segment line drawings"
 icon: "polyline"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -24,17 +24,18 @@ from pynecore.lib import (
     polyline, chart, close, high, low, bar_index,
     color, script
 )
+from pynecore.types import ChartPoint, Polyline
 
 @script.indicator(title="Polyline Pattern", overlay=True)
 def main():
     # Create a simple trend channel using two points
     if bar_index == 50:
-        point1: chart.point = chart.point(50, low[0])
-        point2: chart.point = chart.point(100, high[0])
-        points: list[chart.point] = [point1, point2]
-        
-        # Draw a curved, closed polyline with blue line and light fill
-        pl: polyline = polyline.new(
+        point1: ChartPoint = chart.point.from_index(50, low)
+        point2: ChartPoint = chart.point.from_index(100, high)
+        points: list[ChartPoint] = [point1, point2]
+
+        # Draw a curved, open polyline with blue line and light fill
+        pl: Polyline = polyline.new(
             points=points,
             curved=True,
             closed=False,
@@ -52,7 +53,7 @@ Creates a new polyline by connecting points sequentially with line segments.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `points` | `list[chart.point]` | Array of points to connect |
+| `points` | `list[ChartPoint]` | Array of `chart.point` objects to connect |
 | `curved` | `bool` | Use curved line segments instead of straight (default: `False`) |
 | `closed` | `bool` | Connect the last point back to the first (default: `False`) |
 | `xloc` | `xloc` | Use `xloc.bar_index` (default) or `xloc.bar_time` for x-coordinate |
@@ -66,9 +67,9 @@ Creates a new polyline by connecting points sequentially with line segments.
 
 **Example:**
 ```python
-pt1: chart.point = chart.point(0, 100.0)
-pt2: chart.point = chart.point(10, 105.0)
-pl: polyline = polyline.new([pt1, pt2], line_color=color.green, line_width=2)
+pt1: ChartPoint = chart.point.from_index(0, 100.0)
+pt2: ChartPoint = chart.point.from_index(10, 105.0)
+pl: Polyline = polyline.new([pt1, pt2], line_color=color.green, line_width=2)
 ```
 
 ### polyline.delete()

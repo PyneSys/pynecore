@@ -5,7 +5,7 @@ title: "request"
 description: "Data requests from other symbols and timeframes"
 icon: "cloud_download"
 date: "2026-03-28"
-lastmod: "2026-08-06"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -64,13 +64,21 @@ upper_band: float = request.security("SPY", "240", ta.highest(high, 14))  # High
 ```
 
 **Lookahead behavior:** `barmerge.lookahead_off` (the default) and the PyneSys-native
-`barmerge.lookahead_last_closed` return closed security bars and are repaint-free. With
-`barmerge.lookahead_on`, same-symbol higher-timeframe requests use the containing higher-timeframe
-bar. In historical data, a bare value can therefore expose that completed bar's final value; use
-`close[1]` inside the expression when the intent is the prior closed bar. In live mode, the
-same-symbol higher-timeframe bar is aggregated from the chart data and is unconfirmed. A
-cross-symbol higher-timeframe request cannot build that developing bar, so it yields `na` until the
-period closes.
+`barmerge.lookahead_last_closed` return closed security bars and are repaint-free.
+
+With `barmerge.lookahead_on`, a same-symbol higher-timeframe request steps into the
+higher-timeframe bar that contains the chart bar. That bar is built from the chart data up to the
+current chart bar and is unconfirmed, in historical and live mode alike. A bare `close` therefore
+reads the period **as built so far**, never the period's final value. This is a deliberate
+divergence from TradingView, which hands the final value of the containing period to every chart
+bar of it on historical data, i.e. future data on all but the period's last bar (see
+[No lookahead, ever](../../overview/compatibility.md#no-lookahead-ever)). The `close[1]` idiom,
+`request.security(sym, "D", close[1], lookahead=barmerge.lookahead_on)`, reads the just-closed
+prior period and matches TradingView exactly.
+
+A cross-symbol higher-timeframe request cannot build the developing bar from the chart data (it is
+the wrong instrument), so with `lookahead_on` it yields `na` while the period is open and the
+period's close once it has closed, in historical and live mode alike.
 
 **Implementation:** `SecurityTransformer` rewrites calls into the security execution protocol at
 compile time; the Python stub itself is not called by a transformed script. Conditional calls and
@@ -118,8 +126,13 @@ Gets the exchange rate between two currencies at the current bar's timestamp.
 |-----------|------|-------------|
 | from_currency | str | Source currency code (e.g., "EUR", "GBP") |
 | to_currency | str | Target currency code (e.g., "USD") |
+| ignore_invalid_currency | bool | Return `na` instead of failing when no rate can be calculated (default `False`) |
 
-**Returns:** Exchange rate as float, or `na` if no data is available.
+**Returns:** Exchange rate as float, or `na` if no data is available. The rate is `1.0` when the
+two codes are equal or either is an empty string ("no conversion").
+
+PyneCore cannot tell an invalid pair from one whose rate data was not provided, so a pair without
+rate data returns `na` whatever `ignore_invalid_currency` says.
 
 **Example:**
 ```python
@@ -127,7 +140,10 @@ eur_to_usd: float = request.currency_rate("EUR", "USD")  # 1.095
 gbp_to_eur: float = request.currency_rate("GBP", "EUR")  # 1.168
 ```
 
-**Note:** Looks up rates from OHLCV data whose metadata matches the requested currency pair. Automatically uses inverse pairs (1.0 / rate) if only the reverse pair is available.
+**Note:** Looks up rates from OHLCV data whose metadata matches the requested currency pair, using
+only rate bars that have already closed. Automatically uses inverse pairs (1.0 / rate) if only the
+reverse pair is available. See [Currency rates](../../lib/request-data.md) for source priority and
+timing.
 
 ### dividends()
 
@@ -144,7 +160,7 @@ Requests dividend data for a symbol.
 
 **Returns:** Dividend value or `na`.
 
-**Note:** Returns `na` when `ignore_invalid_symbol=True`. Otherwise raises `NotImplementedError`. No actual dividend data support yet. Used by indicators that reference `request.dividends()` but do not require real data (e.g., VWAP).
+**Note:** Returns `na` when `ignore_invalid_symbol=True` or when `ticker` is the current crypto chart's own ticker. Otherwise raises `NotImplementedError`. No actual dividend data support yet. Used by indicators that reference `request.dividends()` but do not require real data (e.g., VWAP).
 
 ### splits()
 
@@ -160,7 +176,7 @@ Requests stock split data for a symbol.
 
 **Returns:** Split value or `na`.
 
-**Note:** Returns `na` when `ignore_invalid_symbol=True`. Otherwise raises `NotImplementedError`. No actual split data support yet.
+**Note:** Returns `na` when `ignore_invalid_symbol=True` or when `ticker` is the current crypto chart's own ticker. Otherwise raises `NotImplementedError`. No actual split data support yet.
 
 ### earnings()
 
@@ -177,7 +193,7 @@ Requests earnings data for a symbol.
 
 **Returns:** Earnings value or `na`.
 
-**Note:** Returns `na` when `ignore_invalid_symbol=True`. Otherwise raises `NotImplementedError`. No actual earnings data support yet.
+**Note:** Returns `na` when `ignore_invalid_symbol=True` or when `ticker` is the current crypto chart's own ticker. Otherwise raises `NotImplementedError`. No actual earnings data support yet.
 
 ### financial()
 
@@ -228,17 +244,19 @@ Requests volume footprint data for the current bar.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | ticks_per_row | int | Number of ticks per footprint row |
-| va_percent | int | Value Area percentage |
+| va_percent | int | Value Area percentage (default `70`) |
+| imbalance_percent | int | Buy/sell imbalance threshold percentage (default `300`) |
 
 **Returns:** `Footprint | na`.
 
 **Note:** Footprint data requires Level 2 / tick-by-tick market data, which standard OHLCV files do
-not contain. PyneCore returns `na` so scripts can use their normal unavailable-data fallback.
+not contain. PyneCore returns `na` so scripts can use their normal unavailable-data fallback. See
+[footprint](footprint.md) for the `footprint` and `volume_row` API.
 
 ## Compatibility Notes
 
 - **Implemented**: `request.security()`, `request.security_lower_tf()`, `request.currency_rate()`
-- **Partial support**: `request.dividends()`, `request.earnings()`, `request.splits()` — return `na` when `ignore_invalid_symbol=True`, raise `NotImplementedError` otherwise
+- **Partial support**: `request.dividends()`, `request.earnings()`, `request.splits()` — return `na` when `ignore_invalid_symbol=True` or for the current crypto chart's own ticker, raise `NotImplementedError` otherwise
 - **Unavailable data fallbacks**: `request.seed()` and `request.footprint()` return `na`.
   `request.financial()` returns `na` only when `ignore_invalid_symbol=True`; otherwise it, along
   with `request.economic()` and `request.quandl()`, raises `NotImplementedError`.

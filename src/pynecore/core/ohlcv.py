@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pynecore.core._file_io import open_shared_binary, replace_file
 from pynecore.core.ohlcv_legacy import OHLCVReader as _LegacyOHLCVReader
-from pynecore.core.syminfo import SymInfoInterval
+from pynecore.core.syminfo import SymInfoInterval, tick_grid
 from pynecore.types.ohlcv import OHLCV
 
 __all__ = ["OHLCVWriter", "OHLCVReader", "ChartBarWindow", "parse_timezone_name",
@@ -1686,23 +1686,32 @@ class OHLCVWriter:
             self._confidence = 0.1
             return
 
-        histogram_tick = self._calculate_histogram_tick()
-        if histogram_tick[0] > 0.0 and histogram_tick[1] > 0.7:
-            self._analyzed_tick_size = histogram_tick[0]
-            self._analyzed_price_scale = int(round(1.0 / histogram_tick[0]))
-            self._analyzed_min_move = 1
-            self._confidence = histogram_tick[1]
-            return
-
+        tick_size, confidence = self._calculate_histogram_tick()
         frequency_tick = self._calculate_frequency_tick()
-        decimal_tick = self._calculate_decimal_tick()
-        tick_size, confidence = self._combine_tick_estimates(frequency_tick, decimal_tick)
+        if tick_size > 0.0 and confidence > 0.7:
+            if self._is_coarser_grid(frequency_tick[0], tick_size):
+                tick_size = frequency_tick[0]
+        else:
+            decimal_tick = self._calculate_decimal_tick()
+            # The frequency divisor comes from the repeated changes only and matches the rest
+            # loosely, so a coarser divisor must also hold every change on the decimal grid.
+            if (
+                frequency_tick[0] > decimal_tick[0] > 0.0
+                and not self._is_coarser_grid(frequency_tick[0], decimal_tick[0])
+            ):
+                frequency_tick = (0.0, 0.0)
+            tick_size, confidence = self._combine_tick_estimates(frequency_tick, decimal_tick)
         if tick_size > 0.0:
-            self._analyzed_tick_size = tick_size
-            self._analyzed_price_scale = int(round(1.0 / tick_size))
-            self._analyzed_min_move = 1
-            self._confidence = confidence
-            return
+            try:
+                minmove, pricescale = tick_grid(tick_size)
+            except ValueError:
+                pass
+            else:
+                self._analyzed_tick_size = tick_size
+                self._analyzed_price_scale = pricescale
+                self._analyzed_min_move = minmove
+                self._confidence = confidence
+                return
 
         self._analyzed_tick_size = 0.01
         self._analyzed_price_scale = 100
@@ -1747,6 +1756,35 @@ class OHLCVWriter:
         )
         confidence = min(matches / len(filtered_changes), 1.0)
         return tick_size, confidence * 0.7
+
+    def _is_coarser_grid(self, candidate: float, tick: float) -> bool:
+        """Whether ``candidate`` is a coarser grid that every price change sits on.
+
+        The histogram candidates stop at ``1.0``, so a coarse-tick symbol (an option
+        on a ``5.0`` tick) fits that finer grid exactly; the frequency estimator's
+        common divisor recovers the real tick when all observed changes agree.
+
+        :param candidate: Frequency-derived tick size.
+        :param tick: Histogram-derived tick size.
+        :return: ``True`` when ``candidate`` is a multiple of ``tick`` above it and
+            every positive change is a non-zero multiple of ``candidate``.
+        """
+        if candidate <= tick or tick <= 0.0:
+            return False
+        ratio = candidate / tick
+        if abs(ratio - round(ratio)) > 1e-6:
+            return False
+        # Every change already sits on the finer ``tick`` grid, so any real deviation from
+        # the coarser grid is at least one ``tick``; a fraction of it absorbs only float noise.
+        tolerance = tick * 0.1
+        changes = [change for change in self._price_changes[:200] if change > 0.0]
+        if not changes:
+            return False
+        for change in changes:
+            steps = round(change / candidate)
+            if steps < 1 or abs(steps * candidate - change) >= tolerance:
+                return False
+        return True
 
     def _calculate_histogram_tick(self) -> tuple[float, float]:
         """Estimate tick size by fitting common grids to price changes.

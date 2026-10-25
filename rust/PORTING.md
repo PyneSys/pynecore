@@ -18,13 +18,13 @@ pointers.
   `unaryop_type`, `compare_type`, the `annotation_type` family,
   `LIB_TYPE_OVERRIDES`, `BUILTIN_CALL_TYPES` and the stamp accessors
   (`stamp_lowering`). Hermetic. Ported as `crates/pyne-transform/src/pine_type_rules.rs`,
-  gated against the Python module by `tests/t00_pynecore/ast/test_136_native_type_rules.py`
+  gated against the Python module by `tests/t00_pynecore/ast/test_138_native_type_rules.py`
   through `_native._rules`.
 - **F2.** Ported as `crates/pyne-transform/src/pine_qualifier.rs`; `data.rs` carries
   the `routes`, `classes` and `scalar_classes` sections of `lib_types.json` whole,
   and of `names` the fields a native step reads so far (`data::LibName`: kind,
   value type, callable, return types). Both are gated against Python by
-  `tests/t00_pynecore/ast/test_137_native_qualifier.py` through `_native._qualifier`
+  `tests/t00_pynecore/ast/test_139_native_qualifier.py` through `_native._qualifier`
   and `_native._data`. PineType needs the rest of `names` (parameters, defaults).
 - **F3.** The module's `_pine_types` (a `PineTypeTable` dataclass) crosses the
   bridge one of two ways, chosen per run:
@@ -54,7 +54,7 @@ pointers.
 
   `node_ids.rs` ports `assign_node_ids`: the operator and context objects take an
   id from the count though they are no arena nodes. Both are gated against Python
-  by `tests/t00_pynecore/ast/test_140_native_type_table.py` (`_native._type_table`,
+  by `tests/t00_pynecore/ast/test_142_native_type_table.py` (`_native._type_table`,
   `_native._node_ids`) over the corpus and a two-module library that fills every
   field. The interface payload (`module_interface.interface_payload`) is no shape
   for the table: it serializes a `ModuleInterface`, which `build_interface`
@@ -96,9 +96,9 @@ pointers.
      tie check (fits in `u128`), correctly rounded parse.
 
    Ported as `steps/const_fold.rs` with `fdlibm.rs`. The fdlibm port and
-   `quantize_embed` are gated bit for bit by `test_139_native_fdlibm`
+   `quantize_embed` are gated bit for bit by `test_141_native_fdlibm`
    (`PYNE_FDLIBM_SWEEP=2000000` for the full sweep), the evaluation and the step
-   by `test_138_native_const_fold`. `Unsupported`: an int literal or result beyond
+   by `test_140_native_const_fold`. `Unsupported`: an int literal or result beyond
    `i64`, an int true division with an operand beyond 2**53, and `math.round` with
    a positive precision.
 4. **Security** (XL, 4.4k lines). Ported as `steps/security/`: `collection`
@@ -113,7 +113,7 @@ pointers.
    `crate::sha1` (written out: a few dozen lines, nothing extra for the WebAssembly
    build; it covers F4's SHA-1). Its closure was cut to leaf modules
    (`script_entry`, `factory_fields`, `lib_series_attrs`, `security_dependencies`).
-   Gated by `tests/t00_pynecore/ast/test_141_native_security.py`. `Unsupported`:
+   Gated by `tests/t00_pynecore/ast/test_143_native_security.py`. `Unsupported`:
    more than one write site the analysis's site walk never reaches (Python numbers
    them in string-set order, which follows the hash seed), a `__hist_N__` temp
    spelled with a non-ASCII digit, and a `_module_file_path` that is no str.
@@ -131,7 +131,7 @@ pointers.
    and located once (`_CloneSource`), which yields the clone `_build_clone` builds
    whenever it is used, so the port always builds it the latter way. `VARIP_TYPES`
    moved into the leaf `varip_types.py`, so the closure no longer holds
-   `persistent.py` and `slot_layout.py`. Gated by `test_141_native_security.py`
+   `persistent.py` and `slot_layout.py`. Gated by `test_143_native_security.py`
    (typed and untyped inputs, the slicing on and off). Nothing answers
    `Unsupported`.
 6. **PineType** (XXL, ~11k lines in its closure). `assign_node_ids` stamps
@@ -247,7 +247,7 @@ request from `ModuleLayout::new(pyne_mode == "lib")`, as the import hook does.
 4. **CallInline**. Hermetized first: the inline templates are the generated
    registry `transformers/call_inline_templates.json`, written by
    `scripts/call_inline_collector.py` (the body-shape derivation moved there from
-   the step) and guarded by `tests/t00_pynecore/ast/test_142_call_inline_templates.py`,
+   the step) and guarded by `tests/t00_pynecore/ast/test_144_call_inline_templates.py`,
    which names the function whose template changed. Per function the registry holds
    its parameters and derived expression (a parameter read is `{"param": i}`, every
    other node its class, fields and the wrapper-source location the emission
@@ -280,7 +280,7 @@ request from `ModuleLayout::new(pyne_mode == "lib")`, as the import hook does.
    `Host::call_interface` (`module_interface.lookup(..., settled=True)`) instead of
    importing the module. Builtins, keywords and the standard library are the
    generated `python_names.json` (`scripts/python_names_collector.py`, the union
-   over the supported interpreters; `test_143`); the lib routes come from the
+   over the supported interpreters; `test_145`); the lib routes come from the
    compiled `routes` section (`Host::lib_route`). A module that publishes no
    interface (plain Python, pynecore's own modules, a package's `__init__`, a Pyne
    module without settled routes) is still classified by the object it binds,
@@ -288,7 +288,7 @@ request from `ModuleLayout::new(pyne_mode == "lib")`, as the import hook does.
    host answers that `Unsupported`, as it answers every interpreter question. The
    dependency tracking asks `Host::source_key` and `Host::source_record`.
    `NON_TRANSFORMABLE_FUNCTIONS` is mirrored in `function_isolation_plain.in`,
-   held equal by `test_135`. `Unsupported`: a callee copy the reparse fallback
+   held equal by `test_137`. `Unsupported`: a callee copy the reparse fallback
    would normalize (non-ASCII text), a close call in a module without a
    `_module_file_path` or without a location, a stamp of an unexpected shape
    (`_pine_pin`, `_pine_vector`, `_pine_varying`, `_pine_series_len`, a type that

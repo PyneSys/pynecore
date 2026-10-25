@@ -558,23 +558,30 @@ class ObservedDayCounter:
 
     A bare ``ObservedDayCounter()`` (no template, ``fold=False``) is the plain
     year-reset counter — ``ordinal(td)`` advances one slot per present day.
+
+    A stream of nD bars (already on the observed grid) feeds one trading day per
+    bar but stands for ``n`` of them: ``step=n`` advances ``n`` slots per bar and
+    seeds the first bar on a multiple of ``n``.
     """
 
     __slots__ = ('_cur', '_ordinal', '_cur_end', '_folded', '_fold', '_tz',
-                 '_close_table')
+                 '_close_table', '_step')
 
     def __init__(self,
                  tz: 'ZoneInfo | dt_timezone | None' = None,
                  opening_hours: 'list[SymInfoInterval] | None' = None,
-                 fold: bool = False) -> None:
+                 fold: bool = False,
+                 step: int = 1) -> None:
         """
         :param tz: Exchange timezone (only needed when ``fold`` is on)
         :param opening_hours: ``SymInfo.opening_hours`` for the fold's scheduled
             close table (no template -> fold disabled)
         :param fold: Enable holiday half-day folding (intraday source only)
+        :param step: Trading days each fed day stands for (the ``n`` of an nD stream)
         """
         self._cur: date | None = None
         self._ordinal = 0
+        self._step = step
         self._cur_end: int | None = None  # running max bar-end of the current day
         self._folded = False  # current day folded into the previous (chain-stop)
         self._fold = fold and bool(opening_hours)
@@ -632,7 +639,7 @@ class ObservedDayCounter:
         cur = self._cur
         if td != cur:
             if cur is None:
-                self._ordinal = weekday_ordinal(td)
+                self._ordinal = weekday_ordinal(td) // self._step * self._step
                 self._folded = False
             elif td.year != cur.year:
                 self._ordinal = 0
@@ -644,7 +651,7 @@ class ObservedDayCounter:
                 # share its ordinal, and do not let the next day fold too.
                 self._folded = True
             else:
-                self._ordinal += 1
+                self._ordinal += self._step
                 self._folded = False
             self._cur = td
             self._cur_end = bar_end

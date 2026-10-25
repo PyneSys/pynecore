@@ -5,7 +5,7 @@ title: "ta"
 description: "Technical analysis indicators and functions"
 icon: "show_chart"
 date: "2026-03-28"
-lastmod: "2026-08-05"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -21,7 +21,7 @@ The `ta` namespace provides Pine Script-compatible technical analysis indicators
 
 ```python
 from pynecore.lib import (
-    close, high, low, open, volume, bar_index, ta, plot, strategy, script
+    close, high, low, open, volume, bar_index, ta, plot, color, script
 )
 
 @script.indicator(title="RSI and MACD Analysis", overlay=False)
@@ -42,10 +42,10 @@ def main():
     bb_middle, bb_upper, bb_lower = ta.bb(close, 20, 2.0)
     
     # Plot results
-    plot(rsi_val, title="RSI(14)", color="blue")
-    plot(macd_line, title="MACD", color="red")
-    plot(signal_line, title="Signal", color="orange")
-    plot(histogram, title="Histogram", color="gray")
+    plot(rsi_val, title="RSI(14)", color=color.blue)
+    plot(macd_line, title="MACD", color=color.red)
+    plot(signal_line, title="Signal", color=color.orange)
+    plot(histogram, title="Histogram", color=color.gray)
 ```
 
 ## Moving Averages

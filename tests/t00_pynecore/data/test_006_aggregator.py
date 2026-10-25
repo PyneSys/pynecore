@@ -63,6 +63,26 @@ def __test_validate_aggregation_not_divisible_fails__():
         validate_aggregation("7", "60")  # 60 is not divisible by 7
 
 
+def __test_validate_aggregation_calendar_targets__():
+    """Weeks and months accept sources whose bars each lie inside one period."""
+    validate_aggregation("1D", "1M")
+    validate_aggregation("60", "1M")
+    validate_aggregation("240", "1M")
+    validate_aggregation("30S", "1M")
+    validate_aggregation("1M", "3M")
+    validate_aggregation("3M", "12M")
+    validate_aggregation("1W", "2W")
+    validate_aggregation("60", "1W")
+
+    for source, target in (("1W", "1M"),  # a week straddles two months
+                           ("2D", "1M"),  # so does a two-day bar
+                           ("2M", "3M"),  # 2M bars do not tile 3M periods
+                           ("7", "1W"),  # a 7-minute bar crosses midnight
+                           ("2D", "2W")):
+        with pytest.raises(ValueError, match="do not fit evenly"):
+            validate_aggregation(source, target)
+
+
 # --- Merge tests ---
 
 def __test_merge_candles__():
@@ -181,6 +201,64 @@ def __test_aggregate_daily_to_weekly__(tmp_path):
     assert result[1].volume == pytest.approx(sum(c.volume for c in candles[7:]), rel=1e-5)
 
 
+def __test_aggregate_daily_to_monthly__(tmp_path):
+    """Daily candles group into calendar months of their own length."""
+    source = tmp_path / "test_1D.ohlcv"
+    target = tmp_path / "test_1M.ohlcv"
+
+    # 2024-01-01 .. 2024-03-31: 31 + 29 (leap February) + 31 days
+    base_ts = 1_704_067_200_000  # 2024-01-01 00:00:00 UTC
+    day = 86_400_000
+    candles = [OHLCV(timestamp=base_ts + i * day, open=100.0 + i, high=101.0 + i,
+                     low=99.0 + i, close=100.5 + i, volume=10.0)
+               for i in range(91)]
+
+    _create_ohlcv_file(source, candles, "1D")
+    src_count, tgt_count = aggregate_ohlcv(source, target, "1M", source_tf="1D")
+
+    assert src_count == 91
+    assert tgt_count == 3
+
+    result = _read_all(target)
+    month_starts = [base_ts, base_ts + 31 * day, base_ts + 60 * day]
+    month_lengths = [31, 29, 31]
+    first = 0
+    for bar, start, length in zip(result, month_starts, month_lengths):
+        window = candles[first:first + length]
+        assert bar.timestamp == start
+        assert bar.open == pytest.approx(window[0].open, rel=1e-5)
+        assert bar.close == pytest.approx(window[-1].close, rel=1e-5)
+        assert bar.high == pytest.approx(max(c.high for c in window), rel=1e-5)
+        assert bar.low == pytest.approx(min(c.low for c in window), rel=1e-5)
+        assert bar.volume == pytest.approx(10.0 * length, rel=1e-5)
+        first += length
+
+
+def __test_aggregate_hourly_to_monthly__(tmp_path):
+    """Intraday candles split at the month boundary, not at a fixed month length."""
+    source = tmp_path / "test_60.ohlcv"
+    target = tmp_path / "test_1M.ohlcv"
+
+    # 2024-02-28 00:00 .. 2024-03-02 23:00 UTC: two leap-February days, two March days
+    base_ts = 1_709_078_400_000  # 2024-02-28 00:00:00 UTC
+    hour = 3_600_000
+    candles = [OHLCV(timestamp=base_ts + i * hour, open=1.0, high=1.0, low=1.0,
+                     close=1.0, volume=1.0)
+               for i in range(96)]
+
+    _create_ohlcv_file(source, candles, "60")
+    src_count, tgt_count = aggregate_ohlcv(source, target, "1M", source_tf="60")
+
+    assert src_count == 96
+    assert tgt_count == 2
+
+    result = _read_all(target)
+    assert result[0].timestamp == 1_706_745_600_000  # 2024-02-01 00:00:00 UTC
+    assert result[0].volume == pytest.approx(48.0)
+    assert result[1].timestamp == 1_709_251_200_000  # 2024-03-01 00:00:00 UTC
+    assert result[1].volume == pytest.approx(48.0)
+
+
 def __test_aggregate_preserves_high_low__(tmp_path):
     """High/Low must be the true extremes across all source candles."""
     source = tmp_path / "test_src.ohlcv"
@@ -292,6 +370,80 @@ def __test_aggregate_observed_holiday_grouping__():
     assert [c.timestamp for c in result] == [open_ts(g[0]) for g in expected_groups]
     expected_vols = [sum(float(days.index(d) + 1) for d in g) for g in expected_groups]
     assert [c.volume for c in result] == pytest.approx(expected_vols)
+
+
+def __test_aggregate_observed_multi_day_source__(tmp_path):
+    """An observed 2D source chained to 4D groups exactly like 1D aggregated to 4D."""
+    from datetime import datetime, time, timedelta, date
+    from zoneinfo import ZoneInfo
+    from pynecore.core.syminfo import SymInfoInterval, SymInfoSession
+
+    ny = ZoneInfo("America/New_York")
+    t17 = time(17, 0)
+    hours = [SymInfoInterval(day=d, start=t17, end=t17) for d in (6, 0, 1, 2, 3)]
+    starts = [SymInfoSession(day=d, time=t17) for d in (6, 0, 1, 2, 3)]
+
+    def open_ts(trading_day: date) -> int:
+        prev = trading_day - timedelta(days=1)
+        return int(datetime(prev.year, prev.month, prev.day, 17, tzinfo=ny).timestamp()) * 1000
+
+    # January 2025 weekdays from Jan 6, without the Jan 13 and Jan 20 holidays
+    days = [date(2025, 1, d) for d in range(6, 32)
+            if date(2025, 1, d).weekday() < 5 and d not in (13, 20)]
+    candles = [OHLCV(timestamp=open_ts(d), open=10.0, high=11.0, low=9.0, close=10.5,
+                     volume=float(i + 1))
+               for i, d in enumerate(days)]
+
+    daily = tmp_path / "src_1D.ohlcv"
+    _create_ohlcv_file(daily, candles, "1D")
+    kwargs = dict(tz=ny, session_starts=starts, opening_hours=hours, sym_type='futures')
+
+    aggregate_ohlcv(daily, tmp_path / "direct_4D.ohlcv", "4D", source_tf='1D', **kwargs)
+    aggregate_ohlcv(daily, tmp_path / "mid_2D.ohlcv", "2D", source_tf='1D', **kwargs)
+    aggregate_ohlcv(tmp_path / "mid_2D.ohlcv", tmp_path / "chained_4D.ohlcv", "4D",
+                    source_tf='2D', **kwargs)
+
+    direct = _read_all(tmp_path / "direct_4D.ohlcv")
+    chained = _read_all(tmp_path / "chained_4D.ohlcv")
+    assert len(direct) > 3
+    assert [c.timestamp for c in chained] == [c.timestamp for c in direct]
+    assert [c.volume for c in chained] == pytest.approx([c.volume for c in direct])
+
+
+def __test_aggregate_monthly_resolves_intraday_bar_by_last_instant__(tmp_path):
+    """A source bar holding the session open starts the new month; a session end cuts it."""
+    from datetime import datetime, time
+    from zoneinfo import ZoneInfo
+    from pynecore.core.syminfo import SymInfoInterval, SymInfoSession
+
+    ny = ZoneInfo("America/New_York")
+    starts = [SymInfoSession(day=d, time=time(17, 5)) for d in (6, 0, 1, 2, 3)]
+    hours = [SymInfoInterval(day=d, start=time(17, 5), end=time(17, 0))
+             for d in (6, 0, 1, 2, 3)]
+
+    def ts(day: int, hour: int) -> int:
+        return int(datetime(2024, 1, day, hour, tzinfo=ny).timestamp()) * 1000
+
+    # A 4-hour UTC-clock grid around the January 31 17:05 open of trading day Feb 1:
+    # the 15:00 bar runs to 19:00 and holds that open
+    candles = [OHLCV(timestamp=ts(31, h), open=1.0, high=1.0, low=1.0, close=1.0,
+                     volume=1.0)
+               for h in (7, 11, 15, 19, 23)]
+    source = tmp_path / "src_240.ohlcv"
+    _create_ohlcv_file(source, candles, "240")
+
+    # Without opening hours the bar ends at its nominal close: it belongs to February
+    aggregate_ohlcv(source, tmp_path / "nominal.ohlcv", "1M", tz=ny, session_starts=starts,
+                    sym_type='forex', source_tf='240')
+    nominal = _read_all(tmp_path / "nominal.ohlcv")
+    assert [c.volume for c in nominal] == pytest.approx([2.0, 3.0])
+    assert nominal[1].timestamp == int(datetime(2024, 1, 31, 17, 5, tzinfo=ny).timestamp()) * 1000
+
+    # The session ending at 17:00 closes the bar before the open: it stays in January
+    aggregate_ohlcv(source, tmp_path / "cut.ohlcv", "1M", tz=ny, session_starts=starts,
+                    opening_hours=hours, sym_type='forex', source_tf='240')
+    cut = _read_all(tmp_path / "cut.ohlcv")
+    assert [c.volume for c in cut] == pytest.approx([3.0, 2.0])
 
 
 def __test_aggregate_observed_without_sessions_warns__(tmp_path, caplog):

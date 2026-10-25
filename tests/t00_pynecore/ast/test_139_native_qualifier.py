@@ -12,7 +12,7 @@ from pynecore.transformers import pine_qualifier as qualifier
 from pynecore.transformers.lib_registry import lib_registry, lib_types
 from pynecore.transformers.module_property import module_properties
 
-from .test_135_native_transform import __test_helper_require_native
+from .test_137_native_transform import __test_helper_require_native
 
 #: Names the registry does not list, spelled to reach every branch of the rules
 __test_helper_NAMES = [

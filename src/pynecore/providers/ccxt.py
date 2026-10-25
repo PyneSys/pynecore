@@ -8,7 +8,7 @@ import tomllib
 
 from pynecore.core.plugin import override, ProviderError, Broker
 from pynecore.core.plugin.live_provider import LiveProviderConfig, LiveProviderPlugin
-from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
+from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession, tick_grid
 from ..types.ohlcv import OHLCV
 
 if TYPE_CHECKING:
@@ -447,17 +447,11 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
 
         opening_hours, session_starts, session_ends = self._create_24_7_sessions()
 
-        # Derive pricescale from the tick size. ``round_to_mintick`` divides by
-        # pricescale directly and ignores minmove, so the tick must be an
-        # integer reciprocal and minmove must stay 1.
         mintick = self._derive_mintick(market_details)
-        pricescale = max(1, int(round(1.0 / mintick)))
-        if abs(mintick * pricescale - 1.0) > 1e-9:
-            raise CCXTError(
-                f"{self._client.id}: price tick {mintick} for {self.symbol!r} "
-                f"is not an integer reciprocal; cannot derive pricescale."
-            )
-        minmove = 1
+        try:
+            minmove, pricescale = tick_grid(mintick)
+        except ValueError as exc:
+            raise CCXTError(f"{self._client.id}: {self.symbol!r}: {exc}") from None
 
         try:
             ticker = market_details['info']['symbol']

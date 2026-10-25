@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -41,11 +42,13 @@ from pynecore.core.broker.interrupt_guard import request_interrupt
 from pynecore.lib.log import broker_info, broker_warning
 from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.script_runner import ScriptRunner, DataRequirements, SecurityRequirement
+from pynecore.core.profiler import ProfilerUnavailable
 from pynecore.pynesys.compiler import PyneComp
 from pynecore.core.provider_string import ProviderString, is_provider_string, parse_provider_string
 from pynecore.core.session import is_in_session
 from pynecore.core.live_runner import live_ohlcv_generator
 from ...cli.utils.api_error_handler import APIErrorHandler
+from ...cli.utils.profile_report import print_profile_report
 
 __all__ = []
 
@@ -1192,6 +1195,15 @@ def run(
                                             "When larger than data timeframe: aggregates on-the-fly, "
                                             "or activates bar magnifier if strategy uses "
                                             "use_bar_magnifier=true."),
+        profile: bool = Option(False, "--profile",
+                               help="Profile the run: the time and execution count of every "
+                                    "line, and the run's time by category. Writes "
+                                    "<script>_profile.json next to the other outputs. "
+                                    "Backtests only; needs Python 3.13+.",
+                               rich_help_panel="Profiling Options"),
+        profile_top: int = Option(15, "--profile-top", min=0, metavar="N",
+                                  help="Number of lines listed in the profile summary",
+                                  rich_help_panel="Profiling Options"),
 
 ):
     """
@@ -1301,6 +1313,11 @@ def run(
         secho("Error: --live is only available in provider mode.", err=True, fg=colors.RED)
         raise Exit(1)
 
+    if profile and (live or broker):
+        secho("Error: --profile is available for backtests only, not with --live or --broker.",
+              err=True, fg=colors.RED)
+        raise Exit(1)
+
     if provider_mode:
         # Provider mode: download historical warmup data + syminfo. A
         # long-running --broker/--live run rides out transient broker outages
@@ -1389,6 +1406,9 @@ def run(
         viz = True
     if viz and not viz_path:
         viz_path = app_state.output_dir / f"{script.stem}_viz.ndjson"
+
+    profile_path: Path | None = (app_state.output_dir / f"{script.stem}_profile.json"
+                                 if profile else None)
 
     # Validate and process --timeframe option
     magnifier_mode = False
@@ -1750,7 +1770,11 @@ def run(
                                           chart_data_path=data_path,
                                           lossless_volume=lossless_volume,
                                           lossless_prices=lossless_prices,
-                                          config_dir=app_state.config_dir)
+                                          config_dir=app_state.config_dir,
+                                          profile_path=profile_path)
+                except ProfilerUnavailable as e:
+                    secho(f"Error: {e}", err=True, fg=colors.RED)
+                    raise Exit(1)
                 finally:
                     # Remove lib directory from Python path
                     if lib_path_added:
@@ -2089,6 +2113,10 @@ def run(
                         stop_event.set()
                         worker.join(timeout=0.1)
                         progress.refresh()
+
+                if profile_path is not None:
+                    print_profile_report(json.loads(profile_path.read_text(encoding='utf-8')),
+                                         profile_path, profile_top, console)
         finally:
             # A broker run that never reached its completion summary ended
             # abnormally (early raise / crash mid-run). Narrate that the

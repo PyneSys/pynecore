@@ -4,6 +4,7 @@ include LICENSE
 include src/pynecore/core/_native_math.pyx
 include src/pynecore/core/_native_rolling_sum.pyx
 include src/pynecore/core/_native_color.pyx
+include src/pynecore/core/_native_profiler.pyx
 # The Rust sources of the native transform (pynecore.transformers._native)
 recursive-include rust *.rs *.toml *.json *.lock *.py *.sh *.mjs *.md
 prune rust/target

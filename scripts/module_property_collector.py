@@ -131,10 +131,11 @@ def collect_module_names(tree: ast.Module) -> dict[str, dict[str, Any]]:
     """Collect every public module-level name of a parsed lib module.
 
     ``@module_property`` functions are recorded as ``property``; plain functions,
-    classes, assignments (including conditional ones) and imported names as
-    ``variable``. ``_``-prefixed names, ``TYPE_CHECKING`` blocks and typing
-    machinery (``typing`` imports, ``TypeVar`` assignments, the decorator helper
-    modules) are skipped.
+    classes, assignments (including conditional ones), imported names and the names
+    of ``__all__`` as ``variable``. ``__all__`` covers a name the module binds only on
+    first access (a module ``__getattr__``). ``_``-prefixed names, ``TYPE_CHECKING``
+    blocks and typing machinery (``typing`` imports, ``TypeVar`` assignments, the
+    decorator helper modules) are skipped.
 
     :param tree: Parsed module AST.
     :return: name -> {"type": "property"|"variable"} mapping.
@@ -203,6 +204,14 @@ def collect_module_names(tree: ast.Module) -> dict[str, dict[str, Any]]:
                 walk(node.body)
 
     walk(tree.body)
+    for statement in tree.body:
+        if (isinstance(statement, ast.Assign)
+                and isinstance(statement.value, (ast.List, ast.Tuple))
+                and any(isinstance(target, ast.Name) and target.id == '__all__'
+                        for target in statement.targets)):
+            for element in statement.value.elts:
+                if isinstance(element, ast.Constant) and isinstance(element.value, str):
+                    record(element.value, 'variable')
     return info
 
 

@@ -5,7 +5,7 @@ title: "location"
 description: "Plot location constants (abovebar, belowbar, etc.)"
 icon: "place"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -20,15 +20,15 @@ The `location` namespace provides constants that specify where shapes are plotte
 ## Quick Example
 
 ```python
-from pynecore.lib import script, ta, close, high, low, plotshape, location, color
+from pynecore.lib import script, ta, close, high, low, plotshape, location, color, shape
 
 @script.indicator(title="Signal Markers", overlay=True)
 def main():
     is_cross_up = ta.crossover(close, ta.sma(close, 20))
     is_cross_down = ta.crossunder(close, ta.sma(close, 20))
 
-    plotshape(is_cross_up, style="triangleup", location=location.belowbar, color=color.green)
-    plotshape(is_cross_down, style="triangledown", location=location.abovebar, color=color.red)
+    plotshape(is_cross_up, style=shape.triangleup, location=location.belowbar, color=color.green)
+    plotshape(is_cross_down, style=shape.triangledown, location=location.abovebar, color=color.red)
 ```
 
 ---

@@ -162,12 +162,9 @@ class ExportOnceTransformer(ast_walk.NodeTransformer):
                     slice=ast.Name(id='bool', ctx=ast.Load()), ctx=ast.Load()),
                 value=ast.Constant(value=False), simple=1),
         ]
-        # Keep the docstring first; a ``global`` must precede every use of the
-        # names it declares, so the prologue goes above any other statement
-        first = body[0] if body else None
-        insert_at = 1 if (isinstance(first, ast.Expr)
-                          and isinstance(first.value, ast.Constant)
-                          and isinstance(first.value.value, str)) else 0
+        # A ``global`` must precede every use of the names it declares, so the
+        # prologue goes above any statement but the docstring
+        insert_at = ast_walk.docstring_end(body)
         body[insert_at:insert_at] = prologue
         main.body = body
         return node

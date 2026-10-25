@@ -48,7 +48,7 @@ pub const HELPER_ALIASES: &[(&str, &str)] = &[
 ];
 
 /// The callees that keep no per-call-site state, called plainly
-/// (`NON_TRANSFORMABLE_FUNCTIONS`; `test_135` holds the two lists equal).
+/// (`NON_TRANSFORMABLE_FUNCTIONS`; `test_137` holds the two lists equal).
 pub const NON_TRANSFORMABLE_FUNCTIONS: &[&str] = &include!("function_isolation_plain.in");
 
 fn is_plain_callee(path: &str) -> bool {

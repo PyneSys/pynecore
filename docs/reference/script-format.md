@@ -5,7 +5,7 @@ title: "Script Format"
 description: "Structure and anatomy of a PyneCore script file"
 icon: "description"
 date: "2026-04-05"
-lastmod: "2026-10-18"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -76,6 +76,34 @@ default setting is therefore not proof that it meets the edge profile.
 Use plain `@pyne` when a program deliberately needs broader Python integration.
 Removing `edge` opts out of the subset contract; such a program must not be assumed
 portable to a runtime or compiler that supports only edge code.
+
+#### Types and methods in the edge profile
+
+In an edge module, a class declares a user-defined type, Pine's `type`:
+
+- It has exactly one decorator, `@udt` (or `@dataclass`), and no base class.
+- Its body holds annotated fields and methods. A docstring and `pass` are allowed too;
+  any other statement is outside the profile.
+- A method is an undecorated `def` whose first parameter is the receiver, by convention
+  `self`. The receiver needs no annotation: its type is the class. A `@staticmethod`, a
+  `@classmethod` or any other decorator on a method is outside the profile.
+
+```python
+@udt
+class PriceRange:
+    bottom: float = 0.0
+    top: float = 0.0
+
+    def midpoint(self) -> float:
+        return (self.bottom + self.top) / 2
+```
+
+A method is Pine's `method midpoint(PriceRange this)`. Call it on the object,
+`current_range.midpoint()`, or through the class, `PriceRange.midpoint(current_range)`.
+It can keep state like any function (`ta.*` calls, `Series`, `Persistent`), and the state
+belongs to the call site, as on TradingView. The same method can also be written as a free
+function marked `@method` whose first parameter is annotated with the type; PyneComp emits
+that form for converted scripts. See [User-Defined Types](./types.md#user-defined-types-udt).
 
 ## 2. Imports
 

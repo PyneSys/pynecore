@@ -15,7 +15,8 @@ spec's own ``EDGE_RULES_VERSION``. This module pins that version: a spec
 revision that is not re-extracted fails at import rather than gating against
 stale rules. What the data cannot express -- the structural rules: what a
 class may contain, which callee a bare name may be, where a ``lambda`` may
-stand -- is code here, and mirrors the IDE's checker rule for rule.
+stand, where a builtin-named lib read resolves -- is code here, and mirrors
+the IDE's checker rule for rule.
 
 Only an ``@pyne edge`` module is gated. PyneCore's own ``@pyne lib`` modules
 are the machines behind the lib, written in Python -- ``ta.py`` alone uses
@@ -27,7 +28,8 @@ import ast
 import json
 import os
 import re
-from collections.abc import Iterable
+import symtable
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any, Final
 
@@ -40,7 +42,7 @@ __all__ = ['EDGE_RULES_VERSION', 'STRICT_ENV', 'DIAG_ENV', 'edge_rules', 'strict
 
 #: The profile revision this gate was written against. ``edge_rules.json``
 #: must carry the same one.
-EDGE_RULES_VERSION: Final = '2026.09.2'
+EDGE_RULES_VERSION: Final = '2026.10.2'
 
 #: ``1`` makes an edge module's first diagnostic an error, ``0`` never
 #: does; unset is ``0`` until the corpus is clean enough to flip the default.
@@ -87,6 +89,9 @@ _INERT: Final = (ast.expr_context, ast.boolop, ast.operator, ast.unaryop, ast.cm
 
 #: Where a statement stops binding names in its own scope
 _NESTED_SCOPES: Final = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+#: Expressions with a scope of their own: what they store stays inside
+_OWN_SCOPE_EXPRS: Final = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 _rules: dict[str, Any] | None = None
 
@@ -152,7 +157,7 @@ def render_diags(diags: Iterable[Diag], path: str) -> str:
     return '\n'.join(lines)
 
 
-def gate_module(tree: ast.Module) -> list[Diag]:
+def gate_module(tree: ast.Module, source: str) -> list[Diag]:
     """
     Every construct of a module the profile does not allow, in source order.
 
@@ -163,17 +168,20 @@ def gate_module(tree: ast.Module) -> list[Diag]:
     descend into a rejected construct, so one construct is one finding.
 
     :param tree: The parsed module
+    :param source: The text the tree was parsed from: Python's symbol table,
+                   which answers where a name resolves, is built from text
     :return: The findings, as diagnostics with an ``edge-*`` origin
     """
-    return _Gate(tree).run()
+    return _Gate(tree, source).run()
 
 
 class _Gate:
     """One walk over one module."""
 
-    def __init__(self, tree: ast.Module):
+    def __init__(self, tree: ast.Module, source: str):
         rules = edge_rules()
         self.tree = tree
+        self.source = source
         self.nodes: frozenset[str] = frozenset(rules['nodes'])
         self.bin_ops: frozenset[str] = frozenset(rules['bin_ops'])
         self.unary_ops: frozenset[str] = frozenset(rules['unary_ops'])
@@ -189,6 +197,10 @@ class _Gate:
         self.class_decorators: frozenset[tuple[str, str]] = frozenset(
             (module, name) for module, name in rules['class_decorators'])
         self.builtin_calls: frozenset[str] = frozenset(rules['builtin_calls'])
+        #: Lib name -> what it stands for, for the lib names Python's builtins
+        #: would answer here: the collection drops every one a module-wide lib
+        #: import binds (the lifter and the normalizer put it there)
+        self.lib_builtins: dict[str, str] = dict(rules['lib_builtin_names'])
         extras = rules['extras']
         self.dunder_names: frozenset[str] = frozenset(extras.get('dunder_names', ()))
         self.dunder_patterns: list[re.Pattern[str]] = [
@@ -206,6 +218,10 @@ class _Gate:
         #: name -> index of the first module statement that binds it by
         #: assignment or definition: a rebound import is not the import
         self.module_bound_at: dict[str, int] = {}
+        #: The names the module's statements leave in its namespace, each with
+        #: the source position from which it is bound: what an annotation
+        #: without a value declares is not among them
+        self.module_bound_from: dict[str, tuple[int, int]] = {}
         self.allowed_lambdas: set[int] = set()
         self.allowed_lists: set[int] = set()
         #: For each enclosing function, innermost last: the function, name ->
@@ -218,6 +234,16 @@ class _Gate:
         self._local_index: list[int] = []
         self._stmt_index = 0
         self._reported: set[int] = set()
+        #: The functions, classes and lambdas whose body is being visited,
+        #: innermost last: a read resolves through their symbol tables
+        self._scopes: list[ast.FunctionDef | ast.ClassDef | ast.Lambda] = []
+        #: ``id()`` of a class -> the names its body statements visited so far
+        #: left in the class namespace
+        self._class_bound: dict[int, set[str]] = {}
+        #: The module's symbol table, built when the first read asks for it;
+        #: None when only the symbol table rejects the source
+        self._symbols: symtable.SymbolTable | None = None
+        self._symbols_built = False
 
     def run(self) -> list[Diag]:
         self._collect()
@@ -227,29 +253,54 @@ class _Gate:
     # --- collection pre-pass ---------------------------------------------
 
     def _collect(self) -> None:
+        # A lib import binds module-wide only where lowering puts it: at module
+        # level (the normalizer) or lifted out of a function body it stands in
+        # directly (the lifter). Anywhere else it binds in its own scope, which
+        # the symbol table answers for. The walk yields a function before its
+        # body, so the lifted ones are known when they are reached
+        module_wide = {id(stmt) for stmt in self.tree.body}
         # Definitions and imports are statements: no expression is entered
         for node in ast_walk.walk_statements(self.tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 self.def_names.add(node.name)
+                if isinstance(node, ast.FunctionDef):
+                    module_wide.update(id(stmt) for stmt in node.body
+                                       if isinstance(stmt, ast.ImportFrom)
+                                       and _is_lib_module(stmt.module or ''))
             elif isinstance(node, ast.ImportFrom):
                 module = node.module or ''
+                lib_module = _is_lib_module(module)
+                binds_module = id(node) in module_wide
                 for alias in node.names:
                     bound = alias.asname or alias.name
                     self.from_imports[bound] = (module, alias.name)
                     self.import_bound.add(bound)
                     if module == 'pynecore' and alias.name == 'lib':
                         self.lib_names.add(bound)
-                    elif module == 'pynecore.lib' and alias.name == 'script':
-                        self.script_names.add(bound)
+                        if binds_module:
+                            self.lib_builtins.pop(bound, None)
+                    elif lib_module:
+                        if module == 'pynecore.lib' and alias.name == 'script':
+                            self.script_names.add(bound)
+                        # The lib's own star import binds every lib name -- it
+                        # is rejected once, its uses must not cascade
+                        if module == 'pynecore.lib' and alias.name == '*':
+                            self.lib_builtins.clear()
+                        if binds_module:
+                            self.lib_builtins.pop(bound, None)
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     bound = alias.asname or alias.name.split('.')[0]
                     self.import_bound.add(bound)
                     if alias.asname is not None and alias.name == 'pynecore.lib':
                         self.lib_names.add(alias.asname)
+                    if id(node) in module_wide and _is_lib_module(alias.name):
+                        # The normalizer reads a lib module by its last part
+                        self.lib_builtins.pop(alias.asname or alias.name.rpartition('.')[2], None)
         for index, stmt in enumerate(self.tree.body):
             for name in _stored_names(stmt):
                 self.module_bound_at.setdefault(name, index)
+        self.module_bound_from = _binding_points(self.tree.body)
         # ``field(default_factory=lambda: ...)`` is the one legitimate lambda:
         # a UDT field's default, which the compiler emits too -- and only
         # there, as the value of a field in a decorated class body (the
@@ -264,9 +315,10 @@ class _Gate:
         # ``__all__ = ['name', ...]`` at module level is the one legitimate
         # list literal: the library emitter produces it
         for stmt in self.tree.body:
-            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 \
-                    and isinstance(stmt.targets[0], ast.Name) \
-                    and stmt.targets[0].id == '__all__' \
+            if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+                continue
+            target = stmt.targets[0]
+            if isinstance(target, ast.Name) and target.id == '__all__' \
                     and isinstance(stmt.value, ast.List) \
                     and all(isinstance(e, ast.Constant) and isinstance(e.value, str)
                             for e in stmt.value.elts):
@@ -303,9 +355,11 @@ class _Gate:
                 if isinstance(child, ast.stmt):
                     continue
                 self._visit(child)
+            self._scopes.append(node)
             for index, stmt in enumerate(node.body):
                 self._local_index[-1] = index
                 self._visit(stmt)
+            self._scopes.pop()
             self._functions.pop()
             self._locals.pop()
             self._local_index.pop()
@@ -321,14 +375,19 @@ class _Gate:
                             self._visit(stmt.returns)
                 return
             self._check_class(node)
+            self._visit_scope(node, node.body)
+            return
         elif isinstance(node, ast.Call):
-            self._check_call(node)
+            if self._builtin_read(node.func) is None:
+                self._check_call(node)
         elif isinstance(node, ast.Lambda):
             if id(node) not in self.allowed_lambdas:
                 self._report(node, 'edge-lambda',
                              f"'lambda' outside a field(default_factory=...) UDT field "
                              f'default {_SUFFIX}', 'define a function instead')
                 return
+            self._visit_scope(node, [node.body])
+            return
         elif isinstance(node, ast.Assert):
             # A failed assertion ends the run on every runtime, and a compiled
             # script carries its message verbatim: only a string literal can be
@@ -347,6 +406,11 @@ class _Gate:
                 self._check_attribute_store(node)
         elif isinstance(node, ast.Name):
             self._check_ident(node, node.id)
+            name = self._builtin_read(node)
+            if name is not None:
+                self._report(node, 'edge-builtin', f"Python's builtin '{name}' {_SUFFIX}",
+                             f'for {self.lib_builtins[name]}, import it: '
+                             f'from pynecore.lib import {name}')
         elif isinstance(node, ast.arg):
             self._check_ident(node, node.arg)
         elif isinstance(node, (ast.BinOp, ast.AugAssign)):
@@ -435,9 +499,25 @@ class _Gate:
         if body and _is_docstring(body[0]):
             body = body[1:]
         for stmt in body:
-            if not isinstance(stmt, (ast.AnnAssign, ast.Pass)):
-                self._report(stmt, 'edge-class', f'a class body beyond annotated fields {_SUFFIX}',
-                             'declare methods with @method outside the class')
+            if isinstance(stmt, ast.FunctionDef):
+                self._check_member(stmt)
+            elif not isinstance(stmt, (ast.AnnAssign, ast.Pass)):
+                self._report(stmt, 'edge-class',
+                             f'a class body beyond annotated fields and methods {_SUFFIX}',
+                             'declare fields and methods only')
+
+    def _check_member(self, node: ast.FunctionDef) -> None:
+        """
+        A method in a class body: Pine's ``method m(Type this)`` spelled in the
+        class, so it takes no decorator and its receiver first.
+        """
+        if node.decorator_list:
+            self._report(node, 'edge-class', f'a decorated method in a class body {_SUFFIX}',
+                         'drop the decorator: a method takes its receiver first')
+        elif not (node.args.posonlyargs or node.args.args):
+            self._report(node, 'edge-class',
+                         f'a method without its receiver as the first parameter {_SUFFIX}',
+                         'take the receiver as the first parameter')
 
     def _is_protocol_shim(self, node: ast.ClassDef) -> bool:
         """
@@ -445,9 +525,9 @@ class _Gate:
         ellipsis-body method declarations only -- the compiler's typing
         scaffolding, erased at run time.
         """
-        if len(node.bases) != 1 or node.keywords or node.decorator_list \
-                or not isinstance(node.bases[0], ast.Name) \
-                or not self._is_typing_protocol(node.bases[0].id):
+        base = node.bases[0] if len(node.bases) == 1 else None
+        if not isinstance(base, ast.Name) or node.keywords or node.decorator_list \
+                or not self._is_typing_protocol(base.id):
             return False
         body = node.body
         if body and _is_docstring(body[0]):
@@ -455,9 +535,7 @@ class _Gate:
         return bool(body) and all(
             isinstance(stmt, ast.FunctionDef) and stmt.name == '__call__'
             and not stmt.decorator_list and len(stmt.body) == 1
-            and isinstance(stmt.body[0], ast.Expr)
-            and isinstance(stmt.body[0].value, ast.Constant)
-            and stmt.body[0].value.value is Ellipsis
+            and _is_ellipsis(stmt.body[0])
             for stmt in body)
 
     def _check_ident(self, node: ast.AST, name: str) -> None:
@@ -486,6 +564,89 @@ class _Gate:
         self._report(func, 'edge-call', f"calling '{name}' {_SUFFIX}",
                      f'only defined functions, imported names and '
                      f'{", ".join(sorted(self.builtin_calls))} can be called')
+
+    def _visit_scope(self, node: ast.ClassDef | ast.Lambda, body: Sequence[ast.AST]) -> None:
+        """
+        Visit a class or a lambda: the body in its own scope, the rest -- bases,
+        decorators, parameter defaults -- in the enclosing one, where it runs.
+        """
+        inside = {id(part) for part in body}
+        for child in ast_walk.iter_child_nodes(node):
+            if not isinstance(child, _INERT) and id(child) not in inside:
+                self._visit(child)
+        self._scopes.append(node)
+        # A class body runs statement by statement: its bindings are recorded
+        # after each one, so a read knows whether its class binding exists yet
+        bound = self._class_bound.setdefault(id(node), set()) \
+            if isinstance(node, ast.ClassDef) else None
+        for child in body:
+            self._visit(child)
+            if bound is not None and isinstance(child, ast.stmt):
+                bound.update(_binding_points([child]).keys())
+        self._scopes.pop()
+
+    def _builtin_read(self, node: ast.expr) -> str | None:
+        """
+        The lib name a read resolves to Python's builtin for, None when it does not.
+
+        Python's own scoping decides, through the symbol table: a name bound in
+        the reading function or an enclosing one is that binding; a class body
+        sees its own binding only once the statement binding it ran. A
+        module-level read, an implicit global and a class-body read ahead of the
+        class binding are the builtin unless the module binds the name. The
+        module is initialized top to bottom: a read that runs meanwhile -- at
+        module level, in a class body there, in a default or a decorator --
+        sees only a binding made ahead of it. A function or lambda body is
+        taken to run once the module is initialized, and sees every binding.
+        """
+        if not isinstance(node, ast.Name) or node.id not in self.lib_builtins \
+                or not isinstance(node.ctx, ast.Load):
+            return None
+        module = self._module_symbols()
+        if module is None:
+            return None
+        scope = module
+        reader: ast.AST | None = None
+        for owner in self._scopes:
+            label = 'lambda' if isinstance(owner, ast.Lambda) else owner.name
+            table = next((child for child in scope.get_children()
+                          if child.get_name() == label and child.get_lineno() == owner.lineno),
+                         None)
+            if table is not None:
+                scope, reader = table, owner
+        name = node.id
+        try:
+            symbol = scope.lookup(name)
+        except KeyError:
+            return None
+        if scope is not module and not symbol.is_global():
+            # Ahead of its class binding, a class-body read skips the enclosing
+            # functions: Python looks it up in the module and the builtins
+            if not (isinstance(scope, symtable.Class) and symbol.is_local()
+                    and name not in self._class_bound.get(id(reader), ())):
+                return None
+        # The module's statements say whether one of them binds it: the symbol
+        # table counts an annotation without a value as an assignment
+        bound_from = self.module_bound_from.get(name)
+        if bound_from is None:
+            return name
+        if any(isinstance(owner, (ast.FunctionDef, ast.Lambda)) for owner in self._scopes) \
+                or bound_from <= (node.lineno, node.col_offset):
+            return None
+        return name
+
+    def _module_symbols(self) -> symtable.SymbolTable | None:
+        """The module's symbol table, None when only the symbol table rejects the source."""
+        if not self._symbols_built:
+            self._symbols_built = True
+            try:
+                self._symbols = symtable.symtable(self.source, '<pyne>', 'exec')
+            except SyntaxError:
+                # A few parsed sources only the symbol table rejects (``def f(a, a)``,
+                # a module-level ``nonlocal``): compiling reports them, this rule
+                # falls silent
+                pass
+        return self._symbols
 
     def _check_attribute_store(self, node: ast.Attribute) -> None:
         chain = _attribute_chain(node)
@@ -586,6 +747,49 @@ def _stored_names(stmt: ast.stmt) -> set[str]:
     return out
 
 
+def _binding_points(body: Iterable[ast.stmt]) -> dict[str, tuple[int, int]]:
+    """
+    The names module- or class-body statements leave in that namespace, each
+    with the source position from which the first of them binds it.
+
+    A name is bound once its statement ran -- a loop target once the iterable
+    is evaluated, ahead of the loop body. A definition or an import binds its
+    name, an annotation without a value binds nothing, and a nested scope -- a
+    definition's body, a lambda, a comprehension -- binds inside itself.
+    """
+    points: dict[str, tuple[int, int]] = {}
+    pending: list[tuple[ast.AST, tuple[int, int]]] = [(stmt, _end(stmt)) for stmt in body]
+    while pending:
+        node, at = pending.pop()
+        if isinstance(node, ast.stmt):
+            at = _end(node)
+        names: Iterable[str] = ()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names = (node.name,)
+        elif isinstance(node, _OWN_SCOPE_EXPRS) \
+                or (isinstance(node, ast.AnnAssign) and node.value is None):
+            continue
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            names = (node.id,)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = [alias.asname or alias.name.split('.')[0] for alias in node.names]
+        for name in names:
+            if name not in points or at < points[name]:
+                points[name] = at
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        loop = node if isinstance(node, (ast.For, ast.AsyncFor)) else None
+        for child in ast_walk.iter_child_nodes(node):
+            pending.append((child, _end(loop.iter) if loop is not None and child is loop.target
+                            else at))
+    return points
+
+
+def _end(node: ast.stmt | ast.expr) -> tuple[int, int]:
+    """Where a node's source ends."""
+    return node.end_lineno or node.lineno, node.end_col_offset or 0
+
+
 def _scope_bound(node: ast.FunctionDef) -> dict[str, int]:
     """
     Every name a function binds, with the body statement that first binds it.
@@ -612,6 +816,15 @@ def _has_special_parameters(args: ast.arguments) -> bool:
 def _is_docstring(stmt: ast.stmt) -> bool:
     return isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) \
         and isinstance(stmt.value.value, str)
+
+
+def _is_lib_module(module: str) -> bool:
+    return module == 'pynecore.lib' or module.startswith('pynecore.lib.')
+
+
+def _is_ellipsis(stmt: ast.stmt) -> bool:
+    return isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) \
+        and stmt.value.value is Ellipsis
 
 
 #: A double-underscore identifier

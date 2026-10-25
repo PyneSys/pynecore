@@ -9,6 +9,7 @@ from collections.abc import Callable
 # ``<= 1e-10`` / ``>= -1e-10``.
 from pynecore.core.pine_compare import EPSILON
 
+from . import ast_walk
 from .phase import Rule
 from .pine_type_rules import BOOL, stamp_lowering
 
@@ -81,15 +82,7 @@ def _bool_compare(left: ast.expr, ops: list[ast.cmpop],
 
 def _insert_import(body: list[ast.stmt], stmt: ast.ImportFrom) -> None:
     """Insert the generated import after the docstring and the ``__future__`` block."""
-    insert_at = 0
-    first = body[0] if body else None
-    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) \
-            and isinstance(first.value.value, str):
-        insert_at = 1
-    while insert_at < len(body) and isinstance(body[insert_at], ast.ImportFrom) \
-            and getattr(body[insert_at], 'module', None) == '__future__':
-        insert_at += 1
-    body.insert(insert_at, stmt)
+    body.insert(ast_walk.future_end(body), stmt)
 
 
 def _is_skippable_const(node: ast.expr) -> bool:

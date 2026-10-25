@@ -2,6 +2,8 @@ from typing import Literal, NamedTuple, Self
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import time, date, datetime
+from decimal import Decimal
+from math import gcd
 
 SymInfoInterval = NamedTuple("SymInfoInterval", [('day', int), ('start', time), ('end', time)])
 SymInfoSession = NamedTuple("SymInfoSession", [('day', int), ('time', time)])
@@ -631,10 +633,43 @@ def mintick_decimals(mintick: float) -> int:
     """
     if not mintick or mintick <= 0:
         return 0
-    tick_str = str(mintick)
-    if 'e' in tick_str or 'E' in tick_str:
-        # Scientific notation (very small ticks): expand without float dust.
-        tick_str = f"{mintick:.20f}".rstrip('0')
-    if '.' not in tick_str:
-        return 0
-    return len(tick_str.rstrip('0').split('.')[1])
+    # ``Decimal`` reads the shortest repr exactly, so scientific notation
+    # (``7.5e-05``) counts its true digits instead of fixed-point float dust.
+    exponent = Decimal(str(mintick)).normalize().as_tuple().exponent
+    return max(0, -exponent) if isinstance(exponent, int) else 0
+
+
+def tick_grid(mintick: float) -> tuple[int, int]:
+    """
+    Integer ``(minmove, pricescale)`` pair expressing ``mintick``.
+
+    Pine defines ``mintick = minmove / pricescale``. A tick that is an integer
+    reciprocal keeps ``minmove = 1`` (``0.05`` -> ``(1, 20)``); any other tick
+    takes a power-of-ten ``pricescale`` from its decimal places and the
+    matching ``minmove`` (``5.0`` -> ``(5, 1)``, ``0.03`` -> ``(3, 100)``,
+    ``2.5`` -> ``(25, 10)``). A decimal grid wider than the 32-bit OHLCV
+    header fields is reduced by its greatest common divisor (``7.5e-9`` ->
+    ``(3, 400000000)``).
+
+    :param mintick: The symbol's minimum tick size.
+    :return: ``(minmove, pricescale)``, both positive integers.
+    :raises ValueError: If ``mintick`` is not positive or has no exact grid
+        that fits the 32-bit OHLCV header fields.
+    """
+    if not mintick > 0.0:
+        raise ValueError(f"mintick must be positive, got {mintick!r}")
+    pricescale = round(1.0 / mintick)
+    if pricescale >= 1 and abs(mintick * pricescale - 1.0) <= 1e-9:
+        minmove = 1
+    else:
+        pricescale = 10 ** mintick_decimals(mintick)
+        minmove = round(mintick * pricescale)
+        if minmove < 1 or abs(minmove / pricescale - mintick) > mintick * 1e-9:
+            raise ValueError(f"mintick {mintick!r} has no exact minmove / pricescale grid")
+        if pricescale >= 1 << 32:
+            divisor = gcd(minmove, pricescale)
+            minmove //= divisor
+            pricescale //= divisor
+    if minmove >= 1 << 32 or pricescale >= 1 << 32:
+        raise ValueError(f"mintick {mintick!r} needs a tick grid wider than 32 bits")
+    return minmove, pricescale

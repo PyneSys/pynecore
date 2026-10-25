@@ -5,7 +5,7 @@ title: "Type System"
 description: "PyneCore type system — primitives, annotations, collections, and special types"
 icon: "category"
 date: "2026-03-28"
-lastmod: "2026-09-05"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -234,12 +234,12 @@ def main():
 Two-dimensional matrices. Implemented as `pynecore.types.matrix.Matrix`.
 
 ```python
-from pynecore.types import Persistent
+from pynecore.types import Persistent, Matrix
 from pynecore.lib import script, matrix
 
 @script.indicator("Matrix Example")
 def main():
-    m: Persistent[matrix] = matrix.new(float, 3, 3, 0.0)
+    m: Persistent[Matrix] = matrix.new(3, 3, 0.0)
     matrix.set(m, 0, 0, 1.0)
     val = matrix.get(m, 0, 0)
 ```
@@ -254,7 +254,7 @@ from pynecore.lib import script, close, map
 
 @script.indicator("Map Example")
 def main():
-    prices: Persistent[map] = map.new(str, float)
+    prices: Persistent[dict] = map.new()
     map.put(prices, "last_close", close)
     val = map.get(prices, "last_close")
 ```
@@ -312,6 +312,17 @@ class OrderInfo:
 
 Corresponds to TradingView's `type` keyword. The `@udt` decorator provides Pine
 Script-compatible semantics (NA-aware field defaults, copy behavior, etc.).
+
+A method declared in the class body is Pine's `method get_value(OrderInfo this)`:
+the receiver is the class, so `self` needs no annotation. It may keep state like any
+function (`ta.*` calls, `Series`, `Persistent`), and that state belongs to the call
+site, as it does on TradingView: two calls of `order.get_value()` keep two
+independent states, and a call inside a loop keeps one state for all of its
+iterations. `order.get_value()` and `OrderInfo.get_value(order)` are the same call.
+
+A method that keeps state must be a plain method or a `@staticmethod`; any other
+decorator is rejected when the script is compiled. The `edge` profile admits plain
+methods only, with the receiver as the first parameter.
 
 ### Enumerations
 

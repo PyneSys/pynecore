@@ -23,7 +23,7 @@ def __test_historical_updates_and_history__(script_path, module_key, syminfo, mo
     import sys
     from pynecore import lib
     from pynecore.core.script_runner import ScriptRunner
-    from pynecore.types.na import NA
+    from pynecore.lib import na
 
     monkeypatch.setattr(lib, "_timenow_ms", 1_800_000_000_000)
     bars = __test_helper_bars()
@@ -32,7 +32,7 @@ def __test_historical_updates_and_history__(script_path, module_key, syminfo, mo
     runner = ScriptRunner(script_path, bars, syminfo)
     rows = [dict(data) for _, data in runner.run_iter()]
     assert [row["updated"] for row in rows] == [bar.timestamp for bar in bars]
-    assert isinstance(rows[0]["previous"], NA)
+    assert na(rows[0]["previous"])
     assert [row["previous"] for row in rows[1:]] == [bar.timestamp for bar in bars[:-1]]
 
 

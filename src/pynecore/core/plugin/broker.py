@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Collection
 from typing import TYPE_CHECKING, Protocol, TypeVar
 
 from pynecore.core.plugin.live_provider import LiveProviderConfig, LiveProviderPlugin
@@ -28,7 +28,10 @@ from pynecore.core.broker.exceptions import (
     OrderDispositionUnknownError,
     VenueWritesQuarantinedError,
 )
-from pynecore.core.broker.disappearance import resolve_unexpected_cancel_policy
+from pynecore.core.broker.disappearance import (
+    MISSING_PENDING_EXTRA,
+    resolve_unexpected_cancel_policy,
+)
 from pynecore.core.broker.idempotency import CLIENT_ORDER_ID_MAX_LEN
 from pynecore.core.broker.models import (
     CancelDispositionOutcome,
@@ -477,6 +480,36 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     stays ``None`` for netting accounts and for plugins that do not emulate,
     leaving their existing dispatch path untouched.
     """
+
+    def fill_recovery_pending(self, entry_ids: Collection[str]) -> bool:
+        """Whether fills that may explain a venue position change are still being recovered.
+
+        The engine asks this once a venue position that differs from the book
+        has outlasted :attr:`fill_report_grace_s`: while it answers ``True`` it
+        holds the verdict of an external flatten or reduction, for at most
+        :data:`~pynecore.core.broker.sync_engine.FILL_RECOVERY_HOLD_S` beyond
+        the grace, so a close the plugin recovers from the venue's history
+        after an outage is booked as the bot's own exit.
+
+        The default answers from the disappearance tracker's journal: a live
+        row of one of the entries stamped missing
+        (:data:`~pynecore.core.broker.disappearance.MISSING_PENDING_EXTRA`)
+        is under a confirmation that has not concluded yet. A plugin whose
+        recovery the stamp does not cover (one that judges a venue change
+        before stamping it, or a shrink of a position still open) answers from
+        its own evidence.
+
+        Called on the engine's thread: it reads state, never the venue.
+
+        :param entry_ids: The Pine entry ids of the book's open trades.
+        :return: ``True`` while a recovery for one of them is unresolved.
+        """
+        store = self.store_ctx
+        if store is None or not entry_ids:
+            return False
+        return any(
+            row.pine_entry_id in entry_ids and MISSING_PENDING_EXTRA in (row.extras or {})
+            for row in store.iter_live_orders())
 
     def ensure_venue_writes_allowed(self, what: str = "venue write") -> None:
         """Refuse an order-mutating request while the quarantine forbids venue writes.

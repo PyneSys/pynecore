@@ -290,23 +290,14 @@ class ScriptRequirementsTransformer(ast_walk.NodeVisitor):
             ast.keyword(arg='_broker_requirements', value=req_call)
         )
 
-        # Add the import if the module does not already have it. We insert
-        # as the first statement; ``ImportLifter`` runs before us, so any
-        # docstring is still the zeroth statement.
+        # Add the import if the module does not already have it
         if not self._has_script_requirements_import(module):
             import_node = ast.ImportFrom(
                 module='pynecore.core.broker.models',
                 names=[ast.alias(name='ScriptRequirements', asname=None)],
                 level=0,
             )
-            # Insert after the module docstring (if any) to keep it valid
-            insert_at = 0
-            first = module.body[0] if module.body else None
-            if (isinstance(first, ast.Expr)
-                    and isinstance(first.value, ast.Constant)
-                    and isinstance(first.value.value, str)):
-                insert_at = 1
-            module.body.insert(insert_at, import_node)
+            module.body.insert(ast_walk.future_end(module.body), import_node)
 
     @staticmethod
     def _has_script_requirements_import(module: ast.Module) -> bool:

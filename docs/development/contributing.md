@@ -5,7 +5,7 @@ title: "Contributing"
 description: "Guide for contributing to PyneCore"
 icon: "handyman"
 date: "2025-03-31"
-lastmod: "2026-09-28"
+lastmod: "2026-10-25"
 draft: false
 toc: true
 categories: ["Development"]
@@ -194,6 +194,27 @@ When working with library functions in `pynecore/lib/`:
 3. Optimize for performance
 4. Add appropriate type hints
 5. Include examples in docstrings
+6. **Decide the call-site route of every new or renamed function a script can call**, in the same
+   change. A stateless function of a plain module (no per-call-site state, no `@overload`, no
+   `__pyne_layout__`, calls nothing stateful such as `ta.*` or `Persistent`/`Series` code) goes into
+   `NON_TRANSFORMABLE_FUNCTIONS` in `transformers/function_isolation.py`; otherwise leave it out
+   and say why in a comment next to the function. A missing entry is not an error, but every call
+   site then pays for the state-binding machinery. Read the function body before adding it: a
+   wrong entry silently drops state the function relies on.
+7. **Regenerate the lib registry** whenever you add, rename or remove a function, change whether a
+   builtin keeps state, or touch an `@overload` group, a `@module_property`, a
+   `__pyne_shared_call_site__` marker or a module's `__all__`:
+
+   ```bash
+   python scripts/lib_type_collector.py
+   ```
+
+   Commit the regenerated `transformers/lib_types.json` with the change.
+   `tests/t00_pynecore/ast/test_104_lib_types_registry.py` fails until it matches; without the
+   regeneration, cached and freshly transformed scripts keep the old route.
+
+See [Function Isolation — Where the classification comes from](../advanced/function-isolation.md#where-the-classification-comes-from)
+for the details behind both steps.
 
 ### Core Runtime
 

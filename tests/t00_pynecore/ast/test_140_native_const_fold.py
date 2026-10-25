@@ -18,7 +18,7 @@ import pytest
 from pynecore.transformers import const_fold, native
 from pynecore.transformers.const_fold import ConstFoldTransformer, quantize_embed
 
-from .test_135_native_transform import __test_helper_require_native
+from .test_137_native_transform import __test_helper_require_native
 
 #: Every ``lib.math`` name the fold knows, a few it leaves alone, and a non-function
 __test_helper_FUNCTIONS = (

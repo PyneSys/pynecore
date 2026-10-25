@@ -17,6 +17,11 @@ converts every value the type pass marked as such an int:
   ``matrix.add_row`` / ``add_col``, ``matrix.concat``): the operand is wrapped in
   ``safe_convert.safe_float_items`` / ``safe_float_matrix``, a converted copy.
 
+A number passed to a ``bool`` parameter of a lib function (``ta.valuewhen(zigzag,
+...)``, ``ta.barssince(pivot)``) is wrapped in ``safe_convert.safe_bool``: Pine's
+tolerant float-to-bool conversion, which takes na for false. The lib function tests
+its argument with Python's own truthiness, which takes the nan a float na is for true.
+
 A typeless ``na`` literal that goes where a string goes -- a string variable or
 field, a string parameter, a ternary arm next to a string, an element of a string
 container, the key of a string-keyed map, a string parameter of a lib function -- is
@@ -63,7 +68,8 @@ import ast
 
 from . import ast_walk
 from .pine_type_rules import (
-    CONTAINER_NA_WIDENS, FLOAT, OBJECT, STR, WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX,
+    BOOL, CONTAINER_NA_WIDENS, FLOAT, OBJECT, STR, WIDEN_BOOL, WIDEN_FLOAT, WIDEN_ITEMS,
+    WIDEN_MATRIX,
     WIDEN_NA_TEXT, WIDEN_NUMBER_NA,
     WIDEN_STRING_NA, array_of, class_of, get_na_class,
     get_ty,
@@ -146,6 +152,12 @@ class ImplicitConversionTransformer(ast_walk.NodeTransformer):
                 node), FLOAT)
         if kind == WIDEN_NA_TEXT:
             return set_ty(ast.copy_location(ast.Constant(value='na'), node), STR)
+        if kind == WIDEN_BOOL:
+            self._needs_import = True
+            return stamp_lowering(ast.copy_location(ast.Call(
+                func=ast.Attribute(value=ast.Name(id='safe_convert', ctx=ast.Load()),
+                                   attr='safe_bool', ctx=ast.Load()),
+                args=[node], keywords=[]), node), BOOL)
         if kind == WIDEN_FLOAT:
             literal = _int_literal(node)
             if literal is not None:

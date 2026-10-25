@@ -278,6 +278,11 @@ class ClassSig:
     #: first parameter is annotated with the class; it is published with the
     #: class because that is how a receiver reaches it
     methods: dict[str, ExportSig] = field(default_factory=dict)
+    #: Method name -> its signature, for the methods declared IN the class
+    #: body. Those are attributes of the receiver object, so they answer
+    #: before any search for an exported method of that name; the receiver
+    #: is the first parameter, like a Pine method's
+    members: dict[str, ExportSig] = field(default_factory=dict)
 
 
 @dataclass(slots=True, frozen=True)

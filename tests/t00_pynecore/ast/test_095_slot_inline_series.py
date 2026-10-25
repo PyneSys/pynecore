@@ -22,7 +22,6 @@ from pynecore.transformers.layout_emit import apply_layout
 from pynecore.transformers.persistent import PersistentTransformer
 from pynecore.transformers.series import SeriesTransformer
 from pynecore.transformers.slot_layout import ModuleLayout
-from pynecore.types.na import NA
 
 
 def _transform(source: str) -> tuple[dict, str]:
@@ -72,7 +71,7 @@ def main(c, o):
     state = _make_state(ns['__pyne_slot_layout__']['main'])
     with _bars() as next_bar:
         a, b = ns['main'](state, 10.0, 1.0)
-        assert isinstance(a, NA) and isinstance(b, NA)  # no previous bar yet
+        assert lib.na(a) and lib.na(b)  # no previous bar yet
         next_bar()
         a, b = ns['main'](state, 20.0, 2.0)
         assert a == 10.0  # c[1] — the legacy shared buffer returned o[1] here
@@ -98,7 +97,7 @@ def main(v):
     state = _make_state(ns['__pyne_slot_layout__']['main'])
     with _bars() as next_bar:
         first = ns['main'](state, 0.0)
-        assert all(isinstance(x, NA) for x in first)  # committed write: 1.0
+        assert all(lib.na(x) for x in first)  # committed write: 1.0
         next_bar()
         assert ns['main'](state, 10.0) == [1.0, 1.0]  # both read bar 0's last write
     assert '__bind_loop·__(__state__, 0, inline_series)' in dump
@@ -121,4 +120,4 @@ def __test_inline_series_bind_factory__():
         assert one(1.0, 0) == 1.0
         next_bar()
         assert one(2.0, 1) == 1.0
-        assert isinstance(two(5.0, 1), NA)  # untouched by one's history
+        assert lib.na(two(5.0, 1))  # untouched by one's history

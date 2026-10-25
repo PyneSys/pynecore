@@ -10,7 +10,8 @@ Direct unit tests for SeriesImpl.__getitem__ Pine-compat semantics:
 """
 from pynecore import lib
 from pynecore.core.series import SeriesImpl
-from pynecore.types.na import NA
+from pynecore.lib import na
+from pynecore.types.na import NA, na_bool, na_float, set_bool_na
 
 
 def main():
@@ -57,7 +58,7 @@ def __test_na_key_on_empty_series_returns_na__():
     """NA key on an empty series must still return na (no buffer access happens)"""
     s = SeriesImpl()
     result = s[NA(int)]
-    assert isinstance(result, NA)
+    assert na(result)
 
 
 #
@@ -67,9 +68,9 @@ def __test_na_key_on_empty_series_returns_na__():
 def __test_negative_int_key_returns_na__():
     """Negative integer index must return NA(T), not raise IndexError"""
     s = _populate([10.0, 20.0, 30.0])
-    assert isinstance(s[-1], NA)
-    assert isinstance(s[-2], NA)
-    assert isinstance(s[-100], NA)
+    assert na(s[-1])
+    assert na(s[-2])
+    assert na(s[-100])
 
 
 def __test_negative_int_repro_from_issue_57__():
@@ -81,7 +82,7 @@ def __test_negative_int_repro_from_issue_57__():
     hist_p = 0
     j = 1
     key = hist_p - j - 1  # = -2
-    assert isinstance(s[key], NA)
+    assert na(s[key])
 
 
 #
@@ -91,8 +92,8 @@ def __test_negative_int_repro_from_issue_57__():
 def __test_positive_key_past_size_returns_na__():
     """Key >= size returns na (history not yet long enough)"""
     s = _populate([10.0, 20.0])
-    assert isinstance(s[2], NA)
-    assert isinstance(s[100], NA)
+    assert na(s[2])
+    assert na(s[100])
 
 
 #
@@ -112,3 +113,46 @@ def __test_float_key_coerced_to_int__():
     s = _populate([10.0, 20.0, 30.0])
     assert s[0.0] == 30.0
     assert s[1.7] == 20.0  # int(1.7) == 1
+
+
+#
+# Out-of-range na of a series built without an element type — the na of what it stores
+#
+
+def __test_untyped_series_reads_the_na_of_what_it_stores__():
+    """A series built without an element type (an ``inline_series`` buffer) reads the
+    na of its stored value's type out of range, as a ``Series[<type>]`` does: the nan
+    for a number, the empty string for a string, ``NA(<class>)`` for an object."""
+    class Pivot:
+        pass
+
+    for value, expected in ((1.5, na_float), (3, na_float), ('abc', ''),
+                            (Pivot(), NA(Pivot)), ([1.0], NA(list)), (NA(Pivot), NA(Pivot))):
+        s = _populate([value])
+        assert s[1] is expected, (value, s[1])
+        assert s[-1] is expected, (value, s[-1])
+
+
+def __test_untyped_series_keeps_the_bool_na_of_the_script_mode__():
+    """A stored bool makes the out-of-range read the bool na the script runs with:
+    false under the two-state bool, the interned na under the three-state one."""
+    try:
+        set_bool_na(False)
+        assert _populate([True])[1] is False
+        set_bool_na(True)
+        assert _populate([True])[1] is na_bool
+    finally:
+        set_bool_na(False)
+
+
+def __test_untyped_series_learns_its_na_from_the_newest_typed_value__():
+    """A typeless na stored first says nothing about the type: the read stays the typeless
+    na until a typed value is stored, and the na is kept once found."""
+    s = _populate([NA(None)])
+    assert isinstance(s[1], NA)
+    lib.bar_index = 1
+    s.add(2.0)
+    assert s[2] is na_float
+    lib.bar_index = 2
+    s.add(NA(None))
+    assert s[3] is na_float

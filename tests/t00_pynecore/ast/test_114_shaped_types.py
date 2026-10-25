@@ -501,6 +501,60 @@ by_name = method_call('bump', p, 1.0)
     assert sig.methods['bump'].params[0] == PIVOT
 
 
+def __test_a_class_body_method_is_typed_from_its_receiver__():
+    """
+    ``def m(self)`` in the class body is Pine's ``method m(Pivot this)``: the
+    receiver is the class without an annotation, and a call through an
+    instance, through the class or by name reaches the definition
+    """
+    source = UDT_SETUP + '''
+@udt
+class Counter:
+    start: int = 0
+
+    def scaled(self, by: float):
+        return self.start * by
+
+    def twice(self):
+        return self.scaled(2.0)
+
+
+c = Counter(1)
+through_instance = c.scaled(1.5)
+through_class = Counter.scaled(c, 1.5)
+by_name = method_call('scaled', c, 1.5)
+chained = c.twice()
+'''
+    _, table = _infer(source)
+    assert [diag.render() for diag in table.diags] == []
+    types = {name: binding.ty for name, binding in table.bindings[''].items()}
+    assert types['through_instance'] == types['through_class'] == FLOAT
+    assert types['by_name'] == types['chained'] == FLOAT
+
+    sig = table.class_sigs[class_id('test', 'Counter')]
+    assert sig.methods == {}
+    assert sig.members['scaled'].ret == FLOAT
+    # The receiver is the first parameter, like a Pine method's
+    assert sig.members['scaled'].params == (object_ty(class_id('test', 'Counter')), FLOAT)
+
+
+def __test_a_class_body_method_is_not_a_name_of_the_scope__():
+    """A method binds an attribute of its class, so a bare call does not reach it"""
+    _, table = _infer(UDT_SETUP + '''
+@udt
+class Counter:
+    start: int = 0
+
+    def scaled(self, by: float):
+        return self.start * by
+
+
+x = scaled(Counter(1), 2.0)
+''')
+    reasons = {diag.origin.reason for diag in table.diags if diag.origin is not None}
+    assert 'unknown-call' in reasons
+
+
 def __test_a_builtin_object_has_fields_too__():
     """
     ``chart.point`` is a class like any other: its fields have declared types.

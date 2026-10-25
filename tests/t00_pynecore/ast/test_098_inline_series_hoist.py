@@ -23,7 +23,6 @@ from pynecore.transformers.layout_emit import apply_layout
 from pynecore.transformers.persistent import PersistentTransformer
 from pynecore.transformers.series import SeriesTransformer
 from pynecore.transformers.slot_layout import ModuleLayout
-from pynecore.types.na import NA
 
 
 def _transform(source: str) -> tuple[dict, str]:
@@ -75,7 +74,7 @@ def main(gate, v):
     assert 'if gate else -1.0' in dump
     state = _make_state(ns['__pyne_slot_layout__']['main'])
     with _bars() as next_bar:
-        assert isinstance(ns['main'](state, True, 10), NA)  # no history yet
+        assert lib.na(ns['main'](state, True, 10))  # no history yet
         next_bar()
         assert ns['main'](state, False, 20) == -1.0         # gate skips
         next_bar()

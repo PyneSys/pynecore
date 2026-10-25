@@ -21,7 +21,7 @@ def main():
 
 def __test_inline_series_isolation__(csv_reader, runner, log):
     """Two distinct inline_series() call sites produce independent shifted series."""
-    from pynecore.types.na import NA
+    from pynecore.lib import na
 
     prev_close = None
     prev_open = None
@@ -30,8 +30,8 @@ def __test_inline_series_isolation__(csv_reader, runner, log):
             a = pv.get('a')
             b = pv.get('b')
             if i == 0:
-                assert isinstance(a, NA), f"bar 0: a should be na, got {a!r}"
-                assert isinstance(b, NA), f"bar 0: b should be na, got {b!r}"
+                assert na(a), f"bar 0: a should be na, got {a!r}"
+                assert na(b), f"bar 0: b should be na, got {b!r}"
             else:
                 assert a == prev_close, \
                     f"bar {i}: inline_series(close,1)={a} != close[1]={prev_close}"

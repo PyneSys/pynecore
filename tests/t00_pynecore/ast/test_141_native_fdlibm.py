@@ -23,7 +23,7 @@ import pytest
 from pynecore.core import fdlibm
 from pynecore.transformers.const_fold import quantize_embed
 
-from .test_135_native_transform import __test_helper_require_native
+from .test_137_native_transform import __test_helper_require_native
 
 #: Random arguments per function in the default run
 __test_helper_DEFAULT = 20_000

@@ -3,17 +3,48 @@ from typing import Any, TypeVar, Generic, Iterator, Callable, cast, overload
 
 from types import ModuleType
 
-from ..types.na import NA, na_float
+from ..types.na import NA, na_float, na_str
 
 __all__ = ['SeriesImpl', 'inline_series']
 
 T = TypeVar('T')
 
-# Interned na sentinel of untyped series (element type unknown at transform
-# time). The ``not (x == x)`` guards treat it and the native nan as the same na.
-# The cast is needed because the NA stub's __new__ deliberately types as T (so
-# ``NA(X)`` flows anywhere an ``X`` is expected), which here would be a TypeVar.
+# Interned na sentinel of a series whose element type is not known when it is
+# built (``inline_series`` buffers, a bare ``SeriesImpl()``). It is what such a
+# series reads out of range until it has stored a value with a type, whose na
+# then takes over (see :func:`_na_of`). The ``not (x == x)`` guards treat it and
+# the native nan as the same na. The cast is needed because the NA stub's
+# __new__ deliberately types as T (so ``NA(X)`` flows anywhere an ``X`` is
+# expected), which here would be a TypeVar.
 _NA_UNTYPED: NA = cast(NA, NA(T))
+
+
+def _na_of(value: Any) -> Any:
+    """The na of a stored value's type, as a typed series would have been built
+    with: the native nan for a number (a Pine int is a double at runtime, so
+    its na is the nan too), the empty string for a string, the bool na of the
+    running script's mode for a bool, and the interned ``NA(<class>)`` of any
+    other object (a user type, a drawing, a container). An na object is its
+    own type's na already; the typeless ones (``NA(None)`` and the untyped
+    sentinel) carry no type to derive from and stay untyped.
+
+    :param value: A value a series stored.
+    :return: The na of the value's type, or ``_NA_UNTYPED`` when it has none.
+    """
+    cls = value.__class__
+    if cls is bool:
+        return NA(bool)
+    if cls is float or cls is int:
+        return na_float
+    if cls is str:
+        return na_str
+    if cls is NA:
+        return _NA_UNTYPED if value.type is None or value is _NA_UNTYPED else value
+    if isinstance(value, (float, int)):
+        return na_float
+    if isinstance(value, str):
+        return na_str
+    return NA(cls)
 
 
 class SeriesImpl(Generic[T]):
@@ -49,8 +80,11 @@ class SeriesImpl(Generic[T]):
         :param na_value: The na sentinel returned for out-of-range reads.
                          Numeric (float and int) series pass the native nan
                          here so a warmup / out-of-history read behaves exactly
-                         like every other numeric na; untyped series keep the
-                         interned NA object.
+                         like every other numeric na. A series built without
+                         one takes the na of the first typed value it has
+                         stored when it is first read out of range, so an
+                         ``inline_series`` of a float expression reads the nan
+                         before its history exists, as ``Series[float]`` does.
         :param compacted: History counts stored values instead of bars: a bar with
                           no :meth:`add` is simply absent rather than repeating the
                           previous value. Set for the rolling windows of the
@@ -380,7 +414,17 @@ class SeriesImpl(Generic[T]):
         # Pine: out-of-range subscript -> na (covers both negative and
         # positive past-end indices).
         if offset < 0 or offset >= self._size:
-            return self._na
+            na = self._na
+            if na is _NA_UNTYPED and self._size:
+                # A series built without a known element type learns its na
+                # from what it stores: the newest value is the one a typed
+                # series would have been declared with. Kept once found, so
+                # the warmup reads of a long run pay this at most a few times
+                pos = self._write_pos - 1
+                na = _na_of(self._buffer[pos if pos >= 0 else pos + self._capacity])
+                if na is not _NA_UNTYPED:
+                    self._na = na
+            return na
         pos = self._write_pos - 1 - offset
         if pos < 0:
             pos += self._capacity
