@@ -2434,6 +2434,21 @@ def _dbt_rebuild(opening_hours: list | None, session_starts: list | None) -> Non
     _dbt_guard = (opening_hours, session_starts)
 
 
+def _is_scheduled_day(day: date) -> bool:
+    """
+    Whether the session template schedules trading day ``day``.
+
+    Without session starts there is no template to leave a day out, so every calendar day
+    is a trading day -- the same rule :func:`_scheduled_day_shift` and the midnight
+    fallback of ``trading_day_open_sec`` follow.
+
+    :param day: Trading day date
+    :return: True if ``day`` is a scheduled trading day
+    """
+    return not _dbt_starts or _scheduled_day_open_sec(day, _dbt_tz, _dbt_starts,
+                                                      _dbt_on) is not None
+
+
 def _scheduled_year_days(calendar_year: int) -> list[date]:
     """
     The trading days the session template schedules in ``calendar_year``, in order.
@@ -2448,7 +2463,7 @@ def _scheduled_year_days(calendar_year: int) -> list[date]:
         days = []
         day = date(calendar_year, 1, 1)
         while day.year == calendar_year:
-            if _scheduled_day_open_sec(day, _dbt_tz, _dbt_starts, _dbt_on) is not None:
+            if _is_scheduled_day(day):
                 days.append(day)
             day += timedelta(days=1)
         _dbt_years[calendar_year] = days
@@ -2620,7 +2635,7 @@ def _tv_day_walk(day: date, multiplier: int, steps: int) -> date:
         previous = _scheduled_year_days(calendar_year - 1)
         offset: timedelta = days[min(remaining, len(days)) - 1] - date(calendar_year, 1, 1)
         mirror: date = date(calendar_year - 1, 12, 31) - offset
-        while _scheduled_day_open_sec(mirror, _dbt_tz, _dbt_starts, _dbt_on) is None:
+        while not _is_scheduled_day(mirror):
             mirror += timedelta(days=1)
         if mirror.year == calendar_year:
             landing = len(previous) + _bisect_right(days, mirror) - 1

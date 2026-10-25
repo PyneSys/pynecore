@@ -27,6 +27,8 @@ def main():
     plot(time(timeframe="1M"), "m0")
     plot(time(timeframe="1M", timeframe_bars_back=1), "m1")
     plot(time(timeframe="1M", timeframe_bars_back=2), "m2")
+    plot(time(timeframe="D", timeframe_bars_back=1), "d1")
+    plot(time(timeframe="D", timeframe_bars_back=3), "d3")
 
 
 def __test_timeframe_bars_back_steps_the_requested_timeframe__(runner, log):
@@ -104,3 +106,36 @@ def __test_monthly_timeframe_bars_back_walks_calendar_months__(runner, log):
         assert this_month == month_start(2026, month)
         assert one_back == month_start(*prev)
         assert two_back == month_start(*prev2)
+
+
+def __test_daily_timeframe_bars_back_without_session_template__(runner, log):
+    """ With no session starts every calendar day is a trading day, also across the year """
+    from datetime import datetime, UTC, time as dt_time
+    from pynecore.core.syminfo import SymInfoInterval, SymInfoSession
+    from pynecore.types.ohlcv import OHLCV
+
+    seven_days = {
+        "period": "60",
+        "type": "crypto",
+        "timezone": "Etc/UTC",
+        "opening_hours": [SymInfoInterval(day=d, start=dt_time(0, 0), end=dt_time(0, 0))
+                          for d in range(7)],
+        "session_starts": [SymInfoSession(day=d, time=dt_time(0, 0)) for d in range(7)],
+        "session_ends": [SymInfoSession(day=d, time=dt_time(0, 0)) for d in range(7)],
+    }
+    # The SymInfo of a script that declares no trading hours at all; the daily walk
+    # back across January 1 used to index an empty list of scheduled days
+    no_template = dict(seven_days, opening_hours=[], session_starts=[], session_ends=[])
+
+    start = int(datetime(2025, 12, 30, tzinfo=UTC).timestamp()) * 1000
+    bars = [OHLCV(timestamp=start + i * _HOUR_MS, open=1.0, high=1.0, low=1.0,
+                  close=1.0, volume=1.0)
+            for i in range(24 * 6)]
+
+    def walk(override: dict) -> list[tuple[int, int]]:
+        return [(plots["d1"], plots["d3"])
+                for _candle, plots in runner(iter(bars), syminfo_override=override).run_iter()]
+
+    expected = walk(seven_days)
+    assert len(expected) == 24 * 6
+    assert walk(no_template) == expected
