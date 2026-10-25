@@ -27,7 +27,7 @@ PIPELINE_NAME = re.compile(
     # history hoists, per-context ``main`` slices
     r'|cmp\d+|bool\d+|hist_\d+|sec_main_\d+'
     # Slot-state plumbing
-    r'|state|attach_layout|resolve_slot|bind_any|bind_loop|bind_slot|bind_pinned'
+    r'|state|attach_layout|state_method|resolve_slot|bind_any|bind_loop|bind_slot|bind_pinned'
     r'|loop_state|slot_state|dyn_default'
     # The request.security protocol
     r'|security_contexts|active_security|same_context'

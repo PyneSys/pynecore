@@ -42,7 +42,7 @@ __all__ = ['EDGE_RULES_VERSION', 'STRICT_ENV', 'DIAG_ENV', 'edge_rules', 'strict
 
 #: The profile revision this gate was written against. ``edge_rules.json``
 #: must carry the same one.
-EDGE_RULES_VERSION: Final = '2026.10.1'
+EDGE_RULES_VERSION: Final = '2026.10.2'
 
 #: ``1`` makes an edge module's first diagnostic an error, ``0`` never
 #: does; unset is ``0`` until the corpus is clean enough to flip the default.
@@ -499,9 +499,25 @@ class _Gate:
         if body and _is_docstring(body[0]):
             body = body[1:]
         for stmt in body:
-            if not isinstance(stmt, (ast.AnnAssign, ast.Pass)):
-                self._report(stmt, 'edge-class', f'a class body beyond annotated fields {_SUFFIX}',
-                             'declare methods with @method outside the class')
+            if isinstance(stmt, ast.FunctionDef):
+                self._check_member(stmt)
+            elif not isinstance(stmt, (ast.AnnAssign, ast.Pass)):
+                self._report(stmt, 'edge-class',
+                             f'a class body beyond annotated fields and methods {_SUFFIX}',
+                             'declare fields and methods only')
+
+    def _check_member(self, node: ast.FunctionDef) -> None:
+        """
+        A method in a class body: Pine's ``method m(Type this)`` spelled in the
+        class, so it takes no decorator and its receiver first.
+        """
+        if node.decorator_list:
+            self._report(node, 'edge-class', f'a decorated method in a class body {_SUFFIX}',
+                         'drop the decorator: a method takes its receiver first')
+        elif not (node.args.posonlyargs or node.args.args):
+            self._report(node, 'edge-class',
+                         f'a method without its receiver as the first parameter {_SUFFIX}',
+                         'take the receiver as the first parameter')
 
     def _is_protocol_shim(self, node: ast.ClassDef) -> bool:
         """

@@ -132,7 +132,7 @@
     "arg",
     "keyword"
   ],
-  "rules_version": "2026.10.1",
+  "rules_version": "2026.10.2",
   "unary_ops": [
     "Not",
     "UAdd",

@@ -185,8 +185,23 @@ def __test_a_class_is_a_field_list__():
     assert 'inheritance' in diags[0].message
     diags = _gate(HEAD + 'class B:\n    x: int\n')
     assert 'decorator' in diags[0].message
+    diags = _gate(HEAD + '@udt\nclass C:\n    x: int\n    y = 1\n')
+    assert 'annotated fields and methods' in diags[0].message
+
+
+def __test_a_class_body_declares_plain_methods__():
+    """
+    A method in the class body is Pine's ``method m(Type this)``: undecorated,
+    with the receiver first. Any decorator decides what the attribute holds.
+    """
     diags = _gate(HEAD + '@udt\nclass C:\n    x: int\n    def m(self):\n        pass\n')
-    assert 'annotated fields' in diags[0].message
+    assert not diags, [diag.message for diag in diags]
+    diags = _gate(HEAD + '@udt\nclass C:\n    x: int\n    @staticmethod\n'
+                         '    def m():\n        pass\n')
+    assert any('decorated method' in diag.message for diag in diags), \
+        [diag.message for diag in diags]
+    diags = _gate(HEAD + '@udt\nclass C:\n    x: int\n    def m():\n        pass\n')
+    assert 'receiver' in diags[0].message
 
 
 def __test_a_rejected_import_does_not_cascade_into_its_uses__():

@@ -138,7 +138,7 @@ from ..types.na import NA, na_float
 __all__ = [
     '__resolve_slot__', '__bind_any__', '__slot_state__', '__bind_slot__',
     '__loop_state__', '__bind_loop__', '__bind_pinned__',
-    '__attach_layout__', '__dyn_default__',
+    '__attach_layout__', '__state_method__', '__dyn_default__',
     'create_root', 'get_root', 'discard_root', 'reset', 'register_shared_cache',
     'RootVarSnapshot', 'RootSeriesSnapshot', 'RootChildSnapshot', 'explain_state',
 ]
@@ -602,6 +602,49 @@ def __attach_layout__(layout: dict[str, Any]) -> Callable[[Callable], Callable]:
     return attach
 
 
+class _StateMethodBinding:
+    """A state-carrying method bound to its receiver.
+
+    The method's hidden state parameter stands in front of the receiver
+    (``def m(__state__, self, x)``), so a plain bound method would hand the
+    receiver over as the state. This binding takes the state first, like every
+    other state-carrying callee, and puts the receiver right behind it: what
+    the call sites bind is ``partial(binding, state)``, the shape every anchor,
+    rollback and snapshot here already reads.
+    """
+    __slots__ = ('__func__', '__self__')
+
+    def __init__(self, func: Callable, receiver: Any):
+        self.__func__ = func
+        self.__self__ = receiver
+
+    @property
+    def __pyne_layout__(self) -> dict[str, Any]:
+        return getattr(self.__func__, '__pyne_layout__')
+
+    def __call__(self, state: list, *args: Any, **kwargs: Any) -> Any:
+        return self.__func__(state, self.__self__, *args, **kwargs)
+
+
+# noinspection PyPep8Naming
+class __state_method__:
+    """Descriptor of a state-carrying method declared in a class body.
+
+    Reached through an instance it yields a :class:`_StateMethodBinding`;
+    reached through the class it is the function itself, which already takes
+    the state first and the receiver second (``Pair.m(state, p)``).
+    """
+    __slots__ = ('__func__',)
+
+    def __init__(self, func: Callable):
+        self.__func__ = func
+
+    def __get__(self, obj: Any, owner: type | None = None) -> Callable:
+        if obj is None:
+            return self.__func__
+        return _StateMethodBinding(self.__func__, obj)
+
+
 def _carry_state(prev: tuple | None, layout: dict[str, Any]) -> list:
     """State vector for a state-carrying callee at an anchored site: reuse the
     prior anchor's vector when it belongs to the SAME logical callee, else make
@@ -751,6 +794,13 @@ def _restore_bound_builtins(bound: Any, stamped: tuple[int, list, tuple | None])
     _restore_collected(vecs, stamped[1])
 
 
+def _same_state_method(prev: Any, func: Any) -> bool:
+    """Whether two call-site values are bindings of the same state-carrying
+    method (see :class:`_StateMethodBinding`), whatever their receivers."""
+    return type(func) is _StateMethodBinding and type(prev) is _StateMethodBinding \
+        and prev.__func__ is func.__func__
+
+
 def __bind_loop__(parent: list, slot: int, func: Any, pin: str | None = None,
                   vector: tuple | None = None) -> Callable:
     """Whole loop-shaped anchored call site (uniform path): identity check,
@@ -777,6 +827,11 @@ def __bind_loop__(parent: list, slot: int, func: Any, pin: str | None = None,
     if pair[0] is not func:
         bound = _bind_target(func, pair, pin, vector)
         cell[0] = (func, bound)
+        if cell[1] == bar and _same_state_method(pair[0], func):
+            # ``obj.m`` is a fresh binding on every access, yet the same method
+            # on the state vector carried over: it rolls back like a hit
+            _restore_bound_builtins(bound, cell[2])
+            return bound
         cell[1] = bar
         cell[2] = _snap_bound_builtins(bound)
         return bound

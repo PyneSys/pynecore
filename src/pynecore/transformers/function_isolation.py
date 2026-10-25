@@ -97,7 +97,9 @@ Deliberately left untouched (raw calls): module-level call sites (a stateful
 callee there raises a transform error, and one carrying an overload pin binds
 in place through ``__bind_pinned·__`` — there is no anchor up there to resolve
 the pin in, and the module body runs once), decorator and default-argument
-expressions, class bodies, ``__test_*__`` functions (the test framework
+expressions, class bodies apart from their methods (a method is a scope like
+any definition; a state-carrying one is reached through the
+``__state_method__`` descriptor, see ``slot_layout``), ``__test_*__`` functions (the test framework
 calls them with fixtures, they must not grow a hidden parameter), and calls
 whose callee is not a plain name/attribute. Calls inside lambdas are
 anchored on the straight-line uniform route: a lambda body runs at its
@@ -478,6 +480,9 @@ class _ScopeIndex(ast_walk.NodeVisitor):
         # the last definition wins, like the runtime name binding does
         self.defs: dict[str, dict[str, tuple[str, bool]]] = {'': {}}
         self.classes: dict[str, set[str]] = {'': set()}
+        # scope -> class name -> method name -> (scope id of its LAST def,
+        # has decorators)
+        self.methods: dict[str, dict[str, dict[str, tuple[str, bool]]]] = {}
         self.assigned: dict[str, set[str]] = {'': set()}
         # name -> (module path, attribute or None)
         self.import_map: dict[str, tuple[str, str | None]] = {}
@@ -499,10 +504,16 @@ class _ScopeIndex(ast_walk.NodeVisitor):
         self._territory = True
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.defs[self._scope][node.name] = self._index_def(node)
+
+    def _index_def(self, node: ast.FunctionDef) -> tuple[str, bool]:
+        """Index one definition, without binding its name anywhere.
+
+        :return: The definition's scope id, and whether it is decorated
+        """
         outer = self._scope
         segment = self.layout.scope_segment(node)
         scope = f'{outer}·{segment}' if outer else segment
-        self.defs[outer][node.name] = (scope, bool(node.decorator_list))
         self._scope = scope
         self.defs.setdefault(scope, {})
         self.classes.setdefault(scope, set())
@@ -535,10 +546,17 @@ class _ScopeIndex(ast_walk.NodeVisitor):
         self._territory = territory
         self._segments.pop()
         self._scope = outer
+        return scope, bool(node.decorator_list)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self.classes[self._scope].add(node.name)
-        # Class bodies are not isolation scopes — don't index their content
+        # Only the methods of a class body are isolation scopes. The rest of it
+        # runs once, when the class is created, and a method name binds an
+        # attribute of the class, never a name of the enclosing scope
+        methods = self.methods.setdefault(self._scope, {}).setdefault(node.name, {})
+        for stmt in node.body:
+            if isinstance(stmt, ast.FunctionDef):
+                methods[stmt.name] = self._index_def(stmt)
 
     def visit_Call(self, node: ast.Call) -> None:
         self.generic_visit(node)
@@ -670,9 +688,19 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
                     return _UNIFORM
                 return 'same', target
             if base in self.index.classes.get(scope, ()):
+                if is_assigned:
+                    return _UNIFORM
+                if len(parts) == 2:
+                    method = self.index.methods.get(scope, {}).get(base, {}).get(parts[1])
+                    if method is not None:
+                        # ``Pair.m(p)`` reaches the method's own function, which
+                        # takes the state first like any definition of the module.
+                        # A decorator decides what the attribute holds
+                        target, decorated = method
+                        return _UNIFORM if decorated else ('same', target)
                 # Constructor or class attribute — the legacy runtime guard
                 # returned types untouched, skipping is the same net effect
-                return _SKIP if not is_assigned else _UNIFORM
+                return _SKIP
             if is_assigned:
                 return _UNIFORM  # local value (function value, object, ...)
 
@@ -1050,7 +1078,11 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
         return node
 
     def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
-        return node  # class bodies stay raw (no hidden-parameter injection path)
+        # Only the methods are isolation territory: the rest of a class body
+        # runs once, when the class is created
+        node.body = [cast(ast.stmt, self.visit(stmt)) if isinstance(stmt, ast.FunctionDef)
+                     else stmt for stmt in node.body]
+        return node
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
         if _is_test_function(node.name):

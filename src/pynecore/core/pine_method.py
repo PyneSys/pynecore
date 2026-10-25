@@ -32,7 +32,8 @@ from ..types import linefill as linefill_types
 from ..types import polyline as polyline_types
 from ..types.na import NA
 
-from .instance_state import _configure, _make_state, register_shared_cache  # noqa: internal API
+from .instance_state import (_configure, _make_state, _StateMethodBinding,  # noqa: internal API
+                             register_shared_cache)
 from .pine_export import Exported, in_module_bool_mode
 
 
@@ -268,7 +269,13 @@ def _dispatcher(cache: dict[str, tuple[Any, list | None, Callable]],
                 receiver_type = declared if isinstance(declared, type) else type(declared)
             elif receiver_type not in _PINE_SCALAR_TYPES:
                 try:
-                    return getattr(var, method)(*args, **kwargs)
+                    attribute = getattr(var, method)
+                    if type(attribute) is _StateMethodBinding:
+                        # A state-carrying method of the receiver's class: its state
+                        # belongs to this call site, like a method handed over as a
+                        # function, and the function takes the receiver behind it
+                        return _bound_method(attribute.__func__, cache)(var, *args, **kwargs)
+                    return attribute(*args, **kwargs)
                 except AttributeError:
                     pass
 
