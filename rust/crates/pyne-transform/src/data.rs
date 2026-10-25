@@ -232,7 +232,7 @@ pub fn lib_namespaces() -> &'static std::collections::HashSet<String> {
 pub enum InlineFunction {
     /// The body's own expression: the parameter names and the encoded expression
     /// (`{"param": i}` for a read of the i-th parameter, `{"_type": class, field:
-    /// value, ..., "loc": [...], "arg": true}` for any other node)
+    /// value, ..., "arg": true}` for any other node)
     Derive { params: Vec<String>, body: Value },
     /// The fixed-arity expansion of `math.max` / `math.min`: the builtin the body
     /// ends in, and the `inline_support` anchors of `_na_of_operands` and `builtins`

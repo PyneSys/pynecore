@@ -377,10 +377,13 @@ impl ClassSig {
             .iter()
             .map(|(name, sig)| Ok((name.clone(), ExportSig::from_json(sig)?)))
             .collect::<Result<IndexMap<_, _>, String>>()?;
-        let members = json_map(value, "members")?
-            .iter()
-            .map(|(name, sig)| Ok((name.clone(), ExportSig::from_json(sig)?)))
-            .collect::<Result<IndexMap<_, _>, String>>()?;
+        let members = match value.get("members") {
+            None => IndexMap::new(),
+            Some(_) => json_map(value, "members")?
+                .iter()
+                .map(|(name, sig)| Ok((name.clone(), ExportSig::from_json(sig)?)))
+                .collect::<Result<IndexMap<_, _>, String>>()?,
+        };
         Ok(ClassSig {
             name: json_str(value, "name")?,
             id: json_str(value, "id")?,

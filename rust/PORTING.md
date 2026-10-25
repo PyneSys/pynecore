@@ -250,8 +250,9 @@ request from `ModuleLayout::new(pyne_mode == "lib")`, as the import hook does.
    the step) and guarded by `tests/t00_pynecore/ast/test_144_call_inline_templates.py`,
    which names the function whose template changed. Per function the registry holds
    its parameters and derived expression (a parameter read is `{"param": i}`, every
-   other node its class, fields and the wrapper-source location the emission
-   carries), or the builtin and anchors of the varargs expansion; plus the callee
+   other node its class and fields, no location: the emission is anchored at the
+   call site's point, the argument subtrees keep theirs), or the builtin and
+   anchors of the varargs expansion; plus the callee
    paths (`callees`), the spellings of `pine_range` (`loop_ranges`) and the varargs
    arities. The Python step builds its templates from it and proves a callee by the
    path its import map resolves to, where it compared live objects before;
@@ -293,4 +294,9 @@ request from `ModuleLayout::new(pyne_mode == "lib")`, as the import hook does.
    `_module_file_path` or without a location, a stamp of an unexpected shape
    (`_pine_pin`, `_pine_vector`, `_pine_varying`, `_pine_series_len`, a type that
    is no string), a route word outside the five, and any failing host answer.
-   `Rejected`: a stateful call at module level.
+   `Rejected`: a stateful call at module level, and (ApplyLayout) a state-carrying
+   method of a class body with a decorator other than a lone `@staticmethod`.
+   The methods of a class body are isolation scopes of the enclosing scope; a
+   state-carrying one gets the `__state_method__` descriptor and the layout
+   decorator. The native `ClassSig` carries the class-body `members` the table
+   publishes.

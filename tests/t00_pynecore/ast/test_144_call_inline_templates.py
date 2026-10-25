@@ -7,9 +7,8 @@ emits a body the wrapper no longer has. The committed JSON must always match
 what scripts/call_inline_collector.py derives from the current lib sources.
 
 The lib sources are not part of the pipeline hash and this file is, so this
-guard is what turns an edit of an inlined body -- or of the line it stands on,
-whose location the emission carries -- into a regenerated file and with it into
-retransformed script bytecode.
+guard is what turns an edit of an inlined body into a regenerated file and with
+it into retransformed script bytecode.
 """
 import importlib.util
 import json
@@ -54,8 +53,7 @@ def __test_call_inline_templates_are_current__():
                 changes.append(f"{section}[{key!r}]: {then[key].get('text')!r} -> "
                                f"{now[key].get('text')!r}")
             elif section == 'functions':
-                changes.append(f"{section}[{key!r}]: same expression, other source "
-                               f"locations or structure")
+                changes.append(f"{section}[{key!r}]: same expression, other structure")
             else:
                 changes.append(f"{section}[{key!r}]: {then[key]!r} -> {now[key]!r}")
     for section in ('loop_ranges', 'varargs_arities', 'v'):
@@ -86,8 +84,9 @@ def __test_load_bearing_entries__():
     assert functions['pynecore.lib.math.min']['builtin'] == 'min'
     # A parameter read is a slot of the call site's arguments, not a name
     assert functions['pynecore.lib.math.abs']['body']['test']['operand']['left'] == {'param': 0}
-    # ... and a node copied from the wrapper keeps the wrapper's source location
-    assert len(functions['pynecore.lib.math.abs']['body']['test']['loc']) == 4
+    # ... and a node copied from the wrapper carries no location of the wrapper's
+    # source: the emission is anchored at the call site
+    assert 'loc' not in functions['pynecore.lib.math.abs']['body']['test']
 
     assert registry['callees']['pynecore.lib.math.abs'] == 'pynecore.lib.math.abs'
     assert set(registry['callees'].values()) == set(functions)

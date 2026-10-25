@@ -38,23 +38,11 @@
       "ctx": "Load",
       "id": "__inl·array_na_element__"
      },
-     "keywords": [],
-     "loc": [
-      479,
-      23,
-      479,
-      38
-     ]
+     "keywords": []
     },
     "orelse": {
      "_type": "Subscript",
      "ctx": "Load",
-     "loc": [
-      485,
-      11,
-      485,
-      25
-     ],
      "slice": {
       "_type": "Call",
       "args": [
@@ -67,13 +55,7 @@
        "ctx": "Load",
        "id": "__inl·py_int__"
       },
-      "keywords": [],
-      "loc": [
-       485,
-       14,
-       485,
-       24
-      ]
+      "keywords": []
      },
      "value": {
       "param": 0
@@ -81,12 +63,6 @@
     },
     "test": {
      "_type": "UnaryOp",
-     "loc": [
-      474,
-      7,
-      474,
-      27
-     ],
      "op": "Not",
      "operand": {
       "_type": "Compare",
@@ -98,12 +74,6 @@
       "left": {
        "param": 1
       },
-      "loc": [
-       474,
-       12,
-       474,
-       26
-      ],
       "ops": [
        "Eq"
       ]
@@ -133,13 +103,7 @@
        "ctx": "Load",
        "id": "__inl·py_len__"
       },
-      "keywords": [],
-      "loc": [
-       1244,
-       20,
-       1244,
-       27
-      ]
+      "keywords": []
      }
     ],
     "func": {
@@ -147,13 +111,7 @@
      "ctx": "Load",
      "id": "__inl·py_float__"
     },
-    "keywords": [],
-    "loc": [
-     1244,
-     11,
-     1244,
-     28
-    ]
+    "keywords": []
    },
    "kind": "derive",
    "params": [
@@ -180,34 +138,16 @@
       "_type": "Attribute",
       "attr": "abs",
       "ctx": "Load",
-      "loc": [
-       52,
-       21,
-       52,
-       33
-      ],
       "value": {
        "_type": "Name",
        "ctx": "Load",
        "id": "__inl·py_builtins__"
       }
      },
-     "keywords": [],
-     "loc": [
-      52,
-      21,
-      52,
-      41
-     ]
+     "keywords": []
     },
     "test": {
      "_type": "UnaryOp",
-     "loc": [
-      48,
-      7,
-      48,
-      29
-     ],
      "op": "Not",
      "operand": {
       "_type": "Compare",
@@ -219,12 +159,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       48,
-       12,
-       48,
-       28
-      ],
       "ops": [
        "Eq"
       ]
@@ -256,34 +190,16 @@
       "_type": "Attribute",
       "attr": "acos",
       "ctx": "Load",
-      "loc": [
-       65,
-       11,
-       65,
-       22
-      ],
       "value": {
        "_type": "Name",
        "ctx": "Load",
        "id": "__inl·fdlibm__"
       }
      },
-     "keywords": [],
-     "loc": [
-      65,
-      11,
-      65,
-      29
-     ]
+     "keywords": []
     },
     "test": {
      "_type": "UnaryOp",
-     "loc": [
-      62,
-      7,
-      62,
-      27
-     ],
      "op": "Not",
      "operand": {
       "_type": "Compare",
@@ -295,12 +211,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       62,
-       12,
-       62,
-       26
-      ],
       "ops": [
        "Eq"
       ]
@@ -332,34 +242,16 @@
       "_type": "Attribute",
       "attr": "asin",
       "ctx": "Load",
-      "loc": [
-       77,
-       11,
-       77,
-       22
-      ],
       "value": {
        "_type": "Name",
        "ctx": "Load",
        "id": "__inl·fdlibm__"
       }
      },
-     "keywords": [],
-     "loc": [
-      77,
-      11,
-      77,
-      29
-     ]
+     "keywords": []
     },
     "test": {
      "_type": "UnaryOp",
-     "loc": [
-      75,
-      7,
-      75,
-      27
-     ],
      "op": "Not",
      "operand": {
       "_type": "Compare",
@@ -371,12 +263,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       75,
-       12,
-       75,
-       26
-      ],
       "ops": [
        "Eq"
       ]
@@ -408,34 +294,16 @@
       "_type": "Attribute",
       "attr": "atan",
       "ctx": "Load",
-      "loc": [
-       89,
-       11,
-       89,
-       22
-      ],
       "value": {
        "_type": "Name",
        "ctx": "Load",
        "id": "__inl·fdlibm__"
       }
      },
-     "keywords": [],
-     "loc": [
-      89,
-      11,
-      89,
-      29
-     ]
+     "keywords": []
     },
     "test": {
      "_type": "UnaryOp",
-     "loc": [
-      87,
-      7,
-      87,
-      27
-     ],
      "op": "Not",
      "operand": {
       "_type": "Compare",
@@ -447,12 +315,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       87,
-       12,
-       87,
-       26
-      ],
       "ops": [
        "Eq"
       ]
@@ -487,25 +349,13 @@
         "_type": "Attribute",
         "attr": "ceil",
         "ctx": "Load",
-        "loc": [
-         140,
-         20,
-         140,
-         29
-        ],
         "value": {
          "_type": "Name",
          "ctx": "Load",
          "id": "__inl·py_math__"
         }
        },
-       "keywords": [],
-       "loc": [
-        140,
-        20,
-        140,
-        37
-       ]
+       "keywords": []
       }
      ],
      "func": {
@@ -513,22 +363,10 @@
       "ctx": "Load",
       "id": "__inl·py_float__"
      },
-     "keywords": [],
-     "loc": [
-      140,
-      11,
-      140,
-      38
-     ]
+     "keywords": []
     },
     "test": {
      "_type": "UnaryOp",
-     "loc": [
-      138,
-      7,
-      138,
-      29
-     ],
      "op": "Not",
      "operand": {
       "_type": "Compare",
@@ -540,12 +378,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       138,
-       12,
-       138,
-       28
-      ],
       "ops": [
        "Eq"
       ]
@@ -577,34 +409,16 @@
       "_type": "Attribute",
       "attr": "cos",
       "ctx": "Load",
-      "loc": [
-       155,
-       11,
-       155,
-       24
-      ],
       "value": {
        "_type": "Name",
        "ctx": "Load",
        "id": "__inl·pine_math__"
       }
      },
-     "keywords": [],
-     "loc": [
-      155,
-      11,
-      155,
-      31
-     ]
+     "keywords": []
     },
     "test": {
      "_type": "UnaryOp",
-     "loc": [
-      150,
-      7,
-      150,
-      27
-     ],
      "op": "Not",
      "operand": {
       "_type": "Compare",
@@ -616,12 +430,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       150,
-       12,
-       150,
-       26
-      ],
       "ops": [
        "Eq"
       ]
@@ -653,34 +461,16 @@
       "_type": "Attribute",
       "attr": "exp",
       "ctx": "Load",
-      "loc": [
-       167,
-       11,
-       167,
-       24
-      ],
       "value": {
        "_type": "Name",
        "ctx": "Load",
        "id": "__inl·pine_math__"
       }
      },
-     "keywords": [],
-     "loc": [
-      167,
-      11,
-      167,
-      32
-     ]
+     "keywords": []
     },
     "test": {
      "_type": "UnaryOp",
-     "loc": [
-      165,
-      7,
-      165,
-      29
-     ],
      "op": "Not",
      "operand": {
       "_type": "Compare",
@@ -692,12 +482,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       165,
-       12,
-       165,
-       28
-      ],
       "ops": [
        "Eq"
       ]
@@ -732,25 +516,13 @@
         "_type": "Attribute",
         "attr": "floor",
         "ctx": "Load",
-        "loc": [
-         180,
-         20,
-         180,
-         30
-        ],
         "value": {
          "_type": "Name",
          "ctx": "Load",
          "id": "__inl·py_math__"
         }
        },
-       "keywords": [],
-       "loc": [
-        180,
-        20,
-        180,
-        38
-       ]
+       "keywords": []
       }
      ],
      "func": {
@@ -758,22 +530,10 @@
       "ctx": "Load",
       "id": "__inl·py_float__"
      },
-     "keywords": [],
-     "loc": [
-      180,
-      11,
-      180,
-      39
-     ]
+     "keywords": []
     },
     "test": {
      "_type": "UnaryOp",
-     "loc": [
-      177,
-      7,
-      177,
-      29
-     ],
      "op": "Not",
      "operand": {
       "_type": "Compare",
@@ -785,12 +545,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       177,
-       12,
-       177,
-       28
-      ],
       "ops": [
        "Eq"
       ]
@@ -822,34 +576,16 @@
       "_type": "Attribute",
       "attr": "log",
       "ctx": "Load",
-      "loc": [
-       192,
-       11,
-       192,
-       24
-      ],
       "value": {
        "_type": "Name",
        "ctx": "Load",
        "id": "__inl·pine_math__"
       }
      },
-     "keywords": [],
-     "loc": [
-      192,
-      11,
-      192,
-      32
-     ]
+     "keywords": []
     },
     "test": {
      "_type": "UnaryOp",
-     "loc": [
-      190,
-      7,
-      190,
-      29
-     ],
      "op": "Not",
      "operand": {
       "_type": "Compare",
@@ -861,12 +597,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       190,
-       12,
-       190,
-       28
-      ],
       "ops": [
        "Eq"
       ]
@@ -898,34 +628,16 @@
       "_type": "Attribute",
       "attr": "log10",
       "ctx": "Load",
-      "loc": [
-       204,
-       11,
-       204,
-       26
-      ],
       "value": {
        "_type": "Name",
        "ctx": "Load",
        "id": "__inl·pine_math__"
       }
      },
-     "keywords": [],
-     "loc": [
-      204,
-      11,
-      204,
-      34
-     ]
+     "keywords": []
     },
     "test": {
      "_type": "UnaryOp",
-     "loc": [
-      202,
-      7,
-      202,
-      29
-     ],
      "op": "Not",
      "operand": {
       "_type": "Compare",
@@ -937,12 +649,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       202,
-       12,
-       202,
-       28
-      ],
       "ops": [
        "Eq"
       ]
@@ -982,12 +688,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       304,
-       15,
-       304,
-       20
-      ],
       "op": "Mult",
       "right": {
        "param": 0
@@ -1007,25 +707,13 @@
        "_type": "Attribute",
        "attr": "pow",
        "ctx": "Load",
-       "loc": [
-        305,
-        11,
-        305,
-        24
-       ],
        "value": {
         "_type": "Name",
         "ctx": "Load",
         "id": "__inl·pine_math__"
        }
       },
-      "keywords": [],
-      "loc": [
-       305,
-       11,
-       305,
-       37
-      ]
+      "keywords": []
      },
      "test": {
       "_type": "Compare",
@@ -1033,12 +721,6 @@
        {
         "_type": "Constant",
         "kind": null,
-        "loc": [
-         303,
-         19,
-         303,
-         20
-        ],
         "value": [
          "int",
          "2"
@@ -1048,12 +730,6 @@
       "left": {
        "param": 1
       },
-      "loc": [
-       303,
-       7,
-       303,
-       20
-      ],
       "ops": [
        "Eq"
       ]
@@ -1061,22 +737,10 @@
     },
     "test": {
      "_type": "BoolOp",
-     "loc": [
-      294,
-      7,
-      294,
-      55
-     ],
      "op": "Or",
      "values": [
       {
        "_type": "UnaryOp",
-       "loc": [
-        294,
-        7,
-        294,
-        25
-       ],
        "op": "Not",
        "operand": {
         "_type": "Compare",
@@ -1088,12 +752,6 @@
         "left": {
          "param": 0
         },
-        "loc": [
-         294,
-         12,
-         294,
-         24
-        ],
         "ops": [
          "Eq"
         ]
@@ -1101,12 +759,6 @@
       },
       {
        "_type": "UnaryOp",
-       "loc": [
-        294,
-        29,
-        294,
-        55
-       ],
        "op": "Not",
        "operand": {
         "_type": "Compare",
@@ -1118,12 +770,6 @@
         "left": {
          "param": 1
         },
-        "loc": [
-         294,
-         34,
-         294,
-         54
-        ],
         "ops": [
          "Eq"
         ]
@@ -1152,12 +798,6 @@
      "body": {
       "_type": "Constant",
       "kind": null,
-      "loc": [
-       464,
-       15,
-       464,
-       18
-      ],
       "value": [
        "float",
        "0.0"
@@ -1168,12 +808,6 @@
       "body": {
        "_type": "Constant",
        "kind": null,
-       "loc": [
-        466,
-        15,
-        466,
-        18
-       ],
        "value": [
         "float",
         "1.0"
@@ -1181,22 +815,10 @@
       },
       "orelse": {
        "_type": "UnaryOp",
-       "loc": [
-        467,
-        11,
-        467,
-        15
-       ],
        "op": "USub",
        "operand": {
         "_type": "Constant",
         "kind": null,
-        "loc": [
-         467,
-         12,
-         467,
-         15
-        ],
         "value": [
          "float",
          "1.0"
@@ -1209,12 +831,6 @@
         {
          "_type": "Constant",
          "kind": null,
-         "loc": [
-          465,
-          16,
-          465,
-          19
-         ],
          "value": [
           "float",
           "0.0"
@@ -1224,12 +840,6 @@
        "left": {
         "param": 0
        },
-       "loc": [
-        465,
-        7,
-        465,
-        19
-       ],
        "ops": [
         "Gt"
        ]
@@ -1241,12 +851,6 @@
        {
         "_type": "Constant",
         "kind": null,
-        "loc": [
-         463,
-         17,
-         463,
-         20
-        ],
         "value": [
          "float",
          "0.0"
@@ -1256,12 +860,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       463,
-       7,
-       463,
-       20
-      ],
       "ops": [
        "Eq"
       ]
@@ -1269,12 +867,6 @@
     },
     "test": {
      "_type": "UnaryOp",
-     "loc": [
-      461,
-      7,
-      461,
-      29
-     ],
      "op": "Not",
      "operand": {
       "_type": "Compare",
@@ -1286,12 +878,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       461,
-       12,
-       461,
-       28
-      ],
       "ops": [
        "Eq"
       ]
@@ -1323,34 +909,16 @@
       "_type": "Attribute",
       "attr": "sin",
       "ctx": "Load",
-      "loc": [
-       479,
-       11,
-       479,
-       24
-      ],
       "value": {
        "_type": "Name",
        "ctx": "Load",
        "id": "__inl·pine_math__"
       }
      },
-     "keywords": [],
-     "loc": [
-      479,
-      11,
-      479,
-      31
-     ]
+     "keywords": []
     },
     "test": {
      "_type": "UnaryOp",
-     "loc": [
-      477,
-      7,
-      477,
-      27
-     ],
      "op": "Not",
      "operand": {
       "_type": "Compare",
@@ -1362,12 +930,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       477,
-       12,
-       477,
-       26
-      ],
       "ops": [
        "Eq"
       ]
@@ -1406,25 +968,13 @@
        "_type": "Attribute",
        "attr": "sqrt",
        "ctx": "Load",
-       "loc": [
-        493,
-        11,
-        493,
-        20
-       ],
        "value": {
         "_type": "Name",
         "ctx": "Load",
         "id": "__inl·py_math__"
        }
       },
-      "keywords": [],
-      "loc": [
-       493,
-       11,
-       493,
-       28
-      ]
+      "keywords": []
      },
      "test": {
       "_type": "Compare",
@@ -1432,12 +982,6 @@
        {
         "_type": "Constant",
         "kind": null,
-        "loc": [
-         491,
-         16,
-         491,
-         19
-        ],
         "value": [
          "float",
          "0.0"
@@ -1447,12 +991,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       491,
-       7,
-       491,
-       19
-      ],
       "ops": [
        "Lt"
       ]
@@ -1460,12 +998,6 @@
     },
     "test": {
      "_type": "UnaryOp",
-     "loc": [
-      489,
-      7,
-      489,
-      29
-     ],
      "op": "Not",
      "operand": {
       "_type": "Compare",
@@ -1477,12 +1009,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       489,
-       12,
-       489,
-       28
-      ],
       "ops": [
        "Eq"
       ]
@@ -1514,34 +1040,16 @@
       "_type": "Attribute",
       "attr": "tan",
       "ctx": "Load",
-      "loc": [
-       505,
-       11,
-       505,
-       24
-      ],
       "value": {
        "_type": "Name",
        "ctx": "Load",
        "id": "__inl·pine_math__"
       }
      },
-     "keywords": [],
-     "loc": [
-      505,
-      11,
-      505,
-      31
-     ]
+     "keywords": []
     },
     "test": {
      "_type": "UnaryOp",
-     "loc": [
-      503,
-      7,
-      503,
-      27
-     ],
      "op": "Not",
      "operand": {
       "_type": "Compare",
@@ -1553,12 +1061,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       503,
-       12,
-       503,
-       26
-      ],
       "ops": [
        "Eq"
       ]
@@ -1590,34 +1092,16 @@
       "_type": "Attribute",
       "attr": "degrees",
       "ctx": "Load",
-      "loc": [
-       517,
-       11,
-       517,
-       23
-      ],
       "value": {
        "_type": "Name",
        "ctx": "Load",
        "id": "__inl·py_math__"
       }
      },
-     "keywords": [],
-     "loc": [
-      517,
-      11,
-      517,
-      32
-     ]
+     "keywords": []
     },
     "test": {
      "_type": "UnaryOp",
-     "loc": [
-      515,
-      7,
-      515,
-      31
-     ],
      "op": "Not",
      "operand": {
       "_type": "Compare",
@@ -1629,12 +1113,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       515,
-       12,
-       515,
-       30
-      ],
       "ops": [
        "Eq"
       ]
@@ -1666,34 +1144,16 @@
       "_type": "Attribute",
       "attr": "radians",
       "ctx": "Load",
-      "loc": [
-       529,
-       11,
-       529,
-       23
-      ],
       "value": {
        "_type": "Name",
        "ctx": "Load",
        "id": "__inl·py_math__"
       }
      },
-     "keywords": [],
-     "loc": [
-      529,
-      11,
-      529,
-      32
-     ]
+     "keywords": []
     },
     "test": {
      "_type": "UnaryOp",
-     "loc": [
-      527,
-      7,
-      527,
-      31
-     ],
      "op": "Not",
      "operand": {
       "_type": "Compare",
@@ -1705,12 +1165,6 @@
       "left": {
        "param": 0
       },
-      "loc": [
-       527,
-       12,
-       527,
-       30
-      ],
       "ops": [
        "Eq"
       ]
@@ -1728,7 +1182,7 @@
   "pynecore.core.pine_range.pine_range",
   "pynecore.pine_range"
  ],
- "v": 1,
+ "v": 2,
  "varargs_arities": [
   2,
   3

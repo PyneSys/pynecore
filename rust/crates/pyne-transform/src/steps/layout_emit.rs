@@ -5,7 +5,8 @@
 //!   scope),
 //! - a `func.__pyne_layout__ = __pyne_slot_layout__['<scope>']` attach after every
 //!   state-carrying definition; a decorated one gets an innermost
-//!   `@__attach_layout__(...)` decorator instead,
+//!   `@__attach_layout__(...)` decorator instead, and a method of a class body the
+//!   `__state_method__` descriptor besides,
 //! - the hidden state parameter, first, on every state-carrying definition.
 //!
 //! The step runs only when the context asks for the CPython materialization
@@ -13,6 +14,7 @@
 
 use std::collections::BTreeSet;
 
+use pyne_ast::locations::anchor_at;
 use pyne_ast::{Ast, Category, Constant, ExprContext, FieldMut, FieldRef, Int, Kind, NodeId};
 
 use crate::pine_type_rules::{OBJECT, stamp_lowering};
@@ -134,46 +136,95 @@ fn process_nested_bodies(
     prefix: &str,
     layout: &mut ModuleLayout,
     used: &mut BTreeSet<&'static str>,
-) {
+) -> Result<(), Error> {
     for index in 0..ast.kind(node).class().fields.len() {
         let FieldRef::Nodes(items) = ast.kind(node).field(index) else { continue };
         let Some(&first) = items.first() else { continue };
         let items = items.clone();
         if ast.kind(first).class().category == Category::Stmt {
-            let body = process_defs(ast, items, prefix, layout, used);
+            let body = process_defs(ast, items, prefix, layout, used, false)?;
             let FieldMut::Nodes(slot) = ast.kind_mut(node).field_mut(index) else { unreachable!() };
             *slot = body;
             continue;
         }
         for item in items {
             if matches!(ast.kind(item), Kind::ExceptHandler { .. } | Kind::MatchCase { .. }) {
-                process_nested_bodies(ast, item, prefix, layout, used);
+                process_nested_bodies(ast, item, prefix, layout, used)?;
             }
         }
     }
+    Ok(())
+}
+
+/// Wire a state-carrying method of a class body to its layout (`_process_method`).
+///
+/// The hidden state parameter stands first, like on every other definition, so the
+/// class attribute is the plain function; an instance reaches it through the
+/// `__state_method__` descriptor. A static method needs only the layout; any other
+/// decorator decides itself what the attribute holds, so its state could not be
+/// routed.
+fn process_method(
+    ast: &mut Ast,
+    stmt: NodeId,
+    scope_id: &str,
+    used: &mut BTreeSet<&'static str>,
+) -> Result<(), Error> {
+    let Kind::FunctionDef { name: func_name, decorator_list, .. } = ast.kind(stmt) else {
+        unreachable!()
+    };
+    let decorators = decorator_list.clone();
+    let static_method = decorators.len() == 1
+        && matches!(ast.kind(decorators[0]), Kind::Name { id, .. } if id == "staticmethod");
+    if !decorators.is_empty() && !static_method {
+        let line = ast[stmt].loc.lineno.map_or_else(|| "None".to_string(), |l| l.to_string());
+        return Err(Error::Rejected(format!(
+            "method '{func_name}' keeps state (a 'ta' call, a series or a persistent), \
+             which only a plain or a @staticmethod method can do (line {line})"
+        )));
+    }
+    let mut added = Vec::with_capacity(2);
+    if decorators.is_empty() {
+        added.push(name(ast, "__state_method__", ExprContext::Load));
+        used.insert("__state_method__");
+    }
+    added.push(attach_decorator(ast, scope_id));
+    used.insert("__attach_layout__");
+    let Kind::FunctionDef { decorator_list, .. } = ast.kind_mut(stmt) else { unreachable!() };
+    decorator_list.extend(added);
+    Ok(())
 }
 
 /// Inject hidden state parameters and layout attaches into a statement list
-/// (`_process_defs`).
+/// (`_process_defs`); `in_class` when the list is a class body, whose definitions
+/// are methods.
 fn process_defs(
     ast: &mut Ast,
     body: Vec<NodeId>,
     prefix: &str,
     layout: &mut ModuleLayout,
     used: &mut BTreeSet<&'static str>,
-) -> Vec<NodeId> {
+    in_class: bool,
+) -> Result<Vec<NodeId>, Error> {
     let mut new_body = Vec::with_capacity(body.len());
     for stmt in body {
         new_body.push(stmt);
+        if let Kind::ClassDef { body, .. } = ast.kind(stmt) {
+            // A class body is no scope of its own: its methods belong to the
+            // enclosing one, like the scope segments say
+            let inner = process_defs(ast, body.clone(), prefix, layout, used, true)?;
+            let Kind::ClassDef { body, .. } = ast.kind_mut(stmt) else { unreachable!() };
+            *body = inner;
+            continue;
+        }
         let Kind::FunctionDef { name, args, body, decorator_list, .. } = ast.kind(stmt) else {
-            process_nested_bodies(ast, stmt, prefix, layout, used);
+            process_nested_bodies(ast, stmt, prefix, layout, used)?;
             continue;
         };
         let (func_name, args, inner, decorated) =
             (name.clone(), *args, body.clone(), !decorator_list.is_empty());
         let segment = layout.scope_segment(ast, stmt);
         let scope_id = if prefix.is_empty() { segment } else { format!("{prefix}·{segment}") };
-        let inner = process_defs(ast, inner, &scope_id, layout, used);
+        let inner = process_defs(ast, inner, &scope_id, layout, used, false)?;
         let Kind::FunctionDef { body, .. } = ast.kind_mut(stmt) else { unreachable!() };
         *body = inner;
         if !layout.state_carrying(&scope_id) {
@@ -184,9 +235,14 @@ fn process_defs(
             annotation: None,
             type_comment: None,
         });
-        let Kind::Arguments { args: params, .. } = ast.kind_mut(args) else { unreachable!() };
-        params.insert(0, param);
-        if decorated {
+        let Kind::Arguments { posonlyargs, args: params, .. } = ast.kind_mut(args) else {
+            unreachable!()
+        };
+        // First in the signature: positional-only parameters precede the rest
+        if posonlyargs.is_empty() { params } else { posonlyargs }.insert(0, param);
+        if in_class {
+            process_method(ast, stmt, &scope_id, used)?;
+        } else if decorated {
             let decorator = attach_decorator(ast, &scope_id);
             let Kind::FunctionDef { decorator_list, .. } = ast.kind_mut(stmt) else {
                 unreachable!()
@@ -194,10 +250,11 @@ fn process_defs(
             decorator_list.push(decorator);
             used.insert("__attach_layout__");
         } else {
-            new_body.push(attach(ast, &func_name, &scope_id));
+            let attach = attach(ast, &func_name, &scope_id);
+            new_body.push(anchor_at(ast, attach, stmt)?);
         }
     }
-    new_body
+    Ok(new_body)
 }
 
 /// Index right after the module docstring and the leading import block (`_insert_index`).
@@ -232,7 +289,7 @@ pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, E
     // transformed, which the cross-module call-site classification relies on
     layout.assign_scope_ids(ast, module);
     let mut used = BTreeSet::new();
-    let mut body = process_defs(ast, body, "", &mut layout, &mut used);
+    let mut body = process_defs(ast, body, "", &mut layout, &mut used, false)?;
     let index = insert_index(ast, &body);
     let assign = layout_assign(ast, &layout);
     body.insert(index, assign);

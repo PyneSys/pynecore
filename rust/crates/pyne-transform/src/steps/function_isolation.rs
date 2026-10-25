@@ -240,13 +240,19 @@ fn fields(ast: &Ast, id: NodeId) -> Vec<(&'static str, Vec<NodeId>)> {
         .collect()
 }
 
+/// Name -> (scope id of its LAST definition, has decorators)
+type Defs = HashMap<String, (String, bool)>;
+
 /// Pass 1 (`_ScopeIndex`): per-scope name bindings, the module-level import map,
 /// and every call site of the isolation territory with the scope it stands in.
 #[derive(Default)]
 struct ScopeIndex {
     /// scope -> name -> (target scope id of the LAST def, has decorators)
-    defs: HashMap<String, HashMap<String, (String, bool)>>,
+    defs: HashMap<String, Defs>,
     classes: HashMap<String, HashSet<String>>,
+    /// scope -> class name -> method name -> (scope id of its LAST def, has
+    /// decorators)
+    methods: HashMap<String, HashMap<String, Defs>>,
     assigned: HashMap<String, HashSet<String>>,
     /// name -> (module path, attribute)
     import_map: HashMap<String, (String, Option<String>)>,
@@ -279,55 +285,83 @@ impl ScopeIndex {
         self.assigned.entry(self.scope.clone()).or_default().insert(name.to_string());
     }
 
+    /// Index one definition, without binding its name anywhere (`_index_def`):
+    /// its scope id, and whether it is decorated.
+    fn index_def(
+        &mut self,
+        ast: &Ast,
+        id: NodeId,
+        layout: &ModuleLayout,
+    ) -> Result<(String, bool), Error> {
+        let Kind::FunctionDef { name, args, decorator_list, .. } = ast.kind(id) else {
+            unreachable!()
+        };
+        let outer = self.scope.clone();
+        let segment = layout.scope_segment(ast, id);
+        let scope = if outer.is_empty() { segment.clone() } else { format!("{outer}·{segment}") };
+        self.scope = scope.clone();
+        self.defs.entry(scope.clone()).or_default();
+        self.classes.entry(scope.clone()).or_default();
+        let Kind::Arguments { posonlyargs, args, vararg, kwonlyargs, kwarg, .. } = ast.kind(*args)
+        else {
+            unreachable!()
+        };
+        for &arg in args.iter().chain(posonlyargs).chain(kwonlyargs).chain(vararg).chain(kwarg) {
+            let Kind::Arg { arg, .. } = ast.kind(arg) else { unreachable!() };
+            self.assign(arg);
+        }
+        let territory = self.territory;
+        let isolated = territory && !is_test_function(name);
+        if isolated {
+            self.scope_routes.entry(scope.clone()).or_default();
+            if !varying(ast, id)?.is_empty() {
+                self.pin_carriers.insert(scope.clone());
+            }
+        }
+        self.segments.push(segment);
+        // Every field is indexed, only the body of an isolated definition is
+        // territory
+        for (field, ids) in fields(ast, id) {
+            self.territory = isolated && field == "body";
+            for child in ids {
+                self.visit(ast, child, layout)?;
+            }
+        }
+        self.territory = territory;
+        self.segments.pop();
+        self.scope = outer;
+        Ok((scope, !decorator_list.is_empty()))
+    }
+
     fn visit(&mut self, ast: &Ast, id: NodeId, layout: &ModuleLayout) -> Result<(), Error> {
         match ast.kind(id) {
-            Kind::FunctionDef { name, args, decorator_list, .. } => {
-                let outer = self.scope.clone();
-                let segment = layout.scope_segment(ast, id);
-                let scope =
-                    if outer.is_empty() { segment.clone() } else { format!("{outer}·{segment}") };
-                self.defs
-                    .entry(outer.clone())
-                    .or_default()
-                    .insert(name.clone(), (scope.clone(), !decorator_list.is_empty()));
-                self.scope = scope.clone();
-                self.defs.entry(scope.clone()).or_default();
-                self.classes.entry(scope.clone()).or_default();
-                let Kind::Arguments { posonlyargs, args, vararg, kwonlyargs, kwarg, .. } =
-                    ast.kind(*args)
-                else {
-                    unreachable!()
-                };
-                for &arg in
-                    args.iter().chain(posonlyargs).chain(kwonlyargs).chain(vararg).chain(kwarg)
-                {
-                    let Kind::Arg { arg, .. } = ast.kind(arg) else { unreachable!() };
-                    self.assign(arg);
-                }
-                let territory = self.territory;
-                let isolated = territory && !is_test_function(name);
-                if isolated {
-                    self.scope_routes.entry(scope.clone()).or_default();
-                    if !varying(ast, id)?.is_empty() {
-                        self.pin_carriers.insert(scope);
-                    }
-                }
-                self.segments.push(segment);
-                // Every field is indexed, only the body of an isolated definition is
-                // territory
-                for (field, ids) in fields(ast, id) {
-                    self.territory = isolated && field == "body";
-                    for child in ids {
-                        self.visit(ast, child, layout)?;
-                    }
-                }
-                self.territory = territory;
-                self.segments.pop();
-                self.scope = outer;
+            Kind::FunctionDef { name, .. } => {
+                let name = name.clone();
+                let entry = self.index_def(ast, id, layout)?;
+                self.defs.entry(self.scope.clone()).or_default().insert(name, entry);
             }
-            Kind::ClassDef { name, .. } => {
-                // Class bodies are not isolation scopes: their content is not indexed
+            Kind::ClassDef { name, body, .. } => {
                 self.classes.entry(self.scope.clone()).or_default().insert(name.clone());
+                // Only the methods of a class body are isolation scopes. The rest of
+                // it runs once, when the class is created, and a method name binds
+                // an attribute of the class, never a name of the enclosing scope
+                let (class, body) = (name.clone(), body.clone());
+                self.methods
+                    .entry(self.scope.clone())
+                    .or_default()
+                    .entry(class.clone())
+                    .or_default();
+                for stmt in body {
+                    let Kind::FunctionDef { name, .. } = ast.kind(stmt) else { continue };
+                    let name = name.clone();
+                    let entry = self.index_def(ast, stmt, layout)?;
+                    let scope = self.scope.clone();
+                    self.methods
+                        .get_mut(&scope)
+                        .and_then(|classes| classes.get_mut(&class))
+                        .expect("class entry")
+                        .insert(name, entry);
+                }
             }
             Kind::Call { func, .. } => {
                 let func = *func;
@@ -455,7 +489,28 @@ impl FunctionIsolation<'_, '_> {
                 return Ok(Route::Same(target.clone()));
             }
             if self.index.classes.get(&scope).is_some_and(|names| names.contains(base)) {
-                return Ok(if is_assigned { Route::Uniform } else { Route::Skip });
+                if is_assigned {
+                    return Ok(Route::Uniform);
+                }
+                if parts.len() == 2
+                    && let Some((target, decorated)) = self
+                        .index
+                        .methods
+                        .get(&scope)
+                        .and_then(|classes| classes.get(base))
+                        .and_then(|methods| methods.get(&parts[1]))
+                {
+                    // `Pair.m(p)` reaches the method's own function, which takes the
+                    // state first like any definition of the module. A decorator
+                    // decides what the attribute holds
+                    return Ok(if *decorated {
+                        Route::Uniform
+                    } else {
+                        Route::Same(target.clone())
+                    });
+                }
+                // Constructor or class attribute
+                return Ok(Route::Skip);
             }
             if is_assigned {
                 return Ok(Route::Uniform);
@@ -766,8 +821,17 @@ impl FunctionIsolation<'_, '_> {
             return Err(Error::Unsupported(format!("reparsing the callee {text:?}")));
         }
         let copy = pyne_parse::parse_expression_into(ast, &text)?;
+        // A callee another pass built without a location yields an unlocated copy,
+        // which `fix_locations` anchors with its statement
+        let located = [loc.lineno, loc.col_offset, loc.end_lineno, loc.end_col_offset]
+            .iter()
+            .all(Option::is_some);
         for node in walk(ast, copy) {
-            copy_location(ast, node, func);
+            if located {
+                copy_location(ast, node, func);
+            } else {
+                ast[node].loc = Loc::default();
+            }
         }
         Ok(copy)
     }
@@ -1253,8 +1317,17 @@ impl Transformer for FunctionIsolation<'_, '_> {
             return Visited::Node(id);
         }
         match ast.kind(id) {
-            // Class bodies stay raw
-            Kind::ClassDef { .. } => {}
+            // Only the methods are isolation territory: the rest of a class body
+            // runs once, when the class is created
+            Kind::ClassDef { body, .. } => {
+                for stmt in body.clone() {
+                    if matches!(ast.kind(stmt), Kind::FunctionDef { .. })
+                        && let Err(error) = self.visit_function_def(ast, stmt)
+                    {
+                        self.fail(error);
+                    }
+                }
+            }
             Kind::FunctionDef { .. } => {
                 return match self.visit_function_def(ast, id) {
                     Ok(id) => Visited::Node(id),

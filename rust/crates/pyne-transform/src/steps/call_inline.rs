@@ -102,6 +102,29 @@ fn arg_copy(ast: &mut Ast, id: NodeId) -> NodeId {
     copy
 }
 
+/// `_stamp_emission`: anchor every node of the pass's own emission at the call
+/// site's point. The argument subtrees are the user's code and keep their
+/// locations; a call without a location leaves the emission unlocated, for
+/// `fix_locations` to anchor with the enclosing statement.
+fn stamp_emission(ast: &mut Ast, root: NodeId, call: NodeId) -> Result<(), Error> {
+    let loc = ast[call].loc;
+    let point = loc.lineno.map(|line| {
+        let col = loc.col_offset.unwrap_or(0);
+        Loc::new(line, col, line, col)
+    });
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if marked(ast, id, ARG_MARK)? {
+            continue;
+        }
+        if ast.kind(id).class().located {
+            ast[id].loc = point.unwrap_or_default();
+        }
+        stack.extend(children(ast, id));
+    }
+    Ok(())
+}
+
 /// `_mark_exact`: mark the comparisons the pass emitted as exact, never entering an
 /// argument subtree.
 fn mark_exact(ast: &mut Ast, id: NodeId) -> Result<(), Error> {
@@ -167,8 +190,8 @@ fn template_constant(spec: &Json) -> Result<Constant, Error> {
 }
 
 /// `_build`: one node of a derived template for a call site. A parameter read is a
-/// tagged copy of its argument; every other node is built afresh with the location
-/// the template records.
+/// tagged copy of its argument; every other node is built afresh and unlocated, for
+/// [`stamp_emission`] to anchor at the call site.
 fn build(ast: &mut Ast, spec: &Json, args: &[NodeId]) -> Result<NodeId, Error> {
     let bad = |what: &str| unsupported(format!("a template node with {what}: {spec}"));
     if let Some(index) = spec.get("param") {
@@ -250,17 +273,7 @@ fn build(ast: &mut Ast, spec: &Json, args: &[NodeId]) -> Result<NodeId, Error> {
             }
         }
     }
-    let loc = match spec.get("loc") {
-        None => Loc::default(),
-        Some(Json::Array(items)) if items.len() == 4 => Loc {
-            lineno: items[0].as_i64(),
-            col_offset: items[1].as_i64(),
-            end_lineno: items[2].as_i64(),
-            end_col_offset: items[3].as_i64(),
-        },
-        Some(_) => return Err(bad("a location")),
-    };
-    let node = ast.add_at(kind, loc);
+    let node = ast.add(kind);
     if spec.get("arg").and_then(Json::as_bool).unwrap_or(false) {
         ast.set_extra(node, ARG_MARK, Value::Bool(true));
     }
@@ -1037,6 +1050,8 @@ impl<'t> CallInline<'t> {
             expression =
                 ast.add(Kind::BoolOp { op: BoolOperator::And, values: vec![probe, expression] });
         }
+
+        stamp_emission(ast, expression, node)?;
 
         // `stamp_lowering` keeps a string stamp it meets and types the rest; the Python
         // pass would carry any other stamp along as it is

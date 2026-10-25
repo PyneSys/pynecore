@@ -401,6 +401,7 @@
     "pytest.raises",
     "rolling_sum_step",
     "safe_convert.implicit_convert",
+    "safe_convert.safe_bool",
     "safe_convert.safe_float_items",
     "safe_convert.safe_float_matrix",
 ]

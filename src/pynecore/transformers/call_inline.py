@@ -306,10 +306,6 @@ def _copy_value(value: Any) -> Any:
 
 # --- templates ---------------------------------------------------------------
 
-#: The location attributes a template node carries under ``loc``, in order
-_LOCATION = ('lineno', 'col_offset', 'end_lineno', 'end_col_offset')
-
-
 def _constant(spec: list[Any]) -> Any:
     """The value of a template constant (``[type, value]``, see the collector).
 
@@ -328,8 +324,8 @@ def _build(spec: dict[str, Any], args: list[ast.expr]) -> ast.AST:
     """Build one node of a derived template for a call site.
 
     A read of the i-th parameter becomes a tagged copy of the i-th argument;
-    every other node is built afresh, with the location it had in the wrapper's
-    source when it was copied from there.
+    every other node is built afresh and unlocated, for :func:`_stamp_emission`
+    to anchor at the call site.
 
     :param spec: The node's encoding.
     :param args: One expression per parameter.
@@ -356,10 +352,6 @@ def _build(spec: dict[str, Any], args: list[ast.expr]) -> ast.AST:
         elif isinstance(value, list):
             value = [_build(item, args) if isinstance(item, dict) else item for item in value]
         state[field] = value
-    location = spec.get('loc')
-    if location is not None:
-        for name, item in zip(_LOCATION, location):
-            state[name] = item
     if spec.get('arg'):
         state[_ARG_MARK] = True
     return node

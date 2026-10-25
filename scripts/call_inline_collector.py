@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Any, cast
 
 #: Registry format version. Bump whenever the shape below changes
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SRC = Path(__file__).resolve().parent.parent / 'src'
 JSON_PATH = _SRC / 'pynecore' / 'transformers' / 'call_inline_templates.json'
@@ -433,9 +433,9 @@ def _encode(node: ast.AST, params: dict[str, int]) -> dict[str, Any]:
     """One node of a derived expression as JSON.
 
     A read of the i-th parameter is ``{"param": i}``; any other node is
-    ``{"_type": <class>, <field>: <value>, ...}`` with its location under
-    ``loc`` when it has one (a node copied from the source keeps the source's),
-    and ``"arg": true`` when it is the root of an argument stand-in.
+    ``{"_type": <class>, <field>: <value>, ...}``, with ``"arg": true`` when it
+    is the root of an argument stand-in. No location: the transform anchors its
+    emission at the call site.
 
     :param node: The node.
     :param params: Parameter stand-in name -> its index.
@@ -465,9 +465,6 @@ def _encode(node: ast.AST, params: dict[str, int]) -> dict[str, Any]:
                           for item in value]
         else:
             out[field] = value
-    if 'lineno' in state:
-        out['loc'] = [getattr(node, name, None) for name in
-                      ('lineno', 'col_offset', 'end_lineno', 'end_col_offset')]
     if state.get(_ARG_MARK):
         out['arg'] = True
     return out
