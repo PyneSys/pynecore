@@ -355,29 +355,42 @@ def __test_native_ports_are_current__():
     assert native.current_steps() == frozenset(_native.steps())
 
 
-#: F-strings in the shapes and locations CPython 3.12+ gives them
+def __test_native_pipeline_matches_python__():
+    """The pipeline a host without Python runs a dependency through is pipeline.py's"""
+    __test_helper_require_native()
+    from pynecore.transformers import _native
+    from pynecore.transformers.pipeline import ANALYSIS, LOWERING
+
+    analysis, lowering = _native.pipeline()
+    assert analysis == [(step.name, step.user_code_only) for step in ANALYSIS]
+    assert lowering == [(step.name, getattr(step, 'user_code_only', False)) for step in LOWERING]
+
+
+#: F-strings in the shapes and locations CPython gives them
 __test_helper_FSTRINGS = [
     r"f'a{x}b'", r"f'{x!r:>{w}}'", r"'ab' f'{x}' 'cd'", r"f'{x=}'", r"f'{ x = !r:10}'",
     r"f'\n{x}\t'", r"f'{{a}}{x}'", "f'''a\n{x}\nb'''", r"f''", r"f'a' '' f'{x}'",
     r"u'' 'a' f'{x}'", r"'' u'a' f'{x}'", r"f'{x:}'", r"""f'{f"{x}"}'""", r"f'{x:{y}.{z}f}'",
     "f'{\n x\n}'", "(f'{x}'\n 'a')", r"f'é{x}'", r"rf'\d{x}'", r"f'{x:{{}}}'",
+    r"(f'a{b!r:>{w}}' 'z')", r"(f'{a:{b}x}' 'z')", r"('p' f'{a:x}' 'z')",
+    r"(f'k' f'{a:x{b}y}w' f'{c}')", "(f'{a!r:{b}}'\n  f'{c:d}')", """f'{a["#"]}'""",
 ]
 
 
-def __test_helper_has_fstring(source: str) -> bool:
-    return any(isinstance(node, ast.JoinedStr) for node in ast.walk(ast.parse(source)))
-
-
 def __test_native_parse_matches_cpython__():
-    """The native parser builds CPython's tree, locations included. Its f-strings take
-    the shape of Python 3.12 and later, so a 3.11 interpreter compares the rest."""
+    """The native parser builds the tree the running interpreter builds, locations
+    included, f-strings in the shape of its version, and declines what it refuses."""
     __test_helper_require_native()
     from pynecore.transformers import _native
 
     sources = [__test_helper_SOURCE] + [path.read_text() for path in __test_helper_inputs()]
     sources += [f'x = {fstring}\n' for fstring in __test_helper_FSTRINGS]
     for source in sources:
-        if sys.version_info < (3, 12) and __test_helper_has_fstring(source):
+        try:
+            ast.parse(source)
+        except SyntaxError:
+            with pytest.raises(_native.Unsupported):
+                _native.parse(source)
             continue
         tree = _native.parse(source)
         assert (ast.dump(tree, include_attributes=True)

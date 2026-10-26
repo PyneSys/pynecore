@@ -1072,8 +1072,9 @@ fn take(
                 }
             }
             Kind::Constant { value: Constant::Str(text), .. } => {
-                let (parsed, root) = forward_reference(text)?;
-                take(&parsed, root, at, annotations)?;
+                if let Some((parsed, root)) = forward_reference(text)? {
+                    take(&parsed, root, at, annotations)?;
+                }
             }
             _ => {}
         }

@@ -209,7 +209,7 @@ fn bytes_repr(data: &[u8]) -> String {
 }
 
 /// Python's own `repr` of a constant value.
-fn py_repr(value: &Constant, python: (u32, u32)) -> Result<String, Unsupported> {
+pub(crate) fn py_repr(value: &Constant, python: (u32, u32)) -> Result<String, Unsupported> {
     Ok(match value {
         Constant::None => "None".to_string(),
         Constant::Bool(true) => "True".to_string(),
@@ -312,6 +312,9 @@ struct Unparser<'a> {
     out: String,
     precedences: HashMap<NodeId, Prec>,
     python: (u32, u32),
+    /// `_avoid_backslashes`: the unparser of an f-string field before 3.12, where a
+    /// field may hold no backslash
+    avoid_backslashes: bool,
 }
 
 impl Unparser<'_> {
@@ -358,6 +361,32 @@ impl Unparser<'_> {
         }
     }
 
+    /// `_write_constant`: inside an f-string field before 3.12 a string avoids the
+    /// backslashes its `repr` would spell.
+    fn write_constant(&mut self, value: &Constant) -> Result<(), Unsupported> {
+        match value {
+            Constant::Str(text) if self.avoid_backslashes => {
+                self.write_str_avoiding_backslashes(text)
+            }
+            value => {
+                let text = constant_repr(value, self.python)?;
+                self.out.push_str(&text);
+                Ok(())
+            }
+        }
+    }
+
+    /// `_write_str_avoiding_backslashes`: a string literal with a best effort
+    /// attempt to avoid backslashes.
+    fn write_str_avoiding_backslashes(&mut self, text: &str) -> Result<(), Unsupported> {
+        let (text, quote_types) = str_literal_helper(text, &ALL_QUOTES, false, self.python)?;
+        let quote = quote_types[0];
+        self.out.push_str(quote);
+        self.out.push_str(&text);
+        self.out.push_str(quote);
+        Ok(())
+    }
+
     fn traverse(&mut self, node: NodeId) -> Result<(), Unsupported> {
         let ast = self.ast;
         match ast.kind(node) {
@@ -368,8 +397,7 @@ impl Unparser<'_> {
                     if index > 0 {
                         self.out.push_str(", ");
                     }
-                    let text = constant_repr(item, self.python)?;
-                    self.out.push_str(&text);
+                    self.write_constant(item)?;
                 }
                 if items.len() == 1 {
                     self.out.push(',');
@@ -381,8 +409,7 @@ impl Unparser<'_> {
                 if kind.as_deref() == Some("u") {
                     self.out.push('u');
                 }
-                let text = constant_repr(value, self.python)?;
-                self.out.push_str(&text);
+                self.write_constant(value)?;
             }
             Kind::JoinedStr { values } => self.joined_str(values)?,
             Kind::NamedExpr { target, value } => {
@@ -748,14 +775,19 @@ impl Unparser<'_> {
             unreachable!()
         };
         self.out.push('{');
+        let legacy = self.python < (3, 12);
         let mut inner = Unparser {
             ast: self.ast,
             out: String::new(),
             precedences: HashMap::new(),
             python: self.python,
+            avoid_backslashes: legacy,
         };
         inner.set(Prec::Test.next(), &[*value]);
         inner.traverse(*value)?;
+        if legacy && inner.out.contains('\\') {
+            return Err(Unsupported("a backslash in an f-string field before 3.12".into()));
+        }
         if inner.out.starts_with('{') {
             self.out.push(' ');
         }
@@ -770,7 +802,8 @@ impl Unparser<'_> {
         }
         if let Some(spec) = format_spec {
             self.out.push(':');
-            self.fstring_inner(*spec, true)?;
+            // A format spec is escaped since 3.12
+            self.fstring_inner(*spec, !legacy)?;
         }
         self.out.push('}');
         Ok(())
@@ -779,7 +812,7 @@ impl Unparser<'_> {
     /// `visit_JoinedStr`: the parts, then the quotes every constant part allows.
     fn joined_str(&mut self, values: &[NodeId]) -> Result<(), Unsupported> {
         if self.python < (3, 12) {
-            return Err(Unsupported("an f-string unparsed by Python 3.11".into()));
+            return self.legacy_joined_str(values);
         }
         self.out.push('f');
         let mut parts = Vec::with_capacity(values.len());
@@ -839,6 +872,56 @@ impl Unparser<'_> {
         Ok(())
     }
 
+    /// `visit_JoinedStr` before 3.12: every part, the fields included, chooses among
+    /// the quotes, and inside a field the whole f-string avoids backslashes.
+    fn legacy_joined_str(&mut self, values: &[NodeId]) -> Result<(), Unsupported> {
+        self.out.push('f');
+        if self.avoid_backslashes {
+            let saved = std::mem::take(&mut self.out);
+            for &value in values {
+                self.fstring_inner(value, false)?;
+            }
+            let text = std::mem::replace(&mut self.out, saved);
+            return self.write_str_avoiding_backslashes(&text);
+        }
+        let mut parts = Vec::with_capacity(values.len());
+        for &value in values {
+            let saved = std::mem::take(&mut self.out);
+            self.fstring_inner(value, false)?;
+            let text = std::mem::replace(&mut self.out, saved);
+            parts.push((text, matches!(self.ast.kind(value), Kind::Constant { .. })));
+        }
+        let mut new_parts = Vec::with_capacity(parts.len());
+        let mut quote_types: Vec<&'static str> = ALL_QUOTES.to_vec();
+        let mut fallback_to_repr = false;
+        for (value, is_constant) in &parts {
+            let (value, new_quote_types) =
+                str_literal_helper(value, &quote_types, *is_constant, self.python)?;
+            new_parts.push(value);
+            if new_quote_types.iter().all(|q| !quote_types.contains(q)) {
+                fallback_to_repr = true;
+                break;
+            }
+            quote_types = new_quote_types;
+        }
+        if fallback_to_repr {
+            // No quote suits every part: repr of each, triple single quotes
+            quote_types = vec!["'''"];
+            new_parts.clear();
+            for (value, _) in parts {
+                let repr = str_repr(&format!("\"{value}"), self.python)?;
+                new_parts.push(repr[2..repr.len() - 1].to_string());
+            }
+        }
+        let quote = quote_types[0];
+        self.out.push_str(quote);
+        for part in new_parts {
+            self.out.push_str(&part);
+        }
+        self.out.push_str(quote);
+        Ok(())
+    }
+
     fn fstring_inner(&mut self, node: NodeId, is_format_spec: bool) -> Result<(), Unsupported> {
         match self.ast.kind(node) {
             Kind::JoinedStr { values } => {
@@ -866,7 +949,13 @@ impl Unparser<'_> {
 
 /// `ast.unparse(node)` of an expression under the host's interpreter.
 pub fn unparse(ast: &Ast, node: NodeId, python: (u32, u32)) -> Result<String, Unsupported> {
-    let mut unparser = Unparser { ast, out: String::new(), precedences: HashMap::new(), python };
+    let mut unparser = Unparser {
+        ast,
+        out: String::new(),
+        precedences: HashMap::new(),
+        python,
+        avoid_backslashes: false,
+    };
     unparser.traverse(node)?;
     Ok(unparser.out)
 }

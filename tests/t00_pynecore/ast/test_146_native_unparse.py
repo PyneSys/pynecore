@@ -3,11 +3,10 @@
 The native steps spell expressions into messages and identifiers the way the Python
 steps do, with the running interpreter's ``ast.unparse``: every expression of the
 parity corpus of ``test_137_native_transform`` and a set of strings that exercise the
-quote choice, the escapes and the printability table must unparse to the same text.
-A Python 3.11 host leaves f-strings to its own interpreter, whose unparser differs.
+quote choice, the escapes and the printability table must unparse to the same text,
+f-strings in the spelling of the running interpreter's version.
 """
 import ast
-import sys
 from pathlib import Path
 
 from .test_137_native_transform import __test_helper_inputs, __test_helper_require_native
@@ -17,6 +16,7 @@ __test_helper_CASES = [
     "f'a{x}b'", "f\"{x!r:>{w}}\"", "f'{x=}'", "f'{ x = !s:10}'", "f'{{a}}{x}'",
     "f'''a\n{x}\nb'''", "f'{x}\\n'", "f\"it's {x}\"", "f'say \"{x}\"'", "f'''it's \"{x}\"'''",
     "f'{x:%Y-%m-%d}'", "f'{f\"{x}\"}'", "f'{x:{y}.{z}f}'", "f'\\u25b2 {x}'", "f'{x}\\t\\x00'",
+    "f'{x[\"a\"]}'", "f'{a!r} {\"q\"} {b:{c!s}}'", "f'''{x}\n{y}'''", "f'{x:\\n}'",
     "'▲'", "'▼ ● ■'", "'\\u200b'", "'\\x7f\\x80\\xa0\\xad'", "'\\U0001f4ca'",
     "'a\\'b\"c'", "\"it's\"", "u'a'", "b''", "b'a\\'b'", "b\"it's\"", "b'\\x00\\xff\\\\'",
     "1j", "2.5j", "1e300j * 1e300", "-0.0", "1e309", "(1, 'a', None)", "await x",
@@ -35,9 +35,6 @@ def __test_helper_compare(node: ast.expr) -> str | None:
     try:
         got = _native._unparse(node)
     except _native.Unsupported:
-        if sys.version_info < (3, 12) and any(isinstance(sub, ast.JoinedStr)
-                                              for sub in ast.walk(node)):
-            return None
         return f'{want!r}: native defers'
     return None if got == want else f'{want!r} != native {got!r}'
 

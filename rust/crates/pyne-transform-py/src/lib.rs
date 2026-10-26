@@ -36,10 +36,12 @@ fn unsupported(err: pyne_ast::Unsupported) -> PyErr {
     Unsupported::new_err(err.0)
 }
 
-/// Parse a module with the native parser into Python ``ast`` objects.
+/// Parse a module with the native parser into Python ``ast`` objects, as the running
+/// interpreter parses it.
 #[pyfunction]
 fn parse<'py>(py: Python<'py>, source: &str) -> PyResult<Bound<'py, PyAny>> {
-    let (ast, module) = pyne_parse::parse_module(source).map_err(unsupported)?;
+    let (ast, module) =
+        pyne_parse::parse_module_as(source, interpreter(py)).map_err(unsupported)?;
     ToPython::new(py)?.node(&ast, module)
 }
 
@@ -51,13 +53,15 @@ fn roundtrip<'py>(py: Python<'py>, tree: &Bound<'py, PyAny>) -> PyResult<Bound<'
     ToPython::new(py)?.with_objects(from.objects).node(&from.ast, root)
 }
 
-/// ``ast.dump(tree, include_attributes=...)`` written by the native side.
+/// ``ast.dump(tree, include_attributes=...)`` written by the native side, as the running
+/// interpreter writes it.
 #[pyfunction]
 #[pyo3(signature = (tree, include_attributes=false))]
 fn dump(tree: &Bound<'_, PyAny>, include_attributes: bool) -> PyResult<String> {
     let mut from = FromPython::new();
     let root = from.node(tree)?;
-    Ok(pyne_ast::dump::dump(&from.ast, root, include_attributes))
+    pyne_transform::ast_dump::dump(&from.ast, root, include_attributes, interpreter(tree.py()))
+        .map_err(unsupported)
 }
 
 /// The host the Python pipeline provides: an object with the [`pyne_transform::Host`]
@@ -351,6 +355,16 @@ fn steps() -> Vec<&'static str> {
     pyne_transform::STEPS.iter().map(|step| step.name).collect()
 }
 
+/// One half of the pipeline: each step's name with its ``user_code_only``.
+type PipelineHalf = Vec<(&'static str, bool)>;
+
+/// The two halves of the pipeline a host without Python runs a dependency through,
+/// each step with its ``user_code_only``.
+#[pyfunction]
+fn pipeline() -> (PipelineHalf, PipelineHalf) {
+    (pyne_transform::ANALYSIS.to_vec(), pyne_transform::LOWERING.to_vec())
+}
+
 /// The names of the ported steps that read or fill the pipeline's slot layout.
 #[pyfunction]
 fn layout_steps() -> Vec<&'static str> {
@@ -387,6 +401,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(steps, m)?)?;
     m.add_function(wrap_pyfunction!(layout_steps, m)?)?;
+    m.add_function(wrap_pyfunction!(pipeline, m)?)?;
     m.add_function(wrap_pyfunction!(phases, m)?)?;
     m.add_function(wrap_pyfunction!(plain_callees, m)?)?;
     m.add_function(wrap_pyfunction!(ported_json, m)?)?;

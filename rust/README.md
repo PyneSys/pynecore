@@ -53,6 +53,7 @@ catches up. A native step that meets a construct it does not handle answers
 ```bash
 rust/tools/develop.sh                       # build the extension into src/ (debug)
 python rust/tools/parse_gate.py             # native parser vs ast.parse over the corpus
+python rust/tools/wasm_gate.py              # the WebAssembly build vs the Python pipeline
 PYNE_AST_BACKEND=verify pytest tests/t00_pynecore/ast
 python rust/tools/ported.py                 # which ports are current
 python rust/tools/ported.py --update NAME   # after a port matches its Python step again

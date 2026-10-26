@@ -27,10 +27,13 @@ use crate::pine_type_rules::{
 };
 use crate::{Context, Error};
 
-/// A Python number the fold computes with: an `int` that fits 64 bits, or a `float`.
+/// A Python number the fold computes with: an `int` that fits 64 bits, a wider one
+/// that fits 128, or a `float`. A wide int is carried and embedded but computed with
+/// only by negation; any other arithmetic on one answers `Unsupported`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Num {
     Int(i64),
+    Wide(i128),
     Float(f64),
 }
 
@@ -39,8 +42,14 @@ impl Num {
     fn float(self) -> f64 {
         match self {
             Num::Int(value) => value as f64,
+            Num::Wide(value) => value as f64,
             Num::Float(value) => value,
         }
+    }
+
+    /// An int as the narrowest variant that holds it.
+    fn int(value: i128) -> Num {
+        i64::try_from(value).map_or(Num::Wide(value), Num::Int)
     }
 }
 
@@ -123,7 +132,7 @@ fn quantize_float(value: f64) -> f64 {
 /// unsigned; an int unchanged.
 pub fn quantize_embed(value: Num) -> Num {
     match value {
-        Num::Int(_) => value,
+        Num::Int(_) | Num::Wide(_) => value,
         Num::Float(value) => Num::Float(quantize_float(value)),
     }
 }
@@ -133,6 +142,9 @@ fn is_literal(ast: &Ast, node: NodeId, value: Num) -> bool {
     match (ast.kind(node), value) {
         (Kind::Constant { value: Constant::Int(Int::Small(have)), .. }, Num::Int(want)) => {
             *have == want
+        }
+        (Kind::Constant { value: Constant::Int(Int::Big(have)), .. }, Num::Wide(want)) => {
+            *have == want.to_string()
         }
         (Kind::Constant { value: Constant::Float(have), .. }, Num::Float(want)) => {
             *have == want && have.is_sign_negative() == want.is_sign_negative()
@@ -209,6 +221,7 @@ fn compare(left: Num, right: Num) -> Ordering {
         (Num::Float(a), Num::Float(b)) => a.partial_cmp(&b).expect("finite operands"),
         (Num::Int(a), Num::Float(b)) => compare_int_float(a, b),
         (Num::Float(a), Num::Int(b)) => compare_int_float(b, a).reverse(),
+        (Num::Wide(_), _) | (_, Num::Wide(_)) => unreachable!("try_eval computes no wide int"),
     }
 }
 
@@ -391,12 +404,14 @@ fn fold_exact(name: &str, args: &[Num]) -> Eval {
         "abs" => match single {
             Some(Num::Int(value)) => Some(Num::Int(value.checked_abs().ok_or_else(overflow)?)),
             Some(Num::Float(value)) => Some(Num::Float(value.abs())),
+            Some(Num::Wide(_)) => unreachable!("try_eval computes no wide int"),
             None => None,
         },
         // ``pine_int(math.floor(x))``: the int floor back as a float, so never -0.0
         "floor" | "ceil" => single.map(|x| {
             let value = match x {
                 Num::Int(value) => value as f64,
+                Num::Wide(_) => unreachable!("try_eval computes no wide int"),
                 Num::Float(value) if name == "floor" => value.floor(),
                 Num::Float(value) => value.ceil(),
             };
@@ -514,6 +529,7 @@ fn fold_binop(op: Operator, left: Num, right: Num) -> Eval {
 fn is_zero(value: Num) -> bool {
     match value {
         Num::Int(value) => value == 0,
+        Num::Wide(value) => value == 0,
         Num::Float(value) => value == 0.0,
     }
 }
@@ -523,7 +539,9 @@ fn try_eval(ast: &Ast, node: NodeId, env: &HashMap<String, Num>) -> Eval {
     match ast.kind(node) {
         Kind::Constant { value, .. } => Ok(match value {
             Constant::Int(Int::Small(value)) => Some(Num::Int(*value)),
-            Constant::Int(Int::Big(_)) => return Err(overflow()),
+            Constant::Int(Int::Big(digits)) => {
+                Some(Num::int(digits.parse().map_err(|_| overflow())?))
+            }
             // An overflowing float literal (``1e309``) is an infinity: a domain edge
             Constant::Float(value) if value.is_finite() => Some(Num::Float(*value)),
             _ => None,
@@ -536,8 +554,9 @@ fn try_eval(ast: &Ast, node: NodeId, env: &HashMap<String, Num>) -> Eval {
                 return Ok(None);
             };
             Ok(Some(match (op, value) {
-                (UnaryOperator::USub, Num::Int(v)) => {
-                    Num::Int(v.checked_neg().ok_or_else(overflow)?)
+                (UnaryOperator::USub, Num::Int(v)) => Num::int(-i128::from(v)),
+                (UnaryOperator::USub, Num::Wide(v)) => {
+                    Num::int(v.checked_neg().ok_or_else(overflow)?)
                 }
                 (UnaryOperator::USub, Num::Float(v)) => Num::Float(-v),
                 _ => value,
@@ -557,6 +576,9 @@ fn try_eval(ast: &Ast, node: NodeId, env: &HashMap<String, Num>) -> Eval {
             let (Some(left_value), Some(right_value)) = (left_value, right_value) else {
                 return Ok(None);
             };
+            if matches!(left_value, Num::Wide(_)) || matches!(right_value, Num::Wide(_)) {
+                return Err(overflow());
+            }
             if matches!(op, Operator::Div | Operator::Mod) && is_zero(right_value) {
                 return Ok(None);
             }
@@ -591,6 +613,9 @@ fn try_eval(ast: &Ast, node: NodeId, env: &HashMap<String, Num>) -> Eval {
             } else if EXACT_NAMES.contains(&name) {
                 if values.is_empty() {
                     return Ok(None);
+                }
+                if values.iter().any(|value| matches!(value, Num::Wide(_))) {
+                    return Err(overflow());
                 }
                 match fold_exact(name, &values)? {
                     Some(value) => value,
@@ -724,6 +749,7 @@ fn embed(ast: &mut Ast, node: NodeId, value: Num, env: &Env) -> NodeId {
     } else {
         let constant = match quantized {
             Num::Int(value) => Constant::Int(Int::Small(value)),
+            Num::Wide(value) => Constant::Int(Int::Big(value.to_string())),
             Num::Float(value) => Constant::Float(value),
         };
         let literal = ast.add(Kind::Constant { value: constant, kind: None });
@@ -1391,6 +1417,7 @@ impl ConstFold {
                             let literal = ast.add(Kind::Constant {
                                 value: match quantized {
                                     Num::Int(value) => Constant::Int(Int::Small(value)),
+                                    Num::Wide(value) => Constant::Int(Int::Big(value.to_string())),
                                     Num::Float(value) => Constant::Float(value),
                                 },
                                 kind: None,

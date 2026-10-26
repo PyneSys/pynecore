@@ -81,7 +81,7 @@ pub fn quantize_embed<'py>(py: Python<'py>, values: &[u8]) -> PyResult<Bound<'py
         py,
         values.into_iter().map(|value| match const_fold::quantize_embed(Num::Float(value)) {
             Num::Float(value) => value,
-            Num::Int(_) => unreachable!(),
+            Num::Int(_) | Num::Wide(_) => unreachable!(),
         }),
     ))
 }
@@ -95,6 +95,7 @@ pub fn const_eval<'py>(py: Python<'py>, expr: &Bound<'py, PyAny>) -> PyResult<Bo
     let node = from.node(expr)?;
     match const_fold::eval_embedded(&from.ast, node) {
         Ok(Some(Num::Int(value))) => value.into_bound_py_any(py),
+        Ok(Some(Num::Wide(value))) => value.into_bound_py_any(py),
         Ok(Some(Num::Float(value))) => value.into_bound_py_any(py),
         Ok(None) => Ok(py.None().into_bound(py)),
         Err(err) => Err(Unsupported::new_err(err.to_string())),

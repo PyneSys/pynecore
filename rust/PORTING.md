@@ -78,8 +78,8 @@ pointers.
    through `Host::module_origin` (`export_capture.module_origin`) and
    `Host::read_source` (`source_read.stable_source` plus `path.resolve()`),
    and parsed into the same arena; a source the native parser or the UTF-8 check
-   does not take answers `Unsupported`. The WASM host answers both `Unsupported`
-   until a request carries the sources of the modules a library imports.
+   does not take answers `Unsupported`. The WASM host answers both from the files
+   its request carries (see *A host without Python*).
 3. **ConstFold** (M-L). Bakes numerics into the tree:
    - `core/fdlibm.py` (all nine public functions and their kernels): port it, do
      not use the `libm` crate (musl's exp/log/pow are not fdlibm 5.3); gate against
@@ -87,20 +87,21 @@ pointers.
      does for the Cython twin;
    - the `lib.math` folds (`sqrt`, `abs`, `floor`/`ceil` returning float, `max`/
      `min` with Python's mixed compare, Kahan `avg`, `sign`, `todegrees`/
-     `toradians`, `round` — whose precision path uses the platform `pow` and an
-     exact tie check that may need a bignum: answer `Unsupported` where exactness
-     cannot be guaranteed);
-   - Python int semantics for `+ - * / %` (`safe_mod`): checked `i64`, answer
-     `Unsupported` on overflow or `Int::Big`;
+     `toradians`, `round` — whose precision path uses the platform `pow` natively
+     and a correctly rounded `10**y` in WebAssembly (`pow10.rs`), with an exact tie
+     check over big limbs);
+   - Python int semantics for `+ - * / %` (`safe_mod`): checked `i64`; an int
+     beyond it that fits 128 bits is carried, negated and embedded, and any other
+     arithmetic on it answers `Unsupported`;
    - `quantize_embed`: shortest digits, round-down at 1e-16 with an exact binary
      tie check (fits in `u128`), correctly rounded parse.
 
    Ported as `steps/const_fold.rs` with `fdlibm.rs`. The fdlibm port and
    `quantize_embed` are gated bit for bit by `test_141_native_fdlibm`
    (`PYNE_FDLIBM_SWEEP=2000000` for the full sweep), the evaluation and the step
-   by `test_140_native_const_fold`. `Unsupported`: an int literal or result beyond
-   `i64`, an int true division with an operand beyond 2**53, and `math.round` with
-   a positive precision.
+   by `test_140_native_const_fold`. `Unsupported`: arithmetic on an int beyond
+   `i64`, an int literal beyond `i128`, an int true division with an operand beyond
+   2**53, and the rare `10**y` a WebAssembly build cannot round with certainty.
 4. **Security** (XL, 4.4k lines). Ported as `steps/security/`: `collection`
    (call arguments, the simple-chain / hoistable-binding rules, the
    history-reference rule behind `closed_shift`), `builders`, `rewrite` (the
@@ -148,22 +149,25 @@ pointers.
    qualifiers), `lib_calls`, `user_calls` (user and method calls, overload
    groups), `imports` (imported callees and dependency records), `finish`
    (instance vectors, window machines, widen sites, pin suppression) and `report`
-   (`pine_type_report.py`); `unparse.rs` is CPython 3.13's `ast.unparse` for
-   expressions. The lib names come from the compiled `lib_types.json`
+   (`pine_type_report.py`); `unparse.rs` is `ast.unparse` for expressions as the host's
+   interpreter (`Host::python`, 3.11 to 3.14) writes them, its printability table
+   the generated `python_names.json`. The lib names come from the compiled `lib_types.json`
    (`data::lib_entries`). Cross-module analysis asks the Host, whose Python side
    calls the functions the Python pass calls: `interface` (`module_interface.lookup`,
    sent as the JSON of `dataclasses.asdict` of the interface and of its
    `dep_record`), `closes_cycle`, `begin_analysis` / `end_analysis`
    (`analysing_scope`), `module_spec_origin` and `package_member`
-   (`module_paths`), `is_stdlib`. The WASM host answers them `Unsupported`, so
-   there a module that imports anything outside `pynecore` stays in Python.
+   (`module_paths`); the standard library is the generated `python_names.json`.
+   A host without Python answers them by transforming the dependency natively (see
+   *A host without Python*).
    `_overload_groups` and the hops of `_declares_method` were sets whose order
    reached the table; they are ordered now. `module_interface` types the layout
    `routes_digest` reads with a protocol, so `slot_layout.py` is out of the
-   closure. `Unsupported`: a string annotation the native expression parser
-   refuses (`""` among them), `ast.unparse` of a node outside the expression
-   subset, the `repr` of text beyond ASCII, Latin-1 and General Punctuation,
-   and any failing Host answer.
+   closure. A blank string annotation, or one indented before its first token, is
+   the `SyntaxError` it is on every interpreter. `Unsupported`: a string
+   annotation the native expression parser cannot provably read as CPython does,
+   `ast.unparse` of a node outside the expression subset, and any failing Host
+   answer.
 
 ## Lowering steps
 
@@ -285,13 +289,15 @@ request from `ModuleLayout::new(pyne_mode == "lib")`, as the import hook does.
    compiled `routes` section (`Host::lib_route`). A module that publishes no
    interface (plain Python, pynecore's own modules, a package's `__init__`, a Pyne
    module without settled routes) is still classified by the object it binds,
-   through `Host::object_route` (`function_isolation.classify_imported`); the WASM
-   host answers that `Unsupported`, as it answers every interpreter question. The
-   dependency tracking asks `Host::source_key` and `Host::source_record`.
+   through `Host::object_route` (`function_isolation.classify_imported`), which a
+   host without Python is handed by its caller. The dependency tracking asks
+   `Host::source_key` and `Host::source_record`. A module without a
+   `_module_file_path` gets the content stamp Python gives it, the SHA-256 of its
+   `ast.dump(include_attributes=True)` (`ast_dump.rs`).
    `NON_TRANSFORMABLE_FUNCTIONS` is mirrored in `function_isolation_plain.in`,
    held equal by `test_137`. `Unsupported`: a callee copy the reparse fallback
-   would normalize (non-ASCII text), a close call in a module without a
-   `_module_file_path` or without a location, a stamp of an unexpected shape
+   would normalize (an identifier beyond ASCII other than the separator `·`), a
+   close call without a location, a stamp of an unexpected shape
    (`_pine_pin`, `_pine_vector`, `_pine_varying`, `_pine_series_len`, a type that
    is no string), a route word outside the five, and any failing host answer.
    `Rejected`: a stateful call at module level, and (ApplyLayout) a state-carrying
@@ -300,3 +306,36 @@ request from `ModuleLayout::new(pyne_mode == "lib")`, as the import hook does.
    state-carrying one gets the `__state_method__` descriptor and the layout
    decorator. The native `ClassSig` carries the class-body `members` the table
    publishes.
+
+## A host without Python
+
+`crates/pyne-transform/src/resolver.rs` is the `Host` of a pipeline that runs
+without an interpreter: the browser, through `pyne-transform-wasm`. It ports what
+the Python host does for a step's questions about other modules: the registry, the
+analysing marks and the dependency transforms of `module_interface` (`lookup`,
+`closes_cycle`, `dep_current`, `settle`, `Compile` / `reached_back`) and the import
+hook's `compile_interface` path (`source_to_code`, `_transform_module`, `_publish`,
+`_lower_published`, `_settle_deps`, `_script_bool_na`, the reserved-name checks). A
+Pyne dependency is analysed and lowered by the native steps in the order
+`lib.rs` declares (`ANALYSIS`, `LOWERING`, held equal to `pipeline.py` by
+`test_137`), and published by `module_interface.rs`, the port of
+`build_interface`, `interface_digest`, `routes_shape`, `routes_digest`,
+`call_plan` and `call_routes`; the digests are SHA-256 (`sha256.rs`) over the same
+canonical JSON, and the routes shape is taken over the `ast.dump` text of the
+interpreter the host names (`ast_dump.rs`). There is no `.pyc` to read an
+interface from: every dependency is transformed once per request.
+
+What only an interpreter or a file system can say comes from a `Files` source:
+where `find_spec` finds a dotted name, the enum capture's module search, the files
+themselves with their stat, the route of a callee of a plain Python module, and
+whether a library imports. The WebAssembly entry reads them from its request;
+a question the request leaves open is answered "none" for the rest of the run and
+returned as a `needs` list, so its caller answers every one and sends the request
+again. `pyne-parse` takes the interpreter's version too (`parse_module_as`): before
+3.12 an f-string has CPython 3.11's locations and refuses what 3.11 cannot tokenize.
+
+`rust/tools/wasm_gate.py` gates it: every corpus input runs through the whole
+pipeline in the WebAssembly module and through the Python pipeline with
+`compile_interface` as its analyser; the gate answers each `needs` from this
+interpreter and file system. The dumps must be equal, a rejection must be one on
+both sides, and no input may be declined. It holds on every supported interpreter.

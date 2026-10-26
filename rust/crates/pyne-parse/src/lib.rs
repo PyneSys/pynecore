@@ -8,9 +8,12 @@
 //! parentheses, and so on. The parity gate compares the result with
 //! `ast.dump(ast.parse(source), include_attributes=True)` over the corpus.
 //!
-//! F-strings take the shape and the locations of CPython 3.12+ (PEP 701). What
-//! this lowering does not reproduce yet is refused with [`Unsupported`] (t-strings
-//! among them), so a host falls back to CPython's own parser for such a module.
+//! F-strings take the shape and the locations of CPython 3.12+ (PEP 701), or those
+//! of 3.11 for a host that names it ([`parse_module_as`]): there every literal and
+//! field of an f-string stands at the whole string, and a format spec at the token
+//! it is written in. What this lowering does not reproduce yet is refused with
+//! [`Unsupported`] (t-strings among them, and what 3.11 refuses inside an f-string),
+//! so a host falls back to CPython's own parser for such a module.
 
 use pyne_ast::{
     Ast, BoolOperator, CmpOperator, Constant, ExprContext, Int, Kind, Loc, NodeId, Operator,
@@ -21,12 +24,23 @@ use ruff_text_size::{Ranged, TextRange, TextSize};
 
 type Result<T> = std::result::Result<T, Unsupported>;
 
-/// Parse a module into a fresh arena.
+/// Parse a module into a fresh arena, as CPython 3.12+ parses it.
 ///
 /// :return: The arena and the `Module` node.
 pub fn parse_module(source: &str) -> Result<(Ast, NodeId)> {
+    parse_module_as(source, (3, 12))
+}
+
+/// Parse a module into a fresh arena, as the interpreter `python` parses it.
+pub fn parse_module_as(source: &str, python: (u32, u32)) -> Result<(Ast, NodeId)> {
     let mut ast = Ast::new();
-    let module = parse_module_into(&mut ast, source)?;
+    let parsed = ruff_python_parser::parse_module(source)
+        .map_err(|err| Unsupported(format!("syntax error: {err}")))?;
+    let module = parsed.into_syntax();
+    let mut lower = Lowerer::new(&mut ast, source);
+    lower.legacy_fstrings = python < (3, 12);
+    let body = lower.suite(&module.body)?;
+    let module = lower.ast.add(Kind::Module { body, type_ignores: Vec::new() });
     Ok((ast, module))
 }
 
@@ -49,6 +63,39 @@ pub fn parse_expression_into(ast: &mut Ast, source: &str) -> Result<NodeId> {
     lower.expr(&expression.body)
 }
 
+/// Whether an f-string field holds a `#` outside its string literals, which 3.11
+/// refuses (`fstring_find_expr`).
+fn comments(field: &str) -> bool {
+    let bytes = field.as_bytes();
+    let mut quote: Option<&[u8]> = None;
+    let mut at = 0;
+    while at < bytes.len() {
+        let rest = &bytes[at..];
+        match quote {
+            Some(closing) => {
+                if rest.starts_with(closing) {
+                    at += closing.len();
+                    quote = None;
+                    continue;
+                }
+            }
+            None => match rest[0] {
+                b'\'' | b'"' => {
+                    let triple = rest.len() >= 3 && rest[1] == rest[0] && rest[2] == rest[0];
+                    let length = if triple { 3 } else { 1 };
+                    quote = Some(&rest[..length]);
+                    at += length;
+                    continue;
+                }
+                b'#' => return true,
+                _ => {}
+            },
+        }
+        at += 1;
+    }
+    false
+}
+
 /// A piece of an f-string before the literal runs are merged.
 enum Piece {
     Literal { value: String, range: TextRange, unicode: bool },
@@ -60,6 +107,12 @@ struct Lowerer<'a> {
     source: &'a str,
     /// Byte offset of the first character of every line
     line_starts: Vec<usize>,
+    /// Whether f-strings take their CPython 3.11 shape
+    legacy_fstrings: bool,
+    /// The f-string token being lowered, which a 3.11 format spec stands at
+    fstring_token: Option<TextRange>,
+    /// How many format specs the field being lowered stands in
+    spec_depth: usize,
 }
 
 impl<'a> Lowerer<'a> {
@@ -80,7 +133,14 @@ impl<'a> Lowerer<'a> {
             }
             index += 1;
         }
-        Lowerer { ast, source, line_starts }
+        Lowerer {
+            ast,
+            source,
+            line_starts,
+            legacy_fstrings: false,
+            fstring_token: None,
+            spec_depth: 0,
+        }
     }
 
     /// The 1-based line and the byte column of an offset.
@@ -497,12 +557,80 @@ impl<'a> Lowerer<'a> {
                     unicode: literal.flags.prefix() == ra::str_prefix::StringLiteralPrefix::Unicode,
                 }),
                 ra::FStringPartRef::FString(fstring) => {
-                    self.interpolated_pieces(&fstring.elements, &mut pieces)?;
+                    if self.legacy_fstrings && self.spans_lines(fstring.range) {
+                        return Err(Unsupported(
+                            "a single-quoted f-string over lines before 3.12".into(),
+                        ));
+                    }
+                    let outer = self.fstring_token.replace(fstring.range);
+                    let depth = std::mem::take(&mut self.spec_depth);
+                    let found = self.interpolated_pieces(&fstring.elements, &mut pieces);
+                    self.fstring_token = outer;
+                    self.spec_depth = depth;
+                    found?;
                 }
             }
         }
         let values = self.joined_values(pieces);
-        Ok(self.add(Kind::JoinedStr { values }, node.range))
+        let joined = self.add(Kind::JoinedStr { values: values.clone() }, node.range);
+        if self.legacy_fstrings {
+            let whole = self.ast[joined].loc;
+            self.relocate_legacy(&values, whole);
+        }
+        Ok(joined)
+    }
+
+    /// The 3.11 locations of an f-string's pieces: each literal and field at the
+    /// whole string, but the literal a format spec ends with at the spec, which
+    /// stands at its token.
+    fn relocate_legacy(&mut self, values: &[NodeId], whole: Loc) {
+        for &value in values {
+            self.ast[value].loc = whole;
+            if let Kind::FormattedValue { format_spec: Some(spec), .. } = self.ast.kind(value) {
+                let spec = *spec;
+                let Kind::JoinedStr { values: pieces } = self.ast.kind(spec) else { continue };
+                let pieces = pieces.clone();
+                self.relocate_legacy(&pieces, whole);
+                if let Some(&last) = pieces.last()
+                    && matches!(self.ast.kind(last), Kind::Constant { .. })
+                {
+                    self.ast[last].loc = self.ast[spec].loc;
+                }
+            }
+        }
+    }
+
+    /// Whether a single-quoted string token holds a line break no backslash escapes,
+    /// which only 3.12 tokenizes inside an f-string.
+    fn spans_lines(&self, token: TextRange) -> bool {
+        let text = &self.source[token.start().to_usize()..token.end().to_usize()];
+        let body = text.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+        if body.starts_with("\"\"\"") || body.starts_with("'''") {
+            return false;
+        }
+        let bytes = body.as_bytes();
+        bytes.iter().enumerate().any(|(at, &byte)| {
+            (byte == b'\r' || byte == b'\n' && (at == 0 || bytes[at - 1] != b'\r'))
+                && bytes[..at].iter().rev().take_while(|&&c| c == b'\\').count() % 2 == 0
+        })
+    }
+
+    /// Refuse a field 3.11 cannot tokenize: one holding a backslash, a comment or the
+    /// quote that closes its f-string.
+    fn check_legacy_field(&self, expression: TextRange) -> Result<()> {
+        let Some(token) = self.fstring_token else { return Ok(()) };
+        let text = &self.source[token.start().to_usize()..token.end().to_usize()];
+        let body = text.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+        let quote = if body.starts_with("\"\"\"") || body.starts_with("'''") {
+            &body[..3]
+        } else {
+            &body[..1]
+        };
+        let field = &self.source[expression.start().to_usize()..expression.end().to_usize()];
+        if field.contains('\\') || field.contains(quote) || comments(field) {
+            return Err(Unsupported("an f-string field Python 3.11 cannot tokenize".into()));
+        }
+        Ok(())
     }
 
     fn interpolated_pieces(
@@ -536,6 +664,12 @@ impl<'a> Lowerer<'a> {
     }
 
     fn formatted_value(&mut self, node: &ra::InterpolatedElement) -> Result<NodeId> {
+        if self.legacy_fstrings {
+            self.check_legacy_field(node.expression.range())?;
+            if self.spec_depth >= 2 {
+                return Err(Unsupported("an f-string nested too deeply for Python 3.11".into()));
+            }
+        }
         let value = self.expr(&node.expression)?;
         let mut conversion = node.conversion as i64;
         // `{x=}` converts with `repr` unless it names a conversion or a format spec
@@ -549,8 +683,16 @@ impl<'a> Lowerer<'a> {
             None => None,
             Some(spec) => {
                 let mut pieces = Vec::new();
-                self.interpolated_pieces(&spec.elements, &mut pieces)?;
+                self.spec_depth += 1;
+                let found = self.interpolated_pieces(&spec.elements, &mut pieces);
+                self.spec_depth -= 1;
+                found?;
                 let values = self.joined_values(pieces);
+                if self.legacy_fstrings
+                    && let Some(token) = self.fstring_token
+                {
+                    return Ok(self.add_formatted(value, conversion, values, token, node.range));
+                }
                 // The spec starts at its `:`
                 let mut start = spec.range.start();
                 if start > TextSize::from(0) && self.source.as_bytes()[start.to_usize() - 1] == b':'
@@ -562,6 +704,19 @@ impl<'a> Lowerer<'a> {
             }
         };
         Ok(self.add(Kind::FormattedValue { value, conversion, format_spec }, node.range))
+    }
+
+    /// A field whose format spec stands at the token it is written in (3.11).
+    fn add_formatted(
+        &mut self,
+        value: NodeId,
+        conversion: i64,
+        values: Vec<NodeId>,
+        token: TextRange,
+        range: TextRange,
+    ) -> NodeId {
+        let format_spec = Some(self.add(Kind::JoinedStr { values }, token));
+        self.add(Kind::FormattedValue { value, conversion, format_spec }, range)
     }
 
     /// The values of a `JoinedStr`: each run of literal pieces merged into a `Constant`.

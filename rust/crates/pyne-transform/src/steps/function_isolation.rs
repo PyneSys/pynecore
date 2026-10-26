@@ -437,7 +437,7 @@ struct FunctionIsolation<'a, 'h> {
     table: Option<Value>,
     tracked_files: HashSet<String>,
     /// The module's `_module_file_path`, `None` when it carries no usable one
-    close_module: Option<String>,
+    close_module: Result<String, pyne_ast::Unsupported>,
     pin_slots: HashMap<String, usize>,
     pin_index: HashMap<String, HashMap<NodeId, usize>>,
     /// Call node -> its route, as the index's sites were classified
@@ -816,11 +816,13 @@ impl FunctionIsolation<'_, '_> {
             return Ok(copy);
         }
         let text = crate::unparse::unparse(ast, func, python)?;
-        if !text.is_ascii() {
-            // The parser normalizes what is not ASCII
+        let copy = pyne_parse::parse_expression_into(ast, &text)?;
+        // CPython NFKC-normalizes the identifiers it parses, and nothing else: one
+        // outside ASCII is read alike only when it holds nothing but the separator,
+        // which normalizes to itself
+        if walk(ast, copy).into_iter().any(|node| !identifiers_stable(ast, node)) {
             return Err(Error::Unsupported(format!("reparsing the callee {text:?}")));
         }
-        let copy = pyne_parse::parse_expression_into(ast, &text)?;
         // A callee another pass built without a location yields an unlocated copy,
         // which `fix_locations` anchors with its statement
         let located = [loc.lineno, loc.col_offset, loc.end_lineno, loc.end_col_offset]
@@ -1197,9 +1199,7 @@ impl FunctionIsolation<'_, '_> {
             })
         {
             // The close statement, independent of the caller instance
-            let Some(module) = &self.close_module else {
-                return Err(Error::Unsupported("a close call in a module without a path".into()));
-            };
+            let module = self.close_module.clone()?;
             let loc = ast[node].loc;
             let (Some(line), Some(col)) = (loc.lineno, loc.col_offset) else {
                 return Err(Error::Unsupported("a close call without a location".into()));
@@ -1358,16 +1358,34 @@ impl Transformer for FunctionIsolation<'_, '_> {
     }
 }
 
+/// Whether every identifier a node spells is one NFKC leaves as it is: ASCII, or the
+/// separator `·`.
+fn identifiers_stable(ast: &Ast, node: NodeId) -> bool {
+    let kind = ast.kind(node);
+    if matches!(kind, Kind::Constant { .. }) {
+        return true;
+    }
+    let stable = |name: &str| name.chars().all(|c| c.is_ascii() || c == '\u{b7}');
+    (0..pyne_ast::CLASSES[kind.class_index()].fields.len()).all(|index| match kind.field(index) {
+        FieldRef::Str(name) | FieldRef::OptStr(Some(name)) => stable(name),
+        FieldRef::Strs(names) => names.iter().all(|name| stable(name)),
+        _ => true,
+    })
+}
+
 pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, Error> {
     if !matches!(ast.kind(module), Kind::Module { .. }) {
         return Err(Error::Unsupported("FunctionIsolation on a non-module".into()));
     }
-    // A source stamp, or (for a standalone tree) a digest of the tree: only a
-    // close call reads it, which then needs the stamp
+    // A source stamp survives bytecode caching and cannot collide with a statement
+    // in another imported library; a module without the loader's source path gets a
+    // content stamp
     let close_module = match ast.extra(module, "_module_file_path") {
-        Some(Value::Str(path)) if !path.is_empty() => Some(path.clone()),
-        _ => None,
+        Some(Value::Str(path)) if !path.is_empty() => Ok(path.clone()),
+        _ => crate::ast_dump::dump(ast, module, true, ctx.host.python())
+            .map(|text| crate::sha256::sha256_hex(text.as_bytes())),
     };
+
     let table = match ast.extra(module, TABLE_ATTR) {
         None | Some(Value::None) => None,
         Some(value) => Some(value.clone()),

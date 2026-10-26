@@ -9,16 +9,20 @@
 //! the host lets the Python step raise the error the author sees (a browser host
 //! shows the message).
 
+pub mod ast_dump;
 pub mod data;
 pub mod dynamic_default_guard;
 pub mod fdlibm;
+pub mod module_interface;
 pub mod node_ids;
 pub mod phase;
 pub mod pine_qualifier;
 pub mod pine_type_rules;
 pub mod pine_type_table;
 pub mod pow10;
+pub mod resolver;
 pub mod sha1;
+pub mod sha256;
 pub mod slot_layout;
 pub mod steps;
 pub mod unparse;
@@ -331,6 +335,58 @@ pub static STEPS: &[Step] = &[
     Step { name: "ApplyLayout", run: steps::layout_emit::run },
     Step { name: "FixLocations", run: steps::locations::run },
 ];
+
+/// The analysis half of the pipeline as `pipeline.ANALYSIS` declares it: each step's
+/// name, and whether it only applies to user code.
+pub static ANALYSIS: &[(&str, bool)] = &[
+    ("ImportLifter", false),
+    ("TypeCheckingStripper", false),
+    ("TypeErasure", false),
+    ("BuiltinShadow", false),
+    ("ImportNormalizer", false),
+    ("PlotScope", true),
+    ("OuterWrite", true),
+    ("ExportCapture", true),
+    ("SecurityDrawings", true),
+    ("ConstFold", true),
+    ("DynamicDefault", false),
+    ("InlineSeriesHoist", false),
+    ("PineTruthiness", true),
+    ("SecurityInstantiation", false),
+    ("Security", false),
+    ("PersistentSeries", false),
+    ("LibrarySeries", false),
+    ("ModuleProperty", false),
+    ("TaVariableHoist", false),
+    ("ClosureArguments", false),
+    ("PineType", false),
+    ("ImplicitConversion", true),
+    ("SecuritySlice", false),
+];
+
+/// The lowering half as `pipeline.LOWERING` declares it; a phase picks the rules that
+/// apply to the module itself.
+pub static LOWERING: &[(&str, bool)] = &[
+    ("SecurityDefault", false),
+    ("ExportOnce", false),
+    ("UnusedSeriesDetector", false),
+    ("Series", false),
+    ("VerifyClosedShift", false),
+    ("Persistent", false),
+    ("CallInline", false),
+    ("FunctionIsolation", false),
+    ("ScriptRequirements", false),
+    ("Input", false),
+    ("Expression", false),
+    ("FinalizeCloneDefaults", false),
+    ("ApplyLayout", false),
+    ("FixLocations", false),
+];
+
+/// The names of one pipeline half's steps that run over a module.
+pub fn half(steps: &[(&'static str, bool)], user_code: bool) -> Vec<&'static str> {
+    steps.iter().filter(|(_, only_user)| user_code || !only_user).map(|(name, _)| *name).collect()
+}
 
 /// The steps whose port reads or fills the run's [`Context::slot_layout`]. A host
 /// hands the layout of its pipeline over before a run with one of these steps, and

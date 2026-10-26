@@ -1110,18 +1110,24 @@ const KEYWORDS: &[&str] = &[
 ];
 
 /// Parse a stringized annotation (`ast.parse(text, mode='eval').body`) into its own
-/// arena.
+/// arena; `None` where CPython raises `SyntaxError`.
 ///
 /// Only a spelling whose parse provably agrees with CPython's is read: printable ASCII
 /// on one line, not indented, without the punctuation of statements, slices, stars,
-/// comments or line continuations, and without keywords. Everything else, and a
-/// spelling the parser refuses, answers `Unsupported`, so the Python step decides.
-pub(crate) fn forward_reference(text: &str) -> Result<(Ast, NodeId), Unsupported> {
+/// comments or line continuations, and without keywords. A blank spelling, and one
+/// indented before its first token, is a `SyntaxError` on every interpreter.
+/// Everything else, and a spelling the parser refuses, answers `Unsupported`, so the
+/// Python step decides.
+pub(crate) fn forward_reference(text: &str) -> Result<Option<(Ast, NodeId)>, Unsupported> {
     let refuse = || Unsupported(format!("forward reference {text:?}"));
-    if text.starts_with(' ')
-        || !text
-            .bytes()
-            .all(|byte| (0x20..0x7f).contains(&byte) && !b"#\\:;=*@{}`$?!".contains(&byte))
+    let token = text.trim_start_matches([' ', '\t']);
+    if text.chars().all(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c'))
+        || token.len() < text.len()
+            && token.starts_with(|c: char| c.is_ascii_graphic() && c != '\\' && c != '#')
+    {
+        return Ok(None);
+    }
+    if !text.bytes().all(|byte| (0x20..0x7f).contains(&byte) && !b"#\\:;=*@{}`$?!".contains(&byte))
     {
         return Err(refuse());
     }
@@ -1137,7 +1143,7 @@ pub(crate) fn forward_reference(text: &str) -> Result<(Ast, NodeId), Unsupported
     }
     let mut ast = Ast::new();
     let body = pyne_parse::parse_expression_into(&mut ast, text).map_err(|_| refuse())?;
-    Ok((ast, body))
+    Ok(Some((ast, body)))
 }
 
 /// Map a Python annotation onto a Pine type (`annotation_type`).
@@ -1156,10 +1162,10 @@ pub fn annotation_type(
         Kind::Constant { value, .. } => match value {
             Constant::None => Ok(VOID.to_string()),
             // A stringized forward reference: ``'_ExitOrderKey'``, ``'list[Pivot]'``
-            Constant::Str(text) => {
-                let (parsed, body) = forward_reference(text)?;
-                annotation_type(&parsed, Some(body), classes)
-            }
+            Constant::Str(text) => match forward_reference(text)? {
+                Some((parsed, body)) => annotation_type(&parsed, Some(body), classes),
+                None => Ok(UNKNOWN.to_string()),
+            },
             _ => Ok(UNKNOWN.to_string()),
         },
         Kind::Name { id, .. } => Ok(named_type(id, classes)),
@@ -1297,10 +1303,10 @@ pub fn annotation_takes_none(ast: &Ast, node: Option<NodeId>) -> Result<bool, Un
     match ast.kind(node) {
         Kind::Constant { value, .. } => match value {
             Constant::None => Ok(true),
-            Constant::Str(text) => {
-                let (parsed, body) = forward_reference(text)?;
-                annotation_takes_none(&parsed, Some(body))
-            }
+            Constant::Str(text) => match forward_reference(text)? {
+                Some((parsed, body)) => annotation_takes_none(&parsed, Some(body)),
+                None => Ok(false),
+            },
             _ => Ok(false),
         },
         Kind::Name { id, .. } => Ok(NONE_TAKING_NAMES.contains(&id.as_str())),

@@ -206,7 +206,8 @@ __test_helper_ANNOTATION_ATOMS = __test_helper_ANNOTATION_NAMES + [
     'lib.Matrix', 'lib.PyneInt', 'chr.SessionTimeRange', 'a.b.c', 'typing.Any', 'm.list',
     'None', '1', '1.5', 'True', '...', "'int'", "'list[Pivot]'", "'int | None'", "' int'",
     "'1 +'", "'NA'", "'yield'", "'tuple[int, ...]'", "b'x'", "\"'int'\"", "'Optional[int]'",
-    "'m.Settings'", "''", "'int;'", "'1if x else 2'", "'list[int]  '", "'a: int'", "f'x'",
+    "'m.Settings'", "''", "' '", "'\\tint'", "'int;'", "'1if x else 2'", "'list[int]  '",
+    "'a: int'", "f'x'",
     'x()', '[int]', '(int)', '-1',
 ]
 __test_helper_ANNOTATION_HEADS = __test_helper_ANNOTATION_NAMES + [

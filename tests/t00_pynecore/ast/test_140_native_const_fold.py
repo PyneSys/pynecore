@@ -408,11 +408,20 @@ def __test_native_const_fold_step_matches_python__(name):
 
 
 def __test_native_const_fold_declines_a_big_int__():
-    """A module with an int beyond 64 bits is left to the Python step"""
+    """A module computing with an int beyond 64 bits is left to the Python step"""
     __test_helper_require_native()
     python_tree, native_tree = __test_helper_step('A = 2 ** 70\nB = 1180591620717411303424 + 1\n')
     assert native_tree is None
     assert isinstance(python_tree.body[1].value, ast.Constant)
+
+
+def __test_native_const_fold_carries_a_big_int__():
+    """An int beyond 64 bits that is only bound, read and negated folds natively"""
+    __test_helper_require_native()
+    source = 'A = 18446744073709551615\nB = A\nC = -A\nD = -(-9223372036854775807 - 1)\n'
+    python_tree, native_tree = __test_helper_step(source)
+    assert native_tree is not None, 'the native step declined the module'
+    assert native.describe(native_tree) == native.describe(python_tree)
 
 
 def __test_native_round_with_precision_folds_like_python__():
