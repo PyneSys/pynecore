@@ -862,11 +862,30 @@ def __test_slot_steps_reject_what_python_rejects__():
                           native.Rejection)
 
 
-def __test_slot_steps_decline_what_they_cannot_model__():
-    """A persistent int literal beyond 64 bits is converted to float by Python's own
-    arithmetic; the native step declines it, and the pipeline runs the Python step."""
+@pytest.mark.parametrize('literal', [
+    '99999999999999999999', '-99999999999999999999', '9223372036854775807',
+    '-9223372036854775808', '+9007199254740993', '9223372036854776832', '9223372036854779904',
+    '1' + '0' * 308,
+])
+def __test_slot_steps_convert_a_persistent_int_beyond_64_bits__(literal):
+    """A persistent int literal beyond 64 bits converts natively to the double Python's
+    ``float(int)`` gives, ties to even."""
     __test_helper_require_native()
-    source = 'def main():\n    p: Persistent[int] = 99999999999999999999\n    return p\n'
+    source = f'def main():\n    p: Persistent[int] = {literal}\n    return p\n'
+    step = next(step for step in pipeline.LOWERING
+                if isinstance(step, pipeline.Step) and step.name == 'Persistent')
+    ctx = pipeline.PipelineContext(path=Path('big.py'), pyne_mode=None, source=source)
+    layout = ModuleLayout()
+    answer = native.run(['Persistent'], ast.parse(source), ctx, layout)
+    assert isinstance(answer, ast.Module)
+    native.verify('Persistent', step.run(ast.parse(source), ctx), answer, ctx, layout)
+
+
+def __test_slot_steps_decline_what_they_cannot_model__():
+    """A persistent int literal beyond the double range, which Python's ``float(int)``
+    cannot convert either, is declined natively, and the pipeline runs the Python step."""
+    __test_helper_require_native()
+    source = f'def main():\n    p: Persistent[int] = 1{"0" * 400}\n    return p\n'
     ctx = pipeline.PipelineContext(path=Path('big.py'), pyne_mode=None, source=source)
     layout = ModuleLayout()
     assert native.run(['Persistent'], ast.parse(source), ctx, layout) is None

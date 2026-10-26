@@ -5,12 +5,13 @@
 //! The doubles cross as packed little-endian `float64` buffers, so a sweep over
 //! millions of arguments costs one call.
 
+use pyne_ast::{Constant, Int};
 use pyne_transform::fdlibm;
 use pyne_transform::steps::const_fold::{self, Num};
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyInt};
 
 use crate::Unsupported;
 use crate::convert::FromPython;
@@ -81,7 +82,7 @@ pub fn quantize_embed<'py>(py: Python<'py>, values: &[u8]) -> PyResult<Bound<'py
         py,
         values.into_iter().map(|value| match const_fold::quantize_embed(Num::Float(value)) {
             Num::Float(value) => value,
-            Num::Int(_) | Num::Wide(_) => unreachable!(),
+            Num::Int(_) => unreachable!(),
         }),
     ))
 }
@@ -94,9 +95,12 @@ pub fn const_eval<'py>(py: Python<'py>, expr: &Bound<'py, PyAny>) -> PyResult<Bo
     let mut from = FromPython::new();
     let node = from.node(expr)?;
     match const_fold::eval_embedded(&from.ast, node) {
-        Ok(Some(Num::Int(value))) => value.into_bound_py_any(py),
-        Ok(Some(Num::Wide(value))) => value.into_bound_py_any(py),
-        Ok(Some(Num::Float(value))) => value.into_bound_py_any(py),
+        Ok(Some(Constant::Int(Int::Small(value)))) => value.into_bound_py_any(py),
+        Ok(Some(Constant::Int(Int::Big(digits)))) => {
+            py.get_type::<PyInt>().call1((digits.as_str(),))
+        }
+        Ok(Some(Constant::Float(value))) => value.into_bound_py_any(py),
+        Ok(Some(other)) => unreachable!("the fold embeds a number, not {other:?}"),
         Ok(None) => Ok(py.None().into_bound(py)),
         Err(err) => Err(Unsupported::new_err(err.to_string())),
     }

@@ -6,11 +6,10 @@
 //! straight-line order; control flow kills the names it assigns. The Pine type
 //! of a folded subtree is stamped on the emitted literal.
 //!
-//! Python's numbers are modelled exactly where the port can: an int is an `i64`,
-//! and an int result that leaves it (or a literal that never fit) answers
-//! [`Error::Unsupported`], as does an int true division with an operand beyond
-//! 2**53 (Python rounds the exact quotient). A `lib.math.round` with a positive
-//! precision scales by the platform `pow`, as CPython's `math.pow` does.
+//! A Pine int is a double: an int literal and int arithmetic are `f64`, and an
+//! int is embedded as the Python int of its double's exact value (beyond `i64`,
+//! its exact decimal digits). A `lib.math.round` with a positive precision scales
+//! by the platform `pow`, as CPython's `math.pow` does.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -27,29 +26,25 @@ use crate::pine_type_rules::{
 };
 use crate::{Context, Error};
 
-/// A Python number the fold computes with: an `int` that fits 64 bits, a wider one
-/// that fits 128, or a `float`. A wide int is carried and embedded but computed with
-/// only by negation; any other arithmetic on one answers `Unsupported`.
+/// A Python number the fold computes with: an `int`, held as the integral double a
+/// Pine int is (never `-0.0`), or a `float`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Num {
-    Int(i64),
-    Wide(i128),
+    Int(f64),
     Float(f64),
 }
 
 impl Num {
-    /// `float(v)`: an int rounded to the nearest double, ties to even.
+    /// `float(v)`: the double itself.
     fn float(self) -> f64 {
         match self {
-            Num::Int(value) => value as f64,
-            Num::Wide(value) => value as f64,
-            Num::Float(value) => value,
+            Num::Int(value) | Num::Float(value) => value,
         }
     }
 
-    /// An int as the narrowest variant that holds it.
-    fn int(value: i128) -> Num {
-        i64::try_from(value).map_or(Num::Wide(value), Num::Int)
+    /// An int from an integral double: an int has no signed zero.
+    fn int(value: f64) -> Num {
+        Num::Int(if value == 0.0 { 0.0 } else { value })
     }
 }
 
@@ -58,11 +53,6 @@ type Eval = Result<Option<Num>, Error>;
 
 fn unsupported(message: impl Into<String>) -> Error {
     Error::Unsupported(message.into())
-}
-
-/// An int result Python would carry as a big int.
-fn overflow() -> Error {
-    unsupported("a constant int beyond 64 bits")
 }
 
 // --- the embedding --------------------------------------------------------
@@ -132,19 +122,37 @@ fn quantize_float(value: f64) -> f64 {
 /// unsigned; an int unchanged.
 pub fn quantize_embed(value: Num) -> Num {
     match value {
-        Num::Int(_) | Num::Wide(_) => value,
+        Num::Int(_) => value,
         Num::Float(value) => Num::Float(quantize_float(value)),
+    }
+}
+
+/// The Python int of an integral double's exact value: machine-sized when it fits
+/// `i64`, its exact decimal digits otherwise.
+fn int_value(value: f64) -> Int {
+    // 2**63: every integral double below it in magnitude, and -2**63 itself, fits
+    const LIMIT: f64 = 9223372036854775808.0;
+    if (-LIMIT..LIMIT).contains(&value) {
+        Int::Small(value as i64)
+    } else {
+        // A fixed-precision format spells a double's exact value
+        Int::Big(format!("{value:.0}"))
+    }
+}
+
+/// The literal an embedded value is spelled as.
+fn constant(value: Num) -> Constant {
+    match value {
+        Num::Int(value) => Constant::Int(int_value(value)),
+        Num::Float(value) => Constant::Float(value),
     }
 }
 
 /// Whether `node` is already the literal `value`: same type, same value, same zero sign.
 fn is_literal(ast: &Ast, node: NodeId, value: Num) -> bool {
     match (ast.kind(node), value) {
-        (Kind::Constant { value: Constant::Int(Int::Small(have)), .. }, Num::Int(want)) => {
-            *have == want
-        }
-        (Kind::Constant { value: Constant::Int(Int::Big(have)), .. }, Num::Wide(want)) => {
-            *have == want.to_string()
+        (Kind::Constant { value: Constant::Int(have), .. }, Num::Int(want)) => {
+            *have == int_value(want)
         }
         (Kind::Constant { value: Constant::Float(have), .. }, Num::Float(want)) => {
             *have == want && have.is_sign_negative() == want.is_sign_negative()
@@ -214,31 +222,10 @@ fn fold_fdlibm(name: &str, args: &[f64]) -> Option<Option<f64>> {
     })
 }
 
-/// Python's exact comparison of two numbers, an int against a float included.
+/// Python's comparison of two numbers: an int is an exact double, so it is the
+/// comparison of the doubles.
 fn compare(left: Num, right: Num) -> Ordering {
-    match (left, right) {
-        (Num::Int(a), Num::Int(b)) => a.cmp(&b),
-        (Num::Float(a), Num::Float(b)) => a.partial_cmp(&b).expect("finite operands"),
-        (Num::Int(a), Num::Float(b)) => compare_int_float(a, b),
-        (Num::Float(a), Num::Int(b)) => compare_int_float(b, a).reverse(),
-        (Num::Wide(_), _) | (_, Num::Wide(_)) => unreachable!("try_eval computes no wide int"),
-    }
-}
-
-fn compare_int_float(int: i64, float: f64) -> Ordering {
-    // 2**63: every i64 is below, and every double at or above it is an integer
-    const LIMIT: f64 = 9223372036854775808.0;
-    if float >= LIMIT {
-        return Ordering::Less;
-    }
-    if float < -LIMIT {
-        return Ordering::Greater;
-    }
-    let floor = float.floor();
-    match int.cmp(&(floor as i64)) {
-        Ordering::Equal if float > floor => Ordering::Less,
-        order => order,
-    }
+    left.float().partial_cmp(&right.float()).expect("finite operands")
 }
 
 /// `lib.math.round` (`math.py`), the integer rounding: `None` for the precision
@@ -248,7 +235,7 @@ fn fold_round(number: Num) -> Eval {
     const INT_LIMIT: f64 = 4503599627370496.0;
     let negative = compare(number, Num::Float(0.0)) == Ordering::Less;
     let magnitude = match number {
-        Num::Int(value) if negative => Num::Int(value.checked_neg().ok_or_else(overflow)?),
+        Num::Int(value) if negative => Num::Int(-value),
         Num::Float(value) if negative => Num::Float(-value),
         _ => number,
     };
@@ -402,16 +389,14 @@ fn fold_exact(name: &str, args: &[Num]) -> Eval {
             }
         }),
         "abs" => match single {
-            Some(Num::Int(value)) => Some(Num::Int(value.checked_abs().ok_or_else(overflow)?)),
+            Some(Num::Int(value)) => Some(Num::Int(value.abs())),
             Some(Num::Float(value)) => Some(Num::Float(value.abs())),
-            Some(Num::Wide(_)) => unreachable!("try_eval computes no wide int"),
             None => None,
         },
         // ``pine_int(math.floor(x))``: the int floor back as a float, so never -0.0
         "floor" | "ceil" => single.map(|x| {
             let value = match x {
-                Num::Int(value) => value as f64,
-                Num::Wide(_) => unreachable!("try_eval computes no wide int"),
+                Num::Int(value) => value,
                 Num::Float(value) if name == "floor" => value.floor(),
                 Num::Float(value) => value.ceil(),
             };
@@ -475,72 +460,36 @@ fn fold_avg(args: &[Num]) -> f64 {
     (sum - compensation) / count
 }
 
-/// `safe_mod`: the truncated remainder; two ints stay an int.
-fn fold_mod(left: Num, right: Num) -> Eval {
-    if let (Num::Int(a), Num::Int(b)) = (left, right) {
-        let r = a.checked_abs().ok_or_else(overflow)? % b.checked_abs().ok_or_else(overflow)?;
-        return Ok(Some(Num::Int(if a < 0 { -r } else { r })));
-    }
-    Ok(Some(Num::Float(left.float() % right.float())))
-}
-
-fn fold_binop(op: Operator, left: Num, right: Num) -> Eval {
-    let ints = match (left, right) {
-        (Num::Int(a), Num::Int(b)) => Some((a, b)),
-        _ => None,
-    };
+/// `+ - * / %` on two numbers: the double result, `%` the truncated remainder of
+/// `safe_mod`. Two ints give an int, except through `/`.
+fn fold_binop(op: Operator, left: Num, right: Num) -> Option<Num> {
+    let (a, b) = (left.float(), right.float());
     let value = match op {
-        Operator::Add | Operator::Sub | Operator::Mult => {
-            if let Some((a, b)) = ints {
-                let value = match op {
-                    Operator::Add => a.checked_add(b),
-                    Operator::Sub => a.checked_sub(b),
-                    _ => a.checked_mul(b),
-                };
-                return Ok(Some(Num::Int(value.ok_or_else(overflow)?)));
-            }
-            let (a, b) = (left.float(), right.float());
-            match op {
-                Operator::Add => a + b,
-                Operator::Sub => a - b,
-                _ => a * b,
-            }
-        }
-        Operator::Div => {
-            if let Some((a, b)) = ints {
-                // Python rounds the exact quotient once; two exactly converted
-                // operands divide to the same double
-                const EXACT: u64 = 1 << 53;
-                if a.unsigned_abs() > EXACT || b.unsigned_abs() > EXACT {
-                    return Err(unsupported("an int division beyond 2**53"));
-                }
-            }
-            left.float() / right.float()
-        }
-        Operator::Mod => match fold_mod(left, right)? {
-            Some(Num::Float(value)) => value,
-            other => return Ok(other),
-        },
-        _ => return Ok(None),
+        Operator::Add => a + b,
+        Operator::Sub => a - b,
+        Operator::Mult => a * b,
+        Operator::Div => a / b,
+        Operator::Mod => a % b,
+        _ => return None,
     };
-    Ok(if value.is_finite() { Some(Num::Float(value)) } else { None })
-}
-
-fn is_zero(value: Num) -> bool {
-    match value {
-        Num::Int(value) => value == 0,
-        Num::Wide(value) => value == 0,
-        Num::Float(value) => value == 0.0,
+    if !value.is_finite() {
+        return None;
     }
+    Some(match (left, right) {
+        (Num::Int(_), Num::Int(_)) if op != Operator::Div => Num::int(value),
+        _ => Num::Float(value),
+    })
 }
 
 /// Evaluate a subtree as a parse-time constant with exact doubles (`_try_eval`).
 fn try_eval(ast: &Ast, node: NodeId, env: &HashMap<String, Num>) -> Eval {
     match ast.kind(node) {
         Kind::Constant { value, .. } => Ok(match value {
-            Constant::Int(Int::Small(value)) => Some(Num::Int(*value)),
+            // ``float(v)``: the nearest double, ties to even
+            Constant::Int(Int::Small(value)) => Some(Num::Int(*value as f64)),
+            // An int beyond the double range is an infinity: a domain edge
             Constant::Int(Int::Big(digits)) => {
-                Some(Num::int(digits.parse().map_err(|_| overflow())?))
+                digits.parse::<f64>().ok().filter(|value| value.is_finite()).map(Num::Int)
             }
             // An overflowing float literal (``1e309``) is an infinity: a domain edge
             Constant::Float(value) if value.is_finite() => Some(Num::Float(*value)),
@@ -554,10 +503,7 @@ fn try_eval(ast: &Ast, node: NodeId, env: &HashMap<String, Num>) -> Eval {
                 return Ok(None);
             };
             Ok(Some(match (op, value) {
-                (UnaryOperator::USub, Num::Int(v)) => Num::int(-i128::from(v)),
-                (UnaryOperator::USub, Num::Wide(v)) => {
-                    Num::int(v.checked_neg().ok_or_else(overflow)?)
-                }
+                (UnaryOperator::USub, Num::Int(v)) => Num::int(-v),
                 (UnaryOperator::USub, Num::Float(v)) => Num::Float(-v),
                 _ => value,
             }))
@@ -576,13 +522,10 @@ fn try_eval(ast: &Ast, node: NodeId, env: &HashMap<String, Num>) -> Eval {
             let (Some(left_value), Some(right_value)) = (left_value, right_value) else {
                 return Ok(None);
             };
-            if matches!(left_value, Num::Wide(_)) || matches!(right_value, Num::Wide(_)) {
-                return Err(overflow());
-            }
-            if matches!(op, Operator::Div | Operator::Mod) && is_zero(right_value) {
+            if matches!(op, Operator::Div | Operator::Mod) && right_value.float() == 0.0 {
                 return Ok(None);
             }
-            fold_binop(*op, left_value, right_value)
+            Ok(fold_binop(*op, left_value, right_value))
         }
         Kind::Attribute { .. } => {
             Ok(lib_math_attr(ast, node).and_then(math_constant).map(Num::Float))
@@ -613,9 +556,6 @@ fn try_eval(ast: &Ast, node: NodeId, env: &HashMap<String, Num>) -> Eval {
             } else if EXACT_NAMES.contains(&name) {
                 if values.is_empty() {
                     return Ok(None);
-                }
-                if values.iter().any(|value| matches!(value, Num::Wide(_))) {
-                    return Err(overflow());
                 }
                 match fold_exact(name, &values)? {
                     Some(value) => value,
@@ -747,12 +687,7 @@ fn embed(ast: &mut Ast, node: NodeId, value: Num, env: &Env) -> NodeId {
     let target = if is_literal(ast, node, quantized) {
         node
     } else {
-        let constant = match quantized {
-            Num::Int(value) => Constant::Int(Int::Small(value)),
-            Num::Wide(value) => Constant::Int(Int::Big(value.to_string())),
-            Num::Float(value) => Constant::Float(value),
-        };
-        let literal = ast.add(Kind::Constant { value: constant, kind: None });
+        let literal = ast.add(Kind::Constant { value: constant(quantized), kind: None });
         copy_location(ast, literal, node);
         literal
     };
@@ -1414,14 +1349,8 @@ impl ConstFold {
                         let new = if is_literal(ast, value, quantized) {
                             value
                         } else {
-                            let literal = ast.add(Kind::Constant {
-                                value: match quantized {
-                                    Num::Int(value) => Constant::Int(Int::Small(value)),
-                                    Num::Wide(value) => Constant::Int(Int::Big(value.to_string())),
-                                    Num::Float(value) => Constant::Float(value),
-                                },
-                                kind: None,
-                            });
+                            let literal =
+                                ast.add(Kind::Constant { value: constant(quantized), kind: None });
                             copy_location(ast, literal, value);
                             literal
                         };
@@ -1604,9 +1533,9 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
 }
 
 /// `_try_eval` and `quantize_embed` of one expression, for the parity tests: the
-/// embedded value, `None` where the expression is no constant.
-pub fn eval_embedded(ast: &Ast, node: NodeId) -> Result<Option<Num>, Error> {
-    Ok(try_eval(ast, node, &HashMap::new())?.map(quantize_embed))
+/// embedded literal, `None` where the expression is no constant.
+pub fn eval_embedded(ast: &Ast, node: NodeId) -> Result<Option<Constant>, Error> {
+    Ok(try_eval(ast, node, &HashMap::new())?.map(|value| constant(quantize_embed(value))))
 }
 
 #[cfg(test)]
@@ -1627,10 +1556,20 @@ mod tests {
 
     #[test]
     fn mixed_compare() {
-        assert_eq!(compare(Num::Int(1), Num::Float(1.0)), Ordering::Equal);
-        assert_eq!(compare(Num::Int(1), Num::Float(1.5)), Ordering::Less);
-        assert_eq!(compare(Num::Int(-2), Num::Float(-1.5)), Ordering::Less);
-        assert_eq!(compare(Num::Float(-1.5), Num::Int(-2)), Ordering::Greater);
-        assert_eq!(compare(Num::Int(i64::MAX), Num::Float(9.3e18)), Ordering::Less);
+        assert_eq!(compare(Num::Int(1.0), Num::Float(1.0)), Ordering::Equal);
+        assert_eq!(compare(Num::Int(1.0), Num::Float(1.5)), Ordering::Less);
+        assert_eq!(compare(Num::Int(-2.0), Num::Float(-1.5)), Ordering::Less);
+        assert_eq!(compare(Num::Float(-1.5), Num::Int(-2.0)), Ordering::Greater);
+    }
+
+    #[test]
+    fn int_digits() {
+        assert_eq!(int_value(-0.0), Int::Small(0));
+        assert_eq!(int_value(9007199254740992.0), Int::Small(9007199254740992));
+        assert_eq!(int_value(-9223372036854775808.0), Int::Small(i64::MIN));
+        assert_eq!(int_value(9223372036854775808.0), Int::Big("9223372036854775808".into()));
+        assert_eq!(int_value(1e22), Int::Big("10000000000000000000000".into()));
+        assert_eq!(int_value(-2f64.powi(70)), Int::Big("-1180591620717411303424".into()));
+        assert_eq!(int_value(3e29), Int::Big("299999999999999991891638616064".into()));
     }
 }

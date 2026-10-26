@@ -9,6 +9,8 @@ Intel-LIBM double the runtime reproduces. The parser's ``log10`` is
 ``StrictMath.log(x) / StrictMath.log(10)`` (8/8 arguments where that, the product with
 ``1 / log(10)`` and ``StrictMath.log10`` all differ). A constant ``%`` is the truncated
 remainder like a series one: ``-7 % 3`` is -1, ``7 % -3`` is 1, ``-7.5 % 2`` is -1.5.
+Constant int arithmetic is double arithmetic, as on a series int (probes int_a / int_b,
+2026-10-26): ``9007199254740993 - 9007199254740992`` is 0.
 """
 import ast
 import math
@@ -17,6 +19,7 @@ import pytest
 
 from pynecore.core import fdlibm, pine_math
 from pynecore.transformers.const_fold import ConstFoldTransformer
+from pynecore.transformers.pine_type_rules import INT, get_ty
 
 # StrictMath values (JDK 8 x86_64 and JDK 21): the fdlibm port reproduces them bit for bit
 _STRICTMATH = (
@@ -74,10 +77,15 @@ def __test_helper_fold(source: str) -> ast.Module:
     return ConstFoldTransformer().visit(ast.parse(source))
 
 
+def __test_helper_folded_node(expression: str) -> ast.expr:
+    """The right side the fold leaves for ``X = expression``."""
+    tree = __test_helper_fold(f'from pynecore import lib\nX = {expression}\n')
+    return tree.body[1].value
+
+
 def __test_helper_folded_value(expression: str) -> object:
     """The constant the fold embeds for ``X = expression``, or the node it left."""
-    tree = __test_helper_fold(f'from pynecore import lib\nX = {expression}\n')
-    value = tree.body[1].value
+    value = __test_helper_folded_node(expression)
     return value.value if isinstance(value, ast.Constant) else value
 
 
@@ -116,3 +124,41 @@ def __test_constant_zero_remainder_is_unsigned__():
 
 def __test_constant_remainder_by_zero_is_not_folded__():
     assert isinstance(__test_helper_folded_value('7 % 0'), ast.BinOp)
+
+
+# The constant int expressions measured on TradingView, with the value the venue plotted
+@pytest.mark.parametrize('expression,expected', [
+    ('100000000000 * 100000000000 + 1 - 100000000000 * 100000000000', 0),
+    ('9007199254740993 - 9007199254740992', 0),
+    ('4611686018427387904 * 4 / 4611686018427387904', 4.0),
+    ('4611686018427387904 * 4 - 4611686018427387904 * 4 + 7', 7),
+    ('10000000000000000000000 % 7', 4),
+])
+def __test_constant_int_arithmetic_is_double__(expression, expected):
+    node = __test_helper_folded_node(expression)
+    assert isinstance(node, ast.Constant)
+    assert node.value == expected and type(node.value) is type(expected)
+    assert get_ty(node) == INT
+
+
+@pytest.mark.parametrize('literal,expected', [
+    ('9007199254740993', 9007199254740992),
+    ('-9007199254740995', -9007199254740996),
+    ('18446744073709551615', 18446744073709551616),
+    ('100000000000000000000000000000', 99999999999999991433150857216),
+    ('9007199254740991', 9007199254740991),
+])
+def __test_int_literal_embeds_its_double__(literal, expected):
+    node = __test_helper_folded_node(literal)
+    assert isinstance(node, ast.Constant)
+    assert node.value == expected and type(node.value) is int
+    assert get_ty(node) == INT
+
+
+def __test_int_beyond_the_double_range_is_not_folded__():
+    """an int literal or int result that rounds to an infinity stays in the code"""
+    literal = '1' + '0' * 400
+    assert __test_helper_folded_value(literal) == int(literal)
+    assert isinstance(__test_helper_folded_value(f'{literal} - {literal}'), ast.BinOp)
+    huge = str(10 ** 200)
+    assert isinstance(__test_helper_folded_value(f'{huge} * {huge}'), ast.BinOp)

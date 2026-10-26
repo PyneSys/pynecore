@@ -527,17 +527,45 @@ def _const_call_type(node: ast.Call, env: dict[str, int | float],
     return override
 
 
+def _pine_int(v: int):
+    """
+    A Python int as the double a Pine int holds: rounded to the nearest double
+    (ties to even) and carried as the Python int of that double's exact value.
+
+    Returns ``_BAIL`` for an int beyond the double range, an infinity: a domain edge.
+    """
+    # MEASURED 2026-10-26 (probes int_a, int_b, CAPITALCOM:EURUSD 60): the parser
+    # folds Pine ints as doubles, not exact integers --
+    # ``9007199254740993 - 9007199254740992`` is 0, ``100000000000 * 100000000000 + 1
+    # - 100000000000 * 100000000000`` is 0 (like the same chain on a series ``x``),
+    # ``4611686018427387904 * 4 / 4611686018427387904`` is 4,
+    # ``4611686018427387904 * 4 - 4611686018427387904 * 4 + 7`` is 7 and the
+    # literal ``10000000000000000000000 % 7`` is 4
+    try:
+        return int(float(v))
+    except OverflowError:
+        return _BAIL
+
+
 def _try_eval(node: ast.expr, env: dict[str, int | float]):
     """
     Evaluate a subtree as a parse-time constant with exact doubles.
 
+    A Pine int is a double, so an int literal and the int result of ``+``,
+    ``-``, ``*`` and ``%`` are the double TradingView computes, held as a Python
+    int of its exact integral value (see :func:`_pine_int`); the float
+    arithmetic on such an int is the plain double arithmetic.
+
     Returns the exact value, or ``_BAIL`` when the subtree is not constant,
-    leaves the verified fold surface, or hits a domain edge (nan/inf, zero
-    divisor): those stay in the code and keep their runtime behavior.
+    leaves the verified fold surface, or hits a domain edge (nan/inf, an int
+    beyond the double range, zero divisor): those stay in the code and keep
+    their runtime behavior.
     """
     if isinstance(node, ast.Constant):
+        if type(node.value) is int:
+            return _pine_int(node.value)
         # An overflowing float literal (``1e309``) is an infinity: a domain edge
-        if type(node.value) is int or (type(node.value) is float and math.isfinite(node.value)):
+        if type(node.value) is float and math.isfinite(node.value):
             return node.value
         return _BAIL
     if isinstance(node, ast.Name):
@@ -560,6 +588,10 @@ def _try_eval(node: ast.expr, env: dict[str, int | float]):
         if isinstance(node.op, (ast.Div, ast.Mod)) and right == 0:
             return _BAIL
         v = op(left, right)
+        if type(v) is int:
+            # Both operands are exact doubles, so the exact result rounded once is
+            # the IEEE double result
+            return _pine_int(v)
         return _BAIL if isinstance(v, float) and not math.isfinite(v) else v
     if isinstance(node, ast.Attribute):
         name = _is_lib_math_attr(node)

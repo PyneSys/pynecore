@@ -3,8 +3,8 @@ The native ``ConstFold`` step (``rust/crates/pyne-transform/src/steps/const_fold
 against ``transformers/const_fold.py``.
 
 The evaluation is held against ``_try_eval`` + ``quantize_embed`` one expression at a
-time over seeded random ``lib.math`` calls and operator chains with Python's int and
-float semantics at their edges; the step over modules that reach every statement
+time over seeded random ``lib.math`` calls and operator chains with Pine's int (a double)
+and float semantics at their edges; the step over modules that reach every statement
 kind, scope rule and propagation path, compared by ``native.describe``.
 """
 import ast
@@ -364,23 +364,42 @@ def __test_native_const_eval_matches_python__():
     assert checked > 15_000 and unsupported < 2_000, (checked, unsupported)
 
 
-@pytest.mark.parametrize('source', [
+#: Ints beyond 2**53, 2**63 and the double range: the TradingView rows of
+#: ``test_134_const_fold_strictmath`` first
+__test_helper_WIDE_INTS = [
+    '100000000000 * 100000000000 + 1 - 100000000000 * 100000000000',
+    '9007199254740993 - 9007199254740992', '4611686018427387904 * 4 / 4611686018427387904',
+    '4611686018427387904 * 4 - 4611686018427387904 * 4 + 7', '10000000000000000000000 % 7',
     '9223372036854775807 + 1', '-(-9223372036854775807 - 1)', '3037000500 * 3037000500',
     '100000000000000000000', 'lib.math.abs(-9223372036854775807 - 1)',
-    '9007199254740993 / 1', '-9223372036854775807 % 2 - 9',
-    'close + lib.math.sin(100000000000000000000)',
-])
-def __test_native_const_eval_declines_beyond_its_model__(source):
-    """Python big ints and inexact int division stay Python's"""
+    '9007199254740993 / 1', '-9223372036854775807 % 2 - 9', '-18446744073709551615 % 7',
+    'close + lib.math.sin(100000000000000000000)', 'lib.math.max(2 ** 64, 18446744073709551617)',
+    '1' + '0' * 400, f'{10 ** 200} * {10 ** 200}', f'-{10 ** 200} * {10 ** 200}',
+    str(2 ** 1024 - 2 ** 970), str(2 ** 1024 - 2 ** 970 - 1), f'-{2 ** 1024 - 2 ** 970 - 1}',
+    f'{2 ** 1023} + {2 ** 1023}', f'{2 ** 1023} * 2 - {2 ** 1023}', '-0 * 5', '-6 % 3',
+]
+
+
+@pytest.mark.parametrize('source', __test_helper_WIDE_INTS)
+def __test_native_const_eval_folds_ints_as_doubles__(source):
+    """An int of any size folds natively to Python's value: the double a Pine int is"""
     __test_helper_require_native()
     _native = __test_helper_native()
     node = ast.parse(source, mode='eval').body
-    try:
-        _native._const_eval(node)
-    except _native.Unsupported:
-        return
-    # Only folds the native side models exactly may answer
     assert __test_helper_same(_native._const_eval(node), __test_helper_python_eval(node))
+
+
+def __test_native_int_digits_match_python__():
+    """An integral double beyond ``i64`` embeds with Python's exact digits"""
+    __test_helper_require_native()
+    _native = __test_helper_native()
+    rnd = random.Random(20261026)
+    for _ in range(5_000):
+        value = math.ldexp(1.0 + rnd.random(), rnd.randint(53, 1023))
+        source = f'{rnd.choice(("", "-"))}{int(value) + rnd.randint(-3, 3)}'
+        node = ast.parse(source, mode='eval').body
+        assert __test_helper_same(_native._const_eval(node), __test_helper_python_eval(node)), \
+            source
 
 
 def __test_helper_step(source: str):
@@ -407,21 +426,23 @@ def __test_native_const_fold_step_matches_python__(name):
     assert native.describe(native_tree) == native.describe(python_tree)
 
 
-def __test_native_const_fold_declines_a_big_int__():
-    """A module computing with an int beyond 64 bits is left to the Python step"""
-    __test_helper_require_native()
-    python_tree, native_tree = __test_helper_step('A = 2 ** 70\nB = 1180591620717411303424 + 1\n')
-    assert native_tree is None
-    assert isinstance(python_tree.body[1].value, ast.Constant)
-
-
 def __test_native_const_fold_carries_a_big_int__():
-    """An int beyond 64 bits that is only bound, read and negated folds natively"""
+    """An int beyond 64 bits folds natively as the double it rounds to, bound, read,
+    negated and computed with"""
     __test_helper_require_native()
-    source = 'A = 18446744073709551615\nB = A\nC = -A\nD = -(-9223372036854775807 - 1)\n'
+    source = ('A = 18446744073709551615\nB = A\nC = -A\nD = -(-9223372036854775807 - 1)\n'
+              'E = 2 ** 70\nF = 1180591620717411303424 + 1\nG = A * A - A\n'
+              'H = 9007199254740993 - 9007199254740992\nI = close + 18446744073709551617\n'
+              'J = 1' + '0' * 400 + ' + 1\n')
     python_tree, native_tree = __test_helper_step(source)
     assert native_tree is not None, 'the native step declined the module'
     assert native.describe(native_tree) == native.describe(python_tree)
+    values = {statement.targets[0].id: statement.value for statement in python_tree.body}
+    assert values['A'].value == 18446744073709551616
+    assert values['F'].value == 1180591620717411303424
+    assert values['H'].value == 0
+    assert values['I'].right.value == 18446744073709551616
+    assert isinstance(values['J'], ast.BinOp)
 
 
 def __test_native_round_with_precision_folds_like_python__():

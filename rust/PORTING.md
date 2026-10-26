@@ -90,18 +90,19 @@ pointers.
      `toradians`, `round` — whose precision path uses the platform `pow` natively
      and a correctly rounded `10**y` in WebAssembly (`pow10.rs`), with an exact tie
      check over big limbs);
-   - Python int semantics for `+ - * / %` (`safe_mod`): checked `i64`; an int
-     beyond it that fits 128 bits is carried, negated and embedded, and any other
-     arithmetic on it answers `Unsupported`;
+   - Pine int semantics for `+ - * / %` (`safe_mod`): a Pine int is a double, so
+     an int literal and int arithmetic are `f64` (the literal rounded to the
+     nearest double, ties to even; one that rounds to infinity is a domain edge
+     and stays in the code), and an int is embedded as the Python int of the
+     double's exact value, its exact decimal digits (`Int::Big`) beyond `i64`;
    - `quantize_embed`: shortest digits, round-down at 1e-16 with an exact binary
      tie check (fits in `u128`), correctly rounded parse.
 
    Ported as `steps/const_fold.rs` with `fdlibm.rs`. The fdlibm port and
    `quantize_embed` are gated bit for bit by `test_141_native_fdlibm`
    (`PYNE_FDLIBM_SWEEP=2000000` for the full sweep), the evaluation and the step
-   by `test_140_native_const_fold`. `Unsupported`: arithmetic on an int beyond
-   `i64`, an int literal beyond `i128`, an int true division with an operand beyond
-   2**53, and the rare `10**y` a WebAssembly build cannot round with certainty.
+   by `test_140_native_const_fold`. The one numeric `Unsupported` is the rare
+   `10**y` a WebAssembly build cannot round with certainty.
 4. **Security** (XL, 4.4k lines). Ported as `steps/security/`: `collection`
    (call arguments, the simple-chain / hoistable-binding rules, the
    history-reference rule behind `closed_shift`), `builders`, `rewrite` (the
@@ -234,7 +235,8 @@ request from `ModuleLayout::new(pyne_mode == "lib")`, as the import hook does.
    only), a visit inside a dynamic-default guard that answers no single node (the
    Python pass would put the answer into the body as it is), a series declaration
    in a scope the pass never entered (a `KeyError` in Python), and an int
-   persistent initializer beyond 64 bits (`float()` of a Python int).
+   persistent initializer beyond the double range (`float()` of a Python int
+   raises `OverflowError`).
    `Rejected`: a Series or Persistent declaration outside a function.
 3. **ScriptRequirements**, **Input**, the `Expression` phase (**SafeConvert**,
    **SafeDivision**, **FloatTolerance**) and **FixLocations**. Ported as
