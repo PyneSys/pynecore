@@ -198,7 +198,6 @@ def _regions(runner: Any) -> list[tuple[CodeType, int]]:
     return regions
 
 
-# noinspection PyProtectedMember
 def _profiled_files(script_module: ModuleType) -> list[_ProfiledFile]:
     """The script's file and the files of the libraries it imported.
 
@@ -206,10 +205,7 @@ def _profiled_files(script_module: ModuleType) -> list[_ProfiledFile]:
     """
     script_file = _code_of(script_module.main).co_filename
     files = {script_file: _ProfiledFile(script_file, _SCRIPT)}
-    # The registry is process-wide: only libraries whose module is loaded now count
-    for _title, library_main in script._registered_libraries:
-        if sys.modules.get(getattr(library_main, '__module__', '')) is None:
-            continue
+    for _title, library_main in script.imported_libraries(script_module):
         filename = _code_of(library_main).co_filename
         if filename not in files:
             files[filename] = _ProfiledFile(filename, _LIBRARIES)

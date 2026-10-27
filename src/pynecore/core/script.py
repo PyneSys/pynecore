@@ -1,11 +1,14 @@
 from typing import Any, Callable, TypeVar, overload
+import ast
 import os
 import sys
 
 from dataclasses import dataclass, field, fields
 from enum import Enum, StrEnum
-from inspect import signature
+from importlib.util import resolve_name
+from inspect import signature, unwrap
 from pathlib import Path
+from types import ModuleType
 
 import pynecore.lib.format as _format
 import pynecore.lib.scale as _scale
@@ -29,6 +32,61 @@ from . import safe_convert
 
 # Global registry for library main functions
 _registered_libraries: list[tuple[str, Callable]] = []
+
+
+def _imported_module_names(module: ModuleType) -> set[str]:
+    """
+    The names of the modules a module's source imports, anywhere in the file.
+
+    ``from pkg import name`` yields both ``pkg`` and ``pkg.name``: the source alone does
+    not tell whether ``name`` is a submodule.
+
+    :param module: An imported module with a source file.
+    :return: Absolute module names.
+    """
+    tree = ast.parse(Path(module.__file__ or '').read_text(encoding='utf-8'))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            try:
+                base = resolve_name('.' * node.level + (node.module or ''), module.__package__)
+            except (ImportError, ValueError):
+                continue
+            names.add(base)
+            names.update(f'{base}.{alias.name}' for alias in node.names)
+    return names
+
+
+def imported_libraries(script_module: ModuleType) -> list[tuple[str, Callable]]:
+    """
+    The registered libraries a script uses: the ones it imports, directly or through
+    another library, in registration order.
+
+    The registry is process-wide, it keeps the library of every script the process has
+    imported, and a module imported again under the same name leaves its old main
+    there too. An entry counts only if its main (unwrapped from any decorator) belongs
+    to the module object the script's imports reach now.
+
+    :param script_module: The imported script.
+    :return: ``(title, main)`` pairs; the script's own main is one of them when the
+             script is itself a library.
+    """
+    library_modules = {getattr(main, '__module__', '') for _title, main in _registered_libraries}
+    reached = [script_module]
+    pending = [script_module]
+    while pending:
+        for name in _imported_module_names(pending.pop()):
+            module = sys.modules.get(name) if name in library_modules else None
+            if module is not None and all(module is not seen for seen in reached):
+                reached.append(module)
+                pending.append(module)
+    reached_globals = [vars(module) for module in reached]
+    return [(title, main) for title, main in _registered_libraries
+            if any(getattr(unwrap(main), '__globals__', None) is module_globals
+                   for module_globals in reached_globals)]
+
 
 # TypeVar for enum type preservation
 TEnum = TypeVar('TEnum', bound=StrEnum)

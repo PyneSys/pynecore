@@ -71,8 +71,9 @@ def __test_profile_counts_every_execution__(csv_reader, runner, tmp_path):
     bars = profile['bars']
     assert bars > 10
 
-    # Libraries registered by other scripts of this process run too
-    file, = [file for file in profile['files'] if file['role'] == 'script']
+    # The script imports no library, so its own file is the only one profiled
+    file, = profile['files']
+    assert file['role'] == 'script'
     assert Path(file['path']) == Path(__file__).resolve()
     hits = {int(line): counts[1] for line, counts in file['lines'].items()}
 
@@ -113,8 +114,7 @@ def __test_profile_times_add_up__(csv_reader, runner, tmp_path):
         assert categories[category] > 0, category
     assert categories['security'] == 0
 
-    # Libraries registered by other scripts of this process run too
-    file, = [file for file in profile['files'] if file['role'] == 'script']
+    file, = profile['files']
     lines = {int(line): counts for line, counts in file['lines'].items()}
     header = __test_helper_line("    for i in range(3):")
     loop, = [block for block in file['blocks']

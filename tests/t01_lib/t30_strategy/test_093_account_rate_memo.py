@@ -197,7 +197,9 @@ def __test_a_non_converting_run_never_consults_the_memo__(script_path, module_ke
     from pynecore import lib
 
     strat = sys.modules['pynecore.lib.strategy']
-    saved = (lib._script, lib.bar_index, lib.barstate.isrealtime)
+    saved = (lib._script, lib.bar_index, lib.barstate.isrealtime, lib.syminfo.currency)
+    # The chart symbol is quoted in USDT, whatever an earlier test of the process left
+    lib.syminfo.currency = 'USDT'
 
     class _PlainScript:
         currency = 'NONE'  # what an undeclared strategy(currency=...) carries
@@ -234,7 +236,7 @@ def __test_a_non_converting_run_never_consults_the_memo__(script_path, module_ke
             # The rate the Pine builtins report stays the identity
             assert strat._account_rate() == 1.0, f"{script_obj}: rate is 1.0"
     finally:
-        lib._script, lib.bar_index, lib.barstate.isrealtime = saved
+        lib._script, lib.bar_index, lib.barstate.isrealtime, lib.syminfo.currency = saved
         strat._reset_currency_state()
 
 
@@ -250,7 +252,9 @@ def __test_percent_commission_ignores_another_scripts_rate__(script_path, module
     # in a process running several scripts the module-level rate can still belong to a
     # converting one. A non-converting run's commission must not pick it up.
     strat = sys.modules['pynecore.lib.strategy']
-    saved = (lib._script, lib.bar_index, lib.barstate.isrealtime)
+    saved = (lib._script, lib.bar_index, lib.barstate.isrealtime, lib.syminfo.currency)
+    # The chart symbol is quoted in USDT, whatever an earlier test of the process left
+    lib.syminfo.currency = 'USDT'
     saved_rate = request.currency_rate
 
     class _PlainScript:
@@ -281,5 +285,5 @@ def __test_percent_commission_ignores_another_scripts_rate__(script_path, module
         assert booked == 1.0, f"expected 1.0 unconverted, got {booked}"
     finally:
         request.currency_rate = saved_rate
-        lib._script, lib.bar_index, lib.barstate.isrealtime = saved
+        lib._script, lib.bar_index, lib.barstate.isrealtime, lib.syminfo.currency = saved
         strat._reset_currency_state()

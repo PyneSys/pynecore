@@ -851,8 +851,9 @@ def security_process_main(
     # this child needs the protocol, exactly like the chart side (see
     # ScriptRunner's sec_modules). Injecting only the main module leaves a
     # library main raising NameError on __active_security__.
+    libraries = script_mod.imported_libraries(script_module)
     sec_modules: list = [script_module]
-    for _reg_title, _reg_main in script_mod._registered_libraries:
+    for _reg_title, _reg_main in libraries:
         _reg_mod = sys.modules.get(getattr(_reg_main, '__module__', ''))
         if _reg_mod is not None and _reg_mod is not script_module:
             sec_modules.append(_reg_mod)
@@ -871,7 +872,7 @@ def security_process_main(
 
     # Fresh per-process state: drop anything inherited (fork start method) and
     # create the root state vectors of the entry points this process drives —
-    # the script's main and the registered library mains (same binding rules
+    # the script's main and the mains of the libraries it imports (same binding rules
     # as the runner: state-carrying entries get a root vector as hidden first
     # argument, stateless ones are called as-is)
     instance_state.reset()
@@ -886,8 +887,7 @@ def security_process_main(
     root_keys: list[str] = []
     seen_keys: set[str] = set()
     bound_entries: dict[int, Callable] = {}
-    # noinspection PyProtectedMember
-    for run_entry in [entry_func] + [f for _title, f in script_mod._registered_libraries]:
+    for run_entry in [entry_func] + [f for _title, f in libraries]:
         if id(run_entry) in bound_entries:
             continue
         entry_layout = getattr(run_entry, '__pyne_layout__', None)
@@ -910,7 +910,7 @@ def security_process_main(
 
     # noinspection PyProtectedMember
     def _run_script_main():
-        """Mirror the chart's ``_run_libs_and_main``: registered library mains
+        """Mirror the chart's ``_run_libs_and_main``: imported library mains
         initialize their exported-function proxies, so they must run before the
         script's ``main()`` on every bar — otherwise a script that calls an
         imported library function dies here with "Exported proxy has not been
@@ -920,7 +920,7 @@ def security_process_main(
         set_bool_na(na_bool)
         lib._in_lib_main = True
         try:
-            for _title, _lib_main in script_mod._registered_libraries:
+            for _title, _lib_main in libraries:
                 if _lib_main is not main_func:
                     bound_entries.get(id(_lib_main), _lib_main)()
         finally:
