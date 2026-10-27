@@ -376,6 +376,9 @@ def weekday_from_ordinal(year: int, idx: int) -> date:
     return base + timedelta(days=rem if bw + rem <= 4 else rem + 2)
 
 
+_DAY_END_MARKER = dt_time(23, 59, 59)
+
+
 def trading_day_end_sec(d: date, tz: ZoneInfo | dt_timezone | None,
                         opening_hours: 'list[SymInfoInterval] | None') -> int | None:
     """
@@ -385,7 +388,9 @@ def trading_day_end_sec(d: date, tz: ZoneInfo | dt_timezone | None,
     belongs to the trading day it opens into and ends the following weekday, a
     bounded day session ends on its own weekday. A round-the-clock interval
     (``00:00-00:00``) has no meaningful end inside the day and is skipped, which
-    keeps 24/7 feeds on the plain open-driven model.
+    keeps 24/7 feeds on the plain open-driven model. A ``23:59:59`` end is PyneCore's
+    end-of-day marker for a round-the-clock schedule, so that session really ends at
+    midnight.
 
     TradingView closes a daily bar at this instant, which :func:`trading_day`
     cannot express — it answers with a calendar date, derived from opens alone.
@@ -411,6 +416,8 @@ def trading_day_end_sec(d: date, tz: ZoneInfo | dt_timezone | None,
             continue
         sec = int(datetime(d.year, d.month, d.day,
                            end.hour, end.minute, end.second, tzinfo=tz).timestamp())
+        if end == _DAY_END_MARKER:
+            sec += 1
         if best is None or sec > best:
             best = sec
     return best
