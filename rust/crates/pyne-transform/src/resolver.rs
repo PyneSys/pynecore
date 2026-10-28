@@ -49,8 +49,8 @@ pub trait Files {
     /// pynecore's own, not user code.
     fn package(&self) -> &str;
 
-    /// The `.py` source `find_spec` resolves a dotted module name to
-    /// (`module_paths.module_spec_origin`).
+    /// The `.py` source a dotted module name resolves to, found without running a
+    /// package (`module_paths.module_spec_origin`).
     fn spec_origin(&self, dotted: &str) -> R<Option<String>>;
 
     /// The `.py` source of an imported module as the enum capture finds it
@@ -59,21 +59,6 @@ pub trait Files {
 
     /// A file, `None` when there is no file at the path.
     fn file(&self, path: &str) -> R<Option<File>>;
-
-    /// The route of a callee of a module that publishes no interface, and the source
-    /// files it holds while (`function_isolation.classify_imported`).
-    fn object_route(
-        &self,
-        module: &str,
-        names: &[String],
-        star: bool,
-    ) -> R<(String, Vec<Option<String>>)>;
-
-    /// Whether a library module whose alias shadows a builtin namespace imports.
-    fn import_library(&self, module: &str) -> R<bool>;
-
-    /// Whether such a library module serves a name.
-    fn library_serves(&self, module: &str, attr: &str) -> R<bool>;
 }
 
 /// How the modules a transform reaches are transformed.
@@ -493,14 +478,6 @@ impl<F: Files> Host for Resolver<F> {
         self.files.python()
     }
 
-    fn import_library(&self, module: &str) -> R<bool> {
-        self.files.import_library(module)
-    }
-
-    fn library_serves(&self, module: &str, attr: &str) -> R<bool> {
-        self.files.library_serves(module, attr)
-    }
-
     fn module_origin(&self, name: &str, importer: &str, level: i64) -> R<Option<String>> {
         self.files.module_origin(name, importer, level)
     }
@@ -555,15 +532,6 @@ impl<F: Files> Host for Resolver<F> {
 
     fn call_interface(&self, path: &str, settled: bool) -> R<Option<CallInterface>> {
         Ok(self.lookup(path, settled)?.map(|interface| interface.calls()))
-    }
-
-    fn object_route(
-        &self,
-        module: &str,
-        names: &[String],
-        star: bool,
-    ) -> R<(String, Vec<Option<String>>)> {
-        self.files.object_route(module, names, star)
     }
 
     fn source_key(&self, path: &str) -> R<(String, bool)> {

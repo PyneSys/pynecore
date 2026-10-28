@@ -475,6 +475,103 @@ def __test_native_export_capture_reads_enum_sources__(tmp_path, monkeypatch):
     assert 'capture_parity' not in sys.modules
 
 
+#: The modules a script routes its calls into, none of which may run: a package
+#: whose ``__init__`` binds nothing, its submodule, a package whose ``__init__``
+#: reexports, a plain module reexporting a Pyne function, and that Pyne module
+__test_helper_ROUTED = {
+    'routed_pkg/__init__.py': 'raise RuntimeError("must not execute")\n',
+    'routed_pkg/inner.py': ('raise RuntimeError("must not execute")\n\n\n'
+                            'class Box:\n    def __init__(self, x):\n        self.x = x\n\n\n'
+                            'def plain(x):\n    return x\n'),
+    'routed_bound/__init__.py': 'from .core import Box, plain\n',
+    'routed_bound/core.py': ('raise RuntimeError("must not execute")\n\n\n'
+                             'class Box:\n    def __init__(self, x):\n        self.x = x\n\n\n'
+                             'def plain(x):\n    return x\n'),
+    'routed_plain.py': 'from routed_pyne import acc\nraise RuntimeError("must not execute")\n',
+    'routed_pyne.py': ('"""\n@pyne\n"""\nfrom pynecore.types import Persistent\n\n\n'
+                       'def acc(x: float) -> float:\n    total: Persistent[float] = 0.0\n'
+                       '    total += x\n    return total\n'),
+}
+
+#: A script calling through every one of them
+__test_helper_ROUTING = '''"""
+@pyne
+"""
+from pynecore.lib import script, close, plot
+from routed_pkg import inner
+import routed_bound
+import routed_plain
+
+
+@script.indicator("routed")
+def main():
+    box = inner.Box(close)
+    other = routed_bound.Box(close)
+    plot(inner.plain(close) + routed_bound.plain(close) + routed_plain.acc(close) + box.x
+         + other.x, "value")
+'''
+
+
+def __test_native_isolation_routes_from_sources__(tmp_path, monkeypatch):
+    """The call-site isolation routes callees of packages, plain modules and the Pyne
+    functions they reexport from what the sources bind, natively as in Python, and
+    runs none of those modules: a name an empty ``__init__`` cannot bind is its
+    submodule, a class is constructed raw, a plain function takes the uniform route,
+    and a Pyne function reexported through a plain module the fast one."""
+    __test_helper_require_native()
+    for name, text in __test_helper_ROUTED.items():
+        (tmp_path / name).parent.mkdir(exist_ok=True)
+        (tmp_path / name).write_text(text)
+    path = tmp_path / 'routing.py'
+    path.write_text(__test_helper_ROUTING)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv('PYNE_AST_BACKEND', 'verify')
+    answers = []
+    run = native.run
+
+    def recording(names, tree, ctx, layout=None, table=False):
+        answer = run(names, tree, ctx, layout, table)
+        if 'FunctionIsolation' in names:
+            answers.append(answer)
+        return answer
+
+    monkeypatch.setattr(native, 'run', recording)
+    tree = ast.parse(__test_helper_ROUTING)
+    mode = import_hook._module_mode(tree)[1]
+    analysed = import_hook._analyse_tree(tree, __test_helper_ROUTING, path, mode)
+    lowered, _ = import_hook._lower_tree(analysed, path, mode)
+    assert answers and all(isinstance(answer, ast.Module) for answer in answers)
+    text = ast.unparse(lowered)
+    assert 'inner.Box(lib.close)' in text and 'routed_bound.Box(lib.close)' in text
+    assert '__bind_any·__(__state__, ' in text and ', inner.plain)' in text
+    assert ', routed_bound.plain)' in text
+    assert '__resolve_slot·__(__state__, ' in text and ', routed_plain.acc)' in text
+    assert not {'routed_pkg', 'routed_pkg.inner', 'routed_bound', 'routed_plain',
+                'routed_pyne'} & set(sys.modules)
+
+
+def __test_native_builtin_shadow_reads_the_library__(tmp_path, monkeypatch):
+    """A library aliased over a builtin namespace is read for what it serves, not run,
+    natively as in Python: a member it exports stays on it, any other falls back to
+    the builtin namespace."""
+    __test_helper_require_native()
+    library = tmp_path / 'lib' / 'user' / 'shadowed' / 'v1.py'
+    library.parent.mkdir(parents=True)
+    library.write_text("raise RuntimeError('must not execute')\n__all__ = ['boost']\n\n\n"
+                       "def boost(x):\n    return x\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    source = 'import lib.user.shadowed.v1 as ta\na = ta.boost(x)\nb = ta.rsi(x, 14)\n'
+    ctx = pipeline.PipelineContext(path=tmp_path / 'shadowing.py', pyne_mode=None, source=source)
+    answer = native.run(['BuiltinShadow'], ast.parse(source), ctx)
+    assert isinstance(answer, ast.Module)
+    step = next(step for step in pipeline.ANALYSIS
+                if isinstance(step, pipeline.Step) and step.name == 'BuiltinShadow')
+    native.verify('BuiltinShadow', step.run(ast.parse(source), ctx), answer, ctx)
+    text = ast.unparse(answer)
+    assert 'a = ta.boost(x)' in text and 'b = lib.ta.rsi(x, 14)' in text
+    assert 'lib.user.shadowed.v1' not in sys.modules
+
+
 def __test_helper_extras(tree: ast.AST) -> list[tuple[str, object]]:
     """Every value stamped on a tree as an attribute of its own, containers and the
     values inside them included, each node visited once, in a stable order. The

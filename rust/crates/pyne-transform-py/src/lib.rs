@@ -99,14 +99,6 @@ impl pyne_transform::Host for PyHost<'_> {
         self.python
     }
 
-    fn import_library(&self, module: &str) -> Result<bool, pyne_ast::Unsupported> {
-        self.ask("import_library", (module,))
-    }
-
-    fn library_serves(&self, module: &str, attr: &str) -> Result<bool, pyne_ast::Unsupported> {
-        self.ask("library_serves", (module, attr))
-    }
-
     fn has_module_properties(&self, module: &str) -> Result<bool, pyne_ast::Unsupported> {
         self.ask("has_module_properties", (module,))
     }
@@ -216,15 +208,6 @@ impl pyne_transform::Host for PyHost<'_> {
                 .map_err(|err| pyne_ast::Unsupported(format!("interface of {path}: {err}")))
         })
         .transpose()
-    }
-
-    fn object_route(
-        &self,
-        module: &str,
-        names: &[String],
-        star: bool,
-    ) -> Result<(String, Vec<Option<String>>), pyne_ast::Unsupported> {
-        self.ask("object_route", (module, names.to_vec(), star))
     }
 
     fn source_key(&self, path: &str) -> Result<(String, bool), pyne_ast::Unsupported> {

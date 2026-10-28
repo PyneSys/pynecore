@@ -12,12 +12,13 @@
 //! guard into a helper call (Python forbids a walrus there). Same-module callees are
 //! classified by the slot layout and a carrier fixpoint over the call graph;
 //! cross-module ones by the generated lib routes, the interface a Pyne module
-//! publishes, or (through the host) the object a module without one binds. The
+//! publishes, or what the source of a module without one binds; no module is run. The
 //! routes of the imported callees extend the module's dependency records (the
 //! native `PineTypeTable`'s `deps`).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 use indexmap::IndexMap;
@@ -27,6 +28,7 @@ use pyne_ast::{
 };
 
 use crate::data;
+use crate::module_interface::{StaticInterface, read_static_interface};
 use crate::pine_qualifier::{SERIES_LEN_ATTR, SERIES_LENGTH_KEYWORD, SERIES_LENS_ATTR};
 use crate::pine_type_rules::{
     PIN_ATTR, PINS_ATTR, VARYING_ATTR, VECTOR_ATTR, WIDENS_ATTR, stamp_lowering, ty_stamp,
@@ -96,7 +98,8 @@ impl Route {
         })
     }
 
-    /// The routes decided by what the callee object carries (`_OBJECT_ROUTES`).
+    /// The routes decided by what the modules on the import chain bind
+    /// (`_OBJECT_ROUTES`).
     fn is_object_route(&self) -> bool {
         matches!(self, Route::Direct | Route::Fast | Route::FastShared)
     }
@@ -104,6 +107,61 @@ impl Route {
 
 fn host_error(err: pyne_ast::Unsupported) -> Error {
     Error::Unsupported(err.0)
+}
+
+/// What a module publishes for the isolation to route by.
+enum Published {
+    /// The interface a Pyne module's lowering settled
+    Settled(Box<CallInterface>),
+    /// What the source of a module without one binds
+    Static(Rc<StaticInterface>),
+}
+
+impl Published {
+    fn all(&self) -> Option<&Vec<String>> {
+        match self {
+            Published::Settled(interface) => interface.all.as_ref(),
+            Published::Static(interface) => interface.all.as_ref(),
+        }
+    }
+
+    fn call_routes(&self) -> &IndexMap<String, String> {
+        match self {
+            Published::Settled(interface) => &interface.call_routes,
+            Published::Static(interface) => &interface.call_routes,
+        }
+    }
+
+    fn reexports(&self) -> &IndexMap<String, (i64, String, String)> {
+        match self {
+            Published::Settled(interface) => &interface.reexports,
+            Published::Static(interface) => &interface.reexports,
+        }
+    }
+}
+
+/// Whether a source file is a package's `__init__`.
+fn is_init(source: &str) -> bool {
+    Path::new(source).file_name().is_some_and(|name| name == "__init__.py")
+}
+
+/// The submodule a name of a package reaches (`_submodule`): `from pkg import name`
+/// imports `pkg.name` when the package's `__init__` binds no such name. `None` when
+/// the module is no package, may bind the name itself, or has no such submodule.
+fn submodule(
+    host: &dyn Host,
+    interface: &Published,
+    source: &str,
+    head: &str,
+) -> Result<Option<String>, Error> {
+    let Published::Static(interface) = interface else { return Ok(None) };
+    if !is_init(source) || interface.bound.contains(head) || interface.open {
+        return Ok(None);
+    }
+    let Some(directory) = Path::new(source).parent().and_then(Path::to_str) else {
+        return Err(Error::Unsupported(format!("the directory of {source}")));
+    };
+    host.package_member(directory, head).map_err(host_error)
 }
 
 fn is_test_function(name: &str) -> bool {
@@ -433,6 +491,8 @@ struct FunctionIsolation<'a, 'h> {
     used_helpers: BTreeSet<&'static str>,
     /// Callee path -> its route and the files it holds while (`_resolve_cache`)
     resolve_cache: HashMap<String, (Route, Vec<Option<String>>)>,
+    /// Source file -> what it binds (`_static_cache`)
+    static_cache: HashMap<String, Option<Rc<StaticInterface>>>,
     /// The module's type table stamp, the dependency records the routes extend
     table: Option<Value>,
     tracked_files: HashSet<String>,
@@ -585,7 +645,7 @@ impl FunctionIsolation<'_, '_> {
     /// The route of a callee path in a module, read off what the modules publish
     /// (`_resolve`).
     fn resolve(
-        &self,
+        &mut self,
         mut module: String,
         mut source: Option<String>,
         mut names: Vec<String>,
@@ -618,23 +678,23 @@ impl FunctionIsolation<'_, '_> {
                 // The module object itself, or imports that lead in a circle
                 return Ok((Route::Uniform, files));
             }
-            let pyne = !(module == "pynecore" || module.starts_with("pynecore."));
-            if pyne && source.is_none() {
+            if source.is_none() {
                 source = host.module_spec_origin(&module).map_err(host_error)?;
             }
-            let interface = match &source {
-                Some(path) if pyne => self.interface(path)?,
-                _ => None,
-            };
-            let (Some(interface), Some(path)) = (interface, source.clone()) else {
-                let (word, read) = host.object_route(&module, &names, star).map_err(host_error)?;
-                files.extend(read);
-                return Ok((Route::parse(&word)?, files));
+            let Some(path) = source.clone() else { return Ok((Route::Uniform, files)) };
+            let pyne = !(module == "pynecore" || module.starts_with("pynecore."));
+            let settled = if pyne { self.interface(&path)? } else { None };
+            let interface = match settled {
+                Some(interface) => Published::Settled(Box::new(interface)),
+                None => match self.static_interface(&path)? {
+                    Some(interface) => Published::Static(interface),
+                    None => return Ok((Route::Uniform, files)),
+                },
             };
             files.push(Some(path.clone()));
             let head = names[0].clone();
             if star {
-                let hidden = match &interface.all {
+                let hidden = match interface.all() {
                     Some(public) => !public.contains(&head),
                     None => head.starts_with('_'),
                 };
@@ -643,22 +703,32 @@ impl FunctionIsolation<'_, '_> {
                 }
                 star = false;
             }
-            if let Some(word) = interface.call_routes.get(&names.join(".")) {
+            let (call_routes, reexports) = (interface.call_routes(), interface.reexports());
+            if let Some(word) = call_routes.get(&names.join(".")) {
                 return Ok((Route::parse(word)?, files));
             }
-            if interface.call_routes.contains_key(&head) {
+            if call_routes.contains_key(&head) {
                 return Ok((Route::Uniform, files));
             }
             let Some((level, imported, attr)) =
-                interface.reexports.get(&head).or_else(|| interface.reexports.get(STAR)).cloned()
+                reexports.get(&head).or_else(|| reexports.get(STAR)).cloned()
             else {
-                return Ok((Route::Uniform, files));
+                let Some(member) = submodule(host, &interface, &path, &head)? else {
+                    return Ok((Route::Uniform, files));
+                };
+                module = format!("{module}.{head}");
+                source = Some(member);
+                names.remove(0);
+                continue;
             };
             if level != 0 {
                 // Relative to the package of the module the import stands in, found
-                // by its directory as the type pass finds it
+                // by its directory as the type pass finds it; a package's
+                // `__init__` stands in the package itself
                 let mut package: Vec<&str> = module.split('.').collect();
-                package.pop();
+                if !is_init(&path) {
+                    package.pop();
+                }
                 let level = usize::try_from(level)
                     .map_err(|_| Error::Unsupported(format!("an import level {level}")))?;
                 if level > package.len() {
@@ -699,10 +769,21 @@ impl FunctionIsolation<'_, '_> {
     /// The settled interface a Pyne module publishes, when it has one to give
     /// (`_interface`).
     fn interface(&self, source: &str) -> Result<Option<CallInterface>, Error> {
-        if Path::new(source).file_name().is_some_and(|name| name == "__init__.py") {
+        if is_init(source) {
             return Ok(None);
         }
         self.host.call_interface(source, true).map_err(host_error)
+    }
+
+    /// What a module's source binds, read once per module this transform routes
+    /// into (`_static_interface`).
+    fn static_interface(&mut self, source: &str) -> Result<Option<Rc<StaticInterface>>, Error> {
+        if let Some(cached) = self.static_cache.get(source) {
+            return Ok(cached.clone());
+        }
+        let interface = read_static_interface(self.host, source).map_err(host_error)?.map(Rc::new);
+        self.static_cache.insert(source.to_string(), interface.clone());
+        Ok(interface)
     }
 
     /// Make the module's cache depend on what a callee's route was decided by
@@ -1406,6 +1487,7 @@ pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, E
         ordinals: HashMap::new(),
         used_helpers: BTreeSet::new(),
         resolve_cache: HashMap::new(),
+        static_cache: HashMap::new(),
         table,
         tracked_files: HashSet::new(),
         close_module,

@@ -310,9 +310,21 @@ def __test_foo__(file_reader):
     assert 'file_reader()' in dump
 
 
-def __test_cross_module_classification__():
-    """ Imported callees are classified at transform time: layout attribute
-    -> fast path, transformed-module marker -> direct, unknown -> uniform """
+def __test_cross_module_classification__(tmp_path, monkeypatch):
+    """ Imported callees are routed by what their module's source binds, never by
+    the module's objects: a class is constructed raw, a function takes the uniform
+    route, and so does a module without a readable source -- whose state-carrying
+    callee the uniform route still binds """
+    (tmp_path / 'fake_plain_t092.py').write_text('''
+def setter(x):
+    return -x
+
+
+class Box:
+    def __init__(self, x):
+        self.x = x
+''', encoding='utf-8')
+    monkeypatch.syspath_prepend(str(tmp_path))
     transformed_mod = types.ModuleType('fake_pyne_lib_t092')
     exec('''
 __pyne_slot_layout__ = {'acc': {'init': (0.0,), 'series': (), 'varip': (),
@@ -323,34 +335,24 @@ def acc(__state__, x):
     return __state__[0]
 
 acc.__pyne_layout__ = __pyne_slot_layout__['acc']
-
-def helper(x):
-    return x + 1
 ''', transformed_mod.__dict__)
-    plain_mod = types.ModuleType('fake_plain_t092')
-    exec('''
-def setter(x):
-    return -x
-''', plain_mod.__dict__)
-    sys.modules['fake_pyne_lib_t092'] = transformed_mod
-    sys.modules['fake_plain_t092'] = plain_mod
+    monkeypatch.setitem(sys.modules, 'fake_pyne_lib_t092', transformed_mod)
     try:
         ns, dump = _transform('''
 import fake_pyne_lib_t092
 import fake_plain_t092
 
 def main(x):
-    return fake_pyne_lib_t092.acc(x), fake_pyne_lib_t092.helper(x), fake_plain_t092.setter(x)
+    return fake_pyne_lib_t092.acc(x), fake_plain_t092.setter(x), fake_plain_t092.Box(x).x
 ''')
         state = _make_state(ns['__pyne_slot_layout__']['main'])
-        assert ns['main'](state, 1.0) == (1.0, 2.0, -1.0)
-        assert ns['main'](state, 2.0) == (3.0, 3.0, -2.0)  # acc state persisted
-        assert '__resolve_slot·__(__state__, 0, fake_pyne_lib_t092.acc)' in dump
-        assert 'fake_pyne_lib_t092.helper(x)' in dump  # direct, untouched
+        assert ns['main'](state, 1.0) == (1.0, -1.0, 1.0)
+        assert ns['main'](state, 2.0) == (3.0, -2.0, 2.0)  # acc state persisted
+        assert '__bind_any·__(__state__, 0, fake_pyne_lib_t092.acc)' in dump
         assert '__bind_any·__(__state__, 1, fake_plain_t092.setter)' in dump
+        assert 'fake_plain_t092.Box(x)' in dump  # constructed raw
     finally:
-        del sys.modules['fake_pyne_lib_t092']
-        del sys.modules['fake_plain_t092']
+        sys.modules.pop('fake_plain_t092', None)
 
 
 def __test_nested_callee_in_attribute_base_gets_own_site__():

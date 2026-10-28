@@ -18,6 +18,7 @@ use pyne_ast::{
 };
 use serde_json::{Value, json};
 
+use crate::Host;
 use crate::ast_dump::{dump, has_field};
 use crate::pine_type_rules::{Classes, ImplSig, UNKNOWN, annotation_type, get_ty, impl_sig};
 use crate::pine_type_table::{
@@ -1075,6 +1076,58 @@ pub fn call_routes(plan: &CallPlan, ast: &Ast, layout: &ModuleLayout) -> IndexMa
         routes.insert(path.clone(), route.into());
     }
     routes
+}
+
+/// What a call through a module-level name of a module reaches, read off the
+/// module's source without running it: the routes of a module that publishes no
+/// settled interface (`StaticInterface`, see [`static_interface`]).
+#[derive(Clone, Debug, Default)]
+pub struct StaticInterface {
+    /// Dotted path -> its route word, as `ModuleInterface.call_routes`
+    pub call_routes: IndexMap<String, String>,
+    /// `ModuleInterface.reexports`
+    pub reexports: IndexMap<String, (i64, String, String)>,
+    /// The literal `__all__`, `None` when the module spells none
+    pub all: Option<Vec<String>>,
+    /// Every name a statement of the module may bind
+    pub bound: HashSet<String>,
+    /// Whether a name no statement binds may still be served: by a star import or
+    /// by a module `__getattr__`
+    pub open: bool,
+}
+
+/// The call interface of a module that publishes no settled one, from its tree
+/// alone (`static_interface`): what [`call_plan`] proves, with every function on
+/// the uniform route, since whether it carries state is not in its source.
+pub fn static_interface(ast: &Ast, tree: NodeId) -> StaticInterface {
+    let plan = call_plan(ast, tree);
+    let mut call_routes = plan.fixed;
+    for path in plan.defs.keys() {
+        call_routes.insert(path.clone(), ROUTE_UNIFORM.into());
+    }
+    let body = module_body(ast, tree);
+    let found = Bindings::new(ast, body);
+    StaticInterface {
+        call_routes,
+        reexports: plan.reexports,
+        all: module_all(ast, body),
+        open: !found.stars.is_empty() || found.names.contains_key("__getattr__"),
+        bound: found.names.into_keys().collect(),
+    }
+}
+
+/// The static interface of a module source file (`read_static_interface`); `None`
+/// when the file cannot be read. A source the native parser does not take answers
+/// `Unsupported`, where Python reads a `SyntaxError` as no interface.
+pub fn read_static_interface(
+    host: &dyn Host,
+    path: &str,
+) -> Result<Option<StaticInterface>, Unsupported> {
+    let Some(read) = host.read_source(path)? else { return Ok(None) };
+    let source = std::str::from_utf8(&read.data)
+        .map_err(|_| Unsupported(format!("the source of {path} is not UTF-8")))?;
+    let (ast, module) = pyne_parse::parse_module_as(source, host.python())?;
+    Ok(Some(static_interface(&ast, module)))
 }
 
 #[cfg(test)]

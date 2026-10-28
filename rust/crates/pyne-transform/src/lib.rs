@@ -62,9 +62,9 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// What a step needs to know that the tree does not say, answered by whoever runs
-/// the pipeline: the Python host from the live interpreter, a browser host from
-/// data it was handed. Each question is asked exactly where the Python step reads
-/// the live object, so a host that imports (Python) does so at the same moment.
+/// the pipeline: the Python host from the interpreter's file system, a browser host
+/// from data it was handed. Each question is asked exactly where the Python step
+/// asks it; no question runs a module.
 ///
 /// The registry questions default to the data files compiled in (see [`data`]);
 /// the Python host answers them from the registries the Python steps read, so a
@@ -74,18 +74,6 @@ pub trait Host {
     /// `(major, minor)`; a host without one follows the newest it knows.
     fn python(&self) -> (u32, u32) {
         data::newest_python()
-    }
-
-    /// Import a library module whose alias shadows a builtin namespace
-    /// (`builtin_shadow.import_library`); false when it cannot be imported.
-    fn import_library(&self, module: &str) -> Result<bool, Unsupported> {
-        let _ = module;
-        Ok(false)
-    }
-
-    /// Whether an imported library module serves a name (`builtin_shadow.library_serves`).
-    fn library_serves(&self, module: &str, attr: &str) -> Result<bool, Unsupported> {
-        Err(Unsupported(format!("no host to ask whether {module} serves {attr}")))
     }
 
     /// Whether `module_properties.json` has an entry for a module
@@ -172,9 +160,9 @@ pub trait Host {
         Ok(())
     }
 
-    /// The `.py` source a dotted module name resolves to through `find_spec`
-    /// (`module_paths.module_spec_origin(dotted)`); `None` when it is no readable
-    /// Python module.
+    /// The `.py` source a dotted module name resolves to, found without running a
+    /// package (`module_paths.module_spec_origin(dotted)`); `None` when it is no
+    /// readable Python module.
     fn module_spec_origin(&self, dotted: &str) -> Result<Option<String>, Unsupported> {
         Err(Unsupported(format!("no host to find module {dotted}")))
     }
@@ -203,20 +191,6 @@ pub trait Host {
     ) -> Result<Option<pine_type_table::CallInterface>, Unsupported> {
         let _ = settled;
         Err(Unsupported(format!("no host for the interface of {path}")))
-    }
-
-    /// The route of a callee of a module that publishes no interface, read off the
-    /// object an import of the module binds, and the source files it holds while
-    /// (`function_isolation.classify_imported(module, names, star)`). Only a host
-    /// with an interpreter has such a module.
-    fn object_route(
-        &self,
-        module: &str,
-        names: &[String],
-        star: bool,
-    ) -> Result<(String, Vec<Option<String>>), Unsupported> {
-        let _ = (names, star);
-        Err(Unsupported(format!("no host to import {module}")))
     }
 
     /// A module file's resolved path, and whether it lies in pynecore's own package

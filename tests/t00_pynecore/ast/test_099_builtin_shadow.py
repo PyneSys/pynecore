@@ -9,27 +9,32 @@ cannot serve to the canonical ``lib.ta.x`` form; the import normalizer then
 adds the pynecore imports for them like for any other built-in reference.
 """
 import ast
+import importlib
 import sys
-import types
+import tempfile
 from contextlib import contextmanager
+from pathlib import Path
 
 from pynecore.transformers.builtin_shadow import BuiltinShadowTransformer
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
 
 
 @contextmanager
-def _fake_lib(module_name: str, exported: list[str] | None = None, **attrs):
-    """Register a fake workdir library module for the transform-time import."""
-    module = types.ModuleType(module_name)
-    if exported is not None:
-        module.__all__ = exported
-    for name, value in attrs.items():
-        setattr(module, name, value)
-    sys.modules[module_name] = module
-    try:
-        yield module
-    finally:
-        del sys.modules[module_name]
+def _fake_lib(module_name: str, *members: str, exported: list[str] | None = None):
+    """Write a fake workdir library module, which the transform reads without running it."""
+    lines = [] if exported is None else [f'__all__ = {exported!r}']
+    lines += [f'def {member}(*args):\n    return None' for member in members]
+    with tempfile.TemporaryDirectory() as root:
+        path = Path(root, *module_name.split('.')).with_suffix('.py')
+        path.parent.mkdir(parents=True)
+        path.write_text('\n\n'.join(lines) + '\n', encoding='utf-8')
+        sys.path.insert(0, root)
+        importlib.invalidate_caches()
+        try:
+            yield path
+        finally:
+            sys.path.remove(root)
+            importlib.invalidate_caches()
 
 
 def _shadow(source: str) -> str:
@@ -41,7 +46,7 @@ def _shadow(source: str) -> str:
 def __test_missing_member_falls_back_to_builtin__():
     """ A member the library does not export routes to the built-in namespace;
     an exported one stays on the library """
-    with _fake_lib('lib.tv.ta.v7', exported=['t3'], t3=lambda: None):
+    with _fake_lib('lib.tv.ta.v7', 't3', exported=['t3']):
         dump = _shadow(
             'import lib.tv.ta.v7 as ta\n'
             'a = ta.valuewhen(c, t, 0)\n'
@@ -53,7 +58,7 @@ def __test_missing_member_falls_back_to_builtin__():
 
 def __test_alias_differs_from_library_name__():
     """ The fallback keys on the alias, not the library's own name """
-    with _fake_lib('lib.user.ta_ext.v1', exported=['boost'], boost=lambda: None):
+    with _fake_lib('lib.user.ta_ext.v1', 'boost', exported=['boost']):
         dump = _shadow(
             'import lib.user.ta_ext.v1 as ta\n'
             'a = ta.rsi(src, 14)\n'
@@ -67,7 +72,7 @@ def __test_canonical_alias_image_recognized__():
     """ A builtin-named alias arrives under its canonical image
     (``import ... as ta`` is emitted as ``as ta__ren__``); the fallback must
     key on the recovered source alias """
-    with _fake_lib('lib.tv.ta.v9', exported=['supertrend'], supertrend=lambda: None):
+    with _fake_lib('lib.tv.ta.v9', 'supertrend', exported=['supertrend']):
         dump = _shadow(
             'import lib.tv.ta.v9 as ta__ren__\n'
             'a = ta__ren__.crossover(c, s)\n'
@@ -81,7 +86,7 @@ def __test_canonical_member_image_falls_back_to_bare_name__():
     """ A trigger-named member is emitted under its canonical image
     (``math.max`` -> ``max__ren__``); when the library does not serve it, the
     built-in namespace knows the bare name only """
-    with _fake_lib('lib.user.mymath.v1', exported=['pow__ren__'], pow__ren__=lambda: None):
+    with _fake_lib('lib.user.mymath.v1', 'pow__ren__', exported=['pow__ren__']):
         dump = _shadow(
             'import lib.user.mymath.v1 as math__ren__\n'
             'a = math__ren__.max__ren__(x, y)\n'
@@ -93,7 +98,7 @@ def __test_canonical_member_image_falls_back_to_bare_name__():
 
 def __test_non_shadowing_alias_untouched__():
     """ An alias that is not a built-in namespace gets no fallback """
-    with _fake_lib('lib.tv.ta.v7', exported=['t3'], t3=lambda: None):
+    with _fake_lib('lib.tv.ta.v7', 't3', exported=['t3']):
         dump = _shadow(
             'import lib.tv.ta.v7 as myta\n'
             'a = myta.valuewhen(c, t, 0)\n'
@@ -104,7 +109,7 @@ def __test_non_shadowing_alias_untouched__():
 def __test_unknown_member_left_alone__():
     """ A member in neither the library nor the built-in namespace is kept
     on the library to fail at runtime, as before """
-    with _fake_lib('lib.tv.ta.v7', exported=['t3'], t3=lambda: None):
+    with _fake_lib('lib.tv.ta.v7', 't3', exported=['t3']):
         dump = _shadow(
             'import lib.tv.ta.v7 as ta\n'
             'a = ta.nosuchthing(x)\n'
@@ -113,7 +118,7 @@ def __test_unknown_member_left_alone__():
 
 
 def __test_unimportable_library_skipped__():
-    """ When the library cannot be imported the alias is left untouched —
+    """ When the library has no readable source the alias is left untouched —
     the script's own import statement reports the failure """
     dump = _shadow(
         'import lib.missing.ta.v9 as ta\n'
@@ -122,9 +127,9 @@ def __test_unimportable_library_skipped__():
     assert 'a = ta.valuewhen(c, t, 0)' in dump
 
 
-def __test_library_without_all_uses_hasattr__():
-    """ A hand-written library without ``__all__`` falls back to hasattr """
-    with _fake_lib('lib.user.ta.v1', helper=lambda: None):
+def __test_library_without_all_serves_its_bindings__():
+    """ A hand-written library without ``__all__`` serves the names it binds """
+    with _fake_lib('lib.user.ta.v1', 'helper'):
         dump = _shadow(
             'import lib.user.ta.v1 as ta\n'
             'a = ta.helper(x)\n'
@@ -137,7 +142,7 @@ def __test_library_without_all_uses_hasattr__():
 def __test_parameter_shadowing_masks_alias__():
     """ A function parameter named like the alias masks the fallback inside
     that scope only """
-    with _fake_lib('lib.tv.ta.v7', exported=['t3'], t3=lambda: None):
+    with _fake_lib('lib.tv.ta.v7', 't3', exported=['t3']):
         dump = _shadow(
             'import lib.tv.ta.v7 as ta\n'
             'def f(ta):\n'
@@ -151,7 +156,7 @@ def __test_parameter_shadowing_masks_alias__():
 def __test_normalizer_adds_builtin_imports__():
     """ The import normalizer picks up the rewritten chains and adds the
     pynecore imports for them """
-    with _fake_lib('lib.tv.ta.v7', exported=['t3'], t3=lambda: None):
+    with _fake_lib('lib.tv.ta.v7', 't3', exported=['t3']):
         tree = BuiltinShadowTransformer().visit(ast.parse(
             'import lib.tv.ta.v7 as ta\n'
             'a = ta.valuewhen(c, t, 0)\n'

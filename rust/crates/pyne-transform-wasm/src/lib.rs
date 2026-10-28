@@ -9,38 +9,37 @@
 //! Request: `{"source": str, "path": str, "pyne_mode": str | null,
 //! "user_code": bool, "na_bool": bool, "sequential": bool,
 //! "security_slice_disabled": bool, "emit_layout": bool, "steps": [str],
-//! "include_attributes": bool, "libraries": {module: [served name]},
-//! "python": "major.minor", "analyse": bool, "package": str,
-//! "modules": {dotted: path | null}, "origins": [[name, importer, level, path | null]],
+//! "include_attributes": bool, "python": "major.minor", "analyse": bool,
+//! "package": str, "modules": {dotted: path | null},
+//! "origins": [[name, importer, level, path | null]],
 //! "files": {path: null | {"resolved": str, "mtime_ns": int, "size": int,
-//! "source": str | null}}, "objects": [[module, [name], star, route, [path | null]]]}`.
+//! "source": str | null}}}`.
 //!
 //! A step name may also be a phase's (its rules in one traversal, or one pass each
-//! with `sequential`) or one rule's. `libraries` stands in for the Python host's
-//! imports: a library is importable when it is listed, and serves the names listed
-//! for it. `python` names the interpreter whose `repr` and `ast.unparse` the output
-//! follows, the newest one known when left out.
+//! with `sequential`) or one rule's. `python` names the interpreter whose `repr`
+//! and `ast.unparse` the output follows, the newest one known when left out.
 //!
 //! The rest is what the modules around this one look like (see
-//! `pyne_transform::resolver`): `modules` answers `find_spec` for a dotted name,
+//! `pyne_transform::resolver`): `modules` answers where a dotted name's source is,
 //! `origins` the enum capture's own module search, `files` every file the transform
 //! reads or tests for (`null`: there is no such file; a `null` source: it cannot be
-//! read), `objects` the route of a callee of a plain Python module, and `package` is
-//! the directory of the `pynecore` package. A Pyne dependency is transformed natively
-//! into the interface it publishes, unless `analyse` is false.
+//! read), and `package` is the directory of the `pynecore` package. A Pyne
+//! dependency is transformed natively into the interface it publishes, unless
+//! `analyse` is false; any other module the transform routes a call into is read
+//! for what it binds. No module is run.
 //!
 //! Response: `{"dump": str}` (the `ast.dump` of the transformed module, as the
 //! interpreter `python` names writes it),
 //! `{"rejected": str}` (the module is invalid), `{"unsupported": str}` (the
 //! native port does not cover it), `{"error": str}` (a malformed request), or
 //! `{"needs": [need]}` when the request left a question about the modules around it
-//! open: `{"module": dotted}`, `{"origin": [name, importer, level]}`,
-//! `{"file": path}` or `{"object": [module, [name], star]}`. The transform runs on
+//! open: `{"module": dotted}`, `{"origin": [name, importer, level]}` or
+//! `{"file": path}`. The transform runs on
 //! as if each were answered "none" to find every one it reaches, so a host answers
 //! them all and sends the request again.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use pyne_ast::Unsupported;
@@ -50,25 +49,13 @@ use serde_json::{Value, json};
 
 type R<T> = Result<T, Unsupported>;
 
-/// The route of a callee of a plain Python module, as the request answers it.
-struct ObjectRoute {
-    module: String,
-    names: Vec<String>,
-    star: bool,
-    route: String,
-    /// The source files the route holds while
-    read: Vec<Option<String>>,
-}
-
 /// What the request says about the modules around the one it transforms.
 struct RequestFiles {
     python: (u32, u32),
     package: String,
-    libraries: HashMap<String, HashSet<String>>,
     modules: HashMap<String, Option<String>>,
     origins: Vec<(String, String, i64, Option<String>)>,
     files: HashMap<String, Option<File>>,
-    objects: Vec<ObjectRoute>,
     /// The questions the request leaves open, in the order they were asked
     needs: RefCell<Vec<Value>>,
 }
@@ -124,33 +111,6 @@ impl Files for RequestFiles {
             }
         }
     }
-
-    fn object_route(
-        &self,
-        module: &str,
-        names: &[String],
-        star: bool,
-    ) -> R<(String, Vec<Option<String>>)> {
-        let found = self
-            .objects
-            .iter()
-            .find(|object| object.module == module && object.names == names && object.star == star);
-        match found {
-            Some(object) => Ok((object.route.clone(), object.read.clone())),
-            None => {
-                self.need(json!({ "object": [module, names, star] }));
-                Ok(("uniform".into(), Vec::new()))
-            }
-        }
-    }
-
-    fn import_library(&self, module: &str) -> R<bool> {
-        Ok(self.libraries.contains_key(module))
-    }
-
-    fn library_serves(&self, module: &str, attr: &str) -> R<bool> {
-        Ok(self.libraries.get(module).is_some_and(|names| names.contains(attr)))
-    }
 }
 
 /// Parse, run the requested steps, dump: the whole request in one call.
@@ -166,10 +126,6 @@ fn malformed(what: &str) -> Value {
     json!({ "error": format!("malformed {what}") })
 }
 
-fn strings(value: &Value) -> Option<Vec<String>> {
-    value.as_array()?.iter().map(|item| item.as_str().map(str::to_string)).collect()
-}
-
 fn optional_path(value: &Value) -> Result<Option<String>, Value> {
     match value {
         Value::Null => Ok(None),
@@ -181,16 +137,6 @@ fn optional_path(value: &Value) -> Result<Option<String>, Value> {
 fn request_files(request: &Value, python: (u32, u32)) -> Result<RequestFiles, Value> {
     let object = |name: &str| request.get(name).and_then(Value::as_object);
     let list = |name: &str| request.get(name).and_then(Value::as_array);
-    let libraries = object("libraries")
-        .map(|libraries| {
-            libraries
-                .iter()
-                .map(|(module, names)| {
-                    (module.clone(), strings(names).unwrap_or_default().into_iter().collect())
-                })
-                .collect()
-        })
-        .unwrap_or_default();
     let mut modules = HashMap::new();
     for (dotted, path) in object("modules").into_iter().flatten() {
         modules.insert(dotted.clone(), optional_path(path)?);
@@ -228,36 +174,12 @@ fn request_files(request: &Value, python: (u32, u32)) -> Result<RequestFiles, Va
         };
         files.insert(path.clone(), file);
     }
-    let mut objects = Vec::new();
-    for entry in list("objects").into_iter().flatten() {
-        let entry =
-            entry.as_array().filter(|entry| entry.len() == 5).ok_or_else(|| malformed("object"))?;
-        let module = entry[0].as_str().ok_or_else(|| malformed("object module"))?;
-        let names = strings(&entry[1]).ok_or_else(|| malformed("object names"))?;
-        let star = entry[2].as_bool().ok_or_else(|| malformed("object star"))?;
-        let route = entry[3].as_str().ok_or_else(|| malformed("object route"))?;
-        let read = entry[4]
-            .as_array()
-            .ok_or_else(|| malformed("object files"))?
-            .iter()
-            .map(optional_path)
-            .collect::<Result<Vec<_>, _>>()?;
-        objects.push(ObjectRoute {
-            module: module.to_string(),
-            names,
-            star,
-            route: route.to_string(),
-            read,
-        });
-    }
     Ok(RequestFiles {
         python,
         package: request.get("package").and_then(Value::as_str).unwrap_or_default().to_string(),
-        libraries,
         modules,
         origins,
         files,
-        objects,
         needs: RefCell::new(Vec::new()),
     })
 }

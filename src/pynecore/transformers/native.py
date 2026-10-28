@@ -46,10 +46,8 @@ from pathlib import Path
 from typing import Any
 
 from . import ast_walk
-from .builtin_shadow import Library, import_library, library_serves
 from .emission_settings import security_slice_disabled
 from .export_capture import module_origin
-from .function_isolation import classify_imported
 from . import module_interface
 from .lib_registry import lib_routes, lib_star_exports, lib_types
 from .module_paths import module_spec_origin, package_member
@@ -220,20 +218,9 @@ class _Host:
     Python step uses, at the moment the Python step would use them."""
 
     def __init__(self, analyse: Analyser | None = None, pipeline_hash: str = '') -> None:
-        self._libraries: dict[str, Library] = {}
         self._analyse = analyse
         self._pipeline_hash = pipeline_hash
         self._analysing: list[AbstractContextManager[None]] = []
-
-    def import_library(self, name: str) -> bool:
-        library = import_library(name)
-        if library is None:
-            return False
-        self._libraries[name] = library
-        return True
-
-    def library_serves(self, name: str, attr: str) -> bool:
-        return library_serves(self._libraries[name], attr)
 
     @staticmethod
     def has_module_properties(module: str) -> bool:
@@ -306,11 +293,6 @@ class _Host:
     @staticmethod
     def lib_route(path: str) -> str | None:
         return lib_routes().get(path)
-
-    @staticmethod
-    def object_route(module: str, names: list[str],
-                     star: bool) -> tuple[str, tuple[str | None, ...]]:
-        return classify_imported(module, names, star)
 
     @staticmethod
     def source_key(path: str) -> tuple[str, bool]:

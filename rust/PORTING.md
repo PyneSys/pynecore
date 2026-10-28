@@ -289,9 +289,11 @@ request from `ModuleLayout::new(pyne_mode == "lib")`, as the import hook does.
    over the supported interpreters; `test_145`); the lib routes come from the
    compiled `routes` section (`Host::lib_route`). A module that publishes no
    interface (plain Python, pynecore's own modules, a package's `__init__`, a Pyne
-   module without settled routes) is still classified by the object it binds,
-   through `Host::object_route` (`function_isolation.classify_imported`), which a
-   host without Python is handed by its caller. The dependency tracking asks
+   module without settled routes) is routed by what its source binds
+   (`module_interface.static_interface`, read through `Host::read_source`): a class
+   is constructed raw, an import leads on, a function takes the uniform route, and
+   a name an `__init__` cannot bind is the package's submodule. No module is run,
+   by either backend. The dependency tracking asks
    `Host::source_key` and `Host::source_record`. A module without a
    `_module_file_path` gets the content stamp Python gives it, the SHA-256 of its
    `ast.dump(include_attributes=True)` (`ast_dump.rs`).
@@ -326,10 +328,10 @@ canonical JSON, and the routes shape is taken over the `ast.dump` text of the
 interpreter the host names (`ast_dump.rs`). There is no `.pyc` to read an
 interface from: every dependency is transformed once per request.
 
-What only an interpreter or a file system can say comes from a `Files` source:
-where `find_spec` finds a dotted name, the enum capture's module search, the files
-themselves with their stat, the route of a callee of a plain Python module, and
-whether a library imports. The WebAssembly entry reads them from its request;
+What only a file system can say comes from a `Files` source: where a dotted name's
+source is, the enum capture's module search, and the files themselves with their
+stat. Nothing in the pipeline runs a module, so the transform needs no interpreter
+to answer anything else. The WebAssembly entry reads them from its request;
 a question the request leaves open is answered "none" for the rest of the run and
 returned as a `needs` list, so its caller answers every one and sends the request
 again. `pyne-parse` takes the interpreter's version too (`parse_module_as`): before

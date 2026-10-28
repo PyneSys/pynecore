@@ -52,10 +52,12 @@ from .pine_type_rules import UNKNOWN, ImplSig, annotation_type, impl_sig
 from .pine_type_table import (
     Analyser, ClassSig, DepRecord, ExportSig, ModuleInterface, PineTypeTable, qualify,
 )
+from .source_read import stable_source
 
 __all__ = [
     'NO_FINGERPRINT', 'build_interface', 'interface_digest',
     'routes_shape', 'routes_digest', 'CallPlan', 'call_plan', 'call_routes', 'STAR',
+    'StaticInterface', 'static_interface', 'read_static_interface',
     'ROUTE_SKIP', 'ROUTE_DIRECT', 'ROUTE_FAST', 'ROUTE_FAST_SHARED', 'ROUTE_UNIFORM',
     'source_digest', 'register', 'registered', 'lookup',
     'closes_cycle', 'analysing_scope', 'Compile', 'compiling', 'reached_back',
@@ -933,6 +935,67 @@ def call_routes(plan: CallPlan, layout: _Layout) -> dict[str, str]:
         else:
             routes[path] = ROUTE_DIRECT
     return routes
+
+
+@dataclass(frozen=True, slots=True)
+class StaticInterface:
+    """
+    What a call through a module-level name of a module reaches, read off the
+    module's source without running it: the routes of a module that publishes no
+    settled interface (see :func:`static_interface`).
+    """
+    #: Dotted path -> its route, as ``ModuleInterface.call_routes``
+    call_routes: dict[str, str]
+    #: ``ModuleInterface.reexports``
+    reexports: dict[str, tuple[int, str, str]]
+    #: The literal ``__all__``, None when the module spells none
+    all: tuple[str, ...] | None
+    #: Every name a statement of the module may bind
+    bound: frozenset[str]
+    #: Whether a name no statement binds may still be served: by a star import or
+    #: by a module ``__getattr__``
+    open: bool
+
+
+def static_interface(tree: ast.Module) -> StaticInterface:
+    """
+    The call interface of a module that publishes no settled one, from its tree alone.
+
+    :func:`call_plan` proves what each module-level name binds: a class is
+    constructed raw, an import leads on into the module it names. A function
+    takes the uniform route: whether it carries state is not in its source -- a
+    Pyne module's lowering gives it state, and a plain module may attach a
+    ``__pyne_bind__`` to it at run time, as ``core/series.py`` does to
+    ``inline_series`` -- and the uniform route binds whatever it turns out to be.
+
+    :param tree: The module as parsed
+    :return: Its static interface
+    """
+    plan = call_plan(tree)
+    routes = dict(plan.fixed)
+    for path in plan.defs:
+        routes[path] = ROUTE_UNIFORM
+    found = _Bindings(tree.body)
+    return StaticInterface(call_routes=routes, reexports=dict(plan.reexports),
+                           all=_module_all(tree), bound=frozenset(found.names),
+                           open=bool(found.stars) or '__getattr__' in found.names)
+
+
+def read_static_interface(path: str) -> StaticInterface | None:
+    """
+    The static interface of a module source file.
+
+    :param path: The ``.py`` source
+    :return: Its static interface, None when the file cannot be read or parsed
+    """
+    pair = stable_source(Path(path))
+    if pair is None:
+        return None
+    try:
+        tree = ast.parse(pair[0], filename=path)
+    except (SyntaxError, ValueError):
+        return None
+    return static_interface(tree)
 
 
 # --- the registry ---------------------------------------------------------

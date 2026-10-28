@@ -1,8 +1,9 @@
 from typing import Any, cast
 import ast
-import importlib
 
 from . import ast_walk
+from .module_interface import StaticInterface, read_static_interface
+from .module_paths import module_spec_origin
 from .module_property import module_properties
 
 # Pine namespaces whose pynecore module has a different name
@@ -11,29 +12,26 @@ _NAMESPACE_RENAMES = {
 }
 
 
-#: What :func:`import_library` hands back: the module, and its ``__all__`` (None without one)
-Library = tuple[Any, frozenset[str] | None]
+#: What :func:`import_library` hands back: what the library's source binds
+Library = StaticInterface
 
 
 def import_library(name: str) -> Library | None:
-    """Import a library module whose alias shadows a builtin namespace.
+    """Read a library module whose alias shadows a builtin namespace, without running it.
 
     :param name: The module name (``lib.user.somelib.v1``).
-    :return: The module and its exported names, or None when it cannot be imported
-        (the script's own import statement then reports it).
+    :return: What its source binds, or None when it has no readable source (the
+        script's own import statement then reports it).
     """
-    try:
-        lib_module = importlib.import_module(name)
-    except Exception:  # noqa: BLE001 - the script's own import will report it
-        return None
-    exported = getattr(lib_module, '__all__', None)
-    return lib_module, frozenset(exported) if exported is not None else None
+    source = module_spec_origin(name)
+    return None if source is None else read_static_interface(source)
 
 
 def library_serves(library: Library, attr: str) -> bool:
-    """Whether a library serves a name: its ``__all__``, or its attributes without one."""
-    lib_module, members = library
-    return attr in members if members is not None else hasattr(lib_module, attr)
+    """Whether a library serves a name: its literal ``__all__``, or the names its
+    statements bind without one. A name only a star import or a module ``__getattr__``
+    could serve is not counted."""
+    return attr in library.all if library.all is not None else attr in library.bound
 
 
 class BuiltinShadowTransformer(ast_walk.NodeTransformer):
@@ -49,13 +47,13 @@ class BuiltinShadowTransformer(ast_walk.NodeTransformer):
     (``lib.ta.valuewhen``), which the downstream transformers (import
     normalizer, module properties, isolation, series) handle natively.
 
-    Which members the library serves is runtime knowledge: the library module
-    is imported at transform time (the same pattern callee resolution uses in
-    function isolation). Its ``__all__`` is the membership test — matching
-    TV, where non-exported library names are not reachable through the alias —
-    with a ``hasattr`` fallback for hand-written libraries without ``__all__``.
-    If the library cannot be imported, the alias is left untouched and the
-    script fails at its own import statement exactly as before.
+    Which members the library serves is read off its source, without running
+    it (as function isolation routes its callees). Its literal ``__all__`` is the
+    membership test — matching TV, where non-exported library names are not
+    reachable through the alias — with the names its statements bind as the
+    fallback for hand-written libraries without one. If the library has no
+    readable source, the alias is left untouched and the script fails at its
+    own import statement exactly as before.
     """
 
     def __init__(self):

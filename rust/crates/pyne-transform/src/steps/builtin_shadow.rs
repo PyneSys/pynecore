@@ -3,15 +3,26 @@
 //!
 //! An attribute read through such an alias that the library does not serve is
 //! rewritten to the canonical built-in form (`lib.ta.valuewhen`). Which members a
-//! library serves is the host's knowledge ([`crate::Host`]): it is asked where the
-//! Python step imports the library and where it tests a member.
+//! library serves is read off its source, without running it: its literal
+//! `__all__`, or the names its statements bind without one.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use pyne_ast::walk::{Transformer, Visited, copy_location, generic_visit};
 use pyne_ast::{Ast, ExprContext, Kind, NodeId};
 
+use crate::module_interface::{StaticInterface, read_static_interface};
 use crate::{Context, Error, Host, Unsupported};
+
+/// Whether a library serves a name (`library_serves`): its literal `__all__`, or the
+/// names its statements bind without one.
+fn library_serves(library: &StaticInterface, attr: &str) -> bool {
+    match &library.all {
+        Some(all) => all.iter().any(|name| name == attr),
+        None => library.bound.contains(attr),
+    }
+}
 
 /// Pine namespaces whose pynecore module has a different name
 fn namespace_rename(name: &str) -> &str {
@@ -23,8 +34,8 @@ fn namespace_rename(name: &str) -> &str {
 
 struct BuiltinShadow<'h> {
     host: &'h dyn Host,
-    /// alias -> (library module name, builtin namespace)
-    aliases: HashMap<String, (String, String)>,
+    /// alias -> (what the library's source binds, builtin namespace)
+    aliases: HashMap<String, (Rc<StaticInterface>, String)>,
     /// The first host error: the step then declines the module
     error: Option<Unsupported>,
 }
@@ -66,7 +77,7 @@ impl BuiltinShadow<'_> {
         let Some((library, namespace)) = self.aliases.get(base).cloned() else { return Ok(id) };
 
         // The library serves the name -> the access stays on the library
-        if self.host.library_serves(&library, &attr)? {
+        if library_serves(&library, &attr) {
             return Ok(id);
         }
 
@@ -142,10 +153,10 @@ pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, E
             if !ctx.host.has_module_properties(&format!("lib.{namespace}"))? {
                 continue;
             }
-            if !ctx.host.import_library(module_name)? {
-                continue;
-            }
-            aliases.insert(asname.clone(), (module_name.clone(), namespace.to_string()));
+            // `import_library`: the library's source, read without running it
+            let Some(source) = ctx.host.module_spec_origin(module_name)? else { continue };
+            let Some(library) = read_static_interface(ctx.host, &source)? else { continue };
+            aliases.insert(asname.clone(), (Rc::new(library), namespace.to_string()));
         }
     }
     if aliases.is_empty() {

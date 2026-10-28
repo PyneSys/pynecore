@@ -31,7 +31,6 @@ from pynecore.core.import_hook import (  # noqa
     _get_transform_pipeline_hash, _module_mode, _script_bool_na, compile_interface,
 )
 from pynecore.transformers.export_capture import module_origin
-from pynecore.transformers.function_isolation import classify_imported
 from pynecore.transformers.module_paths import module_spec_origin
 from pynecore.transformers.pipeline import (  # noqa
     ANALYSIS, LOWERING, PipelineContext, _units, run_steps,
@@ -53,7 +52,6 @@ class Answers:
         self.modules: dict[str, str | None] = {}
         self.origins: dict[tuple[str, str, int], str | None] = {}
         self.files: dict[str, dict | None] = {}
-        self.objects: dict[tuple[str, tuple[str, ...], bool], tuple[str, list[str | None]]] = {}
 
     def answer(self, need: dict, request: dict) -> None:
         """Put the answer to one open question into a request."""
@@ -69,18 +67,11 @@ class Answers:
                 found = module_origin(name, importer, level)
                 self.origins[key] = None if found is None else str(found)
             request['origins'].append([name, importer, level, self.origins[key]])
-        elif 'file' in need:
+        else:
             path = need['file']
             if path not in self.files:
                 self.files[path] = self.file(path)
             request['files'][path] = self.files[path]
-        else:
-            module, names, star = need['object']
-            key = (module, tuple(names), star)
-            if key not in self.objects:
-                route, read = classify_imported(module, names, star)
-                self.objects[key] = (route, list(read))
-            request['objects'].append([module, names, star, *self.objects[key]])
 
     @staticmethod
     def file(path: str) -> dict | None:
@@ -163,8 +154,7 @@ def main() -> int:
                          'user_code': user_code, 'na_bool': na_bool, 'steps': names,
                          'include_attributes': True,
                          'python': f'{sys.version_info[0]}.{sys.version_info[1]}',
-                         'package': str(PACKAGE), 'modules': {}, 'origins': [], 'files': {},
-                         'objects': []})
+                         'package': str(PACKAGE), 'modules': {}, 'origins': [], 'files': {}})
     counts: Counter[str] = Counter()
     #: Why the native port declined, digits folded, so one reason counts once
     reasons: Counter[str] = Counter()
