@@ -2211,8 +2211,9 @@ class ScriptRunner:
         # Imported library modules can call request.security() too: merge their
         # contexts (sec ids carry a module hash, so they cannot collide) and
         # remember every module that needs the security protocol injected
+        libraries = script.imported_libraries(self.script_module)
         sec_modules: list = [self.script_module]
-        for _lib_title, _lib_main in script._registered_libraries:
+        for _lib_title, _lib_main in libraries:
             _lib_mod = sys.modules.get(getattr(_lib_main, '__module__', ''))
             if _lib_mod is not None and _lib_mod is not self.script_module:
                 sec_modules.append(_lib_mod)
@@ -2281,7 +2282,7 @@ class ScriptRunner:
             main_func = self.script_module.main
             bound_entries: dict[int, Callable[[], Any]] = {}
             seen_keys: set[str] = set()
-            for entry_func in [main_func] + [f for _title, f in script._registered_libraries]:
+            for entry_func in [main_func] + [f for _title, f in libraries]:
                 if id(entry_func) in bound_entries:
                     continue
                 entry_layout = getattr(entry_func, '__pyne_layout__', None)
@@ -2310,7 +2311,7 @@ class ScriptRunner:
             # A library file run directly as the script registers its main as a
             # library entry too — run it once per bar, not twice
             lib_mains = [_in_bool_mode(bound_entries[id(f)])
-                         for _title, f in script._registered_libraries if id(f) != id(main_func)]
+                         for _title, f in libraries if id(f) != id(main_func)]
 
             if sec_contexts:
                 import os
@@ -4617,8 +4618,8 @@ class ScriptRunner:
 
         keys = security_keys or set()
 
-        # Merge contexts from the script module and every registered library
-        # module — sec ids carry a module hash so they cannot collide. Track
+        # Merge contexts from the script module and every library module it
+        # imports — sec ids carry a module hash so they cannot collide. Track
         # which ids came from a library so the report can flag them.
         merged: dict[str, tuple[dict, bool]] = {}
 
@@ -4629,7 +4630,7 @@ class ScriptRunner:
                     merged[_sid] = (_ctx, from_lib)
 
         _absorb(self.script_module, False)
-        for _lib_title, _lib_main in script._registered_libraries:
+        for _lib_title, _lib_main in script.imported_libraries(self.script_module):
             _mod_name = getattr(_lib_main, '__module__', '')
             if _mod_name not in sys.modules:
                 continue

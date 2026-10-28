@@ -195,6 +195,7 @@ from pynecore.types.strategy import (
 if TYPE_CHECKING:
     from pynecore.core.broker.position import BrokerPosition, ProvisionalClose
     from pynecore.core.plugin.broker import BrokerPlugin, PositionPort
+    from pynecore.lib.strategy import Order
 
 __all__ = ['OrderSyncEngine']
 
@@ -1429,6 +1430,12 @@ class OrderSyncEngine:
         # net of a base-coin fee), so :meth:`awaiting_market_fills` keys off
         # the venue's completion instead; a fresh dispatch carries fresh ids.
         self._filled_entry_order_ids = _BoundedIdSet(_FILLED_ENTRY_ORDER_IDS_CAP)
+        # Exit intent keys whose working legs already took a fill. Such a leg's
+        # venue order qty counts its filled part, so :meth:`_bound_exit_qty_to_held`
+        # must not amend it down to the exposure left after that fill. A fresh
+        # dispatch of the key (:meth:`_dispatch_new`) starts it clean. In-memory
+        # only.
+        self._filled_exit_keys: set[str] = set()
         # In-flight flip-fold surplus corrections replayed from a PRIOR
         # process run: close ``intent_key`` ->
         # :class:`_PendingFlipSurplusClose`. Runs on the current code never
@@ -3556,6 +3563,11 @@ class OrderSyncEngine:
         resolved = [self._resolve_ticks(i) for i in raw]
         final = self._apply_interceptors(resolved)
         final = self._clamp_close_intents(final)
+        # Measured live (bybit-spot cycle 348, 2026-10-26): a bar-later
+        # ``strategy.exit`` re-issue with new levels amended the fee-netted
+        # 0.009995 bracket back to the gross 0.01; its stop then sold 5e-06
+        # more than the run held and quarantined the spot inventory ledger.
+        final = self._bound_exit_intents_to_held(final)
 
         dispatchable: list[Intent] = []
         new_deferred: dict[str, ExitIntent] = {}
@@ -8890,6 +8902,14 @@ class OrderSyncEngine:
                         self._active_entry_filled_qty[event.pine_id] = total
                     if event.event_type == "filled":
                         self._filled_entry_order_ids.add(event.order.id)
+                        self._mark_backing_entry_consumed(event.pine_id, active_entry)
+            if (event.leg_type in (LegType.TAKE_PROFIT, LegType.STOP_LOSS,
+                                   LegType.TRAILING_STOP)
+                    and event.pine_id and event.from_entry
+                    and (event.fill_qty or 0.0) > 0.0):
+                self._filled_exit_keys.add(
+                    f"{event.pine_id}{INTENT_KEY_SEP}{event.from_entry}",
+                )
             # Feed the must-settle marker of a flip-fold surplus correction
             # with this slice. Every partial counts towards the dispatched
             # quantity and the marker is retired only when they add up (see
@@ -10371,6 +10391,7 @@ class OrderSyncEngine:
             if resolved.has_unresolved_ticks:
                 self._deferred_exits[key] = deferred
                 continue
+            resolved = self._bound_exit_qty_to_held(resolved)
             try:
                 self._dispatch_new(resolved)
             except OrderSkippedByPlugin as e:
@@ -11930,12 +11951,16 @@ class OrderSyncEngine:
     def _amend_bracket_qty_for_entry_fill(self, event: OrderEvent) -> None:
         """Track partial entry fills with an incremental bracket qty amend.
 
-        Canonical semantics (Option A): the bracket's qty follows the entry's
-        cumulative ``filled_qty`` — every partial fill dispatches a
-        :meth:`BrokerPlugin.modify_exit` with ``new_qty = filled_qty``. This
-        mirrors the Pine backtester, where exits exist against the actually
-        filled entry portion; it also guarantees that if the entry ends with
-        unfilled remainder (cancel/expire), the bracket is not over-sized.
+        Canonical semantics (Option A): the bracket's qty follows what the
+        entry id actually holds — every fill dispatches a
+        :meth:`BrokerPlugin.modify_exit` sized by :meth:`_whole_row_exit_qty`
+        (the script's exit qty, capped at the net exposure booked under the
+        entry id, earlier same-id pyramid fills included). This mirrors the
+        Pine backtester, where exits exist against the actually filled entry
+        portion; it also guarantees that if the entry ends with unfilled
+        remainder (cancel/expire), the bracket is not over-sized. Without a
+        Pine exit order to size from, the bracket follows this order's
+        cumulative fill (net of a base-coin fee).
 
         Suppressed when:
 
@@ -12022,11 +12047,23 @@ class OrderSyncEngine:
             return
 
         entry_intent = self._active_intents.get(pine_id)
-        target_qty = filled_qty
-        overfill = False
-        if isinstance(entry_intent, EntryIntent) and gross_filled > entry_intent.qty:
-            target_qty = min(target_qty, entry_intent.qty)
-            overfill = True
+        overfill = isinstance(entry_intent, EntryIntent) and gross_filled > entry_intent.qty
+        # The bracket covers the whole entry id: a same-id pyramid add filling
+        # on top of an earlier fill must not shrink it to this order's own
+        # fill. Sized like every rebuild of the Pine exit (the script's qty,
+        # capped at the held net), so the next sync derives the same qty.
+        target_qty: float | None = None
+        pine_exit = self._position.exit_orders.get(
+            (bracket_intent.pine_id, bracket_intent.from_entry),
+        )
+        if pine_exit is not None:
+            target_qty = self._whole_row_exit_qty(
+                bracket_intent, abs(float(pine_exit.size)),
+            )
+        if target_qty is None:
+            target_qty = filled_qty
+            if overfill and isinstance(entry_intent, EntryIntent):
+                target_qty = min(target_qty, entry_intent.qty)
 
         if target_qty == bracket_intent.qty:
             if overfill:
@@ -12056,7 +12093,6 @@ class OrderSyncEngine:
             self._active_intents.pop(bracket_key, None)
             return
         self._active_intents[bracket_key] = new_intent
-        self._sync_pine_exit_qty(new_intent, target_qty)
 
         self._emit_broker_event(LegPartialRepairedEvent(
             pine_id=new_intent.pine_id,
@@ -12157,23 +12193,6 @@ class OrderSyncEngine:
                         in self._position.exit_orders):
                     continue
                 self._seed_partial_bracket_exit_from_legs(ikey, legs)
-
-    def _sync_pine_exit_qty(self, bracket: ExitIntent, new_qty: float) -> None:
-        """Mutate the Pine-side exit :class:`Order` to match the amended qty.
-
-        Without this, the next :meth:`sync` rebuilds the ExitIntent from the
-        unchanged ``pos.exit_orders`` entry (keyed by ``_exit_order_key``; whose ``size``
-        still equals the original full qty), the diff engine sees a mismatch
-        against the amended active intent, and emits a *second* ``modify_exit``
-        back to the original qty — undoing the partial-fill cascade we just did.
-        """
-        exit_orders = self._position.exit_orders
-        order = exit_orders.get((bracket.pine_id, bracket.from_entry))
-        if order is None:
-            return
-        sign = 1.0 if order.size >= 0.0 else -1.0
-        order.size = sign * new_qty
-        order.sign = sign if new_qty > 0.0 else 0.0
 
     def _emit_overfill_event(
             self,
@@ -14351,6 +14370,73 @@ class OrderSyncEngine:
             elif isinstance(intent, EntryIntent):
                 mods['stop'] = result.modified_stop
         return dataclasses.replace(intent, **mods) if mods else intent
+
+    def _bound_exit_intents_to_held(self, intents: list[Intent]) -> list[Intent]:
+        """Apply :meth:`_bound_exit_qty_to_held` to every exit of a rebuilt intent list."""
+        return [
+            self._bound_exit_qty_to_held(i) if isinstance(i, ExitIntent) else i
+            for i in intents
+        ]
+
+    def _bound_exit_qty_to_held(self, intent: ExitIntent) -> ExitIntent:
+        """Keep a whole-row exit from closing more than its parent entry holds.
+
+        ``build_intents`` sizes an exit from the Pine order, i.e. from the
+        script's quantity, which is the GROSS figure the entry was dispatched
+        with. What the parent actually holds is the net exposure booked under
+        ``from_entry`` (:meth:`_parent_open_exposure`); the two differ on a spot
+        venue that takes the buy fee in the base coin, and while a resting entry
+        is only partially filled. The fill-time amend
+        (:meth:`_amend_bracket_qty_for_entry_fill`) brings a working bracket down
+        to the filled net, and this bound keeps every later rebuild — a script
+        re-issuing ``strategy.exit`` with new levels, an exit first placed on a
+        bar after its entry filled, a tick-based exit resolved on the fill —
+        from sizing it back up past what is held.
+
+        The sizing rule is :meth:`_whole_row_exit_qty`.
+        """
+        bounded = self._whole_row_exit_qty(intent, intent.qty)
+        if bounded is None or bounded == intent.qty:
+            return intent
+        return dataclasses.replace(intent, qty=bounded)
+
+    def _whole_row_exit_qty(self, bracket: ExitIntent, script_qty: float) -> float | None:
+        """The qty a whole-row exit works at: the script's qty, capped at what is held.
+
+        The cap is the net exposure booked under ``from_entry``
+        (:meth:`_parent_open_exposure`), summed over every open trade of the
+        entry id, so a same-id pyramid add is covered once it fills. While the
+        bracket's own legs have taken a fill, a working bracket above the cap
+        keeps its working qty instead: the venue order qty counts the filled
+        part, and amending it down to the exposure left after that fill would
+        shrink the leg's remainder. A script qty below the cap is kept.
+
+        ``None`` when the cap does not apply:
+
+        - a partial-qty (scale-out) bracket — the script asked for a slice, and
+          the engine-trigger / reduce-only paths cap its close at the parent
+          size when it fires;
+        - an exit whose parent holds nothing yet (a bracket placed with its
+          entry, sized again by the fill-time amend);
+        - venues with a native TP/SL bracket (``tp_sl_bracket = NATIVE``),
+          which track the parent fills themselves.
+
+        :param bracket: The exit to size.
+        :param script_qty: The quantity the script declares for it.
+        """
+        if self._tp_sl_bracket_native or bracket.is_partial_qty_bracket:
+            return None
+        held, _ = self._parent_open_exposure(bracket.from_entry)
+        if held <= 0.0:
+            return None
+        cap = held
+        active = self._active_intents.get(bracket.intent_key)
+        if (isinstance(active, ExitIntent) and active.qty > cap
+                and bracket.intent_key in self._filled_exit_keys):
+            cap = active.qty
+        if script_qty <= cap * (1.0 + 1e-9):
+            return script_qty
+        return cap
 
     def _clamp_close_intents(self, intents: list[Intent]) -> list[Intent]:
         """Cap total close quantity to the current exposure before dispatch.
@@ -16961,7 +17047,7 @@ class OrderSyncEngine:
                     # qualifies — a partially filled resting order still has
                     # a live working remainder that the modify path owns.
                     filled_prev = self._active_entry_filled_qty.get(key, 0.0)
-                    if filled_prev >= active_intent.qty - 1e-9:
+                    if self._entry_cycle_consumed(key, active_intent.qty):
                         if self._entry_reject_retry_exhausted(key, intent):
                             # Same reversal entry the exchange already rejected
                             # up to the bounded cap and Pine keeps re-emitting
@@ -17064,6 +17150,50 @@ class OrderSyncEngine:
                 )
             # else: unchanged — skip
 
+    def _entry_cycle_consumed(self, key: str, qty: float) -> bool:
+        """Whether the entry cycle tracked under ``key`` has nothing left working.
+
+        The fill ledger (:attr:`_active_entry_filled_qty`) books the
+        position-moving quantity, which a spot buy charged its fee in the
+        base coin never brings up to the dispatched ``qty``. Completion is
+        therefore also read in the venue's own terms: every venue order of
+        the cycle reported its terminal fill, or the venue cancelled the
+        unfilled remainder of a partially filled entry (the truncated
+        sentinel, consumed at its filled quantity).
+
+        :param key: The entry's intent key.
+        :param qty: The quantity the cycle was dispatched with.
+        """
+        if self._active_entry_filled_qty.get(key, 0.0) >= qty - 1e-9:
+            return True
+        truncated = self._truncated_entries.get(key)
+        if truncated is not None and truncated[1] is self._active_intents.get(key):
+            return True
+        refs = self._order_mapping.get(key)
+        return bool(refs) and all(ref in self._filled_entry_order_ids for ref in refs)
+
+    def _mark_backing_entry_consumed(self, key: str, active: EntryIntent) -> None:
+        """Mark the Pine entry ``Order`` a completed dispatch was built from as fully filled.
+
+        ``Order.filled_qty`` tells ``strategy.exit`` how much of a retained
+        entry order is already held, and the rest is bound as a still-pending
+        add. A spot buy booked net of a base-coin fee never adds up to the
+        order's size, so the venue's completion closes the gap: otherwise the
+        fee residue stays a phantom pending entry and the exit leg is sized
+        for it instead of for the holding.
+
+        :param key: The entry's intent key.
+        :param active: The entry's active intent.
+        """
+        if not self._entry_cycle_consumed(key, active.qty):
+            return
+        backing: Order | None = self._entry_backing_orders.get(key)
+        if backing is None:
+            return
+        size = abs(backing.size)
+        if backing.filled_qty < size:
+            backing.filled_qty = size
+
     def _maybe_redispatch_reissued_entry(
             self, key: str, intent: EntryIntent,
             skipped_entry_ids_this_sync: set[str],
@@ -17104,7 +17234,7 @@ class OrderSyncEngine:
         if not isinstance(active, EntryIntent):
             return
         filled_prev = self._active_entry_filled_qty.get(key, 0.0)
-        if filled_prev < active.qty - 1e-9:
+        if not self._entry_cycle_consumed(key, active.qty):
             return
         current_order = self._position.entry_orders.get(intent.pine_id)
         if current_order is None:
@@ -19432,6 +19562,7 @@ class OrderSyncEngine:
                         and not intent.stop_fired_market):
                     self._arm_entry_stop_watch(intent, envelope)
             elif isinstance(intent, ExitIntent):
+                self._filled_exit_keys.discard(intent.intent_key)
                 # Route engine-trigger partial brackets through the
                 # dedicated state-machine dispatch. The condition is
                 # deliberately conjunctive (mode AND intent flag) so a
@@ -23229,7 +23360,8 @@ class OrderSyncEngine:
                     if (entry_order is not None
                             and entry_order.filled_qty > filled_entry):
                         filled_entry = entry_order.filled_qty
-                    if filled_entry >= old.qty - 1e-9:
+                    if (filled_entry >= old.qty - 1e-9
+                            or self._entry_cycle_consumed(old.intent_key, old.qty)):
                         _blog_info(
                             "dispatching keyed close %s directly over consumed "
                             "entry (filled=%s qty=%s); dependent protection "

@@ -45,7 +45,7 @@ PyneCore is free and open source under the Apache 2.0 license. Learn more on the
 PyneComp converts Pine Script to Pyne code. It compiles Pine Script v4, v5 and v6, and converts v1 to v3 sources on
 a best-effort basis. It is a separate PyneSys service that needs an API key, available through:
 
-- The [pynesys.io](https://pynesys.io) web interface
+- The [pynesys.io](https://pynesys.io/compiler) web interface
 - The PyneCore CLI (`pyne compile`, or `pyne run` on a `.pine` file) with an API key
 - The [PyneSys Discord bot](https://discord.pynesys.io): `/pyne-help` shows how it works, `/pyne-convert` converts a
   script, and every Discord user gets 3 free conversions

@@ -10721,6 +10721,346 @@ def __test_fee_netted_full_fill_amends_bracket_to_the_net_inventory__():
     assert engine.active_intents["TP\0L"].qty == 0.009995
 
 
+def _base_fee_entry_fill(pine_id: str, *, net: float, gross: float,
+                         price: float = 50_000.0, xchg_id: str | None = None) -> OrderEvent:
+    """A spot market buy whose base-coin fee shrinks the booked fill below the wire fill."""
+    exch = ExchangeOrder(
+        id=xchg_id or f"xchg-{pine_id}", symbol=SYMBOL, side="buy",
+        order_type=OrderType.MARKET, qty=gross,
+        filled_qty=gross, remaining_qty=0.0,
+        price=None, stop_price=None, average_fill_price=price,
+        status=OrderStatus.FILLED,
+        timestamp=0.0, fee=gross - net, fee_currency="ETH",
+    )
+    return OrderEvent(
+        order=exch, event_type='filled', fill_price=price,
+        fill_qty=net, timestamp=0.0,
+        pine_id=pine_id, leg_type=LegType.ENTRY,
+    )
+
+
+def _fee_netted_bracket(b: MockBroker) -> tuple[OrderSyncEngine, BrokerPosition]:
+    """A 0.01 spot buy booked at 0.009995, its bracket amended to the net at the fill."""
+    engine, pos = _mk_engine_with_sink(b, [])
+    pos.entry_orders["L"] = _entry_order("L", 0.01)
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -0.01, "TP", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+    engine.on_order_event(_base_fee_entry_fill("L", net=0.009995, gross=0.01))
+    engine.sync(BAR_TS + 60_000)
+    assert engine.active_intents["TP\0L"].qty == 0.009995
+    b.modify_exit_calls.clear()
+    return engine, pos
+
+
+def __test_fee_netted_bracket_keeps_the_net_qty_when_the_script_reissues_new_levels__():
+    """A later-bar ``strategy.exit`` re-issue amends the levels, never back to the gross qty.
+
+    The re-issued Pine exit is sized from the script's gross quantity again;
+    amending the bracket to it oversold the run's spot inventory when the stop
+    fired (measured live: bybit-spot cycle 348, sell 0.01 vs inventory 0.009995).
+    """
+    b = MockBroker()
+    engine, pos = _fee_netted_bracket(b)
+
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -0.01, "TP", limit=61_000.0, stop=46_000.0,
+    )
+    engine.sync(BAR_TS + 120_000)
+
+    assert len(b.modify_exit_calls) == 1
+    old, new = b.modify_exit_calls[0]
+    assert old.intent.qty == 0.009995
+    assert new.intent.qty == 0.009995
+    assert (new.intent.tp_price, new.intent.sl_price) == (61_000.0, 46_000.0)
+    assert engine.active_intents["TP\0L"].qty == 0.009995
+
+    engine.sync(BAR_TS + 180_000)
+    assert len(b.modify_exit_calls) == 1
+
+
+def __test_fee_netted_bracket_amend_that_did_not_go_out_is_retried_by_the_next_sync__():
+    """A fill-time net amend lost to a connection error is sent again by the next sync."""
+    b = MockBroker()
+    engine, pos = _mk_engine_with_sink(b, [])
+    pos.entry_orders["L"] = _entry_order("L", 0.01)
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -0.01, "TP", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+    b.raise_on_next_modify_exit = ExchangeConnectionError("venue unreachable")
+    engine.on_order_event(_base_fee_entry_fill("L", net=0.009995, gross=0.01))
+    with pytest.raises(ExchangeConnectionError):
+        engine.sync(BAR_TS + 60_000)
+    assert engine.active_intents["TP\0L"].qty == 0.01
+
+    engine.sync(BAR_TS + 120_000)
+
+    assert [new.intent.qty for _, new in b.modify_exit_calls] == [0.009995, 0.009995]
+    assert engine.active_intents["TP\0L"].qty == 0.009995
+
+
+def __test_exit_placed_after_a_fee_netted_fill_is_dispatched_at_the_net_qty__():
+    """An exit the script first places on a bar after its entry filled covers only the net fill."""
+    b = MockBroker()
+    engine, pos = _mk_engine_with_sink(b, [])
+    pos.entry_orders["L"] = _entry_order("L", 0.01)
+    engine.sync(BAR_TS)
+    engine.on_order_event(_base_fee_entry_fill("L", net=0.009995, gross=0.01))
+    engine.sync(BAR_TS + 60_000)
+
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -0.01, "TP", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS + 120_000)
+
+    assert [env.intent.qty for env in b.exit_calls] == [0.009995]
+    assert b.modify_exit_calls == []
+
+
+def __test_tick_exit_resolved_on_a_fee_netted_fill_is_dispatched_at_the_net_qty__():
+    """A tick-based exit armed by the entry fill goes out at the net fill, not gross then amended."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b, mintick=1.0)
+    pos.entry_orders["L"] = _entry_order("L", 0.01)
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -0.01, "TP", profit_ticks=100.0, loss_ticks=50.0,
+    )
+    engine.sync(BAR_TS)
+    assert "TP\0L" in engine.deferred_exits
+
+    engine.on_order_event(_base_fee_entry_fill("L", net=0.009995, gross=0.01))
+    engine.sync(BAR_TS)
+
+    assert [env.intent.qty for env in b.exit_calls] == [0.009995]
+    assert b.modify_exit_calls == []
+    assert engine.active_intents["TP\0L"].qty == 0.009995
+
+
+def __test_fee_netted_bracket_with_a_partly_filled_leg_is_not_amended_under_its_fill__():
+    """After the bracket's own leg filled partly, a re-issue keeps the bracket's working qty.
+
+    The venue order qty counts the filled part, so bounding the bracket to the
+    exposure left after that fill would shrink the leg's remainder.
+    """
+    b = MockBroker()
+    engine, pos = _fee_netted_bracket(b)
+    tp_fill = _fill_event(
+        'sell', 0.004, 60_000.0, pine_id="TP", leg=LegType.TAKE_PROFIT,
+        xchg_id="xchg-TP", event_type='partial', filled_qty=0.004,
+        remaining_qty=0.005995,
+    )
+    engine.on_order_event(replace(tp_fill, from_entry="L"))
+    engine.sync(BAR_TS + 120_000)
+    assert pos.size == pytest.approx(0.005995)
+    assert b.modify_exit_calls == []
+
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -0.01, "TP", limit=61_000.0, stop=46_000.0,
+    )
+    engine.sync(BAR_TS + 180_000)
+
+    assert len(b.modify_exit_calls) == 1
+    assert b.modify_exit_calls[0][1].intent.qty == 0.009995
+
+
+def __test_gross_filled_bracket_reissue_keeps_the_script_qty__():
+    """Where the booked fill equals the wire fill, a re-issue amends the levels at the script qty."""
+    b = MockBroker()
+    engine, pos = _mk_engine_with_sink(b, [])
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+    engine.on_order_event(_fill_event('buy', 1.0, 50_000.0, pine_id="L"))
+    engine.sync(BAR_TS + 60_000)
+    assert b.modify_exit_calls == []
+
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -1.0, "TP", limit=61_000.0, stop=46_000.0,
+    )
+    engine.sync(BAR_TS + 120_000)
+
+    assert len(b.modify_exit_calls) == 1
+    assert b.modify_exit_calls[0][1].intent.qty == 1.0
+
+
+def __test_partially_filled_entry_bracket_reissue_stays_at_the_filled_qty__():
+    """A re-issue while the entry is only partly filled does not size the bracket past the fill."""
+    b = MockBroker()
+    engine, pos = _mk_engine_with_sink(b, [])
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+    engine.on_order_event(_partial_entry_event(
+        pine_id="L", fill_delta=0.4, cumulative_filled=0.4,
+        order_qty=1.0, price=50_000.0,
+    ))
+    engine.sync(BAR_TS + 60_000)
+    assert engine.active_intents["TP\0L"].qty == 0.4
+
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -1.0, "TP", limit=61_000.0, stop=46_000.0,
+    )
+    engine.sync(BAR_TS + 120_000)
+
+    assert b.modify_exit_calls[-1][1].intent.qty == 0.4
+    assert engine.active_intents["TP\0L"].qty == 0.4
+
+    engine.on_order_event(_partial_entry_event(
+        pine_id="L", fill_delta=0.6, cumulative_filled=1.0,
+        order_qty=1.0, price=50_000.0,
+    ))
+    engine.sync(BAR_TS + 180_000)
+    assert engine.active_intents["TP\0L"].qty == 1.0
+
+
+def _fee_netted_consumed_entry(b: MockBroker) -> tuple[OrderSyncEngine, BrokerPosition]:
+    """A 0.01 spot market buy the venue completed, booked at 0.009995 net of its fee."""
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 0.01)
+    engine.sync(BAR_TS)
+    (ref,) = engine.order_mapping["L"]
+    engine.on_order_event(_base_fee_entry_fill("L", net=0.009995, gross=0.01, xchg_id=ref))
+    engine.sync(BAR_TS + 60_000)
+    assert pos.size == pytest.approx(0.009995)
+    assert len(b.entry_calls) == 1
+    return engine, pos
+
+
+def __test_fee_netted_completed_entry_marks_its_pine_order_fully_filled__():
+    """The venue's completion closes the fee gap on the retained Pine entry order.
+
+    ``strategy.exit`` binds the unfilled rest of a retained entry order as a
+    pending add; left at the net 0.009995, the 5e-06 fee residue would be bound
+    as a phantom pending entry and size the exit leg for it.
+    """
+    b = MockBroker()
+    _engine, pos = _fee_netted_consumed_entry(b)
+
+    assert pos.entry_orders["L"].filled_qty == 0.01
+
+
+def __test_fee_netted_entry_reissued_by_the_script_dispatches_a_new_cycle__(monkeypatch):
+    """A same-parameter ``strategy.entry`` re-issue over a fee-netted fill is a pyramid add.
+
+    Measured live (bybit-spot cycle 348): the re-signalled ``L1`` add was
+    swallowed as the sticky sentinel because the net fill never reached the
+    gross qty, while the strategy runtime kept counting it as pending.
+    """
+    monkeypatch.setattr(lib._script, "pyramiding", 3, raising=False)
+    b = MockBroker()
+    engine, pos = _fee_netted_consumed_entry(b)
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.entry_calls) == 1
+
+    pos.entry_orders["L"] = _entry_order("L", 0.01)
+    engine.sync(BAR_TS + 180_000)
+
+    assert len(b.entry_calls) == 2
+
+
+def __test_fee_netted_entry_superseded_with_new_parameters_is_not_amended__(monkeypatch):
+    """A re-emitted entry with new parameters over a completed fee-netted fill is a fresh cycle."""
+    monkeypatch.setattr(lib._script, "pyramiding", 3, raising=False)
+    b = MockBroker()
+    engine, pos = _fee_netted_consumed_entry(b)
+
+    pos.entry_orders["L"] = _entry_order("L", 0.02)
+    engine.sync(BAR_TS + 120_000)
+
+    assert b.modify_entry_calls == []
+    assert b.cancel_calls == []
+    assert [env.intent.qty for env in b.entry_calls] == [0.01, 0.02]
+
+
+def __test_keyed_close_over_a_fee_netted_entry_dispatches_without_cancelling__():
+    """``strategy.close(id)`` over a completed fee-netted entry sends the close only.
+
+    The consumed entry has no resting remainder: the cancel-then-close path
+    would cancel the filled order and evict the protection of the residual.
+    """
+    b = MockBroker()
+    engine, pos = _fee_netted_consumed_entry(b)
+
+    pos.exit_orders[("Close entry(s) order L", "L")] = Order(
+        "L", -0.005, order_type=_order_type_close,
+        exit_id="Close entry(s) order L",
+    )
+    engine.sync(BAR_TS + 120_000)
+
+    assert [env.intent.qty for env in b.close_calls] == [0.005]
+    assert b.cancel_calls == []
+    assert len(b.entry_calls) == 1
+
+
+def __test_fee_netted_entry_reanchors_over_a_stale_close_slot_without_dispatch__():
+    """The retained fee-netted entry re-anchors over a stale close slot, never re-executes."""
+    from pynecore.core.broker.models import EntryIntent
+
+    b = MockBroker()
+    engine, pos = _fee_netted_consumed_entry(b)
+    engine._active_intents["L"] = CloseIntent(
+        pine_id="L", symbol=SYMBOL, side="sell", qty=0.009995,
+    )
+
+    engine.sync(BAR_TS + 120_000)
+
+    assert len(b.entry_calls) == 1
+    assert b.close_calls == []
+    assert b.cancel_calls == []
+    assert isinstance(engine.active_intents["L"], EntryIntent)
+
+
+def __test_same_id_add_fill_amends_the_bracket_to_the_whole_holding__(monkeypatch):
+    """A same-id pyramid add filling partly grows the bracket, never shrinks it to the add's fill.
+
+    The bracket covers every trade booked under the entry id: the 1.0 held
+    plus each slice of the add.
+    """
+    monkeypatch.setattr(lib._script, "pyramiding", 3, raising=False)
+    b = MockBroker()
+    engine, pos = _mk_engine_with_sink(b, [])
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -1.0, "TP", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+    (ref,) = engine.order_mapping["L"]
+    engine.on_order_event(_fill_event('buy', 1.0, 50_000.0, pine_id="L", xchg_id=ref))
+    engine.sync(BAR_TS + 60_000)
+    assert engine.active_intents["TP\0L"].qty == 1.0
+
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=49_000.0)
+    pos.exit_orders[("TP", "L")] = _exit_order(
+        "L", -2.0, "TP", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.entry_calls) == 2
+    assert engine.active_intents["TP\0L"].qty == 1.0
+    (add_ref,) = engine.order_mapping["L"]
+
+    engine.on_order_event(_partial_entry_event(
+        pine_id="L", fill_delta=0.4, cumulative_filled=0.4,
+        order_qty=1.0, price=49_000.0, xchg_id=add_ref,
+    ))
+    engine.sync(BAR_TS + 180_000)
+    assert pos.size == pytest.approx(1.4)
+    assert engine.active_intents["TP\0L"].qty == pytest.approx(1.4)
+
+    engine.on_order_event(_partial_entry_event(
+        pine_id="L", fill_delta=0.6, cumulative_filled=1.0,
+        order_qty=1.0, price=49_000.0, xchg_id=add_ref,
+    ))
+    engine.sync(BAR_TS + 240_000)
+    assert engine.active_intents["TP\0L"].qty == pytest.approx(2.0)
+    assert [new.intent.qty for _, new in b.modify_exit_calls] == pytest.approx([1.4, 2.0])
+
+
 def __test_subsequent_partial_fill_emits_another_amend__():
     """Each partial fill with a new cumulative qty triggers a fresh amend."""
     b = MockBroker()

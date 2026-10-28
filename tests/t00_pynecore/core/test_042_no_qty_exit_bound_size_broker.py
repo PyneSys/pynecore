@@ -153,3 +153,50 @@ def __test_restart_reconstructed_sibling_still_caps_a_reissued_leg__(live_env):
 
     reissued = live_env.exit_orders[("TP", "Long")]
     assert abs(reissued.size) == pytest.approx(7.0)
+
+
+def __test_exit_covers_a_filled_holding_and_a_same_id_pending_add__(live_env):
+    """A re-issued same-id entry leaves the exit covering the holding plus the add.
+
+    A live broker keeps one leg per exit id and entry id: the pending add must
+    grow that leg, not replace the leg protecting the filled holding.
+    """
+    live_env.entry_orders["Long"] = Order("Long", 0.001, order_type=_order_type_entry)
+    live_env.record_fill(_buy_fill(0.001, 50_000.0, pine_id="Long"))
+    lib._script.pyramiding = 3
+
+    strategy.entry("Long", strategy.long, qty=0.001)
+    strategy.exit("Bracket", from_entry="Long", limit=51_500.0, stop=48_500.0)
+
+    assert list(live_env.exit_orders) == [("Bracket", "Long")]
+    assert abs(live_env.exit_orders[("Bracket", "Long")].size) == pytest.approx(0.002)
+
+
+def __test_entry_less_exit_covers_a_filled_holding_and_a_same_id_pending_add__(live_env):
+    """The ``from_entry``-less exit folds a same-id pending add into the holding's leg too."""
+    live_env.entry_orders["Long"] = Order("Long", 0.001, order_type=_order_type_entry)
+    live_env.record_fill(_buy_fill(0.001, 50_000.0, pine_id="Long"))
+    lib._script.pyramiding = 3
+
+    strategy.entry("Long", strategy.long, qty=0.001)
+    strategy.exit("Bracket", limit=51_500.0, stop=48_500.0)
+
+    assert list(live_env.exit_orders) == [("Bracket", "Long")]
+    assert abs(live_env.exit_orders[("Bracket", "Long")].size) == pytest.approx(0.002)
+
+
+def __test_exit_after_a_completed_fee_netted_entry_covers_the_net_holding__(live_env):
+    """An entry order the venue completed binds no pending rest, whatever its net fill.
+
+    A spot buy booked net of a base-coin fee fills 0.0009995 of a 0.001 order;
+    once the venue reports it complete the order is fully filled, so the exit
+    covers the 0.0009995 held instead of a 5e-07 phantom pending remainder.
+    """
+    entry = Order("Long", 0.001, order_type=_order_type_entry)
+    live_env.entry_orders["Long"] = entry
+    live_env.record_fill(_buy_fill(0.0009995, 50_000.0, pine_id="Long"))
+    entry.filled_qty = abs(entry.size)
+
+    strategy.exit("Bracket", from_entry="Long", limit=51_500.0, stop=48_500.0)
+
+    assert abs(live_env.exit_orders[("Bracket", "Long")].size) == pytest.approx(0.0009995)

@@ -242,6 +242,7 @@ class Order:
         "budget_pv",  # Account point value (quote->account rate) frozen with it
         "budget_price",  # Would-execute price at that placement: the level, or the close past it
         "filled_qty",  # Live: quantity of this entry order already reflected in open_trades
+        #               (its full size once the venue completed it, net of a base-coin fee)
         "flip_extra",  # Reversal flip magnitude frozen at creation (added back on deferred re-size)
         "skip_flip",  # Entry re-placed on the same bar: it keeps its raw qty, no flip augmentation
         "bar_index",  # Bar index when the order was placed
@@ -7735,6 +7736,36 @@ def _exit_filled_targets(
     return [(None, trade_id, slot[0], slot[1]) for trade_id, slot in grouped.items()]
 
 
+def _fold_live_pending_into_target(
+        position: PositionBase, targets: list[tuple[int | None, str, float, float]],
+        entry_id: str, sign: float, size: float) -> bool:
+    """Fold a still-pending entry into the filled target of the same id on a live broker.
+
+    The backtest binds a leg to every filled entry and one more to the pending
+    entry order, each under its own ``entry_seq``. A live broker has no binding
+    book: every leg of one ``strategy.exit`` id and entry id shares a single
+    order key, so a separate pending leg would replace the leg covering the
+    filled holding. Here the filled target grows by the pending size instead,
+    and its one leg reserves off both -- the holding plus the add once it
+    fills, the same pre-fan-out shape the filled targets already have. A
+    pending entry on the opposite side (a same-id reversal) is not folded.
+
+    :param position: The position the exit is issued on.
+    :param targets: The ``(entry_seq, entry_id, sign, size)`` filled targets, updated in place.
+    :param entry_id: The pending entry order's id.
+    :param sign: Sign of the pending entry order.
+    :param size: Bindable size of the pending entry order.
+    :return: Whether the pending size was folded into a filled target.
+    """
+    if isinstance(position, SimPosition):
+        return False
+    for i, (entry_seq, target_id, target_sign, target_size) in enumerate(targets):
+        if target_id == entry_id and target_sign == sign:
+            targets[i] = (entry_seq, target_id, target_sign, target_size + size)
+            return True
+    return False
+
+
 # noinspection PyProtectedMember
 def _exit_pending_size(position: PositionBase, entry_id: str) -> tuple[float, float]:
     """Sign and bindable size of a still-pending entry order, at its CURRENT size.
@@ -7845,24 +7876,23 @@ def exit(id: str, from_entry: str = "",
     if qty < 0.0:
         return
 
-    direction = 0
-    init_size = 0.0
-    entry_seq: int | None = None
-
     # Find direction and size
     if from_entry:
         # One leg per filled entry, plus one for a still-pending entry order.
         # The position should be open, or an entry order should exist.
-        for entry_seq, _target_id, direction, init_size in _exit_filled_targets(position, from_entry):
-            _exit_leg(position, id, from_entry, entry_seq, direction, init_size,
+        targets = _exit_filled_targets(position, from_entry)
+        pending_direction, pending_size = _exit_pending_size(position, from_entry)
+        if pending_direction and _fold_live_pending_into_target(
+                position, targets, from_entry, pending_direction, pending_size):
+            pending_direction = 0.0
+        for entry_seq, _target_id, target_direction, target_size in targets:
+            _exit_leg(position, id, from_entry, entry_seq, target_direction, target_size,
                       qty, qty_percent, profit, limit, loss, stop,
                       trail_price, trail_points, trail_offset, oca_name,
                       comment, comment_profit, comment_loss, comment_trailing,
                       alert_message, alert_profit, alert_loss, alert_trailing)
-        direction, init_size = _exit_pending_size(position, from_entry)
-        if direction:
-            entry_seq = None
-            _exit_leg(position, id, from_entry, entry_seq, direction, init_size,
+        if pending_direction:
+            _exit_leg(position, id, from_entry, None, pending_direction, pending_size,
                       qty, qty_percent, profit, limit, loss, stop,
                       trail_price, trail_points, trail_offset, oca_name,
                       comment, comment_profit, comment_loss, comment_trailing,
@@ -7872,14 +7902,8 @@ def exit(id: str, from_entry: str = "",
                 exit_order.named_entry = True
 
     else:
-        for entry_seq, from_entry, direction, init_size in _exit_filled_targets(position, None):
-            _exit_leg(position, id, from_entry, entry_seq, direction, init_size,
-                      qty, qty_percent, profit, limit, loss, stop,
-                      trail_price, trail_points, trail_offset, oca_name,
-                      comment, comment_profit, comment_loss, comment_trailing,
-                      alert_message, alert_profit, alert_loss, alert_trailing)
-        in_position = bool(direction)
-
+        targets = _exit_filled_targets(position, None)
+        in_position = bool(targets)
         # A still-pending entry order is a target too -- but only one that OPENS
         # from flat or ADDS in the position's own direction, so its bracket is
         # already live on the bar it fills. The opposite leg of a REVERSAL is not:
@@ -7896,18 +7920,30 @@ def exit(id: str, from_entry: str = "",
         # Strategy with trailing ATR stop" reference): its from_entry-less
         # qty_percent leg fires on the pyramid add's OWN fill bar, exactly like
         # the from_entry-bound leg beside it.
-        entry_seq = None
+        pending: list[tuple[str, float, float]] = []
         for order in list(position.entry_orders.values()):
             if in_position and order.sign != position.sign:
                 continue
-            from_entry = order.order_id or ""
-            direction, init_size = _exit_pending_size(position, from_entry)
-            if not direction:
+            pending_id = order.order_id or ""
+            pending_direction, pending_size = _exit_pending_size(position, pending_id)
+            if not pending_direction:
                 continue
+            if _fold_live_pending_into_target(position, targets, pending_id,
+                                              pending_direction, pending_size):
+                continue
+            pending.append((pending_id, pending_direction, pending_size))
+        for entry_seq, target_id, target_direction, target_size in targets:
+            _exit_leg(position, id, target_id, entry_seq, target_direction, target_size,
+                      qty, qty_percent, profit, limit, loss, stop,
+                      trail_price, trail_points, trail_offset, oca_name,
+                      comment, comment_profit, comment_loss, comment_trailing,
+                      alert_message, alert_profit, alert_loss, alert_trailing)
+
+        for pending_id, pending_direction, pending_size in pending:
             # Only mark as from_entry_na on first creation (not replacement)
-            exit_key = _exit_key(id, from_entry)
+            exit_key = _exit_key(id, pending_id)
             had_existing_exit = exit_key in position.exit_orders
-            _exit_leg(position, id, from_entry, entry_seq, direction, init_size,
+            _exit_leg(position, id, pending_id, None, pending_direction, pending_size,
                       qty, qty_percent, profit, limit, loss, stop,
                       trail_price, trail_points, trail_offset, oca_name,
                       comment, comment_profit, comment_loss, comment_trailing,

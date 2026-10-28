@@ -100,9 +100,6 @@ class APIErrorHandler:
                         self.console.print(
                             f"[yellow]Location:[/yellow] Line {line_num} in {file_name}"
                         )
-                        self.console.print(
-                            "[yellow]Quick fix:[/yellow] Check the variable declaration and spelling"
-                        )
                         structured_error_parsed = True
 
                 # Fallback to generic error display if structured parsing failed

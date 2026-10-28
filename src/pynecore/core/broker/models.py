@@ -687,12 +687,11 @@ class ExitIntent:
     # ``compare=False`` deliberately excludes the flag from
     # :meth:`__eq__` / :meth:`__hash__`: it is a *route selector* derived
     # from the intent, not state that needs to be diff-synced to the
-    # broker. The sync engine's qty-cap reconciliation
-    # (``_sync_pine_exit_qty``) mutates the ``exit_orders`` entry (keyed by
-    # ``_exit_order_key``) ``.size`` after a partial entry fill so the next ``build_intents``
-    # produces an ExitIntent with the capped qty; including the derived
-    # flag in equality would let that cap mutation flip the flag and
-    # trigger a spurious second ``modify_exit`` dispatch even though
+    # broker. The sync engine caps a whole-row exit's qty at the held
+    # exposure (``OrderSyncEngine._whole_row_exit_qty``), so the same Pine
+    # exit can reach the diff at different quantities as the parent fills;
+    # including the derived flag in equality would let a re-derivation
+    # flip it and trigger a spurious second ``modify_exit`` dispatch even though
     # nothing the broker needs to know has changed.
     is_partial_qty_bracket: bool = field(default=False, compare=False)
 

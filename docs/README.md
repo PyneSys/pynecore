@@ -16,7 +16,7 @@ tags: ["overview", "introduction", "documentation"]
 # PyneCore Documentation
 
 PyneCore runs Pine Script-style indicators and strategies in Python. Its API follows TradingView's Pine Script v6,
-and existing Pine Script is converted to Pyne code with [PyneComp](https://pynesys.io), a separate service used with an
+and existing Pine Script is converted to Pyne code with [PyneComp](https://pynesys.io/compiler), a separate service used with an
 API key.
 
 The results are validated against TradingView on <!--wild:scripts_total-->1,000<!--/wild--> published TradingView scripts:
