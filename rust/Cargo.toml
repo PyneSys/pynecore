@@ -1,0 +1,34 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/pyne-ast",
+    "crates/pyne-parse",
+    "crates/pyne-transform",
+    "crates/pyne-transform-py",
+    "crates/pyne-transform-wasm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+authors = ["PYNESYS LLC <hello@pynesys.com>"]
+
+[workspace.dependencies]
+pyne-ast = { path = "crates/pyne-ast" }
+pyne-parse = { path = "crates/pyne-parse" }
+pyne-transform = { path = "crates/pyne-transform" }
+# The parser crates are internal to Ruff and not published; pinned to a release tag
+ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "0.16.10" }
+ruff_python_ast = { git = "https://github.com/astral-sh/ruff", tag = "0.16.10" }
+ruff_text_size = { git = "https://github.com/astral-sh/ruff", tag = "0.16.10" }
+# Insertion-ordered maps and sets, for the Python dicts whose order a step emits
+indexmap = "2"
+serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
+pyo3 = { version = "0.30", features = ["abi3-py311", "extension-module"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

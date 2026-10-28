@@ -2,7 +2,7 @@ import ast
 from typing import Dict, Set, List, cast
 
 from . import ast_walk
-from .pine_type_infer import lib_star_exports
+from .lib_registry import lib_star_exports
 
 NON_MODULE_ATTRS = {
     'input',  # class

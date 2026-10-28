@@ -3,20 +3,18 @@
 """
 import ast
 import importlib
+import importlib.util
 import struct
 import builtins as py_builtins
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 from pynecore.core import inline_support
 from pynecore.lib import array as lib_array, math as lib_math
 from pynecore.transformers.call_inline import (
     CallInlineTransformer,
-    NotDerivable,
-    INLINABLE_FUNCTIONS,
     SUPPORT_MODULE,
-    SUPPORT_NAMES,
-    derive_template,
     varargs_expansion_arities,
 )
 from pynecore.transformers.float_tolerance import FloatToleranceTransformer
@@ -33,6 +31,19 @@ __test_helper_PROLOGUE = (
     "import pynecore.lib.array\n"
     "import pynecore.lib.math\n"
 )
+
+
+def __test_helper_collector() -> ModuleType:
+    """The template generator, ``scripts/call_inline_collector.py``.
+
+    :return: The loaded script module.
+    """
+    path = Path(__file__).resolve().parents[3] / 'scripts' / 'call_inline_collector.py'
+    spec = importlib.util.spec_from_file_location('call_inline_collector', path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def __test_helper_inline(body: str, prologue: str = __test_helper_PROLOGUE) -> str:
@@ -262,7 +273,7 @@ def __test_call_inline_marks_comparisons_exact__():
 def __test_call_inline_support_anchors__():
     """Every anchor is the very object the wrapper's own module resolves the
     name to -- a module global first, a builtin otherwise."""
-    for module_name, names in SUPPORT_NAMES.items():
+    for module_name, names in __test_helper_collector().SUPPORT_NAMES.items():
         module = importlib.import_module(module_name)
         for name, anchor in names.items():
             assert hasattr(inline_support, anchor), f'{anchor} missing'
@@ -275,21 +286,24 @@ def __test_call_inline_support_anchors__():
 def __test_call_inline_every_entry_is_derivable__():
     """Every allow-listed function still has the body shape the pass copies.
 
-    A body edit that breaks the shape must fail here: the site would silently
-    fall back to a plain call, and the measured behaviour the pass copies
+    A body edit that breaks the shape must fail here: the generator refuses to
+    write a registry without it, and the measured behaviour the pass copies
     would drift away from what it was verified against.
     """
-    assert INLINABLE_FUNCTIONS
-    for module_name, func_name in INLINABLE_FUNCTIONS:
-        template = derive_template(module_name, func_name)
-        assert template.params
+    collector = __test_helper_collector()
+    assert collector.INLINABLE_FUNCTIONS
+    for (module_name, func_name), kind in collector.INLINABLE_FUNCTIONS.items():
+        if kind == 'derive':
+            params, _ = collector.derive_expression(module_name, func_name)
+            assert params
 
 
 def __test_call_inline_differential_math__():
     """Every one-argument math wrapper answers bit-identically inlined."""
-    for module_name, func_name in INLINABLE_FUNCTIONS:
+    inlinable = __test_helper_collector().INLINABLE_FUNCTIONS
+    for module_name, func_name in inlinable:
         if module_name != 'pynecore.lib.math' \
-                or INLINABLE_FUNCTIONS[(module_name, func_name)] != 'derive' \
+                or inlinable[(module_name, func_name)] != 'derive' \
                 or func_name == 'pow':
             continue
         expression = f'lib.math.{func_name}(a0)'
@@ -406,10 +420,11 @@ def __test_call_inline_differential_array__():
 def __test_call_inline_rejected_functions__():
     """The functions left off the allow-list are left off on purpose, and the
     reason still holds: their bodies are not expressions."""
+    inlinable = __test_helper_collector().INLINABLE_FUNCTIONS
     for func_name in ('avg', 'round', 'round_to_mintick'):
-        assert ('pynecore.lib.math', func_name) not in INLINABLE_FUNCTIONS
+        assert ('pynecore.lib.math', func_name) not in inlinable
         assert hasattr(lib_math, func_name)
-    assert ('pynecore.lib.array', 'set') not in INLINABLE_FUNCTIONS
+    assert ('pynecore.lib.array', 'set') not in inlinable
     assert hasattr(lib_array, 'set')
 
 
@@ -473,28 +488,22 @@ def __test_call_inline_float_tolerance_nested__():
 
 
 def __test_call_inline_missing_source__():
-    """A wrapper module without readable source makes the site keep its call
-    instead of failing the whole script import."""
+    """A wrapper module without readable source cannot be derived, and the
+    transform does not need one: it reads the generated registry, never the lib."""
+    collector = __test_helper_collector()
     module = importlib.import_module('pynecore.lib.math')
     original = module.__file__
     try:
-        module.__file__ = None  # type: ignore[assignment]
-        __test_helper_clear_caches()
-        try:
-            derive_template('pynecore.lib.math', 'abs')
-            raise AssertionError('expected NotDerivable')
-        except NotDerivable:
-            pass
-        assert __test_helper_count("def f(v):\n    return lib.math.abs(v)\n") == 0
-
-        module.__file__ = '/nonexistent/pynecore/lib/math.py'
-        __test_helper_clear_caches()
-        assert __test_helper_count("def f(v):\n    return lib.math.abs(v)\n") == 0
+        for missing in (None, '/nonexistent/pynecore/lib/math.py'):
+            module.__file__ = missing  # type: ignore[assignment]
+            try:
+                collector.derive_expression('pynecore.lib.math', 'abs')
+                raise AssertionError('expected NotDerivable')
+            except collector.NotDerivable:
+                pass
+            assert __test_helper_count("def f(v):\n    return lib.math.abs(v)\n") == 1
     finally:
         module.__file__ = original
-        __test_helper_clear_caches()
-    # Back to normal once the source is readable again
-    assert __test_helper_count("def f(v):\n    return lib.math.abs(v)\n") == 1
 
 
 def __test_call_inline_argument_order_with_names__():
@@ -583,21 +592,18 @@ def __test_call_inline_slot_arguments__():
 
 
 def __test_call_inline_pipeline_digest_covers_sources__():
-    """Editing an inlined wrapper body, or the anchor module, must invalidate
-    cached script bytecode."""
+    """Editing an inlined wrapper body reaches cached script bytecode through the
+    regenerated template registry, which the pipeline hash covers with every file
+    of the transformers package; the anchor module is hashed as well."""
     from pynecore.core import import_hook
+    from pynecore.transformers import call_inline
     source = Path(import_hook.__file__).read_text(encoding='utf-8')
     hashed = source[source.index('files = [Path(__file__)'):
                     source.index('digest = hashlib.sha256()')]
-    assert '"math.py"' in hashed
-    assert '"array.py"' in hashed
+    assert 'transformers_dir.iterdir()' in hashed
     assert '"inline_support.py"' in hashed
-
-
-def __test_helper_clear_caches() -> None:
-    """Drop the pass's process-global memos so a source change is seen."""
-    call_inline_module = importlib.import_module('pynecore.transformers.call_inline')
-    getattr(call_inline_module, '_module_asts').clear()
+    templates = Path(call_inline.__file__).parent / 'call_inline_templates.json'
+    assert templates.is_file()
 
 
 __test_helper_LOOP_PROLOGUE = __test_helper_PROLOGUE + "from pynecore import pine_range\n"

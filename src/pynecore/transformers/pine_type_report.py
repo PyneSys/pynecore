@@ -23,7 +23,8 @@ import ast
 import re
 
 from . import ast_walk
-from .pine_type_rules import TY_ATTR, UNKNOWN, FactoryFields, get_ty, render_ty
+from .factory_fields import FactoryFields
+from .pine_type_rules import TY_ATTR, UNKNOWN, get_ty, render_ty
 from .pine_type_table import Diag, PineTypeTable, Unknown, qualify
 
 __all__ = ['unknown_diags']

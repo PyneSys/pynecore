@@ -1,0 +1,1024 @@
+//! `ast.unparse` of an expression, native.
+//!
+//! A port of CPython 3.13's `ast._Unparser` for the expression classes a step
+//! spells into a message: names, constants, the operators with their precedence
+//! rules, calls, subscripts and slices, attributes, displays, conditional
+//! expressions, lambdas, f-strings, `await` and `yield`. A class outside that set
+//! answers [`Unsupported`], so the Python step decides.
+//!
+//! What a string's `repr` escapes follows the printability table of the host's
+//! interpreter ([`crate::Host::python`]); an f-string unparses as Python 3.12 and
+//! later do, so a 3.11 host's f-strings are left to its own interpreter.
+
+use std::collections::HashMap;
+
+use pyne_ast::{
+    Ast, BoolOperator, CmpOperator, Constant, Int, Kind, NodeId, Operator, UnaryOperator,
+    Unsupported,
+};
+
+use crate::data;
+
+/// `_Precedence`, lowest binding first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Prec {
+    NamedExpr,
+    Tuple,
+    Yield,
+    Test,
+    Or,
+    And,
+    Not,
+    Cmp,
+    /// `EXPR`, which `BOR` is an alias of
+    Bor,
+    Bxor,
+    Band,
+    Shift,
+    Arith,
+    Term,
+    Factor,
+    Power,
+    Await,
+    Atom,
+}
+
+impl Prec {
+    fn next(self) -> Prec {
+        use Prec::*;
+        match self {
+            NamedExpr => Tuple,
+            Tuple => Yield,
+            Yield => Test,
+            Test => Or,
+            Or => And,
+            And => Not,
+            Not => Cmp,
+            Cmp => Bor,
+            Bor => Bxor,
+            Bxor => Band,
+            Band => Shift,
+            Shift => Arith,
+            Arith => Term,
+            Term => Factor,
+            Factor => Power,
+            Power => Await,
+            Await | Atom => Atom,
+        }
+    }
+}
+
+const INFSTR: &str = "1e309";
+
+/// `repr(float)` with the unparser's substitutions for the infinities and NaN.
+pub fn float_repr(value: f64) -> String {
+    if value.is_nan() {
+        return format!("({INFSTR}-{INFSTR})");
+    }
+    if value.is_infinite() {
+        return if value < 0.0 { format!("-{INFSTR}") } else { INFSTR.to_string() };
+    }
+    py_float_repr(value)
+}
+
+/// Python's `repr(float)` of a finite value: the shortest digits that round-trip,
+/// in fixed notation while the decimal point stands within 16 digits, exponent
+/// notation outside.
+pub fn py_float_repr(value: f64) -> String {
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    let magnitude = value.abs();
+    if magnitude == 0.0 {
+        return format!("{sign}0.0");
+    }
+    // ``{:e}`` writes the shortest round-trip digits as ``d.ddde<exp>``
+    let scientific = format!("{magnitude:e}");
+    let (mantissa, exponent) = scientific.split_once('e').expect("exponent");
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let exponent: i32 = exponent.parse().expect("exponent digits");
+    let decpt = exponent + 1;
+    if decpt <= -4 || decpt > 16 {
+        let rest = &digits[1..];
+        let point = if rest.is_empty() { String::new() } else { format!(".{rest}") };
+        let exp_sign = if exponent < 0 { '-' } else { '+' };
+        return format!("{sign}{}{point}e{exp_sign}{:02}", &digits[..1], exponent.abs());
+    }
+    if decpt <= 0 {
+        return format!("{sign}0.{}{digits}", "0".repeat((-decpt) as usize));
+    }
+    let decpt = decpt as usize;
+    if decpt >= digits.len() {
+        return format!("{sign}{digits}{}.0", "0".repeat(decpt - digits.len()));
+    }
+    format!("{sign}{}.{}", &digits[..decpt], &digits[decpt..])
+}
+
+/// `str.isprintable` of one character under the host's interpreter.
+fn is_printable(c: char, python: (u32, u32)) -> Result<bool, Unsupported> {
+    if c.is_ascii() {
+        return Ok((' '..='~').contains(&c));
+    }
+    data::is_printable(c, python)
+        .ok_or_else(|| Unsupported(format!("no printability table for Python {python:?}")))
+}
+
+/// The `\\x`, `\\u` or `\\U` escape of a non-printable character.
+fn hex_escape(c: char, out: &mut String) {
+    let code = c as u32;
+    if code < 0x100 {
+        out.push_str(&format!("\\x{code:02x}"));
+    } else if code < 0x10000 {
+        out.push_str(&format!("\\u{code:04x}"));
+    } else {
+        out.push_str(&format!("\\U{code:08x}"));
+    }
+}
+
+/// Python's `repr(str)` under the host's interpreter.
+pub fn str_repr(text: &str, python: (u32, u32)) -> Result<String, Unsupported> {
+    let quote = if text.contains('\'') && !text.contains('"') { '"' } else { '\'' };
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push(quote);
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if is_printable(c, python)? => out.push(c),
+            c => hex_escape(c, &mut out),
+        }
+    }
+    out.push(quote);
+    Ok(out)
+}
+
+/// `PyOS_double_to_string(value, 'r', 0, flags)`: `repr(float)`, without the `.0`
+/// of an integral value unless `add_dot_0`, signed when `sign`.
+fn double_repr(value: f64, add_dot_0: bool, sign: bool) -> String {
+    let plus = if sign { "+" } else { "" };
+    if value.is_nan() {
+        return format!("{plus}nan");
+    }
+    if value.is_infinite() {
+        return if value < 0.0 { "-inf".to_string() } else { format!("{plus}inf") };
+    }
+    let mut text = py_float_repr(value);
+    if !add_dot_0 && let Some(integral) = text.strip_suffix(".0") {
+        text = integral.to_string();
+    }
+    if sign && !text.starts_with('-') {
+        text.insert(0, '+');
+    }
+    text
+}
+
+/// Python's `repr(complex)`.
+fn complex_repr(real: f64, imag: f64) -> String {
+    if real == 0.0 && real.is_sign_positive() {
+        return format!("{}j", double_repr(imag, false, false));
+    }
+    format!("({}{}j)", double_repr(real, false, false), double_repr(imag, false, true))
+}
+
+/// Python's `repr(bytes)`.
+fn bytes_repr(data: &[u8]) -> String {
+    let quote = if data.contains(&b'\'') && !data.contains(&b'"') { b'"' } else { b'\'' };
+    let mut out = String::with_capacity(data.len() + 3);
+    out.push('b');
+    out.push(quote as char);
+    for &byte in data {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            b'\t' => out.push_str("\\t"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            byte if byte == quote => {
+                out.push('\\');
+                out.push(byte as char);
+            }
+            0x20..=0x7e => out.push(byte as char),
+            byte => out.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    out.push(quote as char);
+    out
+}
+
+/// Python's own `repr` of a constant value.
+pub(crate) fn py_repr(value: &Constant, python: (u32, u32)) -> Result<String, Unsupported> {
+    Ok(match value {
+        Constant::None => "None".to_string(),
+        Constant::Bool(true) => "True".to_string(),
+        Constant::Bool(false) => "False".to_string(),
+        Constant::Int(Int::Small(value)) => value.to_string(),
+        Constant::Int(Int::Big(digits)) => digits.clone(),
+        Constant::Float(value) => double_repr(*value, true, false),
+        Constant::Complex { real, imag } => complex_repr(*real, *imag),
+        Constant::Str(text) => str_repr(text, python)?,
+        Constant::Bytes(data) => bytes_repr(data),
+        Constant::Ellipsis => "Ellipsis".to_string(),
+        // Its element order follows the strings' randomized hashes
+        Constant::FrozenSet(_) => return Err(Unsupported("repr of a frozenset".into())),
+        Constant::Tuple(items) => {
+            let items =
+                items.iter().map(|item| py_repr(item, python)).collect::<Result<Vec<_>, _>>()?;
+            if items.len() == 1 {
+                format!("({},)", items[0])
+            } else {
+                format!("({})", items.join(", "))
+            }
+        }
+    })
+}
+
+/// `_write_constant`: `repr`, the infinities and NaN of a float or complex spelled as
+/// overflowing literals.
+fn constant_repr(value: &Constant, python: (u32, u32)) -> Result<String, Unsupported> {
+    Ok(match value {
+        Constant::Float(value) => float_repr(*value),
+        Constant::Complex { .. } => py_repr(value, python)?
+            .replace("inf", INFSTR)
+            .replace("nan", &format!("({INFSTR}-{INFSTR})")),
+        _ => py_repr(value, python)?,
+    })
+}
+
+/// `c.encode("unicode_escape").decode("ascii")` of a backslash or a non-printable
+/// character.
+fn unicode_escape(c: char, out: &mut String) {
+    match c {
+        '\\' => out.push_str("\\\\"),
+        '\t' => out.push_str("\\t"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        c => hex_escape(c, out),
+    }
+}
+
+const MULTI_QUOTES: [&str; 2] = ["\"\"\"", "'''"];
+const ALL_QUOTES: [&str; 4] = ["'", "\"", "\"\"\"", "'''"];
+
+/// `_str_literal_helper`: a string literal's body with as few escapes as the quotes
+/// left allow, and the quotes it may stand between.
+fn str_literal_helper(
+    string: &str,
+    quote_types: &[&'static str],
+    escape_special_whitespace: bool,
+    python: (u32, u32),
+) -> Result<(String, Vec<&'static str>), Unsupported> {
+    let mut escaped = String::with_capacity(string.len());
+    for c in string.chars() {
+        if !escape_special_whitespace && (c == '\n' || c == '\t') {
+            escaped.push(c);
+        } else if c == '\\' || !is_printable(c, python)? {
+            unicode_escape(c, &mut escaped);
+        } else {
+            escaped.push(c);
+        }
+    }
+    let mut possible: Vec<&'static str> = quote_types.to_vec();
+    if escaped.contains('\n') {
+        possible.retain(|q| MULTI_QUOTES.contains(q));
+    }
+    possible.retain(|q| !escaped.contains(q));
+    if possible.is_empty() {
+        let repr = str_repr(string, python)?;
+        let first = repr.chars().next().expect("a quote");
+        let quote = quote_types
+            .iter()
+            .copied()
+            .find(|q| q.contains(first))
+            .unwrap_or(if first == '"' { "\"" } else { "'" });
+        return Ok((repr[1..repr.len() - 1].to_string(), vec![quote]));
+    }
+    if let Some(last) = escaped.chars().last() {
+        // Prefer a quote that does not end like the text: '''"''' over """\""""
+        possible.sort_by_key(|q| q.starts_with(last));
+        if possible[0].starts_with(last) {
+            escaped.pop();
+            escaped.push('\\');
+            escaped.push(last);
+        }
+    }
+    Ok((escaped, possible))
+}
+
+struct Unparser<'a> {
+    ast: &'a Ast,
+    out: String,
+    precedences: HashMap<NodeId, Prec>,
+    python: (u32, u32),
+    /// `_avoid_backslashes`: the unparser of an f-string field before 3.12, where a
+    /// field may hold no backslash
+    avoid_backslashes: bool,
+}
+
+impl Unparser<'_> {
+    fn precedence(&self, node: NodeId) -> Prec {
+        self.precedences.get(&node).copied().unwrap_or(Prec::Test)
+    }
+
+    fn set(&mut self, precedence: Prec, nodes: &[NodeId]) {
+        for &node in nodes {
+            self.precedences.insert(node, precedence);
+        }
+    }
+
+    fn open_if(&mut self, condition: bool, start: &str) -> bool {
+        if condition {
+            self.out.push_str(start);
+        }
+        condition
+    }
+
+    fn close_if(&mut self, opened: bool, end: &str) {
+        if opened {
+            self.out.push_str(end);
+        }
+    }
+
+    fn interleave(&mut self, nodes: &[NodeId]) -> Result<(), Unsupported> {
+        for (index, &node) in nodes.iter().enumerate() {
+            if index > 0 {
+                self.out.push_str(", ");
+            }
+            self.traverse(node)?;
+        }
+        Ok(())
+    }
+
+    fn items_view(&mut self, nodes: &[NodeId]) -> Result<(), Unsupported> {
+        if nodes.len() == 1 {
+            self.traverse(nodes[0])?;
+            self.out.push(',');
+            Ok(())
+        } else {
+            self.interleave(nodes)
+        }
+    }
+
+    /// `_write_constant`: inside an f-string field before 3.12 a string avoids the
+    /// backslashes its `repr` would spell.
+    fn write_constant(&mut self, value: &Constant) -> Result<(), Unsupported> {
+        match value {
+            Constant::Str(text) if self.avoid_backslashes => {
+                self.write_str_avoiding_backslashes(text)
+            }
+            value => {
+                let text = constant_repr(value, self.python)?;
+                self.out.push_str(&text);
+                Ok(())
+            }
+        }
+    }
+
+    /// `_write_str_avoiding_backslashes`: a string literal with a best effort
+    /// attempt to avoid backslashes.
+    fn write_str_avoiding_backslashes(&mut self, text: &str) -> Result<(), Unsupported> {
+        let (text, quote_types) = str_literal_helper(text, &ALL_QUOTES, false, self.python)?;
+        let quote = quote_types[0];
+        self.out.push_str(quote);
+        self.out.push_str(&text);
+        self.out.push_str(quote);
+        Ok(())
+    }
+
+    fn traverse(&mut self, node: NodeId) -> Result<(), Unsupported> {
+        let ast = self.ast;
+        match ast.kind(node) {
+            Kind::Name { id, .. } => self.out.push_str(id),
+            Kind::Constant { value: Constant::Tuple(items), .. } => {
+                self.out.push('(');
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        self.out.push_str(", ");
+                    }
+                    self.write_constant(item)?;
+                }
+                if items.len() == 1 {
+                    self.out.push(',');
+                }
+                self.out.push(')');
+            }
+            Kind::Constant { value: Constant::Ellipsis, .. } => self.out.push_str("..."),
+            Kind::Constant { value, kind } => {
+                if kind.as_deref() == Some("u") {
+                    self.out.push('u');
+                }
+                self.write_constant(value)?;
+            }
+            Kind::JoinedStr { values } => self.joined_str(values)?,
+            Kind::NamedExpr { target, value } => {
+                let opened = self.open_if(self.precedence(node) > Prec::NamedExpr, "(");
+                self.set(Prec::Atom, &[*target, *value]);
+                self.traverse(*target)?;
+                self.out.push_str(" := ");
+                self.traverse(*value)?;
+                self.close_if(opened, ")");
+            }
+            Kind::UnaryOp { op, operand } => {
+                let (operator, precedence) = match op {
+                    UnaryOperator::Invert => ("~", Prec::Factor),
+                    UnaryOperator::Not => ("not", Prec::Not),
+                    UnaryOperator::UAdd => ("+", Prec::Factor),
+                    UnaryOperator::USub => ("-", Prec::Factor),
+                };
+                let opened = self.open_if(self.precedence(node) > precedence, "(");
+                self.out.push_str(operator);
+                if precedence != Prec::Factor {
+                    self.out.push(' ');
+                }
+                self.set(precedence, &[*operand]);
+                self.traverse(*operand)?;
+                self.close_if(opened, ")");
+            }
+            Kind::BinOp { left, op, right } => {
+                let (operator, precedence) = match op {
+                    Operator::Add => ("+", Prec::Arith),
+                    Operator::Sub => ("-", Prec::Arith),
+                    Operator::Mult => ("*", Prec::Term),
+                    Operator::MatMult => ("@", Prec::Term),
+                    Operator::Div => ("/", Prec::Term),
+                    Operator::Mod => ("%", Prec::Term),
+                    Operator::LShift => ("<<", Prec::Shift),
+                    Operator::RShift => (">>", Prec::Shift),
+                    Operator::BitOr => ("|", Prec::Bor),
+                    Operator::BitXor => ("^", Prec::Bxor),
+                    Operator::BitAnd => ("&", Prec::Band),
+                    Operator::FloorDiv => ("//", Prec::Term),
+                    Operator::Pow => ("**", Prec::Power),
+                };
+                let opened = self.open_if(self.precedence(node) > precedence, "(");
+                let (left_prec, right_prec) = if operator == "**" {
+                    (precedence.next(), precedence)
+                } else {
+                    (precedence, precedence.next())
+                };
+                self.set(left_prec, &[*left]);
+                self.traverse(*left)?;
+                self.out.push_str(&format!(" {operator} "));
+                self.set(right_prec, &[*right]);
+                self.traverse(*right)?;
+                self.close_if(opened, ")");
+            }
+            Kind::Compare { left, ops, comparators } => {
+                let opened = self.open_if(self.precedence(node) > Prec::Cmp, "(");
+                self.set(Prec::Cmp.next(), &[*left]);
+                self.set(Prec::Cmp.next(), comparators);
+                self.traverse(*left)?;
+                for (op, &comparator) in ops.iter().zip(comparators) {
+                    let spelled = match op {
+                        CmpOperator::Eq => "==",
+                        CmpOperator::NotEq => "!=",
+                        CmpOperator::Lt => "<",
+                        CmpOperator::LtE => "<=",
+                        CmpOperator::Gt => ">",
+                        CmpOperator::GtE => ">=",
+                        CmpOperator::Is => "is",
+                        CmpOperator::IsNot => "is not",
+                        CmpOperator::In => "in",
+                        CmpOperator::NotIn => "not in",
+                    };
+                    self.out.push_str(&format!(" {spelled} "));
+                    self.traverse(comparator)?;
+                }
+                self.close_if(opened, ")");
+            }
+            Kind::BoolOp { op, values } => {
+                let (operator, mut precedence) = match op {
+                    BoolOperator::And => ("and", Prec::And),
+                    BoolOperator::Or => ("or", Prec::Or),
+                };
+                let opened = self.open_if(self.precedence(node) > precedence, "(");
+                for (index, &value) in values.iter().enumerate() {
+                    if index > 0 {
+                        self.out.push_str(&format!(" {operator} "));
+                    }
+                    precedence = precedence.next();
+                    self.set(precedence, &[value]);
+                    self.traverse(value)?;
+                }
+                self.close_if(opened, ")");
+            }
+            Kind::IfExp { test, body, orelse } => {
+                let opened = self.open_if(self.precedence(node) > Prec::Test, "(");
+                self.set(Prec::Test.next(), &[*body, *test]);
+                self.traverse(*body)?;
+                self.out.push_str(" if ");
+                self.traverse(*test)?;
+                self.out.push_str(" else ");
+                self.set(Prec::Test, &[*orelse]);
+                self.traverse(*orelse)?;
+                self.close_if(opened, ")");
+            }
+            Kind::Attribute { value, attr, .. } => {
+                self.set(Prec::Atom, &[*value]);
+                self.traverse(*value)?;
+                if matches!(
+                    ast.kind(*value),
+                    Kind::Constant { value: Constant::Int(_) | Constant::Bool(_), .. }
+                ) {
+                    self.out.push(' ');
+                }
+                self.out.push('.');
+                self.out.push_str(attr);
+            }
+            Kind::Call { func, args, keywords } => {
+                self.set(Prec::Atom, &[*func]);
+                self.traverse(*func)?;
+                self.out.push('(');
+                let mut comma = false;
+                for &arg in args.iter().chain(keywords) {
+                    if comma {
+                        self.out.push_str(", ");
+                    }
+                    comma = true;
+                    self.traverse(arg)?;
+                }
+                self.out.push(')');
+            }
+            Kind::Keyword { arg, value } => {
+                match arg {
+                    None => self.out.push_str("**"),
+                    Some(arg) => {
+                        self.out.push_str(arg);
+                        self.out.push('=');
+                    }
+                }
+                self.traverse(*value)?;
+            }
+            Kind::Subscript { value, slice, .. } => {
+                self.set(Prec::Atom, &[*value]);
+                self.traverse(*value)?;
+                self.out.push('[');
+                match ast.kind(*slice) {
+                    Kind::Tuple { elts, .. } if !elts.is_empty() => self.items_view(elts)?,
+                    _ => self.traverse(*slice)?,
+                }
+                self.out.push(']');
+            }
+            Kind::Starred { value, .. } => {
+                self.out.push('*');
+                self.set(Prec::Bor, &[*value]);
+                self.traverse(*value)?;
+            }
+            Kind::Slice { lower, upper, step } => {
+                if let Some(lower) = lower {
+                    self.traverse(*lower)?;
+                }
+                self.out.push(':');
+                if let Some(upper) = upper {
+                    self.traverse(*upper)?;
+                }
+                if let Some(step) = step {
+                    self.out.push(':');
+                    self.traverse(*step)?;
+                }
+            }
+            Kind::List { elts, .. } => {
+                self.out.push('[');
+                self.interleave(elts)?;
+                self.out.push(']');
+            }
+            Kind::Tuple { elts, .. } => {
+                let opened =
+                    self.open_if(elts.is_empty() || self.precedence(node) > Prec::Tuple, "(");
+                self.items_view(elts)?;
+                self.close_if(opened, ")");
+            }
+            Kind::Set { elts } => {
+                if elts.is_empty() {
+                    self.out.push_str("{*()}");
+                } else {
+                    self.out.push('{');
+                    self.interleave(elts)?;
+                    self.out.push('}');
+                }
+            }
+            Kind::Dict { keys, values } => {
+                self.out.push('{');
+                for (index, (key, &value)) in keys.iter().zip(values).enumerate() {
+                    if index > 0 {
+                        self.out.push_str(", ");
+                    }
+                    match key {
+                        None => {
+                            self.out.push_str("**");
+                            self.set(Prec::Bor, &[value]);
+                            self.traverse(value)?;
+                        }
+                        Some(key) => {
+                            self.traverse(*key)?;
+                            self.out.push_str(": ");
+                            self.traverse(value)?;
+                        }
+                    }
+                }
+                self.out.push('}');
+            }
+            Kind::ListComp { elt, generators } => self.comprehension("[", *elt, generators, "]")?,
+            Kind::SetComp { elt, generators } => self.comprehension("{", *elt, generators, "}")?,
+            Kind::GeneratorExp { elt, generators } => {
+                self.comprehension("(", *elt, generators, ")")?
+            }
+            Kind::DictComp { key, value, generators } => {
+                self.out.push('{');
+                self.traverse(*key)?;
+                self.out.push_str(": ");
+                self.traverse(*value)?;
+                self.generators(generators)?;
+                self.out.push('}');
+            }
+            Kind::Lambda { args, body } => {
+                let opened = self.open_if(self.precedence(node) > Prec::Test, "(");
+                self.out.push_str("lambda");
+                let mark = self.out.len();
+                self.out.push(' ');
+                self.arguments(*args)?;
+                if self.out.len() == mark + 1 {
+                    self.out.truncate(mark);
+                }
+                self.out.push_str(": ");
+                self.set(Prec::Test, &[*body]);
+                self.traverse(*body)?;
+                self.close_if(opened, ")");
+            }
+            Kind::Await { value } => {
+                let opened = self.open_if(self.precedence(node) > Prec::Await, "(");
+                self.out.push_str("await ");
+                self.set(Prec::Atom, &[*value]);
+                self.traverse(*value)?;
+                self.close_if(opened, ")");
+            }
+            Kind::Yield { value } => {
+                let opened = self.open_if(self.precedence(node) > Prec::Yield, "(");
+                self.out.push_str("yield");
+                if let Some(value) = value {
+                    self.out.push(' ');
+                    self.set(Prec::Atom, &[*value]);
+                    self.traverse(*value)?;
+                }
+                self.close_if(opened, ")");
+            }
+            Kind::YieldFrom { value } => {
+                let opened = self.open_if(self.precedence(node) > Prec::Yield, "(");
+                self.out.push_str("yield from ");
+                self.set(Prec::Atom, &[*value]);
+                self.traverse(*value)?;
+                self.close_if(opened, ")");
+            }
+            Kind::FormattedValue { .. } => self.formatted_value(node)?,
+            Kind::Arg { arg, annotation, .. } => {
+                self.out.push_str(arg);
+                if let Some(annotation) = annotation {
+                    self.out.push_str(": ");
+                    self.traverse(*annotation)?;
+                }
+            }
+            _ => return Err(Unsupported(format!("unparse of {}", ast.name(node)))),
+        }
+        Ok(())
+    }
+
+    fn comprehension(
+        &mut self,
+        start: &str,
+        elt: NodeId,
+        generators: &[NodeId],
+        end: &str,
+    ) -> Result<(), Unsupported> {
+        self.out.push_str(start);
+        self.traverse(elt)?;
+        self.generators(generators)?;
+        self.out.push_str(end);
+        Ok(())
+    }
+
+    fn generators(&mut self, generators: &[NodeId]) -> Result<(), Unsupported> {
+        for &generator in generators {
+            let Kind::Comprehension { target, iter, ifs, is_async } = self.ast.kind(generator)
+            else {
+                return Err(Unsupported("unparse of a malformed comprehension".into()));
+            };
+            self.out.push_str(if *is_async != 0 { " async for " } else { " for " });
+            self.set(Prec::Tuple, &[*target]);
+            self.traverse(*target)?;
+            self.out.push_str(" in ");
+            self.set(Prec::Test.next(), &[*iter]);
+            self.set(Prec::Test.next(), ifs);
+            self.traverse(*iter)?;
+            for &condition in ifs {
+                self.out.push_str(" if ");
+                self.traverse(condition)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn arguments(&mut self, args: NodeId) -> Result<(), Unsupported> {
+        let Kind::Arguments { posonlyargs, args, vararg, kwonlyargs, kw_defaults, kwarg, defaults } =
+            self.ast.kind(args)
+        else {
+            return Err(Unsupported("lambda without arguments".into()));
+        };
+        let all: Vec<NodeId> = posonlyargs.iter().chain(args).copied().collect();
+        let missing = all.len().saturating_sub(defaults.len());
+        let mut first = true;
+        for (index, &arg) in all.iter().enumerate() {
+            if !first {
+                self.out.push_str(", ");
+            }
+            first = false;
+            self.traverse(arg)?;
+            if index >= missing {
+                self.out.push('=');
+                self.traverse(defaults[index - missing])?;
+            }
+            if index + 1 == posonlyargs.len() {
+                self.out.push_str(", /");
+            }
+        }
+        if vararg.is_some() || !kwonlyargs.is_empty() {
+            if !first {
+                self.out.push_str(", ");
+            }
+            first = false;
+            self.out.push('*');
+            if let Some(vararg) = vararg {
+                self.traverse(*vararg)?;
+            }
+        }
+        for (&arg, default) in kwonlyargs.iter().zip(kw_defaults) {
+            self.out.push_str(", ");
+            self.traverse(arg)?;
+            if let Some(default) = default {
+                self.out.push('=');
+                self.traverse(*default)?;
+            }
+        }
+        if let Some(kwarg) = kwarg {
+            if !first {
+                self.out.push_str(", ");
+            }
+            self.out.push_str("**");
+            self.traverse(*kwarg)?;
+        }
+        Ok(())
+    }
+
+    fn formatted_value(&mut self, node: NodeId) -> Result<(), Unsupported> {
+        let Kind::FormattedValue { value, conversion, format_spec } = self.ast.kind(node) else {
+            unreachable!()
+        };
+        self.out.push('{');
+        let legacy = self.python < (3, 12);
+        let mut inner = Unparser {
+            ast: self.ast,
+            out: String::new(),
+            precedences: HashMap::new(),
+            python: self.python,
+            avoid_backslashes: legacy,
+        };
+        inner.set(Prec::Test.next(), &[*value]);
+        inner.traverse(*value)?;
+        if legacy && inner.out.contains('\\') {
+            return Err(Unsupported("a backslash in an f-string field before 3.12".into()));
+        }
+        if inner.out.starts_with('{') {
+            self.out.push(' ');
+        }
+        self.out.push_str(&inner.out);
+        if *conversion != -1 {
+            let conversion = u32::try_from(*conversion)
+                .ok()
+                .and_then(char::from_u32)
+                .ok_or_else(|| Unsupported("f-string conversion".into()))?;
+            self.out.push('!');
+            self.out.push(conversion);
+        }
+        if let Some(spec) = format_spec {
+            self.out.push(':');
+            // A format spec is escaped since 3.12
+            self.fstring_inner(*spec, !legacy)?;
+        }
+        self.out.push('}');
+        Ok(())
+    }
+
+    /// `visit_JoinedStr`: the parts, then the quotes every constant part allows.
+    fn joined_str(&mut self, values: &[NodeId]) -> Result<(), Unsupported> {
+        if self.python < (3, 12) {
+            return self.legacy_joined_str(values);
+        }
+        self.out.push('f');
+        let mut parts = Vec::with_capacity(values.len());
+        for &value in values {
+            let saved = std::mem::take(&mut self.out);
+            self.fstring_inner(value, false)?;
+            let text = std::mem::replace(&mut self.out, saved);
+            parts.push((text, matches!(self.ast.kind(value), Kind::Constant { .. })));
+        }
+        let mut new_parts = Vec::with_capacity(parts.len());
+        let mut quote_types: Vec<&'static str> = ALL_QUOTES.to_vec();
+        let mut fallback_to_repr = false;
+        for (value, is_constant) in &parts {
+            if *is_constant {
+                let (value, new_quote_types) =
+                    str_literal_helper(value, &quote_types, true, self.python)?;
+                if new_quote_types.iter().all(|q| !quote_types.contains(q)) {
+                    fallback_to_repr = true;
+                    break;
+                }
+                quote_types = new_quote_types;
+                new_parts.push(value);
+            } else {
+                if value.contains('\n') {
+                    quote_types.retain(|q| MULTI_QUOTES.contains(q));
+                    if quote_types.is_empty() {
+                        return Err(Unsupported("an f-string field no quotes can hold".into()));
+                    }
+                }
+                let new_quote_types: Vec<&'static str> =
+                    quote_types.iter().copied().filter(|q| !value.contains(q)).collect();
+                if !new_quote_types.is_empty() {
+                    quote_types = new_quote_types;
+                }
+                new_parts.push(value.clone());
+            }
+        }
+        if fallback_to_repr {
+            // No quote suits every part: repr of each constant, triple single quotes
+            quote_types = vec!["'''"];
+            new_parts.clear();
+            for (value, is_constant) in parts {
+                if is_constant {
+                    let repr = str_repr(&format!("\"{value}"), self.python)?;
+                    new_parts.push(repr[2..repr.len() - 1].to_string());
+                } else {
+                    new_parts.push(value);
+                }
+            }
+        }
+        let quote = quote_types[0];
+        self.out.push_str(quote);
+        for part in new_parts {
+            self.out.push_str(&part);
+        }
+        self.out.push_str(quote);
+        Ok(())
+    }
+
+    /// `visit_JoinedStr` before 3.12: every part, the fields included, chooses among
+    /// the quotes, and inside a field the whole f-string avoids backslashes.
+    fn legacy_joined_str(&mut self, values: &[NodeId]) -> Result<(), Unsupported> {
+        self.out.push('f');
+        if self.avoid_backslashes {
+            let saved = std::mem::take(&mut self.out);
+            for &value in values {
+                self.fstring_inner(value, false)?;
+            }
+            let text = std::mem::replace(&mut self.out, saved);
+            return self.write_str_avoiding_backslashes(&text);
+        }
+        let mut parts = Vec::with_capacity(values.len());
+        for &value in values {
+            let saved = std::mem::take(&mut self.out);
+            self.fstring_inner(value, false)?;
+            let text = std::mem::replace(&mut self.out, saved);
+            parts.push((text, matches!(self.ast.kind(value), Kind::Constant { .. })));
+        }
+        let mut new_parts = Vec::with_capacity(parts.len());
+        let mut quote_types: Vec<&'static str> = ALL_QUOTES.to_vec();
+        let mut fallback_to_repr = false;
+        for (value, is_constant) in &parts {
+            let (value, new_quote_types) =
+                str_literal_helper(value, &quote_types, *is_constant, self.python)?;
+            new_parts.push(value);
+            if new_quote_types.iter().all(|q| !quote_types.contains(q)) {
+                fallback_to_repr = true;
+                break;
+            }
+            quote_types = new_quote_types;
+        }
+        if fallback_to_repr {
+            // No quote suits every part: repr of each, triple single quotes
+            quote_types = vec!["'''"];
+            new_parts.clear();
+            for (value, _) in parts {
+                let repr = str_repr(&format!("\"{value}"), self.python)?;
+                new_parts.push(repr[2..repr.len() - 1].to_string());
+            }
+        }
+        let quote = quote_types[0];
+        self.out.push_str(quote);
+        for part in new_parts {
+            self.out.push_str(&part);
+        }
+        self.out.push_str(quote);
+        Ok(())
+    }
+
+    fn fstring_inner(&mut self, node: NodeId, is_format_spec: bool) -> Result<(), Unsupported> {
+        match self.ast.kind(node) {
+            Kind::JoinedStr { values } => {
+                for &value in values {
+                    self.fstring_inner(value, is_format_spec)?;
+                }
+            }
+            Kind::Constant { value: Constant::Str(text), .. } => {
+                let mut value = text.replace('{', "{{").replace('}', "}}");
+                if is_format_spec {
+                    value = value
+                        .replace('\\', "\\\\")
+                        .replace('\'', "\\'")
+                        .replace('"', "\\\"")
+                        .replace('\n', "\\n");
+                }
+                self.out.push_str(&value);
+            }
+            Kind::FormattedValue { .. } => self.formatted_value(node)?,
+            _ => return Err(Unsupported("unexpected node inside an f-string".into())),
+        }
+        Ok(())
+    }
+}
+
+/// `ast.unparse(node)` of an expression under the host's interpreter.
+pub fn unparse(ast: &Ast, node: NodeId, python: (u32, u32)) -> Result<String, Unsupported> {
+    let mut unparser = Unparser {
+        ast,
+        out: String::new(),
+        precedences: HashMap::new(),
+        python,
+        avoid_backslashes: false,
+    };
+    unparser.traverse(node)?;
+    Ok(unparser.out)
+}
+
+/// `ast.unparse(node)[:limit]`: the first `limit` characters.
+pub fn unparse_prefix(
+    ast: &Ast,
+    node: NodeId,
+    limit: usize,
+    python: (u32, u32),
+) -> Result<String, Unsupported> {
+    Ok(unparse(ast, node, python)?.chars().take(limit).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round(source: &str) -> String {
+        let (ast, module) = pyne_parse::parse_module(source).expect("parses");
+        let Kind::Module { body, .. } = ast.kind(module) else { panic!() };
+        let Kind::Expr { value } = ast.kind(body[0]) else { panic!() };
+        unparse(&ast, *value, data::newest_python()).expect("unparses")
+    }
+
+    #[test]
+    fn precedence_and_spacing_follow_cpython() {
+        assert_eq!(round("(a+b)*c"), "(a + b) * c");
+        assert_eq!(round("a+b*c"), "a + b * c");
+        assert_eq!(round("-x"), "-x");
+        assert_eq!(round("not (a and b)"), "not (a and b)");
+        assert_eq!(round("a[1:2]"), "a[1:2]");
+        assert_eq!(round("x[::2]"), "x[::2]");
+        assert_eq!(round("f(a, *b, k=1, **d)"), "f(a, *b, k=1, **d)");
+        assert_eq!(round("lambda x, y=1: x+y"), "lambda x, y=1: x + y");
+        assert_eq!(round("lambda: 0"), "lambda: 0");
+        assert_eq!(round("2**3**4"), "2 ** 3 ** 4");
+        assert_eq!(round("(2**3)**4"), "(2 ** 3) ** 4");
+        assert_eq!(round("a if b else c"), "a if b else c");
+        assert_eq!(round("(1,)"), "(1,)");
+        assert_eq!(round("t[1, 2]"), "t[1, 2]");
+    }
+
+    #[test]
+    fn constants_spell_their_repr() {
+        assert_eq!(round("1e16"), "1e+16");
+        assert_eq!(round("1e15"), "1000000000000000.0");
+        assert_eq!(round("1e-5"), "1e-05");
+        assert_eq!(round("0.0001"), "0.0001");
+        assert_eq!(round("1.5"), "1.5");
+        assert_eq!(round("\"it's\""), "\"it's\"");
+        assert_eq!(round("'a\\nb'"), "'a\\nb'");
+        assert_eq!(round("'Ended \u{b7} '"), "'Ended \u{b7} '");
+        assert_eq!(round("'\u{a0}x\u{ad}'"), "'\\xa0x\\xad'");
+    }
+
+    #[test]
+    fn comprehensions_follow_cpython() {
+        assert_eq!(round("[x for x in y if x if z]"), "[x for x in y if x if z]");
+        assert_eq!(round("{k: v for k, v in d.items()}"), "{k: v for k, v in d.items()}");
+        assert_eq!(round("f(x for x in y)"), "f((x for x in y))");
+        assert_eq!(round("{a for (a, b) in c}"), "{a for a, b in c}");
+        assert_eq!(round("[(a, b) for a in (lambda: 1)()]"), "[(a, b) for a in (lambda: 1)()]");
+        assert_eq!(round("[x for x in (a if b else c)]"), "[x for x in (a if b else c)]");
+    }
+}

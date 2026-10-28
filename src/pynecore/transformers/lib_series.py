@@ -2,13 +2,8 @@ import ast
 from typing import cast
 
 from . import ast_walk
-
-# Builtin price series accepted by generic ``input()`` as source names.
-BUILTIN_PRICE_SERIES = frozenset({
-    'open', 'high', 'low', 'close', 'volume',
-    'bid', 'ask',
-    'hl2', 'hlc3', 'ohlc4', 'hlcc4',
-})
+from .lib_series_attrs import NON_SERIES_LIB_ATTRS
+from .price_series import BUILTIN_PRICE_SERIES
 
 # Builtin series that are always global (declared in main, not nested functions),
 # mapped to the element type their history buffer stores.
@@ -16,11 +11,6 @@ BUILTIN_GLOBAL_SERIES = {
     **dict.fromkeys(BUILTIN_PRICE_SERIES, 'float'),
     'time': 'int',
 }
-
-# Lib attributes that are NOT Series — subscript access on these should not be transformed
-NON_SERIES_LIB_ATTRS = frozenset({
-    'extra_fields',
-})
 
 
 class LibrarySeriesTransformer(ast_walk.NodeTransformer):

@@ -28,6 +28,11 @@ jobs:
         with:
           persist-credentials: false
 
+      # The native transform (rust/) is a Rust extension; the Linux build
+      # containers install their own toolchain (see [tool.cibuildwheel.linux])
+      - uses: dtolnay/rust-toolchain@stable
+        if: runner.os != 'Linux'
+
       - name: Build and test wheels
         uses: pypa/cibuildwheel@v4.2.0
         with:
@@ -69,8 +74,53 @@ jobs:
           name: dist-pure
           path: dist/*
 
+  # The native transform against the Python pipeline it ports: the Rust tests,
+  # the WebAssembly build, and the parity gates over the repository's own sources
+  native-transform:
+    name: Native transform gates
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Rust checks
+        working-directory: rust
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace -- -D warnings
+          cargo test --workspace
+          cargo build -p pyne-transform-wasm --target wasm32-unknown-unknown --release
+
+      - name: Install with the native extension
+        run: python -m pip install -e ".[dev]"
+
+      - name: Parity gates
+        env:
+          PYNE_REQUIRE_NATIVE_TRANSFORM: "1"
+          PYTHONPATH: rust/tools
+        run: |
+          python rust/tools/ported.py --check
+          python rust/tools/parse_gate.py
+          python rust/tools/wasm_gate.py
+          PYNE_AST_BACKEND=verify python -m pytest -p no:cacheprovider tests/t00_pynecore/ast
+
   publish:
-    needs: [build-wheels, build-pure]
+    needs: [build-wheels, build-pure, native-transform]
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
 

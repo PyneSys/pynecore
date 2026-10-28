@@ -26,7 +26,8 @@ from pathlib import Path
 import pytest
 
 from ..pine_analysis import analyse_module
-from pynecore.transformers.pine_type_infer import infer_module, lib_types
+from pynecore.transformers.lib_registry import lib_types
+from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
     BOOL, FLOAT, INT, UNKNOWN, builtin_class_id, get_ty, object_ty,
 )

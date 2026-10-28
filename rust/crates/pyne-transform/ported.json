@@ -1,0 +1,158 @@
+{
+  "ImportLifter": {
+    "module": "import_lifter",
+    "digest": "730597bab8b23437fe645f1836aecda91f7ea0fa0af1a3e9c18342cc741bffe8"
+  },
+  "TypeCheckingStripper": {
+    "module": "type_checking_stripper",
+    "digest": "b4b3e5dfa666588e60a4c6cfb16290903c09a18ff834a81411c7d28c533b265d"
+  },
+  "TypeErasure": {
+    "module": "type_erasure",
+    "digest": "00153931d7ecb3c6b8c2b3c9903fa7e8501fb391440c9169f874c5c17a4b21d4"
+  },
+  "BuiltinShadow": {
+    "module": "builtin_shadow",
+    "digest": "96fab6b00c32a38c3706e869ad2643fd99d84169f65ee4d2b8b3c205eb945146"
+  },
+  "ImportNormalizer": {
+    "module": "import_normalizer",
+    "digest": "2d7a9613084c161eab3f7e16f3f780afcb9f56bc1fe0c8f5395c941c2cbdaf7e"
+  },
+  "PlotScope": {
+    "module": "plot_scope",
+    "digest": "b619787de3075d616d7b7f89dbf0b544e56a475fb6dbaf123641ee66b4cb734d"
+  },
+  "OuterWrite": {
+    "module": "outer_write",
+    "digest": "ecf5166d2f8b9dabf401a39ee80b6ea62086b4bf4feabbe221b60a7353fcd339"
+  },
+  "ExportCapture": {
+    "module": "export_capture",
+    "digest": "a2094e58142fe78068bf98ccbab8ddf7b281af9227a57654a8878116ab4c9b1d"
+  },
+  "SecurityDrawings": {
+    "module": "security_drawings",
+    "digest": "f85c370a7e4b0bdb8f4d96f1a1bb875ad08a37b6b67d40ccbfc907b4fa899b50"
+  },
+  "ConstFold": {
+    "module": "const_fold",
+    "digest": "b988d284e701e5c94a5c024a49b78e0f3361d5449da8ac21cc20228d716ddd5b"
+  },
+  "DynamicDefault": {
+    "module": "dynamic_default",
+    "digest": "f7dddee9a28a9dbd8ad69b7882e77f46232e9c6ade9d17fbe6a54e3acb50785f"
+  },
+  "InlineSeriesHoist": {
+    "module": "inline_series_hoist",
+    "digest": "abd8432a290a5fea81a3debdeee661fb465c19b25ec295559a8c6dd5fecf5480"
+  },
+  "PineTruthiness": {
+    "module": "pine_truthiness",
+    "digest": "5294d808a42c1f47ecef1dd9cb1dfeb9d2f6683330eb20dc48b0777beb6eced5"
+  },
+  "SecurityInstantiation": {
+    "module": "security_instantiation",
+    "digest": "956581677cb5539fa88bcccfa2b52492b86058174bfa950c074c30e81a18c171"
+  },
+  "Security": {
+    "module": "security",
+    "digest": "f02afef234831c4591d495a5fc85db721764e175f201444366031e9f1ec8ede3"
+  },
+  "PersistentSeries": {
+    "module": "persistent_series",
+    "digest": "73b6a7349425e3dad5634cdcdf4d5d2bd45eac7ddeaf309a284eb0f0b92f4fc4"
+  },
+  "LibrarySeries": {
+    "module": "lib_series",
+    "digest": "2e9185076a10b41d64738c0a2fc9129d4399110ddf8f67c1c39ac8197844af69"
+  },
+  "ModuleProperty": {
+    "module": "module_property",
+    "digest": "67415fff0582fdce190b700d7aec74a34860d99ef3a62d14deb10a8a085d831d"
+  },
+  "TaVariableHoist": {
+    "module": "ta_variable_hoist",
+    "digest": "4451c3a33c2ebb00265ae652f0480efd61837b03836f3d76e5d0fc7070688462"
+  },
+  "ClosureArguments": {
+    "module": "closure_arguments_transformer",
+    "digest": "5b8846ed649c91213b1fba6f11c660ff2d1971b2e04f75781b35056ba6820c24"
+  },
+  "PineType": {
+    "module": "pine_type_transformer",
+    "digest": "51229b86b8a0280d1d2dd9f1b35ef4c8821a8f983f90066a2d13cb039e15d523"
+  },
+  "ImplicitConversion": {
+    "module": "implicit_conversion",
+    "digest": "9351aab3db088b08e8104d140c42bac582b6e895186dd6367eb912c259523add"
+  },
+  "SecuritySlice": {
+    "module": "security_slice",
+    "digest": "36fbfb8840cb39d741031ab116f7c05d7240ef8d1182d3a346fe92a2d7a776f1"
+  },
+  "SecurityDefault": {
+    "module": "security_default",
+    "digest": "4a60ec18d2ee8d024f2c524229f105071e24db8c99d2bdea9f9bcedc79498408"
+  },
+  "ExportOnce": {
+    "module": "export_once",
+    "digest": "33605277be73607df1fa17d47594ff7cc3fa433e33183e4a77d08c280a764e71"
+  },
+  "UnusedSeriesDetector": {
+    "module": "unused_series_detector",
+    "digest": "946734c4106af790e6cd079c41fba3fc7b06b3c010773eb3c713fa94831c2532"
+  },
+  "Series": {
+    "module": "series",
+    "digest": "c1c61c8960d430b7b4eb1f958821acbbf7f06c2e8b027a25d8968250d3ad6cf1"
+  },
+  "VerifyClosedShift": {
+    "module": "security_closed_shift_check",
+    "digest": "882b2592d432c3a4bbcaa14ed04e4a8ed9e4d0b75d17f5c50f1ed79c417f3a1e"
+  },
+  "Persistent": {
+    "module": "persistent",
+    "digest": "f2c2648ee8f29e9c5d9ca973d1f013d67428c423f8b3770893bfbbde52c23cf0"
+  },
+  "CallInline": {
+    "module": "call_inline",
+    "digest": "ec8762a57b9d7d7a20be614dcc0142fd3b5b727cd3dd1c6e4b14b3cfb2fee39a"
+  },
+  "FunctionIsolation": {
+    "module": "function_isolation",
+    "digest": "0c28e7770cf49e5a61ad030fc6d8fbc10c4f8c182033fb9b73a4d2084bc56099"
+  },
+  "ScriptRequirements": {
+    "module": "script_requirements",
+    "digest": "ad5f0d6c5ecdc939b6361b968015aa22a8683b554bd369abb675b73b0fa7b208"
+  },
+  "Input": {
+    "module": "input_transformer",
+    "digest": "2a4877e8c5e669fcfc8d7225fa41d950e2bdc40d52ba5911fb6d791ba33750f7"
+  },
+  "SafeConvert": {
+    "module": "safe_convert_transformer",
+    "digest": "e78700ad2a5dda928bd328796397700f3a98b2227ec05b2fe1a01f19afa3b8c9"
+  },
+  "SafeDivision": {
+    "module": "safe_division_transformer",
+    "digest": "2e69cedf37450d9046ff13572570263e43eabd6ae53889ed8ca9243909cfe76f"
+  },
+  "FloatTolerance": {
+    "module": "float_tolerance",
+    "digest": "16c8be80677919c422482068495d4269d61f32dcb72aa503e84ae978a18b0882"
+  },
+  "FinalizeCloneDefaults": {
+    "module": "security_slice",
+    "digest": "36fbfb8840cb39d741031ab116f7c05d7240ef8d1182d3a346fe92a2d7a776f1"
+  },
+  "ApplyLayout": {
+    "module": "layout_emit",
+    "digest": "223c63c12c5218154e87ea5eb412ff77ba044b5b05ad75f40e016116848d2b82"
+  },
+  "FixLocations": {
+    "module": "locations",
+    "digest": "4015fa578e762c7c4eae086c78e8b72e7b98c41e7ef10bbbb4a17f9273e0a139"
+  }
+}

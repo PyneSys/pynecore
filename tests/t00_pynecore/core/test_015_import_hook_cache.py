@@ -16,7 +16,6 @@ import pytest
 import pynecore.core.import_hook as import_hook
 from pynecore.core.import_hook import (
     PyneLoader,
-    PYNE_RESERVED_NAME_CHAR,
     _baked_deps,
     _cache_from_source,
     _get_transform_pipeline_hash,
@@ -24,8 +23,7 @@ from pynecore.core.import_hook import (
     _PYNE_SENTINEL,
 )
 from pynecore.transformers import module_interface
-from pynecore.transformers.module_interface import dep_record, lookup
-from pynecore.transformers.pine_type_transformer import PineTypeTransformer, module_table
+from pynecore.transformers.emission_settings import PYNE_RESERVED_NAME_CHAR
 
 
 def main():
@@ -334,34 +332,8 @@ def __test_import_script_installs_hook_from_namespace_package_cwd__(tmp_path):
 
 
 @contextmanager
-def _typed_against(monkeypatch, dependent: str, dependency: Path):
-    """Make one module's transform record a dependency on another.
-
-    The inference does not resolve cross-module calls yet, so nothing fills
-    ``table.deps`` on its own; this injects the record the resolution will
-    produce. It hooks the type pass rather than the loader because that is
-    where the real record will be written — everything downstream (the baked
-    constant, the check on load, the invalidation) is the production path.
-
-    :param monkeypatch: The active monkeypatch fixture.
-    :param dependent: Stem of the module that gets the dependency record.
-    :param dependency: Source path of the module it depends on.
-    """
-    original = PineTypeTransformer.visit
-
-    def visit(self, tree):
-        tree = original(self, tree)
-        table = module_table(tree)
-        path = getattr(tree, '_module_file_path', '')
-        if table is not None and Path(path).stem == dependent:
-            interface = lookup(str(dependency), import_hook.compile_interface,
-                               _get_transform_pipeline_hash())
-            if interface is not None:
-                record = dep_record(interface)
-                table.deps[record.path] = record
-        return tree
-
-    monkeypatch.setattr(PineTypeTransformer, "visit", visit)
+def _registry_dropped():
+    """Forget every interface the transforms inside published, once they are done."""
     try:
         yield
     finally:
@@ -370,17 +342,18 @@ def _typed_against(monkeypatch, dependent: str, dependency: Path):
 
 
 def _dependency_pair(tmp_path: Path, ret: str = "int") -> tuple[Path, Path]:
-    """Write a dependency and a dependent, and hand back both paths."""
+    """Write a dependency and a dependent that imports it, and hand back both paths."""
     lib = tmp_path / "dep_lib.py"
     lib.write_text(f'"""\n@pyne\n"""\n\n\ndef area(width: int) -> {ret}:\n    return width * 2\n')
     app = tmp_path / "dep_app.py"
-    app.write_text('"""\n@pyne\n"""\nSIZE: int = 3\n')
+    app.write_text('"""\n@pyne\n"""\nfrom dep_lib import area\n\nSIZE: int = 3\n')
     return lib, app
 
 
 def _build_dependent(app: Path, lib: Path, monkeypatch) -> tuple[str, float]:
     """Transform the dependent once and report its baked digest and cache mtime."""
-    with _typed_against(monkeypatch, app.stem, lib), _bytecode_writing_enabled():
+    monkeypatch.syspath_prepend(lib.parent)
+    with _registry_dropped(), _bytecode_writing_enabled():
         code = PyneLoader(app.stem, str(app)).get_code(app.stem)
     records = _baked_deps(code)
     assert len(records) == 1, "the dependency record was not baked into the module"
@@ -402,12 +375,12 @@ def _counted(monkeypatch, app: Path):
     yield counts
 
 
-def _reload(app: Path, lib: Path, monkeypatch) -> tuple[dict, tuple]:
+def _reload(app: Path, monkeypatch) -> tuple[dict, tuple]:
     """Load the dependent again from a cold registry, as a new process would."""
     # The registry answers for this process only; a fresh process starts empty,
     # which is the situation the invalidation exists for.
     module_interface._registry.clear()
-    with _typed_against(monkeypatch, app.stem, lib), _counted(monkeypatch, app) as counts:
+    with _registry_dropped(), _counted(monkeypatch, app) as counts:
         with _bytecode_writing_enabled():
             code = PyneLoader(app.stem, str(app)).get_code(app.stem)
     return counts, _baked_deps(code)
@@ -418,7 +391,7 @@ def __test_untouched_dependency_costs_one_stat__(tmp_path, monkeypatch):
     lib, app = _dependency_pair(tmp_path)
     digest, mtime = _build_dependent(app, lib, monkeypatch)
 
-    counts, records = _reload(app, lib, monkeypatch)
+    counts, records = _reload(app, monkeypatch)
 
     assert counts["dependency"] == 0, "an untouched dependency must not be transformed"
     assert counts["transform"] == 0, "valid bytecode was needlessly retransformed"
@@ -434,7 +407,7 @@ def __test_edited_dependency_body_keeps_the_cache__(tmp_path, monkeypatch):
     lib.write_text('"""\n@pyne\n"""\n\n\ndef area(width: int) -> int:\n'
                    '    doubled: int = width * 2\n    return doubled\n')
 
-    counts, records = _reload(app, lib, monkeypatch)
+    counts, records = _reload(app, monkeypatch)
 
     assert counts["dependency"] == 1, "the moved file has to be transformed exactly once"
     assert counts["transform"] == 0, "an unchanged interface must not invalidate the cache"
@@ -450,7 +423,7 @@ def __test_changed_dependency_signature_drops_the_cache__(tmp_path, monkeypatch)
 
     lib.write_text('"""\n@pyne\n"""\n\n\ndef area(width: int) -> float:\n    return width * 2\n')
 
-    counts, records = _reload(app, lib, monkeypatch)
+    counts, records = _reload(app, monkeypatch)
 
     assert counts["transform"] >= 1, "the stale bytecode was not retransformed"
     assert records[0].digest != digest, "the rebuilt module kept the old dependency digest"
@@ -463,7 +436,7 @@ def __test_missing_dependency_drops_the_cache__(tmp_path, monkeypatch):
     _build_dependent(app, lib, monkeypatch)
     lib.unlink()
 
-    counts, records = _reload(app, lib, monkeypatch)
+    counts, records = _reload(app, monkeypatch)
 
     assert counts["transform"] >= 1, "a vanished dependency must force a retransform"
     assert records == (), "there is no dependency left to record"

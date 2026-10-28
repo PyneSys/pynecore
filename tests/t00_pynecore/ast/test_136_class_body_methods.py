@@ -18,9 +18,10 @@ import pytest
 from pynecore.core.instance_state import (RootChildSnapshot, _make_state, create_root,
                                           discard_root)
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
+from pynecore.transformers.layout_emit import apply_layout
 from pynecore.transformers.persistent import PersistentTransformer
 from pynecore.transformers.series import SeriesTransformer
-from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
+from pynecore.transformers.slot_layout import ModuleLayout
 
 
 def __test_helper_transform(source: str) -> tuple[dict, str]:

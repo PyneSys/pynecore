@@ -18,6 +18,9 @@ from pathlib import Path
 # would have the hook load them through itself
 from pynecore.transformers.type_erasure import erase_type_calls, has_erasure_marker
 from pynecore.transformers.pipeline_names import PIPELINE_NAME, is_pipeline_name
+from pynecore.transformers.emission_settings import (
+    PYNE_RESERVED_NAME_CHAR, env_switch_on, security_slice_disabled,
+)
 
 if TYPE_CHECKING:
     import ast
@@ -27,8 +30,7 @@ if TYPE_CHECKING:
     )
     from pynecore.transformers.slot_layout import ModuleLayout
 
-__all__ = ['PYNE_RESERVED_NAME_CHAR', 'PIPELINE_DIGEST', 'security_slice_disabled',
-           'security_merge_disabled', 'security_dev_skip_disabled',
+__all__ = ['PIPELINE_DIGEST', 'security_merge_disabled', 'security_dev_skip_disabled',
            'source_starts_with_pyne',
            'compile_interface', 'PyneLoader', 'PyneImportHook']
 
@@ -97,19 +99,6 @@ def source_starts_with_pyne(head: bytes) -> bool:
     :return: Whether the module should carry the transform sentinel.
     """
     return _PYNE_HEAD_RE.match(head) is not None
-
-
-# Nearly everything the transformers inject into script scope is named with a
-# Unicode middle dot: the scope-qualified state parameters and slot constants
-# (``__state·main__``, ``__slot·main·x__``), the generated temporaries
-# (``__st·__``, ``__cnt·0__``) and the aliased runtime helper imports
-# (``__resolve_slot·__``). The separator is a legal identifier character in
-# Python (``Other_ID_Continue``), so the namespace is only collision-free while
-# scripts stay out of it — a script name spelled with it would shadow or clobber
-# an injected one and break the emission in ways no transformer can detect. The
-# few plain double-underscore names the transform emits are listed in
-# ``transformers/pipeline_names.py`` and reserved the same way.
-PYNE_RESERVED_NAME_CHAR = '·'
 
 
 def _identifiers(tree: "ast.Module") -> "Iterator[tuple[ast.AST, str]]":
@@ -212,12 +201,6 @@ def _reject_pipeline_names(tree: "ast.Module", source: str, path: Path) -> None:
                       f"Pyne code — rename the identifier", source, path)
 
 
-#: Env switch turning the per-context ``main()`` slicing off (see
-#: ``transformers/security_slice.py``). It changes the EMITTED tree, so it is
-#: mixed into the pipeline digest below — a chart and its security children can
-#: never end up on bytecode built under the other setting.
-SECURITY_SLICE_ENV = 'PYNE_NO_SECURITY_SLICE'
-
 #: Environment switch turning OFF the merge of one context group into ONE child
 #: process (see ``core/script_runner.py``). Runtime-only: the emitted bytecode is
 #: the same either way — a group clone is correct for a single member too — so it
@@ -234,23 +217,13 @@ SECURITY_MERGE_ENV = 'PYNE_NO_SECURITY_MERGE'
 #: very same ``.pyc``.
 SECURITY_DEV_SKIP_ENV = 'PYNE_NO_SECURITY_DEV_SKIP'
 
-_TRUTHY = frozenset({'1', 'true', 'yes', 'on'})
-
-
-def security_slice_disabled() -> bool:
-    """Whether ``PYNE_NO_SECURITY_SLICE`` asks for the unsliced child behaviour.
-
-    :return: True when no backward slice of ``main()`` may be emitted.
-    """
-    return os.environ.get(SECURITY_SLICE_ENV, '').strip().lower() in _TRUTHY
-
 
 def security_merge_disabled() -> bool:
     """Whether ``PYNE_NO_SECURITY_MERGE`` asks for one child process per context.
 
     :return: True when the contexts of one group may not share a child.
     """
-    return os.environ.get(SECURITY_MERGE_ENV, '').strip().lower() in _TRUTHY
+    return env_switch_on(SECURITY_MERGE_ENV)
 
 
 def security_dev_skip_disabled() -> bool:
@@ -259,7 +232,7 @@ def security_dev_skip_disabled() -> bool:
     :return: True when a ``closed_shift`` context must keep every re-tick round
         inside an HTF period.
     """
-    return os.environ.get(SECURITY_DEV_SKIP_ENV, '').strip().lower() in _TRUTHY
+    return env_switch_on(SECURITY_DEV_SKIP_ENV)
 
 
 def _cache_from_source(source_path: Path) -> Path:
@@ -449,16 +422,15 @@ def _get_transform_pipeline_hash() -> str:
         # rest of that directory); ``pine_compare`` holds a constant the pipeline
         # bakes into the emitted bytecode
         files = [Path(__file__), Path(__file__).parent / "pine_compare.py"]
-        # The call-inlining pass copies these bodies into the emission, so a
-        # wrapper edit must invalidate cached script bytecode just like a
-        # transformer edit does (see transformers/call_inline.py)
-        lib_dir = Path(__file__).parent.parent / "lib"
-        files.extend([lib_dir / "math.py", lib_dir / "array.py",
-                      Path(__file__).parent / "inline_support.py"])
+        # The call-inlining pass copies wrapper bodies into the emission from its
+        # generated registry, hashed with the transformers below; the names those
+        # bodies reach resolve through this anchor module
+        files.append(Path(__file__).parent / "inline_support.py")
         # The constant-folding pass evaluates literal math calls through these
         # implementations and bakes the results into the emission; the native
         # twins are bit-exact to them, so the Python sources pin the values
-        files.extend([Path(__file__).parent / "fdlibm.py",
+        files.extend([Path(__file__).parent.parent / "lib" / "math.py",
+                      Path(__file__).parent / "fdlibm.py",
                       Path(__file__).parent / "pine_math.py"])
         # ... and a constant ``%`` through the runtime's own ``safe_mod``
         files.append(Path(__file__).parent / "safe_convert.py")
@@ -794,7 +766,7 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
         diag_dump_enabled, gate_module, gated, render_diags, strict_enabled,
     )
     from pynecore.transformers.pine_type_table import PineTypeError
-    from pynecore.transformers.pine_type_transformer import module_table
+    from pynecore.transformers.pine_type_table import module_table
 
     edge = gated(pyne_mode)
     structural = gate_module(transformed, source) if edge else []
@@ -921,7 +893,7 @@ def _transform_module(tree: "ast.Module", source: str, path: Path, pyne_mode: st
     # through the hook itself, so importing it at module level would re-enter a
     # half-initialized package
     from pynecore.transformers.module_interface import reached_back
-    from pynecore.transformers.pine_type_transformer import module_table
+    from pynecore.transformers.pine_type_table import module_table
 
     analysed = _analyse_tree(tree, source, path, pyne_mode)
     table = module_table(analysed)
@@ -972,13 +944,17 @@ def _lower_published(analysed: "ast.Module", published: "ModuleInterface | None"
     :param na_bool: Whether the module keeps Pine's three-state bool.
     :return: The interface with its routes, registered again, and the lowered tree.
     """
-    from pynecore.transformers.module_interface import register, routes_digest, routes_shape
+    from pynecore.transformers.module_interface import (
+        call_plan, call_routes, register, routes_digest, routes_shape,
+    )
 
     # The routes follow the module as written, before the lowering adds plumbing
     shape = '' if published is None else routes_shape(analysed)
+    plan = None if published is None else call_plan(analysed)
     lowered, layout = _lower_tree(analysed, path, pyne_mode, na_bool=na_bool)
-    if published is not None:
-        published = replace(published, routes=routes_digest(shape, lowered, layout))
+    if published is not None and plan is not None:
+        published = replace(published, routes=routes_digest(shape, lowered, layout),
+                            call_routes=call_routes(plan, layout), reexports=plan.reexports)
         register(published)
     return published, lowered
 
@@ -1363,9 +1339,8 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
             # pairing below cannot be read any earlier than here: a module that
             # merely MENTIONS @pyne reaches this method while its own transform
             # is on the stack, and module_interface is one of them.
-            from pynecore.transformers.module_interface import (
-                interface_payload, stable_source,
-            )
+            from pynecore.transformers.module_interface import interface_payload
+            from pynecore.transformers.source_read import stable_source
 
             # The fingerprint the interface this transform publishes is derived
             # from, read together with the bytes it describes (see

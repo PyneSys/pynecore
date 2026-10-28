@@ -1,0 +1,10 @@
+[package]
+name = "pyne-ast"
+description = "The CPython ast tree as an arena, for PyneCore's native transform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]

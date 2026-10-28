@@ -42,8 +42,6 @@ nothing. That keeps it testable one rule at a time, and keeps the rules
 (``pine_type_rules``) separable from the walking done here.
 """
 import ast
-import importlib.util
-import json
 from bisect import bisect_right
 from collections import deque
 from collections.abc import Callable, Container, Iterator, Mapping, Sequence
@@ -51,10 +49,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
-from ..utils.stdlib_checker import is_stdlib
 from . import ast_walk
 from . import module_interface
-from .dynamic_default import is_script_entry
+from .factory_fields import FactoryFields, dotted_name
+from .lib_registry import lib_registry, lib_routes, lib_star_exports, lib_types
+from .module_paths import module_spec_origin, package_member
 from .node_ids import ID_ATTR, assign_node_ids, node_id
 from .pine_type_report import unknown_diags
 from .pine_type_rules import (
@@ -70,8 +69,7 @@ from .pine_type_rules import (
     NOT_PINE_STRINGS, set_widen, get_widen_site,
     set_widen_site, get_widens, set_widens, is_na_widen, set_na_class,
     overload_result, ImplSig, overload_choice, overload_binding, default_fit, FIT_REQUIRED,
-    FactoryFields,
-    impl_sig, _param_defaults, _dotted, _DYN_DEFAULT,  # noqa: internal API
+    impl_sig, _param_defaults, _DYN_DEFAULT,  # noqa: internal API
     CLASS_SEP, LIB_MODULE, SCALARS, PINE_LOOP, array_of, builtin_class_id, class_id, class_of,
     element_of, elements_of, is_array,
     is_map, is_matrix, is_tuple, key_of, matrix_of, namespace_of,
@@ -86,8 +84,10 @@ from .pine_qualifier import (
     lib_call_qualifier, builtin_call_qualifier, window_length, get_series_lens,
     set_series_len, set_series_lens,
 )
+from .python_names import is_stdlib
+from .script_entry import is_script_entry
 
-__all__ = ['infer_module', 'lib_types', 'lib_classes', 'lib_namespaces', 'lib_routes',
+__all__ = ['infer_module', 'lib_classes', 'lib_namespaces', 'lib_routes',
            'lib_star_exports', 'TY_ATTR', 'get_ty', 'set_ty', 'inherit_ty']
 
 #: How many times a loop body is re-inferred before the types are declared
@@ -189,39 +189,9 @@ def _walker_rule(rule: Callable[[Any], str]) -> Callable[..., str]:
     """
     return lambda walker, node: rule(node)
 
-_LIB_TYPES_PATH = Path(__file__).parent / 'lib_types.json'
-_LIB_REGISTRY: dict[str, Any] = {}
-_LIB_TYPES: dict[str, dict[str, Any]] = {}
 _LIB_CLASSES: dict[str, 'ClassSig'] = {}
 _LIB_SCALARS: dict[str, str] = {}
 _LIB_NAMESPACES: set[str] = set()
-
-
-def _lib_registry() -> dict[str, Any]:
-    """
-    The generated lib registry file, parsed once for every view of it below.
-
-    :return: Its top-level sections
-    """
-    if not _LIB_REGISTRY:
-        _LIB_REGISTRY.update(json.loads(_LIB_TYPES_PATH.read_text()))
-    return _LIB_REGISTRY
-
-
-def lib_types() -> dict[str, dict[str, Any]]:
-    """
-    The generated lib registry, loaded once.
-
-    Read from JSON rather than by importing the lib: this module is imported
-    by the import hook while it transforms pynecore's own lib modules, and an
-    import there would re-enter a half-initialized package (the same reason
-    ``const_fold`` defers its lib import).
-
-    :return: name -> entry mapping
-    """
-    if not _LIB_TYPES:
-        _LIB_TYPES.update(_lib_registry()['names'])
-    return _LIB_TYPES
 
 
 def lib_classes() -> dict[str, ClassSig]:
@@ -236,7 +206,7 @@ def lib_classes() -> dict[str, ClassSig]:
     :return: Class id -> what that class declares
     """
     if not _LIB_CLASSES:
-        published = _lib_registry()['classes']
+        published = lib_registry()['classes']
         for name, fields in published.items():
             cid = builtin_class_id(name)
             _LIB_CLASSES[cid] = ClassSig(name=name, id=cid, fields=dict(fields), methods={})
@@ -255,35 +225,10 @@ def lib_scalar_classes() -> dict[str, str]:
     :return: Class id -> the scalar it is
     """
     if not _LIB_SCALARS:
-        published = _lib_registry().get('scalar_classes') or {}
+        published = lib_registry().get('scalar_classes') or {}
         _LIB_SCALARS.update({object_ty(builtin_class_id(name)): scalar
                              for name, scalar in published.items()})
     return _LIB_SCALARS
-
-
-def lib_routes() -> dict[str, str]:
-    """
-    The call-site route of every lib callee path that does not route uniform.
-
-    ``FunctionIsolationTransformer`` reads a ``pynecore.lib`` callee's route
-    here instead of importing and inspecting the object; the generator computed
-    each entry with the transformer's own ``classify_callee``.
-
-    :return: Callee path as a script spells it (``lib.ta.sma``) -> route
-    """
-    return _lib_registry()['routes']
-
-
-def lib_star_exports() -> dict[str, list[str]]:
-    """
-    The ``__all__`` of every lib module that defines one.
-
-    ``ImportNormalizerTransformer`` expands ``from pynecore.lib... import *``
-    from here instead of importing the module.
-
-    :return: Module name (``pynecore.lib.ta``) -> its ``__all__``, sorted
-    """
-    return _lib_registry()['star_exports']
 
 
 def lib_namespaces() -> set[str]:
@@ -467,8 +412,9 @@ class _Inference:
         #: Whether each function spelled its return type out
         self._annotated_returns: dict[str, bool] = {}
         #: Scope-qualified ids of the module's ``@overload`` groups -- the only
-        #: user callees where a call site has anything to choose between
-        self._overload_groups: set[str] = set()
+        #: user callees where a call site has anything to choose between; in
+        #: declaration order, which is the order the table publishes them in
+        self._overload_groups: dict[str, None] = {}
         #: Every implementation's return type per group, in declaration order.
         #: A group's own type is what they all agree on (``overload_result``),
         #: so the entries have to stay apart until the last one is known
@@ -1341,7 +1287,7 @@ class _Inference:
             return
         if not isinstance(value, ast.Call) or len(value.args) != 2:
             return
-        called = _dotted(value.func)
+        called = dotted_name(value.func)
         if called is None or called.split('.')[-1] != 'shadowed_namespace':
             return
         library = value.args[0]
@@ -1395,7 +1341,7 @@ class _Inference:
         if _is_overload(stmt):
             # One name, several implementations: each contributes its
             # own return, and the group's type is what they agree on
-            self._overload_groups.add(key)
+            self._overload_groups[key] = None
             returns = self._group_returns.setdefault(key, [])
             nid = node_id(stmt)
             if nid is not None:
@@ -2217,7 +2163,7 @@ class _Inference:
                 'unknown-field', node.attr, fix='assign a field of a @udt object')
         elif base == OBJECT and not self._is_reference(node.value):
             self._node_diag(
-                f"the class of '{_dotted(node.value) or ast.unparse(node.value)}' is not "
+                f"the class of '{dotted_name(node.value) or ast.unparse(node.value)}' is not "
                 f"known here, so its field '{node.attr}' cannot be checked", node,
                 'unknown-class', node.attr, fix='annotate the value with the type it holds')
 
@@ -2295,7 +2241,7 @@ class _Inference:
         array of the matrix's element type.
         """
         if isinstance(iter_node, ast.Call):
-            callee = _dotted(iter_node.func)
+            callee = dotted_name(iter_node.func)
             if callee in ('range', 'pine_range', 'lib.pine_range'):
                 bounds = [self._ty_of(a) for a in iter_node.args]
                 if bounds and all(b in NUMERIC for b in bounds):
@@ -2576,7 +2522,7 @@ class _Inference:
         """
         if not isinstance(node, ast.Attribute):
             return None
-        spelled = _dotted(node)
+        spelled = dotted_name(node)
         return None if spelled is None else self._class_named(tuple(spelled.split('.')), node)
 
     def _names_type(self, node: ast.expr) -> bool:
@@ -2672,7 +2618,7 @@ class _Inference:
             return UNKNOWN
         if base == OBJECT and not self._is_reference(node.value):
             self._node_diag(
-                f"the class of '{_dotted(node.value) or ast.unparse(node.value)}' is not "
+                f"the class of '{dotted_name(node.value) or ast.unparse(node.value)}' is not "
                 f"known here, so its field '{node.attr}' has no type", node,
                 'unknown-class', node.attr,
                 fix='annotate the value with the type it holds')
@@ -3289,7 +3235,7 @@ class _Inference:
             self._pin_diags.add(nid)
             self._diag(
                 f"overload pin differs per call context: {sorted(set(seen.values()), key=str)}",
-                node, self._unknown('context-dependent-pin', node, _dotted(node.func) or ''),
+                node, self._unknown('context-dependent-pin', node, dotted_name(node.func) or ''),
                 fix='annotate the parameters so every call site agrees')
         return pin
 
@@ -3876,7 +3822,7 @@ class _Inference:
         which names a class rather than a function and so resolves through
         neither map.
         """
-        name = _dotted(node.func) or ''
+        name = dotted_name(node.func) or ''
         if name == '__sec_read__':
             return self._security_read(node)
         if name == 'method_call':
@@ -4287,7 +4233,7 @@ class _Inference:
         :param args: The receiver and the arguments after it
         :return: The type the call evaluates to, or None
         """
-        spelled = _dotted(selector)
+        spelled = dotted_name(selector)
         if spelled is None:
             return None
         imported = self._imported_selector(spelled)
@@ -4357,13 +4303,13 @@ class _Inference:
         if isinstance(selector, ast.Constant) and isinstance(selector.value, str):
             spelled = selector.value
         else:
-            spelled = _dotted(selector) or ast.unparse(selector)
+            spelled = dotted_name(selector) or ast.unparse(selector)
         receiver_ty = self._ty_of(receiver)
         if receiver_ty == UNKNOWN:
             return UNKNOWN
         if receiver_ty == OBJECT:
             self._node_diag(
-                f"the class of '{_dotted(receiver) or ast.unparse(receiver)}' is not known "
+                f"the class of '{dotted_name(receiver) or ast.unparse(receiver)}' is not known "
                 f"here, so its method '{spelled}' has no type", node, 'unknown-class', spelled,
                 fix='annotate the receiver with the type it holds')
             return UNKNOWN
@@ -4397,7 +4343,7 @@ class _Inference:
             return True
         for _, binding in self._import_sources():
             # ``import m`` names the module itself, ``from m import x`` a name in it
-            for hops in {binding.attrs, binding.attrs[:-1]}:
+            for hops in dict.fromkeys((binding.attrs, binding.attrs[:-1])):
                 interface = self._interface_of(binding.module, hops, node)
                 if interface is not None and name in interface.extensions.get(cid, {}):
                     return True
@@ -4579,7 +4525,7 @@ class _Inference:
             for frame in range(len(self._frames) - 1, -1, -1):
                 if self._frames[frame].scope == scope:
                     return self._call_context(key, node, frame, args,
-                                              record=_dotted(node.func) != 'method_call')
+                                              record=dotted_name(node.func) != 'method_call')
             return None
         sig = self._class_sig(cid, node)
         published = None if sig is None else sig.members.get(name)
@@ -4751,7 +4697,7 @@ class _Inference:
         if isinstance(sec_id, ast.Constant) and isinstance(sec_id.value, str):
             parts += [self._ty_of(written)
                       for written in self._sec_writes.get(sec_id.value, ())]
-        if default is not None and _dotted(default) != 'lib._na_none':
+        if default is not None and dotted_name(default) != 'lib._na_none':
             parts.append(self._ty_of(default))
         result = UNKNOWN
         if parts:
@@ -4959,13 +4905,13 @@ class _Inference:
                 self._call_q[nid] = settled.ret_qual
             return settled.ret
         if (key, params, node_id(target)) in self._in_progress:
-            self._diag(f"'{_dotted(node.func)}' is re-entrant, so its result type is unknown",
+            self._diag(f"'{dotted_name(node.func)}' is re-entrant, so its result type is unknown",
                        node, self._unknown('recursion', node, key))
             return UNKNOWN
         result = self._analyse(key, target, params, parents, node,
                                self._call_quals(target, node, positional))
         if result is None:
-            self._diag(f"'{_dotted(node.func)}' hit the per-module context limit", node,
+            self._diag(f"'{dotted_name(node.func)}' hit the per-module context limit", node,
                        self._unknown('context-budget', node, key))
             return UNKNOWN
         if nid is not None:
@@ -5409,7 +5355,7 @@ class _Inference:
                     directory = anchor
                     for _ in range(stmt.level - 1):
                         directory = directory.parent
-                    source = _package_member(directory, stmt.module or '')
+                    source = package_member(directory, stmt.module or '')
                     if not stmt.module:
                         # ``from . import x``: the names are the package's own,
                         # whether or not it has an ``__init__.py``
@@ -5426,7 +5372,7 @@ class _Inference:
                     continue
                 # A name a package hands out may be one of its submodules
                 for alias in stmt.names:
-                    member = None if alias.name == '*' else _package_member(package, alias.name)
+                    member = None if alias.name == '*' else package_member(package, alias.name)
                     if member is not None:
                         paths[member] = None
         for path in paths:
@@ -5452,13 +5398,7 @@ class _Inference:
         """
         if dotted in self._module_paths:
             return self._module_paths[dotted]
-        origin: str | None = None
-        try:
-            spec = importlib.util.find_spec(dotted)
-        except Exception:  # noqa: any resolution failure means "not a module here"
-            spec = None
-        if spec is not None and spec.origin and spec.origin.endswith('.py'):
-            origin = spec.origin
+        origin = module_spec_origin(dotted)
         self._module_paths[dotted] = origin
         return origin
 
@@ -5658,7 +5598,7 @@ class _Inference:
         if cached is not None and cached[0] is node:
             return cached[1]
         name = None
-        dotted = _dotted(node)
+        dotted = dotted_name(node)
         if dotted is not None:
             head, _, rest = dotted.partition('.')
             if head in self._lib_aliases and rest:
@@ -5904,7 +5844,7 @@ def _scan_tree(tree: ast.Module) -> tuple[dict[str, ast.expr], dict[str, list[as
     def take(expr: ast.expr, where: ast.expr) -> None:
         for child in ast_walk.walk(expr):
             if isinstance(child, (ast.Name, ast.Attribute)):
-                spelled = _dotted(child)
+                spelled = dotted_name(child)
                 if spelled is not None:
                     annotations.setdefault(spelled, where)
             elif isinstance(child, ast.Constant) and isinstance(child.value, str):
@@ -5923,7 +5863,7 @@ def _scan_tree(tree: ast.Module) -> tuple[dict[str, ast.expr], dict[str, list[as
     while todo:
         node = popleft()
         if isinstance(node, ast.Call):
-            if len(node.args) >= 2 and _dotted(node.func) == '__sec_write__':
+            if len(node.args) >= 2 and dotted_name(node.func) == '__sec_write__':
                 sec_id = node.args[0]
                 if isinstance(sec_id, ast.Constant) and isinstance(sec_id.value, str):
                     writes.setdefault(sec_id.value, []).append(node.args[1])
@@ -6476,28 +6416,6 @@ def _publishes_nothing(module: str) -> bool:
     return module == 'pynecore' or module.startswith('pynecore.') or is_stdlib(module)
 
 
-def _package_member(directory: Path, dotted: str) -> str | None:
-    """
-    The source of a module below a package directory, found without importing.
-
-    The candidates are tried in the import hook's order, ``name.py`` before
-    ``name/__init__.py``.
-
-    :param directory: The package directory the name is relative to
-    :param dotted: Dotted module name below it; empty for the package itself
-    :return: Its source path, or None when there is no such file
-    """
-    if dotted:
-        target = directory.joinpath(*dotted.split('.'))
-        candidates = (target.parent / f'{target.name}.py', target / '__init__.py')
-    else:
-        candidates = (directory / '__init__.py',)
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
-    return None
-
-
 def _line(node: ast.AST) -> int:
     """
     A node's line, tolerating the synthetic ones.
@@ -6813,4 +6731,4 @@ def _enumerated(node: ast.expr) -> ast.expr | None:
     """
     if not isinstance(node, ast.Call) or len(node.args) != 1:
         return None
-    return node.args[0] if _dotted(node.func) == 'enumerate' else None
+    return node.args[0] if dotted_name(node.func) == 'enumerate' else None

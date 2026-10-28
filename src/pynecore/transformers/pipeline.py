@@ -24,7 +24,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pynecore.transformers.builtin_shadow import BuiltinShadowTransformer
 from pynecore.transformers.call_inline import CallInlineTransformer
@@ -40,8 +40,9 @@ from pynecore.transformers.import_lifter import ImportLifterTransformer
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
 from pynecore.transformers.inline_series_hoist import InlineSeriesHoistTransformer
 from pynecore.transformers.input_transformer import InputTransformer
+from pynecore.transformers.layout_emit import apply_layout
 from pynecore.transformers.lib_series import LibrarySeriesTransformer
-from pynecore.transformers import locations
+from pynecore.transformers import locations, native
 from pynecore.transformers.module_property import ModulePropertyTransformer
 from pynecore.transformers.outer_write import OuterWriteTransformer
 from pynecore.transformers.persistent import PersistentTransformer
@@ -60,7 +61,7 @@ from pynecore.transformers.security_drawings import SecurityDrawingsTransformer
 from pynecore.transformers.security_instantiation import SecurityInstantiationTransformer
 from pynecore.transformers.security_slice import SecuritySliceTransformer, finalize_clone_defaults
 from pynecore.transformers.series import SeriesTransformer
-from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
+from pynecore.transformers.slot_layout import ModuleLayout
 from pynecore.transformers.ta_variable_hoist import TaVariableHoistTransformer
 from pynecore.transformers.type_checking_stripper import TypeCheckingStripperTransformer
 from pynecore.transformers.type_erasure import erase_type_calls
@@ -70,6 +71,12 @@ if TYPE_CHECKING:
     from pynecore.transformers.pine_type_table import Analyser
 
 __all__ = ['PipelineContext', 'Step', 'RuleStep', 'Phase', 'ANALYSIS', 'LOWERING', 'run_steps']
+
+#: Whether every step's wall time is reported on stderr
+_TIMING = bool(os.environ.get('PYNE_AST_TIMING'))
+
+#: Whether the rules of a phase run as separate passes instead of in one traversal
+_SEQUENTIAL = bool(os.environ.get('PYNE_AST_SEQUENTIAL'))
 
 
 @dataclass(slots=True)
@@ -90,6 +97,8 @@ class PipelineContext:
     pipeline_hash: str = ''
     #: Whether the module keeps Pine's three-state bool (see FloatToleranceTransformer)
     na_bool: bool = False
+    #: Whether the rules of a phase run as separate passes (``PYNE_AST_SEQUENTIAL``)
+    sequential: bool = field(default_factory=lambda: _SEQUENTIAL)
     #: Whether ``apply_layout`` materializes the slot layout for CPython
     emit_layout: bool = True
     #: The shared slot allocator of the lowering half (see slot_layout.py)
@@ -290,11 +299,33 @@ LOWERING: Sequence[Step | Phase] = (
     Step('FixLocations', lambda tree, ctx: locations.fix_locations(tree)),
 )
 
-#: Whether every step's wall time is reported on stderr
-_TIMING = bool(os.environ.get('PYNE_AST_TIMING'))
+#: One pass as the dispatch runs it: its name and the pass
+_Unit = tuple[str, Callable[[ast.Module, PipelineContext], ast.Module]]
 
-#: Whether the rules of a phase run as separate passes instead of in one traversal
-_SEQUENTIAL = bool(os.environ.get('PYNE_AST_SEQUENTIAL'))
+
+def _rule_pass(rule: RuleStep) -> Callable[[ast.Module, PipelineContext], ast.Module]:
+    return lambda tree, ctx: rule.make(ctx).visit(tree)
+
+
+def _phase_pass(rules: Sequence[RuleStep]) -> Callable[[ast.Module, PipelineContext], ast.Module]:
+    return lambda tree, ctx: cast(ast.Module, run_phase([rule.make(ctx) for rule in rules], tree))
+
+
+def _units(step: Step | Phase, ctx: PipelineContext) -> list[_Unit]:
+    """The passes one entry of a pipeline half runs over this module.
+
+    A step is one pass, or none when it only applies to user code. A phase is one
+    pass over its rules, or one pass per rule in sequential mode; either way only
+    the rules that apply to this module take part.
+    """
+    if isinstance(step, Phase):
+        rules = [rule for rule in step.rules if ctx.user_code or not rule.user_code_only]
+        if ctx.sequential:
+            return [(rule.name, _rule_pass(rule)) for rule in rules]
+        return [(step.name, _phase_pass(rules))]
+    if ctx.user_code or not step.user_code_only:
+        return [(step.name, step.run)]
+    return []
 
 
 def run_steps(steps: Sequence[Step | Phase], tree: ast.Module, ctx: PipelineContext) -> ast.Module:
@@ -305,17 +336,53 @@ def run_steps(steps: Sequence[Step | Phase], tree: ast.Module, ctx: PipelineCont
     :param ctx: What the steps share besides the tree.
     :return: The transformed module.
     """
+    mode = native.backend()
+    ported = frozenset()
+    if mode != 'python':
+        # A phase runs natively as one unit, under its own name, while the native
+        # phase has the same rules and every one of them is current
+        ported = native.current_steps() | native.current_phases(
+            step for step in steps if isinstance(step, Phase))
+    layout_steps = native.layout_steps() if mode != 'python' else frozenset()
+    # The native passes waiting to run as one native call (``native`` backend)
+    batch: list[_Unit] = []
     for step in steps:
-        if isinstance(step, Phase):
-            rules = [(rule.name, rule.make(ctx)) for rule in step.rules
-                     if ctx.user_code or not rule.user_code_only]
-            if _SEQUENTIAL:
-                for name, rule in rules:
-                    tree = _run(name, ctx, rule.visit, tree)
+        for name, run in _units(step, ctx):
+            if name not in ported:
+                tree = _run_native(batch, tree, ctx)
+                tree = _run(name, ctx, run, tree, ctx)
+            elif mode == 'native':
+                batch.append((name, run))
             else:
-                tree = _run(step.name, ctx, run_phase, [rule for _, rule in rules], tree)
-        elif ctx.user_code or not step.user_code_only:
-            tree = _run(step.name, ctx, step.run, tree, ctx)
+                # Native first: it reads the input and leaves it as it is, while
+                # the Python pass transforms it in place. A step that uses the slot
+                # layout leaves its own into a layout of its own
+                layout = ModuleLayout() if name in layout_steps else None
+                native_result = native.run([name], tree, ctx, layout)
+                try:
+                    tree = _run(name, ctx, run, tree, ctx)
+                except Exception as exc:
+                    native.verify_rejection(name, native_result, exc, ctx)
+                    raise
+                native.verify(name, tree, native_result, ctx, layout)
+    return _run_native(batch, tree, ctx)
+
+
+def _run_native(batch: list[_Unit], tree: ast.Module, ctx: PipelineContext) -> ast.Module:
+    """Run the batched native passes, in Python where a native port declines; empties the batch."""
+    if not batch:
+        return tree
+    units = list(batch)
+    batch.clear()
+    names = [name for name, _ in units]
+    # The layout and the type table the native steps leave replace the pipeline's,
+    # as the Python steps would have filled them
+    result = _run('+'.join(names) + ' (native)', ctx, native.run, names, tree, ctx,
+                  ctx.slot_layout, True)
+    if isinstance(result, ast.Module):
+        return result
+    for name, run in units:
+        tree = _run(name, ctx, run, tree, ctx)
     return tree
 
 

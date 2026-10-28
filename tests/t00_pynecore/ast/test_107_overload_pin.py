@@ -21,6 +21,7 @@ from pynecore.core.instance_state import _make_state
 from pynecore.core.overload import Implementation, _anchored  # noqa: internal API
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
+from pynecore.transformers.layout_emit import apply_layout
 from pynecore.transformers.persistent import PersistentTransformer
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
@@ -30,7 +31,7 @@ from pynecore.transformers.pine_type_rules import (
 )
 from pynecore.transformers.pine_type_transformer import PineTypeTransformer
 from pynecore.transformers.series import SeriesTransformer
-from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
+from pynecore.transformers.slot_layout import ModuleLayout
 
 # The reverse-engineering probe (``ovl2.pine``, FX:EURUSD@60) AS COMPILED: this
 # is PyneComp's output verbatim, with only the measured argument substituted.

@@ -76,7 +76,7 @@ def __test_test_functions_may_use_them__(tmp_path):
 #: their own: Python's own, PyneComp's suffix markers, and runtime protocol
 #: attributes read off lib objects outside the ``__pyne_*__`` namespace
 __test_helper_not_emitted = frozenset({
-    '__all__', '__call__', '__class__', '__defaults__', '__file__', '__future__',
+    '__all__', '__call__', '__class__', '__defaults__', '__file__', '__future__', '__getattr__',
     '__init__', '__kwdefaults__', '__main__', '__module__', '__name__', '__self__',
     '__setitem__', '__ren__', '__global__', '__module_property__',
 })

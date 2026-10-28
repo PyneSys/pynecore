@@ -41,6 +41,7 @@ from pynecore.core.instance_state import _make_state
 from pynecore.transformers import module_interface
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
+from pynecore.transformers.layout_emit import apply_layout
 from pynecore.transformers.persistent import PersistentTransformer
 from pynecore.transformers.module_interface import (
     build_interface, interface_from_payload, interface_payload, registered,
@@ -55,7 +56,7 @@ from pynecore.transformers.pine_type_rules import (
 from pynecore.transformers.pine_type_table import PineTypeTable
 from pynecore.transformers.pine_type_transformer import PineTypeTransformer
 from pynecore.transformers.series import SeriesTransformer
-from pynecore.transformers.slot_layout import ModuleLayout, apply_layout
+from pynecore.transformers.slot_layout import ModuleLayout
 
 
 @pytest.fixture(autouse=True)

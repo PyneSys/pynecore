@@ -1,14 +1,37 @@
 from typing import Any, cast
 import ast
-import importlib
 
 from . import ast_walk
+from .module_interface import StaticInterface, read_static_interface
+from .module_paths import module_spec_origin
 from .module_property import module_properties
 
 # Pine namespaces whose pynecore module has a different name
 _NAMESPACE_RENAMES = {
     'str': 'string',
 }
+
+
+#: What :func:`import_library` hands back: what the library's source binds
+Library = StaticInterface
+
+
+def import_library(name: str) -> Library | None:
+    """Read a library module whose alias shadows a builtin namespace, without running it.
+
+    :param name: The module name (``lib.user.somelib.v1``).
+    :return: What its source binds, or None when it has no readable source (the
+        script's own import statement then reports it).
+    """
+    source = module_spec_origin(name)
+    return None if source is None else read_static_interface(source)
+
+
+def library_serves(library: Library, attr: str) -> bool:
+    """Whether a library serves a name: its literal ``__all__``, or the names its
+    statements bind without one. A name only a star import or a module ``__getattr__``
+    could serve is not counted."""
+    return attr in library.all if library.all is not None else attr in library.bound
 
 
 class BuiltinShadowTransformer(ast_walk.NodeTransformer):
@@ -24,21 +47,21 @@ class BuiltinShadowTransformer(ast_walk.NodeTransformer):
     (``lib.ta.valuewhen``), which the downstream transformers (import
     normalizer, module properties, isolation, series) handle natively.
 
-    Which members the library serves is runtime knowledge: the library module
-    is imported at transform time (the same pattern callee resolution uses in
-    function isolation). Its ``__all__`` is the membership test — matching
-    TV, where non-exported library names are not reachable through the alias —
-    with a ``hasattr`` fallback for hand-written libraries without ``__all__``.
-    If the library cannot be imported, the alias is left untouched and the
-    script fails at its own import statement exactly as before.
+    Which members the library serves is read off its source, without running
+    it (as function isolation routes its callees). Its literal ``__all__`` is the
+    membership test — matching TV, where non-exported library names are not
+    reachable through the alias — with the names its statements bind as the
+    fallback for hand-written libraries without one. If the library has no
+    readable source, the alias is left untouched and the script fails at its
+    own import statement exactly as before.
     """
 
     def __init__(self):
         # Structure: module -> name -> {"type": "property"|"variable"}
         self.registry: dict[str, dict[str, Any]] = module_properties()
 
-        # alias -> (library module, exported names or None, builtin namespace)
-        self.aliases: dict[str, tuple[Any, frozenset[str] | None, str]] = {}
+        # alias -> (library, builtin namespace)
+        self.aliases: dict[str, tuple[Library, str]] = {}
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
         for stmt in node.body:
@@ -61,13 +84,10 @@ class BuiltinShadowTransformer(ast_walk.NodeTransformer):
                 namespace = _NAMESPACE_RENAMES.get(name, name)
                 if f'lib.{namespace}' not in self.registry:
                     continue
-                try:
-                    lib_module = importlib.import_module(alias.name)
-                except Exception:  # noqa: BLE001 - the script's own import will report it
+                library = import_library(alias.name)
+                if library is None:
                     continue
-                exported = getattr(lib_module, '__all__', None)
-                members = frozenset(exported) if exported is not None else None
-                self.aliases[alias.asname] = (lib_module, members, namespace)
+                self.aliases[alias.asname] = (library, namespace)
 
         if not self.aliases:
             return node
@@ -103,10 +123,10 @@ class BuiltinShadowTransformer(ast_walk.NodeTransformer):
         entry = self.aliases.get(node.value.id)
         if entry is None:
             return node
-        lib_module, members, namespace = entry
+        library, namespace = entry
 
         # The library serves the name -> the access stays on the library
-        if node.attr in members if members is not None else hasattr(lib_module, node.attr):
+        if library_serves(library, node.attr):
             return node
 
         # Built-in namespace fallback -> canonical lib.<namespace>.<attr> form;

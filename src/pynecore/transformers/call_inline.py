@@ -15,18 +15,16 @@ Bit-exactness by construction
 -----------------------------
 
 The emitted expression is DERIVED from the wrapper's own source AST, never
-hand-written: the defining module is parsed, the function body is accepted
-only in a restricted shape (docstring, ``if <test>: return <expr>`` guards,
-name aliases, one final ``return <expr>``) and folded into a nested
-conditional expression. The same operations run in the same order on the same
-operands, so the result is the same double, the same ``na`` object and the
-same exception. A body that grows past the shape stops being derivable and
-the site keeps its call -- and the pass's tests fail on it, so the loss is
-never silent.
-
-``typing.cast`` is the one call folded away: it is defined to return its
-second argument untouched, and the pass verifies the wrapper's ``cast`` IS
-``typing.cast`` before folding it.
+hand-written: ``scripts/call_inline_collector.py`` parses the defining module,
+accepts the function body only in a restricted shape (docstring, ``if <test>:
+return <expr>`` guards, name aliases, one final ``return <expr>``) and folds it
+into a nested conditional expression. The same operations run in the same
+order on the same operands, so the result is the same double, the same ``na``
+object and the same exception. The derived expressions are the generated
+registry ``call_inline_templates.json``, which this pass reads instead of the
+lib: the transform imports no lib module and parses no lib source, and a lib
+edit that changes a template fails ``test_142`` until the file is regenerated
+(see the collector's docstring).
 
 A guard a LITERAL argument decides is resolved at transform time
 (``math.pow(x, 2)`` keeps only ``x * x``), and so are the operations that
@@ -69,8 +67,8 @@ tolerant rewrite.
 
 ``math.max`` / ``math.min`` are varargs and cannot come out of that shape.
 They get one expansion written here for a fixed positional arity, guarded by
-a structural check of their real bodies (:func:`_varargs_shape`), so an edit
-to either body disables the expansion instead of changing what it means.
+a structural check of their real bodies in the collector, so an edit to
+either body fails the generation instead of changing what the expansion means.
 
 Name resolution
 ---------------
@@ -83,11 +81,12 @@ name of a copied body therefore resolves through
 collision-safe middle-dot alias the other passes use. A name that module does
 not anchor makes the body non-derivable.
 
-The callee itself must be PROVABLY the library function: the dotted path is
-resolved through the module's import map at transform time and the resulting
-object is compared by identity against the allow-listed function. A name the
-module binds anywhere -- a user ``def abs``, a variable named ``math`` -- takes
-the whole base name out of the pass.
+The callee itself must be PROVABLY the library function: the base name of the
+dotted path is resolved through the module's import map at transform time,
+and the resulting path must be one the registry records for the function (its
+own module path, or a re-export by the packages scripts import from). A name
+the module binds anywhere -- a user ``def abs``, a variable named ``math`` --
+takes the whole base name out of the pass.
 
 Where a site is left alone
 --------------------------
@@ -121,25 +120,19 @@ from collections.abc import Callable
 from typing import Any, cast
 import ast
 import builtins
-import importlib
+import json
 import operator
-import types
 from pathlib import Path
 
-from ..core.pine_range import pine_range
 from . import ast_walk
 from .pine_type_rules import get_ty, stamp_lowering
-from .slot_layout import DEFAULT_STATE_PARAM
+from .state_param import DEFAULT_STATE_PARAM
 
-__all__ = ['CallInlineTransformer', 'INLINABLE_FUNCTIONS', 'SUPPORT_NAMES',
-           'SUPPORT_MODULE', 'SUPPORT_ALIAS_PREFIX', 'derive_template',
+__all__ = ['CallInlineTransformer', 'SUPPORT_MODULE', 'SUPPORT_ALIAS_PREFIX', 'inline_templates',
            'varargs_expansion_arities']
 
 #: The module every free name of an inlined body resolves through
 SUPPORT_MODULE = 'pynecore.core.inline_support'
-
-#: The package every inlinable function is defined in
-_PACKAGE = 'pynecore'
 
 #: Alias prefix/suffix of an anchored support name, and of a bound argument.
 #: The middle dot cannot appear in a Python identifier, so neither a script
@@ -150,75 +143,29 @@ _TEMP_NAME = '__inl{}·__'
 #: Stand-in for an actual argument while the emission's shape is decided
 _PLACEHOLDER = '__inlp{}·__'
 
-#: The functions whose body may be copied into the call site, and how the
-#: expression is built: ``derive`` reads the body's own AST, ``varargs`` uses
-#: the fixed-arity expansion below. Every entry was read against its body;
-#: a function missing from here simply keeps its call.
-#:
-#: Deliberately absent: ``math.avg`` / ``math.round`` / ``math.round_to_mintick``
-#: (loops and multi-step arithmetic), ``array.set`` (a bare ``return`` no-op
-#: branch is not an expression).
-INLINABLE_FUNCTIONS: dict[tuple[str, str], str] = {
-    ('pynecore.lib.math', 'abs'): 'derive',
-    ('pynecore.lib.math', 'acos'): 'derive',
-    ('pynecore.lib.math', 'asin'): 'derive',
-    ('pynecore.lib.math', 'atan'): 'derive',
-    ('pynecore.lib.math', 'ceil'): 'derive',
-    ('pynecore.lib.math', 'cos'): 'derive',
-    ('pynecore.lib.math', 'exp'): 'derive',
-    ('pynecore.lib.math', 'floor'): 'derive',
-    ('pynecore.lib.math', 'log'): 'derive',
-    ('pynecore.lib.math', 'log10'): 'derive',
-    ('pynecore.lib.math', 'pow'): 'derive',
-    ('pynecore.lib.math', 'sign'): 'derive',
-    ('pynecore.lib.math', 'sin'): 'derive',
-    ('pynecore.lib.math', 'sqrt'): 'derive',
-    ('pynecore.lib.math', 'tan'): 'derive',
-    ('pynecore.lib.math', 'todegrees'): 'derive',
-    ('pynecore.lib.math', 'toradians'): 'derive',
-    ('pynecore.lib.math', 'max'): 'varargs',
-    ('pynecore.lib.math', 'min'): 'varargs',
-    ('pynecore.lib.array', 'get'): 'derive',
-    ('pynecore.lib.array', 'size'): 'derive',
-}
+#: The generated template registry (``scripts/call_inline_collector.py``)
+_TEMPLATES_PATH = Path(__file__).parent / 'call_inline_templates.json'
+_REGISTRY: dict[str, Any] = {}
 
-#: Free name of a copied body -> the attribute of :mod:`inline_support` that
-#: anchors it. A name outside this table makes the body non-derivable, and the
-#: pass's tests check every entry by object identity against the real module.
-SUPPORT_NAMES: dict[str, dict[str, str]] = {
-    'pynecore.lib.math': {
-        'NA': 'NA', 'na_float': 'na_float', 'na_int': 'na_int',
-        'builtins': 'py_builtins', 'math': 'py_math',
-        'pine_math': 'pine_math', 'fdlibm': 'fdlibm',
-        'float': 'py_float', 'int': 'py_int',
-        'pine_int': 'py_float',
-        '_na_of_operands': 'math_na_of_operands',
-    },
-    'pynecore.lib.array': {
-        'NA': 'NA', 'na_float': 'na_float', 'na_int': 'na_int',
-        'builtins': 'py_builtins',
-        'float': 'py_float', 'int': 'py_int', 'len': 'py_len',
-        'pine_int': 'py_float',
-        '_na_element': 'array_na_element',
-    },
-}
 
-#: Positional arities the varargs expansion is written for. Pine's own
-#: ``math.max``/``math.min`` calls are two- or three-operand in practice;
-#: anything wider keeps its call.
-_VARARGS_ARITIES = (2, 3)
+def inline_templates() -> dict[str, Any]:
+    """The generated template registry, read once per process.
+
+    :return: Its sections: ``functions`` (function path -> its template),
+        ``callees`` (callee path -> function path), ``loop_ranges`` (the paths
+        of ``pine_range``) and ``varargs_arities``.
+    """
+    if not _REGISTRY:
+        _REGISTRY.update(json.loads(_TEMPLATES_PATH.read_text(encoding='utf-8')))
+    return _REGISTRY
 
 
 def varargs_expansion_arities() -> tuple[int, ...]:
-    """The positional arities :func:`_varargs_template` expands.
+    """The positional arities the ``math.max`` / ``math.min`` expansion is written for.
 
     :return: The supported arities.
     """
-    return _VARARGS_ARITIES
-
-
-class NotDerivable(Exception):
-    """A wrapper body does not have the shape the pass can copy."""
+    return tuple(inline_templates()['varargs_arities'])
 
 
 #: Attribute tagging the ROOT of a subtree that came from the call site's own
@@ -280,97 +227,6 @@ def _func_path(func: ast.expr) -> str | None:
         parts.append(current.id)
         return '.'.join(reversed(parts))
     return None
-
-
-# --- source derivation -------------------------------------------------------
-
-#: Parsed wrapper modules, keyed by ``(path, mtime_ns, size)``: a long-lived
-#: process that re-imports scripts after a lib edit must re-read the body, not
-#: answer from a memo of the previous source.
-_module_asts: dict[tuple[str, int, int], dict[str, ast.FunctionDef]] = {}
-
-
-def _module_functions(module_name: str) -> dict[str, ast.FunctionDef]:
-    """Parse a defining module once and index its undecorated top-level defs.
-
-    A decorated definition is skipped on purpose: the runtime name is the
-    decorator's return value (an ``overload`` dispatcher), not the body below
-    it, so copying that body would be copying the wrong function.
-
-    :param module_name: Importable module name.
-    :return: Function name -> its last undecorated definition.
-    :raises NotDerivable: If the module has no readable source -- a pyc-only
-        install, a zipapp or a frozen module. The site then keeps its call
-        instead of failing the whole import.
-    """
-    try:
-        module = importlib.import_module(module_name)
-        path = Path(cast(str, module.__file__))
-        stat = path.stat()
-        key = (str(path), stat.st_mtime_ns, stat.st_size)
-        cached = _module_asts.get(key)
-        if cached is not None:
-            return cached
-        source = path.read_text(encoding='utf-8')
-    except (ImportError, OSError, TypeError, ValueError) as exc:
-        raise NotDerivable(f"{module_name} has no readable source: {exc!r}") from exc
-    functions: dict[str, ast.FunctionDef] = {}
-    for stmt in ast.parse(source).body:
-        if isinstance(stmt, ast.FunctionDef) and not stmt.decorator_list:
-            functions[stmt.name] = stmt
-    _module_asts[key] = functions
-    return functions
-
-
-def _is_cast_call(node: ast.expr, module: types.ModuleType) -> bool:
-    """Whether a node is ``cast(<type>, <value>)`` of ``typing.cast``.
-
-    ``typing.cast`` is defined to return its second argument untouched, so
-    folding it away removes a call and changes nothing else -- but only if the
-    module's ``cast`` really is that function, which is checked here.
-
-    :param node: The candidate node.
-    :param module: The defining module object.
-    :return: True when the call can be folded to its second argument.
-    """
-    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-            and node.func.id == 'cast' and len(node.args) == 2 and not node.keywords):
-        return False
-    import typing
-    return getattr(module, 'cast', None) is typing.cast
-
-
-class _BodySubstitutor(ast_walk.NodeTransformer):
-    """Rewrite a copied body expression into call-site terms.
-
-    Parameters and body-local aliases become the expressions bound for them,
-    every other free name becomes its :mod:`inline_support` anchor, and
-    ``typing.cast`` calls fold to their value argument.
-    """
-
-    def __init__(self, bindings: dict[str, ast.expr], supported: dict[str, str],
-                 module: types.ModuleType, used: set[str]):
-        self.bindings = bindings
-        self.supported = supported
-        self.module = module
-        self.used = used
-
-    def visit_Call(self, node: ast.Call) -> ast.expr:
-        if _is_cast_call(node, self.module):
-            return self.visit(node.args[1])
-        return cast(ast.expr, self.generic_visit(node))
-
-    def visit_Name(self, node: ast.Name) -> ast.expr:
-        if not isinstance(node.ctx, ast.Load):
-            raise NotDerivable(f"name {node.id!r} is written in the body")
-        bound = self.bindings.get(node.id)
-        if bound is not None:
-            return _arg_copy(bound)
-        anchor = self.supported.get(node.id)
-        if anchor is None:
-            raise NotDerivable(f"free name {node.id!r} has no inline_support anchor")
-        self.used.add(anchor)
-        return ast.Name(id=_SUPPORT_ALIAS.format(anchor), ctx=ast.Load())
 
 
 def _stamp_emission(node: ast.AST, call: ast.Call) -> None:
@@ -448,176 +304,90 @@ def _copy_value(value: Any) -> Any:
     return value
 
 
+# --- templates ---------------------------------------------------------------
+
+def _constant(spec: list[Any]) -> Any:
+    """The value of a template constant (``[type, value]``, see the collector).
+
+    :param spec: The tagged value.
+    :return: The value.
+    """
+    tag, value = spec
+    if tag == 'int':
+        return int(value)
+    if tag == 'float':
+        return float(value)
+    return value
+
+
+def _build(spec: dict[str, Any], args: list[ast.expr]) -> ast.AST:
+    """Build one node of a derived template for a call site.
+
+    A read of the i-th parameter becomes a tagged copy of the i-th argument;
+    every other node is built afresh and unlocated, for :func:`_stamp_emission`
+    to anchor at the call site.
+
+    :param spec: The node's encoding.
+    :param args: One expression per parameter.
+    :return: The node.
+    """
+    index = spec.get('param')
+    if index is not None:
+        return _arg_copy(args[index])
+    cls = getattr(ast, spec['_type'])
+    node = cls.__new__(cls)
+    state = node.__dict__
+    for field in cls._fields:
+        if field not in spec:
+            continue
+        value = spec[field]
+        if field == 'value' and cls is ast.Constant:
+            value = _constant(value)
+        elif field in ('op', 'ctx'):
+            value = getattr(ast, value)()
+        elif field == 'ops':
+            value = [getattr(ast, op)() for op in value]
+        elif isinstance(value, dict):
+            value = _build(value, args)
+        elif isinstance(value, list):
+            value = [_build(item, args) if isinstance(item, dict) else item for item in value]
+        state[field] = value
+    if spec.get('arg'):
+        state[_ARG_MARK] = True
+    return node
+
+
 class _Template:
     """A wrapper body reduced to parameters plus a renderable expression."""
 
-    def __init__(self, params: list[str], render: Any):
+    def __init__(self, kind: str, params: list[str],
+                 render: Callable[[list[ast.expr]], ast.expr]):
+        #: ``derive`` (the body's own expression) or ``varargs``
+        self.kind = kind
         self.params = params
         self._render = render
 
-    def render(self, args: list[ast.expr], used: set[str]) -> ast.expr:
+    def render(self, args: list[ast.expr]) -> ast.expr:
         """Build the call-site expression.
 
         :param args: One expression per parameter, already bound if needed.
-        :param used: Collector of the support anchors the emission needs.
         :return: The inlined expression.
         """
-        return cast(ast.expr, self._render(args, used))
+        return self._render(args)
 
 
-#: Derived templates, process-wide: ``(module, name)`` -> the parsed functions
-#: of the module they were derived from (see :func:`_module_functions`) and the
-#: template, None for a body that is not derivable
-_derived: dict[tuple[str, str], tuple[dict[str, ast.FunctionDef], _Template | None]] = {}
+def _derived_template(entry: dict[str, Any]) -> _Template:
+    """The template of a ``derive`` registry entry.
 
-
-def derive_template(module_name: str, func_name: str) -> _Template:
-    """Reduce a wrapper's body to a renderable conditional expression.
-
-    Accepted shape, in order: an optional docstring, then any sequence of
-    ``if <test>: return <expr>`` guards (no ``else`` branch needed) and
-    ``<name> = <expr>`` aliases whose value folds to a name already in scope
-    or to a constant, closed by a final ``return <expr>``.
-
-    :param module_name: The defining module.
-    :param func_name: The function name.
+    :param entry: The entry.
     :return: The template.
-    :raises NotDerivable: If the signature or the body is outside the shape.
     """
-    kind = INLINABLE_FUNCTIONS.get((module_name, func_name))
-    if kind == 'varargs':
-        return _varargs_template(module_name, func_name)
-    functions = _module_functions(module_name)
-    node = functions.get(func_name)
-    if node is None:
-        raise NotDerivable(f"{module_name}.{func_name} has no undecorated definition")
-    args = node.args
-    if args.posonlyargs or args.kwonlyargs or args.vararg or args.kwarg or args.defaults:
-        raise NotDerivable("only plain positional parameters are supported")
-    params = [arg.arg for arg in args.args]
-    module = importlib.import_module(module_name)
-    supported = SUPPORT_NAMES.get(module_name, {})
-
-    body = list(node.body)
-    first = body[0] if body else None
-    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) \
-            and isinstance(first.value.value, str):
-        body = body[1:]
-    if not body:
-        raise NotDerivable("empty body")
-
-    def render(call_args: list[ast.expr], used: set[str]) -> ast.expr:
-        bindings = dict(zip(params, call_args))
-
-        def substitute(expr: ast.expr) -> ast.expr:
-            return _BodySubstitutor(bindings, supported, module, used).visit(_deep_copy(expr))
-
-        def build(stmts: list[ast.stmt]) -> ast.expr:
-            head = stmts[0]
-            if isinstance(head, ast.Return):
-                if len(stmts) != 1 or head.value is None:
-                    raise NotDerivable("a bare or non-final return is not an expression")
-                return substitute(head.value)
-            if isinstance(head, ast.Assign):
-                if len(head.targets) != 1 or not isinstance(head.targets[0], ast.Name):
-                    raise NotDerivable("only a single-name alias is supported")
-                folded = head.value
-                while _is_cast_call(folded, module):
-                    folded = cast(ast.Call, folded).args[1]
-                if not isinstance(folded, (ast.Name, ast.Constant)):
-                    raise NotDerivable("an alias must fold to a name or a constant")
-                target = cast(ast.Name, head.targets[0]).id
-                bindings[target] = bindings[folded.id] if isinstance(folded, ast.Name) \
-                    else folded
-                return build(stmts[1:])
-            if isinstance(head, ast.If):
-                if head.orelse or len(head.body) != 1 \
-                        or not isinstance(head.body[0], ast.Return):
-                    raise NotDerivable("a guard must be a single `if <test>: return <expr>`")
-                guarded = cast(ast.Return, head.body[0])
-                if guarded.value is None or len(stmts) == 1:
-                    raise NotDerivable("a guard must return a value and be followed by more")
-                return ast.IfExp(test=substitute(head.test),
-                                 body=substitute(guarded.value),
-                                 orelse=build(stmts[1:]))
-            raise NotDerivable(f"{type(head).__name__} is not part of the derivable shape")
-
-        return build(body)
-
-    # Render once with placeholder parameters: a body outside the shape must
-    # fail here, at allow-list time, not at the first call site
-    render([ast.Name(id=param, ctx=ast.Load()) for param in params], set())
-    return _Template(params, render)
+    body = entry['body']
+    return _Template('derive', entry['params'],
+                     lambda call_args: cast(ast.expr, _build(body, call_args)))
 
 
-def _varargs_shape(module_name: str, func_name: str) -> str:
-    """Verify that ``math.max``/``math.min`` still have the body the expansion
-    below reproduces, and report which builtin they end in.
-
-    Expected, exactly: a docstring, an ``assert``, a ``for n in numbers``
-    loop whose only statement returns ``_na_of_operands(numbers)`` when ``n``
-    is na, and a final ``return builtins.<max|min>(cast(..., numbers))``.
-
-    :param module_name: The defining module.
-    :param func_name: The function name.
-    :return: The name of the builtin the body ends in.
-    :raises NotDerivable: If the body drifted from that shape.
-    """
-    node = _module_functions(module_name).get(func_name)
-    if node is None:
-        raise NotDerivable(f"{module_name}.{func_name} has no undecorated definition")
-    args = node.args
-    if args.args or args.posonlyargs or args.kwonlyargs or args.kwarg or not args.vararg:
-        raise NotDerivable("expected a pure varargs signature")
-    vararg = args.vararg.arg
-    body = list(node.body)
-    first = body[0] if body else None
-    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
-        body = body[1:]
-    if len(body) != 3 or not isinstance(body[0], ast.Assert):
-        raise NotDerivable("expected `assert`, the na loop and the final return")
-    loop, final = body[1], body[2]
-    if not (isinstance(loop, ast.For) and not loop.orelse
-            and isinstance(loop.target, ast.Name)
-            and isinstance(loop.iter, ast.Name) and loop.iter.id == vararg
-            and len(loop.body) == 1):
-        raise NotDerivable("expected `for <n> in <numbers>:` with one statement")
-    item = loop.target.id
-    guard = loop.body[0]
-    if not (isinstance(guard, ast.If) and not guard.orelse and len(guard.body) == 1
-            and isinstance(guard.body[0], ast.Return)):
-        raise NotDerivable("expected a single na guard in the loop")
-    test = guard.test
-    if not (isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)
-            and isinstance(test.operand, ast.Compare)
-            and len(test.operand.ops) == 1 and isinstance(test.operand.ops[0], ast.Eq)
-            and isinstance(test.operand.left, ast.Name) and test.operand.left.id == item
-            and isinstance(test.operand.comparators[0], ast.Name)
-            and cast(ast.Name, test.operand.comparators[0]).id == item):
-        raise NotDerivable("expected `not (<n> == <n>)` as the na test")
-    returned = cast(ast.Return, guard.body[0]).value
-    if not (isinstance(returned, ast.Call) and isinstance(returned.func, ast.Name)
-            and returned.func.id == '_na_of_operands' and len(returned.args) == 1
-            and isinstance(returned.args[0], ast.Name)
-            and cast(ast.Name, returned.args[0]).id == vararg):
-        raise NotDerivable("expected `_na_of_operands(<numbers>)` on the na path")
-    if not isinstance(final, ast.Return):
-        raise NotDerivable("expected a final return")
-    call = final.value
-    module = importlib.import_module(module_name)
-    if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
-            and isinstance(call.func.value, ast.Name) and call.func.value.id == 'builtins'
-            and len(call.args) == 1):
-        raise NotDerivable("expected a final `builtins.<name>(...)` call")
-    inner = call.args[0]
-    while _is_cast_call(inner, module):
-        inner = cast(ast.Call, inner).args[1]
-    if not (isinstance(inner, ast.Name) and inner.id == vararg):
-        raise NotDerivable("expected the varargs tuple as the builtin's only argument")
-    return call.func.attr
-
-
-def _varargs_template(module_name: str, func_name: str) -> _Template:
+def _varargs_template(entry: dict[str, Any]) -> _Template:
     """The fixed-arity expansion of ``math.max`` / ``math.min``.
 
     For ``max(a, b)`` the body scans the operands for na and otherwise hands
@@ -632,22 +402,15 @@ def _varargs_template(module_name: str, func_name: str) -> _Template:
     and short-circuits exactly where the loop's ``return`` does, and the
     builtin is handed the same single tuple argument the body hands it.
 
-    :param module_name: The defining module.
-    :param func_name: The function name.
+    :param entry: The registry entry: the builtin the body ends in and the
+        anchors of ``_na_of_operands`` and ``builtins``.
     :return: The template, for the widest supported arity.
-    :raises NotDerivable: If the real body drifted from the expected shape.
     """
-    builtin_name = _varargs_shape(module_name, func_name)
-    supported = SUPPORT_NAMES[module_name]
+    builtin_name = entry['builtin']
+    na_anchor = _SUPPORT_ALIAS.format(entry['na_anchor'])
+    builtins_anchor = _SUPPORT_ALIAS.format(entry['builtins_anchor'])
 
-    def render(call_args: list[ast.expr], used: set[str]) -> ast.expr:
-        if len(call_args) not in _VARARGS_ARITIES:
-            raise NotDerivable("unsupported arity")
-        used.add(supported['_na_of_operands'])
-        used.add(supported['builtins'])
-        na_anchor = _SUPPORT_ALIAS.format(supported['_na_of_operands'])
-        builtins_anchor = _SUPPORT_ALIAS.format(supported['builtins'])
-
+    def render(call_args: list[ast.expr]) -> ast.expr:
         def operands() -> ast.expr:
             return ast.Tuple(elts=[_arg_copy(arg) for arg in call_args], ctx=ast.Load())
 
@@ -664,7 +427,26 @@ def _varargs_template(module_name: str, func_name: str) -> _Template:
                                    attr=builtin_name, ctx=ast.Load()),
                 args=[operands()], keywords=[]))
 
-    return _Template([f'__arg{i}' for i in range(_VARARGS_ARITIES[-1])], render)
+    arities = varargs_expansion_arities()
+    return _Template('varargs', [f'__arg{i}' for i in range(arities[-1])], render)
+
+
+#: Templates built from the registry, process-wide: function path -> template
+_TEMPLATES: dict[str, _Template] = {}
+
+
+def _template(key: str) -> _Template:
+    """The template of a registry function, built once per process.
+
+    :param key: The function path (``pynecore.lib.math.abs``).
+    :return: The template.
+    """
+    template = _TEMPLATES.get(key)
+    if template is None:
+        entry = inline_templates()['functions'][key]
+        template = _TEMPLATES[key] = (_derived_template(entry) if entry['kind'] == 'derive'
+                                      else _varargs_template(entry))
+    return template
 
 
 # --- constant folding --------------------------------------------------------
@@ -1121,9 +903,6 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
     def __init__(self) -> None:
         self.index = _NameIndex()
         self._used: set[str] = set()
-        self._templates: dict[tuple[str, str], _Template | None] = {}
-        self._resolved: dict[str, Any] = {}
-        self._targets: dict[str, tuple[str, str] | None] = {}
         self._counter = 0
         self._func_depth = 0
         #: The enclosing function definitions, innermost last
@@ -1139,32 +918,16 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
 
     # --- callee proof ------------------------------------------------------
 
-    def _target(self, func: ast.expr) -> tuple[str, str] | None:
-        """Prove that a callee IS an allow-listed library function.
-
-        The answer is memoized per dotted path: an unprovable path would
-        otherwise re-walk the whole allow-list on every site.
+    def _resolve_path(self, func: ast.expr) -> str | None:
+        """The path a callee spells once the module's import map resolved its base name.
 
         :param func: The callee expression.
-        :return: The ``(module, name)`` entry, or None when unprovable.
+        :return: The resolved dotted path, or None when the base name is bound by
+            the module or imported by no trusted import.
         """
         path = _func_path(func)
         if path is None:
             return None
-        try:
-            return self._targets[path]
-        except KeyError:
-            pass
-        target = self._resolve_target(path)
-        self._targets[path] = target
-        return target
-
-    def _resolve_target(self, path: str) -> tuple[str, str] | None:
-        """Resolve one dotted path against the allow-list, by object identity.
-
-        :param path: The dotted callee path.
-        :return: The ``(module, name)`` entry, or None when unprovable.
-        """
         parts = path.split('.')
         base = parts[0]
         if base in self.index.bound:
@@ -1172,83 +935,19 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
         entry = self.index.import_map.get(base)
         if entry is None:
             return None
-        obj = self._resolve(path, parts, entry)
-        if obj is None:
-            return None
-        for key in INLINABLE_FUNCTIONS:
-            try:
-                module = importlib.import_module(key[0])
-            except ImportError:
-                continue
-            if getattr(module, key[1], None) is obj:
-                return key
-        return None
-
-    def _resolve(self, path: str, parts: list[str],
-                 entry: tuple[str, str | None]) -> Any | None:
-        """Resolve a dotted callee path through the module-level import map.
-
-        :param path: The dotted path, used as the cache key.
-        :param parts: Its segments.
-        :param entry: The import map entry of the base name.
-        :return: The runtime object, or None if it cannot be resolved.
-        """
-        try:
-            return self._resolved[path]
-        except KeyError:
-            pass
         module_name, attr = entry
-        obj: Any | None
-        if module_name != _PACKAGE and not module_name.startswith(_PACKAGE + '.'):
-            # Every inlinable function lives in this package, and a user module
-            # is not imported just to look at it
-            self._resolved[path] = None
-            return None
-        try:
-            obj = importlib.import_module(module_name)
-            for name in ([attr] if attr else []) + parts[1:]:
-                try:
-                    obj = getattr(obj, name)
-                except AttributeError:
-                    if not isinstance(obj, types.ModuleType):
-                        raise
-                    obj = importlib.import_module(f'{obj.__name__}.{name}')
-        except (ImportError, AttributeError):
-            obj = None
-        self._resolved[path] = obj
-        return obj
+        return '.'.join([module_name, *([attr] if attr else []), *parts[1:]])
 
-    def _template(self, key: tuple[str, str]) -> _Template | None:
-        """The template of an allow-listed function, derived once per source.
+    def _target(self, func: ast.expr) -> str | None:
+        """Prove that a callee IS an allow-listed library function.
 
-        A template is never changed by a render, so one derivation serves every
-        module of the process -- for as long as the parsed source it was
-        derived from is the current one.
-
-        :param key: ``(module, name)``.
-        :return: The template, or None when the body is not derivable.
+        :param func: The callee expression.
+        :return: The function's registry path, or None when unprovable.
         """
-        try:
-            return self._templates[key]
-        except KeyError:
-            pass
-        template: _Template | None
-        try:
-            functions = _module_functions(key[0])
-        except NotDerivable:
-            template = None
-        else:
-            derived = _derived.get(key)
-            if derived is not None and derived[0] is functions:
-                template = derived[1]
-            else:
-                try:
-                    template = derive_template(*key)
-                except NotDerivable:
-                    template = None
-                _derived[key] = (functions, template)
-        self._templates[key] = template
-        return template
+        path = self._resolve_path(func)
+        if path is None:
+            return None
+        return inline_templates()['callees'].get(path)
 
     # --- emission ----------------------------------------------------------
 
@@ -1263,13 +962,11 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
         key = self._target(node.func)
         if key is None:
             return None
-        template = self._template(key)
-        if template is None:
-            return None
-        if INLINABLE_FUNCTIONS[key] == 'derive':
+        template = _template(key)
+        if template.kind == 'derive':
             if len(node.args) != len(template.params):
                 return None
-        elif len(node.args) not in _VARARGS_ARITIES:
+        elif len(node.args) not in varargs_expansion_arities():
             return None
 
         classes = [_arg_class(arg) for arg in node.args]
@@ -1290,12 +987,7 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
         counters = frozenset(placeholders[index] for index, kind in enumerate(classes)
                              if kind == _ARG_NAME
                              and cast(ast.Name, node.args[index]).id in self._counters)
-        used: set[str] = set()
-        try:
-            expression = _fold_guards(_LiteralFolder(counters).visit(
-                template.render(render_args, used)))
-        except NotDerivable:
-            return None
+        expression = _fold_guards(_LiteralFolder(counters).visit(template.render(render_args)))
         # Marked BEFORE the arguments go in: what is in the tree now is the
         # pass's own emission, and the user's subtrees must stay untouched
         _mark_exact(expression)
@@ -1304,7 +996,6 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
         # away takes its anchors with it, and an import nothing reads is dead
         # weight. The arguments going in below bring none of their own -- a
         # nested inlined call registered its anchors when it was inlined
-        del used
         reads: dict[int, int] = {index: 0 for index in placeholders}
         indexes = {name: index for index, name in placeholders.items()}
         for child in ast_walk.walk(expression):
@@ -1448,13 +1139,7 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
         if not self._functions or not isinstance(node.target, ast.Name) \
                 or not isinstance(node.iter, ast.Call):
             return None
-        path = _func_path(node.iter.func)
-        if path is None:
-            return None
-        base = path.split('.')[0]
-        entry = self.index.import_map.get(base)
-        if base in self.index.bound or entry is None \
-                or self._resolve(path, path.split('.'), entry) is not pine_range:
+        if self._resolve_path(node.iter.func) not in inline_templates()['loop_ranges']:
             return None
         name = node.target.id
         rebinds = _Rebinds(name)

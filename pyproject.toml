@@ -1,7 +1,7 @@
 [build-system]
 # Cython compiles the optional native extensions (see setup.py); without it, or
 # without a C compiler, the package still builds and runs on its pure-Python code.
-requires = ["setuptools>=61.0", "Cython>=3.0"]
+requires = ["setuptools>=61.0", "Cython>=3.0", "setuptools-rust>=1.9"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -54,7 +54,7 @@ optional-dependencies.cli = ["typer>=0.16", "rich", "tzdata"]
 optional-dependencies.all = ["typer>=0.16", "rich", "ccxt", "tzdata"]
 
 #Optional dependencies for development
-optional-dependencies.dev = ["pytest>=9.1", "pytest-spec", "Cython>=3.0"]
+optional-dependencies.dev = ["pytest>=9.1", "pytest-spec", "Cython>=3.0", "setuptools-rust>=1.9"]
 
 ### Providers
 
@@ -112,6 +112,12 @@ pytest -p no:cacheprovider \
 {project}/tests/t01_lib/t04_math/test_016_native_math_matches_python.py \
 {project}/tests/t01_lib/t04_math/test_022_native_rolling_sum_matches_python.py \
 {project}/tests/t00_pynecore/core/test_114_native_color_matches_python.py \
+{project}/tests/t00_pynecore/ast/test_137_native_transform.py \
 {project}/tests/t00_pynecore/core/test_166_profiler.py
 """
-test-environment = { PYNE_REQUIRE_NATIVE_MATH = "1", PYNE_REQUIRE_NATIVE_COLOR = "1", PYNE_REQUIRE_NATIVE_PROFILER = "1" }
+test-environment = { PYNE_REQUIRE_NATIVE_MATH = "1", PYNE_REQUIRE_NATIVE_COLOR = "1", PYNE_REQUIRE_NATIVE_PROFILER = "1", PYNE_REQUIRE_NATIVE_TRANSFORM = "1" }
+
+# The manylinux / musllinux build containers have no Rust toolchain
+[tool.cibuildwheel.linux]
+before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+environment = { PATH = "$HOME/.cargo/bin:$PATH" }

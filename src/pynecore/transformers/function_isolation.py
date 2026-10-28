@@ -46,19 +46,28 @@ Classification sources:
   own slots or any non-direct call site; a name whose LAST definition is
   decorated routes uniform (the runtime value is the decorator's return
   value — an ``overload`` dispatcher, an ``lru_cache`` wrapper, ...);
-- cross-module callees: every one is classified by :func:`classify_callee`
-  — ``__pyne_bind__`` marks an overload dispatcher (uniform),
-  ``__pyne_layout__`` proves state-carrying, a ``__pyne_slot_layout__``
-  marker in the function's globals with no layout attribute proves
-  stateless, everything else falls to uniform. A ``pynecore.lib`` callee is
-  NOT inspected here: its classification was computed by the same function
-  when ``scripts/lib_type_collector.py`` generated ``lib_types.json``, and is
-  read from that file's ``routes`` section. The file is hashed into the
-  pipeline digest and the lib sources mostly are not, so a lib edit that
-  changes a route reaches the cached script bytecode through the
-  regenerated file (``test_104`` fails until it is regenerated). Any other
-  callee module (a user Pyne library, a plain module, the rest of
-  ``pynecore``) is imported at transform time and the object inspected.
+- cross-module callees, without importing the module they are called in:
+
+  - a ``pynecore.lib`` callee's route was computed by :func:`classify_callee`
+    when ``scripts/lib_type_collector.py`` generated ``lib_types.json``, and
+    is read from that file's ``routes`` section. The file is hashed into the
+    pipeline digest and the lib sources mostly are not, so a lib edit that
+    changes a route reaches the cached script bytecode through the
+    regenerated file (``test_104`` fails until it is regenerated);
+  - a callee of a Pyne module (a user library) is routed by the interface
+    the module publishes (``ModuleInterface.call_routes``, which its own
+    lowering settled), following the imports it reexports through
+    (``ModuleInterface.reexports``);
+  - a callee of any other module -- a plain Python module, the rest of
+    ``pynecore``, a package, a Pyne module that has no settled interface to
+    give -- is routed by what the module's source binds
+    (:func:`module_interface.static_interface`): a class is constructed raw,
+    an import leads on into the module it names, a name a package's
+    ``__init__`` cannot bind is its submodule, and a function takes the
+    uniform route. Nothing is imported: the transform runs no module, and a
+    host without an interpreter routes exactly the same;
+  - the standard library and the builtins are called plainly
+    (``python_names.json``).
 
 Unprovable always degrades to uniform (correct, only slower) — an error can
 only come from a false proof, never from missing knowledge.
@@ -107,26 +116,25 @@ consumer's cadence (a sort comparator, a filter predicate), which is not
 loop-iteration semantics, so the loop form's same-bar rollback must not
 apply there.
 """
+from collections.abc import Sequence
 from pathlib import Path
 from typing import cast, Any
 import ast
-import builtins
 import hashlib
-import importlib
-import keyword
 import types
 
 from ..core.pine_export import Exported
-from ..utils.stdlib_checker import is_stdlib
 from . import ast_walk
 from . import module_interface
 from .call_inline import SUPPORT_ALIAS_PREFIX
-from .pine_type_infer import lib_routes
+from .lib_registry import lib_routes
+from .module_interface import StaticInterface
+from .module_paths import module_spec_origin, package_member
 from .pine_type_rules import (get_pin, get_pins, get_ty, get_varying, get_vector, get_widens,
                               stamp_lowering)
 from .pine_qualifier import SERIES_LENGTH_KEYWORD, get_series_len, get_series_lens
-from .pine_type_table import Analyser, PineTypeTable
-from .pine_type_transformer import module_table
+from .pine_type_table import Analyser, ModuleInterface, PineTypeTable, module_table
+from .python_names import is_builtin, is_keyword, is_stdlib
 # noinspection PyProtectedMember
 from .slot_layout import DEFAULT_STATE_PARAM, ModuleLayout, scope_for_function
 
@@ -338,10 +346,11 @@ NON_TRANSFORMABLE_FUNCTIONS = {
 
 # Call-site routes decided at transform time. Same-module defs resolve to a
 # ('same', scope_id) tuple first and collapse to fast/direct through the
-# carrier fixpoint.
-_SKIP = 'skip'
-_DIRECT = 'direct'
-_FAST = 'fast'
+# carrier fixpoint. A module's interface publishes the routes of its own
+# callees in the same words.
+_SKIP = module_interface.ROUTE_SKIP
+_DIRECT = module_interface.ROUTE_DIRECT
+_FAST = module_interface.ROUTE_FAST
 # Cross-module state-carrying callee marked ``__pyne_shared_call_site__``:
 # emitted on the fast route with the STRAIGHT-LINE shape even inside a loop.
 # Every loop site shares one instance across iterations now, so the marker no
@@ -354,8 +363,8 @@ _FAST = 'fast'
 # exactly that: shared slot, no rollback; the ``per_call`` layout flag
 # (see ``_collect_builtins``) shields the same machines when they sit deeper
 # in a rolled-back callee subtree.
-_FAST_SHARED = 'fast-shared'
-_UNIFORM = 'uniform'
+_FAST_SHARED = module_interface.ROUTE_FAST_SHARED
+_UNIFORM = module_interface.ROUTE_UNIFORM
 
 _Route = str | tuple[str, str]
 
@@ -363,8 +372,8 @@ _Route = str | tuple[str, str]
 #: instead of being imported and inspected (see :func:`classify_callee`)
 _LIB_PACKAGE = 'pynecore.lib'
 
-#: The routes decided by what the callee object carries: they hold only while
-#: the modules that bound and defined it say the same thing
+#: The routes decided by what the modules on the import chain bind: they hold only
+#: while those modules say the same thing
 _OBJECT_ROUTES = (_DIRECT, _FAST, _FAST_SHARED)
 
 #: pynecore's own package directory: its sources are part of the pipeline
@@ -407,6 +416,24 @@ def classify_callee(obj: Any) -> str:
     if isinstance(obj, types.FunctionType) and '__pyne_slot_layout__' in obj.__globals__:
         return _DIRECT  # transformed module, no layout -> provably stateless
     return _UNIFORM
+
+
+def _submodule(interface: ModuleInterface | StaticInterface, source: str,
+               head: str) -> str | None:
+    """
+    The submodule a name of a package reaches: ``from pkg import name`` imports
+    ``pkg.name`` when the package's ``__init__`` binds no such name.
+
+    :param interface: What the module publishes.
+    :param source: The module's source file.
+    :param head: The name.
+    :return: The submodule's source, None when the module is no package, may bind
+        the name itself, or has no such submodule.
+    """
+    if Path(source).name != '__init__.py' or not isinstance(interface, StaticInterface) \
+            or head in interface.bound or interface.open:
+        return None
+    return package_member(Path(source).parent, head)
 
 
 def _is_test_function(name: str) -> bool:
@@ -457,7 +484,7 @@ def _copy_name_chain(func: ast.expr, location: list[int]) -> ast.expr | None:
         return None
     # The parser normalizes a non-ASCII identifier and reads a keyword back as
     # something else; those take the reparse
-    if not (name.isascii() and name.isidentifier()) or keyword.iskeyword(name):
+    if not (name.isascii() and name.isidentifier()) or is_keyword(name):
         return None
     new.lineno, new.col_offset, new.end_lineno, new.end_col_offset = location
     return new
@@ -633,7 +660,10 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
         self._comp_iter_depth = 0
         self._ordinals: dict[str, int] = {}
         self._used_helpers: set[str] = set()
-        self._resolve_cache: dict[str, tuple[Any, tuple[types.ModuleType, ...]]] = {}
+        #: Callee path -> its route and the files it holds while (``_route_imported``)
+        self._resolve_cache: dict[str, tuple[str, tuple[str | None, ...]]] = {}
+        #: Source file -> what it binds (``_static_interface``)
+        self._static_cache: dict[str, StaticInterface | None] = {}
         #: The module's type table: the dependency records the routes extend
         self._table: PineTypeTable | None = None
         #: The module files a route was already tracked through, as spelled
@@ -706,22 +736,13 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
 
         entry = self.index.import_map.get(base)
         if entry is not None:
-            module_name, attr = entry
-            if is_stdlib(module_name):
+            if is_stdlib(entry[0]):
                 return _SKIP
-            target = '.'.join([f'{module_name}.{attr}' if attr else module_name] + parts[1:])
-            if target == _LIB_PACKAGE or target.startswith(_LIB_PACKAGE + '.'):
-                # Spelled the way a script spells it (``lib.ta.sma``); a path the
-                # generator did not record is not provable, like an unresolvable one
-                return lib_routes().get('lib' + target[len(_LIB_PACKAGE):], _UNIFORM)
-            obj, modules = self._resolve_imported(path, parts)
-            if obj is None:
-                return _UNIFORM
-            route = classify_callee(obj)
+            route, files = self._route_imported(path, parts)
             if route in _OBJECT_ROUTES:
-                self._track_route(obj, modules)
+                self._track_route(files)
             return route
-        if len(parts) == 1 and base in vars(builtins):
+        if len(parts) == 1 and is_builtin(base):
             return _SKIP
         if base.startswith('_'):
             return _SKIP  # unresolvable private name — legacy parity
@@ -754,47 +775,138 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
         index = sub.slice.value
         return 0 <= index < len(scope.slots) and scope.slots[index].kind == 'series'
 
-    def _resolve_imported(self, path: str, parts: list[str]) \
-            -> tuple[Any | None, tuple[types.ModuleType, ...]]:
-        """Resolve a dotted callee path of a non-lib module through the
-        module-level import map at transform time (imports are cached in
-        sys.modules).
+    def _route_imported(self, path: str, parts: list[str]) -> tuple[str, tuple[str | None, ...]]:
+        """The route of a dotted callee path that starts at a module-level import.
 
         :param path: The dotted callee path.
         :param parts: Its segments.
-        :return: The callee object (None when unresolvable), and every module
-            the resolution read an attribute of or imported on the way.
+        :return: The route, and the files it holds while (see :meth:`_track_route`).
         """
         try:
             return self._resolve_cache[path]
         except KeyError:
             pass
         module_name, attr = self.index.import_map[parts[0]]
-        obj: Any | None
-        modules: list[types.ModuleType] = []
-        try:
-            obj = importlib.import_module(module_name)
-            modules.append(obj)
-            for name in ([attr] if attr else []) + parts[1:]:
-                try:
-                    obj = getattr(obj, name)
-                except AttributeError:
-                    # Submodule not yet loaded: the script's own import only
-                    # runs after compilation, so import it here — otherwise
-                    # the route would depend on what happens to be in
-                    # sys.modules and the emission would not be deterministic
-                    if not isinstance(obj, types.ModuleType):
-                        raise
-                    obj = importlib.import_module(f'{obj.__name__}.{name}')
-                if isinstance(obj, types.ModuleType):
-                    modules.append(obj)
-        except Exception:  # noqa: any resolution failure means "unprovable"
-            obj = None
-        result = obj, tuple(modules)
+        result = self._resolve(module_name, None, ([attr] if attr else []) + parts[1:])
         self._resolve_cache[path] = result
         return result
 
-    def _track_route(self, obj: Any, modules: tuple[types.ModuleType, ...]) -> None:
+    def _resolve(self, module: str, source: str | None,
+                 names: list[str]) -> tuple[str, tuple[str | None, ...]]:
+        """The route of a callee path in a module, read off what the modules publish.
+
+        A Pyne module answers from its interface, the import a name of it binds
+        leading on into the next module; a lib path answers from the generated
+        routes; any other module -- pynecore's own, which are part of the
+        pipeline, a package, one without a settled interface -- from what its
+        source binds (:func:`module_interface.static_interface`). A name a
+        package's ``__init__`` cannot bind is its submodule. No module is run:
+        what the import chain binds is read off the sources.
+
+        :param module: Dotted name of the module the path starts in.
+        :param source: Its source file when the path is known to start there (a
+            relative import), None to find it by name.
+        :param names: The path after the module.
+        :return: The route, and the source files of the modules it was read off.
+        """
+        files: list[str | None] = []
+        star = False
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+        while True:
+            target = '.'.join([module] + names)
+            if target == _LIB_PACKAGE or target.startswith(_LIB_PACKAGE + '.'):
+                # Spelled the way a script spells it (``lib.ta.sma``); a path the
+                # generator did not record is not provable, like an unresolvable one
+                route = _UNIFORM if star else \
+                    lib_routes().get('lib' + target[len(_LIB_PACKAGE):], _UNIFORM)
+                return route, tuple(files)
+            if not names:
+                return _UNIFORM, tuple(files)  # the module object itself
+            if (module, tuple(names)) in seen:
+                return _UNIFORM, tuple(files)  # imports that lead in a circle
+            seen.add((module, tuple(names)))
+            if source is None:
+                source = module_spec_origin(module)
+                if source is None:
+                    return _UNIFORM, tuple(files)
+            pyne = not (module == 'pynecore' or module.startswith('pynecore.'))
+            interface = (self._interface(source) if pyne else None) \
+                or self._static_interface(source)
+            if interface is None:
+                return _UNIFORM, tuple(files)
+            files.append(source)
+            head = names[0]
+            if star:
+                public = interface.all
+                if head not in public if public is not None else head.startswith('_'):
+                    return _UNIFORM, tuple(files)
+                star = False
+            route = interface.call_routes.get('.'.join(names))
+            if route is not None:
+                return route, tuple(files)
+            if head in interface.call_routes:
+                return _UNIFORM, tuple(files)
+            forward = interface.reexports.get(head) \
+                or interface.reexports.get(module_interface.STAR)
+            if forward is None:
+                member = _submodule(interface, source, head)
+                if member is None:
+                    return _UNIFORM, tuple(files)
+                module, source, names = f'{module}.{head}', member, names[1:]
+                continue
+            level, imported, attr = forward
+            if level:
+                # Relative to the package of the module the import stands in, found
+                # by its directory as the type pass finds it; a package's
+                # ``__init__`` stands in the package itself
+                package = module.split('.')
+                if Path(source).name != '__init__.py':
+                    package.pop()
+                if level > len(package):
+                    return _UNIFORM, tuple(files)
+                directory = Path(source).parent
+                for _ in range(level - 1):
+                    directory = directory.parent
+                package = package[:len(package) - level + 1]
+                module = '.'.join(package + [imported] if imported else package)
+                source = package_member(directory, imported)
+            else:
+                module, source = imported, None
+            if attr == module_interface.STAR:
+                star = True
+            elif attr:
+                names = [attr] + names[1:]
+            else:
+                names = names[1:]
+
+    def _interface(self, source: str | None) -> ModuleInterface | None:
+        """The settled interface a Pyne module publishes, when it has one to give.
+
+        A package's ``__init__`` publishes none a route is read off: it binds its
+        submodules as they are imported.
+
+        :param source: The module's source file; None when it has none.
+        :return: The interface, None when the module has none to give.
+        """
+        if source is None or Path(source).name == '__init__.py':
+            return None
+        return module_interface.lookup(source, self._analyse, self._pipeline_hash, settled=True)
+
+    def _static_interface(self, source: str) -> StaticInterface | None:
+        """What a module's source binds, read once per module this transform routes into.
+
+        :param source: The module's source file.
+        :return: Its static interface, None when the source cannot be read or parsed.
+        """
+        try:
+            return self._static_cache[source]
+        except KeyError:
+            pass
+        interface = module_interface.read_static_interface(source)
+        self._static_cache[source] = interface
+        return interface
+
+    def _track_route(self, files: Sequence[str | None]) -> None:
         """Make the module's cache depend on what a callee's route was decided by.
 
         The route is read off the object the import chain BINDS, so it holds
@@ -808,15 +920,11 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
         modules depending on THIS one as well: a route that moves here moves
         the routes of every caller of the function it is in.
 
-        :param obj: The callee object.
-        :param modules: The modules its resolution went through.
+        :param files: Source files of the modules the route was read off, in order.
         """
         table = self._table
         if table is None:
             return
-        files = [getattr(module, '__file__', None) for module in modules]
-        if isinstance(obj, types.FunctionType):
-            files.append(obj.__globals__.get('__file__'))
         for file in files:
             if not isinstance(file, str) or file in self._tracked_files:
                 continue

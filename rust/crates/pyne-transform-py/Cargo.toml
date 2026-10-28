@@ -1,0 +1,22 @@
+[package]
+name = "pyne-transform-py"
+description = "Python extension module of PyneCore's native transform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+indexmap.workspace = true
+pyne-ast.workspace = true
+pyne-parse.workspace = true
+pyne-transform.workspace = true
+pyo3.workspace = true
+
+[build-dependencies]
+pyo3-build-config = "0.30"

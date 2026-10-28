@@ -6,7 +6,9 @@ transcendental functions in ``core/pine_math.py`` and ``core/fdlibm.py``, and
 ``pynecore.core._native_rolling_sum``, the compiled twin of the ``math.sum`` machine in
 ``core/rolling_sum.py``, and ``pynecore.core._native_color``, the compiled twin of
 ``lib.color.new``, and ``pynecore.core._native_profiler``, the ``sys.monitoring``
-callbacks of the per-line profiler.
+callbacks of the per-line profiler. ``pynecore.transformers._native`` is the Rust port
+of the AST transform pipeline (``rust/``), built with setuptools-rust when a Rust
+toolchain is present.
 
 The extensions are optional in every sense: a platform without a C compiler, or a
 compile that fails, still installs a working package that runs the pure-Python
@@ -75,4 +77,22 @@ def _extensions() -> list[Extension]:
     )
 
 
-setup(ext_modules=_extensions(), cmdclass={'build_ext': OptionalBuildExt})
+def _rust_extensions() -> list:
+    if os.environ.get('PYNE_BUILD_PURE'):
+        return []
+    try:
+        from setuptools_rust import Binding, RustExtension
+    except ImportError:
+        print("WARNING: setuptools-rust not available; building without the native transform.",
+              file=sys.stderr)
+        return []
+    # ``optional``: without a Rust toolchain, or when the build fails, the package
+    # installs without it and every transform step runs in Python
+    return [RustExtension('pynecore.transformers._native',
+                          path='rust/crates/pyne-transform-py/Cargo.toml',
+                          binding=Binding.PyO3, optional=True)]
+
+
+_rust = _rust_extensions()
+setup(ext_modules=_extensions(), cmdclass={'build_ext': OptionalBuildExt},
+      **({'rust_extensions': _rust} if _rust else {}))

@@ -2,8 +2,8 @@
 The plain double-underscore names the transform emits into user code.
 
 Most names the transformers inject carry the reserved middle dot (see
-``PYNE_RESERVED_NAME_CHAR`` in ``core/import_hook.py``). The ones below do not:
-runtime helpers, module-level protocol records and generated temporaries that
+``PYNE_RESERVED_NAME_CHAR`` in ``transformers/emission_settings.py``). The ones below
+do not: runtime helpers, module-level protocol records and generated temporaries that
 other tools (the runtime, the security children, the ahead-of-time compiler)
 address by these exact spellings. User code that binds or reads one of them
 would silently collide with the emission -- a truthiness temporary rebinding a
