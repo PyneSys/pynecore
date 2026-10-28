@@ -59,6 +59,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, UTC
 from multiprocessing import parent_process
 from time import monotonic
+from types import ModuleType
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from ..types.na import set_bool_na
@@ -410,6 +411,41 @@ def _heikinashi_step(prev_open: float | None, prev_close: float | None,
     return ha_open, max(h, ha_open, ha_close), min(lo, ha_open, ha_close), ha_close
 
 
+def _child_entries(script_module: ModuleType, libraries: list[tuple[str, Callable]],
+                   sec_modules: list[ModuleType], sid: str, slice_main: str | None,
+                   ) -> tuple[Callable, list[Callable]]:
+    """The entry points a security child runs on every bar.
+
+    A context's per-context clone (``transformers/security_slice.py``) is the
+    backward slice of the ``main()`` of the module that DECLARED the context —
+    the script, or a library whose own ``main()`` calls ``request.security`` —
+    and runs in place of that ``main()``; every other entry runs whole. Clone
+    names are numbered per module, so the name is resolved in the declaring
+    module only: the script module may hold a clone of the very same name built
+    for one of its own contexts. Every member of a group comes from one module.
+
+    :param script_module: The script the child imported.
+    :param libraries: ``(title, main)`` of every library the script imports.
+    :param sec_modules: The script module and every library module.
+    :param sid: The context the child serves (a group's primary).
+    :param slice_main: Name of the context's clone, if it has one.
+    :return: ``(script entry, library entries in run order)``.
+    """
+    main_func = script_module.main
+    owner = next((module for module in sec_modules
+                  if sid in (getattr(module, '__security_contexts__', None) or {})),
+                 script_module)
+    clone = getattr(owner, slice_main, None) if slice_main else None
+    lib_entries: list[Callable] = []
+    for _title, lib_main in libraries:
+        if lib_main is main_func:
+            continue
+        if clone is not None and sys.modules.get(getattr(lib_main, '__module__', '')) is owner:
+            lib_main = clone
+        lib_entries.append(lib_main)
+    return (clone if clone is not None and owner is script_module else main_func), lib_entries
+
+
 # noinspection PyProtectedMember
 def security_process_main(
         sec_ids: list[str],
@@ -482,8 +518,9 @@ def security_process_main(
     :param ohlcv_tuple: Per served sid, True when its ``ohlcv_fields`` came from
         a tuple/list expression (write a tuple), False for a scalar expression.
     :param slice_main: Name of this context's sliced ``main()`` clone in the
-        script module (``transformers/security_slice.py``). When set, the clone
-        runs on every bar in place of ``main()``: it holds the backward slice of
+        module that declared the context — the script or one of its libraries
+        (``transformers/security_slice.py``). When set, the clone runs on every
+        bar in place of that module's ``main()``: it holds the backward slice of
         ``main()``'s statements this context's ``__sec_write__`` can depend on.
     :param chart_type: Synthetic chart type requested via ``ticker.heikinashi()``
         etc. (currently only ``"heikinashi"``). When set, the child applies the
@@ -877,24 +914,24 @@ def security_process_main(
     # argument, stateless ones are called as-is)
     instance_state.reset()
     main_func = script_module.main
-    # Per-context backward slice of main(): an ordinary module-level function
-    # with its own slot layout, so it becomes this process's entry point — root
-    # vector, root key and every snapshot below refer to the clone, not to
-    # main(). ``main_func`` stays the script entry the script metadata hangs on.
-    entry_func = getattr(script_module, slice_main, None) if slice_main else None
-    if entry_func is None:
-        entry_func = main_func
+    # The clone becomes the entry point of the module that declared the context,
+    # so root vector, root key and every snapshot below refer to the clone, not
+    # to that main(). ``main_func`` stays the script entry the script metadata
+    # hangs on.
+    entry_func, lib_entries = _child_entries(
+        script_module, libraries, sec_modules, sec_ids[0], slice_main)
     root_keys: list[str] = []
     seen_keys: set[str] = set()
     bound_entries: dict[int, Callable] = {}
-    for run_entry in [entry_func] + [f for _title, f in libraries]:
+    for run_entry in [entry_func] + lib_entries:
         if id(run_entry) in bound_entries:
             continue
         entry_layout = getattr(run_entry, '__pyne_layout__', None)
         if entry_layout is None:
             bound_entries[id(run_entry)] = run_entry
             continue
-        entry_root_key = f'{run_entry.__module__}.{run_entry.__qualname__}'
+        entry_root_key = (f"{getattr(run_entry, '__module__', '')}."
+                          f"{getattr(run_entry, '__qualname__', '')}")
         if entry_root_key in seen_keys:
             entry_root_key = f'{entry_root_key}#{len(root_keys)}'
         seen_keys.add(entry_root_key)
@@ -920,9 +957,8 @@ def security_process_main(
         set_bool_na(na_bool)
         lib._in_lib_main = True
         try:
-            for _title, _lib_main in libraries:
-                if _lib_main is not main_func:
-                    bound_entries.get(id(_lib_main), _lib_main)()
+            for _lib_entry in lib_entries:
+                bound_entries[id(_lib_entry)]()
         finally:
             lib._in_lib_main = False
         run_main()

@@ -914,7 +914,25 @@ def _drop_discarded_run(drawing_snapshot: DrawingSnapshot) -> None:
     lib._viz_seq.clear()
 
 
-def _security_cyclic_groups(contexts: dict, states: dict) -> set[int]:
+def _security_group(sid: str, contexts: dict) -> tuple[str, int] | None:
+    """The merge group of a context, qualified by the module that declared it.
+
+    The transformer numbers ``group`` ordinals per module, while the runner
+    merges the contexts of the script and of every library it imports into one
+    map — two modules' group 0 are unrelated feeds. The sid's module part
+    (``sec·<module hash>``) keeps them apart.
+
+    :param sid: The context's id.
+    :param contexts: ``__security_contexts__``.
+    :return: ``(module part of the sid, ordinal)``, or None for an ungrouped context.
+    """
+    group = contexts.get(sid, {}).get('group')
+    if group is None:
+        return None
+    return sid.rpartition('\xb7')[0], group
+
+
+def _security_cyclic_groups(contexts: dict, states: dict) -> set[tuple[str, int]]:
     """Context groups that must NOT be merged, because merging would deadlock.
 
     A child publishes its own values and waits on its peers' rings, and what
@@ -936,11 +954,11 @@ def _security_cyclic_groups(contexts: dict, states: dict) -> set[int]:
 
     :param contexts: ``__security_contexts__``.
     :param states: The per-context runtime states (for the resolved ``depends``).
-    :return: The ordinals of the groups that may not be merged.
+    :return: The groups (see :func:`_security_group`) that may not be merged.
     """
     unit_of: dict[str, tuple] = {}
     for sid in states:
-        group = contexts.get(sid, {}).get('group')
+        group = _security_group(sid, contexts)
         unit_of[sid] = ('g', group) if group is not None else ('s', sid)
     edges: dict[tuple, set[tuple]] = {}
     for sid, state in states.items():
@@ -1071,12 +1089,12 @@ def _security_merge_group(sid: str, all_sec_ids: list[str], contexts: dict,
     """
     if disabled or sid in no_process_ids or sid in processes:
         return None
-    group = contexts[sid].get('group')
+    group = _security_group(sid, contexts)
     if group is None or group in cyclic_groups:
         return None
     stable = bool(contexts[sid].get('group_stable'))
     group_sids = [other for other in all_sec_ids
-                  if contexts.get(other, {}).get('group') == group]
+                  if _security_group(other, contexts) == group]
     if any(states[other].depends & unresolved_ids for other in group_sids):
         # A member depends on a context whose symbol or timeframe only exists
         # once its own signal runs, so it cannot be started with the group: the
@@ -1094,7 +1112,7 @@ def _security_merge_group(sid: str, all_sec_ids: list[str], contexts: dict,
         return None
     members = [sid]
     for other in all_sec_ids:
-        if other == sid or contexts.get(other, {}).get('group') != group:
+        if other == sid or _security_group(other, contexts) != group:
             continue
         if (other in no_process_ids or other in processes
                 or states[other].started
