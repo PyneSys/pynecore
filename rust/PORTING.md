@@ -246,9 +246,8 @@ request from `ModuleLayout::new(pyne_mode == "lib")`, as the import hook does.
    `BUILTIN_PRICE_SERIES` moved into the leaf `price_series.py`, so Input's closure
    no longer holds `lib_series.py`; FloatTolerance's holds `core/pine_compare.py`
    (`EPSILON`), as PineTruthiness's does. `Unsupported`: a `_pine_ty` stamp that is
-   no string where a rule carries it over to a new node, an int index literal
-   beyond `i64` (`lst[1e300]` typed int), an opaque `pine_exact` stamp, a leave hook
-   handed a list by an earlier rule, and a node with a line but no column for
+   no string where a rule carries it over to a new node, an opaque `pine_exact`
+   stamp, a leave hook handed a list by an earlier rule, and a node with a line but no column for
    `fix_locations`.
 4. **CallInline**. Hermetized first: the inline templates are the generated
    registry `transformers/call_inline_templates.json`, written by
@@ -268,7 +267,7 @@ request from `ModuleLayout::new(pyne_mode == "lib")`, as the import hook does.
    `data::inline_templates`; it never reads the `PineTypeTable` or the slot layout.
    `Unsupported`: an `_inl_argument` marker that is no bool, a `_pine_ty` stamp on
    the call that is no string or one in the inlined expression that is neither a
-   string nor `None`, and a literal comparison with an int beyond 64 bits.
+   string nor `None`.
 5. **FinalizeCloneDefaults**. Ported in `steps/security_slice/mod.rs` with the step
    it finishes; it shares SecuritySlice's module and digest.
 6. **FunctionIsolation** and **ApplyLayout**. Ported as `steps/function_isolation.rs`

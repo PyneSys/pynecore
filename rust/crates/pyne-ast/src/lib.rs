@@ -44,6 +44,31 @@ pub enum Int {
     Big(String),
 }
 
+impl Int {
+    /// `float(n)`: the nearest double, ties to even; `None` beyond the double range,
+    /// where Python raises `OverflowError`.
+    pub fn to_f64(&self) -> Option<f64> {
+        let value = match self {
+            Int::Small(value) => *value as f64,
+            Int::Big(digits) => digits.parse::<f64>().ok()?,
+        };
+        value.is_finite().then_some(value)
+    }
+
+    /// `int(x)` of a finite integral double: machine-sized when it fits `i64`, its
+    /// exact decimal digits otherwise.
+    pub fn from_integral(value: f64) -> Int {
+        // 2**63: every integral double below it in magnitude, and -2**63 itself, fits
+        const LIMIT: f64 = 9223372036854775808.0;
+        if (-LIMIT..LIMIT).contains(&value) {
+            Int::Small(value as i64)
+        } else {
+            // A fixed-precision format spells a double's exact value
+            Int::Big(format!("{value:.0}"))
+        }
+    }
+}
+
 impl fmt::Display for Int {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -262,3 +287,32 @@ impl fmt::Display for Unsupported {
 }
 
 impl std::error::Error for Unsupported {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn int_digits() {
+        assert_eq!(Int::from_integral(-0.0), Int::Small(0));
+        assert_eq!(Int::from_integral(9007199254740992.0), Int::Small(9007199254740992));
+        assert_eq!(Int::from_integral(-9223372036854775808.0), Int::Small(i64::MIN));
+        assert_eq!(
+            Int::from_integral(9223372036854775808.0),
+            Int::Big("9223372036854775808".into())
+        );
+        assert_eq!(Int::from_integral(1e22), Int::Big("10000000000000000000000".into()));
+        assert_eq!(Int::from_integral(-2f64.powi(70)), Int::Big("-1180591620717411303424".into()));
+        assert_eq!(Int::from_integral(3e29), Int::Big("299999999999999991891638616064".into()));
+    }
+
+    #[test]
+    fn int_to_f64() {
+        assert_eq!(Int::Small(9007199254740993).to_f64(), Some(9007199254740992.0));
+        assert_eq!(Int::Big("9223372036854776832".into()).to_f64(), Some(9223372036854775808.0));
+        assert_eq!(Int::Big("-9223372036854778880".into()).to_f64(), Some(-9223372036854779904.0));
+        assert_eq!(Int::Big("1".repeat(310)).to_f64(), None);
+        assert_eq!(Int::Big("179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497791".into()).to_f64(), Some(f64::MAX));
+        assert_eq!(Int::Big("179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792".into()).to_f64(), None);
+    }
+}

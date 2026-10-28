@@ -5,6 +5,7 @@
 //! A guard a literal argument decides is resolved here, a non-trivial argument is
 //! bound once by a walrus, and the argument evaluation order of the call is kept.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use pyne_ast::walk::{
@@ -342,6 +343,15 @@ impl Number {
         }
     }
 
+    /// An int's decimal digits with an optional `-`.
+    fn digits(&self) -> String {
+        match self {
+            Number::Int(value) => value.to_string(),
+            Number::Big(digits) => digits.clone(),
+            Number::Float(_) => unreachable!("a float has no int digits"),
+        }
+    }
+
     fn constant(self) -> Constant {
         match self {
             Number::Int(value) => Constant::Int(Int::Small(value)),
@@ -397,34 +407,44 @@ fn py_float(value: Number) -> Option<Number> {
     }
 }
 
-/// Python's order of two numeric literals, exact across int and float.
-fn compare_numbers(left: &Number, right: &Number) -> Result<std::cmp::Ordering, Error> {
-    use std::cmp::Ordering;
-    fn int_float(int: i64, float: f64) -> Ordering {
-        if float.is_infinite() {
-            return if float > 0.0 { Ordering::Less } else { Ordering::Greater };
-        }
-        if float >= 9_223_372_036_854_775_808.0 {
-            return Ordering::Less;
-        }
-        if float < -9_223_372_036_854_775_808.0 {
-            return Ordering::Greater;
-        }
-        let floor = float.floor();
-        let whole = floor as i64;
-        match int.cmp(&whole) {
-            Ordering::Equal if float > floor => Ordering::Less,
-            other => other,
+/// The order of two ints spelled as their canonical decimal digits.
+fn compare_digits(left: &str, right: &str) -> Ordering {
+    fn sign(digits: &str) -> (bool, &str) {
+        digits.strip_prefix('-').map_or((false, digits), |magnitude| (true, magnitude))
+    }
+    let ((left_negative, left), (right_negative, right)) = (sign(left), sign(right));
+    match (left_negative, right_negative) {
+        (false, true) => Ordering::Greater,
+        (true, false) => Ordering::Less,
+        _ => {
+            let magnitude = left.len().cmp(&right.len()).then_with(|| left.cmp(right));
+            if left_negative { magnitude.reverse() } else { magnitude }
         }
     }
+}
+
+/// Python's exact order of an int, spelled as its digits, against a float.
+fn compare_int_float(int: &str, float: f64) -> Ordering {
+    if float.is_infinite() {
+        return if float > 0.0 { Ordering::Less } else { Ordering::Greater };
+    }
+    let floor = float.floor();
+    match compare_digits(int, &Int::from_integral(floor).to_string()) {
+        Ordering::Equal if float > floor => Ordering::Less,
+        other => other,
+    }
+}
+
+/// Python's order of two numeric literals, exact across int and float.
+fn compare_numbers(left: &Number, right: &Number) -> Result<Ordering, Error> {
     Ok(match (left, right) {
         (Number::Int(a), Number::Int(b)) => a.cmp(b),
         (Number::Float(a), Number::Float(b)) => {
             a.partial_cmp(b).ok_or_else(|| unsupported("a nan literal"))?
         }
-        (Number::Int(a), Number::Float(b)) => int_float(*a, *b),
-        (Number::Float(a), Number::Int(b)) => int_float(*b, *a).reverse(),
-        _ => return Err(unsupported("a comparison of an int literal beyond 64 bits")),
+        (Number::Float(_), _) => compare_numbers(right, left)?.reverse(),
+        (int, Number::Float(float)) => compare_int_float(&int.digits(), *float),
+        (left, right) => compare_digits(&left.digits(), &right.digits()),
     })
 }
 
@@ -480,7 +500,7 @@ impl LiteralFolder<'_> {
         let mut result = true;
         for (index, op) in ops.iter().enumerate() {
             use std::cmp::Ordering::{Equal, Greater, Less};
-            let test: fn(std::cmp::Ordering) -> bool = match op {
+            let test: fn(Ordering) -> bool = match op {
                 CmpOperator::Eq => |order| order == Equal,
                 CmpOperator::NotEq => |order| order != Equal,
                 CmpOperator::Lt => |order| order == Less,
@@ -1284,5 +1304,36 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
     match pass.error {
         Some(error) => Err(error),
         None => Ok(module),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn big(digits: &str) -> Number {
+        Number::Big(digits.into())
+    }
+
+    #[test]
+    fn literals_compare_exactly_beyond_64_bits() {
+        let order = |left: Number, right: Number| compare_numbers(&left, &right).unwrap();
+        assert_eq!(order(big("99999999999999999999"), Number::Float(1e20)), Ordering::Less);
+        assert_eq!(order(big("100000000000000000000"), Number::Float(1e20)), Ordering::Equal);
+        assert_eq!(order(big("100000000000000000001"), Number::Float(1e20)), Ordering::Greater);
+        assert_eq!(order(Number::Float(1e20), big("100000000000000000001")), Ordering::Less);
+        assert_eq!(order(big("-99999999999999999999"), Number::Int(i64::MIN)), Ordering::Less);
+        assert_eq!(order(big("9223372036854775808"), Number::Int(i64::MAX)), Ordering::Greater);
+        assert_eq!(
+            order(big("-1000000000000000000000"), big("-100000000000000000000")),
+            Ordering::Less
+        );
+        assert_eq!(
+            order(big("1000000000000000000000"), Number::Float(f64::INFINITY)),
+            Ordering::Less
+        );
+        assert_eq!(order(Number::Int(3), Number::Float(2.5)), Ordering::Greater);
+        assert_eq!(order(Number::Int(-3), Number::Float(-2.5)), Ordering::Less);
+        assert_eq!(order(Number::Int(0), Number::Float(-0.0)), Ordering::Equal);
     }
 }

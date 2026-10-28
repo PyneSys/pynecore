@@ -55,17 +55,6 @@ pub(crate) fn binds_by_import(ast: &Ast, names: &[NodeId]) -> bool {
     })
 }
 
-/// `int(value)` of a float literal with an integral value.
-fn integral(value: f64) -> Result<Int, Error> {
-    // Every float in [-2**63, 2**63) converts exactly; beyond it Python makes a big int
-    const LIMIT: f64 = 9_223_372_036_854_775_808.0;
-    if (-LIMIT..LIMIT).contains(&value) {
-        Ok(Int::Small(value as i64))
-    } else {
-        Err(Error::Unsupported(format!("an int index literal {value} beyond i64")))
-    }
-}
-
 pub struct SafeConvert {
     /// The module is a `@pyne lib`: `int()` truncates to a native int
     lib: bool,
@@ -129,7 +118,7 @@ impl SafeConvert {
             &Kind::Constant { value: Constant::Float(value), .. } => {
                 // A folded Pine int literal is a float (`2.0`): truncate it here
                 if value.is_finite() && value.fract() == 0.0 {
-                    let value = integral(value)?;
+                    let value = Int::from_integral(value);
                     let Kind::Constant { value: slot, .. } = ast.kind_mut(index) else {
                         unreachable!()
                     };

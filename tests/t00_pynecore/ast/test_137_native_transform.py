@@ -291,6 +291,7 @@ def main(src=input.source(close, "Source"), length=input.int(5, "Length"),
     levels = lib.array.from_items(high, low)
     for k in pine_range(0, 1):
         total += lib.array.get(levels, k) + lib.math.pow(ratio, 2)
+    total += lib.math.pow(ratio, 99999999999999999999) + lib.math.pow(ratio, -1e300)
     total += lib.math.max(level, lib.math.abs(close - src)) + lib.array.size(levels)
     if ratio > 1.01 and close >= src:
         strategy.entry("long", strategy.long, limit=low)
@@ -864,7 +865,7 @@ def __test_slot_steps_reject_what_python_rejects__():
 
 @pytest.mark.parametrize('literal', [
     '99999999999999999999', '-99999999999999999999', '9223372036854775807',
-    '-9223372036854775808', '+9007199254740993', '9223372036854776832', '9223372036854779904',
+    '-9223372036854775808', '+9007199254740993', '9223372036854776832', '-9223372036854778880',
     '1' + '0' * 308,
 ])
 def __test_slot_steps_convert_a_persistent_int_beyond_64_bits__(literal):
@@ -905,6 +906,7 @@ import os
 def f(lst, n, a, b, c, y, key, d, m, i, j):
     x = lst[n] + lst[n + 1] + lst[int(y)] + lst[int(y) + 1] + lst[2.0] + lst[3]
     x = lst[a:b:c] + lst[:b] + d[key] + m[i, j] + 'abc'[2.0] + lst[-0.0]
+    x = lst[1e20] + lst[-1e300]
     lst[n] = 1.0
     z = __state__[3][n] + __state·f__[0][n]
     for i in range(n):

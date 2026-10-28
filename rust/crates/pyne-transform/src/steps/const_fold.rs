@@ -127,23 +127,10 @@ pub fn quantize_embed(value: Num) -> Num {
     }
 }
 
-/// The Python int of an integral double's exact value: machine-sized when it fits
-/// `i64`, its exact decimal digits otherwise.
-fn int_value(value: f64) -> Int {
-    // 2**63: every integral double below it in magnitude, and -2**63 itself, fits
-    const LIMIT: f64 = 9223372036854775808.0;
-    if (-LIMIT..LIMIT).contains(&value) {
-        Int::Small(value as i64)
-    } else {
-        // A fixed-precision format spells a double's exact value
-        Int::Big(format!("{value:.0}"))
-    }
-}
-
 /// The literal an embedded value is spelled as.
 fn constant(value: Num) -> Constant {
     match value {
-        Num::Int(value) => Constant::Int(int_value(value)),
+        Num::Int(value) => Constant::Int(Int::from_integral(value)),
         Num::Float(value) => Constant::Float(value),
     }
 }
@@ -152,7 +139,7 @@ fn constant(value: Num) -> Constant {
 fn is_literal(ast: &Ast, node: NodeId, value: Num) -> bool {
     match (ast.kind(node), value) {
         (Kind::Constant { value: Constant::Int(have), .. }, Num::Int(want)) => {
-            *have == int_value(want)
+            *have == Int::from_integral(want)
         }
         (Kind::Constant { value: Constant::Float(have), .. }, Num::Float(want)) => {
             *have == want && have.is_sign_negative() == want.is_sign_negative()
@@ -1560,16 +1547,5 @@ mod tests {
         assert_eq!(compare(Num::Int(1.0), Num::Float(1.5)), Ordering::Less);
         assert_eq!(compare(Num::Int(-2.0), Num::Float(-1.5)), Ordering::Less);
         assert_eq!(compare(Num::Float(-1.5), Num::Int(-2.0)), Ordering::Greater);
-    }
-
-    #[test]
-    fn int_digits() {
-        assert_eq!(int_value(-0.0), Int::Small(0));
-        assert_eq!(int_value(9007199254740992.0), Int::Small(9007199254740992));
-        assert_eq!(int_value(-9223372036854775808.0), Int::Small(i64::MIN));
-        assert_eq!(int_value(9223372036854775808.0), Int::Big("9223372036854775808".into()));
-        assert_eq!(int_value(1e22), Int::Big("10000000000000000000000".into()));
-        assert_eq!(int_value(-2f64.powi(70)), Int::Big("-1180591620717411303424".into()));
-        assert_eq!(int_value(3e29), Int::Big("299999999999999991891638616064".into()));
     }
 }

@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use pyne_ast::walk::{Transformer, Visited, copy_location, generic_visit, walk};
 use pyne_ast::{
-    Ast, Category, Constant, ExprContext, Int, Kind, NodeId, UnaryOperator, Unsupported, Value,
+    Ast, Category, Constant, ExprContext, Kind, NodeId, UnaryOperator, Unsupported, Value,
 };
 
 use crate::pine_type_rules::{
@@ -189,8 +189,7 @@ impl ImplicitConversion {
             }
             WIDEN_FLOAT => {
                 if let Some(literal) = int_literal(ast, node)? {
-                    // Rounded to nearest, ties to even, as Python's `float(int)`
-                    let float = constant(ast, Constant::Float(literal as f64));
+                    let float = constant(ast, Constant::Float(literal));
                     let float = located(ast, float, node);
                     return Ok(set_ty(ast, float, FLOAT));
                 }
@@ -426,27 +425,24 @@ fn class_expr(ast: &mut Ast, node: NodeId) -> NodeId {
     located(ast, expr, node)
 }
 
-/// The value of an int literal, a signed one included (`-3` is a `UnaryOp`).
-fn int_literal(ast: &Ast, node: NodeId) -> Result<Option<i128>, Unsupported> {
-    let mut sign = 1i128;
+/// `float()` of an int literal, a signed one included (`-3` is a `UnaryOp`): the
+/// nearest double, ties to even.
+fn int_literal(ast: &Ast, node: NodeId) -> Result<Option<f64>, Unsupported> {
+    let mut negate = false;
     let mut node = node;
     if let &Kind::UnaryOp { op: op @ (UnaryOperator::USub | UnaryOperator::UAdd), operand } =
         ast.kind(node)
     {
-        if op == UnaryOperator::USub {
-            sign = -1;
-        }
+        negate = op == UnaryOperator::USub;
         node = operand;
     }
-    match ast.kind(node) {
-        Kind::Constant { value: Constant::Int(Int::Small(value)), .. } => {
-            Ok(Some(sign * i128::from(*value)))
-        }
-        Kind::Constant { value: Constant::Int(Int::Big(_)), .. } => {
-            Err(Unsupported("a float conversion of a big int literal".into()))
-        }
-        _ => Ok(None),
-    }
+    let Kind::Constant { value: Constant::Int(value), .. } = ast.kind(node) else {
+        return Ok(None);
+    };
+    // Beyond the double range `float(int)` raises OverflowError
+    let float = value.to_f64().ok_or_else(|| Unsupported(format!("float({value})")))?;
+    // `-n` is taken on the int, so `-0` is `0.0`; any other negation is exact
+    Ok(Some(if negate && float != 0.0 { -float } else { float }))
 }
 
 /// Whether the module already binds the `safe_convert` module name at its top level.
@@ -503,6 +499,7 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
 mod tests {
     use super::*;
     use crate::NoHost;
+    use pyne_ast::Int;
 
     fn ctx() -> Context<'static> {
         Context {
@@ -540,6 +537,17 @@ mod tests {
         assert!(matches!(ast.kind(args[1]), Kind::Constant { value: Constant::Float(v), .. }
             if *v == -3.0));
         assert_eq!(get_ty(&ast, args[1]), FLOAT);
+    }
+
+    #[test]
+    fn a_big_int_literal_becomes_its_nearest_float() {
+        let mut ast = Ast::new();
+        let digits = Int::Big("99999999999999999999".into());
+        let (root, call) = module(&mut ast, Constant::Int(digits), Value::Str(WIDEN_FLOAT.into()));
+        assert_eq!(run(&mut ast, root, &ctx()), Ok(root));
+        let Kind::Call { args, .. } = ast.kind(call) else { unreachable!() };
+        assert!(matches!(ast.kind(args[1]), Kind::Constant { value: Constant::Float(v), .. }
+            if *v == 1e20));
     }
 
     #[test]

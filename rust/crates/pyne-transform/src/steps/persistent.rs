@@ -59,15 +59,8 @@ fn declared_elem(ast: &Ast, annotation: NodeId) -> Option<String> {
 
 /// `float(n)` of a Python int literal.
 fn int_to_float(value: &Int, negate: bool) -> Result<f64, Error> {
-    // An int converts to the nearest double, ties to even, as `float(int)` does
-    let float = match value {
-        Int::Small(n) => *n as f64,
-        Int::Big(digits) => digits.parse::<f64>().unwrap_or(f64::INFINITY),
-    };
     // Beyond the double range `float(int)` raises OverflowError
-    if !float.is_finite() {
-        return Err(Error::Unsupported(format!("float({value})")));
-    }
+    let float = value.to_f64().ok_or_else(|| Error::Unsupported(format!("float({value})")))?;
     // `-n` is taken on the int, so `-0` is `0.0`; any other negation is exact
     Ok(if negate && float != 0.0 { -float } else { float })
 }
