@@ -107,7 +107,7 @@ can also be used, keeping code readability and personal preferences in mind.
 
 The PyneCore library implements the Pine Script API while leveraging Python's strengths. PyneCore is validated against
 TradingView on <!--wild:scripts_total-->1,000<!--/wild--> published TradingView scripts (Pine Script v4–v6, converted to
-Pyne code with [PyneComp](https://pynesys.io)): all <!--wild:tv_verified-->1,353<!--/wild--> comparable outputs
+Pyne code with [PyneComp](https://pynesys.io/compiler)): all <!--wild:tv_verified-->1,353<!--/wild--> comparable outputs
 match, <!--wild:bars_exact_pct-->99.771<!--/wild-->% of <!--wild:bars_compared_millions-->132<!--/wild--> million
 plotted values are bit-identical, and <!--wild:strategy_trades-->353,577<!--/wild--> strategy trades match
 TradingView's timing (snapshot <!--wild:generated_at-->2026-10-24<!--/wild-->, [Pyne in the

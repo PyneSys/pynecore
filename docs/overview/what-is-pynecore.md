@@ -24,7 +24,7 @@ persistent state. PyneCore implements those language rules in Python and provide
 a Pine Script-compatible calculation and strategy library.
 
 PyneCore is validated against TradingView on <!--wild:scripts_total-->1,000<!--/wild--> published
-TradingView scripts (Pine Script v4–v6, converted to Pyne code with [PyneComp](https://pynesys.io)):
+TradingView scripts (Pine Script v4–v6, converted to Pyne code with [PyneComp](https://pynesys.io/compiler)):
 all <!--wild:tv_verified-->1,353<!--/wild--> comparable outputs match,
 <!--wild:bars_exact_pct-->99.771<!--/wild-->% of
 <!--wild:bars_compared_millions-->132<!--/wild--> million plotted values are bit-identical, and

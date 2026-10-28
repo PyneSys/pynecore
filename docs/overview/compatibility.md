@@ -21,7 +21,7 @@ Script v6, with results that match TradingView. This page lists how completely t
 API is covered, how closely the results match, and where PyneCore differs on purpose.
 
 > **Running existing Pine Script:** PyneCore does not read Pine Script source itself. Existing
-> scripts are converted to Pyne code by [PyneComp](https://pynesys.io), the PyneSys compiler for
+> scripts are converted to Pyne code by [PyneComp](https://pynesys.io/compiler), the PyneSys compiler for
 > Pine Script v4, v5 and v6 (v1–v3 sources are converted too, on a best-effort basis). PyneComp is
 > a separate service that needs a PyneSys API key; with the key configured, `pyne compile
 > script.pine` converts a script, and `pyne run script.pine` converts it before running — see

@@ -109,7 +109,7 @@ your working directory. This mechanism is the heart of PyneCore. You actually wr
 
 ### Direct Execution
 
-If you have a compiled script (from [PyneSys](https://pynesys.io) or [converted from Pine Script](./converting-from-pine.md)), you can run it directly with Python — no CLI or workdir needed:
+If you have a compiled script (from [PyneSys](https://pynesys.io/compiler) or [converted from Pine Script](./converting-from-pine.md)), you can run it directly with Python — no CLI or workdir needed:
 
 ```bash
 python my_compiled_script.py my_data.csv
