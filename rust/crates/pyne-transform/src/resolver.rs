@@ -323,7 +323,7 @@ impl<F: Files> Resolver<F> {
             return Ok(());
         }
         let fingerprint = (file.mtime_ns, file.size);
-        let na_bool = script_bool_na(&ast, module)?;
+        let na_bool = script_bool_na(&ast, module).ok_or(Stop::Rejected)?;
         let key = self.key(path)?;
         let outermost = self.transforming.borrow_mut().insert(key.clone());
         let result =
@@ -632,9 +632,9 @@ pub fn module_mode(ast: &Ast, module: NodeId) -> (bool, Option<String>) {
 }
 
 /// The script's bool na choice off its `script.*` decorator (`_script_bool_na`),
-/// False without one; a decorator the loader refuses is a rejection.
-fn script_bool_na(ast: &Ast, module: NodeId) -> Result<bool, Stop> {
-    let Kind::Module { body, .. } = ast.kind(module) else { return Ok(false) };
+/// false without one; None for a decorator the loader refuses.
+pub fn script_bool_na(ast: &Ast, module: NodeId) -> Option<bool> {
+    let Kind::Module { body, .. } = ast.kind(module) else { return Some(false) };
     let mut lib_names: HashSet<&str> = HashSet::new();
     let mut script_names: HashSet<&str> = HashSet::new();
     for &node in body {
@@ -693,25 +693,25 @@ fn script_bool_na(ast: &Ast, module: NodeId) -> Result<bool, Stop> {
                 continue;
             }
             if name != "main" || entry.is_some() {
-                return Err(Stop::Rejected);
+                return None;
             }
             entry = Some(decorator);
             break;
         }
     }
-    let Some(entry) = entry else { return Ok(false) };
-    let Kind::Call { keywords, .. } = ast.kind(entry) else { return Ok(false) };
+    let Some(entry) = entry else { return Some(false) };
+    let Kind::Call { keywords, .. } = ast.kind(entry) else { return Some(false) };
     for &keyword in keywords {
         let Kind::Keyword { arg, value } = ast.kind(keyword) else { continue };
         if arg.as_deref() != Some("na_bool") {
             continue;
         }
         return match ast.kind(*value) {
-            Kind::Constant { value: Constant::Bool(value), .. } => Ok(*value),
-            _ => Err(Stop::Rejected),
+            Kind::Constant { value: Constant::Bool(value), .. } => Some(*value),
+            _ => None,
         };
     }
-    Ok(false)
+    Some(false)
 }
 
 /// The characters whose NFKC form holds the reserved separator `·`: it, U+0387 GREEK
