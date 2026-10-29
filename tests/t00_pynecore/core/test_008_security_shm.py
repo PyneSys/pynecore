@@ -2,6 +2,7 @@
 @pyne
 """
 import pickle
+import queue
 import multiprocessing as mp
 
 import pytest
@@ -178,17 +179,20 @@ def __test_write_na__(log):
         sb.unlink()
 
 
-def _stress_writer(sec_id, sync_block_name, lock, n_iterations, error_queue):
+def _stress_writer(sec_id, sync_block_name, lock, min_iterations, stop_event, error_queue):
     """Writer subprocess: cycles through small payload, large payload, and write_na
     while holding ``lock`` for each publication. Mirrors the security child's
-    write surface (write_result + write_na) under contention.
+    write surface (write_result + write_na) under contention. Runs at least
+    ``min_iterations`` publications and then until ``stop_event`` is set, so a
+    reader that starts late still meets a live writer.
     """
     try:
         sb = SyncBlock([sec_id], create=False, name=sync_block_name)
         rb = ResultBlock(sec_id, create=False, version=0, prefix=sb.block_prefix(sec_id))
         small_template = ("small", 0)
         large_template = ("large", 0, list(range(200)))
-        for i in range(n_iterations):
+        i = 0
+        while i < min_iterations or not stop_event.is_set():
             with lock:
                 phase = i % 3
                 if phase == 0:
@@ -197,6 +201,7 @@ def _stress_writer(sec_id, sync_block_name, lock, n_iterations, error_queue):
                     write_result(rb, sb, ("large", i, list(range(200))))
                 else:
                     write_na(rb, sb)
+            i += 1
         rb.close()
         sb.close()
         # touch templates so linters don't drop them
@@ -205,10 +210,12 @@ def _stress_writer(sec_id, sync_block_name, lock, n_iterations, error_queue):
         error_queue.put(("writer", repr(exc)))
 
 
-def _stress_reader(sec_id, sync_block_name, lock, stop_event, result_queue, error_queue):
+def _stress_reader(sec_id, sync_block_name, lock, stop_event, seen_both_event,
+                   result_queue, error_queue):
     """Reader subprocess: spins on cross-context-style reads under ``lock``
     until ``stop_event`` is set. Records counts of each payload kind so the
-    parent can sanity-check that no torn / wrong-shape values escape.
+    parent can sanity-check that no torn / wrong-shape values escape, and sets
+    ``seen_both_event`` once it has observed both a small and a large payload.
     """
     try:
         sb = SyncBlock([sec_id], create=False, name=sync_block_name)
@@ -237,6 +244,8 @@ def _stress_reader(sec_id, sync_block_name, lock, stop_event, result_queue, erro
             else:
                 error_queue.put(("reader", f"unexpected value: {val!r}"))
                 break
+            if n_small and n_large and not seen_both_event.is_set():
+                seen_both_event.set()
         rr.close()
         sb.close()
         result_queue.put((n_reads, n_default, n_small, n_large))
@@ -268,38 +277,53 @@ def __test_concurrent_lock_protects_cross_context__(log):
     # children without needing the tests/ directory on sys.path.
     ctx = mp.get_context("fork")
     lock = ctx.Lock()
-    stop_event = ctx.Event()
+    writer_stop_event = ctx.Event()
+    reader_stop_event = ctx.Event()
+    seen_both_event = ctx.Event()
     error_queue = ctx.Queue()
     result_queue = ctx.Queue()
 
-    n_iterations = 1500
+    min_iterations = 1500
     writer = ctx.Process(
         target=_stress_writer,
-        args=(sec_id, sync_block_name, lock, n_iterations, error_queue),
+        args=(sec_id, sync_block_name, lock, min_iterations, writer_stop_event, error_queue),
         daemon=True,
     )
     reader = ctx.Process(
         target=_stress_reader,
-        args=(sec_id, sync_block_name, lock, stop_event, result_queue, error_queue),
+        args=(sec_id, sync_block_name, lock, reader_stop_event, seen_both_event,
+              result_queue, error_queue),
         daemon=True,
     )
 
     try:
         reader.start()
         writer.start()
+        # The writer keeps publishing until the reader has caught both payload
+        # kinds (or the deadline passes), so a reader the scheduler starts late
+        # still meets real contention instead of only the final na state.
+        seen_both_event.wait(timeout=20)
+        writer_stop_event.set()
         writer.join(timeout=30)
         assert not writer.is_alive(), "writer did not finish in time"
-        stop_event.set()
+        reader_stop_event.set()
         reader.join(timeout=10)
         assert not reader.is_alive(), "reader did not finish in time"
 
         errors = []
-        while not error_queue.empty():
-            errors.append(error_queue.get_nowait())
+        while True:
+            try:
+                errors.append(error_queue.get_nowait())
+            except queue.Empty:
+                break
         assert not errors, f"subprocess errors: {errors}"
 
-        assert not result_queue.empty(), "reader produced no result"
-        n_reads, n_default, n_small, n_large = result_queue.get_nowait()
+        try:
+            result = result_queue.get(timeout=10)
+        except queue.Empty:
+            result = None
+        assert result is not None, "reader produced no result"
+        n_reads, n_default, n_small, n_large = result
         log.info(
             "stress: reads=%d default=%d small=%d large=%d",
             n_reads, n_default, n_small, n_large,
