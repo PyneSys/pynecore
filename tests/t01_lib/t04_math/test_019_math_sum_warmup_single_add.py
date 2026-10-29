@@ -2,16 +2,13 @@
 @pyne
 
 Regression test: while the ``math.sum`` window fills, each bar is a single
-compensated add, not the fused evict-and-add step with a zero eviction.
-
-The two forms only differ when rounding ``s - c`` alone moves the sum, so the
-entry stored on such a bar comes out an ulp off and every later eviction of it
-carries the error. Volume-scaled and ratio sources hit it all the time, price
-sources practically never. Measured on CAPITALCOM:EURUSD 30m (probe ws: 42
-warmups of ``close * volume``, ``(close - open) * volume`` and
-``(high - low) / close`` at lengths 10..60, 841k displayed bars bit-exact with
-the single add, none with the fused form). The bars and expected sums below are
-TradingView's own, from bars 148.. and 1480.. of that chart.
+compensated add with no eviction. Volume-scaled and ratio sources carry live
+rounding error from the first bars on, so a machine that evicts a zero or
+re-baselines during warmup drifts off them. The bars are TradingView's own
+(CAPITALCOM:EURUSD 30m, bars 148.. and 1480.. of that chart), and the expected
+sums are TradingView's plots for exactly these bars, replayed through
+``array.from`` literals on 2026-10-29 (probe replay019, the current engine:
+Neumaier-compensated rolling sum read out as ``s + c``).
 """
 from pynecore.lib import close, high, low, math, plot, script, volume
 
@@ -90,18 +87,17 @@ __test_helper_bars_1480 = [
 # TradingView's plotted sums from the 11th bar on (the first ten are na)
 __test_helper_tv_cv = [
     8615.30691, 8825.8984, 8846.20783, 8767.84437, 9606.08541, 11796.6829, 13943.31861,
-    15561.666609999998, 17453.6132, 18631.554139999997, 20681.24114, 21836.637759999998,
-    22586.376229999998, 23274.953929999996, 24437.919449999998, 25679.344889999997,
-    24882.88054, 24612.850629999997, 24766.462109999997, 24863.204629999997,
+    15561.66661, 17453.6132, 18631.55414, 20681.24114, 21836.637759999998, 22586.376229999998, 23274.95393,
+    24437.919449999998, 25679.34489, 24882.88054, 24612.85063, 24766.46211, 24863.20463,
 ]
 __test_helper_tv_rng = [
-    0.01704680684423804, 0.01678514993513952, 0.012005861647612512, 0.0093705215266941,
-    0.008956621021218693, 0.0072257304836446275, 0.0066619267480767415,
-    0.00646125043909119, 0.006174898786486918, 0.006127434279645612,
-    0.00613726436736733, 0.006309818115261105, 0.006033134766322121,
-    0.005727977954019244, 0.005862125912682021, 0.005613858219315178,
-    0.006282018206383469, 0.006491962943169739, 0.0077414482536507226,
-    0.008475582955731522,
+    0.017046806844238042, 0.01678514993513952, 0.012005861647612514,
+    0.009370521526694101, 0.008956621021218693, 0.007225730483644629,
+    0.006661926748076742, 0.006461250439091191, 0.006174898786486919,
+    0.006127434279645614, 0.006137264367367332, 0.006309818115261107,
+    0.006033134766322124, 0.005727977954019246, 0.005862125912682022,
+    0.00561385821931518, 0.0062820182063834705, 0.006491962943169741,
+    0.007741448253650724, 0.008475582955731524,
 ]
 
 

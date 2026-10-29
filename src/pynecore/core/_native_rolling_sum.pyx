@@ -12,12 +12,12 @@ the results identical.
 Bit-identity rests on the C compiler evaluating every expression exactly as written: no
 fused multiply-add contraction and no reassociation (the build passes
 ``-ffp-contract=off``, ``/fp:precise`` on MSVC, and never ``-ffast-math``). The
-compensated steps are exactly the kind of arithmetic a reassociating compiler would
-"simplify" to zero.
+compensated adds are exactly the kind of arithmetic a reassociating compiler would
+"simplify" away.
 
-The window and the ring live in ``array('d')`` objects rather than raw buffers: a
-rollback token holds the arrays of the state it was taken in, and a step that grows
-either one leaves the token's array untouched, so the reference keeps it alive.
+The window lives in an ``array('d')`` rather than a raw buffer: a rollback token holds
+the array of the state it was taken in, and a step that grows it leaves the token's
+array untouched, so the reference keeps it alive.
 """
 cimport cython
 from cpython cimport array
@@ -50,9 +50,9 @@ cdef inline array.array _zeros(Py_ssize_t n):
 
 
 cdef struct _Undo:
-    unsigned long long ring_gen, values_gen
-    long long ring_at, win_at
-    double ring_old, win_old
+    unsigned long long values_gen
+    long long win_at
+    double win_old
 
 
 # The records live in a C array instead of a list of tuples, so journaling a step
@@ -73,8 +73,8 @@ cdef class _Journal:
     def __dealloc__(self):
         free(self.records)
 
-    cdef int append(self, unsigned long long ring_gen, long long ring_at, double ring_old,
-                    unsigned long long values_gen, long long win_at, double win_old) except -1:
+    cdef int append(self, unsigned long long values_gen, long long win_at,
+                    double win_old) except -1:
         cdef Py_ssize_t size
         cdef _Undo* records
         cdef _Undo* record
@@ -86,9 +86,6 @@ cdef class _Journal:
             self.records = records
             self.alloc = size
         record = &self.records[self.count]
-        record.ring_gen = ring_gen
-        record.ring_at = ring_at
-        record.ring_old = ring_old
         record.values_gen = values_gen
         record.win_at = win_at
         record.win_old = win_old
@@ -99,11 +96,11 @@ cdef class _Journal:
 cdef class _SumToken:
     """Rollback token of a :class:`SumMachine` (see ``__pyne_snapshot__``)."""
     cdef _Journal journal
-    cdef unsigned long long ring_gen, values_gen
+    cdef unsigned long long values_gen
     cdef double summ, compensation
-    cdef long long seen, window, capacity, ring_cap, slot
+    cdef long long seen, window, capacity
     cdef long long values_cap, values_size, values_pos
-    cdef array.array ring, values
+    cdef array.array values
     cdef object values_bar
 
 
@@ -111,8 +108,6 @@ cdef class SumMachine:
     """The rolling-sum machine of one ``math.sum`` call site (compiled twin)."""
     cdef double summ, compensation
     cdef long long seen, window, capacity
-    cdef array.array ring
-    cdef long long ring_cap, slot
     cdef array.array values
     cdef long long values_cap, values_size, values_pos
     cdef object values_bar
@@ -124,7 +119,7 @@ cdef class SumMachine:
     cdef double* memo_comps
     cdef Py_ssize_t memo_len, memo_alloc
     cdef _Journal journal
-    cdef unsigned long long ring_gen, values_gen, counter
+    cdef unsigned long long values_gen, counter
 
     def __cinit__(self):
         self.memo_sums = NULL
@@ -139,9 +134,6 @@ cdef class SumMachine:
         self.seen = 0
         self.window = 0
         self.capacity = _SeriesImpl.DEFAULT_MAX_BARS_BACK
-        self.ring = _zeros(0)
-        self.ring_cap = 0
-        self.slot = 0
         self.values = _zeros(0)
         self.values_cap = _SeriesImpl.DEFAULT_MAX_BARS_BACK + 1
         self.values_size = 0
@@ -149,7 +141,6 @@ cdef class SumMachine:
         self.values_bar = -1
         self.memo_valid = False
         self.journal = None
-        self.ring_gen = 0
         self.values_gen = 0
         self.counter = 0
 
@@ -190,15 +181,6 @@ cdef class SumMachine:
             raise IndexError("Slice stop index out of range!")
         return 0
 
-    cdef double _ring_get(self, array.array ent, long long cap, long long e) except? -1.0:
-        # ``ent[e]`` with Python list indexing: the caller wrapped a negative index
-        # once, a still-negative one wraps again, and anything else out of range raises
-        if e < 0:
-            e += cap
-        if e < 0 or e >= cap:
-            raise IndexError("list index out of range")
-        return ent.data.as_doubles[e]
-
     cdef int _resize_values(self, long long max_bars_back) except -1:
         # ``SeriesImpl.max_bars_back`` setter semantics, see the original
         cdef long long new_cap, size, pos, old_cap, keep, start, i
@@ -235,20 +217,16 @@ cdef class SumMachine:
 
     def step(self, source, length):
         """One ``math.sum`` call (see :meth:`pynecore.core.rolling_sum.SumMachine.step`)."""
-        cdef bint source_na, grown_ring, fires, warm
+        cdef bint source_na
         cdef double value = 0.0
-        cdef double s, c, d0, v, y, new_sum, b, r, y1, t, e1, y2, d
-        cdef double ring_old = 0.0
+        cdef double s, c, v, t, d
         cdef double win_old = 0.0
-        cdef long long ring_at = -1
         cdef long long win_at = -1
-        cdef unsigned long long ring_gen, values_gen
-        cdef long long clen, n, prev_w, new_w, pos, size, capacity, need, cap, at, grow
-        cdef long long kept, i, j, cnt, shift, base, top, walked, k, e, stop, start
+        cdef unsigned long long values_gen
+        cdef long long clen, n, prev_w, new_w, pos, size, need, grow
+        cdef long long i, shift, top, walked, k, stop, start
         cdef int overflow = 0
-        cdef array.array ent, grown
         cdef double* vals
-        cdef double* ring_data
         cdef object bar
 
         if type(source) is float:
@@ -293,9 +271,8 @@ cdef class SumMachine:
         prev_w = self.window
         new_w = clen if n >= clen else n
         if source_na and prev_w == new_w:
-            return self.summ if new_w >= clen else _na_float
+            return self.summ + self.compensation if new_w >= clen else _na_float
 
-        ring_gen = self.ring_gen
         values_gen = self.values_gen
 
         if not source_na:
@@ -340,57 +317,14 @@ cdef class SumMachine:
                 self.capacity = clen
                 self._resize_values(clen)
 
-        ent = self.ring
-        cap = self.ring_cap
-        at = self.slot
-        capacity = self.capacity
-        need = n if n < capacity else capacity
-        grown_ring = False
-        if need > cap:
-            size = cap + cap
-            if size < need:
-                size = need
-            elif size > capacity:
-                size = capacity
-            grown = _zeros(size)
-            j = 0
-            if cap:
-                kept = cap if self.seen > cap else self.seen
-                i = at - kept
-                if i < 0:
-                    i += cap
-                j = size - kept
-                for cnt in range(kept):
-                    grown.data.as_doubles[j] = ent.data.as_doubles[i]
-                    i += 1
-                    if i == cap:
-                        i = 0
-                    j += 1
-                    if j == size:
-                        j = 0
-            ent = grown
-            cap = size
-            at = j
-            self.ring = ent
-            self.ring_cap = cap
-            self.slot = at
-            self.counter += 1
-            self.ring_gen = self.counter
-            grown_ring = True
-
         c = self.compensation
         s = self.summ
 
         if source_na:
             shift = 0
-            base = at - 1
-            if base < 0:
-                base += cap
         else:
             shift = 1
-            base = at
 
-        d0 = 0.0
         if prev_w + shift > new_w:
             top = prev_w - 1 + shift
             if top > new_w:
@@ -426,17 +360,22 @@ cdef class SumMachine:
                     i = walked + 1
                     k = stop - 1
                     while k >= new_w + 1:
-                        v = self._offset(k)
-                        y = -v - c
-                        new_sum = s + y
-                        c = (new_sum - s) - y
-                        s = new_sum
+                        v = -self._offset(k)
+                        t = s + v
+                        if (s if s >= 0.0 else -s) >= (v if v >= 0.0 else -v):
+                            c += (s - t) + v
+                        else:
+                            c += (v - t) + s
+                        s = t
                         self.memo_sums[i] = s
                         self.memo_comps[i] = c
                         i += 1
                         k -= 1
-        elif new_w > prev_w + shift or new_w < n:
-            top = new_w + 1 if new_w < n else n
+        elif new_w > prev_w + shift or (new_w < n and not source_na):
+            if source_na:
+                top = new_w
+            else:
+                top = new_w + 1 if new_w < n else n
             self._check_stop(top)
             start = prev_w + shift
             if start > top:
@@ -445,67 +384,38 @@ cdef class SumMachine:
             k = start
             while k < top:
                 v = self._offset(k)
-                y = v - c
-                new_sum = s + y
-                c = (new_sum - s) - y
-                s = new_sum
+                t = s + v
+                if (s if s >= 0.0 else -s) >= (v if v >= 0.0 else -v):
+                    c += (s - t) + v
+                else:
+                    c += (v - t) + s
+                s = t
                 k += 1
-        warm = new_w == n
-        if not warm:
-            e = base - new_w
-            if e < 0:
-                e += cap
-            d0 = self._ring_get(ent, cap, e)
 
-        ring_data = ent.data.as_doubles
-        if not source_na and not grown_ring:
-            ring_at = at
-            ring_old = ring_data[at]
-
-        fires = False
-        if c != 0.0 and value != 0.0:
-            b = c if c > 0.0 else -c
-            r = value + b
-            if r != 0.0 and r - r == 0.0:
-                fires = b - (r - value) > 0.0
-
-        if fires:
-            self._check_stop(new_w)
-            s = value
-            k = 1
-            while k < new_w:
-                s = s + self._offset(k)
-                k += 1
-            self.compensation = 0.0
-            if not source_na:
-                ring_data[at] = value
-        elif warm:
-            y = value - c
-            new_sum = s + y
-            self.compensation = (new_sum - s) - y
-            s = new_sum
-            if not source_na:
-                ring_data[at] = y
-        else:
-            y1 = -d0 - c
-            t = s + y1
-            e1 = (t - s) - y1
-            y2 = value - e1
-            new_sum = t + y2
-            self.compensation = (new_sum - t) - y2
-            s = new_sum
-            if not source_na:
-                ring_data[at] = y2
+        if new_w < n and (shift or prev_w > new_w):
+            self._check_stop(new_w + 1)
+            v = -self._offset(new_w)
+            t = s + v
+            if (s if s >= 0.0 else -s) >= (v if v >= 0.0 else -v):
+                c += (s - t) + v
+            else:
+                c += (v - t) + s
+            s = t
+        if not source_na:
+            t = s + value
+            if (s if s >= 0.0 else -s) >= (value if value >= 0.0 else -value):
+                c += (s - t) + value
+            else:
+                c += (value - t) + s
+            s = t
         self.summ = s
+        self.compensation = c
         self.seen = n
         self.window = new_w
-        if not source_na:
-            at += 1
-            self.slot = 0 if at == cap else at
         if self.journal is not None:
-            self.journal.append(ring_gen, ring_at, ring_old, values_gen, win_at, win_old)
+            self.journal.append(values_gen, win_at, win_old)
 
-        return s if new_w >= clen else _na_float
+        return s + c if new_w >= clen else _na_float
 
     def __pyne_snapshot__(self):
         """Rollback token of the current state (see ``__pyne_restore__``)."""
@@ -523,29 +433,22 @@ cdef class SumMachine:
         token.seen = self.seen
         token.window = self.window
         token.capacity = self.capacity
-        token.ring = self.ring
-        token.ring_cap = self.ring_cap
-        token.slot = self.slot
         token.values = self.values
         token.values_cap = self.values_cap
         token.values_size = self.values_size
         token.values_pos = self.values_pos
         token.values_bar = self.values_bar
-        token.ring_gen = self.ring_gen
         token.values_gen = self.values_gen
         return token
 
     cdef void _unwind(self, _Journal journal, _SumToken token):
-        # The records of one journal, newest first, put back into the token's arrays
+        # The records of one journal, newest first, put back into the token's array
         cdef Py_ssize_t i = journal.count
         cdef _Undo* record
-        cdef double* ring = token.ring.data.as_doubles
         cdef double* values = token.values.data.as_doubles
         while i > 0:
             i -= 1
             record = &journal.records[i]
-            if record.ring_at >= 0 and record.ring_gen == token.ring_gen:
-                ring[record.ring_at] = record.ring_old
             if record.win_at >= 0 and record.values_gen == token.values_gen:
                 values[record.win_at] = record.win_old
 
@@ -580,15 +483,11 @@ cdef class SumMachine:
         self.seen = token.seen
         self.window = token.window
         self.capacity = token.capacity
-        self.ring = token.ring
-        self.ring_cap = token.ring_cap
-        self.slot = token.slot
         self.values = token.values
         self.values_cap = token.values_cap
         self.values_size = token.values_size
         self.values_pos = token.values_pos
         self.values_bar = token.values_bar
-        self.ring_gen = token.ring_gen
         self.values_gen = token.values_gen
         journal.count = 0
         journal.following = None

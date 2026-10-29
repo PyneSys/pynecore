@@ -9,13 +9,11 @@ validation runs through the ``t01_lib`` behavior suites.
 """
 from contextlib import contextmanager
 from datetime import datetime, time, timedelta, UTC
-from fractions import Fraction
-from math import isfinite
+from math import fsum, sin
 
 from pynecore import lib
 from pynecore.core.instance_state import _make_state
 from pynecore.core.random import PineRandom
-from pynecore.core.rolling_sum import sum_fires
 from pynecore.core.syminfo import SymInfoInterval, SymInfoSession
 from pynecore.lib import syminfo
 from pynecore.types.na import NA
@@ -111,180 +109,115 @@ def __test_math_random_instances_independent__():
 
 ### math.sum ###
 
-def _ref_fires(comp: float, x: float) -> bool:
-    """Exact-arithmetic (Fraction) re-baseline condition, written independently
+def _ref_sum_factory():
+    """The TradingView rolling-sum machine on plain lists, written independently
     of ``pynecore.core.rolling_sum`` so it doubles as its regression check.
 
-    The engine shifts the incoming value by the compensation's MAGNITUDE and
-    tests the fixed-order Fast2Sum residue of that add, WITHOUT the usual
-    magnitude swap: fire iff ``fl(|c| - fl(fl(x + |c|) - x)) > 0``. Every
-    rounding step is re-derived here from rationals — ``float(Fraction)`` is
-    correctly rounded — so the oracle shares no float expression with the
-    production code."""
-    if comp == 0.0 or x == 0.0 or not (isfinite(comp) and isfinite(x)):
-        return False
-    b = Fraction(-comp if comp < 0.0 else comp)
-    xf = Fraction(x)
-    try:
-        r = float(xf + b)  # fl(x + |c|)
-    except OverflowError:  # the add itself overflows to +-inf
-        return False
-    if r == 0.0 or not isfinite(r):
-        return False
-    d = float(Fraction(r) - xf)  # fl(fl(x + |c|) - x), inexact when |c| > |x|
-    return float(b - Fraction(d)) > 0.0
+    MEASURED (2026-10-29, CAPITALCOM:BTCUSD 5m, 20.9k bars per probe): a
+    Neumaier-compensated rolling sum -- every add of ``v`` is ``t = s + v``,
+    ``c += (s - t) + v`` when ``|s| >= |v|`` else ``c += (v - t) + s``, ``s = t``
+    -- read out as ``s + c`` and never renormalized. A stored bar evicts the raw
+    value at offset ``length`` (when the window does not reach the first stored
+    value) and then adds its own value; a moved length walks the change first,
+    one compensated add per value: a shrink evicts the extra leaving offsets
+    oldest first, a grow admits the newly covered offsets newest first down to
+    the one PAST the window, which the step's own eviction then takes out again.
+    An na bar stores nothing and, when its length moved, only resizes the window
+    of the values already stored (a grow admits down to the window's own edge
+    and evicts nothing)."""
+    buf: list[float] = []  # non-na values, oldest first
+    summ, comp, width = 0.0, 0.0, 0
 
-
-def _ref_sum_factory():
-    """The manual TV rolling-sum machine on plain lists, as an independent
-    bit-exactness reference (NA values are skipped, never buffered): fused
-    two-round compensated evict-and-add, with exact-arithmetic re-baseline
-    detection and newest-first linear window rebuilds."""
-    buf: list[float] = []
-    entries: list[float] = []
-    summ, count, comp = 0.0, 0, 0.0
+    def add(v: float) -> None:
+        nonlocal summ, comp
+        t = summ + v
+        if abs(summ) >= abs(v):
+            comp += (summ - t) + v
+        else:
+            comp += (v - t) + summ
+        summ = t
 
     def ref(source, length):
-        nonlocal summ, count, comp
-        if length == 1:
-            return source
+        nonlocal width
         length = int(length)
         isna = isinstance(source, NA) or source != source
-        if isna:
-            return summ if count >= length else NA(float)
-        x = float(source)
-        buf.append(x)
-        if count < length:  # Warmup: d0 = 0, fires sum the available prefix
-            count += 1
-            if _ref_fires(comp, x):
-                acc = x
-                for v in buf[-count:-1][::-1]:
-                    acc = v + acc
-                summ, comp = acc, 0.0
-                entries.append(x)
-            else:
-                y1 = -comp
-                t = summ + y1
-                e1 = (t - summ) - y1
-                y2 = x - e1
-                new_sum = t + y2
-                comp = (new_sum - t) - y2
-                summ = new_sum
-                entries.append(y2)
-            return summ if count == length else NA(float)
-        old = entries.pop(0)
-        if _ref_fires(comp, x):
-            acc = x
-            for v in buf[-length:-1][::-1]:
-                acc = v + acc
-            summ, comp = acc, 0.0
-            entries.append(x)
-        else:
-            y1 = -old - comp
-            t = summ + y1
-            e1 = (t - summ) - y1
-            y2 = x - e1
-            new_sum = t + y2
-            comp = (new_sum - t) - y2
-            summ = new_sum
-            entries.append(y2)
-        return summ
+        if not isna:
+            buf.append(float(source))
+        n = len(buf)
+        new_w = min(length, n)
+        if isna and new_w == width:
+            return summ + comp if new_w >= length else NA(float)
+        shift = 0 if isna else 1
+
+        def offset(k: int) -> float:  # window offset k, 0 = newest stored value
+            return buf[-1 - k]
+
+        prev_top = width - 1 + shift
+        if prev_top + 1 > new_w:
+            for k in range(prev_top, new_w, -1):
+                add(-offset(k))
+        elif new_w > prev_top or (new_w < n and not isna):
+            top = new_w - 1 if isna else (new_w if new_w < n else n - 1)
+            for k in range(prev_top + 1, top + 1):
+                add(offset(k))
+        if new_w < n and (not isna or width > new_w):
+            add(-offset(new_w))
+        if not isna:
+            add(buf[-1])
+        width = new_w
+        return summ + comp if new_w >= length else NA(float)
 
     return ref
 
 
-def _fire_rule_pairs():
-    """Deterministic ``(compensation, value)`` pairs spanning ~30 binades in
-    both signs — a plain LCG so the sweep is reproducible everywhere."""
-    s = 12345
-    for i in range(20000):
-        s = (s * 1103515245 + 12345) % (1 << 31)
-        c = (s / (1 << 31) - 0.5) * 10.0 ** (i % 27 - 24)
-        s = (s * 1103515245 + 12345) % (1 << 31)
-        x = (s / (1 << 31) - 0.5) * 10.0 ** (i % 13 - 7)
-        yield c, x
-
-
-def __test_rolling_sum_fire_rule_golden__():
-    """ Golden bars that separate the measured rule from its plausible
-    neighbours: the magnitude shift (a signed probe walks the finer downward
-    grid below a binade edge) and the missing Fast2Sum magnitude swap """
-    # (compensation, value, fires)
-    cases = [
-        # Negative compensation at a binade edge: shifting the signed value
-        # instead of its magnitude labels these bars the other way.
-        (-2.117582368135751e-22, 9.536743164062499e-07, True),
-        (-0.001055446444665531, 0.0009760761164057203, True),
-        (-1.5096162171497207, 1.3090738838615936e-06, False),
-        # |c| > |x|: the fixed-order residue is inexact, and that inexact
-        # value is what the engine tests — an exact 2Sum would fire here.
-        (55.99389814121456, 0.3611502021234201, False),
-        (-20.420464290753458, -6.986601940076164e-09, False),
-        (9.109360478429427e-07, -2.7167312094343507e-08, False),
-        # Degenerate operands never fire.
-        (0.0, 1.0, False),
-        (1.0, 0.0, False),
-        (float('nan'), 1.0, False),
-        (1e308, 1e308, False),
-    ]
-    for comp, value, want in cases:
-        assert sum_fires(comp, value) is want, (comp, value)
-        assert _ref_fires(comp, value) is want, (comp, value)
-
-
-def __test_rolling_sum_fire_rule_matches_exact_oracle__():
-    """ The float fire detector agrees with the exact-arithmetic oracle on a
-    dense deterministic sweep """
-    for comp, value in _fire_rule_pairs():
-        assert sum_fires(comp, value) == _ref_fires(comp, value), (comp, value)
-
-
-def __test_math_sum_inlined_fire_rule_matches_core__():
-    """ ``lib.math.sum`` inlines the fire test instead of calling
-    ``core.rolling_sum.sum_fires``; this window makes the two disagree on the
-    output bars if the inlined expression ever drifts from the core one """
-    values = [-1274720.6437522452, -3.341532690643485, 8.450734784875934,
-              2.050491000209509e-10, -1.9922460506784567, -1844830.279632077,
-              -2.9881426742597395, -1.3691775656187065e-06, -5.087091405520743e-06,
-              -5.499330175468724e-06, -5.198905520846737e-06, -2.0588158189627496e-09]
-    state = _make_state(lib.math.sum.__pyne_layout__)
-    ref = _ref_sum_factory()
-    with _bars() as next_bar:
-        for v in values:
-            got = lib.math.sum(state, v, 3)
-            want = ref(v, 3)
-            if isinstance(want, NA) or want != want:
-                assert isinstance(got, NA) or got != got
-            else:
-                assert got == want
-            next_bar()
+def _assert_same(got, want, where) -> None:
+    if isinstance(want, NA) or want != want:
+        assert isinstance(got, NA) or got != got, where
+    else:
+        assert repr(got) == repr(want), (where, got, want)
 
 
 def __test_math_sum_bit_exact__():
-    """ The port matches the manual rolling-sum machine bit for bit, with NA
+    """ The port matches the reference rolling-sum machine bit for bit, with NA
     values hitting the warmup, transition and steady branches """
     values = [1.1, 2.2, NA(float), 3.3, 0.1, NA(float), NA(float), 4.4, 1e-9, 5.5,
               0.3333333333, 7.7, NA(float), 8.8, 1e12, 0.0001, 9.9, 2.5, NA(float), 6.6]
     state = _make_state(lib.math.sum.__pyne_layout__)
     ref = _ref_sum_factory()
     with _bars() as next_bar:
-        for v in values:
-            got = lib.math.sum(state, v, 5)
-            want = ref(v, 5)
-            if isinstance(want, NA) or want != want:
-                assert isinstance(got, NA) or got != got
-            else:
-                assert got == want
+        for i, v in enumerate(values):
+            _assert_same(lib.math.sum(state, v, 5), ref(v, 5), i)
             next_bar()
+
+
+def __test_math_sum_spike_leaves_the_compensation_live__():
+    """ A huge value passing through the window leaves its rounding residue in the
+    compensation register, which the readout keeps applying bar after bar: the
+    reported sums are then NOT the correctly rounded window sums, and the
+    reference machine says exactly which doubles they are (MEASURED, probe
+    newsum1: 1e15 spikes through a length-5 window, 20.9k bars bit-exact) """
+    values = [1e15 if i % 7 == 0 else 0.5 + 0.25 * sin(i * 12.9898) for i in range(400)]
+    state = _make_state(lib.math.sum.__pyne_layout__)
+    ref = _ref_sum_factory()
+    off_exact = 0
+    with _bars() as next_bar:
+        for i, v in enumerate(values):
+            got = lib.math.sum(state, v, 5)
+            _assert_same(got, ref(v, 5), i)
+            if i >= 4 and got != fsum(values[i - 4:i + 1]):
+                off_exact += 1
+            next_bar()
+    assert off_exact > 0
 
 
 def __test_math_sum_length_one_na_bar_echoes_the_window__():
     """ length == 1 gives back the source, and an na bar echoes the last non-na
 
-    MEASURED (probe sumlen4, BINANCE:BTCUSDT 30m, 28746 bars): a length-1 sum
-    equals the source on every non-na bar, and on an na bar it reports the last
-    NON-NA value rather than na — an na bar is not stored and does not advance
-    the window, exactly like every other length.
+    MEASURED (probe sumlen4, BINANCE:BTCUSDT 30m, 28746 bars, and again on the
+    current engine, probe newsum1): a length-1 sum equals the source on every
+    non-na bar, and on an na bar it reports the last NON-NA value rather than
+    na -- an na bar is not stored and does not advance the window, exactly like
+    every other length.
     """
     state = _make_state(lib.math.sum.__pyne_layout__)
     with _bars() as next_bar:
@@ -314,18 +247,16 @@ def __test_math_sum_growing_length_keeps_history__():
 def __test_math_sum_grown_length_matches_the_constant_machine__():
     """ A length grown one bar at a time IS the constant-length machine
 
-    MEASURED LAW (probe sumlen2, BINANCE:BTCUSDT 30m): ``math.sum(volume,
-    min(bar_index + 1, 610))`` equals ``math.sum(volume, 610)`` bit-for-bit on
-    every one of the 28746 exported bars, and so does the shorter 5-length pair.
-    TradingView does not re-baseline when the length moves — while the window is
-    still filling there is nothing to evict, so the two runs are the same
-    machine — hence the clamped-length idiom (``ta.sma(volume, math.min(
-    bar_index + 1, len))``, Heatmap Volume [xdecow]) must not restart the
-    accumulator.
+    MEASURED LAW (probe sumlen2, BINANCE:BTCUSDT 30m, and the current engine's
+    ramp probes): ``math.sum(volume, min(bar_index + 1, 610))`` equals
+    ``math.sum(volume, 610)`` bit-for-bit on every one of the 28746 exported
+    bars, and so does the shorter 5-length pair. While the window is still
+    filling there is nothing to evict, so the two runs are the same machine --
+    hence the clamped-length idiom (``ta.sma(volume, math.min(bar_index + 1,
+    len))``, Heatmap Volume [xdecow]) must not restart the accumulator.
     """
     length = 9
-    # Mixed magnitudes so the compensated accumulator carries a live residue:
-    # a re-baselined linear sum drifts off the running machine within a window.
+    # Mixed magnitudes so the compensation register carries a live residue
     values = [1e7 + i * 0.1 + (i % 13) * 1e-9 if i % 3 else 3.25e-5 * (i % 7 + 1)
               for i in range(60)]
     grown = _make_state(lib.math.sum.__pyne_layout__)
@@ -339,173 +270,58 @@ def __test_math_sum_grown_length_matches_the_constant_machine__():
             next_bar()
 
 
-def __test_math_sum_length_change_walks_one_entry_at_a_time__():
-    """ A moved length enters and leaves the window ONE entry per machine step
+def __test_math_sum_length_changes_walk_one_value_at_a_time__():
+    """ A moved length enters and leaves the window ONE value per compensated add,
+    in the measured order, and the walk matters
 
-    MEASURED LAW (probes sumlen6/sumlen7, BINANCE:BTCUSDT 30m): a 5->6, 6->7,
-    4->10 or 6->5 length step reproduces TradingView bit-for-bit only when every
-    admitted/evicted entry runs its own compensated round -- folding the whole
-    change into a single fused ``d0`` lands 1-3 ulp away. A grow admits the raw
-    values newest first down to offset ``new_w`` itself, then the fused step
-    evicts that offset's ORIGINAL entry; admitted bars keep their original
-    entries (probes wg/wh/wk: 131 grows bit-exact). The two models are compared
-    here directly, so the test fails if the implementation folds.
+    MEASURED (probe newsum2, CAPITALCOM:BTCUSD 5m: +-5 jumps, sawtooth and
+    pseudo-random lengths 2..14 over 1e15 spikes, 20.9k bars each bit-exact
+    this way; folding a change into one pre-summed delta, admitting only to the
+    window's own edge on a stored bar, or reversing either walk drifts off
+    within a few hundred bars). The reference machine is compared here over
+    the same kind of schedule, with na bars mixed in, and a folded variant must
+    disagree somewhere or the comparison proves nothing.
     """
-    length_before, length_after = 4, 8
-    # Magnitudes chosen so the compensated residue is live when the length moves
-    values = [1e8 + i * 0.5 if i % 2 else 7.5e-7 * (i % 5 + 1) for i in range(24)]
-    change_at = 16
+    values = [1e15 if i % 37 == 0 else 0.5 + 0.25 * sin(i * 12.9898) for i in range(400)]
+    values = [NA(float) if i % 11 == 5 else v for i, v in enumerate(values)]
+    lengths = [2 + (i * 7919) % 13 if i % 50 < 25 else 3 + i % 7 for i in range(400)]
 
-    def lengths(i):
-        return length_before if i < change_at else length_after
-
-    def model(sequential):
-        summ = 0.0
-        comp = 0.0
-        ent = []            # realized entries, index 0 = newest
-        win = 0
-        got = []
+    def folded():
+        # The same machine with every change folded into ONE add of the delta
+        buf, summ, comp, width = [], 0.0, 0.0, 0
+        out = []
         for i, v in enumerate(values):
-            length = lengths(i)
-            new_w = length if i + 1 >= length else i + 1
-            d0 = 0.0
-            if win + 1 > new_w:
-                for k in range(win, new_w, -1):
-                    if sequential:
-                        y1 = -ent[k - 1] - comp
-                        t = summ + y1
-                        y2 = -((t - summ) - y1)
-                        summ = t + y2
-                        comp = (summ - t) - y2
-                    else:
-                        d0 += ent[k - 1]
-                d0 = d0 + ent[new_w - 1] if not sequential else ent[new_w - 1]
-            elif new_w > win + 1 or new_w < i + 1:
-                top = new_w if new_w < i + 1 else i
-                for k in range(win + 1, top + 1):
-                    a = values[i - k]
-                    if sequential:
-                        y = a - comp
-                        ns = summ + y
-                        comp = (ns - summ) - y
-                        summ = ns
-                    else:
-                        d0 -= a
-                if new_w < i + 1:
-                    d0 = d0 + ent[new_w - 1] if not sequential else ent[new_w - 1]
-            fires = False
-            if comp != 0.0 and v != 0.0:
-                b = comp if comp > 0.0 else -comp
-                r = v + b
-                if r != 0.0 and r - r == 0.0:
-                    fires = b - (r - v) > 0.0
-            if fires:
-                # Re-baseline: newest-first linear sum of the raw window
-                summ = v
-                for k in range(1, new_w):
-                    summ = values[i - k] + summ
-                comp = 0.0
-                ent = [v] + ent
-            else:
-                y1 = -d0 - comp
-                t = summ + y1
-                y2 = v - ((t - summ) - y1)
-                ns = t + y2
-                comp = (ns - t) - y2
-                summ = ns
-                ent = [y2] + ent
-            win = new_w
-            got.append(summ if new_w >= length else None)
-        return got
+            isna = isinstance(v, NA)
+            if not isna:
+                buf.append(float(v))
+            n = len(buf)
+            new_w = min(lengths[i], n)
+            if isna and new_w == width:
+                out.append(summ + comp if new_w >= lengths[i] else None)
+                continue
+            window = buf[-new_w:] if new_w else []
+            prev = (buf[-1 - width:-1] if not isna else buf[-width:]) if width else []
+            delta = sum(window) - sum(prev)
+            t = summ + delta
+            comp += (summ - t) + delta if abs(summ) >= abs(delta) else (delta - t) + summ
+            summ = t
+            width = new_w
+            out.append(summ + comp if new_w >= lengths[i] else None)
+        return out
 
-    walked = model(True)
-    folded = model(False)
     state = _make_state(lib.math.sum.__pyne_layout__)
+    ref = _ref_sum_factory()
+    fold = folded()
+    disagree = False
     with _bars() as next_bar:
         for i, v in enumerate(values):
-            got = lib.math.sum(state, v, lengths(i))
-            if walked[i] is not None:
-                assert repr(got) == repr(walked[i]), f'bar {i}: {got!r} != {walked[i]!r}'
+            got = lib.math.sum(state, v, lengths[i])
+            want = ref(v, lengths[i])
+            _assert_same(got, want, i)
+            if fold[i] is not None and not isinstance(want, NA) and fold[i] != want:
+                disagree = True
             next_bar()
-
-    # The two models must actually disagree, or the assertion above proves nothing
-    assert any(a is not None and repr(a) != repr(b) for a, b in zip(walked, folded))
-
-
-def __test_math_sum_isolated_shrink_evicts_raw_values__():
-    """ An isolated multi-entry shrink evicts the RAW source values
-
-    MEASURED LAW (probes sumlen3/sumlen6, BINANCE:BTCUSDT 30m): the isolated
-    8->1, 100->1, 300->150, 610->100 and 5->3 events reproduce TradingView
-    bit-for-bit only when each extra leaving offset runs its own compensated
-    add with the RAW source value — evicting the stored realized entries
-    instead lands away on the event bar. The two models are compared here
-    directly, so the test fails if the implementation reads the ring.
-    """
-    length_before, length_after = 8, 1
-    # Mixed magnitudes so realized entries differ from the raw values
-    values = [1e8 + i * 0.5 if i % 2 else 7.5e-7 * (i % 5 + 1) for i in range(24)]
-    change_at = 16
-
-    def model(raw_extras):
-        summ = 0.0
-        comp = 0.0
-        ent = []            # realized entries, index 0 = newest
-        win = 0
-        got = []
-        for i, v in enumerate(values):
-            length = length_before if i < change_at else length_after
-            new_w = length if i + 1 >= length else i + 1
-            d0 = 0.0
-            if win + 1 > new_w:
-                for k in range(win, new_w, -1):
-                    leaving = values[i - k] if raw_extras else ent[k - 1]
-                    y = -leaving - comp
-                    ns = summ + y
-                    comp = (ns - summ) - y
-                    summ = ns
-                d0 = ent[new_w - 1]
-            elif win + 1 == new_w and i + 1 > length:
-                d0 = 0.0
-            elif new_w == win and i + 1 > length:
-                d0 = ent[new_w - 1]
-            fires = False
-            if comp != 0.0 and v != 0.0:
-                b = comp if comp > 0.0 else -comp
-                r = v + b
-                if r != 0.0 and r - r == 0.0:
-                    fires = b - (r - v) > 0.0
-            if fires:
-                summ = v
-                for k in range(1, new_w):
-                    summ = values[i - k] + summ
-                comp = 0.0
-                ent = [v] + ent
-            else:
-                y1 = -d0 - comp
-                t = summ + y1
-                y2 = v - ((t - summ) - y1)
-                ns = t + y2
-                comp = (ns - t) - y2
-                summ = ns
-                ent = [y2] + ent
-            win = new_w
-            got.append(summ if new_w >= length else None)
-        return got
-
-    raw = model(True)
-    realized = model(False)
-    state = _make_state(lib.math.sum.__pyne_layout__)
-    with _bars() as next_bar:
-        for i, v in enumerate(values):
-            length = length_before if i < change_at else length_after
-            got = lib.math.sum(state, v, length)
-            if raw[i] is not None:
-                assert repr(got) == repr(raw[i]), f'bar {i}: {got!r} != {raw[i]!r}'
-            next_bar()
-
-    # The two models must actually disagree, or the assertion above proves nothing
-    assert any(a is not None and repr(a) != repr(b) for a, b in zip(raw, realized))
+    assert disagree
 
 
 def __test_math_sum_length_change_on_na_bar_keeps_window__():
@@ -530,7 +346,7 @@ def __test_math_sum_growth_after_long_short_length_run__():
         for i in range(10):
             lib.math.sum(state, float(i + 1), 2)
             next_bar()
-        # 7 + 8 + 9 + 10 + 11 — all five values are still buffered
+        # 7 + 8 + 9 + 10 + 11 -- all five values are still buffered
         assert lib.math.sum(state, 11.0, 5) == 45.0
 
 

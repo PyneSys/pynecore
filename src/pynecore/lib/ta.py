@@ -347,26 +347,29 @@ def cog(source: Series[float], length: int) -> PyneFloat:
     # truncation happens where an integer is required — see ``_check_type``.
     length = int(length)
     count: Persistent[int] = 0
-    summ: Persistent[float] = 0.0
-    weighted_summ: Persistent[float] = 0.0
     val: Persistent[float] = na_float
     capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
+
+    # MEASURED (2026-10-29, CAPITALCOM:BTCUSD 5m, 20871 bars bit-exact): the
+    # denominator is the rolling ``math.sum`` machine and the numerator is a plain
+    # newest-first loop ``sum(source[i] * (i + 1))`` over the window, the reference
+    # implementation of the Pine documentation; carrying the numerator as a rolling
+    # recurrence instead lands one ulp away on nearly every bar. The machine must
+    # advance on every bar, na bars included, so it runs before any early return.
+    summ = lib_math.sum(source, length)
 
     if not (source == source):  # is_na_arg
         # An NA bar leaves the window unchanged; hold the last full value
         # (still NA while warming up)
         return na_float if count < length else val
 
-    # NA values are NOT stored in the buffer, only skipped, so ``src[length]``
-    # indexes past NA gaps to the true oldest value still inside the window.
-    # Reading the parameter directly would step back ``length`` *bars* and land
-    # inside an NA gap, subtracting an NA that poisons ``summ`` forever.
+    # NA values are NOT stored in the buffer, only skipped, so ``src[i]`` indexes
+    # past NA gaps to the true values still inside the window.
     src: Series[float] = source
-    # Grow the na-compacted buffer so ``src[length]`` stays addressable for lengths
-    # beyond the per-series default max_bars_back (500); otherwise the window-drop
-    # read returns na and poisons ``summ`` permanently. The resize is monotonic: a
-    # series ``length`` that dips low must not shrink the buffer, or the history a
-    # later increase needs would already be gone.
+    # Grow the na-compacted buffer so ``src[length - 1]`` stays addressable for
+    # lengths beyond the per-series default max_bars_back (500). The resize is
+    # monotonic: a series ``length`` that dips low must not shrink the buffer, or
+    # the history a later increase needs would already be gone.
     if length > capacity:
         capacity = length
         max_bars_back(src, capacity)
@@ -374,17 +377,13 @@ def cog(source: Series[float], length: int) -> PyneFloat:
     # Warming up phase — only non-NA samples advance the window
     if count < length:
         count += 1
-        summ += source
-        weighted_summ += source * (length - count)
         if count < length:
             return na_float
 
-    # Normal calculation phase
-    else:
-        new_summ = summ + source - src[length]
-        weighted_summ = weighted_summ + summ - length * src[length]
-        summ = new_summ
-    val = -weighted_summ / summ - 1.0
+    num = 0.0
+    for i in builtins.range(length):
+        num += src[i] * (i + 1)
+    val = -num / summ
     return val
 
 
@@ -2665,110 +2664,118 @@ def sar(start: float = 0.02, inc: float = 0.02, max: float = 0.2) -> PyneFloat:
     :param max: Maximum acceleration factor value
     :return: SAR value for current bar
     """
-    # The comparisons below stay exact. They cannot be measured directly -- the builtin
-    # takes no source, so a sub-tolerance series cannot be fed into it -- but they were
-    # bounded instead: over 49k bars of BTCUSDT 30m and EURUSD 1m the smallest non-zero
-    # |sar - low| / |sar - high| margin was 2.7e-8, with zero margins in the (0, 1e-10)
-    # band (probe m555).
-    #
     # MEASURED (probes ``sar_probe``/``sar_probe2``, BINANCE:BTCUSDT 30m, 28915 bars):
     # TradingView validates NONE of the three arguments -- it runs the recurrence with
     # whatever it is given. ``start`` above ``max`` is a distinct series from both
     # ``max = start`` and ``start = max`` (so neither side is clamped to the other),
     # ``max`` of 0.9 / 0.7 / 0.5 stay distinct once ``inc`` is large enough to reach
     # them (so there is no 0.5 ceiling), and a zero, negative or zero-increment
-    # acceleration factor computes rather than errors. An acceleration factor large
-    # enough to place the projected stop exactly ON the bar's extreme also settles the
-    # tie: the reversal test is STRICT on both sides, so a bar whose high equals the
-    # short stop (or whose low equals the long stop) does NOT reverse -- the level is
-    # merely carried forward by the two-bar clip. ``ta.sar(0.25, 0.25, 0.13)`` puts 11
-    # such bars in the window and every one of them decides TradingView's way only
-    # under the strict rule.
-
-    if bar_index == 0:
-        return na_float
+    # acceleration factor computes rather than errors (an overflowing one runs into an
+    # infinite value, which TradingView plots -- and ``na()`` reports -- as na). An
+    # acceleration factor large enough to place the projected stop exactly ON the bar's
+    # extreme also settles the tie: a bar whose high equals the short stop (or whose low
+    # equals the long stop) does NOT reverse -- the level is merely carried forward by
+    # the two-bar clip. ``ta.sar(0.25, 0.25, 0.13)`` puts 11 such bars in the window.
+    #
+    # MEASURED (probes ``sar/p1``, ``sar/p2``, ``sar/scan``, ``sar/scan2``, 2026-10-29): the
+    # builtin IS the reference implementation published in the Pine manual, bit for bit --
+    # including its warmup. Ten parameter sets (the defaults, ``(0.5, 0.5, 0.9)``,
+    # ``(0.25, 0.25, 0.13)``, negative / zero start, increment and maximum, start above
+    # maximum) agreed with a hand-written copy of it on every bar of CAPITALCOM:BTCUSD 5m
+    # (20898 bars), CAPITALCOM:EURUSD 60m (23820) and 1m (26592), BINANCE:BTCUSDT 30m (31997)
+    # and NASDAQ:AAPL 1D (11557); two parameter sets agreed on the first bars of 65 daily
+    # ``request.security`` series that start inside a BITSTAMP:BTCUSD 1D chart (IPOs, coin
+    # listings, stablecoins) and on every bar of the 64 of them that reach the chart's last
+    # bar -- 70 different first bars in all. The warmup law:
+    #
+    # - the initial trend is decided on bar 1 by ``close > close[1]``, and a tie starts
+    #   SHORT (COINBASE:USDCEUR, whose first two closes are both 0.831). It is not decided
+    #   by ``high[1] > high``: that rule picks the other trend on 21 of the 70 first bars
+    #   (CAPITALCOM:BTCUSD 5m among them: TV gives 62936.5 = low of bar 0 on bar 1, a long
+    #   start, while high[1] > high would start short at 62976.35);
+    # - bar 1 is NOT returned as the bare start value: the full step runs on it -- the
+    #   projection, the reversal test (a large enough factor reverses already on bar 1,
+    #   ``(0.5, 0.5, 0.9)`` on CAPITALCOM:BTCUSD 5m gives 62976.35 there, not 62936.5) and the
+    #   one-bar clip -- with the acceleration factor left unchanged on that bar;
+    # - the two-bar clip reads ``low[2]`` / ``high[2]`` only from bar 2 on.
+    #
+    # Every comparison is Pine's TOLERANT one (``core/pine_compare.py``), as in the
+    # reference script: a projected stop within EPSILON of the bar's extreme does not
+    # reverse. Exact tests miss TradingView on 8 of those 50 series -- e.g. CAPITALCOM:EURUSD
+    # 1m, ``(0.5, 0.5, 0.9)``, bar 179: the short stop 1.12479 + 0.5 * (1.12463 - 1.12479)
+    # rounds to 1.1247099999999999, one ulp below the high 1.12471, and TradingView keeps
+    # the short there (strict tests: 3021 wrong bars over the five charts; tolerant: none).
+    # Only the two reversal tests are observable -- the trend and extreme-point tests
+    # compare two prices, which never sit closer than EPSILON without being equal.
 
     # Persistent states
-    pos_long: Persistent[bool] = True  # Current position (long/short)
-    af: Persistent[float] = start  # Current acceleration factor
-    sar_val: Persistent[float] = na_float  # Current SAR value
-    ep: Persistent[float] = na_float  # Extreme point
+    result: Persistent[float] = na_float
+    max_min: Persistent[float] = na_float  # Extreme point
+    acceleration: Persistent[float] = na_float
+    is_below: Persistent[bool] = False  # SAR below the price, i.e. long
+    is_first_trend_bar = False
 
     # Unlike ``tr``, the previous bars here are read from this function's OWN window,
     # which advances per CALL -- measured (probe m571): a ta.sar() inside an `if` is na
     # on TradingView for the whole run, even when only every 100th bar is skipped,
     # while a gated ta.atr() in the same block keeps producing values. The first gated
-    # call has no history yet, so ``high[1]`` is na and the recurrence below carries
-    # that na forward for good, which is exactly what TradingView shows. Reading the
-    # runner's global ``lib._last_*`` windows instead would invent values there.
+    # call has no history yet, so ``close[1]`` / ``high[1]`` are na (and a first call after
+    # bar 1 never initializes at all); the recurrence below carries that na forward for
+    # good, which is exactly what TradingView shows.
+    # Reading the runner's global ``lib._last_*`` windows instead would invent values there.
+    # ``result`` stays the FIRST argument of every min/max below, so an na result keeps
+    # propagating the way Pine's ``math.min`` / ``math.max`` propagate it.
 
-    # Initialize on second bar
     if bar_index == 1:
-        if high[1] > high:
-            pos_long = False
-            sar_val = high[1]  # short start
-            ep = low  # EP is current low
+        if close - close[1] > _EPSILON:
+            is_below = True
+            max_min = high
+            result = low[1]
         else:
-            pos_long = True
-            sar_val = low[1]  # long start
-            ep = high  # EP is current high
-        return sar_val
+            is_below = False
+            max_min = low
+            result = high[1]
+        is_first_trend_bar = True
+        acceleration = start
 
-    # Calculate next SAR value
-    next_sar = sar_val + af * (ep - sar_val)
+    result = result + acceleration * (max_min - result)
 
-    # Trend-dependent logic
-    if pos_long:
-        # Long trend
-        if low < next_sar:  # Reverse to short
-            pos_long = False
-            af = start
-            next_sar = ep  # Start from previous EP (Wilder method)
-            # Clip to current and previous 2 candle highs
-            next_sar = builtins.max(
-                next_sar,
-                high,
-                high[1],
-                high[2] if high[2] == high[2] else high[1]
-            )
-            ep = low  # New EP
-        else:
-            # Continue long
-            next_sar = builtins.min(
-                next_sar,
-                low[1],
-                low[2] if low[2] == low[2] else low[1]
-            )
-            if high > ep:  # New peak
-                ep = high
-                af = builtins.min(af + inc, max)
+    if is_below:
+        if result - low > _EPSILON:
+            is_first_trend_bar = True
+            is_below = False
+            result = builtins.max(high, max_min)
+            max_min = low
+            acceleration = start
     else:
-        # Short trend
-        if high > next_sar:  # Reverse to long
-            pos_long = True
-            af = start
-            next_sar = ep  # Start from previous EP (Wilder method)
-            # Clip to current and previous 2 candle lows
-            next_sar = builtins.min(
-                next_sar,
-                low,
-                low[1],
-                low[2] if low[2] == low[2] else low[1]
-            )
-            ep = high  # New EP
-        else:
-            # Continue short
-            next_sar = builtins.max(
-                next_sar,
-                high[1],
-                high[2] if high[2] == high[2] else high[1]
-            )
-            if low < ep:  # New trough
-                ep = low
-                af = builtins.min(af + inc, max)
+        if result - high < -_EPSILON:
+            is_first_trend_bar = True
+            is_below = True
+            result = builtins.min(low, max_min)
+            max_min = high
+            acceleration = start
 
-    sar_val = next_sar
-    return sar_val
+    if not is_first_trend_bar:
+        if is_below:
+            if high - max_min > _EPSILON:
+                max_min = high
+                acceleration = builtins.min(acceleration + inc, max)
+        else:
+            if low - max_min < -_EPSILON:
+                max_min = low
+                acceleration = builtins.min(acceleration + inc, max)
+
+    # Clip to the previous two bars' extremes
+    if is_below:
+        result = builtins.min(result, low[1])
+        if bar_index > 1:
+            result = builtins.min(result, low[2])
+    else:
+        result = builtins.max(result, high[1])
+        if bar_index > 1:
+            result = builtins.max(result, high[2])
+
+    return result
 
 
 def sma(source: Series[float], length: int) -> PyneFloat:
