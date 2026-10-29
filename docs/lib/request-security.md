@@ -327,6 +327,24 @@ The daily-pivot idiom `request.security(sym, "D", close[1], lookahead=lookahead_
 `close[0]` form differs, and only inside an open period — on a period's last chart bar the
 developing bar and the closed bar are the same bar, so the values coincide there too.
 
+**Closed bars come from the context's own data** — the series of a `lookahead_on` context is
+its own timeframe's bars, as on TradingView, where every closed bar it shows is the feed's own
+bar. The chart bars build only the developing bar of the open period. A closed bar is complete
+past data, so reading it from the context's data file leaks nothing. This matters whenever the
+chart bars do not cover a period exactly:
+
+* the chart timeframe does not divide the requested one (`"5"` on a 3-minute chart: the 02:03
+  bar runs to 02:06, past the 5-minute period end);
+* the chart starts inside a period, or has a gap inside one;
+* the context's data has no bar for a period at all (a venue's maintenance minutes): the
+  period is skipped, and `[1]` steps over it;
+* the context's data has a bar in a period no chart bar falls in (a gap in the chart's data):
+  the bar is part of the series all the same.
+
+Every expression evaluated in the context (`ta.*` state included) therefore runs on the
+requested timeframe's real bars. On a chart that does not divide the requested timeframe, the
+developing bar of an open period starts at the first chart bar that opens inside it.
+
 **Cross-symbol HTF** — the chart-side `HTFAggregator` aggregates the *chart* symbol's
 OHLCV; it cannot produce OHLCV for a different security symbol. Cross-symbol HTF
 contexts therefore keep no aggregator and read closed bars directly from the

@@ -147,6 +147,10 @@ FLAG_DEV_BATCH_ROUND = 0x400  # historical DEVELOPING batch round: as FLAG_BATCH
                               # does NOT publish uncapped: every entry closes at its own
                               # chart bar's tick, so the frontier has to stop there or the
                               # chart would pair a bar with the previous bar's value.
+FLAG_CLOSED_FROM_FEED = 0x800  # with FLAG_CLOSED_OVERRIDE: the chart's fold of this closed
+                               # period is not the HTF bar (see ``DevelopingBar.exact``),
+                               # so the subprocess takes the bar from its own feed when that
+                               # holds it, the pushed OHLCV otherwise
 
 
 def is_ltf_window(flags: int) -> bool:

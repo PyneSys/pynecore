@@ -20,6 +20,7 @@ import pickle
 import sys
 import threading
 from bisect import bisect_right
+from functools import partial
 from time import monotonic
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
@@ -37,7 +38,7 @@ from .security_shm import (
     SyncBlock, ResultBlock, ResultReader, INITIAL_RESULT_SIZE,
     FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE, FLAG_DEV_HISTORICAL,
     FLAG_LTF_WINDOW, FLAG_LTF_CHART_DEVELOPING, FLAG_LTF_LIVE_PHASE,
-    FLAG_MORE_STEPS, FLAG_BATCH_ROUND, FLAG_DEV_BATCH_ROUND,
+    FLAG_MORE_STEPS, FLAG_BATCH_ROUND, FLAG_DEV_BATCH_ROUND, FLAG_CLOSED_FROM_FEED,
     INITIAL_RING_CAPACITY, INITIAL_RING_ARENA, RING_RUNAHEAD_ENTRIES,
     RingReader, RingWriter, write_result,
 )
@@ -52,7 +53,7 @@ if TYPE_CHECKING:
     from typing import Callable, Iterator
     from .ohlcv import ChartBarWindow, OHLCVReader
     from .resampler import Resampler
-    from .htf_aggregator import HTFAggregator
+    from .htf_aggregator import DevelopingBar, HTFAggregator
     from .syminfo import SymInfo, SymInfoSession, SymInfoInterval
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,18 @@ class Lookahead(Enum):
         The outer-``[1]`` form ``request.security(..., close, lookahead_on)[1]``
         reads the previously delivered chart-series value. Use ``LAST_CLOSED``
         when you want explicit last-closed semantics.
+
+        The context's series is its FEED's bars; the chart only builds the
+        developing bar (MEASURED: every closed ``lookahead_on`` bar TradingView
+        shows is the feed's own bar). Where the chart's fold of a closed period
+        is not that bar — a chart bar straddling the period boundary (``"5"``
+        on a 3-minute chart), a chart starting or missing bars inside the
+        period, any fold of a D/W/M chart, whose coverage cannot be proven —
+        the aggregator marks it (``DevelopingBar.exact``) and the
+        child takes the bar from its own file (``FLAG_CLOSED_FROM_FEED``): the
+        period is closed, so its bar is past data. A period the feed lacks gets
+        no step at all, and feed bars the chart never reached are read in by a
+        catch-up step (:func:`feed_step_view`, :func:`feed_catch_up`).
 
         **Cross-symbol HTF** — when the security symbol differs from the
         chart symbol there is no chart-side aggregator (the chart OHLCV
@@ -431,6 +444,9 @@ class SecurityState:
     bar_closes: list[int] | None = None
     bar_opens_multiperiod: bool = False
     bar_ptr: int = -1
+    # ``next_open_after`` over ``bar_opens``: the feed oracle a ``lookahead_on``
+    # context builds its series from (see :func:`feed_lacks_period`).
+    next_feed_open: 'Callable[[int], int | None] | None' = None
     chart_off: int = 0
     sec_grid_args: tuple | None = None
 
@@ -875,9 +891,12 @@ def batch_eligible(state: SecurityState, sec_id: str, *, is_live: bool) -> bool:
 # record it is on, whatever the chart's length.
 
 # Record kinds, mirroring the three steps ``__sec_signal__`` builds per bar.
+# ``DEV_BATCH_CLOSED_FROM_FEED`` is the closed step of a period the chart's fold
+# does not reproduce (``FLAG_CLOSED_FROM_FEED``).
 DEV_BATCH_PREFILL = 0
 DEV_BATCH_CLOSED = 1
 DEV_BATCH_DEVELOPING = 2
+DEV_BATCH_CLOSED_FROM_FEED = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -923,7 +942,102 @@ class DevBatchSpec:
     first_dev_only: bool = False
 
 
-def iter_dev_batch_records(spec: DevBatchSpec) -> 'Iterator[tuple]':
+def next_open_after(opens: list[int], after: int) -> int | None:
+    """The first of a feed's bar opens strictly after ``after``.
+
+    :param opens: The feed's bar opens in ms, ascending.
+    :param after: The instant in ms.
+    :return: The open, or ``None`` past the feed's end.
+    """
+    idx = bisect_right(opens, after)
+    return opens[idx] if idx < len(opens) else None
+
+
+def feed_lacks_period(next_open: 'Callable[[int], int | None]', period_start: int,
+                      period_ms: int) -> bool:
+    """Whether a context's feed has no bar in the period opening at ``period_start``.
+
+    A ``lookahead_on`` context's series is its feed's bars: MEASURED on
+    TradingView, every closed bar it shows is the feed's own bar, never the
+    chart's fold of the period. A period the feed skips (a venue's maintenance
+    minutes: Capital.com has no 5-minute bar at 21:00 UTC while the chart trades
+    from 21:03) therefore gets no bar at all, closed or developing, and
+    TradingView's ``[1]`` steps over it. Only a feed whose next bar opens a whole
+    nominal period later proves the gap: a feed that ends before the period (a
+    live period past the file) says nothing, and a bar inside the period on
+    another grid is not a gap, so the chart's bars stay in charge.
+
+    :param next_open: The feed oracle (``SecurityState.next_feed_open``).
+    :param period_start: The period's open time, in ms.
+    :param period_ms: The nominal period length (``HTFAggregator.period_ms``).
+    :return: ``True`` when the period is a gap of the feed.
+    """
+    nxt = next_open(period_start - 1)
+    return nxt is not None and nxt >= period_start + period_ms
+
+
+def feed_catch_up(next_open: 'Callable[[int], int | None]', after: int,
+                  period_start: int) -> bool:
+    """Whether the feed holds bars the chart never reached before a fresh period.
+
+    A feed bar in a period no chart bar falls in (a gap in the chart's own data)
+    is part of the context's series on TradingView all the same, so before the
+    fresh period the child reads such bars from its own file, exactly as the
+    one-time prefill reads the bars before the first period.
+
+    :param next_open: The feed oracle (``SecurityState.next_feed_open``).
+    :param after: The last instant the context's series already covers, in ms.
+    :param period_start: The fresh period's open time, in ms.
+    :return: ``True`` when a feed bar opens after ``after`` and before the period.
+    """
+    nxt = next_open(after)
+    return nxt is not None and nxt < period_start
+
+
+def feed_step_view(aggregator: 'HTFAggregator', dev_bar: 'DevelopingBar | None',
+                   closed_bar: 'DevelopingBar | None',
+                   next_open: 'Callable[[int], int | None] | None') -> tuple:
+    """What one chart bar's ``HTFAggregator.update(..., double_close=True)`` asks for.
+
+    The update reports at most two closes: the previous period, left without its
+    completing chart bar (``closed`` next to a developing bar, or next to
+    ``also_closed``), and the period this chart bar completed. Each is dropped,
+    and so is the developing bar, when the feed has no bar for its period (see
+    :func:`feed_lacks_period`). The per-bar path and ``iter_dev_batch_records``
+    both take their steps from here, so the two cannot drift apart.
+
+    :param aggregator: The context's aggregator, right after the update.
+    :param dev_bar: The update's developing bar.
+    :param closed_bar: The update's closed bar.
+    :param next_open: The feed oracle, ``None`` when there is no static feed.
+    :return: ``(containing, prev_closed, cur_closed, dev_bar)`` — ``containing``
+        is the period this chart bar falls in, taken before the feed filter.
+    """
+    cur_closed = aggregator.also_closed
+    if cur_closed is not None:
+        prev_closed = closed_bar
+    elif dev_bar is None:
+        prev_closed, cur_closed = None, closed_bar
+    else:
+        prev_closed = closed_bar
+    containing = dev_bar if dev_bar is not None else cur_closed
+    if next_open is not None:
+        period_ms = aggregator.period_ms
+        if prev_closed is not None and feed_lacks_period(
+                next_open, prev_closed.period_start, period_ms):
+            prev_closed = None
+        if cur_closed is not None and feed_lacks_period(
+                next_open, cur_closed.period_start, period_ms):
+            cur_closed = None
+        if dev_bar is not None and feed_lacks_period(
+                next_open, dev_bar.period_start, period_ms):
+            dev_bar = None
+    return containing, prev_closed, cur_closed, dev_bar
+
+
+def iter_dev_batch_records(spec: DevBatchSpec,
+                           next_open: 'Callable[[int], int | None] | None' = None
+                           ) -> 'Iterator[tuple]':
     """Produce the whole historical developing-transport sequence of a context.
 
     Walks the CHART's bars — from ``spec.window``, the same production the bar
@@ -951,6 +1065,8 @@ def iter_dev_batch_records(spec: DevBatchSpec) -> 'Iterator[tuple]':
     therefore stay equal to each other bar for bar, whichever one runs.
 
     :param spec: The context's batch specification.
+    :param next_open: The child's feed oracle over its own file, the same opens
+        the chart's ``SecurityState.next_feed_open`` answers from.
     :return: Iterator of ``(kind, period_start, open, high, low, close, volume,
         tick, sched_next_open)`` records, in push order.
     """
@@ -976,6 +1092,12 @@ def iter_dev_batch_records(spec: DevBatchSpec) -> 'Iterator[tuple]':
     prefilled = False
     dev_period_start = 0
 
+    def _closed_record(closed: 'DevelopingBar', tick: int, sched_next_open: int) -> tuple:
+        """The record of a closed step: the fold, or the feed's bar when the fold is inexact."""
+        return (DEV_BATCH_CLOSED if closed.exact else DEV_BATCH_CLOSED_FROM_FEED,
+                closed.period_start, closed.open, closed.high, closed.low,
+                closed.close, closed.volume, tick, sched_next_open)
+
     def _bar_records(bar: tuple, next_time: int) -> list[tuple]:
         """Every record ONE chart bar produces.
 
@@ -995,26 +1117,35 @@ def iter_dev_batch_records(spec: DevBatchSpec) -> 'Iterator[tuple]':
         else:
             sched_next_open = 0
 
-        _, dev_bar, closed_bar = aggregator.update(
+        is_new, dev_bar, closed_bar = aggregator.update(
             bar_time, b_open, b_high, b_low, b_close, b_volume,
-            chart_confirmed=True)
+            chart_confirmed=True, double_close=True)
+        # Exactly the per-bar path's filter and step order (see the
+        # ``Lookahead.ON`` branch of ``__sec_signal__``).
+        containing, prev_closed, cur_closed, dev_bar = feed_step_view(
+            aggregator, dev_bar, closed_bar, next_open)
 
         out: list[tuple] = []
+        was_prefilled = prefilled
         if not prefilled:
             prefilled = True
-            containing = dev_bar if dev_bar is not None else closed_bar
             prefill_target = (containing.period_start - 1
                               if containing is not None else 0)
             if prefill_target > last_confirmed:
                 last_confirmed = prefill_target
                 out.append((DEV_BATCH_PREFILL, prefill_target,
                             0.0, 0.0, 0.0, 0.0, 0.0, tick, sched_next_open))
-        if closed_bar is not None:
-            last_confirmed = closed_bar.period_start
-            out.append((DEV_BATCH_CLOSED, closed_bar.period_start,
-                        closed_bar.open, closed_bar.high, closed_bar.low,
-                        closed_bar.close, closed_bar.volume,
-                        tick, sched_next_open))
+        if prev_closed is not None:
+            last_confirmed = prev_closed.period_start
+            out.append(_closed_record(prev_closed, tick, sched_next_open))
+        if (was_prefilled and is_new and next_open is not None and containing is not None
+                and feed_catch_up(next_open, last_confirmed, containing.period_start)):
+            last_confirmed = containing.period_start - 1
+            out.append((DEV_BATCH_PREFILL, last_confirmed,
+                        0.0, 0.0, 0.0, 0.0, 0.0, tick, sched_next_open))
+        if cur_closed is not None:
+            last_confirmed = cur_closed.period_start
+            out.append(_closed_record(cur_closed, tick, sched_next_open))
         if dev_bar is not None and not (spec.first_dev_only
                                         and dev_bar.period_start == dev_period_start):
             dev_period_start = dev_bar.period_start
@@ -2260,11 +2391,30 @@ def create_chart_protocol(
             raw_vol = lib.volume
             chart_volume = 0.0 if raw_vol is None else float(raw_vol)
 
-            _, dev_bar, closed_bar = state.htf_aggregator.update(
+            is_new_period, dev_bar, closed_bar = state.htf_aggregator.update(
                 chart_time, chart_open, chart_high, chart_low,
                 chart_close, chart_volume,
                 chart_confirmed=bool(lib.barstate.isconfirmed),
+                double_close=True,
             )
+            # The series of the context is its FEED's bars (see
+            # :func:`feed_lacks_period`): a period the feed skips gets neither a
+            # closed nor a developing step, and feed bars the chart never
+            # reached are read in before the fresh period (the catch-up). The
+            # steps go out in this order: the previous period's late close, the
+            # catch-up, this chart bar's own completed period, its developing
+            # bar. ``iter_dev_batch_records`` builds the very same sequence.
+            next_open = state.next_feed_open
+            containing, prev_closed, cur_closed, dev_bar = feed_step_view(
+                state.htf_aggregator, dev_bar, closed_bar, next_open)
+            any_closed = prev_closed is not None or cur_closed is not None
+            catch_up_target = 0
+            if (state.htf_prefilled and is_new_period and next_open is not None
+                    and containing is not None):
+                after = (prev_closed.period_start if prev_closed is not None
+                         else state.last_confirmed)
+                if feed_catch_up(next_open, after, containing.period_start):
+                    catch_up_target = containing.period_start - 1
 
             if state.dev_batch_spec is not None:
                 # Historical DEVELOPING batch: the child produces and replays
@@ -2278,10 +2428,24 @@ def create_chart_protocol(
                 # record of this bar carries.
                 state.batch_prev_asof = state.batch_asof
                 state.batch_asof = round_state['tick']
+                # The replay's own coverage bookkeeping, so the catch-up above
+                # is decided from exactly what the child's series already holds.
+                if not state.htf_prefilled:
+                    state.htf_prefilled = True
+                    prefill_target = (containing.period_start - 1
+                                      if containing is not None else 0)
+                    if prefill_target > state.last_confirmed:
+                        state.last_confirmed = prefill_target
+                if cur_closed is not None:
+                    state.last_confirmed = cur_closed.period_start
+                elif catch_up_target:
+                    state.last_confirmed = catch_up_target
+                elif prev_closed is not None:
+                    state.last_confirmed = prev_closed.period_start
                 # The per-bar path sets ``new_period`` True whenever a developing
                 # step goes out, and otherwise from whether a period just closed.
-                state.new_period = (dev_bar is not None
-                                    or closed_bar is not None)
+                state.new_period = (dev_bar is not None or any_closed
+                                    or catch_up_target > 0)
                 # Which chart bars the replay publishes an entry for — the same
                 # rule the per-bar path builds its steps by, ``first_dev_only``
                 # included (see :func:`iter_dev_batch_records`). A bar that gets
@@ -2293,7 +2457,8 @@ def create_chart_protocol(
                 if fresh_dev and dev_bar is not None:
                     state.dev_period_start = dev_bar.period_start
                 state.batch_expects_entry = (not state.batch_launched
-                                             or closed_bar is not None or fresh_dev)
+                                             or any_closed or fresh_dev
+                                             or catch_up_target > 0)
                 if not state.batch_launched:
                     state.batch_launched = True
                     sync_block.set_flags(sec_id, (sync_block.get_flags(sec_id) & ~(
@@ -2362,43 +2527,52 @@ def create_chart_protocol(
                 defer_steps = (not state.started and not state.depends
                                and not consumers_by_sid.get(sec_id))
 
+                def _prefill_step(_target):
+                    sync_block.set_flags(
+                        sec_id,
+                        sync_block.get_flags(sec_id) & ~(
+                            FLAG_IS_DEVELOPING | FLAG_CLOSED_OVERRIDE
+                            | FLAG_DEV_HISTORICAL
+                        ),
+                    )
+                    sync_block.set_target_time(sec_id, _target)
+                    _launch(sec_id, state, lazy_ok=False)
+
                 if not state.htf_prefilled:
                     state.htf_prefilled = True
-                    containing = dev_bar if dev_bar is not None else closed_bar
                     prefill_target = (containing.period_start - 1
                                       if containing is not None else 0)
                     if prefill_target > state.last_confirmed:
                         state.last_confirmed = prefill_target
+                        steps.append(partial(_prefill_step, prefill_target))
 
-                        def _prefill_step(_target=prefill_target):
-                            sync_block.set_flags(
-                                sec_id,
-                                sync_block.get_flags(sec_id) & ~(
-                                    FLAG_IS_DEVELOPING | FLAG_CLOSED_OVERRIDE
-                                    | FLAG_DEV_HISTORICAL
-                                ),
-                            )
-                            sync_block.set_target_time(sec_id, _target)
-                            _launch(sec_id, state, lazy_ok=False)
+                def _closed_step(_bar):
+                    sync_block.set_developing_bar(
+                        sec_id, _bar.open, _bar.high, _bar.low,
+                        _bar.close, _bar.volume, _bar.period_start,
+                    )
+                    sync_block.set_flags(sec_id, (
+                        sync_block.get_flags(sec_id)
+                        & ~(FLAG_IS_DEVELOPING | FLAG_DEV_HISTORICAL
+                            | FLAG_CLOSED_FROM_FEED)
+                    ) | FLAG_CLOSED_OVERRIDE | hist_phase
+                      | (0 if _bar.exact else FLAG_CLOSED_FROM_FEED))
+                    sync_block.set_target_time(sec_id, _bar.period_start)
+                    _launch(sec_id, state, lazy_ok=False)
 
-                        steps.append(_prefill_step)
+                if prev_closed is not None:
+                    state.last_confirmed = prev_closed.period_start
+                    steps.append(partial(_closed_step, prev_closed))
 
-                if closed_bar is not None:
-                    state.last_confirmed = closed_bar.period_start
+                if catch_up_target:
+                    # Feed bars of periods no chart bar fell in: the child reads
+                    # them from its own file, the way the prefill does.
+                    state.last_confirmed = catch_up_target
+                    steps.append(partial(_prefill_step, catch_up_target))
 
-                    def _closed_step(_bar=closed_bar):
-                        sync_block.set_developing_bar(
-                            sec_id, _bar.open, _bar.high, _bar.low,
-                            _bar.close, _bar.volume, _bar.period_start,
-                        )
-                        sync_block.set_flags(sec_id, (
-                            sync_block.get_flags(sec_id)
-                            & ~(FLAG_IS_DEVELOPING | FLAG_DEV_HISTORICAL)
-                        ) | FLAG_CLOSED_OVERRIDE | hist_phase)
-                        sync_block.set_target_time(sec_id, _bar.period_start)
-                        _launch(sec_id, state, lazy_ok=False)
-
-                    steps.append(_closed_step)
+                if cur_closed is not None:
+                    state.last_confirmed = cur_closed.period_start
+                    steps.append(partial(_closed_step, cur_closed))
 
                 # Developing bar — only for ``Lookahead.ON``. ``dev_bar`` is
                 # None when the confirmed chart bar just completed the period
@@ -2441,10 +2615,10 @@ def create_chart_protocol(
                     # the round for is still a developing bar, so the
                     # bookkeeping of the transport is left exactly as it is
                     # without the skip.
-                    state.new_period = (closed_bar is not None
+                    state.new_period = (any_closed or catch_up_target > 0
                                         or (dev_bar is not None
                                             and state.lookahead is Lookahead.ON))
-                    if closed_bar is None:
+                    if not any_closed and not catch_up_target:
                         # Clear any stale developing flag from a prior
                         # ``Lookahead.ON`` session (same SyncBlock slot).
                         sync_block.set_flags(sec_id, sync_block.get_flags(sec_id) & ~(
@@ -4188,6 +4362,7 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
                 opens = [reader.read(0).timestamp]
 
     state.bar_opens = opens
+    state.next_feed_open = partial(next_open_after, opens)
     state.bar_ptr = -1
 
     sec_tz: ZoneInfo | None = state.tz

@@ -34,6 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from ..lib import timeframe as tf_module
 from .resampler import Resampler
 
 if TYPE_CHECKING:
@@ -48,6 +49,15 @@ class DevelopingBar:
     folded chart bar so repeated intra-bar updates from a live provider
     (which carry the running cumulative candle volume) can replace their
     own prior contribution instead of stacking it.
+
+    ``exact`` is ``False`` when the folded chart bars do not cover the period
+    from its start to its end without a hole: the first one opens after the
+    period start (the chart starts inside the period, has a gap there, or its
+    previous bar ran into this period), a chart bar inside the period is
+    missing, the period was left without its completing bar, or a chart bar runs
+    past the period end. On a D/W/M chart (no chart bar span) the coverage cannot
+    be proven, so every closed fold is inexact there. Such a fold is not the HTF
+    bar, so a closed bar marked inexact has to come from the context's own feed.
     """
     period_start: int  # HTF period open time in ms
     open: float
@@ -57,6 +67,7 @@ class DevelopingBar:
     volume: float
     last_chart_time_ms: int = 0
     last_chart_volume: float = 0.0
+    exact: bool = True
 
     def update(self, chart_time_ms: int, chart_high: float, chart_low: float,
                chart_close: float, chart_volume: float) -> None:
@@ -80,7 +91,8 @@ class HTFAggregator:
     """Per-sec_id aggregator of chart OHLCV into a developing HTF bar."""
 
     __slots__ = ('_timeframe', '_tz', '_resampler', '_state', '_session_starts',
-                 '_chart_span_ms', '_opening_hours', '_grid_mode')
+                 '_chart_span_ms', '_opening_hours', '_grid_mode', '_period_ms',
+                 'also_closed')
 
     def __init__(self, timeframe: str, tz: 'ZoneInfo',
                  session_starts: 'list | None' = None,
@@ -102,10 +114,20 @@ class HTFAggregator:
         # 0 (D/W/M charts: no fixed arithmetic span) disables it — the period
         # then closes on the first chart bar of the next period instead.
         self._chart_span_ms = chart_span_ms
+        # noinspection PyProtectedMember
+        self._period_ms = tf_module._in_seconds(timeframe) * 1000
+        #: With ``double_close``: the period this chart bar completed in the same
+        #: update that delivered the previous, gap-left period as ``closed``.
+        self.also_closed: DevelopingBar | None = None
 
     @property
     def timeframe(self) -> str:
         return self._timeframe
+
+    @property
+    def period_ms(self) -> int:
+        """Nominal HTF period length in ms (a session can cut a period short)."""
+        return self._period_ms
 
     @property
     def current(self) -> DevelopingBar | None:
@@ -119,6 +141,7 @@ class HTFAggregator:
         chart_close: float, chart_volume: float,
         chart_confirmed: bool = True,
         period_complete: bool | None = None,
+        double_close: bool = False,
     ) -> tuple[bool, DevelopingBar | None, DevelopingBar | None]:
         """
         Fold one chart bar into the developing HTF bar.
@@ -139,6 +162,11 @@ class HTFAggregator:
             reaches the HTF period's close instant. Used by the script-level
             timeframe path, which resolves both closes from the trading
             schedule (see :mod:`pynecore.core.script_timeframe`).
+        :param double_close: When this chart bar both closes the previous,
+            gap-left period and completes its own, complete its own period too:
+            it is returned as ``also_closed`` and no developing bar is left.
+            Without it the own period closes one chart bar late, via the
+            fallback of the next update.
         :return: ``(is_new_period, developing_or_none, closed_or_none)``
 
             - ``is_new_period`` — True iff the chart bar opens a fresh HTF period.
@@ -155,43 +183,72 @@ class HTFAggregator:
             self._opening_hours, self._grid_mode)
 
         closed: DevelopingBar | None = None
+        self.also_closed = None
         state = self._state
         if state is None or period_start != state.period_start:
             is_new = True
             if state is not None:
                 # The period was left without its completing chart bar (data
-                # gap) — deliver its accumulated final form one bar late.
+                # gap) — deliver its accumulated final form one bar late. With
+                # a known chart bar span that bar is missing from the fold.
+                # Without one (D/W/M charts) this is how every period closes,
+                # and the fold's coverage cannot be proven: a weekly bar opening
+                # on September 29 carries October's first days into September,
+                # and a missing daily bar leaves no trace. Inexact either way.
                 closed = state
+                closed.exact = False
             state = DevelopingBar(
                 period_start=period_start,
                 open=chart_open, high=chart_high, low=chart_low,
                 close=chart_close, volume=chart_volume,
                 last_chart_time_ms=chart_time_ms,
                 last_chart_volume=chart_volume,
+                # The fold misses the period's head unless this bar opens it.
+                exact=chart_time_ms == period_start,
             )
             self._state = state
         else:
             is_new = False
+            if (self._chart_span_ms and chart_time_ms != state.last_chart_time_ms
+                    and chart_time_ms != state.last_chart_time_ms + self._chart_span_ms):
+                # A chart bar inside the period is missing from the fold.
+                state.exact = False
             state.update(chart_time_ms, chart_high, chart_low,
                          chart_close, chart_volume)
 
         # TV ``lookahead_off`` merge rule: the confirmed chart bar whose close
         # instant reaches the period end completes the HTF bar — deliver it
         # now, one chart bar earlier than the next-period fallback above.
-        # Skipped when a gap-closed bar is already pending (one closed bar per
-        # update; the fresh period then closes via the fallback) or when the
-        # chart bar span is unknown (``chart_span_ms == 0``).
+        # Skipped when a gap-closed bar is already pending, unless the caller
+        # takes both (``double_close``); otherwise the fresh period then closes
+        # via the fallback. Also skipped when the chart bar span is unknown
+        # (``chart_span_ms == 0``).
         if period_complete is None:
             period_complete = bool(self._chart_span_ms) and self._resampler.get_bar_time(
                 chart_time_ms + self._chart_span_ms, self._tz,
                 self._session_starts, self._opening_hours,
                 self._grid_mode) != period_start
-        if closed is None and chart_confirmed and period_complete:
-            self._state = None
-            return is_new, None, state
+            # A bar that completes the period may also run PAST its end: its last
+            # millisecond lies in a later period (a 3-minute bar opening at 02:03
+            # under a 5-minute period ends at 02:06). Only a bar that reaches the
+            # period end can, so the extra lookup is paid on those alone.
+            if period_complete and self._resampler.get_bar_time(
+                    chart_time_ms + self._chart_span_ms - 1, self._tz,
+                    self._session_starts, self._opening_hours,
+                    self._grid_mode) != period_start:
+                state.exact = False
+        if chart_confirmed and period_complete:
+            if closed is None:
+                self._state = None
+                return is_new, None, state
+            if double_close:
+                self._state = None
+                self.also_closed = state
+                return is_new, None, closed
 
         return is_new, state, closed
 
     def reset(self) -> None:
         """Discard any in-flight developing bar (used on context teardown)."""
         self._state = None
+        self.also_closed = None

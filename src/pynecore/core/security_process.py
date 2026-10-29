@@ -53,6 +53,7 @@ import logging
 import os
 import sys
 import threading
+from bisect import bisect_left
 from collections import deque
 from functools import partial
 from pathlib import Path
@@ -66,12 +67,13 @@ from ..types.na import set_bool_na
 from .security_shm import (
     SyncBlock, ResultBlock, write_na, FRONTIER_INF,
     FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE, FLAG_DEV_HISTORICAL,
-    FLAG_MORE_STEPS, FLAG_BATCH_ROUND, FLAG_DEV_BATCH_ROUND,
+    FLAG_MORE_STEPS, FLAG_BATCH_ROUND, FLAG_DEV_BATCH_ROUND, FLAG_CLOSED_FROM_FEED,
     RING_RESUME_ENTRIES, RING_RUNAHEAD_ENTRIES, is_ltf_window,
     is_ltf_chart_developing, is_ltf_live_phase,
 )
 from .security import (
-    BarCalendar, DEV_BATCH_CLOSED, DEV_BATCH_DEVELOPING, actual_bar_close,
+    BarCalendar, DEV_BATCH_CLOSED, DEV_BATCH_CLOSED_FROM_FEED, DEV_BATCH_DEVELOPING,
+    actual_bar_close,
     create_security_protocol, inject_protocol, iter_dev_batch_records,
     same_calendar,
 )
@@ -1120,6 +1122,46 @@ def security_process_main(
     # against the saved baseline).
     last_dev_period_start: int | None = None
 
+    def _feed_bar_at(time_ms: int) -> 'OHLCV | None':
+        """The context's own bar opening at ``time_ms``, from its feed file.
+
+        :param time_ms: The bar's open time in ms.
+        :return: The bar, or ``None`` when the feed has none there (no file, a
+            live period past its end, or a legacy feed's gap fill).
+        """
+        if reader is None:
+            return None
+        position, end = reader.get_positions(time_ms, time_ms)
+        if position == end:
+            return None
+        candidate = reader.read(position)
+        return None if candidate.volume < 0 and is_legacy_feed else candidate
+
+    def _feed_next_open(after: int) -> int | None:
+        """:func:`next_open_after` over this context's own feed file.
+
+        The chart answers the same question from ``SecurityState.bar_opens``,
+        which lists the real bars of the same file: a legacy feed's gap fills
+        are skipped here too, or the batch would see a bar in a period the
+        per-bar path treats as a gap of the feed.
+
+        :param after: The instant in ms.
+        :return: The first bar open strictly after it, or ``None`` past the end.
+        """
+        if reader is None:
+            return None
+        position, end = reader.get_positions(after + 1, None)
+        if real_index_map is not None:
+            idx = bisect_left(real_index_map, position)
+            return (reader.read(real_index_map[idx]).timestamp
+                    if idx < len(real_index_map) else None)
+        while position < end:
+            candidate = reader.read(position)
+            if not (is_legacy_feed and candidate.volume < 0):
+                return candidate.timestamp
+            position += 1
+        return None
+
     # A developing batch's records, produced one at a time while they are
     # replayed. The first one is pulled here: its tick is what the ring is
     # primed from, and every step needs to know the NEXT record's tick anyway
@@ -1131,7 +1173,7 @@ def security_process_main(
     # same bound plus one chart bar's records.
     dev_batch_pending: 'deque[int]' = deque()
     if dev_batch_spec is not None:
-        dev_batch_records = iter_dev_batch_records(dev_batch_spec)
+        dev_batch_records = iter_dev_batch_records(dev_batch_spec, _feed_next_open)
         dev_batch_next = next(dev_batch_records, None)
         if dev_batch_next is None:
             # The chart armed the batch because its window holds bars, and every
@@ -1571,8 +1613,10 @@ def security_process_main(
                 step_flags = FLAG_IS_DEVELOPING | FLAG_DEV_HISTORICAL
                 step_values = (r_open, r_high, r_low, r_close, r_volume,
                                period_start)
-            elif kind == DEV_BATCH_CLOSED:
+            elif kind == DEV_BATCH_CLOSED or kind == DEV_BATCH_CLOSED_FROM_FEED:
                 step_flags = FLAG_CLOSED_OVERRIDE | FLAG_DEV_HISTORICAL
+                if kind == DEV_BATCH_CLOSED_FROM_FEED:
+                    step_flags |= FLAG_CLOSED_FROM_FEED
                 step_values = (r_open, r_high, r_low, r_close, r_volume,
                                period_start)
             else:
@@ -1817,6 +1861,14 @@ def security_process_main(
                         open=dev_open, high=dev_high, low=dev_low,
                         close=dev_close, volume=dev_volume,
                     )
+                    if flags & FLAG_CLOSED_FROM_FEED:
+                        # The chart's fold is not this period's bar (a chart bar
+                        # straddled a boundary, chart bars are missing, or a D/W/M
+                        # chart cannot prove its coverage). The period is closed, so the
+                        # feed's own bar is past data and leaks nothing.
+                        feed_bar = _feed_bar_at(dev_time_ms)
+                        if feed_bar is not None:
+                            ohlcv = feed_bar
 
                     sec_ctx.bar_open = dev_time_ms
                     sec_ctx.bar_close = actual_bar_close(dev_time_ms, 0, own_calendar,
@@ -1883,6 +1935,12 @@ def security_process_main(
 
                 # Historical path resets dev-period tracking.
                 last_dev_period_start = None
+                if seen_live_bar:
+                    # A ``lookahead_on`` catch-up after pushed bars: ``current_bar``
+                    # still points at the slot the last pushed bar took, which is
+                    # that bar's own feed record, so the file read starts after it.
+                    current_bar += 1
+                    seen_live_bar = False
 
                 # ── (1) Historical / cross-symbol-live closed bar from local source ──
                 # In cross-symbol live mode (``live_streamer is not None``), the

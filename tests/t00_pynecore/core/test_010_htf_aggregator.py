@@ -223,3 +223,85 @@ def __test_intra_bar_updates_do_not_inflate_volume__(log):
     assert dev.high == 1.3
     assert dev.low == 0.95
     assert dev.close == 1.25
+
+
+def __test_straddling_chart_bar_marks_both_periods_inexact__(log):
+    """A chart bar that runs past its period end leaves both periods' folds inexact.
+
+    3-minute bars under a 5-minute period: the 02:03 bar runs to 02:06, so the
+    02:00 fold carries a close and volume from past 02:05, and the 02:05 fold,
+    which opens at 02:06, misses its first minute.
+    """
+    agg = HTFAggregator("5", _UTC, chart_span_ms=180_000)
+    base = _ms(2026, 5, 21, 2, 0)
+    _, dev, closed = agg.update(base, 1.0, 1.0, 1.0, 1.0, 3.0)
+    assert closed is None and dev.exact
+    _, dev, closed = agg.update(base + 3 * 60_000, 1.0, 1.0, 1.0, 1.0, 3.0)
+    assert dev is None
+    assert closed.period_start == base and not closed.exact
+    _, dev, closed = agg.update(base + 6 * 60_000, 1.0, 1.0, 1.0, 1.0, 3.0)
+    assert closed is None
+    assert dev.period_start == base + 5 * 60_000 and not dev.exact
+
+
+def __test_nested_chart_bars_keep_periods_exact__(log):
+    """Chart bars that end on the period boundary leave every fold exact."""
+    agg = HTFAggregator("15", _UTC, chart_span_ms=180_000)
+    base = _ms(2026, 5, 21, 2, 0)
+    closed_bars = []
+    for i in range(10):
+        _, dev, closed = agg.update(base + i * 3 * 60_000, 1.0, 1.0, 1.0, 1.0, 3.0)
+        if closed is not None:
+            closed_bars.append(closed)
+        assert dev is None or dev.exact
+    assert [bar.period_start for bar in closed_bars] == [base, base + 15 * 60_000]
+    assert all(bar.exact for bar in closed_bars)
+
+
+def __test_chart_bar_opening_late_marks_the_fold_inexact__(log):
+    """A period whose first chart bar opens after its start misses its head."""
+    agg = HTFAggregator("15", _UTC, chart_span_ms=180_000)
+    base = _ms(2026, 5, 21, 2, 0)
+    _, dev, _ = agg.update(base + 6 * 60_000, 1.0, 1.0, 1.0, 1.0, 3.0)
+    assert not dev.exact
+    for minute in (9, 12):
+        _, dev, closed = agg.update(base + minute * 60_000, 1.0, 1.0, 1.0, 1.0, 3.0)
+    assert dev is None and closed.period_start == base and not closed.exact
+
+
+def __test_double_close_completes_the_own_period_after_a_gap__(log):
+    """With ``double_close`` a bar closes the gap-left period and its own one."""
+    base = _ms(2026, 5, 21, 2, 0)
+    for double in (False, True):
+        agg = HTFAggregator("5", _UTC, chart_span_ms=180_000)
+        agg.update(base, 1.0, 1.0, 1.0, 1.0, 3.0)
+        # The 02:03 and 02:06 bars are missing; the 02:09 bar reaches 02:10.
+        _, dev, closed = agg.update(base + 9 * 60_000, 1.0, 1.0, 1.0, 1.0, 3.0,
+                                    double_close=double)
+        assert closed.period_start == base and not closed.exact
+        if double:
+            assert dev is None
+            assert agg.also_closed.period_start == base + 5 * 60_000
+        else:
+            assert dev.period_start == base + 5 * 60_000
+            assert agg.also_closed is None
+
+
+def __test_dwm_chart_closed_folds_are_inexact__(log):
+    """On a D/W/M chart no closed fold is proven to be the HTF bar.
+
+    Weekly bars under a monthly period: the week opening on Monday 2025-09-29
+    belongs to September by its open, yet it carries October's first three days,
+    and without a chart bar span nothing shows it. The closed fold is therefore
+    marked inexact, so the context reads the closed bar from its own feed.
+    """
+    agg = HTFAggregator("M", _UTC, chart_span_ms=0)
+    week = 7 * 86_400_000
+    start = _ms(2025, 9, 1)
+    closed_bars = []
+    for i in range(6):
+        _, dev, closed = agg.update(start + i * week, 1.0, 1.0, 1.0, 1.0, 1.0)
+        if closed is not None:
+            closed_bars.append(closed)
+    assert [bar.period_start for bar in closed_bars] == [_ms(2025, 9, 1)]
+    assert not closed_bars[0].exact
