@@ -743,12 +743,17 @@ fn identifiers(ast: &Ast, module: NodeId) -> Vec<String> {
 /// Reject Pyne code that spells an identifier in the transformers' namespace
 /// (`_reject_reserved_names`): an identifier binds a name holding the separator
 /// exactly when it holds one of the characters that normalize to one.
-fn reject_reserved_names(ast: &Ast, module: NodeId, source: &str) -> Result<(), Stop> {
+pub fn reject_reserved_names(ast: &Ast, module: NodeId, source: &str) -> Result<(), Error> {
     if source.is_ascii() || !source.contains(RESERVED_SOURCES) {
         return Ok(());
     }
-    if identifiers(ast, module).iter().any(|name| name.contains(RESERVED_SOURCES)) {
-        return Err(Stop::Rejected);
+    if let Some(name) =
+        identifiers(ast, module).into_iter().find(|name| name.contains(RESERVED_SOURCES))
+    {
+        return Err(Error::Rejected(format!(
+            "'{name}' contains '\u{b7}', which is reserved for PyneCore's internal names in \
+             Pyne code \u{2014} rename the identifier"
+        )));
     }
     Ok(())
 }
@@ -756,13 +761,16 @@ fn reject_reserved_names(ast: &Ast, module: NodeId, source: &str) -> Result<(), 
 /// Reject user code that spells one of the plain names the transform emits
 /// (`_reject_pipeline_names`). Every such name is ASCII; an identifier outside ASCII
 /// is one the parser would have had to NFKC-normalize first.
-fn reject_pipeline_names(ast: &Ast, module: NodeId) -> Result<(), Stop> {
+pub fn reject_pipeline_names(ast: &Ast, module: NodeId) -> Result<(), Error> {
     for name in identifiers(ast, module) {
         if !name.is_ascii() {
-            return Err(Stop::Unsupported(Unsupported(format!("the identifier {name:?}"))));
+            return Err(Error::Unsupported(format!("the identifier {name:?}")));
         }
         if is_pipeline_name(&name) {
-            return Err(Stop::Rejected);
+            return Err(Error::Rejected(format!(
+                "'{name}' is a name PyneCore's transform generates, reserved in Pyne code \
+                 \u{2014} rename the identifier"
+            )));
         }
     }
     Ok(())

@@ -12,9 +12,9 @@ use pyne_ast::{Ast, ExprContext, Kind, NodeId};
 use crate::{Context, Error};
 
 /// Engine-global inside user functions too: rewired everywhere
-const ENGINE_GLOBAL_VARIABLES: [&str; 5] = ["nvi", "obv", "pvi", "pvt", "wad"];
+pub const ENGINE_GLOBAL_VARIABLES: [&str; 5] = ["nvi", "obv", "pvi", "pvt", "wad"];
 /// Per-instance inside a function: rewired in `main`'s own body only
-const MAIN_SCOPE_VARIABLES: [&str; 2] = ["accdist", "vwap"];
+pub const MAIN_SCOPE_VARIABLES: [&str; 2] = ["accdist", "vwap"];
 
 fn is_hoisted(name: &str) -> bool {
     ENGINE_GLOBAL_VARIABLES.contains(&name) || MAIN_SCOPE_VARIABLES.contains(&name)
