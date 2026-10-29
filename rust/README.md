@@ -32,10 +32,11 @@ a native step reads or builds) is a `Value::Native`. The traversal helpers in
 
 `PYNE_AST_BACKEND` selects it (see `src/pynecore/transformers/native.py`):
 
-- `python` (default): every step runs in Python.
-- `native`: a step with a current native port runs natively; consecutive native
-  steps run in one call. A phase runs natively as one unit while every rule of it
-  is current (in sequential mode, rule by rule).
+- `native` (default): a step with a current native port runs natively;
+  consecutive native steps run in one call. A phase runs natively as one unit
+  while every rule of it is current (in sequential mode, rule by rule). Without
+  the extension every step runs in Python.
+- `python`: every step runs in Python.
 - `verify`: every step runs in Python, and each step with a current port also runs
   natively on the same input; a difference raises `NativeMismatch`.
 

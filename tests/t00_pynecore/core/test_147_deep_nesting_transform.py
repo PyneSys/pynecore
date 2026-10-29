@@ -75,6 +75,8 @@ def __test_overflowing_stage_reruns_with_measured_headroom__(tmp_path, monkeypat
     path = tmp_path / "deeper_switch.py"
     __test_helper_write_switch_module(path, 600)
     measured = __test_helper_count_depth_measures(monkeypatch)
+    # Only the Python steps recurse on the interpreter's stack
+    monkeypatch.setenv('PYNE_AST_BACKEND', 'python')
     # Stands in for a module nested beyond what the real transform limit covers
     monkeypatch.setattr(import_hook, '_TRANSFORM_RECURSION_LIMIT', 1000)
     limit = sys.getrecursionlimit()

@@ -116,6 +116,9 @@ def _transform(path: Path, source: str, monkeypatch: pytest.MonkeyPatch | None =
         return result
 
     patcher = monkeypatch or pytest.MonkeyPatch()
+    # The Python steps must run for the hook to see the tree; under ``verify`` the
+    # native ones run beside them and must agree
+    patcher.setenv('PYNE_AST_BACKEND', 'verify')
     patcher.setattr(locations, 'fix_locations', capture)
     try:
         code = PyneLoader(path.stem, str(path)).source_to_code(source, str(path))

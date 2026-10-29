@@ -72,6 +72,9 @@ def _transformed(source: str, path: str, monkeypatch) -> ast.Module:
         captured.append(tree)
         return original(tree)
 
+    # The Python steps must run for the hook to see the tree; under ``verify`` the
+    # native ones run beside them and must agree
+    monkeypatch.setenv('PYNE_AST_BACKEND', 'verify')
     monkeypatch.setattr(locations, 'fix_locations', capture)
     PyneLoader(Path(path).stem, path).source_to_code(source, path)
     assert captured, "the pipeline never reached fix_locations"

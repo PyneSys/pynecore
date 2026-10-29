@@ -8,10 +8,11 @@ compiler) and, step by step, run faster here.
 
 Which backend a step runs on:
 
-- ``PYNE_AST_BACKEND=python`` (the default): every step runs in Python.
-- ``PYNE_AST_BACKEND=native``: a step with a CURRENT native port runs natively;
-  consecutive native steps run in one native call, so the tree crosses the
-  boundary once per run of them.
+- ``PYNE_AST_BACKEND=native`` (the default): a step with a CURRENT native port
+  runs natively; consecutive native steps run in one native call, so the tree
+  crosses the boundary once per run of them. Without the extension every step
+  runs in Python.
+- ``PYNE_AST_BACKEND=python``: every step runs in Python.
 - ``PYNE_AST_BACKEND=verify``: every step runs in Python, and a step with a
   current native port runs natively on the same input as well; any difference
   in the resulting trees (fields, locations, stamped attributes) raises
@@ -81,7 +82,7 @@ def available() -> bool:
 
 def backend() -> str:
     """The selected backend: ``python``, ``native`` or ``verify``."""
-    value = os.environ.get('PYNE_AST_BACKEND', 'python')
+    value = os.environ.get('PYNE_AST_BACKEND', 'native')
     if value not in _BACKENDS:
         raise ValueError(f"PYNE_AST_BACKEND={value!r}: expected one of {', '.join(_BACKENDS)}")
     return value
