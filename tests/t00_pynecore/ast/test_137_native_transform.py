@@ -344,7 +344,7 @@ def __test_helper_require_native():
 def __test_helper_inputs() -> list[Path]:
     """Pyne modules of the test suite and the lib, for the parity checks."""
     paths = sorted((_TESTS / 't00_pynecore' / 'ast').glob('test_*.py'))
-    paths += sorted(path for path in _LIB.rglob('*.py') if '@pyne' in path.read_text()[:400])
+    paths += sorted(path for path in _LIB.rglob('*.py') if '@pyne' in path.read_text(encoding='utf-8')[:400])
     return paths
 
 
@@ -384,7 +384,7 @@ def __test_native_parse_matches_cpython__():
     __test_helper_require_native()
     from pynecore.transformers import _native
 
-    sources = [__test_helper_SOURCE] + [path.read_text() for path in __test_helper_inputs()]
+    sources = [__test_helper_SOURCE] + [path.read_text(encoding='utf-8') for path in __test_helper_inputs()]
     sources += [f'x = {fstring}\n' for fstring in __test_helper_FSTRINGS]
     for source in sources:
         try:
@@ -418,7 +418,7 @@ def __test_native_dump_matches_cpython__():
     from pynecore.transformers import _native
 
     for path in __test_helper_inputs():
-        tree = ast.parse(path.read_text())
+        tree = ast.parse(path.read_text(encoding='utf-8'))
         assert _native.dump(tree, True) == ast.dump(tree, include_attributes=True), path
 
 
@@ -430,7 +430,7 @@ def __test_native_steps_match_python__(source, monkeypatch):
     if source == 'helper':
         items = [(Path('native_parity.py'), __test_helper_SOURCE)]
     else:
-        items = [(path, path.read_text()) for path in __test_helper_inputs()]
+        items = [(path, path.read_text(encoding='utf-8')) for path in __test_helper_inputs()]
     for path, text in items:
         tree = ast.parse(text)
         user, mode = import_hook._module_mode(tree)
@@ -446,12 +446,12 @@ def __test_native_export_capture_reads_enum_sources__(tmp_path, monkeypatch):
     __test_helper_require_native()
     package = tmp_path / 'capture_parity'
     package.mkdir()
-    (package / '__init__.py').write_text('raise RuntimeError("must not execute")\n')
+    (package / '__init__.py').write_text('raise RuntimeError("must not execute")\n', encoding='utf-8')
     definitions = package / 'definitions.py'
     definitions.write_text("from enum import StrEnum\n\n\nclass Mode(StrEnum):\n"
-                           "    fixed = 'FIXED'\n    hexadecimal = 'HEX'\n")
+                           "    fixed = 'FIXED'\n    hexadecimal = 'HEX'\n", encoding='utf-8')
     path = package / 'library.py'
-    path.write_text(__test_helper_LIBRARY)
+    path.write_text(__test_helper_LIBRARY, encoding='utf-8')
     monkeypatch.syspath_prepend(str(tmp_path))
     monkeypatch.setenv('PYNE_AST_BACKEND', 'verify')
     answers = []
@@ -521,9 +521,9 @@ def __test_native_isolation_routes_from_sources__(tmp_path, monkeypatch):
     __test_helper_require_native()
     for name, text in __test_helper_ROUTED.items():
         (tmp_path / name).parent.mkdir(exist_ok=True)
-        (tmp_path / name).write_text(text)
+        (tmp_path / name).write_text(text, encoding='utf-8')
     path = tmp_path / 'routing.py'
-    path.write_text(__test_helper_ROUTING)
+    path.write_text(__test_helper_ROUTING, encoding='utf-8')
     monkeypatch.syspath_prepend(str(tmp_path))
     monkeypatch.setenv('PYNE_AST_BACKEND', 'verify')
     answers = []
@@ -558,7 +558,7 @@ def __test_native_builtin_shadow_reads_the_library__(tmp_path, monkeypatch):
     library = tmp_path / 'lib' / 'user' / 'shadowed' / 'v1.py'
     library.parent.mkdir(parents=True)
     library.write_text("raise RuntimeError('must not execute')\n__all__ = ['boost']\n\n\n"
-                       "def boost(x):\n    return x\n")
+                       "def boost(x):\n    return x\n", encoding='utf-8')
     monkeypatch.syspath_prepend(str(tmp_path))
     source = 'import lib.user.shadowed.v1 as ta\na = ta.boost(x)\nb = ta.rsi(x, 14)\n'
     ctx = pipeline.PipelineContext(path=tmp_path / 'shadowing.py', pyne_mode=None, source=source)
@@ -653,7 +653,7 @@ def __test_typed_tree_crosses_the_bridge__(monkeypatch):
     monkeypatch.setattr(pipeline, '_run', checking)
     items = [(Path('native_parity.py'), __test_helper_SOURCE),
              (Path('native_stamps.py'), __test_helper_STAMPS)]
-    items += [(path, path.read_text()) for path in __test_helper_inputs()]
+    items += [(path, path.read_text(encoding='utf-8')) for path in __test_helper_inputs()]
     modules = 0
     for path, text in items:
         tree = ast.parse(text)
