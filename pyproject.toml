@@ -121,3 +121,15 @@ test-environment = { PYNE_REQUIRE_NATIVE_MATH = "1", PYNE_REQUIRE_NATIVE_COLOR =
 [tool.cibuildwheel.linux]
 before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
 environment = { PATH = "$HOME/.cargo/bin:$PATH" }
+
+# The ruff crates are a git dependency: cargo checks out the whole ruff repository,
+# whose deepest snapshot files pass Windows' 260-character path limit under the
+# default cargo home
+[tool.cibuildwheel.windows]
+before-all = "git config --global core.longpaths true"
+environment = { CARGO_HOME = "C:/cargo", CARGO_NET_GIT_FETCH_WITH_CLI = "true" }
+
+# Rust targets macOS 10.12 at the earliest on x86_64
+[[tool.cibuildwheel.overrides]]
+select = "*-macosx_x86_64"
+environment = { MACOSX_DEPLOYMENT_TARGET = "10.12" }
