@@ -8,7 +8,9 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from .. import lib
 from ..types.na import NA
+from .closed_trade_stats import utc_month_index
 from .csv_file import CSVWriter
 from ..lib.strategy import PositionBase
 
@@ -187,18 +189,22 @@ class StrategyStatistics:
 def calculate_strategy_statistics(
         position: PositionBase,
         initial_capital: float,
-        equity_curve: list[float] | None = None,
         first_price: float | None = None,
-        last_price: float | None = None
+        last_price: float | None = None,
+        risk_free_rate: float = 2.0,
+        last_bar_time: int | None = None
 ) -> StrategyStatistics:
     """
     Calculate comprehensive strategy statistics from position data.
 
     :param position: PositionBase object containing all trade data
     :param initial_capital: Initial capital for percentage calculations
-    :param equity_curve: List of equity values for Sharpe/Sortino calculations
     :param first_price: First price for buy & hold calculation
     :param last_price: Last price for buy & hold calculation
+    :param risk_free_rate: The script's yearly risk-free rate in percent, for the Sharpe and
+                           Sortino ratios (``strategy()``'s default is 2)
+    :param last_bar_time: UNIX time (ms) of the last bar, the month the open trades' profit
+                          belongs to; the current bar's time when omitted
     :return: StrategyStatistics object with all calculated metrics
     """
     stats = StrategyStatistics()
@@ -216,8 +222,9 @@ def calculate_strategy_statistics(
     stats.max_equity_drawdown_percent = float(position.max_drawdown_percent)
     stats.max_equity_runup_percent = float(position.max_runup_percent)
 
-    # Calculate percentages
-    if initial_capital > 0:
+    # Every percentage of the initial capital stays 0.0 without a capital to measure against
+    has_capital = initial_capital > 0
+    if has_capital:
         stats.net_profit_percent = (stats.net_profit / initial_capital) * 100
         stats.gross_profit_percent = (stats.gross_profit / initial_capital) * 100
         stats.gross_loss_percent = (stats.gross_loss / initial_capital) * 100
@@ -227,7 +234,8 @@ def calculate_strategy_statistics(
         buy_hold_shares = initial_capital / first_price
         buy_hold_value = buy_hold_shares * last_price
         stats.buy_and_hold_return = buy_hold_value - initial_capital
-        stats.buy_and_hold_return_percent = (stats.buy_and_hold_return / initial_capital) * 100
+        if has_capital:
+            stats.buy_and_hold_return_percent = (stats.buy_and_hold_return / initial_capital) * 100
 
     stats.total_trades = position.closed_trades_count
     stats.winning_trades = position.wintrades
@@ -297,11 +305,12 @@ def calculate_strategy_statistics(
             stats.long_trades = long_stats.count
             stats.long_winning_trades = long_stats.winning_count
             stats.long_net_profit = long_stats.net_profit
-            stats.long_net_profit_percent = stats.long_net_profit / initial_capital * 100
             stats.long_gross_profit = long_stats.gross_profit
-            stats.long_gross_profit_percent = stats.long_gross_profit / initial_capital * 100
             stats.long_gross_loss = long_stats.gross_loss
-            stats.long_gross_loss_percent = stats.long_gross_loss / initial_capital * 100
+            if has_capital:
+                stats.long_net_profit_percent = stats.long_net_profit / initial_capital * 100
+                stats.long_gross_profit_percent = stats.long_gross_profit / initial_capital * 100
+                stats.long_gross_loss_percent = stats.long_gross_loss / initial_capital * 100
             stats.long_avg_trade = stats.long_net_profit / long_stats.count
             # Side percentages express the average profit against initial capital.
             stats.long_avg_trade_percent = stats.long_net_profit_percent / long_stats.count
@@ -317,11 +326,12 @@ def calculate_strategy_statistics(
             stats.short_trades = short_stats.count
             stats.short_winning_trades = short_stats.winning_count
             stats.short_net_profit = short_stats.net_profit
-            stats.short_net_profit_percent = stats.short_net_profit / initial_capital * 100
             stats.short_gross_profit = short_stats.gross_profit
-            stats.short_gross_profit_percent = stats.short_gross_profit / initial_capital * 100
             stats.short_gross_loss = short_stats.gross_loss
-            stats.short_gross_loss_percent = stats.short_gross_loss / initial_capital * 100
+            if has_capital:
+                stats.short_net_profit_percent = stats.short_net_profit / initial_capital * 100
+                stats.short_gross_profit_percent = stats.short_gross_profit / initial_capital * 100
+                stats.short_gross_loss_percent = stats.short_gross_loss / initial_capital * 100
             stats.short_avg_trade = stats.short_net_profit / short_stats.count
             # Side percentages express the average profit against initial capital.
             stats.short_avg_trade_percent = stats.short_net_profit_percent / short_stats.count
@@ -340,35 +350,88 @@ def calculate_strategy_statistics(
         position.max_contracts_held_short,
     )
 
-    # Sharpe and Sortino ratios (if equity curve provided)
-    if equity_curve and len(equity_curve) > 1:
-        returns = []
-        for i in range(1, len(equity_curve)):
-            if equity_curve[i - 1] != 0:
-                ret = (equity_curve[i] - equity_curve[i - 1]) / equity_curve[i - 1]
-                returns.append(ret)
-
-        if returns:
-            avg_return = sum(returns) / len(returns)
-
-            # Sharpe ratio calculation
-            if len(returns) > 1:
-                variance = sum((r - avg_return) ** 2 for r in returns) / (len(returns) - 1)
-                std_dev = math.sqrt(variance)
-                if std_dev > 0:
-                    # Annualized Sharpe ratio (assuming daily returns and 252 trading days)
-                    stats.sharpe_ratio = (avg_return * 252) / (std_dev * math.sqrt(252))
-
-            # Sortino ratio calculation
-            downside_returns = [r for r in returns if r < 0]
-            if len(downside_returns) > 1:
-                downside_variance = sum(r ** 2 for r in downside_returns) / len(downside_returns)
-                downside_std = math.sqrt(downside_variance)
-                if downside_std > 0:
-                    # Annualized Sortino ratio
-                    stats.sortino_ratio = (avg_return * 252) / (downside_std * math.sqrt(252))
+    stats.sharpe_ratio, stats.sortino_ratio = _sharpe_sortino_ratios(
+        position, initial_capital, risk_free_rate,
+        lib._time if last_bar_time is None else last_bar_time)
 
     return stats
+
+
+# noinspection PyProtectedMember
+def _sharpe_sortino_ratios(position: PositionBase, initial_capital: float,
+                           risk_free_rate: float, last_bar_time: int) -> tuple[float, float]:
+    """
+    Calculate the Sharpe and Sortino ratios from the monthly returns of the realized profit.
+
+    Every closed trade's profit belongs to the UTC calendar month it closed in, and the open
+    trades add the position's open profit to the month of the last bar. The months run from
+    the first entry's month — or the month after it, when no trade closed in it — to the
+    last month with profit; a month without a close counts as a zero return. A month's
+    return is its profit over the equity rolled forward month by month from the initial
+    capital. The excess return is taken over the yearly risk-free rate spread over twelve
+    months, both deviations divide by the month count, and neither ratio is annualized.
+
+    :param position: The position whose closed-trade statistics hold the monthly profit
+    :param initial_capital: The equity the first month's return is measured against
+    :param risk_free_rate: The yearly risk-free rate in percent
+    :param last_bar_time: UNIX time (ms) of the last bar
+    :return: The Sharpe and the Sortino ratio, 0.0 where there is none, like the report's
+             other undefined ratios: without a closed trade, with fewer than two months, or
+             with a zero deviation
+    """
+    # Measured on TradingView's strategy report (17 CAPITALCOM probes, 2026-10-31), bit
+    # for bit: a trade-ledger equity (initial capital + netprofit) as the month's base
+    # misses by ULPs, and so does a ``(end - start) / start`` return
+    ledger = position._closed_trade_stats
+    month_profit = ledger.month_profit
+    first_entry_time = ledger.first_entry_time
+    if not month_profit or first_entry_time is None:
+        return 0.0, 0.0
+    for trade in position.open_trades:
+        if trade.entry_time < first_entry_time:
+            first_entry_time = trade.entry_time
+
+    first_month = utc_month_index(first_entry_time)
+    start = first_month if first_month in month_profit else first_month + 1
+    end = utc_month_index(last_bar_time) if position.open_trades else max(month_profit)
+
+    returns: list[float] = []
+    equity = initial_capital
+    for month in range(start, end + 1):
+        profit = month_profit.get(month, 0.0)
+        if month == end and position.open_trades:
+            profit = profit + float(position.openprofit)
+        if equity == 0.0:
+            return 0.0, 0.0
+        returns.append(profit / equity)
+        equity = equity + profit
+
+    count = len(returns)
+    if count < 2:
+        return 0.0, 0.0
+
+    # Plain left-to-right sums: the built-in ``sum()`` of floats is compensated since
+    # Python 3.12, which TradingView's sums are not. Every square is the exact product,
+    # never ``** 2``, which is the platform's ``pow()``
+    total = 0.0
+    for monthly_return in returns:
+        total += monthly_return
+    mean = total / count
+    monthly_risk_free = risk_free_rate / 12 / 100
+    excess = mean - monthly_risk_free
+
+    deviation_sum = 0.0
+    downside_sum = 0.0
+    for monthly_return in returns:
+        deviation = monthly_return - mean
+        deviation_sum += deviation * deviation
+        if monthly_return < monthly_risk_free:
+            shortfall = monthly_return - monthly_risk_free
+            downside_sum += shortfall * shortfall
+
+    sharpe = excess / math.sqrt(deviation_sum / count) if deviation_sum > 0.0 else 0.0
+    sortino = excess / math.sqrt(downside_sum / count) if downside_sum > 0.0 else 0.0
+    return sharpe, sortino
 
 
 def write_strategy_statistics_csv(

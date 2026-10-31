@@ -414,6 +414,36 @@ def __test_report_uses_position_peak_for_same_timestamp_closed_trades__():
     assert report.max_contracts_held == pytest.approx(2.0)
 
 
+def __test_report_without_initial_capital_keeps_absolute_metrics__():
+    position = BrokerPosition()
+
+    empty = calculate_strategy_statistics(position, 0.0, first_price=100.0, last_price=110.0)
+
+    assert empty.buy_and_hold_return == 0.0
+    assert empty.buy_and_hold_return_percent == 0.0
+
+    _add_report_trade(position, _trade(0, profit=30.0, profit_percent=3.0, sign=1))
+    _add_report_trade(position, _trade(1, profit=-10.0, profit_percent=-1.0, sign=-1))
+
+    report = calculate_strategy_statistics(position, 0.0, first_price=100.0, last_price=110.0)
+
+    assert report.net_profit == pytest.approx(20.0)
+    assert report.long_net_profit == pytest.approx(30.0)
+    assert report.long_gross_profit == pytest.approx(30.0)
+    assert report.short_net_profit == pytest.approx(-10.0)
+    assert report.short_gross_loss == pytest.approx(-10.0)
+    for field in (
+            "net_profit_percent", "gross_profit_percent", "gross_loss_percent",
+            "buy_and_hold_return_percent",
+            "long_net_profit_percent", "long_gross_profit_percent", "long_gross_loss_percent",
+            "long_avg_trade_percent",
+            "short_net_profit_percent", "short_gross_profit_percent", "short_gross_loss_percent",
+            "short_avg_trade_percent",
+            "sharpe_ratio", "sortino_ratio",
+    ):
+        assert getattr(report, field) == 0.0, field
+
+
 @pytest.mark.parametrize("size", (2.0, -3.0))
 def __test_report_preserves_adopted_position_peak_after_close__(monkeypatch, size: float):
     script = script_module.Script(initial_capital=1_000.0)

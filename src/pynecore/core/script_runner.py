@@ -1217,7 +1217,7 @@ class ScriptRunner:
                  'bar_index', 'tz', 'plot_writer', 'strat_writer', 'trades_writer', 'last_bar_index',
                  'last_bar_time',
                  'viz_writer', 'viz_journal', '_viz_shadow', 'viz_events',
-                 'equity_curve', 'first_price', 'last_price', '_trade_num',
+                 'first_price', 'last_price', '_trade_num',
                  '_script_path', '_security_data', '_magnifier_iter', '_magnifier_source_tf',
                  '_chart_provider_name', '_chart_provider_instance', '_chart_data_path',
                  '_time_from', '_sec_syminfos', '_chart_type_warmup', '_missing_sec_data',
@@ -1675,7 +1675,6 @@ class ScriptRunner:
                     script_tf, self.script.timeframe_gaps, chart_tf, syminfo, self.tz)
 
         # Initialize tracking variables for statistics
-        self.equity_curve: list[float] = []
         self.first_price: float | None = None
         self.last_price: float | None = None
         self._trade_num = 0
@@ -3658,11 +3657,6 @@ class ScriptRunner:
                 lib._viz_dyn.clear()
                 lib._viz_seq.clear()
 
-                if is_strat and position:
-                    current_equity = float(position.equity) if position.equity \
-                        else self.script.initial_capital
-                    self.equity_curve.append(current_equity)
-
                 if on_progress and lib._datetime is not None:
                     on_progress(lib._datetime.replace(tzinfo=None))
 
@@ -4089,11 +4083,6 @@ class ScriptRunner:
                         lib._viz_dyn.clear()
                         lib._viz_seq.clear()
 
-                        if is_strat and position:
-                            current_equity = float(position.equity) if position.equity \
-                                else self.script.initial_capital
-                            self.equity_curve.append(current_equity)
-
                         last_bar_timestamp = candle.timestamp
                         barstate.isfirst = False
 
@@ -4221,9 +4210,9 @@ class ScriptRunner:
                         stats = calculate_strategy_statistics(
                             position,
                             self.script.initial_capital,
-                            self.equity_curve if self.equity_curve else None,
                             self.first_price,
-                            self.last_price
+                            self.last_price,
+                            risk_free_rate=self.script.risk_free_rate,
                         )
 
                         write_strategy_statistics_csv(stats, self.strat_writer)
@@ -4594,11 +4583,6 @@ class ScriptRunner:
             lib._plot_data.clear()
             lib._viz_dyn.clear()
             lib._viz_seq.clear()
-
-            # Track equity curve for strategies
-            if is_strat and position:
-                current_equity = float(position.equity) if position.equity else self.script.initial_capital
-                self.equity_curve.append(current_equity)
 
             # Call the progress callback
             if on_progress and lib._datetime is not None:
@@ -5323,8 +5307,8 @@ class ScriptRunner:
             self.strat_writer.open()
             stats = calculate_strategy_statistics(
                 position, self.script.initial_capital,
-                self.equity_curve if self.equity_curve else None,
                 self.first_price, self.last_price,
+                risk_free_rate=self.script.risk_free_rate,
             )
             write_strategy_statistics_csv(stats, self.strat_writer)
             self.strat_writer.close()

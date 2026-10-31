@@ -1,9 +1,23 @@
-"""Fixed-size cumulative statistics for finalized closed trades."""
+"""Cumulative statistics for finalized closed trades."""
 
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..lib.strategy import Trade
+
+_UNIX_EPOCH = datetime(1970, 1, 1)
+
+
+def utc_month_index(time_ms: int) -> int:
+    """
+    Number the UTC calendar month a UNIX time falls in.
+
+    :param time_ms: UNIX time in milliseconds
+    :return: ``year * 12 + month - 1``, so consecutive months differ by one
+    """
+    moment = _UNIX_EPOCH + timedelta(milliseconds=time_ms)
+    return moment.year * 12 + moment.month - 1
 
 
 class _SideClosedTradeStats:
@@ -59,9 +73,11 @@ class _SideClosedTradeStats:
 
 
 class ClosedTradeStats:
-    """Fixed-size cumulative statistics for finalized closed trades."""
+    """Cumulative statistics for finalized closed trades, kept beyond the trade history."""
 
     __slots__ = (
+        "month_profit",
+        "first_entry_time",
         "commission",
         "winning_count",
         "losing_count",
@@ -86,6 +102,11 @@ class ClosedTradeStats:
     )
 
     def __init__(self) -> None:
+        # The report's Sharpe and Sortino ratios work on monthly returns: the realized
+        # profit of each UTC calendar month, keyed by ``utc_month_index`` of the exit
+        # and summed in closing order, and the earliest entry the month range starts at.
+        self.month_profit: dict[int, float] = {}
+        self.first_entry_time: int | None = None
         self.commission: float = 0.0
         self.winning_count: int = 0
         self.losing_count: int = 0
@@ -113,6 +134,11 @@ class ClosedTradeStats:
         profit = float(trade.profit)
         profit_percent = float(trade.profit_percent)
         self.commission += float(trade.commission)
+
+        month = utc_month_index(trade.exit_time)
+        self.month_profit[month] = self.month_profit.get(month, 0.0) + profit
+        if self.first_entry_time is None or trade.entry_time < self.first_entry_time:
+            self.first_entry_time = trade.entry_time
 
         bar_length: int | None = None
         if trade.exit_bar_index >= 0:
