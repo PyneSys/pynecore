@@ -61,21 +61,31 @@ _FOLD_EXACT: dict = {}
 _FOLD_EXACT_NAMES = ('sqrt', 'abs', 'floor', 'ceil', 'min', 'max', 'avg', 'sign',
                      'todegrees', 'toradians')
 
-#: ``0.5 - 5e-16`` as an exact fraction: from here up a fraction rounded to 15
-#: decimal places reaches the tie (see :func:`_fold_round`)
-_ROUND_TIE_15 = 4999999999999995
-_ROUND_TIE_15_SCALE = 10 ** 16
 #: From here up every double is an integer
 _ROUND_INT_LIMIT = 2.0 ** 52
+#: A larger precision acts as this one, at parse time as at runtime
+_ROUND_MAX_PRECISION = 16
 
 
 def _fold_exact() -> dict:
     if not _FOLD_EXACT:
         from pynecore.lib import math as lib_math
         _FOLD_EXACT.update({name: getattr(lib_math, name) for name in _FOLD_EXACT_NAMES})
-        # The runtime ``round``, which a positive precision folds with
+        # The runtime ``round``, which an int or an integral double folds with
         _FOLD_EXACT['round'] = lib_math.round
     return _FOLD_EXACT
+
+
+def _reaches_tie(fraction: float, places: int) -> bool:
+    """
+    Whether a fraction in ``[0, 1)`` reaches 0.5 once rounded to ``places``
+    decimal places, half up: ``fraction >= 0.5 - 0.5 / 10**places`` exactly.
+    """
+    numerator, denominator = fraction.as_integer_ratio()
+    if places == 0:
+        return 2 * numerator >= denominator
+    tie = 10 ** places
+    return 2 * numerator * tie >= (tie - 1) * denominator
 
 
 def _fold_round(number: int | float, precision: int | float | None = None) -> int | float:
@@ -85,23 +95,58 @@ def _fold_round(number: int | float, precision: int | float | None = None) -> in
     The integer rounding (no precision, or one of zero or less) differs from the
     runtime's: the parser rounds the number to 15 decimal places, half up, before
     it rounds it half away from zero, so every fraction from ``0.4999999999999995``
-    up reaches the tie. A positive precision folds with the runtime function.
+    up reaches the tie. A positive precision folds with :func:`_fold_round_to`.
     """
     # MEASURED (probes roundsplit, roundconst, roundconst2, CAPITALCOM:EURUSD 60):
     # a constant 0.49999999999999994, 0.4999999999999995 and 3.4999999999999996
     # round up, 0.4999999999999994, 2.499999999999999 and 1000.4999999999999 down,
     # while a series rounds all of them down
     if precision is not None and precision > 0:
-        return _fold_exact()['round'](number, precision)
+        return _fold_round_to(number, precision)
     magnitude = -number if number < 0 else number
     if type(magnitude) is not float or magnitude >= _ROUND_INT_LIMIT:
         return _fold_exact()['round'](number)
     units = math.floor(magnitude)
-    numerator, denominator = (magnitude - units).as_integer_ratio()
-    if numerator * _ROUND_TIE_15_SCALE >= _ROUND_TIE_15 * denominator:
+    if _reaches_tie(magnitude - units, 15):
         units += 1
     # A Pine int is a double at runtime: the integral result travels as a float
     return float(-units if number < 0 else units)
+
+
+def _fold_round_to(number: int | float, precision: int | float) -> float:
+    """
+    ``lib.math.round(number, precision)`` with a positive precision, as the parser
+    folds it.
+
+    The magnitude is rounded to 15 decimal places, half up, and multiplied by
+    ``10**precision``, the StrictMath ``pow`` of the other folds; a precision above
+    16 acts as 16. The product is rounded half up twice, to ``int(precision)``
+    decimal places first and then to an integer, which is divided back by the
+    power. The first rounding moves the tie: ``1.245`` and ``1.2451`` fold to 1.3
+    at precision 1, ``1.23495`` to 1.24 at precision 2.
+    """
+    # MEASURED (probes roundconst-roundconst9, 340 constants, CAPITALCOM:EURUSD 60):
+    # the parser does not split off the integer part as the runtime does, so a
+    # fractional precision scales the whole number (2.34567 at 38 / 1000 folds to
+    # 3 / 10**0.038); 0.529078455 at 8 folds down because its product with 1e8 is
+    # one ulp short of the tie and the 8-place rounding keeps it there, while the
+    # same one-ulp shortfall of 0.333323265 * 1e8 rounds up to the tie. The only
+    # misses left are the parser's pow itself: it answers 3162.277660168379 for
+    # ``math.pow(10, 3.5)``, where StrictMath answers 3162.2776601683795
+    places = min(precision, _ROUND_MAX_PRECISION)
+    magnitude = -number if number < 0 else number
+    numerator, denominator = magnitude.as_integer_ratio()
+    rounded = (2 * numerator * 10 ** 15 + denominator) // (2 * denominator) / 10 ** 15
+    scale = fdlibm.pow(10.0, places)
+    scaled = rounded * scale
+    if not math.isfinite(scaled):
+        return scaled
+    units = math.floor(scaled)
+    if _reaches_tie(scaled - units, int(places)):
+        units += 1
+    value = units / scale
+    # A negative number rounded away to nothing is 0, not -0
+    return 0.0 - value if number < 0 else value
 
 # lib.math module constants, read from the values the runtime module defines
 # so the fold and a residual runtime read cannot drift apart

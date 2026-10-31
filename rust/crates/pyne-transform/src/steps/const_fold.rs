@@ -9,8 +9,7 @@
 //! A Pine int is a double: an int literal and int arithmetic are `f64`, and an
 //! int is embedded as the Python int of its double's exact value (beyond `i64`,
 //! its exact decimal digits). A `lib.math.round` with a positive precision scales
-//! by `pine_math.pow`, which is the correctly rounded power at an integral
-//! precision; a fractional precision is left to Python.
+//! by the fdlibm power of ten, like the parser.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -232,88 +231,71 @@ fn fold_round(number: Num) -> Eval {
         return Ok(Some(number));
     }
     let mut units = magnitude.float().floor();
-    if reaches_tie_at_15_places(magnitude.float() - units) {
+    if reaches_tie(magnitude.float() - units, 15) {
         units += 1.0;
     }
     // ``float(-units if negative else units)``: an int negated, so never -0.0
     Ok(Some(Num::Float(if negative && units != 0.0 { -units } else { units })))
 }
 
-/// `lib.math.round(number, precision)` with a positive precision: the integer part
-/// kept, the fraction scaled by the reciprocal of `10**-precision` and rounded half
-/// away from zero, a near-tie decided on the exact product with a 1e-10 tolerance.
+/// `lib.math.round(number, precision)` with a positive precision, as the parser
+/// folds it (`_fold_round_to`): the magnitude rounded to 15 decimal places, half
+/// up, times the fdlibm `10**precision` (a precision above 16 acts as 16), that
+/// product rounded half up to `int(precision)` places and then to an integer, and
+/// divided back by the power.
 fn fold_round_to(number: Num, precision: Num) -> Eval {
     const MAX_PRECISION: f64 = 16.0;
     let negative = compare(number, Num::Float(0.0)) == Ordering::Less;
-    let magnitude = number.float().abs();
-    let p = if compare(precision, Num::Float(MAX_PRECISION)) == Ordering::Greater {
-        MAX_PRECISION
-    } else {
-        precision.float()
-    };
-    if p.fract() != 0.0 {
-        return Err(unsupported("math.round at a fractional precision scales by pine_math.pow"));
+    let p = precision.float().min(MAX_PRECISION);
+    let scale = fdlibm::pow(10.0, p);
+    let scaled = round_to_15_places(number.float().abs()) * scale;
+    if !scaled.is_finite() {
+        return Ok(None);
     }
-    let scale = 1.0 / platform_pow10(-p)?;
-    let fraction = magnitude % 1.0;
-    let scaled = fraction * scale;
     let mut units = scaled.floor();
-    let offset = scaled - units - 0.5;
-    let slack = 1e-9 + scaled * 1.8e-15;
-    if -slack < offset && offset < slack {
-        if rounds_up_at_tie(fraction, scale, units) {
-            units += 1.0;
-        }
-    } else if offset > 0.0 {
+    if reaches_tie(scaled - units, p as u32) {
         units += 1.0;
     }
-    let value = magnitude - fraction + units / scale;
+    let value = units / scale;
     // ``0.0 - value``: a negative number rounded away to nothing is 0, not -0
     Ok(Some(Num::Float(if negative { 0.0 - value } else { value })))
 }
 
-/// `pine_math.pow(10.0, y)` for an integral `y`: the correctly rounded power there,
-/// which the platform's own `pow` answers; WebAssembly has none, so it computes it.
-#[cfg(not(target_arch = "wasm32"))]
-fn platform_pow10(y: f64) -> Result<f64, Error> {
-    Ok(10f64.powf(y))
+/// The double nearest to a finite non-negative double rounded to 15 decimal places,
+/// half up.
+fn round_to_15_places(magnitude: f64) -> f64 {
+    // From 8 up an ulp is wider than twice the 5e-16 the rounding can move the
+    // number, so the nearest double is the number itself
+    if magnitude >= 8.0 {
+        return magnitude;
+    }
+    // Below 2**-52 the number is less than half of 1e-15
+    if magnitude < f64::EPSILON {
+        return 0.0;
+    }
+    // magnitude == mantissa * 2**-shift exactly, with 50 <= shift <= 104
+    let (mantissa, exponent) = decompose(magnitude);
+    let shift = (-exponent) as u32;
+    let places = (u128::from(mantissa) * 1_000_000_000_000_000 + (1u128 << (shift - 1))) >> shift;
+    // places < 8 * 10**15 < 2**53, so both operands are exact and the quotient is
+    // correctly rounded
+    places as f64 / 1e15
 }
 
-#[cfg(target_arch = "wasm32")]
-fn platform_pow10(y: f64) -> Result<f64, Error> {
-    crate::pow10::pow10(y).ok_or_else(|| unsupported("a power of ten too close to a tie"))
-}
-
-/// Whether a fraction in `[0, 1)` reaches the integer tie once rounded to 15
-/// decimal places, half up: `fraction >= 0.4999999999999995` exactly.
-fn reaches_tie_at_15_places(fraction: f64) -> bool {
+/// Whether a fraction in `[0, 1)` reaches 0.5 once rounded to `places` decimal
+/// places, half up: `fraction >= 0.5 - 0.5 / 10**places` exactly.
+fn reaches_tie(fraction: f64, places: u32) -> bool {
     if fraction >= 0.5 {
         return true;
     }
-    if fraction < 0.25 {
+    if places == 0 || fraction < 0.25 {
         return false;
     }
-    // In [0.25, 0.5) the fraction is mantissa * 2**-54 exactly
+    // In [0.25, 0.5) the fraction is mantissa * 2**-54 exactly:
+    // 2 * mantissa * 2**-54 * tie >= tie - 1
     let (mantissa, _) = decompose(fraction);
-    u128::from(mantissa) * 10_000_000_000_000_000 >= 4_999_999_999_999_995u128 << 54
-}
-
-/// Whether the exact `fraction * scale - units` reaches the tie within 1e-10:
-/// `remainder * 10**10 >= (5 * 10**9 - 1) * denominator` over the exact ratios.
-fn rounds_up_at_tie(fraction: f64, scale: f64, units: f64) -> bool {
-    let (fraction_mantissa, fraction_exponent) = decompose(fraction);
-    let (scale_mantissa, scale_exponent) = decompose(scale);
-    // fraction * scale == product * 2**exponent exactly
-    let product = Big::from(u128::from(fraction_mantissa) * u128::from(scale_mantissa));
-    let exponent = fraction_exponent + scale_exponent;
-    // product * 2**exponent * 10**10 >= units * 10**10 + 5 * 10**9 - 1
-    let threshold = Big::from(units as u128 * 10_000_000_000 + 4_999_999_999);
-    let left = product.mul(10_000_000_000);
-    if exponent >= 0 {
-        left.shl(exponent as u32) >= threshold
-    } else {
-        left >= threshold.shl((-exponent) as u32)
-    }
+    let tie = 10u128.pow(places);
+    u128::from(mantissa) * tie >= (tie - 1) << 53
 }
 
 /// A finite non-negative double as `mantissa * 2**exponent`.
@@ -322,64 +304,6 @@ fn decompose(value: f64) -> (u64, i32) {
     let biased = ((bits >> 52) & 0x7ff) as i32;
     let fraction = bits & ((1 << 52) - 1);
     if biased == 0 { (fraction, -1074) } else { (fraction | (1 << 52), biased - 1075) }
-}
-
-/// An unsigned integer of any size, little-endian 64-bit limbs without leading zeros.
-#[derive(PartialEq, Eq)]
-struct Big(Vec<u64>);
-
-impl From<u128> for Big {
-    fn from(value: u128) -> Big {
-        Big(vec![value as u64, (value >> 64) as u64]).trimmed()
-    }
-}
-
-impl Big {
-    fn trimmed(mut self) -> Big {
-        while self.0.last() == Some(&0) {
-            self.0.pop();
-        }
-        self
-    }
-
-    fn mul(&self, factor: u64) -> Big {
-        let mut carry = 0u128;
-        let mut limbs = Vec::with_capacity(self.0.len() + 1);
-        for &limb in &self.0 {
-            let product = u128::from(limb) * u128::from(factor) + carry;
-            limbs.push(product as u64);
-            carry = product >> 64;
-        }
-        limbs.push(carry as u64);
-        Big(limbs).trimmed()
-    }
-
-    fn shl(&self, bits: u32) -> Big {
-        if self.0.is_empty() {
-            return Big(Vec::new());
-        }
-        let (words, bits) = ((bits / 64) as usize, bits % 64);
-        let mut limbs = vec![0u64; words];
-        let mut carry = 0u64;
-        for &limb in &self.0 {
-            limbs.push(if bits == 0 { limb } else { (limb << bits) | carry });
-            carry = if bits == 0 { 0 } else { limb >> (64 - bits) };
-        }
-        limbs.push(carry);
-        Big(limbs).trimmed()
-    }
-}
-
-impl PartialOrd for Big {
-    fn partial_cmp(&self, other: &Big) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Big {
-    fn cmp(&self, other: &Big) -> Ordering {
-        self.0.len().cmp(&other.0.len()).then_with(|| self.0.iter().rev().cmp(other.0.iter().rev()))
-    }
 }
 
 /// One of `_FOLD_EXACT`: the `lib.math` runtime function itself, `None` where

@@ -19,7 +19,6 @@ pub mod phase;
 pub mod pine_qualifier;
 pub mod pine_type_rules;
 pub mod pine_type_table;
-pub mod pow10;
 pub mod resolver;
 pub mod sha1;
 pub mod sha256;

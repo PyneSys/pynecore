@@ -394,7 +394,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(qualifier::registry, m)?)?;
     m.add_function(wrap_pyfunction!(fold::fdlibm_call, m)?)?;
     m.add_function(wrap_pyfunction!(fold::quantize_embed, m)?)?;
-    m.add_function(wrap_pyfunction!(fold::pow10, m)?)?;
     m.add_function(wrap_pyfunction!(fold::const_eval, m)?)?;
     m.add_function(wrap_pyfunction!(type_table::round_trip, m)?)?;
     m.add_function(wrap_pyfunction!(type_table::node_ids, m)?)?;

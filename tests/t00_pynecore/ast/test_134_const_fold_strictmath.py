@@ -12,7 +12,9 @@ remainder like a series one: ``-7 % 3`` is -1, ``7 % -3`` is 1, ``-7.5 % 2`` is 
 Constant int arithmetic is double arithmetic, as on a series int (probes int_a / int_b,
 2026-10-26): ``9007199254740993 - 9007199254740992`` is 0. A constant ``math.round``
 without a precision rounds the number to 15 decimal places before it rounds it to an
-integer, so ``3.4999999999999996`` folds to 4 where a series rounds it to 3.
+integer, so ``3.4999999999999996`` folds to 4 where a series rounds it to 3. With a
+positive precision it rounds the scaled number twice, to the precision's places and then
+to an integer, so ``math.round(1.245, 1)`` folds to 1.3 where a series answers 1.2.
 """
 import ast
 import math
@@ -188,3 +190,37 @@ def __test_series_integer_round_compares_the_exact_fraction__():
     assert lib_math.round(0.49999999999999994) == 0.0
     assert lib_math.round(3.4999999999999996) == 3.0
     assert lib_math.round(0.4999999999999995, 0) == 0.0
+
+
+# The constants TradingView plotted (probes roundconst-roundconst9, CAPITALCOM:EURUSD 60)
+@pytest.mark.parametrize('number,precision,expected', [
+    ('1.245', '1', 1.3), ('1.2451', '1', 1.3), ('1.24499', '1', 1.2), ('-1.2451', '1', -1.3),
+    ('0.245', '1', 0.3), ('0.145', '1', 0.1), ('1.23495', '2', 1.24), ('-1.23495', '2', -1.24),
+    ('1.2349499', '2', 1.23), ('0.08495', '2', 0.08), ('1.2344995', '3', 1.235),
+    ('1.23444999501', '4', 1.2345), ('1.23444499995', '5', 1.23445), ('63.986275', '5', 63.98628),
+    ('0.12345499999999', '5', 0.12346), ('123456.37453499998', '5', 123456.37454),
+    ('4503599.960634999', '5', 4503599.96063), ('4503599.225499999', '3', 4503599.226),
+    ('3.4140024999999996', '6', 3.414003), ('63.134680499999995', '6', 63.134681),
+    ('-63.134680499999995', '6', -63.134681), ('0.529078455', '8', 0.52907845),
+    ('-0.529078455', '8', -0.52907845), ('0.333323265', '8', 0.33332327),
+    ('0.517401755', '8', 0.51740176), ('0.945807305', '8', 0.94580731),
+    ('0.6435383349999999', '8', 0.64353834), ('0.6519647549999997', '8', 0.65196475),
+    ('0.3024663349999995', '8', 0.30246633), ('0.7809848565499995', '10', 0.7809848565),
+    ('0.12345678901234568', '17', 0.123456789012346), ('0.12345678901234568', '100', 0.123456789012346),
+    ('7', '2', 7.0), ('2.34567', '38 / 1000', 2.748661470365999),
+    ('123.456789', '38 / 1000', 123.68976616646995), ('2.34567', '361 / 1000', 2.177559368427843),
+    ('4.006', '6 / 5', 4.038127004673237), ('6.3712', '3 / 2', 6.387800873540127),
+    ('4.211', '27 / 10', 4.211998746899304),
+])
+def __test_constant_round_to_a_precision_rounds_twice__(number, precision, expected):
+    """a constant ``math.round(number, precision)`` rounds the number to 15 decimal places,
+    scales it by ``10**precision``, rounds the product half up to ``int(precision)`` places
+    and then to an integer: the first rounding moves the tie"""
+    assert __test_helper_folded_value(f'lib.math.round({number}, {precision})') == expected
+
+
+def __test_series_round_to_a_precision_rounds_once__():
+    assert lib_math.round(1.245, 1) == 1.2
+    assert lib_math.round(1.23495, 2) == 1.23
+    assert lib_math.round(63.986275, 5) == 63.98627
+    assert lib_math.round(2.34567, 0.038) == 2.0
