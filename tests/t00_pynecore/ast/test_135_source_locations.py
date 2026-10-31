@@ -58,9 +58,21 @@ def _code_objects(code: types.CodeType):
 
 
 def _lines(code: types.CodeType) -> list[int]:
-    """The line of each bytecode range in order, the module's line-0 RESUME aside."""
-    return [line for start, _, line in code.co_lines()
-            if line is not None and not (start == 0 and line == 0)]
+    """The line of each bytecode range in order, the module's line-0 prologue aside.
+
+    The prologue is CPython's own: the module's ``RESUME`` at line 0, preceded on
+    3.14 by a line-less ``MAKE_CELL __conditional_annotations__`` when the module
+    has conditional annotations (PEP 649), which moves the ``RESUME`` off offset 0.
+    """
+    lines: list[int] = []
+    in_prologue = True
+    for _, _, line in code.co_lines():
+        if in_prologue and (line is None or line == 0):
+            continue
+        in_prologue = False
+        if line is not None:
+            lines.append(line)
+    return lines
 
 
 class _Transformed:
@@ -85,11 +97,18 @@ class _Transformed:
         A function the transform generated from one of the source (a
         ``request.security`` slice of ``main``, a per-call-site instance) has a name
         of its own but starts at the source function's ``def`` line.
+
+        CPython's ``__annotate__`` (PEP 649, 3.14) also starts at the ``def`` line,
+        but it runs the annotation expressions at their own locations — an
+        injected parameter's annotation sits at the declaration it came from — so
+        it is not code of the function.
         """
         functions = self.functions()
         by_def_line = {node.lineno: node for node in functions.values()}
         found = {}
         for code in _code_objects(self.code):
+            if code.co_name == '__annotate__':
+                continue
             function = (functions.get((code.co_name, code.co_firstlineno))
                         or by_def_line.get(code.co_firstlineno))
             if function is not None:
