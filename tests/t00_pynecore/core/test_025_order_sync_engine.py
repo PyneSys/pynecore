@@ -531,6 +531,64 @@ def __test_reissued_same_parameter_pyramid_entry_dispatches_fresh__():
     assert pos.size == 2.0
 
 
+def __test_native_bracket_fill_on_one_pyramid_deal_keeps_the_exit_armed__():
+    """One deal's position-attached TP fill leaves the exit on its sibling deal.
+
+    A venue with per-deal brackets (Capital.com) attaches a whole-row exit to
+    every deal of a same-id pyramid and labels a TP fill with the PARENT's
+    pine id and the deal's own id. The fill closes one trade; the exit still
+    covers the surviving trade, so it must stay tracked with all its legs and
+    its next re-emission must amend it — never a cancel that would strip the
+    surviving deal's native protection (measured live: capitalcom cycle 356).
+    """
+    b = MockBroker(capabilities=ExchangeCapabilities(
+        short_selling=CapabilityLevel.NATIVE, tp_sl_bracket=CapabilityLevel.NATIVE,
+    ))
+    engine, pos = _mk_engine(b)
+    lib._script.pyramiding = 3
+    pos.entry_orders["L1"] = _entry_order("L1", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L1", xchg_id="deal-1",
+                    fill_id="l1-a"))
+    pos.entry_orders["L1"] = _entry_order("L1", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(
+        _fill_event('buy', 1.0, 50_100.0, pine_id="L1", xchg_id="deal-2",
+                    fill_id="l1-b"))
+    pos.exit_orders[("L1-X", "L1")] = _exit_order(
+        "L1", -2.0, "L1-X", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+    key = "L1-X\0L1"
+    assert key in engine.active_intents
+    assert engine.active_intents[key].qty == 2.0
+    assert not engine.active_intents[key].is_partial_qty_bracket
+    legs = ["deal-1:tp", "deal-1:sl", "deal-2:tp", "deal-2:sl"]
+    engine._order_mapping[key] = list(legs)
+
+    engine._route_event(replace(
+        _fill_event('sell', 1.0, 60_000.0, pine_id="L1",
+                    leg=LegType.TAKE_PROFIT, xchg_id="deal-1", fill_id="tp-1"),
+        from_entry=None,
+    ))
+
+    assert pos.size == 1.0
+    assert [t.entry_id for t in pos.open_trades] == ["L1"]
+    assert key in engine.active_intents
+    assert engine.order_mapping[key] == legs
+    assert ("L1-X", "L1") in pos.exit_orders
+    assert b.cancel_calls == []
+
+    pos.exit_orders[("L1-X", "L1")] = _exit_order(
+        "L1", -1.0, "L1-X", limit=60_000.0, stop=45_000.0,
+    )
+    engine.sync(BAR_TS)
+    assert b.cancel_calls == []
+    assert [(old.intent.qty, new.intent.qty)
+            for old, new in b.modify_exit_calls] == [(2.0, 1.0)]
+
+
 def __test_reissued_entry_at_pyramiding_cap_is_dropped_like_the_simulator__():
     """A same-direction re-issue at the pyramiding cap never dispatches.
 
