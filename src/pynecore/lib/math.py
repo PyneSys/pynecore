@@ -352,11 +352,16 @@ def round(number: TFI | NA[TFI], precision: PyneInt = na_int) -> PyneFloat | Pyn
         # BINANCE:BTCUSDT@30 and FX:EURUSD@60 (probes roundprobe, mr2, mr3, mr10).
         # A negative precision does NOT round to tens or hundreds: it is the same
         # integer rounding (1234.5678 @ -2 -> 1235, 2.5 @ -3 -> 3, mr2/mr3).
-        # From 2**52 up every double is an integer, and ``magnitude + 0.5`` would
-        # round to even there (2**52 + 1 -> 2**52 + 2); below it the sum is exact.
+        # The fraction is compared, not ``magnitude + 0.5`` floored: that sum
+        # rounds 0.49999999999999994 up to 1.0, where TV answers 0 at every
+        # precision <= 0 (CAPITALCOM:EURUSD@60, probe roundrt: the value built at
+        # runtime, as a literal is embedded rounded to 16 places). From 2**52 up
+        # every double is an integer.
         if magnitude >= _ROUND_INT_LIMIT:
             return cast(float, number)
-        units = math.floor(magnitude + 0.5)
+        units = math.floor(magnitude)
+        if magnitude - units >= 0.5:
+            units += 1
         # A Pine int is a double at runtime: the integral result travels as a float
         return float(-units if negative else units)
     # TV splits the number into its integer part and its fraction and scales ONLY
@@ -372,8 +377,12 @@ def round(number: TFI | NA[TFI], precision: PyneInt = na_int) -> PyneFloat | Pyn
     # bit-identical to the one at 16 (mrp2), while at 15.8 .. 16 TV's own last
     # bit is not fully modelled (67/78 there) -- that noise is inherited by the
     # clamped range.
+    # ``10**-p`` is the runtime ``Math.pow`` (pine_math), not the platform's: at the
+    # 26 fractional precisions <= 16 where the two disagree, CAPITALCOM:EURUSD@60
+    # (probe roundpm, 620100 values) misses 1256 with it, all at p >= 13.1 where
+    # every variant misses, and 43352 with the platform's.
     p = precision if precision <= _ROUND_MAX_PRECISION else _ROUND_MAX_PRECISION
-    scale = 1.0 / math.pow(10.0, -p)
+    scale = 1.0 / pine_math.pow(10.0, -p)
     fraction = math.fmod(magnitude, 1.0)
     scaled = fraction * scale
     units = math.floor(scaled)

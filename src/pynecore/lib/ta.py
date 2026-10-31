@@ -163,10 +163,14 @@ def alma(series: Series[float], length: int, offset: float = 0.85, sigma: float 
     # 30m, 28774 bars: this form is bit-exact on all four measured parameter sets
     # — lengths 3/9/21/5, floored offset included — while the sum-then-divide form
     # and every summation-order variant of it miss thousands of bars by 1-3 ULP).
+    # The Gaussian is Pine's runtime ``math.exp``, the JVM intrinsic, not the
+    # platform's ``exp``: an impulse source prints every normalized weight, and
+    # all 275 of 11 parameter sets match it bit for bit (probe ``almapm``,
+    # CAPITALCOM:EURUSD 60), where the platform's missed 28 of them.
     if not weights:
         m = offset * (length - 1) if not floor else math.floor(offset * (length - 1))
         s = length / sigma
-        weights = [math.exp(-1 * ((i - m) * (i - m)) / (2 * (s * s))) for i in builtins.range(length)]
+        weights = [lib_math.exp(-1 * ((i - m) * (i - m)) / (2 * (s * s))) for i in builtins.range(length)]
         norm = 0.0
         for w in weights:
             norm += w

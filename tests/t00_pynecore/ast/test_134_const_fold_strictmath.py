@@ -10,7 +10,9 @@ Intel-LIBM double the runtime reproduces. The parser's ``log10`` is
 ``1 / log(10)`` and ``StrictMath.log10`` all differ). A constant ``%`` is the truncated
 remainder like a series one: ``-7 % 3`` is -1, ``7 % -3`` is 1, ``-7.5 % 2`` is -1.5.
 Constant int arithmetic is double arithmetic, as on a series int (probes int_a / int_b,
-2026-10-26): ``9007199254740993 - 9007199254740992`` is 0.
+2026-10-26): ``9007199254740993 - 9007199254740992`` is 0. A constant ``math.round``
+without a precision rounds the number to 15 decimal places before it rounds it to an
+integer, so ``3.4999999999999996`` folds to 4 where a series rounds it to 3.
 """
 import ast
 import math
@@ -18,6 +20,7 @@ import math
 import pytest
 
 from pynecore.core import fdlibm, pine_math
+from pynecore.lib import math as lib_math
 from pynecore.transformers.const_fold import ConstFoldTransformer
 from pynecore.transformers.pine_type_rules import INT, get_ty
 
@@ -162,3 +165,26 @@ def __test_int_beyond_the_double_range_is_not_folded__():
     assert isinstance(__test_helper_folded_value(f'{literal} - {literal}'), ast.BinOp)
     huge = str(10 ** 200)
     assert isinstance(__test_helper_folded_value(f'{huge} * {huge}'), ast.BinOp)
+
+
+@pytest.mark.parametrize('expression,expected', [
+    ('lib.math.round(0.49999999999999994)', 1.0), ('lib.math.round(-0.49999999999999994)', -1.0),
+    ('lib.math.round(0.5 - lib.math.pow(2, -53))', 1.0), ('lib.math.round(0.4999999999999995)', 1.0),
+    ('lib.math.round(0.4999999999999994)', 0.0), ('lib.math.round(0.49999999999999944)', 0.0),
+    ('lib.math.round(3.4999999999999996)', 4.0), ('lib.math.round(-3.4999999999999996)', -4.0),
+    ('lib.math.round(2.4999999999999996, 0)', 3.0), ('lib.math.round(2.499999999999999)', 2.0),
+    ('lib.math.round(1.4999999999999996)', 2.0), ('lib.math.round(1.4999999999999993)', 1.0),
+    ('lib.math.round(1000.4999999999999)', 1000.0), ('lib.math.round(452523.49999999994)', 452523.0),
+    ('lib.math.round(0.5 - 1e-11)', 0.0),
+])
+def __test_constant_integer_round_rounds_to_15_places_first__(expression, expected):
+    """a constant ``math.round`` with no precision, or precision 0, rounds the number to
+    15 decimal places, half up, before it rounds it to an integer; a series one compares
+    the exact fraction (probes roundsplit, roundconst, roundconst2, CAPITALCOM:EURUSD 60)"""
+    assert __test_helper_folded_value(expression) == expected
+
+
+def __test_series_integer_round_compares_the_exact_fraction__():
+    assert lib_math.round(0.49999999999999994) == 0.0
+    assert lib_math.round(3.4999999999999996) == 3.0
+    assert lib_math.round(0.4999999999999995, 0) == 0.0

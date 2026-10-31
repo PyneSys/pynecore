@@ -59,14 +59,49 @@ _FOLD_FDLIBM = {
 # would re-enter the partially initialized lib package.
 _FOLD_EXACT: dict = {}
 _FOLD_EXACT_NAMES = ('sqrt', 'abs', 'floor', 'ceil', 'min', 'max', 'avg', 'sign',
-                     'round', 'todegrees', 'toradians')
+                     'todegrees', 'toradians')
+
+#: ``0.5 - 5e-16`` as an exact fraction: from here up a fraction rounded to 15
+#: decimal places reaches the tie (see :func:`_fold_round`)
+_ROUND_TIE_15 = 4999999999999995
+_ROUND_TIE_15_SCALE = 10 ** 16
+#: From here up every double is an integer
+_ROUND_INT_LIMIT = 2.0 ** 52
 
 
 def _fold_exact() -> dict:
     if not _FOLD_EXACT:
         from pynecore.lib import math as lib_math
         _FOLD_EXACT.update({name: getattr(lib_math, name) for name in _FOLD_EXACT_NAMES})
+        # The runtime ``round``, which a positive precision folds with
+        _FOLD_EXACT['round'] = lib_math.round
     return _FOLD_EXACT
+
+
+def _fold_round(number: int | float, precision: int | float | None = None) -> int | float:
+    """
+    ``lib.math.round`` as the parser folds it.
+
+    The integer rounding (no precision, or one of zero or less) differs from the
+    runtime's: the parser rounds the number to 15 decimal places, half up, before
+    it rounds it half away from zero, so every fraction from ``0.4999999999999995``
+    up reaches the tie. A positive precision folds with the runtime function.
+    """
+    # MEASURED (probes roundsplit, roundconst, roundconst2, CAPITALCOM:EURUSD 60):
+    # a constant 0.49999999999999994, 0.4999999999999995 and 3.4999999999999996
+    # round up, 0.4999999999999994, 2.499999999999999 and 1000.4999999999999 down,
+    # while a series rounds all of them down
+    if precision is not None and precision > 0:
+        return _fold_exact()['round'](number, precision)
+    magnitude = -number if number < 0 else number
+    if type(magnitude) is not float or magnitude >= _ROUND_INT_LIMIT:
+        return _fold_exact()['round'](number)
+    units = math.floor(magnitude)
+    numerator, denominator = (magnitude - units).as_integer_ratio()
+    if numerator * _ROUND_TIE_15_SCALE >= _ROUND_TIE_15 * denominator:
+        units += 1
+    # A Pine int is a double at runtime: the integral result travels as a float
+    return float(-units if number < 0 else units)
 
 # lib.math module constants, read from the values the runtime module defines
 # so the fold and a residual runtime read cannot drift apart
@@ -617,6 +652,10 @@ def _try_eval(node: ast.expr, env: dict[str, int | float]):
             if len(args) != arity:
                 return _BAIL
             v = function(*[float(arg) for arg in args])
+        elif name == 'round':
+            if not 1 <= len(args) <= 2:
+                return _BAIL
+            v = _fold_round(*args)
         elif name in _FOLD_EXACT_NAMES:
             if not args:
                 return _BAIL

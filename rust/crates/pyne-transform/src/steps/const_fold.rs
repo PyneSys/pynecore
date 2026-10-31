@@ -9,7 +9,8 @@
 //! A Pine int is a double: an int literal and int arithmetic are `f64`, and an
 //! int is embedded as the Python int of its double's exact value (beyond `i64`,
 //! its exact decimal digits). A `lib.math.round` with a positive precision scales
-//! by the platform `pow`, as CPython's `math.pow` does.
+//! by `pine_math.pow`, which is the correctly rounded power at an integral
+//! precision; a fractional precision is left to Python.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -215,8 +216,9 @@ fn compare(left: Num, right: Num) -> Ordering {
     left.float().partial_cmp(&right.float()).expect("finite operands")
 }
 
-/// `lib.math.round` (`math.py`), the integer rounding: `None` for the precision
-/// path, which the port leaves to Python.
+/// `lib.math.round` as the parser folds it, the integer rounding: the number
+/// rounded to 15 decimal places, half up, then half away from zero
+/// (`_fold_round`).
 fn fold_round(number: Num) -> Eval {
     // From here up every double is an integer
     const INT_LIMIT: f64 = 4503599627370496.0;
@@ -229,8 +231,11 @@ fn fold_round(number: Num) -> Eval {
     if compare(magnitude, Num::Float(INT_LIMIT)) != Ordering::Less {
         return Ok(Some(number));
     }
+    let mut units = magnitude.float().floor();
+    if reaches_tie_at_15_places(magnitude.float() - units) {
+        units += 1.0;
+    }
     // ``float(-units if negative else units)``: an int negated, so never -0.0
-    let units = (magnitude.float() + 0.5).floor();
     Ok(Some(Num::Float(if negative && units != 0.0 { -units } else { units })))
 }
 
@@ -246,6 +251,9 @@ fn fold_round_to(number: Num, precision: Num) -> Eval {
     } else {
         precision.float()
     };
+    if p.fract() != 0.0 {
+        return Err(unsupported("math.round at a fractional precision scales by pine_math.pow"));
+    }
     let scale = 1.0 / platform_pow10(-p)?;
     let fraction = magnitude % 1.0;
     let scaled = fraction * scale;
@@ -264,8 +272,8 @@ fn fold_round_to(number: Num, precision: Num) -> Eval {
     Ok(Some(Num::Float(if negative { 0.0 - value } else { value })))
 }
 
-/// `math.pow(10.0, y)`: the platform's own `pow`, as CPython calls it; WebAssembly
-/// has none, so it takes the correctly rounded power, what a good `pow` answers.
+/// `pine_math.pow(10.0, y)` for an integral `y`: the correctly rounded power there,
+/// which the platform's own `pow` answers; WebAssembly has none, so it computes it.
 #[cfg(not(target_arch = "wasm32"))]
 fn platform_pow10(y: f64) -> Result<f64, Error> {
     Ok(10f64.powf(y))
@@ -274,6 +282,20 @@ fn platform_pow10(y: f64) -> Result<f64, Error> {
 #[cfg(target_arch = "wasm32")]
 fn platform_pow10(y: f64) -> Result<f64, Error> {
     crate::pow10::pow10(y).ok_or_else(|| unsupported("a power of ten too close to a tie"))
+}
+
+/// Whether a fraction in `[0, 1)` reaches the integer tie once rounded to 15
+/// decimal places, half up: `fraction >= 0.4999999999999995` exactly.
+fn reaches_tie_at_15_places(fraction: f64) -> bool {
+    if fraction >= 0.5 {
+        return true;
+    }
+    if fraction < 0.25 {
+        return false;
+    }
+    // In [0.25, 0.5) the fraction is mantissa * 2**-54 exactly
+    let (mantissa, _) = decompose(fraction);
+    u128::from(mantissa) * 10_000_000_000_000_000 >= 4_999_999_999_999_995u128 << 54
 }
 
 /// Whether the exact `fraction * scale - units` reaches the tie within 1e-10:

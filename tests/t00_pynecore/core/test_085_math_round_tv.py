@@ -70,6 +70,16 @@ def __test_integer_rounding_has_no_tolerance__():
     assert math.round(0.4999999999999) == 0.0
     assert math.round(0.4999999999999, 0) == 0.0
     assert math.round(1000.4999999999, 0) == 1000.0
+    # The double below 0.5, where ``x + 0.5`` rounds to 1.0 (probe roundrt,
+    # CAPITALCOM:EURUSD@60, the value built at runtime)
+    assert math.round(0.49999999999999994) == 0.0
+    assert math.round(-0.49999999999999994) == 0.0
+    assert math.round(0.49999999999999994, 0) == 0.0
+    assert math.round(0.49999999999999994, -1) == 0.0
+    assert math.round(-0.49999999999999994, -1) == 0.0
+    assert math.round(0.4999999999999999) == 0.0
+    assert math.round(3.4999999999999996) == 3.0
+    assert math.round(452523.49999999994) == 452523.0
 
 
 def __test_negative_precision_is_integer_rounding__():

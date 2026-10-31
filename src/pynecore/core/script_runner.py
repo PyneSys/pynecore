@@ -11,7 +11,7 @@ import tempfile
 import tomllib
 from dataclasses import dataclass, field as dataclasses_field
 from functools import partial
-from math import log10, floor
+from math import floor
 from pathlib import Path
 from datetime import datetime, UTC
 
@@ -21,7 +21,7 @@ from datetime import datetime, UTC
 # CLI launched from the monorepo root, whose top-level ``pynecore/`` directory
 # shadows the editable ``src/pynecore``), and then only a cached transformed
 # ``.pyc`` would hide it. Importing the module installs the hook.
-from pynecore.core import import_hook
+from pynecore.core import import_hook, pine_math
 from pynecore import lib
 from pynecore.core import script as script_mod
 from pynecore.lib import timeframe as timeframe_lib
@@ -266,7 +266,8 @@ def _round_price(price: float, tick_decimals: int | None):
     """
     if price == 0.0:
         return 0.0
-    precision = 5 - floor(log10(abs(price)))  # 6 significant digits
+    # The portable log10 kernel, not the platform's, whose answers differ per system
+    precision = 5 - floor(pine_math.log10(abs(price)))  # 6 significant digits
     if tick_decimals is not None and tick_decimals > precision:
         precision = tick_decimals
     return round(price, precision)

@@ -446,8 +446,9 @@ def __test_native_const_fold_carries_a_big_int__():
 
 
 def __test_native_round_with_precision_folds_like_python__():
-    """``lib.math.round`` with a positive precision, ties and fractional precisions
-    included, folds to Python's value"""
+    """``lib.math.round`` with a positive integral precision, ties included, folds to
+    Python's value; a fractional one, which scales by ``pine_math.pow``, is left to
+    Python"""
     __test_helper_require_native()
     _native = __test_helper_native()
     rnd = random.Random(20261025)
@@ -461,6 +462,30 @@ def __test_native_round_with_precision_folds_like_python__():
                              repr(rnd.uniform(-10.0, 10.0)), str(rnd.randint(-10 ** 6, 10 ** 6))))
         precision = rnd.choice((str(rnd.randint(1, 18)), repr(round(rnd.uniform(0.01, 17), 3))))
         sources.append(f'lib.math.round({number}, {precision})')
+    for source in sources:
+        node = ast.parse(source, mode='eval').body
+        precision = __test_helper_python_eval(node.args[1])
+        if min(precision, 16) % 1:
+            with pytest.raises(_native.Unsupported):
+                _native._const_eval(node)
+            continue
+        got = _native._const_eval(node)
+        assert __test_helper_same(got, __test_helper_python_eval(node)), source
+
+
+def __test_native_integer_round_folds_like_python__():
+    """The parser's integer rounding, the number rounded to 15 decimal places first,
+    folds natively to Python's value at and around the threshold"""
+    __test_helper_require_native()
+    _native = __test_helper_native()
+    numbers = ['0.4999999999999995', '0.4999999999999994', '0.49999999999999944',
+               '0.49999999999999994', '0.25', '0.5', '3.4999999999999996', '2.499999999999999',
+               '1.4999999999999996', '1.4999999999999993', '1000.4999999999999',
+               '452523.49999999994', '0.49999999999', '4503599627370495.5', '7', '0.0']
+    numbers += [repr(0.5 - k * 2.0 ** -54) for k in range(1, 40)]
+    numbers += [repr(1.5 - k * 2.0 ** -52) for k in range(1, 10)]
+    sources = [f'lib.math.round({sign}{number}{precision})' for number in numbers
+               for sign in ('', '-') for precision in ('', ', 0')]
     for source in sources:
         node = ast.parse(source, mode='eval').body
         got = _native._const_eval(node)
