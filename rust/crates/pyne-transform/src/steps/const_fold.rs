@@ -9,7 +9,7 @@
 //! A Pine int is a double: an int literal and int arithmetic are `f64`, and an
 //! int is embedded as the Python int of its double's exact value (beyond `i64`,
 //! its exact decimal digits). A `lib.math.round` with a positive precision scales
-//! by the fdlibm power of ten, like the parser.
+//! by the parser's power of ten, `fdlibm::pow_no_tail`, like the `pow` fold.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -196,8 +196,10 @@ fn fold_fdlibm(name: &str, args: &[f64]) -> Option<Option<f64>> {
         "acos" => fdlibm::acos,
         "atan" => fdlibm::atan,
         "pow" => {
+            // MEASURED (probes pw1-pw7, 452 constants): the parser's pow is StrictMath's
+            // without the tail of the reduced exponent
             return Some(match args {
-                &[x, y] => Some(fdlibm::pow(x, y)),
+                &[x, y] => Some(fdlibm::pow_no_tail(x, y)),
                 _ => None,
             });
         }
@@ -240,14 +242,14 @@ fn fold_round(number: Num) -> Eval {
 
 /// `lib.math.round(number, precision)` with a positive precision, as the parser
 /// folds it (`_fold_round_to`): the magnitude rounded to 15 decimal places, half
-/// up, times the fdlibm `10**precision` (a precision above 16 acts as 16), that
+/// up, times the parser's `10**precision` (a precision above 16 acts as 16), that
 /// product rounded half up to `int(precision)` places and then to an integer, and
 /// divided back by the power.
 fn fold_round_to(number: Num, precision: Num) -> Eval {
     const MAX_PRECISION: f64 = 16.0;
     let negative = compare(number, Num::Float(0.0)) == Ordering::Less;
     let p = precision.float().min(MAX_PRECISION);
-    let scale = fdlibm::pow(10.0, p);
+    let scale = fdlibm::pow_no_tail(10.0, p);
     let scaled = round_to_15_places(number.float().abs()) * scale;
     if !scaled.is_finite() {
         return Ok(None);

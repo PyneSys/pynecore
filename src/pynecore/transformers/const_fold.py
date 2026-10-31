@@ -32,9 +32,13 @@ def _fold_log10(x: float) -> float:
 # StrictMath; at runtime sin/cos/exp/log/log10/pow go through the JIT's Intel-LIBM
 # intrinsics instead (see ``core.pine_math``), which disagree with fdlibm in the
 # last ulp, so their fold must NOT go through the runtime implementations.
-# MEASURED for log/log10/pow/tan (CAPITALCOM:EURUSD 60): a constant call embeds
-# the StrictMath double, a series one the Intel-LIBM double. asin/acos/atan have
-# no intrinsic -- their runtime is fdlibm too -- but they fold all the same.
+# MEASURED for exp/log/log10/tan (CAPITALCOM:EURUSD 60): a constant call embeds
+# the StrictMath double, a series one the Intel-LIBM double. The parser's pow is
+# StrictMath's without the tail of the reduced exponent: MEASURED on 452 constants
+# (probes pw1-pw7, 2026-10-31, 64 of 64 predicted where the two differ), e.g.
+# ``pow(10, -4)``, ``pow(100, -2)`` and ``pow(1e16, -0.25)`` all embed
+# 9.999999999999999e-05 where StrictMath answers 1e-4. asin/acos/atan have no
+# intrinsic -- their runtime is fdlibm too -- but they fold all the same.
 _FOLD_FDLIBM = {
     'sin': (fdlibm.sin, 1),
     'cos': (fdlibm.cos, 1),
@@ -42,7 +46,7 @@ _FOLD_FDLIBM = {
     'exp': (fdlibm.exp, 1),
     'log': (fdlibm.log, 1),
     'log10': (_fold_log10, 1),
-    'pow': (fdlibm.pow, 2),
+    'pow': (fdlibm.pow_no_tail, 2),
     'asin': (fdlibm.asin, 1),
     'acos': (fdlibm.acos, 1),
     'atan': (fdlibm.atan, 1),
@@ -119,7 +123,7 @@ def _fold_round_to(number: int | float, precision: int | float) -> float:
     folds it.
 
     The magnitude is rounded to 15 decimal places, half up, and multiplied by
-    ``10**precision``, the StrictMath ``pow`` of the other folds; a precision above
+    ``10**precision``, the parser's ``pow`` of the other folds; a precision above
     16 acts as 16. The product is rounded half up twice, to ``int(precision)``
     decimal places first and then to an integer, which is divided back by the
     power. The first rounding moves the tie: ``1.245`` and ``1.2451`` fold to 1.3
@@ -130,14 +134,14 @@ def _fold_round_to(number: int | float, precision: int | float) -> float:
     # fractional precision scales the whole number (2.34567 at 38 / 1000 folds to
     # 3 / 10**0.038); 0.529078455 at 8 folds down because its product with 1e8 is
     # one ulp short of the tie and the 8-place rounding keeps it there, while the
-    # same one-ulp shortfall of 0.333323265 * 1e8 rounds up to the tie. The only
-    # misses left are the parser's pow itself: it answers 3162.277660168379 for
-    # ``math.pow(10, 3.5)``, where StrictMath answers 3162.2776601683795
+    # same one-ulp shortfall of 0.333323265 * 1e8 rounds up to the tie. 2.4076 and
+    # 7.367 at 7 / 2 need the parser's 10**3.5 = 3162.277660168379, where StrictMath
+    # answers 3162.2776601683795
     places = min(precision, _ROUND_MAX_PRECISION)
     magnitude = -number if number < 0 else number
     numerator, denominator = magnitude.as_integer_ratio()
     rounded = (2 * numerator * 10 ** 15 + denominator) // (2 * denominator) / 10 ** 15
-    scale = fdlibm.pow(10.0, places)
+    scale = fdlibm.pow_no_tail(10.0, places)
     scaled = rounded * scale
     if not math.isfinite(scaled):
         return scaled

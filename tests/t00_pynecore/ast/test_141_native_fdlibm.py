@@ -17,6 +17,7 @@ import os
 import random
 import struct
 from array import array
+from collections.abc import Callable
 
 import pytest
 
@@ -129,7 +130,7 @@ def __test_helper_native(name: str, xs: list[float], ys: list[float] | None = No
     return out
 
 
-def __test_helper_reference(name: str):
+def __test_helper_reference(name: str) -> Callable[..., float]:
     """The pure-Python original (the public name may be the compiled twin)."""
     return getattr(fdlibm, 'PYTHON_IMPLEMENTATIONS', {}).get(name, getattr(fdlibm, name))
 
@@ -151,8 +152,9 @@ def __test_native_fdlibm_matches_python__(name):
     assert not bad, f'{name}: {len(bad)} of {len(args)} differ, e.g. {bad[:5]}'
 
 
-def __test_native_fdlibm_pow_matches_python__():
-    """The native ``pow`` agrees with the Python port bit for bit"""
+@pytest.mark.parametrize('name', ('pow', 'pow_no_tail'))
+def __test_native_fdlibm_pow_matches_python__(name):
+    """The native ``pow`` and ``pow_no_tail`` agree with the Python port bit for bit"""
     __test_helper_require_native()
     count = __test_helper_count()
     args = __test_helper_arguments(count, 20261023)
@@ -162,11 +164,11 @@ def __test_native_fdlibm_pow_matches_python__():
     for x in args:
         near_one = 1.0 + rnd.uniform(-0.0625, 0.0625) * rnd.choice((1.0, 2.0 ** -20, 2.0 ** -45))
         bases.append(x if rnd.random() < 0.5 else near_one)
-    reference = __test_helper_reference('pow')
+    reference = __test_helper_reference(name)
     want = [reference(x, y) for x, y in zip(bases, exps)]
-    bad = __test_helper_mismatches(__test_helper_native('pow', bases, exps), want,
+    bad = __test_helper_mismatches(__test_helper_native(name, bases, exps), want,
                                    list(zip(bases, exps)))
-    assert not bad, f'pow: {len(bad)} of {len(bases)} differ, e.g. {bad[:5]}'
+    assert not bad, f'{name}: {len(bad)} of {len(bases)} differ, e.g. {bad[:5]}'
 
 
 def __test_helper_embed_values(count: int, seed: int) -> list[float]:

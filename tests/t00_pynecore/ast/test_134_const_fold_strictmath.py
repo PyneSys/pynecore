@@ -5,7 +5,9 @@ TradingView's parser folds them.
 MEASURED on TradingView (CAPITALCOM:EURUSD 60, last bar), each value compared against an
 exact literal reference below 1e-3, where the embedding is not quantized: a constant call
 embeds the StrictMath (fdlibm) double, while the same call on a series argument returns the
-Intel-LIBM double the runtime reproduces. The parser's ``log10`` is
+Intel-LIBM double the runtime reproduces. The parser's ``pow`` is StrictMath's without the
+tail of the reduced exponent, one ulp off it where that tail moves the last rounding
+(``pow(10, -4)`` is 9.999999999999999e-05, StrictMath's 1e-4). The parser's ``log10`` is
 ``StrictMath.log(x) / StrictMath.log(10)`` (8/8 arguments where that, the product with
 ``1 / log(10)`` and ``StrictMath.log10`` all differ). A constant ``%`` is the truncated
 remainder like a series one: ``-7 % 3`` is -1, ``7 % -3`` is 1, ``-7.5 % 2`` is -1.5.
@@ -23,7 +25,7 @@ import pytest
 
 from pynecore.core import fdlibm, pine_math
 from pynecore.lib import math as lib_math
-from pynecore.transformers.const_fold import ConstFoldTransformer
+from pynecore.transformers.const_fold import ConstFoldTransformer, quantize_embed
 from pynecore.transformers.pine_type_rules import INT, get_ty
 
 # StrictMath values (JDK 8 x86_64 and JDK 21): the fdlibm port reproduces them bit for bit
@@ -77,6 +79,58 @@ _VENUE_CONSTANTS = (
     ('pow', '0.0286, 3.0', 2.3393656e-05),
 )
 
+# The constant pow calls measured on TradingView where the venue's double is not
+# StrictMath's (probes roundconst7/8 and pw1-pw7, CAPITALCOM:EURUSD 60, 2026-10-31). Equal
+# products y * log2(x) embed the same double: pow(10, -4), pow(1e8, -0.5), pow(100, -2) and
+# pow(1e16, -0.25). Negative bases, the |y| > 2**31 path of bases next to one, subnormal
+# and huge results drop the tail all the same.
+_PARSER_POW = (
+    (10.0, 3.5, 3162.277660168379),
+    (10.0, -4.0, 9.999999999999999e-05),
+    (10.0, 7.7, 50118723.362727255),
+    (10.0, 3.75, 5623.41325190349),
+    (10.0, -6.9492, 1.1240871934697294e-07),
+    (10.0, -12.11, 7.762471166286928e-13),
+    (10.0, -5.3012, 4.9980431357823956e-06),
+    (10.0, -5.598, 2.5234807724805758e-06),
+    (100000000.0, -0.5, 9.999999999999999e-05),
+    (10.0, -11.0, 1e-11),
+    (10.0, -23.0, 1.0000000000000001e-23),
+    (5.0, -17.8107, 3.5551255601153003e-13),
+    (6.0, -13.685, 2.2438826393740117e-11),
+    (2.5, -10.89, 4.6390954209948444e-05),
+    (20.0, -6.3173, 6.039530911209967e-09),
+    (20.0, -10.652, 1.3849321150303411e-14),
+    (20.0, -2.7513, 0.000263315347475703),
+    (7.0, -15.52, 7.657348603941436e-14),
+    (1.1, -315.6631, 8.587300993670791e-14),
+    (0.07, 10.005, 2.7874423261898983e-12),
+    (1.7, -50.5556, 2.2362302108160535e-12),
+    (2.0, -23.1334, 1.0868076789460136e-07),
+    (2.0, -32.7482, 1.3861476594977307e-10),
+    (2.0, -20.8738, 5.204273075281934e-07),
+    (2.0, -11.757, 0.00028892847210756136),
+    (100.0, -2.0, 9.999999999999999e-05),
+    (1e+16, -0.25, 9.999999999999999e-05),
+    (100.0, 1.75, 3162.277660168379),
+    (100000000000000.0, 0.25, 3162.277660168379),
+    (10000000000.0, 0.77, 50118723.362727255),
+    (-36.0, -15.0, -4.5233739070769964e-24),
+    (-54.3, 11.0, -1.2100355380322263e+19),
+    (-48.54, -4.0, 1.8013616475160188e-07),
+    (-40.0, -11.0, -2.384185791015625e-18),
+    (0.999999999562533, -70588518506.0, 25767729031418.562),
+    (1.0000000005402399, -188973603330.0, 4.596327229381187e-45),
+    (1.000000000435648, -262015666165.0, 2.6715629043993666e-50),
+    (1.0000000001055014, -292784380502.0, 3.845999570327458e-14),
+    (351.2, 11.644, 4.369549687753981e+29),
+    (35.48, 161.293, 1.0034750868428818e+250),
+    (72.2, -16.0, 1.834023258213995e-30),
+    (159.65, -32.7054, 8.799927817062741e-73),
+    (44.95, -6.2693, 4.350525478732898e-11),
+    (203.855, -19.04, 1.0728059017174899e-44),
+)
+
 
 def __test_helper_fold(source: str) -> ast.Module:
     return ConstFoldTransformer().visit(ast.parse(source))
@@ -103,6 +157,13 @@ def __test_fdlibm_port_is_strictmath__(name, x, y, expected):
 @pytest.mark.parametrize('name,arguments,expected', _VENUE_CONSTANTS)
 def __test_constant_call_embeds_the_venue_double__(name, arguments, expected):
     assert __test_helper_folded_value(f'lib.math.{name}({arguments})') == expected
+
+
+@pytest.mark.parametrize('x,y,expected', _PARSER_POW)
+def __test_constant_pow_drops_the_tail_of_the_reduced_exponent__(x, y, expected):
+    """a constant ``math.pow`` embeds the parser's double where StrictMath's differs"""
+    assert __test_helper_folded_value(f'lib.math.pow({x!r}, {y!r})') == expected
+    assert quantize_embed(fdlibm.pow(x, y)) != expected
 
 
 def __test_series_and_constant_calls_differ_where_measured__():
@@ -210,7 +271,8 @@ def __test_series_integer_round_compares_the_exact_fraction__():
     ('7', '2', 7.0), ('2.34567', '38 / 1000', 2.748661470365999),
     ('123.456789', '38 / 1000', 123.68976616646995), ('2.34567', '361 / 1000', 2.177559368427843),
     ('4.006', '6 / 5', 4.038127004673237), ('6.3712', '3 / 2', 6.387800873540127),
-    ('4.211', '27 / 10', 4.211998746899304),
+    ('4.211', '27 / 10', 4.211998746899304), ('2.4076', '7 / 2', 2.4077582104522044),
+    ('7.367', '7 / 2', 7.367158264894274),
 ])
 def __test_constant_round_to_a_precision_rounds_twice__(number, precision, expected):
     """a constant ``math.round(number, precision)`` rounds the number to 15 decimal places,

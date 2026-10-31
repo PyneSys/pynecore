@@ -1,5 +1,6 @@
 //! Port of `core/fdlibm.py`: fdlibm 5.3 sin/cos/tan/exp/log/pow/asin/acos/atan, the
-//! StrictMath doubles TradingView's parser folds constant expressions with.
+//! StrictMath doubles TradingView's parser folds constant expressions with, and the
+//! parser's own `pow_no_tail`.
 //!
 //! Ported from the SunSoft fdlibm sources (netlib.org/fdlibm) by way of the Python
 //! port, which carry the following notice that must be preserved:
@@ -976,6 +977,20 @@ fn div(a: f64, b: f64) -> f64 {
 }
 
 pub fn pow(x: f64, y: f64) -> f64 {
+    pow_impl(x, y, true)
+}
+
+/// `pow` without the tail of the reduced exponent.
+///
+/// `pow` reduces `y * log2(x)` to `n + z / ln2` with `z` split into a double and its
+/// rounding error `w`, and returns `2**n * exp(z + w)`. This variant drops `w` and
+/// returns `2**n * exp(z)`: the same log2, specials and scaling, a result one ulp
+/// apart where `w` moves the last rounding.
+pub fn pow_no_tail(x: f64, y: f64) -> f64 {
+    pow_impl(x, y, false)
+}
+
+fn pow_impl(x: f64, y: f64, tail: bool) -> f64 {
     let hx = hi(x);
     let lx = lo(x);
     let hy = hi(y);
@@ -1195,7 +1210,10 @@ pub fn pow(x: f64, y: f64) -> f64 {
     let w = v - (z - u);
     let t = z * z;
     let t1 = z - t * (EP1 + t * (EP2 + t * (EP3 + t * (EP4 + t * EP5))));
-    let r = (z * t1) / (t1 - 2.0) - (w + z * w);
+    let mut r = (z * t1) / (t1 - 2.0);
+    if tail {
+        r -= w + z * w;
+    }
     z = 1.0 - (r - z);
     let j = hi(z) + (n << 20);
     if (j >> 20) <= 0 {
@@ -1217,6 +1235,8 @@ mod tests {
         assert_eq!(exp(1.0), 2.7182818284590455);
         assert_eq!(log(1.0), 0.0);
         assert_eq!(pow(2.0, 10.0), 1024.0);
+        assert_eq!(pow(10.0, -4.0), 1e-4);
+        assert_eq!(pow_no_tail(10.0, -4.0), 9.999999999999999e-05);
         assert_eq!(atan(f64::INFINITY), std::f64::consts::FRAC_PI_2);
         assert!(asin(2.0).is_nan());
         assert_eq!(ldexp(1.0, -1074), f64::from_bits(1));

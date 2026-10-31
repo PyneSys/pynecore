@@ -30,9 +30,9 @@ fn packed<'py>(py: Python<'py>, values: impl Iterator<Item = f64>) -> Bound<'py,
 
 /// One public function of the native fdlibm port over packed arguments.
 ///
-/// :param name: The `core.fdlibm` name (`sin`, ..., `pow`).
+/// :param name: The `core.fdlibm` name (`sin`, ..., `pow`, `pow_no_tail`).
 /// :param x: The arguments, packed float64.
-/// :param y: The exponents of `pow`, packed float64, as many as `x`.
+/// :param y: The exponents of `pow` and `pow_no_tail`, packed float64, as many as `x`.
 /// :return: The results, packed float64.
 #[pyfunction]
 #[pyo3(name = "_fdlibm", signature = (name, x, y=None))]
@@ -43,12 +43,17 @@ pub fn fdlibm_call<'py>(
     y: Option<&[u8]>,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let x = doubles(x)?;
-    if name == "pow" {
+    let binary: Option<fn(f64, f64) -> f64> = match name {
+        "pow" => Some(fdlibm::pow),
+        "pow_no_tail" => Some(fdlibm::pow_no_tail),
+        _ => None,
+    };
+    if let Some(function) = binary {
         let y = doubles(y.ok_or_else(|| PyValueError::new_err("pow takes exponents"))?)?;
         if y.len() != x.len() {
             return Err(PyValueError::new_err("as many exponents as bases"));
         }
-        return Ok(packed(py, x.iter().zip(&y).map(|(&x, &y)| fdlibm::pow(x, y))));
+        return Ok(packed(py, x.iter().zip(&y).map(|(&x, &y)| function(x, y))));
     }
     let function: fn(f64) -> f64 = match name {
         "sin" => fdlibm::sin,

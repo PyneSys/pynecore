@@ -16,15 +16,16 @@ Python floats are IEEE binary64 and Python arithmetic maps 1:1 onto the C
 double operations, so the port is bit-exact by construction; it is verified
 against Java StrictMath (the same fdlibm lineage) over millions of arguments.
 
-``tan``, ``log`` and ``pow`` serve the parse-time constant fold only (see
-``transformers.const_fold``): at runtime the venue computes them with its Intel-LIBM
-intrinsics, so they have no compiled twin in ``_native_math``.
+``tan``, ``log`` and ``pow_no_tail``, the parser's variant of ``pow``, serve the
+parse-time constant fold only (see ``transformers.const_fold``): at runtime the venue
+computes them with its Intel-LIBM intrinsics, so they have no compiled twin in
+``_native_math``.
 """
 import math as _math
 import os as _os
 from struct import pack as _pack, unpack as _unpack
 
-__all__ = ['sin', 'cos', 'exp', 'asin', 'acos', 'atan', 'log', 'tan', 'pow']
+__all__ = ['sin', 'cos', 'exp', 'asin', 'acos', 'atan', 'log', 'tan', 'pow', 'pow_no_tail']
 
 _M32 = 0xFFFFFFFF
 
@@ -790,6 +791,22 @@ def _div(a: float, b: float) -> float:
 
 # noinspection shadowing-builtins
 def pow(x: float, y: float) -> float:
+    return _pow(x, y, True)
+
+
+def pow_no_tail(x: float, y: float) -> float:
+    """
+    ``pow`` without the tail of the reduced exponent.
+
+    ``pow`` reduces ``y * log2(x)`` to ``n + z / ln2`` with ``z`` split into a double
+    and its rounding error ``w``, and returns ``2**n * exp(z + w)``. This variant drops
+    ``w`` and returns ``2**n * exp(z)``: the same log2, specials and scaling, a result
+    one ulp apart where ``w`` moves the last rounding.
+    """
+    return _pow(x, y, False)
+
+
+def _pow(x: float, y: float, tail: bool) -> float:
     hx = _hi(x)
     lx = _lo(x)
     hy = _hi(y)
@@ -956,7 +973,9 @@ def pow(x: float, y: float) -> float:
     w = v - (z - u)
     t = z * z
     t1 = z - t * (_EP1 + t * (_EP2 + t * (_EP3 + t * (_EP4 + t * _EP5))))
-    r = (z * t1) / (t1 - 2.0) - (w + z * w)
+    r = (z * t1) / (t1 - 2.0)
+    if tail:
+        r -= w + z * w
     z = 1.0 - (r - z)
     j = _hi(z) + (n << 20)
     if (j >> 20) <= 0:
