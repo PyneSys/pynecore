@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 
+use pyne_ast::dump::shortest_digits;
 use pyne_ast::{
     Ast, BoolOperator, CmpOperator, Constant, Int, Kind, NodeId, Operator, UnaryOperator,
     Unsupported,
@@ -90,12 +91,8 @@ pub fn py_float_repr(value: f64) -> String {
     if magnitude == 0.0 {
         return format!("{sign}0.0");
     }
-    // ``{:e}`` writes the shortest round-trip digits as ``d.ddde<exp>``
-    let scientific = format!("{magnitude:e}");
-    let (mantissa, exponent) = scientific.split_once('e').expect("exponent");
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let exponent: i32 = exponent.parse().expect("exponent digits");
-    let decpt = exponent + 1;
+    let (digits, decpt) = shortest_digits(magnitude);
+    let exponent = decpt - 1;
     if decpt <= -4 || decpt > 16 {
         let rest = &digits[1..];
         let point = if rest.is_empty() { String::new() } else { format!(".{rest}") };
@@ -1006,6 +1003,7 @@ mod tests {
         assert_eq!(round("1e-5"), "1e-05");
         assert_eq!(round("0.0001"), "0.0001");
         assert_eq!(round("1.5"), "1.5");
+        assert_eq!(round("1452635759377422.25"), "1452635759377422.2");
         assert_eq!(round("\"it's\""), "\"it's\"");
         assert_eq!(round("'a\\nb'"), "'a\\nb'");
         assert_eq!(round("'Ended \u{b7} '"), "'Ended \u{b7} '");

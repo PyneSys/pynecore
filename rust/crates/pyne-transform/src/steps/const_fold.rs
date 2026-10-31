@@ -14,6 +14,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
+use pyne_ast::dump;
 use pyne_ast::walk::{Transformer, Visited, copy_location, generic_visit, walk};
 use pyne_ast::{
     Ast, Category, Constant, ExprContext, FieldRef, Int, Kind, NodeId, Operator, UnaryOperator,
@@ -64,12 +65,9 @@ const POW10: [u64; 4] = [1, 10, 100, 1000];
 /// The shortest decimal digits of a positive finite double (Python's `repr`), as
 /// `(digits, exponent)` with `value == digits * 10**exponent`.
 fn shortest_digits(magnitude: f64) -> (u64, i32) {
-    let text = format!("{magnitude:e}");
-    let (mantissa, exponent) = text.split_once('e').expect("an exponent");
-    let exponent: i32 = exponent.parse().expect("a decimal exponent");
-    let (head, tail) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    let digits: u64 = format!("{head}{tail}").parse().expect("at most 17 digits");
-    (digits, exponent - tail.len() as i32)
+    let (digits, point) = dump::shortest_digits(magnitude);
+    let exponent = point - digits.len() as i32;
+    (digits.parse().expect("at most 17 digits"), exponent)
 }
 
 /// How the exact binary value of a positive normal double compares with

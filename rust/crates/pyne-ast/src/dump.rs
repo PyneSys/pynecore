@@ -222,12 +222,66 @@ pub fn constant(value: &Constant, out: &mut String) {
 
 /// The shortest round-trip digits and the decimal exponent of a finite non-zero
 /// `|value|`, as `(digits, exponent)` with the value `0.digits * 10^exponent`.
-fn shortest(value: f64) -> (String, i32) {
-    // ``{:e}`` writes the shortest digits that round-trip: ``d.ddde<exp>``
-    let text = format!("{:e}", value.abs());
+///
+/// Among equally short spellings the nearest one wins, and an exact tie between
+/// the two nearest goes to the even last digit, as in `dtoa` mode 0 that
+/// `repr(float)` uses (`25767729031418.5625` is written `25767729031418.562`).
+pub fn shortest_digits(value: f64) -> (String, i32) {
+    let magnitude = value.abs();
+    // ``{:e}`` writes the shortest digits that round-trip: ``d.ddde<exp>``; of two
+    // equally near ones it takes the upper
+    let (digits, exponent) = scientific(&format!("{magnitude:e}"));
+    let length = digits.len();
+    // A tie leaves exactly one 5 past the shortest digits; one more digit,
+    // rounded, ends in 5 whenever it can be one
+    let (closer, _) = scientific(&format!("{magnitude:.length$e}"));
+    if !closer.ends_with('5') {
+        return (digits, exponent);
+    }
+    // Every double is a finite decimal of at most 767 significant digits
+    let (exact, exact_exponent) = scientific(&format!("{magnitude:.767e}"));
+    let exact = exact.trim_end_matches('0');
+    if exact.len() != length + 1 || !exact.ends_with('5') {
+        return (digits, exponent);
+    }
+    let lower = &exact[..length];
+    let (upper, upper_exponent) = increment(lower, exact_exponent);
+    let reads_back =
+        |candidate: &str, at: i32| format!("0.{candidate}e{at}").parse::<f64>() == Ok(magnitude);
+    let even = |candidate: &str| candidate.as_bytes()[candidate.len() - 1].is_multiple_of(2);
+    if even(lower) && reads_back(lower, exact_exponent) {
+        let lower = lower.trim_end_matches('0');
+        return (lower.to_string(), exact_exponent);
+    }
+    if even(&upper) && reads_back(&upper, upper_exponent) {
+        let upper = upper.trim_end_matches('0');
+        return (upper.to_string(), upper_exponent);
+    }
+    (digits, exponent)
+}
+
+/// The digits of a ``d.ddde<exp>`` spelling and its exponent as
+/// ``0.digits * 10^exponent``.
+fn scientific(text: &str) -> (String, i32) {
     let (mantissa, exponent) = text.split_once('e').unwrap();
     let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
     (digits, exponent.parse::<i32>().unwrap() + 1)
+}
+
+/// ``0.digits * 10^exponent`` one unit up in its last digit, carried.
+fn increment(digits: &str, exponent: i32) -> (String, i32) {
+    let mut bytes = digits.as_bytes().to_vec();
+    for byte in bytes.iter_mut().rev() {
+        if *byte == b'9' {
+            *byte = b'0';
+        } else {
+            *byte += 1;
+            return (String::from_utf8(bytes).unwrap(), exponent);
+        }
+    }
+    bytes.insert(0, b'1');
+    bytes.pop();
+    (String::from_utf8(bytes).unwrap(), exponent + 1)
 }
 
 /// `repr(float)`: the shortest round-trip digits, positional while the decimal
@@ -252,7 +306,7 @@ fn float_format(value: f64, add_point: bool) -> String {
     if value == 0.0 {
         return format!("{sign}0{}", if add_point { ".0" } else { "" });
     }
-    let (digits, point) = shortest(value);
+    let (digits, point) = shortest_digits(value);
     // Python's ``repr`` switches to scientific outside 1e-4 <= |x| < 1e16
     let exponent = point - 1;
     let mut out = String::from(sign);
@@ -373,6 +427,9 @@ mod tests {
             (1e-10, "1e-10"),
             (2.5e300, "2.5e+300"),
             (f64::INFINITY, "inf"),
+            (25767729031418.5625, "25767729031418.562"),
+            (0.5, "0.5"),
+            (9.5, "9.5"),
         ] {
             assert_eq!(float_repr(value), text, "{value}");
         }
