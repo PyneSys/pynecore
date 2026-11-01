@@ -6597,7 +6597,7 @@ class OrderSyncEngine:
             # single parent can be recovered (no bracket, or pyramided
             # multi-parent position).
             adopted_entry_id = (
-                self._recover_adopted_parent_entry_id()
+                self._recover_adopted_parent_entry_id(broker_signed)
                 or ADOPTED_STARTUP_ENTRY_ID
             )
             self._position.reconstruct_parent_trade(
@@ -14841,7 +14841,7 @@ class OrderSyncEngine:
             by_id[entry_id] = by_id.get(entry_id, 0.0) + (size if want_buy else -size)
         return list(by_id.items())
 
-    def _recover_adopted_parent_entry_id(self) -> str | None:
+    def _recover_adopted_parent_entry_id(self, broker_signed: float) -> str | None:
         """Recover the single real Pine parent entry id for a startup adoption.
 
         When startup adoption seeds the FIFO parent trade for a position opened
@@ -14855,14 +14855,22 @@ class OrderSyncEngine:
 
         Recover the parent id from the durable broker-side ledgers that persist
         the real ``from_entry``: the one-way bracket-ownership rows (the same rows
-        :meth:`_reconstruct_one_way_bracket_exits` rebuilds the exit from) AND the
+        :meth:`_reconstruct_one_way_bracket_exits` rebuilds the exit from), the
         engine-trigger partial-leg ledger (already rehydrated by
-        ``restart_replay`` in ``__init__``). Return the id only when every active
-        record agrees on a single parent: a pyramided position carries several
-        distinct ``from_entry`` parents that cannot be collapsed into one seeded
-        trade, so fall back to the synthetic id there (a degraded but safe state —
-        the bracket is still preserved, only dynamic re-targeting by a specific
-        parent id is lost). Returns ``None`` when no parent can be recovered.
+        ``restart_replay`` in ``__init__``) AND the run's live entry rows that
+        still hold exposure on the adopted side. The entry rows name their
+        entry even where :meth:`_recover_adopted_parent_trades` cannot use their
+        quantities (a row journaled in a venue wire unit, or a durable sum the
+        adopted net disagrees with): the parent's identity does not depend on
+        the unit. Return the id only when every record agrees on a single
+        parent: a pyramided position carries several distinct ``from_entry``
+        parents that cannot be collapsed into one seeded trade, so fall back to
+        the synthetic id there (a degraded but safe state — the bracket is
+        still preserved, only dynamic re-targeting by a specific parent id is
+        lost). Returns ``None`` when no parent can be recovered.
+
+        :param broker_signed: The adopted signed size; only entry rows on its
+            side name a parent of it.
 
         Pure-local: read-only over the persisted ledger and the in-memory legs.
         """
@@ -14894,6 +14902,17 @@ class OrderSyncEngine:
                 continue
             if leg.from_entry:
                 parents.add(leg.from_entry)
+        want_buy = broker_signed > 0.0
+        for row in self._store_ctx.iter_live_orders():
+            filled = row.filled_qty
+            extras = row.extras or {}
+            if (filled <= 0.0 or extras.get(ADOPTED_STARTUP_EXTRA_KEY)
+                    or filled - _retired_exposure(extras, filled) <= 0.0):
+                continue
+            entry_id = row.pine_entry_id
+            if (entry_id and entry_id != ADOPTED_STARTUP_ENTRY_ID
+                    and (row.side == 'buy') == want_buy):
+                parents.add(entry_id)
         if len(parents) == 1:
             return next(iter(parents))
         return None
@@ -15109,6 +15128,79 @@ class OrderSyncEngine:
                 "the bot re-asserts it on the venue",
                 format_intent_key(key), tp_price, sl_price,
             )
+
+    def _cancel_untracked_journal_legs(self, key: str, intent: ExitIntent) -> bool:
+        """Cancel the venue legs of an earlier dispatch of this exit before it goes out afresh.
+
+        A Pine exit replaces its previous order of the same id. After a
+        restart the previous process's legs of the exit can still rest on
+        the venue as journal rows the engine does not track: the restarted
+        script declares the exit again on a later signal, the diff finds no
+        mapping and dispatches a fresh bracket. The old legs and the new
+        ones would then rest together: two exits over one parent, which a
+        reduce-only venue answers by refusing the new leg (Bybit truncates
+        it to zero and the parent is closed defensively). Those legs are
+        cancelled here, through the regular cancel path, so their
+        ``CANCELLED`` pushes are the engine's own, and the fresh bracket goes
+        out only once the cancel settled.
+
+        Only whole-row TP / SL leg rows of the same exit id and parent
+        count, and only the ones the engine does not track: a mapped
+        order, an order whose cancel this process already sent, a dispatch
+        parked for verification, and the legs of the journaled dispatch the
+        fresh one goes out under again (same client order ids, which the
+        venue answers with those very legs) are left alone.
+
+        :return: Whether the fresh dispatch may go out now: ``False`` while
+            the cancel has not settled (it is retried every sync, and the
+            diff defers the key) or could not go out.
+        """
+        if self._store_ctx is None or intent.from_entry is None:
+            return True
+        tracked = set(self._strategy_cancel_expected_ids)
+        for ids in self._order_mapping.values():
+            tracked.update(ids)
+        reused: set[str] = set()
+        envelope = self._envelopes.get(key)
+        anchor = self._persisted_envelope_anchors.get(key)
+        if envelope is None and anchor is not None:
+            envelope = DispatchEnvelope(
+                intent=intent, run_tag=anchor.run_tag or self._run_tag,
+                bar_ts_ms=anchor.bar_ts_ms, retry_seq=anchor.retry_seq,
+                coid_max_len=self._coid_max_len,
+            )
+        if envelope is not None:
+            reused = {envelope.client_order_id(KIND_EXIT_TP),
+                      envelope.client_order_id(KIND_EXIT_SL)}
+        refs: list[str] = []
+        for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+            ref = row.exchange_order_id or row.client_order_id
+            if (row.from_entry != intent.from_entry or ref in tracked
+                    or row.client_order_id in reused
+                    or row.client_order_id in self._pending_verification):
+                continue
+            leg = self._journal_exit_leg(row)
+            if leg is not None and leg[0] == intent.pine_id:
+                refs.append(ref)
+        if not refs:
+            return True
+        _blog_info(
+            "exit %s goes out afresh: cancelling the %d venue leg(s) an earlier "
+            "dispatch of it left first",
+            format_intent_key(key), len(refs),
+        )
+        self._order_mapping[key] = refs
+        try:
+            settled = self._dispatch_cancel(intent)
+        except ExchangeConnectionError as e:
+            # Parked as a forced cancel already: the per-sync retry re-drives
+            # it, and the diff defers the key until it lands.
+            _blog_warning(
+                "cancel of the earlier legs of exit %s did not go out (%s); the "
+                "fresh exit waits until it lands", format_intent_key(key), e,
+            )
+            return False
+        return settled
 
     @staticmethod
     def _journal_exit_leg(row: OrderRow) -> tuple[str, tuple[str, int]] | None:
@@ -16829,6 +16921,9 @@ class OrderSyncEngine:
                         # would otherwise re-dispatch it on every venue event.
                         # The next bar — or the wall-clock cap on a slow
                         # chart — retries against the settled book.
+                        continue
+                    if (isinstance(intent, ExitIntent)
+                            and not self._cancel_untracked_journal_legs(key, intent)):
                         continue
                     try:
                         self._dispatch_new(intent)

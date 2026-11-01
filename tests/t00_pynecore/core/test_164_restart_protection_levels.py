@@ -45,6 +45,7 @@ from pynecore.core.broker.software_partial_bracket_engine import PartialBracketL
 from pynecore.core.broker.storage import BrokerStore, RunContext
 from pynecore.core.broker.store_helpers import LEG_KIND_SL_PARTIAL, LEG_STATE_ARMED
 from pynecore.core.broker.sync_engine import OrderSyncEngine
+from pynecore.types.strategy import JOURNAL_WIRE_QTY_ANCHOR_EXTRA_KEY
 
 SYMBOL = "EURUSD"
 PLUGIN = "Mock"
@@ -76,6 +77,8 @@ class _Broker:
     exit_errors: list[Exception | None] = field(default_factory=list)
     """Outcome of each next ``execute_exit``, in order: raised, or ``None`` to land."""
     cancel_settles: bool = True
+    calls: list[str] = field(default_factory=list)
+    """The order of the ``execute_exit`` / ``execute_cancel`` calls."""
 
     @staticmethod
     def get_capabilities() -> ExchangeCapabilities:
@@ -100,6 +103,7 @@ class _Broker:
         return []
 
     async def execute_cancel(self, envelope):
+        self.calls.append("cancel")
         self.cancel_calls.append(envelope)
         return self.cancel_settles
 
@@ -569,6 +573,7 @@ class _JournalingBroker(_Broker):
     """The qty the venue rounded the legs to, as Bybit spot's lot step does."""
 
     async def execute_exit(self, envelope):
+        self.calls.append("exit")
         self.exit_calls.append(envelope)
         if self.exit_errors and (error := self.exit_errors.pop(0)) is not None:
             raise error
@@ -623,7 +628,8 @@ def _strategy_exit(engine: OrderSyncEngine) -> None:
 def _restart_with_a_journaled_exit(
         store: BrokerStore, *, refs: tuple[str, ...], resumed: bool, declared: bool = True,
         leg_keys: bool = False, trailing: bool = False, leg_qty: float | None = None,
-        cancelled: str | None = None,
+        cancelled: str | None = None, wire_qty: float | None = None,
+        forget_envelope: bool = False,
 ) -> tuple[RunContext, OrderSyncEngine, _JournalingBroker, DispatchEnvelope]:
     """The previous process dispatched the exit; the next one starts over it.
 
@@ -635,10 +641,18 @@ def _restart_with_a_journaled_exit(
     :param cancelled: The leg kind of the order the operator cancelled: its
         leg row is closed in the previous process. A cancelled take-profit is
         closed after the take-profit row of an earlier dispatch of the exit.
+    :param wire_qty: The entry row is journaled in this venue wire unit
+        quantity (inverse contracts), not in the position's base unit.
+    :param forget_envelope: The exit's dispatch anchor is gone from the
+        journal while its legs still rest on the venue.
     """
     first = _open_ctx(store)
-    first.upsert_order("row-l", symbol=SYMBOL, side="buy", qty=1.0, filled_qty=1.0,
-                       state="confirmed", pine_entry_id="L", extras={"kind": "position"})
+    entry_qty = 1.0 if wire_qty is None else wire_qty
+    entry_extras: dict = {"kind": "position"}
+    if wire_qty is not None:
+        entry_extras[JOURNAL_WIRE_QTY_ANCHOR_EXTRA_KEY] = "1.1"
+    first.upsert_order("row-l", symbol=SYMBOL, side="buy", qty=entry_qty, filled_qty=entry_qty,
+                       state="confirmed", pine_entry_id="L", extras=entry_extras)
     previous_broker = _JournalingBroker(position=_long(1.0), refs=refs, journal=first,
                                         leg_keys=leg_keys, trailing=trailing,
                                         leg_qty=leg_qty)
@@ -659,6 +673,8 @@ def _restart_with_a_journaled_exit(
         first.close_order(journaled.client_order_id(cancelled))
     if cancelled == KIND_EXIT_TP:
         first.close_order(earlier)
+    if forget_envelope:
+        first.record_complete(f"L-X{INTENT_KEY_SEP}L")
     if resumed:
         previous.record_quarantine("operator moved the stop-loss",
                                    kind=QuarantineKind.EXTERNAL_INTERVENTION)
@@ -792,6 +808,34 @@ def __test_a_resume_restores_the_cancelled_leg_of_an_undeclared_exit_over_the_fu
         ctx.close()
 
 
+def __test_a_resume_restores_the_cancelled_stop_of_an_entry_journaled_in_wire_units__(
+        tmp_path: Path) -> None:
+    """The adopted trade keeps its entry id when the journal's qty is in venue contracts.
+
+    Measured live: Bybit inverse cycle 311 -- the operator cancelled the stop,
+    resumed, and the adoption seeded the position under the synthetic entry id
+    (the contracts could not be summed against the base-unit net), so the
+    journal rebuild found no trade of ``L`` and the stop never came back.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx, engine, broker, journaled = _restart_with_a_journaled_exit(
+            store, refs=("xchg-tp", "xchg-sl"), resumed=True, declared=False,
+            cancelled=KIND_EXIT_SL, wire_qty=110_000.0)
+
+        assert [t.entry_id for t in engine._position.open_trades] == ["L"]  # noqa: SLF001
+        engine.sync(BAR_TS + 60_000, last_price=1.1000)
+
+        redispatched, rearmed = broker.exit_calls
+        assert (redispatched.client_order_id(KIND_EXIT_TP)
+                == journaled.client_order_id(KIND_EXIT_TP))
+        assert isinstance(rearmed.intent, ExitIntent)
+        assert (rearmed.intent.tp_price, rearmed.intent.sl_price) == (1.1200, 1.0900)
+        assert rearmed.intent.qty == 1.0
+        assert [e['mode'] for e in _events(ctx, 'resume_exit_reasserted')] == ['rearm']
+        assert store.open_quarantines() == []
+        ctx.close()
+
+
 @pytest.mark.parametrize("cancelled", [None, KIND_EXIT_SL], ids=["as-armed", "trail-cancelled"])
 def __test_a_resume_leaves_an_undeclared_trailing_exit_as_the_venue_shows_it__(
         tmp_path: Path, caplog: pytest.LogCaptureFixture, cancelled: str | None) -> None:
@@ -812,6 +856,50 @@ def __test_a_resume_leaves_an_undeclared_trailing_exit_as_the_venue_shows_it__(
         assert broker.exit_calls == [] and broker.cancel_calls == []
         assert any(r.levelno == logging.WARNING and "trailing exit" in r.getMessage()
                    for r in caplog.records)
+        ctx.close()
+
+
+@pytest.mark.parametrize("settles", [True, False], ids=["cancel-settles", "cancel-pending"])
+def __test_an_exit_declared_afresh_after_a_restart_replaces_the_legs_its_earlier_dispatch_left__(
+        tmp_path: Path, settles: bool) -> None:
+    """The old legs are cancelled first; the new bracket never rests beside them.
+
+    Measured live: Bybit inverse cycle 312 -- the previous cycle's take-profit
+    of ``L-X`` still rested when the restarted script declared ``L-X`` again on
+    a new signal; the fresh take-profit went out beside it, the venue
+    truncated the reduce-only leg to zero and the parent was closed
+    defensively.
+    """
+    from pynecore.lib.strategy import Order, _order_type_close
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx, engine, broker, _journaled = _restart_with_a_journaled_exit(
+            store, refs=("xchg-tp", "xchg-sl"), resumed=False, declared=False,
+            forget_envelope=True)
+        broker.cancel_settles = settles
+        engine.sync(BAR_TS + 60_000, last_price=1.1000)
+        assert broker.calls == []
+
+        engine._position.exit_orders[("L-X", "L")] = Order(  # noqa: SLF001
+            "L", -1.0, order_type=_order_type_close, exit_id="L-X",
+            limit=1.1300, stop=1.0950,
+        )
+        engine.sync(BAR_TS + 120_000, last_price=1.1000)
+
+        assert [c.intent.pine_id for c in broker.cancel_calls] == ["L-X"]
+        if not settles:
+            assert broker.calls == ["cancel"], "no fresh bracket beside the live legs"
+            ctx.close()
+            return
+        assert broker.calls == ["cancel", "exit"]
+        fresh = broker.exit_calls[0].intent
+        assert isinstance(fresh, ExitIntent)
+        assert (fresh.tp_price, fresh.sl_price) == (1.1300, 1.0950)
+        assert fresh.qty == 1.0
+        assert not engine.quarantined
+
+        engine.sync(BAR_TS + 180_000, last_price=1.1000)
+        assert broker.calls == ["cancel", "exit"], "once only"
         ctx.close()
 
 

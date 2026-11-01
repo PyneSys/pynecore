@@ -15021,7 +15021,7 @@ def __test_recover_adopted_parent_entry_id_from_partial_legs__(tmp_path):
             broker=_software_partial_broker(), position=BrokerPosition(),  # type: ignore[arg-type]
             symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
         )
-        assert engine._recover_adopted_parent_entry_id() == "L"  # type: ignore[attr-defined]
+        assert engine._recover_adopted_parent_entry_id(1.0) == "L"  # type: ignore[attr-defined]
 
 
 def __test_restart_reconstructs_partial_bracket_exit__(tmp_path):
