@@ -1225,7 +1225,7 @@ class ScriptRunner:
                  '_signal_rate_sources_fn', '_sec_begin_bar_fn', '_sec_end_bar_fn',
                  '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
                  '_engine_event_stream_future', '_quarantine_resume_watch_future',
-                 '_broker_stop_settle_s', 'broker_stop_settled',
+                 '_broker_stop_settle_s', 'broker_stop_settled', '_broker_stop_settle_ran',
                  '_broker_store_ctx', '_log_ohlcv', '_price_decimals',
                  '_round_decimals', '_lossless_volume', '_lossless_prices',
                  '_config_dir', '_symbol_map', '_script_timeframe',
@@ -1469,6 +1469,7 @@ class ScriptRunner:
         # Whether the stop wait saw every dispatched market order filled; None
         # when the run was not stopped (or has no broker, or no wait was asked)
         self.broker_stop_settled: bool | None = None
+        self._broker_stop_settle_ran = False
         self.broker_balance: dict[str, float] | None = None
         # Identities of open SimPosition trades already announced via
         # ``[SIM]`` logging — so each fill is narrated once in paper mode.
@@ -1943,23 +1944,37 @@ class ScriptRunner:
                 "the next run reconciles them from the venue", exc,
             )
 
-    def _settle_broker_stop(self) -> None:
+    def settle_broker_stop(self) -> None:
         """Ingest the fills of already-dispatched market orders at a stop.
 
         Runs while the run is unwinding from :class:`KeyboardInterrupt`, BEFORE
         the teardown stops the broker event stream: the fills arrive through
         that stream, and the position, the journal and the trade output must
-        still be open to take them. A repeated stop during the wait ends it
-        early; the teardown then proceeds and the next run reconciles the
+        still be open to take them. A stop that lands inside the live stream
+        unwinds through the stream's own teardown first, which disconnects the
+        provider, so the stream calls this before it (see the ``on_interrupt``
+        of :func:`~pynecore.core.live_runner.live_ohlcv_generator`); the run's
+        own unwinding then finds the stop settled and does nothing.
+
+        A repeated stop during the wait ends it early, and so does a lost broker
+        connection; the teardown then proceeds and the next run reconciles the
         order from the venue.
         """
-        if self._order_sync_engine is None or self._broker_stop_settle_s <= 0.0:
+        if (self._order_sync_engine is None or self._broker_stop_settle_s <= 0.0
+                or self._broker_stop_settle_ran):
             return
+        self._broker_stop_settle_ran = True
         engine = cast('OrderSyncEngine', self._order_sync_engine)
         try:
             self.broker_stop_settled = engine.settle_in_flight_fills(self._broker_stop_settle_s)
         except KeyboardInterrupt:
             self.broker_stop_settled = False
+        except ExchangeConnectionError as exc:
+            broker_warning(
+                "the stop could not settle the broker events (%s); the next run "
+                "reconciles them from the venue", exc,
+            )
+            self.broker_stop_settled = not engine.awaiting_market_fills()
 
     @property
     def quarantine_resume_restart(self) -> bool:
@@ -4101,7 +4116,7 @@ class ScriptRunner:
             pass
 
         except KeyboardInterrupt:
-            self._settle_broker_stop()
+            self.settle_broker_stop()
             raise
 
         except BrokerManualInterventionError:

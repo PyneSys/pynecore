@@ -1814,6 +1814,10 @@ def run(
                     # real cause here, not be masked by start_broker()'s
                     # reconcile ("live connection not established").
                     raise_on_connect_failure=broker_plugin is not None,
+                    # A stop landing in the bar wait settles the in-flight fills
+                    # before the stream's teardown disconnects the provider
+                    on_interrupt=(runner.settle_broker_stop
+                                  if broker_plugin is not None else None),
                 )
                 runner.ohlcv_iter = itertools.chain(runner.ohlcv_iter, live_iter)
 

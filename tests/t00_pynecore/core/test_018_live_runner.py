@@ -175,6 +175,27 @@ def __test_live_generator_propagates_interrupt_after_teardown__():
     assert not provider.is_connected
 
 
+def __test_live_generator_runs_on_interrupt_before_the_teardown__():
+    """An interrupt landing inside the iterator runs ``on_interrupt`` while the
+    provider is still connected, then tears down and propagates.
+
+    Broker mode settles its in-flight fills in the hook; with a provider that is
+    also the broker the fills and the protective follow-up writes travel on the
+    connection the teardown closes (measured live: ctrader cycle 335, the
+    rotation stop left a filled entry without its exit)."""
+    provider = MockLiveProvider([_make_ohlcv(1000, is_closed=True)])
+    connected_at_hook: list[bool] = []
+    gen = live_ohlcv_generator(
+        provider, "BTC/USDT", "1D",
+        on_interrupt=lambda: connected_at_hook.append(provider.is_connected),
+    )
+    next(gen)
+    with pytest.raises(KeyboardInterrupt):
+        gen.throw(KeyboardInterrupt)
+    assert connected_at_hook == [True]
+    assert not provider.is_connected
+
+
 def __test_live_generator_empty_stream__():
     """live_ohlcv_generator emits LIVE_TRANSITION even for an empty stream"""
     provider = MockLiveProvider([])

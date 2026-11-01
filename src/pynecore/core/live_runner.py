@@ -44,7 +44,7 @@ import logging
 import sys
 import time
 import threading
-from collections.abc import Coroutine, Generator
+from collections.abc import Callable, Coroutine, Generator
 from datetime import datetime
 from queue import Queue, Empty, Full
 from typing import Any
@@ -503,6 +503,7 @@ def live_ohlcv_generator(
         event_loop: asyncio.AbstractEventLoop | None = None,
         engine_event_stream: Coroutine[Any, Any, Any] | None = None,
         raise_on_connect_failure: bool = False,
+        on_interrupt: Callable[[], None] | None = None,
 ) -> Generator[OHLCV, None, None]:
     """
     Bridge async watch_ohlcv() to a sync Generator[OHLCV, None, None].
@@ -550,6 +551,13 @@ def live_ohlcv_generator(
                                 failure. Data-only callers (and the security
                                 ``LiveBarStreamer``) leave it False and keep the
                                 surface-through-the-iterator behaviour.
+    :param on_interrupt: Called when a :class:`KeyboardInterrupt` (a signalled
+                         stop) lands inside the iterator, BEFORE the teardown
+                         disconnects the provider and ends the producer loop.
+                         Broker mode ingests the fills of its in-flight orders
+                         here: when the provider is also the broker, those
+                         fills and any follow-up write travel on the very
+                         connection the teardown closes.
     :return: Iterator yielding OHLCV objects (both closed and intra-bar) interleaved
              with a single ``LIVE_TRANSITION`` sentinel marking the warmup→live boundary.
     """
@@ -1700,6 +1708,8 @@ def live_ohlcv_generator(
             # iterator; swallowing it here made a signalled stop look like
             # a completed run.
             logger.info("Live streaming interrupted by user")
+            if on_interrupt is not None:
+                on_interrupt()
             raise
         finally:
             stop_event.set()

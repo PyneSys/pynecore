@@ -1006,6 +1006,39 @@ def __test_stop_gives_up_when_no_fill_arrives__(tmp_path):
     assert runner.broker_stop_settled is False
 
 
+def __test_stop_settled_by_the_live_stream_is_not_settled_again__(tmp_path):
+    """The live stream settles a stop before its teardown; the run's own
+    unwinding from the same stop then waits for nothing."""
+    runner, it, _ = _stopped_after_entry_dispatch(tmp_path, 5.0)
+    engine = runner._order_sync_engine
+    assert engine is not None
+    engine.on_order_event(_entry_fill(engine._order_mapping["L"][0]))
+    runner.settle_broker_stop()
+    assert runner.broker_stop_settled is True
+    calls: list[float] = []
+    engine.settle_in_flight_fills = lambda timeout_s: calls.append(timeout_s) or False
+    with pytest.raises(KeyboardInterrupt):
+        it.throw(KeyboardInterrupt)
+    assert calls == []
+    assert runner.broker_stop_settled is True
+
+
+def __test_stop_settle_survives_a_lost_broker_connection__(tmp_path):
+    """A connection loss while the stop settles (a follow-up write on a closed
+    wire) ends the wait instead of escaping the stop as a crash."""
+    runner, it, _ = _stopped_after_entry_dispatch(tmp_path, 5.0)
+    engine = runner._order_sync_engine
+    assert engine is not None
+
+    def lost(_timeout_s: float) -> bool:
+        raise ExchangeConnectionError("live connection not established")
+
+    engine.settle_in_flight_fills = lost
+    with pytest.raises(KeyboardInterrupt):
+        it.throw(KeyboardInterrupt)
+    assert runner.broker_stop_settled is False
+
+
 def __test_stop_without_a_settle_wait_does_not_wait__(tmp_path):
     """No wait asked for: the stop unwinds at once and reports nothing."""
     runner, it, _ = _stopped_after_entry_dispatch(tmp_path, 0.0)
