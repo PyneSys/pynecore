@@ -267,6 +267,11 @@ def main(
     config_dir = Path(workdir) / 'config'
     config_dir.mkdir(exist_ok=True)
 
+    # Config files can contain API keys and broker credentials.
+    gitignore_file = config_dir / '.gitignore'
+    if not gitignore_file.exists():
+        gitignore_file.write_text('*\n!.gitignore\n', encoding='utf-8')
+
     # Generate per-plugin config files for all installed plugins
     from ...core.plugin import discover_plugins
     from ...core.config import ensure_config
