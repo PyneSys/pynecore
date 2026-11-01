@@ -77,15 +77,31 @@ def _bound_names(nodes: list[ast.stmt]) -> set[str]:
     return bound
 
 
-def _is_export(node: ast.FunctionDef) -> bool:
+def export_names(module: ast.Module) -> frozenset[str]:
+    """The names a module calls the ``export`` decorator by.
+
+    :param module: The module to scan.
+    :return: ``export``, and every alias a ``from pynecore.core.pine_export
+             import export as <alias>`` binds.
+    """
+    names = {'export'}
+    for stmt in module.body:
+        if isinstance(stmt, ast.ImportFrom) and stmt.module == 'pynecore.core.pine_export':
+            names.update(alias.asname or alias.name for alias in stmt.names
+                         if alias.name == 'export')
+    return frozenset(names)
+
+
+def is_export(node: ast.FunctionDef | ast.AsyncFunctionDef, names: frozenset[str]) -> bool:
     """Whether a definition carries the ``@export`` decorator.
 
     :param node: The definition to check.
-    :return: True if any decorator is ``export`` or ``<mod>.export``.
+    :param names: The module's names of the decorator (:func:`export_names`).
+    :return: True if any decorator is one of ``names`` or ``<mod>.export``.
     """
     for decorator in node.decorator_list:
         target = decorator.func if isinstance(decorator, ast.Call) else decorator
-        if isinstance(target, ast.Name) and target.id == 'export':
+        if isinstance(target, ast.Name) and target.id in names:
             return True
         if isinstance(target, ast.Attribute) and target.attr == 'export':
             return True
@@ -101,8 +117,11 @@ class ExportOnceTransformer(ast_walk.NodeTransformer):
             if isinstance(stmt, ast.FunctionDef) and stmt.name == 'main':
                 main = stmt
                 break
-        if main is None or not any(isinstance(stmt, ast.FunctionDef) and _is_export(stmt)
-                                   for stmt in main.body):
+        if main is None:
+            return node
+        export_decorators = export_names(node)
+        if not any(isinstance(stmt, ast.FunctionDef) and is_export(stmt, export_decorators)
+                   for stmt in main.body):
             return node
 
         # A name the library binds anywhere ELSE in ``main`` stays out of the
@@ -113,7 +132,7 @@ class ExportOnceTransformer(ast_walk.NodeTransformer):
         # decorator registered is the only thing a caller ever resolves to
         outside = _bound_names([
             stmt for stmt in main.body
-            if not (isinstance(stmt, ast.FunctionDef) and _is_export(stmt))])
+            if not (isinstance(stmt, ast.FunctionDef) and is_export(stmt, export_decorators))])
 
         # Contiguous runs of latchable export definitions, so nothing between
         # them is moved: a run is guarded where it stands
@@ -121,7 +140,7 @@ class ExportOnceTransformer(ast_walk.NodeTransformer):
         names: list[str] = []
         start: int | None = None
         for i, stmt in enumerate(main.body):
-            if (isinstance(stmt, ast.FunctionDef) and _is_export(stmt)
+            if (isinstance(stmt, ast.FunctionDef) and is_export(stmt, export_decorators)
                     and stmt.name not in outside):
                 if start is None:
                     start = i

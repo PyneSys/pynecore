@@ -6,9 +6,12 @@
 //! assigning each referenced cache from the real call. Which reads are rewired
 //! follows the measured TradingView scoping the Python module documents.
 
+use std::collections::HashSet;
+
 use pyne_ast::walk::{Transformer, Visited, copy_location, docstring_end, generic_visit};
 use pyne_ast::{Ast, ExprContext, Kind, NodeId};
 
+use super::export_once::{export_names, has_export_decorator};
 use crate::{Context, Error};
 
 /// Engine-global inside user functions too: rewired everywhere
@@ -39,14 +42,6 @@ fn is_library_main(ast: &Ast, decorators: &[NodeId]) -> bool {
     })
 }
 
-fn is_export(ast: &Ast, decorators: &[NodeId]) -> bool {
-    decorators.iter().any(|&decorator| match ast.kind(decorator_func(ast, decorator)) {
-        Kind::Name { id, .. } => id == "export",
-        Kind::Attribute { attr, .. } => attr == "export",
-        _ => false,
-    })
-}
-
 struct TaVariableHoist {
     /// Referenced variable names, in first-reference order
     hoisted: Vec<String>,
@@ -54,6 +49,8 @@ struct TaVariableHoist {
     /// How many enclosing functions are `@export`-decorated
     export_depth: usize,
     is_library: bool,
+    /// The module's names of the `export` decorator
+    export_decorators: HashSet<String>,
 }
 
 impl TaVariableHoist {
@@ -99,7 +96,7 @@ impl Transformer for TaVariableHoist {
     fn visit(&mut self, ast: &mut Ast, id: NodeId) -> Visited {
         match ast.kind(id) {
             Kind::FunctionDef { name, decorator_list, .. } => {
-                let export = is_export(ast, decorator_list);
+                let export = has_export_decorator(ast, decorator_list, &self.export_decorators);
                 self.function_stack.push(name.clone());
                 self.export_depth += usize::from(export);
                 generic_visit(self, ast, id);
@@ -128,6 +125,7 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
         function_stack: Vec::new(),
         export_depth: 0,
         is_library: is_library_main(ast, decorator_list),
+        export_decorators: export_names(ast, module),
     };
     generic_visit(&mut hoist, ast, module);
     if hoist.hoisted.is_empty() {

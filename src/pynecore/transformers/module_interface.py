@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Protocol
 
 from . import ast_walk
+from .export_once import export_names, is_export
 from .pine_type_rules import UNKNOWN, ImplSig, annotation_type, impl_sig
 from .pine_type_table import (
     Analyser, ClassSig, DepRecord, ExportSig, ModuleInterface, PineTypeTable, qualify,
@@ -167,6 +168,7 @@ def build_interface(tree: ast.Module, table: PineTypeTable, path: str,
     exports: dict[str, ExportSig] = {}
 
     proxies = _exported_proxies(tree)
+    export_decorators = export_names(tree)
     definitions: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, str, str]] = []
     _collect_defs(tree, '', definitions)
 
@@ -181,9 +183,9 @@ def build_interface(tree: ast.Module, table: PineTypeTable, path: str,
             sig = _export_sig(node, key, table)
             if sig is not None:
                 exports[node.name] = sig
-                proxied[node.name] = node.name in proxies and _is_exported(node)
+                proxied[node.name] = node.name in proxies and is_export(node, export_decorators)
     for node, key, scope in definitions:
-        if scope != '' and node.name in proxies and _is_exported(node):
+        if scope != '' and node.name in proxies and is_export(node, export_decorators):
             sig = _export_sig(node, key, table)
             if sig is not None:
                 exports[node.name] = sig
@@ -306,22 +308,6 @@ def _exported_proxies(tree: ast.Module) -> set[str]:
             continue
         names.update(target.id for target in targets if isinstance(target, ast.Name))
     return names
-
-
-def _is_exported(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    """
-    Whether a definition carries the ``@export`` decorator.
-
-    :param node: The definition to inspect
-    :return: True when one of its decorators is named ``export``
-    """
-    for decorator in node.decorator_list:
-        target = decorator.func if isinstance(decorator, ast.Call) else decorator
-        if isinstance(target, ast.Name) and target.id == 'export':
-            return True
-        if isinstance(target, ast.Attribute) and target.attr == 'export':
-            return True
-    return False
 
 
 def _module_all(tree: ast.Module) -> tuple[str, ...] | None:

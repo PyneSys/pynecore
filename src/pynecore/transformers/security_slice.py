@@ -50,6 +50,7 @@ from typing import Any
 
 from . import ast_walk
 from .emission_settings import PYNE_RESERVED_NAME_CHAR, security_slice_disabled
+from .export_once import export_names, is_export
 from .locations import fix_locations
 from .pine_type_rules import COLOR, OBJECT, SCALARS, STR, get_ty, stamp_lowering
 from .script_entry import is_script_entry
@@ -719,7 +720,9 @@ class SecuritySliceTransformer(ast_walk.NodeTransformer):
         if main_key is None:
             self.module_skip = 'no_main_scope'
             return []
-        reachable, unmodelled = _reachable_scopes(scopes, main_key, reach.walks)
+        export_decorators = export_names(node)
+        reachable, unmodelled = _reachable_scopes(scopes, main_key, reach.walks,
+                                                  export_decorators)
         for key in reachable:
             reason = unmodelled.get(key)
             if reason is not None:
@@ -745,7 +748,8 @@ class SecuritySliceTransformer(ast_walk.NodeTransformer):
             collector.record_aliases(key)
         summaries = _function_summaries(collector, scopes, reachable, main_key)
 
-        index_of_stmt = _build_index(main.body, collector, aliases, summaries, main_key, reach)
+        index_of_stmt = _build_index(main.body, collector, aliases, summaries, main_key, reach,
+                                     scopes, export_decorators)
         if collector.unresolved is not None:
             self.module_skip = collector.unresolved
             return []
@@ -839,8 +843,8 @@ def _unresolved_collection(node: ast.Call) -> bool:
     return _collection_target(node) is None
 
 
-def _reachable_scopes(scopes: _SliceScopes, main_key: str,
-                      walks: _OwnWalks) -> tuple[list[str], dict[str, str]]:
+def _reachable_scopes(scopes: _SliceScopes, main_key: str, walks: _OwnWalks,
+                      export_decorators: frozenset[str]) -> tuple[list[str], dict[str, str]]:
     """Scope keys of ``main`` and every user function it can reach.
 
     The one walk of each scope's own body that finds its callees also finds
@@ -853,6 +857,14 @@ def _reachable_scopes(scopes: _SliceScopes, main_key: str,
     """
     seen = {main_key}
     work = [main_key]
+    # A library's importers call its exports from outside ``main()``, so an export
+    # is reached with no call of it in this module.
+    for stmt in scopes.scope_body(main_key):
+        if isinstance(stmt, ast.FunctionDef) and is_export(stmt, export_decorators):
+            key = scopes.scope_key_of(stmt)
+            if key is not None and key not in seen:
+                seen.add(key)
+                work.append(key)
     reasons: dict[str, str] = {}
     while work:
         key = work.pop()
@@ -1807,7 +1819,8 @@ def _stmt_nodes(stmt: ast.stmt) -> list[ast.AST]:
 
 def _build_index(body: list[ast.stmt], collector: _Collector, aliases: _Aliases,
                  summaries: dict[str, _Facts], main_key: str,
-                 reach: _Reach) -> list[_StmtIndex]:
+                 reach: _Reach, scopes: _SliceScopes,
+                 export_decorators: frozenset[str]) -> list[_StmtIndex]:
     """Build the context-independent :class:`_StmtIndex` of ``main()``'s body."""
     index: list[_StmtIndex] = []
     for stmt in body:
@@ -1825,6 +1838,13 @@ def _build_index(body: list[ast.stmt], collector: _Collector, aliases: _Aliases,
             # A definition costs nothing per bar and may be called by anything
             # the slice keeps.
             entry.mandatory = True
+            # An export is called by the library's importers, so no statement
+            # kept here calls it: the names around it that its body reads are
+            # read by the definition itself.
+            key = scopes.scope_key_of(stmt)
+            if (isinstance(stmt, ast.FunctionDef) and is_export(stmt, export_decorators)
+                    and key in summaries):
+                entry.reads |= aliases.classes(summaries[key].reads)
         elif reach.own(stmt).returns:
             # An early exit decides whether a later write block is reached.
             entry.mandatory = True

@@ -11,6 +11,7 @@ use super::{
     Aliases, EXTERNAL, PROTOCOL_CALLS, chain_root_name, is_def, own, protocol_sid, stmt_nodes,
 };
 use crate::pine_type_rules::{BOOL, FLOAT, INT, STR, get_ty};
+use crate::steps::export_once::is_export;
 use crate::steps::security::dependencies::{
     COLLECTION_NAMESPACES, DependencyAnalyzer, is_collection_reader, is_unmodelled, root_name,
 };
@@ -153,9 +154,20 @@ pub(super) fn reachable_scopes(
     ast: &Ast,
     scopes: &DependencyAnalyzer<'_>,
     main_key: &str,
+    export_decorators: &HashSet<String>,
 ) -> (Vec<String>, HashSet<String>) {
     let mut seen: HashSet<String> = HashSet::from([main_key.to_string()]);
     let mut work = vec![main_key.to_string()];
+    // A library's importers call its exports from outside `main()`, so an export is
+    // reached with no call of it in this module.
+    for &stmt in &scopes.scopes[main_key].body {
+        if is_export(ast, stmt, export_decorators)
+            && let Some(key) = scopes.key_of.get(&stmt)
+            && seen.insert(key.clone())
+        {
+            work.push(key.clone());
+        }
+    }
     let mut unmodelled: HashSet<String> = HashSet::new();
     while let Some(key) = work.pop() {
         let node = scopes.scopes[&key].node;
@@ -639,6 +651,7 @@ pub(super) fn build_index(
     collector: &mut Collector<'_, '_>,
     summaries: &IndexMap<String, Facts>,
     main_key: &str,
+    export_decorators: &HashSet<String>,
 ) -> Vec<StmtIndex> {
     let mut index = Vec::with_capacity(body.len());
     for &stmt in body {
@@ -646,6 +659,16 @@ pub(super) fn build_index(
         let aliases = &collector.aliases;
         let mut defs = aliases.classes(&facts.writes);
         defs.extend(aliases.classes(&facts.mutates));
+        let mut reads = aliases.classes(&facts.reads);
+        // An export is called by the library's importers, so no statement kept here
+        // calls it: the names around it that its body reads are read by the
+        // definition itself.
+        if is_export(ast, stmt, export_decorators)
+            && let Some(summary) =
+                collector.scopes.key_of.get(&stmt).and_then(|key| summaries.get(key))
+        {
+            reads.extend(aliases.classes(&summary.reads));
+        }
         let mandatory = if is_def(ast, stmt) {
             // A definition costs nothing per bar and may be called by anything the
             // slice keeps.
@@ -655,7 +678,7 @@ pub(super) fn build_index(
             own(ast, stmt).into_iter().any(|sub| matches!(ast.kind(sub), Kind::Return { .. }))
         };
         index.push(StmtIndex {
-            reads: aliases.classes(&facts.reads),
+            reads,
             defs,
             // The sids come from the same expansion as the names: a protocol call
             // inside a helper belongs to the STATEMENT THAT CALLS the helper, not to

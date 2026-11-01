@@ -26,6 +26,7 @@ use crate::pine_type_table::{
 };
 use crate::sha256::sha256_hex;
 use crate::slot_layout::ModuleLayout;
+use crate::steps::export_once::{export_names, has_export_decorator};
 
 type R<T> = Result<T, Unsupported>;
 
@@ -127,6 +128,7 @@ pub fn build_interface(
 ) -> R<Interface> {
     let body = module_body(ast, tree);
     let proxies = exported_proxies(ast, body);
+    let export_decorators = export_names(ast, tree);
     let mut definitions = Vec::new();
     collect_defs(ast, tree, "", &mut definitions);
     let classes: Classes =
@@ -141,14 +143,18 @@ pub fn build_interface(
             && let Some(sig) = export_sig(ast, *node, key, table, &classes)?
         {
             exports.insert(name.to_string(), sig);
-            proxied.insert(name.to_string(), proxies.contains(name) && is_exported(ast, *node));
+            proxied.insert(
+                name.to_string(),
+                proxies.contains(name)
+                    && has_export_decorator(ast, decorators(ast, *node), &export_decorators),
+            );
         }
     }
     for (node, key, scope) in &definitions {
         let name = def_name(ast, *node);
         if !scope.is_empty()
             && proxies.contains(name)
-            && is_exported(ast, *node)
+            && has_export_decorator(ast, decorators(ast, *node), &export_decorators)
             && let Some(sig) = export_sig(ast, *node, key, table, &classes)?
         {
             exports.insert(name.to_string(), sig);
@@ -315,21 +321,6 @@ fn exported_proxies(ast: &Ast, body: &[NodeId]) -> HashSet<String> {
         }
     }
     names
-}
-
-/// Whether a definition carries the `@export` decorator (`_is_exported`).
-fn is_exported(ast: &Ast, node: NodeId) -> bool {
-    decorators(ast, node).iter().any(|&decorator| {
-        let target = match ast.kind(decorator) {
-            Kind::Call { func, .. } => *func,
-            _ => decorator,
-        };
-        match ast.kind(target) {
-            Kind::Name { id, .. } => id == "export",
-            Kind::Attribute { attr, .. } => attr == "export",
-            _ => false,
-        }
-    })
 }
 
 /// The module's literal `__all__`, when it spells one (`_module_all`).

@@ -38,20 +38,52 @@ fn bound_names(ast: &Ast, nodes: &[NodeId]) -> HashSet<String> {
     bound
 }
 
-/// Whether a statement is a definition carrying `@export` or `@<mod>.export`.
-fn is_export(ast: &Ast, stmt: NodeId) -> bool {
-    let Kind::FunctionDef { decorator_list, .. } = ast.kind(stmt) else { return false };
-    decorator_list.iter().any(|&decorator| {
+/// The names a module calls the `export` decorator by (`export_names`): `export`,
+/// and every alias a `from pynecore.core.pine_export import export as <alias>` binds.
+pub(crate) fn export_names(ast: &Ast, module: NodeId) -> HashSet<String> {
+    let mut names = HashSet::from(["export".to_string()]);
+    let Kind::Module { body, .. } = ast.kind(module) else { return names };
+    for &stmt in body {
+        let Kind::ImportFrom { module: Some(from), names: aliases, .. } = ast.kind(stmt) else {
+            continue;
+        };
+        if from != "pynecore.core.pine_export" {
+            continue;
+        }
+        for &alias in aliases {
+            let Kind::Alias { name, asname } = ast.kind(alias) else { unreachable!() };
+            if name == "export" {
+                names.insert(asname.clone().unwrap_or_else(|| name.clone()));
+            }
+        }
+    }
+    names
+}
+
+/// Whether a decorator list carries `@export`: one of the module's `names` of the
+/// decorator ([`export_names`]) or `@<mod>.export` (`is_export`).
+pub(crate) fn has_export_decorator(
+    ast: &Ast,
+    decorators: &[NodeId],
+    names: &HashSet<String>,
+) -> bool {
+    decorators.iter().any(|&decorator| {
         let target = match ast.kind(decorator) {
             Kind::Call { func, .. } => *func,
             _ => decorator,
         };
         match ast.kind(target) {
-            Kind::Name { id, .. } => id == "export",
+            Kind::Name { id, .. } => names.contains(id),
             Kind::Attribute { attr, .. } => attr == "export",
             _ => false,
         }
     })
+}
+
+/// Whether a statement is a definition carrying `@export`.
+pub(crate) fn is_export(ast: &Ast, stmt: NodeId, names: &HashSet<String>) -> bool {
+    let Kind::FunctionDef { decorator_list, .. } = ast.kind(stmt) else { return false };
+    has_export_decorator(ast, decorator_list, names)
 }
 
 fn function_name(ast: &Ast, stmt: NodeId) -> &str {
@@ -74,13 +106,17 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
     let Some(main) = main else { return Ok(module) };
     let Kind::FunctionDef { body: main_body, .. } = ast.kind(main) else { unreachable!() };
     let main_body = main_body.clone();
-    if !main_body.iter().any(|&stmt| is_export(ast, stmt)) {
+    let export_decorators = export_names(ast, module);
+    if !main_body.iter().any(|&stmt| is_export(ast, stmt, &export_decorators)) {
         return Ok(module);
     }
 
     // A name main binds anywhere else stays out of the latch
-    let others: Vec<NodeId> =
-        main_body.iter().copied().filter(|&stmt| !is_export(ast, stmt)).collect();
+    let others: Vec<NodeId> = main_body
+        .iter()
+        .copied()
+        .filter(|&stmt| !is_export(ast, stmt, &export_decorators))
+        .collect();
     let outside = bound_names(ast, &others);
 
     // Contiguous runs of latchable export definitions, each guarded where it stands
@@ -88,7 +124,7 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
     let mut names: Vec<String> = Vec::new();
     let mut start: Option<usize> = None;
     for (i, &stmt) in main_body.iter().enumerate() {
-        if is_export(ast, stmt) && !outside.contains(function_name(ast, stmt)) {
+        if is_export(ast, stmt, &export_decorators) && !outside.contains(function_name(ast, stmt)) {
             start.get_or_insert(i);
             let name = function_name(ast, stmt);
             if !names.iter().any(|known| known == name) {

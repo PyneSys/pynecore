@@ -2,6 +2,7 @@ import ast
 from typing import cast
 
 from . import ast_walk
+from .export_once import export_names, is_export
 
 # The stateful ``ta`` builtin variables. Their accumulators live in per-call-site
 # Persistent state, but TradingView keeps ONE engine-level series per builtin
@@ -82,22 +83,13 @@ class TaVariableHoistTransformer(ast_walk.NodeTransformer):
         self.function_stack: list[str] = []
         self.export_depth = 0  # how many enclosing functions are @export-decorated
         self.is_library = False
+        self.export_decorators: frozenset[str] = frozenset()
 
     @staticmethod
     def _is_library_main(main: ast.FunctionDef) -> bool:
         for decorator in main.decorator_list:
             func = decorator.func if isinstance(decorator, ast.Call) else decorator
             if isinstance(func, ast.Attribute) and func.attr == 'library':
-                return True
-        return False
-
-    @staticmethod
-    def _is_export(node: ast.FunctionDef) -> bool:
-        for decorator in node.decorator_list:
-            func = decorator.func if isinstance(decorator, ast.Call) else decorator
-            if isinstance(func, ast.Name) and func.id == 'export':
-                return True
-            if isinstance(func, ast.Attribute) and func.attr == 'export':
                 return True
         return False
 
@@ -113,6 +105,7 @@ class TaVariableHoistTransformer(ast_walk.NodeTransformer):
         if main is None:
             return node
         self.is_library = self._is_library_main(main)
+        self.export_decorators = export_names(node)
 
         node = cast(ast.Module, self.generic_visit(node))
         if not self.hoisted:
@@ -137,14 +130,14 @@ class TaVariableHoistTransformer(ast_walk.NodeTransformer):
         return node
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
-        is_export = self._is_export(node)
+        exported = is_export(node, self.export_decorators)
         self.function_stack.append(node.name)
-        self.export_depth += is_export
+        self.export_depth += exported
         try:
             return self.generic_visit(node)
         finally:
             self.function_stack.pop()
-            self.export_depth -= is_export
+            self.export_depth -= exported
 
     def visit_Call(self, node: ast.Call) -> ast.AST:
         node = cast(ast.Call, self.generic_visit(node))

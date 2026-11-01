@@ -121,3 +121,66 @@ def __test_same_ordinal_groups_of_two_modules_stay_apart__(tmp_path, monkeypatch
 
     assert results[True] == results[False]
     assert set(results[True]) - {'0.0', 'nan'}, "the security values must reach the chart"
+
+
+EXPORT_LIBRARY = '''"""@pyne"""
+from pynecore.core.pine_export import Exported, {export_import}
+from pynecore.lib import bar_index, close, request, script, syminfo, ta
+
+prev = Exported()
+
+
+@script.library('T170 Export Library')
+def main():
+    @{decorator}
+    def prev():
+        return close[1]
+
+    x = ta.sma(close, 2)
+    if bar_index > 1:
+        a = request.security(syminfo.tickerid, '60', x)
+'''
+
+EXPORT_SCRIPT = '''"""@pyne"""
+import t170_export_lib as el
+from pynecore.lib import close, plot, script
+
+
+@script.indicator('T170 Export Script')
+def main():
+    plot(el.prev(), 'prev')
+'''
+
+
+@pytest.mark.parametrize('export_import, decorator', [
+    ('export', 'export'),
+    ('export as publish', 'publish'),
+])
+def __test_an_export_keeps_what_it_reads_in_the_library_clone__(tmp_path, monkeypatch, syminfo,
+                                                               export_import, decorator):
+    """ The library's clone keeps the history its export reads, though its write does not """
+    (tmp_path / 't170_export_lib.py').write_text(
+        EXPORT_LIBRARY.format(export_import=export_import, decorator=decorator), encoding='utf-8')
+    path = tmp_path / 't170_export_script.py'
+    path.write_text(EXPORT_SCRIPT, encoding='utf-8')
+    monkeypatch.syspath_prepend(str(tmp_path))
+    feed = tmp_path / 'feed_60.ohlcv'
+    with OHLCVWriter(feed, '60') as writer:
+        for index in range(8):
+            price = 10.0 + index
+            writer.write(OHLCV(timestamp=START + index * 3_600_000, open=price,
+                               high=price + 1, low=price - 1, close=price, volume=1.0))
+    replace(syminfo, period='60').save_toml(feed.with_suffix('.toml'))
+    chart = replace(syminfo, period='5')
+    bars = [OHLCV(timestamp=START + index * 300_000, open=10.0 + index, high=11.0 + index,
+                  low=9.0 + index, close=10.0 + index, volume=1.0) for index in range(60)]
+
+    import_script(path)
+    library = sys.modules['t170_export_lib']
+    clone_name = next(iter(__test_helper_contexts(library).values()))['slice_main']
+    assert clone_name, "the library context is sliced"
+    # A child of the library's context runs the clone in place of the library's main,
+    # and the script's export call there reaches the clone's `prev`
+    rows = list(ScriptRunner(path, bars, chart, security_data={'60': feed}).run_iter())
+    assert [repr(row[1]['prev']) for row in rows[1:]] == [
+        repr(10.0 + index) for index in range(len(rows) - 1)]

@@ -49,6 +49,7 @@ use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId, Unsupported};
 use self::facts::Collector;
 use self::reach::{Reach, declares_varip, pynecore_imported_names, rebound_names};
 use super::dynamic_default::is_script_entry;
+use super::export_once::export_names;
 use super::security::collection::is_function;
 use super::security::contexts::{ctx_get, iter_contexts};
 use super::security::dependencies::DependencyAnalyzer;
@@ -501,7 +502,9 @@ fn sliced_units(
 ) -> Vec<Plan> {
     let scopes = DependencyAnalyzer::scopes_only(ast, module);
     let Some(main_key) = scopes.key_of.get(&main).cloned() else { return Vec::new() };
-    let (reachable, unmodelled) = facts::reachable_scopes(ast, &scopes, &main_key);
+    let export_decorators = export_names(ast, module);
+    let (reachable, unmodelled) =
+        facts::reachable_scopes(ast, &scopes, &main_key, &export_decorators);
     if reachable.iter().any(|key| unmodelled.contains(key)) {
         return Vec::new();
     }
@@ -534,7 +537,14 @@ fn sliced_units(
         Kind::FunctionDef { body, .. } => body.clone(),
         _ => unreachable!(),
     };
-    let index = facts::build_index(ast, &main_body, &mut collector, &summaries, &main_key);
+    let index = facts::build_index(
+        ast,
+        &main_body,
+        &mut collector,
+        &summaries,
+        &main_key,
+        &export_decorators,
+    );
     if collector.unresolved {
         return Vec::new();
     }
