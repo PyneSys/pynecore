@@ -15149,7 +15149,9 @@ class OrderSyncEngine:
         order, an order whose cancel this process already sent, a dispatch
         parked for verification, and the legs of the journaled dispatch the
         fresh one goes out under again (same client order ids, which the
-        venue answers with those very legs) are left alone.
+        venue answers with those very legs) are left alone. A journaled
+        dispatch that is spent (:meth:`_persisted_exit_anchor_is_spent`) is
+        not reused, so a leg of it still resting is cancelled too.
 
         :return: Whether the fresh dispatch may go out now: ``False`` while
             the cancel has not settled (it is retried every sync, and the
@@ -15163,7 +15165,8 @@ class OrderSyncEngine:
         reused: set[str] = set()
         envelope = self._envelopes.get(key)
         anchor = self._persisted_envelope_anchors.get(key)
-        if envelope is None and anchor is not None:
+        if (envelope is None and anchor is not None
+                and not self._persisted_exit_anchor_is_spent(intent, anchor)):
             envelope = DispatchEnvelope(
                 intent=intent, run_tag=anchor.run_tag or self._run_tag,
                 bar_ts_ms=anchor.bar_ts_ms, retry_seq=anchor.retry_seq,
@@ -17406,7 +17409,8 @@ class OrderSyncEngine:
             )
         anchor = self._persisted_envelope_anchors.get(intent.intent_key)
         if (anchor is not None
-                and self._persisted_entry_anchor_is_spent(intent, anchor)):
+                and (self._persisted_entry_anchor_is_spent(intent, anchor)
+                     or self._persisted_exit_anchor_is_spent(intent, anchor))):
             # A restart clears the in-memory active-intent sentinel. If the
             # re-emitted intent reverses a fully-filled persisted entry, or
             # re-enters after that entry's own position is already closed,
@@ -17523,6 +17527,50 @@ class OrderSyncEngine:
             if row.side != intent.side or row.closed_ts_ms is not None:
                 return True
         return False
+
+    def _persisted_exit_anchor_is_spent(
+            self, intent: Intent, anchor: EnvelopeRecord,
+    ) -> bool:
+        """Whether ``anchor`` names an exit dispatch whose legs are all spent.
+
+        The exit counterpart of :meth:`_persisted_entry_anchor_is_spent`. A
+        restart rebuilds an exit's journaled anchor so a re-dispatch reuses its
+        client order ids, and a venue that knows those ids hands back the legs
+        still resting under them. Once a leg of that dispatch filled, the exit
+        is consumed; once every leg is closed, nothing rests under those ids.
+        Either way, re-sent ids only find dead orders: an idempotent venue
+        hands back the filled leg as if it had just been placed and refuses
+        the cancelled one as spent (measured live: bybit-spot cycle 374, the
+        previous cycle's take-profit filled at startup, its stop was
+        cancelled, and the restarted script's ``L-X`` on a new signal went out
+        under the same ids: the rollback took the filled leg for a sibling
+        and the parent's defensive close shrank to an unplaceable dust size).
+        A dispatch none of whose leg rows is in the journal is not judged.
+        """
+        if not isinstance(intent, ExitIntent) or self._store_ctx is None:
+            return False
+        prior = DispatchEnvelope(
+            intent=intent,
+            run_tag=anchor.run_tag or self._run_tag,
+            bar_ts_ms=anchor.bar_ts_ms,
+            retry_seq=anchor.retry_seq,
+            coid_max_len=self._coid_max_len,
+        )
+        coids = {prior.client_order_id(kind) for kind in (KIND_EXIT_TP, KIND_EXIT_SL)}
+        # A leg closed by an earlier instance stays with that instance; one
+        # still live, or closed since, belongs to this one
+        by_coid = {row.client_order_id: row
+                   for row in self._store_ctx.iter_closed_orders_for_run_id(
+                       from_entry=intent.from_entry or '')
+                   if row.client_order_id in coids}
+        for coid in coids:
+            if (row := self._store_ctx.get_order(coid)) is not None:
+                by_coid[coid] = row
+        rows = list(by_coid.values())
+        if not rows:
+            return False
+        return (any(row.filled_qty > 0.0 for row in rows)
+                or all(row.closed_ts_ms is not None for row in rows))
 
     def _filled_restart_entry_at_pyramiding_cap(
             self, intent: EntryIntent,

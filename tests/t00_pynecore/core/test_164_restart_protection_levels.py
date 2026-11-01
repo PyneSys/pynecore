@@ -629,7 +629,7 @@ def _restart_with_a_journaled_exit(
         store: BrokerStore, *, refs: tuple[str, ...], resumed: bool, declared: bool = True,
         leg_keys: bool = False, trailing: bool = False, leg_qty: float | None = None,
         cancelled: str | None = None, wire_qty: float | None = None,
-        forget_envelope: bool = False,
+        forget_envelope: bool = False, spent: str | None = None,
 ) -> tuple[RunContext, OrderSyncEngine, _JournalingBroker, DispatchEnvelope]:
     """The previous process dispatched the exit; the next one starts over it.
 
@@ -645,6 +645,9 @@ def _restart_with_a_journaled_exit(
         quantity (inverse contracts), not in the position's base unit.
     :param forget_envelope: The exit's dispatch anchor is gone from the
         journal while its legs still rest on the venue.
+    :param spent: The take-profit leg filled; ``"stop-cancelled"`` closes the
+        stop leg too, ``"stop-live"`` leaves it resting. The exit's dispatch
+        anchor stays journaled.
     """
     first = _open_ctx(store)
     entry_qty = 1.0 if wire_qty is None else wire_qty
@@ -675,6 +678,14 @@ def _restart_with_a_journaled_exit(
         first.close_order(earlier)
     if forget_envelope:
         first.record_complete(f"L-X{INTENT_KEY_SEP}L")
+    if spent is not None:
+        tp_coid = journaled.client_order_id(KIND_EXIT_TP)
+        first.upsert_order(tp_coid, symbol=SYMBOL, side="sell", qty=1.0, filled_qty=1.0,
+                           state="confirmed", intent_key=f"L-X{INTENT_KEY_SEP}L",
+                           from_entry="L", tp_level=1.1200, extras={"kind": "exit_leg"})
+        first.close_order(tp_coid)
+        if spent == "stop-cancelled":
+            first.close_order(journaled.client_order_id(KIND_EXIT_SL))
     if resumed:
         previous.record_quarantine("operator moved the stop-loss",
                                    kind=QuarantineKind.EXTERNAL_INTERVENTION)
@@ -900,6 +911,38 @@ def __test_an_exit_declared_afresh_after_a_restart_replaces_the_legs_its_earlier
 
         engine.sync(BAR_TS + 180_000, last_price=1.1000)
         assert broker.calls == ["cancel", "exit"], "once only"
+        ctx.close()
+
+
+@pytest.mark.parametrize("spent", ["stop-cancelled", "stop-live"])
+def __test_an_exit_declared_afresh_after_its_journaled_dispatch_was_spent_mints_fresh_ids__(
+        tmp_path: Path, spent: str) -> None:
+    """A filled leg spends the dispatch: its ids must not go out again.
+
+    Measured live: bybit-spot cycle 374 -- the previous cycle's take-profit
+    filled at startup and its stop was cancelled; the restarted script's
+    ``L-X`` on a new signal reused the journaled ids, the venue handed back
+    the filled take-profit and refused the stop as spent, and the parent's
+    defensive close shrank to an unplaceable dust size: halt. A stop leg of
+    the spent dispatch still resting is cancelled before the fresh bracket.
+    """
+    from pynecore.lib.strategy import Order, _order_type_close
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx, engine, broker, journaled = _restart_with_a_journaled_exit(
+            store, refs=("xchg-tp", "xchg-sl"), resumed=False, declared=False, spent=spent)
+        engine._position.exit_orders[("L-X", "L")] = Order(  # noqa: SLF001
+            "L", -1.0, order_type=_order_type_close, exit_id="L-X",
+            limit=1.1300, stop=1.0950,
+        )
+        engine.sync(BAR_TS + 120_000, last_price=1.1000)
+
+        assert broker.calls == (["exit"] if spent == "stop-cancelled" else ["cancel", "exit"])
+        fresh = broker.exit_calls[0]
+        for kind in (KIND_EXIT_TP, KIND_EXIT_SL):
+            assert fresh.client_order_id(kind) != journaled.client_order_id(kind)
+        assert isinstance(fresh.intent, ExitIntent)
+        assert (fresh.intent.tp_price, fresh.intent.sl_price) == (1.1300, 1.0950)
         ctx.close()
 
 
