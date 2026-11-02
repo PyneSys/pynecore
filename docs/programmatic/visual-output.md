@@ -5,7 +5,7 @@ title: "Visual Output (Viz)"
 description: "Plot styles and drawing data output — the NDJSON viz stream, CLI flags and programmatic accessors"
 icon: "brush"
 date: "2026-07-19"
-lastmod: "2026-07-19"
+lastmod: "2026-11-02"
 draft: false
 toc: true
 categories: ["Programmatic"]
@@ -91,7 +91,7 @@ The stream is [NDJSON](https://ndjson.org/): one JSON object per line. Every rec
 | Field      | Type   | Description                                                        |
 |------------|--------|--------------------------------------------------------------------|
 | `t`        | str    | `"hdr"`                                                            |
-| `v`        | int    | Format version (`1`)                                              |
+| `v`        | int    | Format version (`2`)                                               |
 | `script`   | object | Script context: `type`, `title`, `shorttitle`, `overlay`, `format`, `precision`, `explicit_plot_zorder`, `max_lines_count`, `max_labels_count`, `max_boxes_count`, `max_polylines_count` (null fields dropped) |
 | `syminfo`  | object | Symbol context: `tickerid`, `prefix`, `ticker`, `timeframe`, `mintick`, `timezone`, `type` (empty fields dropped) |
 | `journal`  | bool   | Whether per-bar `ev` records are present                          |
@@ -99,8 +99,8 @@ The stream is [NDJSON](https://ndjson.org/): one JSON object per line. Every rec
 ### `meta` — plot-family definition
 
 The registered-once style of one plot-family call. Common fields are shared; kind-specific fields
-follow. `display` defaults to `"all"`; other defaults are applied per kind and null fields are
-dropped, so a record only lists what deviates from the default.
+follow. `display` defaults to every location (`display.all`); other defaults are applied per
+kind and null fields are dropped, so a record only lists what deviates from the default.
 
 A `meta` record is emitted before the first `bar` record of the plot. When a plot only turns out
 to be dynamic on a later bar (its first differing color arrives after the record went out), the
@@ -113,7 +113,7 @@ repeated `id` as an update of the earlier record.
 | `id`      | str  | all        | The plot id (see [Ordinal Ids](#ordinal-id-semantics))          |
 | `kind`    | str  | all        | `plot`/`shape`/`char`/`arrow`/`candle`/`bar`/`bgcolor`/`barcolor`/`hline`/`fill` |
 | `title`   | str  | all        | Present when the call had a title                               |
-| `display` | str  | all        | `all`/`none`/`pane`/`data_window`/`price_scale`/`status_line`   |
+| `display` | list | all        | Locations in bit order: `pane`/`data_window`/`price_scale`/`status_line`/`pine_screener`; `[]` = `display.none` |
 | `dynamic` | bool | all        | `true` when the call has a per-bar color channel                |
 | `style`   | str  | plot       | `line`/`stepline`/`histogram`/`columns`/`area`/… (default `line`) |
 | `color`   | str  | most       | `#RRGGBBAA` hex; the static color                               |
@@ -171,6 +171,9 @@ na are encoded as `null`.
 | `polylines` | array | Serialized `polyline` objects           |
 | `linefills` | array | Serialized `linefill` objects (each embeds `line1_state` / `line2_state`) |
 
+The `text_formatting` of a label, box or table cell is the list of its text styles in bit order
+(`bold`, `italic`); `[]` is `text.format_none`.
+
 ### `end` — terminator
 
 | Field  | Type | Description                      |
@@ -184,12 +187,12 @@ A three-bar indicator with a dynamic-colored `plot`, a static `plot`, a `fill`, 
 `hline`:
 
 ```json
-{"t":"hdr","v":1,"script":{"type":"indicator","title":"Demo","shorttitle":"demo","overlay":true,"format":"inherit","explicit_plot_zorder":false,"max_lines_count":50,"max_labels_count":50,"max_boxes_count":50,"max_polylines_count":50},"syminfo":{"tickerid":"BINANCE:BTCUSD","prefix":"BINANCE","ticker":"BINANCE:BTCUSD","timeframe":"60","mintick":0.01,"timezone":"UTC","type":"crypto"},"journal":false}
-{"t":"meta","id":"close","kind":"plot","title":"close","display":"all","style":"line","color":"#F23645FF","linewidth":2}
-{"t":"meta","id":"open","kind":"plot","title":"open","display":"all","style":"line","color":"#2962FFFF","linewidth":1}
-{"t":"meta","id":"fill#0","kind":"fill","title":"band","display":"all","color":"#787B8619","plot1":"close","plot2":"open"}
-{"t":"meta","id":"up","kind":"shape","title":"up","display":"all","style":"triangleup","location":"abovebar","size":"auto","color":"#4CAF50FF"}
-{"t":"meta","id":"hline#0","kind":"hline","title":"level","display":"all","price":100.0,"color":"#787B86FF","linewidth":1,"linestyle":"solid"}
+{"t":"hdr","v":2,"script":{"type":"indicator","title":"Demo","shorttitle":"demo","overlay":true,"format":"inherit","explicit_plot_zorder":false,"max_lines_count":50,"max_labels_count":50,"max_boxes_count":50,"max_polylines_count":50},"syminfo":{"tickerid":"BINANCE:BTCUSD","prefix":"BINANCE","ticker":"BINANCE:BTCUSD","timeframe":"60","mintick":0.01,"timezone":"UTC","type":"crypto"},"journal":false}
+{"t":"meta","id":"close","kind":"plot","title":"close","display":["pane","data_window","price_scale","status_line","pine_screener"],"style":"line","color":"#F23645FF","linewidth":2}
+{"t":"meta","id":"open","kind":"plot","title":"open","display":["pane","data_window","price_scale","status_line","pine_screener"],"style":"line","color":"#2962FFFF","linewidth":1}
+{"t":"meta","id":"fill#0","kind":"fill","title":"band","display":["pane","data_window","price_scale","status_line","pine_screener"],"color":"#787B8619","plot1":"close","plot2":"open"}
+{"t":"meta","id":"up","kind":"shape","title":"up","display":["pane","data_window","price_scale","status_line","pine_screener"],"style":"triangleup","location":"abovebar","size":"auto","color":"#4CAF50FF"}
+{"t":"meta","id":"hline#0","kind":"hline","title":"level","display":["pane","data_window","price_scale","status_line","pine_screener"],"price":100.0,"color":"#787B86FF","linewidth":1,"linestyle":"solid"}
 {"t":"bar","i":0,"time":1704067200000,"v":{"close":100.5,"open":100.0,"up":1}}
 {"t":"bar","i":1,"time":1704070800000,"v":{"close":100.2,"open":100.5,"up":0},"c":{"close":"#00E676FF"}}
 {"t":"bar","i":2,"time":1704074400000,"v":{"close":101.5,"open":100.2,"up":1}}

@@ -52,7 +52,7 @@ def __test_label_setters__(runner):
     assert len(labels) == 4
 
     assert labels["fmt"]["text_font_family"] == "monospace"
-    assert labels["fmt"]["text_formatting"] == "bold"
+    assert labels["fmt"]["text_formatting"] == ["bold"]
 
     assert labels["idx"]["x"] == 42
     assert labels["idx"]["y"] == 123.5

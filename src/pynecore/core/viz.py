@@ -66,9 +66,25 @@ def _names(mod, cls, strip: str = '') -> dict:
             for k, v in vars(mod).items() if isinstance(v, cls)}
 
 
+def _flags(mod, cls, strip: str = '') -> list[tuple[int, str]]:
+    """Collect the single-flag constants of a :class:`BitSet` class in ``mod``.
+
+    :param mod: The module holding the constants (e.g. ``lib.display``)
+    :param cls: The flag-set type (e.g. ``Display``)
+    :param strip: Optional attribute-name prefix to drop (e.g. ``'format_'``)
+    :return: ``(bit, name)`` pairs in bit order. Constants of no flag or of several
+             (``display.all``, ``text.format_none``) are sets of these, not flags.
+             ``int()`` first: a flag set's ``-`` is set difference, not the
+             subtraction the power-of-two test needs.
+    """
+    return sorted((int(v), k[len(strip):] if strip and k.startswith(strip) else k)
+                  for k, v in vars(mod).items()
+                  if isinstance(v, cls) and v and not int(v) & (int(v) - 1))
+
+
 PLOT_STYLE = _names(_plot_mod, PlotEnum, strip='style_')
 PLOT_LINESTYLE = _names(_plot_mod, PlotEnum, strip='linestyle_')
-DISPLAY = _names(_display_mod, Display)
+DISPLAY_PLACES = _flags(_display_mod, Display)
 SCRIPT_TYPE = _names(_script_type_mod, ScriptType)
 SHAPE = _names(_shape_mod, Shape)
 LOCATION = _names(_location_mod, Location)
@@ -81,7 +97,7 @@ LINE_STYLE = _names(_line_mod, LineEnum, strip='style_')
 LABEL_STYLE = _names(_label_mod, LabelStyleEnum, strip='style_')
 HLINE_LINESTYLE = _names(_hline_mod, HLineEnum, strip='style_')
 ALIGN = _names(_text_mod, AlignEnum, strip='align_')
-FORMAT = _names(_text_mod, FormatEnum, strip='format_')
+TEXT_FORMATS = _flags(_text_mod, FormatEnum, strip='format_')
 WRAP = _names(_text_mod, WrapEnum, strip='wrap_')
 FONT = _names(_font_mod, FontFamilyEnum, strip='family_')
 NUM_FORMAT = _names(_format_mod, Format)
@@ -106,6 +122,32 @@ def enum_name(value: Any, table: dict, default: Any = None) -> Any:
     if isinstance(value, str):
         return str(value)
     return default
+
+
+def flag_names(value: Any, flags: list[tuple[int, str]]) -> list[str] | None:
+    """Name the flags a flag-set value holds.
+
+    :param value: A flag-set constant or a combination of them
+    :param flags: The ``(bit, name)`` pairs built by :func:`_flags`
+    :return: The flag names in bit order, an empty list for no flag, or ``None``
+             for ``None``
+    """
+    if value is None:
+        return None
+    return [name for bit, name in flags if value & bit]
+
+
+def display_places(value: Any) -> list[str]:
+    """Name the chart places a ``display`` value shows in.
+
+    :param value: A ``display.*`` constant or a combination of them; ``None`` is
+                  the Pine default, ``display.all``
+    :return: The place names in bit order: every place for ``display.all``, an
+             empty list for ``display.none``
+    """
+    if value is None:
+        value = _display_mod.all
+    return [name for bit, name in DISPLAY_PLACES if value & bit]
 
 
 #
@@ -195,7 +237,7 @@ def serialize_meta(meta: Any) -> dict:
 
     if meta.title is not None:
         d["title"] = meta.title
-    d["display"] = enum_name(meta.display, DISPLAY, "all")
+    d["display"] = display_places(meta.display)
     if meta.force_overlay:
         d["force_overlay"] = True
     if not meta.editable:
@@ -319,7 +361,7 @@ def _label_dict(la: Any) -> dict:
         "tooltip": la.tooltip,
         "text_font_family": enum_name(la.text_font_family, FONT),
         "force_overlay": la.force_overlay,
-        "text_formatting": enum_name(la.text_formatting, FORMAT),
+        "text_formatting": flag_names(la.text_formatting, TEXT_FORMATS),
     }
 
 
@@ -341,7 +383,7 @@ def _box_dict(b: Any) -> dict:
         "text_valign": enum_name(b.text_valign, ALIGN),
         "text_wrap": enum_name(b.text_wrap, WRAP),
         "text_font_family": enum_name(b.text_font_family, FONT),
-        "text_formatting": enum_name(b.text_formatting, FORMAT),
+        "text_formatting": flag_names(b.text_formatting, TEXT_FORMATS),
         "force_overlay": b.force_overlay,
     }
 
@@ -359,7 +401,7 @@ def _cell_dict(col: int, row: int, cell: Any) -> dict:
         "bgcolor": color_str(cell.bgcolor),
         "tooltip": cell.tooltip,
         "text_font_family": enum_name(cell.text_font_family, FONT),
-        "text_formatting": enum_name(cell.text_formatting, FORMAT),
+        "text_formatting": flag_names(cell.text_formatting, TEXT_FORMATS),
     }
     if cell.is_merged:
         # [start_col, start_row, end_col, end_row] of the merged range; the range's
@@ -586,7 +628,7 @@ class VizWriter:
             "timezone": getattr(syminfo, 'timezone', None) or None,
             "type": getattr(syminfo, 'type', None) or None,
         })
-        self._emit({"t": "hdr", "v": 1, "script": script_rec,
+        self._emit({"t": "hdr", "v": 2, "script": script_rec,
                     "syminfo": syminfo_rec, "journal": journal})
 
     def write_bar(self, bar_index: int, time_ms: int, values: dict, dyn: dict) -> None:

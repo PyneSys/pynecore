@@ -1,11 +1,11 @@
-from .base import StrLiteral
+from .base import BitSet, StrLiteral
 
 
 class AlignEnum(StrLiteral):
     ...
 
 
-class FormatEnum(StrLiteral):
+class FormatEnum(BitSet):
     ...
 
 

@@ -5,7 +5,7 @@ title: "box"
 description: "Chart boxes — create and modify rectangular drawings"
 icon: "check_box_outline_blank"
 date: "2026-03-28"
-lastmod: "2026-08-05"
+lastmod: "2026-11-02"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -75,7 +75,7 @@ Creates a new box object on the chart with specified dimensions, styling, and op
 | `text_wrap` | `text.WrapEnum` | Text wrapping: `text.wrap_none` or `text.wrap_word` |
 | `text_font_family` | `font.FontFamilyEnum` | Font family: `font.family_default`, `font.family_monospace` |
 | `force_overlay` | `bool` | If `True`, draw on main pane regardless of indicator placement |
-| `text_formatting` | `text.FormatEnum` | Text formatting: `text.format_none`, `text.format_bold`, `text.format_italic` |
+| `text_formatting` | `text.FormatEnum` | Text formatting: `text.format_none`, `text.format_bold`, `text.format_italic`, or a combination such as `text.format_bold + text.format_italic` |
 
 **Return type:** `box`
 

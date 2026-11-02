@@ -87,7 +87,7 @@ def __test_plot_meta__(runner, tmp_path):
     sm = viz.serialize_meta(styled)
     assert sm["kind"] == "plot"
     assert sm["style"] == "stepline"
-    assert sm["display"] == "pane"
+    assert sm["display"] == ["pane"]
     assert sm["linewidth"] == 3
     assert sm["offset"] == 2
     assert sm["trackprice"] is True
@@ -102,7 +102,8 @@ def __test_plot_meta__(runner, tmp_path):
     assert plain.dynamic is False
     # A plain plot serializes to the Pine default style/display.
     assert viz.serialize_meta(plain)["style"] == "line"
-    assert viz.serialize_meta(plain)["display"] == "all"
+    assert viz.serialize_meta(plain)["display"] == [
+        "pane", "data_window", "price_scale", "status_line", "pine_screener"]
 
     late = meta["late"]
     assert late.kind == "plot"

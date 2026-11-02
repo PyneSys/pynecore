@@ -6,7 +6,7 @@ description: "PyneCore vs TradingView: 1,000 published TradingView scripts (Pine
 wildDescription: "PyneCore vs TradingView: {{scripts_total}} published TradingView scripts (Pine Script v4-v6, converted to Pyne code with PyneComp) validated, {{bars_exact_pct}}% of {{bars_compared_millions}} million values bit-identical, {{strategy_trades}} trades matched. Feature status of every Pine Script v6 module."
 icon: "checklist"
 date: "2026-03-28"
-lastmod: "2026-10-25"
+lastmod: "2026-11-02"
 draft: false
 toc: true
 categories: ["Overview"]
@@ -180,24 +180,24 @@ create/update/delete event log) for any charting front end — see
 
 All Pine Script v6 enum constants are implemented:
 
-| Module          | Constants                                                 |
-|-----------------|-----------------------------------------------------------|
-| `currency`      | 21 currency codes (USD, EUR, BTC, etc.)                   |
-| `barmerge`      | gaps_on/off, lookahead_on/off                             |
-| `display`       | none, all, data_window, pane, price_scale, status_line    |
-| `color`         | 50+ named colors                                          |
-| `extend`        | none, left, right, both                                   |
-| `format`        | inherit, price, volume, percent, mintick                  |
-| `location`      | abovebar, belowbar, top, bottom, absolute                 |
-| `position`      | 9 table positions (top/middle/bottom x left/center/right) |
-| `shape`         | 10+ marker shapes                                         |
-| `size`          | auto, tiny, small, normal, large, huge                    |
-| `xloc` / `yloc` | bar_index/bar_time, price/abovebar/belowbar               |
-| `dayofweek`     | monday through sunday                                     |
-| `dividends`     | gross, net                                                |
-| `earnings`      | actual, estimate, standardized                            |
-| `adjustment`    | none, dividends, splits                                   |
-| `scale`         | right, left, none                                         |
+| Module          | Constants                                                             |
+|-----------------|-----------------------------------------------------------------------|
+| `currency`      | 21 currency codes (USD, EUR, BTC, etc.)                               |
+| `barmerge`      | gaps_on/off, lookahead_on/off                                         |
+| `display`       | none, all, data_window, pane, pine_screener, price_scale, status_line |
+| `color`         | 50+ named colors                                                      |
+| `extend`        | none, left, right, both                                               |
+| `format`        | inherit, price, volume, percent, mintick                              |
+| `location`      | abovebar, belowbar, top, bottom, absolute                             |
+| `position`      | 9 table positions (top/middle/bottom x left/center/right)             |
+| `shape`         | 10+ marker shapes                                                     |
+| `size`          | auto, tiny, small, normal, large, huge                                |
+| `xloc` / `yloc` | bar_index/bar_time, price/abovebar/belowbar                           |
+| `dayofweek`     | monday through sunday                                                 |
+| `dividends`     | gross, net                                                            |
+| `earnings`      | actual, estimate, standardized                                        |
+| `adjustment`    | none, dividends, splits                                               |
+| `scale`         | right, left, none                                                     |
 
 ## Pine Script Syntax Features
 

@@ -2221,6 +2221,10 @@
    "kind": "value",
    "ty": "o:lib#Display"
   },
+  "display.pine_screener": {
+   "kind": "value",
+   "ty": "o:lib#Display"
+  },
   "display.price_scale": {
    "kind": "value",
    "ty": "o:lib#Display"
@@ -9517,6 +9521,7 @@
   "AlertEnum": "s",
   "AlignEnum": "s",
   "BarMerge": "i",
+  "BitSet": "i",
   "Commission": "s",
   "Currency": "s",
   "DayOfWeek": "i",
@@ -9527,7 +9532,7 @@
   "Extend": "s",
   "FontFamilyEnum": "s",
   "Format": "s",
-  "FormatEnum": "s",
+  "FormatEnum": "i",
   "HLineEnum": "s",
   "IntEnum": "i",
   "LabelStyleEnum": "s",

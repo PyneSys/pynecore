@@ -5,7 +5,7 @@ title: "label"
 description: "Chart labels — create, modify, and style text labels"
 icon: "label"
 date: "2026-03-28"
-lastmod: "2026-08-06"
+lastmod: "2026-11-02"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -359,7 +359,7 @@ label.set_text_formatting(id: label, text_formatting: text_format) → None
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | id | label | Label object |
-| text_formatting | text_format | Formatting: text.format_none, text.format_bold, or text.format_italic |
+| text_formatting | text_format | Formatting: text.format_none, text.format_bold, text.format_italic, or a combination such as text.format_bold + text.format_italic |
 
 ### label.set_tooltip()
 

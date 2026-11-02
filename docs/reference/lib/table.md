@@ -5,7 +5,7 @@ title: "table"
 description: "Data tables — create and populate on-chart tables"
 icon: "table_chart"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-11-02"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -169,7 +169,7 @@ Creates or updates a cell with text and formatting.
 | `bgcolor` | `color.Color` | Background color | `None` |
 | `tooltip` | `str` | Tooltip text on hover | `""` |
 | `text_font_family` | `font.FontFamily` | Font: `font.family_default`, `font.family_monospace` | `font.family_default` |
-| `text_formatting` | `text.Format` | Formatting: `text.format_none`, `text.format_bold`, `text.format_italic`, `text.format_strikeout` | `text.format_none` |
+| `text_formatting` | `text.Format` | Formatting: `text.format_none`, `text.format_bold`, `text.format_italic`, or a combination such as `text.format_bold + text.format_italic` | `text.format_none` |
 
 **Returns:** `None`
 
@@ -315,14 +315,14 @@ Sets the font family of a cell's text.
 
 ### table.cell_set_text_formatting()
 
-Applies text formatting (bold, italic, strikethrough) to a cell.
+Applies text formatting (bold, italic, or both) to a cell.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `table_id` | `table.Table` | The table containing the cell |
 | `column` | `int` | Column index |
 | `row` | `int` | Row index |
-| `text_formatting` | `text.Format` | Format: `text.format_none`, `text.format_bold`, `text.format_italic`, `text.format_strikeout` |
+| `text_formatting` | `text.Format` | Format: `text.format_none`, `text.format_bold`, `text.format_italic`, or a combination such as `text.format_bold + text.format_italic` |
 
 **Returns:** `None`
 

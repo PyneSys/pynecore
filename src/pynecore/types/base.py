@@ -1,3 +1,6 @@
+from typing import Self
+
+
 class IntEnum(int):
     """
     IntEnum class that auto-increments values.
@@ -13,6 +16,25 @@ class IntEnum(int):
         cls._counter += 1
         # noinspection PyTypeChecker
         return super().__new__(cls, value)
+
+
+class BitSet(int):
+    """
+    A set of flags, one bit each, that Pine combines with ``+`` and ``-``.
+
+    Both are set operations: ``+`` is union and ``-`` is difference, so adding a
+    flag that is already in the set, or subtracting one that is not, leaves the
+    set unchanged. The result has the same class, so it can be combined further.
+    Plain integer math on a value needs ``int()`` first.
+    """
+
+    __slots__ = ()
+
+    def __add__(self, other: int) -> Self:
+        return type(self)(self | other)
+
+    def __sub__(self, other: int) -> Self:
+        return type(self)(self & ~other)
 
 
 class StrLiteral(str):

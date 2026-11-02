@@ -5,7 +5,7 @@ title: "text"
 description: "Text alignment and wrapping constants"
 icon: "text_format"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-11-02"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -53,13 +53,21 @@ Vertical alignment constants (`align_top`, `align_center`, `align_bottom`) are u
 
 ### Formatting
 
-| Constant              | Description                                          |
-|-----------------------|------------------------------------------------------|
-| `text.format_bold`    | Renders text in bold                                 |
-| `text.format_italic`  | Renders text in italic                               |
-| `text.format_none`    | No special formatting (default)                      |
+| Constant             | Value | Description                     |
+|----------------------|-------|---------------------------------|
+| `text.format_bold`   | `1`   | Renders text in bold            |
+| `text.format_italic` | `2`   | Renders text in italic          |
+| `text.format_none`   | `0`   | No special formatting (default) |
 
 Used with the `text_formatting` parameter of `label.new()`, `box.new()`, `table.cell()`, and their corresponding `*set_text_formatting()` functions.
+
+Each style is one bit, the same values TradingView uses. A formatting value is a set of styles: `+`
+adds styles and `-` removes them, as set operations rather than integer arithmetic. Adding a style
+that is already in the set, or removing one that is not, leaves the set unchanged:
+
+```python
+label.new(bar_index, high, "BUY", text_formatting=text.format_bold + text.format_italic)
+```
 
 ### Wrapping
 

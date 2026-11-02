@@ -967,6 +967,9 @@
     "pane": {
       "type": "variable"
     },
+    "pine_screener": {
+      "type": "variable"
+    },
     "price_scale": {
       "type": "variable"
     },
