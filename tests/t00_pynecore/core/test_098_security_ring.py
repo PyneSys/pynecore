@@ -387,8 +387,9 @@ def _child_appender(sec_id, sync_name, sec_ids, condition, n, error_queue):
 def __test_ring_child_process_append_parent_waits__(log):
     """A real child appends while the parent blocks on the per-sid Condition."""
     sec_ids = ["childprod"]
-    sync_name = "pyne_sync_ring_child"
-    sb = SyncBlock(sec_ids, create=True, name=sync_name)
+    # The OS names the block, as in a real run, so parallel workers cannot collide
+    sb = SyncBlock(sec_ids, create=True)
+    sync_name = sb.name
     conds = create_ring_conditions(sec_ids)
     cond = conds["childprod"]
 
@@ -406,20 +407,24 @@ def __test_ring_child_process_append_parent_waits__(log):
 
         # Block on the condition until the last bar's close is published —
         # no sleep-based polling anywhere.
-        assert reader.wait_for_close(n * 100, timeout=30.0), "child never published"
+        published = reader.wait_for_close(n * 100, timeout=30.0)
+        if published:
+            assert reader.last_close_at_or_before(n * 100) == (
+                (n - 1) * 100, n * 100, ("bar", n - 1))
+            # The ring grew and/or was compacted in the child; the parent follows
+            assert reader.version >= 1
 
+        # The last append wakes the parent before the child bumps rounds-done and
+        # finishes the ring, so those are only settled once the child has exited
+        proc.join(timeout=10)
         errors = []
         while not error_queue.empty():
             errors.append(error_queue.get_nowait())
         assert not errors, f"child errors: {errors}"
-
-        assert reader.last_close_at_or_before(n * 100) == ((n - 1) * 100, n * 100, ("bar", n - 1))
-        # The ring grew and/or was compacted in the child; the parent follows
-        assert reader.version >= 1
-        assert sb.get_rounds_done("childprod") == 1
-
-        proc.join(timeout=10)
+        assert published, "child never published"
         assert not proc.is_alive(), "child did not exit"
+        assert proc.exitcode == 0
+        assert sb.get_rounds_done("childprod") == 1
         assert reader.frontier_close() == FRONTIER_INF
         log.info("child ring: count=%d version=%d", reader.count(), reader.version)
     finally:
