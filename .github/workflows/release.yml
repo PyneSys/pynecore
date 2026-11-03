@@ -15,13 +15,39 @@ jobs:
   # native-vs-Python bit-identity test inside every wheel it builds (see
   # [tool.cibuildwheel] in pyproject.toml), so a platform whose compiler changes a
   # single last bit fails the release instead of shipping.
+  #
+  # The wheels of one platform are split over parallel jobs. The first wheel of a
+  # job compiles the whole Rust dependency tree (4.5 to 9.5 minutes), the ones after
+  # it reuse it (about 2 minutes each), so a job builds two wheels: one per job would
+  # pay the full compile everywhere. The split stays within the Free plan's 20
+  # concurrent jobs (17 here, plus the two other jobs) and 5 concurrent macOS jobs;
+  # macos-15-intel compiles slowest, so it runs three jobs. ``build`` is passed to
+  # cibuildwheel as CIBW_BUILD, overriding [tool.cibuildwheel] build; together the
+  # selectors cover that list exactly.
   build-wheels:
-    name: Wheels on ${{ matrix.os }}
+    name: Wheels ${{ matrix.wheels }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-15-intel, macos-latest]
+        include:
+          - { os: ubuntu-latest, wheels: cp311-cp312-manylinux, build: "cp311-manylinux_* cp312-manylinux_*" }
+          - { os: ubuntu-latest, wheels: cp313-cp314-manylinux, build: "cp313-manylinux_* cp314-manylinux_*" }
+          - { os: ubuntu-latest, wheels: cp311-cp312-musllinux, build: "cp311-musllinux_* cp312-musllinux_*" }
+          - { os: ubuntu-latest, wheels: cp313-cp314-musllinux, build: "cp313-musllinux_* cp314-musllinux_*" }
+          - { os: ubuntu-24.04-arm, wheels: cp311-cp312-manylinux, build: "cp311-manylinux_* cp312-manylinux_*" }
+          - { os: ubuntu-24.04-arm, wheels: cp313-cp314-manylinux, build: "cp313-manylinux_* cp314-manylinux_*" }
+          - { os: ubuntu-24.04-arm, wheels: cp311-cp312-musllinux, build: "cp311-musllinux_* cp312-musllinux_*" }
+          - { os: ubuntu-24.04-arm, wheels: cp313-cp314-musllinux, build: "cp313-musllinux_* cp314-musllinux_*" }
+          - { os: windows-latest, wheels: cp311-cp312, build: "cp311-* cp312-*" }
+          - { os: windows-latest, wheels: cp313-cp314, build: "cp313-* cp314-*" }
+          - { os: windows-11-arm, wheels: cp311-cp312, build: "cp311-* cp312-*" }
+          - { os: windows-11-arm, wheels: cp313-cp314, build: "cp313-* cp314-*" }
+          - { os: macos-15-intel, wheels: cp311, build: "cp311-*" }
+          - { os: macos-15-intel, wheels: cp312, build: "cp312-*" }
+          - { os: macos-15-intel, wheels: cp313-cp314, build: "cp313-* cp314-*" }
+          - { os: macos-latest, wheels: cp311-cp312, build: "cp311-* cp312-*" }
+          - { os: macos-latest, wheels: cp313-cp314, build: "cp313-* cp314-*" }
 
     steps:
       - uses: actions/checkout@v6
@@ -35,12 +61,14 @@ jobs:
 
       - name: Build and test wheels
         uses: pypa/cibuildwheel@v4.2.0
+        env:
+          CIBW_BUILD: ${{ matrix.build }}
         with:
           output-dir: wheelhouse
 
       - uses: actions/upload-artifact@v6
         with:
-          name: dist-wheels-${{ matrix.os }}
+          name: dist-wheels-${{ matrix.os }}-${{ matrix.wheels }}
           path: ./wheelhouse/*.whl
 
   # The sdist, plus the pure-Python wheel every platform without a matching binary wheel
