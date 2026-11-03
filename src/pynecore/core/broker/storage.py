@@ -2019,10 +2019,15 @@ class RunContext:
 
     def iter_live_orders(
             self, *,
-            symbol: str | None = None,
             from_entry: str | None = None,
     ) -> Iterator[OrderRow]:
-        """Iterator over live (not yet closed) orders.
+        """Iterator over this run's live (not yet closed) orders.
+
+        A run trades exactly one instrument, so there is no symbol filter:
+        its rows spell that instrument differently -- the sync engine
+        journals under the chart ticker (``BTCUSD.P``), a plugin under the
+        venue wire name (``BTCUSD``) -- and a filter by either spelling
+        would hide the other writer's rows.
 
         The partial index (``idx_orders_live``) serves the filter; a
         realistic one-way Pine strategy has fewer than 50 live rows at
@@ -2033,9 +2038,6 @@ class RunContext:
             "WHERE run_instance_id = ? AND closed_ts_ms IS NULL"
         )
         params: list[Any] = [self.run_instance_id]
-        if symbol is not None:
-            sql += " AND symbol = ?"
-            params.append(symbol)
         if from_entry is not None:
             sql += " AND from_entry = ?"
             params.append(from_entry)
@@ -2087,14 +2089,16 @@ class RunContext:
         for row in rows:
             yield _row_to_order(row)
 
-    def foreign_live_exchange_order_ids(self, *, symbol: str) -> set[str]:
-        """Return physical order ids claimed by another run on this account.
+    def foreign_live_exchange_order_ids(self) -> set[str]:
+        """Return physical order ids claimed by another run on this account and instrument.
 
         Ended run instances remain authoritative owners while their order row is
         still live. This lets a restarting sibling distinguish genuinely
         untracked venue exposure from a position opened by another run label.
 
-        :param symbol: Canonical broker symbol to scope the ownership query.
+        The instrument is the runs' own symbol, never the rows': one run's
+        rows spell it both as the chart ticker and as the venue wire name.
+
         :return: Non-empty exchange order ids owned outside this run instance.
         """
         with self._store.read_lock() as conn:
@@ -2109,10 +2113,10 @@ class RunContext:
                 "  AND owned.closed_ts_ms IS NULL "
                 "  AND owned.exchange_order_id IS NOT NULL "
                 "  AND owned.exchange_order_id != '' "
-                "  AND owned.symbol = ? "
+                "  AND owner_run.symbol = current_run.symbol "
                 "  AND owner_run.account_id = current_run.account_id "
                 "  AND owner_run.plugin_name = current_run.plugin_name",
-                (self.run_instance_id, self.run_instance_id, symbol),
+                (self.run_instance_id, self.run_instance_id),
             ).fetchall()
         return {str(row['exchange_order_id']) for row in rows}
 

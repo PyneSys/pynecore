@@ -701,19 +701,24 @@ def __test_iter_live_orders_filters_closed__(tmp_path: Path) -> None:
         assert live_ids == {"a", "c"}
 
 
-def __test_iter_live_orders_symbol_filter__(tmp_path: Path) -> None:
-    """``iter_live_orders(symbol=...)`` returns only orders for the requested symbol."""
+def __test_iter_live_orders_returns_the_run_rows_of_every_symbol_spelling__(
+        tmp_path: Path) -> None:
+    """The engine journals under the chart ticker, a plugin under the venue wire name.
+
+    Measured live: Bybit inverse cycle 319 -- the operator resume's journal
+    rebuild filtered by ``BTCUSD.P`` and never saw the plugin's ``BTCUSD``
+    exit-leg rows, so the take-profit the operator removed did not come back.
+    """
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
-        ctx = _open_run(store)
+        ctx = _open_run(store, symbol="BTCUSD.P")
         ctx.upsert_order(
-            "a", symbol="EURUSD", side="buy", qty=1.0, state="submitted",
+            "a", symbol="BTCUSD.P", side="buy", qty=1.0, state="submitted",
         )
         ctx.upsert_order(
-            "b", symbol="GBPUSD", side="buy", qty=1.0, state="submitted",
+            "b", symbol="BTCUSD", side="buy", qty=1.0, state="submitted",
         )
 
-        eur = {r.client_order_id for r in ctx.iter_live_orders(symbol="EURUSD")}
-        assert eur == {"a"}
+        assert {r.client_order_id for r in ctx.iter_live_orders()} == {"a", "b"}
 
 
 def __test_set_risk_preserves_unset_fields__(tmp_path: Path) -> None:
@@ -979,6 +984,7 @@ def __test_foreign_live_exchange_order_ids_include_stopped_sibling__(
         run_a = _open_run(store, label="A")
         run_b = _open_run(store, label="B")
         other_account = _open_run(store, label="C", account_id="other-account")
+        other_symbol = _open_run(store, label="D", symbol="GBPUSD")
         run_a.upsert_order(
             "a", symbol="EURUSD", side="buy", qty=1.0, state="confirmed",
             exchange_order_id="deal-a",
@@ -991,11 +997,27 @@ def __test_foreign_live_exchange_order_ids_include_stopped_sibling__(
             "c", symbol="EURUSD", side="buy", qty=1.0, state="confirmed",
             exchange_order_id="deal-c",
         )
+        other_symbol.upsert_order(
+            "d", symbol="EURUSD", side="buy", qty=1.0, state="confirmed",
+            exchange_order_id="deal-d",
+        )
         run_a.close()
 
-        assert run_b.foreign_live_exchange_order_ids(symbol="EURUSD") == {
-            "deal-a"
-        }
+        assert run_b.foreign_live_exchange_order_ids() == {"deal-a"}
+
+
+def __test_foreign_live_exchange_order_ids_scope_by_the_runs_instrument__(
+        tmp_path: Path) -> None:
+    """A sibling's row in the venue wire spelling is still on this run's instrument."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        sibling = _open_run(store, label="A", symbol="BTCUSD.P")
+        run = _open_run(store, label="B", symbol="BTCUSD.P")
+        sibling.upsert_order(
+            "a", symbol="BTCUSD", side="buy", qty=1.0, state="confirmed",
+            exchange_order_id="deal-a",
+        )
+
+        assert run.foreign_live_exchange_order_ids() == {"deal-a"}
 
 
 # === Torn write / recovery ================================================

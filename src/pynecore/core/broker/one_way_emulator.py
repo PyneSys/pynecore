@@ -639,9 +639,7 @@ class OneWayEmulator:
         # book — until every position-opening dispatch on this side has its
         # fill on the books; the re-run then covers all legs.
         if self._store_ctx is not None:
-            pending_coid = self._pending_position_entry(
-                intent.symbol, protected_side,
-            )
+            pending_coid = self._pending_position_entry(protected_side)
             if pending_coid is not None:
                 return BracketFanResult(
                     legs=(), skipped=True,
@@ -736,7 +734,7 @@ class OneWayEmulator:
             replicated.append(leg.leg_id)
         return BracketFanResult(legs=tuple(replicated), skipped=False)
 
-    def _pending_position_entry(self, symbol: str, protected_side: str) -> str | None:
+    def _pending_position_entry(self, protected_side: str) -> str | None:
         """Client-order-id of a protected-side position entry awaiting its fill.
 
         A live journal row with ``extras['kind'] == ENTRY_KIND_POSITION`` opens
@@ -746,14 +744,13 @@ class OneWayEmulator:
         rows are excluded — they hold no leg until their fill promotes them to
         ``ENTRY_KIND_POSITION`` — and so are entries opening the opposite side.
 
-        :param symbol: The exit's canonical broker symbol.
         :param protected_side: Position side the exit protects (``'buy'`` /
             ``'sell'``).
         :return: The first pending row's ``client_order_id``, or ``None`` when
             every protected-side position entry has its fill on the books.
         """
         assert self._store_ctx is not None
-        for row in self._store_ctx.iter_live_orders(symbol=symbol):
+        for row in self._store_ctx.iter_live_orders():
             if (row.extras or {}).get('kind') != ENTRY_KIND_POSITION:
                 continue
             if row.side != protected_side:
@@ -793,7 +790,7 @@ class OneWayEmulator:
             return
         clear_coid = envelope.client_order_id(KIND_CANCEL)
         rows = list(iter_active_bracket_ownerships(
-            self._store_ctx, symbol=intent.symbol, from_entry=intent.from_entry,
+            self._store_ctx, from_entry=intent.from_entry,
         ))
         for row in rows:
             if (row.intent_key or '') != intent.intent_key:
@@ -859,7 +856,7 @@ class OneWayEmulator:
             return set()
         rows = [
             row
-            for row in iter_active_bracket_ownerships(self._store_ctx, symbol=symbol)
+            for row in iter_active_bracket_ownerships(self._store_ctx)
             if (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_STATE)
             == BRACKET_OWN_STATE_CLEARING
         ]
@@ -909,12 +906,12 @@ class OneWayEmulator:
             return released
         still_owned = {
             row.intent_key
-            for row in iter_active_bracket_ownerships(self._store_ctx, symbol=symbol)
+            for row in iter_active_bracket_ownerships(self._store_ctx)
             if row.intent_key is not None
         }
         return released - still_owned
 
-    async def drain_residual_opens(self, symbol: str, port: 'PositionPort') -> None:
+    async def drain_residual_opens(self, port: 'PositionPort') -> None:
         """Reconcile any live reversal residual-open breadcrumb per sync (in-session).
 
         The restart counterpart :meth:`_replay_residual_opens` reconciles these
@@ -927,8 +924,8 @@ class OneWayEmulator:
         would wait for the NEXT process restart before being reconciled.
 
         This closes that window. The engine calls it once per sync (alongside
-        :meth:`drain_clearing_rows`), reconciling every live breadcrumb for
-        ``symbol`` through the SAME :meth:`_replay_residual_one` path restart replay
+        :meth:`drain_clearing_rows`), reconciling every live breadcrumb of
+        the run through the SAME :meth:`_replay_residual_one` path restart replay
         uses: if the residual's persist-first entry row already landed the breadcrumb
         is simply discharged (the entry / recovery path owns the open), otherwise the
         residual is re-opened under its deterministic entry coid (``KIND_ENTRY``, or
@@ -937,12 +934,11 @@ class OneWayEmulator:
         next sync to retry rather than halting the bot, mirroring
         :meth:`drain_clearing_rows`. A successful in-session reversal discharges its
         own breadcrumb synchronously, so this only ever sees genuinely unresolved
-        rows. Scoped to ``symbol`` (the engine owns one symbol); a breadcrumb for
-        another symbol is that engine's drain to reconcile.
+        rows.
         """
         if self._store_ctx is None:
             return
-        for row in list(iter_active_residual_opens(self._store_ctx, symbol=symbol)):
+        for row in list(iter_active_residual_opens(self._store_ctx)):
             await self._replay_residual_one(row, port)
 
     @staticmethod
@@ -975,7 +971,7 @@ class OneWayEmulator:
             return ClearFanResult(legs=())
         cancel_coid = envelope.client_order_id(KIND_CANCEL)
         rows = list(iter_active_bracket_ownerships(
-            self._store_ctx, symbol=intent.symbol, from_entry=intent.from_entry,
+            self._store_ctx, from_entry=intent.from_entry,
         ))
         cleared: list[str] = []
         for row in rows:

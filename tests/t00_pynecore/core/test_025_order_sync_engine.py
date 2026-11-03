@@ -8160,25 +8160,16 @@ def __test_unattributed_nonzero_settlement_keeps_every_exit_armed__():
     assert len(b.cancel_calls) == n_cancels
 
 
-def __test_venue_shared_with_other_runs_checks_the_journal_symbols__():
-    """Foreign live orders under this run's journal (wire) symbol are found."""
+def __test_venue_shared_with_other_runs_asks_the_store_for_sibling_orders__():
+    """The store scopes the sibling runs by instrument, whatever spelling their rows use."""
     b = MockBroker()
     engine, _ = _mk_engine(b)
-    queried: list[str] = []
-
-    def foreign_ids(*, symbol: str) -> set[str]:
-        queried.append(symbol)
-        return {"other-run-order"} if symbol == "BTCUSDT-WIRE" else set()
-
     engine._store_ctx = SimpleNamespace(  # type: ignore[assignment]
-        iter_live_orders=lambda: iter([SimpleNamespace(symbol="BTCUSDT-WIRE")]),
-        foreign_live_exchange_order_ids=foreign_ids,
+        foreign_live_exchange_order_ids=lambda: {"other-run-order"},
     )
     assert engine._venue_shared_with_other_runs() is True  # type: ignore[attr-defined]
-    assert "BTCUSDT-WIRE" in queried
     engine._store_ctx = SimpleNamespace(  # type: ignore[assignment]
-        iter_live_orders=lambda: iter([]),
-        foreign_live_exchange_order_ids=lambda *, symbol: set(),
+        foreign_live_exchange_order_ids=lambda: set(),
     )
     assert engine._venue_shared_with_other_runs() is False  # type: ignore[attr-defined]
 

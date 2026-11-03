@@ -6506,20 +6506,10 @@ class OrderSyncEngine:
         return None
 
     def _venue_shared_with_other_runs(self) -> bool:
-        """Whether another run holds live orders on this account and symbol.
-
-        Journal rows carry the venue wire symbol, which can differ from
-        ``self._symbol``, so the symbols of this run's own live rows are checked
-        too.
-        """
+        """Whether another run holds live orders on this account and symbol."""
         if self._store_ctx is None:
             return False
-        symbols = {row.symbol for row in self._store_ctx.iter_live_orders() if row.symbol}
-        symbols.add(self._symbol)
-        return any(
-            self._store_ctx.foreign_live_exchange_order_ids(symbol=symbol)
-            for symbol in symbols
-        )
+        return bool(self._store_ctx.foreign_live_exchange_order_ids())
 
     def _adopt_signed_size(
             self, broker_signed: float, broker_entry_price: float, *,
@@ -7435,7 +7425,7 @@ class OrderSyncEngine:
                 continue
             if owned_rows is None:
                 rows: dict[str, OrderRow] = {}
-                for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+                for row in self._store_ctx.iter_live_orders():
                     if row.exchange_order_id:
                         rows[row.exchange_order_id] = row
                     rows[row.client_order_id] = row
@@ -7686,7 +7676,7 @@ class OrderSyncEngine:
                 owner_of_order[oid] = key
         wanted = set(keys)
         pending: dict[str, list[str]] = {}
-        for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+        for row in self._store_ctx.iter_live_orders():
             key = owner_of_order.get(row.exchange_order_id or '')
             if key is None and row.intent_key in wanted:
                 key = row.intent_key
@@ -12842,7 +12832,7 @@ class OrderSyncEngine:
         # partial legs are engine-internal and never have a broker-side
         # order, so a missing row for the parent is simply a no-op.
         if tentative_parents and self._store_ctx is not None:
-            for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+            for row in self._store_ctx.iter_live_orders():
                 if (row.intent_key is None
                         or row.intent_key not in tentative_parents
                         or not row.exchange_order_id):
@@ -14882,9 +14872,7 @@ class OrderSyncEngine:
         if self._store_ctx is None:
             return None
         parents: set[str] = set()
-        for row in iter_active_bracket_ownerships(
-                self._store_ctx, symbol=self._symbol,
-        ):
+        for row in iter_active_bracket_ownerships(self._store_ctx):
             if (row.extras or {}).get(
                     EXTRAS_KEY_BRACKET_OWN_STATE) != BRACKET_OWN_STATE_ACTIVE:
                 continue
@@ -15003,7 +14991,7 @@ class OrderSyncEngine:
         """
         if self._store_ctx is None or not self._restart_live_entry_orders_by_id:
             return
-        for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+        for row in self._store_ctx.iter_live_orders():
             pine_id = row.pine_entry_id
             if pine_id is None:
                 continue
@@ -15093,7 +15081,7 @@ class OrderSyncEngine:
         if not self._resumed_from_quarantine or self._store_ctx is None:
             return
         groups: dict[tuple[str, str], list[OrderRow]] = {}
-        for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+        for row in self._store_ctx.iter_live_orders():
             leg = self._journal_exit_leg(row)
             if leg is not None:
                 groups.setdefault((leg[0], row.from_entry or ''), []).append(row)
@@ -15107,8 +15095,7 @@ class OrderSyncEngine:
             dispatches = {leg[1] for leg in map(self._journal_exit_leg, rows) if leg is not None}
             released = [
                 r for r in self._store_ctx.iter_closed_orders_for_run_id(from_entry=from_entry)
-                if r.symbol == self._symbol
-                and (leg := self._journal_exit_leg(r)) is not None
+                if (leg := self._journal_exit_leg(r)) is not None
                 and leg[0] == pine_id and leg[1] in dispatches
             ]
             if any(r.trailing_stop for r in rows + released):
@@ -15181,7 +15168,7 @@ class OrderSyncEngine:
             reused = {envelope.client_order_id(KIND_EXIT_TP),
                       envelope.client_order_id(KIND_EXIT_SL)}
         refs: list[str] = []
-        for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+        for row in self._store_ctx.iter_live_orders():
             ref = row.exchange_order_id or row.client_order_id
             if (row.from_entry != intent.from_entry or ref in tracked
                     or row.client_order_id in reused
@@ -15251,9 +15238,7 @@ class OrderSyncEngine:
         if one_way_port is None or self._store_ctx is None:
             return
         groups: dict[str, list] = {}
-        for row in iter_active_bracket_ownerships(
-                self._store_ctx, symbol=self._symbol,
-        ):
+        for row in iter_active_bracket_ownerships(self._store_ctx):
             extras = row.extras or {}
             if extras.get(EXTRAS_KEY_BRACKET_OWN_STATE) != BRACKET_OWN_STATE_ACTIVE:
                 continue
@@ -16014,9 +15999,7 @@ class OrderSyncEngine:
         one_way_port: PositionPort | None = getattr(self._broker, 'position_port', None)
         if one_way_port is not None and self._store_ctx is not None:
             orphan_cancels: dict[str, CancelIntent] = {}
-            for row in iter_active_bracket_ownerships(
-                    self._store_ctx, symbol=self._symbol,
-            ):
+            for row in iter_active_bracket_ownerships(self._store_ctx):
                 ikey = row.intent_key
                 if (ikey is None or ikey in orphan_cancels
                         or ikey in self._active_intents or ikey in new_map
@@ -16111,9 +16094,7 @@ class OrderSyncEngine:
             # ambiguous retry leaves the row live rather than halting the bot.
             try:
                 self._run_async_recovery(
-                    self._one_way_emulator.drain_residual_opens(
-                        self._symbol, one_way_port,
-                    ),
+                    self._one_way_emulator.drain_residual_opens(one_way_port),
                 )
             except BrokerManualInterventionError as e:
                 self._record_halt(e)
@@ -17601,7 +17582,7 @@ class OrderSyncEngine:
         if len(self._position.open_trades) < max(1, pyramiding):
             return None
         filled = 0.0
-        for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+        for row in self._store_ctx.iter_live_orders():
             if row.pine_entry_id != intent.pine_id or row.side != intent.side:
                 continue
             if row.filled_qty < row.qty - 1e-9:
@@ -17776,7 +17757,7 @@ class OrderSyncEngine:
             if anchor.run_tag:
                 tags.add(anchor.run_tag)
         if self._store_ctx is not None:
-            for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+            for row in self._store_ctx.iter_live_orders():
                 parsed = parse_client_order_id(row.client_order_id)
                 if parsed is not None:
                     tags.add(parsed.run_tag)
@@ -18325,7 +18306,7 @@ class OrderSyncEngine:
             return 0.0
         wanted = set(keys)
         total = 0.0
-        for row in self._store_ctx.iter_live_orders(symbol=self._symbol):
+        for row in self._store_ctx.iter_live_orders():
             if row.side == 'sell' and row.intent_key in wanted:
                 working = row.qty - row.filled_qty
                 if working > 0.0:

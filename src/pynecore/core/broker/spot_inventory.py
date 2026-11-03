@@ -1695,7 +1695,7 @@ class SpotInventoryManager:
                 )
         coids: set[str] = set()
         unfilled = Decimal(0)
-        for row in self._store.iter_live_orders(symbol=self._symbol):
+        for row in self._store.iter_live_orders():
             if row.side != side:
                 continue
             filled = max(Decimal(str(row.filled_qty)),

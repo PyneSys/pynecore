@@ -453,7 +453,7 @@ def __test_reconcile_cancels_a_journal_owned_reduce_leg_no_intent_maps__(
 
         assert broker.cancel_broker_order_calls == ["xchg-orphan"]
         assert not [
-            row for row in ctx.iter_live_orders(symbol=SYMBOL)
+            row for row in ctx.iter_live_orders()
             if row.client_order_id == coid
         ], "the cancelled leg's journal row must be closed"
         assert "xchg-orphan" in engine._strategy_cancel_expected_ids  # type: ignore[attr-defined]
@@ -496,7 +496,7 @@ def __test_reconcile_cancels_a_journal_owned_stray_entry_no_intent_manages__(
 
         assert broker.cancel_broker_order_calls == ["xchg-stray"]
         assert not [
-            row for row in ctx.iter_live_orders(symbol=SYMBOL)
+            row for row in ctx.iter_live_orders()
             if row.client_order_id == coid
         ]
         assert "xchg-stray" in engine._strategy_cancel_expected_ids  # type: ignore[attr-defined]

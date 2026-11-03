@@ -571,6 +571,8 @@ class _JournalingBroker(_Broker):
     trailing: bool = False
     leg_qty: float | None = None
     """The qty the venue rounded the legs to, as Bybit spot's lot step does."""
+    wire_symbol: str = SYMBOL
+    """The venue's spelling of the instrument the leg rows are journaled under."""
 
     async def execute_exit(self, envelope):
         self.calls.append("exit")
@@ -582,7 +584,7 @@ class _JournalingBroker(_Broker):
             for kind, leg, tp, sl in ((KIND_EXIT_TP, "TP", intent.tp_price, None),
                                       (KIND_EXIT_SL, "SL", None, intent.sl_price)):
                 self.journal.upsert_order(
-                    envelope.client_order_id(kind), symbol=SYMBOL, side=intent.side,
+                    envelope.client_order_id(kind), symbol=self.wire_symbol, side=intent.side,
                     qty=intent.qty if self.leg_qty is None else self.leg_qty,
                     state="confirmed",
                     intent_key=(f"{intent.intent_key}{INTENT_KEY_SEP}{leg}"
@@ -629,7 +631,7 @@ def _restart_with_a_journaled_exit(
         store: BrokerStore, *, refs: tuple[str, ...], resumed: bool, declared: bool = True,
         leg_keys: bool = False, trailing: bool = False, leg_qty: float | None = None,
         cancelled: str | None = None, wire_qty: float | None = None,
-        forget_envelope: bool = False, spent: str | None = None,
+        forget_envelope: bool = False, spent: str | None = None, wire_symbol: str = SYMBOL,
 ) -> tuple[RunContext, OrderSyncEngine, _JournalingBroker, DispatchEnvelope]:
     """The previous process dispatched the exit; the next one starts over it.
 
@@ -648,23 +650,26 @@ def _restart_with_a_journaled_exit(
     :param spent: The take-profit leg filled; ``"stop-cancelled"`` closes the
         stop leg too, ``"stop-live"`` leaves it resting. The exit's dispatch
         anchor stays journaled.
+    :param wire_symbol: The plugin journals the entry and leg rows under this
+        venue spelling of the engine's chart ticker.
     """
     first = _open_ctx(store)
     entry_qty = 1.0 if wire_qty is None else wire_qty
     entry_extras: dict = {"kind": "position"}
     if wire_qty is not None:
         entry_extras[JOURNAL_WIRE_QTY_ANCHOR_EXTRA_KEY] = "1.1"
-    first.upsert_order("row-l", symbol=SYMBOL, side="buy", qty=entry_qty, filled_qty=entry_qty,
+    first.upsert_order("row-l", symbol=wire_symbol, side="buy", qty=entry_qty,
+                       filled_qty=entry_qty,
                        state="confirmed", pine_entry_id="L", extras=entry_extras)
     previous_broker = _JournalingBroker(position=_long(1.0), refs=refs, journal=first,
                                         leg_keys=leg_keys, trailing=trailing,
-                                        leg_qty=leg_qty)
+                                        leg_qty=leg_qty, wire_symbol=wire_symbol)
     previous = _engine(first, previous_broker)
     # An earlier dispatch of the same exit, released no sooner than the cancelled leg
     earlier = build_client_order_id(run_tag=first.run_tag, pine_id="L-X",
                                     bar_ts_ms=BAR_TS - 60_000, kind=KIND_EXIT_TP)
     if cancelled == KIND_EXIT_TP:
-        first.upsert_order(earlier, symbol=SYMBOL, side="sell", qty=1.0, state="confirmed",
+        first.upsert_order(earlier, symbol=wire_symbol, side="sell", qty=1.0, state="confirmed",
                            intent_key=f"L-X{INTENT_KEY_SEP}L", from_entry="L",
                            tp_level=1.1500, extras={"kind": "exit_leg"})
     previous.reconcile()
@@ -842,6 +847,33 @@ def __test_a_resume_restores_the_cancelled_stop_of_an_entry_journaled_in_wire_un
         assert isinstance(rearmed.intent, ExitIntent)
         assert (rearmed.intent.tp_price, rearmed.intent.sl_price) == (1.1200, 1.0900)
         assert rearmed.intent.qty == 1.0
+        assert [e['mode'] for e in _events(ctx, 'resume_exit_reasserted')] == ['rearm']
+        assert store.open_quarantines() == []
+        ctx.close()
+
+
+def __test_a_resume_restores_the_cancelled_take_profit_of_legs_journaled_in_the_venue_spelling__(
+        tmp_path: Path) -> None:
+    """The plugin journals under the venue's symbol, the engine trades the chart ticker.
+
+    Measured live: Bybit inverse cycle 319 -- the operator removed the
+    take-profit and resumed; the journal rebuild looked for ``BTCUSD.P`` rows
+    while the plugin had journaled the exit legs under ``BTCUSD``, so the
+    take-profit stayed off the venue until the script declared the exit afresh.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx, engine, broker, journaled = _restart_with_a_journaled_exit(
+            store, refs=("xchg-tp", "xchg-sl"), resumed=True, declared=False,
+            cancelled=KIND_EXIT_TP, wire_qty=110_000.0, wire_symbol="EUR/USD")
+
+        assert [t.entry_id for t in engine._position.open_trades] == ["L"]  # noqa: SLF001
+        engine.sync(BAR_TS + 60_000, last_price=1.1000)
+
+        redispatched, rearmed = broker.exit_calls
+        assert (redispatched.client_order_id(KIND_EXIT_SL)
+                == journaled.client_order_id(KIND_EXIT_SL))
+        assert isinstance(rearmed.intent, ExitIntent)
+        assert (rearmed.intent.tp_price, rearmed.intent.sl_price) == (1.1200, 1.0900)
         assert [e['mode'] for e in _events(ctx, 'resume_exit_reasserted')] == ['rearm']
         assert store.open_quarantines() == []
         ctx.close()

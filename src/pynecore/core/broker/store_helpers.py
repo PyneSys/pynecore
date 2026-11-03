@@ -130,6 +130,7 @@ __all__ = [
     'BRACKET_OWN_STATE_CLEARING',
     'BRACKET_OWN_STATE_RELEASED',
     'BRACKET_OWN_STATE_LIVE',
+    'LEDGER_ROW_STATES',
     'EXTRAS_KEY_BRACKET_OWN_STATE',
     'EXTRAS_KEY_BRACKET_OWN_LEG_ID',
     'EXTRAS_KEY_BRACKET_OWN_ATTACH_COID',
@@ -578,6 +579,18 @@ BRACKET_OWN_STATE_LIVE: frozenset[str] = frozenset(
     {BRACKET_OWN_STATE_ACTIVE, BRACKET_OWN_STATE_CLEARING}
 )
 
+# Every ``orders.state`` marker of a ledger row that owns no exchange order of
+# its own. A path walking the journal for venue orders (an ``orderLinkId``
+# lookup, a fill walk, a terminality check) skips these rows: the venue never
+# heard of their client order id.
+LEDGER_ROW_STATES: frozenset[str] = frozenset({
+    STATE_PARTIAL_BRACKET_LEG,
+    STATE_ENTRY_STOP_WATCH,
+    STATE_CLOSE_LEG,
+    STATE_RESIDUAL_OPEN,
+    STATE_BRACKET_OWN,
+})
+
 # Canonical ``extras`` keys for a bracket-ownership row.
 EXTRAS_KEY_BRACKET_OWN_STATE = 'bracket_own_state'
 # Broker leg id (cTrader ``positionId``) this exit's bracket is replicated onto.
@@ -914,7 +927,7 @@ def adopt_untracked_position_legs(
     for row in store.iter_live_orders():
         if row.exchange_order_id:
             tracked_ids.add(str(row.exchange_order_id))
-    foreign_ids = store.foreign_live_exchange_order_ids(symbol=symbol)
+    foreign_ids = store.foreign_live_exchange_order_ids()
 
     adopted_count = 0
     for leg in legs:
@@ -1705,7 +1718,6 @@ def update_engine_trigger_partial_leg_state(
 def iter_active_engine_trigger_partial_legs(
         store: 'RunContext',
         *,
-        symbol: str | None = None,
         from_entry: str | None = None,
 ) -> Iterator['OrderRow']:
     """Iterate live engine-trigger partial bracket leg rows.
@@ -1723,13 +1735,11 @@ def iter_active_engine_trigger_partial_legs(
     verification state.
 
     :param store: The active run context.
-    :param symbol: Optional symbol filter — passed straight through
-        to :meth:`RunContext.iter_live_orders`.
     :param from_entry: Optional Pine parent entry id filter — same
         passthrough; the cascade-cancel callers use this to target
         all legs of one parent.
     """
-    for row in store.iter_live_orders(symbol=symbol, from_entry=from_entry):
+    for row in store.iter_live_orders(from_entry=from_entry):
         if row.state != STATE_PARTIAL_BRACKET_LEG:
             continue
         leg_state = (row.extras or {}).get(EXTRAS_KEY_LEG_STATE)
@@ -1845,8 +1855,6 @@ def update_close_leg_state(
 
 def iter_active_close_legs(
         store: 'RunContext',
-        *,
-        symbol: str | None = None,
 ) -> Iterator['OrderRow']:
     """Iterate live (pending) close-leg rows for restart replay.
 
@@ -1857,10 +1865,8 @@ def iter_active_close_legs(
     the live broker legs before re-dispatching.
 
     :param store: The active run context.
-    :param symbol: Optional symbol filter, passed to
-        :meth:`RunContext.iter_live_orders`.
     """
-    for row in store.iter_live_orders(symbol=symbol):
+    for row in store.iter_live_orders():
         if row.state != STATE_CLOSE_LEG:
             continue
         leg_state = (row.extras or {}).get(EXTRAS_KEY_CLOSE_LEG_STATE)
@@ -1940,8 +1946,6 @@ def clear_residual_open_row(store: 'RunContext', coid: str) -> None:
 
 def iter_active_residual_opens(
         store: 'RunContext',
-        *,
-        symbol: str | None = None,
 ) -> Iterator['OrderRow']:
     """Iterate live residual-open breadcrumbs for restart replay.
 
@@ -1950,10 +1954,8 @@ def iter_active_residual_opens(
     durability (its own entry row) the crash may have pre-empted.
 
     :param store: The active run context.
-    :param symbol: Optional symbol filter, passed to
-        :meth:`RunContext.iter_live_orders`.
     """
-    for row in store.iter_live_orders(symbol=symbol):
+    for row in store.iter_live_orders():
         if row.state == STATE_RESIDUAL_OPEN:
             yield row
 
@@ -2092,7 +2094,6 @@ def update_bracket_ownership_state(
 def iter_active_bracket_ownerships(
         store: 'RunContext',
         *,
-        symbol: str | None = None,
         from_entry: str | None = None,
 ) -> Iterator['OrderRow']:
     """Iterate live (active) bracket-ownership rows.
@@ -2104,12 +2105,10 @@ def iter_active_bracket_ownerships(
     re-asserts every active row against the live broker legs.
 
     :param store: The active run context.
-    :param symbol: Optional symbol filter, passed to
-        :meth:`RunContext.iter_live_orders`.
     :param from_entry: Optional parent-entry filter, passed to
         :meth:`RunContext.iter_live_orders` (the indexed ``from_entry`` column).
     """
-    for row in store.iter_live_orders(symbol=symbol, from_entry=from_entry):
+    for row in store.iter_live_orders(from_entry=from_entry):
         if row.state != STATE_BRACKET_OWN:
             continue
         own_state = (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_STATE)
@@ -2253,8 +2252,6 @@ def update_entry_stop_watch_state(
 
 def iter_active_entry_stop_watches(
         store: 'RunContext',
-        *,
-        symbol: str | None = None,
 ) -> Iterator['OrderRow']:
     """Iterate live entry-stop watch rows.
 
@@ -2266,10 +2263,8 @@ def iter_active_entry_stop_watches(
     ``close_order`` has not yet flipped ``closed_ts_ms``).
 
     :param store: The active run context.
-    :param symbol: Optional symbol filter — passed straight through to
-        :meth:`RunContext.iter_live_orders`.
     """
-    for row in store.iter_live_orders(symbol=symbol):
+    for row in store.iter_live_orders():
         if row.state != STATE_ENTRY_STOP_WATCH:
             continue
         watch_state = (row.extras or {}).get(EXTRAS_KEY_ENTRY_STOP_STATE)

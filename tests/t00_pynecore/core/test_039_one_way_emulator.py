@@ -1097,7 +1097,7 @@ def __test_replay_withholds_residual_reopen_under_quarantine__(tmp_path):
     # The quarantine lifted (operator restart): the drain finishes the reopen.
     quarantined = False
     port2 = _FakePort([])
-    _run(eng.drain_residual_opens("EURUSD", port2))
+    _run(eng.drain_residual_opens(port2))
     assert port2.placed == [("EURUSD", 2.0)]
     assert list(iter_active_residual_opens(ctx)) == []
     store.close()
@@ -1483,7 +1483,7 @@ def __test_drain_residual_opens_reconciles_breadcrumb_restart_left_stranded__(tm
     # Later sync, healthy broker: the per-sync drain re-opens the residual and
     # discharges the breadcrumb.
     healthy = _FakePort([])
-    _run(eng.drain_residual_opens("EURUSD", healthy))
+    _run(eng.drain_residual_opens(healthy))
     assert healthy.placed == [("EURUSD", 2.0)]
     assert list(iter_active_residual_opens(ctx)) == []
     store.close()
@@ -1503,7 +1503,7 @@ def __test_drain_residual_opens_keeps_breadcrumb_on_ambiguous_retry__(tmp_path):
         ),
     )
     eng = OneWayEmulator(store_ctx=ctx)
-    _run(eng.drain_residual_opens("EURUSD", port))  # no exception escapes
+    _run(eng.drain_residual_opens(port))  # no exception escapes
     assert port.placed == []
     assert len(list(iter_active_residual_opens(ctx))) == 1
     store.close()
@@ -1521,26 +1521,23 @@ def __test_drain_residual_opens_discharges_when_entry_row_exists__(tmp_path):
     _seed_residual(ctx, entry_coid="entry-present", qty=2.0)
     port = _FakePort([])
     eng = OneWayEmulator(store_ctx=ctx)
-    _run(eng.drain_residual_opens("EURUSD", port))
+    _run(eng.drain_residual_opens(port))
     assert port.placed == []  # entry path owns the open; no re-dispatch
     assert list(iter_active_residual_opens(ctx)) == []  # breadcrumb discharged
     store.close()
 
 
-def __test_drain_residual_opens_is_symbol_scoped__(tmp_path):
-    """The per-sync drain is symbol-scoped, leaving a different symbol's breadcrumb untouched."""
-    # The per-sync drain is per-symbol (the engine owns one symbol). A live
-    # breadcrumb for a DIFFERENT symbol must be left untouched — that symbol's own
-    # engine drains it. (restart_replay is global; the per-sync drain is scoped.)
+def __test_drain_residual_opens_drains_a_breadcrumb_in_the_venue_spelling__(tmp_path):
+    """A run trades one instrument: a breadcrumb under the venue's spelling is the run's own."""
     store, ctx = _make_store(tmp_path)
     create_residual_open_row(
-        ctx, coid="rev:residual", symbol="GBPUSD", side="buy", qty=2.0,
+        ctx, coid="rev:residual", symbol="EUR/USD", side="buy", qty=2.0,
         intent_key="Long", pine_entry_id="Long", entry_coid="entry-missing",
         run_tag="t000", bar_ts_ms=1000, retry_seq=0,
     )
     port = _FakePort([])
     eng = OneWayEmulator(store_ctx=ctx)
-    _run(eng.drain_residual_opens("EURUSD", port))  # different symbol
-    assert port.placed == []  # the GBPUSD breadcrumb is not this symbol's concern
-    assert len(list(iter_active_residual_opens(ctx))) == 1  # still live
+    _run(eng.drain_residual_opens(port))
+    assert port.placed == [("EUR/USD", 2.0)]
+    assert list(iter_active_residual_opens(ctx)) == []
     store.close()
