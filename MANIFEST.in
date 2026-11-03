@@ -1,6 +1,8 @@
 recursive-include src/pynecore *.json
 include NOTICE
 include LICENSE
+# Copied into the package as pynecore/docs/ at build time (setup.py, BuildPyWithDocs)
+graft docs
 include src/pynecore/core/_native_math.pyx
 include src/pynecore/core/_native_rolling_sum.pyx
 include src/pynecore/core/_native_color.pyx

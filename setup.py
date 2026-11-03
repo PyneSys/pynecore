@@ -17,10 +17,13 @@ WebAssembly runtimes and unlisted platforms install). The profiler is the except
 it has no pure-Python twin, so such an install runs scripts but cannot profile them.
 """
 import os
+import shutil
 import sys
+from pathlib import Path
 
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
+from setuptools.command.build_py import build_py
 
 # The compiled code must round every operation exactly as the Python originals
 # do. clang and gcc may fuse ``a * b + c`` into one FMA instruction unless told not to
@@ -55,6 +58,28 @@ class OptionalBuildExt(build_ext):
     def _warn(exc: Exception) -> None:
         print(f"WARNING: a pynecore native extension was not built ({exc}); "
               f"the pure-Python implementation will be used.", file=sys.stderr)
+
+
+class BuildPyWithDocs(build_py):
+    """Ship the repository's ``docs/`` inside the package as ``pynecore/docs/``.
+
+    The documentation stays at the repository root; only the build copies it, so an
+    installed PyneCore carries the docs of its own version (``pynecore.docs_path()``).
+    An editable install skips the copy: there ``docs_path()`` resolves to the source
+    tree's ``docs/``.
+    """
+
+    def run(self) -> None:
+        super().run()
+        if self.editable_mode:
+            return
+        source = Path(__file__).parent / 'docs'
+        if not source.is_dir():
+            raise FileNotFoundError(f"PyneCore documentation not found at {source}")
+        target = Path(self.build_lib) / 'pynecore' / 'docs'
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(source, target)
 
 
 def _extensions() -> list[Extension]:
@@ -94,5 +119,6 @@ def _rust_extensions() -> list:
 
 
 _rust = _rust_extensions()
-setup(ext_modules=_extensions(), cmdclass={'build_ext': OptionalBuildExt},
+setup(ext_modules=_extensions(),
+      cmdclass={'build_ext': OptionalBuildExt, 'build_py': BuildPyWithDocs},
       **({'rust_extensions': _rust} if _rust else {}))
