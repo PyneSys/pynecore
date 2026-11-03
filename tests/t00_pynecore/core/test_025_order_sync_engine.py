@@ -1415,6 +1415,32 @@ def __test_rejected_reversal_close_arms_the_marker_and_retries_after_the_stale_w
     assert pos.size == 0.0
 
 
+def __test_a_rejected_reversal_close_is_reported_once_as_a_warning__(caplog):
+    """The reversal path owns its close's reject and logs no ERROR for it.
+
+    Measured live (Bybit inverse lane, cycle 318): the stop leg filled while
+    the private stream was down, so the reversal close went out against a
+    position the venue had already emptied and was rejected reduce-only
+    ("current position is zero"). The reversal self-heals on the fill that
+    settles the book, so the operator sees one warning, not an ERROR.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+
+    b.raise_on_next_close = ExchangeOrderRejectedError(
+        "current position is zero, cannot fix reduce-only order qty")
+    pos.entry_orders["S"] = _entry_order("S", -1.0)
+    with caplog.at_level(logging.INFO):
+        engine.sync(BAR_TS + 60_000)
+
+    assert "S" in engine._pending_reversal_opens
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    warnings = [r.getMessage() for r in caplog.records
+                if r.levelno == logging.WARNING]
+    assert len([m for m in warnings if "reversal close for" in m]) == 1
+
+
 def __test_persistently_rejected_reversal_close_dispatches_once_per_bar__():
     """A close rejected on every attempt is re-driven once per bar, not per sync.
 

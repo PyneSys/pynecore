@@ -14165,6 +14165,11 @@ class OrderSyncEngine:
             # rejected the dispatch, so no live order owns the COID anchor;
             # a later re-trigger must mint a fresh one instead of reusing
             # the stale persisted anchor (and surviving a restart with it).
+            _blog_warning(
+                "partial-trigger close for %r rejected by broker (%s: %s) — "
+                "the leg re-arms on the next price tick",
+                leg.key, type(e).__name__, e,
+            )
             self._order_mapping.pop(synth_pine_id, None)
             self._drop_envelope(synth_pine_id)
             self._partial_bracket_engine.mark_trigger_dispatch_failed(
@@ -20076,6 +20081,12 @@ class OrderSyncEngine:
                 return
             if isinstance(intent, CloseIntent) and intent.synthetic_kind is None:
                 self._recover_rejected_close(intent, e)
+            if isinstance(intent, CloseIntent) and intent.synthetic_kind is not None:
+                # The owner catches the reject and logs it at the level its
+                # recovery warrants: a reversal close rejected because a
+                # racing protective fill already flattened the position is
+                # self-healing, a defensive close reject halts.
+                raise
             if not isinstance(intent, EntryIntent):
                 _blog_error(
                     "dispatch failed for %s: %s: %s",
