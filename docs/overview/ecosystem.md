@@ -2,7 +2,7 @@
 ---
 weight: 102
 title: "Pyne Ecosystem"
-description: "The Pyne ecosystem: PyneCore, the PyneComp Pine Script compiler, Pyne Edge and the Pyne in the Wild validation report, and how they work together"
+description: "See how PyneCore runs Pyne code, PyneComp converts Pine Script and Pyne in the Wild compares results with TradingView. Learn where Pyne Edge fits in the ecosystem."
 icon: "lan"
 date: "2025-03-31"
 lastmod: "2026-09-28"

@@ -2,7 +2,7 @@
 ---
 weight: 432
 title: "strategy.risk"
-description: "Strategy risk management rules"
+description: "Define PyneCore strategy risk rules that close positions, cancel pending orders or prevent new entries. Review risk function parameters and script examples."
 icon: "shield"
 date: "2026-03-28"
 lastmod: "2026-03-28"

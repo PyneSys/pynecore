@@ -2,7 +2,7 @@
 ---
 weight: 1004
 title: "Fast CSV Reader/Writer"
-description: "High-performance CSV processing with multithreaded writing and memory mapping"
+description: "Read and write market data with PyneCore's CSV tools. Learn about memory-mapped reading, multithreaded writing and the options for processing OHLCV records."
 icon: "table_chart"
 date: "2025-03-31"
 lastmod: "2026-07-28"

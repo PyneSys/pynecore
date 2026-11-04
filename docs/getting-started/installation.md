@@ -2,7 +2,7 @@
 ---
 weight: 201
 title: "Installing PyneCore"
-description: "Step-by-step guide to installing PyneCore on different platforms"
+description: "Install PyneCore and its optional components for your platform. Follow the setup instructions and prepare an environment for running Pyne code and CLI commands."
 icon: "download"
 date: "2025-03-31"
 lastmod: "2026-09-28"

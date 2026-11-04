@@ -2,7 +2,7 @@
 ---
 weight: 471
 title: "currency"
-description: "Currency code constants (USD, EUR, etc.)"
+description: "Look up PyneCore currency code constants such as USD and EUR. Learn their Currency type and how to use them in script declarations and strategy configuration."
 icon: "payments"
 date: "2026-03-28"
 lastmod: "2026-03-28"

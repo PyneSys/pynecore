@@ -2,7 +2,7 @@
 ---
 weight: 1105
 title: "Broker Plugin Authoring Guide"
-description: "The full contract a live broker plugin must uphold"
+description: "Implement a PyneCore BrokerPlugin using the documented contract for live order handling. Review persistence requirements and the behavior broker authors must test."
 icon: "account_balance"
 date: "2026-07-12"
 lastmod: "2026-10-15"

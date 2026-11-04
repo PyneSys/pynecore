@@ -2,7 +2,7 @@
 ---
 weight: 104
 title: "Differences from Pine Script"
-description: "Key differences between PyneCore and TradingView Pine Script"
+description: "Compare Pyne code with Pine Script, including the module marker, Python syntax and explicit state annotations. Learn how ordinary Pyne and the edge profile differ."
 icon: "compare"
 date: "2025-03-31"
 lastmod: "2026-10-18"

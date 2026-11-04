@@ -2,7 +2,7 @@
 ---
 weight: 475
 title: "font"
-description: "Font family constants"
+description: "Choose default or monospace fonts for PyneCore drawing text. Look up font family constants and their use in label.new(), box.new() and table.cell() parameters."
 icon: "font_download"
 date: "2026-03-28"
 lastmod: "2026-03-28"

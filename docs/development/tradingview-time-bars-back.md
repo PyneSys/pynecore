@@ -2,7 +2,7 @@
 ---
 weight: 1106
 title: "time() Offsets on D/W/M Grids"
-description: "How time() and time_close() walk daily, weekly and monthly grids with timeframe_bars_back, and what was measured on TradingView"
+description: "Learn how time() and time_close() handle timeframe_bars_back on daily, weekly and monthly grids, with calendar rules and measurements taken on TradingView."
 icon: "calendar_month"
 date: "2026-09-27"
 lastmod: "2026-09-27"

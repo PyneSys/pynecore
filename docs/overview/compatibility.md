@@ -2,8 +2,7 @@
 ---
 weight: 105
 title: "Pine Script Compatibility"
-description: "PyneCore vs TradingView: 1,000 published TradingView scripts (Pine Script v4-v6, converted to Pyne code with PyneComp) validated, 99.771% of 132 million values bit-identical, 353,577 trades matched. Feature status of every Pine Script v6 module."
-wildDescription: "PyneCore vs TradingView: {{scripts_total}} published TradingView scripts (Pine Script v4-v6, converted to Pyne code with PyneComp) validated, {{bars_exact_pct}}% of {{bars_compared_millions}} million values bit-identical, {{strategy_trades}} trades matched. Feature status of every Pine Script v6 module."
+description: "Review PyneCore's Pine Script v6 API coverage and measured results against TradingView. Check module compatibility, intentional differences and current limitations."
 icon: "checklist"
 date: "2026-03-28"
 lastmod: "2026-11-02"

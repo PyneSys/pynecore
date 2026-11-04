@@ -2,7 +2,7 @@
 ---
 weight: 101
 title: "What is PyneCore"
-description: "Introduction to PyneCore and its core concepts"
+description: "Meet PyneCore, the open-source Python runtime for Pyne code. Learn about its bar-by-bar execution model and Pine Script-compatible indicator and strategy library."
 icon: "code"
 date: "2025-03-31"
 lastmod: "2026-10-18"

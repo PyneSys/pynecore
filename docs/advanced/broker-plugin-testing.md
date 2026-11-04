@@ -2,7 +2,7 @@
 ---
 weight: 1080
 title: "How Broker Plugins Are Tested"
-description: "How the PyneCore broker plugins are tested before live trading: an offline conformance lab, continuous live runs on venue demo accounts, fault injection, and an end-of-cycle reconciliation with the venue"
+description: "Learn how PyneCore broker plugins are checked with unit tests, an offline conformance lab and venue demo runs, including faults and end-of-run reconciliation."
 icon: "verified"
 date: "2026-09-28"
 lastmod: "2026-09-28"

@@ -2,7 +2,7 @@
 ---
 weight: 300
 title: "Command Line Interface"
-description: "PyneCore Command Line Interface (CLI) overview and usage"
+description: "Use the PyneCore CLI to run scripts, compile Pine Script with PyneComp and manage market data. Find command guides for symbol selection and live broker runs."
 icon: "terminal"
 date: "2025-04-03"
 lastmod: "2026-10-14"

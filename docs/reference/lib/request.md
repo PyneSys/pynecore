@@ -2,7 +2,7 @@
 ---
 weight: 428
 title: "request"
-description: "Data requests from other symbols and timeframes"
+description: "Request other symbols, timeframes and currency rates in PyneCore. Look up request functions and check the fallback behavior of unsupported corporate event data."
 icon: "cloud_download"
 date: "2026-03-28"
 lastmod: "2026-10-25"

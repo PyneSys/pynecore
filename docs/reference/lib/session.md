@@ -2,7 +2,7 @@
 ---
 weight: 444
 title: "session"
-description: "Trading session detection"
+description: "Detect trading session phases in PyneCore with session flags. Identify session boundaries and use read-only bar properties to condition script calculations."
 icon: "access_time"
 date: "2026-03-28"
 lastmod: "2026-10-25"

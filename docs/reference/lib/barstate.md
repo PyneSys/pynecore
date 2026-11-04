@@ -2,7 +2,7 @@
 ---
 weight: 442
 title: "barstate"
-description: "Bar state flags — first bar, last bar, new bar, etc."
+description: "Inspect barstate flags in PyneCore to identify first and last bars, new updates and confirmed data. Review how each flag describes historical or live execution."
 icon: "toggle_on"
 date: "2026-03-28"
 lastmod: "2026-09-26"

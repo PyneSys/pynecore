@@ -2,7 +2,7 @@
 ---
 weight: 304
 title: "Symbol Browser TUI"
-description: "Interactive symbol browser for pyne data download"
+description: "Choose provider symbols in PyneCore's terminal browser when running pyne data download. Inspect symbol information and start a download with the inline wizard."
 icon: "list"
 date: "2026-05-17"
 lastmod: "2026-05-17"

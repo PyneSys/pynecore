@@ -2,7 +2,7 @@
 ---
 weight: 492
 title: "xloc"
-description: "X-axis location constants for labels and lines"
+description: "Choose bar-index or timestamp coordinates for PyneCore labels and lines with xloc constants. Review the values accepted by label.new() and line.new()."
 icon: "swap_horiz"
 date: "2026-04-05"
 lastmod: "2026-04-05"

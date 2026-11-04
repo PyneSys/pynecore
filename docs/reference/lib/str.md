@@ -2,7 +2,7 @@
 ---
 weight: 423
 title: "str"
-description: "String manipulation functions"
+description: "Work with text in PyneCore indicators and strategies using the str namespace. Find string search, formatting and conversion functions with arguments and examples."
 icon: "text_fields"
 date: "2026-03-28"
 lastmod: "2026-10-25"

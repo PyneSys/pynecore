@@ -2,7 +2,7 @@
 ---
 weight: 427
 title: "map"
-description: "Key-value map operations"
+description: "Store and manage key-value pairs with PyneCore's map namespace. Look up functions for creating maps, reading values and updating or removing dictionary entries."
 icon: "map"
 date: "2026-03-28"
 lastmod: "2026-08-05"

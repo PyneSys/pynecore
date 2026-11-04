@@ -2,7 +2,7 @@
 ---
 weight: 202
 title: "Your First PyneCore Script"
-description: "Learn how to write and run your first PyneCore script"
+description: "Write and run your first PyneCore script. Learn the required @pyne module marker and basic program structure, then compare Pyne code with ordinary Python."
 icon: "code"
 date: "2025-03-31"
 lastmod: "2026-09-28"

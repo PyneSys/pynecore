@@ -2,7 +2,7 @@
 ---
 weight: 803
 title: "Integration Patterns"
-description: "Real-world patterns for integrating PyneCore into trading systems"
+description: "Integrate PyneCore into Python trading applications using data bridges and script runners. Follow patterns for DataFrames, FreqTrade and other trading frameworks."
 icon: "hub"
 date: "2025-03-31"
 lastmod: "2026-10-25"

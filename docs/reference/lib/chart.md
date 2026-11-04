@@ -2,7 +2,7 @@
 ---
 weight: 443
 title: "chart"
-description: "Chart properties — type, colors, visible range"
+description: "Read PyneCore chart properties for chart type, color scheme and visible range. Review the available variables and compatibility notes before using them in scripts."
 icon: "candlestick_chart"
 date: "2026-03-28"
 lastmod: "2026-08-04"

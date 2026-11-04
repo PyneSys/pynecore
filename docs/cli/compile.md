@@ -2,7 +2,7 @@
 ---
 weight: 304
 title: "Compiling Pine Scripts"
-description: "Compiling Pine Script to Python using PyneSys API"
+description: "Convert Pine Script files to Pyne code with the pyne compile command and PyneSys API. Configure your API key, output path, strict checks and compilation options."
 icon: "code"
 date: "2025-08-03"
 lastmod: "2026-09-26"

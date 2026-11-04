@@ -2,7 +2,7 @@
 ---
 weight: 433
 title: "label"
-description: "Chart labels — create, modify, and style text labels"
+description: "Create, update and style chart labels with PyneCore's label namespace. Review coordinate overloads and the parameters for positioning text on bars or price levels."
 icon: "label"
 date: "2026-03-28"
 lastmod: "2026-11-02"

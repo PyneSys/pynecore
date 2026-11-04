@@ -2,7 +2,7 @@
 ---
 weight: 439
 title: "Global functions"
-description: "Top-level functions of pynecore.lib — time and date, na handling, max_bars_back and the plot family"
+description: "Look up global pynecore.lib functions for time and dates, na handling and history buffers. Find the plot-family functions imported directly into Pyne code."
 icon: "functions"
 date: "2026-10-25"
 lastmod: "2026-10-25"

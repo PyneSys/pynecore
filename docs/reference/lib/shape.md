@@ -2,7 +2,7 @@
 ---
 weight: 481
 title: "shape"
-description: "plotshape marker shape constants"
+description: "Choose chart marker styles with PyneCore shape constants. Look up the Shape values accepted by plotshape() and compare the available symbols in the reference."
 icon: "category"
 date: "2026-03-28"
 lastmod: "2026-10-25"

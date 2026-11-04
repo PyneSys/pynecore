@@ -2,7 +2,7 @@
 ---
 weight: 429
 title: "strategy"
-description: "Strategy order management — entry, exit, close, and order functions"
+description: "Manage strategy entries, exits and orders with PyneCore's strategy namespace. Look up position metrics, cancellation methods and functions used in backtests."
 icon: "trending_up"
 date: "2026-03-28"
 lastmod: "2026-10-25"

@@ -2,7 +2,7 @@
 ---
 weight: 1002
 title: "Function Isolation"
-description: "How function isolation works in PyneCore and why it's essential for Pine Script compatibility"
+description: "Understand how PyneCore isolates function calls so each call site keeps its own Series and Persistent state, following Pine Script's bar-by-bar execution rules."
 icon: "privacy_tip"
 date: "2025-03-31"
 lastmod: "2026-10-25"

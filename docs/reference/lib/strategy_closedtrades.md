@@ -2,7 +2,7 @@
 ---
 weight: 430
 title: "strategy.closedtrades"
-description: "Information about closed trades in a strategy"
+description: "Inspect closed trades in PyneCore with strategy.closedtrades functions. Look up entry and exit details, bar indices, commissions and profit metrics by trade number."
 icon: "assignment_turned_in"
 date: "2026-03-28"
 lastmod: "2026-03-28"

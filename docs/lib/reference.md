@@ -2,7 +2,7 @@
 ---
 weight: 501
 title: "Library Reference"
-description: "PyneCore library modules, types, and usage patterns"
+description: "Browse the PyneCore library overview for built-in market data variables and function usage. Find the modules and types used when writing indicators and strategies."
 icon: "menu_book"
 date: "2025-03-31"
 lastmod: "2026-10-25"

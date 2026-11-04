@@ -2,7 +2,7 @@
 ---
 weight: 1005
 title: "Extra Fields"
-description: "Accessing extra per-bar columns beyond OHLCV data in Pyne code"
+description: "Access custom CSV columns alongside OHLCV bars in Pyne code. Learn how extra_fields carries per-bar values and how data loading affects their availability."
 icon: "playlist_add"
 date: "2025-03-31"
 lastmod: "2026-10-25"

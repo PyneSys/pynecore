@@ -2,7 +2,7 @@
 ---
 weight: 484
 title: "adjustment"
-description: "Dividend adjustment constants"
+description: "Look up PyneCore adjustment constants for corporate-action price adjustments. Read their use with request.security() and check the documented compatibility notes."
 icon: "tune"
 date: "2026-03-28"
 lastmod: "2026-03-28"

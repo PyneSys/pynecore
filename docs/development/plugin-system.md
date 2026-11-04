@@ -2,7 +2,7 @@
 ---
 weight: 1104
 title: "Plugin System"
-description: "How to create plugins for PyneCore"
+description: "Extend PyneCore with Python entry-point plugins. Learn provider and broker class relationships, configuration files and how plugins add or extend CLI commands."
 icon: "extension"
 date: "2026-03-30"
 lastmod: "2026-07-19"

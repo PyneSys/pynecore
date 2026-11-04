@@ -2,7 +2,7 @@
 ---
 weight: 424
 title: "color"
-description: "Color functions and color constants"
+description: "Create and modify PyneCore colors for plots and chart drawings. Look up RGB construction, transparency controls, gradient functions and color component accessors."
 icon: "palette"
 date: "2026-03-28"
 lastmod: "2026-08-06"

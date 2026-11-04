@@ -2,7 +2,7 @@
 ---
 weight: 301
 title: "Basic Usage"
-description: "Basic usage of the PyneCore Command Line Interface"
+description: "Learn the PyneCore command structure, common CLI options and working directory layout. Install the CLI extras and find help for running commands in a project."
 icon: "terminal"
 date: "2025-03-31"
 lastmod: "2026-09-28"

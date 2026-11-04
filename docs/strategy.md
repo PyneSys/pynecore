@@ -2,7 +2,7 @@
 ---
 weight: 700
 title: "Strategy Development"
-description: "Creating and testing trading strategies with PyneCore"
+description: "Create and test PyneCore strategies with script.strategy(). Configure backtest settings through TOML files and learn the basics of orders and position management."
 icon: "trending_up"
 date: "2025-03-31"
 lastmod: "2026-09-28"

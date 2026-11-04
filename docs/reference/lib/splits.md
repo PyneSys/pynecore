@@ -2,7 +2,7 @@
 ---
 weight: 473
 title: "splits"
-description: "Stock split data field constants"
+description: "Look up splits.numerator and splits.denominator for request.splits() in PyneCore. Understand the constants and why stock split requests currently return na."
 icon: "call_split"
 date: "2026-08-04"
 lastmod: "2026-10-25"

@@ -2,7 +2,7 @@
 ---
 weight: 107
 title: "Configuring PyneCore"
-description: "Learn how to configure PyneCore for your specific needs"
+description: "Configure a PyneCore working directory with TOML files. Learn how the runtime finds projects and organizes script settings, market data and generated output."
 icon: "settings"
 date: "2025-03-31"
 lastmod: "2026-10-03"

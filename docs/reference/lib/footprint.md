@@ -2,7 +2,7 @@
 ---
 weight: 487
 title: "footprint"
-description: "Volume footprint accessors — buy/sell volume, delta, POC, VAH and VAL of a bar"
+description: "Review PyneCore volume footprint accessors for buy/sell volume, delta and value-area rows. Understand why these return na when footprint data is unavailable."
 icon: "stacked_bar_chart"
 date: "2026-10-25"
 lastmod: "2026-10-25"

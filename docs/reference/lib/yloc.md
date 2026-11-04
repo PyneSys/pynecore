@@ -2,7 +2,7 @@
 ---
 weight: 493
 title: "yloc"
-description: "Y-axis location constants for labels"
+description: "Position PyneCore labels at a price, above a bar or below a bar with yloc constants. Learn how these settings affect the y coordinate passed to label.new()."
 icon: "swap_vert"
 date: "2026-04-05"
 lastmod: "2026-04-05"

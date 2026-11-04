@@ -2,7 +2,7 @@
 ---
 weight: 1001
 title: "AST Transformation"
-description: "How PyneCore uses AST transformation to implement Pine Script behavior"
+description: "Follow the AST passes that give Pyne code its Pine Script execution rules, including series history, isolated state, na handling and request.security() calls."
 icon: "code"
 date: "2025-03-31"
 lastmod: "2026-10-09"

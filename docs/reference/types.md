@@ -2,7 +2,7 @@
 ---
 weight: 410
 title: "Type System"
-description: "PyneCore type system — primitives, annotations, collections, and special types"
+description: "Review PyneCore primitive types, Series and Persistent annotations, collections and drawing types. Learn how type declarations affect values during bar execution."
 icon: "category"
 date: "2026-03-28"
 lastmod: "2026-10-25"

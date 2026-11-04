@@ -2,7 +2,7 @@
 ---
 weight: 1000
 title: "Advanced"
-description: "Advanced topics and features of PyneCore"
+description: "Read about PyneCore internals, from AST transformations and isolated function state to market data formats, live execution and lower-timeframe order fills."
 icon: "psychology"
 date: "2025-03-31"
 lastmod: "2026-07-28"

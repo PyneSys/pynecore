@@ -2,7 +2,7 @@
 ---
 weight: 1060
 title: "Bar Magnifier"
-description: "Accurate intrabar order fills using lower-timeframe data"
+description: "Configure PyneCore's bar magnifier to process strategy order fills using lower-timeframe data. Understand intrabar price assumptions and prepare the required data."
 icon: "zoom_in"
 date: "2025-07-24"
 lastmod: "2026-10-25"

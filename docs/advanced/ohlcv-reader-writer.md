@@ -2,7 +2,7 @@
 ---
 weight: 1003
 title: "OHLCV Reader/Writer"
-description: "The self-describing OHLCV v2 binary format: declared timeframe, delta-encoded records and memory-mapped access"
+description: "Use PyneCore's OHLCV v2 binary format to store market data with timeframe metadata. Read about file headers, delta-encoded records and memory-mapped access."
 icon: "data_object"
 date: "2025-03-31"
 lastmod: "2026-07-28"

@@ -2,7 +2,7 @@
 ---
 weight: 436
 title: "table"
-description: "Data tables — create and populate on-chart tables"
+description: "Create and populate chart tables with PyneCore's table namespace. Review functions for cells, text and styling to display script data or strategy statistics."
 icon: "table_chart"
 date: "2026-03-28"
 lastmod: "2026-11-02"

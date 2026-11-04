@@ -2,7 +2,7 @@
 ---
 weight: 1100
 title: "Development"
-description: "Documentation for PyneCore developers"
+description: "Find PyneCore developer guides for creating plugins, implementing broker contracts and testing changes, plus contribution instructions and calendar-grid notes."
 icon: "engineering"
 date: "2025-03-31"
 lastmod: "2026-09-28"

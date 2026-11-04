@@ -2,7 +2,7 @@
 ---
 weight: 1310
 title: "Profiling"
-description: "Finding the slow lines of a script with pyne run --profile"
+description: "Profile PyneCore backtests with pyne run --profile. Find slow script lines, read execution counts and inspect how runtime is divided between processing stages."
 icon: "speed"
 date: "2026-10-24"
 lastmod: "2026-10-24"

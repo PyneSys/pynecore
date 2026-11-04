@@ -2,7 +2,7 @@
 ---
 weight: 1400
 title: "Reference"
-description: "PyneCore type system and library reference documentation"
+description: "Look up PyneCore script structure, type annotations and configurable inputs. Browse the built-in library reference for Pine Script-style functions and constants."
 icon: "menu_book"
 date: "2026-03-28"
 lastmod: "2026-04-05"

@@ -2,7 +2,7 @@
 ---
 weight: 405
 title: "Script Format"
-description: "Structure and anatomy of a PyneCore script file"
+description: "Write a valid Pyne code script with the @pyne module marker, imports and main() function. Learn required elements, decorators and the optional edge profile."
 icon: "description"
 date: "2026-04-05"
 lastmod: "2026-10-25"

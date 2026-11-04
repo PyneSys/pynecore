@@ -2,7 +2,7 @@
 ---
 weight: 431
 title: "strategy.opentrades"
-description: "Information about open trades in a strategy"
+description: "Inspect open trades in PyneCore with strategy.opentrades functions. Read entry details, profit and loss, commissions and drawdown statistics by trade number."
 icon: "assignment"
 date: "2026-03-28"
 lastmod: "2026-08-06"

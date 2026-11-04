@@ -2,7 +2,7 @@
 ---
 weight: 437
 title: "polyline"
-description: "Multi-segment line drawings"
+description: "Create multi-segment chart drawings with PyneCore's polyline namespace. Review point arrays and the options for curved segments, closed paths and fill colors."
 icon: "polyline"
 date: "2026-03-28"
 lastmod: "2026-10-25"

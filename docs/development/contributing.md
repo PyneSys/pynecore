@@ -2,7 +2,7 @@
 ---
 weight: 1103
 title: "Contributing"
-description: "Guide for contributing to PyneCore"
+description: "Set up a PyneCore development environment and prepare contributions. Read the project requirements and workflow for changing code and checking your implementation."
 icon: "handyman"
 date: "2025-03-31"
 lastmod: "2026-10-25"

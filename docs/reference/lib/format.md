@@ -2,7 +2,7 @@
 ---
 weight: 476
 title: "format"
-description: "Number format constants for labels and tooltips"
+description: "Set numeric display formats in PyneCore with format constants. Review their use in script.indicator() and str.tostring() for legend values and text output."
 icon: "format_list_numbered"
 date: "2026-03-28"
 lastmod: "2026-10-25"

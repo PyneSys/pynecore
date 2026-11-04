@@ -2,7 +2,7 @@
 ---
 weight: 507
 title: "request.currency_rate() & Corporate Events"
-description: "Currency conversion rates and corporate event data (dividends, splits, earnings) in PyneCore"
+description: "Use request.currency_rate() for timestamp-based currency conversion in PyneCore. Understand the fallback behavior of dividend, split and earnings data requests."
 icon: "currency_exchange"
 date: "2026-03-28"
 lastmod: "2026-10-25"

@@ -2,7 +2,7 @@
 ---
 weight: 1200
 title: "FAQ"
-description: "Frequently asked questions about PyneCore"
+description: "Find answers to common PyneCore questions about the runtime, Pine Script compatibility and development workflow, with links to detailed guides and examples."
 icon: "psychology"
 date: "2025-03-31"
 lastmod: "2026-10-18"

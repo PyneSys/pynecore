@@ -2,7 +2,7 @@
 ---
 weight: 483
 title: "text"
-description: "Text alignment and wrapping constants"
+description: "Control drawing text in PyneCore with text alignment, formatting and wrapping constants. Look up options for labels, boxes and table cells in the reference."
 icon: "text_format"
 date: "2026-03-28"
 lastmod: "2026-11-02"

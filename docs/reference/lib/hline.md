@@ -2,7 +2,7 @@
 ---
 weight: 462
 title: "hline"
-description: "Horizontal line drawing functions and style constants"
+description: "Draw fixed horizontal price levels in PyneCore with hline(). Look up its parameters and line style constants for levels that span the full chart history."
 icon: "horizontal_rule"
 date: "2026-03-28"
 lastmod: "2026-03-28"

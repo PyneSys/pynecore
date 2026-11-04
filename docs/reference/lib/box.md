@@ -2,7 +2,7 @@
 ---
 weight: 435
 title: "box"
-description: "Chart boxes — create and modify rectangular drawings"
+description: "Create and modify rectangular chart drawings with PyneCore's box namespace. Set price and time coordinates, style borders and backgrounds, and add box text."
 icon: "check_box_outline_blank"
 date: "2026-03-28"
 lastmod: "2026-11-02"

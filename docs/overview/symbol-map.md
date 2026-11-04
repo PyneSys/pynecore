@@ -2,7 +2,7 @@
 ---
 weight: 108
 title: "Symbol Map"
-description: "Translate TradingView-canonical symbols to your provider-native data with a workdir-level symbol map"
+description: "Map TradingView symbol names to provider-native data in a PyneCore workdir. Configure symbol resolution for backtests, live runs and request.security() contexts."
 icon: "swap_horiz"
 date: "2026-07-24"
 lastmod: "2026-07-24"

@@ -2,7 +2,7 @@
 ---
 weight: 302
 title: "Running Scripts"
-description: "Running PyneCore scripts from the command line"
+description: "Run Pyne code on local OHLCV files or provider data with pyne run. Learn command arguments, script settings and the options for continuing with live data."
 icon: "play_circle"
 date: "2025-03-31"
 lastmod: "2026-10-24"

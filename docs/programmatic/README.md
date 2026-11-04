@@ -2,7 +2,7 @@
 ---
 weight: 800
 title: "Programmatic Usage"
-description: "Using PyneCore from Python code — embedding indicators and strategies into your applications"
+description: "Embed PyneCore indicators and strategies in Python applications. Learn the ScriptRunner API, prepare market data and read results or optional visual output."
 icon: "integration_instructions"
 date: "2025-03-31"
 lastmod: "2026-10-03"

@@ -2,7 +2,7 @@
 ---
 weight: 1006
 title: "request.security() Internals"
-description: "Technical deep-dive into the multiprocessing architecture behind request.security()"
+description: "Examine how PyneCore implements request.security(), including AST rewriting, context processes and shared memory used to coordinate bar-by-bar data requests."
 icon: "memory"
 date: "2026-03-27"
 lastmod: "2026-10-25"

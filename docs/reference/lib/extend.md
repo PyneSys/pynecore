@@ -2,7 +2,7 @@
 ---
 weight: 474
 title: "extend"
-description: "Line/box extend direction constants"
+description: "Control line extension in PyneCore with extend.none, left, right and both. Review how extension constants are passed to line.new() and line.set_extend()."
 icon: "open_in_full"
 date: "2026-03-28"
 lastmod: "2026-03-28"

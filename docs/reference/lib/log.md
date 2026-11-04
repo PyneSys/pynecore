@@ -2,7 +2,7 @@
 ---
 weight: 450
 title: "log"
-description: "Logging functions for debugging"
+description: "Debug PyneCore scripts with log.info(), log.warning() and log.error(). Review message formatting and the timestamps and bar indices included in console output."
 icon: "terminal"
 date: "2026-03-28"
 lastmod: "2026-03-28"

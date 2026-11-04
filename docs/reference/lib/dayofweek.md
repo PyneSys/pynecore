@@ -2,7 +2,7 @@
 ---
 weight: 472
 title: "dayofweek"
-description: "Day of week constants (sunday through saturday)"
+description: "Use PyneCore dayofweek constants to compare a bar's day with Sunday through Saturday. Learn how the namespace and current-bar variable share the same import."
 icon: "calendar_today"
 date: "2026-03-28"
 lastmod: "2026-03-28"

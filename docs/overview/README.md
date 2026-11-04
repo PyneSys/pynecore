@@ -2,7 +2,7 @@
 ---
 weight: 100
 title: "Overview"
-description: "PyneCore overview and main concepts"
+description: "Understand PyneCore's runtime, Pyne code and Pine Script compatibility. Find guides to the ecosystem, execution concepts, project structure and configuration."
 icon: "article"
 date: "2025-03-31"
 lastmod: "2026-09-26"

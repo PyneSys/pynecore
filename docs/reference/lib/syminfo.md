@@ -2,7 +2,7 @@
 ---
 weight: 440
 title: "syminfo"
-description: "Symbol information — ticker, exchange, currency, session, etc."
+description: "Access current-symbol metadata with PyneCore's syminfo namespace. Look up ticker names, exchange prefixes and currency fields, with variable types and examples."
 icon: "info"
 date: "2026-03-28"
 lastmod: "2026-03-28"

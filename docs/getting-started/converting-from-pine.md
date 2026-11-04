@@ -2,7 +2,7 @@
 ---
 weight: 203
 title: "Converting from Pine Script"
-description: "Learn how to convert your TradingView Pine Script code to Pyne code"
+description: "Move TradingView Pine Script to Pyne code manually or through the PyneComp compiler service. Compare the workflows and learn when a PyneSys API key is required."
 icon: "swap_horiz"
 date: "2025-03-31"
 lastmod: "2026-09-28"

@@ -2,7 +2,7 @@
 ---
 weight: 460
 title: "alert"
-description: "Alert triggering functions"
+description: "Use alert() in PyneCore to print highlighted terminal messages. Review its parameters and learn why the Pine-compatible freq argument has no effect at runtime."
 icon: "notifications"
 date: "2026-03-28"
 lastmod: "2026-10-06"

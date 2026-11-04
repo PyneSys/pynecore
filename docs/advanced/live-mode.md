@@ -2,7 +2,7 @@
 ---
 weight: 1070
 title: "Live Mode"
-description: "Real-time data streaming with intra-bar updates, varip support, and paper trading"
+description: "Run PyneCore scripts on live provider data after historical replay. Configure tick updates, persistent intrabar state, paper trading and broker order routing."
 icon: "stream"
 date: "2026-04-08"
 lastmod: "2026-10-25"

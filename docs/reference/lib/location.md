@@ -2,7 +2,7 @@
 ---
 weight: 477
 title: "location"
-description: "Plot location constants (abovebar, belowbar, etc.)"
+description: "Position plotshape and plotchar markers with PyneCore location constants. Compare placement above or below bars with absolute values and chart-edge locations."
 icon: "place"
 date: "2026-03-28"
 lastmod: "2026-10-25"

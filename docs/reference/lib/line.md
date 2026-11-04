@@ -2,7 +2,7 @@
 ---
 weight: 434
 title: "line"
-description: "Chart lines — create and modify line drawings"
+description: "Draw and modify chart lines with PyneCore's line namespace. Look up coordinate overloads and methods for setting line color, style and extension behavior."
 icon: "timeline"
 date: "2026-03-28"
 lastmod: "2026-08-05"

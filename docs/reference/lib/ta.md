@@ -2,7 +2,7 @@
 ---
 weight: 421
 title: "ta"
-description: "Technical analysis indicators and functions"
+description: "Look up PyneCore technical analysis functions in the ta namespace. Find moving averages, momentum oscillators and volatility calculations with usage examples."
 icon: "show_chart"
 date: "2026-03-28"
 lastmod: "2026-10-25"

@@ -2,7 +2,7 @@
 ---
 weight: 600
 title: "Scripting with PyneCore"
-description: "Writing effective and idiomatic Pyne code"
+description: "Write PyneCore scripts with the required module marker and script structure. Learn how Series and persistent state work within Pine Script-style execution."
 icon: "code"
 date: "2025-03-31"
 lastmod: "2026-09-28"

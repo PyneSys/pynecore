@@ -2,7 +2,7 @@
 ---
 weight: 420
 title: "Input Functions"
-description: "User-configurable script parameters in PyneCore"
+description: "Define configurable PyneCore script parameters with input functions. Review supported input types and override main() defaults through generated TOML files."
 icon: "tune"
 date: "2026-03-28"
 lastmod: "2026-04-05"

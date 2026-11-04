@@ -2,7 +2,7 @@
 ---
 weight: 802
 title: "Data & SymInfo"
-description: "Loading and creating OHLCV data and symbol information for programmatic use"
+description: "Supply OHLCV candles and SymInfo metadata when running PyneCore from Python. Learn data conversion options and the timestamp units expected by the runtime."
 icon: "database"
 date: "2025-03-31"
 lastmod: "2026-10-03"

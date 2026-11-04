@@ -2,7 +2,7 @@
 ---
 weight: 305
 title: "Broker Run Management"
-description: "Resuming a quarantined live broker run with the PyneCore CLI"
+description: "Manage quarantined live broker runs with the PyneCore CLI. Understand quarantine states, inspect what a bot continues to do and resume a run when appropriate."
 icon: "shield"
 date: "2026-10-14"
 lastmod: "2026-10-15"

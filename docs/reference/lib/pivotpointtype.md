@@ -2,7 +2,7 @@
 ---
 weight: 494
 title: "pivotpointtype"
-description: "Pivot point calculation type constants"
+description: "Select pivot calculation methods with PyneCore pivotpointtype constants. Compare the named methods accepted by ta.pivot_point_levels() in the library reference."
 icon: "pivot_table_chart"
 date: "2026-04-05"
 lastmod: "2026-10-25"

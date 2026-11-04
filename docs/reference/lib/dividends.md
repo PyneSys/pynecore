@@ -2,7 +2,7 @@
 ---
 weight: 485
 title: "dividends"
-description: "Dividend data field constants"
+description: "Review PyneCore dividend fields and gross or net request constants. Check compatibility notes to understand which dividend values return na in the runtime."
 icon: "account_balance"
 date: "2026-03-28"
 lastmod: "2026-10-25"

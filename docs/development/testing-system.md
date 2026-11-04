@@ -2,7 +2,7 @@
 ---
 weight: 1104
 title: "Testing System"
-description: "Overview of the PyneCore testing system"
+description: "Understand PyneCore's testing system, where test scripts run as Pyne code. Review the test structure and how the framework checks behavior in its own runtime."
 icon: "science"
 date: "2025-03-31"
 lastmod: "2026-06-10"

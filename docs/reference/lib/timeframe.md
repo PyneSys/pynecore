@@ -2,7 +2,7 @@
 ---
 weight: 441
 title: "timeframe"
-description: "Timeframe detection and conversion utilities"
+description: "Detect timeframe changes and convert timeframe strings in PyneCore. Look up functions and properties for intraday, daily, weekly and monthly bar intervals."
 icon: "schedule"
 date: "2026-03-28"
 lastmod: "2026-03-28"

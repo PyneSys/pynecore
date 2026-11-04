@@ -2,7 +2,7 @@
 ---
 weight: 422
 title: "math"
-description: "Mathematical functions and constants"
+description: "Use PyneCore math functions and constants for indicator calculations. Find arithmetic, trigonometric and logarithmic operations, with notes on na value handling."
 icon: "calculate"
 date: "2026-03-28"
 lastmod: "2026-08-06"

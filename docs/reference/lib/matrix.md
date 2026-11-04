@@ -2,7 +2,7 @@
 ---
 weight: 426
 title: "matrix"
-description: "Two-dimensional matrix operations"
+description: "Create and manipulate two-dimensional data with PyneCore's matrix namespace. Look up element access, row and column operations and linear algebra functions."
 icon: "grid_on"
 date: "2026-03-28"
 lastmod: "2026-10-25"

@@ -2,7 +2,7 @@
 ---
 weight: 303
 title: "Data Management"
-description: "Managing OHLCV data with the PyneCore CLI"
+description: "Download historical OHLCV data with the PyneCore CLI, convert local files between supported formats and aggregate bars into the timeframes your scripts need."
 icon: "database"
 date: "2025-04-03"
 lastmod: "2026-10-25"

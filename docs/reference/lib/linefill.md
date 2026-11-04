@@ -2,7 +2,7 @@
 ---
 weight: 438
 title: "linefill"
-description: "Fill areas between two lines"
+description: "Fill the area between two chart lines with PyneCore's linefill namespace. Learn how to create, inspect and manage fills for price channels and chart zones."
 icon: "format_color_fill"
 date: "2026-03-28"
 lastmod: "2026-03-28"

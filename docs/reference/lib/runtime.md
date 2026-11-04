@@ -2,7 +2,7 @@
 ---
 weight: 451
 title: "runtime"
-description: "Runtime error handling"
+description: "Stop a PyneCore script with runtime.error() when an invalid condition occurs. Review the message parameter, return behavior and an example of runtime validation."
 icon: "error"
 date: "2026-03-28"
 lastmod: "2026-03-28"

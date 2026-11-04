@@ -2,7 +2,7 @@
 ---
 weight: 488
 title: "volume_row"
-description: "Accessors of one price row of a volume footprint"
+description: "Review PyneCore volume_row accessors for footprint price boundaries and buy/sell volume. Understand the na results when the runtime has no footprint data."
 icon: "table_rows"
 date: "2026-10-25"
 lastmod: "2026-10-25"

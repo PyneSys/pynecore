@@ -2,7 +2,7 @@
 ---
 weight: 473
 title: "display"
-description: "Plot display mode constants"
+description: "Look up PyneCore display constants for plot and input visibility. Review the display parameter values and their compatibility with TradingView chart interfaces."
 icon: "visibility"
 date: "2026-03-28"
 lastmod: "2026-11-02"

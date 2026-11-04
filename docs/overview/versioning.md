@@ -2,7 +2,7 @@
 ---
 weight: 109
 title: "Versioning"
-description: "Versioning policy for PyneCore"
+description: "Understand PyneCore version numbers and their relationship to Pine Script API versions. See how breaking changes, feature releases and fixes affect each component."
 icon: "history"
 date: "2025-03-31"
 lastmod: "2026-09-28"

@@ -2,7 +2,7 @@
 ---
 weight: 442
 title: "ticker"
-description: "Ticker identifiers and supported synthetic chart types"
+description: "Build ticker identifiers for request.security() in PyneCore. Review exchange-qualified symbols, Heikin Ashi support and limitations of other synthetic charts."
 icon: "sell"
 date: "2026-08-04"
 lastmod: "2026-08-04"

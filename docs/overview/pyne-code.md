@@ -2,7 +2,7 @@
 ---
 weight: 102
 title: "What is Pyne code?"
-description: "Pyne's domain-specific language for market data, indicators, and trading strategies: Python syntax, bar-by-bar semantics, and the edge subset."
+description: "Learn what Pyne code is: a language for market data and trading scripts using Python syntax, with bar-by-bar execution rules, series history and persistent state."
 icon: "code"
 date: "2026-10-18"
 lastmod: "2026-10-25"

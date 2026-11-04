@@ -2,7 +2,7 @@
 ---
 weight: 479
 title: "position"
-description: "Table/label position constants"
+description: "Anchor PyneCore tables to fixed chart locations with position constants. Review each Position value and its use when creating tables and configuring cells."
 icon: "dashboard"
 date: "2026-03-28"
 lastmod: "2026-03-28"

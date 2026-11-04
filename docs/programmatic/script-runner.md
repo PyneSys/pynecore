@@ -2,7 +2,7 @@
 ---
 weight: 801
 title: "ScriptRunner API"
-description: "Running PyneCore scripts programmatically from Python"
+description: "Run PyneCore scripts from Python with ScriptRunner. Configure OHLCV data, symbol metadata and script inputs, then access indicator values and strategy results."
 icon: "play_circle"
 date: "2025-03-31"
 lastmod: "2026-10-25"

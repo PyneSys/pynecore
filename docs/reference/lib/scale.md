@@ -2,7 +2,7 @@
 ---
 weight: 480
 title: "scale"
-description: "Scale type constants for indicators"
+description: "Set an indicator's price scale in PyneCore with scale.left, scale.right or scale.none. Look up the constants accepted by the script.indicator() scale parameter."
 icon: "straighten"
 date: "2026-03-28"
 lastmod: "2026-03-28"

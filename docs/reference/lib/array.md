@@ -2,7 +2,7 @@
 ---
 weight: 425
 title: "array"
-description: "Dynamic array operations"
+description: "Create and manipulate typed arrays in PyneCore with the array namespace. Find functions for updating elements, searching collections and calculating statistics."
 icon: "view_list"
 date: "2026-03-28"
 lastmod: "2026-08-06"

@@ -2,7 +2,7 @@
 ---
 weight: 486
 title: "earnings"
-description: "Earnings data field constants"
+description: "Look up PyneCore earnings fields and constants used by request.earnings(). Read the reference and compatibility notes for estimates and earnings data availability."
 icon: "trending_up"
 date: "2026-03-28"
 lastmod: "2026-10-25"

@@ -2,7 +2,7 @@
 ---
 weight: 470
 title: "barmerge"
-description: "Bar merge constants for request.security() gaps and lookahead"
+description: "Configure request.security() bar merging in PyneCore. Compare gaps_on and gaps_off, and understand how lookahead settings align requested data with chart bars."
 icon: "merge"
 date: "2026-03-28"
 lastmod: "2026-08-04"

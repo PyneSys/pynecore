@@ -2,7 +2,7 @@
 ---
 weight: 461
 title: "plot"
-description: "Plot functions for displaying data on charts"
+description: "Record value series with PyneCore's plot() function. Look up plot parameters and learn how numeric CSV output differs from styles captured by the viz stream."
 icon: "show_chart"
 date: "2026-03-28"
 lastmod: "2026-10-25"

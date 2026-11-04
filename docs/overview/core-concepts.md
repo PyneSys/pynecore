@@ -2,7 +2,7 @@
 ---
 weight: 103
 title: "Core Concepts"
-description: "Fundamental concepts and mechanisms of PyneCore"
+description: "Learn how PyneCore uses AST transformations to execute Pyne code bar by bar. Understand Series history, persistent variables and the state kept by function calls."
 icon: "psychology_alt"
 date: "2025-03-31"
 lastmod: "2026-10-25"

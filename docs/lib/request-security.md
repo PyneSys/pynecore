@@ -2,7 +2,7 @@
 ---
 weight: 506
 title: "request.security()"
-description: "Using request.security() for multi-symbol and multi-timeframe data in PyneCore"
+description: "Use request.security() to evaluate other symbols and timeframes in PyneCore. Prepare OHLCV files, provide security data mappings and write multi-context scripts."
 icon: "security"
 date: "2026-03-27"
 lastmod: "2026-10-25"

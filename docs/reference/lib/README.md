@@ -2,7 +2,7 @@
 ---
 weight: 420
 title: "Library"
-description: "PyneCore built-in library reference — functions, variables, and constants"
+description: "Browse PyneCore's built-in library by namespace. Look up function arguments, variables and constants, with usage examples and notes on Pine Script compatibility."
 icon: "library_books"
 date: "2026-03-28"
 lastmod: "2026-10-25"

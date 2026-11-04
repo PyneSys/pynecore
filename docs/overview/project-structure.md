@@ -2,7 +2,7 @@
 ---
 weight: 106
 title: "Project Structure"
-description: "Overview of the PyneCore project structure and architecture"
+description: "Explore the PyneCore repository layout and its main components. Find the modules responsible for series data, script execution and the framework's extension points."
 icon: "account_tree"
 date: "2025-04-03"
 lastmod: "2026-09-28"

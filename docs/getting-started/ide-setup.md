@@ -2,7 +2,7 @@
 ---
 weight: 204
 title: "IDE Setup"
-description: "Setting up your IDE for PyneCore scripts"
+description: "Set up an editor for PyneCore development. Follow the IDE configuration guide to prepare your environment for writing, running and debugging Pyne code scripts."
 icon: "code"
 date: "2025-03-31"
 lastmod: "2026-09-28"

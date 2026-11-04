@@ -2,7 +2,7 @@
 ---
 weight: 804
 title: "Visual Output (Viz)"
-description: "Plot styles and drawing data output — the NDJSON viz stream, CLI flags and programmatic accessors"
+description: "Export PyneCore plot styles and drawing data through the optional NDJSON viz stream. Configure CLI flags or Python accessors to read visual metadata per bar."
 icon: "brush"
 date: "2026-07-19"
 lastmod: "2026-11-02"

@@ -2,7 +2,7 @@
 ---
 weight: 1300
 title: "Debugging"
-description: "Debugging techniques for PyneCore scripts"
+description: "Debug PyneCore scripts with print statements, Pine-style logging and IDE breakpoints. Inspect Series values and understand execution after AST transformation."
 icon: "bug_report"
 date: "2025-07-05"
 lastmod: "2026-06-10"

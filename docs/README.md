@@ -2,7 +2,7 @@
 ---
 weight: 100
 title: "PyneCore Documentation"
-description: "PyneCore documentation: run Pine Script-style indicators and strategies in Python, with results validated against TradingView"
+description: "Read the PyneCore documentation to run Pine Script-style indicators and strategies in Python. Find installation guides, CLI commands and the library reference."
 icon: "code"
 date: "2025-03-31"
 lastmod: "2026-09-28"

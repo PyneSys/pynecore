@@ -2,7 +2,7 @@
 ---
 weight: 482
 title: "size"
-description: "Label and shape size constants"
+description: "Set visual sizes for PyneCore labels, shapes and drawing text. Look up size constants and their use in label.new(), box.new(), plotchar() and plotshape()."
 icon: "format_size"
 date: "2026-03-28"
 lastmod: "2026-03-28"

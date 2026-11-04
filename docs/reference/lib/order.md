@@ -2,7 +2,7 @@
 ---
 weight: 478
 title: "order"
-description: "Sort order constants (ascending, descending)"
+description: "Sort PyneCore arrays with order.ascending or order.descending. Review the sort direction constants and examples of passing them to array sorting functions."
 icon: "sort"
 date: "2026-03-28"
 lastmod: "2026-03-28"
