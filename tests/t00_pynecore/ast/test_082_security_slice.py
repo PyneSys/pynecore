@@ -1839,3 +1839,210 @@ def main(flag=False):
     module = ast.unparse(__test_helper_pipeline(source))
     assert '__sec_dep' not in module, module
     log.info("the except-handler target did not license the lift")
+
+
+def __test_helper_body_without_defs(clone: ast.FunctionDef) -> str:
+    """The clone's statements other than function definitions, as source text."""
+    return '\n'.join(ast.unparse(stmt) for stmt in clone.body
+                     if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)))
+
+
+def __test_every_binding_form_carries_an_alias__(log):
+    """A mutation through a name bound by any binding form stays in the slice
+
+    Each name below is bound to ``store`` by a different form: an unpacking,
+    an unpacking of a helper's tuple, a walrus, a ``case`` capture and a
+    ``for`` target unpacking. Each mutates the collection the expression
+    reads, so dropping one would hand the child an emptier array.
+    """
+    source = """
+@script.indicator("t")
+def main():
+    store = lib.array.new_float(0)
+    other = lib.array.new_float(0)
+    a, b = store, other
+    lib.array.push(a, lib.close)
+
+    def pair():
+        return store, other
+
+    c, e = pair()
+    lib.array.push(c, lib.close)
+    (w := store)
+    lib.array.push(w, lib.close)
+    match store:
+        case m:
+            lib.array.push(m, lib.close)
+    for item, _ in ((store, 1),):
+        lib.array.push(item, lib.close)
+    d = lib.request.security(lib.syminfo.tickerid, "1D", lib.array.size(store))
+    lib.plot(d)
+"""
+    body = __test_helper_body(__test_helper_only_clone(__test_helper_transform(source)))
+    for name in ('a', 'c', 'w', 'm', 'item'):
+        assert f'lib.array.push({name},' in body, f"the mutation through {name!r} was dropped"
+    log.info("every binding form kept its mutation")
+
+
+def __test_a_helper_mutating_its_parameter_keeps_the_call__(log):
+    """What a helper does to a parameter it does to the argument of the call"""
+    source = """
+@script.indicator("t")
+def main():
+    store = lib.array.new_float(0)
+
+    def bump(arr):
+        lib.array.push(arr, lib.close)
+
+    bump(store)
+    d = lib.request.security(lib.syminfo.tickerid, "1D", lib.array.size(store))
+    lib.plot(d)
+"""
+    body = __test_helper_body(__test_helper_only_clone(__test_helper_transform(source)))
+    assert 'bump(store)' in body, "the call mutating the read collection was dropped"
+    log.info("the mutating helper call was kept")
+
+
+def __test_a_helper_storing_an_argument_in_another_is_followed__(log):
+    """An argument a helper stores inside another is reached through that one
+
+    ``put`` pushes ``inner`` into ``outer``, so mutating the first element of
+    ``outer`` mutates ``inner``, which the expression reads.
+    """
+    source = """
+@script.indicator("t")
+def main():
+    inner = lib.array.new_float(0)
+    outer = lib.array.new_float(0)
+
+    def put(dst, item):
+        lib.array.push(dst, item)
+
+    put(outer, inner)
+    lib.array.push(lib.array.get(outer, 0), lib.close)
+    d = lib.request.security(lib.syminfo.tickerid, "1D", lib.array.size(inner))
+    lib.plot(d)
+"""
+    body = __test_helper_body(__test_helper_only_clone(__test_helper_transform(source)))
+    assert 'put(outer, inner)' in body, "the call storing the read collection was dropped"
+    assert 'lib.array.push(lib.array.get(outer, 0)' in body, \
+        "the mutation through the containing collection was dropped"
+    log.info("the stored argument was followed through its container")
+
+
+def __test_an_unpacked_argument_may_be_mutated_by_the_callee__(log):
+    """An argument the call unpacks binds no one parameter, so it may be mutated"""
+    source = """
+@script.indicator("t")
+def main():
+    store = lib.array.new_float(0)
+
+    def bump(arr):
+        lib.array.push(arr, lib.close)
+
+    boxes = (store,)
+    bump(*boxes)
+    d = lib.request.security(lib.syminfo.tickerid, "1D", lib.array.size(store))
+    lib.plot(d)
+"""
+    body = __test_helper_body(__test_helper_only_clone(__test_helper_transform(source)))
+    assert 'bump(*boxes)' in body, "the call through an unpacked argument was dropped"
+    log.info("the unpacked call was kept")
+
+
+def __test_a_helper_only_reading_its_argument_is_dropped__(log):
+    """Handing a collection to a helper that only reads it changes nothing"""
+    source = """
+@script.indicator("t")
+def main():
+    store = lib.array.new_float(0)
+
+    def peek(arr):
+        return lib.array.size(arr)
+
+    lib.plot(peek(store))
+    d = lib.request.security(lib.syminfo.tickerid, "1D", lib.array.size(store))
+    lib.plot(d)
+"""
+    body = __test_helper_body_without_defs(
+        __test_helper_only_clone(__test_helper_transform(source)))
+    assert 'peek(' not in body, "a call only reading the collection was kept"
+    log.info("the reading helper call was dropped")
+
+
+def __test_calls_of_one_helper_are_not_tied_by_its_locals__(log):
+    """A helper's own names live in the frame of each call
+
+    Both calls bind the helper's ``total``; only the first feeds the
+    expression, and the second runs in a frame (and with persistent state) of
+    its own.
+    """
+    source = """
+@script.indicator("t")
+def main():
+    def accumulate(x):
+        total: Persistent[float] = 0.0
+        total = total + x
+        return total
+
+    a = accumulate(lib.close)
+    b = accumulate(lib.open)
+    d = lib.request.security(lib.syminfo.tickerid, "1D", a)
+    lib.plot(b)
+"""
+    body = __test_helper_body_without_defs(
+        __test_helper_only_clone(__test_helper_transform(source)))
+    assert 'accumulate(lib.close)' in body, "the call feeding the expression was dropped"
+    assert 'accumulate(lib.open)' not in body, "a call tied only by the helper's locals was kept"
+    log.info("the unrelated call of the same helper was dropped")
+
+
+def __test_rebinding_an_alias_leaves_the_aliased_object__(log):
+    """Rebinding a name that aliased a collection does not change the collection"""
+    source = """
+@script.indicator("t")
+def main():
+    store = lib.array.new_float(0)
+    alias = store
+    alias = lib.array.new_float(3)
+    lib.plot(lib.array.size(alias))
+    d = lib.request.security(lib.syminfo.tickerid, "1D", lib.array.size(store))
+    lib.plot(d)
+"""
+    body = __test_helper_body(__test_helper_only_clone(__test_helper_transform(source)))
+    assert 'alias' not in body, "a rebinding of a former alias was kept"
+    log.info("the alias rebinding was dropped")
+
+
+def __test_a_library_type_handed_to_a_call_aliases_nothing__(log):
+    """``NA(Color)`` neither mutates nor aliases anything of the script
+
+    ``pick`` binds its result to ``NA(Color)`` or to ``c``. Taking the type
+    ``Color`` for a script object would put ``c`` in one alias class with it,
+    and the library call would then count as a mutation of ``c``, keeping the
+    call of ``pick`` the expression never reads.
+    """
+    source = '''"""
+@pyne
+"""
+from pynecore.lib import script, request, syminfo, close, color, plot
+from pynecore.types import Color, NA
+
+@script.indicator("t")
+def main():
+    c = color.new(color.red, 0)
+
+    def pick(x):
+        z = NA(Color)
+        if x > 0:
+            z = c
+        return z
+
+    p = pick(close)
+    sec = request.security(syminfo.tickerid, "5", c.t)
+    plot(sec)
+    plot(p.t)
+'''
+    body = __test_helper_body_without_defs(__test_helper_only_clone(__test_helper_pipeline(source)))
+    assert 'pick(' not in body, "a call tied to the read color only through NA(Color) was kept"
+    log.info("the library type aliased nothing")

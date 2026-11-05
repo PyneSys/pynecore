@@ -12,6 +12,7 @@ use super::{
 };
 use crate::pine_type_rules::{BOOL, FLOAT, INT, STR, get_ty};
 use crate::steps::export_once::is_export;
+use crate::steps::security::collection::{arg_name, function_args};
 use crate::steps::security::dependencies::{
     COLLECTION_NAMESPACES, DependencyAnalyzer, is_collection_reader, is_unmodelled, root_name,
 };
@@ -26,12 +27,22 @@ const MAX_ROUNDS: usize = 1000;
 const IMMUTABLE_SCALARS: [&str; 4] = [INT, FLOAT, BOOL, STR];
 
 /// Per top-level statement of `main()`, the facts every slice needs (`_StmtIndex`).
+///
+/// A name's value is what its last binding left in it, and the object it names is
+/// changed by a mutation through any alias of it. So a read depends on the
+/// statements that rebind that very name and on those that mutate its alias class,
+/// while rebinding an alias (`alias = other`) leaves the object the read reaches as
+/// it was.
 #[derive(Default)]
 pub(super) struct StmtIndex {
-    /// Alias classes the statement reads
+    /// Qualified names the statement reads
     reads: HashSet<String>,
-    /// Alias classes it writes or may mutate
-    defs: HashSet<String>,
+    /// Alias classes of the names it reads
+    read_classes: HashSet<String>,
+    /// Qualified names it rebinds
+    rebinds: HashSet<String>,
+    /// Alias classes it may mutate
+    mutates: HashSet<String>,
     /// Sids whose `__sec_read__` the statement holds
     read_sids: HashSet<String>,
     /// Sids whose `__sec_write__` the statement holds
@@ -128,6 +139,46 @@ fn call_operands(ast: &Ast, call: NodeId) -> Vec<NodeId> {
         _ => unreachable!("no keyword"),
     }));
     out
+}
+
+/// Base names an assignment target binds or stores into, each of an unpacking
+/// (`_target_roots`).
+fn target_roots<'a>(ast: &'a Ast, target: NodeId, out: &mut Vec<&'a str>) {
+    match ast.kind(target) {
+        Kind::Tuple { elts, .. } | Kind::List { elts, .. } => {
+            for &elt in elts {
+                target_roots(ast, elt, out);
+            }
+        }
+        &Kind::Starred { value, .. } => target_roots(ast, value, out),
+        _ => {
+            if let Some(root) = root_name(ast, target) {
+                out.push(root);
+            }
+        }
+    }
+}
+
+/// The name a `case` pattern node captures, if it captures one (`_capture_name`).
+fn capture_name(ast: &Ast, node: NodeId) -> Option<&str> {
+    match ast.kind(node) {
+        Kind::MatchAs { name, .. } | Kind::MatchStar { name } => name.as_deref(),
+        Kind::MatchMapping { rest, .. } => rest.as_deref(),
+        _ => None,
+    }
+}
+
+/// Whether a qualified name belongs to one of the scopes or to a scope nested in one
+/// (`_bound_in`).
+fn bound_in(qualified: &str, keys: &HashSet<String>) -> bool {
+    let mut scope = qualified.split('\0').next().unwrap_or("");
+    while !scope.is_empty() {
+        if keys.contains(scope) {
+            return true;
+        }
+        scope = scope.rfind('.').map_or("", |at| &scope[..at]);
+    }
+    false
 }
 
 /// Whether a call is a collection builtin mutating an unnameable id
@@ -272,6 +323,11 @@ impl<'s, 'a> Collector<'s, 'a> {
             Kind::Name { .. } | Kind::Attribute { .. } | Kind::Subscript { .. } => {
                 return match root_name(ast, expr) {
                     None | Some("lib") => Vec::new(),
+                    // A name a pynecore import binds is pynecore's own object (a type,
+                    // a function, a module), never one the script built: handing it
+                    // to a call (``NA(Color)``) or binding it to a name aliases nothing
+                    // of the script.
+                    Some(root) if self.library_calls.contains(root) => Vec::new(),
                     Some(root) => vec![self.qualify(root, scope)],
                 };
             }
@@ -286,6 +342,27 @@ impl<'s, 'a> Collector<'s, 'a> {
                     roots.extend(self.alias_roots(value, scope));
                 }
                 return roots;
+            }
+            Kind::Tuple { elts, .. } | Kind::List { elts, .. } | Kind::Set { elts } => {
+                // A container literal holds the very objects it is built of, so what
+                // is taken out of it again (``a, b = store, other``) is one of them.
+                let mut roots = Vec::new();
+                for elt in elts.clone() {
+                    roots.extend(self.alias_roots(elt, scope));
+                }
+                return roots;
+            }
+            Kind::Dict { keys, values } => {
+                let parts: Vec<NodeId> =
+                    keys.iter().flatten().copied().chain(values.iter().copied()).collect();
+                let mut roots = Vec::new();
+                for part in parts {
+                    roots.extend(self.alias_roots(part, scope));
+                }
+                return roots;
+            }
+            &Kind::Starred { value, .. } | &Kind::NamedExpr { value, .. } => {
+                return self.alias_roots(value, scope);
             }
             Kind::Call { .. } => {}
             _ => return Vec::new(),
@@ -357,6 +434,11 @@ impl<'s, 'a> Collector<'s, 'a> {
     }
 
     /// Union every `target = <alias expression>` of the scope (`record_aliases`).
+    ///
+    /// Every binding form counts: an assignment, an annotated one, a `for` target, a
+    /// walrus and a `case` pattern's captures. An unpacking target joins each of its
+    /// names with the whole value; which element went where is not followed, which
+    /// only ever keeps more statements.
     pub(super) fn record_aliases(&mut self, scope: &str) {
         let ast = self.ast;
         for sub in own(ast, self.scopes.scopes[scope].node) {
@@ -369,6 +451,11 @@ impl<'s, 'a> Collector<'s, 'a> {
                 Kind::For { target, iter, .. } | Kind::AsyncFor { target, iter, .. } => {
                     (vec![*target], *iter)
                 }
+                Kind::NamedExpr { target, value } => (vec![*target], *value),
+                Kind::Match { .. } => {
+                    self.record_capture_aliases(sub, scope);
+                    continue;
+                }
                 _ => continue,
             };
             let roots = self.alias_roots(value, scope);
@@ -376,16 +463,97 @@ impl<'s, 'a> Collector<'s, 'a> {
                 continue;
             }
             for target in targets {
-                let name = match root_name(ast, target) {
-                    None | Some("lib") => continue,
-                    Some(name) => name,
-                };
-                let qualified = self.qualify(name, scope);
-                for root in &roots {
-                    self.aliases.union(&qualified, root);
+                let mut names = Vec::new();
+                target_roots(ast, target, &mut names);
+                for name in names {
+                    if name == "lib" {
+                        continue;
+                    }
+                    let qualified = self.qualify(name, scope);
+                    for root in &roots {
+                        self.aliases.union(&qualified, root);
+                    }
                 }
             }
         }
+    }
+
+    /// Join every name a `case` pattern captures with the match subject
+    /// (`_record_capture_aliases`).
+    ///
+    /// A capture binds the subject or a part of it (an element, a field, the rest of
+    /// a mapping); taking it for the subject itself only ever keeps more statements.
+    fn record_capture_aliases(&mut self, node: NodeId, scope: &str) {
+        let ast = self.ast;
+        let Kind::Match { subject, cases } = ast.kind(node) else { unreachable!() };
+        let roots = self.alias_roots(*subject, scope);
+        if roots.is_empty() {
+            return;
+        }
+        for &case in cases {
+            let Kind::MatchCase { pattern, .. } = ast.kind(case) else { unreachable!() };
+            for sub in pyne_ast::walk::walk(ast, *pattern) {
+                if let Some(name) = capture_name(ast, sub) {
+                    let qualified = self.qualify(name, scope);
+                    for root in &roots {
+                        self.aliases.union(&qualified, root);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Each argument of a call of the user function `key`, with its parameter
+    /// (`_bound_args`).
+    ///
+    /// `None` when an argument has no one parameter the code spells out: an
+    /// unpacking (`*args`, `**kwargs`), a positional past the last positional
+    /// parameter with no `*` parameter to take it, a keyword naming no parameter (or
+    /// one already bound) with no `**` parameter to take it.
+    fn bound_args(&self, call: NodeId, key: &str) -> Option<Vec<(NodeId, String)>> {
+        let ast = self.ast;
+        let function = self.scopes.scopes[key].node;
+        if !matches!(ast.kind(function), Kind::FunctionDef { .. } | Kind::AsyncFunctionDef { .. }) {
+            return None;
+        }
+        let Kind::Arguments { posonlyargs, args, vararg, kwonlyargs, kwarg, .. } =
+            ast.kind(function_args(ast, function))
+        else {
+            unreachable!()
+        };
+        let positional: Vec<&str> =
+            posonlyargs.iter().chain(args).map(|&arg| arg_name(ast, arg)).collect();
+        let by_keyword: HashSet<&str> =
+            args.iter().chain(kwonlyargs).map(|&arg| arg_name(ast, arg)).collect();
+        let Kind::Call { args: call_args, keywords, .. } = ast.kind(call) else { unreachable!() };
+        let mut bound: Vec<(NodeId, String)> = Vec::new();
+        let mut taken: HashSet<&str> = HashSet::new();
+        for (position, &arg) in call_args.iter().enumerate() {
+            if matches!(ast.kind(arg), Kind::Starred { .. }) {
+                return None;
+            }
+            if let Some(&param) = positional.get(position) {
+                bound.push((arg, param.to_string()));
+                taken.insert(param);
+            } else if let Some(vararg) = vararg {
+                bound.push((arg, arg_name(ast, *vararg).to_string()));
+            } else {
+                return None;
+            }
+        }
+        for &keyword in keywords {
+            let Kind::Keyword { arg, value } = ast.kind(keyword) else { unreachable!() };
+            let name = arg.as_deref()?;
+            if by_keyword.contains(name) && !taken.contains(name) {
+                bound.push((*value, name.to_string()));
+                taken.insert(name);
+            } else if let Some(kwarg) = kwarg {
+                bound.push((*value, arg_name(ast, *kwarg).to_string()));
+            } else {
+                return None;
+            }
+        }
+        Some(bound)
     }
 
     /// Join the objects a call may store into one another (`_record_call_aliases`).
@@ -395,10 +563,28 @@ impl<'s, 'a> Collector<'s, 'a> {
     /// unknown callee may keep one argument inside another the same way, and a
     /// method call may keep an argument inside its receiver. Joining the argument
     /// classes is conservative: a wider class only ever keeps more statements.
+    ///
+    /// A call of a user function whose every argument binds one parameter
+    /// ([`Collector::bound_args`]) joins each argument with its parameter instead, as
+    /// the assignment `parameter = argument` would: the callee's own body then
+    /// records what it does to the object, every store into another object included,
+    /// and its summary carries that to the call.
     fn record_call_aliases(&mut self, call: NodeId, scope: &str) {
         let ast = self.ast;
         let Kind::Call { func, .. } = ast.kind(call) else { unreachable!() };
         let func = *func;
+        if let Kind::Name { id, .. } = ast.kind(func)
+            && let Some(key) = self.scopes.lookup_func_from(id, scope)
+            && let Some(bound) = self.bound_args(call, &key)
+        {
+            for (arg, param) in bound {
+                let qualified = self.qualify(&param, &key);
+                for root in self.alias_roots(arg, scope) {
+                    self.aliases.union(&qualified, &root);
+                }
+            }
+            return;
+        }
         let mut args = call_operands(ast, call);
         if let Kind::Attribute { value: receiver, .. } = ast.kind(func) {
             if let Some((namespace, function)) = collection_call(ast, func) {
@@ -496,7 +682,12 @@ impl<'s, 'a> Collector<'s, 'a> {
                     facts.writes.insert(self.qualify(name, scope));
                 }
             }
-            _ => {}
+            _ => {
+                if let Some(name) = capture_name(ast, node) {
+                    // A ``case`` pattern binds the names it captures like an assignment.
+                    facts.writes.insert(self.qualify(name, scope));
+                }
+            }
         }
     }
 
@@ -514,8 +705,15 @@ impl<'s, 'a> Collector<'s, 'a> {
         match ast.kind(func) {
             Kind::Name { id, .. } => {
                 if let Some(key) = self.scopes.lookup_func_from(id, scope) {
+                    if self.bound_args(call, &key).is_none() {
+                        // An argument no one parameter takes may reach any of them, so
+                        // whatever the callee does to a parameter cannot be traced back
+                        // to it: the call may mutate every argument. A bound argument
+                        // shares its parameter's alias class (`record_call_aliases`),
+                        // so the callee's summary names what the call does to it.
+                        self.mutate_args(&args, scope, facts);
+                    }
                     facts.calls.insert(key);
-                    self.mutate_args(&args, scope, facts);
                     return;
                 }
                 if PROTOCOL_CALLS.contains(&id.as_str()) {
@@ -626,6 +824,13 @@ pub(super) fn function_summaries(
 }
 
 /// Fold the summaries of the functions a statement calls into its facts (`_expand`).
+///
+/// A name a callee binds itself is rebound in the callee's own frame: no statement
+/// of the caller reads it, and another call of the same function runs in a frame of
+/// its own, its persistent state that of its own call site (see the function
+/// isolation pass). What a callee rebinds is the statement's write only when the
+/// name belongs to a scope outside the callees (a `nonlocal` / `global` write); what
+/// it mutates always is.
 fn expand(mut facts: Facts, summaries: &IndexMap<String, Facts>) -> Facts {
     let mut seen: HashSet<String> = HashSet::new();
     let mut work: Vec<String> = facts.calls.iter().cloned().collect();
@@ -640,6 +845,9 @@ fn expand(mut facts: Facts, summaries: &IndexMap<String, Facts>) -> Facts {
                 work.extend(other.calls.iter().cloned());
             }
         }
+    }
+    if !seen.is_empty() {
+        facts.writes.retain(|name| !bound_in(name, &seen));
     }
     facts
 }
@@ -657,9 +865,8 @@ pub(super) fn build_index(
     for &stmt in body {
         let facts = expand(collector.facts(&stmt_nodes(ast, stmt), main_key), summaries);
         let aliases = &collector.aliases;
-        let mut defs = aliases.classes(&facts.writes);
-        defs.extend(aliases.classes(&facts.mutates));
-        let mut reads = aliases.classes(&facts.reads);
+        let Facts { mut reads, writes, mutates, read_sids, write_sids, .. } = facts;
+        let mutates = aliases.classes(&mutates);
         // An export is called by the library's importers, so no statement kept here
         // calls it: the names around it that its body reads are read by the
         // definition itself.
@@ -667,8 +874,9 @@ pub(super) fn build_index(
             && let Some(summary) =
                 collector.scopes.key_of.get(&stmt).and_then(|key| summaries.get(key))
         {
-            reads.extend(aliases.classes(&summary.reads));
+            reads.extend(summary.reads.iter().cloned());
         }
+        let read_classes = aliases.classes(&reads);
         let mandatory = if is_def(ast, stmt) {
             // A definition costs nothing per bar and may be called by anything the
             // slice keeps.
@@ -679,39 +887,53 @@ pub(super) fn build_index(
         };
         index.push(StmtIndex {
             reads,
-            defs,
+            read_classes,
+            rebinds: writes,
+            mutates,
             // The sids come from the same expansion as the names: a protocol call
             // inside a helper belongs to the STATEMENT THAT CALLS the helper, not to
             // the ``def`` that only binds it -- dropping the call site would leave
             // the write block unreached and the context silently unwritten.
-            read_sids: facts.read_sids,
-            write_sids: facts.write_sids,
+            read_sids,
+            write_sids,
             mandatory,
         });
     }
     index
 }
 
-/// Per alias class, the positions of the statements that define it (`_definers`).
-pub(super) fn definers(index: &[StmtIndex]) -> HashMap<String, Vec<usize>> {
-    let mut definers: HashMap<String, Vec<usize>> = HashMap::new();
+/// The positions of the statements that define what a read depends on
+/// (`_definers`): per qualified name, the statements rebinding it, and per alias
+/// class, the statements that may mutate it.
+pub(super) struct Definers {
+    rebinders: HashMap<String, Vec<usize>>,
+    mutators: HashMap<String, Vec<usize>>,
+}
+
+pub(super) fn definers(index: &[StmtIndex]) -> Definers {
+    let mut rebinders: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut mutators: HashMap<String, Vec<usize>> = HashMap::new();
     for (position, entry) in index.iter().enumerate() {
-        for class in &entry.defs {
-            definers.entry(class.clone()).or_default().push(position);
+        for name in &entry.rebinds {
+            rebinders.entry(name.clone()).or_default().push(position);
+        }
+        for class in &entry.mutates {
+            mutators.entry(class.clone()).or_default().push(position);
         }
     }
-    definers
+    Definers { rebinders, mutators }
 }
 
 /// Backward slice of `main()`'s top-level statements for one unit (`_slice`).
 ///
-/// A statement is kept when it defines an alias class a kept statement reads. Each
-/// class is followed once, from the moment the first kept statement reads it, to
-/// every statement defining it. Answers the sorted indexes of the kept statements,
-/// or `None` when nothing was dropped.
+/// A statement is kept when it rebinds a name a kept statement reads, or may mutate
+/// the alias class of one. Each name and each class is followed once, from the
+/// moment the first kept statement reads it, to every statement defining it.
+/// Answers the sorted indexes of the kept statements, or `None` when nothing was
+/// dropped.
 pub(super) fn slice(
     index: &[StmtIndex],
-    definers: &HashMap<String, Vec<usize>>,
+    definers: &Definers,
     sids: &HashSet<String>,
     keep_reads: &HashSet<String>,
 ) -> Option<Vec<usize>> {
@@ -724,14 +946,26 @@ pub(super) fn slice(
             kept.insert(position);
         }
     }
-    let mut needed: HashSet<&str> = HashSet::new();
+    let mut needed_names: HashSet<&str> = HashSet::new();
+    let mut needed_classes: HashSet<&str> = HashSet::new();
     let mut work: Vec<usize> = kept.iter().copied().collect();
     while let Some(position) = work.pop() {
-        for class in &index[position].reads {
-            if !needed.insert(class) {
+        let entry = &index[position];
+        for name in &entry.reads {
+            if !needed_names.insert(name) {
                 continue;
             }
-            for &definer in definers.get(class).into_iter().flatten() {
+            for &definer in definers.rebinders.get(name).into_iter().flatten() {
+                if kept.insert(definer) {
+                    work.push(definer);
+                }
+            }
+        }
+        for class in &entry.read_classes {
+            if !needed_classes.insert(class) {
+                continue;
+            }
+            for &definer in definers.mutators.get(class).into_iter().flatten() {
                 if kept.insert(definer) {
                     work.push(definer);
                 }

@@ -725,6 +725,8 @@ A security child process re-runs the script's whole `main()` on every bar of its
 
 Key aspects:
 - The slice is a conservative over-approximation: every uncertainty keeps a statement, and a construct the pass cannot classify drops the optimization for the module (the child then runs `main()`)
+- A kept statement keeps the statements that rebind a name it reads, and those that may mutate the object such a name refers to, through any alias of it. Every binding form makes an alias: an assignment, an unpacking, a `for` target, a walrus, a `case` capture
+- A call of a user function binds each argument to its parameter, so the callee's own body decides what the call mutates; a call the binding cannot follow (`*args`, `**kwargs`) may mutate every argument. A name the callee binds itself lives in the frame of each call and ties no two calls together
 - A clone is also where a guarded write is made unconditional, so a context the slice does not serve still gets a clone whenever its write is guarded
 - `PYNE_NO_SECURITY_SLICE=1` switches slicing off; the flag is mixed into the pipeline hash
 - The step is last of the analysis half: the clones must see the tree every earlier step produced (the hoisted `ta` assignments among them), and the lowering half then lays them out like any other function with their own slot layout

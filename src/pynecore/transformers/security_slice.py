@@ -154,18 +154,29 @@ class _StmtIndex:
     All of it is independent of the context being sliced for, so it is built
     once and every context's fixpoint reads it instead of re-walking ``main()``.
 
-    :ivar reads: alias classes the statement reads
-    :ivar defs: alias classes it writes or may mutate
+    A name's value is what its last binding left in it, and the object it
+    names is changed by a mutation through any alias of it. So a read depends
+    on the statements that rebind that very name and on those that mutate its
+    alias class, while rebinding an alias (``alias = other``) leaves the
+    object the read reaches as it was.
+
+    :ivar reads: qualified names the statement reads
+    :ivar read_classes: alias classes of the names it reads
+    :ivar rebinds: qualified names it rebinds
+    :ivar mutates: alias classes it may mutate
     :ivar read_sids: sids whose ``__sec_read__`` the statement holds
     :ivar write_sids: sids whose ``__sec_write__`` the statement holds
     :ivar mandatory: a definition or an early exit — kept in every slice
     """
 
-    __slots__ = ('reads', 'defs', 'read_sids', 'write_sids', 'mandatory')
+    __slots__ = ('reads', 'read_classes', 'rebinds', 'mutates', 'read_sids', 'write_sids',
+                 'mandatory')
 
     def __init__(self) -> None:
         self.reads: set[str] = set()
-        self.defs: set[str] = set()
+        self.read_classes: set[str] = set()
+        self.rebinds: set[str] = set()
+        self.mutates: set[str] = set()
         self.read_sids: set[str] = set()
         self.write_sids: set[str] = set()
         self.mandatory: bool = False
@@ -290,6 +301,36 @@ def _walk_own(node: ast.AST):
     return ast_walk.iter_descendants(node, (ast.FunctionDef, ast.AsyncFunctionDef))
 
 
+def _target_roots(target: ast.expr) -> Iterator[str]:
+    """Base names an assignment target binds or stores into, each of an unpacking."""
+    if isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            yield from _target_roots(elt)
+    elif isinstance(target, ast.Starred):
+        yield from _target_roots(target.value)
+    else:
+        root = _SliceScopes.root_name(target)
+        if root is not None:
+            yield root
+
+
+def _capture_name(node: ast.AST) -> str | None:
+    """The name a ``case`` pattern node captures, if it captures one."""
+    if isinstance(node, (ast.MatchAs, ast.MatchStar)):
+        return node.name
+    if isinstance(node, ast.MatchMapping):
+        return node.rest
+    return None
+
+
+def _capture_names(pattern: ast.pattern) -> Iterator[str]:
+    """Every name a ``case`` pattern captures, those of its sub-patterns included."""
+    for node in ast_walk.walk(pattern):
+        name = _capture_name(node)
+        if name is not None:
+            yield name
+
+
 class _OwnWalks:
     """``[node, *_walk_own(node)]`` of statements and scopes, made once.
 
@@ -360,7 +401,11 @@ class _Collector:
             return []
         if isinstance(expr, (ast.Name, ast.Attribute, ast.Subscript)):
             root = self._scopes.root_name(expr)
-            if root is None or root == 'lib':
+            if root is None or root == 'lib' or root in self._library_calls:
+                # A name a pynecore import binds is pynecore's own object (a
+                # type, a function, a module), never one the script built:
+                # handing it to a call (``NA(Color)``) or binding it to a name
+                # aliases nothing of the script.
                 return []
             return [self._scopes.qualify(root, scope)]
         if isinstance(expr, ast.IfExp):
@@ -371,6 +416,17 @@ class _Collector:
             for value in expr.values:
                 roots.extend(self.alias_roots(value, scope))
             return roots
+        if isinstance(expr, (ast.Tuple, ast.List, ast.Set, ast.Dict)):
+            # A container literal holds the very objects it is built of, so what
+            # is taken out of it again (``a, b = store, other``) is one of them.
+            parts = (list(expr.keys) + list(expr.values) if isinstance(expr, ast.Dict)
+                     else expr.elts)
+            roots = []
+            for part in parts:
+                roots.extend(self.alias_roots(part, scope))
+            return roots
+        if isinstance(expr, (ast.Starred, ast.NamedExpr)):
+            return self.alias_roots(expr.value, scope)
         if not isinstance(expr, ast.Call):
             return []
         func = expr.func
@@ -431,7 +487,13 @@ class _Collector:
         return roots
 
     def record_aliases(self, scope: str) -> None:
-        """Union every ``target = <alias expression>`` of the scope."""
+        """Union every ``target = <alias expression>`` of the scope.
+
+        Every binding form counts: an assignment, an annotated one, a ``for``
+        target, a walrus and a ``case`` pattern's captures. An unpacking target
+        joins each of its names with the whole value; which element went where
+        is not followed, which only ever keeps more statements.
+        """
         for sub in self._walks.own(self._scopes.scope_node(scope)):
             if isinstance(sub, ast.Call):
                 self._record_call_aliases(sub, scope)
@@ -443,18 +505,79 @@ class _Collector:
                 targets, value = [sub.target], sub.value
             elif isinstance(sub, (ast.For, ast.AsyncFor)):
                 targets, value = [sub.target], sub.iter
+            elif isinstance(sub, ast.NamedExpr):
+                targets, value = [sub.target], sub.value
+            elif isinstance(sub, ast.Match):
+                self._record_capture_aliases(sub, scope)
             if value is None:
                 continue
             roots = self.alias_roots(value, scope)
             if not roots:
                 continue
             for target in targets:
-                name = self._scopes.root_name(target)
-                if name is None or name == 'lib':
-                    continue
+                for name in _target_roots(target):
+                    if name == 'lib':
+                        continue
+                    qualified = self._scopes.qualify(name, scope)
+                    for root in roots:
+                        self._aliases.union(qualified, root)
+
+    def _record_capture_aliases(self, node: ast.Match, scope: str) -> None:
+        """Join every name a ``case`` pattern captures with the match subject.
+
+        A capture binds the subject or a part of it (an element, a field, the
+        rest of a mapping); taking it for the subject itself only ever keeps
+        more statements.
+        """
+        roots = self.alias_roots(node.subject, scope)
+        if not roots:
+            return
+        for case in node.cases:
+            for name in _capture_names(case.pattern):
                 qualified = self._scopes.qualify(name, scope)
                 for root in roots:
                     self._aliases.union(qualified, root)
+
+    def _bound_args(self, node: ast.Call, key: str) -> list[tuple[ast.expr, str]] | None:
+        """Each argument of a call of the user function ``key``, with its parameter.
+
+        :param node: the call
+        :param key: scope key of the function it calls
+        :return: ``(argument, parameter name)`` pairs, or None when an argument
+            has no one parameter the code spells out: an unpacking (``*args``,
+            ``**kwargs``), a positional past the last positional parameter with
+            no ``*`` parameter to take it, a keyword naming no parameter (or one
+            already bound) with no ``**`` parameter to take it
+        """
+        fn = self._scopes.scope_node(key)
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        spec = fn.args
+        positional = [param.arg for param in (*spec.posonlyargs, *spec.args)]
+        by_keyword = {param.arg for param in (*spec.args, *spec.kwonlyargs)}
+        bound: list[tuple[ast.expr, str]] = []
+        taken: set[str] = set()
+        for position, arg in enumerate(node.args):
+            if isinstance(arg, ast.Starred):
+                return None
+            if position < len(positional):
+                bound.append((arg, positional[position]))
+                taken.add(positional[position])
+            elif spec.vararg is not None:
+                bound.append((arg, spec.vararg.arg))
+            else:
+                return None
+        for keyword in node.keywords:
+            if keyword.arg is None:
+                return None
+            if keyword.arg in by_keyword and keyword.arg not in taken:
+                bound.append((keyword.value, keyword.arg))
+                taken.add(keyword.arg)
+            elif spec.kwarg is not None:
+                bound.append((keyword.value, spec.kwarg.arg))
+            else:
+                return None
+        return bound
 
     def _record_call_aliases(self, node: ast.Call, scope: str) -> None:
         """Join the objects a call may store into one another.
@@ -465,8 +588,23 @@ class _Collector:
         another the same way, and a method call may keep an argument inside its
         receiver. Joining the argument classes is conservative: a wider class
         only ever keeps more statements.
+
+        A call of a user function whose every argument binds one parameter
+        (:meth:`_bound_args`) joins each argument with its parameter instead, as
+        the assignment ``parameter = argument`` would: the callee's own body
+        then records what it does to the object, every store into another
+        object included, and its summary carries that to the call.
         """
         func = node.func
+        if isinstance(func, ast.Name):
+            key = self._scopes.func_key(func.id, scope)
+            bound = None if key is None else self._bound_args(node, key)
+            if key is not None and bound is not None:
+                for arg, param in bound:
+                    qualified = self._scopes.qualify(param, key)
+                    for root in self.alias_roots(arg, scope):
+                        self._aliases.union(qualified, root)
+                return
         args: list[ast.expr] = list(node.args) + [kw.value for kw in node.keywords]
         if isinstance(func, ast.Attribute):
             collection = _collection_call(func)
@@ -545,6 +683,10 @@ class _Collector:
             for name in node.names:
                 facts.writes.add(self._scopes.qualify(name, scope))
             return
+        captured = _capture_name(node)
+        if captured is not None:
+            # A ``case`` pattern binds the names it captures like an assignment.
+            facts.writes.add(self._scopes.qualify(captured, scope))
 
     def _visit_call(self, node: ast.Call, scope: str, facts: _Facts) -> None:
         func = node.func
@@ -553,8 +695,15 @@ class _Collector:
             key = self._scopes.func_key(func.id, scope)
             if key is not None:
                 facts.calls.add(key)
-                for arg in args:
-                    facts.mutates.update(self.alias_roots(arg, scope))
+                if self._bound_args(node, key) is None:
+                    # An argument no one parameter takes may reach any of them,
+                    # so whatever the callee does to a parameter cannot be
+                    # traced back to it: the call may mutate every argument.
+                    # A bound argument shares its parameter's alias class
+                    # (:meth:`_record_call_aliases`), so the callee's summary
+                    # names what the call does to it.
+                    for arg in args:
+                        facts.mutates.update(self.alias_roots(arg, scope))
                 return
             if func.id in _PROTOCOL_CALLS:
                 # A protocol call belongs to the context named by its first
@@ -922,7 +1071,15 @@ def _function_summaries(collector: _Collector, scopes: _SliceScopes,
 
 
 def _expand(facts: _Facts, summaries: dict[str, _Facts]) -> _Facts:
-    """Fold the summaries of the functions a statement calls into its facts."""
+    """Fold the summaries of the functions a statement calls into its facts.
+
+    A name a callee binds itself is rebound in the callee's own frame: no
+    statement of the caller reads it, and another call of the same function
+    runs in a frame of its own, its persistent state that of its own call site
+    (see the function isolation pass). What a callee rebinds is the statement's
+    write only when the name belongs to a scope outside the callees (a
+    ``nonlocal`` / ``global`` write); what it mutates always is.
+    """
     seen: set[str] = set()
     work = list(facts.calls)
     while work:
@@ -936,7 +1093,23 @@ def _expand(facts: _Facts, summaries: dict[str, _Facts]) -> _Facts:
             continue
         facts.absorb(other)
         work.extend(other.calls)
+    if seen:
+        facts.writes = {name for name in facts.writes if not _bound_in(name, seen)}
     return facts
+
+
+def _bound_in(qualified: str, keys: set[str]) -> bool:
+    """Whether a qualified name belongs to one of the scopes or to a scope nested in one.
+
+    :param qualified: a name as :meth:`_SliceScopes.qualify` spells it
+    :param keys: function scope keys
+    """
+    scope = qualified.partition('\x00')[0]
+    while scope:
+        if scope in keys:
+            return True
+        scope = scope.rpartition('.')[0]
+    return False
 
 
 def _skip_reason(sid: str, ctx: ast.Dict, written_sids: set[str]) -> str | None:
@@ -1826,8 +1999,9 @@ def _build_index(body: list[ast.stmt], collector: _Collector, aliases: _Aliases,
     for stmt in body:
         entry = _StmtIndex()
         facts = _expand(collector.facts(_stmt_nodes(stmt), main_key), summaries)
-        entry.reads = aliases.classes(facts.reads)
-        entry.defs = aliases.classes(facts.writes) | aliases.classes(facts.mutates)
+        entry.reads = facts.reads
+        entry.rebinds = facts.writes
+        entry.mutates = aliases.classes(facts.mutates)
         # The sids come from the same expansion as the names: a protocol call
         # inside a helper belongs to the STATEMENT THAT CALLS the helper, not to
         # the ``def`` that only binds it — dropping the call site would leave
@@ -1844,49 +2018,69 @@ def _build_index(body: list[ast.stmt], collector: _Collector, aliases: _Aliases,
             key = scopes.scope_key_of(stmt)
             if (isinstance(stmt, ast.FunctionDef) and is_export(stmt, export_decorators)
                     and key in summaries):
-                entry.reads |= aliases.classes(summaries[key].reads)
+                entry.reads |= summaries[key].reads
         elif reach.own(stmt).returns:
             # An early exit decides whether a later write block is reached.
             entry.mandatory = True
+        entry.read_classes = aliases.classes(entry.reads)
         index.append(entry)
     return index
 
 
-def _definers(index: list[_StmtIndex]) -> dict[str, list[int]]:
-    """Per alias class, the positions of the statements that define it."""
-    definers: dict[str, list[int]] = {}
+def _definers(index: list[_StmtIndex]) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
+    """The positions of the statements that define what a read depends on.
+
+    :return: per qualified name, the statements rebinding it; per alias class,
+        the statements that may mutate it
+    """
+    rebinders: dict[str, list[int]] = {}
+    mutators: dict[str, list[int]] = {}
     for position, entry in enumerate(index):
-        for alias_class in entry.defs:
-            definers.setdefault(alias_class, []).append(position)
-    return definers
+        for name in entry.rebinds:
+            rebinders.setdefault(name, []).append(position)
+        for alias_class in entry.mutates:
+            mutators.setdefault(alias_class, []).append(position)
+    return rebinders, mutators
 
 
-def _slice(index: list[_StmtIndex], definers: dict[str, list[int]], sids: set[str],
+def _slice(index: list[_StmtIndex],
+           definers: tuple[dict[str, list[int]], dict[str, list[int]]], sids: set[str],
            keep_reads: set[str]) -> list[int] | None:
     """Backward slice of ``main()``'s top-level statements for one unit.
 
-    A statement is kept when it defines an alias class a kept statement reads.
-    Each class is followed once, from the moment the first kept statement
-    reads it, to every statement defining it (:func:`_definers`).
+    A statement is kept when it rebinds a name a kept statement reads, or may
+    mutate the alias class of one. Each name and each class is followed once,
+    from the moment the first kept statement reads it, to every statement
+    defining it (:func:`_definers`).
 
     :param index: the per-statement index of ``main()``'s body
-    :param definers: the defining positions per alias class
+    :param definers: the rebinding positions per name and the mutating
+        positions per alias class
     :param sids: the contexts the clone must write (one, or a whole group)
     :param keep_reads: sids whose ``__sec_read__`` must run in this child
     :return: indexes of the kept statements, or None when nothing was dropped
     """
+    rebinders, mutators = definers
     kept: set[int] = set()
     for position, entry in enumerate(index):
         if (entry.mandatory or entry.write_sids & sids
                 or entry.read_sids & keep_reads):
             kept.add(position)
 
-    needed: set[str] = set()
+    needed_names: set[str] = set()
+    needed_classes: set[str] = set()
     work = list(kept)
     while work:
-        for alias_class in index[work.pop()].reads - needed:
-            needed.add(alias_class)
-            for position in definers.get(alias_class, ()):
+        entry = index[work.pop()]
+        for name in entry.reads - needed_names:
+            needed_names.add(name)
+            for position in rebinders.get(name, ()):
+                if position not in kept:
+                    kept.add(position)
+                    work.append(position)
+        for alias_class in entry.read_classes - needed_classes:
+            needed_classes.add(alias_class)
+            for position in mutators.get(alias_class, ()):
                 if position not in kept:
                     kept.add(position)
                     work.append(position)
