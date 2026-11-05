@@ -553,14 +553,21 @@ is_falling: bool = ta.falling(close, 5)  # Falling for 5 bars
 
 ### cross()
 
-Cross. Returns true when two series have crossed (in either direction).
+Cross. Returns true when source1 moves to the other side of source2, in either direction.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `source1` | float | First series |
 | `source2` | float | Second series |
 
-**Returns:** bool — True if the two series crossed.
+**Returns:** bool — True if source1 is strictly above source2 now and was below it on the last
+bar where the two differed by more than 1e-10, or the mirror of that downwards. Bars where the
+two are equal within 1e-10 keep the previous direction, so a cross through an equality run
+still fires. A bar where either source is na returns false and leaves the state unchanged.
+
+`cross()` is not the same as `crossover() or crossunder()`: when the series start out equal,
+there is no previous direction yet, so the first separation does not fire `cross()`, while
+`crossover()` or `crossunder()` does.
 
 ```python
 crossed: bool = ta.cross(sma_fast, sma_slow)  # Either direction
@@ -575,7 +582,9 @@ Crossover. Returns true when source1 crosses above source2.
 | `source1` | float | First series |
 | `source2` | float | Second series |
 
-**Returns:** bool — True if source1 > source2 and source1[1] <= source2[1].
+**Returns:** bool — True if source1 > source2 and source1 <= source2 on the last bar where both
+series were defined. A bar where either source is na returns false and does not reset that
+previous relation, so a cross across an na gap still fires.
 
 ```python
 cross_up: bool = ta.crossover(close, ma)  # Price crosses above MA
@@ -596,7 +605,8 @@ Crossunder. Returns true when source1 crosses below source2.
 | `source1` | float | First series |
 | `source2` | float | Second series |
 
-**Returns:** bool — True if source1 < source2 and source1[1] >= source2[1].
+**Returns:** bool — True if source1 < source2 and source1 >= source2 on the last bar where both
+series were defined. Na bars are handled the same way as in [`crossover()`](#crossover).
 
 ```python
 cross_down: bool = ta.crossunder(close, ma)  # Price crosses below MA
