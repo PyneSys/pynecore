@@ -63,6 +63,7 @@ from pynecore.core.broker.models import (
     PositionLeg,
     format_intent_key,
 )
+from pynecore.core.plugin import ProviderError, is_retryable_provider_error
 from pynecore.lib.log import broker_warning as _blog_warning
 from pynecore.core.broker.store_helpers import (
     BRACKET_OWN_STATE_CLEARING,
@@ -98,6 +99,41 @@ if TYPE_CHECKING:
 
     from pynecore.core.broker.storage import RunContext
     from pynecore.core.plugin.broker import PositionPort
+
+
+async def _read_legs(port: 'PositionPort', symbol: str) -> list[PositionLeg]:
+    """Read the raw legs of ``symbol``, translating a transient fault to the taxonomy.
+
+    The fan-outs run inside the engine's order-dispatch bridge, which halts the
+    bot on a raw transient fault because a WRITE that failed that way may have
+    landed. A read has no venue side effect, so its transient fault is a plain
+    :class:`ExchangeConnectionError` (park and retry) — the same verdict the
+    engine's state-read bridge reaches. A non-retryable ``ProviderError``
+    propagates unchanged.
+    """
+    try:
+        return await port.fetch_raw_positions(symbol)
+    except Exception as exc:
+        raise _translate_port_read_fault(exc) from exc
+
+
+async def _read_quantizer(port: 'PositionPort', symbol: str) -> 'Callable[[float], int]':
+    """Read the volume quantizer of ``symbol`` with the :func:`_read_legs` fault mapping."""
+    try:
+        return await port.get_volume_quantizer(symbol)
+    except Exception as exc:
+        raise _translate_port_read_fault(exc) from exc
+
+
+def _translate_port_read_fault(exc: Exception) -> Exception:
+    """Map a transient port-read fault to :class:`ExchangeConnectionError`, else keep it."""
+    if isinstance(exc, ProviderError):
+        if is_retryable_provider_error(exc):
+            return ExchangeConnectionError(str(exc) or "connection lost")
+        return exc
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return ExchangeConnectionError(str(exc) or "connection lost")
+    return exc
 
 
 __all__ = [
@@ -258,7 +294,7 @@ class OneWayEmulator:
         """
         intent = envelope.intent
         assert isinstance(intent, CloseIntent)
-        legs = await port.fetch_raw_positions(intent.symbol)
+        legs = await _read_legs(port, intent.symbol)
         pos = aggregate_positions(intent.symbol, legs)
         if pos is None or pos.side == 'flat':
             # Nothing open, or offsetting legs net to flat — benign no-op.
@@ -336,7 +372,7 @@ class OneWayEmulator:
             return ReversalFanResult(
                 closes=(), open_qty=intent.qty, opened_orders=opened,
             )
-        legs = await port.fetch_raw_positions(intent.symbol)
+        legs = await _read_legs(port, intent.symbol)
         plan = plan_reversal(intent.side, intent.qty, legs)
         # Pre-flight partial-leg capability BEFORE anything is persisted or
         # sent — same atomicity rationale as the volume-bounds check below.
@@ -459,7 +495,7 @@ class OneWayEmulator:
             return
         if not closes:
             return
-        quantize = await port.get_volume_quantizer(symbol)
+        quantize = await _read_quantizer(port, symbol)
         live_by_id = {leg.leg_id: leg for leg in legs}
         for close in closes:
             live = live_by_id.get(close.leg_id)
@@ -509,7 +545,7 @@ class OneWayEmulator:
         :class:`~pynecore.core.broker.exceptions.ExchangeOrderRejectedError`
         so a reversal's or a replay's leg close keeps its loud contract.
         """
-        quantize = await port.get_volume_quantizer(symbol)
+        quantize = await _read_quantizer(port, symbol)
         planned = plan_leg_close_volumes(closes, quantize)
         dispatched: list[tuple[str, int]] = []
         for leg_id, volume in planned:
@@ -611,7 +647,7 @@ class OneWayEmulator:
                 intent.symbol, intent.pine_id, intent.trail_offset,
                 intent.trail_price,
             )
-        legs = await port.fetch_raw_positions(intent.symbol)
+        legs = await _read_legs(port, intent.symbol)
         side, on_side = net_survivor_legs(legs)
         # The net side must be the one this exit protects: ``intent.side`` is
         # the CLOSING direction, so a sell-side exit belongs to a long. When
@@ -862,7 +898,7 @@ class OneWayEmulator:
         ]
         if not rows:
             return set()
-        legs = await port.fetch_raw_positions(symbol)
+        legs = await _read_legs(port, symbol)
         live_ids = {leg.leg_id for leg in legs}
         released: set[str] = set()
         for row in rows:
@@ -1076,9 +1112,9 @@ class OneWayEmulator:
             by_symbol.setdefault(row.symbol, []).append(row)
         settled = True
         for symbol, rows in by_symbol.items():
-            legs = await port.fetch_raw_positions(symbol)
+            legs = await _read_legs(port, symbol)
             live_by_id = {leg.leg_id: leg for leg in legs}
-            quantize = await port.get_volume_quantizer(symbol)
+            quantize = await _read_quantizer(port, symbol)
             for row in rows:
                 if not await self._replay_one(row, symbol, live_by_id, quantize, port):
                     settled = False
@@ -1173,7 +1209,7 @@ class OneWayEmulator:
         assert isinstance(bar_ts_ms, int)
         assert isinstance(retry_seq, int)
         opposing_side = 'sell' if row.side == 'buy' else 'buy'
-        live_legs = await port.fetch_raw_positions(row.symbol)
+        live_legs = await _read_legs(port, row.symbol)
         owed_closes = tuple(
             LegClose(leg_id=leg.leg_id, qty=leg.qty)
             for leg in live_legs
@@ -1278,7 +1314,7 @@ class OneWayEmulator:
             by_symbol.setdefault(row.symbol, []).append(row)
         complete = True
         for symbol, srows in by_symbol.items():
-            legs = await port.fetch_raw_positions(symbol)
+            legs = await _read_legs(port, symbol)
             live_ids = {leg.leg_id for leg in legs}
             for row in srows:
                 if not await self._replay_bracket_one(row, symbol, live_ids, port):

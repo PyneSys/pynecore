@@ -17,6 +17,7 @@ import pytest
 
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
+    ExchangeConnectionError,
     ExchangeOrderRejectedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
@@ -53,6 +54,7 @@ from pynecore.core.broker.store_helpers import (
     iter_active_close_legs,
     iter_active_residual_opens,
 )
+from pynecore.core.plugin import ProviderError
 
 
 class _FakePort:
@@ -1541,3 +1543,73 @@ def __test_drain_residual_opens_drains_a_breadcrumb_in_the_venue_spelling__(tmp_
     assert port.placed == [("EUR/USD", 2.0)]
     assert list(iter_active_residual_opens(ctx)) == []
     store.close()
+
+
+# === transient port-read faults inside a dispatch =======================
+
+class _TransientProviderError(ProviderError):
+    """A plugin's own transient wire fault (a retryable ``ProviderError``)."""
+
+    retryable = True
+
+
+class _PermanentProviderError(ProviderError):
+    """A plugin's own permanent misconfiguration (a non-retryable ``ProviderError``)."""
+
+
+class _FailingReadPort(_FakePort):
+    """A port whose position read (or quantizer read) raises ``fault``."""
+
+    def __init__(self, legs: list[PositionLeg], fault: Exception, *, quantizer: bool) -> None:
+        super().__init__(legs)
+        self._fault = fault
+        self._quantizer = quantizer
+
+    async def fetch_raw_positions(self, symbol: str) -> list[PositionLeg]:
+        if not self._quantizer:
+            raise self._fault
+        return await super().fetch_raw_positions(symbol)
+
+    async def get_volume_quantizer(self, symbol: str):
+        if self._quantizer:
+            raise self._fault
+        return await super().get_volume_quantizer(symbol)
+
+
+@pytest.mark.parametrize("fault", [
+    _TransientProviderError("HTTP transport error on /v5/position/list"),
+    ConnectionError("Server disconnected without sending a response"),
+    TimeoutError("read timed out"),
+], ids=["retryable-provider-error", "connection-error", "timeout-error"])
+@pytest.mark.parametrize("quantizer", [False, True], ids=["legs", "quantizer"])
+def __test_transient_port_read_fault_parks_the_dispatch__(fault, quantizer):
+    """A transient fault on a fan-out's venue READ surfaces as ``ExchangeConnectionError``.
+
+    The fan-outs run inside the engine's dispatch bridge, which halts the bot
+    on a raw transient fault; a read sends nothing, so it must park instead.
+    """
+    legs = [_leg("10", "buy", 2.0)]
+    dispatches = [
+        lambda eng, legs_port: eng.run_exit_bracket(
+            _exit_env("TP", "Long", tp=1.20, sl=1.00), legs_port),
+        lambda eng, legs_port: eng.run_close(_close_env("sell", 2.0), legs_port),
+        lambda eng, legs_port: eng.run_reversal(
+            _entry_env("sell", 3.0, pine_id="Short"), legs_port),
+    ]
+    for dispatch in dispatches:
+        if quantizer and dispatch is dispatches[0]:
+            continue  # the bracket fan-out never quantizes
+        port = _FailingReadPort(legs, fault, quantizer=quantizer)
+        with pytest.raises(ExchangeConnectionError) as info:
+            _run(dispatch(OneWayEmulator(store_ctx=None), port))
+        assert info.value.__cause__ is fault
+        assert port.closed == [] and port.placed == [] and port.amended == []
+
+
+def __test_permanent_port_read_fault_propagates_unchanged__():
+    """A non-retryable ``ProviderError`` on a fan-out read fails loud, untranslated."""
+    fault = _PermanentProviderError("unknown symbol")
+    port = _FailingReadPort([_leg("10", "buy", 2.0)], fault, quantizer=False)
+    with pytest.raises(_PermanentProviderError):
+        _run(OneWayEmulator(store_ctx=None).run_exit_bracket(
+            _exit_env("TP", "Long", tp=1.20, sl=1.00), port))
