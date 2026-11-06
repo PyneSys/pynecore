@@ -10729,27 +10729,42 @@ class OrderSyncEngine:
           fallback (see the matching comment in
           :meth:`_route_defensive_close_fill`).
 
+        A fill on the side of the position a marker closes never matches
+        it: a close of a long is a sell. A venue that closes a position
+        under the position's own deal id (Capital.com) hands back a close
+        ref equal to the parent ENTRY's order id, so the parent fill landing
+        after the attach reject would otherwise settle the marker — the
+        trade never reaches the book and the real close fill is dropped as
+        a duplicate (live: capitalcom cycle 380, 2026-11-06).
+
         Returns ``None`` when no marker matches, including the trivial
         ``_pending_defensive_close`` empty case.
         """
         if not self._pending_defensive_close:
             return None
+        order = event.order
+        event_side = order.side if order is not None else None
+        candidates = [
+            (entry_id, marker)
+            for entry_id, marker in self._pending_defensive_close.items()
+            if event_side is None
+            or event_side != marker.reject_context.position_side
+        ]
         for close_key in (event.pine_id, event.from_entry):
             if close_key is None:
                 continue
-            for entry_id, marker in self._pending_defensive_close.items():
+            for entry_id, marker in candidates:
                 if marker.close_intent_key == close_key:
                     return entry_id
-        order = event.order
         if order is not None:
             order_id = order.id
-            for entry_id, marker in self._pending_defensive_close.items():
+            for entry_id, marker in candidates:
                 if (marker.close_order_ref is not None
                         and marker.close_order_ref == order_id):
                     return entry_id
             event_coid = order.client_order_id
             if event_coid is not None:
-                for entry_id, marker in self._pending_defensive_close.items():
+                for entry_id, marker in candidates:
                     marker_coid = marker.close_client_order_id
                     if (marker_coid == event_coid
                             or _is_composed_leg_coid(event_coid, marker_coid)):

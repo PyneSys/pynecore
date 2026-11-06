@@ -12435,6 +12435,48 @@ def __test_defensive_close_fill_matched_by_order_ref__(tmp_path):
         store.close()
 
 
+def __test_late_parent_entry_fill_sharing_the_close_ref_books_the_trade__(tmp_path, caplog):
+    """A parent ENTRY fill that arrives AFTER the attach reject is not the close.
+
+    Capital.com closes a position under the position's own deal id, so the
+    defensive close's order ref equals the parent ENTRY's order id (live:
+    capitalcom c380, 2026-11-06). The parent fill landing after the reject
+    must book the trade, and the close fill then closes it — matching the
+    entry fill as the close would settle the marker on the wrong event and
+    drop the real close as a duplicate, losing the trade."""
+    store, ctx, engine, pos, b = _bracket_reject_scenario(tmp_path)
+    try:
+        marker = engine._pending_defensive_close['Long']
+        engine._pending_defensive_close['Long'] = replace(
+            marker, close_order_ref='xchg-1',
+        )
+        assert not pos.open_trades
+        caplog.set_level(logging.WARNING)
+        engine.on_order_event(_fill_event(
+            'buy', qty=1.0, price=50_000.0, pine_id='Long',
+            leg=LegType.ENTRY, xchg_id='xchg-1', fill_id='f-entry',
+        ))
+        engine.apply_async_events()
+        assert 'Long' in engine.pending_defensive_close
+        assert [t.entry_id for t in pos.open_trades] == ['Long']
+
+        engine.on_order_event(_fill_event(
+            'sell', qty=1.0, price=49_900.0, pine_id='Long',
+            leg=LegType.CLOSE, xchg_id='xchg-1', fill_id='f-close',
+        ))
+        engine.apply_async_events()
+
+        assert 'Long' not in engine.pending_defensive_close
+        assert pos.size == 0.0
+        assert [(t.entry_id, round(t.profit, 6)) for t in pos.closed_trades] == [
+            ('Long', -100.0),
+        ]
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING
+                    and 'defensive-close' in r.getMessage()]
+    finally:
+        store.close()
+
+
 def __test_settle_in_flight_fills_waits_for_the_defensive_close_fill__(tmp_path):
     """A stop right after a defensive close waits for that close's FILL.
 
