@@ -605,7 +605,12 @@ class VizWriter:
         self._f.write('\n')
 
     def write_header(self, script: Any, syminfo: Any, journal: bool) -> None:
-        """Write the ``hdr`` record with script + symbol context."""
+        """Write the ``hdr`` record with script + symbol context.
+
+        :param script: The script's declaration
+        :param syminfo: The ``lib.syminfo`` module, set for the run
+        :param journal: Whether the file is a journal
+        """
         script_rec = _clean({
             "type": enum_name(script.script_type, SCRIPT_TYPE),
             "title": script.title,
@@ -621,8 +626,9 @@ class VizWriter:
         })
         syminfo_rec = _clean({
             "tickerid": getattr(syminfo, 'tickerid', None) or None,
-            "prefix": getattr(syminfo, 'prefix', None) or None,
-            "ticker": getattr(syminfo, 'ticker', None) or None,
+            # Module properties: their bare value is the call's
+            "prefix": syminfo.prefix() or None,
+            "ticker": syminfo.ticker() or None,
             "timeframe": getattr(syminfo, 'period', None) or None,
             "mintick": getattr(syminfo, 'mintick', None) or None,
             "timezone": getattr(syminfo, 'timezone', None) or None,

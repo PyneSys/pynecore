@@ -2163,7 +2163,7 @@ def _dg_on_roll(ts: float) -> None:
         # (Re)configure from the symbol template
         _dg_template = opening_hours
         _dg_mode = _grid_mode(getattr(syminfo, 'type', None), opening_hours,
-                              getattr(syminfo, 'prefix', None))
+                              syminfo._prefix)
         tz_name = getattr(syminfo, 'timezone', None)
         _dg_tz = _parse_timezone(tz_name) if tz_name else None
         _dg_overnight = _overnight_opens(opening_hours, syminfo._session_starts)
@@ -3222,7 +3222,7 @@ def _dwm_close_ms(bar_open_ms: int, timeframe: str, to_next_open: bool = False) 
             opening_hours=tuple(oh or ()),
             session_starts=tuple(ss or ()),
             corrections=corr,
-            grid_mode=_grid_mode(syminfo.type, oh or None, syminfo.prefix),
+            grid_mode=_grid_mode(syminfo.type, oh or None, syminfo._prefix),
         )
         _dwc_guard = (oh, ss, corr, tz_name)
         _dwc_cache.clear()

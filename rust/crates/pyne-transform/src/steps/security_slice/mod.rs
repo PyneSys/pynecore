@@ -297,18 +297,14 @@ fn ctx_group(ast: &Ast, ctx: NodeId) -> Option<String> {
 }
 
 /// Why this context may not get a clone at all, or `None` when it may
-/// (`_skip_reason`): a `request.security_lower_tf` context, the plain-OHLCV fast
-/// path (which already skips `main()` entirely) and a write block that does not
-/// sit in `main()` itself.
+/// (`_skip_reason`): the plain-OHLCV fast path (which already skips `main()`
+/// entirely) and a write block that does not sit in `main()` itself.
 fn skip_reason(
     ast: &Ast,
     sid: &str,
     ctx: NodeId,
     written: &HashSet<String>,
 ) -> Option<&'static str> {
-    if ctx_get(ast, ctx, "is_ltf").is_some() {
-        return Some("lower_tf");
-    }
     if ctx_get(ast, ctx, "ohlcv_fields").is_some() {
         return Some("ohlcv_passthrough");
     }

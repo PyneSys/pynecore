@@ -182,8 +182,9 @@ NO_BATCH = os.environ.get("PYNE_NO_SECURITY_BATCH", "").strip().lower() in (
 SECURITY_TRACE_ENV = "PYNE_SECURITY_TRACE"
 
 # Frames under these roots are the runtime's own or the interpreter's, never the
-# script's, so the trace leaves them out of a read's ``stack``.
-_TRACE_SKIP_ROOTS = tuple(sorted({
+# script's: the trace leaves them out of a read's ``stack``, and a dead child's
+# failure report points past them, at the script line that raised.
+RUNTIME_ROOTS = tuple(sorted({
     str(Path(__file__).resolve().parent.parent) + os.sep,
     str(Path(sys.prefix).resolve()) + os.sep,
     str(Path(sys.base_prefix).resolve()) + os.sep,
@@ -193,9 +194,10 @@ _TRACE_SKIP_ROOTS = tuple(sorted({
 def watch_security_child(
     sec_id: str,
     proc: 'BaseProcess',
-    failed_children: set[str],
+    failed_children: dict[str, str],
     events: 'tuple[EventType, ...]',
     stop_events: 'tuple[EventType, ...]' = (),
+    failure_conn: 'Connection | None' = None,
 ) -> None:
     """
     Start a daemon thread that watches a security child for abnormal death.
@@ -215,12 +217,16 @@ def watch_security_child(
 
     :param sec_id: Security context id the process serves
     :param proc: The started child process
-    :param failed_children: Shared registry of abnormally died sec_ids
+    :param failed_children: Shared registry of abnormally died sec_ids, each
+        with the report of the exception that ended it ('' when it left none)
     :param events: Events a chart wait may block on for this context
     :param stop_events: Every child's shutdown event. One child's death has to
         release them ALL: a sibling blocked on this context's ring would never
         wake, and the chart waiting on that sibling would freeze instead of
         raising.
+    :param failure_conn: Read end of the child's failure pipe
+        (:func:`~pynecore.core.security_process.run_security_process`), closed
+        here once the child is gone
     """
     def _watch() -> None:
         connection.wait([proc.sentinel])
@@ -233,8 +239,20 @@ def watch_security_child(
         # parks forever. ``join()`` is the blocking reap: the process is on its
         # way out, so it returns promptly and leaves a real exit code behind.
         proc.join()
-        if proc.exitcode not in (0, None):
-            failed_children.add(sec_id)
+        failed = proc.exitcode not in (0, None)
+        report = ''
+        if failure_conn is not None:
+            # The child writes its report before it exits, so after the reap
+            # whatever it left is already in the pipe and the read cannot block
+            try:
+                if failed and failure_conn.poll():
+                    report = failure_conn.recv()
+            except (EOFError, OSError):
+                pass  # It died without one: a signal, or ``os._exit``
+            finally:
+                failure_conn.close()
+        if failed:
+            failed_children[sec_id] = report
             # Release every OTHER child too: a peer blocked on this one's ring
             # would otherwise never wake, and the chart would wait on that peer.
             for ev in stop_events:
@@ -246,11 +264,38 @@ def watch_security_child(
                      name=f"sec-watch-{sec_id}").start()
 
 
+def _child_death_error(
+    sec_id: str,
+    sec_processes: 'dict[str, BaseProcess] | None',
+    failed_children: dict[str, str],
+) -> RuntimeError:
+    """The error a chart wait raises once ``failed_children`` holds a death.
+
+    ANY child's death can freeze a wait, not only the awaited one's: contexts read
+    each other, so a dead consumer leaves a producer blocked and the chart waiting
+    on that producer. The error names the awaited context when it is the dead one,
+    otherwise the child that actually died, with the exception that ended it.
+
+    :param sec_id: The context the chart waited on
+    :param sec_processes: The children, by sec_id
+    :param failed_children: The registry :func:`watch_security_child` fills
+    :return: The error to raise
+    """
+    dead = sec_id if sec_id in failed_children else next(iter(failed_children))
+    proc = sec_processes.get(dead) if sec_processes is not None else None
+    report = failed_children[dead]
+    return RuntimeError(
+        f"Security process for '{dead}' died unexpectedly "
+        f"(exit code: {proc.exitcode if proc is not None else '?'})"
+        + (f": {report}" if report else "")
+    )
+
+
 def _wait_with_liveness(
     event: 'EventType',
     sec_id: str,
     sec_processes: 'dict[str, BaseProcess] | None',
-    failed_children: 'set[str] | None' = None,
+    failed_children: 'dict[str, str] | None' = None,
 ) -> None:
     """
     Wait for ``event`` without deadlocking on a dead security process.
@@ -278,17 +323,7 @@ def _wait_with_liveness(
             # happened is visible here and raises instead of parking forever.
             event.wait()
         if failed_children:
-            # ANY child's death can freeze this wait, not only the awaited
-            # one's: contexts read each other, so a dead consumer leaves a
-            # producer blocked and the chart waiting on that producer. Report
-            # the awaited context when it is the dead one, otherwise the child
-            # that actually died.
-            dead = sec_id if sec_id in failed_children else next(iter(failed_children))
-            proc = sec_processes.get(dead)
-            raise RuntimeError(
-                f"Security process for '{dead}' died unexpectedly "
-                f"(exit code: {proc.exitcode if proc is not None else '?'})"
-            )
+            raise _child_death_error(sec_id, sec_processes, failed_children)
         return
     proc = sec_processes[sec_id]
     while not event.wait(timeout=_LIVENESS_POLL_SECONDS):
@@ -926,6 +961,7 @@ class DevBatchSpec:
     :param first_dev_only: Whether the context skips a period's developing
         re-ticks (``dev_skip``), so only the period's FIRST chart bar gets a
         developing record.
+    :param grid_mode: The aggregator's multi-period grid mode, or ``None``.
     """
 
     window: 'ChartBarWindow'
@@ -940,6 +976,7 @@ class DevBatchSpec:
     chart_timeframe: str | None
     chart_calendar: 'BarCalendar | None'
     first_dev_only: bool = False
+    grid_mode: str | None = None
 
 
 def next_open_after(opens: list[int], after: int) -> int | None:
@@ -1082,7 +1119,7 @@ def iter_dev_batch_records(spec: DevBatchSpec,
     # not see this walk.
     aggregator = HTFAggregator(
         spec.timeframe, spec.tz, session_starts=spec.session_starts,
-        chart_span_ms=spec.chart_span_ms)
+        chart_span_ms=spec.chart_span_ms, grid_mode=spec.grid_mode)
     chart_off = spec.chart_off
     chart_timeframe = spec.chart_timeframe
     round_decimals = spec.round_decimals
@@ -1396,12 +1433,13 @@ def create_chart_protocol(
     currency_conversions: dict[str, tuple[str, str]] | None = None,
     sec_processes: 'dict[str, BaseProcess] | None' = None,
     auto_rate_sec_ids: frozenset[str] = frozenset(),
-    failed_children: 'set[str] | None' = None,
+    failed_children: 'dict[str, str] | None' = None,
     ring_conditions: 'dict[str, ConditionType] | None' = None,
     consumers_by_sid: 'dict[str, list[str]] | None' = None,
     merge_group_fn: 'Callable[[str], list[str] | None] | None' = None,
     merge_primary: 'dict[str, str] | None' = None,
     merge_members: 'dict[str, list[str]] | None' = None,
+    invalid_ltf_ids: 'set[str] | frozenset[str]' = frozenset(),
 ) -> tuple:
     """
     Create protocol functions for the **chart** process.
@@ -1481,6 +1519,13 @@ def create_chart_protocol(
                           captured by reference, so the runner sees the mapping
                           the spawn produced.
     :param merge_members: Primary sid -> the group's OTHER members.
+    :param invalid_ltf_ids: ``request.security_lower_tf()`` contexts at a
+                            timeframe higher than the one the script runs on,
+                            called with ``ignore_invalid_timeframe=true``. They
+                            have no process (they are in ``no_process_ids`` too)
+                            and every read answers ``na``. Captured by
+                            reference: the deferred resolver adds the contexts
+                            whose timeframe is only known at runtime.
     :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup,
               signal_rate_sources, begin_bar, end_bar)
     """
@@ -2093,12 +2138,7 @@ def create_chart_protocol(
             # unpublished bar closes above the chart's as-of, so publishing it
             # raises the frontier past this instant.
             if failed_children:
-                dead = sec_id if sec_id in failed_children else next(iter(failed_children))
-                proc = sec_processes.get(dead) if sec_processes is not None else None
-                raise RuntimeError(
-                    f"Security process for '{dead}' died unexpectedly "
-                    f"(exit code: {proc.exitcode if proc is not None else '?'})"
-                )
+                raise _child_death_error(sec_id, sec_processes, failed_children)
             if state.stop_event.is_set():
                 return default
             proc = sec_processes.get(sec_id) if sec_processes is not None else None
@@ -2107,7 +2147,19 @@ def create_chart_protocol(
                     f"Security process for '{sec_id}' died unexpectedly "
                     f"(exit code: {proc.exitcode})"
                 )
-        entry = reader.last_close_at_or_before(asof)
+        # A developing batch on a D/W/M chart publishes a period's CLOSING
+        # record on the chart bar AFTER the one that ends it (the aggregator
+        # learns of the close from the next period's first bar), with the
+        # period's own scheduled close: exactly this bar's as-of. The child runs
+        # ahead, so that later bar's record may or may not be in the ring yet
+        # when this bar is read. Within one chart bar every record closes later
+        # than the one before, and the ring is in close order, so a tie at the
+        # latest close is always this bar's record followed by a later bar's:
+        # the first of them is this bar's answer, as on the per-bar path. A
+        # developing batch has no consumers (``dev_batch_eligible``), so the
+        # chart is the only reader this pairing has to agree with.
+        entry = reader.last_close_at_or_before(
+            asof, first_of_ties=state.dev_batch_spec is not None)
         if entry is None:
             return default
         if (state.dev_batch_spec is not None and state.batch_expects_entry
@@ -2784,7 +2836,9 @@ def create_chart_protocol(
         # ``_wait_with_liveness`` would deadlock here. Short-circuit to
         # ``default`` (Pine ``na``) so the script keeps running.
         if sec_id in no_process_ids and sec_id not in same_context_ids:
-            return default
+            # An LTF request above the script's timeframe has no intrabars to
+            # collect, and TradingView answers ``na`` there, not an empty array
+            return NA(list) if sec_id in invalid_ltf_ids else default
         state = states[sec_id]
         if state.ltf_skip:
             # LTF chart bar before the feed began: ``__sec_signal__`` skipped the
@@ -2956,7 +3010,7 @@ def _trace_first_reads(read, signal_values: dict[str, tuple],
             stack = []
             for info in reversed(inspect.stack(0)):
                 filename = os.path.abspath(info.filename)
-                if not filename.startswith(_TRACE_SKIP_ROOTS):
+                if not filename.startswith(RUNTIME_ROOTS):
                     stack.append([filename, info.lineno])
             with open(path, 'a', encoding='utf-8') as trace:
                 trace.write(json.dumps({
@@ -2989,10 +3043,14 @@ def __ltf_unzip__(rows, n):
     ``request.security_lower_tf()`` calls; scalar calls read the array directly.
 
     :param rows: Per-intrabar value tuples (possibly empty when there are no
-        intrabars).
+        intrabars), or ``na`` for a request whose timeframe is higher than the
+        script's.
     :param n: Tuple arity (number of expression elements).
     :return: Tuple of ``n`` lists, column-major.
     """
+    if rows.__class__ is NA:
+        # An LTF request above the script's timeframe: every element is na
+        return tuple(NA(list) for _ in range(n))
     if not rows:
         return tuple([] for _ in range(n))
     return tuple(list(col) for col in zip(*rows))
@@ -3494,6 +3552,12 @@ def create_security_protocol(
             if not bar_written[sid] and sid in depends_within and gaps_on[sid]:
                 return default
             return default if own is None else own
+        known_record = known.get(sid)
+        if known_record is not None and known_record.get('invalid_timeframe'):
+            # An LTF request above the script's timeframe: ``na`` on every read,
+            # a dependency or not. The child replays the whole script, so its
+            # own branches see the same value the chart's do.
+            return NA(list)
         if sid in fail_on_missing:
             # Resolved at runtime with no feed behind it. The producer never
             # started, so the missing feed surfaces at the first real read of
@@ -3503,7 +3567,6 @@ def create_security_protocol(
             # to avoid. A read outside this expression is no demand for the
             # feed: the child replays the whole script on its own prices, so
             # it can take a branch the chart never does.
-            known_record = known.get(sid)
             if known_record is not None and known_record.get('missing_data'):
                 raise ValueError(known_record['missing_data'])
         if sid not in depends:
@@ -3518,6 +3581,8 @@ def create_security_protocol(
         record = _peer_record(sid)
         if record is not None and record.get('missing_data'):
             raise ValueError(record['missing_data'])
+        if record is not None and record.get('invalid_timeframe'):
+            return NA(list)
         if (record is None or not record.get('has_producer')
                 or sid not in ring_conditions
                 or (record.get('is_ltf') and record.get('ltf_live_stream'))):
@@ -4657,9 +4722,14 @@ def setup_security_states(
                     si, timeframe, tz)
 
                 if is_same_symbol:
+                    # The context's own scheduled grid, as its bar closes use
+                    # (``load_htf_bar_opens``): a 24/7 market anchors no session,
+                    # so an inferred multi-period grid would count weekdays.
                     htf_aggregator = HTFAggregator(
                         timeframe, tz, session_starts=anchor_starts,
-                        chart_span_ms=chart_off + 1 if chart_off else 0)
+                        chart_span_ms=chart_off + 1 if chart_off else 0,
+                        grid_mode=(grid_mode(si.type, si.opening_hours, si.prefix)
+                                   if si is not None else None))
                 elif lookahead_mode is Lookahead.ON:
                     # Cross-symbol HTF + lookahead_on: developing bar cannot
                     # be aggregated from chart OHLCV (wrong instrument). The

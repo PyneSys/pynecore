@@ -462,6 +462,11 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo',
     props['_dg_last_ts'] = ts_sec
 
 
+# The ``lib.syminfo`` cells behind its module properties, by SymInfo slot: the
+# property name itself must keep its function.
+_SYMINFO_PROPERTY_CELLS = {'prefix': '_prefix', 'ticker': '_ticker'}
+
+
 # noinspection PyUnusedLocal
 def _set_lib_syminfo_properties(syminfo: SymInfo):
     """
@@ -474,13 +479,12 @@ def _set_lib_syminfo_properties(syminfo: SymInfo):
             if type(value) is int:
                 value = float(value)
             try:
-                setattr(lib.syminfo, slot_name, value)
+                setattr(lib.syminfo, _SYMINFO_PROPERTY_CELLS.get(slot_name, slot_name), value)
             except AttributeError:
                 pass
 
     lib.syminfo.root = syminfo.ticker
     lib.syminfo.tickerid = syminfo.prefix + ':' + syminfo.ticker
-    lib.syminfo.ticker = lib.syminfo.tickerid
     lib.syminfo.main_tickerid = lib.syminfo.tickerid
 
     lib.syminfo._opening_hours = syminfo.opening_hours
@@ -601,6 +605,36 @@ def _try_in_seconds(period: str | None) -> int | None:
         return timeframe_lib._in_seconds(period)
     except (ValueError, AssertionError):
         return None
+
+
+def _ltf_timeframe_too_high(timeframe: str, script_tf: str) -> bool:
+    """Whether a ``request.security_lower_tf()`` timeframe is above the script's.
+
+    Such a request has no intrabars to collect at all. TradingView answers ``na``
+    when the call passes ``ignore_invalid_timeframe=true``, and stops the script
+    at its start otherwise; the same timeframe is valid (one intrabar, the bar
+    itself).
+
+    :param timeframe: The requested timeframe.
+    :param script_tf: The timeframe the script body runs on.
+    :return: Whether both parse and the requested one is the longer.
+    """
+    req_sec = _try_in_seconds(timeframe)
+    script_sec = _try_in_seconds(script_tf)
+    return req_sec is not None and script_sec is not None and req_sec > script_sec
+
+
+def _ltf_timeframe_error(timeframe: str, script_tf: str) -> RuntimeError:
+    """The error of a ``request.security_lower_tf()`` above the script's timeframe.
+
+    :param timeframe: The requested timeframe.
+    :param script_tf: The timeframe the script body runs on.
+    :return: The error to raise.
+    """
+    return RuntimeError(
+        f"request.security_lower_tf() requests the {timeframe!r} timeframe, which is "
+        f"higher than the {script_tf!r} timeframe the script runs on. Use a lower "
+        f"timeframe, or pass ignore_invalid_timeframe=true to get na instead.")
 
 
 def _measure_feed_period_sec(path: Path, declared: str | None = None) -> int | None:
@@ -1992,6 +2026,24 @@ class ScriptRunner:
             return None
         return cast('OrderSyncEngine', self._order_sync_engine).exchange_position
 
+    def _sec_grid_mode(self, sec_id: str) -> str | None:
+        """The scheduled multi-period grid mode of a security context's symbol.
+
+        The same :func:`~.resampler.grid_mode` its bar closes are computed on
+        (``load_htf_bar_opens``), from the context's own syminfo or the chart's.
+        An aggregator built without it infers the grid from its session anchor,
+        which a 24/7 market does not need, and would count a ``3D`` or ``2M``
+        period in weekdays.
+
+        :param sec_id: The context's id.
+        :return: ``'calendar'``, ``'weekday'`` or ``'observed'``; ``None`` without a syminfo.
+        """
+        from .resampler import grid_mode
+        si = self._sec_syminfos.get(sec_id) or self.syminfo
+        if si is None:
+            return None
+        return grid_mode(si.type, si.opening_hours, si.prefix)
+
     def _dev_batch_spec(self, sec_state) -> 'DevBatchSpec':
         """What a context's child needs to reproduce its developing-batch rounds.
 
@@ -2020,6 +2072,8 @@ class ScriptRunner:
             chart_timeframe=sec_state.chart_timeframe,
             chart_calendar=sec_state.chart_calendar,
             first_dev_only=sec_state.dev_skip,
+            grid_mode=(sec_state.htf_aggregator.grid_mode
+                       if sec_state.htf_aggregator is not None else None),
         )
 
     def run_iter(self, on_progress: Callable[[datetime], None] | None = None,
@@ -2267,9 +2321,10 @@ class ScriptRunner:
                 _merged_contexts[_sec_id] = {**_sec_ctx, 'symbol': _chart_tickerid}
         sec_contexts: dict[str, dict] | None = _merged_contexts or None
         sec_processes: 'dict[str, BaseProcess]' = {}
-        # Abnormally died children, filled by ``watch_security_child`` — lets
-        # the chart's per-bar waits stay UNTIMED (see ``_wait_with_liveness``)
-        sec_failed_children: set[str] = set()
+        # Abnormally died children, filled by ``watch_security_child`` with how
+        # each died — lets the chart's per-bar waits stay UNTIMED (see
+        # ``_wait_with_liveness``)
+        sec_failed_children: dict[str, str] = {}
         sec_resample_dirs: 'list[str]' = []  # per-run temp dirs for HTF feed resampling
         sec_cleanup_fn: Callable[[], None] | None = None
         # Parent ends of the per-child registry pipes, closed at teardown.
@@ -2368,26 +2423,26 @@ class ScriptRunner:
                     dev_batch_eligible, prepare_developing_batch, dev_skip_active,
                 )
                 from .security_shm import create_ring_conditions
-                from .security_process import security_process_main
+                from .security_process import run_security_process
                 from .security_mp import mp_context, preload_in_forkserver, child_run_env
 
                 # Before the first ``Process()``, which is what starts the
                 # forkserver. The module name comes off the entry point so it
                 # cannot drift from the import above.
-                preload_in_forkserver(security_process_main.__module__)
+                preload_in_forkserver(run_security_process.__module__)
 
                 # Detect same-context: symbol+TF identical to chart. Pine names the
                 # chart instrument either bare (``syminfo.ticker``) or exchange
                 # qualified (``syminfo.tickerid``, the form a literal
                 # ``"BINANCE:BTCUSDT"`` also takes) — both must short-circuit, or a
                 # request for the chart's own bars would go looking for a data file.
-                chart_ticker = str(lib.syminfo.ticker)
+                chart_ticker = lib.syminfo._ticker
                 # The timeframe the BODY runs on — the script timeframe when the
                 # declaration carries one, else the chart's own.
                 chart_tf = run_tf
                 # '' is the chart's own instrument in Pine, so a runtime-deferred
                 # empty symbol short-circuits here too
-                own_symbols = {'', chart_ticker, f"{lib.syminfo.prefix}:{chart_ticker}"}
+                own_symbols = {'', chart_ticker, lib.syminfo.tickerid}
                 same_context_ids: set[str] = set()
                 for sec_id, ctx in sec_contexts.items():
                     sym = ctx.get('symbol')
@@ -2400,6 +2455,22 @@ class ScriptRunner:
                             and _same_timeframe(tf, chart_tf)):
                         same_context_ids.add(sec_id)
 
+                # An LTF request above the body's timeframe has no process and
+                # answers na, or stops the run here (see
+                # ``_ltf_timeframe_too_high``). A runtime-only timeframe is
+                # checked as it resolves, in ``_deferred_resolve``.
+                invalid_ltf_ids: set[str] = set()
+                for sec_id, ctx in sec_contexts.items():
+                    tf_val = ctx.get('timeframe', chart_tf)
+                    if (not ctx.get('is_ltf') or sec_id in same_context_ids
+                            or tf_val is None):
+                        continue
+                    tf = str(tf_val) or chart_tf
+                    if _ltf_timeframe_too_high(tf, chart_tf):
+                        if not ctx.get('ignore_invalid_timeframe'):
+                            raise _ltf_timeframe_error(tf, chart_tf)
+                        invalid_ltf_ids.add(sec_id)
+
                 # Separate static and deferred contexts. The security transformer
                 # stores None for symbol/timeframe expressions that are not
                 # evaluable at module level (inputs, function parameters), so a
@@ -2409,7 +2480,7 @@ class ScriptRunner:
                 static_contexts = {}
                 deferred_sec_ids: set[str] = set()
                 for sec_id, ctx in sec_contexts.items():
-                    if sec_id in same_context_ids:
+                    if sec_id in same_context_ids or sec_id in invalid_ltf_ids:
                         continue
                     if ctx.get('symbol') is not None and ctx.get('timeframe', '') is not None:
                         static_contexts[sec_id] = ctx
@@ -2452,7 +2523,8 @@ class ScriptRunner:
                 # syminfo lookup fails) — without that, the chart-side
                 # ``__sec_signal__`` would wait on a process that was never
                 # spawned. ``create_chart_protocol`` captures by reference.
-                no_process_ids: set[str] = set(same_context_ids | ignored_sec_ids)
+                no_process_ids: set[str] = set(same_context_ids | ignored_sec_ids
+                                               | invalid_ltf_ids)
 
                 sec_states, sec_sync_block, sec_result_blocks = setup_security_states(
                     sec_contexts, chart_tf, self.tz, chart_symbol=chart_ticker,
@@ -2565,6 +2637,9 @@ class ScriptRunner:
                         # chart and in a consumer child alike. ``None`` when
                         # the context is provisioned.
                         'missing_data': self._missing_sec_data.get(_sid),
+                        # An LTF request above the script's timeframe: every
+                        # read answers na
+                        'invalid_timeframe': _sid in invalid_ltf_ids,
                     }
 
                 def _sec_registry() -> dict:
@@ -2787,6 +2862,9 @@ class ScriptRunner:
                         _chart_ring_capacity, _chart_ring_arena)
                     _registry_parent_conn, _registry_child_conn = mp_context.Pipe()
                     sec_registry_pipes[sid] = _registry_parent_conn
+                    # The child reports the exception that ends it here, for the
+                    # death watcher to put into the chart's error
+                    _failure_read_conn, _failure_write_conn = mp_context.Pipe(duplex=False)
                     # A profiled run profiles the child too: it sends what it measured
                     # through a pipe of its own as it stops
                     _profile_conn = None
@@ -2796,7 +2874,7 @@ class ScriptRunner:
                             data_source.symbol if isinstance(data_source, PluginSymbol)
                             else Path(data_source).name)
                     proc = mp_context.Process(
-                        target=security_process_main,
+                        target=run_security_process,
                         args=(
                             served,
                             script_path_str,
@@ -2833,13 +2911,15 @@ class ScriptRunner:
                         # because that tuple describes the CONTEXT, and its tail
                         # is what identifies a planned developing batch.
                         kwargs={'run_env': child_run_env(), 'resolved_configs': resolved_configs,
-                                'profile_conn': _profile_conn},
+                                'profile_conn': _profile_conn,
+                                'failure_conn': _failure_write_conn},
                         daemon=True,
                     )
                     proc.start()
                     # The child owns its end now; keeping the parent's copy of
                     # it open would stop the child from ever seeing EOF.
                     _registry_child_conn.close()
+                    _failure_write_conn.close()
                     if _profile_conn is not None:
                         _profile_conn.close()
                     # Tell the children spawned EARLIER what this context is.
@@ -2856,6 +2936,7 @@ class ScriptRunner:
                         sid, proc, sec_failed_children,
                         _watch_events,
                         tuple(st.stop_event for st in sec_states.values()),  # noqa
+                        _failure_read_conn,
                     )
 
                 # Callback for lazy resolution of deferred security contexts
@@ -2875,6 +2956,17 @@ class ScriptRunner:
                     # Resolve actual timeframe
                     current_chart_tf = run_tf
                     resolved_tf = timeframe if timeframe else current_chart_tf
+                    _state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
+                    if (_state.is_ltf
+                            and _ltf_timeframe_too_high(resolved_tf, current_chart_tf)):
+                        if not cast('dict[str, dict]', sec_contexts)[sid].get(
+                                'ignore_invalid_timeframe'):
+                            raise _ltf_timeframe_error(resolved_tf, current_chart_tf)
+                        _state.timeframe = resolved_tf
+                        invalid_ltf_ids.add(sid)
+                        no_process_ids.add(sid)
+                        _publish_sec_record(sid)
+                        return
                     # The context may turn out to be the chart's own symbol and
                     # timeframe: no subprocess and no data file is needed, the
                     # inline same-context write/read path serves it. A chart-type
@@ -2883,7 +2975,6 @@ class ScriptRunner:
                     if (chart_type is None and chart_ticker is not None
                             and str(base_symbol) in own_symbols
                             and _same_timeframe(resolved_tf, current_chart_tf)):
-                        _state = sec_states[sid]  # noqa - guaranteed non-None inside if sec_contexts
                         _state.timeframe = resolved_tf
                         _state.same_timeframe = True
                         _state.resampler = None
@@ -2979,7 +3070,8 @@ class ScriptRunner:
                             resolved_tf, self.tz,
                             session_starts=sec_state.session_starts,
                             chart_span_ms=(sec_state.chart_off + 1
-                                           if sec_state.chart_off else 0))
+                                           if sec_state.chart_off else 0),
+                            grid_mode=self._sec_grid_mode(sid))
                     elif not needs_aggregator and sec_state.htf_aggregator is not None:
                         sec_state.htf_aggregator = None
                     elif (needs_aggregator
@@ -2992,7 +3084,8 @@ class ScriptRunner:
                             resolved_tf, self.tz,
                             session_starts=sec_state.session_starts,
                             chart_span_ms=(sec_state.chart_off + 1
-                                           if sec_state.chart_off else 0))
+                                           if sec_state.chart_off else 0),
+                            grid_mode=self._sec_grid_mode(sid))
                     # Cross-symbol HTF + lookahead_on: developing bar cannot be
                     # aggregated from chart OHLCV (wrong instrument). Chart-side
                     # read returns ``na`` for every chart bar inside an open HTF
@@ -3124,6 +3217,7 @@ class ScriptRunner:
                     merge_group_fn=_merge_group,
                     merge_primary=sec_merge_primary,
                     merge_members=sec_merge_members,
+                    invalid_ltf_ids=invalid_ltf_ids,
                 )
                 self._sec_begin_bar_fn = sec_begin_bar_fn
                 self._sec_end_bar_fn = sec_end_bar_fn
@@ -4626,7 +4720,7 @@ class ScriptRunner:
         present, so it never raises.
 
         :param chart_symbol: The chart's ``PREFIX:TICKER`` (matches what
-            ``_set_lib_syminfo_properties`` stores in ``lib.syminfo.ticker``).
+            ``_set_lib_syminfo_properties`` stores in ``lib.syminfo.tickerid``).
         :param chart_tf: The chart's timeframe (``lib.syminfo.period``).
         :param security_keys: The keys of the user-provided ``--security``
             mappings, used to flag which contexts already have a data file.
@@ -4660,6 +4754,9 @@ class ScriptRunner:
         same_symbol_other_tf: list[SecurityRequirement] = []
         cross_symbol: list[SecurityRequirement] = []
         dynamic: list[SecurityRequirement] = []
+        # Every spelling of the chart instrument is the chart's, as ``run_iter``
+        # decides: bare (``syminfo.ticker``), exchange qualified and empty
+        chart_spellings = {'', chart_symbol, chart_symbol.partition(':')[2] or chart_symbol}
 
         for sec_id, (ctx, from_library) in merged.items():
             sym = ctx.get('symbol')
@@ -4670,6 +4767,10 @@ class ScriptRunner:
                 tf_val = chart_tf
             is_ltf = bool(ctx.get('is_ltf'))
             ignore_invalid = bool(ctx.get('ignore_invalid_symbol'))
+            if (is_ltf and tf_val is not None and ctx.get('ignore_invalid_timeframe')
+                    and _ltf_timeframe_too_high(str(tf_val), chart_tf)):
+                # Answers na and reads no feed (see ``_ltf_timeframe_too_high``)
+                continue
 
             if sym is None or tf_val is None:
                 dynamic.append(SecurityRequirement(
@@ -4682,6 +4783,8 @@ class ScriptRunner:
 
             sym_str = str(sym)
             tf_str = str(tf_val)
+            if sym_str in chart_spellings:
+                sym_str = chart_symbol
             # Mirror _resolve_security_data's key precedence: "SYMBOL:TF",
             # then "SYMBOL", then "TF".
             has_mapping = (
@@ -4865,8 +4968,9 @@ class ScriptRunner:
             timeframe = str(ctx.get('timeframe', ''))
             # A runtime-deferred symbol may still arrive empty, which Pine reads
             # as the chart's own instrument (static contexts are normalized when
-            # they are merged)
-            if not symbol:
+            # they are merged), and the chart's bare name (``syminfo.ticker``)
+            # is that instrument too: both look up the qualified keys
+            if not symbol or symbol == self.syminfo.ticker:
                 symbol = f"{self.syminfo.prefix}:{self.syminfo.ticker}"
 
             entry: str | Path | PluginSymbol | None = None

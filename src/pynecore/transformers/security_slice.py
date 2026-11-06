@@ -35,12 +35,19 @@ optimization for the module (the child then runs ``main()`` as before).
 the transform pipeline digest, so chart and child can never load bytecode built
 under the other setting.
 
+A ``request.security_lower_tf`` context is sliced like any other. Its child runs
+the entry once per INTRABAR, which makes the slice matter most there: a whole
+``main()`` costs every chart-side statement once per intrabar, and a chart-side
+statement that raises on the context's own bars (one guarded by
+``timeframe.period``, an index the chart's own bars keep in range) would kill
+the child although TradingView never evaluates it in that context.
+
 A clone is also where a guarded write is made unconditional
 (:func:`_force_conditional_writes`). That is a matter of what the child
 computes, not of how much it may skip, so a context the slice does not serve —
-an LTF one, one of a module the analysis gave up on, any of them while the
-slicing is switched off — still gets a clone whenever its write is guarded: one
-of the whole ``main()``, with nothing dropped.
+one of a module the analysis gave up on, any of them while the slicing is
+switched off — still gets a clone whenever its write is guarded: one of the
+whole ``main()``, with nothing dropped.
 """
 import ast
 import copy
@@ -1115,9 +1122,8 @@ def _bound_in(qualified: str, keys: set[str]) -> bool:
 def _skip_reason(sid: str, ctx: ast.Dict, written_sids: set[str]) -> str | None:
     """Why this context may not get a clone at all, or None when it may.
 
-    Excluded: ``request.security_lower_tf`` contexts, the plain-OHLCV fast path
-    (which already skips ``main()`` entirely) and a write block that does not
-    sit in ``main()`` itself.
+    Excluded: the plain-OHLCV fast path (which already skips ``main()``
+    entirely) and a write block that does not sit in ``main()`` itself.
 
     A context whose symbol or timeframe is only resolved at runtime is NOT
     excluded: the slice is of ``main()``'s statements, which are the same
@@ -1125,8 +1131,6 @@ def _skip_reason(sid: str, ctx: ast.Dict, written_sids: set[str]) -> str | None:
     from the context meta the chart hands it when the process is spawned —
     after the deferred resolution, on the very same path as a static context.
     """
-    if _ctx_get(ctx, 'is_ltf') is not None:
-        return 'lower_tf'
     if _ctx_get(ctx, 'ohlcv_fields') is not None:
         return 'ohlcv_passthrough'
     if sid not in written_sids:
@@ -1902,8 +1906,8 @@ def _slice_units(entries: list[tuple[int, tuple[str, ast.Dict]]],
     can serve all of them, and the clone must then hold every member's write
     block and every member's reads.
 
-    A member the pass cannot slice at all (an LTF context, a write block
-    outside ``main()``) takes the whole group down with it — the group's child
+    A member the pass cannot slice at all (a write block outside ``main()``)
+    takes the whole group down with it — the group's child
     would be missing that member's value. A plain-OHLCV member does NOT: its
     write block is a single trivial statement the group clone simply keeps. A
     group of nothing but plain-OHLCV members gets no clone, because its child

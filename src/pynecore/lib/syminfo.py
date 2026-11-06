@@ -4,6 +4,7 @@ from ..types.na import NA, na_float, na_int
 from ..types.pine_types import PyneFloat, PyneInt
 from .session import regular
 
+from ..core.module_property import module_function_property
 from ..core.syminfo import SymInfoSession, SymInfoInterval
 
 __all__ = [
@@ -38,9 +39,7 @@ avg_spread: float
 taker_fee: float
 maker_fee: float
 
-prefix: str = ""
 description: str = ""
-ticker: str = ""
 root: str = ""
 tickerid: str = ""
 main_tickerid: str = ""
@@ -89,3 +88,59 @@ target_price_date: int | NA = na_int
 target_price_estimates: PyneFloat = na_float
 
 _size_round_factor: float
+
+# The chart symbol's exchange prefix and its name without that prefix, as the
+# runner sets them. Pine reads ``syminfo.prefix`` / ``syminfo.ticker`` as these
+# values and also calls them as functions of another symbol, so the two names
+# are module properties over these cells.
+_prefix: str = ""
+_ticker: str = ""
+
+
+def _symbol_parts(symbol: str) -> tuple[str, str]:
+    """
+    A ticker identifier's exchange prefix and the rest, split at its first colon.
+
+    A chart-type marker (``ticker.heikinashi()``) belongs to neither part, and a
+    symbol without a colon has neither: TradingView answers both with an empty
+    string (``syminfo.ticker("ETHUSDT")`` is ``""``), and the rest of a spread
+    keeps its later colons (``"BINANCE:ETHUSDT/BINANCE:BTCUSDT"`` ->
+    ``"ETHUSDT/BINANCE:BTCUSDT"``).
+
+    :param symbol: The ticker identifier
+    :return: ``(prefix, ticker)``
+    """
+    from .ticker import _split_chart_type  # ``ticker`` imports this module
+    base, _chart_type = _split_chart_type(symbol)
+    prefix_part, colon, ticker_part = base.partition(':')
+    return (prefix_part, ticker_part) if colon else ('', '')
+
+
+@module_function_property
+def prefix(symbol: str | None = None) -> str:
+    """
+    The exchange prefix of a symbol.
+
+    :param symbol: A ticker identifier (``"BINANCE:BTCUSDT"``); None reads the
+                   chart symbol's own prefix
+    :return: The part before the first colon (``"BINANCE"``), or an empty
+             string for a symbol without one
+    """
+    if symbol is None:
+        return _prefix
+    return _symbol_parts(str(symbol))[0]
+
+
+@module_function_property
+def ticker(symbol: str | None = None) -> str:
+    """
+    The name of a symbol without its exchange prefix.
+
+    :param symbol: A ticker identifier (``"BINANCE:BTCUSDT"``); None reads the
+                   chart symbol's own name
+    :return: The part after the first colon (``"BTCUSDT"``), or an empty string
+             for a symbol without one
+    """
+    if symbol is None:
+        return _ticker
+    return _symbol_parts(str(symbol))[1]

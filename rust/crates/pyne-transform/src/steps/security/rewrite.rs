@@ -329,8 +329,10 @@ impl Security {
         for (call, sec_id, is_ltf) in &calls {
             let (call, is_ltf) = (*call, *is_ltf);
             let (symbol, timeframe, expression, gaps, lookahead, ignore_invalid, currency);
+            let mut ignore_invalid_tf = None;
             if is_ltf {
-                [symbol, timeframe, expression, ignore_invalid] = extract_ltf_args(ast, call);
+                [symbol, timeframe, expression, ignore_invalid, _, ignore_invalid_tf] =
+                    extract_ltf_args(ast, call);
                 (gaps, lookahead, currency) = (None, None, None);
                 // A tuple/list expression makes security_lower_tf() return one
                 // array per element (column-major): the read is wrapped in
@@ -429,6 +431,10 @@ impl Security {
             if let Some(ignore_invalid) = ignore_invalid {
                 let entry = clone(ast, ignore_invalid, &mut HashMap::new());
                 entries.insert("ignore_invalid_symbol".into(), entry);
+            }
+            if let Some(ignore_invalid_tf) = ignore_invalid_tf {
+                let entry = clone(ast, ignore_invalid_tf, &mut HashMap::new());
+                entries.insert("ignore_invalid_timeframe".into(), entry);
             }
             if !is_ltf && let Some(currency) = currency {
                 let entry = clone(ast, currency, &mut HashMap::new());

@@ -42,7 +42,7 @@ def __test_a_registered_death_raises_instead_of_blocking__():
 
     def chart():
         try:
-            _wait_with_liveness(event, 'sid', {'sid': _DeadProcess()}, {'sid'})
+            _wait_with_liveness(event, 'sid', {'sid': _DeadProcess()}, {'sid': ''})
         except BaseException as exc:  # noqa: BLE001 - the raise IS the result
             box['raised'] = exc
 
@@ -69,7 +69,7 @@ def __test_a_peer_death_raises_on_this_context_s_wait__(log):
         try:
             _wait_with_liveness(event, 'alive_sid',
                                 {'alive_sid': _DeadProcess(),
-                                 'dead_sid': _DeadProcess()}, {'dead_sid'})
+                                 'dead_sid': _DeadProcess()}, {'dead_sid': ''})
         except BaseException as exc:  # noqa: BLE001 - the raise IS the result
             box['raised'] = exc
 
@@ -104,7 +104,7 @@ def __test_the_watcher_fills_the_registry_before_it_wakes_the_chart__(log):
     registry, and a set that arrives first would be answered with "no death
     yet" and a fresh untimed wait.
     """
-    failed: set[str] = set()
+    failed: dict[str, str] = {}
     ctx = multiprocessing.get_context('spawn')
     # ``sys.exit`` is picklable, so the child needs no module-level target of
     # its own -- and a non-zero exit is exactly what the watcher reacts to.
@@ -164,7 +164,7 @@ def __test_a_death_whose_exit_code_is_not_readable_yet_is_still_reported__(log):
     a clean exit. A watcher that takes it for one registers nothing and sets no
     event, and the chart parks forever on a child that is already gone.
     """
-    failed: set[str] = set()
+    failed: dict[str, str] = {}
     proc = _ExitingProcess(1)
     wait_event = _RecordingEvent(failed)
     stop_event = _RecordingEvent(failed)
@@ -175,7 +175,7 @@ def __test_a_death_whose_exit_code_is_not_readable_yet_is_still_reported__(log):
         proc.close()
 
     assert reported, "the watcher dropped a death whose exit code was not readable yet"
-    assert failed == {'sid'}, f"the death was not registered: {failed}"
+    assert failed == {'sid': ''}, f"the death was not registered: {failed}"
     assert stop_event.set_count == 1, "the sibling children were not released"
     log.info("death reported after the reap: registry=%s", failed)
 
@@ -190,5 +190,5 @@ def __test_a_context_without_a_process_keeps_the_plain_wait__(sec_id):
     """
     event = multiprocessing.Event()
     event.set()
-    _wait_with_liveness(event, sec_id, None, set())
-    _wait_with_liveness(event, sec_id, {}, set())
+    _wait_with_liveness(event, sec_id, None, {})
+    _wait_with_liveness(event, sec_id, {}, {})

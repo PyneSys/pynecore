@@ -13,6 +13,7 @@ from ..types.pine_types import PyneFloat, PyneInt
 T = TypeVar('T')
 _FI = TypeVar('_FI', bound=Callable[..., PyneInt])
 _FF = TypeVar('_FF', bound=Callable[..., PyneFloat])
+_FS = TypeVar('_FS', bound=Callable[..., str])
 _P = ParamSpec('_P')
 
 
@@ -39,6 +40,14 @@ class FloatFunctionProperty(PyneFloat, Generic[_FF]):
     A Pine float that is also a function: ``ta.tr`` reads the value, ``ta.tr(true)`` calls it.
     """
     __call__: _FF
+
+
+class StrFunctionProperty(str, Generic[_FS]):
+    """
+    A Pine string that is also a function: ``syminfo.ticker`` reads the value,
+    ``syminfo.ticker("BINANCE:BTCUSDT")`` calls it.
+    """
+    __call__: _FS
 
 
 class BandsFunctionProperty(PyneFloat):
@@ -69,6 +78,10 @@ def module_function_property(func: _FI) -> IntFunctionProperty[_FI]:
 
 @overload
 def module_function_property(func: _FF) -> FloatFunctionProperty[_FF]: ...
+
+
+@overload
+def module_function_property(func: _FS) -> StrFunctionProperty[_FS]: ...
 
 
 @overload

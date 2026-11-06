@@ -6,28 +6,21 @@ from pynecore.lib import array, na, open, plot, request, script
 
 @script.indicator(title="LTF Array Non-Nested", shorttitle="LANN")
 def main():
-    # Two lower timeframes that do NOT nest into the 3-minute chart: 2 minutes
-    # (finer, but off-grid) and 4 minutes (coarser than the chart bar). Each
-    # intrabar's ``open`` price IS its open offset in minutes, so a plotted
-    # array element identifies the intrabar it came from and the test can check
-    # its scheduled close against the chart bar's own close.
+    # A lower timeframe that does NOT nest into the 3-minute chart: 2 minutes,
+    # finer but off-grid. Each intrabar's ``open`` price IS its open offset in
+    # minutes, so a plotted array element identifies the intrabar it came from
+    # and the test can check its scheduled close against the chart bar's own
+    # close.
     v2 = request.security_lower_tf("EXCH:LTF2", "2", open)
-    v4 = request.security_lower_tf("EXCH:LTF4", "4", open)
     n2 = array.size(v2)
-    n4 = array.size(v4)
     f2 = na
     l2 = na
-    f4 = na
     if n2 > 0:
         f2 = array.first(v2)
         l2 = array.last(v2)
-    if n4 > 0:
-        f4 = array.first(v4)
     plot(n2, "n2")
     plot(f2, "f2")
     plot(l2, "l2")
-    plot(n4, "n4")
-    plot(f4, "f4")
 
 
 _MIN = 60_000  # one minute in milliseconds
@@ -75,12 +68,11 @@ def __test_helper_chart_bars():
 def __test_ltf_array_non_nested_no_straddle__(runner, log):
     """No intrabar closing AFTER the chart bar's close ever enters its array.
 
-    The 2- and 4-minute grids do not nest into the 3-minute chart, so on almost
-    every chart bar an intrabar straddles its close. Such an intrabar belongs to
-    the NEXT chart bar's round — its close is a price from after this bar ended.
-    An intrabar pushed over that way is not lost: the chart bar its close falls
-    into collects it, so the two feeds' arrays still tile their intrabars exactly
-    once.
+    The 2-minute grid does not nest into the 3-minute chart, so on every other
+    chart bar an intrabar straddles its close. Such an intrabar belongs to the
+    NEXT chart bar's round — its close is a price from after this bar ended. An
+    intrabar pushed over that way is not lost: the chart bar its close falls
+    into collects it, so the arrays still tile the intrabars exactly once.
     """
     import sys
     import tempfile
@@ -93,10 +85,9 @@ def __test_ltf_array_non_nested_no_straddle__(runner, log):
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         p2 = __test_helper_write_ltf(tmp, "LTF2", 2, range(0, 24, 2))
-        p4 = __test_helper_write_ltf(tmp, "LTF4", 4, range(0, 24, 4))
         r = runner(__test_helper_chart_bars(),
                    syminfo_override={"period": str(_CHART_TF_MIN)},
-                   security_data={"EXCH:LTF2:2": p2, "EXCH:LTF4:4": p4})
+                   security_data={"EXCH:LTF2:2": p2})
         # ``run_iter`` hands out the SAME plot dict every bar, so copy at once.
         for _candle, pv in r.run_iter():
             rows.append(dict(pv))
@@ -104,32 +95,29 @@ def __test_ltf_array_non_nested_no_straddle__(runner, log):
     def _num(v):
         return None if v is None or isinstance(v, NA) or v != v else float(v)
 
-    # Per chart bar: (n2, f2, l2, n4, f4). The 2-minute arrays hold every
-    # intrabar exactly once across the 8 chart bars (12 intrabars), the
-    # 4-minute ones likewise (6 intrabars); chart bar 4 sees no 4-minute close
-    # at all, which is an EMPTY array, never the straddling bar.
+    # Per chart bar: (n2, f2, l2). The 2-minute arrays hold every intrabar
+    # exactly once across the 8 chart bars (12 intrabars).
     expected = [
-        (1, 0.0, 0.0, 0, None),
-        (2, 2.0, 4.0, 1, 0.0),
-        (1, 6.0, 6.0, 1, 4.0),
-        (2, 8.0, 10.0, 1, 8.0),
-        (1, 12.0, 12.0, 0, None),
-        (2, 14.0, 16.0, 1, 12.0),
-        (1, 18.0, 18.0, 1, 16.0),
-        (2, 20.0, 22.0, 1, 20.0),
+        (1, 0.0, 0.0),
+        (2, 2.0, 4.0),
+        (1, 6.0, 6.0),
+        (2, 8.0, 10.0),
+        (1, 12.0, 12.0),
+        (2, 14.0, 16.0),
+        (1, 18.0, 18.0),
+        (2, 20.0, 22.0),
     ]
     assert len(rows) == len(expected), f"bar count {len(rows)} != {len(expected)}"
-    for i, (n2, f2, l2, n4, f4) in enumerate(expected):
-        got = (int(_num(rows[i]["n2"]) or 0), _num(rows[i]["f2"]), _num(rows[i]["l2"]),
-               int(_num(rows[i]["n4"]) or 0), _num(rows[i]["f4"]))
-        assert got == (n2, f2, l2, n4, f4), f"bar {i}: {got} != {(n2, f2, l2, n4, f4)}"
+    for i, (n2, f2, l2) in enumerate(expected):
+        got = (int(_num(rows[i]["n2"]) or 0), _num(rows[i]["f2"]), _num(rows[i]["l2"]))
+        assert got == (n2, f2, l2), f"bar {i}: {got} != {(n2, f2, l2)}"
 
     # The structural invariant behind those numbers, asserted directly: the
     # chart bar closes at ``(i + 1) * 3`` minutes and an intrabar opening at
     # ``m`` closes at ``m + span``.
     for i, row in enumerate(rows):
         chart_close = (i + 1) * _CHART_TF_MIN
-        for key, span in (("f2", 2), ("l2", 2), ("f4", 4)):
+        for key, span in (("f2", 2), ("l2", 2)):
             m = _num(row[key])
             if m is None:
                 continue
@@ -137,7 +125,5 @@ def __test_ltf_array_non_nested_no_straddle__(runner, log):
                 f"bar {i}: intrabar {m}+{span} closes after the chart bar's {chart_close}"
 
     total2 = sum(int(_num(r_["n2"]) or 0) for r_ in rows)
-    total4 = sum(int(_num(r_["n4"]) or 0) for r_ in rows)
     assert total2 == 12, f"2-minute intrabars delivered {total2} times, not 12"
-    assert total4 == 6, f"4-minute intrabars delivered {total4} times, not 6"
-    log.info("non-nested LTF arrays tile their intrabars with no straddling close")
+    log.info("a non-nested LTF array tiles its intrabars with no straddling close")

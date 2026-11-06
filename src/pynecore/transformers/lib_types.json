@@ -7239,6 +7239,7 @@
    "ty": "f"
   },
   "syminfo.prefix": {
+   "callable": true,
    "kind": "value",
    "ty": "s"
   },
@@ -7339,6 +7340,7 @@
    "ty": "f"
   },
   "syminfo.ticker": {
+   "callable": true,
    "kind": "value",
    "ty": "s"
   },
@@ -9427,6 +9429,8 @@
   "lib.string._copysign": "skip",
   "lib.string.isinf": "skip",
   "lib.string.localcontext": "skip",
+  "lib.syminfo.prefix": "skip",
+  "lib.syminfo.ticker": "skip",
   "lib.ta._linreg_fit": "direct",
   "lib.ta._linreg_x_sums": "direct",
   "lib.ta._rank_insert_pos": "direct",

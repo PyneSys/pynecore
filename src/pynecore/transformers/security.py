@@ -26,16 +26,17 @@ _FORBIDDEN_STRATEGY_STATE_ATTRS = frozenset({
     "position_avg_price", "position_size", "wintrades",
 })
 
-# Raw price series the security child can serve WITHOUT running the script's
+# Raw bar series the security child can serve WITHOUT running the script's
 # ``main()``: every one is set straight from the bar by ``_set_lib_properties``
 # (the derived sources hl2/hlc3/ohlc4/hlcc4 are pure functions of that bar's
-# OHLC, also set there), so reading ``lib.<field>`` after the per-bar property
-# set is byte-identical to what ``main()`` would have produced. A
+# OHLC, also set there; ``time`` is the module property over the bar's open
+# time, ``lib._time``), so reading the field after the per-bar property set is
+# byte-identical to what ``main()`` would have produced. A
 # ``request.security[_lower_tf]`` whose expression is only these can take the
 # fast path (see ``security_process.security_process_main``).
 _OHLCV_PASSTHROUGH_FIELDS = frozenset({
     "open", "high", "low", "close", "volume",
-    "hl2", "hlc3", "ohlc4", "hlcc4",
+    "hl2", "hlc3", "ohlc4", "hlcc4", "time",
 })
 
 #: Name shape of the temps ``InlineSeriesHoistTransformer`` lifts an
@@ -331,10 +332,11 @@ class SecurityTransformer(ast_walk.NodeTransformer):
 
     @staticmethod
     def _extract_ltf_args(call: ast.Call) -> tuple[
-        ast.expr | None, ast.expr | None, ast.expr | None, ast.expr | None
+        ast.expr | None, ast.expr | None, ast.expr | None, ast.expr | None, ast.expr | None
     ]:
-        """Extract (symbol, timeframe, expression, ignore_invalid_symbol)
-        from request.security_lower_tf() call.
+        """Extract (symbol, timeframe, expression, ignore_invalid_symbol,
+        ignore_invalid_timeframe) from request.security_lower_tf() call, in Pine
+        v6's positional order (``currency`` stands between the two flags).
 
         Note: no gaps parameter (LTF has no gaps/lookahead).
         """
@@ -345,6 +347,7 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             kwargs.get('timeframe', args[1] if len(args) > 1 else None),
             kwargs.get('expression', args[2] if len(args) > 2 else None),
             kwargs.get('ignore_invalid_symbol', args[3] if len(args) > 3 else None),
+            kwargs.get('ignore_invalid_timeframe', args[5] if len(args) > 5 else None),
         )
 
     @staticmethod
@@ -1304,8 +1307,9 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         for call, sec_id, is_ltf in calls:
             currency = None
             lookahead = None
+            ignore_invalid_tf = None
             if is_ltf:
-                symbol, timeframe, expression, ignore_invalid = (
+                symbol, timeframe, expression, ignore_invalid, ignore_invalid_tf = (
                     self._extract_ltf_args(call)
                 )
                 gaps = None
@@ -1398,6 +1402,9 @@ class SecurityTransformer(ast_walk.NodeTransformer):
 
             if ignore_invalid is not None:
                 ctx['ignore_invalid_symbol'] = ast_walk.clone(ignore_invalid)
+
+            if ignore_invalid_tf is not None:
+                ctx['ignore_invalid_timeframe'] = ast_walk.clone(ignore_invalid_tf)
 
             if not is_ltf and currency is not None:
                 ctx['currency'] = ast_walk.clone(currency)

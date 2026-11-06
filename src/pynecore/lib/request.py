@@ -108,7 +108,8 @@ def security_lower_tf(
     :param expression: Expression to evaluate in the lower timeframe context
     :param ignore_invalid_symbol: If True, return empty array for invalid symbols
     :param currency: Currency for conversion (not yet supported)
-    :param ignore_invalid_timeframe: If True, ignore invalid timeframe
+    :param ignore_invalid_timeframe: If True, a timeframe higher than the chart's
+        answers ``na`` instead of stopping the script
     :param calc_bars_count: Number of bars to calculate (not yet supported)
     :return: array of expression values per intrabar
     """

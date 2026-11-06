@@ -107,6 +107,7 @@ def __test_a_dead_merged_child_unblocks_every_context_it_served__(runner, log):
         f"expected a RuntimeError about the dead child, got "
         f"{type(raised).__name__}: {raised}")
     assert "died" in str(raised), f"unexpected error message: {raised}"
+    __test_helper_check_report(raised)
     log.info("a dead merged security child surfaced as: %s", raised)
 
 
@@ -127,7 +128,23 @@ def __test_the_unmerged_run_fails_the_same_way__(runner, log):
         f"expected a RuntimeError about the dead child, got "
         f"{type(raised).__name__}: {raised}")
     assert "died" in str(raised), f"unexpected error message: {raised}"
+    __test_helper_check_report(raised)
     log.info("unmerged: %s", raised)
+
+
+def __test_helper_check_report(raised):
+    """The chart's error carries the exception that ended the child, and where.
+
+    The child's traceback goes to ITS stderr, which a caller of the run may never
+    see; the chart's error is what reaches it.
+
+    :param raised: The error the run ended with.
+    """
+    from pathlib import Path
+
+    text = str(raised)
+    assert "ZeroDivisionError" in text, f"the error lost the child's exception: {text}"
+    assert f"{Path(__file__).name}:" in text, f"the error lost the script line: {text}"
 
 
 # Every timestamp here is Unix MILLISECONDS.

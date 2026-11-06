@@ -34,11 +34,12 @@ const FORBIDDEN_STRATEGY_STATE_ATTRS: [&str; 13] = [
     "wintrades",
 ];
 
-/// Raw price series the security child can serve WITHOUT running the script's
-/// `main()`: each is set straight from the bar, so a `request.security[_lower_tf]`
-/// whose expression is only these can take the fast path.
-const OHLCV_PASSTHROUGH_FIELDS: [&str; 9] =
-    ["open", "high", "low", "close", "volume", "hl2", "hlc3", "ohlc4", "hlcc4"];
+/// Raw bar series the security child can serve WITHOUT running the script's
+/// `main()`: each is set straight from the bar (`time` is the module property
+/// over the bar's open time), so a `request.security[_lower_tf]` whose
+/// expression is only these can take the fast path.
+const OHLCV_PASSTHROUGH_FIELDS: [&str; 10] =
+    ["open", "high", "low", "close", "volume", "hl2", "hlc3", "ohlc4", "hlcc4", "time"];
 
 /// Annotations of an `AnnAssign` that DECLARE a history-bearing variable.
 const SERIES_ANNOTATIONS: [&str; 3] = ["Series", "PersistentSeries", "IBPersistentSeries"];
@@ -136,10 +137,22 @@ fn call_args<const N: usize>(ast: &Ast, call: NodeId, names: [&str; N]) -> [Opti
     out
 }
 
-/// `(symbol, timeframe, expression, ignore_invalid_symbol)` of a
-/// `request.security_lower_tf()` call (`_extract_ltf_args`).
-pub(crate) fn extract_ltf_args(ast: &Ast, call: NodeId) -> [Option<NodeId>; 4] {
-    call_args(ast, call, ["symbol", "timeframe", "expression", "ignore_invalid_symbol"])
+/// `(symbol, timeframe, expression, ignore_invalid_symbol, currency,
+/// ignore_invalid_timeframe)` of a `request.security_lower_tf()` call
+/// (`_extract_ltf_args`), in Pine v6's positional order.
+pub(crate) fn extract_ltf_args(ast: &Ast, call: NodeId) -> [Option<NodeId>; 6] {
+    call_args(
+        ast,
+        call,
+        [
+            "symbol",
+            "timeframe",
+            "expression",
+            "ignore_invalid_symbol",
+            "currency",
+            "ignore_invalid_timeframe",
+        ],
+    )
 }
 
 /// `(symbol, timeframe, expression, gaps, lookahead, ignore_invalid_symbol,

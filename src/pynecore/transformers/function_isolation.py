@@ -320,8 +320,9 @@ NON_TRANSFORMABLE_FUNCTIONS = {
     'lib.array.new_box', 'lib.array.new_label', 'lib.array.new_line', 'lib.array.new_linefill',
 
     # Ticker functions
-    'lib.ticker.new', 'lib.ticker.standard', 'lib.ticker.heikinashi', 'lib.ticker.renko',
-    'lib.ticker.linebreak', 'lib.ticker.kagi', 'lib.ticker.pointfigure',
+    'lib.ticker.new', 'lib.ticker.modify', 'lib.ticker.inherit', 'lib.ticker.standard',
+    'lib.ticker.heikinashi', 'lib.ticker.renko', 'lib.ticker.linebreak', 'lib.ticker.kagi',
+    'lib.ticker.pointfigure',
 
     # Request functions that open no context
     'lib.request.seed', 'lib.request.footprint', 'lib.request.dividends', 'lib.request.splits',

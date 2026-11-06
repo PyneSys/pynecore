@@ -275,12 +275,31 @@ def main():
     log.info("both skip reasons were reported")
 
 
-def __test_no_clone_for_lower_tf_or_passthrough__(log):
-    """An LTF context and a plain-OHLCV one both keep the existing child path
+def __test_no_clone_for_a_passthrough__(log):
+    """A plain-OHLCV context keeps the existing child path
 
-    ``request.security_lower_tf`` is out of scope, and a plain-OHLCV expression
-    already skips ``main()`` entirely in the child — a clone would only be dead
-    weight there.
+    A plain-OHLCV expression already skips ``main()`` entirely in the child — a
+    clone would only be dead weight there.
+    """
+    passthrough = """
+@script.indicator("t")
+def main():
+    d = lib.request.security(lib.syminfo.tickerid, "1D", lib.close)
+    lib.plot(d)
+"""
+    tree = __test_helper_transform(passthrough)
+    assert not __test_helper_clones(tree), "the plain-OHLCV context got a clone"
+    assert not __test_helper_slice_names(tree), "the plain-OHLCV context recorded a slice_main"
+    log.info("the plain-OHLCV context was not sliced")
+
+
+def __test_an_ltf_context_is_sliced__(log):
+    """A ``request.security_lower_tf`` context runs its own slice, as any other
+
+    Its child runs the entry once per INTRABAR, so a whole ``main()`` there costs
+    the chart-side statements once per intrabar, and a chart-side statement that
+    raises on the context's own bars (one guarded by ``timeframe.period``, say)
+    kills the child.
     """
     ltf = """
 @script.indicator("t")
@@ -288,17 +307,11 @@ def main():
     d = lib.request.security_lower_tf(lib.syminfo.tickerid, "1", lib.ta.sma(lib.close, 3))
     lib.plot(lib.array.size(d))
 """
-    passthrough = """
-@script.indicator("t")
-def main():
-    d = lib.request.security(lib.syminfo.tickerid, "1D", lib.close)
-    lib.plot(d)
-"""
-    for name, source in (("lower_tf", ltf), ("plain-OHLCV", passthrough)):
-        tree = __test_helper_transform(source)
-        assert not __test_helper_clones(tree), f"{name} context got a clone"
-        assert not __test_helper_slice_names(tree), f"{name} recorded a slice_main"
-    log.info("neither the LTF nor the plain-OHLCV context was sliced")
+    tree = __test_helper_transform(ltf)
+    clone = __test_helper_only_clone(tree)
+    assert __test_helper_slice_names(tree), "the LTF context recorded no slice_main"
+    assert 'lib.plot' not in __test_helper_body(clone), "the chart-side plot stayed in the clone"
+    log.info("the LTF context runs a sliced clone")
 
 
 def __test_slice_follows_a_user_function__(log):
@@ -1364,7 +1377,7 @@ def main():
 
 
 def __test_a_guarded_write_gets_a_whole_clone_where_nothing_is_sliced__(log):
-    """An LTF context, or any context while slicing is off, is still forced"""
+    """Any context is still forced while slicing is off; a sliced one drops the rest"""
     import os
 
     ltf_guarded = """
@@ -1390,14 +1403,16 @@ def main():
 """
     clone = __test_helper_only_clone(__test_helper_transform(ltf_guarded))
     assert __test_helper_write_guards(clone) == []
-    # Nothing was dropped: the chart-side statements are all still there
-    assert 'lib.plot' in __test_helper_body(clone)
+    # Sliced: the chart-side statements are gone
+    assert 'lib.plot' not in __test_helper_body(clone)
 
     os.environ['PYNE_NO_SECURITY_SLICE'] = '1'
     try:
-        clone = __test_helper_only_clone(__test_helper_transform(htf_guarded))
-        assert __test_helper_write_guards(clone) == []
-        assert 'lib.plot' in __test_helper_body(clone)
+        for source in (ltf_guarded, htf_guarded):
+            clone = __test_helper_only_clone(__test_helper_transform(source))
+            assert __test_helper_write_guards(clone) == []
+            # Nothing was dropped: the chart-side statements are all still there
+            assert 'lib.plot' in __test_helper_body(clone)
         assert __test_helper_clones(__test_helper_transform(htf_plain)) == {}
     finally:
         os.environ.pop('PYNE_NO_SECURITY_SLICE', None)

@@ -125,6 +125,11 @@ class HTFAggregator:
         return self._timeframe
 
     @property
+    def grid_mode(self) -> str | None:
+        """The scheduled-grid mode of the multi-period (nD/nW/nM) grid, or ``None``."""
+        return self._grid_mode
+
+    @property
     def period_ms(self) -> int:
         """Nominal HTF period length in ms (a session can cut a period short)."""
         return self._period_ms

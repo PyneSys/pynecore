@@ -1158,11 +1158,14 @@ class RingReader:
         """The producer's frontier close (ms); :data:`FRONTIER_INF` = done."""
         return self._sync.get_frontier_close(self._sec_id)
 
-    def last_close_at_or_before(self, ms: int) -> tuple[int, int, Any] | None:
+    def last_close_at_or_before(self, ms: int,
+                                first_of_ties: bool = False) -> tuple[int, int, Any] | None:
         """
         The last entry whose close is at or before ``ms``.
 
         :param ms: As-of instant in ms.
+        :param first_of_ties: When several entries share that latest close,
+            return the FIRST appended of them instead of the last.
         :return: ``(open_ms, close_ms, value)`` or ``None`` if there is none.
         """
         with self._cond:
@@ -1175,6 +1178,9 @@ class RingReader:
             pos = self._bisect_close(block, head, count, ms) - 1
             if pos < 0:
                 return None
+            if first_of_ties:
+                close_ms = block.read_entry(head + pos)[1]
+                pos = self._bisect_close(block, head, count, close_ms, left=True)
             return self._entry(block, head + pos)
 
     def has_close(self, ms: int) -> bool:

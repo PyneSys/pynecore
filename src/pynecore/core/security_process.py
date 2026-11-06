@@ -49,10 +49,12 @@ Three flavors of advance are supported, distinguished by SyncBlock flags:
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sys
 import threading
+import traceback
 from bisect import bisect_left
 from collections import deque
 from functools import partial
@@ -73,7 +75,7 @@ from .security_shm import (
 )
 from .security import (
     BarCalendar, DEV_BATCH_CLOSED, DEV_BATCH_CLOSED_FROM_FEED, DEV_BATCH_DEVELOPING,
-    actual_bar_close,
+    RUNTIME_ROOTS, actual_bar_close,
     create_security_protocol, inject_protocol, iter_dev_batch_records,
     same_calendar,
 )
@@ -979,8 +981,13 @@ def security_process_main(
     # write block in the clone is disabled for that reason, see
     # ``__active_security__`` above). Writing them FIRST is also what a sibling
     # depending on one of them reads out of the bar state.
+    # ``time`` is a module property: main() reads it as the call
+    # ``lib.time()``; every other field is the ``lib`` attribute itself.
     _pt_plan = tuple(
-        (_sid, tuple(ohlcv_fields[_sid] or ()), bool(ohlcv_tuple.get(_sid)))
+        (_sid,
+         tuple(lib.time if _f == 'time' else partial(getattr, lib, _f)
+               for _f in ohlcv_fields[_sid] or ()),
+         bool(ohlcv_tuple.get(_sid)))
         for _sid in _pt_sids
     )
     if _pt_plan:
@@ -988,12 +995,11 @@ def security_process_main(
         _pt_only = not _mixed_pt_sids
 
         def _run_script_main():
-            for _pt_sid, _pt_fields, _pt_is_tuple in _pt_plan:
+            for _pt_sid, _pt_readers, _pt_is_tuple in _pt_plan:
                 if _pt_is_tuple:
-                    write_fn(_pt_sid,
-                             tuple(getattr(lib, _f) for _f in _pt_fields))
+                    write_fn(_pt_sid, tuple(_read() for _read in _pt_readers))
                 else:
-                    write_fn(_pt_sid, getattr(lib, _pt_fields[0]))
+                    write_fn(_pt_sid, _pt_readers[0]())
             if not _pt_only:
                 _clone_main()
 
@@ -2090,3 +2096,59 @@ def security_process_main(
         # Last, so a chart that is already gone cannot cut the cleanup above short
         if context_profiler is not None:
             context_profiler.send(int(lib.bar_index) + 1)
+
+
+# Upper bound of an exception message in a failure report. The child writes the
+# report while it is still alive and the chart reads it only after the reap, so
+# the whole report has to fit the pipe's buffer, or the write would block forever.
+_FAILURE_MESSAGE_LIMIT = 500
+
+
+def _failure_report(exc: BaseException) -> str:
+    """What killed this child: the exception, and where the script raised it.
+
+    :param exc: The exception leaving the child's entry point.
+    :return: ``"Type: message (at path:line)"``. The location is the innermost
+        frame outside the runtime, or the innermost frame when the whole
+        traceback is the runtime's. The function name is left out: in a child it
+        is the sliced ``main()`` clone's generated name.
+    """
+    message = str(exc)
+    if len(message) > _FAILURE_MESSAGE_LIMIT:
+        message = message[:_FAILURE_MESSAGE_LIMIT] + '...'
+    report = f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+    frames = traceback.extract_tb(exc.__traceback__)
+    if not frames:
+        return report
+    where = next((f for f in reversed(frames)
+                  if not os.path.abspath(f.filename).startswith(RUNTIME_ROOTS)), frames[-1])
+    return f"{report} (at {where.filename}:{where.lineno})"
+
+
+def run_security_process(*args: Any, failure_conn: '_ConnectionBase | None' = None,
+                         **kwargs: Any) -> None:
+    """Process target of a security child: :func:`security_process_main`, telling how it died.
+
+    The chart's death watcher sees only the exit code. The exception that ends
+    the child goes out through ``failure_conn``, the write end of a one-way pipe
+    whose read end the watcher drains after the reap, so the chart's error names
+    it. The traceback itself still goes to stderr, as for any process.
+
+    :param args: :func:`security_process_main`'s positional arguments.
+    :param failure_conn: Write end of this child's failure pipe, or None.
+    :param kwargs: :func:`security_process_main`'s keyword arguments.
+    """
+    try:
+        security_process_main(*args, **kwargs)
+    except SystemExit:
+        raise
+    except BaseException as exc:
+        if failure_conn is not None:
+            # Best effort: a chart that is already gone cannot read the report,
+            # and nothing about writing it may replace the exception itself
+            with contextlib.suppress(Exception):
+                failure_conn.send(_failure_report(exc))
+        raise
+    finally:
+        if failure_conn is not None:
+            failure_conn.close()

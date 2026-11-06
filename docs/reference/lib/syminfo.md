@@ -5,7 +5,7 @@ title: "syminfo"
 description: "Access current-symbol metadata with PyneCore's syminfo namespace. Look up ticker names, exchange prefixes and currency fields, with variable types and examples."
 icon: "info"
 date: "2026-03-28"
-lastmod: "2026-03-28"
+lastmod: "2026-11-06"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -26,7 +26,7 @@ from pynecore.lib import (
 
 @script.indicator(title="Symbol Info Display", overlay=True)
 def main():
-    # syminfo.tickerid and syminfo.ticker both contain "PREFIX:SYMBOL"
+    # syminfo.tickerid is "PREFIX:SYMBOL", syminfo.ticker the symbol alone
     full_id: str = syminfo.tickerid  # "NASDAQ:AAPL"
     currency: str = syminfo.currency or "NA"
     market_type: str = syminfo.type or "NA"
@@ -50,19 +50,31 @@ The exchange prefix of the symbol. For example, "NASDAQ" for "NASDAQ:AAPL" or "B
 exch: str | NA[str] = syminfo.prefix  # "NASDAQ"
 ```
 
+`syminfo.prefix` is also a function of another symbol: `syminfo.prefix(symbol)` returns the part of a ticker identifier before its first colon, and an empty string for a symbol without one.
+
+```python
+other: str = syminfo.prefix("BINANCE:ETHUSDT")  # "BINANCE"
+```
+
 #### ticker
 Type: `str | NA[str]`
 
-The full symbol identifier including the exchange prefix, in `"PREFIX:SYMBOL"` format. For example, `"NASDAQ:AAPL"` or `"BINANCE:BTCUSDT"`. In PyneCore, `ticker` and `tickerid` return the same value.
+The symbol name without the exchange prefix. For example, `"AAPL"` for `"NASDAQ:AAPL"` or `"BTCUSDT"` for `"BINANCE:BTCUSDT"`.
 
 ```python
-sym: str | NA[str] = syminfo.ticker  # "NASDAQ:AAPL"
+sym: str | NA[str] = syminfo.ticker  # "AAPL"
+```
+
+`syminfo.ticker` is also a function of another symbol: `syminfo.ticker(symbol)` returns the part of a ticker identifier after its first colon, and an empty string for a symbol without one. A chart-type ticker (`ticker.heikinashi(...)`) answers for its base symbol.
+
+```python
+other: str = syminfo.ticker("BINANCE:ETHUSDT")  # "ETHUSDT"
 ```
 
 #### tickerid
 Type: `str | NA[str]`
 
-The full symbol identifier including the exchange prefix, in `"PREFIX:SYMBOL"` format. Same value as `ticker`. This is the form used as the first argument to `request.security()`.
+The full symbol identifier including the exchange prefix, in `"PREFIX:SYMBOL"` format. This is the form used as the first argument to `request.security()`.
 
 ```python
 full_id: str | NA[str] = syminfo.tickerid  # "NASDAQ:AAPL"

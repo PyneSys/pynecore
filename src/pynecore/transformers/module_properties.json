@@ -2951,7 +2951,7 @@
       "type": "variable"
     },
     "prefix": {
-      "type": "variable"
+      "type": "property"
     },
     "pricescale": {
       "type": "variable"
@@ -3026,7 +3026,7 @@
       "type": "variable"
     },
     "ticker": {
-      "type": "variable"
+      "type": "property"
     },
     "tickerid": {
       "type": "variable"

@@ -59,6 +59,38 @@ def __test_ring_append_and_read_by_close__(log):
         sb.unlink()
 
 
+def __test_first_of_tied_closes__(log):
+    """``first_of_ties`` answers the first entry appended at the latest close.
+
+    The developing batch's shape on a weekly-on-daily chart: the bar ending the
+    week publishes its developing record at the period's close, and the NEXT
+    chart bar publishes the period's closing record at that same close. A read
+    for the first bar must get its own record whether or not the second one is
+    already in the ring.
+    """
+    sb, conds = _make(["prod"])
+    w = RingWriter("prod", sb, conds["prod"], capacity=8)
+    r = RingReader("prod", sb, conds["prod"])
+    try:
+        w.append(0, 100, "dev a", frontier_close=100)
+        w.append(0, 200, "dev b", frontier_close=200)
+        assert r.last_close_at_or_before(200, first_of_ties=True) == (0, 200, "dev b")
+        w.append(0, 200, "closed", frontier_close=250)
+        w.append(200, 300, "dev c", frontier_close=300)
+        assert r.last_close_at_or_before(200, first_of_ties=True) == (0, 200, "dev b")
+        assert r.last_close_at_or_before(200) == (0, 200, "closed")
+        assert r.last_close_at_or_before(250, first_of_ties=True) == (0, 200, "dev b")
+        assert r.last_close_at_or_before(300, first_of_ties=True) == (200, 300, "dev c")
+        assert r.last_close_at_or_before(150, first_of_ties=True) == (0, 100, "dev a")
+        assert r.last_close_at_or_before(99, first_of_ties=True) is None
+    finally:
+        r.close()
+        w.close()
+        w.unlink()
+        sb.close()
+        sb.unlink()
+
+
 def __test_ring_frontier_semantics__(log):
     """frontier_close rises monotonically; finish() publishes the +inf sentinel."""
     sb, conds = _make(["prod"])

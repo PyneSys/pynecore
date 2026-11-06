@@ -5,7 +5,7 @@ title: "request"
 description: "Request other symbols, timeframes and currency rates in PyneCore. Look up request functions and check the fallback behavior of unsupported corporate event data."
 icon: "cloud_download"
 date: "2026-03-28"
-lastmod: "2026-10-25"
+lastmod: "2026-11-06"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -105,10 +105,11 @@ Requests intrabar values from a lower timeframe, returning an array of values pe
 | expression | any | Expression to evaluate per intrabar |
 | ignore_invalid_symbol | bool | Return empty array for invalid symbols |
 | currency | str | Target currency — auto-converts result using `CurrencyRateProvider` |
-| ignore_invalid_timeframe | bool | Ignore invalid timeframe errors |
+| ignore_invalid_timeframe | bool | Return `na` instead of stopping the script when the timeframe is higher than the chart's |
 | calc_bars_count | int | Number of bars to calculate (not yet used) |
 
 **Returns:** Array of values, one per intrabar within each chart bar. Empty array if no data.
+`na` when the timeframe is higher than the chart's and `ignore_invalid_timeframe` is true.
 
 **Example:**
 ```python
@@ -116,7 +117,7 @@ ltf_closes: list[float] = request.security_lower_tf("EURUSD", "5", close)  # All
 ltf_volumes: list[float] = request.security_lower_tf("SPY", "15", volume)  # All 15-min volumes
 ```
 
-**Note:** Fully implemented with multiprocessing support. Returns an array of intrabar values per chart bar. If the chart timeframe is lower than the requested timeframe, returns empty arrays.
+**Note:** Fully implemented with multiprocessing support. Returns an array of intrabar values per chart bar. At the chart's own timeframe the array has one element, the chart bar itself. A timeframe higher than the chart's stops the script before its first bar with an error; with `ignore_invalid_timeframe=True` every read is `na` instead, each element of a tuple expression included, and no data feed is needed for it.
 
 ### currency_rate()
 
