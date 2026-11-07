@@ -44,7 +44,7 @@ import ast
 
 from . import ast_walk
 
-__all__ = ['ExportOnceTransformer']
+__all__ = ['ExportOnceTransformer', 'export_names', 'is_export']
 
 #: Per-root latch the definitions run under, a Persistent slot of ``main``
 EXPORT_LATCH = '__exports·__'

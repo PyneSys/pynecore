@@ -2112,11 +2112,13 @@ def _reaching_defs(defs: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]]
                 if any(_contains_write(stmt, hit)
                        for node in nodes for stmt in node.body
                        if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)))}
-    callees = {
-        name: {sub.func.id for node in nodes for sub in _walk_own(node)
-               if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)}
-        for name, nodes in defs.items()
-    }
+    callees: dict[str, set[str]] = {}
+    for name, nodes in defs.items():
+        called = callees[name] = set()
+        for node in nodes:
+            for sub in _walk_own(node):
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
+                    called.add(sub.func.id)
     for _ in range(len(defs) + 1):
         grown = False
         for name, called in callees.items():
@@ -2132,9 +2134,9 @@ def _nested_defs(func: ast.FunctionDef) -> dict[str, list[ast.FunctionDef | ast.
     """Every ``def`` standing anywhere inside ``func``, by name."""
     defs: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
     for node in ast_walk.walk_statements(func):
-        if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and node is not func):
-            defs.setdefault(node.name, []).append(node)
+        if node is func or not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        defs.setdefault(node.name, []).append(node)
     return defs
 
 
@@ -2442,8 +2444,11 @@ _STATEFUL_ANNOTATIONS = frozenset({'Persistent', 'Series', *VARIP_TYPES})
 
 def _loaded_names(node: ast.AST) -> set[str]:
     """Every name the node reads."""
-    return {sub.id for sub in ast_walk.walk(node)
-            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load)}
+    names: set[str] = set()
+    for sub in ast_walk.walk(node):
+        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+            names.add(sub.id)
+    return names
 
 
 #: Statements whose bindings only happen on some paths through them.
@@ -2473,11 +2478,12 @@ def _definite_bindings(stmt: ast.stmt) -> tuple[set[str], set[str]]:
     :param stmt: The statement.
     :return: The names certainly bound, and the names possibly unbound.
     """
-    nodes = [stmt, *_walk_own(stmt)]
-    removed = {sub.id for sub in nodes
-               if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Del)}
-    removed |= {sub.name for sub in nodes
-                if isinstance(sub, ast.ExceptHandler) and sub.name is not None}
+    removed: set[str] = set()
+    for sub in [stmt, *_walk_own(stmt)]:
+        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Del):
+            removed.add(sub.id)
+        elif isinstance(sub, ast.ExceptHandler) and sub.name is not None:
+            removed.add(sub.name)
     if isinstance(stmt, _CONDITIONAL_STMT):
         return set(), removed
     bound: set[str] = set()
@@ -2493,8 +2499,9 @@ def _definite_bindings(stmt: ast.stmt) -> tuple[set[str], set[str]]:
     elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
         bound |= {(alias.asname or alias.name).split('.')[0] for alias in stmt.names}
     for target in targets:
-        bound |= {sub.id for sub in [target, *ast_walk.walk(target)]
-                  if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store)}
+        for sub in [target, *ast_walk.walk(target)]:
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                bound.add(sub.id)
     return bound - removed, removed
 
 
@@ -2613,9 +2620,11 @@ def _operand_names(node: ast.AST) -> set[str]:
                 base = base.value
             if isinstance(base, ast.Name) and base.id == 'lib':
                 roots.add(id(base))
-    return {sub.id for sub in ast_walk.walk(node)
-            if isinstance(sub, ast.Name) and id(sub) not in roots
-            and get_ty(sub) not in SCALARS}
+    operands: set[str] = set()
+    for sub in ast_walk.walk(node):
+        if isinstance(sub, ast.Name) and id(sub) not in roots and get_ty(sub) not in SCALARS:
+            operands.add(sub.id)
+    return operands
 
 
 def _is_copyable_assignment(stmt: ast.stmt) -> bool:
@@ -2760,13 +2769,13 @@ def _force_conditional_writes(module: ast.Module, clone: ast.FunctionDef,
             defs.setdefault(name, []).extend(nodes)
     reaching = _reaching_defs(defs, hit)
 
-    def test(node: ast.AST) -> bool:
+    def test(candidate: ast.AST) -> bool:
         # Both targets are calls, and ``hit`` holds for no other node
-        if not isinstance(node, ast.Call):
+        if not isinstance(candidate, ast.Call):
             return False
-        if hit(node):
+        if hit(candidate):
             return True
-        return isinstance(node.func, ast.Name) and node.func.id in reaching
+        return isinstance(candidate.func, ast.Name) and candidate.func.id in reaching
 
     shared_forcer = _Forcer(test, _plain_aliases(list(copies)))
     for node in copies:
