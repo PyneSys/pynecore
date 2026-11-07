@@ -3211,7 +3211,7 @@ def create_security_protocol(
         of a not-yet-known dependency blocks on the pipe until it arrives.
     :return: (sec_signal, sec_write, sec_read, sec_wait, cleanup, flush,
              ltf_take_value, ltf_publish, buffer_len, ctx, after_bar, finish,
-             prime_ring)
+             raise_frontier, release_unwritten)
     """
     sec_id = sec_ids[0]
     served: frozenset[str] = frozenset(sec_ids)
@@ -3670,17 +3670,27 @@ def create_security_protocol(
                 for own_index in own_indexes:
                     sync_block.set_watermark(own_index, peer_index, mark)
 
-    def prime_ring(frontier_close: int) -> None:
-        """Publish the frontier this producer starts with.
+    def raise_frontier(frontier_close: int) -> None:
+        """Raise every member's frontier where no bar publishes it.
 
-        A producer the chart has not woken yet has published nothing, and a
-        frontier left at zero would hold up any consumer whose own first bar
-        closes before this context's first one — the chart never targets this
-        context in that round, so nothing would ever raise it. The runner
-        therefore primes the frontier from the feed's first bar as soon as the
-        producer is ready: "nothing of mine closes at or before this".
+        A bar raises the frontier at its write, or in ``after_bar`` when it does
+        not write. Two moments run no bar, yet a consumer can be waiting on what
+        they claim:
 
-        :param frontier_close: Initial frontier close in epoch ms.
+        * The producer's START. A producer the chart has not woken yet has
+          published nothing, and a frontier left at zero would hold up any
+          consumer whose own first bar closes before this context's first one —
+          the chart never targets this context in that round, so nothing would
+          ever raise it. The runner therefore primes the frontier from the
+          feed's first bar as soon as the producer is ready: "nothing of mine
+          closes at or before this".
+        * A round the chart launched that runs NO feed bar: a lower-timeframe
+          context is launched on every chart bar, also over a hole in its feed.
+          The runner raises the frontier to what the round's last bar would
+          have published, or a consumer whose period lies in the hole would
+          wait for it forever while the chart waits for that consumer.
+
+        :param frontier_close: Frontier close in epoch ms; applied monotonically.
         """
         for member_writer in writers.values():
             member_writer.set_frontier_close(frontier_close)
@@ -3718,7 +3728,7 @@ def create_security_protocol(
 
     return (__sec_signal__, __sec_write__, __sec_read__, __sec_wait__, cleanup,
             flush, ltf_take_value, ltf_publish, buffer_len, ctx, after_bar, finish,
-            prime_ring, release_unwritten)
+            raise_frontier, release_unwritten)
 
 
 # Representative dates for the off-grid session probe — one on each side of the

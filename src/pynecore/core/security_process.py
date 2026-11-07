@@ -849,7 +849,7 @@ def security_process_main(
     # Create protocol functions for security context
     (signal_fn, write_fn, read_fn, wait_fn, cleanup, flush_fn,
      ltf_take_value, ltf_publish, ltf_buffer_len, sec_ctx, after_bar,
-     finish_ring, prime_ring, release_unwritten) = create_security_protocol(
+     finish_ring, raise_frontier, release_unwritten) = create_security_protocol(
         sec_ids, sync_block, result_blocks, all_sec_ids, result_locks, is_ltf=is_ltf,
         registry=registry, chart_calendar=chart_calendar,
         ring_conditions=ring_conditions, consumer_ids=consumer_ids,
@@ -1711,12 +1711,12 @@ def security_process_main(
                 # first period, far below its close. Priming from the bar grid
                 # would claim every chart tick of that first period as published
                 # and the chart would pair its first bars against an empty ring.
-                prime_ring(dev_batch_next[7] - 1)
+                raise_frontier(dev_batch_next[7] - 1)
             else:
                 _first_open = _bar_open_at(0)
                 if _first_open:
-                    prime_ring(actual_bar_close(_first_open, _bar_open_at(1),
-                                                own_calendar, own_timeframe) - 1)
+                    raise_frontier(actual_bar_close(_first_open, _bar_open_at(1),
+                                                    own_calendar, own_timeframe) - 1)
 
         while True:
             # Wait for chart to signal this process
@@ -2051,6 +2051,21 @@ def security_process_main(
                     if snap is not None:
                         snap.save()
                     _ensure_child_snapshot().save()
+                else:
+                    # The chart launched this round, so the chart does not raise
+                    # the frontier for it (``_settle_no_round`` only covers a
+                    # round it skips), and with no bar there is no write and no
+                    # ``after_bar`` either. A lower-timeframe context is launched
+                    # on every chart bar, and over a hole in its feed every such
+                    # round runs nothing: a consumer whose period lies in the
+                    # hole waits for this frontier, and the chart for that
+                    # consumer. Publish what the round's last bar would have:
+                    # the next unpublished bar's close minus one ms, inside the
+                    # round's own as-of.
+                    unpublished_open = _bar_open_at(current_bar)
+                    raise_frontier(_capped_frontier(_next_frontier(
+                        unpublished_open,
+                        _bar_open_at(current_bar + 1) if unpublished_open else 0)))
 
                 if is_ltf:
                     flush_fn(ltf_prefix_len)
