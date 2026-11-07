@@ -6,11 +6,10 @@ from pynecore.types import Series
 
 
 @script.indicator(title="Dependent Input Timeframe", shorttitle="DIT")
-def main():
-    # The context timeframe comes from an input, so the dependency analysis has
-    # to hoist the binding: a dependent context's timeframe must be resolvable
-    # ahead of every write block, or the chain could not be signalled in time.
-    htf = input.timeframe("60", "HTF")
+def main(htf=input.timeframe("60", "HTF")):
+    # The context timeframe comes from an input: a dependent context's timeframe
+    # must be resolvable ahead of every write block, or the chain could not be
+    # signalled in time.
     base: Series[float] = request.security(syminfo.tickerid, htf, close)
     dep: Series[float] = request.security(syminfo.tickerid, htf, ta.sma(base, 3))
     plot(base, "base")
@@ -84,9 +83,9 @@ def __test_helper_run_with_timeout(fn, seconds=120):
 def __test_dependent_chain_on_an_input_timeframe__(runner, log):
     """A dependent chain works when the context timeframe comes from an input.
 
-    The timeframe is a Pine "simple" value, so the binding hoists to the top
-    block and both contexts are signalled before any write block runs. Had the
-    dependency not been hoistable the transform would have refused the script;
+    The timeframe is a Pine "simple" value, a ``main()`` parameter, so both
+    contexts are signalled before any write block runs. Had the dependency not
+    been resolvable ahead of them the transform would have refused the script;
     here it must simply produce the same values a literal ``"60"`` would.
     """
     import sys

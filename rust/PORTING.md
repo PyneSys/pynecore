@@ -248,7 +248,9 @@ request from `ModuleLayout::new(pyne_mode == "lib")`, as the import hook does.
    (`EPSILON`), as PineTruthiness's does. `Unsupported`: a `_pine_ty` stamp that is
    no string where a rule carries it over to a new node, an opaque `pine_exact`
    stamp, a leave hook handed a list by an earlier rule, and a node with a line but no column for
-   `fix_locations`.
+   `fix_locations`. `Rejected`: an input call that is not a parameter default of
+   module-level `main()` or of one of its security-slice clones, which Input tells by
+   their pipeline names (the leaf `pipeline_names.py` in its closure).
 4. **CallInline**. Hermetized first: the inline templates are the generated
    registry `transformers/call_inline_templates.json`, written by
    `scripts/call_inline_collector.py` (the body-shape derivation moved there from

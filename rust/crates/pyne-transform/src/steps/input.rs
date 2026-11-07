@@ -1,12 +1,16 @@
-//! Port of `transformers/input_transformer.py`: an input call that is a parameter's
-//! default gets the parameter's name as its `_id`; a source input's parameter is
-//! rebound at the top of its function to the series it names
-//! (`x = __pyne_getattr__(lib, x, lib.na)`), the reserved alias imported once.
+//! Port of `transformers/input_transformer.py`: an input call that is a parameter
+//! default of module-level `main()` (or of one of its generated clones) gets the
+//! parameter's name as its `_id`; a source input's parameter is rebound at the top of
+//! its function to the series it names (`x = __pyne_getattr__(lib, x, lib.na)`), the
+//! reserved alias imported once. Any other input call rejects the module.
 
-use indexmap::{IndexMap, IndexSet};
+use std::collections::HashSet;
+
+use indexmap::IndexSet;
 use pyne_ast::walk::{children, docstring_end, future_end};
 use pyne_ast::{Ast, Constant, ExprContext, Int, Kind, NodeId};
 
+use crate::resolver::is_pipeline_name;
 use crate::{Context, Error};
 
 /// Builtin price series accepted by generic `input()` as source names
@@ -37,8 +41,9 @@ fn constant_truthy(value: &Constant) -> bool {
     }
 }
 
-/// Whether a call is `lib.input(...)`, `lib.input.<kind>(...)`, `input(...)` or
-/// `input.<kind>(...)`.
+/// Whether a call is `lib.input(...)` or `lib.input.<kind>(...)`. The import normalizer
+/// has already rewritten every name imported from `pynecore.lib` to its `lib.` path, so
+/// a bare `input` is a name the script binds itself (or Python's builtin).
 fn is_input_call(ast: &Ast, call: NodeId) -> bool {
     let Kind::Call { func, .. } = ast.kind(call) else { return false };
     match ast.kind(*func) {
@@ -47,35 +52,46 @@ fn is_input_call(ast: &Ast, call: NodeId) -> bool {
             Kind::Attribute { value: owner, attr, .. } => {
                 is_name(ast, *owner, "lib") && attr == "input"
             }
-            Kind::Name { id, .. } => id == "input",
             _ => false,
         },
-        Kind::Name { id, .. } => id == "input",
         _ => false,
     }
 }
 
 struct Input {
-    /// Function name -> the source-input parameters to rebind, in first-seen order
-    function_source_vars: IndexMap<String, IndexSet<String>>,
-    current_function: Option<String>,
     has_source_inputs: bool,
+    /// The input calls that are parameter defaults of an entry
+    declared: HashSet<NodeId>,
+    /// The module's own statements
+    module_level: HashSet<NodeId>,
 }
 
 impl Input {
-    /// Add `_id` to the input calls among a function's defaults and collect its
-    /// source inputs.
-    fn visit_arguments(&mut self, ast: &mut Ast, node: NodeId) {
-        let Some(current) = self.current_function.clone() else { return };
-        let Kind::Arguments { args, defaults, .. } = ast.kind(node) else { unreachable!() };
-        // `zip(node.args[-len(node.defaults):], node.defaults)`
-        let start = if defaults.is_empty() { 0 } else { args.len().saturating_sub(defaults.len()) };
-        let pairs: Vec<(NodeId, NodeId)> =
-            args[start..].iter().copied().zip(defaults.iter().copied()).collect();
+    /// Add `_id` to the input calls among an entry's defaults and collect its source
+    /// inputs: the parameters to rebind to the series they name, in parameter order.
+    fn declare_inputs(&mut self, ast: &mut Ast, function: NodeId) -> IndexSet<String> {
+        let mut source_vars = IndexSet::new();
+        let Kind::FunctionDef { args: spec, .. } = ast.kind(function) else { unreachable!() };
+        let Kind::Arguments { posonlyargs, args, kwonlyargs, kw_defaults, defaults, .. } =
+            ast.kind(*spec)
+        else {
+            unreachable!()
+        };
+        let positional: Vec<NodeId> = posonlyargs.iter().chain(args).copied().collect();
+        let start = positional.len().saturating_sub(defaults.len());
+        let mut pairs: Vec<(NodeId, NodeId)> =
+            positional[start..].iter().copied().zip(defaults.iter().copied()).collect();
+        pairs.extend(
+            kwonlyargs
+                .iter()
+                .zip(kw_defaults)
+                .filter_map(|(&arg, default)| default.map(|default| (arg, default))),
+        );
         for (arg, default) in pairs {
             if !matches!(ast.kind(default), Kind::Call { .. }) || !is_input_call(ast, default) {
                 continue;
             }
+            self.declared.insert(default);
             let Kind::Arg { arg: arg_name, .. } = ast.kind(arg) else { unreachable!() };
             let arg_name = arg_name.clone();
             let value =
@@ -88,7 +104,6 @@ impl Input {
             let (is_source_call, is_input_call) = match ast.kind(*func) {
                 Kind::Attribute { attr, .. } if attr == "source" => (true, false),
                 Kind::Attribute { attr, .. } if attr == "input" => (false, true),
-                Kind::Name { id, .. } if id == "input" => (false, true),
                 _ => (false, false),
             };
             let defval = args.first().copied().or_else(|| {
@@ -119,20 +134,24 @@ impl Input {
                 _ => false,
             };
             if source {
-                self.function_source_vars.entry(current.clone()).or_default().insert(arg_name);
+                source_vars.insert(arg_name);
                 self.has_source_inputs = true;
             }
         }
+        source_vars
     }
 
-    fn visit_function(&mut self, ast: &mut Ast, node: NodeId, name: String) {
-        let previous = self.current_function.replace(name.clone());
-        self.generic_visit(ast, node);
-        let source_vars: Vec<String> = self
-            .function_source_vars
-            .get(&name)
-            .map(|vars| vars.iter().cloned().collect())
-            .unwrap_or_default();
+    fn visit_function(&mut self, ast: &mut Ast, node: NodeId, name: String) -> Result<(), Error> {
+        // The runner reads inputs only from the parameter defaults of module-level
+        // main(). The security slices are generated module-level clones of main() that
+        // copy its parameters; their names are pipeline names no script can bind
+        let source_vars =
+            if self.module_level.contains(&node) && (name == "main" || is_pipeline_name(&name)) {
+                self.declare_inputs(ast, node)
+            } else {
+                IndexSet::new()
+            };
+        self.generic_visit(ast, node)?;
         for var_name in source_vars {
             let target = ast.add(Kind::Name { id: var_name.clone(), ctx: ExprContext::Store });
             let func = ast.add(Kind::Name { id: GETATTR_ALIAS.into(), ctx: ExprContext::Load });
@@ -152,22 +171,33 @@ impl Input {
             let Kind::FunctionDef { body, .. } = ast.kind_mut(node) else { unreachable!() };
             body.insert(at, assign);
         }
-        self.current_function = previous;
+        Ok(())
     }
 
-    fn generic_visit(&mut self, ast: &mut Ast, node: NodeId) {
+    fn generic_visit(&mut self, ast: &mut Ast, node: NodeId) -> Result<(), Error> {
         for child in children(ast, node) {
-            self.visit(ast, child);
+            self.visit(ast, child)?;
         }
+        Ok(())
     }
 
-    fn visit(&mut self, ast: &mut Ast, node: NodeId) {
+    fn visit(&mut self, ast: &mut Ast, node: NodeId) -> Result<(), Error> {
         match ast.kind(node) {
             Kind::FunctionDef { name, .. } => {
                 let name = name.clone();
-                self.visit_function(ast, node, name);
+                self.visit_function(ast, node, name)
             }
-            Kind::Arguments { .. } => self.visit_arguments(ast, node),
+            Kind::Call { .. } if !self.declared.contains(&node) && is_input_call(ast, node) => {
+                // An input outside the parameter defaults gets no `_id`: it never
+                // reaches the settings file and silently runs with its default
+                let line =
+                    ast[node].loc.lineno.map_or_else(|| "None".to_string(), |l| l.to_string());
+                Err(Error::Rejected(format!(
+                    "the input call on line {line} is not a main() parameter default; inputs \
+                     must be declared as main() parameter defaults: \
+                     def main(length=input.int(14, ...))"
+                )))
+            }
             _ => self.generic_visit(ast, node),
         }
     }
@@ -177,12 +207,14 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
     if !matches!(ast.kind(module), Kind::Module { .. }) {
         return Err(Error::Unsupported("Input on a non-module".into()));
     }
+    let Kind::Module { body, .. } = ast.kind(module) else { unreachable!() };
+    let module_level = body.iter().copied().collect();
     let mut pass = Input {
-        function_source_vars: IndexMap::new(),
-        current_function: None,
         has_source_inputs: false,
+        declared: HashSet::new(),
+        module_level,
     };
-    pass.generic_visit(ast, module);
+    pass.generic_visit(ast, module)?;
     if !pass.has_source_inputs {
         return Ok(module);
     }

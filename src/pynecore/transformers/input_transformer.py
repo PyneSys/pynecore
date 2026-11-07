@@ -1,6 +1,8 @@
 import ast
+import linecache
 
 from . import ast_walk
+from .pipeline_names import is_pipeline_name
 from .price_series import BUILTIN_PRICE_SERIES
 
 
@@ -10,6 +12,7 @@ class InputTransformer(ast_walk.NodeVisitor):
     1. Add _id parameter to input calls
     2. Add getattr for source inputs at the start of functions
     3. Add required imports (lib, na) if not present
+    4. Reject every input call that is not a parameter default of module-level ``main()``
     Must be applied after SeriesTransformer.
 
     Every edit is made in place and no node is replaced, so the walk is a plain
@@ -17,14 +20,21 @@ class InputTransformer(ast_walk.NodeVisitor):
     """
 
     def __init__(self):
-        self.function_source_vars = {}  # function_name -> {var_name -> source_str}
-        self.current_function = None
         self.has_source_inputs = False
         self.imported_names: set[str] = set()  # Track what's already imported
+        # The input calls that are parameter defaults of an entry
+        self._declared: set[ast.Call] = set()
+        self._module: ast.Module | None = None
+        self._module_level: set[int] = set()  # ids of the module's own statements
 
     @staticmethod
     def _is_input_call(node: ast.Call) -> bool:
-        """Check if node is lib.input(), lib.input.xxx(), or imported input() call"""
+        """Check if node is ``lib.input()`` or ``lib.input.xxx()``
+
+        The import normalizer has already rewritten every name imported from
+        ``pynecore.lib`` to its ``lib.`` path, so a bare ``input`` here is a name the
+        script binds itself (or Python's builtin), never PyneCore's input.
+        """
         # Handle lib.input(...) pattern
         if isinstance(node.func, ast.Attribute) and node.func.attr == 'input':
             return isinstance(node.func.value, ast.Name) and node.func.value.id == 'lib'
@@ -35,25 +45,24 @@ class InputTransformer(ast_walk.NodeVisitor):
                     node.func.value.value.id == 'lib' and
                     node.func.value.attr == 'input')
 
-        # Handle imported input(...) call
-        if isinstance(node.func, ast.Name) and node.func.id == 'input':
-            return True
-
-        # Handle imported input.xxx(...) call
-        if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
-            return node.func.value.id == 'input'
-
         return False
 
-    def visit_arguments(self, node: ast.arguments) -> ast.arguments:
-        """Add _id to input calls in function arguments and collect source vars"""
-        if self.current_function is None:
-            return node
+    def _declare_inputs(self, node: ast.FunctionDef) -> list[str]:
+        """Add ``_id`` to the input calls among an entry's defaults and collect its source vars
 
-        # Loop through arguments and defaults together
-        for arg, default in zip(node.args[-len(node.defaults):], node.defaults):
+        :param node: Module-level ``main()`` or one of its generated clones
+        :return: The source-input parameters of ``node``, to rebind to the series they name
+        """
+        source_vars: list[str] = []
+        spec = node.args
+        positional = spec.posonlyargs + spec.args
+        pairs = list(zip(positional[len(positional) - len(spec.defaults):], spec.defaults))
+        pairs.extend((arg, default) for arg, default in zip(spec.kwonlyargs, spec.kw_defaults)
+                     if default is not None)
+        for arg, default in pairs:
             if default and isinstance(default, ast.Call):
                 if self._is_input_call(default):
+                    self._declared.add(default)
                     # Add id keyword argument with argument name
                     default.keywords.append(
                         ast.keyword(
@@ -67,13 +76,10 @@ class InputTransformer(ast_walk.NodeVisitor):
                     is_input_call = False
 
                     if isinstance(default.func, ast.Attribute) and default.func.attr == 'source':
-                        # This is lib.input.source or input.source call
+                        # This is lib.input.source call
                         is_source_call = True
                     elif isinstance(default.func, ast.Attribute) and default.func.attr == 'input':
                         # This is lib.input call
-                        is_input_call = True
-                    elif isinstance(default.func, ast.Name) and default.func.id == 'input':
-                        # This is imported input() call - check if defval is a source
                         is_input_call = True
 
                     # Find the defval parameter value (either positional or keyword)
@@ -112,25 +118,45 @@ class InputTransformer(ast_walk.NodeVisitor):
                                 source_name = defval_node.id
 
                         if source_name:
-                            if self.current_function not in self.function_source_vars:
-                                self.function_source_vars[self.current_function] = {}
-                            self.function_source_vars[self.current_function][arg.arg] = source_name
+                            source_vars.append(arg.arg)
                             self.has_source_inputs = True
+        return source_vars
 
+    def visit_Call(self, node: ast.Call) -> ast.Call:
+        """Reject an input call that is not a parameter default of ``main()``"""
+        if node not in self._declared and self._is_input_call(node):
+            self._reject(node)
+        self.generic_visit(node)
         return node
+
+    def _reject(self, node: ast.Call) -> None:
+        """Raise a source-located error before the module can execute.
+
+        An input outside the parameter defaults gets no ``_id``: it never reaches the
+        settings file, no override can reach it, and it silently runs with its default.
+        """
+        name = ast.unparse(node.func).removeprefix('lib.')
+        filename = getattr(self._module, '_module_file_path', '<script>')
+        line = getattr(node, 'lineno', 0)
+        text = (linecache.getline(filename, line) or None) if line > 0 else None
+        raise SyntaxError(f'{name}() is not a main() parameter default; inputs must be declared '
+                          f'as main() parameter defaults: def main(length=input.int(14, ...))',
+                          (filename, line, getattr(node, 'col_offset', 0) + 1, text))
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
         """Insert getattr calls at the start of functions for source inputs"""
-        # Save previous function name
-        previous_function = self.current_function
-        self.current_function = node.name
+        # The runner reads inputs only from the parameter defaults of module-level
+        # main(). The security slices are generated module-level clones of main()
+        # that copy its parameters; their names are pipeline names no script can bind
+        source_vars: list[str] = []
+        if id(node) in self._module_level and (node.name == 'main' or is_pipeline_name(node.name)):
+            source_vars = self._declare_inputs(node)
 
         # Process function arguments and body
         self.generic_visit(node)
 
-        # Add getattr for each source input in this function
-        source_vars = self.function_source_vars.get(self.current_function, {})
-        for var_name, source_str in source_vars.items():
+        # Add getattr for each source input of this function
+        for var_name in source_vars:
             # Create: var_name = __pyne_getattr__(lib, var_name, lib.na)
             # A reserved module-level alias of the builtin is used instead of a
             # bare ``getattr``: a script variable named ``getattr`` would shadow
@@ -154,12 +180,12 @@ class InputTransformer(ast_walk.NodeVisitor):
             )
             node.body.insert(ast_walk.docstring_end(node.body), assign)
 
-        # Restore previous function name
-        self.current_function = previous_function
         return node
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
         """Add required imports if not present"""
+        self._module = node
+        self._module_level = {id(stmt) for stmt in node.body}
         # Process the module first to collect existing imports
         self.generic_visit(node)
 

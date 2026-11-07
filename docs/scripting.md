@@ -107,6 +107,17 @@ def main(
 ):
 ```
 
+This is the only place an input can be declared. PyneCore identifies an input by the name of
+its `main()` parameter: that name is its key in the generated TOML file and in runtime
+overrides. An `input.*()` call anywhere else (at module level, in the body of `main()`, or as
+the default of another function's parameter) has no such name, so the script fails to load
+with an error at that line:
+
+```text
+input.int() is not a main() parameter default; inputs must be declared as main() parameter
+defaults: def main(length=input.int(14, ...))
+```
+
 Available input types:
 - `input.int()` - Integer inputs
 - `input.float()` - Float inputs

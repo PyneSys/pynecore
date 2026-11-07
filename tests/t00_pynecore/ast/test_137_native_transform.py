@@ -1203,35 +1203,47 @@ from __future__ import annotations
 from pynecore import lib
 
 
-def main(a, src=input.source(close), x=lib.input(lib.close), y=lib.input.float(1.0),
-         z=input(hl2), w=input(5), v=lib.input.source('high'), u=input.source(defval=lib.low),
-         t=input.source(''), s=foo.input(1), r=x.y.input(1), q=input.int(defval=close),
-         p=input.source(0), o=input(lib.na), n=input(defval=volume), m=lib.input(lib.time)):
-    def inner(p=input.source(open)):
+def main(a, src=lib.input.source(close), x=lib.input(lib.close), y=lib.input.float(1.0),
+         z=lib.input(hl2), w=lib.input(5), v=lib.input.source('high'),
+         u=lib.input.source(defval=lib.low), t=lib.input.source(''), s=foo.input(1),
+         r=x.y.input(1), q=lib.input.int(defval=close), p=lib.input.source(0),
+         o=lib.input(lib.na), n=lib.input(defval=volume), m=lib.input(lib.time),
+         own=input(hl2), own_source=input.source(close)):
+    def inner(p=open):
         pass
 
-    f = lambda k=input.source(close): k
-
-    async def coro(m=input.source(close)):
+    def main():
         pass
 
+    f = lambda k=close: k
 
-def main(a=input.source(volume), *, kw=input.source(close)):
+    async def coro(m=close):
+        pass
+
+    input(1)
+    input.int(2)
+
+
+def main(a=lib.input.source(volume), *, kw=lib.input.source(close), plain=1):
     pass
 
 
-def posonly(a=input.source(close), /, b=input.source(high)):
+def main(a=lib.input.source(close), /, b=lib.input.source(high)):
     pass
 
 
-g = lambda k=input.source(close): k
+def __sec_main_0__(a=lib.input.source(close), b=lib.input.int(1)):
+    pass
+
+
+g = lambda k=close: k
 
 
 class C:
-    def method(self, s=lib.input.source(lib.close)):
+    def method(self, s=lib.close):
         pass
 ''',
-    '''def main(length=input.int(5)):
+    '''def main(length=lib.input.int(5)):
     pass
 ''',
 )
@@ -1246,3 +1258,28 @@ def __test_requirements_and_inputs_match_python__():
     for source in __test_helper_STEP_SOURCES:
         for name in ('ScriptRequirements', 'Input', 'FixLocations'):
             __test_helper_check_native(name, ast.parse(source), ctx, steps[name].run)
+
+
+@pytest.mark.parametrize('source', [
+    'x = lib.input.int(1)\n',
+    'g = lambda k=lib.input.source(close): k\n',
+    'def main():\n    y = lib.input.float(1.0)\n',
+    'def main():\n    def inner(p=lib.input.source(open)):\n        pass\n',
+    'def main():\n    f = lambda k=lib.input.source(close): k\n',
+    'def main():\n    async def coro(m=lib.input.source(close)):\n        pass\n',
+    'def main(n=max(lib.input.int(1), 2)):\n    pass\n',
+    'def main(n=lib.input.int(lib.input.int(1))):\n    pass\n',
+    'def posonly(a=lib.input.source(close), /, b=1):\n    pass\n',
+    'class C:\n    def main(self, s=lib.input.source(lib.close)):\n        pass\n',
+    'if True:\n    def main(n=lib.input(1)):\n        pass\n',
+])
+def __test_input_outside_main_defaults_is_rejected_natively__(source):
+    """An input call that is not a module-level main() parameter default is rejected by
+    the native Input step as by the Python one."""
+    __test_helper_require_native()
+    step = next(step for step in pipeline.LOWERING
+                if isinstance(step, pipeline.Step) and step.name == 'Input')
+    ctx = pipeline.PipelineContext(path=Path('rejected.py'), pyne_mode=None, source=source)
+    assert isinstance(native.run(['Input'], ast.parse(source), ctx), native.Rejection)
+    with pytest.raises(SyntaxError, match='inputs must be declared as main'):
+        step.run(ast.parse(source), ctx)

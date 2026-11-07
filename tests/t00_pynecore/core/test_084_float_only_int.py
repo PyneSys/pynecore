@@ -14,8 +14,7 @@ from pynecore.types.series import Series
 
 
 @script.indicator(title="float-only int")
-def main():
-    length = input.int(3)
+def main(length=input.int(3)):
     count: Persistent[int] = 0
     count += 1
     hist: Series[int] = 2 * 1
