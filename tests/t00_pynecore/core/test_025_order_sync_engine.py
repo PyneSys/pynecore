@@ -6986,6 +6986,30 @@ def __test_startup_adoption_decodes_short_side_to_negative_size__():
     assert pos.open_trades == []
 
 
+def __test_startup_adoption_without_a_journal_warns__(caplog):
+    """A venue position no durable journal accounts for is adopted with a WARNING.
+
+    Only a run's own journal can show the position is its own; without one the
+    adopted exposure is unattributed, unlike a warm restart resuming its own.
+    """
+    b = MockBroker()
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=1000.0, entry_price=1.15200,
+        unrealized_pnl=0.0, liquidation_price=None,
+        leverage=1.0, margin_mode="isolated",
+    )
+    engine, pos = _mk_engine(b)
+
+    with caplog.at_level(logging.INFO):
+        engine.reconcile()
+
+    assert pos.size == 1000.0
+    assert any("position size mismatch" in r.getMessage()
+               for r in caplog.records if r.levelno == logging.WARNING)
+    assert not any("resuming this run's open position" in r.getMessage()
+                   for r in caplog.records)
+
+
 def __test_record_fill_exit_leg_clamps_to_flat_instead_of_flipping__():
     """A reduce-only/exit leg with insufficient FIFO clamps to flat, never opening an opposite side."""
     pos = BrokerPosition()

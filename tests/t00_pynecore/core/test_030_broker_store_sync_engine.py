@@ -18,6 +18,7 @@ Unit tests for the ``BrokerStore`` API itself live in
 the two layers.
 """
 import asyncio
+import logging
 import signal
 import time
 from dataclasses import dataclass, field
@@ -2205,14 +2206,15 @@ def __test_startup_does_not_adopt_a_concurrent_runs_venue_net__(
 
 
 def __test_startup_adopts_own_open_position_across_restart__(
-        tmp_path: Path,
+        tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A genuine single-run restart still adopts its own venue net in full.
 
     The run left a 0.01 long open in a prior process; its durable entry row
     survives with a ``filled_qty`` cursor covering the position. On restart
     the run owns the whole venue net, so the ownership clamp is a no-op and
-    adoption proceeds exactly as before.
+    adoption proceeds exactly as before. Resuming its own position is the
+    restart protocol, so it is logged at INFO, never as a size mismatch.
     """
     db = tmp_path / "broker.sqlite"
     with BrokerStore(db, plugin_name=PLUGIN) as store:
@@ -2231,12 +2233,17 @@ def __test_startup_adopts_own_open_position_across_restart__(
         )
         engine, pos = _mk_engine(broker, ctx)
 
-        engine.reconcile()  # startup adoption
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            engine.reconcile()  # startup adoption
 
         assert pos.size == 0.01, "the run owns its whole venue net — adopt it"
         assert pos.sign == 1.0
         assert len(pos.open_trades) == 1
         assert pos.open_trades[0].size == 0.01
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("resuming this run's open position" in r.getMessage()
+                   for r in caplog.records if r.levelno == logging.INFO)
         ctx.close()
 
 

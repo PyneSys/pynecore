@@ -6206,10 +6206,17 @@ class OrderSyncEngine:
             # the clamp is a no-op there. Only applies when the durable
             # journal is available; the store-less unit path keeps the raw
             # unconditional adoption.
+            # Every warm restart of a run holding a position reaches this
+            # branch with an empty book, so adopting exposure this run's own
+            # journal accounts for is the resume protocol, not an anomaly:
+            # logged at INFO. A venue reduction against the journal and a
+            # clamp to the run-owned slice are reported on their own lines.
+            run_owned = False
             if adopt_known and self._store_ctx is not None:
                 owned_signed = self._durable_owned_signed_size()
                 self._report_startup_reduction(broker_signed, owned_signed)
                 adoptable = self._adoptable_owned_size(owned_signed, broker_entry_price)
+                run_owned = adoptable is not None
                 clamped = (broker_signed if adoptable is None
                            else self._clamp_adoption_to_owned(broker_signed, adoptable))
                 if clamped != broker_signed:
@@ -6224,11 +6231,18 @@ class OrderSyncEngine:
                     if broker_signed == 0.0:
                         broker_entry_price = 0.0
             if adopt_known and broker_signed != self._position.size:
-                _blog_warning(
-                    "position size mismatch (exchange=%s, internal=%s) — "
-                    "adopting exchange",
-                    broker_signed, self._position.size,
-                )
+                if run_owned and self._position.size == 0.0:
+                    _blog_info(
+                        "startup: resuming this run's open position from the "
+                        "exchange (%s, entry %s)",
+                        broker_signed, broker_entry_price,
+                    )
+                else:
+                    _blog_warning(
+                        "position size mismatch (exchange=%s, internal=%s) — "
+                        "adopting exchange",
+                        broker_signed, self._position.size,
+                    )
                 self._adopt_signed_size(broker_signed, broker_entry_price, fifo_trim=True)
         elif (not is_startup and self._position.size != 0.0
               and (new_size == 0.0 or self._venue_on_opposite_side(exch_pos))):
