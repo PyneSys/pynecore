@@ -31,17 +31,15 @@ SCRIPT = '''"""
 @pyne
 """
 from pynecore import Series, Persistent
-from pynecore.lib import close, high, low, ta, math, plot, input, nz
-
-
-length = input.int(14, "Length")
+from pynecore.lib import close, high, low, ta, math, plot, input, nz, script
 
 
 def half(value: float) -> float:
     return value / 2
 
 
-def main():
+@script.indicator("T")
+def main(length=input.int(14, "Length")):
     d = length / 8
     fast: Series[float] = ta.sma(close, 5)
     total: Persistent[float] = 0.0

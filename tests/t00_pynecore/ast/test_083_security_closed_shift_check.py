@@ -190,8 +190,7 @@ def __test_a_hoisted_inline_series_keeps_the_flag__(log):
     """
     source = """
 @lib.script.indicator("T")
-def main():
-    mode = lib.input.string("SMA")
+def main(mode=lib.input.string("SMA")):
     a = (lib.request.security(lib.syminfo.tickerid, "D",
                               inline_series(lib.ta.sma(lib.close, 3), 1),
                               lookahead=lib.barmerge.lookahead_on)
