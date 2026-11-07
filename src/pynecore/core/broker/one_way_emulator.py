@@ -263,6 +263,11 @@ class OneWayEmulator:
         #: replay; the engine takes them (:meth:`take_replay_refusals`) and
         #: re-arms the exits through its regular dispatch path.
         self._replay_refusals: list[BracketReplayRefusal] = []
+        #: Exits (symbol, pine_id, from_entry) already told that their
+        #: ``trail_price`` activation arms immediately per-leg. The limitation
+        #: is a property of the exit, not of a dispatch: a trailing exit is
+        #: re-dispatched on every bar it changes, so it is reported once.
+        self._trail_activation_reported: set[tuple[str, str, str | None]] = set()
 
     def take_replay_refusals(self) -> list[BracketReplayRefusal]:
         """Hand over (and forget) the brackets the restart replay could not re-assert."""
@@ -633,12 +638,16 @@ class OneWayEmulator:
         """
         intent = envelope.intent
         assert isinstance(intent, ExitIntent)
-        if intent.trail_price is not None and intent.trail_offset is not None:
+        trail_key = (intent.symbol, intent.pine_id, intent.from_entry)
+        if (intent.trail_price is not None and intent.trail_offset is not None
+                and trail_key not in self._trail_activation_reported):
             # The PositionPort amend surface carries no ``trail_price`` — the
             # deferred-activation trailing of the direct paths is not
             # expressible per-leg, so the trailing arms IMMEDIATELY at
             # ``trail_offset``. Trades can exit earlier/tighter than the Pine
-            # simulation; surface it instead of diverging silently.
+            # simulation; surface it (once per exit) instead of diverging
+            # silently.
+            self._trail_activation_reported.add(trail_key)
             _blog_warning(
                 "one-way bracket replication: trail_price activation is not "
                 "expressible per-leg — trailing on %s (exit %r) arms "

@@ -520,10 +520,10 @@ def __test_run_reversal_resting_stop_rests_without_closing_opposing__():
 # === run_exit_bracket / clear — per-leg ownership =======================
 
 def _exit_env(pine_id, from_entry, *, side="sell", qty=3.0, symbol="EURUSD",
-              tp=None, sl=None, trail=None) -> DispatchEnvelope:
+              tp=None, sl=None, trail=None, trail_price=None) -> DispatchEnvelope:
     intent = ExitIntent(
         pine_id=pine_id, from_entry=from_entry, symbol=symbol, side=side, qty=qty,
-        tp_price=tp, sl_price=sl, trail_offset=trail,
+        tp_price=tp, sl_price=sl, trail_offset=trail, trail_price=trail_price,
     )
     return DispatchEnvelope(intent=intent, run_tag="t000", bar_ts_ms=1000)
 
@@ -558,6 +558,33 @@ def __test_run_exit_bracket_converts_trailing_ticks_to_price_distance__():
     assert len(port.amended) == 1
     leg_id, side, tp, sl, trail, _coid = port.amended[0]
     assert (leg_id, side, tp, sl, trail) == ("10", "sell", None, None, 0.1)
+
+
+def __test_run_exit_bracket_trail_activation_limit_reported_once_per_exit__(monkeypatch):
+    """The per-leg ``trail_price`` limitation is reported once per exit, not per dispatch.
+
+    A trailing exit is re-dispatched on every bar it changes; repeating the
+    same limitation notice on each one floods an unattended live log
+    (ctrader cycle 335: 20 identical warnings in one 6h cycle).
+    """
+    warnings: list[tuple] = []
+    monkeypatch.setattr(
+        "pynecore.core.broker.one_way_emulator._blog_warning",
+        lambda msg, *args, **_kw: warnings.append(args),
+    )
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=None, mintick=0.01)
+
+    for _ in range(3):
+        _run(eng.run_exit_bracket(
+            _exit_env("TR", "Long", trail=10.0, trail_price=1.15), port))
+    assert len(warnings) == 1
+    assert len(port.amended) == 3
+
+    # A different exit is its own limitation instance.
+    _run(eng.run_exit_bracket(
+        _exit_env("TR2", "Long", trail=10.0, trail_price=1.15), port))
+    assert [w[1] for w in warnings] == ["TR", "TR2"]
 
 
 def __test_run_exit_bracket_flat_skips__():

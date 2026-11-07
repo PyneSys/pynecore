@@ -873,6 +873,11 @@ def live_ohlcv_generator(
         # False on the first synth-skip in a closed period (emits a single
         # INFO log) and back to True when a real bar arrives.
         market_open_state = True
+        # Backpressure episode: ``True`` from the first lag report until the
+        # queue drains, so a lagging consumer is reported once per episode
+        # rather than once per bar; the peak depth goes into the drain line.
+        backpressure_reported = False
+        backpressure_peak = 0
         # Wall-clock of the last REAL ``watch_ohlcv`` update (closed bar or
         # intra-bar tick). The feed-liveness watchdog measures staleness
         # against this — ``last_closed_bar`` is unusable for that because
@@ -1282,16 +1287,42 @@ def live_ohlcv_generator(
                         # can still take meaningful time when the consumer
                         # is busy. Warn so the live log preserves the
                         # evidence next time a synth-laden run happens.
+                        # A bar that closed more than a missed-bar deadline
+                        # ago is catch-up (the provider re-delivering the
+                        # bars of an outage, live: ctrader cycle 358,
+                        # 2026-11-07, ~130 bars after a 2h venue outage):
+                        # the queue is deep because the bars arrive in one
+                        # burst, not because the consumer lags.
                         qsize_before = bar_queue.qsize()
                         put_t0 = time.monotonic()
                         bar_queue.put(bar_update)
                         put_ms = (time.monotonic() - put_t0) * 1000.0
-                        if qsize_before > 50 or put_ms > 100.0:
-                            broker_warning(
-                                "bar_queue backpressure: qsize_before=%d "
-                                "put_ms=%.1f ts=%d",
-                                qsize_before, put_ms, bar_update.timestamp,
+                        catching_up = (
+                            time.time() * 1000.0 - bar_update.timestamp
+                            > 2 * tf_ms + bar_grace_ms
+                        )
+                        lagging = put_ms > 100.0 or (
+                            qsize_before > 50 and not catching_up
+                        )
+                        if lagging:
+                            backpressure_peak = max(
+                                backpressure_peak, qsize_before,
                             )
+                            if not backpressure_reported:
+                                broker_warning(
+                                    "bar_queue backpressure: qsize_before=%d "
+                                    "put_ms=%.1f ts=%d — the strategy is "
+                                    "falling behind the live feed",
+                                    qsize_before, put_ms, bar_update.timestamp,
+                                )
+                                backpressure_reported = True
+                        elif backpressure_reported and qsize_before <= 50:
+                            broker_info(
+                                "bar_queue backpressure cleared (peak "
+                                "qsize=%d)", backpressure_peak,
+                            )
+                            backpressure_reported = False
+                            backpressure_peak = 0
                     else:
                         # Remember the latest forming bar BEFORE the queue
                         # soft-cap. Finalisation state must not depend on

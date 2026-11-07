@@ -2,6 +2,7 @@
 Tests for the live runner async/sync bridge.
 """
 import asyncio
+import logging
 import threading
 import time
 from datetime import UTC, datetime, time as datetime_time, timedelta
@@ -992,6 +993,56 @@ def __test_queue_overflow_preserves_closed_bars__():
     assert len(closed_received) == 2
     assert closed_received[0].close == 150.0
     assert closed_received[1].close == 250.0
+
+
+class _BurstProvider(MockLiveProvider):
+    """Delivers every bar at once and flags when the stream is exhausted."""
+
+    def __init__(self, bar_updates: list[OHLCV]):
+        super().__init__(bar_updates)
+        self.delivered = threading.Event()
+
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
+        if self._index >= len(self._bar_updates):
+            self.delivered.set()
+            raise asyncio.CancelledError()
+        bar = self._bar_updates[self._index]
+        self._index += 1
+        return bar
+
+
+def _drain_with_stalled_consumer(provider: _BurstProvider) -> list:
+    """Hold the consumer after its first item until the producer queued every bar."""
+    gen = live_ohlcv_generator(provider, "BTC/USDT", "1")
+    items = [next(gen)]
+    assert provider.delivered.wait(10.0)
+    items.extend(gen)
+    return [item for item in items if item is not LIVE_TRANSITION]
+
+
+def _backpressure_warnings(caplog) -> list:
+    return [r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'bar_queue backpressure' in r.getMessage()]
+
+
+def __test_bar_queue_backpressure_is_reported_once_per_episode__(caplog):
+    """A consumer that falls behind live bars is reported once, not per bar."""
+    caplog.set_level(logging.INFO)
+    now_ms = int(time.time() * 1000)
+    bars = [_make_ohlcv(now_ms + i * 60_000) for i in range(120)]
+    received = _drain_with_stalled_consumer(_BurstProvider(bars))
+    assert len(received) == 120
+    assert len(_backpressure_warnings(caplog)) == 1
+
+
+def __test_bar_queue_catch_up_burst_is_not_backpressure__(caplog):
+    """Bars re-delivered after an outage queue up in one burst: no lag warning."""
+    caplog.set_level(logging.INFO)
+    start_ms = int(time.time() * 1000) - 3 * 3600 * 1000
+    bars = [_make_ohlcv(start_ms + i * 60_000) for i in range(120)]
+    received = _drain_with_stalled_consumer(_BurstProvider(bars))
+    assert len(received) == 120
+    assert _backpressure_warnings(caplog) == []
 
 
 # --- normalize_symbol tests ---
