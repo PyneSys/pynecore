@@ -7850,8 +7850,13 @@ def __test_external_reduction_consuming_a_pyramid_parent_retires_it__():
     assert f"L2-X{INTENT_KEY_SEP}L2" in engine.active_intents
 
 
-def __test_external_reduction_is_not_adopted_while_our_own_close_is_in_flight__():
-    """A dispatched close explains the smaller venue size: no adoption, the fill will."""
+def __test_external_reduction_is_not_adopted_while_our_own_close_is_in_flight__(caplog):
+    """A dispatched close explains the smaller venue size: no adoption, the fill will.
+
+    Nor a warning: live (ctrader cycle 360, 2026-11-07) a three-leg reversal
+    close was netted on the venue while its fills were still streaming in,
+    and every reversal logged "confirming the external reduction".
+    """
     from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S
 
     b = MockBroker()
@@ -7867,10 +7872,12 @@ def __test_external_reduction_is_not_adopted_while_our_own_close_is_in_flight__(
         symbol=SYMBOL, side="long", size=0.6, entry_price=50_000.0,
         unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cross",
     )
-    engine.reconcile()
-    _age_shrink_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
-    engine.reconcile()
+    with caplog.at_level(logging.WARNING):
+        engine.reconcile()
+        _age_shrink_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+        engine.reconcile()
     assert pos.size == 1.0
+    assert not [r for r in caplog.records if "external reduction" in r.getMessage()]
 
     # The close fill lands and the book agrees with the venue; the observation is dropped.
     engine._route_event(  # type: ignore[attr-defined]
@@ -7879,6 +7886,43 @@ def __test_external_reduction_is_not_adopted_while_our_own_close_is_in_flight__(
     assert pos.size == pytest.approx(0.6)
     engine.reconcile()
     assert engine._shrink_observed is None  # type: ignore[attr-defined]
+
+
+def __test_a_shrink_left_after_our_close_settles_is_reported_once__(caplog):
+    """The shrink notice waits for our own work, then appears once, before the adoption."""
+    from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -0.4, order_type=_order_type_close, exit_id="Close position order",
+    )
+    engine.sync(BAR_TS + 60_000)
+    _list_resting_stops(b, engine, pos)
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.6, entry_price=50_000.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cross",
+    )
+
+    def notices() -> int:
+        return len([r for r in caplog.records
+                    if r.levelno == logging.WARNING
+                    and "confirming the external reduction" in r.getMessage()])
+
+    with caplog.at_level(logging.WARNING):
+        engine.reconcile()
+        assert notices() == 0
+        # Our close is gone from the engine without a fill that explains the venue.
+        engine.active_intents.pop("", None)
+        engine.order_mapping.pop("", None)
+        engine.reconcile()
+        engine.reconcile()
+        assert notices() == 1 and pos.size == 1.0
+        _age_shrink_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+        engine.reconcile()
+    assert pos.size == pytest.approx(0.6)
+    assert notices() == 1
 
 
 def _age_unbooked_exit_observation(engine, seconds: float) -> None:
@@ -8353,6 +8397,70 @@ def __test_flat_close_retires_journal_only_adopted_legs__(tmp_path):
             getattr(env.intent, 'from_entry', None) == "L1"
             for env in b.cancel_calls
         )
+
+
+def __test_flat_close_retires_journal_only_legs_with_a_leg_suffixed_key__(tmp_path):
+    """Leg rows keyed ``<exit>\\0<from_entry>\\0TP`` / ``\\0SL`` retire as their one exit.
+
+    Capital.com journals each bracket leg under the exit's key plus a leg
+    suffix. The durable recovery split such a key at its first separator,
+    so the exit's ``from_entry`` read ``L1\\0TP`` and never matched the
+    closed parent: the adopted legs were never cancelled, stayed live, and
+    every later flat book re-flagged the parent as an orphan (measured
+    live: capitalcom cycle 381, 45 warnings in one cycle; cycle 385, four).
+    """
+    from decimal import Decimal
+
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.run_identity import RunIdentity
+    from pynecore.types.strategy import ADOPTED_STARTUP_ENTRY_ID
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(
+                strategy_id="t025", symbol=SYMBOL, timeframe="60",
+                account_id="testbroker-demo", label=None,
+            ),
+            script_source="src", script_path="t025.py",
+        )
+        b = MockBroker()
+        b.spot_inventory_port = SimpleNamespace(
+            position_dust_threshold=Decimal("0.00001"),
+        )
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=0.01, store_ctx=ctx,
+        )
+        pos.size = 0.01
+        pos.sign = 1.0
+        pos.avg_price = 2500.0
+        pos.reconstruct_parent_trade(
+            entry_id=ADOPTED_STARTUP_ENTRY_ID, size=0.01, entry_price=2500.0,
+        )
+        ctx.upsert_order(
+            "test-l1x-t0", symbol=SYMBOL, side="sell", qty=0.01,
+            state="confirmed", intent_key="L1-X\0L1\0TP",
+            from_entry="L1", pine_entry_id="L1", tp_level=2514.46,
+            extras={"leg_kind": "tp", "parent_deal_id": "D-1"},
+        )
+        ctx.upsert_order(
+            "test-l1x-s0", symbol=SYMBOL, side="sell", qty=0.01,
+            state="confirmed", intent_key="L1-X\0L1\0SL",
+            from_entry="L1", pine_entry_id="L1", sl_level=2431.03,
+            extras={"leg_kind": "sl", "parent_deal_id": "D-1"},
+        )
+        engine.sync(BAR_TS)
+
+        engine._route_event(  # type: ignore[attr-defined]
+            _fill_event('sell', 0.01, 2494.87, pine_id="",
+                        leg=LegType.CLOSE, xchg_id="xchg-close"))
+
+        assert pos.size == 0.0
+        cancels = [env.intent for env in b.cancel_calls
+                   if getattr(env.intent, 'from_entry', None) == "L1"]
+        assert [(c.pine_id, c.from_entry) for c in cancels] == [("L1-X", "L1")]
 
 
 def __test_flat_close_spares_journal_legs_of_an_opening_parent__(tmp_path):
@@ -17212,6 +17320,29 @@ def __test_failsafe_lifecycle_events_reach_the_broker_log_without_a_sink__(caplo
     assert any('ownership -> UNKNOWN' in m for m in messages)
 
 
+def __test_routine_failsafe_transitions_are_info_degradation_warns__(caplog):
+    """Retiring with the closed position or confirming the protection is routine.
+
+    Measured live: every closed position logged "native fail-safe healthy ->
+    retired ... dealId disappeared" as a WARNING (14 in the last 30 cycles).
+    """
+    from pynecore.core.broker.models import NativeFailsafeStateTransitionEvent
+
+    b = MockBroker()
+    engine, _ = _mk_engine(b)
+
+    with caplog.at_level(logging.INFO, logger="pyne_core_logger"):
+        for from_state, to_state in (("healthy", "retired"), ("degrading", "healthy"),
+                                     ("healthy", "degrading"), ("degrading", "degraded")):
+            engine._emit_broker_event(NativeFailsafeStateTransitionEvent(  # noqa: SLF001
+                parent_entry_dispatch_ref='ref-1', symbol=SYMBOL,
+                from_state=from_state, to_state=to_state, reason='r',
+            ))
+
+    assert [r.levelno for r in caplog.records if "native fail-safe" in r.getMessage()] == [
+        logging.INFO, logging.INFO, logging.WARNING, logging.WARNING]
+
+
 def __test_parent_labelled_tp_fill_retires_the_consumed_entrys_tracking__():
     """A TP fill labelled with the PARENT's pine_id must retire that parent.
 
@@ -17767,7 +17898,32 @@ def __test_stale_pending_partial_legs_are_not_promoted_by_the_new_parent_fill__(
         assert not engine._partial_bracket_engine.has_active_partial_bracket(SYMBOL, "L")  # type: ignore[attr-defined]
 
 
-def __test_venue_reduce_only_cancel_with_reason_is_trimmed_not_quarantined__():
+def __test_venue_reduce_only_cancel_beside_its_sibling_fill_is_info__(caplog):
+    """An SL hit that cancels its own reduce-only TP is the bracket working, not a warning.
+
+    Measured live (bybit-inverse cycle 336): every bracket exit logged
+    "exit leg ... cancelled by the venue itself (venue_reduce_only)" as a
+    WARNING, because the venue tags the OCA fallout of the sibling's fill with
+    its reduce-only reason. A lone cancel (no own sibling fill) still warns.
+    """
+    b = MockBroker()
+    engine, pos, tp_id, sl_id = _mk_two_leg_bracket_without_close(b)
+
+    with caplog.at_level(logging.INFO):
+        engine.on_order_event(replace(
+            _reduce_only_cancel_event(tp_id),
+            cancel_reason=CANCEL_REASON_VENUE_REDUCE_ONLY,
+        ))
+        engine.on_order_event(_sl_leg_fill_event(sl_id))
+        engine._drain_events()
+
+    assert not engine._quarantined
+    assert pos.size == 0.0
+    trimmed = [r for r in caplog.records if "exit leg TP" in r.getMessage()]
+    assert [r.levelno for r in trimmed] == [logging.INFO]
+
+
+def __test_venue_reduce_only_cancel_with_reason_is_trimmed_not_quarantined__(caplog):
     """A cancel the venue attributes to its own reduce-only handling is never
     an external cancel, whatever else sits in the drain batch.
 
@@ -17782,14 +17938,17 @@ def __test_venue_reduce_only_cancel_with_reason_is_trimmed_not_quarantined__():
     b = MockBroker()
     engine, _, tp_id, sl_id = _mk_two_leg_bracket_without_close(b)
 
-    engine._route_event(replace(
-        _reduce_only_cancel_event(tp_id),
-        cancel_reason=CANCEL_REASON_VENUE_REDUCE_ONLY,
-    ))
+    with caplog.at_level(logging.WARNING):
+        engine._route_event(replace(
+            _reduce_only_cancel_event(tp_id),
+            cancel_reason=CANCEL_REASON_VENUE_REDUCE_ONLY,
+        ))
 
     assert not engine._quarantined
     assert engine.order_mapping.get("TP\0L") == [sl_id]
     assert "TP\0L" in engine.active_intents
+    assert [r.levelno for r in caplog.records
+            if "cancelled by the venue itself" in r.getMessage()] == [logging.WARNING]
 
 
 def __test_venue_driven_cancel_of_a_spot_exit_leg_is_trimmed_not_quarantined__():

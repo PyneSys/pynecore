@@ -1826,6 +1826,11 @@ class OrderSyncEngine:
         # monotonic time it was first seen at that size — the confirmation
         # window of :meth:`_adopt_external_shrink`.
         self._shrink_observed: tuple[float, float] | None = None
+        # Whether the operator was told about the observed shrink. The notice
+        # waits until nothing of ours is in flight: a multi-leg close the
+        # venue already netted while its fills are still streaming in is the
+        # bot's own trade, not a reduction to confirm.
+        self._shrink_reported = False
         # The reduction :meth:`_adopt_external_shrink` booked without a fill
         # that a late fill may still explain: its unexplained quantity, the
         # side that reduces the book, and the venue ids of the orders that
@@ -6744,18 +6749,23 @@ class OrderSyncEngine:
             self._shrink_observed = None
             return
         observed = self._shrink_observed
-        if observed is None or observed[0] != venue_abs:
-            self._shrink_observed = (venue_abs, now)
+        first_sighting = observed is None or observed[0] != venue_abs
+        if observed is None or first_sighting:
+            observed = (venue_abs, now)
+            self._shrink_observed = observed
+            self._shrink_reported = False
+        in_flight = self._position_work_in_flight()
+        if not in_flight and not self._shrink_reported:
+            self._shrink_reported = True
             _blog_warning(
                 "exchange holds %s but the book %s — confirming the external "
                 "reduction of %s over the next %.0fs before adopting it",
                 venue_abs, self._position.size, delta, grace,
             )
-            return
-        if (now - observed[1] < grace
+        if (first_sighting or now - observed[1] < grace
                 or now - self._last_position_fill_monotonic < grace):
             return
-        if self._position_work_in_flight():
+        if in_flight:
             return
         if self._fill_recovery_holds(observed[1], now):
             return
@@ -9240,11 +9250,23 @@ class OrderSyncEngine:
                 # external cancel: trim the dead leg, keep the intent on its
                 # live sibling (or retire it when this was the last leg, so
                 # the next sync re-arms the protection), no quarantine.
-                _blog_warning(
-                    "exit leg %s cancelled by the venue itself (%s) — trimming "
-                    "the dead leg, no quarantine",
-                    format_intent_key(key), event.cancel_reason,
-                )
+                # The common case is the plain OCA fallout of the same
+                # bracket's other leg filling in this drain batch (an SL hit
+                # cancels its reduce-only TP): that is the bracket working as
+                # designed, logged at INFO; only a cancel no own sibling fill
+                # explains is worth a warning.
+                if self._is_oca_sibling_fill_queued(event, key):
+                    _blog_info(
+                        "exit leg %s cancelled by the venue (%s) alongside its "
+                        "sibling leg's fill — expected, trimming the dead leg",
+                        format_intent_key(key), event.cancel_reason,
+                    )
+                else:
+                    _blog_warning(
+                        "exit leg %s cancelled by the venue itself (%s) — trimming "
+                        "the dead leg, no quarantine",
+                        format_intent_key(key), event.cancel_reason,
+                    )
                 self._trim_cancelled_bracket_leg(event, key)
                 if self._store_ctx is not None:
                     self._store_ctx.log_event(
@@ -11902,9 +11924,14 @@ class OrderSyncEngine:
                 if (row.intent_key is None
                         or (row.tp_level is None and row.sl_level is None)):
                     continue
-                key = row.intent_key
-                if INTENT_KEY_SEP not in key:
-                    pine_id = row.pine_entry_id or key
+                exit_pine_id, separator, rest = row.intent_key.partition(INTENT_KEY_SEP)
+                if separator:
+                    # A per-leg row may carry a leg suffix after the exit's own
+                    # key (Capital.com: ``<exit>\0<from_entry>\0TP`` / ``\0SL``);
+                    # both legs belong to the one exit ``<exit>\0<from_entry>``.
+                    key = f'{exit_pine_id}{INTENT_KEY_SEP}{rest.partition(INTENT_KEY_SEP)[0]}'
+                else:
+                    pine_id = row.pine_entry_id or row.intent_key
                     key = f'{pine_id}{INTENT_KEY_SEP}{closed_entry_id}'
                 recovered = durable_exits.setdefault(key, {
                     'side': row.side,
@@ -12244,7 +12271,13 @@ class OrderSyncEngine:
         that secondary symptom.
         """
         if isinstance(event, NativeFailsafeStateTransitionEvent):
-            _blog_warning(
+            # Confirming or recovering the protection and retiring it with
+            # its closed position are the lifecycle's routine steps; only a
+            # transition into degradation is a warning.
+            log = (_blog_info
+                   if event.to_state in (FailsafeHealth.HEALTHY, FailsafeHealth.RETIRED)
+                   else _blog_warning)
+            log(
                 "native fail-safe %s -> %s on %s (parent %r): %s",
                 event.from_state, event.to_state, event.symbol,
                 event.parent_entry_dispatch_ref, event.reason,
