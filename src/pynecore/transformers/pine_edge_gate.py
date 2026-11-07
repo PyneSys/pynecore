@@ -42,7 +42,7 @@ __all__ = ['EDGE_RULES_VERSION', 'STRICT_ENV', 'DIAG_ENV', 'edge_rules', 'strict
 
 #: The profile revision this gate was written against. ``edge_rules.json``
 #: must carry the same one.
-EDGE_RULES_VERSION: Final = '2026.10.2'
+EDGE_RULES_VERSION: Final = '2026.11.1'
 
 #: ``1`` makes an edge module's first diagnostic an error, ``0`` never
 #: does; unset is ``0`` until the corpus is clean enough to flip the default.

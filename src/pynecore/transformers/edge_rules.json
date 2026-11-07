@@ -23,7 +23,6 @@
     "min",
     "print",
     "range",
-    "round",
     "str"
   ],
   "class_decorators": [
@@ -132,7 +131,7 @@
     "arg",
     "keyword"
   ],
-  "rules_version": "2026.10.2",
+  "rules_version": "2026.11.1",
   "unary_ops": [
     "Not",
     "UAdd",
