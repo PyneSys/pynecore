@@ -948,6 +948,7 @@ def _drop_discarded_run(drawing_snapshot: DrawingSnapshot) -> None:
     lib._plot_data.clear()
     lib._viz_dyn.clear()
     lib._viz_seq.clear()
+    lib._plot_ids.clear()
 
 
 def _security_group(sid: str, contexts: dict) -> tuple[str, int] | None:
@@ -3767,6 +3768,7 @@ class ScriptRunner:
                 lib._plot_data.clear()
                 lib._viz_dyn.clear()
                 lib._viz_seq.clear()
+                lib._plot_ids.clear()
 
                 if on_progress and lib._datetime is not None:
                     on_progress(lib._datetime.replace(tzinfo=None))
@@ -4115,6 +4117,7 @@ class ScriptRunner:
                             lib._plot_data.clear()
                             lib._viz_dyn.clear()
                             lib._viz_seq.clear()
+                            lib._plot_ids.clear()
                             # Restart settle: this branch runs the script BEFORE
                             # sync (so a bar-close order dispatches same-bar), but
                             # on the first bar after a restart the Pine order book
@@ -4168,6 +4171,7 @@ class ScriptRunner:
                             lib._plot_data.clear()
                             lib._viz_dyn.clear()
                             lib._viz_seq.clear()
+                            lib._plot_ids.clear()
                             _run_libs_and_main()
 
                             # Fill immediate closes enqueued during the body, at
@@ -4193,6 +4197,7 @@ class ScriptRunner:
                         lib._plot_data.clear()
                         lib._viz_dyn.clear()
                         lib._viz_seq.clear()
+                        lib._plot_ids.clear()
 
                         last_bar_timestamp = candle.timestamp
                         barstate.isfirst = False
@@ -4694,6 +4699,7 @@ class ScriptRunner:
             lib._plot_data.clear()
             lib._viz_dyn.clear()
             lib._viz_seq.clear()
+            lib._plot_ids.clear()
 
             # Call the progress callback
             if on_progress and lib._datetime is not None:

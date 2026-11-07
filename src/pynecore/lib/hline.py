@@ -49,9 +49,7 @@ def hline(
     if lib._in_lib_main:
         return NA(HLine)
 
-    n = lib._viz_seq.get('hline', 0)
-    lib._viz_seq['hline'] = n + 1
-    hid = f'hline#{n}'
+    hid = lib._seq_id('hline')
     t = title or None
     if hid not in lib._plot_meta:
         meta = PlotMeta(id=hid, kind='hline', title=t, price=price, color=color,

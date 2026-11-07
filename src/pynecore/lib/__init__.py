@@ -187,6 +187,7 @@ _plot_meta: _PlotMetaRegistry = _PlotMetaRegistry()  # insertion order = registr
 _plot_meta_new: list[PlotMeta] = []  # pending metas, drained only by the viz writer
 _viz_dyn: dict[str, Any] = {}  # per-bar dynamic channels, cleared with _plot_data
 _viz_seq: dict[str, int] = {}  # per-bar ordinal counters for bgcolor/barcolor/fill/hline
+_plot_ids: set[str] = set()  # per-bar claimed meta ids and data keys, cleared with _viz_seq
 
 # Extra fields from CSV data (beyond OHLCV), populated each bar by ScriptRunner
 extra_fields: dict[str, Any] = {}
@@ -509,13 +510,60 @@ def timestamp(year: int | float, month: int | float, day: int | float, hour: int
 ### Plotting ###
 
 def _uniq_title(title: str) -> str:
-    """Return a title unique against the current bar's ``_plot_data`` keys."""
+    """
+    Claim and return a title not yet used as a meta id or data key in the current bar.
+
+    A taken title gets a number appended (``title 0``, ``title 1``, ...).
+    """
     c = 0
     t = title
-    while t in _plot_data:
+    while t in _plot_ids:
         t = title + ' ' + str(c)
         c += 1
+    _plot_ids.add(t)
     return t
+
+
+def _uniq_ohlc_title(title: str) -> tuple[str, str, str, str, str]:
+    """
+    Claim a ``plotcandle`` / ``plotbar`` title and its four channel keys for the current bar.
+
+    The title is numbered like :func:`_uniq_title` until neither it nor any of its
+    ``<title> (open|high|low|close)`` keys is taken.
+
+    :return: The title and its open, high, low and close data keys
+    """
+    c = 0
+    t = title
+    while True:
+        ko = t + ' (open)'
+        kh = t + ' (high)'
+        kl = t + ' (low)'
+        kc = t + ' (close)'
+        if t not in _plot_ids and ko not in _plot_ids and kh not in _plot_ids \
+                and kl not in _plot_ids and kc not in _plot_ids:
+            break
+        t = title + ' ' + str(c)
+        c += 1
+    _plot_ids.update((t, ko, kh, kl, kc))
+    return t, ko, kh, kl, kc
+
+
+def _seq_id(kind: str) -> str:
+    """
+    Claim and return the next ``<kind>#<n>`` meta id of the current bar.
+
+    ``n`` counts the calls of ``kind`` in call order, skipping an id a plot title
+    already took, so the id stays stable across bars.
+    """
+    n = _viz_seq.get(kind, 0)
+    key = kind + '#' + str(n)
+    while key in _plot_ids:
+        n += 1
+        key = kind + '#' + str(n)
+    _viz_seq[kind] = n + 1
+    _plot_ids.add(key)
+    return key
 
 
 def _auto_viz_title(seq_key: str, base: str) -> str:
@@ -704,16 +752,11 @@ def plotcandle(open: Any, high: Any, low: Any, close: Any, title: str | None = N
     """
     if _lib_semaphore:
         return
-    base = 'Candles' if title is None else title
-    c = 0
-    t = base
-    while f"{t} (open)" in _plot_data:
-        t = base + ' ' + str(c)
-        c += 1
-    _plot_data[f"{t} (open)"] = open
-    _plot_data[f"{t} (high)"] = high
-    _plot_data[f"{t} (low)"] = low
-    _plot_data[f"{t} (close)"] = close
+    t, ko, kh, kl, kc = _uniq_ohlc_title('Candles' if title is None else title)
+    _plot_data[ko] = open
+    _plot_data[kh] = high
+    _plot_data[kl] = low
+    _plot_data[kc] = close
     meta = _plot_meta.get(t)
     if meta is None:
         meta = PlotMeta(id=t, kind='candle', title=t, color=color, wickcolor=wickcolor,
@@ -757,16 +800,11 @@ def plotbar(open: Any, high: Any, low: Any, close: Any, title: str | None = None
     """
     if _lib_semaphore:
         return
-    base = 'Bars' if title is None else title
-    c = 0
-    t = base
-    while f"{t} (open)" in _plot_data:
-        t = base + ' ' + str(c)
-        c += 1
-    _plot_data[f"{t} (open)"] = open
-    _plot_data[f"{t} (high)"] = high
-    _plot_data[f"{t} (low)"] = low
-    _plot_data[f"{t} (close)"] = close
+    t, ko, kh, kl, kc = _uniq_ohlc_title('Bars' if title is None else title)
+    _plot_data[ko] = open
+    _plot_data[kh] = high
+    _plot_data[kl] = low
+    _plot_data[kc] = close
     meta = _plot_meta.get(t)
     if meta is None:
         meta = PlotMeta(id=t, kind='bar', title=t, color=color, editable=editable,
@@ -802,9 +840,7 @@ def bgcolor(color: Any = None, offset: int = 0, editable: bool = True, show_last
         return
     if title is None:
         title = _auto_viz_title('bgcolor:title', 'Background color')
-    n = _viz_seq.get('bgcolor', 0)
-    _viz_seq['bgcolor'] = n + 1
-    key = f'bgcolor#{n}'
+    key = _seq_id('bgcolor')
     meta = _plot_meta.get(key)
     if meta is None:
         meta = PlotMeta(id=key, kind='bgcolor', title=title, offset=offset, editable=editable,
@@ -833,9 +869,7 @@ def barcolor(color: Any = None, offset: int = 0, editable: bool = True, show_las
         return
     if title is None:
         title = _auto_viz_title('barcolor:title', 'Bar color')
-    n = _viz_seq.get('barcolor', 0)
-    _viz_seq['barcolor'] = n + 1
-    key = f'barcolor#{n}'
+    key = _seq_id('barcolor')
     meta = _plot_meta.get(key)
     if meta is None:
         meta = PlotMeta(id=key, kind='barcolor', title=title, offset=offset, editable=editable,
@@ -918,9 +952,7 @@ def fill(*args: Any, **kwargs: Any) -> None:
     bottom_value = kwargs.get('bottom_value')
     top_color = kwargs.get('top_color')
     bottom_color = kwargs.get('bottom_color')
-    n = _viz_seq.get('fill', 0)
-    _viz_seq['fill'] = n + 1
-    key = f'fill#{n}'
+    key = _seq_id('fill')
     meta = _plot_meta.get(key)
     created = meta is None
     if meta is None:

@@ -69,14 +69,15 @@ def plot(series: Any, title: str | None = None, color: Any = None, linewidth: in
     if lib._lib_semaphore:
         return Plot('')
 
-    # Ensure unique title
+    # Unique among the meta ids and data keys of this bar; numbered when taken
     title: str = 'Plot' if title is None else title
-    # Handle duplicate titles
+    ids = lib._plot_ids
     c = 0
     t: str = title
-    while t in lib._plot_data:
+    while t in ids:
         t = title + ' ' + str(c)
         c += 1
+    ids.add(t)
 
     lib._plot_data[t] = series
     meta = lib._plot_meta.get(t)

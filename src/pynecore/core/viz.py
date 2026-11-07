@@ -551,6 +551,7 @@ def reset_state() -> None:
     lib._plot_meta_new.clear()
     lib._viz_dyn.clear()
     lib._viz_seq.clear()
+    lib._plot_ids.clear()
     _line_mod._registry.clear()
     _label_mod._registry.clear()
     _box_mod._registry.clear()
