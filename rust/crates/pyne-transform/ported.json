@@ -13,7 +13,7 @@
   },
   "BuiltinShadow": {
     "module": "builtin_shadow",
-    "digest": "4fda1f411027b2c54f79e79a07ad87e3b647e95a9791eea82d953aa368a19bdc"
+    "digest": "0f1a58e09d7992bc66606cc9941b8a977599c032c4803f072461fb8eaf8231a5"
   },
   "ImportNormalizer": {
     "module": "import_normalizer",
@@ -73,7 +73,7 @@
   },
   "TaVariableHoist": {
     "module": "ta_variable_hoist",
-    "digest": "a387d0b5fd8ce20ae62b770850d450d052fadfb00445a2ad21ef86f8f6e43979"
+    "digest": "11c3f617381909c33c982077acab885b2cf6cb87fce4472e23efad241dfeb5b8"
   },
   "ClosureArguments": {
     "module": "closure_arguments_transformer",
@@ -81,7 +81,7 @@
   },
   "PineType": {
     "module": "pine_type_transformer",
-    "digest": "990cdc6bbca8a381864db196bd73427668e26e972ee791fc70eb7220e2d7db65"
+    "digest": "2b8a27a170328ca66abccc3e3ba14f0b4e02482467e1703c8a621f390a70a234"
   },
   "ImplicitConversion": {
     "module": "implicit_conversion",
@@ -121,7 +121,7 @@
   },
   "FunctionIsolation": {
     "module": "function_isolation",
-    "digest": "84e449cf927a6d8f740e835d7ba3e751da97354333d4f7833a2059486394f955"
+    "digest": "27fa6cc3bc0efe43a06efefaa4823b09a4a564e51108168dc13395bc02c94285"
   },
   "ScriptRequirements": {
     "module": "script_requirements",

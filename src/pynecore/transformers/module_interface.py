@@ -329,8 +329,11 @@ def _module_all(tree: ast.Module) -> tuple[str, ...] | None:
             continue
         if not isinstance(value, (ast.List, ast.Tuple)):
             continue
-        found = tuple(element.value for element in value.elts
-                      if isinstance(element, ast.Constant) and isinstance(element.value, str))
+        names: list[str] = []
+        for element in value.elts:
+            if isinstance(element, ast.Constant) and isinstance(element.value, str):
+                names.append(element.value)
+        found = tuple(names)
     return found
 
 
@@ -423,7 +426,7 @@ def _unlined(payload: dict) -> dict:
     :param payload: The serialized signature
     :return: The same, without ``line``
     """
-    return {field: value for field, value in payload.items() if field != 'line'}
+    return {key: value for key, value in payload.items() if key != 'line'}
 
 
 def source_digest(source: bytes) -> str:
@@ -814,8 +817,8 @@ def call_plan(tree: ast.Module) -> CallPlan:
                 continue
         elif isinstance(node, ast.ClassDef):
             decorators = node.decorator_list
-            udt = len(decorators) == 1 and isinstance(decorators[0], ast.Name) \
-                and _bound_to(found, decorators[0].id, _UDT, final.index)
+            only = decorators[0] if len(decorators) == 1 else None
+            udt = isinstance(only, ast.Name) and _bound_to(found, only.id, _UDT, final.index)
             if not decorators or udt:
                 _plan_class(plan, found, name, node, final.index, udt)
                 continue

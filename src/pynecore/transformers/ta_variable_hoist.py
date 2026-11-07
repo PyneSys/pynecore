@@ -100,8 +100,11 @@ class TaVariableHoistTransformer(ast_walk.NodeTransformer):
         return f'__ta·{name}'
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
-        main = next((stmt for stmt in node.body
-                     if isinstance(stmt, ast.FunctionDef) and stmt.name == 'main'), None)
+        main: ast.FunctionDef | None = None
+        for stmt in node.body:
+            if isinstance(stmt, ast.FunctionDef) and stmt.name == 'main':
+                main = stmt
+                break
         if main is None:
             return node
         self.is_library = self._is_library_main(main)
