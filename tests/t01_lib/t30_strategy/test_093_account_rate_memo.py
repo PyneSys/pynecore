@@ -255,9 +255,12 @@ def __test_percent_commission_ignores_another_scripts_rate__(script_path, module
     # in a process running several scripts the module-level rate can still belong to a
     # converting one. A non-converting run's commission must not pick it up.
     strat = sys.modules['pynecore.lib.strategy']
-    saved = (lib._script, lib.bar_index, lib.barstate.isrealtime, lib.syminfo.currency)
-    # The chart symbol is quoted in USDT, whatever an earlier test of the process left
+    saved = (lib._script, lib.bar_index, lib.barstate.isrealtime, lib.syminfo.currency,
+             lib.syminfo.pointvalue)
+    # The chart symbol is quoted in USDT with a unit point value, whatever an earlier test
+    # of the process left -- or the module default of 0.0 when no run came before
     lib.syminfo.currency = 'USDT'
+    lib.syminfo.pointvalue = 1.0
     saved_rate = request.currency_rate
 
     class _PlainScript:
@@ -288,5 +291,6 @@ def __test_percent_commission_ignores_another_scripts_rate__(script_path, module
         assert booked == 1.0, f"expected 1.0 unconverted, got {booked}"
     finally:
         request.currency_rate = saved_rate
-        lib._script, lib.bar_index, lib.barstate.isrealtime, lib.syminfo.currency = saved
+        (lib._script, lib.bar_index, lib.barstate.isrealtime, lib.syminfo.currency,
+         lib.syminfo.pointvalue) = saved
         strat._reset_currency_state()
