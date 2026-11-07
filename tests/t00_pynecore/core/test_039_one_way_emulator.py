@@ -33,6 +33,7 @@ from pynecore.core.broker.models import (
     PositionLeg,
 )
 from pynecore.core.broker.one_way_emulator import (
+    BOOK_INCOMPLETE_GRACE_DEFERRALS,
     BracketFanResult,
     ClearFanResult,
     CloseFanResult,
@@ -680,6 +681,41 @@ def __test_run_exit_bracket_defers_while_a_sibling_entry_fill_is_pending__(tmp_p
     ))
     assert res.legs == ("10", "11") and res.skipped is False
     assert _amended_levels(port) == [("10", 1.20, 1.00), ("11", 1.20, 1.00)]
+    store.close()
+
+
+def __test_run_exit_bracket_incomplete_book_stalls_after_the_grace__(tmp_path):
+    """The routine fill wait defers quietly; one that outgrows the grace is flagged once.
+
+    Measured live (ctrader cycle 360, pyramid): every pyramid round deferred its
+    new leg's exit for the one or two syncs its fill took to drain, each logged
+    as a WARNING. A wait past :data:`BOOK_INCOMPLETE_GRACE_DEFERRALS` leaves the
+    leg unprotected for real, so exactly that skip is ``stalled``; the counter
+    restarts once the fan passes the gate.
+    """
+    store, ctx = _make_store(tmp_path)
+    _entry_row(ctx, "e-l1", side="buy", qty=1.0, pine_id="L1", leg_id="10", filled=1.0)
+    _entry_row(ctx, "e-l2", side="buy", qty=1.0, pine_id="L2")  # fill pending
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    env = _exit_env("L2-X", "L2", qty=1.0, tp=1.20, sl=1.00)
+
+    results = [_run(eng.run_exit_bracket(env, port))
+               for _ in range(BOOK_INCOMPLETE_GRACE_DEFERRALS + 2)]
+    assert all(r.skipped for r in results)
+    assert [r.stalled for r in results] == (
+        [False] * BOOK_INCOMPLETE_GRACE_DEFERRALS + [True, False])
+    assert "unprotected" in (results[BOOK_INCOMPLETE_GRACE_DEFERRALS].skip_reason or "")
+
+    ctx.upsert_order("e-l2", state=STATE_CONFIRMED, exchange_order_id="11", filled_qty=1.0)
+    port.set_legs([_leg("10", "buy", 1.0, open_time=0.0),
+                   _leg("11", "buy", 1.0, open_time=1.0)])
+    assert _run(eng.run_exit_bracket(env, port)).skipped is False
+    assert not eng._book_incomplete_deferrals  # noqa: SLF001
+    _entry_row(ctx, "e-l3", side="buy", qty=1.0, pine_id="L3")  # next round
+    again = [_run(eng.run_exit_bracket(env, port))
+             for _ in range(BOOK_INCOMPLETE_GRACE_DEFERRALS)]
+    assert [r.stalled for r in again] == [False] * BOOK_INCOMPLETE_GRACE_DEFERRALS
     store.close()
 
 

@@ -46,7 +46,9 @@ from pynecore.core.broker.sync_engine import (
     _BoundedIdSet,
     _CancelTentativeMeta,
     _OPPOSITE_ENTRY_FILL_WAIT_S,
+    _bracket_skip_reason,
 )
+from pynecore.core.broker.one_way_emulator import BracketFanResult
 from pynecore.core.plugin import ProviderError, TransientProviderError
 from pynecore.core.broker.models import (
     CANCEL_REASON_VENUE_REDUCE_ONLY,
@@ -11463,7 +11465,8 @@ def __test_bracket_reject_of_a_level_crossed_at_fill_is_an_immediate_exit__(capl
     ("spot_full_close_pre_clear", logging.INFO),
     ("pre_clear_leg_fill_pending", logging.INFO),
     ("pre_clear_leg_filled", logging.INFO),
-    ("position_book_incomplete", logging.WARNING),
+    ("position_book_incomplete", logging.INFO),
+    ("position_book_incomplete_stalled", logging.WARNING),
     ("parent_entry_disposition_pending", logging.WARNING),
 ])
 def __test_the_bots_own_protocol_steps_are_logged_as_info__(caplog, reason, level):
@@ -11477,6 +11480,17 @@ def __test_the_bots_own_protocol_steps_are_logged_as_info__(caplog, reason, leve
         OrderSyncEngine._log_plugin_skip(OrderSkippedByPlugin(  # noqa
             "skipped", intent_key="k", reason=reason))
     assert [rec.levelno for rec in caplog.records] == [level]
+
+
+def __test_a_skipped_one_way_bracket_maps_to_its_skip_reason__():
+    """Flat book, routine fill wait and stalled fill wait each carry their own reason."""
+    assert _bracket_skip_reason(BracketFanResult(legs=(), skipped=True)) \
+        == "no_position_to_protect"
+    assert _bracket_skip_reason(BracketFanResult(
+        legs=(), skipped=True, skip_reason="waiting")) == "position_book_incomplete"
+    assert _bracket_skip_reason(BracketFanResult(
+        legs=(), skipped=True, skip_reason="stuck", stalled=True,
+    )) == "position_book_incomplete_stalled"
 
 
 def __test_a_reversal_parks_its_entry_without_a_warning__(caplog):

@@ -94,6 +94,12 @@ from pynecore.core.broker.store_helpers import (
     update_close_leg_state,
 )
 
+#: Incomplete-book deferrals of one exit on one pending entry that count as
+#: the routine wait for the entry's fill to drain (live: a pyramid entry's
+#: fill lands within the next one or two syncs). Past it the deferral is a
+#: stall: the newest leg stays unprotected, so the caller warns.
+BOOK_INCOMPLETE_GRACE_DEFERRALS = 3
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -218,10 +224,14 @@ class BracketFanResult:
         no-op; the caller re-evaluates next bar.
     :ivar skip_reason: Human-readable cause for an incomplete-book skip, for
         the caller's skip message; ``None`` for the flat / flipped-side skips.
+    :ivar stalled: ``True`` on the one incomplete-book skip where the wait for
+        the pending entry's fill outgrew :data:`BOOK_INCOMPLETE_GRACE_DEFERRALS`
+        — the deferral is no longer routine and the caller warns.
     """
     legs: tuple[str, ...]
     skipped: bool
     skip_reason: str | None = None
+    stalled: bool = False
 
 
 @dataclass(frozen=True)
@@ -268,6 +278,9 @@ class OneWayEmulator:
         #: is a property of the exit, not of a dispatch: a trailing exit is
         #: re-dispatched on every bar it changes, so it is reported once.
         self._trail_activation_reported: set[tuple[str, str, str | None]] = set()
+        #: Consecutive incomplete-book deferrals per (exit intent key, pending
+        #: entry coid); dropped once the exit's fan passes the gate.
+        self._book_incomplete_deferrals: dict[tuple[object, str], int] = {}
 
     def take_replay_refusals(self) -> list[BracketReplayRefusal]:
         """Hand over (and forget) the brackets the restart replay could not re-assert."""
@@ -686,13 +699,23 @@ class OneWayEmulator:
         if self._store_ctx is not None:
             pending_coid = self._pending_position_entry(protected_side)
             if pending_coid is not None:
+                deferral_key = (intent.intent_key, pending_coid)
+                deferrals = self._book_incomplete_deferrals.get(deferral_key, 0) + 1
+                self._book_incomplete_deferrals[deferral_key] = deferrals
+                stalled = deferrals == BOOK_INCOMPLETE_GRACE_DEFERRALS + 1
                 return BracketFanResult(
                     legs=(), skipped=True,
                     skip_reason=(
                         f"position book incomplete — entry dispatch "
-                        f"{pending_coid!r} has not journaled its fill yet"
+                        f"{pending_coid!r} has not journaled its fill "
+                        + (f"after {deferrals} syncs; its leg stays unprotected "
+                           f"until it does" if stalled else "yet")
                     ),
+                    stalled=stalled,
                 )
+            for deferral_key in [k for k in self._book_incomplete_deferrals
+                                 if k[0] == intent.intent_key]:
+                del self._book_incomplete_deferrals[deferral_key]
         survivors = {leg.leg_id for leg in on_side}
         # A re-attach can narrow the survivor set: a manual hedge or an
         # interrupted reversal opens an opposing leg that virtually FIFO-consumes

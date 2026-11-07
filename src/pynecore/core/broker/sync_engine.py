@@ -151,7 +151,11 @@ from pynecore.core.broker.software_entry_stop_engine import (
     EntryStopWatch,
     SoftwareEntryStopEngine,
 )
-from pynecore.core.broker.one_way_emulator import CloseFanResult, OneWayEmulator
+from pynecore.core.broker.one_way_emulator import (
+    BracketFanResult,
+    CloseFanResult,
+    OneWayEmulator,
+)
 from pynecore.core.broker.storage import (
     EnvelopeRecord,
     OrderRow,
@@ -776,10 +780,22 @@ _INFO_SKIP_REASONS = frozenset({
     'reversal_close_pending',
     'reversal_close_in_flight',
     'no_position_to_protect',
+    # An exit waiting for its same-sync pyramid entry's fill to drain; a wait
+    # that outgrows the grace is ``position_book_incomplete_stalled`` (WARNING).
+    'position_book_incomplete',
     'spot_full_close_pre_clear',
     'pre_clear_leg_fill_pending',
     'pre_clear_leg_filled',
 })
+
+
+def _bracket_skip_reason(bracket: BracketFanResult) -> str:
+    """The :class:`OrderSkippedByPlugin` reason of a skipped one-way bracket fan."""
+    if bracket.skip_reason is None:
+        return 'no_position_to_protect'
+    if bracket.stalled:
+        return 'position_book_incomplete_stalled'
+    return 'position_book_incomplete'
 
 
 @dataclasses.dataclass(slots=True)
@@ -19902,9 +19918,7 @@ class OrderSyncEngine:
                                 f"{bracket.skip_reason or 'no open position-side legs to attach a bracket to'}; "
                                 f"re-evaluating next bar.",
                                 intent_key=intent.intent_key,
-                                reason=("position_book_incomplete"
-                                        if bracket.skip_reason is not None
-                                        else "no_position_to_protect"),
+                                reason=_bracket_skip_reason(bracket),
                                 context={'symbol': intent.symbol,
                                          'from_entry': intent.from_entry},
                             )
@@ -23477,9 +23491,7 @@ class OrderSyncEngine:
                             f"{bracket.skip_reason or 'no open position-side legs to attach a bracket to'}; "
                             f"re-evaluating next bar.",
                             intent_key=new.intent_key,
-                            reason=("position_book_incomplete"
-                                    if bracket.skip_reason is not None
-                                    else "no_position_to_protect"),
+                            reason=_bracket_skip_reason(bracket),
                             context={'symbol': new.symbol,
                                      'from_entry': new.from_entry},
                         )
