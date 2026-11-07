@@ -10,17 +10,17 @@ Communication with the chart process uses shared memory + Events (see security.p
 Two data-source modes (selected by the ``data_source`` arg type):
 
   Backtest / file mode (``str`` path):
-      The subprocess opens a static ``.ohlcv`` file via :class:`OHLCVReader`
+      The subprocess opens a static ``.ohlcv`` file via :class:`~pynecore.core.ohlcv.OHLCVReader`
       and steps through it indexed by ``current_bar``. Used by historical
       runs and same-symbol HTF live runs (where the chart-side aggregator
       ships closed bars over the SyncBlock).
 
   Live cross-symbol mode (:class:`PluginSymbol`):
-      The subprocess instantiates the named :class:`LiveProviderPlugin`,
-      downloads warmup history in-memory via
-      :func:`download_warmup_in_memory`, then streams closed bars from the
-      provider's WS feed via :class:`LiveBarStreamer`. No ``.ohlcv`` file is
-      involved.
+      The subprocess instantiates the named
+      :class:`~pynecore.core.plugin.live_provider.LiveProviderPlugin`, downloads warmup
+      history in-memory via :func:`~pynecore.core.live_runner.download_warmup_in_memory`,
+      then streams closed bars from the provider's WS feed via :class:`LiveBarStreamer`.
+      No ``.ohlcv`` file is involved.
 
 Three flavors of advance are supported, distinguished by SyncBlock flags:
 
@@ -33,8 +33,8 @@ Three flavors of advance are supported, distinguished by SyncBlock flags:
   (2) Live closed bar — FLAG_CLOSED_OVERRIDE is set, FLAG_IS_DEVELOPING is not.
       The chart supplies the closed HTF OHLCV directly via the SyncBlock.
       Used by same-symbol HTF contexts where the chart-side
-      :class:`HTFAggregator` builds the closed bar from the chart's own
-      OHLCV stream.
+      :class:`~pynecore.core.htf_aggregator.HTFAggregator` builds the closed bar from the
+      chart's own OHLCV stream.
 
   (3) Live developing bar — FLAG_IS_DEVELOPING is set. The chart supplies the
       in-progress HTF OHLCV via the SyncBlock. The subprocess re-runs ``main()``
@@ -165,7 +165,7 @@ def _run_rate_source_loop(
 
     Skips Pine import and ``main()`` execution; every chart-side advance
     pushes the next warmup/live ``close`` into the ``ResultBlock`` so the
-    :class:`CurrencyRateProvider` can read it as the live FX rate.
+    :class:`~pynecore.core.currency.CurrencyRateProvider` can read it as the live FX rate.
     """
     from .plugin import load_plugin
     from .plugin.live_provider import LiveProviderPlugin
@@ -1144,7 +1144,7 @@ def security_process_main(
         return None if candidate.volume < 0 and is_legacy_feed else candidate
 
     def _feed_next_open(after: int) -> int | None:
-        """:func:`next_open_after` over this context's own feed file.
+        """:func:`~pynecore.core.security.next_open_after` over this context's own feed file.
 
         The chart answers the same question from ``SecurityState.bar_opens``,
         which lists the real bars of the same file: a legacy feed's gap fills
@@ -1466,8 +1466,8 @@ def security_process_main(
 
         The cap is how far a consumer of this round can ask: the round's tick,
         or the end of the scheduled break containing it for a D/W/M context
-        keeping the chart's calendar (:func:`chart_asof`). Nothing asks beyond
-        it, so capping never holds a consumer back. A round with no tick (no
+        keeping the chart's calendar (:func:`~pynecore.core.security.chart_asof`). Nothing
+        asks beyond it, so capping never holds a consumer back. A round with no tick (no
         chart bar cycle, as in unit tests) is left uncapped.
 
         A closed BATCH round is the exception -- see the first branch. A
@@ -1515,8 +1515,8 @@ def security_process_main(
         The round's tick — the instant the developing entry carries as its close
         — except for a D/W/M context keeping the CHART's calendar, which is read
         as far as the end of the scheduled break the tick falls in: the chart
-        derives that as-of with :func:`chart_asof` (and settles a context it does
-        NOT launch to exactly it), a peer child with ``_peer_asof``. A weekly
+        derives that as-of with :func:`~pynecore.core.security.chart_asof` (and settles a
+        context it does NOT launch to exactly it), a peer child with ``_peer_asof``. A weekly
         context on a daily equity chart is therefore asked for Thursday 09:30 on
         the Wednesday bar closing at 16:00, and stopping the frontier at 16:00
         would leave that consumer waiting forever for an instant no round of this

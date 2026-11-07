@@ -6,7 +6,7 @@ bracket that the *engine* watches and fires — as opposed to a native
 broker bracket attached to the parent ``dealId`` (covered by
 ``execute_exit``).
 
-The state machine and the persisted leg rows in :mod:`store_helpers`
+The state machine and the persisted leg rows in :mod:`~pynecore.core.broker.store_helpers`
 form one pair: the rows are the durable representation (PERSIST-FIRST),
 the in-memory :class:`PartialBracketLeg` ledger is the working set the
 WATCH phase reads on every WS price tick. On a clean restart the
@@ -31,7 +31,7 @@ at the tail of every sync cycle for plugins that advertise
 ``partial_qty_bracket_exit = CapabilityLevel.SOFTWARE``: the sync
 engine refreshes the parent snapshot, calls
 :meth:`SoftwarePartialBracketEngine.on_price_tick`, synthesises a
-:class:`CloseIntent` for each triggering leg, and dispatches it
+:class:`~pynecore.core.broker.models.CloseIntent` for each triggering leg, and dispatches it
 through the regular ``_dispatch_new`` path before calling the
 matching settling method on the state machine. See the partial-qty
 bracket exit design dossier §3 for the full lifecycle.
@@ -98,7 +98,7 @@ LegKey = tuple[str, str, str]
 class PartialBracketLeg:
     """In-memory mirror of one engine-trigger partial bracket leg row.
 
-    Mirrors the canonical extras keys in :mod:`store_helpers`; the
+    Mirrors the canonical extras keys in :mod:`~pynecore.core.broker.store_helpers`; the
     persistent representation is the authoritative one (the engine
     reloads this struct from there on restart). Field names match
     the ``EXTRAS_KEY_*`` constants so a future refactor that flips
@@ -187,7 +187,7 @@ def _close_side_for_parent(parent_side: str) -> str:
 class SoftwarePartialBracketEngine:
     """In-memory state machine for engine-trigger partial brackets.
 
-    One instance per :class:`OrderSyncEngine`. The engine does not
+    One instance per :class:`~pynecore.core.broker.sync_engine.OrderSyncEngine`. The engine does not
     talk to the broker directly; the sync engine performs every
     broker-side action (close dispatch, audit emission, safety
     snapshot) on the state machine's behalf via dedicated hooks
@@ -449,7 +449,7 @@ class SoftwarePartialBracketEngine:
         Returns the legs that crossed their trigger this tick and
         passed the safety check — i.e. legs in :data:`LEG_STATE_TRIGGERING`
         that the sync engine should now dispatch a partial
-        :class:`CloseIntent` for. The close dispatch itself is the
+        :class:`~pynecore.core.broker.models.CloseIntent` for. The close dispatch itself is the
         sync engine's responsibility (Slice B wiring); this method
         owns only the state-machine bookkeeping.
 
@@ -767,7 +767,7 @@ class SoftwarePartialBracketEngine:
         """Settle a :data:`LEG_STATE_TRIGGERING` leg as fired.
 
         Called by the sync engine immediately after the synthetic
-        :class:`CloseIntent` for ``leg`` has been dispatched to the
+        :class:`~pynecore.core.broker.models.CloseIntent` for ``leg`` has been dispatched to the
         broker plugin. The leg moves to
         :data:`LEG_STATE_TRIGGERED` (terminal, row closed) and the
         OCA cascade fires for sibling legs sharing the same
@@ -1037,11 +1037,11 @@ class SoftwarePartialBracketEngine:
 
         Called by the sync engine's swallowed-unknown branch of
         ``_dispatch_cancel`` when ``execute_cancel`` raises
-        :class:`OrderDispositionUnknownError` on a parent entry. The
-        legs stay live (the row's ``closed_ts_ms`` is not set) and are
-        excluded from worst-SL contribution / price-tick arming until
-        either the ``reconcile()`` cancel-retry-loop resolves the
-        disposition (→ :meth:`confirm_cancel_tentative` or
+        :class:`~pynecore.core.broker.exceptions.OrderDispositionUnknownError` on a
+        parent entry. The legs stay live (the row's ``closed_ts_ms`` is not set) and are
+        excluded from worst-SL contribution / price-tick arming until either the
+        ``reconcile()`` cancel-retry-loop resolves the disposition (→
+        :meth:`confirm_cancel_tentative` or
         :meth:`restore_legs_from_cancel_tentative`) or the stale-grace
         deadline expires (→ ``DEGRADED_HALT`` by the caller).
 
@@ -1052,7 +1052,8 @@ class SoftwarePartialBracketEngine:
         is still pending.
 
         :param parent_from_entry: The parent ``EntryIntent.intent_key``
-            (≡ Pine ``from_entry`` on every child :class:`ExitIntent`).
+            (≡ Pine ``from_entry`` on every child
+            :class:`~pynecore.core.broker.models.ExitIntent`).
         :param reason: Audit reason recorded on the leg row's extras.
         :param now_ms: Wall-clock timestamp (ms) marking entry into
             the cancel-tentative state. Persisted under
@@ -1214,8 +1215,9 @@ class SoftwarePartialBracketEngine:
         """Rebuild the in-memory ledger from persisted leg rows.
 
         Called once by the sync engine during startup, after the
-        journal's regular replay but before the first :meth:`sync`.
-        Terminal rows are filtered out by
+        journal's regular replay but before the first
+        :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine.sync`. Terminal rows
+        are filtered out by
         :func:`iter_active_engine_trigger_partial_legs`; active rows
         in ``triggering`` / ``triggered_failed`` / ``triggered_unknown``
         are reloaded as-is and the next :meth:`on_price_tick` re-

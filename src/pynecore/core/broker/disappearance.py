@@ -356,11 +356,11 @@ def resolve_unexpected_cancel_policy(
 
     Applies the ``ignore`` / ``re_place`` audit-only logging and the
     ``stop`` quarantine latch, and RETURNS the halt the caller must arm its
-    own way (the tracker parks it on :attr:`pending_halt`; the engine
+    own way (the tracker parks it on :attr:`~DisappearanceTracker.pending_halt`; the engine
     records + raises it) — or ``None`` when the outcome needed no halt
     (ignored, re-placed, or quarantined). An unexpected cancel is someone
     else acting on a bot-owned order, so ``stop`` latches an
-    :attr:`~pynecore.core.broker.models.QuarantineKind.EXTERNAL_INTERVENTION`
+    :attr:`~QuarantineKind.EXTERNAL_INTERVENTION`
     quarantine: the bot leaves the venue exactly as the operator left it.
     The fail-closed rule lives here: a ``stop`` whose ``request_quarantine``
     sink is missing or raises falls back to the halt, never to continued

@@ -353,7 +353,7 @@ def _is_transient_connect_error(exc: BaseException) -> bool:
     on the backoff path rather than die before the handshake. The ``__cause__`` /
     ``__context__`` chain is walked so a transient still classifies after being
     re-wrapped. Permanent failures (bad symbol / credentials / account mode)
-    surface as a non-retryable :class:`ProviderError` and correctly return
+    surface as a non-retryable :class:`~pynecore.core.plugin.ProviderError` and correctly return
     ``False`` here so they keep failing fast.
 
     :param exc: The exception raised by ``provider.connect()``.
@@ -540,7 +540,8 @@ def live_ohlcv_generator(
     :param engine_event_stream: Optional coroutine (typically
                                 ``OrderSyncEngine.run_event_stream()``) to run as a
                                 long-lived task alongside the OHLCV watcher. The engine
-                                receives its :class:`OrderEvent` stream this way.
+                                receives its :class:`~pynecore.core.broker.models.OrderEvent`
+                                stream this way.
     :param raise_on_connect_failure: When True, a ``provider.connect()`` that
                                 fails fast during warmup is re-raised here, from
                                 the construction call, instead of being buffered
@@ -755,7 +756,7 @@ def live_ohlcv_generator(
         24/7 fallback when the symbol has no calendar). Use this for
         bar-synth decisions and any other slot-aware logic — for the
         point-in-time "is the market open right now?" question use
-        :func:`_market_open_now` instead, which does not extend the
+        ``_market_open_now()`` instead, which does not extend the
         instant by one timeframe.
 
         :param epoch_ms: Bar slot start time in Unix milliseconds, the unit
@@ -908,7 +909,7 @@ def live_ohlcv_generator(
             window the constructing thread waits on ``connected_event``) so a
             genuinely-down venue still surfaces a clean error inside that window
             rather than looping forever, and a permanent misconfiguration
-            (non-retryable :class:`ProviderError`) is re-raised on the first
+            (non-retryable :class:`~pynecore.core.plugin.ProviderError`) is re-raised on the first
             attempt so it keeps failing fast. The inter-attempt wait is
             event-driven — raced against ``stop_aevent`` — so a shutdown request
             abandons it at once without polling.

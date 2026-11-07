@@ -25,7 +25,7 @@ The manager produces:
 Time enters via an explicit ``now_ms`` argument; the manager itself does
 not call ``time.time()`` so unit tests and replay paths get deterministic
 clocks. Retry pacing is **event-driven**: the manager records the failed
-PUT and exposes :meth:`legs_wanting_retry` for the engine's poll tick to
+PUT and exposes :meth:`NativeFailsafeManager.pending_dispatch` for the engine's poll tick to
 re-dispatch — never a ``sleep`` (``feedback_no_sleep``).
 """
 from dataclasses import dataclass, field
@@ -327,7 +327,9 @@ class NativeFailsafeManager:
 
     The manager itself emits no PUT and uses no clock; the engine controls
     timing through the ``now_ms`` arguments. The Slice B plugin wires its
-    own dispatcher into :attr:`dispatch_hook` to actually issue the PUT.
+    own dispatcher in through
+    :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine.set_native_bracket_dispatcher` to
+    actually issue the PUT.
     """
 
     def __init__(

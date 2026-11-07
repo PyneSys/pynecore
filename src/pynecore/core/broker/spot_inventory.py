@@ -552,7 +552,7 @@ class SpotInventoryManager:
             carries (not necessarily ``port.product_id``).
         :param request_quarantine: The engine quarantine latch, normally
             the plugin's
-            :attr:`~pynecore.core.plugin.broker.BrokerPlugin.quarantine_sink`:
+            :attr:`~BrokerPlugin.quarantine_sink`:
             called as ``(reason, context)``, plus
             ``kind=QuarantineKind.EXTERNAL_INTERVENTION`` when the bot's own
             inventory was taken.

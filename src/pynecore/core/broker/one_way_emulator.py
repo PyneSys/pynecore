@@ -13,15 +13,15 @@ It is the close/reversal counterpart of
 :class:`~pynecore.core.broker.software_entry_stop_engine.SoftwareEntryStopEngine`
 and :class:`~pynecore.core.broker.software_partial_bracket_engine.SoftwarePartialBracketEngine`:
 one instance per :class:`~pynecore.core.broker.sync_engine.OrderSyncEngine`, the
-persisted close-leg rows in :mod:`store_helpers` are the durable representation
-(PERSIST-FIRST), and :meth:`restart_replay` re-derives an unfinished fan-out
-from them. The legs' close FILLs themselves flow through the engine's ordinary
-natural-close path (mapped to ``LegType.CLOSE`` by the plugin), so this engine
+persisted close-leg rows in :mod:`~pynecore.core.broker.store_helpers` are the durable
+representation (PERSIST-FIRST), and :meth:`OneWayEmulator.restart_replay` re-derives an
+unfinished fan-out from them. The legs' close FILLs themselves flow through the engine's
+ordinary natural-close path (mapped to ``LegType.CLOSE`` by the plugin), so this engine
 never touches the fill router — only the dispatch + its crash/replay.
 
 The engine carries no broker, clock, or exchange-model state. Each broker action
 goes through the :class:`PositionPort`; aggregation / selection / quantization
-are the pure functions in :mod:`emulator`. That keeps it deterministic and
+are the pure functions in :mod:`~pynecore.core.broker.emulator`. That keeps it deterministic and
 unit-testable in isolation, with ``store_ctx=None`` for the no-persistence path.
 """
 from dataclasses import dataclass
@@ -180,7 +180,7 @@ class CloseFanResult:
         quantity; use ``dispatched_qty`` for that.
     :ivar dispatched_qty: Pine-unit quantity the dispatched legs cover — the
         summed FIFO plan slices, in the SAME unit as
-        :attr:`~pynecore.core.broker.models.OrderEvent.fill_qty`, so the
+        :attr:`~OrderEvent.fill_qty`, so the
         caller can compare it with the fills that come back. ``0.0`` when
         nothing was dispatched.
     :ivar shortfall: Pine-unit quantity the open legs could not cover (the

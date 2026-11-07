@@ -168,9 +168,10 @@ class BracketAttachAfterFillRejectedError(ExchangeOrderRejectedError):
 
     The plugin raises this *after* rolling back the persisted leg rows
     (so the BrokerStore does not leak phantom protective legs). The sync
-    engine's :meth:`_dispatch_new` recovery path catches it, builds a
-    synthetic :class:`~pynecore.core.broker.models.CloseIntent` for the
-    parent position, and dispatches that. The runner continues.
+    engine's :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine._dispatch_new`
+    recovery path catches it, builds a synthetic
+    :class:`~pynecore.core.broker.models.CloseIntent` for the parent position, and
+    dispatches that. The runner continues.
 
     Engine-side recovery uses a derived
     :class:`~pynecore.core.broker.models.BracketAttachRejectContext` as
@@ -390,8 +391,9 @@ class UnexpectedCancelError(BrokerManualInterventionError):
     maintenance, margin-induced cancel, etc.). Modelled as a manual-
     intervention error because automated recovery cannot reason about why
     the order vanished — the safe default is to halt and let a human
-    inspect. The sync engine's :meth:`run_event_stream` and dispatch paths
-    catch :class:`BrokerManualInterventionError` uniformly, so the same
-    graceful-stop pipeline applies whether the trigger came from a polling
-    snapshot or from an in-flight dispatch.
+    inspect. The sync engine's
+    :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine.run_event_stream` and
+    dispatch paths catch :class:`BrokerManualInterventionError` uniformly, so the same
+    graceful-stop pipeline applies whether the trigger came from a polling snapshot or
+    from an in-flight dispatch.
     """

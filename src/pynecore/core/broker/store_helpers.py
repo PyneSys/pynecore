@@ -1,7 +1,8 @@
 """
 Typed helpers over :class:`~pynecore.core.broker.storage.RunContext`.
 
-The :class:`BrokerStore` exposes :meth:`upsert_order` with a free-form
+The :class:`~pynecore.core.broker.storage.BrokerStore` exposes
+:meth:`~BrokerStore.upsert_order` with a free-form
 ``extras`` dict and individual setters per column. Each broker plugin
 currently re-implements the same micro-patterns on top of that surface:
 seed a row with ``{'kind': ..., 'order_type': ...}`` extras, record the
@@ -1543,7 +1544,7 @@ def create_engine_trigger_partial_leg_row(
         parent position direction.
     :param qty: Partial-close quantity, already quantized to the
         broker's lot step.
-    :param intent_key: The owning :class:`ExitIntent`'s diff key.
+    :param intent_key: The owning :class:`~pynecore.core.broker.models.ExitIntent`'s diff key.
     :param pine_entry_id: Pine ``strategy.exit(id=...)`` value, kept
         for audit symmetry with non-leg rows.
     :param from_entry: Pine ``strategy.exit(from_entry=...)`` — the
@@ -1782,7 +1783,7 @@ def create_close_leg_row(
     :param symbol: Exchange-side symbol.
     :param side: The close side (opposite the position direction being reduced).
     :param qty: The Pine-unit quantity this leg closes (its FIFO slice).
-    :param intent_key: The owning :class:`CloseIntent`'s diff key.
+    :param intent_key: The owning :class:`~pynecore.core.broker.models.CloseIntent`'s diff key.
     :param pine_entry_id: The owning ``strategy.close(id=...)`` value, for audit.
     :param parent_close_coid: The CloseIntent dispatch's ``KIND_CLOSE`` coid.
     :param leg_id: Broker leg id (cTrader ``positionId``) this row closes.
@@ -1911,7 +1912,7 @@ def create_residual_open_row(
     :param symbol: Exchange-side symbol.
     :param side: The residual open's side (the entry's own direction).
     :param qty: The residual open quantity (Pine units).
-    :param intent_key: The owning :class:`EntryIntent`'s diff key.
+    :param intent_key: The owning :class:`~pynecore.core.broker.models.EntryIntent`'s diff key.
     :param pine_entry_id: The owning ``strategy.entry(id=...)`` value.
     :param entry_coid: The residual ``place_leg``'s deterministic entry coid
         (``KIND_ENTRY``, or ``KIND_ENTRY_STOP`` for a stop-fired reversal) —
@@ -2001,8 +2002,8 @@ def create_bracket_ownership_row(
     :param coid: The ownership row's deterministic client-order-id.
     :param symbol: Exchange-side symbol.
     :param side: The exit (bracket) side.
-    :param qty: The owning :class:`ExitIntent`'s quantity, for audit.
-    :param intent_key: The owning :class:`ExitIntent`'s diff key
+    :param qty: The owning :class:`~pynecore.core.broker.models.ExitIntent`'s quantity, for audit.
+    :param intent_key: The owning :class:`~pynecore.core.broker.models.ExitIntent`'s diff key
         (``f"{pine_id}\\0{from_entry}"``), matched by the clear path.
     :param pine_entry_id: The owning ``strategy.exit(id=...)`` value.
     :param from_entry: The exit's parent entry id (its own column for filtering).
@@ -2154,7 +2155,8 @@ def create_entry_stop_watch_row(
     :param side: The ENTRY side (``'buy'`` / ``'sell'``) — the direction the
         stop-fired MARKET opens in, same as the native LIMIT leg.
     :param qty: Entry quantity, already quantized to the broker's lot step.
-    :param intent_key: The owning :class:`EntryIntent`'s diff key (≡ pine_id).
+    :param intent_key: The owning :class:`~pynecore.core.broker.models.EntryIntent`'s
+        diff key (≡ pine_id).
     :param pine_entry_id: The Pine ``strategy.entry(id=...)`` value.
     :param stop_level: Absolute price the watch fires the MARKET at.
     :param limit_coid: The native LIMIT leg's client-order-id — the

@@ -211,7 +211,7 @@ class CapabilityLevel(StrEnum):
     - :data:`NATIVE` — single atomic exchange call delivers the full
       semantics (e.g. Bybit attached TP/SL, exchange-side OCA group, native
       reduce-only flag). The sync engine may suppress its software fallback
-      paths on this level (see :class:`OrderSyncEngine`).
+      paths on this level (see :class:`~pynecore.core.broker.sync_engine.OrderSyncEngine`).
 
     The string values are stable and safe to log / persist (e.g. SQLite
     columns, ``pyne plugin info`` output).
@@ -1055,8 +1055,8 @@ class PendingDefensiveClose:
         rebuilding the exception.
     :ivar residual_cleanup_pending: ``True`` when the dispatch-time
         residual-cancel call hit a transient
-        :class:`ExchangeConnectionError` /
-        :class:`OrderDispositionUnknownError` and could not finish
+        :class:`~pynecore.core.broker.exceptions.ExchangeConnectionError` /
+        :class:`~pynecore.core.broker.exceptions.OrderDispositionUnknownError` and could not finish
         cancelling parent/TP/SL/partial-remainder orders. The next
         :meth:`OrderSyncEngine.reconcile` replays
         :meth:`OrderSyncEngine._cancel_bracket_reject_residuals` so the
@@ -1129,10 +1129,10 @@ class PendingDefensiveClose:
         replay path falls back to the conservative "skip adoption"
         behaviour in that case.
     :ivar fifo_closed_entry_ids: Snapshot of the entry ids whose FIFO
-        ``Trade`` rows were closed by :meth:`record_fill` for this
-        defensive close, accumulated across every ``partial`` /
-        terminal ``filled`` event of the close sequence. The
-        ``t == 'partial'`` branch in
+        ``Trade`` rows were closed by
+        :meth:`~pynecore.core.broker.position.BrokerPosition.record_fill` for this
+        defensive close, accumulated across every ``partial`` / terminal ``filled``
+        event of the close sequence. The ``t == 'partial'`` branch in
         :meth:`OrderSyncEngine._route_event` merges each partial's
         FIFO closures here, and
         :meth:`OrderSyncEngine._route_defensive_close_fill` merges the
@@ -1144,11 +1144,11 @@ class PendingDefensiveClose:
         can run the same FIFO-aware
         :meth:`OrderSyncEngine._cleanup_position_tracking` walk as the
         in-flight FILL path even when intervening
-        :meth:`record_fill` calls have overwritten the live
-        ``_last_fifo_closed_entry_ids`` snapshot. Empty when the FILL
-        produced no FIFO closures (no-FIFO / degenerate path) or when
-        the marker is replayed from an older schema; the retry path
-        falls back to ``marker.entry_id`` in that case.
+        :meth:`~pynecore.core.broker.position.BrokerPosition.record_fill` calls have
+        overwritten the live ``_last_fifo_closed_entry_ids`` snapshot. Empty when the
+        FILL produced no FIFO closures (no-FIFO / degenerate path) or when the marker is
+        replayed from an older schema; the retry path falls back to ``marker.entry_id``
+        in that case.
     :ivar expected_close_qty: Total quantity the close was actually
         dispatched for when the one-way emulator fanned it across more
         than one hedge leg, in PINE units (``CloseFanResult`` reports it
@@ -1531,10 +1531,11 @@ class DispatchEnvelope:
     """Broker dispatch envelope — an intent plus idempotency metadata.
 
     The :class:`~pynecore.core.broker.sync_engine.OrderSyncEngine` wraps every
-    intent in a fresh envelope before handing it to the :class:`BrokerPlugin`.
-    Plugins call :meth:`client_order_id` for each exchange order they place;
-    the result is deterministic, so a retry or restart regenerates the same id
-    and the exchange dedups the duplicate.
+    intent in a fresh envelope before handing it to the
+    :class:`~pynecore.core.plugin.broker.BrokerPlugin`. Plugins call
+    :meth:`client_order_id` for each exchange order they place; the result is
+    deterministic, so a retry or restart regenerates the same id and the exchange dedups
+    the duplicate.
 
     :ivar intent: The Pine-level intent this dispatch carries.
     :ivar run_tag: 4-char base36 session tag (see
@@ -1543,7 +1544,7 @@ class DispatchEnvelope:
     :ivar retry_seq: Bumped by the recovery path only when a prior attempt is
         deliberately abandoned — defaults to ``0``.
     :ivar coid_max_len: The venue's client-id budget (the plugin's
-        :attr:`~pynecore.core.plugin.broker.BrokerPlugin.client_order_id_max_len`).
+        :attr:`~BrokerPlugin.client_order_id_max_len`).
         When the canonical id exceeds it, :meth:`client_order_id` emits the
         deterministic wire form instead (see
         :mod:`pynecore.core.broker.idempotency`). The default keeps the
@@ -1754,8 +1755,9 @@ class ManualInterventionRequiredEvent(BrokerEvent):
     plugin-supplied diagnostic context) so the observability bus, on-call
     alerting, and the user-facing event stream can page without the runner
     needing to reach into plugin internals. After this event fires the
-    engine is halted — all subsequent :meth:`sync` calls return early until
-    the strategy is restarted.
+    engine is halted — all subsequent
+    :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine.sync` calls return early
+    until the strategy is restarted.
     """
     reason: str
     intent_key: str | None = None
@@ -1922,7 +1924,7 @@ class CancelDispositionOutcome(StrEnum):
 class PartialBracketCancelTentativeStartedEvent(BrokerEvent):
     """A pending-entry partial bracket leg entered ``cancel_tentative``
     because :meth:`BrokerPlugin.execute_cancel` raised
-    :class:`OrderDispositionUnknownError`.
+    :class:`~pynecore.core.broker.exceptions.OrderDispositionUnknownError`.
 
     The sync engine retains the order mapping and envelope; the
     ``reconcile()`` cancel-retry-loop drives the leg to resolution within

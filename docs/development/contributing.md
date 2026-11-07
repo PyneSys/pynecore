@@ -252,6 +252,30 @@ def function_name(param1: type, param2: type) -> return_type:
 
 This is the PyCharm's default Sphinx-style docstring format, not the full reStructuredText syntax used for comprehensive documentation.
 
+### Cross-References in Docstrings
+
+PyCharm resolves every `:class:`, `:meth:`, `:attr:`, `:data:`, `:mod:` and `:func:` role in a
+docstring, and reports a target it cannot find as an "Unresolved reference" warning. These roles
+give Ctrl+click navigation and let rename-refactoring update the docstring too. Keep them
+warning-free, so that a warning always means a stale reference (a renamed or deleted name).
+Use the form that resolves:
+
+- **Class member** (method, property, class attribute, or instance attribute set in `__init__`):
+  `~Class.member`, for example `` :attr:`~OrderSyncEngine._order_mapping` `` or
+  `` :meth:`~BrokerPlugin.get_position` ``. A bare `` :attr:`_order_mapping` `` does not resolve
+  for an instance attribute, and a full dotted path to a member is unreliable. The class does
+  not need to be imported.
+- **Class, function or constant that the module does not import**: the full dotted path with
+  `~`, for example `` :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError` ``.
+- **Module**: the full dotted path, for example `` :mod:`~pynecore.core.broker.sync_engine` ``.
+- **Method referenced from a module docstring**: prefix it with its class, for example
+  `` :meth:`OrderSyncEngine.on_order_event` ``.
+- **Nested function** (defined inside another function): it cannot be referenced; write it as a
+  ``` ``literal`` ``` instead.
+
+Do not add an import only to make a docstring reference resolve: PyCharm and type checkers
+report it as an unused import.
+
 ## Contribution Workflow
 
 1. **Select or create an issue**: Start by finding an existing issue to work on or create a new one

@@ -858,7 +858,7 @@ class BrokerStore:
         writer thread, and SQLite's transaction visibility is
         connection-global: a read issued mid-write sees the writer's
         uncommitted rows, and a subsequent writer rollback leaves the
-        reader having acted on phantom data. Holding :attr:`_lock` for the
+        reader having acted on phantom data. Holding :attr:`~BrokerStore._lock` for the
         fetch closes that window. The lock is re-entrant, so a read nested
         inside a :meth:`transaction` block on the same thread is safe.
 

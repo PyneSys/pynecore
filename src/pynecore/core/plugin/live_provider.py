@@ -58,13 +58,13 @@ class PluginSymbol:
     itself, downloads warmup history in-memory, then streams live bars.
     No intermediate ``.ohlcv`` file is written.
 
-    :ivar provider_name: Entry-point name for :func:`load_plugin`
+    :ivar provider_name: Entry-point name for :func:`~pynecore.core.plugin.load_plugin`
                          (e.g. ``"capitalcom"``).
     :ivar symbol: Plugin-native symbol (e.g. ``"EURUSD"``); already passed
                   through :meth:`ProviderPlugin.resolve_symbol`.
     :ivar timeframe: Timeframe in TradingView format (e.g. ``"1D"``).
     :ivar config: Pre-loaded plugin config dataclass instance. The chart
-                  process runs :func:`ensure_config` once and hands the
+                  process runs :func:`~pynecore.core.config.ensure_config` once and hands the
                   resulting instance to every subprocess via spawn args —
                   subprocesses must not touch the TOML file themselves, so
                   every context runs with the configuration the chart read.
@@ -116,7 +116,8 @@ class LiveProviderPlugin(ProviderPlugin[LiveProviderConfigT], metaclass=ABCMeta)
     in addition to the :class:`ProviderPlugin` abstract methods.
 
     The async methods run in a background thread; the framework bridges them
-    to the synchronous :class:`ScriptRunner` via a :class:`queue.Queue`.
+    to the synchronous :class:`~pynecore.core.script_runner.ScriptRunner` via a
+    :class:`queue.Queue`.
 
     Every blocking call these methods hand to a worker thread (``asyncio.to_thread``
     and any other default-executor use) must carry its own enforceable timeout.

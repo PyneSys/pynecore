@@ -13,14 +13,14 @@ Fixture format (UTF-8 JSON)::
       "live":   [[ts, open, high, low, close, volume, is_closed], ...]
     }
 
-``warmup`` rows are always closed bars (returned by :meth:`download_ohlcv`).
-``live`` rows are streamed by :meth:`watch_ohlcv` in order; the optional 7th
+``warmup`` rows are always closed bars (returned by :meth:`ReplayProvider.download_ohlcv`).
+``live`` rows are streamed by :meth:`ReplayProvider.watch_ohlcv` in order; the optional 7th
 element is the ``is_closed`` flag (default ``True``). Timestamps are Unix
 milliseconds — the OHLCV storage unit — and must lie in the past relative to
 the run's wall clock so the child's warmup-horizon drop keeps them.
 
 Determinism contract: this is a *deterministic closed-window replay*, not a
-deterministic forming-update replay. :meth:`watch_ohlcv` emits the fixture
+deterministic forming-update replay. :meth:`ReplayProvider.watch_ohlcv` emits the fixture
 bars eagerly (one per call, no pacing); the security child rations closed
 intrabars per LTF period from its own buffer, so closed-window output is
 deterministic. The developing/forming tail is not lockstep-paced across the

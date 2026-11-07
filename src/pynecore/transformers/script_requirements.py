@@ -7,11 +7,11 @@ from the keyword arguments present at each call site deduces which
 :class:`~pynecore.core.broker.models.ScriptRequirements` flags the script
 needs.
 
-The detected :class:`ScriptRequirements` is injected as the
-``_broker_requirements`` keyword of the ``@script.strategy(...)`` decorator
-call on the script's ``main`` function, so the :class:`Script` object
-carries the requirements at runtime — no need for a second AST pass or
-metadata side channel.
+The detected :class:`~pynecore.core.broker.models.ScriptRequirements` is
+injected as the ``_broker_requirements`` keyword of the
+``@script.strategy(...)`` decorator call on the script's ``main`` function,
+so the :class:`~pynecore.core.script.Script` object carries the requirements
+at runtime — no need for a second AST pass or metadata side channel.
 
 Detection is **conservative**: if the keyword is syntactically present
 (even with an ``na`` value), the requirement is taken to be needed. Better
@@ -117,7 +117,7 @@ def _is_script_strategy_decorator(node: ast.expr) -> bool:
     """
     True if ``node`` is a ``@script.strategy(...)`` call — matches both the
     raw form and the ``@lib.script.strategy(...)`` form produced by
-    :class:`ImportNormalizerTransformer`.
+    :class:`~pynecore.transformers.import_normalizer.ImportNormalizerTransformer`.
     """
     if not isinstance(node, ast.Call):
         return False
@@ -137,9 +137,9 @@ def _is_script_strategy_decorator(node: ast.expr) -> bool:
 
 class ScriptRequirementsTransformer(ast_walk.NodeVisitor):
     """
-    Compute :class:`ScriptRequirements` for a strategy script and inject it
-    into the ``@script.strategy(...)`` decorator as the
-    ``_broker_requirements`` keyword argument.
+    Compute :class:`~pynecore.core.broker.models.ScriptRequirements` for a
+    strategy script and inject it into the ``@script.strategy(...)``
+    decorator as the ``_broker_requirements`` keyword argument.
 
     No-op on scripts that have no ``@script.strategy(...)`` decorator
     (indicator scripts). The walk itself replaces no node, so it is a plain

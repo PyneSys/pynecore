@@ -117,8 +117,9 @@ def _process_nested_bodies(node: ast.AST, scope_prefix: str, layout: ModuleLayou
     """Run :func:`_process_defs` over every statement list hanging off a node.
 
     A definition nested in a compound statement belongs to the ENCLOSING
-    scope (:func:`_scope_defs` collects it there), so it must get the same
-    hidden parameter and layout attach as a top-level one.
+    scope (:func:`~pynecore.transformers.slot_layout._scope_defs` collects it
+    there), so it must get the same hidden parameter and layout attach as a
+    top-level one.
     """
     for name in node._fields:
         value = getattr(node, name, None)

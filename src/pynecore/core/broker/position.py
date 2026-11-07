@@ -456,7 +456,7 @@ class BrokerPosition(PositionBase):
         Startup adoption restores :attr:`size`/:attr:`avg_price` but leaves
         :attr:`open_trades` empty. A partial-quantity bracket needs the parent's
         open qty to classify
-        :attr:`~pynecore.core.broker.models.ExitIntent.is_partial_qty_bracket`
+        :attr:`~ExitIntent.is_partial_qty_bracket`
         consistently across bars (``build_intents`` derives the parent total
         from :attr:`open_trades`); without it the exit would be misclassified as
         a whole-row bracket and adopted on the wrong dispatch path. The trade is
@@ -884,7 +884,7 @@ class BrokerPosition(PositionBase):
         Per-trade returns include the exchange-reported entry fees;
         :attr:`openprofit` tracks the aggregate gross unrealized profit.
 
-        Also rolls the :attr:`max_equity` peak forward and the
+        Also rolls the :attr:`~BrokerPosition.max_equity` peak forward and the
         :attr:`max_drawdown` running maximum off the live price — these feed
         :meth:`_peak_equity` and :meth:`_is_max_drawdown_breached` so the
         broker risk gates see real-time equity, not just realized P&L.

@@ -5,7 +5,7 @@ a :class:`~pynecore.core.plugin.broker.BrokerPlugin`.
 On each bar the engine:
 
 1. Drains any :class:`OrderEvent` objects that the broker posted
-   asynchronously (via :meth:`on_order_event`), routing fills to the
+   asynchronously (via :meth:`OrderSyncEngine.on_order_event`), routing fills to the
    :class:`~pynecore.core.broker.position.BrokerPosition` and unfreezing
    tick-based exits once their entry fill price is known.
 2. Builds intents from the position's pending order dicts.
@@ -17,7 +17,7 @@ On each bar the engine:
 5. Every ``reconcile_every_n_syncs`` calls (optional) performs a read-side
    state reconciliation with the exchange.
 
-The engine is synchronous; the broker plugin is async. :meth:`_run_async`
+The engine is synchronous; the broker plugin is async. :meth:`OrderSyncEngine._run_async`
 bridges the two, using ``run_coroutine_threadsafe`` on a background event
 loop in live mode and ``asyncio.run`` for single-shot unit tests.
 """
@@ -1051,7 +1051,7 @@ class _PartialBracketModifyDeferred(Exception):
     this signal the diff would treat Pine == active and never retry once the
     fail-safe recovers, leaving the engine watching stale TP/SL/qty levels.
 
-    Module-private — never propagates outside :mod:`sync_engine`.
+    Module-private — never propagates outside :mod:`~pynecore.core.broker.sync_engine`.
     """
 
 
@@ -1064,7 +1064,7 @@ class _QuarantineModifyDeferred(Exception):
     :class:`OrderSkippedByPlugin` here would pop the slot and desync the
     engine from a resting order that was never cancelled.
 
-    Module-private — never propagates outside :mod:`sync_engine`.
+    Module-private — never propagates outside :mod:`~pynecore.core.broker.sync_engine`.
     """
 
 
@@ -1078,7 +1078,7 @@ class _ParentEntryParkedModifyDeferred(Exception):
     ``_active_intents[key]`` pointing at the OLD intent and re-diff once
     the parent's disposition resolves.
 
-    Module-private — never propagates outside :mod:`sync_engine`.
+    Module-private — never propagates outside :mod:`~pynecore.core.broker.sync_engine`.
     """
 
 
@@ -1092,7 +1092,7 @@ class _RejectedModifyDeferred(Exception):
     refused spec is remembered in ``_rejected_exit_modifies`` so the identical
     amend is not re-sent every sync — Pine changing the levels releases it.
 
-    Module-private — never propagates outside :mod:`sync_engine`.
+    Module-private — never propagates outside :mod:`~pynecore.core.broker.sync_engine`.
     """
 
 
@@ -1103,7 +1103,7 @@ class _MarketClosedModifyDeferred(_RejectedModifyDeferred):
     for a refused amend, but the spec is not remembered: a later sync re-sends
     it, so the amend goes out once the market reopens.
 
-    Module-private — never propagates outside :mod:`sync_engine`.
+    Module-private — never propagates outside :mod:`~pynecore.core.broker.sync_engine`.
     """
 
 
@@ -1173,8 +1173,9 @@ class OrderSyncEngine:
         single-shot backtests; production wires the runner's observability
         bus here.
     :param store_ctx: Optional :class:`RunContext` from the unified
-        :class:`BrokerStore`. When provided the engine persists envelope
-        identity and parked-verification entries through it; on construction
+        :class:`~pynecore.core.broker.storage.BrokerStore`. When provided the
+        engine persists envelope identity and parked-verification entries
+        through it; on construction
         the context is replayed (``SELECT``-ed from SQLite) so a restarted
         process re-uses the same ``client_order_id`` for every live intent
         and matches up parked dispatches against ``get_open_orders`` on the
@@ -2352,7 +2353,7 @@ class OrderSyncEngine:
         never surfaces as an open order), forcing a spurious broker
         round-trip on every sync.
 
-        A ``forced_cancel`` row re-arms :attr:`_forced_cancel_pending` so
+        A ``forced_cancel`` row re-arms :attr:`OrderSyncEngine._forced_cancel_pending` so
         :meth:`_retry_forced_cancels` keeps re-driving the cancel across a
         restart — the window that makes the rows worth persisting: with the
         in-memory map lost and the script no longer re-emitting the intent,
@@ -2362,7 +2363,7 @@ class OrderSyncEngine:
         prevent).
 
         A ``cancel_tentative`` row re-arms
-        :attr:`_cancel_disposition_pending` — the parent-level restart
+        :attr:`~OrderSyncEngine._cancel_disposition_pending` — the parent-level restart
         persistence for the cancel-tentative state machine. For a parent
         WITH partial-bracket legs the leg rows mirror the state and
         :meth:`_rehydrate_cancel_tentative_from_replayed_legs` would also
@@ -2375,7 +2376,7 @@ class OrderSyncEngine:
         ``parked_ts_ms`` carries the original mark-time ``since_ts_ms``,
         so the stale-grace deadline survives the restart without slippage
         (leg-extras parity), and ``order_ids`` re-seeds
-        :attr:`_order_mapping` so replayed FILL / cancelled events route
+        :attr:`~OrderSyncEngine._order_mapping` so replayed FILL / cancelled events route
         to the tentative parent (the leg path seeds the same way from the
         ``orders`` table).
 
@@ -2384,7 +2385,7 @@ class OrderSyncEngine:
         round-trip (:meth:`_dispatch_cancel`) — is re-armed through the
         SAME cancel-tentative path. It only reaches a restart when a crash
         stranded it before the disposition landed, so the outcome is
-        genuinely unknown: routing it to :attr:`_cancel_disposition_pending`
+        genuinely unknown: routing it to :attr:`~OrderSyncEngine._cancel_disposition_pending`
         makes the startup :meth:`_drive_cancel_tentative` re-probe with
         ``execute_cancel_with_outcome``, which distinguishes an
         ALREADY_FILLED parent (restore + arm the live position's partial
@@ -2455,7 +2456,7 @@ class OrderSyncEngine:
         ``from_entry`` for an exit) selects the working order at the plugin,
         and ``intent_key`` drives the engine-side teardown once the cancel
         lands. ``side`` / ``qty`` / ``order_type`` are placeholders — no
-        consumer of :attr:`_forced_cancel_pending` reads them
+        consumer of :attr:`~OrderSyncEngine._forced_cancel_pending` reads them
         (:meth:`_dispatch_cancel_strict` builds a bare :class:`CancelIntent`
         from the identity fields and the diff guard tests key membership).
         """
@@ -2639,7 +2640,7 @@ class OrderSyncEngine:
         a venue change dated before this moment is no external intervention.
         A process applying the same resume again keeps the first time, so a
         change made while no process ran is judged. The runner hands it to
-        the plugin (:attr:`~pynecore.core.plugin.broker.BrokerPlugin.operator_resume_ts_ms`)
+        the plugin (:attr:`BrokerPlugin.operator_resume_ts_ms`)
         for the judges the core does not run itself.
         """
         return self._operator_resume_ts_ms
@@ -3146,8 +3147,8 @@ class OrderSyncEngine:
         Cheap, drain-free check meant for the script runner's tick loop:
         an async halt set on the broker event-loop thread (e.g. from
         :meth:`run_event_stream` reacting to an
-        :class:`UnexpectedCancelError`) should surface in the runner thread
-        on the very next tick — *not* one full bar later when
+        :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError`) should
+        surface in the runner thread on the very next tick — *not* one full bar later when
         :meth:`apply_async_events` runs at bar close.
         """
         if self._halted:
@@ -3166,7 +3167,7 @@ class OrderSyncEngine:
         booked fills stay short of the qty (a spot buy net of a base-coin fee).
 
         A defensive close after a bracket-attach reject is dispatched outside
-        :attr:`_active_intents` and lives only as a
+        :attr:`~OrderSyncEngine._active_intents` and lives only as a
         :class:`PendingDefensiveClose` marker, so it counts while its FILL is
         unobserved or legs of its fan are still outstanding.
         """
@@ -3232,8 +3233,8 @@ class OrderSyncEngine:
         leaving the script's view of the position one bar stale.
 
         Also propagates an async-recorded halt (e.g. an
-        :class:`UnexpectedCancelError` from ``run_event_stream``) so the
-        bar loop exits via its ``finally`` block instead of running the
+        :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError` from
+        ``run_event_stream``) so the bar loop exits via its ``finally`` block instead of running the
         script with stale state.
         """
         self.raise_if_halted()
@@ -3245,7 +3246,7 @@ class OrderSyncEngine:
 
         A halt raised on the broker event loop (a plugin's
         ``report_external_intervention`` under the ``halt`` policy, an
-        :class:`UnexpectedCancelError`) can follow events
+        :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError`) can follow events
         :meth:`run_event_stream` already queued -- typically the fill of the
         very manual close that caused it. :meth:`apply_async_events` and
         :meth:`sync` refuse to run once halted, so the runner calls this while
@@ -3288,7 +3289,7 @@ class OrderSyncEngine:
         one-way replay -> pending-dispatch verify -> Pine-bracket reconstruct)
         and shares the same flags, so whichever runs first latches them and the
         other skips. :meth:`sync` stays the unconditional per-bar backstop: once
-        :attr:`_pine_bracket_reconstruct_done` latches this returns immediately,
+        :attr:`~OrderSyncEngine._pine_bracket_reconstruct_done` latches this returns immediately,
         so steady-state bars do no extra work here and the every-bar
         ``_drain_events`` / ``_verify_pending_dispatches`` keep running only in
         :meth:`sync`. On a restart bar ``_verify_pending_dispatches`` runs here
@@ -5477,7 +5478,7 @@ class OrderSyncEngine:
         """Drop adoption markers that no Pine intent claimed.
 
         :meth:`_consume_plugin_resolutions` seeds a slot in
-        :attr:`_order_mapping` for two distinct cases:
+        :attr:`~OrderSyncEngine._order_mapping` for two distinct cases:
 
         - ``'attached'`` resolution: an empty list, signalling "this
           intent is already live, just adopt it on the next diff".
@@ -6364,7 +6365,7 @@ class OrderSyncEngine:
         flat or holds the fill's own side. Either the book already accounts for
         that reduction (a late or redelivered fill) or it booked an earlier fill
         in the wrong order (the venue now holds the book plus this fill). The
-        event alone cannot tell which, so :meth:`record_fill` leaves the book as
+        event alone cannot tell which, so :meth:`~BrokerPosition.record_fill` leaves the book as
         it is and :meth:`_settle_unbooked_exit_fills` decides against the venue.
 
         :param event: The exit-leg fill :meth:`BrokerPosition.is_non_reducing_exit`
@@ -9562,7 +9563,8 @@ class OrderSyncEngine:
           — the process keeps running but no venue write is admitted, so the
           strategy's next-bar re-dispatch of the cancelled order is
           suppressed and whatever the operator left on the venue stays as is.
-        - ``halt`` records and RAISES :class:`UnexpectedCancelError` out of
+        - ``halt`` records and RAISES
+          :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError` out of
           the event-application path (mirroring
           :meth:`_halt_if_defensive_close_terminal`) so the engine performs
           its graceful stop.
@@ -9990,9 +9992,10 @@ class OrderSyncEngine:
         no-op on the exit / close branches.
 
         The aborted legs leave behind their parent :class:`ExitIntent`
-        slot in :attr:`_active_intents` / :attr:`_order_mapping`. Without
-        retiring those slots here, a later sync that re-issues the same
-        entry under the same ``pine_id`` together with the same partial
+        slot in :attr:`~OrderSyncEngine._active_intents` /
+        :attr:`~OrderSyncEngine._order_mapping`. Without retiring those slots
+        here, a later sync that re-issues the same entry under the same
+        ``pine_id`` together with the same partial
         ``strategy.exit`` would diff the still-active ExitIntent against
         the freshly emitted one, see them as equal (dataclass equality on
         identical params) and skip
@@ -10147,7 +10150,7 @@ class OrderSyncEngine:
         The bumped anchor is **not** written back to the journal:
         :meth:`_drop_envelope` already DELETEd the row (via
         :meth:`storage.RunContext.record_complete`), and the bar scope that
-        bounds this anchor lives in :attr:`_reject_anchor_bars`, which is
+        bounds this anchor lives in :attr:`~OrderSyncEngine._reject_anchor_bars`, which is
         in-memory only (see its declaration in ``__init__``). Persisting the
         bumped anchor without its bar scope would let a restart replay revive
         it as a plain anchor with no reject tag — :meth:`_build_envelope`
@@ -10224,12 +10227,12 @@ class OrderSyncEngine:
         """Thread-safe expected-cancel arm for a plugin native bulk cancel.
 
         The runner installs this as the plugin's
-        :attr:`~pynecore.core.plugin.broker.BrokerPlugin.native_cancel_all_expected_sink`.
+        :attr:`~BrokerPlugin.native_cancel_all_expected_sink`.
         A plugin whose ``execute_cancel_all`` calls a single native bulk-cancel
         endpoint invokes this on the broker event-loop thread BEFORE issuing the
         venue call, so the marker is FIFO-ordered ahead of the ``CANCELLED``
         pushes the bulk cancel produces. Enqueuing onto the shared
-        :attr:`_event_queue` (rather than snapshotting the mapping here) keeps
+        :attr:`~OrderSyncEngine._event_queue` (rather than snapshotting the mapping here) keeps
         the mapping read on the main thread in
         :meth:`_register_native_cancel_all_expected`, drained in
         :meth:`_drain_events` — the same marshaling ``run_event_stream`` uses for
@@ -10250,7 +10253,7 @@ class OrderSyncEngine:
         :class:`_NativeCancelAllExpected` marker is drained — ahead of the
         venue's ``CANCELLED`` pushes for the bulk-cancelled orders. Every broker
         order id the engine still maps is recorded in
-        :attr:`_native_cancel_all_expected_ids`; the ``cancelled`` branch of
+        :attr:`~OrderSyncEngine._native_cancel_all_expected_ids`; the ``cancelled`` branch of
         :meth:`_route_event` consumes each one-shot, tearing the order down as
         the engine's own cancel instead of an external one.
         """
@@ -10270,7 +10273,7 @@ class OrderSyncEngine:
         """Retire an order the engine's own native bulk cancel removed.
 
         Consumes the one-shot ``event.order.id`` entry in
-        :attr:`_native_cancel_all_expected_ids` and tears the mapped order down
+        :attr:`~OrderSyncEngine._native_cancel_all_expected_ids` and tears the mapped order down
         WITHOUT firing the ``on_unexpected_cancel`` policy — this ``CANCELLED``
         is the deterministic result of the engine's own
         :meth:`enqueue_native_cancel_all_expected` bulk cancel, not an external
@@ -10475,7 +10478,7 @@ class OrderSyncEngine:
         ``oca_cancel = CapabilityLevel.NATIVE`` (exchange handles the
         group) or the filled intent has no ``cancel`` OCA group.
         Idempotent within a sync via
-        :attr:`_cancelled_oca_groups_this_sync`, so a follow-up
+        :attr:`~OrderSyncEngine._cancelled_oca_groups_this_sync`, so a follow-up
         in-band call on the same fill is a no-op.
         """
         if self._oca_cancel_native:
@@ -10588,11 +10591,11 @@ class OrderSyncEngine:
         ``fill_qty == close_qty - applied_partial_qty``) sees a
         consistent pre-state. Without this drain, ``record_fill`` on
         the terminal subtracts only the remaining slice and leaves
-        :attr:`_position` long/short by the previously-skipped partial
+        :attr:`~OrderSyncEngine._position` long/short by the previously-skipped partial
         qty while the broker is flat.
 
         The applied delta is CLAMPED to the parent-side exposure
-        :attr:`_position` currently carries, because the parent ENTRY fill
+        :attr:`~OrderSyncEngine._position` currently carries, because the parent ENTRY fill
         may itself arrive in slices: draining more than the first slice
         opened would push ``size`` past zero into a phantom opposite-side
         position and empty ``open_trades`` while later slices keep
@@ -10818,7 +10821,7 @@ class OrderSyncEngine:
         A slice dropped for a missing fill price
         (:attr:`PendingDefensiveClose.dropped_close_qty`) is not
         necessarily lost: :meth:`_is_duplicate_fill` deliberately keeps an
-        unbookable fill's id OUT of :attr:`_seen_fill_ids` so the broker
+        unbookable fill's id OUT of :attr:`~OrderSyncEngine._seen_fill_ids` so the broker
         can redeliver the same execution with a corrected price, and that
         redelivery books the quantity. Without discharging the ledger here
         the aggregate would stay positive forever, permanently disabling
@@ -10867,11 +10870,11 @@ class OrderSyncEngine:
 
         - **Quantity.** :attr:`PendingDefensiveClose.applied_close_qty`
           (plus ``extra_applied``, the slice the caller is about to
-          credit) reaching :attr:`expected_close_qty`.
+          credit) reaching :attr:`~PendingDefensiveClose.expected_close_qty`.
         - **Booked leg count.**
           :attr:`PendingDefensiveClose.booked_leg_count` (plus the leg the
           caller is about to book, ``extra_booked_leg``) reaching
-          :attr:`expected_leg_count`.
+          :attr:`~PendingDefensiveClose.expected_leg_count`.
 
         ``expected_close_qty`` is the PINE-unit close plan, while the
         broker executes that plan snapped to its integer volume grid: with
@@ -10985,7 +10988,7 @@ class OrderSyncEngine:
         engine-generated ``pine_id`` (``__pyne_defensive_close__<coid>``)
         that the standard :meth:`_cleanup_closed_position` cannot map to
         the parent entry. This handler matches the FILL event against
-        the live :attr:`_pending_defensive_close` markers via
+        the live :attr:`~OrderSyncEngine._pending_defensive_close` markers via
         :meth:`_match_pending_defensive_close` (pine_id → order ref →
         client_order_id fallback).
 
@@ -11005,7 +11008,7 @@ class OrderSyncEngine:
         :param applied_qty: Quantity this event actually booked, when the
             caller applied it outside :meth:`BrokerPosition.record_fill`.
             The no-FIFO branch of :meth:`_route_event` books the close
-            against :attr:`_position` itself under different gates than
+            against :attr:`~OrderSyncEngine._position` itself under different gates than
             ``record_fill`` (no fill-price requirement), so it passes the
             quantity it booked instead of letting the fan accounting
             below re-derive it from the event. ``None`` keeps the
@@ -11479,7 +11482,7 @@ class OrderSyncEngine:
         path that can surface the same execution (see :class:`OrderEvent`).
 
         On a first sighting the id is recorded in the bounded FIFO ring
-        (:attr:`_seen_fill_ids`, capped at
+        (:attr:`~OrderSyncEngine._seen_fill_ids`, capped at
         :data:`_SEEN_FILL_IDS_CAP`) and ``False`` is returned so the fill is
         applied. A second sighting returns ``True`` (drop). When
         ``fill_id`` is ``None`` the gate is a no-op (``False``): the plugin
@@ -11490,7 +11493,7 @@ class OrderSyncEngine:
 
         Safe without a lock: :meth:`_route_event` is single-consumer (only
         :meth:`_drain_events` calls it, on the sync thread); producers hand
-        events over through the thread-safe :attr:`_event_queue` only.
+        events over through the thread-safe :attr:`~OrderSyncEngine._event_queue` only.
         """
         fill_id = event.fill_id
         if fill_id is None:
@@ -12817,7 +12820,7 @@ class OrderSyncEngine:
     # === Cancel-tentative state machine ====================================
 
     def _rehydrate_cancel_tentative_from_replayed_legs(self) -> None:
-        """Rebuild :attr:`_cancel_disposition_pending` from replayed legs.
+        """Rebuild :attr:`~OrderSyncEngine._cancel_disposition_pending` from replayed legs.
 
         Scheduled by ``__init__`` (via
         ``_pending_cancel_tentative_rehydrate``) and executed at the top
@@ -12937,7 +12940,7 @@ class OrderSyncEngine:
     ) -> None:
         """Atomic two-level cancel-tentative entry.
 
-        Sets the envelope/intent-level :attr:`_cancel_disposition_pending`
+        Sets the envelope/intent-level :attr:`~OrderSyncEngine._cancel_disposition_pending`
         flag AND flips every ``pending_entry`` leg of the trio to
         :data:`LEG_STATE_CANCEL_TENTATIVE` via
         :meth:`SoftwarePartialBracketEngine.mark_legs_cancel_tentative`.
@@ -13019,9 +13022,9 @@ class OrderSyncEngine:
         Called from three sites:
 
         - :meth:`_drive_cancel_tentative` on a non-``UNKNOWN`` outcome.
-        - :meth:`_on_order_event` FILL ag when a late parent fill
+        - :meth:`_route_event` FILL ag when a late parent fill
           arrives for a tentative key (``via='order_event'``).
-        - :meth:`_on_order_event` cancelled ag when the broker pushes
+        - :meth:`_route_event` cancelled ag when the broker pushes
           a CANCELLED confirmation for a tentative key.
 
         Acts according to the outcome:
@@ -13435,7 +13438,7 @@ class OrderSyncEngine:
         broker still honors the cancel.
 
         :param intent_key: Parent ``EntryIntent.intent_key`` whose
-            residual order remains live in :attr:`_order_mapping` and
+            residual order remains live in :attr:`~OrderSyncEngine._order_mapping` and
             now needs an explicit cancel.
         """
         if intent_key not in self._order_mapping:
@@ -14121,7 +14124,7 @@ class OrderSyncEngine:
     def _dispatch_partial_bracket_close(self, leg) -> None:
         """Synthesise + dispatch one partial-bracket :class:`CloseIntent`.
 
-        Drives the :data:`LEG_STATE_TRIGGERING` leg through its
+        Drives the :data:`~pynecore.core.broker.store_helpers.LEG_STATE_TRIGGERING` leg through its
         terminal settling step. The synthesised ``pine_id`` carries
         the leg's identity coordinates so the dispatched intent
         cannot collide with the script's own :class:`CloseIntent`
@@ -14136,8 +14139,9 @@ class OrderSyncEngine:
         * Clean return AND the dispatch landed (``_order_mapping``
           populated for ``synth_pine_id``) →
           :meth:`SoftwarePartialBracketEngine.confirm_trigger_dispatched`
-          flips the leg to :data:`LEG_STATE_TRIGGERED` and cascades the
-          OCA siblings.
+          flips the leg to
+          :data:`~pynecore.core.broker.store_helpers.LEG_STATE_TRIGGERED` and
+          cascades the OCA siblings.
         * Clean return but the dispatch was parked by
           :meth:`_dispatch_new` (it swallows
           :class:`OrderDispositionUnknownError` and routes it to
@@ -14150,13 +14154,14 @@ class OrderSyncEngine:
           :meth:`SoftwarePartialBracketEngine.mark_trigger_dispatch_failed`
           re-arms the leg with the skip reason on the audit row.
         * :class:`ExchangeOrderRejectedError` (including subclasses such
-          as :class:`InsufficientMarginError`) →
+          as :class:`~pynecore.core.broker.exceptions.InsufficientMarginError`) →
           :meth:`SoftwarePartialBracketEngine.mark_trigger_dispatch_failed`
           re-arms the leg with the broker reject reason. Without this
           branch the generic ``Exception`` re-raise in
           :meth:`_dispatch_new` would propagate out of the trigger loop,
           aborting the current sync while the leg stays in
-          :data:`LEG_STATE_TRIGGERING` and OCA siblings remain reserved.
+          :data:`~pynecore.core.broker.store_helpers.LEG_STATE_TRIGGERING` and OCA
+          siblings remain reserved.
         * :class:`BrokerManualInterventionError` propagates after
           marking the leg failed — the engine is going to halt.
         """
@@ -17301,7 +17306,7 @@ class OrderSyncEngine:
     def _entry_cycle_consumed(self, key: str, qty: float) -> bool:
         """Whether the entry cycle tracked under ``key`` has nothing left working.
 
-        The fill ledger (:attr:`_active_entry_filled_qty`) books the
+        The fill ledger (:attr:`~OrderSyncEngine._active_entry_filled_qty`) books the
         position-moving quantity, which a spot buy charged its fee in the
         base coin never brings up to the dispatched ``qty``. Completion is
         therefore also read in the venue's own terms: every venue order of
@@ -17444,7 +17449,8 @@ class OrderSyncEngine:
         duplicate rather than a new order.
 
         After a restart, the anchor for an existing ``intent_key`` is
-        reconstructed from the persisted :class:`BrokerStore` / :class:`RunContext`
+        reconstructed from the persisted
+        :class:`~pynecore.core.broker.storage.BrokerStore` / :class:`RunContext`
         instead of being recomputed from ``_current_bar_ts_ms`` — the latter
         would yield a new ``client_order_id`` and break exchange-side dedup.
         """
@@ -17665,7 +17671,7 @@ class OrderSyncEngine:
         bumped anchor (``retry_seq > 0``) unjournaled: a retry that never
         materialises must re-evaluate the signal fresh after a restart, and the
         bar scope that bounds the bump lives only in the in-memory
-        :attr:`_reject_anchor_bars` (see that attribute's declaration and
+        :attr:`~OrderSyncEngine._reject_anchor_bars` (see that attribute's declaration and
         :meth:`_reanchor_envelope_after_reject`'s docstring). That keeps the
         non-materialised case correct, but it leaves a hole the moment the
         bumped dispatch actually reaches the broker — a clean ``execute_*``
@@ -17674,7 +17680,7 @@ class OrderSyncEngine:
         At that point the bumped ``client_order_id`` is real broker state and
         MUST survive a restart: :meth:`_resolve_parent_opening_ref` and every
         modify/cancel rebuild the parent COID from
-        :attr:`_persisted_envelope_anchors`, which is repopulated from the
+        :attr:`~OrderSyncEngine._persisted_envelope_anchors`, which is repopulated from the
         journal on replay. Without this write a restart would reconstruct
         ``retry_seq=0`` for a live order opened under ``retry_seq=1``, so the
         native fail-safe retire and any amend/cancel would target the wrong
@@ -17707,12 +17713,12 @@ class OrderSyncEngine:
         ``run_tag`` is one of :meth:`_journaled_run_tags` (our own, or a
         rotated predecessor's whose journal this run adopted), and its kind
         is :data:`KIND_ENTRY` or :data:`KIND_ENTRY_STOP` — into
-        :attr:`_restart_live_entry_anchors`, keyed by ``pid_hash`` ->
+        :attr:`~OrderSyncEngine._restart_live_entry_anchors`, keyed by ``pid_hash`` ->
         ``(bar_ts_ms, retry_seq)``, with the order's own tag in
-        :attr:`_restart_live_entry_tags`. An id that is
+        :attr:`~OrderSyncEngine._restart_live_entry_tags`. An id that is
         not canonical but parses as a wire form (short-budget venue) with a
         matching ``run_tag`` and entry kind lands in
-        :attr:`_restart_live_wire_entry_orders` instead, deferred to the
+        :attr:`~OrderSyncEngine._restart_live_wire_entry_orders` instead, deferred to the
         adoption-time forward-hash match. Only the entry
         working order is recoverable this way: position-attached bracket legs
         never surface in ``get_open_orders`` (and are not entry kinds anyway),
@@ -17865,7 +17871,7 @@ class OrderSyncEngine:
         ``client_order_id`` — it does NOT stop the first post-restart diff from
         dispatching the re-declared entry again. Venues that do not treat the
         client id as a working-order idempotency key (Capital.com, cTrader)
-        then double-open, raising live exposure. Seed :attr:`_order_mapping`
+        then double-open, raising live exposure. Seed :attr:`~OrderSyncEngine._order_mapping`
         from the live exchange order id here, before the dispatch loop, so the
         cross-restart adoption branch in :meth:`_diff_and_dispatch` pins the
         entry as the active intent and sends no fresh order. A later
@@ -18108,7 +18114,7 @@ class OrderSyncEngine:
         :param old_intent: Only set for ``kind='modify'``. The pre-modify
             ``_active_intents[key]`` snapshot, captured BEFORE
             ``_diff_and_dispatch`` promotes the slot to the new intent
-            (line 1328). Stashed in :attr:`_modify_old_intents` so a
+            (line 1328). Stashed in :attr:`~OrderSyncEngine._modify_old_intents` so a
             later ``'rejected'`` resolution can restore the slot and
             force the next diff to re-emit the amend — without this the
             promoted-new active matches Pine and the diff stays silent
@@ -18184,7 +18190,7 @@ class OrderSyncEngine:
         ``_position.size`` — reserving the full quantity would count that
         slice twice and falsely halt a legitimate later sell (e.g. a spot
         flatten). The residual comes from
-        :attr:`_active_entry_filled_qty`; a key missing from the ledger
+        :attr:`~OrderSyncEngine._active_entry_filled_qty`; a key missing from the ledger
         conservatively reserves the full quantity (the safe direction — an
         over-reservation can only cause a graceful halt, never a short).
 
@@ -18255,10 +18261,10 @@ class OrderSyncEngine:
         Two parked shapes have left ``_active_intents`` while their resting
         SELL order may STILL be live and fillable at the broker:
 
-        - :attr:`_forced_cancel_pending` — a short-gate forced cancel
+        - :attr:`~OrderSyncEngine._forced_cancel_pending` — a short-gate forced cancel
           (:meth:`_attempt_short_gate_forced_cancel`) whose cancel has not
           provably landed (:meth:`_retry_forced_cancels` keeps re-driving it).
-        - :attr:`_cancel_disposition_pending` — a SOFTWARE partial-bracket
+        - :attr:`~OrderSyncEngine._cancel_disposition_pending` — a SOFTWARE partial-bracket
           parent entry whose cancel is disposition-unknown / did-not-land,
           moved into the cancel-tentative state machine by
           :meth:`_mark_intent_cancel_disposition_pending` (the diff loop popped
@@ -18278,7 +18284,7 @@ class OrderSyncEngine:
         1. The live in-memory intent — the real parked ``EntryIntent``
            (``_forced_cancel_pending``) or the preserved envelope's intent
            (``_cancel_disposition_pending``): reserve ``qty - filled`` from
-           :attr:`_active_entry_filled_qty` (the filled slice already lives in
+           :attr:`~OrderSyncEngine._active_entry_filled_qty` (the filled slice already lives in
            ``_position.size``). A buy parent reserves nothing.
         2. Restart-stranded keys with NO usable in-memory qty — a forced cancel
            rehydrated with a ``qty=0.0`` placeholder
@@ -22101,7 +22107,7 @@ class OrderSyncEngine:
           :class:`ExchangeConnectionError` /
           :class:`OrderDispositionUnknownError`. In that state the
           marker's ``close_intent_key`` is already in
-          :attr:`_settled_defensive_close_pine_ids` (duplicate FILLs are
+          :attr:`~OrderSyncEngine._settled_defensive_close_pine_ids` (duplicate FILLs are
           ignored before re-entering the FILL routing path); the
           ``cache_seeded`` branch finishes the documented lifecycle on
           retry success.
@@ -22572,7 +22578,7 @@ class OrderSyncEngine:
         yet routed. In that case the close is in fact complete — the
         only missing piece is the audit + marker drop — so each stale
         marker is settled via :meth:`_settle_marker_from_flat_broker`
-        instead of halting. If :meth:`get_position` itself fails, we
+        instead of halting. If :meth:`~BrokerPlugin.get_position` itself fails, we
         cannot prove the broker is flat and fall through to the
         original manual-intervention halt.
 
@@ -23108,8 +23114,8 @@ class OrderSyncEngine:
         exchange, the parent row must opt out of the plugin-side
         missing-position reconciler. Without the stamp, a broker that
         drops the position from its snapshot before the close activity is
-        ingested would trigger a false :class:`UnexpectedCancelError`
-        halt after the grace window.
+        ingested would trigger a false
+        :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError` halt after the grace window.
 
         Idempotent: re-stamping an already-stamped row is harmless (the
         reconciler only cares that the key is present).
@@ -24125,7 +24131,7 @@ class OrderSyncEngine:
         Strategy-initiated parent-entry cancel: retire any engine-trigger
         partial-bracket :data:`LEG_STATE_PENDING_ENTRY` legs and their
         parked partial :class:`ExitIntent` slots tied to this entry. The
-        async ``cancelled`` event path (:meth:`_on_order_event`) calls
+        async ``cancelled`` event path (:meth:`_route_event`) calls
         :meth:`_abort_pending_partial_legs_for_dead_entry`, but a
         synchronous ``execute_cancel`` success — or a swallowed
         :class:`OrderDispositionUnknownError` in
@@ -24296,7 +24302,7 @@ class OrderSyncEngine:
         order had gone out. A late terminal fault (a permanent misconfiguration)
         propagates before any order can land.
 
-        The verdict tracks :attr:`_read_view_confirmed`, not merely "is a read
+        The verdict tracks :attr:`~OrderSyncEngine._read_view_confirmed`, not merely "is a read
         stuck". Every state in which the view could not be refreshed gates
         dispatch the same way — a wedged read, a fault, an unexpired venue
         rate-limit backoff (which parks reads outright, so nothing is retained

@@ -1078,12 +1078,12 @@ def iter_dev_batch_records(spec: DevBatchSpec,
     """Produce the whole historical developing-transport sequence of a context.
 
     Walks the CHART's bars — from ``spec.window``, the same production the bar
-    loop takes its bars from, cleaned by the same :func:`_clean_bar` the loop
-    publishes through — with a private :class:`HTFAggregator` configured exactly
-    like the runtime one, and yields per bar what ``__sec_signal__``'s
-    ``Lookahead.ON`` branch would have pushed: the one-time prefill target, then
-    the closed step of a period that just completed and the developing step of
-    the period in progress.
+    loop takes its bars from, cleaned by the same
+    :func:`~pynecore.core.script_runner._clean_bar` the loop publishes through — with a
+    private :class:`HTFAggregator` configured exactly like the runtime one, and yields
+    per bar what ``__sec_signal__``'s ``Lookahead.ON`` branch would have pushed: the
+    one-time prefill target, then the closed step of a period that just completed
+    and the developing step of the period in progress.
 
     A GENERATOR on purpose: the child consumes each record as it replays it, so
     the memory this costs is one record and one chart bar rather than the
@@ -1502,7 +1502,7 @@ def create_chart_protocol(
                               chart loop must call ``signal_rate_sources()``
                               once per bar to advance their subprocess and
                               refresh the ResultBlock the
-                              :class:`CurrencyRateProvider` reads from.
+                              :class:`~pynecore.core.currency.CurrencyRateProvider` reads from.
     :param failed_children: Shared registry filled by
                             :func:`watch_security_child` when a child dies
                             abnormally. Enables the cheap UNTIMED waits; when

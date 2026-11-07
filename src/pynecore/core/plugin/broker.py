@@ -125,8 +125,8 @@ class PositionPort(Protocol):
             self, envelope: 'DispatchEnvelope', qty: float,
     ) -> list[ExchangeOrder]:
         """Open ONE order of ``qty`` (Pine units) for the envelope's
-        :class:`EntryIntent` — the residual leg of a reversal, or a plain add.
-        Returns the resulting :class:`ExchangeOrder`(s)."""
+        :class:`~pynecore.core.broker.models.EntryIntent` — the residual leg of a
+        reversal, or a plain add. Returns the resulting :class:`ExchangeOrder`(s)."""
         ...
 
     async def amend_bracket(
@@ -142,10 +142,11 @@ class PositionPort(Protocol):
         Sets the take-profit / stop-loss / trailing levels of the exit's bracket
         on broker leg ``leg_id`` under client-order-id ``coid``. Levels are in
         PINE UNITS (absolute prices for ``tp_price`` / ``sl_price``, a price
-        distance for ``trail_offset``), exactly as the :class:`ExitIntent`
-        carries them — the plugin owns the conversion to its broker grid and any
-        broker-specific reduction (e.g. cTrader has no numeric trailing offset,
-        so the plugin seeds an absolute trailing anchor and a trailing flag).
+        distance for ``trail_offset``), exactly as the
+        :class:`~pynecore.core.broker.models.ExitIntent` carries them — the plugin owns
+        the conversion to its broker grid and any broker-specific reduction (e.g.
+        cTrader has no numeric trailing offset, so the plugin seeds an absolute
+        trailing anchor and a trailing flag).
         ``side`` is the exit side, supplied because a trail-only bracket needs it
         to place the initial anchor on the correct side.
 
@@ -613,8 +614,8 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
         Open or add to a position.
 
         Maps to ``strategy.entry()`` and ``strategy.order()``. ``envelope.intent``
-        is the :class:`EntryIntent`. Use ``envelope.client_order_id(KIND_ENTRY)``
-        for the exchange-side client id.
+        is the :class:`~pynecore.core.broker.models.EntryIntent`. Use
+        ``envelope.client_order_id(KIND_ENTRY)`` for the exchange-side client id.
 
         | Pine params         | order_type   | limit    | stop     |
         |---------------------|--------------|----------|----------|
@@ -636,7 +637,7 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
         Exit (reduce) a position.  OCA REDUCE semantics expected.
 
         Maps to ``strategy.exit()``. ``envelope.intent`` is the
-        :class:`ExitIntent`. Allocate per-leg client ids via
+        :class:`~pynecore.core.broker.models.ExitIntent`. Allocate per-leg client ids via
         ``envelope.client_order_id(KIND_EXIT_TP)`` and
         ``envelope.client_order_id(KIND_EXIT_SL)``.
 
@@ -753,8 +754,8 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
         :meth:`cancel_broker_order_ref`.
 
         Default implementation returns an empty list. Plugins that
-        raise :class:`BracketAttachAfterFillRejectedError` MUST override
-        this method when their execution model can leave residual
+        raise :class:`~pynecore.core.broker.exceptions.BracketAttachAfterFillRejectedError`
+        MUST override this method when their execution model can leave residual
         cancellable orders, namely:
 
         - Residual unfilled portion of a partial-fill parent entry that
@@ -768,7 +769,7 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
         legitimately drop out of the list between calls.
 
         :param context: Recovery context built from the raised
-            :class:`BracketAttachAfterFillRejectedError`.
+            :class:`~pynecore.core.broker.exceptions.BracketAttachAfterFillRejectedError`.
         :return: List of exchange-native order refs to cancel. Empty by
             default; the engine treats an empty list as "no residual
             cleanup required".

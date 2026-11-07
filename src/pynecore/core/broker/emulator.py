@@ -157,7 +157,7 @@ def select_legs_for_close(
 ) -> tuple[tuple[LegClose, ...], float]:
     """Pick which ``side`` legs to close for a ``qty`` reduction, oldest first.
 
-    FIFO by :attr:`~pynecore.core.broker.models.PositionLeg.open_time` so the
+    FIFO by :attr:`~PositionLeg.open_time` so the
     plan matches Pine's oldest-trade-first close order and is deterministic
     across restarts (a replay sees the same legs in the same order).
 

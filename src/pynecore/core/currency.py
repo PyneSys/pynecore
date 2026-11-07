@@ -6,7 +6,7 @@ Sources of exchange-rate data, in priority order:
 * a security context already attached to the run — backtest or live —
   whose ``(basecurrency, currency)`` syminfo matches the requested pair.
   The provider reads the security's latest ``close`` from its
-  :class:`ResultBlock` (the same channel ``__sec_read__`` uses).
+  :class:`~pynecore.core.security_shm.ResultBlock` (the same channel ``__sec_read__`` uses).
 * legacy file path: a sibling ``.toml`` describing a static
   ``.ohlcv`` file. Only relevant when older callers still pass plain
   paths; live runs never carry these.
@@ -87,7 +87,7 @@ class CurrencyRateProvider:
                            security infrastructure. Required when any rate
                            source is a sec_id (so :class:`ResultReader`
                            can fetch the latest pickled close from the
-                           security's :class:`ResultBlock`).
+                           security's :class:`~pynecore.core.security_shm.ResultBlock`).
         """
         # Tagged source: ``('sec', sec_id)`` for in-process security
         # contexts, ``('file', path)`` for legacy file-backed sources.

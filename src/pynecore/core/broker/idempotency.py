@@ -41,7 +41,7 @@ A venue whose client-id limit is below the canonical width (some FIX
 implementations cap ``ClOrdID`` at 20 characters) cannot carry the canonical
 id. For those, :func:`encode_wire_client_order_id` derives a fixed-length
 **wire form** that exactly fills the venue budget declared by the plugin
-(:attr:`~pynecore.core.plugin.broker.BrokerPlugin.client_order_id_max_len`)::
+(:attr:`~BrokerPlugin.client_order_id_max_len`)::
 
     {run}{bar}{k}{hash}
 

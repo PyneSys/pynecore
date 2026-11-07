@@ -198,7 +198,7 @@ def validate_plugin_contract(
       storage derives the run identity from it; a silent ``"default"``
       would collide every run of the account.
     - **PositionPort surface** — a non-``None``
-      :attr:`~pynecore.core.plugin.broker.BrokerPlugin.position_port` must
+      :attr:`~BrokerPlugin.position_port` must
       carry the full port surface the core
       :class:`~pynecore.core.broker.one_way_emulator.OneWayEmulator` drives.
 

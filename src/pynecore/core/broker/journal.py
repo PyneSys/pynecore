@@ -551,8 +551,8 @@ class CloseDispatchHooks(Protocol):
         ``deal_reference`` populated, ``exchange_id`` set to the new
         opposite-leg ``dealId``, and ``applied_targets`` listing that
         single ``dealId``. The hook itself raises
-        :class:`BrokerManualInterventionError` on an unresolved race;
-        the journal does not catch that — it propagates to the engine.
+        :class:`~pynecore.core.broker.exceptions.BrokerManualInterventionError` on an
+        unresolved race; the journal does not catch that — it propagates to the engine.
         """
         ...
 
@@ -635,9 +635,9 @@ class ModifyEntryDispatchHooks(Protocol):
     ) -> list[ExchangeOrder]:
         """Build the :class:`ExchangeOrder` list for the engine.
 
-        The engine's :meth:`modify_entry` signature returns a list of
-        orders; for atomic amends this is a one-element list pointing
-        at the same target as before. Pure function.
+        The engine's :meth:`~pynecore.core.plugin.broker.BrokerPlugin.modify_entry`
+        signature returns a list of orders; for atomic amends this is a one-element list
+        pointing at the same target as before. Pure function.
         """
         ...
 
@@ -728,9 +728,11 @@ class DispatchJournal:
     ) -> list[ExchangeOrder]:
         """Run an entry dispatch from initial persist through confirm.
 
-        The state-machine is :data:`STATE_SUBMITTED` → optionally
-        :data:`STATE_SERVER_REF_SEEN` → :data:`STATE_CONFIRMED` (or
-        :data:`STATE_REJECTED` / :data:`STATE_DISPOSITION_UNKNOWN` on
+        The state-machine is :data:`~pynecore.core.broker.store_helpers.STATE_SUBMITTED`
+        → optionally :data:`~pynecore.core.broker.store_helpers.STATE_SERVER_REF_SEEN` →
+        :data:`~pynecore.core.broker.store_helpers.STATE_CONFIRMED` (or
+        :data:`~pynecore.core.broker.store_helpers.STATE_REJECTED` /
+        :data:`~pynecore.core.broker.store_helpers.STATE_DISPOSITION_UNKNOWN` on
         the failure paths). Every state advance happens through a
         store helper, so the on-disk schema is identical to what the
         legacy plugin path writes — the parity test relies on that.
@@ -740,9 +742,9 @@ class DispatchJournal:
         :param intent: The :class:`EntryIntent` being dispatched.
         :param qty: Quantity to submit, already quantized to the
             broker's lot step.
-        :param kind: :data:`ENTRY_KIND_POSITION` for MARKET orders or
-            :data:`ENTRY_KIND_WORKING` for LIMIT / STOP. Decides the
-            ``extras['kind']`` value.
+        :param kind: :data:`~pynecore.core.broker.store_helpers.ENTRY_KIND_POSITION` for
+            MARKET orders or :data:`~pynecore.core.broker.store_helpers.ENTRY_KIND_WORKING`
+            for LIMIT / STOP. Decides the ``extras['kind']`` value.
         :param hooks: Plugin-supplied callbacks (see
             :class:`EntryDispatchHooks`).
         :param audit_payload: Extra fields merged into the
@@ -1341,7 +1343,7 @@ class DispatchJournal:
         """Run a position bracket amend dispatch.
 
         The journal owns the entry-side command row state machine and
-        invokes :meth:`mirror_bracket_legs` on the happy path. The
+        invokes :meth:`~ModifyExitDispatchHooks.mirror_bracket_legs` on the happy path. The
         synthetic leg rows themselves are written by the hook (both
         the disposition-unknown seeds in the ambiguous path and the
         confirmed leg rows in the mirror path).

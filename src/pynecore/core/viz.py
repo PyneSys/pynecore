@@ -67,7 +67,7 @@ def _names(mod, cls, strip: str = '') -> dict:
 
 
 def _flags(mod, cls, strip: str = '') -> list[tuple[int, str]]:
-    """Collect the single-flag constants of a :class:`BitSet` class in ``mod``.
+    """Collect the single-flag constants of a :class:`~pynecore.types.base.BitSet` class in ``mod``.
 
     :param mod: The module holding the constants (e.g. ``lib.display``)
     :param cls: The flag-set type (e.g. ``Display``)
@@ -223,7 +223,7 @@ def _clean(d: dict) -> dict:
 #
 
 def serialize_meta(meta: Any) -> dict:
-    """Serialize a :class:`PlotMeta` to a ``meta`` record.
+    """Serialize a :class:`~pynecore.types.plot_meta.PlotMeta` to a ``meta`` record.
 
     Enum fields are mapped to names, colors to hex, kind-specific defaults are
     applied when the source field is ``None``, and remaining ``None`` fields are

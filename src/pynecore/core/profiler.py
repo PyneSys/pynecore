@@ -154,7 +154,7 @@ def _nested_codes(func: Any, names: tuple[str, ...]) -> list[CodeType]:
 def _regions(runner: Any) -> list[tuple[CodeType, int]]:
     """The runtime functions timed as a category, with their category.
 
-    :param runner: The :class:`ScriptRunner` being profiled.
+    :param runner: The :class:`~pynecore.core.script_runner.ScriptRunner` being profiled.
     """
     runner_cls = type(runner)
     runner_module = sys.modules[runner_cls.__module__]
@@ -267,7 +267,7 @@ def _pynecore_version() -> str | None:
 
 
 class RunProfiler:
-    """The profiler of one :class:`ScriptRunner` run."""
+    """The profiler of one :class:`~pynecore.core.script_runner.ScriptRunner` run."""
 
     def __init__(self, runner: Any, path: Path):
         """

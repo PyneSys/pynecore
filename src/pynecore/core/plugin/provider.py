@@ -153,7 +153,8 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         """
         Normalize a provider-format symbol to the exchange API format.
 
-        Called by the framework before passing ``symbol`` to :meth:`watch_ohlcv`
+        Called by the framework before passing ``symbol`` to
+        :meth:`~pynecore.core.plugin.live_provider.LiveProviderPlugin.watch_ohlcv`
         in the live runner. For historical methods (:meth:`download_ohlcv`,
         :meth:`update_symbol_info`), providers use ``self.symbol`` directly —
         handle any needed format conversion in ``__init__`` instead.
@@ -308,7 +309,7 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         """
         Save OHLCV data to the file.
 
-        Bars at or before :attr:`resume_timestamp` are already stored and are
+        Bars at or before :attr:`~ProviderPlugin.resume_timestamp` are already stored and are
         dropped instead of written: a continuation deliberately requests a window
         that reaches back into the existing data, because the opening instant of
         the next bar cannot be predicted from the period alone (calendar months and

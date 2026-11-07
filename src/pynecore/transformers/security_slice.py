@@ -866,7 +866,8 @@ class SecuritySliceTransformer(ast_walk.NodeTransformer):
         :param entries: ``(index, (sid, context dict))`` in context order
         :param reach: the module's reachability cache
         :return: ``(unit, kept indexes)`` per sliced unit; empty when the module
-            cannot be sliced at all (see :attr:`module_skip`)
+            cannot be sliced at all (see
+            :attr:`~SecuritySliceTransformer.module_skip`)
         """
         if security_slice_disabled():
             self.module_skip = 'disabled'

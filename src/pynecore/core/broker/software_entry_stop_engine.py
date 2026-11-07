@@ -19,8 +19,8 @@ Because only one leg is ever native, there are never two simultaneous native
 triggers: no race, and no need for a halt (a halt is forbidden for a live bot).
 
 This module is the dispatch-time + watch-time counterpart of
-:mod:`software_partial_bracket_engine`. The state machine and the persisted
-watch rows in :mod:`store_helpers` form one pair: the rows are the durable
+:mod:`~pynecore.core.broker.software_partial_bracket_engine`. The state machine and the persisted
+watch rows in :mod:`~pynecore.core.broker.store_helpers` form one pair: the rows are the durable
 representation (PERSIST-FIRST), the in-memory :class:`EntryStopWatch` ledger is
 the working set the WATCH phase reads on every price tick. On a clean restart
 the ledger is rebuilt from the rows by :meth:`SoftwareEntryStopEngine.restart_replay`.
@@ -67,7 +67,7 @@ __all__ = [
 class EntryStopWatch:
     """In-memory mirror of one entry-stop watch row.
 
-    Mirrors the canonical extras keys in :mod:`store_helpers`; the persistent
+    Mirrors the canonical extras keys in :mod:`~pynecore.core.broker.store_helpers`; the persistent
     representation is authoritative (the engine reloads this struct from there
     on restart). Keyed by ``pine_id`` — a both-set entry is exactly one Pine
     entry id, so there is at most one live watch per id.
@@ -285,11 +285,13 @@ class SoftwareEntryStopEngine:
         """Rebuild the in-memory ledger from persisted watch rows.
 
         Called once by the sync engine during startup, after the journal's
-        regular replay but before the first :meth:`sync`. Terminal rows are
-        filtered out by :func:`iter_active_entry_stop_watches`. The latched
-        intermediate states (``cancel_pending`` / ``stop_market_pending``) are
-        reloaded as-is: the next :meth:`_drive_entry_stop_triggers` re-drives
-        them deterministically (re-issue the idempotent cancel / re-dispatch
+        regular replay but before the first
+        :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine.sync`. Terminal rows
+        are filtered out by :func:`iter_active_entry_stop_watches`. The latched
+        intermediate states (``cancel_pending`` / ``stop_market_pending``) are reloaded
+        as-is: the next
+        :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine._drive_entry_stop_triggers`
+        re-drives them deterministically (re-issue the idempotent cancel / re-dispatch
         the idempotent MARKET), so no demotion is needed.
         """
         if self._store_ctx is None:

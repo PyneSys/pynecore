@@ -17,7 +17,7 @@ class Step:
 
 
 class VenueProfile(Protocol):
-    """Venue semantics consumed by :class:`ScenarioRunner`.
+    """Venue semantics consumed by :class:`~pynecore.testing.broker_lab.runner.ScenarioRunner`.
 
     Profiles may return a real plugin instance or a deliberately small broker
     implementation. Plugin suites normally return the real plugin with only its

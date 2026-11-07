@@ -1003,8 +1003,8 @@ class SimPosition(PositionBase):
     Covers OHLC-based fill detection, synthetic slippage, margin-call emulation,
     gap-through logic, OCA reduce/cancel handling, trailing-stop tracking, etc.
 
-    Live broker trading uses :class:`BrokerPosition` instead — exchange fills
-    override all of the simulator logic below.
+    Live broker trading uses :class:`~pynecore.core.broker.position.BrokerPosition`
+    instead — exchange fills override all of the simulator logic below.
     """
 
     __slots__ = (
@@ -4391,7 +4391,7 @@ class SimPosition(PositionBase):
 
         The emulator walks open -> the extreme nearest it -> the other extreme ->
         close, and a calc_on_order_fills re-execution sees it standing on one of
-        those nodes: the one :attr:`_coof_cursor` names.
+        those nodes: the one :attr:`~SimPosition._coof_cursor` names.
 
         Measured 2026-08-15 on BINANCE:BTCUSDT 30m with a body whose only way
         into a position is a stop placed 0.3% off the close — so its fill is
@@ -4419,7 +4419,7 @@ class SimPosition(PositionBase):
         bar close 62921.19 gives one lot step less; and 2026-08-15 on Hull
         Moving Average Swing Trader, where the entry a pass places is sized at
         the very price that pass fills it at. Which point of the bar that is,
-        is decided by :attr:`_coof_cursor` and :meth:`_path_price`.
+        is decided by :attr:`~SimPosition._coof_cursor` and :meth:`_path_price`.
         ``process_orders`` re-anchors ``c`` and the open P&L to the bar close at
         the start of the next pass, so nothing needs undoing.
 
@@ -5705,7 +5705,7 @@ class SimPosition(PositionBase):
         :param start: Sub-bar to resume the walk at. A calc_on_order_fills
             re-execution passes the sub-bar its triggering fill happened in, so
             the orders it places are offered the rest of the bar and not the
-            sub-bars that are already behind them. :attr:`_path_node` carries
+            sub-bars that are already behind them. :attr:`~SimPosition._path_node` carries
             that index — the same bookkeeping the assumed path uses for its own
             nodes, over sub-bar indexes here.
         """

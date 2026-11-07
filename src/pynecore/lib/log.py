@@ -433,8 +433,8 @@ def sim_info(message: str, *args: Any) -> None:
     """Emit an INFO-level paper-trading event (``[SIM]`` tag).
 
     The simulator counterpart to ``broker_info``: in ``--live`` mode without
-    ``--broker`` the :class:`SimPosition` fills orders locally, so there is no
-    ``OrderSyncEngine`` to narrate entries and exits. This gives the operator
+    ``--broker`` the :class:`~pynecore.lib.strategy.SimPosition` fills orders locally, so
+    there is no ``OrderSyncEngine`` to narrate entries and exits. This gives the operator
     the same per-fill visibility for paper trading.
     """
     _emit_tagged(logging.INFO, "[SIM] ", message, args)

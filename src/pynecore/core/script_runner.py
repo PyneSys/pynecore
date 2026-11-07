@@ -683,8 +683,8 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
     would otherwise expose a single raw sub-bar of the period instead of the
     period aggregate, so ``request.security(.., open/high/low/close)`` diverges
     from TradingView. This resamples the base feed to ``target_tf`` (via
-    :func:`aggregate_ohlcv`) so the child reads ONE aggregated bar per period and
-    every field matches TradingView.
+    :func:`~pynecore.core.aggregator.aggregate_ohlcv`) so the child reads ONE aggregated bar
+    per period and every field matches TradingView.
 
     :return: Path to a temporary resampled ``.ohlcv`` (with a cloned ``.toml``
         sidecar) when the feed is finer than ``target_tf``; otherwise ``data_path``
@@ -1092,8 +1092,8 @@ def _security_merge_group(sid: str, all_sec_ids: list[str], contexts: dict,
       to the script entry, and they cannot change during a bar. A member
       therefore reads the seed's feed whether or not it has signalled, so an
       unresolved member JOINS and the chart resolves it from the seed (see
-      ``_start`` in :func:`create_chart_protocol`). Once resolved its FEED key
-      must equal the seed's — that is exactly what the compile-time proof says —
+      ``_start`` in :func:`~pynecore.core.security.create_chart_protocol`). Once resolved its
+      FEED key must equal the seed's — that is exactly what the compile-time proof says —
       so a difference there is a bug in the key rule and is raised rather than
       filtered away. Its BATCH key may legitimately differ (batch eligibility
       also depends on the context's dependencies and consumers), and then it
@@ -1361,10 +1361,11 @@ class ScriptRunner:
                                   broker coroutines can be awaited from the runner thread
                                   via ``run_coroutine_threadsafe``.
         :param broker_store_ctx: Optional :class:`RunContext` from the unified
-                                 :class:`BrokerStore`. When provided the engine persists
-                                 envelope identity and parked-verification entries through
-                                 it, and the runner heartbeats this context on every sync
-                                 so crash detection works. ``None`` means no persistence
+                                 :class:`~pynecore.core.broker.storage.BrokerStore`. When
+                                 provided the engine persists envelope identity and
+                                 parked-verification entries through it, and the runner
+                                 heartbeats this context on every sync so crash detection
+                                 works. ``None`` means no persistence
                                  (tests, backtests) — the ``run_tag`` is then derived
                                  locally from the plugin's ``account_id``. Caller owns
                                  the lifecycle: ``close()`` on shutdown.
@@ -1372,7 +1373,8 @@ class ScriptRunner:
                                      :class:`KeyboardInterrupt` waits for the fills of the
                                      market orders it already dispatched, before its
                                      teardown stops the broker event stream. ``0`` skips
-                                     the wait. The outcome is :attr:`broker_stop_settled`.
+                                     the wait. The outcome is
+                                     :attr:`~ScriptRunner.broker_stop_settled`.
         :param lossless_volume: Whether ``ohlcv_iter`` yields the feed's own volume,
                                 needing no float32 storage clean-up. Read from the
                                 chart feed's :attr:`OHLCVReader.lossless_volume`;
@@ -2727,7 +2729,7 @@ class ScriptRunner:
                     as one round. Both must therefore be in place from the
                     context's very first signal, while the child process itself
                     is only needed once the chart actually READS the context
-                    (see ``_start`` in :func:`create_chart_protocol`).
+                    (see ``_start`` in :func:`~pynecore.core.security.create_chart_protocol`).
 
                     Idempotent: the result is cached per sid.
 
