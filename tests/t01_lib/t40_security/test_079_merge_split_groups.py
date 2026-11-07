@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 from pynecore.lib import (
     barmerge, close, input, plot, request, script, syminfo
 )
@@ -115,6 +116,7 @@ def __test_helper_run(runner, no_merge):
     return rows, spawned
 
 
+@pytest.mark.aot_unsupported("counts or groups security child processes; a compiled run has none")
 def __test_groups_split_exactly_where_the_feed_or_the_syntax_differs__(runner, log):
     """Which contexts merge, which stay apart — and identical values either way.
 

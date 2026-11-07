@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 from pynecore.lib import close, high, input, na, plot, request, script, syminfo, ta
 from pynecore.types import Series
 
@@ -184,6 +185,7 @@ def __test_helper_run_with_timeout(fn, seconds=60):
     return box.get('result')
 
 
+@pytest.mark.aot_unsupported("counts or groups security child processes; a compiled run has none")
 def __test_inline_signalled_contexts_share_one_child__(runner, log):
     """Every call on one stable feed shares a child, however its signal stands.
 

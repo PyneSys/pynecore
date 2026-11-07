@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 from pynecore.lib import close, high, plot, request, script, syminfo, ta
 from pynecore.types import Series
 
@@ -181,6 +182,7 @@ def __test_helper_run_with_timeout(fn, seconds=60):
     return box.get('result')
 
 
+@pytest.mark.aot_unsupported("counts or groups security child processes; a compiled run has none")
 def __test_a_groups_non_primary_member_publishes_its_frontier__(runner, log):
     """A consumer of a merged group's NON-primary member never parks.
 

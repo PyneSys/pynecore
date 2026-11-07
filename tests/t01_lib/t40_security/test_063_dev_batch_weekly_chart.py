@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 from pynecore.lib import barmerge, close, plot, request, script, syminfo
 from pynecore.types import Series
 
@@ -157,6 +158,8 @@ def __test_helper_run(runner, no_batch):
     return rows, batched
 
 
+@pytest.mark.aot_unsupported("inspects the developing-batch plan; "
+                             "a compiled run has no batch planner")
 def __test_weekly_batch_matches_per_bar_path__(runner, log):
     """A weekly batch on a daily chart answers exactly like the per-bar path.
 

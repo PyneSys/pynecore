@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 from pynecore.lib import (
     bar_index, close, high, input, na, plot, request, script, syminfo, ta
 )
@@ -160,6 +161,7 @@ def __test_helper_run(runner, no_merge=False):
     return rows, spawned
 
 
+@pytest.mark.aot_unsupported("counts or groups security child processes; a compiled run has none")
 def __test_unread_branch_gets_no_process__(runner, log):
     """A READ starts a context — and the whole group it belongs to with it.
 

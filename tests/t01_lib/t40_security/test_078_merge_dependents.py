@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 from pynecore.lib import close, nz, plot, request, script, syminfo, ta
 from pynecore.types import Persistent, Series
 
@@ -83,6 +84,7 @@ def __test_helper_run(runner, no_merge):
     return rows, spawned
 
 
+@pytest.mark.aot_unsupported("counts or groups security child processes; a compiled run has none")
 def __test_dependent_siblings_survive_sharing_one_child__(runner, log):
     """Dependent, accumulating, history-reading and looped members stay exact.
 

@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 from pynecore.lib import bar_index, close, input, nz, plot, request, script, ta
 from pynecore.types import Persistent, Series
 
@@ -191,6 +192,7 @@ def __test_helper_run_with_timeout(fn, seconds=180):
     return box.get('result')
 
 
+@pytest.mark.aot_unsupported("counts or groups security child processes; a compiled run has none")
 def __test_merged_group_equals_one_child_per_context__(runner, log):
     """Three calls on one context answer identically merged and unmerged.
 

@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 from pynecore.lib import (
     barmerge, close, high, low, na, open, plot, request, script, syminfo, ta
 )
@@ -291,6 +292,8 @@ def __test_helper_both_runs(runner):
     return skip, plain
 
 
+@pytest.mark.aot_unsupported("inspects the developing-batch plan; "
+                             "a compiled run has no batch planner")
 def __test_batched_dev_skip_matches_a_round_per_bar__(runner, log):
     """A batch that drops the re-ticks answers like one that replays them all
 
@@ -318,6 +321,8 @@ def __test_batched_dev_skip_matches_a_round_per_bar__(runner, log):
              len(skip_rows), len(skip_rows[0]), len(batched))
 
 
+@pytest.mark.aot_unsupported("inspects the developing-batch plan; "
+                             "a compiled run has no batch planner")
 def __test_the_plan_holds_one_developing_record_per_period__(runner, log):
     """The skip is in the plan itself, not only in the chart's step building
 
@@ -351,6 +356,8 @@ def __test_the_plan_holds_one_developing_record_per_period__(runner, log):
              skip_dev, plain_dev, skip_total, plain_total)
 
 
+@pytest.mark.aot_unsupported("inspects the developing-batch plan; "
+                             "a compiled run has no batch planner")
 def __test_every_closed_shift_context_gets_a_skipping_plan__(runner, log):
     """The DEFERRED context's plan skips too, not only the statically resolved ones
 

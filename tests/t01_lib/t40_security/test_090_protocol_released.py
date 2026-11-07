@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 from pynecore.lib import close, plot, request, script, syminfo
 
 
@@ -25,6 +26,7 @@ def __test_helper_chart_bars():
     return bars
 
 
+@pytest.mark.aot_unsupported("inspects the runner's module globals and security state objects")
 def __test_finished_run_releases_its_security_states__(runner, log):
     """A finished run leaves no security protocol and no security state behind
 

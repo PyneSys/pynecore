@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 from pynecore.lib import close, high, plot, request, script, syminfo
 from pynecore.types import Series
 
@@ -89,6 +90,7 @@ def __test_helper_run_with_timeout(fn, seconds=120):
     return box.get('result')
 
 
+@pytest.mark.aot_unsupported("try/except: a compiled script has no exceptions")
 def __test_two_live_htf_contexts_do_not_deadlock__(script_path, module_key, syminfo, log):
     """Two mutually dependent 120-minute contexts on a live 60-minute chart terminate.
 

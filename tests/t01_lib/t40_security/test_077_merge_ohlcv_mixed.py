@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 from pynecore.lib import close, high, plot, request, script, syminfo, ta, volume
 from pynecore.types import Series
 
@@ -82,6 +83,7 @@ def __test_helper_run(runner, no_merge):
     return rows, spawned
 
 
+@pytest.mark.aot_unsupported("counts or groups security child processes; a compiled run has none")
 def __test_mixed_and_all_ohlcv_groups_each_share_one_child__(runner, log):
     """A mixed group and an all-OHLCV group each collapse to a single child.
 

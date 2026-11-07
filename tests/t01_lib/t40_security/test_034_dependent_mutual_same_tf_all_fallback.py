@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 from pynecore.lib import close, plot, request, script, timeframe
 from pynecore.types import Series
 
@@ -81,6 +82,7 @@ def __test_helper_run_with_timeout(fn, seconds=120):
     return box.get('result')
 
 
+@pytest.mark.aot_unsupported("try/except: a compiled script has no exceptions")
 def __test_mutual_all_sids_fallback_terminates__(runner, log):
     """Two mutually dependent same-timeframe contexts terminate with correct values.
 

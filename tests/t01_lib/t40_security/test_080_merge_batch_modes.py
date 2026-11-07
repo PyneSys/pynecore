@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 from pynecore.lib import barmerge, close, plot, request, script, syminfo, ta
 from pynecore.types import Series
 
@@ -189,6 +190,7 @@ def __test_helper_run_strategy(runner, no_merge):
     return trades, spawned
 
 
+@pytest.mark.aot_unsupported("counts or groups security child processes; a compiled run has none")
 def __test_batched_and_closed_only_groups_match_the_unmerged_run__(runner, log):
     """A developing-batch group and a closed-only group both stay value-exact.
 
@@ -218,6 +220,7 @@ def __test_batched_and_closed_only_groups_match_the_unmerged_run__(runner, log):
     __test_helper_compare(merged_rows, plain_rows, log, "batch-modes")
 
 
+@pytest.mark.aot_unsupported("counts or groups security child processes; a compiled run has none")
 def __test_strategy_trades_are_unchanged_by_merging__(runner, log):
     """Two merged higher-timeframe values drive a strategy to the same trades.
 

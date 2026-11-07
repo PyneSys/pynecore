@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 from pynecore.lib import bar_index, close, plot, request, script, syminfo, ta
 from pynecore.types import Series
 
@@ -83,6 +84,7 @@ def __test_helper_run(runner, no_merge):
     return raised, spawned
 
 
+@pytest.mark.aot_unsupported("a security child process dies; a compiled run has no child process")
 def __test_a_dead_merged_child_unblocks_every_context_it_served__(runner, log):
     """A merged child dying stops the chart with an error instead of freezing it.
 
@@ -111,6 +113,7 @@ def __test_a_dead_merged_child_unblocks_every_context_it_served__(runner, log):
     log.info("a dead merged security child surfaced as: %s", raised)
 
 
+@pytest.mark.aot_unsupported("a security child process dies; a compiled run has no child process")
 def __test_the_unmerged_run_fails_the_same_way__(runner, log):
     """With merging off the same script fails identically, one child per context.
 

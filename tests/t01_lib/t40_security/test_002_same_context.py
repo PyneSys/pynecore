@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 import math
 
 from pynecore.lib import close, high, format, plot, request, script, syminfo, timeframe, ta
@@ -18,6 +19,8 @@ def main():
     plot(sec_sma, title="SecSMA")
 
 
+@pytest.mark.aot_unsupported("counts shared-memory cleanups of security child processes; "
+                             "a compiled run has none")
 def __test_same_context__(csv_reader, runner, log, monkeypatch):
     """Same symbol + same TF uses chart data directly without spawning a process."""
     from pynecore import lib

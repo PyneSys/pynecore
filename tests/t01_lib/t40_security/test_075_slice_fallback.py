@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 from pynecore.lib import close, plot, request, script, syminfo
 from pynecore.types import Series
 
@@ -206,6 +207,7 @@ def __test_unmodelled_main_falls_back_to_the_whole_main__(log):
     log.info("the unsliceable script fell back to the whole main()")
 
 
+@pytest.mark.aot_unsupported("try/except: a compiled script has no exceptions")
 def __test_unsliceable_script_still_runs__(runner, log):
     """The fallback script produces values whether or not slicing exists
 
