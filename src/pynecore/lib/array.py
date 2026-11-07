@@ -822,8 +822,9 @@ def new_bool(size: int | NA = 0, initial_value: bool | None = None) -> list[bool
     :return: New array of the specified size
     """
     size = _na_size(size)
-    # The default is the bool na the script runs with (na or false), decided at call time
-    if initial_value is None:
+    # The default, and any na passed, is the bool na the script runs with (na or
+    # false), decided at call time
+    if initial_value is None or isinstance(initial_value, NA):
         initial_value = NA(bool)
     assert isinstance(initial_value, (bool, NA)), "Initial value must be bool!"
     return [initial_value] * size

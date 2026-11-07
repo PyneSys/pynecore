@@ -179,8 +179,9 @@ def implicit_convert(value: Any, kind: str | type | None) -> Any:
     property of the instance. The transform wraps such a value in this call and
     hands it the instance's own vector entry, one of the type pass's conversion
     characters: ``'f'`` converts one int to float, ``'a'`` / ``'m'`` copy an int
-    array / matrix as floats, ``'s'`` / ``'n'`` / ``'t'`` turn Pine's typeless na into
-    the string na, the numeric na or the text ``na``, ``'A'`` / ``'M'`` / ``'X'`` into
+    array / matrix as floats, ``'s'`` / ``'n'`` / ``'b'`` / ``'t'`` turn Pine's typeless
+    na into the string na, the numeric na, the bool na of the mode in effect or the
+    text ``na``, ``'A'`` / ``'M'`` / ``'X'`` into
     the na of an array, a map or a matrix, None converts nothing.
 
     A value that holds the typeless na without spelling it -- a defaulted parameter, a
@@ -205,6 +206,8 @@ def implicit_convert(value: Any, kind: str | type | None) -> Any:
         return value
     if kind == 'n':
         return na_float
+    if kind == 'b':
+        return NA(bool)
     if kind == 't':
         return 'na'
     if kind == 'A':

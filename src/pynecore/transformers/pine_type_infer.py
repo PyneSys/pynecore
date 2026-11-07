@@ -64,7 +64,7 @@ from .pine_type_rules import (
     constant_type, PIN_ANY, pin_chars, pin_for, get_pins, set_pin, set_pins, set_vector,
     get_varying, set_varying,
     WIDEN_FLOAT, WIDEN_BOOL, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_STRING_NA, WIDEN_NUMBER_NA,
-    WIDEN_NA_TEXT, WIDEN_ARRAY_NA, WIDEN_MAP_NA, WIDEN_MATRIX_NA, CONTAINER_NA_WIDENS,
+    WIDEN_BOOL_NA, WIDEN_NA_TEXT, WIDEN_ARRAY_NA, WIDEN_MAP_NA, WIDEN_MATRIX_NA, CONTAINER_NA_WIDENS,
     NA_TEXT_PARAMS,
     NOT_PINE_STRINGS, set_widen, get_widen_site,
     set_widen_site, get_widens, set_widens, is_na_widen, set_na_class,
@@ -2967,14 +2967,15 @@ class _Inference:
         if isinstance(entry, dict):
             self._record_lib_na_args(callee, entry, node.args, node.keywords)
         positions = _FILL_POSITIONS.get(callee)
-        if positions is not None and (is_array(ty) or is_matrix(ty)) \
-                and element_of(ty) in NUMERIC:
-            # The value a numeric container is filled with goes in as one of its
-            # elements: a typeless na there is the numeric na, the same NaN the
-            # constructor fills it with when the value is left out
+        fill = _na_widen(element_of(ty)) if positions is not None \
+            and (is_array(ty) or is_matrix(ty)) else None
+        if positions is not None and fill in (WIDEN_NUMBER_NA, WIDEN_BOOL_NA):
+            # The value a numeric or bool container is filled with goes in as one of
+            # its elements: a typeless na there is the na of the element, the same one
+            # the constructor fills it with when the value is left out
             for arg in _element_args(callee, node, positions):
                 if self._ty_of(arg) == TYPELESS:
-                    self._record_widen(arg, WIDEN_NUMBER_NA)
+                    self._record_widen(arg, fill)
         return ty
 
     def _record_lib_na_args(self, callee: str, entry: dict[str, Any], args: Sequence[ast.expr],
@@ -5621,6 +5622,7 @@ _FILL_POSITIONS: Final[dict[str, tuple[int, ...]]] = {
     'array.new': (1,),
     'array.new_float': (1,),
     'array.new_int': (1,),
+    'array.new_bool': (1,),
     'matrix.new': (2,),
 }
 
@@ -5742,19 +5744,29 @@ def _na_widen(ty: str) -> str | None:
     The conversion a typeless ``na`` literal needs where a value of a type goes.
 
     Pine has no typeless na at run time: where a string goes it is the string na,
-    where a float or an int goes the numeric na, where an object of a class goes
-    the na of that class, where an array, a map or a matrix goes the na of that
-    container. Anywhere else (a bool, a bare object, a type this pass does not
-    know) it stays as it is.
+    where a float or an int goes the numeric na, where a bool goes the bool na,
+    where an object of a class goes the na of that class, where an array, a map or
+    a matrix goes the na of that container. Anywhere else (a bare object, a type
+    this pass does not know) it stays as it is. The bool na is the one the script
+    runs with: the third state under ``na_bool``, false otherwise.
 
     :param ty: The type the na takes there
-    :return: ``WIDEN_STRING_NA``, ``WIDEN_NUMBER_NA``, the object type itself, one of
-             ``CONTAINER_NA_WIDENS``, or None
+    :return: ``WIDEN_STRING_NA``, ``WIDEN_NUMBER_NA``, ``WIDEN_BOOL_NA``, the object
+             type itself, one of ``CONTAINER_NA_WIDENS``, or None
     """
     if ty == STR:
         return WIDEN_STRING_NA
     if ty in NUMERIC:
         return WIDEN_NUMBER_NA
+    if ty == BOOL:
+        # MEASURED (CAPITALCOM:EURUSD 60): a v5 ``na`` put where a bool goes -- an
+        # ``array<bool>`` element by any array call, a bool variable, parameter,
+        # ternary arm, map value, matrix element or UDT field -- is the third state
+        # (``na(x)`` true, ``x == false`` not true). v6 refuses every one of them at
+        # compile time (CE10121 / CE10123 / CE10171 / CE10173), so a two-state module
+        # only meets them in a v5 source compiled two-state or in hand-written Pyne
+        # code, where the only bool na there is is false
+        return WIDEN_BOOL_NA
     if class_of(ty) is not None:
         return ty
     if is_array(ty):
@@ -5796,8 +5808,8 @@ def _widen_for(kind: str, element: str, other: str) -> str | None:
     :param other: The value's type
     :return: ``WIDEN_FLOAT``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX``, ``_WIDEN_HARMLESS``
              when the value is a float (or holds floats) already, ``WIDEN_STRING_NA`` /
-             ``WIDEN_NUMBER_NA`` for a typeless na element of a string / numeric
-             container, or None
+             ``WIDEN_NUMBER_NA`` / ``WIDEN_BOOL_NA`` for a typeless na element of a
+             string / numeric / bool container, or None
     """
     if other == TYPELESS:
         return _na_widen(element) if kind in ('array', 'map', 'matrix') else None

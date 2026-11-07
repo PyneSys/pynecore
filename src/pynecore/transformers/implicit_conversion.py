@@ -30,7 +30,12 @@ literal. One that goes where a float or an int goes -- a numeric variable, field
 parameter or declared return, a ternary arm or an arithmetic operand next to a number,
 an element of a numeric container -- is the numeric na: it becomes ``lib._na_float``,
 the NaN that ``NA(float)`` and ``NA(int)`` both are, so a container, an overload
-dispatch or a library receives the na the way Pine typed it. One that goes where an
+dispatch or a library receives the na the way Pine typed it. One that goes where a bool
+goes -- a bool variable, field, parameter or declared return, a ternary arm next to a
+bool, an element of a bool container -- is the bool na: it becomes ``lib.na(bool)``,
+built where it is evaluated, so it is the na of the mode in effect there (Pine v4/v5's
+third state under ``na_bool``, false otherwise); a field default is built for each
+object, ``field(default_factory=lambda: lib.na(bool))``. One that goes where an
 object of a class goes -- a UDT or drawing variable, field, parameter or declared
 return, a ternary arm next to such an object, an element of a container of them -- is
 the na OF that class: it becomes ``lib.na(<class>)``, the class spelled the way the
@@ -70,7 +75,7 @@ from . import ast_walk
 from .pine_type_rules import (
     BOOL, CONTAINER_NA_WIDENS, FLOAT, OBJECT, STR, WIDEN_BOOL, WIDEN_FLOAT, WIDEN_ITEMS,
     WIDEN_MATRIX,
-    WIDEN_NA_TEXT, WIDEN_NUMBER_NA,
+    WIDEN_BOOL_NA, WIDEN_NA_TEXT, WIDEN_NUMBER_NA,
     WIDEN_STRING_NA, array_of, class_of, get_na_class,
     get_ty,
     get_widen, get_widen_site, is_na_literal, is_na_widen, matrix_of, set_ty, set_widen,
@@ -131,11 +136,14 @@ class ImplicitConversionTransformer(ast_walk.NodeTransformer):
             else:
                 converted = ast.Constant(value=kind)
                 result = FLOAT if kind == WIDEN_NUMBER_NA \
+                    else BOOL if kind == WIDEN_BOOL_NA \
                     else OBJECT if kind in CONTAINER_NA_WIDENS else STR
             converted_value = stamp_lowering(ast.copy_location(ast.Call(
                 func=ast.Attribute(value=ast.Name(id='safe_convert', ctx=ast.Load()),
                                    attr='implicit_convert', ctx=ast.Load()),
                 args=[node, converted], keywords=[]), node), result)
+            if kind == WIDEN_BOOL_NA:
+                return self._bool_field_default(original, converted_value)
             return self._field_default(original, converted_value, result)
         if class_of(kind) is not None or kind in CONTAINER_NA_WIDENS:
             # The na of a class or of a container: ``lib.na(<class>)``
@@ -150,6 +158,14 @@ class ImplicitConversionTransformer(ast_walk.NodeTransformer):
             return set_ty(ast.copy_location(ast.Attribute(
                 value=ast.Name(id='lib', ctx=ast.Load()), attr='_na_float', ctx=ast.Load()),
                 node), FLOAT)
+        if kind == WIDEN_BOOL_NA:
+            # ``lib.na(bool)``, built where it is evaluated: the bool na is the one of
+            # the mode in effect there
+            return self._bool_field_default(original, stamp_lowering(ast.copy_location(
+                ast.Call(func=ast.Attribute(value=ast.Name(id='lib', ctx=ast.Load()),
+                                            attr='na', ctx=ast.Load()),
+                         args=[ast.Name(id='bool', ctx=ast.Load())], keywords=[]),
+                node), BOOL))
         if kind == WIDEN_NA_TEXT:
             return set_ty(ast.copy_location(ast.Constant(value='na'), node), STR)
         if kind == WIDEN_BOOL:
@@ -189,6 +205,35 @@ class ImplicitConversionTransformer(ast_walk.NodeTransformer):
         if id(original) not in self._field_defaults or spelled not in self._module_classes \
                 or spelled in self._defined_classes:
             return value
+        return self._deferred_field(original, value, result)
+
+    def _bool_field_default(self, original: ast.expr, value: ast.expr) -> ast.expr:
+        """
+        Defer a field default that is the bool na.
+
+        The bool na is what the mode in effect says it is (``set_bool_na``), while a
+        class body runs once, under the mode of the module that defines it. The
+        default is built for each object the dataclass creates instead, under the
+        mode in effect there -- the way ``DynamicDefaultTransformer`` defers a
+        spelled ``na(bool)`` field default.
+
+        :param original: The default as the type pass stamped it
+        :param value: Its conversion into the bool na
+        :return: ``value``, or the deferred field built from it
+        """
+        if id(original) not in self._field_defaults:
+            return value
+        return self._deferred_field(original, value, BOOL)
+
+    def _deferred_field(self, original: ast.expr, value: ast.expr, result: str) -> ast.expr:
+        """
+        A field default built for each object the dataclass creates.
+
+        :param original: The default as the type pass stamped it
+        :param value: The expression the factory evaluates
+        :param result: The Pine type of ``value``
+        :return: ``field(default_factory=lambda: <value>)``
+        """
         if self._field_alias is None:
             self._field_alias = self._dataclass_field_alias()
         factory = ast.Lambda(args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[],

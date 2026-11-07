@@ -252,6 +252,7 @@ pub fn call<'py>(
                 ("WIDEN_MATRIX", rules::WIDEN_MATRIX),
                 ("WIDEN_STRING_NA", rules::WIDEN_STRING_NA),
                 ("WIDEN_NUMBER_NA", rules::WIDEN_NUMBER_NA),
+                ("WIDEN_BOOL_NA", rules::WIDEN_BOOL_NA),
                 ("WIDEN_NA_TEXT", rules::WIDEN_NA_TEXT),
                 ("WIDEN_ARRAY_NA", rules::WIDEN_ARRAY_NA),
                 ("WIDEN_MAP_NA", rules::WIDEN_MAP_NA),

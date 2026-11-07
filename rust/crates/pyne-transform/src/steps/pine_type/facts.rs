@@ -13,8 +13,8 @@ use crate::data;
 use crate::node_ids::node_id;
 use crate::pine_type_rules::{
     BOOL, FLOAT, INT, NUMERIC, OBJECT, SCALARS, STR, TYPELESS, UNKNOWN, VOID, WIDEN_ARRAY_NA,
-    WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MAP_NA, WIDEN_MATRIX, WIDEN_MATRIX_NA, WIDEN_NUMBER_NA,
-    WIDEN_STRING_NA, builtin_class_id, class_of, dotted, element_of, elements_of,
+    WIDEN_BOOL_NA, WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MAP_NA, WIDEN_MATRIX, WIDEN_MATRIX_NA,
+    WIDEN_NUMBER_NA, WIDEN_STRING_NA, builtin_class_id, class_of, dotted, element_of, elements_of,
     forward_reference, get_pins, get_widen_site, get_widens, is_array, is_map, is_matrix, join,
     object_ty, shape_conflict,
 };
@@ -492,6 +492,9 @@ pub fn na_widen(ty: &str) -> Option<String> {
     }
     if NUMERIC.contains(&ty) {
         return Some(WIDEN_NUMBER_NA.to_string());
+    }
+    if ty == BOOL {
+        return Some(WIDEN_BOOL_NA.to_string());
     }
     if class_of(ty).is_some() {
         return Some(ty.to_string());

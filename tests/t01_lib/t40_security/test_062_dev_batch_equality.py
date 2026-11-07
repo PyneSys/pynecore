@@ -7,7 +7,7 @@ from pynecore.lib import (
 from pynecore.types import IBPersistent, Series
 
 
-def __test_helper_tick_count():
+def tick_count():
     """Count every execution of this expression, re-ticks included.
 
     A ``varip`` slot is the one piece of child state a developing re-tick does
@@ -40,7 +40,7 @@ def main():
         syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_on)
     # The round-sequence fingerprint.
     ticks: Series[float] = request.security(
-        syminfo.tickerid, "60", __test_helper_tick_count(),
+        syminfo.tickerid, "60", tick_count(),
         lookahead=barmerge.lookahead_on)
     # A dependent pair: the producer has a consumer and the consumer has a
     # dependency, so NEITHER may be batched — both keep the per-bar path, and

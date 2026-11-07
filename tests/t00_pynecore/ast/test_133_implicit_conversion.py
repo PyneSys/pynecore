@@ -153,10 +153,11 @@ def __test_typeless_na_where_a_string_goes_is_empty__(body, expected):
      'a = lib.array.new_int(3, initial_value=lib._na_float)'),
     ('m: Matrix[float] = lib.matrix.new(2, 2, lib._na_none)',
      'm: Matrix[float] = lib.matrix.new(2, 2, lib._na_float)'),
-    ('a = lib.array.new_bool(3, lib._na_none)', 'a = lib.array.new_bool(3, lib._na_none)'),
-    # a bool has no numeric na, and a NaN map key would never find itself again
-    ('b: bool = lib._na_none', 'b: bool = lib._na_none'),
-    ('def flag() -> bool:\n    return lib._na_none', '    return lib._na_none'),
+    # a bool takes the bool na, the one of the mode in effect where it is built
+    ('a = lib.array.new_bool(3, lib._na_none)', 'a = lib.array.new_bool(3, lib.na(bool))'),
+    ('b: bool = lib._na_none', 'b: bool = lib.na(bool)'),
+    ('def flag() -> bool:\n    return lib._na_none', '    return lib.na(bool)'),
+    # a NaN map key would never find itself again
     ('m: dict[float, str] = lib.map.new()\nlib.map.put(m, lib._na_none, "v")',
      "lib.map.put(m, lib._na_none, 'v')"),
     # a lib parameter keeps its na: there it is the absent value the lib tests for
@@ -611,8 +612,8 @@ def main():
     # a held typeless na is converted at run time, with the class
     ('def pick(v=lib._na_none):\n    return Pivot(1.0) if lib.bar_index < 0 else v\nx = pick()',
      '    return Pivot(1.0) if lib.bar_index < 0 else safe_convert.implicit_convert(v, Pivot)'),
-    # a bool keeps the typeless na
-    ('b: bool = lib._na_none', 'b: bool = lib._na_none'),
+    # a bool takes the bool na
+    ('b: bool = lib._na_none', 'b: bool = lib.na(bool)'),
 ])
 def __test_typeless_na_where_an_object_goes_is_the_na_of_its_class__(body, expected):
     emitted, diags = __test_helper_widen(body, __test_helper_UDT_PRELUDE)
@@ -914,8 +915,8 @@ def main():
     # a value the function computes decides it too
     ('def half(v):\n    return v / 2\nresult = lib._na_none\nif lib.bar_index > 0:\n'
      '    result = half(lib.close)', 'result = lib._na_float'),
-    # a bool, and a name nothing else assigns, keep the typeless na
-    ('flag = lib._na_none\nif lib.bar_index > 0:\n    flag = True', 'flag = lib._na_none'),
+    # a bool takes the bool na, a name nothing else assigns keeps the typeless na
+    ('flag = lib._na_none\nif lib.bar_index > 0:\n    flag = True', 'flag = lib.na(bool)'),
     ('nothing = lib._na_none\nx = nothing', 'nothing = lib._na_none'),
 ])
 def __test_a_typeless_na_a_name_starts_as_is_the_na_of_what_it_is_assigned_later__(body,
@@ -958,9 +959,9 @@ def __test_branches_assigning_different_types_are_reported__(body, message):
     ('box = (lib._na_none, lib._na_none)\nif lib.bar_index > 0:\n'
      '    box = (Pivot(1.0), lib.array.new_float(0))\nx = box',
      'box = (lib.na(Pivot), lib.na(list))'),
-    # a position a bool is assigned to keeps the typeless na
+    # a position a bool is assigned to takes the bool na
     ('mixed = (lib._na_none, lib._na_none)\nif lib.bar_index > 0:\n'
-     '    mixed = (True, lib.close)\nx = mixed', 'mixed = (lib._na_none, lib._na_float)'),
+     '    mixed = (True, lib.close)\nx = mixed', 'mixed = (lib.na(bool), lib._na_float)'),
 ])
 def __test_a_tuple_a_name_starts_as_is_the_na_of_each_position_assigned_later__(body,
                                                                                  expected):
@@ -984,10 +985,10 @@ def __test_tuple_positions_assigned_different_types_are_reported_one_by_one__():
     ("__sec_write__('sec-2', (lib.high, 'tag', Pivot(1.0)))\n"
      "hi, tag, top = __sec_read__('sec-2', (lib._na_none, lib._na_none, lib._na_none))",
      "hi, tag, top = __sec_read__('sec-2', (lib._na_float, '', lib.na(Pivot)))"),
-    # a bool position, and an id nothing writes, keep the typeless na
+    # a bool position takes the bool na, an id nothing writes keeps the typeless na
     ("__sec_write__('sec-3', (lib.close > lib.open, lib.close))\n"
      "up, c = __sec_read__('sec-3', (lib._na_none, lib._na_none))",
-     "up, c = __sec_read__('sec-3', (lib._na_none, lib._na_float))"),
+     "up, c = __sec_read__('sec-3', (lib.na(bool), lib._na_float))"),
     ("value = __sec_read__('sec-4', lib._na_none)",
      "value = __sec_read__('sec-4', lib._na_none)"),
 ])

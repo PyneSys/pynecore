@@ -41,6 +41,7 @@ __all__ = [
     'PIN_ATTR', 'PINS_ATTR', 'PINNABLE', 'PIN_CONTAINERS', 'PIN_ANY', 'get_pin', 'set_pin', 'get_pins', 'set_pins',
     'VECTOR_ATTR', 'VARYING_ATTR', 'get_vector', 'set_vector', 'get_varying', 'set_varying',
     'WIDEN_ATTR', 'WIDEN_FLOAT', 'WIDEN_BOOL', 'WIDEN_ITEMS', 'WIDEN_MATRIX', 'WIDEN_STRING_NA', 'WIDEN_NUMBER_NA',
+    'WIDEN_BOOL_NA',
     'WIDEN_NA_TEXT', 'WIDEN_ARRAY_NA', 'WIDEN_MAP_NA', 'WIDEN_MATRIX_NA', 'CONTAINER_NA_WIDENS',
     'NA_LITERALS', 'is_na_literal', 'is_na_widen',
     'NA_CLASS_ATTR', 'get_na_class', 'set_na_class',
@@ -105,6 +106,11 @@ WIDEN_STRING_NA: Final = 's'
 #: The value is a typeless ``na`` that goes where a float or an int goes: it is the
 #: numeric na, NaN (what ``NA(float)`` and ``NA(int)`` both are)
 WIDEN_NUMBER_NA: Final = 'n'
+
+#: The value is a typeless ``na`` that goes where a bool goes: it is the bool na the
+#: script runs with -- ``NA(bool)``, Pine v4/v5's third state under ``na_bool``, plain
+#: ``False`` otherwise (v6 refuses the typeless na there at compile time)
+WIDEN_BOOL_NA: Final = 'b'
 
 #: The value is a typeless ``na`` passed as compile-time text of the study
 #: (``NA_TEXT_PARAMS``): TradingView writes it out as the text ``na``
@@ -290,8 +296,8 @@ def get_widen(node) -> str | None:
 
     :param node: The value node
     :return: ``WIDEN_FLOAT``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX``, ``WIDEN_STRING_NA``,
-             ``WIDEN_NUMBER_NA``, ``WIDEN_NA_TEXT`` or an object type (the na of that
-             class), or None
+             ``WIDEN_NUMBER_NA``, ``WIDEN_BOOL_NA``, ``WIDEN_NA_TEXT`` or an object type
+             (the na of that class), or None
     """
     return getattr(node, WIDEN_ATTR, None)
 
@@ -303,8 +309,8 @@ def set_widen(node, kind: str | None):
 
     :param node: The value node
     :param kind: ``WIDEN_FLOAT``, ``WIDEN_BOOL``, ``WIDEN_ITEMS``, ``WIDEN_MATRIX``,
-                 ``WIDEN_STRING_NA``, ``WIDEN_NUMBER_NA``, ``WIDEN_NA_TEXT``, an object type
-                 or None
+                 ``WIDEN_STRING_NA``, ``WIDEN_NUMBER_NA``, ``WIDEN_BOOL_NA``,
+                 ``WIDEN_NA_TEXT``, an object type or None
     :return: ``node``
     """
     setattr(node, WIDEN_ATTR, kind)
@@ -316,10 +322,10 @@ def is_na_widen(kind: str | None) -> bool:
     Whether a conversion turns Pine's typeless ``na`` into the na of a type.
 
     :param kind: A conversion kind, or None
-    :return: True for the string na, the numeric na, the text ``na``, the na of a
-             container and the na of a class (an object type)
+    :return: True for the string na, the numeric na, the bool na, the text ``na``, the
+             na of a container and the na of a class (an object type)
     """
-    return kind in (WIDEN_STRING_NA, WIDEN_NUMBER_NA, WIDEN_NA_TEXT) \
+    return kind in (WIDEN_STRING_NA, WIDEN_NUMBER_NA, WIDEN_BOOL_NA, WIDEN_NA_TEXT) \
         or kind in CONTAINER_NA_WIDENS \
         or (kind is not None and kind.startswith(_OBJ))
 

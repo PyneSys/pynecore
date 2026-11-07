@@ -23,10 +23,10 @@ use pyne_ast::{
 };
 
 use crate::pine_type_rules::{
-    BOOL, CONTAINER_NA_WIDENS, FLOAT, OBJECT, STR, WIDEN_ATTR, WIDEN_BOOL, WIDEN_FLOAT,
-    WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_NA_TEXT, WIDEN_NUMBER_NA, WIDEN_SITE_ATTR, WIDEN_STRING_NA,
-    array_of, class_of, get_na_class, get_ty, is_na_literal, is_na_widen, matrix_of, set_ty,
-    set_widen, set_widen_site, stamp_lowering,
+    BOOL, CONTAINER_NA_WIDENS, FLOAT, OBJECT, STR, WIDEN_ATTR, WIDEN_BOOL, WIDEN_BOOL_NA,
+    WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_NA_TEXT, WIDEN_NUMBER_NA, WIDEN_SITE_ATTR,
+    WIDEN_STRING_NA, array_of, class_of, get_na_class, get_ty, is_na_literal, is_na_widen,
+    matrix_of, set_ty, set_widen, set_widen_site, stamp_lowering,
 };
 use crate::{Context, Error};
 
@@ -141,6 +141,8 @@ impl ImplicitConversion {
             } else {
                 let result = if kind == WIDEN_NUMBER_NA {
                     FLOAT
+                } else if kind == WIDEN_BOOL_NA {
+                    BOOL
                 } else if is_container_na {
                     OBJECT
                 } else {
@@ -152,6 +154,9 @@ impl ImplicitConversion {
             let wrapped = call(ast, func, vec![node, converted]);
             let wrapped = located(ast, wrapped, node);
             let value = stamp_lowering(ast, wrapped, result);
+            if kind == WIDEN_BOOL_NA {
+                return Ok(self.bool_field_default(ast, original, value));
+            }
             return Ok(self.field_default(ast, original, value, result));
         }
         if class_of(kind).is_some() || is_container_na {
@@ -174,6 +179,16 @@ impl ImplicitConversion {
                 let nan = module_attr(ast, "lib", "_na_float");
                 let nan = located(ast, nan, node);
                 Ok(set_ty(ast, nan, FLOAT))
+            }
+            WIDEN_BOOL_NA => {
+                // `lib.na(bool)`, built where it is evaluated: the bool na is the one of
+                // the mode in effect there
+                let func = module_attr(ast, "lib", "na");
+                let class = name(ast, "bool");
+                let na = call(ast, func, vec![class]);
+                let na = located(ast, na, node);
+                let value = stamp_lowering(ast, na, BOOL);
+                Ok(self.bool_field_default(ast, original, value))
             }
             WIDEN_NA_TEXT => {
                 let text = constant(ast, Constant::Str("na".to_string()));
@@ -228,6 +243,27 @@ impl ImplicitConversion {
         if !self.field_defaults.contains(&original) || reachable {
             return value;
         }
+        self.deferred_field(ast, original, value, result)
+    }
+
+    /// Defer a field default that is the bool na: it is built for each object, under
+    /// the mode in effect there.
+    fn bool_field_default(&mut self, ast: &mut Ast, original: NodeId, value: NodeId) -> NodeId {
+        if !self.field_defaults.contains(&original) {
+            return value;
+        }
+        self.deferred_field(ast, original, value, BOOL)
+    }
+
+    /// A field default built for each object the dataclass creates,
+    /// `field(default_factory=lambda: <value>)`.
+    fn deferred_field(
+        &mut self,
+        ast: &mut Ast,
+        original: NodeId,
+        value: NodeId,
+        result: &str,
+    ) -> NodeId {
         if self.field_alias.is_none() {
             self.field_alias = Some(self.dataclass_field_alias());
         }

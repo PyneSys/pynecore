@@ -14,9 +14,9 @@ use crate::data::{self, LibEntry};
 use crate::pine_qualifier::{SERIES, SERIES_LENGTH_KEYWORD, WINDOW_CALLS, window_length};
 use crate::pine_type_rules::{
     BOOL, CONTAINER_NA_WIDENS, CallRule, FIT_REQUIRED, FLOAT, INT, ImplSig, NUMERIC, OBJECT,
-    PIN_ANY, SCALARS, STR, TYPELESS, UNKNOWN, VOID, WIDEN_ARRAY_NA, WIDEN_BOOL, WIDEN_FLOAT,
-    WIDEN_MAP_NA, WIDEN_NA_TEXT, WIDEN_NUMBER_NA, WIDEN_STRING_NA, array_of, class_of, default_fit,
-    element_of, get_ty, is_array, is_map, is_matrix, is_na_text_param, is_na_widen,
+    PIN_ANY, SCALARS, STR, TYPELESS, UNKNOWN, VOID, WIDEN_ARRAY_NA, WIDEN_BOOL, WIDEN_BOOL_NA,
+    WIDEN_FLOAT, WIDEN_MAP_NA, WIDEN_NA_TEXT, WIDEN_NUMBER_NA, WIDEN_STRING_NA, array_of, class_of,
+    default_fit, element_of, get_ty, is_array, is_map, is_matrix, is_na_text_param, is_na_widen,
     is_not_pine_string, join, key_of, lib_type_override, matrix_of, object_ty, overload_binding,
     overload_choice, overload_result, override_param_names, pin_chars, pin_for, render_ty,
     set_na_class, set_pin, set_pins, set_widen, shape_conflict, value_of,
@@ -37,7 +37,7 @@ fn constructor_elements(callee: &str) -> Option<&'static [usize]> {
 /// Constructors that fill the container they build with one value (`_FILL_POSITIONS`).
 fn fill_positions(callee: &str) -> Option<&'static [usize]> {
     match callee {
-        "array.new" | "array.new_float" | "array.new_int" => Some(&[1]),
+        "array.new" | "array.new_float" | "array.new_int" | "array.new_bool" => Some(&[1]),
         "matrix.new" => Some(&[2]),
         _ => None,
     }
@@ -195,11 +195,12 @@ impl Engine<'_, '_> {
         }
         if let Some(positions) = fill_positions(callee)
             && (is_array(&ty) || is_matrix(&ty))
-            && NUMERIC.contains(&element_of(&ty))
+            && let Some(fill) = facts::na_widen(element_of(&ty))
+            && (fill == WIDEN_NUMBER_NA || fill == WIDEN_BOOL_NA)
         {
             for arg in self.element_args(callee, node, positions) {
                 if self.ty_of(arg) == TYPELESS {
-                    self.record_widen(arg, Some(WIDEN_NUMBER_NA.to_string()))?;
+                    self.record_widen(arg, Some(fill.clone()))?;
                 }
             }
         }

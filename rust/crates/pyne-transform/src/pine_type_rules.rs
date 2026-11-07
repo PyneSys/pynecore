@@ -59,6 +59,8 @@ pub const WIDEN_MATRIX: &str = "m";
 pub const WIDEN_STRING_NA: &str = "s";
 /// A typeless `na` where a number goes: NaN
 pub const WIDEN_NUMBER_NA: &str = "n";
+/// A typeless `na` where a bool goes: the bool na of the mode in effect
+pub const WIDEN_BOOL_NA: &str = "b";
 /// A typeless `na` passed as compile-time text of the study
 pub const WIDEN_NA_TEXT: &str = "t";
 /// A typeless `na` where an array goes
@@ -226,7 +228,7 @@ pub fn is_na_widen(kind: Option<&str>) -> bool {
     let Some(kind) = kind else {
         return false;
     };
-    [WIDEN_STRING_NA, WIDEN_NUMBER_NA, WIDEN_NA_TEXT].contains(&kind)
+    [WIDEN_STRING_NA, WIDEN_NUMBER_NA, WIDEN_BOOL_NA, WIDEN_NA_TEXT].contains(&kind)
         || CONTAINER_NA_WIDENS.contains(&kind)
         || kind.starts_with(OBJ)
 }
