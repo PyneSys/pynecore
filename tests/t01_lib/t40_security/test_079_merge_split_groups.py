@@ -148,11 +148,19 @@ def __test_groups_split_exactly_where_the_feed_or_the_syntax_differs__(runner, l
     assert len(merged) == 7, f"merged children: {merged}"
 
     __test_helper_compare(merged_rows, plain_rows, log, "split-groups")
-    for i in range(len(merged_rows)):
-        row = merged_rows[i]
+
+
+def __test_input_timeframes_holding_one_string_answer_alike__(runner, log):
+    """Two input-derived timeframes resolving to one feed answer the same values."""
+    rows, _spawned = __test_helper_run_with_timeout(
+        lambda: __test_helper_run(runner, no_merge=False))
+
+    for i in range(len(rows)):
+        row = rows[i]
         assert __test_helper_same(row['inA'], row['inB']), (
             f"bar {i}: the two input-derived timeframes resolved to the same "
             f"feed but answered differently: {row['inA']!r} vs {row['inB']!r}")
+    log.info("inA matched inB on %d bars", len(rows))
 
 
 # Every timestamp here is Unix MILLISECONDS.

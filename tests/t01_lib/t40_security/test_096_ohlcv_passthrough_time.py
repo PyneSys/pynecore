@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 from pynecore.lib import open, plot, request, script, syminfo, time
 from pynecore.types import Series
 
@@ -25,8 +26,7 @@ def __test_helper_run(runner):
     """Run the script with one child per context.
 
     :param runner: The ``runner`` fixture.
-    :return: ``(rows, contexts)``, the values per chart bar and the script
-        module's security contexts.
+    :return: ``(rows, r)``, the values per chart bar and the finished runner.
     """
     import os
     import sys
@@ -49,25 +49,33 @@ def __test_helper_run(runner):
             for _candle, values in r.run_iter():
                 rows.append({k: (list(v) if isinstance(v, list) else v)
                              for k, v in values.items()})
-            contexts = dict(getattr(r.script_module, '__security_contexts__'))
     finally:
         os.environ.pop('PYNE_NO_SECURITY_MERGE', None)
-    return rows, contexts
+    return rows, r
 
 
-def __test_time_takes_the_passthrough_and_answers_as_main_does__(runner, log):
-    """``time`` is a passthrough field, and its fast path equals the computed one.
+@pytest.mark.aot_unsupported("reads the script module's security contexts; "
+                             "a compiled run has no script module")
+def __test_time_takes_the_passthrough__(runner, log):
+    """``time`` is a passthrough field.
 
     A one-minute ``request.security_lower_tf`` of ``(open, high, low, close,
     volume, time)`` ran the whole sliced ``main()`` once per intrabar because
     ``time`` was not a passthrough field, which made a script with loops after
     the call (Mxwll Price Action Suite) run for hours.
     """
-    rows, contexts = __test_helper_run(runner)
+    _rows, r = __test_helper_run(runner)
 
+    contexts = dict(getattr(r.script_module, '__security_contexts__'))
     fields = sorted(tuple(ctx.get('ohlcv_fields') or ()) for ctx in contexts.values())
     assert fields == [(), (), ('open', 'time'), ('time',)], \
         f"the passthrough contexts: {fields}"
+    log.info("passthrough fields: %s", fields)
+
+
+def __test_the_passthrough_answers_as_main_does__(runner, log):
+    """The fast path of a passthrough field equals the computed one."""
+    rows, _r = __test_helper_run(runner)
 
     checked = 0
     for row in rows:

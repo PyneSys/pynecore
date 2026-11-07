@@ -184,10 +184,6 @@ def __test_unread_branch_gets_no_process__(runner, log):
     assert len(spawned) == 1, f"spawned children: {spawned}"
     assert len(spawned[0]) == 8, f"served contexts: {spawned[0]}"
     assert len(set(spawned[0])) == 8, f"duplicate member: {spawned[0]}"
-    # The TAKEN arm is the same request as ``eager``, so it answers the same.
-    for i in (0, 10, 100, 140):
-        assert __test_helper_same(rows[i]["branch"], rows[i]["eager"]), \
-            f"bar {i}: branch={rows[i]['branch']} != eager={rows[i]['eager']}"
 
     unmerged_rows, unmerged = __test_helper_run(runner, no_merge=True)
     assert len(unmerged) == 7, f"unmerged children: {unmerged}"
@@ -203,6 +199,17 @@ def __test_unread_branch_gets_no_process__(runner, log):
 
     log.info("one child served the whole group; %d children without merging",
              len(unmerged))
+
+
+def __test_the_taken_arm_answers_like_its_twin__(runner, log):
+    """The branch arm the run takes is the same request as ``eager``, so it answers the same."""
+    rows, _spawned = __test_helper_run(runner)
+
+    for i in (0, 10, 100, 140):
+        assert __test_helper_same(rows[i]["branch"], rows[i]["eager"]), \
+            f"bar {i}: branch={rows[i]['branch']} != eager={rows[i]['eager']}"
+
+    log.info("the taken arm matched eager")
 
 
 def __test_late_first_read_matches_eager__(runner, log):

@@ -126,7 +126,7 @@ def __test_the_rate_is_sampled_once_per_bar__(script_path, module_key):
         rate_path = _write_rate_file(Path(tmpdir))
         CurrencyRateProvider.get_rate = counting_get_rate
         try:
-            rows = _run(script_path, module_key, rate_path)
+            _run(script_path, module_key, rate_path)
             first_run_calls = len(calls)
             _run(script_path, module_key, rate_path)
         finally:
@@ -137,7 +137,17 @@ def __test_the_rate_is_sampled_once_per_bar__(script_path, module_key):
     # The memo is dropped between runs, so the second run samples every bar again
     assert len(calls) == 2 * BAR_COUNT, f"expected {2 * BAR_COUNT} lookups, got {len(calls)}"
 
-    # Each bar saw its own rate, so the memo is per bar and not per run
+
+# noinspection PyShadowingNames
+def __test_each_bar_converts_at_its_own_rate__(script_path, module_key):
+    """Each bar sees its own rate, so the memo is per bar and not per run."""
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        rows = _run(script_path, module_key, _write_rate_file(Path(tmpdir)))
+
+    assert len(rows) == BAR_COUNT
     for i, row in enumerate(rows):
         assert abs(row['to_acct'] - RATES[i]) < 1e-12, f"bar {i}: {row['to_acct']}"
 

@@ -182,6 +182,21 @@ def __test_helper_run_with_timeout(fn, seconds=60):
     return box.get('result')
 
 
+def __test_the_outside_consumer_resolves__(runner, log):
+    """The consumer of the group's non-primary member resolves a value.
+
+    The consumer really does read the member: an all-``na`` column would make the
+    merged-versus-unmerged comparison vacuous.
+    """
+    rows, _spawned = __test_helper_run_with_timeout(
+        lambda: __test_helper_run(runner, no_merge=False))
+
+    assert len(rows) == __test_helper_bars
+    assert any(not __test_helper_is_na(row["consumer"]) for row in rows), \
+        "the outside consumer never resolved a value"
+    log.info("the outside consumer resolved on %d bars", len(rows))
+
+
 @pytest.mark.aot_unsupported("counts or groups security child processes; a compiled run has none")
 def __test_a_groups_non_primary_member_publishes_its_frontier__(runner, log):
     """A consumer of a merged group's NON-primary member never parks.
@@ -216,11 +231,6 @@ def __test_a_groups_non_primary_member_publishes_its_frontier__(runner, log):
         for key in want:
             assert __test_helper_same(got[key], want[key]), (
                 f"bar {i} '{key}': merged={got[key]!r} unmerged={want[key]!r}")
-
-    # The consumer really did read the member: an all-``na`` column would make
-    # the comparison above vacuous.
-    assert any(not __test_helper_is_na(row["consumer"]) for row in merged_rows), \
-        "the outside consumer never resolved a value"
 
     log.info("%d bars x %d plots identical; group of 2 plus its outside consumer",
              len(merged_rows), len(merged_rows[0]))

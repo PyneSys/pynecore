@@ -158,6 +158,20 @@ def __test_helper_run(runner, no_batch):
     return rows, batched
 
 
+def __test_the_weekly_reads_start_na_and_resolve__(runner, log):
+    """The chart's first week is ``na`` and the last one is not.
+
+    The point of the fixture: the batch-versus-per-bar comparison is not
+    comparing ``na`` to ``na``.
+    """
+    rows, _batched = __test_helper_run(runner, no_batch=False)
+
+    assert len(rows) == __test_helper_bars
+    assert __test_helper_is_na(rows[0]["prev_weekly"]), "first week not na"
+    assert not __test_helper_is_na(rows[-1]["weekly"]), "last week stayed na"
+    log.info("first week na, last week resolved on %d daily bars", len(rows))
+
+
 @pytest.mark.aot_unsupported("inspects the developing-batch plan; "
                              "a compiled run has no batch planner")
 def __test_weekly_batch_matches_per_bar_path__(runner, log):
@@ -184,11 +198,6 @@ def __test_weekly_batch_matches_per_bar_path__(runner, log):
                     ) or got[key] == want[key]
             assert same, (
                 f"bar {i} '{key}': batch={got[key]!r} per-bar={want[key]!r}")
-
-    # The point of the fixture: the first week really is ``na`` and later weeks
-    # really are not, so the comparison above is not comparing ``na`` to ``na``.
-    assert __test_helper_is_na(batch_rows[0]["prev_weekly"]), "first week not na"
-    assert not __test_helper_is_na(batch_rows[-1]["weekly"]), "last week stayed na"
 
     log.info("weekly developing batch matched the per-bar path on %d daily bars, "
              "%d contexts batched", len(batch_rows), len(batched))

@@ -84,6 +84,17 @@ def __test_helper_run(runner, no_merge):
     return raised, spawned
 
 
+def __test_a_zero_division_in_a_context_stops_the_run__(runner, log):
+    """A context whose expression divides by zero ends the run with an error."""
+    raised, _spawned = __test_helper_run_with_timeout(
+        lambda: __test_helper_run(runner, no_merge=False), seconds=90)
+
+    assert raised is not None, "the chart finished normally after a zero division"
+    assert isinstance(raised, RuntimeError), (
+        f"expected a RuntimeError, got {type(raised).__name__}: {raised}")
+    log.info("the zero division surfaced as %s: %s", type(raised).__name__, raised)
+
+
 @pytest.mark.aot_unsupported("a security child process dies; a compiled run has no child process")
 def __test_a_dead_merged_child_unblocks_every_context_it_served__(runner, log):
     """A merged child dying stops the chart with an error instead of freezing it.

@@ -1,6 +1,7 @@
 """
 @pyne
 """
+import pytest
 from pynecore.lib import array, close, matrix, plot, request, script, syminfo, ta, timeframe
 from pynecore.types import Matrix, Persistent
 
@@ -46,13 +47,14 @@ def __test_helper_run(runner, no_slice):
     return rows
 
 
-def __test_an_ltf_context_skips_the_chart_side_statements__(runner, log):
-    """The LTF child runs its slice, not the chart's statements that raise there.
+@pytest.mark.aot_unsupported("switches the security slice off; "
+                             "a compiled run has no unsliced child")
+def __test_the_unsliced_child_reaches_the_chart_side_statement__(runner, log):
+    """Unsliced, the LTF child evaluates the chart's statements that raise there.
 
-    Unsliced, the child evaluates ``matrix.get(boxes, 0, 0)`` on its own bars,
-    where the chart's row was never added, and dies with an ``IndexError``
-    (converter corpus 1a04048648, Volume Analysis - Heatmap and Volume Profile).
-    Sliced, every chart bar carries its five intrabars' ``ta.sma(close, 3)``.
+    The child evaluates ``matrix.get(boxes, 0, 0)`` on its own bars, where the
+    chart's row was never added, and dies with an ``IndexError`` (converter corpus
+    1a04048648, Volume Analysis - Heatmap and Volume Profile).
     """
     try:
         __test_helper_run(runner, no_slice=True)
@@ -60,7 +62,14 @@ def __test_an_ltf_context_skips_the_chart_side_statements__(runner, log):
         assert "IndexError" in str(exc), f"unexpected failure: {exc}"
     else:
         raise AssertionError("the unsliced child did not reach the chart-side statement")
+    log.info("the unsliced child died on the chart-side statement")
 
+
+def __test_an_ltf_context_skips_the_chart_side_statements__(runner, log):
+    """The LTF child runs its slice, not the chart's statements that raise there.
+
+    Sliced, every chart bar carries its five intrabars' ``ta.sma(close, 3)``.
+    """
     rows = __test_helper_run(runner, no_slice=False)
     sma = __test_helper_sma([b.close for b in __test_helper_bars(__test_helper_minute)], 3)
     per_bar = __test_helper_step // __test_helper_minute

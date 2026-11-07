@@ -1,13 +1,12 @@
 """
 @pyne
 """
-from dataclasses import dataclass
-
+from pynecore.core.pine_udt import udt
 from pynecore.lib import array, close, plot, request, script, syminfo
 from pynecore.types import Persistent, Series
 
 
-@dataclass(slots=True)
+@udt
 class Slot:
     """A one-field UDT the security expression reads and the tail writes."""
     acc: float = 0.0

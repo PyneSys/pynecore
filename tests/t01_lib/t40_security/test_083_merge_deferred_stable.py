@@ -185,6 +185,21 @@ def __test_helper_run_with_timeout(fn, seconds=60):
     return box.get('result')
 
 
+def __test_every_read_context_resolves__(runner, log):
+    """Every context the run reads resolves a value.
+
+    An all-``na`` column would make the merged-versus-unmerged comparison vacuous.
+    """
+    rows, _spawned = __test_helper_run_with_timeout(
+        lambda: __test_helper_run(runner, no_merge=False))
+
+    assert len(rows) == __test_helper_bars
+    for column in ("fast", "mid", "slow", "gated", "gated2"):
+        assert any(not __test_helper_is_na(row[column]) for row in rows), \
+            f"'{column}' never resolved a value"
+    log.info("all five read contexts resolved on %d bars", len(rows))
+
+
 @pytest.mark.aot_unsupported("counts or groups security child processes; a compiled run has none")
 def __test_inline_signalled_contexts_share_one_child__(runner, log):
     """Every call on one stable feed shares a child, however its signal stands.
@@ -228,10 +243,6 @@ def __test_inline_signalled_contexts_share_one_child__(runner, log):
         for key in want:
             assert __test_helper_same(got[key], want[key]), (
                 f"bar {i} '{key}': merged={got[key]!r} unmerged={want[key]!r}")
-
-    for column in ("fast", "mid", "slow", "gated", "gated2"):
-        assert any(not __test_helper_is_na(row[column]) for row in merged_rows), \
-            f"'{column}' never resolved a value"
 
     log.info("%d bars x %d plots identical; 1 child for 8 contexts merged, "
              "%d children unmerged", len(merged_rows), len(merged_rows[0]),
