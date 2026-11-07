@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 from pynecore.core._file_io import replace_file
+from pynecore.core.data_path import with_data_extension
 from pynecore.core.ohlcv import OHLCVReader, OHLCVWriter
 from pynecore.lib.timeframe import _in_seconds
 from pynecore.core.ohlcv_importers import (
@@ -139,7 +140,7 @@ class DataConverter:
         :param ohlcv_path: Path to the OHLCV file (auto-generated if None)
         :return: True if conversion is needed
         """
-        path = ohlcv_path if ohlcv_path is not None else source_path.with_suffix('.ohlcv')
+        path = ohlcv_path if ohlcv_path is not None else with_data_extension(source_path, '.ohlcv')
 
         # If OHLCV file doesn't exist, conversion is needed
         if not path.exists():
@@ -184,7 +185,7 @@ class DataConverter:
             raise DataFormatError(f"Unsupported file format '{detected_format}' for file: {file_path}")
 
         # Determine OHLCV output path
-        ohlcv_path = file_path.with_suffix('.ohlcv')
+        ohlcv_path = with_data_extension(file_path, '.ohlcv')
 
         # Check if conversion is needed
         if not force and not self.is_conversion_required(file_path, ohlcv_path):
@@ -217,8 +218,8 @@ class DataConverter:
 
         # Existing TOML values remain user-owned except for period, which must match
         # the period declared by the newly generated binary file.
-        toml_path = file_path.with_suffix('.toml')
-        extra_csv_path = file_path.with_suffix('.extra.csv')
+        toml_path = with_data_extension(file_path, '.toml')
+        extra_csv_path = with_data_extension(file_path, '.extra.csv')
         # The conversion is built next to the destination and moved into place only
         # once it is complete. Writing straight to the destination would empty the
         # previously converted file the moment the writer opens it, so a malformed
@@ -505,7 +506,7 @@ class DataConverter:
         :param file_path: Path to the data file
         :return: Tuple of (symbol, provider) or (None, None) if not detected
         """
-        filename = file_path.stem  # Filename without extension
+        filename = with_data_extension(file_path, '').name  # Filename without extension
         filename_upper = filename.upper()
 
         # Known provider patterns - these will be detected first

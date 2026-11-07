@@ -33,6 +33,7 @@ from pynecore.types.na import na_float, set_bool_na
 from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.types.session import Session
 from pynecore.core.csv_file import CSVWriter
+from pynecore.core.data_path import with_data_extension
 from pynecore.core.drawing_snapshot import DrawingSnapshot
 from pynecore.core.lookahead import ALLOW_LOOKAHEAD
 from pynecore.core.ohlcv import ChartBarWindow, OHLCVReader, copy_ohlcv_tail, restore_f32_volume
@@ -5188,13 +5189,8 @@ class ScriptRunner:
                 # symbol's exchange session rather than falling back to the
                 # chart's session.
                 if isinstance(entry, (str, Path)) and sec_id not in self._sec_syminfos:
-                    # ``entry`` is a stem or an ``.ohlcv`` path; a dot inside the
-                    # name belongs to the symbol (e.g. a perpetual ``BTCUSDT.P``),
-                    # so swap the extension by name, not via ``with_suffix``.
-                    _entry = Path(entry)
-                    _stem = (_entry.name[:-len('.ohlcv')]
-                             if _entry.name.endswith('.ohlcv') else _entry.name)
-                    sec_toml = _entry.with_name(_stem + '.toml')
+                    # ``entry`` is a stem or an ``.ohlcv`` path.
+                    sec_toml = with_data_extension(entry, '.toml')
                     if sec_toml.exists():
                         self._sec_syminfos[sec_id] = SymInfo.load_toml(sec_toml)
                 out[sec_id] = entry
@@ -5403,16 +5399,11 @@ class ScriptRunner:
 
     @staticmethod
     def _ensure_ohlcv_ext(path: str | Path) -> str:
-        """Add the ``.ohlcv`` extension if not already present.
-
-        A dot inside the name belongs to the symbol (e.g. a perpetual
-        ``BTCUSDT.P``), so append by name rather than ``with_suffix`` which
-        would clobber the symbol's own dotted tail.
-        """
+        """Add the ``.ohlcv`` extension if not already present."""
         p = Path(path)
         if p.name.endswith('.ohlcv'):
             return str(path)
-        ohlcv_path = p.with_name(p.name + '.ohlcv')
+        ohlcv_path = with_data_extension(p, '.ohlcv')
         if ohlcv_path.exists():
             return str(ohlcv_path)
         return str(path)

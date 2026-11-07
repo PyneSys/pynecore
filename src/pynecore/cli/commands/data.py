@@ -17,6 +17,7 @@ from ...core.plugin import ProviderPlugin, ProviderError
 from ...core.provider_string import is_provider_string, parse_provider_string
 from ...lib.timeframe import in_seconds
 from ...core.data_converter import DataConverter, SupportedFormats as InputFormats
+from ...core.data_path import data_extension, with_data_extension
 from ...core.download_runner import (download_to_file, ConflictAction, DownloadConflict,
                                      DownloadPlan, DownloadProgress, DownloadError)
 from ...core.ohlcv import OHLCVReader
@@ -547,9 +548,9 @@ def convert_to(
     Convert downloaded data from pyne's OHLCV format to another format
     """
     # Check file format and extension
-    if ohlcv_path.suffix == "":
-        # No extension, add .ohlcv
-        ohlcv_path = ohlcv_path.with_suffix(".ohlcv")
+    if not data_extension(ohlcv_path):
+        # No data extension, add .ohlcv
+        ohlcv_path = with_data_extension(ohlcv_path, ".ohlcv")
 
     # Expand data path
     if len(ohlcv_path.parts) == 1:
@@ -679,8 +680,8 @@ def aggregate(
     # Resolve source path
     if len(source.parts) == 1:
         source = app_state.data_dir / source
-    if source.suffix == "":
-        source = source.with_suffix(".ohlcv")
+    if not data_extension(source):
+        source = with_data_extension(source, ".ohlcv")
 
     if not source.exists():
         secho(f"Error: Source file not found: {source}", err=True, fg=colors.RED)
@@ -727,8 +728,8 @@ def aggregate(
     if len(out_path.parts) == 1:
         out_path = app_state.data_dir / out_path
 
-    if out_path.suffix == "":
-        out_path = out_path.with_suffix(".ohlcv")
+    if not data_extension(out_path):
+        out_path = with_data_extension(out_path, ".ohlcv")
 
     if out_path.exists() and out_path.samefile(source):
         secho(f"Error: Output is the source file: {out_path}", err=True, fg=colors.RED)

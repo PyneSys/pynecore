@@ -9,6 +9,7 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 
 from ..app import app, app_state
+from ...core.data_path import data_extension, with_data_extension
 from ...core.ohlcv import OHLCVReader
 from ...core.syminfo import SymInfo
 from ...core.script_runner import ScriptRunner
@@ -48,12 +49,13 @@ def benchmark(
 
     # Process data path - similar logic
     # Check file format and extension
-    if data.suffix == "":
-        # No extension, add .ohlcv
-        data = data.with_suffix(".ohlcv")
-    elif data.suffix != ".ohlcv":
-        # Has extension but not .ohlcv
-        secho(f"Cannot run with '{data.suffix}' files. The PyneCore runtime requires .ohlcv format.",
+    data_ext = data_extension(data)
+    if not data_ext:
+        # No data extension, add .ohlcv
+        data = with_data_extension(data, ".ohlcv")
+    elif data_ext != ".ohlcv":
+        # Has a data extension but not .ohlcv
+        secho(f"Cannot run with '{data_ext}' files. The PyneCore runtime requires .ohlcv format.",
               fg="red", err=True)
         secho("If you're trying to use a different data format, please convert it first:", fg="red")
         symbol_placeholder = "YOUR_SYMBOL"

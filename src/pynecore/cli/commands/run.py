@@ -33,6 +33,7 @@ from ...utils.rich.date_column import DateColumn
 from pynecore.core._file_io import exclusive_file_lock, replace_file
 from pynecore.core.ohlcv import ChartBarWindow, OHLCVReader, OHLCVWriter
 from pynecore.core.data_converter import DataConverter, DataFormatError, ConversionError
+from pynecore.core.data_path import DATA_EXTENSIONS, data_extension, with_data_extension
 from pynecore.core.aggregator import validate_aggregation
 from pynecore.lib.log import logger as pyne_logger
 from pynecore.lib.timeframe import in_seconds
@@ -1335,23 +1336,24 @@ def run(
         if len(data_path.parts) == 1:
             data_path = app_state.data_dir / data_path
 
-        if data_path.suffix == "":
-            ohlcv_path = data_path.with_suffix(".ohlcv")
-            csv_path = data_path.with_suffix(".csv")
-            if ohlcv_path.exists():
-                data_path = ohlcv_path
-            elif csv_path.exists():
-                data_path = csv_path
-            else:
-                data_path = ohlcv_path
+        # A name without a known data extension (e.g. ``bybit_BTCUSD.P_1D``, whose
+        # ``.P_1D`` belongs to the symbol) resolves to its first existing data
+        # sibling. A file that exists under the name as given is a source file of
+        # its own, its format detected by content.
+        if not data_extension(data_path):
+            candidates = [with_data_extension(data_path, ext) for ext in DATA_EXTENSIONS]
+            data_path = next(
+                (c for c in candidates if c.exists()),
+                data_path if data_path.is_file() else candidates[0],
+            )
 
-        if data_path.suffix != ".ohlcv":
+        if data_extension(data_path) != ".ohlcv":
             try:
                 converter = DataConverter()
                 if converter.is_conversion_required(data_path):
                     detected_symbol, detected_provider = DataConverter.guess_symbol_from_filename(data_path)
                     if not detected_symbol:
-                        detected_symbol = data_path.stem.upper()
+                        detected_symbol = with_data_extension(data_path, '').name.upper()
                     with Progress(
                             SpinnerColumn(finished_text="[green]✓"),
                             TextColumn("[progress.description]{task.description}"),
@@ -1362,10 +1364,10 @@ def run(
                             data_path, provider=detected_provider,
                             symbol=detected_symbol, force=True
                         )
-                        data_path = data_path.with_suffix(".ohlcv")
+                        data_path = with_data_extension(data_path, ".ohlcv")
                         progress.update(task, completed=1)
                 else:
-                    data_path = data_path.with_suffix(".ohlcv")
+                    data_path = with_data_extension(data_path, ".ohlcv")
             except (DataFormatError, ConversionError) as e:
                 secho(f"Conversion failed: {e}", fg="red", err=True)
                 secho("Please convert the file manually:", fg="red")
@@ -1707,13 +1709,9 @@ def run(
                         if len(sec_path.parts) == 1:
                             sec_path = app_state.data_dir / sec_path
                         # ``value`` may carry the ``.ohlcv`` data extension or be a
-                        # bare stem. Only ``.ohlcv`` is meaningful — a dot inside the
-                        # name belongs to the symbol (e.g. a perpetual ``BTCUSDT.P``),
-                        # so append/strip by name instead of ``with_suffix`` which
-                        # would clobber the symbol's own dotted tail.
-                        if sec_path.name.endswith('.ohlcv'):
-                            sec_path = sec_path.with_name(sec_path.name[:-len('.ohlcv')])
-                        ohlcv_check = sec_path.with_name(sec_path.name + '.ohlcv')
+                        # bare stem; the runner takes the stem.
+                        ohlcv_check = with_data_extension(sec_path, '.ohlcv')
+                        sec_path = with_data_extension(sec_path, '')
                         if not ohlcv_check.exists():
                             secho(
                                 f"Security data not found: {ohlcv_check}",

@@ -28,6 +28,7 @@ from math import isnan
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .data_path import with_data_extension
 from .ohlcv import OHLCVReader, record_count
 from .security_shm import ResultReader
 
@@ -313,16 +314,11 @@ class CurrencyRateProvider:
 
     @staticmethod
     def _resolve_ohlcv_path(path: str | Path) -> str | None:
-        """Resolve OHLCV file path, adding the ``.ohlcv`` extension if needed.
-
-        A dot inside the name belongs to the symbol (e.g. a perpetual
-        ``BTCUSDT.P``), so append by name rather than ``with_suffix`` which
-        would clobber the symbol's own dotted tail.
-        """
+        """Resolve OHLCV file path, adding the ``.ohlcv`` extension if needed."""
         p = Path(path)
         if p.name.endswith('.ohlcv'):
             return str(p) if p.exists() else None
-        ohlcv_p = p.with_name(p.name + '.ohlcv')
+        ohlcv_p = with_data_extension(p, '.ohlcv')
         if ohlcv_p.exists():
             return str(ohlcv_p)
         return str(p) if p.exists() else None
