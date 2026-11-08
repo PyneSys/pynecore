@@ -8,6 +8,8 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import tomllib
 from dataclasses import dataclass, field as dataclasses_field
 from functools import partial
@@ -91,6 +93,21 @@ once reports 2 when both fills land on node 2 and 3 when they land on node 1
 
 MAX_COOF_RE_EXECUTIONS below is the magnified path's fallback: there real
 sub-bars replace the assumed one, so there are no nodes to run out of.
+"""
+
+STARTUP_RECONCILE_RETRY_BASE_S = 2.0
+"""First wait before the startup reconcile retries a transient venue read fault."""
+
+STARTUP_RECONCILE_RETRY_MAX_S = 60.0
+"""Cap of the startup reconcile's doubling retry wait."""
+
+STARTUP_RECONCILE_QUIET_S = 60.0
+"""Outage length the startup reconcile rides out at INFO before it warns.
+
+A venue that answers a moment later (an execution index catching up with a fill
+that landed during the restart, a dropped keep-alive) is a routine startup step;
+only an outage that outlasts this keeps the bot away from trading long enough to
+deserve a warning.
 """
 
 MAX_COOF_RE_EXECUTIONS = 3
@@ -1830,7 +1847,43 @@ class ScriptRunner:
         # escalates and the stale-grace reconcile keeps demanding proof
         # of settlement.
         engine._replay_pending_flip_surplus_closes()
-        engine.reconcile()
+        self._startup_reconcile(engine)
+
+    @staticmethod
+    def _startup_reconcile(engine: 'OrderSyncEngine') -> None:
+        """Run the startup reconcile, riding out transient venue read faults.
+
+        The startup reconcile is the adoption read: the first bar must not run
+        before it succeeds, or a restart with an open venue position would
+        re-enter beside it. A transient read fault
+        (:class:`ExchangeConnectionError` — a dropped connection, a throttle, or
+        a plugin read that cannot yet produce a consistent snapshot, such as an
+        execution index still behind a fill that landed during the restart) is
+        retried with a doubling wait capped at
+        :data:`STARTUP_RECONCILE_RETRY_MAX_S` until the venue answers or the
+        operator interrupts. The reconcile is re-entrant on that fault — the
+        periodic reconcile already parks it and retries — and every plugin
+        commits nothing from a failed adoption read. Anything else (a
+        permanent misconfiguration, a deliberate halt) still propagates.
+
+        :param engine: The run's sync engine.
+        """
+        delay = STARTUP_RECONCILE_RETRY_BASE_S
+        started = time.monotonic()
+        attempt = 0
+        while True:
+            try:
+                engine.reconcile()
+                return
+            except ExchangeConnectionError as e:
+                attempt += 1
+                log = (broker_warning
+                       if time.monotonic() - started >= STARTUP_RECONCILE_QUIET_S
+                       else broker_info)
+                log("startup reconcile could not read the venue yet (%s) — "
+                    "retry #%d in %.0fs before the first bar", e, attempt, delay)
+                threading.Event().wait(timeout=delay)
+                delay = min(delay * 2.0, STARTUP_RECONCILE_RETRY_MAX_S)
 
     # === Order-processing dispatch =========================================
 

@@ -47,6 +47,7 @@ from pynecore.core.broker.exceptions import (
 )
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.plugin.broker import BrokerPlugin
+from pynecore.core import script_runner as script_runner_mod
 from pynecore.core.script_runner import LIVE_TRANSITION, ScriptRunner
 from pynecore.core.syminfo import SymInfo
 from pynecore.types.ohlcv import OHLCV
@@ -313,6 +314,55 @@ def __test_startup_reconcile_seeds_broker_position_from_exchange__(tmp_path):
     assert pos.avg_price == 50_000.0
     assert pos.openprofit == 123.45
     assert runner.broker_position_snapshot is plugin.startup_position
+
+
+@dataclass
+class _FlakyStartupReadPlugin(MockBrokerPlugin):
+    """A venue whose first position reads cannot yet produce a consistent snapshot."""
+
+    position_read_faults: int = 0
+    position_reads: int = 0
+
+    async def get_position(self, _symbol):
+        self.position_reads += 1
+        if self.position_read_faults > 0:
+            self.position_read_faults -= 1
+            raise ExchangeConnectionError("execution index remained behind order truth")
+        return self.startup_position
+
+
+def __test_startup_reconcile_rides_out_a_transient_venue_read_fault__(tmp_path, monkeypatch):
+    """A transient read fault at startup delays the first bar instead of ending the run.
+
+    A resting entry of the previous process filled during the restart; the venue's
+    execution index lagged the order truth for a moment, so the plugin's adoption
+    read raised a retryable fault and the whole run died before its first bar
+    (bybit cycle 383). The startup reconcile retries until the venue answers and
+    then adopts the position as usual.
+    """
+    monkeypatch.setattr(script_runner_mod, "STARTUP_RECONCILE_RETRY_BASE_S", 0.0)
+    plugin = _FlakyStartupReadPlugin(
+        capabilities=ExchangeCapabilities(),
+        startup_position=ExchangePosition(
+            symbol="BTCUSDT", side="short", size=0.01, entry_price=2239.72,
+            unrealized_pnl=0.0, liquidation_price=None,
+            leverage=1.0, margin_mode="cross",
+        ),
+        position_read_faults=2,
+    )
+    script_path = __test_helper_write_script(tmp_path, _MARKET_ENTRY_SCRIPT)
+    runner = ScriptRunner(
+        script_path=script_path,
+        ohlcv_iter=_make_bars(1),
+        syminfo=_make_syminfo(),
+        broker_plugin=plugin,  # type: ignore[arg-type]
+    )
+    runner.start_broker()
+
+    assert plugin.position_reads == 3
+    pos = runner.script.position
+    assert isinstance(pos, BrokerPosition)
+    assert pos.size == -0.01
 
 
 def __test_startup_validation_rejects_incompatible_script__(tmp_path):
