@@ -123,12 +123,19 @@ trades. One choice of the strategy is randomized at a time:
 
 **Direction.** A flipped entry fills at the same moment and price: a stop entry becomes a
 limit entry at the same level and the other way round. Its stop and target are mirrored
-through the fill price, so they keep their distances. By default the test runs one more
-backtest with every entry flipped, pairs its trades with the real ones, and each of the
-10,000 draws picks the real or the flipped outcome of every trade by a coin. This assumes the
-trades do not depend on each other. A strategy whose later entries depend on the earlier
-trades (a flipped trade that closes earlier, a compounding position size) needs `--exact`:
-a full backtest per draw, 200 by default (`--coinflip-runs`).
+through the fill price, so they keep their distances. The script keeps seeing the side it
+asked for: `strategy.position_size`, `strategy.opentrades.size()` and
+`strategy.closedtrades.size()` carry the sign of the entry it placed, so a bracket it builds
+from `strategy.position_size > 0` after the fill is the long bracket, mirrored like the
+others. Profits, equity and prices stay the real ones.
+
+By default the test runs one more backtest with every entry flipped, pairs its trades with
+the real ones, and each of the 10,000 draws picks the real or the flipped outcome of every
+trade by a coin. This assumes the trades do not depend on each other. A strategy whose later
+entries depend on the earlier trades (a flipped trade that closes earlier or later, a
+compounding position size) loses pairs: when fewer than 90% of the real trades have a
+counterpart in the flipped backtest, the test gives no verdict and says so. Such a strategy
+needs `--exact`: a full backtest per draw, 200 by default (`--coinflip-runs`).
 
 **Timing.** The script places no order. The real trades enter in their own order at random
 bars between the first real entry and the last real exit, each once the previous one has
@@ -140,6 +147,12 @@ The result reads like this:
 
 ```
 Coin flip (direction): 28% of the random direction draws did better; the real rules beat 72% of them
+```
+
+or, when the pairing fails:
+
+```
+Coin flip (direction): not valid for this script: only 927 of 1122 trades had a counterpart in the flipped backtest (at least 90% needed)
 ```
 
 A strategy whose rules carry information should beat most of the random draws. When the

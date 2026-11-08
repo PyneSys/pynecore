@@ -1,15 +1,30 @@
 """
 @pyne
 """
-from pynecore.lib import bar_index, close, high, input, script, strategy
+from pynecore.lib import bar_index, close, high, input, na, script, strategy
+from pynecore.types import Persistent
 
 
 @script.strategy("Coin flip", initial_capital=10000,
                  default_qty_type=strategy.fixed, default_qty_value=1)
 def main(stop_entry=input.bool(False), repeat=input.bool(False), stop_limit=input.bool(False),
-         replace=input.bool(False), reverse=input.bool(False), every=input.int(20)):
+         replace=input.bool(False), reverse=input.bool(False), after_fill=input.bool(False),
+         every=input.int(20)):
     phase = bar_index % every
     flat = strategy.position_size == 0
+    stop_level: Persistent[float] = na
+    target_level: Persistent[float] = na
+    # The bracket is placed once the entry fills, from the side the position reads
+    if after_fill and flat and phase == 5:
+        stop_level = close - 2.0
+        target_level = close + 4.0
+        strategy.entry("L", strategy.long)
+    if after_fill and not flat:
+        is_long = strategy.position_size > 0
+        risk = (strategy.position_avg_price - stop_level if is_long
+                else stop_level - strategy.position_avg_price)
+        if risk > 0:
+            strategy.exit("LX", "L", stop=stop_level, limit=target_level)
     # A far limit entry rests for a bar, then a stop-limit entry replaces it
     if replace and flat and phase == 5:
         strategy.entry("L", strategy.long, limit=close - 20.0)
@@ -17,15 +32,16 @@ def main(stop_entry=input.bool(False), repeat=input.bool(False), stop_limit=inpu
     if replace and flat and phase == 6:
         strategy.entry("L", strategy.long, stop=high + 0.5, limit=high + 1.0)
         strategy.exit("LX", "L", stop=close - 2.0, limit=close + 4.0)
-    # A market entry stays open until a stop-limit entry of its id reverses it
+    # A market entry, then a stop-limit entry of its id: a flipped (short) trade
+    # is reversed by it, an unflipped one only repeats it
     if reverse and flat and phase == 5:
         strategy.entry("L", strategy.long)
-    if reverse and strategy.position_size < 0:
-        strategy.entry("L", strategy.long, stop=high + 0.5, limit=high + 1.0)
+    if reverse and not flat and phase == 6:
+        strategy.entry("L", strategy.long, stop=high + 0.1, limit=high + 1.0)
     if reverse and strategy.position_size > 0:
         strategy.exit("LX", "L", stop=strategy.position_avg_price - 2.0,
                       limit=strategy.position_avg_price + 4.0)
-    entry_bar = flat and phase == 5 and not replace and not reverse
+    entry_bar = flat and phase == 5 and not replace and not reverse and not after_fill
     if repeat and strategy.position_size != 0 and 5 < phase < 9:
         # The entry signal holds on while its trade is open
         strategy.entry("L", strategy.long)
@@ -161,8 +177,8 @@ def __test_stop_limit_reversing_a_flipped_trade_keeps_its_own_exits__(runner):
     reversals = [t for t in flipped if t.direction == 1]
     assert reversals and any(t.direction == -1 for t in flipped)
     for t in reversals:
-        assert t.initial_stop is not None
-        assert abs(t.initial_stop - (t.entry_price - 2.0)) < 0.011
+        # The leg the script stated for its pending entry, below the long's fill
+        assert t.initial_stop is not None and t.initial_stop < t.entry_price
         assert min(abs(t.exit_price - (t.entry_price - 2.0)),
                    abs(t.exit_price - (t.entry_price + 4.0))) < 0.011
 
@@ -224,3 +240,40 @@ def __test_timing_test__(runner):
     result = timing_test(make, syminfo, real, 'r', seed=2, runs=10)
     assert result.draws == 10 and result.mode == 'timing'
     assert engine._orders_blocked is False
+
+
+def __test_flipped_entry_reads_its_own_direction__(runner):
+    """A flipped entry's script reads its own side, so a bracket placed after the fill mirrors."""
+    make = __test_helper_factory(runner, after_fill=True)
+    real, _ = __test_helper_record(make)
+    flipped, _ = __test_helper_record(make, lambda _id, _bar: True)
+
+    def key(trades):
+        return [(t.entry_bar_index, t.entry_price) for t in trades]
+
+    assert len(real) > 5 and all(t.direction == 1 for t in real)
+    assert key(flipped) == key(real)
+    for t, f in zip(real, flipped):
+        assert f.direction == -1
+        assert t.initial_stop is not None and f.initial_stop is not None
+        assert abs((f.initial_stop - f.entry_price) + (t.initial_stop - t.entry_price)) < 1e-6
+
+
+def __test_direction_test_without_pairs_gives_no_verdict__(runner):
+    """Too few paired trades leave the fast path without a verdict, and its JSON stays valid."""
+    import dataclasses
+    import json
+    import math
+    from pynecore.analysis.coinflip import direction_test
+    make = __test_helper_factory(runner)
+    real, syminfo = __test_helper_record(make)
+    # Real trades under an id the flipped backtest never opens: nothing pairs
+    renamed = [dataclasses.replace(t, entry_id='other') for t in real]
+    result = direction_test(make, syminfo, renamed, 'r', seed=3, draws=500)
+    assert not result.valid and result.trades == 0 and result.unpaired == len(real)
+    assert result.draws == 0 and not result.totals
+    assert math.isnan(result.percentile) and math.isnan(result.share_better)
+    assert result.verdict.startswith('not valid for this script')
+    data = json.loads(json.dumps(result.to_dict(), allow_nan=False))
+    assert data['valid'] is False and data['percentile'] is None
+    assert direction_test(make, syminfo, real, 'r', seed=3, draws=50).valid

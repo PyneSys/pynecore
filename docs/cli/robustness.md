@@ -95,7 +95,8 @@ The same as for `pyne run`:
 - `--coinflip-runs`: Backtests of the tests that run one per draw: `timing`, and `direction`
   with `--exact` (default: 200)
 - `--exact`: Direction test: a full backtest per draw instead of pairing the trades of one
-  flipped backtest. Needed when the strategy's later entries depend on its earlier trades.
+  flipped backtest. Needed when the strategy's later entries depend on its earlier trades:
+  without it, fewer than 90% paired trades give no verdict.
 
 ### Output Path Options
 

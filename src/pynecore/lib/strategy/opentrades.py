@@ -270,7 +270,9 @@ def size(trade_num: int) -> PyneFloat:
     try:
         assert lib._script is not None
         assert lib._script.position is not None
-        return lib._script.position.open_trades[trade_num].size
+        trade = lib._script.position.open_trades[trade_num]
+        flip = lib.strategy._entry_flip
+        return trade.size if flip is None else flip.script_size(trade)
     except (IndexError, AssertionError):
         return 0.0
 

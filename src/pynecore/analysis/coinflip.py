@@ -43,6 +43,8 @@ DEFAULT_DRAWS = 10_000
 """Draws of the direction test's fast path, where a draw costs no backtest."""
 DEFAULT_RUNS = 200
 """Backtests of the tests that run the strategy once per draw."""
+MIN_PAIRED_SHARE = 0.9
+"""Share of the real trades the direction test's fast path must pair to give a verdict."""
 
 _TIMING_ID = 'coinflip'
 
@@ -69,6 +71,8 @@ class CoinFlipResult:
     :ivar totals: Every random total, in draw order
     :ivar unpaired: ``paired``: real trades the flipped backtest had no counterpart
         for, left out of the comparison
+    :ivar valid: False when too few trades paired (see :data:`MIN_PAIRED_SHARE`):
+        the result then gives no verdict, and its percentile and share are NaN
     :ivar not_placed: ``timing``: random entries that found no flat moment before
         the end of the data, per draw on average
     :ivar notes: Warnings about the parts of the script the test could not randomize
@@ -87,6 +91,7 @@ class CoinFlipResult:
     share_better: float
     totals: list[float] = field(default_factory=list)
     unpaired: int = 0
+    valid: bool = True
     not_placed: float = 0.0
     notes: list[str] = field(default_factory=list)
     seconds: float = 0.0
@@ -102,6 +107,10 @@ class CoinFlipResult:
     @property
     def verdict(self) -> str:
         """:return: The comparison in plain words"""
+        if not self.valid:
+            return (f"not valid for this script: only {self.trades} of "
+                    f"{self.trades + self.unpaired} trades had a counterpart in the flipped "
+                    f"backtest (at least {MIN_PAIRED_SHARE:.0%} needed)")
         return (f"{self.share_better:.0%} of the random {self.mode} draws did better; "
                 f"the real rules beat {self.percentile:.0%} of them")
 
@@ -109,13 +118,18 @@ class CoinFlipResult:
         """:return: JSON-ready form, without the individual totals"""
         return {
             'mode': self.mode, 'method': self.method, 'unit': self.unit, 'draws': self.draws,
-            'seed': self.seed, 'real': self.real, 'trades': self.trades,
-            'distribution': self.distribution, 'percentile': self.percentile,
-            'share_better': self.share_better, 'unpaired': self.unpaired,
+            'seed': self.seed, 'real': _finite(self.real), 'trades': self.trades,
+            'distribution': self.distribution, 'percentile': _finite(self.percentile),
+            'share_better': _finite(self.share_better), 'unpaired': self.unpaired,
+            'valid': self.valid,
             'not_placed': self.not_placed, 'notes': list(self.notes),
             'description': self.description, 'verdict': self.verdict,
             'seconds': self.seconds,
         }
+
+
+def _finite(value: float) -> float | None:
+    return value if math.isfinite(value) else None
 
 
 def coin(seed: int, draw: int, *keys: Any) -> bool:
@@ -246,19 +260,30 @@ def direction_test(make_runner: Callable[[], 'ScriptRunner'], syminfo: 'SymInfo'
         flipped_values = _fill_values(flipped_trades, unit)
         keys = [k for k in real_values if k in flipped_values]
         pairs = [(real_values[k], flipped_values[k]) for k in keys]
+        unpaired = len(real_values) - len(pairs)
+        if unpaired:
+            notes.append(f"{unpaired} of {len(real_values)} trades had no counterpart in the "
+                         f"flipped backtest and were left out")
+        if not real_values or len(pairs) < MIN_PAIRED_SHARE * len(real_values):
+            # Too few pairs say nothing about the strategy's direction choices; the
+            # exact path, a backtest per draw, needs no pairing
+            notes.append("the trades of the flipped backtest depend on each other too much "
+                         "for pairing: run the exact test (a backtest per draw) instead")
+            empty: dict[str, float | None] = {f"p{q:g}": None for q in PERCENTILES}
+            return CoinFlipResult(mode='direction', method='paired', unit=unit, draws=0,
+                                  seed=seed, real=math.fsum(v for v, _ in pairs),
+                                  trades=len(pairs), distribution=empty, percentile=math.nan,
+                                  share_better=math.nan, unpaired=unpaired, valid=False,
+                                  notes=notes, seconds=time.perf_counter() - started)
         rng = random.Random(seed)
         totals: list[float] = []
-        for _ in range(draws if pairs else 0):
+        for _ in range(draws):
             total = 0.0
             for real_value, flipped_value in pairs:
                 total += flipped_value if rng.random() < 0.5 else real_value
             totals.append(total)
         real = math.fsum(v for v, _ in pairs)
         dist, rank, better = _compare(real, totals)
-        unpaired = len(real_values) - len(pairs)
-        if unpaired:
-            notes.append(f"{unpaired} of {len(real_values)} trades had no counterpart in the "
-                         f"flipped backtest and were left out")
         return CoinFlipResult(mode='direction', method='paired', unit=unit, draws=len(totals),
                               seed=seed, real=real, trades=len(pairs), distribution=dist,
                               percentile=rank, share_better=better, totals=totals,

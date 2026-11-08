@@ -94,9 +94,16 @@ class _EntryFlip:
     The decision is kept for the latest entry order of every id and, from its
     fill on, for the filled entry itself, so the exits of an open trade and of a
     pending order under the same id each mirror with their own entry.
+
+    The script keeps seeing the side it asked for: ``strategy.position_size``,
+    ``strategy.opentrades.size()`` and ``strategy.closedtrades.size()`` carry the
+    sign of the entry the script placed, so a bracket it derives from that sign
+    (``position_size > 0`` means long) is the one it would place unflipped, and the
+    mirroring applies to it. Money (profit, equity) and prices stay the real ones.
     """
 
-    __slots__ = ('_decide', '_flipped', '_filled', 'stop_limit_entries', 'order_calls')
+    __slots__ = ('_decide', '_flipped', '_filled', '_flipped_fills', 'stop_limit_entries',
+                 'order_calls')
 
     def __init__(self, decide: _Callable[[str, int], bool]):
         """
@@ -106,6 +113,7 @@ class _EntryFlip:
         self._decide = decide
         self._flipped: dict[str, bool] = {}
         self._filled: dict[int, bool] = {}
+        self._flipped_fills: set[int] = set()
         self.stop_limit_entries = 0
         """Stop-limit entries met: they have no mirror image and stay unflipped."""
         self.order_calls = 0
@@ -144,15 +152,47 @@ class _EntryFlip:
         self._flipped[entry_id] = decision
         return decision
 
-    def filled(self, entry_id: str | None, entry_seq: int) -> None:
+    def filled(self, entry_id: str | None, entry_seq: int, fill_seq: int) -> None:
         """
         Bind the decision of the entry order of an id to the entry it just filled.
 
         :param entry_id: The id of the filled entry order
         :param entry_seq: The entry sequence of the fill
+        :param fill_seq: The fill the entry's trade opened at (``Trade.entry_fill_seq``)
         """
+        decision = entry_id is not None and self._flipped.get(entry_id, False)
         if entry_id is not None and entry_id in self._flipped:
-            self._filled[entry_seq] = self._flipped[entry_id]
+            self._filled[entry_seq] = decision
+        if decision:
+            self._flipped_fills.add(fill_seq)
+        else:
+            self._flipped_fills.discard(fill_seq)
+
+    def script_size(self, trade: 'Trade') -> float:
+        """
+        :param trade: An open or closed trade
+        :return: Its signed size as the script placed it: negated for a flipped entry
+        """
+        return -trade.size if trade.entry_fill_seq in self._flipped_fills else trade.size
+
+    def script_position_size(self, position: 'PositionBase') -> float:
+        """
+        :param position: The position of the run
+        :return: Its signed size as the script placed its entries
+        """
+        size = position.size
+        if size == 0.0:
+            return size
+        trades = position.open_trades
+        flipped = sum(1 for t in trades if t.entry_fill_seq in self._flipped_fills)
+        if flipped == 0:
+            return size
+        if flipped == len(trades):
+            return -size
+        total = 0.0
+        for trade in trades:
+            total = _size_add(total, self.script_size(trade))
+        return total
 
     def is_flipped(self, entry_id: str | None, entry_seq: int | None) -> bool:
         """
@@ -1562,7 +1602,7 @@ class SimPosition(PositionBase):
         binding = _EntryBinding(self._entry_seq, entry_id, size, entry_price, exit_opened)
         self._entry_book.append(binding)
         if _entry_flip is not None:
-            _entry_flip.filled(entry_id, binding.seq)
+            _entry_flip.filled(entry_id, binding.seq, self._fill_counter)
         if entry_id is None:
             return
         for exit_order in list(self.exit_orders.values()):
@@ -8596,6 +8636,8 @@ def openprofit_percent() -> PyneFloat:
 def position_size() -> PyneFloat:
     if not lib._script:
         return 0.0
+    if _entry_flip is not None:
+        return _entry_flip.script_position_size(lib._script.position)
     return lib._script.position.size
 
 
