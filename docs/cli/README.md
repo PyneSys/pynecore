@@ -5,7 +5,7 @@ title: "Command Line Interface"
 description: "Use the PyneCore CLI to run scripts, compile Pine Script with PyneComp and manage market data. Find command guides for symbol selection and live broker runs."
 icon: "terminal"
 date: "2025-04-03"
-lastmod: "2026-10-14"
+lastmod: "2026-11-08"
 draft: false
 toc: true
 categories: ["CLI"]
@@ -22,6 +22,7 @@ PyneCore Command Line Interface (CLI) overview and usage
 - [Basics](./basics.md) - Basic CLI usage and getting started
 - [Run](./run.md) - Running scripts with the CLI
 - [Compile](./compile.md) - Converting Pine Script to Pyne code with PyneComp (PyneSys API key required)
+- [Robustness](./robustness.md) - Testing how much of a strategy's backtest result could be luck
 - [Data](./data.md) - Data management commands
 - [Symbol Browser TUI](./symbol-browser.md) - Interactive symbol picker for `pyne data download`
 - [Broker](./broker.md) - Managing live broker runs (resuming a quarantined bot)

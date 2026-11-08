@@ -5,7 +5,7 @@ title: "Strategy Development"
 description: "Create and test PyneCore strategies with script.strategy(). Configure backtest settings through TOML files and learn the basics of orders and position management."
 icon: "trending_up"
 date: "2025-03-31"
-lastmod: "2026-09-28"
+lastmod: "2026-11-08"
 draft: false
 toc: true
 categories: ["Strategy"]
@@ -298,6 +298,8 @@ Negative offsets never reach into the future: `close[-1]`, like any offset outsi
 - Test on multiple symbols and timeframes
 - Vary strategy parameters to avoid over-optimization
 - Include different market conditions in test data
+- Run [`pyne robustness`](./robustness.md) to see how much of the result could be luck: the
+  trade order, the best few trades, trading costs, and random decisions on the same trades
 
 ### 3. Start Simple
 
