@@ -143,6 +143,21 @@ def __test_analyze_chooses_the_unit__():
     assert analyze(mixed, RobustnessConfig(draws=200)).unit == 'currency'
 
 
+def __test_account_leverage_limit__():
+    """A stop too close for the risk at the leverage limit risks less; others keep it."""
+    tight = __test_helper_trade(0, -1.0, risk=1.0)  # stop 0.1% away: 1% risk is 10x
+    wide = __test_helper_trade(1, 2.0, risk=100.0)  # stop 10% away: 1% risk is 0.1x
+    free = analyze([tight, wide], RobustnessConfig(draws=50, mc_method='shuffle'))
+    capped = analyze([tight, wide], RobustnessConfig(draws=50, mc_method='shuffle',
+                                                     max_leverage=1.0))
+    assert free.account is not None and capped.account is not None
+    assert free.account_capped is None and capped.account_capped == 1
+    assert abs(free.account.final['p50'] - 10_000.0 * 0.99 * 1.02) < 1e-6
+    assert abs(capped.account.final['p50'] - 10_000.0 * 0.999 * 1.02) < 1e-6
+    assert capped.to_dict()['config']['max_leverage'] == 1.0
+    assert any('1 of 2 trades capped' in row['Method'] for row in capped.summary_rows())
+
+
 def __test_csv_output__(tmp_path):
     """One file per kind of result; no negative zero reaches a cell."""
     trades = [__test_helper_trade(i, r) for i, r in enumerate([1.0, -1.0, 2.0, -1.0, 0.0])]

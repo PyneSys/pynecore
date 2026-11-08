@@ -323,6 +323,11 @@ def robustness(
         ruin: float = Option(50.0, "--ruin", min=0.0, max=100.0,
                              help="Loss of the starting account that counts as ruin, percent",
                              rich_help_panel="Account Options"),
+        max_leverage: float | None = Option(None, "--max-leverage", min=0.0,
+                                            help="Largest position of the account Monte Carlo "
+                                                 "as a multiple of the account (1 = no "
+                                                 "leverage); a closer stop then risks less",
+                                            rich_help_panel="Account Options"),
         target: float | None = Option(None, "--target", min=0.0,
                                       help="Multiple of the starting account counted as "
                                            "reaching the target (100 = $100 to $10,000)",
@@ -389,6 +394,7 @@ def robustness(
         risk_fraction=risk / 100.0,
         ruin_fraction=ruin / 100.0,
         target_multiple=target,
+        max_leverage=max_leverage or None,
     )
 
     def _analyze(closed: list[TradeRecord]) -> RobustnessReport:

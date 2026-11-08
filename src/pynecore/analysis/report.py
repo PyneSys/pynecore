@@ -60,6 +60,9 @@ class RobustnessConfig:
     :ivar ruin_fraction: Loss of the starting account that counts as ruin
     :ivar target_multiple: Multiple of the starting account counted as reaching the
         target, ``None`` for no target
+    :ivar max_leverage: Largest position of the account Monte Carlo of R multiples, as a
+        multiple of the account: a trade whose stop is too close for
+        :attr:`risk_fraction` at this leverage risks less. ``None`` for no limit.
     """
 
     unit: Unit | None = None
@@ -74,6 +77,7 @@ class RobustnessConfig:
     risk_fraction: float = DEFAULT_RISK_FRACTION
     ruin_fraction: float = DEFAULT_RUIN_FRACTION
     target_multiple: float | None = None
+    max_leverage: float | None = None
 
 
 @dataclass(slots=True)
@@ -94,6 +98,8 @@ class RobustnessReport:
         give no per-trade return
     :ivar account_sizing: How the account form sized its trades: ``risk`` (a fixed
         share of the account per R) or ``strategy`` (the backtest's own returns)
+    :ivar account_capped: Trades the leverage limit made risk less than the set share
+        of the account, ``None`` without a limit or with ``strategy`` sizing
     :ivar costs: The result under extra costs
     :ivar periods: Calendar breakdowns
     :ivar coinflips: Coin-flip tests; they run the strategy again, so the caller
@@ -110,6 +116,7 @@ class RobustnessReport:
     monte_carlo: MonteCarloResult
     account: MonteCarloResult | None
     account_sizing: str | None
+    account_capped: int | None
     costs: CostTable
     periods: list[PeriodRow] = field(default_factory=list)
     coinflips: list['CoinFlipResult'] = field(default_factory=list)
@@ -126,6 +133,7 @@ class RobustnessReport:
                 'periods': list(config.periods), 'initial_capital': config.initial_capital,
                 'risk_fraction': config.risk_fraction, 'ruin_fraction': config.ruin_fraction,
                 'target_multiple': config.target_multiple,
+                'max_leverage': config.max_leverage,
             },
             'unit': self.unit,
             'trades': self.trades,
@@ -136,6 +144,7 @@ class RobustnessReport:
             'monte_carlo': self.monte_carlo.to_dict(),
             'account': self.account.to_dict() if self.account is not None else None,
             'account_sizing': self.account_sizing,
+            'account_capped': self.account_capped,
             'costs': self.costs.to_dict(),
             'periods': [row.to_dict() for row in self.periods],
             'coinflips': [result.to_dict() for result in self.coinflips],
@@ -177,6 +186,9 @@ class RobustnessReport:
         if self.account is not None:
             sizing = (f"{cfg.risk_fraction:.2%} of the account per R"
                       if self.account_sizing == 'risk' else 'the strategy\'s own returns')
+            if self.account_sizing == 'risk' and cfg.max_leverage is not None:
+                sizing += (f", positions at most {cfg.max_leverage:g}x the account"
+                           f" ({self.account_capped} of {self.account.trades} trades capped)")
             rows.extend(_monte_carlo_rows('Account Monte Carlo', self.account, 'currency',
                                           note=f"compounding {sizing}"))
         for flip in self.coinflips:
@@ -328,6 +340,39 @@ def _write(path: Path, header: list[str] | tuple[str, ...], rows: list[list[Any]
             writer.writerow([_cell(v) for v in row])
 
 
+def _risk_returns(trades: list[TradeRecord], risk_fraction: float,
+                  max_leverage: float | None) -> tuple[list[float], int | None]:
+    """
+    Per-trade account returns of a fixed share of the account risked per R.
+
+    Risking ``risk_fraction`` of the account with a stop ``d`` away from the entry
+    takes a position of ``risk_fraction / d`` times the account. With a leverage limit
+    the position stays at most ``max_leverage`` times the account, so a trade with a
+    closer stop risks ``max_leverage * d`` instead.
+
+    :param trades: The closed trades, one per fill
+    :param risk_fraction: Account risked per R
+    :param max_leverage: Largest position as a multiple of the account, ``None`` for
+        no limit
+    :return: The returns of the trades measured in R, and the number of trades the
+        limit capped (``None`` without a limit)
+    """
+    returns: list[float] = []
+    capped = 0
+    for trade in trades:
+        r = trade.r
+        if r is None:
+            continue
+        fraction = risk_fraction
+        if max_leverage is not None and trade.initial_stop is not None and trade.entry_price > 0.0:
+            stop_distance = abs(trade.entry_price - trade.initial_stop) / trade.entry_price
+            if max_leverage * stop_distance < risk_fraction:
+                fraction = max_leverage * stop_distance
+                capped += 1
+        returns.append(fraction * r)
+    return returns, capped if max_leverage is not None else None
+
+
 def analyze(trades: list[TradeRecord], config: RobustnessConfig | None = None) -> RobustnessReport:
     """
     Run every robustness test on the closed trades of one backtest.
@@ -357,8 +402,9 @@ def analyze(trades: list[TradeRecord], config: RobustnessConfig | None = None) -
     account: MonteCarloResult | None = None
     sizing: str | None = None
     returns: list[float] | None = None
+    capped: int | None = None
     if unit == 'r':
-        returns = [cfg.risk_fraction * v for v in values]
+        returns, capped = _risk_returns(trades, cfg.risk_fraction, cfg.max_leverage)
         sizing = 'risk'
     else:
         fractions = [t.return_fraction for t in trades]
@@ -387,6 +433,7 @@ def analyze(trades: list[TradeRecord], config: RobustnessConfig | None = None) -
         monte_carlo=monte_carlo(values, method=cfg.mc_method, draws=cfg.draws, seed=cfg.seed),
         account=account,
         account_sizing=sizing if account is not None else None,
+        account_capped=capped if account is not None else None,
         costs=cost_table(trades, unit, cfg.cost_bps),
         periods=[row for period in cfg.periods for row in by_period(values, times, period)],
     )
