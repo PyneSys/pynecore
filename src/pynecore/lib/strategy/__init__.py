@@ -1,5 +1,6 @@
 from typing import TYPE_CHECKING, Literal
 from typing import TypeAlias as _TypeAlias  # underscore-aliased: kept out of the module-property registry
+from collections.abc import Callable as _Callable  # underscore-aliased, as above
 
 import logging as _logging  # underscore-aliased: kept out of the module-property registry
 import sys as _sys  # underscore-aliased: kept out of the module-property registry
@@ -79,6 +80,97 @@ percent_of_equity = QtyType("percent_of_equity")
 
 long = direction.long
 short = direction.short
+
+
+class _EntryFlip:
+    """
+    Turns entries of a backtest into the opposite direction, for a robustness test.
+
+    While :data:`_entry_flip` holds one, ``strategy.entry`` asks it which entries
+    to flip. A flipped entry keeps its moment and price: a stop entry becomes a
+    limit entry at the same level and the other way round. The exits bound to it
+    are mirrored around its fill price (see :func:`_exit_leg`).
+
+    The decision is kept for the latest entry order of every id and, from its
+    fill on, for the filled entry itself, so the exits of an open trade and of a
+    pending order under the same id each mirror with their own entry.
+    """
+
+    __slots__ = ('_decide', '_flipped', '_filled', 'stop_limit_entries', 'order_calls')
+
+    def __init__(self, decide: _Callable[[str, int], bool]):
+        """
+        :param decide: Called with the entry id and the bar index for every new
+            entry order; True flips it
+        """
+        self._decide = decide
+        self._flipped: dict[str, bool] = {}
+        self._filled: dict[int, bool] = {}
+        self.stop_limit_entries = 0
+        """Stop-limit entries met: they have no mirror image and stay unflipped."""
+        self.order_calls = 0
+        """``strategy.order`` calls met: they are not flipped."""
+
+    def flip(self, entry_id: str, pending: bool, open_seq: int | None, stop_limit: bool) -> bool:
+        """
+        Whether an entry call goes in the opposite direction.
+
+        A call made while the id still has a pending entry order keeps the decision
+        of that order, as a resting order does not change side. A call made while
+        a trade of the id is open, with no order pending, stays in the direction of
+        the latest open trade it repeats.
+
+        A stop-limit entry has no mirror image and is never flipped, so its order
+        and the fill it makes stay unflipped, also when it replaces a pending
+        flipped order or reverses an open flipped trade of the same id.
+
+        :param entry_id: The entry id
+        :param pending: True when an entry order with this id is still pending
+        :param open_seq: The entry sequence of the latest open entry under this
+            id, or None when the id has none
+        :param stop_limit: True for an entry with both a limit and a stop price
+        :return: True to flip the entry
+        """
+        if stop_limit:
+            self.stop_limit_entries += 1
+            self._flipped[entry_id] = False
+            return False
+        if pending and entry_id in self._flipped:
+            return self._flipped[entry_id]
+        if open_seq is not None and open_seq in self._filled:
+            decision = self._filled[open_seq]
+        else:
+            decision = self._decide(entry_id, int(lib.bar_index))
+        self._flipped[entry_id] = decision
+        return decision
+
+    def filled(self, entry_id: str | None, entry_seq: int) -> None:
+        """
+        Bind the decision of the entry order of an id to the entry it just filled.
+
+        :param entry_id: The id of the filled entry order
+        :param entry_seq: The entry sequence of the fill
+        """
+        if entry_id is not None and entry_id in self._flipped:
+            self._filled[entry_seq] = self._flipped[entry_id]
+
+    def is_flipped(self, entry_id: str | None, entry_seq: int | None) -> bool:
+        """
+        :param entry_id: An entry id
+        :param entry_seq: The filled entry an exit is bound to, or None for the
+            pending entry order of the id
+        :return: True when that entry was flipped
+        """
+        if entry_seq is not None:
+            return self._filled.get(entry_seq, False)
+        return self._flipped.get(entry_id or '', False)
+
+
+_entry_flip: _EntryFlip | None = None
+"""The entry flipper of a direction robustness test; None in every other run."""
+
+_orders_blocked: bool = False
+"""True while a timing robustness test drives the position instead of the script."""
 
 # Possible order types
 _order_type_normal = _OrderType()
@@ -261,6 +353,7 @@ class Order:
         "placed_fill_seq",  # Fills processed before this order was booked (see _fill_order)
         "act_seq",  # Activation slot: the order's place in a simultaneous-trigger batch
         "issue_spec",  # strategy.exit arguments as issued, for the legs later adds inherit
+        "mirror_levels",  # Exit levels to mirror around the entry fill, once it fills (_EntryFlip)
         "spawn_spent",  # A leg of this strategy.exit call fired: later adds inherit nothing
         "target_trade",  # The one open trade this close fills against (margin call under ANY)
     )
@@ -398,6 +491,10 @@ class Order:
         # stays empty on every other order, which is what keeps a broker-restored
         # or non-exit order from spawning anything.
         self.issue_spec: tuple = ()
+        # ``(limit, stop, trail_price)`` of an exit bound to a flipped entry that
+        # had not filled yet: the levels the entry's fill price mirrors (see
+        # ``SimPosition._resolve_tick_exit``). None on every other order.
+        self.mirror_levels: tuple[float | None, float | None, float | None] | None = None
         # Set on every leg of a ``strategy.exit`` call once ONE of them fires: the
         # call stops covering pyramid adds until the script issues it again.
         self.spawn_spent = False
@@ -550,7 +647,8 @@ def _same_order_slot(resting: Order, issued: Order) -> bool:
             and resting.trail_offset == issued.trail_offset
             and resting.profit_ticks == issued.profit_ticks
             and resting.loss_ticks == issued.loss_ticks
-            and resting.trail_points_ticks == issued.trail_points_ticks)
+            and resting.trail_points_ticks == issued.trail_points_ticks
+            and resting.mirror_levels == issued.mirror_levels)
 
 
 class PriceOrderBook:
@@ -1030,10 +1128,17 @@ class SimPosition(PositionBase):
         '_deferred_margin_call', '_mc_stage2', '_mc_ghosts', '_bar_start_size', '_bar_start_equity',
         '_fill_counter', '_last_fill_price', '_partial_close_bar',
         '_entry_book', '_entry_seq', '_act_counter', '_deferred_immediate_closes', '_coof_cursor', '_market_fill_price',
-        '_walk_node', '_path_node', '_leg_start', '_spawned_trail_legs', '_triggered_stop_limits'
+        '_walk_node', '_path_node', '_leg_start', '_spawned_trail_legs', '_triggered_stop_limits',
+        'exit_listener'
     )
 
     def __init__(self):
+        # Called with every exit order the position books, the moment it is booked:
+        # the initial-stop recording of a robustness test (analysis.TradeRecorder)
+        # sees this way the stops a calc_on_order_fills re-execution places and
+        # fills within one bar. None in every other run.
+        self.exit_listener: _Callable[[Order], None] | None = None
+
         # OHLC values
         self.h: float = 0.0
         self.l: float = 0.0
@@ -1271,6 +1376,8 @@ class SimPosition(PositionBase):
         # a fill itself produced (a calc_on_order_fills re-execution) -- see the
         # same-instant reversal booking in ``_fill_order``.
         order.placed_fill_seq = self._fill_counter
+        if self.exit_listener is not None and order.order_type is _order_type_close:
+            self.exit_listener(order)
 
         # Add market order to market orders dict. Key on exit_id too: two
         # brackets sharing the same from_entry (order_id) would otherwise
@@ -1454,6 +1561,8 @@ class SimPosition(PositionBase):
         self._entry_seq += 1
         binding = _EntryBinding(self._entry_seq, entry_id, size, entry_price, exit_opened)
         self._entry_book.append(binding)
+        if _entry_flip is not None:
+            _entry_flip.filled(entry_id, binding.seq)
         if entry_id is None:
             return
         for exit_order in list(self.exit_orders.values()):
@@ -1544,6 +1653,7 @@ class SimPosition(PositionBase):
             leg.bound_size = bound
             leg.entry_seq = binding.seq
             leg.from_entry_na = source.from_entry_na
+            leg.mirror_levels = source.mirror_levels
             leg.named_entry = source.named_entry
             self._add_order(leg)
             if leg.trail_price is not None or leg.trail_points_ticks is not None:
@@ -2726,6 +2836,20 @@ class SimPosition(PositionBase):
         # A tick offset that undercuts an absolute level leaves the old, farther
         # level indexed: ``add_order`` only ever adds, so the book is rebuilt.
         moved = False
+
+        # The levels of a flipped entry's exit, reflected through the fill (see _exit_leg)
+        if order.mirror_levels is not None:
+            mirror_limit, mirror_stop, mirror_trail = order.mirror_levels
+            order.mirror_levels = None
+            if mirror_limit is not None:
+                order.limit = _price_round(2.0 * entry_price - mirror_limit, direction)
+                changed = True
+            if mirror_stop is not None:
+                order.stop = _price_round(2.0 * entry_price - mirror_stop, -direction)
+                changed = True
+            if mirror_trail is not None:
+                order.trail_price = _price_round(2.0 * entry_price - mirror_trail, -direction)
+                changed = True
 
         if order.profit_ticks is not None:
             level = _price_round(
@@ -6219,7 +6343,7 @@ def cancel(id: str):
 
     :param id: The identifier of the order to cancel
     """
-    if lib._lib_semaphore or lib._strategy_suppressed:
+    if lib._lib_semaphore or lib._strategy_suppressed or _orders_blocked:
         return
 
     position = lib._script.position
@@ -6231,7 +6355,7 @@ def cancel_all():
     """
     Cancels all pending or unfilled orders
     """
-    if lib._lib_semaphore or lib._strategy_suppressed:
+    if lib._lib_semaphore or lib._strategy_suppressed or _orders_blocked:
         return
     lib._script.position._cancel_all_orders()
 
@@ -6253,7 +6377,7 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
     :param immediately: If true, the closing order executes on the same tick when the strategy places it
     :param disable_alert: If true, the strategy does not trigger an alert when the order fills
     """
-    if lib._lib_semaphore or lib._strategy_suppressed:
+    if lib._lib_semaphore or lib._strategy_suppressed or _orders_blocked:
         return
 
     position = lib._script.position
@@ -6387,7 +6511,7 @@ def close_all(comment: PyneStr = na_str, alert_message: PyneStr = na_str, immedi
     :param immediately: If true, the closing order executes on the same tick when the strategy places it
     :param disable_alert: If true, the strategy does not trigger an alert when the order fills
     """
-    if lib._lib_semaphore or lib._strategy_suppressed:
+    if lib._lib_semaphore or lib._strategy_suppressed or _orders_blocked:
         return
 
     position = lib._script.position
@@ -6986,11 +7110,25 @@ def entry(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     :param alert_message: Custom text for the alert that fires when an order fills
     :param disable_alert: If true, the strategy does not trigger an alert when the order fills
     """
-    if lib._lib_semaphore or lib._strategy_suppressed:
+    if lib._lib_semaphore or lib._strategy_suppressed or _orders_blocked:
         return
 
     script = lib._script
     position = script.position
+
+    if _entry_flip is not None:
+        open_seq: int | None = None
+        if isinstance(position, SimPosition):
+            for binding in position._entry_book:
+                if binding.entry_id == id:
+                    open_seq = binding.seq
+        if _entry_flip.flip(id, id in position.entry_orders, open_seq,
+                            limit is not None and stop is not None
+                            and limit == limit and stop == stop):
+            # The opposite side at the same moment and price: a level the price
+            # reaches from below triggers a buy stop or a sell limit alike
+            direction = short if direction == long else long
+            limit, stop = stop, limit
 
     # Risk management: Check if trading is halted
     if position.risk_halt_trading:
@@ -7423,6 +7561,27 @@ def _exit_leg(position: PositionBase, exit_id: str, from_entry: str,
     if existing is not None and existing.consumed:
         return
 
+    # A leg of a flipped entry is the mirror image of the leg the script states:
+    # each level is reflected through the entry's fill price, which keeps its
+    # distance and moves it to the other side. Before the fill the levels wait in
+    # ``mirror_levels`` and resolve with the fill (SimPosition._resolve_tick_exit).
+    mirror_levels: tuple[float | None, float | None, float | None] | None = None
+    if (_entry_flip is not None and isinstance(position, SimPosition)
+            and _entry_flip.is_flipped(from_entry, entry_seq)):
+        fill = position._entry_fill_price(from_entry, entry_seq)
+        if fill is not None:
+            if limit == limit:  # is_na_arg
+                limit = 2.0 * fill - limit
+            if stop == stop:  # is_na_arg
+                stop = 2.0 * fill - stop
+            if trail_price == trail_price:  # is_na_arg
+                trail_price = 2.0 * fill - trail_price
+        elif limit == limit or stop == stop or trail_price == trail_price:  # is_na_arg
+            mirror_levels = (limit if limit == limit else None,  # is_na_arg
+                             stop if stop == stop else None,  # is_na_arg
+                             trail_price if trail_price == trail_price else None)  # is_na_arg
+            limit = stop = trail_price = na_float
+
     # A call whose price/tick args ALL resolve to na arms no trigger -- e.g.
     # brackets computed from a flat position_avg_price (na) on a bar before the
     # entry fills. It is not a level-less market close that fires at the next
@@ -7442,8 +7601,9 @@ def _exit_leg(position: PositionBase, exit_id: str, from_entry: str,
     # the legs issued above the call (probes xb/xc, 4 x ~135 cycles each).
     # A live broker gets no such order: the plugin would dispatch a level-less
     # exit as a market close, so there the call only cancels the resting leg.
-    dormant = not (limit == limit or stop == stop or profit == profit or loss == loss
-                   or trail_price == trail_price or trail_points == trail_points)  # is_na_arg
+    dormant = mirror_levels is None and not (
+            limit == limit or stop == stop or profit == profit or loss == loss
+            or trail_price == trail_price or trail_points == trail_points)  # is_na_arg
     if dormant and not isinstance(position, SimPosition):
         if existing is not None:
             position._remove_order(existing)
@@ -7606,6 +7766,7 @@ def _exit_leg(position: PositionBase, exit_id: str, from_entry: str,
             and existing.bound_size == bound and existing.rest_leg == is_rest_leg
             and existing.oca_type is _oca.reduce and existing.act_seq != 0
             and existing.issue_spec == issue_spec
+            and mirror_levels is None and existing.mirror_levels is None
             and existing.oca_name == _oca_name
             and existing.comment == _comment
             and existing.alert_message == _alert_message
@@ -7647,6 +7808,10 @@ def _exit_leg(position: PositionBase, exit_id: str, from_entry: str,
     )
     if dormant:
         # No level to index it at and no market fill: it only holds its slice.
+        order.is_market_order = False
+    if mirror_levels is not None:
+        # Its levels come with the flipped entry's fill; until then it is no market close
+        order.mirror_levels = mirror_levels
         order.is_market_order = False
 
     # Sticky bracket (TV semantics): a re-issued live trailing leg keeps its
@@ -7867,7 +8032,7 @@ def exit(id: str, from_entry: str = "",
     :param alert_trailing: Custom text for the alert that fires when an order fills
     :param disable_alert: If true, the alert will not fire when the order fills
     """
-    if lib._lib_semaphore or lib._strategy_suppressed:
+    if lib._lib_semaphore or lib._strategy_suppressed or _orders_blocked:
         return
 
     script = lib._script
@@ -7983,8 +8148,10 @@ def order(id: str, direction: direction.Direction, qty: int | PyneFloat = na_flo
     :param alert_message: Custom text for the alert that fires when an order fills
     :param disable_alert: If true, the strategy does not trigger an alert when the order fills
     """
-    if lib._lib_semaphore or lib._strategy_suppressed:
+    if lib._lib_semaphore or lib._strategy_suppressed or _orders_blocked:
         return
+    if _entry_flip is not None:
+        _entry_flip.order_calls += 1
 
     script = lib._script
     position = script.position

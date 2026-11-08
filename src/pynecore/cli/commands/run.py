@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from dataclasses import replace as dc_replace
 from datetime import datetime, timedelta, UTC, tzinfo
+from collections.abc import Callable
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -51,7 +52,9 @@ from pynecore.core.live_runner import live_ohlcv_generator
 from ...cli.utils.api_error_handler import APIErrorHandler
 from ...cli.utils.profile_report import print_profile_report
 
-__all__ = []
+__all__ = ['backtest_security_path', 'check_data_period', 'resolve_chart_timeframe',
+           'resolve_data', 'resolve_script', 'resolve_time_window',
+           'run_backtest_with_progress']
 
 
 #: How long a stopped live run waits for the fills of market orders it already
@@ -1121,6 +1124,361 @@ def _print_data_requirements(requirements: DataRequirements, script_name: str) -
     console.print("\n".join(lines), markup=False, highlight=False)
 
 
+def resolve_script(script: Path, api_key: str | None) -> Path:
+    """
+    Find a script by name or path and compile it when it is Pine Script.
+
+    A bare name is looked up in the workdir's ``scripts`` directory; without a suffix
+    ``.pine`` is tried first, then ``.py``. A ``.pine`` script is compiled to the
+    ``.py`` beside it when the API configuration has a key and the source changed.
+
+    :param script: Script name or path
+    :param api_key: PyneSys API key overriding the configuration file
+    :return: The ``.py`` script to run
+    :raises Exit: When the script does not exist or the configuration is invalid
+    """
+    # Expand script path
+    if len(script.parts) == 1:
+        script = app_state.scripts_dir / script
+
+    # If no script suffix, try .pine 1st
+    if script.suffix == "":
+        script = script.with_suffix(".pine")
+    # If doesn't exist, try .py
+    if not script.exists():
+        script = script.with_suffix(".py")
+
+    # Check if script exists
+    if not script.exists():
+        secho(f"Script file '{script}' not found!", fg="red", err=True)
+        raise Exit(1)
+
+    # Handle .pine files - compile them first
+    if script.suffix == ".pine":
+        # Read api.toml configuration
+        api_config = {}
+        try:
+            with open(app_state.config_dir / 'api.toml', 'rb') as f:
+                api_config = tomllib.load(f)['api']
+        except KeyError:
+            console.print("[red]Invalid API config file (api.toml)![/red]")
+            raise Exit(1)
+        except FileNotFoundError:
+            pass
+
+        # Override API key if provided
+        if api_key:
+            api_config['api_key'] = api_key
+
+        # Override API URL if provided via environment variable
+        api_url = os.getenv("PYNESYS_API_URL")
+        if api_url:
+            api_config['base_url'] = api_url
+
+        if api_config.get('api_key'):
+            # Create the compiler instance
+            compiler = PyneComp(**api_config)
+
+            # Determine output path for compiled file
+            out_path = script.with_suffix(".py")
+
+            # Check if compilation is needed
+            if compiler.needs_compilation(script, out_path):
+                with APIErrorHandler(console):
+                    with Progress(
+                            SpinnerColumn(finished_text="[green]✓"),
+                            TextColumn("[progress.description]{task.description}"),
+                            console=console
+                    ) as progress:
+                        task = progress.add_task("Compiling Pine Script...", total=1)
+
+                        # Compile the .pine file
+                        compiler.compile(script, out_path)
+
+                        progress.update(task, completed=1)
+
+            # Update script to point to the compiled file
+            script = out_path
+
+        # Go back to normal .py file
+        else:
+            script = script.with_suffix(".py")
+            # Check if script exists
+            if not script.exists():
+                secho(f"Script file '{script}' not found!", fg="red", err=True)
+                raise Exit(1)
+
+    return script
+
+
+def resolve_data(data: str, time_from: str | None, *,
+                 retry_transient: bool = False) -> tuple[Path, SymInfo, '_ProviderData | None']:
+    """
+    Resolve the chart data of a run: download it from a provider or find the file.
+
+    A provider string downloads the history and the symbol information. A file name
+    is looked up in the workdir's ``data`` directory and converted to OHLCV when it
+    is in another format.
+
+    :param data: Data file or provider string
+    :param time_from: The ``--from`` value, which sizes a provider download
+    :param retry_transient: Keep retrying a provider through transient outages
+    :return: The OHLCV file, its symbol information, and the provider download when
+        the data came from a provider
+    :raises Exit: When the data cannot be found, converted or downloaded
+    """
+    provider_data = None
+    if is_provider_string(data):
+        # Provider mode: download historical warmup data + syminfo. A
+        # long-running --broker/--live run rides out transient broker outages
+        # (maintenance, lost route) instead of dying mid-startup; a one-shot
+        # backtest and any permanent failure (unknown symbol, bad credentials)
+        # still fail fast with a clean one-line error, not a traceback.
+        provider_data = _download_provider_data_resilient(
+            data, time_from, retry_transient=retry_transient,
+        )
+        data_path, syminfo = provider_data.ohlcv_path, provider_data.syminfo
+    else:
+        # File mode: resolve path, convert if needed
+        data_path = Path(data)
+
+        if len(data_path.parts) == 1:
+            data_path = app_state.data_dir / data_path
+
+        # A name without a known data extension (e.g. ``bybit_BTCUSD.P_1D``, whose
+        # ``.P_1D`` belongs to the symbol) resolves to its first existing data
+        # sibling. A file that exists under the name as given is a source file of
+        # its own, its format detected by content.
+        if not data_extension(data_path):
+            candidates = [with_data_extension(data_path, ext) for ext in DATA_EXTENSIONS]
+            data_path = next(
+                (c for c in candidates if c.exists()),
+                data_path if data_path.is_file() else candidates[0],
+            )
+
+        if data_extension(data_path) != ".ohlcv":
+            try:
+                converter = DataConverter()
+                if converter.is_conversion_required(data_path):
+                    detected_symbol, detected_provider = DataConverter.guess_symbol_from_filename(data_path)
+                    if not detected_symbol:
+                        detected_symbol = with_data_extension(data_path, '').name.upper()
+                    with Progress(
+                            SpinnerColumn(finished_text="[green]✓"),
+                            TextColumn("[progress.description]{task.description}"),
+                            console=console
+                    ) as progress:
+                        task = progress.add_task(f"Converting {data_path.suffix} to OHLCV format...", total=1)
+                        converter.convert_to_ohlcv(
+                            data_path, provider=detected_provider,
+                            symbol=detected_symbol, force=True
+                        )
+                        data_path = with_data_extension(data_path, ".ohlcv")
+                        progress.update(task, completed=1)
+                else:
+                    data_path = with_data_extension(data_path, ".ohlcv")
+            except (DataFormatError, ConversionError) as e:
+                secho(f"Conversion failed: {e}", fg="red", err=True)
+                secho("Please convert the file manually:", fg="red")
+                secho(f"pyne data convert-from {data_path}", fg="yellow")
+                raise Exit(1)
+
+        if not data_path.exists():
+            secho(f"Data file not found: {data_path.name}", fg="red", err=True)
+            raise Exit(1)
+
+        try:
+            syminfo = SymInfo.load_toml(data_path.with_suffix(".toml"))
+        except FileNotFoundError:
+            secho(f"Symbol info file '{data_path.with_suffix('.toml')}' not found!", fg="red", err=True)
+            raise Exit(1)
+
+    return data_path, syminfo, provider_data
+
+
+def resolve_chart_timeframe(syminfo: SymInfo, timeframe: str | None) -> str | None:
+    """
+    Apply the ``--timeframe`` option to the chart.
+
+    A chart timeframe above the data's own aggregates the data, or runs the bar
+    magnifier when the strategy asks for it; ``syminfo.period`` becomes the chart
+    timeframe.
+
+    :param syminfo: Symbol information of the data; its period is updated
+    :param timeframe: The ``--timeframe`` value, or ``None``
+    :return: The data's own timeframe when it differs from the chart's, else ``None``
+    :raises Exit: When the timeframe is invalid or cannot be aggregated to
+    """
+    if timeframe:
+        chart_tf: str = timeframe.upper()
+        try:
+            in_seconds(chart_tf)
+        except (ValueError, AssertionError):
+            secho(f"Invalid timeframe: {chart_tf}. Must be a valid TradingView format "
+                  f"(e.g. '1', '5', '60', '1D', '1W', '1M').", fg="red", err=True)
+            raise Exit(1)
+
+        data_tf = syminfo.period
+        if chart_tf != data_tf:
+            try:
+                validate_aggregation(data_tf, chart_tf)
+            except ValueError as e:
+                secho(str(e), fg="red", err=True)
+                raise Exit(1)
+            # Override syminfo period to the chart timeframe
+            syminfo.period = chart_tf
+            return data_tf
+    return None
+
+
+def check_data_period(reader: OHLCVReader, data_file_period: str | None, data_path: Path) -> None:
+    """
+    Reject a symbol information file whose period disagrees with the data file.
+
+    :param reader: The open data file
+    :param data_file_period: The period the symbol information declares
+    :param data_path: The data file, for the message
+    :raises Exit: When the two periods differ
+    """
+    # The file header owns the data's period; a sidecar that disagrees is
+    # stale and would silently drive the magnifier / aggregation decisions off
+    # the wrong resolution. Legacy files declare no header period.
+    if reader.period is not None and data_file_period:
+        try:
+            header_sec = in_seconds(reader.period)
+            toml_sec = in_seconds(data_file_period)
+        except (ValueError, AssertionError):
+            header_sec = toml_sec = None
+        if header_sec is not None and header_sec != toml_sec:
+            secho(f"Stale syminfo: TOML period '{data_file_period}' does not match "
+                  f"the period '{reader.period}' declared by {data_path.name}.",
+                  fg="red", err=True)
+            raise Exit(1)
+
+
+def resolve_time_window(reader: OHLCVReader, time_from: str | None, time_to: str | None,
+                        provider_data: '_ProviderData | None') -> tuple[datetime, datetime]:
+    """
+    The time window of a run, from the ``--from`` / ``--to`` options and the data.
+
+    :param reader: The open data file
+    :param time_from: The ``--from`` value; ``None`` in provider mode, where the
+        download already applied it
+    :param time_to: The ``--to`` value
+    :param provider_data: The provider download, or ``None`` in file mode
+    :return: Start and end of the window
+    """
+    # Parse time range
+    time_from_dt = _parse_time_value(time_from) if time_from else None
+    time_to_dt = _parse_time_value(time_to) if time_to else None
+
+    if not time_from_dt:
+        # Provider bar-count mode pins the start to the N-th last
+        # real bar; otherwise use the file's natural start.
+        if provider_data is not None and provider_data.time_from_ts is not None:
+            time_from_dt = datetime.fromtimestamp(
+                provider_data.time_from_ts / 1000, UTC,
+            )
+        else:
+            time_from_dt = reader.start_datetime
+    if not time_to_dt:
+        time_to_dt = reader.end_datetime
+    assert isinstance(time_from_dt, datetime) and isinstance(time_to_dt, datetime)
+    return time_from_dt, time_to_dt
+
+
+def backtest_security_path(value: str) -> str:
+    """
+    The data file a ``--security`` mapping names in a backtest.
+
+    :param value: File stem or path; a bare name is looked up in the workdir's
+        ``data`` directory, and may carry the ``.ohlcv`` extension
+    :return: The file path without extension, as the runner takes it
+    :raises Exit: When the OHLCV file does not exist
+    """
+    sec_path = Path(value)
+    if len(sec_path.parts) == 1:
+        sec_path = app_state.data_dir / sec_path
+    ohlcv_check = with_data_extension(sec_path, '.ohlcv')
+    if not ohlcv_check.exists():
+        secho(f"Security data not found: {ohlcv_check}", fg="red", err=True)
+        raise Exit(1)
+    return str(with_data_extension(sec_path, ''))
+
+
+def run_backtest_with_progress(runner: ScriptRunner, time_from_display: datetime,
+                               time_to_display: datetime, total_seconds: int,
+                               on_bar: Callable[[], None] | None = None) -> None:
+    """
+    Run a backtest to its end under a progress bar of the time window.
+
+    :param runner: The script runner
+    :param time_from_display: Start of the window, naive UTC
+    :param time_to_display: End of the window, naive UTC
+    :param total_seconds: Length of the window
+    :param on_bar: Called after every bar, once its orders and trades are settled
+    """
+    with Progress(
+            SpinnerColumn(finished_text="[green]✓"),
+            TextColumn("{task.description}"),
+            DateColumn(time_from_display),
+            BarColumn(),
+            CustomTimeElapsedColumn(),
+            "/",
+            CustomTimeRemainingColumn(),
+    ) as progress:
+        task = progress.add_task(
+            description="Running script...",
+            total=total_seconds,
+        )
+
+        # Single slot for progress updates. The callback runs once per
+        # BAR while the bar only ever redraws on a whole-second change,
+        # so all a queue could offer is a backlog the reader throws
+        # away. One producer, one consumer, and a list store is a single
+        # bytecode under the GIL -- overwriting needs no lock.
+        last_time: list[datetime | None] = [None]
+        stop_event = threading.Event()
+
+        def progress_worker():
+            """Worker thread that updates progress bar at 30Hz"""
+            last_update = 0
+            while not stop_event.is_set():
+                try:
+                    current_time = last_time[0]
+                    if current_time is not None:
+                        if current_time == datetime.max:
+                            current_time = time_to_display
+                        elapsed_seconds = int(
+                            (current_time - time_from_display).total_seconds())
+                        if elapsed_seconds != last_update:
+                            progress.update(task, completed=elapsed_seconds)
+                            last_update = elapsed_seconds
+                except Exception:  # noqa
+                    pass
+
+                time.sleep(1 / 30)
+
+        # Start worker thread
+        worker = threading.Thread(target=progress_worker, daemon=True)
+        worker.start()
+
+        def cb_progress(current_time: datetime | None):
+            """Callback that keeps only the newest timestamp"""
+            last_time[0] = current_time
+            if on_bar is not None and current_time != datetime.max:
+                on_bar()
+
+        try:
+            runner.run(on_progress=cb_progress)
+
+            progress.update(task, completed=total_seconds)
+        finally:
+            stop_event.set()
+            worker.join(timeout=0.1)
+            progress.refresh()
+
+
 @app.command(cls=PluggableCommand)
 def run(
         script: Path = Argument(..., dir_okay=False, file_okay=True, help="Script to run (.py or .pine)"),
@@ -1235,80 +1593,10 @@ def run(
     Supports CSV, TXT, JSON, and OHLCV data files. Non-OHLCV files are automatically converted.
     """  # noqa
 
-    # Expand script path
-    if len(script.parts) == 1:
-        script = app_state.scripts_dir / script
-
-    # If no script suffix, try .pine 1st
-    if script.suffix == "":
-        script = script.with_suffix(".pine")
-    # If doesn't exist, try .py
-    if not script.exists():
-        script = script.with_suffix(".py")
-
-    # Check if script exists
-    if not script.exists():
-        secho(f"Script file '{script}' not found!", fg="red", err=True)
-        raise Exit(1)
-
-    # Handle .pine files - compile them first
-    if script.suffix == ".pine":
-        # Read api.toml configuration
-        api_config = {}
-        try:
-            with open(app_state.config_dir / 'api.toml', 'rb') as f:
-                api_config = tomllib.load(f)['api']
-        except KeyError:
-            console.print("[red]Invalid API config file (api.toml)![/red]")
-            raise Exit(1)
-        except FileNotFoundError:
-            pass
-
-        # Override API key if provided
-        if api_key:
-            api_config['api_key'] = api_key
-
-        # Override API URL if provided via environment variable
-        api_url = os.getenv("PYNESYS_API_URL")
-        if api_url:
-            api_config['base_url'] = api_url
-
-        if api_config.get('api_key'):
-            # Create the compiler instance
-            compiler = PyneComp(**api_config)
-
-            # Determine output path for compiled file
-            out_path = script.with_suffix(".py")
-
-            # Check if compilation is needed
-            if compiler.needs_compilation(script, out_path):
-                with APIErrorHandler(console):
-                    with Progress(
-                            SpinnerColumn(finished_text="[green]✓"),
-                            TextColumn("[progress.description]{task.description}"),
-                            console=console
-                    ) as progress:
-                        task = progress.add_task("Compiling Pine Script...", total=1)
-
-                        # Compile the .pine file
-                        compiler.compile(script, out_path)
-
-                        progress.update(task, completed=1)
-
-            # Update script to point to the compiled file
-            script = out_path
-
-        # Go back to normal .py file
-        else:
-            script = script.with_suffix(".py")
-            # Check if script exists
-            if not script.exists():
-                secho(f"Script file '{script}' not found!", fg="red", err=True)
-                raise Exit(1)
+    script = resolve_script(script, api_key)
 
     # --- Data resolution: provider string or file path ---
     provider_mode = is_provider_string(data)
-    provider_data = None
 
     if live and not provider_mode:
         secho("Error: --live is only available in provider mode.", err=True, fg=colors.RED)
@@ -1319,70 +1607,9 @@ def run(
               err=True, fg=colors.RED)
         raise Exit(1)
 
-    if provider_mode:
-        # Provider mode: download historical warmup data + syminfo. A
-        # long-running --broker/--live run rides out transient broker outages
-        # (maintenance, lost route) instead of dying mid-startup; a one-shot
-        # backtest and any permanent failure (unknown symbol, bad credentials)
-        # still fail fast with a clean one-line error, not a traceback.
-        provider_data = _download_provider_data_resilient(
-            data, time_from, retry_transient=(live or broker),
-        )
-        data_path, syminfo = provider_data.ohlcv_path, provider_data.syminfo
-    else:
-        # File mode: resolve path, convert if needed
-        data_path = Path(data)
-
-        if len(data_path.parts) == 1:
-            data_path = app_state.data_dir / data_path
-
-        # A name without a known data extension (e.g. ``bybit_BTCUSD.P_1D``, whose
-        # ``.P_1D`` belongs to the symbol) resolves to its first existing data
-        # sibling. A file that exists under the name as given is a source file of
-        # its own, its format detected by content.
-        if not data_extension(data_path):
-            candidates = [with_data_extension(data_path, ext) for ext in DATA_EXTENSIONS]
-            data_path = next(
-                (c for c in candidates if c.exists()),
-                data_path if data_path.is_file() else candidates[0],
-            )
-
-        if data_extension(data_path) != ".ohlcv":
-            try:
-                converter = DataConverter()
-                if converter.is_conversion_required(data_path):
-                    detected_symbol, detected_provider = DataConverter.guess_symbol_from_filename(data_path)
-                    if not detected_symbol:
-                        detected_symbol = with_data_extension(data_path, '').name.upper()
-                    with Progress(
-                            SpinnerColumn(finished_text="[green]✓"),
-                            TextColumn("[progress.description]{task.description}"),
-                            console=console
-                    ) as progress:
-                        task = progress.add_task(f"Converting {data_path.suffix} to OHLCV format...", total=1)
-                        converter.convert_to_ohlcv(
-                            data_path, provider=detected_provider,
-                            symbol=detected_symbol, force=True
-                        )
-                        data_path = with_data_extension(data_path, ".ohlcv")
-                        progress.update(task, completed=1)
-                else:
-                    data_path = with_data_extension(data_path, ".ohlcv")
-            except (DataFormatError, ConversionError) as e:
-                secho(f"Conversion failed: {e}", fg="red", err=True)
-                secho("Please convert the file manually:", fg="red")
-                secho(f"pyne data convert-from {data_path}", fg="yellow")
-                raise Exit(1)
-
-        if not data_path.exists():
-            secho(f"Data file not found: {data_path.name}", fg="red", err=True)
-            raise Exit(1)
-
-        try:
-            syminfo = SymInfo.load_toml(data_path.with_suffix(".toml"))
-        except FileNotFoundError:
-            secho(f"Symbol info file '{data_path.with_suffix('.toml')}' not found!", fg="red", err=True)
-            raise Exit(1)
+    data_path, syminfo, provider_data = resolve_data(
+        data, time_from, retry_transient=(live or broker),
+    )
 
     # --- Output paths ---
     if no_plot and plot_path:
@@ -1413,67 +1640,19 @@ def run(
                                  if profile else None)
 
     # Validate and process --timeframe option
-    magnifier_mode = False
-    magnifier_source_tf: str | None = None
     # ``syminfo.period`` is the CHART timeframe from here on — the magnifier path
     # below deliberately overwrites it. Keep the data file's own declared period so
     # it can still be checked against the file header once the reader is open.
     data_file_period = syminfo.period
-    if timeframe:
-        chart_tf: str = timeframe.upper()
-        try:
-            in_seconds(chart_tf)
-        except (ValueError, AssertionError):
-            secho(f"Invalid timeframe: {chart_tf}. Must be a valid TradingView format "
-                  f"(e.g. '1', '5', '60', '1D', '1W', '1M').", fg="red", err=True)
-            raise Exit(1)
-
-        data_tf = syminfo.period
-        if chart_tf != data_tf:
-            try:
-                validate_aggregation(data_tf, chart_tf)
-            except ValueError as e:
-                secho(str(e), fg="red", err=True)
-                raise Exit(1)
-            # Override syminfo period to the chart timeframe
-            syminfo.period = chart_tf
-            magnifier_mode = True
-            magnifier_source_tf = data_tf
+    magnifier_source_tf = resolve_chart_timeframe(syminfo, timeframe)
+    magnifier_mode = magnifier_source_tf is not None
 
     # --- Open data and run ---
     with OHLCVReader(data_path) as reader:
-        # The file header owns the data's period; a sidecar that disagrees is
-        # stale and would silently drive the magnifier / aggregation decisions off
-        # the wrong resolution. Legacy files declare no header period.
-        if reader.period is not None and data_file_period:
-            try:
-                header_sec = in_seconds(reader.period)
-                toml_sec = in_seconds(data_file_period)
-            except (ValueError, AssertionError):
-                header_sec = toml_sec = None
-            if header_sec is not None and header_sec != toml_sec:
-                secho(f"Stale syminfo: TOML period '{data_file_period}' does not match "
-                      f"the period '{reader.period}' declared by {data_path.name}.",
-                      fg="red", err=True)
-                raise Exit(1)
-
-        # Parse time range
-        time_from_dt = _parse_time_value(time_from) if time_from and not provider_mode else None
-        time_to_dt = _parse_time_value(time_to) if time_to else None
-
-        if not time_from_dt:
-            # Provider bar-count mode pins the start to the N-th last
-            # real bar; otherwise use the file's natural start.
-            if provider_data is not None and provider_data.time_from_ts is not None:
-                time_from_dt = datetime.fromtimestamp(
-                    provider_data.time_from_ts / 1000, UTC,
-                )
-            else:
-                time_from_dt = reader.start_datetime
-        if not time_to_dt:
-            time_to_dt = reader.end_datetime
-
-        assert isinstance(time_from_dt, datetime) and isinstance(time_to_dt, datetime)
+        check_data_period(reader, data_file_period, data_path)
+        time_from_dt, time_to_dt = resolve_time_window(
+            reader, None if provider_mode else time_from, time_to, provider_data,
+        )
         # The reader window and the live-stream dedup boundary are both in the
         # OHLCV unit, Unix milliseconds.
         time_from_ts = int(time_from_dt.timestamp() * 1000)
@@ -1705,20 +1884,7 @@ def run(
                         )
                     else:
                         # Backtest mode: value is a file stem or path.
-                        sec_path = Path(value)
-                        if len(sec_path.parts) == 1:
-                            sec_path = app_state.data_dir / sec_path
-                        # ``value`` may carry the ``.ohlcv`` data extension or be a
-                        # bare stem; the runner takes the stem.
-                        ohlcv_check = with_data_extension(sec_path, '.ohlcv')
-                        sec_path = with_data_extension(sec_path, '')
-                        if not ohlcv_check.exists():
-                            secho(
-                                f"Security data not found: {ohlcv_check}",
-                                fg="red", err=True,
-                            )
-                            raise Exit(1)
-                        sec_map[key] = str(sec_path)
+                        sec_map[key] = backtest_security_path(value)
                 security_data = sec_map
 
             # Add lib directory to Python path for library imports
@@ -2057,64 +2223,8 @@ def run(
                     broker_run_reached_summary = True
 
             else:
-                # Batch mode: progress bar with time range
-                with Progress(
-                        SpinnerColumn(finished_text="[green]✓"),
-                        TextColumn("{task.description}"),
-                        DateColumn(time_from_display),
-                        BarColumn(),
-                        CustomTimeElapsedColumn(),
-                        "/",
-                        CustomTimeRemainingColumn(),
-                ) as progress:
-                    task = progress.add_task(
-                        description="Running script...",
-                        total=total_seconds,
-                    )
-
-                    # Single slot for progress updates. The callback runs once per
-                    # BAR while the bar only ever redraws on a whole-second change,
-                    # so all a queue could offer is a backlog the reader throws
-                    # away. One producer, one consumer, and a list store is a single
-                    # bytecode under the GIL -- overwriting needs no lock.
-                    last_time: list[datetime | None] = [None]
-                    stop_event = threading.Event()
-
-                    def progress_worker():
-                        """Worker thread that updates progress bar at 30Hz"""
-                        last_update = 0
-                        while not stop_event.is_set():
-                            try:
-                                current_time = last_time[0]
-                                if current_time is not None:
-                                    if current_time == datetime.max:
-                                        current_time = time_to_display
-                                    elapsed_seconds = int(
-                                        (current_time - time_from_display).total_seconds())
-                                    if elapsed_seconds != last_update:
-                                        progress.update(task, completed=elapsed_seconds)
-                                        last_update = elapsed_seconds
-                            except Exception:  # noqa
-                                pass
-
-                            time.sleep(1 / 30)
-
-                    # Start worker thread
-                    worker = threading.Thread(target=progress_worker, daemon=True)
-                    worker.start()
-
-                    def cb_progress(current_time: datetime | None):
-                        """Callback that keeps only the newest timestamp"""
-                        last_time[0] = current_time
-
-                    try:
-                        runner.run(on_progress=cb_progress)
-
-                        progress.update(task, completed=total_seconds)
-                    finally:
-                        stop_event.set()
-                        worker.join(timeout=0.1)
-                        progress.refresh()
+                run_backtest_with_progress(runner, time_from_display, time_to_display,
+                                           total_seconds)
 
                 if profile_path is not None:
                     print_profile_report(json.loads(profile_path.read_text(encoding='utf-8')),

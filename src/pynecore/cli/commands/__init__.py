@@ -9,7 +9,7 @@ from ..pluggable import PluggableCommand
 from ..utils.error_hook import setup_global_error_logging
 
 # Import commands
-from . import run, data, compile, benchmark, debug, plugin, broker
+from . import run, data, compile, benchmark, debug, plugin, broker, robustness
 
 __all__ = ['run', 'data', 'compile', 'benchmark', 'debug', 'plugin', 'broker']
 
@@ -308,7 +308,8 @@ timeout = 30
 # ---------------------------------------------------------------------------
 # CLIPlugin loading: subcommands and parameter hooks
 # ---------------------------------------------------------------------------
-_BUILTIN_COMMANDS = {'run', 'data', 'compile', 'benchmark', 'debug', 'plugin', 'broker'}
+_BUILTIN_COMMANDS = {'run', 'data', 'compile', 'benchmark', 'debug', 'plugin', 'broker',
+                     'robustness'}
 # Commands plugins may inject parameters into, as space-separated paths so a
 # nested subcommand (e.g. ``data download``) can be reached as well.
 _PLUGGABLE_COMMANDS = ('run', 'data download')
