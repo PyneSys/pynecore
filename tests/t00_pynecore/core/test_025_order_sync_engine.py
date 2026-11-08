@@ -7495,6 +7495,41 @@ def __test_reconcile_waits_for_the_venue_to_settle_a_booked_fill__(caplog):
     assert not [r for r in caplog.records if "reduce-coverage" in r.getMessage()]
 
 
+def __test_reduce_coverage_read_outage_is_reported_once_per_interval__(caplog):
+    """A failed open-orders read skips the coverage check with a throttled warning.
+
+    Every reconcile pass runs the check, and a venue outage fails each of them:
+    the skip line used to repeat on every pass (a dozen per minute through one
+    REST outage, bybit-spot cycle 401). It now shares the read-outage throttle.
+    """
+    class _OrdersDownBroker(MockBroker):
+        down: bool = False
+
+        async def get_open_orders(self, symbol=None):
+            if self.down:
+                raise ExchangeConnectionError("orders read timed out")
+            return await MockBroker.get_open_orders(self, symbol)
+
+    b = _OrdersDownBroker()
+    engine, _ = _mk_engine(b)
+    held = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.01, entry_price=2500.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cash",
+    )
+    b.down = True
+    with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+        for _ in range(5):
+            engine._check_reduce_coverage(held)  # type: ignore[attr-defined]
+        skips = [rec for rec in caplog.records
+                 if "reduce-coverage check skipped" in rec.getMessage()]
+        assert len(skips) == 1
+        engine._read_outage_warned_at -= READ_OUTAGE_WARN_INTERVAL_S + 1.0
+        engine._check_reduce_coverage(held)  # type: ignore[attr-defined]
+        skips = [rec for rec in caplog.records
+                 if "reduce-coverage check skipped" in rec.getMessage()]
+        assert len(skips) == 2
+
+
 def __test_reconcile_leaves_rounding_sized_coverage_alone__(caplog):
     """A leg a hair larger than its fee-netted parent is rounding, not stale."""
     b = MockBroker(two_leg_exits=True)

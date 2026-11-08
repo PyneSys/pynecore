@@ -7448,7 +7448,7 @@ class OrderSyncEngine:
             orders = self._run_async_read(self._broker.get_open_orders(self._symbol))
         except (ExchangeConnectionError, ExchangeRateLimitError,
                 OrderDispositionUnknownError) as e:
-            _blog_warning(
+            self._warn_read_outage(
                 "reduce-coverage check skipped: open-orders read failed (%s)", e,
             )
             return
