@@ -209,11 +209,7 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
     }
     let Kind::Module { body, .. } = ast.kind(module) else { unreachable!() };
     let module_level = body.iter().copied().collect();
-    let mut pass = Input {
-        has_source_inputs: false,
-        declared: HashSet::new(),
-        module_level,
-    };
+    let mut pass = Input { has_source_inputs: false, declared: HashSet::new(), module_level };
     pass.generic_visit(ast, module)?;
     if !pass.has_source_inputs {
         return Ok(module);
