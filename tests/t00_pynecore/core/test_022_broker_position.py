@@ -219,6 +219,28 @@ def __test_untradable_fifo_remainder_is_spread_over_the_open_trades__(caplog):
     assert [rec.levelno for rec in spread] == [logging.INFO]
 
 
+def __test_spread_remainder_keeps_its_cost_basis__():
+    """The trades taking a remainder also take its entry cost.
+
+    E1 keeps 0.5 under a least tradable quantity of 1.0 and E2 takes it: the
+    open trade's entry price becomes the volume-weighted price of both, so the
+    two closes book exactly the P&L of the fills (+50 - 25 = +25).
+    """
+    p = BrokerPosition()
+    p.least_tradable_qty = lambda price: 1.0
+    p.record_fill(_fill("buy", 1.5, 100.0, pine_id="E1"))
+    p.record_fill(_fill("buy", 1.0, 200.0, pine_id="E2"))
+    p.record_fill(_fill("sell", 1.0, 150.0, pine_id="X1", leg=LegType.CLOSE))
+
+    assert [t.entry_id for t in p.open_trades] == ["E2"]
+    assert p.open_trades[0].size == pytest.approx(1.5)
+    assert p.open_trades[0].entry_price == pytest.approx((0.5 * 100.0 + 1.0 * 200.0) / 1.5)
+
+    p.record_fill(_fill("sell", 1.5, 150.0, pine_id="X2", leg=LegType.CLOSE))
+    assert p.size == 0.0
+    assert p.netprofit == pytest.approx(25.0)
+
+
 def __test_tradable_fifo_remainder_stays_on_its_trade__():
     """A remainder of at least one contract keeps its trade open."""
     p = _inverse_pyramid(lambda price: 1e-7)

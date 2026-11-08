@@ -743,8 +743,10 @@ class BrokerPosition(PositionBase):
         """Spread a trade's untradable remainder over the other open trades.
 
         Each open trade takes a share in proportion to its size, so the trades
-        still add up to the venue position. The entry prices stay the venue's
-        own fill prices.
+        still add up to the venue position. A trade's entry price becomes the
+        volume-weighted price of its own quantity and its share, so the share
+        keeps the source trade's entry cost and the later closes book the P&L
+        of the fills.
 
         :param source: The trade the remainder came from, already removed
             from :attr:`open_trades`.
@@ -757,6 +759,9 @@ class BrokerPosition(PositionBase):
         for i, trade in enumerate(self.open_trades):
             share = residue - given if i == last else residue * abs(trade.size) / total
             given += share
+            held = abs(trade.size)
+            trade.entry_price = ((trade.entry_price * held + source.entry_price * share)
+                                 / (held + share))
             trade.size += source.sign * share
         _blog_info(
             "closing fill left %s of entry %r below the least tradable %s — "
