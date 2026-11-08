@@ -1297,6 +1297,10 @@ class OrderSyncEngine:
             event_sink=self._emit_broker_event,
         )
         self._native_bracket_dispatcher: Callable[[NativeBracketSnapshot], None] | None = None
+        # Parent whose whole venue position a partial-bracket close is taking
+        # right now: its native stop stays as it is until the deal closes
+        # (see :meth:`_dispatch_partial_bracket_close`).
+        self._native_failsafe_closing_parent: str | None = None
         # Engine-trigger partial bracket state machine. The state
         # machine itself is cheap to keep around (empty ledger when the
         # mode is UNSUPPORTED), so it is constructed unconditionally —
@@ -13578,6 +13582,8 @@ class OrderSyncEngine:
         watch level (the latter is the *planned* worst, used so the
         broker-native bracket is in place before activation).
         """
+        if parent_entry_dispatch_ref == self._native_failsafe_closing_parent:
+            return
         manager = self._native_failsafe_manager
         state = manager.get_state(parent_entry_dispatch_ref)
         if state is None:
@@ -14327,9 +14333,24 @@ class OrderSyncEngine:
                 leg.key, reason='dispatch_parked',
             )
             return
-        self._partial_bracket_engine.confirm_trigger_dispatched(
-            leg.key, close_pine_id=synth_pine_id,
-        )
+        # A close for the parent's whole position leaves nothing for the
+        # native stop to protect once it fills, and the venue drops the stop
+        # with the deal. Re-pointing it as the sibling legs cascade only races
+        # the close: the write lands on a closed deal (measured live: cTrader
+        # POSITION_NOT_FOUND, cycles 326 / 357 / 365; Capital.com
+        # error.not-found.dealId, retried into ``degrading``, cycles 345 /
+        # 362 / 369 / 378), and should the close not fill, the parent would
+        # be left without the stop. The deal's disappearance retires the
+        # fail-safe.
+        held, _ = self._parent_open_exposure(leg.from_entry)
+        if held > 0.0 and leg.qty >= held * (1.0 - 1e-9):
+            self._native_failsafe_closing_parent = leg.parent_entry_dispatch_ref
+        try:
+            self._partial_bracket_engine.confirm_trigger_dispatched(
+                leg.key, close_pine_id=synth_pine_id,
+            )
+        finally:
+            self._native_failsafe_closing_parent = None
         # Retire the synthetic close identity now that the leg owns the
         # dispatch. ``_order_mapping`` / ``_envelopes`` keyed on
         # ``synth_pine_id`` are not consulted by any later engine path

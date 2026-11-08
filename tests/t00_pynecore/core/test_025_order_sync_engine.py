@@ -69,6 +69,7 @@ from pynecore.core.broker.models import (
     LegPartialRepairedEvent,
     LegRepairFailedEvent,
     OcaPartialFillPolicy,
+    OcaType,
     OrderEvent,
     OrderStatus,
     OrderType,
@@ -78,6 +79,13 @@ from pynecore.core.broker.models import (
     QuarantineEnteredEvent,
 )
 from pynecore.core.broker.native_failsafe_manager import FailsafeHealth, FailsafeOwner
+from pynecore.core.broker.software_partial_bracket_engine import PartialBracketLeg
+from pynecore.core.broker.store_helpers import (
+    LEG_KIND_SL_PARTIAL as _LEG_KIND_SL_PARTIAL,
+    LEG_KIND_TP_PARTIAL as _LEG_KIND_TP_PARTIAL,
+    LEG_STATE_ARMED as _LEG_STATE_ARMED,
+    LEG_STATE_TRIGGERING as _LEG_STATE_TRIGGERING,
+)
 from pynecore.lib.strategy import (
     Order,
     Trade,
@@ -3296,6 +3304,66 @@ def __test_partially_filled_entry_cancel_keeps_native_failsafe_armed__():
     engine.sync(BAR_TS + 60_000)
     assert len(b.cancel_calls) == 1
     assert mgr.get_state(coid).health is not FailsafeHealth.RETIRED
+
+
+@pytest.mark.parametrize("held, writes", [(0.01, []), (0.02, [None]), (0.0, [None])])
+def __test_partial_close_of_the_whole_parent_leaves_its_native_stop__(held, writes):
+    """A partial-bracket close that takes the whole parent does not move its native stop.
+
+    The last TP leg's close cascades its SL sibling, and the worst-SL recompute
+    then cleared the native stop on a deal the close was taking: the write hit a
+    closed deal (cTrader POSITION_NOT_FOUND, cycle 365) and would have left the
+    parent unprotected had the close not filled. A close for part of the parent
+    still clears the stop the cancelled SL leg held, and so does a close for a
+    parent the book holds nothing under.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    if held:
+        pos.open_trades.append(Trade(
+            size=-held, entry_id="S", entry_bar_index=0, entry_time=0,
+            entry_price=75_600.0, commission=0.0, entry_comment=None,
+            entry_equity=1_000_000.0,
+        ))
+        pos.size = -held
+    ref = "ref-S"
+    mgr = engine._native_failsafe_manager  # type: ignore[attr-defined]
+    mgr.register_parent(
+        parent_entry_dispatch_ref=ref, symbol=SYMBOL, parent_side='short', mintick=1.0,
+    )
+    sent: list = []
+    engine.set_native_bracket_dispatcher(sent.append)
+    legs = {
+        kind: PartialBracketLeg(
+            coid=f"leg-{kind}", symbol=SYMBOL, pine_id="S-X2", from_entry="S",
+            leg_kind=kind, leg_state=_LEG_STATE_ARMED, side='buy', qty=0.01,
+            intent_key=f"S-X2{INTENT_KEY_SEP}S", parent_pine_entry_id="S",
+            parent_entry_dispatch_ref=ref, intent_partial_qty=0.01,
+            trigger_level=level, oca_group="S-X2-oca", oca_type=OcaType.CANCEL.value,
+        )
+        for kind, level in ((_LEG_KIND_TP_PARTIAL, 75_400.0),
+                            (_LEG_KIND_SL_PARTIAL, 76_000.0))
+    }
+    engine._partial_bracket_engine.register_legs(legs.values())  # type: ignore[attr-defined]
+    engine.drive_native_failsafe(now_ms=1.0)
+    assert [snapshot.stop_level for snapshot in sent] == [76_000.0]
+
+    tp = legs[_LEG_KIND_TP_PARTIAL]
+    tp.leg_state = _LEG_STATE_TRIGGERING
+    engine._dispatch_partial_bracket_close(tp)  # type: ignore[attr-defined]
+    engine.drive_native_failsafe(now_ms=2.0)
+
+    assert len(b.close_calls) == 1
+    assert [snapshot.stop_level for snapshot in sent[1:]] == writes
+
+    # The parent's later leg changes move its stop again.
+    engine._partial_bracket_engine.register_leg(replace(  # type: ignore[attr-defined]
+        legs[_LEG_KIND_SL_PARTIAL], coid="leg-x3", pine_id="S-X3",
+        intent_key=f"S-X3{INTENT_KEY_SEP}S", oca_group="S-X3-oca",
+        trigger_level=76_500.0, leg_state=_LEG_STATE_ARMED,
+    ))
+    engine.drive_native_failsafe(now_ms=3.0)
+    assert sent[-1].stop_level == 76_500.0
 
 
 def __test_restart_does_not_adopt_foreign_run_or_brand_new_entry__(tmp_path):
@@ -7715,7 +7783,6 @@ def __test_stop_coverage_leaves_engine_trigger_partial_brackets_alone__(caplog):
     leg that never rests on the venue. The guard waited on the leg's journal
     row, re-armed the bracket with an ERROR and repeated it every pass.
     """
-    from pynecore.core.broker.software_partial_bracket_engine import PartialBracketLeg
     from pynecore.core.broker.store_helpers import LEG_KIND_SL_PARTIAL, LEG_STATE_ARMED
     b = MockBroker(two_leg_exits=True)
     engine, _pos = _spot_like_pyramid(b)
