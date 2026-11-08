@@ -8357,7 +8357,7 @@ def __test_venue_shared_with_other_runs_asks_the_store_for_sibling_orders__():
     assert engine._venue_shared_with_other_runs() is False  # type: ignore[attr-defined]
 
 
-def __test_flat_close_retires_adopted_bracket_keyed_on_a_foreign_parent_id__():
+def __test_flat_close_retires_adopted_bracket_keyed_on_a_foreign_parent_id__(caplog):
     """A flat book must retire adopted exit legs keyed on the prior run's id.
 
     Startup adoption can seed the net exposure under the synthetic
@@ -8400,12 +8400,17 @@ def __test_flat_close_retires_adopted_bracket_keyed_on_a_foreign_parent_id__():
 
     # Flat signal: the grid-floored close fill leaves sub-step dust and the
     # dust flatten books the position flat under the synthetic parent only.
-    engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('sell', 0.00999, 2494.87, pine_id="",
-                    leg=LegType.CLOSE, xchg_id="xchg-close"))
+    with caplog.at_level(logging.INFO):
+        engine._route_event(  # type: ignore[attr-defined]
+            _fill_event('sell', 0.00999, 2494.87, pine_id="",
+                        leg=LegType.CLOSE, xchg_id="xchg-close"))
 
     assert pos.size == 0.0
     assert pos.open_trades == []
+    # The retirement is the bot's own routine step: logged, never a warning.
+    sweep = [rec for rec in caplog.records
+             if "flat book left exit tracking" in rec.getMessage()]
+    assert [rec.levelno for rec in sweep] == [logging.INFO]
     # The adopted leg must be retired with the book: no active exit intent,
     # no sticky Pine-side reservation, and its venue order cancelled.
     assert not any(

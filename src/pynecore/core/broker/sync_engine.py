@@ -11728,9 +11728,13 @@ class OrderSyncEngine:
                                          LEG_STATE_CANCEL_TENTATIVE)
                    for leg in self._partial_bracket_engine.iter_legs()):
                 continue
-            _blog_warning(
+            # A routine step of the bot's own: the shape comes from startup
+            # adoption across scripts or a sibling cancel the quarantine
+            # deferred, and the sweep itself is what keeps those legs from
+            # filling into the flat book.
+            _blog_info(
                 "flat book left exit tracking under parent %r with no open "
-                "trade — retiring the orphan exits (adopted-leg shape)",
+                "trade — retiring its exit legs",
                 pid,
             )
             self._cleanup_position_tracking(pid)
