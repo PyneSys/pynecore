@@ -15597,23 +15597,29 @@ class OrderSyncEngine:
 
     # === Diff + dispatch ===
 
-    def _restore_adopted_partial_bracket_classification(
+    def _restore_partial_bracket_classification(
             self, intents: list[Intent],
     ) -> list[Intent]:
-        """Re-flag adopted engine-trigger partial brackets the builder mis-typed.
+        """Re-flag engine-trigger partial brackets the builder reads as whole-row.
 
-        :func:`build_intents` derives :attr:`ExitIntent.is_partial_qty_bracket`
-        from the per-``from_entry`` open qty in ``position.open_trades``.
-        Startup adoption of a *pyramided* position seeds a single synthetic
-        parent trade — :meth:`_recover_adopted_parent_entry_id` returns ``None``
-        when several distinct ``from_entry`` parents cannot collapse into one —
-        so each real ``from_entry`` carries no ``open_trades`` row,
-        ``parent_total_qty`` reads ``0`` and the bracket is misclassified as a
-        whole-row exit. The cross-restart partial-adoption branch in
-        :meth:`_diff_and_dispatch` is gated on the flag, so the misclassified
-        exit falls through to the whole-row path where the
-        ``partial_to_whole_row_conversion`` cleanup cancels the very legs
-        ``restart_replay`` restored — rewriting the live software protection.
+        :func:`build_intents` flags :attr:`ExitIntent.is_partial_qty_bracket`
+        only while the exit is smaller than the per-``from_entry`` open qty in
+        ``position.open_trades``. Two cases break that reading for a bracket
+        already working as engine-trigger legs:
+
+        * a sibling exit of the same parent filled, so the remaining exit now
+          covers the parent's whole open qty (two 0.01 exits on a 0.02 parent:
+          after the first fills, the second equals the 0.01 still held);
+        * startup adoption of a *pyramided* position seeds a single synthetic
+          parent trade — :meth:`_recover_adopted_parent_entry_id` returns
+          ``None`` when several distinct ``from_entry`` parents cannot
+          collapse into one — so each real ``from_entry`` carries no
+          ``open_trades`` row and ``parent_total_qty`` reads ``0``.
+
+        The partial-adoption branch in :meth:`_diff_and_dispatch` is gated on
+        the flag, so the misread exit falls through to the whole-row path where
+        the ``partial_to_whole_row_conversion`` cleanup cancels the very legs
+        protecting the parent — rewriting the live software protection.
 
         The engine-trigger leg ledger is the authoritative signal: a leg is
         *only ever* created by a partial-qty bracket dispatch (a whole-row exit
@@ -15622,9 +15628,7 @@ class OrderSyncEngine:
         the exit's qty still matches the legs' ``intent_partial_qty``: a genuine
         partial->whole-row conversion (the script grew the exit to cover the
         full parent) changes the qty, so it stays whole-row and the conversion
-        path runs as before. In-session ``open_trades`` carries the per-parent
-        rows so the flag is already correct — this only fires on the
-        post-restart adoption path where the per-parent seed is missing.
+        path runs as before.
 
         ``pending_entry`` / ``cancel_tentative`` legs are ignored: their parent
         has not filled, so there is no open position to protect and the exit
@@ -15657,14 +15661,20 @@ class OrderSyncEngine:
                     )
                     if intent.intent_key not in self._partial_restore_logged:
                         self._partial_restore_logged.add(intent.intent_key)
+                        held, _ = self._parent_open_exposure(intent.from_entry)
+                        cause = (
+                            "the exit now covers the parent's whole open qty"
+                            if held > 0.0 else
+                            "open_trades holds no row for the parent after a "
+                            "pyramided restart"
+                        )
                         _blog_info(
-                            "restored partial-qty classification for adopted "
-                            "engine-trigger bracket %r (qty=%s): open_trades "
-                            "lacks the per-parent seed after a pyramided "
-                            "restart — adopting the live legs instead of "
-                            "converting to a whole-row exit (logged once; the "
-                            "restore itself repeats every sync)",
-                            format_intent_key(intent.intent_key), intent.qty,
+                            "kept the partial-qty classification of "
+                            "engine-trigger bracket %r (qty=%s): %s — its live "
+                            "legs keep protecting the parent instead of a "
+                            "whole-row exit replacing them (logged once; the "
+                            "restore repeats every sync)",
+                            format_intent_key(intent.intent_key), intent.qty, cause,
                         )
             corrected.append(intent)
         return corrected
@@ -15874,7 +15884,7 @@ class OrderSyncEngine:
             are the ones that could open exposure against a position state
             the engine could not re-read.
         """
-        intents = self._restore_adopted_partial_bracket_classification(intents)
+        intents = self._restore_partial_bracket_classification(intents)
         self._spot_close_cleared_entry_ids.clear()
         new_map: dict[str, Intent] = {i.intent_key: i for i in intents}
 

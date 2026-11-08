@@ -15639,6 +15639,48 @@ def __test_restart_partial_bracket_adopted_not_swept__(tmp_path):
         assert engine._partial_bracket_engine.has_active_legs_for_intent("X\0L")  # type: ignore[attr-defined]
 
 
+@pytest.mark.parametrize("held, cause", [
+    (0.01, "the exit now covers the parent's whole open qty"),
+    (0.0, "open_trades holds no row for the parent after a pyramided restart"),
+])
+def __test_partial_bracket_read_as_whole_row_keeps_its_legs__(caplog, held, cause):
+    """An exit working as engine-trigger legs stays a partial bracket.
+
+    Two 0.01 exits on a 0.02 parent: once the first fills, the builder reads the
+    second, now equal to the 0.01 still held, as a whole-row exit (ctrader cycle
+    365, no restart). A pyramided restart that seeds no row for the parent reads
+    it so too. The live legs keep it partial, and the log names the cause.
+    """
+    engine, pos = _mk_engine(_software_partial_broker())
+    if held:
+        pos.open_trades.append(Trade(
+            size=held, entry_id="L", entry_bar_index=0, entry_time=0,
+            entry_price=74_562.69, commission=0.0, entry_comment=None,
+            entry_equity=1_000_000.0,
+        ))
+        pos.size = held
+    engine._partial_bracket_engine.register_leg(PartialBracketLeg(  # type: ignore[attr-defined]
+        coid="leg-tp", symbol=SYMBOL, pine_id="L-X2", from_entry="L",
+        leg_kind=_LEG_KIND_TP_PARTIAL, leg_state=_LEG_STATE_ARMED, side='sell',
+        qty=0.01, intent_key=f"L-X2{INTENT_KEY_SEP}L", parent_pine_entry_id="L",
+        parent_entry_dispatch_ref="ref-L", intent_partial_qty=0.01,
+        trigger_level=75_140.0,
+    ))
+    exit_intent = ExitIntent(
+        pine_id="L-X2", from_entry="L", symbol=SYMBOL, side="sell", qty=0.01,
+        tp_price=75_140.0, sl_price=73_870.0,
+    )
+
+    with caplog.at_level(logging.INFO):
+        restored = engine._restore_partial_bracket_classification(  # type: ignore[attr-defined]
+            [exit_intent])
+
+    assert isinstance(restored[0], ExitIntent) and restored[0].is_partial_qty_bracket
+    kept = [rec.getMessage() for rec in caplog.records
+            if "kept the partial-qty classification" in rec.getMessage()]
+    assert len(kept) == 1 and cause in kept[0], kept
+
+
 def __test_restart_multi_parent_partial_brackets_adopted_not_converted__(tmp_path):
     """A pyramided (multi-parent) restart adopts every partial bracket, never converting one.
 
@@ -15649,7 +15691,7 @@ def __test_restart_multi_parent_partial_brackets_adopted_not_converted__(tmp_pat
     misclassifying every partial bracket as a whole-row exit. Left uncorrected the
     dispatch else-branch fires the ``partial_to_whole_row_conversion`` cleanup and
     cancels the replayed legs, rewriting the live software protection. The leg
-    ledger is authoritative: ``_restore_adopted_partial_bracket_classification``
+    ledger is authoritative: ``_restore_partial_bracket_classification``
     re-flags the exits as partial so the adoption branch pins each one and the
     live legs of BOTH parents survive.
     """
