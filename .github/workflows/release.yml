@@ -9,6 +9,7 @@ on:
 permissions:
   contents: write
   id-token: write  # Required for trusted publishing
+  actions: write  # A failed job cancels the run
 
 jobs:
   # Platform wheels with the compiled native extensions. cibuildwheel runs the
@@ -71,6 +72,14 @@ jobs:
           name: dist-wheels-${{ matrix.os }}-${{ matrix.wheels }}
           path: ./wheelhouse/*.whl
 
+      # A failure anywhere fails the release, so the other jobs need not run to their end
+      - name: Cancel the run
+        if: failure()
+        shell: bash
+        run: gh run cancel ${{ github.run_id }} --repo ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   # The sdist, plus the pure-Python wheel every platform without a matching binary wheel
   # installs (WebAssembly runtimes among them). It runs the Python math only.
   build-pure:
@@ -101,6 +110,14 @@ jobs:
         with:
           name: dist-pure
           path: dist/*
+
+      # A failure anywhere fails the release, so the other jobs need not run to their end
+      - name: Cancel the run
+        if: failure()
+        shell: bash
+        run: gh run cancel ${{ github.run_id }} --repo ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   # The native transform against the Python pipeline it ports: the Rust tests,
   # the WebAssembly build, and the parity gates over the repository's own sources
@@ -146,6 +163,14 @@ jobs:
           python rust/tools/parse_gate.py
           python rust/tools/wasm_gate.py
           PYNE_AST_BACKEND=verify python -m pytest -p no:cacheprovider tests/t00_pynecore/ast
+
+      # A failure anywhere fails the release, so the other jobs need not run to their end
+      - name: Cancel the run
+        if: failure()
+        shell: bash
+        run: gh run cancel ${{ github.run_id }} --repo ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   publish:
     needs: [build-wheels, build-pure, native-transform]
