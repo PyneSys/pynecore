@@ -277,3 +277,63 @@ def __test_direction_test_without_pairs_gives_no_verdict__(runner):
     data = json.loads(json.dumps(result.to_dict(), allow_nan=False))
     assert data['valid'] is False and data['percentile'] is None
     assert direction_test(make, syminfo, real, 'r', seed=3, draws=50).valid
+
+
+def __test_early_stop_keeps_the_first_draws__(monkeypatch):
+    """A clear verdict stops the draws at a check, on the first draws in draw order."""
+    from pynecore.analysis import coinflip
+    monkeypatch.setattr(coinflip, '_run_draw',
+                        lambda task_, draw: coinflip._DrawResult(total=float(draw)))
+    task = coinflip._DrawTask(mode='direction', make_runner=lambda: None,
+                              syminfo=None, unit='r', seed=0)  # type: ignore[arg-type]
+    seen: list[tuple[int, int]] = []
+    # Every random total beats a real total below them all
+    results, reason = coinflip._run_draws(task, -1.0, 200, early_stop='edge',
+                                          on_progress=lambda d, t: seen.append((d, t)))
+    assert len(results) == coinflip.STOP_MIN_RUNS
+    assert [r.total for r in results] == [float(i) for i in range(coinflip.STOP_MIN_RUNS)]
+    assert reason is not None and 'fewer than 95%' in reason
+    assert seen[-1] == (coinflip.STOP_MIN_RUNS, coinflip.STOP_MIN_RUNS)
+    # Beating every random total proves half sooner than 95%
+    results, reason = coinflip._run_draws(task, 1e9, 200, early_stop='better')
+    assert len(results) == coinflip.STOP_MIN_RUNS and 'more than 50%' in str(reason)
+    results, reason = coinflip._run_draws(task, 1e9, 200, early_stop='edge')
+    assert coinflip.STOP_MIN_RUNS < len(results) < 200 and 'more than 95%' in str(reason)
+    assert (len(results) - coinflip.STOP_MIN_RUNS) % coinflip.STOP_EVERY == 0
+    # Without a rule, or near the mark, every backtest runs
+    assert coinflip._run_draws(task, -1.0, 200, early_stop='off') == (
+        [coinflip._DrawResult(total=float(i)) for i in range(200)], None)
+    # Every other random total above the real one: half of them, never clear of 50%
+    monkeypatch.setattr(coinflip, '_run_draw',
+                        lambda task_, draw: coinflip._DrawResult(total=float(draw % 2) - 0.5))
+    results, reason = coinflip._run_draws(task, 0.0, 200, early_stop='better')
+    assert len(results) == 200 and reason is None
+
+
+def __test_early_stop_in_the_result__(runner):
+    """A stopped test reports its backtests, the planned ones and why it stopped."""
+    import json
+    from pynecore.analysis.coinflip import STOP_MIN_RUNS, direction_test
+    make = __test_helper_factory(runner)
+    real, syminfo = __test_helper_record(make)
+    full = direction_test(make, syminfo, real, 'r', seed=1, exact=True, runs=12)
+    assert full.planned == 12 and full.stop_reason is None
+    result = direction_test(make, syminfo, real, 'r', seed=1, exact=True, runs=60,
+                            early_stop='better')
+    # With this seed the real total beats 90% of the draws: clear of half at the first check
+    assert result.planned == 60 and result.draws == STOP_MIN_RUNS
+    assert result.stop_reason is not None and 'more than 50%' in result.stop_reason
+    assert f"stopped after {STOP_MIN_RUNS} of 60 backtests" in result.verdict
+    assert result.totals[:12] == full.totals
+    data = json.loads(json.dumps(result.to_dict(), allow_nan=False))
+    assert data['planned'] == 60 and data['stop_reason'] == result.stop_reason
+
+
+def __test_parallel_draws_need_a_picklable_runner__(runner):
+    """A closure cannot reach the worker processes: the test says so instead of failing late."""
+    import pytest
+    from pynecore.analysis.coinflip import direction_test
+    make = __test_helper_factory(runner)
+    real, syminfo = __test_helper_record(make)
+    with pytest.raises(TypeError, match='pickled'):
+        direction_test(make, syminfo, real, 'r', exact=True, runs=4, jobs=2)

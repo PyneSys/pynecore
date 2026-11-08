@@ -143,10 +143,31 @@ closed, with the real trade's direction and size, a stop at its stop distance an
 after its holding time. The script's own exits are not used, as they belong to its own entry
 signals. Every draw is a backtest, 200 by default.
 
+**Backtests per draw.** The exact direction test and the timing test run a backtest per draw.
+They run several at the same time, each in its own process: by default as many as the CPU
+count minus one (`--jobs`). Every draw takes its random choices from the seed and its own
+number, so the results are the same with any number of processes.
+
+They also stop once the verdict is clear (`--early-stop`). After 30 backtests, and after
+every 10 more, the test computes a 99% interval of the share of random draws the real rules
+beat. The default rule, `edge`, stops when that interval is all below or all above 95%: the
+real rules clearly do not, or clearly do, beat 95% of the random draws. `better` asks the same
+about half of the random draws and stops sooner. `off` runs every backtest. The interval is
+99% rather than 95% because it is checked again and again. A stopped test reports how many
+backtests it ran; its percentages are less precise than those of 200 backtests, but the
+answer to the rule's question is clear. A strategy whose result sits close to the mark runs
+every backtest.
+
 The result reads like this:
 
 ```
 Coin flip (direction): 28% of the random direction draws did better; the real rules beat 72% of them
+```
+
+after an early stop:
+
+```
+Coin flip (direction): 87% of the random direction draws did better; the real rules beat 13% of them (stopped after 30 of 200 backtests: the real rules clearly beat fewer than 95% of the random draws)
 ```
 
 or, when the pairing fails:
@@ -254,6 +275,10 @@ report.coinflips.append(coinflip_test("direction", make_runner, syminfo, recorde
 report.write_csv(Path("workdir/output"), "ema_cross")
 print(report.coinflips[0].verdict)
 ```
+
+`coinflip_test` runs its backtests one at a time and to the end unless it gets `jobs` and
+`early_stop`. With `jobs` above 1, `make_runner` goes to the worker processes, so it must be
+picklable: a module-level function or class instance, not a closure like the one above.
 
 `report.to_dict()` gives the whole result as JSON-ready data, `report.summary_rows()` the
 rows of the summary table. The engine's closed-trade list is capped, so a long backtest must

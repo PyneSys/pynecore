@@ -40,6 +40,9 @@ pyne robustness ema_cross binance_BTCUSDT_15
 
 # Both coin-flip tests, a 2x target and no leverage in the account Monte Carlo
 pyne robustness ema_cross binance_BTCUSDT_15 --coinflip both --target 2 --max-leverage 1
+
+# The exact direction test on 4 processes, every one of its 200 backtests
+pyne robustness ema_cross binance_BTCUSDT_15 --exact --early-stop off --jobs 4
 ```
 
 The command prints a summary table and writes the results as CSV files.
@@ -97,6 +100,12 @@ The same as for `pyne run`:
 - `--exact`: Direction test: a full backtest per draw instead of pairing the trades of one
   flipped backtest. Needed when the strategy's later entries depend on its earlier trades:
   without it, fewer than 90% paired trades give no verdict.
+- `--early-stop`: When the tests that run one backtest per draw may stop before
+  `--coinflip-runs`: `edge` (default; once it is clear whether the real rules beat 95% of the
+  random draws), `better` (once it is clear whether they beat half of them) or `off` (every
+  backtest runs)
+- `--jobs`, `-j`: Backtests those tests run at the same time, each in its own process
+  (default: the CPU count minus one). The results do not depend on it.
 
 ### Output Path Options
 

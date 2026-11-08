@@ -1,8 +1,8 @@
 import json
+import os
 import sys
-from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator, cast
@@ -20,7 +20,7 @@ from .run import _pin_timenow
 from ...analysis import (RobustnessConfig, RobustnessReport, TradeRecord, TradeRecorder, analyze,
                          load_trade_csv)
 from ...analysis.bootstrap import Block
-from ...analysis.coinflip import DEFAULT_RUNS, Mode, coinflip_test
+from ...analysis.coinflip import DEFAULT_RUNS, EarlyStop, Mode, coinflip_test
 from ...analysis.costs import DEFAULT_COST_BPS
 from ...analysis.montecarlo import Method
 from ...analysis.periods import Period
@@ -38,6 +38,7 @@ _METHODS = ('bootstrap', 'shuffle')
 _BLOCKS = ('week', 'month', 'trade')
 _PERIODS = ('year', 'month', 'weekday')
 _COINFLIPS = ('direction', 'timing', 'both', 'none')
+_EARLY_STOPS = ('edge', 'better', 'off')
 
 
 def _parse_list(value: str, name: str) -> list[str]:
@@ -66,9 +67,8 @@ def _choice(value: str, choices: tuple[str, ...], name: str) -> str:
 
 
 @contextmanager
-def _scripts_lib_path() -> Iterator[None]:
+def _scripts_lib_path(lib_dir: Path) -> Iterator[None]:
     """Make the workdir's script libraries importable while the script loads."""
-    lib_dir = app_state.scripts_dir / "lib"
     added = lib_dir.is_dir()
     if added:
         sys.path.insert(0, str(lib_dir))
@@ -77,6 +77,73 @@ def _scripts_lib_path() -> Iterator[None]:
     finally:
         if added:
             sys.path.remove(str(lib_dir))
+
+
+@dataclass(slots=True)
+class _RunnerFactory:
+    """
+    Builds a fresh runner of the backtest on its data.
+
+    The coin-flip tests send it to their worker processes: it holds only picklable
+    settings and opens the data itself, once per process.
+    """
+
+    script: Path
+    data_path: Path
+    syminfo: SymInfo
+    size: int
+    last_bar_time: int | None
+    time_from_ts: int
+    time_to_ts: int
+    time_from: datetime
+    security_data: dict[str, Any]
+    magnifier_source_tf: str | None
+    config_dir: Path
+    lib_dir: Path
+    _reader: OHLCVReader | None = field(default=None, repr=False)
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = {name: getattr(self, name) for name in self.__slots__}
+        state['_reader'] = None
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        for name, value in state.items():
+            setattr(self, name, value)
+
+    def close(self) -> None:
+        """Close the data opened by the runners of this process."""
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
+
+    def __call__(self) -> ScriptRunner:
+        reader = self._reader
+        if reader is None:
+            # A worker process imports the library fresh, with the real clock
+            _pin_timenow(self.last_bar_time)
+            reader = self._reader = OHLCVReader(self.data_path).open()
+        chart_bar_window = ChartBarWindow(reader.path, self.time_from_ts, self.time_to_ts)
+        if self.magnifier_source_tf is not None:
+            magnifier_iter = reader.read_from(self.time_from_ts, self.time_to_ts)
+            ohlcv_iter = iter([])
+        else:
+            magnifier_iter = None
+            ohlcv_iter = chart_bar_window.bars()
+        with _scripts_lib_path(self.lib_dir):
+            return ScriptRunner(self.script, ohlcv_iter, self.syminfo,
+                                last_bar_index=self.size - 1,
+                                last_bar_time=self.last_bar_time,
+                                plot_path=None, strat_path=None, trade_path=None,
+                                security_data=self.security_data or None,
+                                magnifier_iter=magnifier_iter,
+                                magnifier_source_tf=self.magnifier_source_tf,
+                                chart_bar_window=chart_bar_window,
+                                time_from=self.time_from,
+                                chart_data_path=self.data_path,
+                                lossless_volume=reader.lossless_volume,
+                                lossless_prices=reader.lossless_prices,
+                                config_dir=self.config_dir)
 
 
 @dataclass(slots=True)
@@ -91,7 +158,7 @@ class _Session:
     """
 
     syminfo: SymInfo
-    make_runner: Callable[[], ScriptRunner]
+    make_runner: _RunnerFactory
     time_from: datetime
     time_to: datetime
 
@@ -135,31 +202,19 @@ def _backtest_session(script: Path, data: str, time_from: str | None, time_to: s
         last_bar_time = reader.get_last_bar_time(time_from_ts, time_to_ts)
         _pin_timenow(last_bar_time)
 
-        def make_runner() -> ScriptRunner:
-            chart_bar_window = ChartBarWindow(reader.path, time_from_ts, time_to_ts)
-            if magnifier_source_tf is not None:
-                magnifier_iter = reader.read_from(time_from_ts, time_to_ts)
-                ohlcv_iter = iter([])
-            else:
-                magnifier_iter = None
-                ohlcv_iter = chart_bar_window.bars()
-            with _scripts_lib_path():
-                return ScriptRunner(script, ohlcv_iter, syminfo, last_bar_index=size - 1,
-                                    last_bar_time=last_bar_time,
-                                    plot_path=None, strat_path=None, trade_path=None,
-                                    security_data=security_data or None,
-                                    magnifier_iter=magnifier_iter,
-                                    magnifier_source_tf=magnifier_source_tf,
-                                    chart_bar_window=chart_bar_window,
-                                    time_from=time_from_dt,
-                                    chart_data_path=data_path,
-                                    lossless_volume=reader.lossless_volume,
-                                    lossless_prices=reader.lossless_prices,
-                                    config_dir=app_state.config_dir)
-
+    make_runner = _RunnerFactory(script=script, data_path=data_path, syminfo=syminfo, size=size,
+                                 last_bar_time=last_bar_time, time_from_ts=time_from_ts,
+                                 time_to_ts=time_to_ts, time_from=time_from_dt,
+                                 security_data=security_data,
+                                 magnifier_source_tf=magnifier_source_tf,
+                                 config_dir=app_state.config_dir,
+                                 lib_dir=app_state.scripts_dir / "lib")
+    try:
         yield _Session(syminfo=syminfo, make_runner=make_runner,
                        time_from=time_from_dt.astimezone(UTC).replace(tzinfo=None),
                        time_to=time_to_dt.astimezone(UTC).replace(tzinfo=None))
+    finally:
+        make_runner.close()
 
 
 def _record_backtest(session: _Session, script: Path) -> list[TradeRecord]:
@@ -188,7 +243,7 @@ def _record_backtest(session: _Session, script: Path) -> list[TradeRecord]:
 
 def _run_coinflips(session: _Session, report: RobustnessReport, trades: list[TradeRecord],
                    modes: tuple[Mode, ...], seed: int, draws: int, runs: int,
-                   exact: bool) -> None:
+                   exact: bool, jobs: int, early_stop: EarlyStop) -> None:
     """Run the coin-flip tests and add them to the report."""
     for mode in modes:
         backtests = 1 if mode == 'direction' and not exact else runs
@@ -203,7 +258,7 @@ def _run_coinflips(session: _Session, report: RobustnessReport, trades: list[Tra
 
             result = coinflip_test(mode, session.make_runner, session.syminfo, trades,
                                    report.unit, seed=seed, draws=draws, exact=exact, runs=runs,
-                                   on_progress=on_progress)
+                                   jobs=jobs, early_stop=early_stop, on_progress=on_progress)
         report.coinflips.append(result)
 
 
@@ -345,6 +400,16 @@ def robustness(
                              help="Direction test: a full backtest per draw instead of pairing "
                                   "the trades of one flipped backtest",
                              rich_help_panel="Coin Flip Options"),
+        early_stop: str = Option('edge', "--early-stop",
+                                 help="Stop the tests that run one backtest per draw once their "
+                                      "verdict is clear: edge (whether the real rules beat 95% "
+                                      "of the random draws), better (whether they beat half), "
+                                      "or off (run every backtest)",
+                                 rich_help_panel="Coin Flip Options"),
+        jobs: int | None = Option(None, "--jobs", "-j", min=1,
+                                  help="Backtests run at the same time by the tests that run "
+                                       "one per draw (default: the CPU count minus one)",
+                                  rich_help_panel="Coin Flip Options"),
         output_dir: Path | None = Option(None, "--output", "-o", file_okay=False,
                                          help="Directory of the CSV files "
                                               "(default: workdir/output)",
@@ -377,6 +442,8 @@ def robustness(
     """  # noqa
     unit_choice = _choice(unit, _UNITS, '--unit')
     coinflip_choice = _choice(coinflip, _COINFLIPS, '--coinflip')
+    early_stop_choice = cast(EarlyStop, _choice(early_stop, _EARLY_STOPS, '--early-stop'))
+    workers = jobs if jobs is not None else max(1, (os.cpu_count() or 2) - 1)
     modes: tuple[Mode, ...] = (('direction', 'timing') if coinflip_choice == 'both'
                                else () if coinflip_choice == 'none'
                                else (cast(Mode, coinflip_choice),))
@@ -437,5 +504,6 @@ def robustness(
                                security) as session:
             trades = _record_backtest(session, resolved)
             report = _analyze(trades)
-            _run_coinflips(session, report, trades, modes, seed, draws, coinflip_runs, exact)
+            _run_coinflips(session, report, trades, modes, seed, draws, coinflip_runs, exact,
+                           workers, early_stop_choice)
         _finish(report, output_dir, stem, write_json)

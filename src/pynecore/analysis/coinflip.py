@@ -16,18 +16,31 @@ Both run the strategy in the engine, so the real and the random trades fill by t
 same rules. Every random decision is a pure function of the seed, the draw and the
 bar, so a run repeats exactly, and the re-executions of one bar (calc on order
 fills, the bar magnifier) agree with each other.
+
+The tests that run a backtest per draw can spread the draws over worker processes
+(``jobs``) and stop once their verdict is clear (``early_stop``). A draw does not
+depend on the others or on the worker that runs it, and the stop is decided on the
+draws in draw order, so the result is the same with any number of workers.
 """
 
 import hashlib
 import math
+import multiprocessing.context
+import os
+import pickle
 import random
+import signal
+import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
+from multiprocessing.pool import Pool
+from types import FrameType
 from typing import Any, Literal, TYPE_CHECKING
 
 from .. import lib
 from ..lib import strategy as _strategy
+from .bootstrap import wilson_interval
 from .metrics import percentile
 from .montecarlo import PERCENTILES
 from .trades import TradeRecord, TradeRecorder, Unit, trade_value
@@ -38,6 +51,7 @@ if TYPE_CHECKING:
     from ..lib.strategy import SimPosition
 
 Mode = Literal['direction', 'timing']
+EarlyStop = Literal['edge', 'better', 'off']
 
 DEFAULT_DRAWS = 10_000
 """Draws of the direction test's fast path, where a draw costs no backtest."""
@@ -45,6 +59,21 @@ DEFAULT_RUNS = 200
 """Backtests of the tests that run the strategy once per draw."""
 MIN_PAIRED_SHARE = 0.9
 """Share of the real trades the direction test's fast path must pair to give a verdict."""
+STOP_MARKS: dict[str, float] = {'edge': 0.95, 'better': 0.5}
+"""
+Share of the random draws the real result is tested against, per early-stop rule:
+``edge`` stops once it is clear whether the real rules beat 95% of the random draws,
+``better`` once it is clear whether they beat half of them.
+"""
+STOP_MIN_RUNS = 30
+"""Backtests before the first early-stop check."""
+STOP_EVERY = 10
+"""Backtests between two early-stop checks."""
+STOP_CONFIDENCE = 0.99
+"""
+Coverage of the interval an early stop needs to be clear of the mark. It is above
+the usual 95% because the interval is checked again and again.
+"""
 
 _TIMING_ID = 'coinflip'
 
@@ -75,6 +104,9 @@ class CoinFlipResult:
         the result then gives no verdict, and its percentile and share are NaN
     :ivar not_placed: ``timing``: random entries that found no flat moment before
         the end of the data, per draw on average
+    :ivar planned: ``runs``: backtests the test runs without an early stop
+    :ivar stop_reason: ``runs``: why the test stopped before ``planned`` backtests,
+        None when it ran them all
     :ivar notes: Warnings about the parts of the script the test could not randomize
     :ivar seconds: Run time of the test
     """
@@ -93,6 +125,8 @@ class CoinFlipResult:
     unpaired: int = 0
     valid: bool = True
     not_placed: float = 0.0
+    planned: int = 0
+    stop_reason: str | None = None
     notes: list[str] = field(default_factory=list)
     seconds: float = 0.0
 
@@ -111,8 +145,12 @@ class CoinFlipResult:
             return (f"not valid for this script: only {self.trades} of "
                     f"{self.trades + self.unpaired} trades had a counterpart in the flipped "
                     f"backtest (at least {MIN_PAIRED_SHARE:.0%} needed)")
-        return (f"{self.share_better:.0%} of the random {self.mode} draws did better; "
-                f"the real rules beat {self.percentile:.0%} of them")
+        verdict = (f"{self.share_better:.0%} of the random {self.mode} draws did better; "
+                   f"the real rules beat {self.percentile:.0%} of them")
+        if self.stop_reason is not None:
+            verdict += (f" (stopped after {self.draws} of {self.planned} backtests: "
+                        f"{self.stop_reason})")
+        return verdict
 
     def to_dict(self) -> dict[str, Any]:
         """:return: JSON-ready form, without the individual totals"""
@@ -121,8 +159,8 @@ class CoinFlipResult:
             'seed': self.seed, 'real': _finite(self.real), 'trades': self.trades,
             'distribution': self.distribution, 'percentile': _finite(self.percentile),
             'share_better': _finite(self.share_better), 'unpaired': self.unpaired,
-            'valid': self.valid,
-            'not_placed': self.not_placed, 'notes': list(self.notes),
+            'valid': self.valid, 'not_placed': self.not_placed, 'planned': self.planned,
+            'stop_reason': self.stop_reason, 'notes': list(self.notes),
             'description': self.description, 'verdict': self.verdict,
             'seconds': self.seconds,
         }
@@ -225,6 +263,7 @@ def _run_flipped(make_runner: Callable[[], 'ScriptRunner'], syminfo: 'SymInfo',
 def direction_test(make_runner: Callable[[], 'ScriptRunner'], syminfo: 'SymInfo',
                    real_trades: list[TradeRecord], unit: Unit, *, seed: int = 0,
                    draws: int = DEFAULT_DRAWS, exact: bool = False, runs: int = DEFAULT_RUNS,
+                   jobs: int = 1, early_stop: EarlyStop = 'off',
                    on_progress: Callable[[int, int], None] | None = None) -> CoinFlipResult:
     """
     The real direction choices against coin flips on the same entries.
@@ -245,6 +284,8 @@ def direction_test(make_runner: Callable[[], 'ScriptRunner'], syminfo: 'SymInfo'
     :param draws: Draws of the fast path
     :param exact: Run a backtest per draw
     :param runs: Backtests of the exact path
+    :param jobs: Worker processes of the exact path (see :func:`_run_draws`)
+    :param early_stop: Early-stop rule of the exact path (see :data:`STOP_MARKS`)
     :param on_progress: Called with the backtests done and the backtests in all
     :return: The comparison
     """
@@ -290,22 +331,18 @@ def direction_test(make_runner: Callable[[], 'ScriptRunner'], syminfo: 'SymInfo'
                               unpaired=unpaired, notes=notes,
                               seconds=time.perf_counter() - started)
 
-    totals = []
-    notes = []
-    for draw in range(runs):
-        trades, run_notes = _run_flipped(
-            make_runner, syminfo,
-            lambda entry_id, bar, d=draw: coin(seed, d, bar, entry_id))
-        if not notes:
-            notes = run_notes
-        totals.append(math.fsum(_fill_values(trades, unit).values()))
-        if on_progress is not None:
-            on_progress(draw + 1, runs)
     real = math.fsum(real_values.values())
+    task = _DrawTask(mode='direction', make_runner=make_runner, syminfo=syminfo, unit=unit,
+                     seed=seed)
+    results, stop_reason = _run_draws(task, real, runs, jobs=jobs, early_stop=early_stop,
+                                      on_progress=on_progress)
+    totals = [r.total for r in results]
+    notes = next((r.notes for r in results if r.notes), [])
     dist, rank, better = _compare(real, totals)
     return CoinFlipResult(mode='direction', method='runs', unit=unit, draws=len(totals),
                           seed=seed, real=real, trades=len(real_values), distribution=dist,
-                          percentile=rank, share_better=better, totals=totals, notes=notes,
+                          percentile=rank, share_better=better, totals=totals, planned=runs,
+                          stop_reason=stop_reason, notes=notes,
                           seconds=time.perf_counter() - started)
 
 
@@ -405,9 +442,212 @@ class _TimingDriver:
             _strategy._orders_blocked = True
 
 
+@dataclass(slots=True)
+class _DrawTask:
+    """
+    What one draw of a test that runs a backtest per draw needs.
+
+    It travels to the worker processes, so with more than one job every field,
+    ``make_runner`` included, must be picklable.
+    """
+
+    mode: Mode
+    make_runner: Callable[[], 'ScriptRunner']
+    syminfo: 'SymInfo'
+    unit: Unit
+    seed: int
+    plans: list[_Plan] = field(default_factory=list)
+    span: range = range(0)
+    mintick: float = 0.0
+
+
+@dataclass(slots=True)
+class _DrawResult:
+    """The outcome of one draw."""
+
+    total: float
+    notes: list[str] = field(default_factory=list)
+    not_placed: int = 0
+
+
+def _run_draw(task: _DrawTask, draw: int) -> _DrawResult:
+    """
+    Run the backtest of one draw.
+
+    :param task: The test
+    :param draw: Number of the draw; with the seed it decides every random choice
+    :return: The draw's total
+    """
+    if task.mode == 'direction':
+        seed = task.seed
+        trades, notes = _run_flipped(task.make_runner, task.syminfo,
+                                     lambda entry_id, bar: coin(seed, draw, bar, entry_id))
+        return _DrawResult(math.fsum(_fill_values(trades, task.unit).values()), notes)
+
+    rng = random.Random(f"{task.seed}:{draw}")
+    schedule = sorted(rng.sample(task.span, len(task.plans)))
+    runner = task.make_runner()
+    driver = _TimingDriver(task.plans, schedule, runner.script.position, task.mintick)
+    _strategy._orders_blocked = True
+    try:
+        trades = _record(runner, task.syminfo, driver.on_bar)
+    finally:
+        _strategy._orders_blocked = False
+    return _DrawResult(math.fsum(_fill_values(trades, task.unit).values()),
+                       not_placed=driver.not_placed)
+
+
+class _WorkerProcess(multiprocessing.context.SpawnProcess):
+    """
+    A pool worker that may start processes of its own.
+
+    ``request.security`` runs each context in a child process, which a daemon
+    process cannot start, so the worker never becomes one. The pool terminates its
+    workers itself, and an orphaned security child exits on its own.
+    """
+
+    @property
+    def daemon(self) -> bool:
+        """:return: Always False"""
+        return False
+
+    @daemon.setter
+    def daemon(self, value: bool) -> None:
+        """Ignore the pool's request to make the worker a daemon."""
+
+
+class _WorkerContext(multiprocessing.context.SpawnContext):
+    """
+    Workers that may have children, each in a fresh interpreter: forking a process
+    that may run threads is not safe.
+    """
+
+    Process = _WorkerProcess
+
+
+_worker_task: _DrawTask | None = None
+
+
+def _stop_worker(_signum: int, _frame: FrameType | None) -> None:
+    """Unwind the running backtest, so it stops its security children and frees its memory."""
+    sys.exit(0)
+
+
+def _init_worker(task: _DrawTask) -> None:
+    global _worker_task
+    _worker_task = task
+    # A worker is a replica of the recorded backtest: its imports of the script must not
+    # rewrite the script's toml at the same time as the other workers
+    os.environ['PYNE_SAVE_SCRIPT_TOML'] = '0'
+    signal.signal(signal.SIGTERM, _stop_worker)
+
+
+def _worker_draw(draw: int) -> tuple[int, _DrawResult]:
+    assert _worker_task is not None
+    return draw, _run_draw(_worker_task, draw)
+
+
+def _iter_draws(task: _DrawTask, runs: int,
+                jobs: int) -> Generator[tuple[int, _DrawResult], None, None]:
+    """
+    The draws as they finish: in draw order in this process, in any order in workers.
+
+    Closing the generator stops the draws still running.
+    """
+    if jobs <= 1 or runs <= 1:
+        for draw in range(runs):
+            yield draw, _run_draw(task, draw)
+        return
+    try:
+        pickle.dumps(task)
+    except (pickle.PicklingError, TypeError, AttributeError) as e:
+        raise TypeError("running the backtests in parallel needs a make_runner that can be "
+                        "pickled: a module-level function or class instance, not a closure; "
+                        "or run them with jobs=1") from e
+    pool = Pool(min(jobs, runs), initializer=_init_worker, initargs=(task,),
+                context=_WorkerContext())
+    try:
+        yield from pool.imap_unordered(_worker_draw, range(runs))
+    finally:
+        pool.terminate()
+        pool.join()
+
+
+def _stop_reason(real: float, totals: list[float], mark: float) -> str | None:
+    """
+    :param real: The real total
+    :param totals: The random totals so far
+    :param mark: Share of the random draws the real result is tested against
+    :return: Why the verdict is already clear, or None while it is not
+    """
+    below = sum(1 for v in totals if v < real)
+    equal = sum(1 for v in totals if v == real)
+    # Ties count against the side being proven, so a stop never rests on them
+    if wilson_interval(below + equal, len(totals), STOP_CONFIDENCE).high < mark:
+        return f"the real rules clearly beat fewer than {mark:.0%} of the random draws"
+    if wilson_interval(below, len(totals), STOP_CONFIDENCE).low > mark:
+        return f"the real rules clearly beat more than {mark:.0%} of the random draws"
+    return None
+
+
+def _run_draws(task: _DrawTask, real: float, runs: int, *, jobs: int = 1,
+               early_stop: EarlyStop = 'off',
+               on_progress: Callable[[int, int], None] | None = None,
+               ) -> tuple[list[_DrawResult], str | None]:
+    """
+    Run the backtests of a test, one per draw.
+
+    With an early-stop rule the draws are checked after :data:`STOP_MIN_RUNS`
+    backtests and every :data:`STOP_EVERY` after that, always on the first draws in
+    draw order. The test stops at the first check whose interval of the share of
+    random draws the real result beat (:data:`STOP_CONFIDENCE`) is clear of the
+    rule's mark: below it or above it.
+
+    :param task: The test
+    :param real: The real total
+    :param runs: Backtests without an early stop
+    :param jobs: Worker processes; above 1 the task must be picklable
+    :param early_stop: ``edge``, ``better`` or ``off`` (see :data:`STOP_MARKS`)
+    :param on_progress: Called with the backtests done and the backtests in all
+    :return: The draws kept, in draw order, and why the test stopped early (None when
+        it ran every backtest)
+    """
+    mark = STOP_MARKS.get(early_stop)
+    results: dict[int, _DrawResult] = {}
+    in_order = 0
+    check = STOP_MIN_RUNS
+    kept = runs
+    reason: str | None = None
+    draws = _iter_draws(task, runs, jobs)
+    try:
+        for draw, result in draws:
+            results[draw] = result
+            if on_progress is not None:
+                on_progress(len(results), runs)
+            if mark is None:
+                continue
+            while in_order in results:
+                in_order += 1
+            # Workers finish out of order: every check runs on its own first draws,
+            # so the stop does not depend on the number of workers
+            while reason is None and check < runs and check <= in_order:
+                reason = _stop_reason(real, [results[i].total for i in range(check)], mark)
+                if reason is None:
+                    check += STOP_EVERY
+                else:
+                    kept = check
+            if reason is not None:
+                break
+    finally:
+        draws.close()
+    if reason is not None and on_progress is not None:
+        on_progress(kept, kept)
+    return [results[i] for i in range(kept)], reason
+
+
 def timing_test(make_runner: Callable[[], 'ScriptRunner'], syminfo: 'SymInfo',
                 real_trades: list[TradeRecord], unit: Unit, *, seed: int = 0,
-                runs: int = DEFAULT_RUNS,
+                runs: int = DEFAULT_RUNS, jobs: int = 1, early_stop: EarlyStop = 'off',
                 on_progress: Callable[[int, int], None] | None = None) -> CoinFlipResult:
     """
     The real entry moments against random ones.
@@ -425,6 +665,8 @@ def timing_test(make_runner: Callable[[], 'ScriptRunner'], syminfo: 'SymInfo',
     :param unit: Unit of the totals
     :param seed: Seed of the random moments
     :param runs: Backtests, one per draw
+    :param jobs: Worker processes (see :func:`_run_draws`)
+    :param early_stop: Early-stop rule (see :data:`STOP_MARKS`)
     :param on_progress: Called with the backtests done and the backtests in all
     :return: The comparison
     """
@@ -435,43 +677,34 @@ def timing_test(make_runner: Callable[[], 'ScriptRunner'], syminfo: 'SymInfo',
     last_bar = max(t.exit_bar_index for t in real_trades)
     span = range(first_bar, max(first_bar + 1, last_bar))
     count = min(len(plans), len(span))
-    mintick = float(syminfo.mintick or 0.0)
-
-    totals: list[float] = []
-    not_placed = 0
-    for draw in range(runs):
-        rng = random.Random(f"{seed}:{draw}")
-        schedule = sorted(rng.sample(span, count))
-        runner = make_runner()
-        driver = _TimingDriver(plans[:count], schedule, runner.script.position, mintick)
-        _strategy._orders_blocked = True
-        try:
-            trades = _record(runner, syminfo, driver.on_bar)
-        finally:
-            _strategy._orders_blocked = False
-        not_placed += driver.not_placed
-        totals.append(math.fsum(_fill_values(trades, unit).values()))
-        if on_progress is not None:
-            on_progress(draw + 1, runs)
 
     real = math.fsum(real_values.values())
+    task = _DrawTask(mode='timing', make_runner=make_runner, syminfo=syminfo, unit=unit,
+                     seed=seed, plans=plans[:count], span=span,
+                     mintick=float(syminfo.mintick or 0.0))
+    results, stop_reason = _run_draws(task, real, runs, jobs=jobs, early_stop=early_stop,
+                                      on_progress=on_progress)
+    totals = [r.total for r in results]
+    not_placed = sum(r.not_placed for r in results)
     dist, rank, better = _compare(real, totals)
     notes: list[str] = []
     if any(p.risk_fraction is None for p in plans):
         notes.append("trades without a stop were re-entered with their holding time only")
-    average_missing = not_placed / runs if runs else 0.0
+    average_missing = not_placed / len(results) if results else 0.0
     if average_missing:
         notes.append(f"on average {average_missing:.1f} random entries found no flat moment "
                      f"before the end of the data")
     return CoinFlipResult(mode='timing', method='runs', unit=unit, draws=len(totals), seed=seed,
                           real=real, trades=len(real_values), distribution=dist, percentile=rank,
                           share_better=better, totals=totals, not_placed=average_missing,
-                          notes=notes, seconds=time.perf_counter() - started)
+                          planned=runs, stop_reason=stop_reason, notes=notes,
+                          seconds=time.perf_counter() - started)
 
 
 def coinflip_test(mode: Mode, make_runner: Callable[[], 'ScriptRunner'], syminfo: 'SymInfo',
                   real_trades: list[TradeRecord], unit: Unit, *, seed: int = 0,
                   draws: int = DEFAULT_DRAWS, exact: bool = False, runs: int = DEFAULT_RUNS,
+                  jobs: int = 1, early_stop: EarlyStop = 'off',
                   on_progress: Callable[[int, int], None] | None = None) -> CoinFlipResult:
     """
     Run one coin-flip test.
@@ -485,12 +718,17 @@ def coinflip_test(mode: Mode, make_runner: Callable[[], 'ScriptRunner'], syminfo
     :param draws: Draws of the direction test's fast path
     :param exact: Direction test: run a backtest per draw
     :param runs: Backtests of the tests that run one per draw
+    :param jobs: Worker processes of the tests that run one per draw; above 1
+        ``make_runner`` must be picklable (see :func:`_run_draws`)
+    :param early_stop: Early-stop rule of the tests that run one per draw (see
+        :data:`STOP_MARKS`)
     :param on_progress: Called with the backtests done and the backtests in all
     :return: The comparison
     """
     if mode == 'direction':
         return direction_test(make_runner, syminfo, real_trades, unit, seed=seed, draws=draws,
-                              exact=exact, runs=runs, on_progress=on_progress)
+                              exact=exact, runs=runs, jobs=jobs, early_stop=early_stop,
+                              on_progress=on_progress)
     return timing_test(make_runner, syminfo, real_trades, unit, seed=seed, runs=runs,
-                       on_progress=on_progress)
+                       jobs=jobs, early_stop=early_stop, on_progress=on_progress)
 

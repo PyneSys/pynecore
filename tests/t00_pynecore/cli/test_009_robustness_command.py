@@ -109,6 +109,70 @@ def __test_timing_coin_flip__(__test_helper_workdir__, tmp_path):
     assert not (out / 'robustness_cli_coinflip_direction.csv').exists()
 
 
+def __test_parallel_backtests_give_the_same_totals__(__test_helper_workdir__, tmp_path):
+    """``--jobs`` spreads the draws over worker processes without changing any of them."""
+    totals = {}
+    for jobs in ('1', '3'):
+        out = tmp_path / f'out_{jobs}'
+        result = CliRunner().invoke(app, [
+            '--workdir', str(__test_helper_workdir__),
+            'robustness', str(tmp_path / 'robustness_cli.py'), __test_helper_data,
+            '--draws', '200', '--coinflip', 'both', '--exact', '--coinflip-runs', '10',
+            '--early-stop', 'off', '--jobs', jobs, '--output', str(out),
+        ])
+        assert result.exit_code == 0, result.output
+        totals[jobs] = [__test_helper_rows(out / f'robustness_cli_coinflip_{mode}.csv')
+                        for mode in ('direction', 'timing')]
+    assert totals['1'] == totals['3']
+    assert all(len(rows) == 10 for rows in totals['1'])
+
+
+__test_helper_security_script = '''"""
+@pyne
+"""
+from pynecore.lib import bar_index, close, request, script, strategy, syminfo, time, timenow
+
+
+@script.strategy("Robustness CLI security", initial_capital=10000,
+                 default_qty_type=strategy.fixed, default_qty_value=1)
+def main():
+    htf = request.security(syminfo.tickerid, "240", close)
+    recent = time >= timenow - 300 * 3_600_000
+    if recent and close > htf - 100 and bar_index % 20 == 5 and strategy.position_size == 0:
+        strategy.entry("L", strategy.long)
+        strategy.exit("LX", "L", stop=close - 2.0, limit=close + 4.0)
+'''
+
+
+def __test_parallel_backtests_with_security_and_timenow__(__test_helper_workdir__, tmp_path):
+    """A worker starts the security children and keeps the replay's ``timenow``."""
+    data_dir = __test_helper_workdir__ / 'data'
+    name = 'robustness_ms_1h'
+    (data_dir / f'{name}.toml').write_bytes((data_dir / f'{__test_helper_data}.toml').read_bytes())
+    # Hourly bars in milliseconds, so the 4-hour bars close and ``timenow`` is a real instant
+    with OHLCVWriter(data_dir / f'{name}.ohlcv', '60', truncate=True) as writer:
+        for i in range(600):
+            mid = round(100.0 + 6.0 * math.sin(i / 6.0), 2)
+            writer.write(OHLCV(1_735_689_600_000 + i * 3_600_000, mid, mid + 1.5, mid - 1.5,
+                               mid + 0.2, 1.0))
+    script = tmp_path / 'robustness_security.py'
+    script.write_text(__test_helper_security_script, encoding='utf-8')
+    totals = {}
+    for jobs in ('1', '2'):
+        out = tmp_path / f'out_{jobs}'
+        result = CliRunner().invoke(app, [
+            '--workdir', str(__test_helper_workdir__),
+            'robustness', str(script), name,
+            '--draws', '200', '--coinflip', 'direction', '--exact', '--coinflip-runs', '10',
+            '--early-stop', 'off', '--jobs', jobs, '--security', f'240={name}',
+            '--output', str(out),
+        ])
+        assert result.exit_code == 0, result.output
+        totals[jobs] = __test_helper_rows(out / 'robustness_security_coinflip_direction.csv')
+    assert totals['1'] == totals['2']
+    assert len(totals['1']) == 10
+
+
 def __test_from_trades_measures_in_currency__(__test_helper_workdir__, tmp_path):
     """A trade CSV carries no stops, so its results are in account currency."""
     trade_path = tmp_path / 'trades.csv'
