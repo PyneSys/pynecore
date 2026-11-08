@@ -461,6 +461,54 @@ def __test_reconcile_cancels_a_journal_owned_reduce_leg_no_intent_maps__(
         ctx.close()
 
 
+def __test_reconcile_counts_an_orphan_bracket_once_against_the_held_size__(
+        tmp_path: Path,
+) -> None:
+    """An orphan exit's TP and SL are one coverage, so neither leg is cancelled.
+
+    The cross-script adoption shape of bybit-inverse cycle 337: the prior
+    run's bracket (TP and SL of one exit, both journal rows of that exit)
+    rests on the venue for the position the next script adopts, while no
+    intent of the new script maps either leg. The two legs are alternatives
+    covering the same held size once; summing them read as a 2x excess and
+    cancelled the stop, leaving the position unprotected.
+    """
+    db = tmp_path / "broker.sqlite"
+    broker = _MockBroker()
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, _pos = _mk_engine(broker, ctx)
+        engine.sync(BAR_TS)
+
+        legs = (("prior-tp", "xchg-tp", 2_100.0, None),
+                ("prior-sl", "xchg-sl", None, 1_900.0))
+        for coid, xid, tp, sl in legs:
+            ctx.upsert_order(
+                coid, symbol=SYMBOL, side="sell", qty=0.002, state="live",
+                intent_key="L-X\0L", exchange_order_id=xid, from_entry="L",
+                pine_entry_id="L-X", tp_level=tp, sl_level=sl,
+            )
+        broker.open_orders = [ExchangeOrder(
+            id=xid, symbol=SYMBOL, side="sell",
+            order_type=OrderType.LIMIT if tp is not None else OrderType.STOP,
+            qty=0.002, filled_qty=0.0, remaining_qty=0.002, price=tp,
+            stop_price=sl, average_fill_price=None, status=OrderStatus.OPEN,
+            timestamp=0.0, fee=0.0, fee_currency="", client_order_id=coid,
+        ) for coid, xid, tp, sl in legs]
+        broker.position = ExchangePosition(
+            symbol=SYMBOL, side="long", size=0.002, entry_price=2_000.0,
+            unrealized_pnl=0.0, liquidation_price=None,
+            leverage=1.0, margin_mode="isolated",
+        )
+
+        engine.reconcile()
+
+        assert broker.cancel_broker_order_calls == [], (
+            "one orphan exit's TP and SL cover the held size once"
+        )
+        ctx.close()
+
+
 def __test_reconcile_cancels_a_journal_owned_stray_entry_no_intent_manages__(
         tmp_path: Path,
 ) -> None:

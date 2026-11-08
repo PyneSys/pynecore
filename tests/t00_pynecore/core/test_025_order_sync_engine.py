@@ -1652,7 +1652,11 @@ def __test_flat_snapshot_during_a_pending_reversal_only_starts_the_clock__():
     engine.sync(BAR_TS + 60_000)
     close = _dispatched_close(b.close_calls[0])
     assert "S" in engine._pending_reversal_opens
-    assert not engine.active_intents, \
+    # The consumed long stays pinned until its position closes; it has
+    # nothing working on the venue, so the marker is still the only
+    # in-flight signal.
+    assert set(engine.active_intents) == {"L"}
+    assert engine._entry_orders_terminal("L"), \
         "the marker must be the only in-flight signal for this test"
     # Age the entry fill out of the recent-fill grace so only the marker
     # can gate the flat observation.
@@ -1672,6 +1676,7 @@ def __test_flat_snapshot_during_a_pending_reversal_only_starts_the_clock__():
     assert pos.open_trades == []
     assert b.entry_calls[-1].intent.pine_id == "S"
     assert engine._pending_reversal_opens == {}
+    assert "L" not in engine.active_intents, "the close retires the consumed long"
 
 
 def __test_late_close_labelled_with_the_entry_pine_id_is_dropped_after_the_clear__():
@@ -7366,6 +7371,10 @@ def _spot_like_pyramid(
             _fill_event('buy', 0.009995, price, pine_id=pine_id,
                         xchg_id=f"xchg-{pine_id}"))
     assert pos.size == pytest.approx(0.01999)
+    # The fills are settled: the reduce-coverage pass judges the venue only
+    # outside the recent-fill grace.
+    engine._last_position_fill_monotonic = (
+        time.monotonic() - EXTERNAL_FLATTEN_CONFIRM_GRACE_S - 1.0)
     return engine, pos
 
 
@@ -7420,6 +7429,70 @@ def __test_reconcile_cancels_the_stale_bracket_whose_parent_no_longer_holds__():
     assert l3_key in engine.active_intents
     assert engine.order_mapping[l3_key] == l3_ids
     assert pos.size == pytest.approx(0.010005)
+
+
+def _add_pyramid_leg_l4(b: MockBroker, engine: OrderSyncEngine,
+                        pos: BrokerPosition) -> str:
+    """Dispatch a third market leg ``L4`` with its two-leg bracket; return its exit key."""
+    pos.entry_orders["L4"] = _entry_order("L4", 0.009995)
+    pos.exit_orders[("L4-X", "L4")] = _exit_order(
+        "L4", 0.009995, "L4-X", limit=2495.0, stop=2486.0)
+    engine.sync(BAR_TS + 180_000)
+    key = f"L4-X{chr(0)}L4"
+    template = b._mk_order(b.exit_calls[0], 't')
+    legs = []
+    for exit_key in (f"L2-X{chr(0)}L2", f"L3-X{chr(0)}L3", key):
+        ids = engine.order_mapping[exit_key]
+        legs.append(_resting_leg(replace(template, id=ids[0], side="sell"),
+                                 qty=0.00999, price=2492.0))
+        legs.append(_resting_leg(replace(template, id=ids[1], side="sell"),
+                                 qty=0.00999, stop=2486.0))
+    b.open_orders = legs
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.01999, entry_price=2489.5,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0,
+        margin_mode="cash",
+    )
+    return key
+
+
+def __test_reconcile_keeps_the_fresh_bracket_of_an_unbooked_market_entry__():
+    """A just-dispatched pyramid leg's bracket is not stale while its fill is on the way.
+
+    Live (bybit-spot cycle 399, L2-X): the market entry and its bracket went
+    out in one sync, the venue balance still showed the earlier legs only
+    and the fill was not in the book yet, so the new exit's parent held
+    nothing. The coverage pass cancelled the fresh bracket and retired its
+    Pine exit for good; the leg rode on unprotected.
+    """
+    b = MockBroker(two_leg_exits=True)
+    engine, pos = _spot_like_pyramid(b)
+    key = _add_pyramid_leg_l4(b, engine, pos)
+    n_cancels = len(b.cancel_calls)
+
+    engine.reconcile()
+
+    assert b.cancel_calls[n_cancels:] == []
+    assert key in engine.active_intents
+    assert ("L4-X", "L4") in pos.exit_orders
+
+
+def __test_reconcile_waits_for_the_venue_to_settle_a_booked_fill__(caplog):
+    """A venue snapshot trailing a fill just booked is not an unexplained excess."""
+    b = MockBroker(two_leg_exits=True)
+    engine, pos = _spot_like_pyramid(b)
+    key = _add_pyramid_leg_l4(b, engine, pos)
+    engine._route_event(_fill_event(
+        'buy', 0.009995, 2491.0, pine_id="L4", xchg_id=engine.order_mapping["L4"][0],
+    ))
+    n_cancels = len(b.cancel_calls)
+
+    with caplog.at_level(logging.WARNING):
+        engine.reconcile()
+
+    assert b.cancel_calls[n_cancels:] == []
+    assert key in engine.active_intents
+    assert not [r for r in caplog.records if "reduce-coverage" in r.getMessage()]
 
 
 def __test_reconcile_leaves_rounding_sized_coverage_alone__(caplog):
@@ -7910,6 +7983,46 @@ def __test_external_reduction_is_not_adopted_while_our_own_close_is_in_flight__(
     assert pos.size == pytest.approx(0.6)
     engine.reconcile()
     assert engine._shrink_observed is None  # type: ignore[attr-defined]
+
+
+def __test_a_fill_pushed_during_the_position_read_is_not_an_external_reduction__(caplog):
+    """Our own fill queued between the reconcile drain and the read explains the venue.
+
+    Live (bybit-inverse cycle 337, 2026-11-08): an engine-trigger partial TP
+    close filled while the periodic reconcile was reading the position. The
+    reconcile drains the queue before the read, so the fill was on the venue
+    and in the queue but not yet in the book, and the shrink was announced as
+    an external reduction. The next drain books it and the views agree.
+    """
+    class _FillDuringReadBroker(MockBroker):
+        engine: OrderSyncEngine | None = None
+        pending: OrderEvent | None = None
+
+        async def get_position(self, symbol):
+            if self.engine is not None and self.pending is not None:
+                self.engine.on_order_event(self.pending)
+                self.pending = None
+            return await MockBroker.get_position(self, symbol)
+
+    b = _FillDuringReadBroker()
+    engine, pos = _mk_engine(b)
+    b.engine = engine
+    _open_long_with_bracket(b, engine, pos)
+    _list_resting_stops(b, engine, pos)
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.6, entry_price=50_000.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cross",
+    )
+    b.pending = _fill_event('sell', 0.4, 50_100.0, pine_id="", leg=LegType.CLOSE,
+                            xchg_id="xchg-partial-close", fill_id="pc-1")
+
+    with caplog.at_level(logging.WARNING):
+        engine.reconcile()
+    assert not [r for r in caplog.records if "external reduction" in r.getMessage()]
+
+    engine.reconcile()
+    assert pos.size == pytest.approx(0.6)
+    assert engine._shrink_observed is None
 
 
 def __test_a_shrink_left_after_our_close_settles_is_reported_once__(caplog):
@@ -17920,6 +18033,57 @@ def __test_stale_pending_partial_legs_are_not_promoted_by_the_new_parent_fill__(
         assert not engine._partial_bracket_engine.has_active_legs_for_intent("S-X1\0L"), \
             "previous parent's pending legs were promoted onto the new position"  # type: ignore[attr-defined]
         assert not engine._partial_bracket_engine.has_active_partial_bracket(SYMBOL, "L")  # type: ignore[attr-defined]
+
+
+def __test_consumed_entry_dropped_by_the_script_keeps_its_partial_brackets__(tmp_path):
+    """A filled entry the script stops emitting keeps the open position's brackets.
+
+    Measured live on every lane's partial bot (bybit-inverse cycle 337, bar
+    320): a second same-direction signal re-places ``strategy.entry("L")``
+    while the first fill is still held, the pyramiding limit drops the new
+    order, and the consumed entry leaves the intent list. Nothing works on
+    the venue any more, yet the cancel diff tore the entry down with its
+    envelope and its engine-trigger partial exits; the re-emitted exits then
+    read as a previous run's orphans, their live legs were cancelled and the
+    long rode on without protection until the next reversal.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = _software_partial_broker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos,
+            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0)
+        pos.exit_orders[("X1", "L")] = _exit_order(
+            "L", -0.5, "X1", limit=51_000.0, stop=49_000.0,
+        )
+        pos.exit_orders[("X2", "L")] = _exit_order(
+            "L", -0.5, "X2", limit=52_000.0, stop=49_000.0,
+        )
+        engine.sync(BAR_TS)
+        engine.on_order_event(_fill_event(
+            "buy", qty=1.0, price=50_000.0, pine_id="L", leg=LegType.ENTRY,
+            xchg_id=engine.order_mapping["L"][0],
+        ))
+        engine.apply_async_events()
+        engine.sync(BAR_TS + 60_000)
+        legs = engine._partial_bracket_engine
+        assert pos.size == 1.0
+        assert legs.has_active_legs_for_intent("X1\0L")
+        assert legs.has_active_legs_for_intent("X2\0L")
+
+        del pos.entry_orders["L"]
+        engine.sync(BAR_TS + 120_000)
+
+        assert legs.has_active_legs_for_intent("X1\0L"), "X1 lost its live legs"
+        assert legs.has_active_legs_for_intent("X2\0L"), "X2 lost its live legs"
+        assert ("X1", "L") in pos.exit_orders
+        assert ("X2", "L") in pos.exit_orders
+        assert b.cancel_calls == [], "a consumed entry has nothing to cancel"
+        ctx.close()
 
 
 def __test_venue_reduce_only_cancel_beside_its_sibling_fill_is_info__(caplog):

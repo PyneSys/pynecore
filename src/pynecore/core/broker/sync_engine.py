@@ -7324,13 +7324,19 @@ class OrderSyncEngine:
     def _position_work_in_flight(self) -> bool:
         """Whether work of ours that could still move the position is in flight.
 
-        Parked dispatches, pending defensive / reversal / surplus closes and a
-        dispatched close can each explain a venue size the book has not booked
-        yet, so a venue-vs-book difference is not proven while any of them runs.
+        Parked dispatches, pending defensive / reversal / surplus closes, a
+        dispatched close and a pushed event still waiting in the queue can
+        each explain a venue size the book has not booked yet, so a
+        venue-vs-book difference is not proven while any of them runs. The
+        queue matters because :meth:`~OrderSyncEngine.reconcile` drains it
+        BEFORE reading the position: a fill pushed in between is on the venue
+        and in the queue, yet not in the book (bybit-inverse cycle 337, an
+        engine-trigger partial close's fill read as an external reduction).
         """
         if (self._pending_verification or self._pending_defensive_close
                 or self._pending_reversal_opens
-                or self._pending_flip_surplus_closes):
+                or self._pending_flip_surplus_closes
+                or not self._event_queue.empty()):
             return True
         return any(
             isinstance(intent, CloseIntent) and self._order_mapping.get(key)
@@ -7354,10 +7360,15 @@ class OrderSyncEngine:
         inventory the book does not own:
 
         ``coverage = sum(exit intents: max resting leg) + sum(bot-owned
-        orphan reduce orders)``, ``excess = coverage - |held|``.
+        orphan exits: max resting leg)``, ``excess = coverage - |held|``.
 
-        A whole-row bracket's TP and SL are alternatives, so an exit intent
-        counts once (its larger resting leg). Orders mapped to an entry or
+        A whole-row bracket's TP and SL are alternatives, so an exit counts
+        once (its larger resting leg) — a live intent's exit and an orphan
+        exit alike. Orphan legs are grouped by the exit their journal row
+        records: a prior run's bracket left resting for a position the next
+        script adopts (bybit-inverse cycle 337) is one exit, and summing
+        its TP and SL read as double coverage and cancelled the stop.
+        Orders mapped to an entry or
         close intent are not reduce coverage; orders no intent maps count
         only when this run's durable journal owns them (another run's
         legs on the same account are not ours to judge). An excess at or
@@ -7370,9 +7381,9 @@ class OrderSyncEngine:
         :meth:`_cancel_and_retire_exit_leg` (the proven whole-intent
         sweep — the next sync re-arms a right-sized bracket for whatever
         the parent still holds); an owned orphan through
-        ``cancel_broker_order_ref``. An excess no candidate explains is
-        logged, never acted on — a leg the book still owes is not cancelled
-        on arithmetic alone.
+        ``cancel_broker_order_ref``, all legs of that exit together. An
+        excess no candidate explains is logged, never acted on — a leg the
+        book still owes is not cancelled on arithmetic alone.
 
         The mirror check RE-ARMS missing stop protection: when the stop-side
         coverage is below half of the held size while an exit intent
@@ -7446,7 +7457,9 @@ class OrderSyncEngine:
             for oid in ids:
                 key_of_order[oid] = key
         legs_by_exit: dict[str, list[ExchangeOrder]] = {}
-        orphans: list[tuple[ExchangeOrder, str | None]] = []
+        # Orphan reduce legs per exit: a journal row's intent key names the
+        # exit, so a prior run's TP and SL of one bracket share a group
+        orphans_by_exit: dict[str, list[tuple[ExchangeOrder, str]]] = {}
         strays: list[tuple[ExchangeOrder, str]] = []
         # This run's live journal rows by venue and client order id, read on
         # the first order that needs them
@@ -7484,7 +7497,9 @@ class OrderSyncEngine:
                     legs_by_exit.setdefault(owner, []).append(order)
                 continue
             if reduces:
-                orphans.append((order, row.client_order_id))
+                orphans_by_exit.setdefault(
+                    owner if owner is not None else row.client_order_id, [],
+                ).append((order, row.client_order_id))
             else:
                 strays.append((order, row.client_order_id))
         for order, coid in strays:
@@ -7506,18 +7521,34 @@ class OrderSyncEngine:
             key: max(leg.remaining_qty for leg in legs)
             for key, legs in legs_by_exit.items()
         }
-        coverage = sum(exit_coverage.values()) + sum(
-            order.remaining_qty for order, _coid in orphans
-        )
+        orphan_coverage = {
+            owner: max(order.remaining_qty for order, _coid in legs)
+            for owner, legs in orphans_by_exit.items()
+        }
+        coverage = sum(exit_coverage.values()) + sum(orphan_coverage.values())
         smallest_leg = min(
             [leg.remaining_qty for legs in legs_by_exit.values() for leg in legs]
-            + [order.remaining_qty for order, _coid in orphans],
+            + [order.remaining_qty for legs in orphans_by_exit.values()
+               for order, _coid in legs],
             default=0.0,
         )
         rounding = 0.5 * smallest_leg
         excess = coverage - held_abs
-        if (legs_by_exit or orphans) and excess > rounding:
-            candidates: list[tuple[float, float, str, ExchangeOrder | None, str | None]] = []
+        # Our own fills can still be on their way: a market entry whose fill
+        # is unbooked (or pushed but still queued) holds nothing in the book
+        # while its fresh bracket already rests, and a venue snapshot taken
+        # inside the fill grace can trail the fill (a spot balance settles
+        # later). Judged then, a just-placed bracket read as stale and was
+        # cancelled for good — its Pine exit retired with it, a pyramid leg
+        # rode on unprotected (bybit-spot cycle 399, L2-X). The next pass
+        # judges the settled views.
+        settling = (
+            self._position_work_in_flight() or self.awaiting_market_fills()
+            or time.monotonic() - self._last_position_fill_monotonic
+            < self._fill_report_grace_s()
+        )
+        if (legs_by_exit or orphans_by_exit) and excess > rounding and not settling:
+            candidates: list[tuple[float, float, str, list[tuple[ExchangeOrder, str]]]] = []
             for key, cov in exit_coverage.items():
                 intent = self._active_intents[key]
                 assert isinstance(intent, ExitIntent)
@@ -7527,16 +7558,15 @@ class OrderSyncEngine:
                 )
                 deficit = cov - parent_held
                 if deficit > 0.5 * cov:
-                    candidates.append((deficit, cov, key, None, None))
-            for order, coid in orphans:
-                candidates.append(
-                    (order.remaining_qty, order.remaining_qty, '', order, coid),
-                )
+                    candidates.append((deficit, cov, key, []))
+            for owner, legs in orphans_by_exit.items():
+                cov = orphan_coverage[owner]
+                candidates.append((cov, cov, '', legs))
             candidates.sort(key=lambda c: c[0], reverse=True)
-            for deficit, cov, key, order, coid in candidates:
+            for deficit, cov, key, legs in candidates:
                 if excess <= rounding:
                     break
-                if order is None:
+                if not legs:
                     intent = self._active_intents[key]
                     assert isinstance(intent, ExitIntent)
                     _blog_warning(
@@ -7555,15 +7585,19 @@ class OrderSyncEngine:
                                      'leg_qty': cov, 'parent_held': cov - deficit},
                         )
                 else:
-                    _blog_warning(
-                        "reduce-coverage invariant: resting reduce orders %s "
-                        "exceed the held %s by %s — bot-owned order %s (%s) "
-                        "maps to no intent, cancelling it",
-                        coverage, held_abs, excess, order.id, coid,
-                    )
-                    if not self._cancel_owned_venue_order(
-                            order, coid, 'reduce_coverage_orphan_cancelled',
-                            payload={'coverage': coverage, 'held': held_abs}):
+                    cancelled = True
+                    for order, coid in legs:
+                        _blog_warning(
+                            "reduce-coverage invariant: resting reduce orders %s "
+                            "exceed the held %s by %s — bot-owned order %s (%s) "
+                            "maps to no intent, cancelling it",
+                            coverage, held_abs, excess, order.id, coid,
+                        )
+                        if not self._cancel_owned_venue_order(
+                                order, coid, 'reduce_coverage_orphan_cancelled',
+                                payload={'coverage': coverage, 'held': held_abs}):
+                            cancelled = False
+                    if not cancelled:
                         continue
                 excess -= cov
             if excess > rounding:
@@ -16219,6 +16253,22 @@ class OrderSyncEngine:
                     # legitimate remover while the marker is armed.
                     continue
                 old = self._active_intents[key]
+                if (isinstance(old, EntryIntent)
+                        and self._entry_orders_terminal(key)
+                        and any(trade.entry_id == key
+                                for trade in self._position.open_trades)):
+                    # A consumed entry whose position is still open leaves
+                    # the intent list when the script re-places it and the
+                    # pyramiding limit drops the new order (a second
+                    # same-direction signal). Nothing of it works on the
+                    # venue, while its envelope is the parent ref the open
+                    # position's exits resolve: tearing it down dropped the
+                    # engine-trigger partial exits with it, the re-emitted
+                    # exits read as a previous run's orphans and their live
+                    # legs were cancelled (every lane's partial bot,
+                    # bybit-inverse cycle 337). The close cleanup retires it
+                    # with the position.
+                    continue
                 if (isinstance(old, ExitIntent)
                         and old.from_entry in self._pending_defensive_close):
                     # Child exit of a parent entry whose defensive close
@@ -17333,6 +17383,20 @@ class OrderSyncEngine:
         """
         if self._active_entry_filled_qty.get(key, 0.0) >= qty - 1e-9:
             return True
+        return self._entry_orders_terminal(key)
+
+    def _entry_orders_terminal(self, key: str) -> bool:
+        """Whether no venue order of the entry tracked under ``key`` still works.
+
+        Read in the venue's own terms only: every mapped order reported its
+        terminal fill, or the venue cancelled the unfilled remainder of a
+        partially filled entry (the truncated sentinel). Unlike
+        :meth:`~OrderSyncEngine._entry_cycle_consumed` the fill ledger does
+        not count: a cancel is what retires a still-working residual, so it
+        may be skipped only on the venue's word.
+
+        :param key: The entry's intent key.
+        """
         truncated = self._truncated_entries.get(key)
         if truncated is not None and truncated[1] is self._active_intents.get(key):
             return True
