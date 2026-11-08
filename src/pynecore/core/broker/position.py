@@ -10,13 +10,14 @@ from __future__ import annotations
 import copy
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from pynecore import lib
 from pynecore.core.broker.intent_builder import CLOSE_ALL_EXIT_ID, CLOSE_EXIT_ID_PREFIX
 from pynecore.core.broker.models import LegType
 from pynecore.core.closed_trade_stats import ClosedTradeStats
 from pynecore.lib.log import broker_error as _blog_error
+from pynecore.lib.log import broker_info as _blog_info
 from pynecore.lib.log import broker_warning as _blog_warning
 from pynecore.lib.strategy import PositionBase, Trade
 from pynecore.types.na import na_float
@@ -111,6 +112,7 @@ class BrokerPosition(PositionBase):
         'risk_cons_loss_days', 'risk_last_trading_day', 'risk_last_day_equity',
         'risk_intraday_filled_orders', 'risk_intraday_start_equity',
         '_current_price',
+        'least_tradable_qty',
     )
 
     def __init__(self) -> None:
@@ -148,6 +150,9 @@ class BrokerPosition(PositionBase):
         self.open_trades: list[Trade] = []
         self.closed_trades: deque[Trade] = deque(maxlen=9000)
         self.new_closed_trades: list[Trade] = []
+        # The venue's least tradable quantity at a price, in the book's units
+        # (``BrokerPlugin.least_tradable_qty``); ``None`` keeps every remainder.
+        self.least_tradable_qty: Callable[[float], float] | None = None
 
         self.entry_orders: dict[str | None, 'Order'] = {}
         # Composite key ``(exit_id, from_entry)`` mirrors
@@ -606,13 +611,17 @@ class BrokerPosition(PositionBase):
                 remaining -= trade_abs
             else:
                 # Partial close: split the trade
+                residue = trade_abs - remaining
+                floor = self._untradable_floor(residue, fill_price)
+                absorb = floor is not None
                 closed_piece = Trade(
                     size=trade.sign * remaining,
                     entry_id=trade.entry_id,
                     entry_bar_index=trade.entry_bar_index,
                     entry_time=trade.entry_time,
                     entry_price=trade.entry_price,
-                    commission=trade.commission * (remaining / trade_abs),
+                    commission=(trade.commission if absorb
+                                else trade.commission * (remaining / trade_abs)),
                     entry_comment=trade.entry_comment,
                     entry_equity=trade.entry_equity,
                 )
@@ -622,9 +631,13 @@ class BrokerPosition(PositionBase):
                     fee_share=fee * (remaining / fill_qty),
                 )
                 closed_profit += closed_piece.profit
-                # Shrink the remaining open trade
-                trade.size -= closed_piece.size
-                trade.commission -= closed_entry_commission
+                if absorb:
+                    self.open_trades.remove(trade)
+                    self._spread_residue(trade, residue, floor)
+                else:
+                    # Shrink the remaining open trade
+                    trade.size -= closed_piece.size
+                    trade.commission -= closed_entry_commission
                 remaining = 0.0
         # A trade within 1e-12 of the remainder closes in full, so the
         # subtraction can leave float residue behind: no leftover exposure
@@ -703,6 +716,53 @@ class BrokerPosition(PositionBase):
         self.open_commission = float(sum(t.commission for t in self.open_trades))
 
         return self.sign != old_sign
+
+    def _untradable_floor(self, residue: float, price: float) -> float | None:
+        """The venue's least tradable quantity, when a remainder falls below it.
+
+        A partially closed trade's remainder below the venue's least tradable
+        quantity can never be closed by an order of its own: its exit could
+        only be resized to a quantity the venue rounds to nothing. Pyramid legs
+        that open with the same venue quantity book slightly different base
+        quantities on an inverse contract (whole USD contracts converted at
+        each fill's price), so a FIFO close of one leg leaves such a remainder
+        on another. The remainder moves only when another trade stays open to
+        take it; the last trade keeps it for the flat-book dust handling.
+
+        :param residue: What the trade would keep, unsigned.
+        :param price: The closing fill's price.
+        :return: The least tradable quantity when ``residue`` is below it and
+            another trade can take it, otherwise ``None``.
+        """
+        if residue <= 0.0 or len(self.open_trades) < 2 or self.least_tradable_qty is None:
+            return None
+        floor = self.least_tradable_qty(price)
+        return floor if residue < floor else None
+
+    def _spread_residue(self, source: Trade, residue: float, floor: float) -> None:
+        """Spread a trade's untradable remainder over the other open trades.
+
+        Each open trade takes a share in proportion to its size, so the trades
+        still add up to the venue position. The entry prices stay the venue's
+        own fill prices.
+
+        :param source: The trade the remainder came from, already removed
+            from :attr:`open_trades`.
+        :param residue: The remainder, unsigned.
+        :param floor: The least tradable quantity it fell below.
+        """
+        total = sum(abs(trade.size) for trade in self.open_trades)
+        given = 0.0
+        last = len(self.open_trades) - 1
+        for i, trade in enumerate(self.open_trades):
+            share = residue - given if i == last else residue * abs(trade.size) / total
+            given += share
+            trade.size += source.sign * share
+        _blog_info(
+            "closing fill left %s of entry %r below the least tradable %s — "
+            "spread over the open trades",
+            residue, source.entry_id, floor,
+        )
 
     def record_provisional_close(self, event: 'OrderEvent') -> ProvisionalClose:
         """

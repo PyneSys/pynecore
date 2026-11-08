@@ -837,6 +837,49 @@ def __test_partial_fifo_close_keeps_a_pyramided_entry_alive__():
     assert "L" in engine.active_intents
 
 
+def __test_untradable_fifo_remainder_retires_its_entry_instead_of_a_dust_amend__():
+    """A FIFO close may not leave a pyramid leg holding less than the venue trades.
+
+    Inverse legs of the same contract count book different base quantities,
+    so S3's exit fill FIFO-closes S1 and left it 1.4e-6 BTC, which the engine
+    then tried to resize S1's exit to (bybit-inverse cycle 340). With the
+    venue's least tradable quantity the remainder moves onto S2 and S3: S1
+    closes, its exit retires, and no exit is amended to a sub-contract size.
+    """
+    @dataclass
+    class InverseBroker(MockBroker):
+        @staticmethod
+        def least_tradable_qty(price: float) -> float:
+            return 1.0 / price
+
+    b = InverseBroker()
+    engine, pos = _mk_engine(b)
+    legs = [("S1", 0.0019906400369125304), ("S2", 0.0019896564219125737),
+            ("S3", 0.0019892553861395007)]
+    for i, (pine_id, qty) in enumerate(legs, start=1):
+        pos.entry_orders[pine_id] = _entry_order(pine_id, -qty)
+        pos.exit_orders[(f"{pine_id}-X", pine_id)] = _exit_order(
+            pine_id, qty, f"{pine_id}-X", stop=101_000.0)
+        engine.sync(BAR_TS + i * 60_000)
+        engine._route_event(  # type: ignore[attr-defined]
+            _fill_event('sell', qty, 200.0 / qty, pine_id=pine_id,
+                        xchg_id=f"xchg-{pine_id}"))
+    s3_leg = engine.order_mapping[f"S3-X{chr(0)}S3"][0]
+
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('buy', legs[2][1], 100_500.0, pine_id="S3-X",
+                    leg=LegType.STOP_LOSS, xchg_id=s3_leg, fill_id="f-s3"),
+        from_entry="S3",
+    ))
+    engine.sync(BAR_TS + 10 * 60_000)
+
+    assert [trade.entry_id for trade in pos.open_trades] == ["S2", "S3"]
+    assert ("S1-X", "S1") not in pos.exit_orders
+    assert "S1" not in engine.active_intents
+    resized = [new.intent.qty for _old, new in b.modify_exit_calls]
+    assert all(qty >= 1.0 / 100_500.0 for qty in resized), resized
+
+
 def __test_reversal_close_labelled_with_the_reversing_id_spares_the_new_entry__():
     """A closing fill labelled with the REVERSING id must not wipe it.
 

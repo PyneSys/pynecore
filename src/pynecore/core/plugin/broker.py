@@ -732,14 +732,12 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
             return CancelDispositionOutcome.UNKNOWN
         return CancelDispositionOutcome.UNKNOWN
 
-    # noinspection PyMethodMayBeStatic,PyUnusedLocal
     async def execute_cancel_all(self, symbol: str | None = None) -> int:
         """Cancel all open orders.  Returns the count cancelled."""
         raise ExchangeCapabilityError("Bulk cancel not supported")
 
     # === Defensive-close recovery (bracket attach reject) ===
 
-    # noinspection PyMethodMayBeStatic,PyUnusedLocal
     def get_residual_orders_after_bracket_attach_reject(
             self, context: 'BracketAttachRejectContext',
     ) -> list[str]:
@@ -776,7 +774,6 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
         """
         return []
 
-    # noinspection PyMethodMayBeStatic,PyUnusedLocal
     async def cancel_broker_order_ref(self, ref: str) -> None:
         """Cancel a broker-side order by its raw exchange ref.
 
@@ -932,7 +929,6 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
 
     # === Exception mapping ===
 
-    # noinspection PyMethodMayBeStatic
     def _map_exception(self, raw: Exception) -> BrokerError | None:
         """Translate a raw exchange-SDK exception into the broker taxonomy.
 
@@ -951,6 +947,24 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
         if isinstance(raw, ConnectionError):
             return ExchangeConnectionError(str(raw) or "Connection lost")
         return None
+
+    # === Quantity grid ===
+
+    def least_tradable_qty(self, price: float) -> float:
+        """Smallest quantity one venue order can trade at ``price``.
+
+        In the units the plugin reports fills in (the engine's base units).
+        The position book never leaves a partially closed trade a remainder
+        below it while another trade is open: no order could close that
+        remainder on its own, so it is spread over the open trades and no exit
+        is ever resized to it. Called synchronously while a fill is booked, so
+        it must not do I/O.
+
+        :param price: The price the quantity would trade at.
+        :return: The least tradable quantity; ``0.0`` (the default) keeps
+            every remainder where it is.
+        """
+        return 0.0
 
     # === Capabilities ===
 

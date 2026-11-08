@@ -5,6 +5,7 @@ Covers entry accounting (open, add), exit accounting (full close, partial
 close, FIFO close across multiple entries), side flip in a single fill,
 mark-to-market, and liquidation.
 """
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -160,6 +161,97 @@ def __test_record_fill_fifo_partial_close_splits_exit_fee__():
     assert total_exit_fee == pytest.approx(3.0)
     # netprofit = (20000 - 2.0) + (5000 - 1.0)
     assert p.netprofit == pytest.approx(24_997.0)
+
+
+# Three short pyramid legs of 200 USD contracts on an inverse market, as the
+# venue booked them in base units (bybit-inverse cycle 340): the same order
+# quantity converts to a different base quantity at each fill's price.
+_INVERSE_LEGS = (
+    ("S1", 0.0019906400369125304),
+    ("S2", 0.0019896564219125737),
+    ("S3", 0.0019892553861395007),
+)
+
+
+def _inverse_pyramid(least_tradable_qty=None) -> BrokerPosition:
+    """Open the three inverse legs, each with a 0.01 entry fee."""
+    p = BrokerPosition()
+    p.least_tradable_qty = least_tradable_qty
+    for pine_id, qty in _INVERSE_LEGS:
+        p.record_fill(_fill("sell", qty, 200.0 / qty, pine_id=pine_id, fee=0.01))
+    return p
+
+
+def _one_contract(price: float) -> float:
+    """One whole USD contract in base units at ``price``."""
+    return 1.0 / price
+
+
+def __test_untradable_fifo_remainder_is_spread_over_the_open_trades__(caplog):
+    """A FIFO close leaving less than one contract on a trade closes that trade.
+
+    S3's exit fill FIFO-closes S1 instead, and S1 keeps 1.4e-6 BTC, under a
+    hundredth of a contract: no exit could ever be resized to it. The
+    remainder moves pro rata onto S2 and S3, so S1 closes in full, the trades
+    still add up to the venue position and the entry fees stay booked.
+    """
+    p = _inverse_pyramid(_one_contract)
+    held = sum(qty for _, qty in _INVERSE_LEGS)
+    fill_qty = _INVERSE_LEGS[2][1]
+
+    with caplog.at_level(logging.INFO):
+        p.record_fill(_fill("buy", fill_qty, 100_500.0, pine_id="S3-X",
+                            leg=LegType.TAKE_PROFIT, fee=0.02))
+
+    assert [t.entry_id for t in p.open_trades] == ["S2", "S3"]
+    assert p.size == pytest.approx(-(held - fill_qty), rel=1e-12)
+    assert sum(t.size for t in p.open_trades) == pytest.approx(p.size, rel=1e-12)
+    residue = _INVERSE_LEGS[0][1] - fill_qty
+    for trade, (_, qty) in zip(p.open_trades, _INVERSE_LEGS[1:]):
+        assert abs(trade.size) - qty == pytest.approx(residue / 2.0, rel=1e-3)
+    closed = p.closed_trades[-1]
+    assert closed.entry_id == "S1"
+    assert closed.size == pytest.approx(-fill_qty, rel=1e-12)
+    assert closed.commission == pytest.approx(0.01 + 0.02)
+    assert p.open_commission == pytest.approx(0.02)
+    spread = [rec for rec in caplog.records
+              if "spread over the open trades" in rec.getMessage()]
+    assert [rec.levelno for rec in spread] == [logging.INFO]
+
+
+def __test_tradable_fifo_remainder_stays_on_its_trade__():
+    """A remainder of at least one contract keeps its trade open."""
+    p = _inverse_pyramid(lambda price: 1e-7)
+    fill_qty = _INVERSE_LEGS[2][1]
+    p.record_fill(_fill("buy", fill_qty, 100_500.0, pine_id="S3-X",
+                        leg=LegType.TAKE_PROFIT))
+
+    assert [t.entry_id for t in p.open_trades] == ["S1", "S2", "S3"]
+    assert abs(p.open_trades[0].size) == pytest.approx(
+        _INVERSE_LEGS[0][1] - fill_qty, rel=1e-9)
+    assert [abs(t.size) for t in p.open_trades[1:]] == [qty for _, qty in _INVERSE_LEGS[1:]]
+
+
+def __test_fifo_remainder_stays_without_a_quantity_grid__():
+    """Without the venue's least tradable quantity no remainder moves."""
+    p = _inverse_pyramid()
+    fill_qty = _INVERSE_LEGS[2][1]
+    p.record_fill(_fill("buy", fill_qty, 100_500.0, pine_id="S3-X",
+                        leg=LegType.TAKE_PROFIT))
+
+    assert [t.entry_id for t in p.open_trades] == ["S1", "S2", "S3"]
+
+
+def __test_untradable_remainder_of_the_last_trade_stays__():
+    """The last open trade keeps an untradable remainder: no trade can take it."""
+    p = BrokerPosition()
+    p.least_tradable_qty = _one_contract
+    p.record_fill(_fill("sell", 0.002, 100_000.0, pine_id="S1"))
+    p.record_fill(_fill("buy", 0.002 - 2e-6, 100_000.0, pine_id="S1-X",
+                        leg=LegType.TAKE_PROFIT))
+
+    assert [t.entry_id for t in p.open_trades] == ["S1"]
+    assert p.open_trades[0].size == pytest.approx(-2e-6, rel=1e-6)
 
 
 def __test_record_fill_side_flip_in_single_event__():

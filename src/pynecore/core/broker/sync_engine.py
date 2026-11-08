@@ -1205,6 +1205,7 @@ class OrderSyncEngine:
     ) -> None:
         self._broker = broker
         self._position = position
+        position.least_tradable_qty = getattr(broker, 'least_tradable_qty', None)
         self._symbol = symbol
         self._run_tag = run_tag
         # Venue client-id budget — stamped on every envelope so coid minting
