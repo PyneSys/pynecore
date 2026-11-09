@@ -231,6 +231,9 @@ def _record(runner: 'ScriptRunner', syminfo: 'SymInfo',
     position = runner.script.position
     recorder = TradeRecorder(position, syminfo)
     for _ in runner.run_iter(copy_results=False):
+        if _stop_requested:
+            # Unwind the backtest, so it stops its security children and frees its memory
+            sys.exit(0)
         if on_bar is not None:
             on_bar()
         recorder.on_bar()
@@ -530,8 +533,25 @@ WORKER_STOP_TIMEOUT = 5.0
 """Seconds the workers get to unwind their backtests before they are killed."""
 
 
+_drawing = False
+"""A worker process runs a draw."""
+
+_stop_requested = False
+"""The parent stopped this worker during a draw; the draw stops at its next bar."""
+
+
 def _stop_worker(_signum: int, _frame: FrameType | None) -> None:
-    """Unwind the running backtest, so it stops its security children and frees its memory."""
+    """
+    Stop the worker: at once while it waits for a draw, at the next bar of a draw.
+
+    Raised here, the exit could land inside native code of the draw (the script's
+    transform), which cannot pass it on: it would be printed as ignored and the draw
+    would go on until the kill.
+    """
+    global _stop_requested
+    if _drawing:
+        _stop_requested = True
+        return
     sys.exit(0)
 
 
@@ -542,35 +562,48 @@ def _worker_loop(task: _DrawTask, conn: Connection) -> None:
     Every worker has a pipe of its own, so a worker that is stopped or dies in the
     middle of a draw holds no lock the parent or the other workers need.
     """
+    global _drawing
     # A worker is a replica of the recorded backtest: its imports of the script must not
     # rewrite the script's toml at the same time as the other workers
     os.environ['PYNE_SAVE_SCRIPT_TOML'] = '0'
     signal.signal(signal.SIGTERM, _stop_worker)
-    while True:
-        try:
-            draw = conn.recv()
-        except EOFError:
-            return
-        if draw is None:
-            return
-        result: _DrawResult | Exception
-        try:
-            result = _run_draw(task, draw)
-        except Exception as e:
-            # The parent raises it; the traceback stays here, so it travels as a note
-            e.add_note(f"In the coin-flip worker:\n{traceback.format_exc()}")
-            result = e
-        try:
-            conn.send((draw, result))
-        except (pickle.PicklingError, TypeError, AttributeError) as e:
-            conn.send((draw, RuntimeError(f"draw {draw}: its result cannot reach the parent: "
-                                          f"{e!r} ({result!r})")))
+    try:
+        while True:
+            try:
+                draw = conn.recv()
+            except EOFError:
+                return
+            if draw is None:
+                return
+            result: _DrawResult | Exception
+            _drawing = True
+            try:
+                result = _run_draw(task, draw)
+            except Exception as e:
+                # The parent raises it; the traceback stays here, so it travels as a note
+                e.add_note(f"In the coin-flip worker:\n{traceback.format_exc()}")
+                result = e
+            finally:
+                _drawing = False
+            if _stop_requested:
+                # Stopped after the draw's last bar: the parent no longer reads its result
+                return
+            try:
+                conn.send((draw, result))
+            except (pickle.PicklingError, TypeError, AttributeError) as e:
+                conn.send((draw, RuntimeError(f"draw {draw}: its result cannot reach the parent: "
+                                              f"{e!r} ({result!r})")))
+    finally:
+        # Nothing is left to unwind: a stop arriving now would raise inside the
+        # interpreter's shutdown (its atexit callbacks) and print a traceback there
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 
 def _stop_workers(workers: list[tuple[_WorkerProcess, Connection]]) -> None:
     """
     Stop the workers: a SIGTERM to unwind their backtests, then a kill for those
-    still running after :data:`WORKER_STOP_TIMEOUT`.
+    still running after :data:`WORKER_STOP_TIMEOUT`. A worker that has already left
+    its loop ignores the SIGTERM and finishes its own exit.
     """
     for process, _ in workers:
         if process.is_alive():

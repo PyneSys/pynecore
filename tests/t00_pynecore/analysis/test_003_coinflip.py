@@ -365,3 +365,104 @@ def __test_a_dead_worker_raises_instead_of_hanging__(runner):
     dying = functools.partial(os._exit, 3)
     with pytest.raises(RuntimeError, match=r'stopped during draw \d+ \(exit code 3\)'):
         direction_test(dying, syminfo, real, 'r', exact=True, runs=4, jobs=2)
+
+
+__test_helper_worker_module = '''
+import atexit
+import time
+
+from pynecore.core.script_runner import ScriptRunner
+
+
+class Linger:
+    """Sleeps in its finalizer, where an exception can only be printed as ignored."""
+
+    def __init__(self, seconds):
+        self.seconds = seconds
+
+    def __del__(self):
+        time.sleep(self.seconds)
+
+
+class Factory:
+    """
+    Runners of the script for the coin-flip workers.
+
+    :param exit_delay: The worker's interpreter exit sleeps this long in an atexit callback
+    :param draw_delay: Every draw but the worker's first starts with this long a sleep that
+        cannot pass an exception on, as native code of the draw cannot
+    """
+
+    def __init__(self, script, bars, syminfo, exit_delay=0.0, draw_delay=0.0):
+        self.script = script
+        self.bars = bars
+        self.syminfo = syminfo
+        self.exit_delay = exit_delay
+        self.draw_delay = draw_delay
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if self.calls == 1 and self.exit_delay:
+            atexit.register(time.sleep, self.exit_delay)
+        if self.calls > 1 and self.draw_delay:
+            Linger(self.draw_delay)
+        return ScriptRunner(self.script, iter(self.bars), self.syminfo,
+                            last_bar_index=len(self.bars) - 1,
+                            last_bar_time=self.bars[-1].timestamp)
+'''
+
+
+def __test_helper_worker_factory(tmp_path, monkeypatch):
+    """A runner factory the spawned workers can import, from a module next to the test."""
+    import importlib
+    import sys
+    name = 'coinflip_worker_stop_helper'
+    (tmp_path / f'{name}.py').write_text(__test_helper_worker_module, encoding='utf-8')
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv('PYNE_SAVE_SCRIPT_TOML', '0')
+    module = importlib.import_module(name)
+    # Registered with the monkeypatch, so the test's teardown removes it again
+    del sys.modules[name]
+    monkeypatch.setitem(sys.modules, name, module)
+    return module.Factory
+
+
+def __test_completed_parallel_run_exits_its_workers_silently__(
+        tmp_path, monkeypatch, script_path, syminfo, capfd):
+    """Workers still in their interpreter exit when the parent stops them print nothing."""
+    import sys
+    from pynecore.analysis.coinflip import _record, direction_test
+    factory = __test_helper_worker_factory(tmp_path, monkeypatch)
+    bars = __test_helper_bars()
+    # A fresh import of the script, with a fresh position (see the runner fixture)
+    sys.modules.pop(script_path.stem, None)
+    real = _record(factory(script_path, bars, syminfo)(), syminfo)
+    # The workers' exit lingers in an atexit callback, where the parent's stop reaches them
+    make = factory(script_path, bars, syminfo, exit_delay=1.0)
+    result = direction_test(make, syminfo, real, 'r', exact=True, runs=4, jobs=2)
+    assert result.draws == 4
+    err = capfd.readouterr().err
+    assert 'Exception ignored' not in err and 'SystemExit' not in err, err
+
+
+def __test_worker_stopped_in_a_draw_stops_at_its_next_bar__(
+        tmp_path, monkeypatch, script_path, syminfo, capfd):
+    """A stop in the middle of a draw is not lost in code that cannot pass it on, nor printed."""
+    import time
+    from pynecore.analysis import coinflip
+    factory = __test_helper_worker_factory(tmp_path, monkeypatch)
+    make = factory(script_path, __test_helper_bars(), syminfo, draw_delay=2.0)
+    task = coinflip._DrawTask(mode='direction', make_runner=make, syminfo=syminfo, unit='r',
+                              seed=0)
+    draws = coinflip._iter_draws(task, 8, 2)
+    next(draws)
+    next(draws)
+    # One worker is now in its second draw, inside the sleep no exception can leave
+    time.sleep(0.5)
+    started = time.monotonic()
+    draws.close()
+    # It unwound at its first bar instead of finishing the draw and waiting for the kill
+    assert time.monotonic() - started < coinflip.WORKER_STOP_TIMEOUT
+    err = capfd.readouterr().err
+    assert 'Exception ignored' not in err and 'SystemExit' not in err, err
