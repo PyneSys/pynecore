@@ -127,6 +127,23 @@ def __test_parallel_backtests_give_the_same_totals__(__test_helper_workdir__, tm
     assert all(len(rows) == 10 for rows in totals['1'])
 
 
+def __test_parallel_early_stop_stops_the_workers__(__test_helper_workdir__, tmp_path):
+    """An early stop with draws still running in the workers ends, with the draws of one job."""
+    totals = {}
+    for jobs in ('1', '4'):
+        out = tmp_path / f'out_{jobs}'
+        result = CliRunner().invoke(app, [
+            '--workdir', str(__test_helper_workdir__),
+            'robustness', str(tmp_path / 'robustness_cli.py'), __test_helper_data,
+            '--draws', '200', '--coinflip', 'direction', '--exact', '--coinflip-runs', '200',
+            '--early-stop', 'better', '--jobs', jobs, '--output', str(out),
+        ])
+        assert result.exit_code == 0, result.output
+        totals[jobs] = __test_helper_rows(out / 'robustness_cli_coinflip_direction.csv')
+    assert totals['1'] == totals['4']
+    assert len(totals['1']) < 200
+
+
 __test_helper_security_script = '''"""
 @pyne
 """

@@ -32,9 +32,10 @@ import random
 import signal
 import sys
 import time
+import traceback
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
-from multiprocessing.pool import Pool
+from multiprocessing.connection import Connection, wait
 from types import FrameType
 from typing import Any, Literal, TYPE_CHECKING
 
@@ -499,11 +500,11 @@ def _run_draw(task: _DrawTask, draw: int) -> _DrawResult:
 
 class _WorkerProcess(multiprocessing.context.SpawnProcess):
     """
-    A pool worker that may start processes of its own.
+    A worker that may start processes of its own.
 
     ``request.security`` runs each context in a child process, which a daemon
-    process cannot start, so the worker never becomes one. The pool terminates its
-    workers itself, and an orphaned security child exits on its own.
+    process cannot start, so the worker never becomes one. :func:`_stop_workers`
+    stops the workers itself, and an orphaned security child exits on its own.
     """
 
     @property
@@ -513,7 +514,7 @@ class _WorkerProcess(multiprocessing.context.SpawnProcess):
 
     @daemon.setter
     def daemon(self, value: bool) -> None:
-        """Ignore the pool's request to make the worker a daemon."""
+        """Ignore a request to make the worker a daemon."""
 
 
 class _WorkerContext(multiprocessing.context.SpawnContext):
@@ -525,7 +526,8 @@ class _WorkerContext(multiprocessing.context.SpawnContext):
     Process = _WorkerProcess
 
 
-_worker_task: _DrawTask | None = None
+WORKER_STOP_TIMEOUT = 5.0
+"""Seconds the workers get to unwind their backtests before they are killed."""
 
 
 def _stop_worker(_signum: int, _frame: FrameType | None) -> None:
@@ -533,18 +535,55 @@ def _stop_worker(_signum: int, _frame: FrameType | None) -> None:
     sys.exit(0)
 
 
-def _init_worker(task: _DrawTask) -> None:
-    global _worker_task
-    _worker_task = task
+def _worker_loop(task: _DrawTask, conn: Connection) -> None:
+    """
+    Run the draws the parent sends until it sends None or goes away.
+
+    Every worker has a pipe of its own, so a worker that is stopped or dies in the
+    middle of a draw holds no lock the parent or the other workers need.
+    """
     # A worker is a replica of the recorded backtest: its imports of the script must not
     # rewrite the script's toml at the same time as the other workers
     os.environ['PYNE_SAVE_SCRIPT_TOML'] = '0'
     signal.signal(signal.SIGTERM, _stop_worker)
+    while True:
+        try:
+            draw = conn.recv()
+        except EOFError:
+            return
+        if draw is None:
+            return
+        result: _DrawResult | Exception
+        try:
+            result = _run_draw(task, draw)
+        except Exception as e:
+            # The parent raises it; the traceback stays here, so it travels as a note
+            e.add_note(f"In the coin-flip worker:\n{traceback.format_exc()}")
+            result = e
+        try:
+            conn.send((draw, result))
+        except (pickle.PicklingError, TypeError, AttributeError) as e:
+            conn.send((draw, RuntimeError(f"draw {draw}: its result cannot reach the parent: "
+                                          f"{e!r} ({result!r})")))
 
 
-def _worker_draw(draw: int) -> tuple[int, _DrawResult]:
-    assert _worker_task is not None
-    return draw, _run_draw(_worker_task, draw)
+def _stop_workers(workers: list[tuple[_WorkerProcess, Connection]]) -> None:
+    """
+    Stop the workers: a SIGTERM to unwind their backtests, then a kill for those
+    still running after :data:`WORKER_STOP_TIMEOUT`.
+    """
+    for process, _ in workers:
+        if process.is_alive():
+            process.terminate()
+    deadline = time.monotonic() + WORKER_STOP_TIMEOUT
+    for process, _ in workers:
+        process.join(max(0.0, deadline - time.monotonic()))
+    for process, conn in workers:
+        if process.is_alive():
+            process.kill()
+            process.join()
+        conn.close()
+        process.close()
 
 
 def _iter_draws(task: _DrawTask, runs: int,
@@ -552,7 +591,8 @@ def _iter_draws(task: _DrawTask, runs: int,
     """
     The draws as they finish: in draw order in this process, in any order in workers.
 
-    Closing the generator stops the draws still running.
+    Closing the generator stops the draws still running. A draw that fails, or a
+    worker that dies, raises here.
     """
     if jobs <= 1 or runs <= 1:
         for draw in range(runs):
@@ -564,13 +604,43 @@ def _iter_draws(task: _DrawTask, runs: int,
         raise TypeError("running the backtests in parallel needs a make_runner that can be "
                         "pickled: a module-level function or class instance, not a closure; "
                         "or run them with jobs=1") from e
-    pool = Pool(min(jobs, runs), initializer=_init_worker, initargs=(task,),
-                context=_WorkerContext())
+    context = _WorkerContext()
+    workers: list[tuple[_WorkerProcess, Connection]] = []
     try:
-        yield from pool.imap_unordered(_worker_draw, range(runs))
+        for _ in range(min(jobs, runs)):
+            conn, child_conn = context.Pipe()
+            process = context.Process(target=_worker_loop, args=(task, child_conn))
+            process.start()
+            child_conn.close()
+            workers.append((process, conn))
+        pending = iter(range(runs))
+        busy: dict[Connection, tuple[_WorkerProcess, int]] = {}
+
+        def feed(process_: _WorkerProcess, conn_: Connection) -> None:
+            draw_ = next(pending, None)
+            conn_.send(draw_)
+            if draw_ is not None:
+                busy[conn_] = (process_, draw_)
+
+        for process, conn in workers:
+            feed(process, conn)
+        while busy:
+            # A dead worker's sentinel wakes the wait too, so it cannot leave it hanging
+            ready = set(wait([*busy, *(p.sentinel for p, _ in busy.values())]))
+            for conn in [c for c, (p, _) in busy.items() if c in ready or p.sentinel in ready]:
+                process, draw = busy.pop(conn)
+                try:
+                    done, result = conn.recv()
+                except EOFError:
+                    process.join(WORKER_STOP_TIMEOUT)
+                    raise RuntimeError(f"a coin-flip worker stopped during draw {draw} "
+                                       f"(exit code {process.exitcode})") from None
+                if isinstance(result, Exception):
+                    raise result
+                yield done, result
+                feed(process, conn)
     finally:
-        pool.terminate()
-        pool.join()
+        _stop_workers(workers)
 
 
 def _stop_reason(real: float, totals: list[float], mark: float) -> str | None:

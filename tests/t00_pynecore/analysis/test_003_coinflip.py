@@ -337,3 +337,31 @@ def __test_parallel_draws_need_a_picklable_runner__(runner):
     real, syminfo = __test_helper_record(make)
     with pytest.raises(TypeError, match='pickled'):
         direction_test(make, syminfo, real, 'r', exact=True, runs=4, jobs=2)
+
+
+
+def __test_parallel_draw_errors_reach_the_caller__(runner):
+    """A draw that fails in a worker raises its own error here, with the worker's traceback."""
+    import functools
+    import pytest
+    from pynecore.analysis.coinflip import direction_test
+    make = __test_helper_factory(runner)
+    real, syminfo = __test_helper_record(make)
+    # A picklable runner factory whose backtests cannot start
+    failing = functools.partial(int, 'no backtest')
+    with pytest.raises(ValueError, match='no backtest') as info:
+        direction_test(failing, syminfo, real, 'r', exact=True, runs=4, jobs=2)
+    assert any('In the coin-flip worker' in note for note in info.value.__notes__)
+
+
+def __test_a_dead_worker_raises_instead_of_hanging__(runner):
+    """A worker that dies in the middle of a draw is an error, not a wait without end."""
+    import functools
+    import os
+    import pytest
+    from pynecore.analysis.coinflip import direction_test
+    make = __test_helper_factory(runner)
+    real, syminfo = __test_helper_record(make)
+    dying = functools.partial(os._exit, 3)
+    with pytest.raises(RuntimeError, match=r'stopped during draw \d+ \(exit code 3\)'):
+        direction_test(dying, syminfo, real, 'r', exact=True, runs=4, jobs=2)
