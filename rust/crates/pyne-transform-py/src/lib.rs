@@ -70,6 +70,9 @@ struct PyHost<'py> {
     object: Option<Bound<'py, PyAny>>,
     /// The running interpreter's `(major, minor)`
     python: (u32, u32),
+    /// A host call that raised what is not an ``Exception`` (``SystemExit``,
+    /// ``KeyboardInterrupt``): no fallback may swallow it, so :func:`run` raises it
+    interrupt: RefCell<Option<PyErr>>,
 }
 
 impl PyHost<'_> {
@@ -81,10 +84,21 @@ impl PyHost<'_> {
         let Some(object) = &self.object else {
             return Err(pyne_ast::Unsupported(format!("no host for {method}")));
         };
+        if self.interrupt.borrow().is_some() {
+            return Err(pyne_ast::Unsupported(format!("host {method}: interrupted")));
+        }
         object
             .call_method1(method, args)
             .and_then(|answer| answer.extract::<T>().map_err(Into::into))
-            .map_err(|err| pyne_ast::Unsupported(format!("host {method}: {err}")))
+            .map_err(|err| {
+                // A host failure only means the native port cannot answer and the
+                // Python step runs instead; an interruption must reach the caller
+                if !err.is_instance_of::<PyException>(object.py()) {
+                    self.interrupt.borrow_mut().get_or_insert(err);
+                    return pyne_ast::Unsupported(format!("host {method}: interrupted"));
+                }
+                pyne_ast::Unsupported(format!("host {method}: {err}"))
+            })
     }
 }
 
@@ -247,7 +261,8 @@ fn run<'py>(
     context: &Bound<'py, PyDict>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let get = |name: &str| context.get_item(name);
-    let host = PyHost { object: get("host")?, python: interpreter(py) };
+    let host =
+        PyHost { object: get("host")?, python: interpreter(py), interrupt: RefCell::new(None) };
     let names: Vec<&str> = steps.iter().map(String::as_str).collect();
     let mut from = FromPython::new();
     if pyne_transform::reads_type_table(&names) {
@@ -303,11 +318,14 @@ fn run<'py>(
         slot_layout: RefCell::new(layout),
     };
     let mut ast = from.ast;
-    let root =
-        pyne_transform::run_steps(&mut ast, root, &names, &ctx).map_err(|err| match err {
-            pyne_transform::Error::Unsupported(message) => Unsupported::new_err(message),
-            pyne_transform::Error::Rejected(message) => Rejected::new_err(message),
-        })?;
+    let steps = pyne_transform::run_steps(&mut ast, root, &names, &ctx);
+    if let Some(interrupt) = host.interrupt.take() {
+        return Err(interrupt);
+    }
+    let root = steps.map_err(|err| match err {
+        pyne_transform::Error::Unsupported(message) => Unsupported::new_err(message),
+        pyne_transform::Error::Rejected(message) => Rejected::new_err(message),
+    })?;
     let mut to = ToPython::new(py)?.with_objects(from.objects);
     let module = to.node(&ast, root)?;
     if let Some(classes) = classes {

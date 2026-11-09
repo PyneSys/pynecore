@@ -757,6 +757,35 @@ def __test_stale_port_runs_in_python__(monkeypatch):
     assert __test_helper_emission('native', monkeypatch) == expected
 
 
+@pytest.mark.parametrize('interrupt', [KeyboardInterrupt, SystemExit])
+def __test_host_interrupt_reaches_the_caller__(interrupt, monkeypatch):
+    """An interruption inside a host call is not a declined port: it is raised, not run in Python."""
+    __test_helper_require_native()
+    calls = []
+
+    def interrupted(module: str) -> bool:
+        calls.append(module)
+        raise interrupt()
+
+    monkeypatch.setattr(native._Host, 'has_module_properties', staticmethod(interrupted))
+    with pytest.raises(interrupt):
+        __test_helper_emission('native', monkeypatch)
+    # The host is not asked again once interrupted
+    assert len(calls) == 1
+
+
+def __test_host_error_runs_the_python_step__(monkeypatch):
+    """A host call that fails declines the native port: the Python step gives the same result."""
+    __test_helper_require_native()
+    expected = __test_helper_emission('python', monkeypatch)
+
+    def failing(module: str) -> bool:
+        raise LookupError(module)
+
+    monkeypatch.setattr(native._Host, 'has_module_properties', staticmethod(failing))
+    assert __test_helper_emission('native', monkeypatch) == expected
+
+
 @pytest.mark.parametrize('backend', ['native', 'verify'])
 def __test_native_rejection_matches_python__(backend, monkeypatch):
     """A module the Python step rejects is rejected natively too, with Python's error."""
