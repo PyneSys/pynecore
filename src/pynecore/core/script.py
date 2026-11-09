@@ -561,7 +561,6 @@ class Script:
             pyramiding: int = 0,
             calc_on_order_fills=False,
             calc_on_every_tick=False,
-            calc_on_every_history_tick=False,
 
             max_bars_back=0,
 
@@ -593,6 +592,10 @@ class Script:
 
             behind_chart=True,
 
+            # MEASURED (CAPITALCOM:EURUSD 60): Pine's 10th positional argument is
+            # ``max_bars_back``; this one came later, so it can only be named
+            calc_on_every_history_tick=False,
+
             _broker_requirements: ScriptRequirements | None = None,
 
             na_bool=False,
@@ -612,8 +615,6 @@ class Script:
         :param pyramiding: The maximum number of entries allowed in the same direction
         :param calc_on_order_fills: Specifies whether the strategy should be recalculated after an order is filled
         :param calc_on_every_tick: Specifies whether the strategy should be recalculated on each realtime tick
-        :param calc_on_every_history_tick: Specifies whether the strategy should be recalculated on every
-                                          available tick of a historical bar instead of once at its close
         :param max_bars_back: The length of the historical buffer the script keeps for every
         :param backtest_fill_limits_assumption: Limit order execution threshold in ticks
         :param default_qty_type: Specifies the units used for `default_qty_value`
@@ -648,6 +649,8 @@ class Script:
         :param max_polylines_count: The number of last polyline drawings displayed
         :param dynamic_requests: Specifies whether the script can dynamically call functions from
         :param behind_chart: Controls whether the script's plots and drawings in the main chart pane
+        :param calc_on_every_history_tick: Specifies whether the strategy should be recalculated on every
+                                          available tick of a historical bar instead of once at its close
         :param na_bool: Keep Pine v4/v5's three-state bool: a bool may be na (a history
                         before warm-up, ``na(bool)``, a fresh array or UDT bool); v6 has
                         no such state

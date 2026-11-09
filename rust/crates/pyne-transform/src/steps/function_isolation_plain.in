@@ -399,6 +399,7 @@
     "lib.volume_row.up_price",
     "lib.weekofyear",
     "lib.year",
+    "pine_loop",
     "pine_range",
     "pytest.raises",
     "rolling_sum_step",

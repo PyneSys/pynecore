@@ -49,6 +49,9 @@ impl Num {
     }
 }
 
+/// The module a compiled script imports its Pine casts from.
+const PINE_CAST: &str = "pynecore.core.pine_cast";
+
 /// What `_try_eval` answers: `None` is `_BAIL`, not a compile-time constant.
 type Eval = Result<Option<Num>, Error>;
 
@@ -667,20 +670,58 @@ fn assigned_names(ast: &Ast, node: NodeId, names: &mut HashSet<String>) {
 /// literal (`_ExprFolder`); the first error stops the walk.
 struct Folder<'e> {
     env: &'e Env,
+    /// Local names of `pine_cast.cast_bool`, the call a Pine `bool()` compiles to
+    bool_casts: &'e HashSet<String>,
+    /// The casts of the innermost module or function scope: a lambda or
+    /// comprehension body resolves its free names there, never in a class body
+    lexical_casts: &'e HashSet<String>,
+    /// The constants of that scope, for the same reason
+    lexical_env: &'e Env,
+    /// The names of that scope that are never rebound: a lambda or generator
+    /// body runs later, when only these still hold the value seen here
+    stable: &'e HashSet<String>,
     error: Option<Error>,
 }
 
 impl Folder<'_> {
-    /// A folder over the environment without the names a construct binds.
-    fn shadowed(&self, bound: &HashSet<String>) -> Env {
+    /// The lexical environment without the names a lambda or comprehension binds;
+    /// `deferred` when its body runs after the enclosing expression, which keeps
+    /// only the stable names.
+    fn shadowed(&self, bound: &HashSet<String>, deferred: bool) -> Env {
         let mut inner = Env::default();
-        for (name, value) in &self.env.values {
-            if !bound.contains(name) {
+        for (name, value) in &self.lexical_env.values {
+            if !bound.contains(name) && (!deferred || self.stable.contains(name)) {
                 inner.values.insert(name.clone(), *value);
             }
         }
-        inner.types = self.env.types.clone();
+        inner.types = self.lexical_env.types.clone();
         inner
+    }
+
+    /// The lexical cast names a lambda or comprehension scope does not rebind.
+    fn shadowed_casts(&self, bound: &HashSet<String>) -> HashSet<String> {
+        self.lexical_casts.iter().filter(|name| !bound.contains(*name)).cloned().collect()
+    }
+
+    /// `bool()` of a constant number folded to its exact truth value
+    /// (`_ExprFolder._fold_bool_cast`); `None` where the call is no such cast.
+    fn fold_bool_cast(&self, ast: &mut Ast, id: NodeId) -> Result<Option<NodeId>, Error> {
+        let Kind::Call { func, args, keywords } = ast.kind(id) else {
+            return Ok(None);
+        };
+        let is_cast =
+            matches!(ast.kind(*func), Kind::Name { id, .. } if self.bool_casts.contains(id));
+        if !is_cast || args.len() != 1 || !keywords.is_empty() {
+            return Ok(None);
+        }
+        let arg = args[0];
+        let Some(value) = try_eval(ast, arg, &self.env.values)? else {
+            return Ok(None);
+        };
+        let literal =
+            ast.add(Kind::Constant { value: Constant::Bool(value.float() != 0.0), kind: None });
+        copy_location(ast, literal, id);
+        Ok(Some(stamp(ast, literal, BOOL)))
     }
 
     fn fail(&mut self, error: Option<Error>) {
@@ -703,6 +744,16 @@ impl Transformer for Folder<'_> {
                 }
                 Ok(Some(value)) => return Visited::Node(embed(ast, id, value, self.env)),
                 Ok(None) => {}
+            }
+            if !self.bool_casts.is_empty() {
+                match self.fold_bool_cast(ast, id) {
+                    Err(error) => {
+                        self.error = Some(error);
+                        return Visited::Node(id);
+                    }
+                    Ok(Some(literal)) => return Visited::Node(literal),
+                    Ok(None) => {}
+                }
             }
         }
         match ast.kind(id) {
@@ -733,8 +784,16 @@ impl Transformer for Folder<'_> {
                         }
                     }
                 }
-                let inner = self.shadowed(&bound);
-                let mut folder = Folder { env: &inner, error: None };
+                let inner = self.shadowed(&bound, true);
+                let casts = self.shadowed_casts(&bound);
+                let mut folder = Folder {
+                    env: &inner,
+                    bool_casts: &casts,
+                    lexical_casts: &casts,
+                    lexical_env: &inner,
+                    stable: self.stable,
+                    error: None,
+                };
                 let Visited::Node(new) = folder.visit(ast, body) else { unreachable!() };
                 self.fail(folder.error);
                 if let Kind::Lambda { body, .. } = ast.kind_mut(id) {
@@ -745,11 +804,80 @@ impl Transformer for Folder<'_> {
             | Kind::SetComp { .. }
             | Kind::DictComp { .. }
             | Kind::GeneratorExp { .. } => {
+                // The outermost iterable is evaluated in the enclosing scope, the
+                // rest of the comprehension in its own
+                let (elts, generators) = match ast.kind(id) {
+                    Kind::ListComp { elt, generators }
+                    | Kind::SetComp { elt, generators }
+                    | Kind::GeneratorExp { elt, generators } => (vec![*elt], generators.clone()),
+                    Kind::DictComp { key, value, generators } => {
+                        (vec![*key, *value], generators.clone())
+                    }
+                    _ => unreachable!(),
+                };
+                let Kind::Comprehension { iter: first_iter, .. } = *ast.kind(generators[0]) else {
+                    unreachable!()
+                };
+                let Visited::Node(new) = self.visit(ast, first_iter) else { unreachable!() };
+                if let Kind::Comprehension { iter, .. } = ast.kind_mut(generators[0]) {
+                    *iter = new;
+                }
                 let mut bound = HashSet::new();
                 assigned_names(ast, id, &mut bound);
-                let inner = self.shadowed(&bound);
-                let mut folder = Folder { env: &inner, error: None };
-                generic_visit(&mut folder, ast, id);
+                let deferred = matches!(ast.kind(id), Kind::GeneratorExp { .. });
+                let inner = self.shadowed(&bound, deferred);
+                let casts = self.shadowed_casts(&bound);
+                let mut folder = Folder {
+                    env: &inner,
+                    bool_casts: &casts,
+                    lexical_casts: &casts,
+                    lexical_env: &inner,
+                    stable: self.stable,
+                    error: None,
+                };
+                let mut folded = Vec::with_capacity(elts.len());
+                for elt in elts {
+                    let Visited::Node(new) = folder.visit(ast, elt) else { unreachable!() };
+                    folded.push(new);
+                }
+                match ast.kind_mut(id) {
+                    Kind::ListComp { elt, .. }
+                    | Kind::SetComp { elt, .. }
+                    | Kind::GeneratorExp { elt, .. } => *elt = folded[0],
+                    Kind::DictComp { key, value, .. } => {
+                        *key = folded[0];
+                        *value = folded[1];
+                    }
+                    _ => unreachable!(),
+                }
+                for (index, &generator) in generators.iter().enumerate() {
+                    let Kind::Comprehension { target, iter, ref ifs, .. } = *ast.kind(generator)
+                    else {
+                        unreachable!()
+                    };
+                    let ifs = ifs.clone();
+                    let Visited::Node(target) = folder.visit(ast, target) else { unreachable!() };
+                    let iter = if index == 0 {
+                        iter
+                    } else {
+                        let Visited::Node(new) = folder.visit(ast, iter) else { unreachable!() };
+                        new
+                    };
+                    let mut conditions = Vec::with_capacity(ifs.len());
+                    for condition in ifs {
+                        let Visited::Node(new) = folder.visit(ast, condition) else {
+                            unreachable!()
+                        };
+                        conditions.push(new);
+                    }
+                    if let Kind::Comprehension { target: t, iter: i, ifs, .. } =
+                        ast.kind_mut(generator)
+                    {
+                        *t = target;
+                        *i = iter;
+                        *ifs = conditions;
+                    }
+                }
                 self.fail(folder.error);
             }
             _ => generic_visit(self, ast, id),
@@ -759,8 +887,16 @@ impl Transformer for Folder<'_> {
 }
 
 /// Fold one expression in an environment (`ConstFoldTransformer._fold`).
-fn fold(ast: &mut Ast, node: NodeId, env: &Env) -> Result<NodeId, Error> {
-    let mut folder = Folder { env, error: None };
+fn fold(
+    ast: &mut Ast,
+    node: NodeId,
+    env: &Env,
+    bool_casts: &HashSet<String>,
+    lexical_casts: &HashSet<String>,
+    lexical_env: &Env,
+    stable: &HashSet<String>,
+) -> Result<NodeId, Error> {
+    let mut folder = Folder { env, bool_casts, lexical_casts, lexical_env, stable, error: None };
     let Visited::Node(new) = folder.visit(ast, node) else { unreachable!() };
     match folder.error {
         Some(error) => Err(error),
@@ -1001,6 +1137,36 @@ impl ScopeBindings {
 
 // --- the statement walk ---------------------------------------------------
 
+/// The names of a scope whose value can never change once bound
+/// (`_stable_names`): bound exactly once, never declared `global` / `nonlocal`
+/// anywhere, and not a parameterized annotation (those can carry
+/// Series/Persistent state instead of a native scalar value).
+fn stable_names(
+    ast: &Ast,
+    body: &[NodeId],
+    bindings: &ScopeBindings,
+    outer_writes: &HashSet<String>,
+) -> HashSet<String> {
+    if bindings.wildcard_import {
+        return HashSet::new();
+    }
+    let mut names: HashSet<String> = bindings
+        .names
+        .iter()
+        .filter(|&(name, &count)| count == 1 && !outer_writes.contains(name))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for &stmt in body {
+        if let &Kind::AnnAssign { target, annotation, .. } = ast.kind(stmt)
+            && let Kind::Name { id, .. } = ast.kind(target)
+            && matches!(ast.kind(annotation), Kind::Subscript { .. })
+        {
+            names.remove(id);
+        }
+    }
+    names
+}
+
 /// The transform's state over one module (`ConstFoldTransformer`). The Python
 /// environments are dicts several places hold at once (the module's `env` is
 /// also its `_global_env`), so they live in an arena and are passed by index.
@@ -1014,6 +1180,19 @@ struct ConstFold {
     scope_blocked: HashMap<NodeId, HashSet<String>>,
     has_walrus: bool,
     bindings_memo: HashMap<NodeId, HashSet<String>>,
+    /// Local names of `pine_cast.cast_bool` in the current scope
+    bool_casts: HashSet<String>,
+    /// The casts of the innermost enclosing module or function scope: a class
+    /// body or a method resolves its free names there, never in a class body
+    lexical_casts: HashSet<String>,
+    /// The environment a lambda or comprehension body sees inside a class body,
+    /// as an arena index; `None` outside one, where it sees the scope's own
+    lexical_env: Option<usize>,
+    /// The names of the innermost module or function scope that are never
+    /// rebound, the only ones a lambda or generator body may fold
+    stable: HashSet<String>,
+    /// The names any `global` / `nonlocal` statement of the module declares
+    outer_writes: HashSet<String>,
 }
 
 impl ConstFold {
@@ -1029,7 +1208,16 @@ impl ConstFold {
     }
 
     fn fold(&self, ast: &mut Ast, node: NodeId, env: usize) -> Result<NodeId, Error> {
-        fold(ast, node, &self.envs[env])
+        let lexical = &self.envs[self.lexical_env.unwrap_or(env)];
+        fold(
+            ast,
+            node,
+            &self.envs[env],
+            &self.bool_casts,
+            &self.lexical_casts,
+            lexical,
+            &self.stable,
+        )
     }
 
     fn fold_opt(
@@ -1166,16 +1354,19 @@ impl ConstFold {
             }
         }
         self.pop(env, &name);
-        let mut bound: HashSet<String> = ScopeBindings::new(ast, &body).names.into_keys().collect();
+        let local_bindings = ScopeBindings::new(ast, &body);
+        let mut params = HashSet::new();
         if let Kind::Arguments { posonlyargs, args, vararg, kwonlyargs, kwarg, .. } = ast.kind(args)
         {
             let all = posonlyargs.iter().chain(args).chain(kwonlyargs);
             for &arg in all.chain(vararg.iter()).chain(kwarg.iter()) {
                 if let Kind::Arg { arg, .. } = ast.kind(arg) {
-                    bound.insert(arg.clone());
+                    params.insert(arg.clone());
                 }
             }
         }
+        let mut bound: HashSet<String> = local_bindings.names.keys().cloned().collect();
+        bound.extend(params.iter().cloned());
         let globals = &self.envs[self.global_env];
         let mut captured = Env::default();
         for (name, value) in &globals.values {
@@ -1195,8 +1386,24 @@ impl ConstFold {
             .cloned()
             .ok_or_else(|| unsupported("a function the module facts did not see"))?;
         let outer_blocked = std::mem::replace(&mut self.blocked, blocked);
+        let casts: HashSet<String> =
+            self.lexical_casts.iter().filter(|name| !bound.contains(*name)).cloned().collect();
+        let outer_casts = std::mem::replace(&mut self.bool_casts, casts.clone());
+        let outer_lexical = std::mem::replace(&mut self.lexical_casts, casts);
+        let outer_env = self.lexical_env.take();
+        let mut stable: HashSet<String> = captured.values.keys().cloned().collect();
+        stable.extend(
+            stable_names(ast, &body, &local_bindings, &self.outer_writes)
+                .into_iter()
+                .filter(|name| !params.contains(name)),
+        );
+        let outer_stable = std::mem::replace(&mut self.stable, stable);
         let local = self.new_env(captured);
         let result = self.process_body(ast, &body, local);
+        self.stable = outer_stable;
+        self.lexical_env = outer_env;
+        self.bool_casts = outer_casts;
+        self.lexical_casts = outer_lexical;
         self.blocked = outer_blocked;
         self.global_env = outer_globals;
         result
@@ -1223,8 +1430,30 @@ impl ConstFold {
             }
             Kind::ClassDef { name, body, .. } => {
                 self.pop(env, &name);
+                let bound = ScopeBindings::new(ast, &body).names;
+                let casts =
+                    self.lexical_casts.iter().filter(|name| !bound.contains_key(*name)).cloned();
+                let outer_casts = std::mem::replace(&mut self.bool_casts, casts.collect());
+                // A class binding is invisible to a lambda or comprehension body:
+                // it sees the module constants a function would capture
+                let globals = &self.envs[self.global_env];
+                let mut captured = Env::default();
+                for (name, value) in &globals.values {
+                    if self.global_names.contains(name) {
+                        let ty = globals.types.get(name).ok_or_else(|| {
+                            unsupported(format!("a module constant {name} without a type"))
+                        })?;
+                        captured.values.insert(name.clone(), *value);
+                        captured.types.insert(name.clone(), ty.clone());
+                    }
+                }
+                let captured = self.new_env(captured);
+                let outer_env = self.lexical_env.replace(captured);
                 let fresh = self.new_env(Env::default());
-                self.process_body(ast, &body, fresh)?;
+                let result = self.process_body(ast, &body, fresh);
+                self.lexical_env = outer_env;
+                self.bool_casts = outer_casts;
+                result?;
             }
             Kind::Assign { targets, value, .. } => {
                 let folded = try_eval(ast, value, &self.envs[env].values)?;
@@ -1432,34 +1661,39 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
     let body = body.clone();
     let facts = ModuleFacts::new(ast, module);
     let bindings = ScopeBindings::new(ast, &body);
-    let mut global_names: HashSet<String> = bindings
-        .names
-        .iter()
-        .filter(|&(name, &count)| count == 1 && !facts.outer_writes.contains(name))
-        .map(|(name, _)| name.clone())
-        .collect();
-    // Parameterized annotations can carry Series/Persistent state instead of a
-    // native scalar value.
+    let global_names = stable_names(ast, &body, &bindings, &facts.outer_writes);
+    // A name bound once, by the `pine_cast` import, is the cast itself
+    let mut bool_casts = HashSet::new();
     for &stmt in &body {
-        if let &Kind::AnnAssign { target, annotation, .. } = ast.kind(stmt)
-            && let Kind::Name { id, .. } = ast.kind(target)
-            && matches!(ast.kind(annotation), Kind::Subscript { .. })
+        if let Kind::ImportFrom { module: Some(module), names, .. } = ast.kind(stmt)
+            && module == PINE_CAST
         {
-            global_names.remove(id);
+            for &alias in names {
+                if let Kind::Alias { name, asname } = ast.kind(alias)
+                    && name == "cast_bool"
+                {
+                    let bound = asname.clone().unwrap_or_else(|| name.clone());
+                    if bindings.names.get(&bound) == Some(&1) {
+                        bool_casts.insert(bound);
+                    }
+                }
+            }
         }
-    }
-    if bindings.wildcard_import {
-        global_names.clear();
     }
     let blocked = facts.blocked.get(&module).cloned().unwrap_or_default();
     let mut fold = ConstFold {
         envs: vec![Env::default()],
         global_env: 0,
-        global_names,
+        global_names: global_names.clone(),
         blocked,
         scope_blocked: facts.blocked,
         has_walrus: facts.has_walrus,
         bindings_memo: HashMap::new(),
+        lexical_casts: bool_casts.clone(),
+        bool_casts,
+        lexical_env: None,
+        stable: global_names.clone(),
+        outer_writes: facts.outer_writes,
     };
     fold.process_body(ast, &body, 0)?;
     Ok(module)

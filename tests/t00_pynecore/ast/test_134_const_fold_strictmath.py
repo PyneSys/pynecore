@@ -26,7 +26,7 @@ import pytest
 from pynecore.core import fdlibm, pine_math
 from pynecore.lib import math as lib_math
 from pynecore.transformers.const_fold import ConstFoldTransformer, quantize_embed
-from pynecore.transformers.pine_type_rules import INT, get_ty
+from pynecore.transformers.pine_type_rules import BOOL, INT, get_ty
 
 # StrictMath values (JDK 8 x86_64 and JDK 21): the fdlibm port reproduces them bit for bit
 _STRICTMATH = (
@@ -286,3 +286,147 @@ def __test_series_round_to_a_precision_rounds_once__():
     assert lib_math.round(1.23495, 2) == 1.23
     assert lib_math.round(63.986275, 5) == 63.98627
     assert lib_math.round(2.34567, 0.038) == 2.0
+
+
+@pytest.mark.parametrize('expression,expected', [
+    ('cast_bool(1e-10)', True), ('cast_bool(-1e-10)', True), ('cast_bool(2.5e-17)', True),
+    ('cast_bool(0.1 + 0.2 - 0.3)', True), ('cast_bool(lib.math.abs(1e-10))', True),
+    ('cast_bool(0.0)', False), ('cast_bool(-0.0)', False), ('cast_bool(0)', False),
+])
+def __test_constant_bool_cast_is_exact__(expression, expected):
+    """a constant ``bool()`` is exact, any non-zero value is true (MEASURED v5 and v6,
+    CAPITALCOM:EURUSD 60: literal, constant variable, expression and ``math.*`` call)"""
+    tree = __test_helper_fold('from pynecore import lib\nfrom pynecore.core.pine_cast import cast_bool\n'
+                              f'X = {expression}\n')
+    value = tree.body[2].value
+    assert isinstance(value, ast.Constant) and value.value is expected
+    assert get_ty(value) == BOOL
+
+
+def __test_series_bool_cast_is_not_folded__():
+    """a series ``bool()`` stays the runtime cast, which is tolerant (``close * 0 + 1e-10``
+    is false on TradingView), and a name that is not the ``pine_cast`` import is no cast"""
+    tree = __test_helper_fold('from pynecore.lib import close\n'
+                              'from pynecore.core.pine_cast import cast_bool\n'
+                              'X = cast_bool(close * 0 + 1e-10)\n'
+                              'def cast_float(v):\n    return v\n'
+                              'Y = cast_float(1e-10)\n')
+    assert isinstance(tree.body[2].value, ast.Call)
+    assert isinstance(tree.body[4].value, ast.Call)
+    shadowed = __test_helper_fold('from pynecore.core.pine_cast import cast_bool\n'
+                                  'cast_bool = bool\nX = cast_bool(1e-10)\n')
+    assert isinstance(shadowed.body[2].value, ast.Call)
+
+
+def __test_class_local_bool_cast_shadowing__():
+    """a class-local binding shadows the cast in the class body, while a method keeps
+    resolving it in the module (a method does not see the class namespace)"""
+    tree = __test_helper_fold('from pynecore.core.pine_cast import cast_bool\n'
+                              'class K:\n'
+                              '    cast_bool = lambda x: False\n'
+                              '    flag = cast_bool(1.0)\n'
+                              '    def m(self):\n'
+                              '        return cast_bool(1.0)\n')
+    klass = tree.body[1]
+    assert isinstance(klass, ast.ClassDef)
+    flag, method = klass.body[1], klass.body[2]
+    assert isinstance(flag, ast.Assign) and isinstance(flag.value, ast.Call)
+    assert isinstance(method, ast.FunctionDef)
+    statement = method.body[0]
+    assert isinstance(statement, ast.Return)
+    returned = statement.value
+    assert isinstance(returned, ast.Constant) and returned.value is True
+
+
+def __test_class_local_bool_cast_shadowing_in_lambda_and_comprehension__():
+    """a lambda or comprehension in a class body resolves the cast in the module, as a
+    method does; only the outermost iterable of a comprehension sees the class binding"""
+    tree = __test_helper_fold('from pynecore.core.pine_cast import cast_bool\n'
+                              'class K:\n'
+                              '    cast_bool = lambda x: False\n'
+                              '    anonymous = staticmethod(lambda: cast_bool(1e-10))\n'
+                              '    listed = [cast_bool(1e-10) for _ in (1,)]\n'
+                              '    outer = [x for x in (cast_bool(1e-10),)]\n')
+    klass = tree.body[1]
+    assert isinstance(klass, ast.ClassDef)
+    anonymous, listed, outer = klass.body[1], klass.body[2], klass.body[3]
+    assert isinstance(anonymous, ast.Assign) and isinstance(anonymous.value, ast.Call)
+    lambda_node = anonymous.value.args[0]
+    assert isinstance(lambda_node, ast.Lambda)
+    assert isinstance(lambda_node.body, ast.Constant) and lambda_node.body.value is True
+    assert isinstance(listed, ast.Assign) and isinstance(listed.value, ast.ListComp)
+    assert isinstance(listed.value.elt, ast.Constant) and listed.value.elt.value is True
+    assert isinstance(outer, ast.Assign) and isinstance(outer.value, ast.ListComp)
+    iterable = outer.value.generators[0].iter
+    assert isinstance(iterable, ast.Tuple) and isinstance(iterable.elts[0], ast.Call)
+
+
+def __test_class_local_constant_shadowing_in_lambda_and_comprehension__():
+    """a lambda or comprehension in a class body reads the module constant, not the
+    class binding of the same name; only the outermost iterable sees the class one"""
+    tree = __test_helper_fold('from pynecore.core.pine_cast import cast_bool\n'
+                              'X = 1\n'
+                              'E = 1e-10\n'
+                              'class K:\n'
+                              '    X = 0\n'
+                              '    E = 0\n'
+                              '    anonymous = staticmethod(lambda: X)\n'
+                              '    listed = [X for _ in (0,)]\n'
+                              '    outer = [x for x in (X,)]\n'
+                              '    cast = staticmethod(lambda: cast_bool(E))\n')
+    klass = tree.body[3]
+    assert isinstance(klass, ast.ClassDef)
+    anonymous, listed, outer, cast = klass.body[2:6]
+    assert isinstance(anonymous, ast.Assign) and isinstance(anonymous.value, ast.Call)
+    lambda_node = anonymous.value.args[0]
+    assert isinstance(lambda_node, ast.Lambda)
+    assert isinstance(lambda_node.body, ast.Constant) and lambda_node.body.value == 1
+    assert isinstance(listed, ast.Assign) and isinstance(listed.value, ast.ListComp)
+    assert isinstance(listed.value.elt, ast.Constant) and listed.value.elt.value == 1
+    assert isinstance(outer, ast.Assign) and isinstance(outer.value, ast.ListComp)
+    iterable = outer.value.generators[0].iter
+    assert isinstance(iterable, ast.Tuple)
+    first = iterable.elts[0]
+    assert isinstance(first, ast.Constant) and first.value == 0
+    assert isinstance(cast, ast.Assign) and isinstance(cast.value, ast.Call)
+    cast_lambda = cast.value.args[0]
+    assert isinstance(cast_lambda, ast.Lambda)
+    assert isinstance(cast_lambda.body, ast.Constant) and cast_lambda.body.value is True
+
+
+def __test_deferred_body_folds_only_names_never_rebound__():
+    """a lambda or generator body runs later and reads the value a name has then: it
+    folds a name only when its scope never rebinds it; a list comprehension and the
+    outermost iterable of a generator run at once and fold the current value"""
+    tree = __test_helper_fold('X = 1.5\nS = 2.0\n'
+                              'f = lambda: X\n'
+                              'g = (X for _ in range(int(X)))\n'
+                              'h = [X for _ in (0,)]\n'
+                              'k = lambda: S\n'
+                              'X = 2.5\n'
+                              'def m():\n'
+                              '    Y = 1.5\n'
+                              '    T = 3.0\n'
+                              '    f = lambda: Y\n'
+                              '    k = lambda: T + S\n'
+                              '    Y = 2.5\n'
+                              '    return f, k\n')
+    f, g, h, k = (statement.value for statement in tree.body[2:6])  # type: ignore[attr-defined]
+    assert isinstance(f, ast.Lambda) and isinstance(f.body, ast.Name)
+    assert isinstance(g, ast.GeneratorExp) and isinstance(g.elt, ast.Name)
+    call = g.generators[0].iter
+    assert isinstance(call, ast.Call)
+    inner = call.args[0]
+    assert isinstance(inner, ast.Call)
+    argument = inner.args[0]
+    assert isinstance(argument, ast.Constant) and argument.value == 1.5
+    assert isinstance(h, ast.ListComp)
+    assert isinstance(h.elt, ast.Constant) and h.elt.value == 1.5
+    assert isinstance(k, ast.Lambda)
+    assert isinstance(k.body, ast.Constant) and k.body.value == 2.0
+    method = tree.body[7]
+    assert isinstance(method, ast.FunctionDef)
+    local_f, local_k = (statement.value for statement in method.body[2:4])  # type: ignore[attr-defined]
+    assert isinstance(local_f, ast.Lambda) and isinstance(local_f.body, ast.Name)
+    assert isinstance(local_k, ast.Lambda)
+    assert isinstance(local_k.body, ast.Constant) and local_k.body.value == 5.0

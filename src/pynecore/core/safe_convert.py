@@ -93,16 +93,20 @@ def safe_float(value: PyneFloat) -> float:
         return na_float
 
 
-def safe_bool(x: bool | int | float | NA) -> bool:
+def safe_bool(x: bool | int | float | NA) -> bool | NA[bool]:
     """
     Converts the x value to a bool value: Pine's ``bool()`` cast, and the implicit
     conversion of a number passed to a ``bool`` parameter of a lib function.
+
+    A na operand gives the bool na of the running script: ``False`` for the v6
+    two-state bool, the real na for the v4/v5 three-state one.
 
     :param x: The value to convert
     :return: The casted value
     """
     if not (x == x):  # NA object or native nan
-        return False
+        # MEASURED (CAPITALCOM:EURUSD 60, v5): ``na(bool(z))`` is true for a na float
+        return NA(bool)
     if x.__class__ is float:
         # Pine converts a float to bool by the same tolerant rule its comparison
         # operators use, in the explicit cast too, not only in the implicit

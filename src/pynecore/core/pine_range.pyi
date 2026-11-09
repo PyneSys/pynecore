@@ -29,12 +29,15 @@ class PineLoop(Generic[_TNum]):
     Counter of a Pine ``for`` loop whose ``to`` bound is not loop-invariant.
     """
     value: _TNum
+    entering: bool
     _by: int | float | None
     _step: int | float
     _ascending: bool
-    _started: bool
+    _entry: bool
+    _phase: int
 
-    def __init__(self, from_num: _TNum, step_num: _TNum | None = None) -> None: ...
+    def __init__(self, from_num: _TNum, step_num: _TNum | None = None, *,
+                 entry: bool = False) -> None: ...
 
     def step(self, to_num: int | float) -> bool:
         """
@@ -45,12 +48,22 @@ class PineLoop(Generic[_TNum]):
         :raises ValueError: If the step is zero
         """
 
+    def enter(self, step_num: int | float | None = None) -> None:
+        """
+        Take the ``by`` value after the entry read of an ``entry`` mode loop.
 
-def pine_loop(from_num: _TNum, step_num: _TNum | None = None) -> PineLoop[_TNum]:
+        :param step_num: The loop's ``by`` value, or None when the loop has none
+        :raises ValueError: If the step is zero
+        """
+
+
+def pine_loop(from_num: _TNum, step_num: _TNum | None = None, *,
+              entry: bool = False) -> PineLoop[_TNum]:
     """
     Start a Pine ``for`` loop with a bound that has to be re-read each iteration.
 
     :param from_num: Start value (inclusive), evaluated once
     :param step_num: Step value (optional), evaluated once
+    :param entry: Read ``to`` once on entry before ``by`` and the first check
     :return: The loop counter the ``while`` condition drives
     """

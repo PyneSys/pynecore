@@ -11,9 +11,9 @@ use crate::pine_qualifier::{
 };
 use crate::pine_type_rules::{
     BOOL, CallRule, DYN_DEFAULT, INT, NUMERIC, OBJECT, PINE_LOOP, SCALARS, TY_ATTR, TYPELESS,
-    UNKNOWN, binop_type, builtin_name_type, class_of, compare_type, constant_type, elements_of,
-    is_array, is_map, is_matrix, is_tuple, join, lib_type_override, render_ty, tuple_of,
-    unaryop_type,
+    UNKNOWN, VOID, binop_type, builtin_name_type, class_of, compare_type, constant_type,
+    elements_of, is_array, is_map, is_matrix, is_tuple, join, lib_type_override, render_ty,
+    tuple_of, unaryop_type,
 };
 
 impl Engine<'_, '_> {
@@ -351,8 +351,11 @@ impl Engine<'_, '_> {
         let Kind::Attribute { value, attr, .. } = self.kind(node).clone() else {
             return Ok(UNKNOWN.to_string());
         };
-        if attr == "step" {
+        if attr == "step" || attr == "enter" {
             return Ok(OBJECT.to_string());
+        }
+        if attr == "entering" {
+            return Ok(BOOL.to_string());
         }
         if attr != "value" {
             self.node_diag(
@@ -360,7 +363,7 @@ impl Engine<'_, '_> {
                 node,
                 "unknown-field",
                 &format!("PineLoop.{attr}"),
-                "read 'value', or call 'step'",
+                "read 'value' or 'entering', or call 'step' or 'enter'",
             );
             return Ok(UNKNOWN.to_string());
         }
@@ -418,11 +421,31 @@ impl Engine<'_, '_> {
         Ok(result)
     }
 
-    /// Type a `loop.step(to)` call (`_loop_step`).
+    /// Type a `loop.step(to)` or `loop.enter(by)` call (`_loop_step`).
     pub(super) fn loop_step(&mut self, node: NodeId, func: NodeId) -> R<String> {
         let Kind::Attribute { value, attr, .. } = self.kind(func).clone() else {
             return Ok(UNKNOWN.to_string());
         };
+        if attr == "enter" {
+            let Some((_, args, keywords)) = facts::call_parts(self.ast, node) else {
+                return Ok(VOID.to_string());
+            };
+            let (args, has_keywords) = (args.to_vec(), !keywords.is_empty());
+            if args.len() > 1 || has_keywords {
+                let arity =
+                    call_arity(self.ast, node).map_or("None".to_string(), |n| n.to_string());
+                self.node_diag(
+                    &format!("'enter' takes 0 or 1 argument(s), {arity} passed"),
+                    node,
+                    "bad-call",
+                    "PineLoop.enter",
+                    "pass the step: 'enter(by)'",
+                );
+                return Ok(VOID.to_string());
+            }
+            self.widen_loop_counter(node, value, "enter", &args)?;
+            return Ok(VOID.to_string());
+        }
         if attr != "step" {
             return Ok(UNKNOWN.to_string());
         }
@@ -441,9 +464,22 @@ impl Engine<'_, '_> {
             );
             return Ok(BOOL.to_string());
         }
-        let counter = self.loop_counter(value);
-        if let (Some(counter), Kind::Name { id, .. }) = (counter, self.kind(value).clone()) {
-            let joined = self.loop_bound(node, "step", &args, Some(counter))?;
+        self.widen_loop_counter(node, value, "step", &args)?;
+        Ok(BOOL.to_string())
+    }
+
+    /// Join the counter recorded for a loop object with the bounds a call passes
+    /// (`_widen_loop_counter`).
+    fn widen_loop_counter(
+        &mut self,
+        node: NodeId,
+        receiver: NodeId,
+        what: &str,
+        args: &[NodeId],
+    ) -> R<()> {
+        let counter = self.loop_counter(receiver);
+        if let (Some(counter), Kind::Name { id, .. }) = (counter, self.kind(receiver).clone()) {
+            let joined = self.loop_bound(node, what, args, Some(counter))?;
             for index in (0..self.stack.len()).rev() {
                 let frame = self.stack[index];
                 if self.frames[frame].loop_counters.contains_key(&id) {
@@ -452,7 +488,7 @@ impl Engine<'_, '_> {
                 }
             }
         }
-        Ok(BOOL.to_string())
+        Ok(())
     }
 
     /// Whether an attribute's base is a module or a namespace (`_is_reference`).

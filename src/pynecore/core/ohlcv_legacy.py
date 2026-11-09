@@ -322,19 +322,36 @@ class OHLCVReader:
             return start_pos, start_pos
         return start_pos, end_pos
 
-    def get_size(self, start_timestamp: int | None = None, end_timestamp: int | None = None) -> int:
+    def get_size(
+        self,
+        start_timestamp: int | None = None,
+        end_timestamp: int | None = None,
+        skip_gaps: bool = True,
+    ) -> int:
         """
-        Return the number of records in a timestamp range.
+        Return the number of records :meth:`read_from` yields for a timestamp range.
+
+        The run takes ``last_bar_index`` from this count, so it has to leave out the
+        phantom gap records ``read_from`` skips: counting them, a file with 5376 of
+        them among 13186 bars reported ``last_bar_index`` 18561 on a chart whose
+        last bar is 13185.
 
         :param start_timestamp: Start timestamp in milliseconds.
         :param end_timestamp: End timestamp in milliseconds.
+        :param skip_gaps: Leave out legacy phantom records with negative volume.
         :return: The number of matching records.
         """
         if not self._size:
             return 0
 
         start_pos, end_pos = self.get_positions(start_timestamp, end_timestamp)
-        return end_pos - start_pos
+        if not skip_gaps or end_pos <= start_pos:
+            return end_pos - start_pos
+        assert self._mmap is not None
+        with memoryview(self._mmap)[start_pos * RECORD_SIZE:end_pos * RECORD_SIZE] as records:
+            # ``not volume < 0`` keeps a NaN volume, as ``read_from`` does.
+            return sum(1 for record in struct.iter_unpack(STRUCT_FORMAT, records)
+                       if not record[5] < 0)
 
     def save_to_csv(self, path: str, as_datetime: bool = False) -> None:
         """

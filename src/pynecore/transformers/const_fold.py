@@ -17,6 +17,9 @@ __all__ = ['ConstFoldTransformer', 'quantize_embed']
 # Sentinel for "not a compile-time constant"
 _BAIL = object()
 
+#: The module a compiled script imports its Pine casts from
+_PINE_CAST = 'pynecore.core.pine_cast'
+
 #: ``StrictMath.log(10)``, the divisor of the parser's ``log10``
 _LN10 = fdlibm.log(10.0)
 
@@ -457,6 +460,26 @@ class _ScopeBindings(ast_walk.NodeVisitor):
         self.generic_visit(node)
 
 
+def _stable_names(body: list[ast.stmt], bindings: _ScopeBindings,
+                  outer_writes: set[str]) -> set[str]:
+    """
+    The names of a scope whose value can never change once bound: bound
+    exactly once, never declared ``global`` / ``nonlocal`` anywhere, and not
+    a parameterized annotation (those can carry Series/Persistent state
+    instead of a native scalar value).
+    """
+    if bindings.wildcard_import:
+        return set()
+    names = {name for name, count in bindings.names.items()
+             if count == 1 and name not in outer_writes}
+    for statement in body:
+        if isinstance(statement, ast.AnnAssign) and isinstance(statement.annotation, ast.Subscript):
+            target = statement.target
+            if isinstance(target, ast.Name):
+                names.discard(target.id)
+    return names
+
+
 class _ExprFolder(ast_walk.NodeTransformer):
     """
     Replace every maximal constant subtree of one expression with the
@@ -465,11 +488,28 @@ class _ExprFolder(ast_walk.NodeTransformer):
     """
 
     def __init__(self, env: dict[str, int | float],
-                 types: dict[str, str] | None = None) -> None:
+                 types: dict[str, str] | None = None,
+                 bool_casts: frozenset[str] = frozenset(),
+                 lexical_casts: frozenset[str] | None = None,
+                 lexical_env: dict[str, int | float] | None = None,
+                 lexical_types: dict[str, str] | None = None,
+                 stable: frozenset[str] | None = None) -> None:
         self.env = env
         # Pine types of the folded names, so the emitted literal can keep the
         # TYPE the folded expression had (see ``const_type``)
         self.types = types if types is not None else {}
+        # Local names of ``pine_cast.cast_bool``, the call a Pine ``bool()`` compiles to
+        self.bool_casts = bool_casts
+        # The casts of the innermost module or function scope: a lambda or
+        # comprehension body resolves its free names there, never in a class body
+        self.lexical_casts = bool_casts if lexical_casts is None else lexical_casts
+        # The constants of that scope, for the same reason
+        self.lexical_env = env if lexical_env is None else lexical_env
+        self.lexical_types = self.types if lexical_types is None else lexical_types
+        # The names of that scope that are never rebound: a lambda or generator
+        # body runs later, when only these still hold the value seen here.
+        # ``None`` when every name of the lexical environment is
+        self.stable = stable
 
     def visit(self, node: ast.AST) -> ast.AST:
         if isinstance(node, ast.expr):
@@ -480,7 +520,30 @@ class _ExprFolder(ast_walk.NodeTransformer):
                 if _is_literal(node, q):
                     return _stamp(node, ty)
                 return _stamp(ast.copy_location(ast.Constant(value=q), node), ty)
+            if self.bool_casts and isinstance(node, ast.Call):
+                folded = self._fold_bool_cast(node)
+                if folded is not None:
+                    return folded
         return super().visit(node)
+
+    def _fold_bool_cast(self, node: ast.Call) -> ast.expr | None:
+        """
+        Fold ``bool()`` of a constant number to its exact truth value.
+
+        MEASURED (CAPITALCOM:EURUSD 60, v5 and v6): the parser casts a constant
+        exactly, any non-zero value is true -- a literal ``bool(1e-10)``, a
+        constant variable, ``var`` initializer, expression or ``math.*`` call of
+        it, and ``bool(-1e-10)``. A series or input value is cast at runtime by
+        the tolerant rule of ``safe_bool`` (``bool(close * 0 + 1e-10)`` is false).
+        """
+        func = node.func
+        if not (isinstance(func, ast.Name) and func.id in self.bool_casts
+                and len(node.args) == 1 and not node.keywords):
+            return None
+        v = _try_eval(node.args[0], self.env)
+        if v is _BAIL:
+            return None
+        return _stamp(ast.copy_location(ast.Constant(value=v != 0), node), BOOL)
 
     def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
         # ``x[1]`` on a constant-valued series variable is NOT the constant:
@@ -491,16 +554,16 @@ class _ExprFolder(ast_walk.NodeTransformer):
         node.slice = self.visit(node.slice)  # type: ignore[assignment]
         return node
 
-    def _visit_shadowing(self, node: ast.expr, bound: set[str]) -> ast.AST:
-        inner = {k: v for k, v in self.env.items() if k not in bound}
-        folder = _ExprFolder(inner, self.types)
-        for field, value in ast.iter_fields(node):
-            if isinstance(value, ast.expr):
-                setattr(node, field, folder.visit(value))
-            elif isinstance(value, list):
-                setattr(node, field, [folder.visit(v) if isinstance(v, ast.AST) else v
-                                      for v in value])
-        return node
+    def _nested(self, bound: set[str], deferred: bool) -> '_ExprFolder':
+        """
+        The folder of a lambda or comprehension scope that binds ``bound``;
+        ``deferred`` when its body runs after the enclosing expression.
+        """
+        casts = self.lexical_casts - bound
+        stable = self.stable if deferred else None
+        env = {k: v for k, v in self.lexical_env.items()
+               if k not in bound and (stable is None or k in stable)}
+        return _ExprFolder(env, self.lexical_types, casts, casts, stable=self.stable)
 
     def visit_Lambda(self, node: ast.Lambda) -> ast.AST:
         bound = {a.arg for a in (node.args.args + node.args.posonlyargs + node.args.kwonlyargs)}
@@ -508,13 +571,25 @@ class _ExprFolder(ast_walk.NodeTransformer):
             bound.add(node.args.vararg.arg)
         if node.args.kwarg:
             bound.add(node.args.kwarg.arg)
-        node.body = _ExprFolder({k: v for k, v in self.env.items() if k not in bound},
-                                self.types).visit(node.body)  # type: ignore[assignment]
+        node.body = self._nested(bound, True).visit(node.body)  # type: ignore[assignment]
         return node
 
-    def _visit_comprehension(self, node: ast.expr) -> ast.AST:
-        bound = _assigned_names(node)
-        return self._visit_shadowing(node, bound)
+    def _visit_comprehension(
+            self, node: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp) -> ast.AST:
+        # The outermost iterable is evaluated in the enclosing scope, the rest
+        # of the comprehension in its own
+        first = node.generators[0]
+        first.iter = self.visit(first.iter)  # type: ignore[assignment]
+        inner = self._nested(_assigned_names(node), isinstance(node, ast.GeneratorExp))
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, ast.expr):
+                setattr(node, field, inner.visit(value))
+        for generator in node.generators:
+            generator.target = inner.visit(generator.target)  # type: ignore[assignment]
+            if generator is not first:
+                generator.iter = inner.visit(generator.iter)  # type: ignore[assignment]
+            generator.ifs = [inner.visit(condition) for condition in generator.ifs]  # type: ignore[misc]
+        return node
 
     visit_ListComp = _visit_comprehension
     visit_SetComp = _visit_comprehension
@@ -764,6 +839,18 @@ class ConstFoldTransformer:
         self._scope_blocked: dict[ast.AST, frozenset[str]] = {}
         self._has_walrus = False
         self._bindings_memo: dict[ast.AST, frozenset[str]] = {}
+        self._bool_casts: frozenset[str] = frozenset()
+        # The casts of the innermost enclosing module or function scope: a class
+        # body or a method resolves its free names there, never in a class body
+        self._lexical_casts: frozenset[str] = frozenset()
+        # The constants and their types a lambda or comprehension body sees
+        # inside a class body; ``None`` outside one, where it sees the scope's own
+        self._lexical_env: tuple[dict[str, int | float], dict[str, str]] | None = None
+        # The names of the innermost module or function scope that are never
+        # rebound, the only ones a lambda or generator body may fold
+        self._stable: frozenset[str] = frozenset()
+        self._global_names: set[str] = set()
+        self._outer_writes: set[str] = set()
 
     def visit(self, tree: ast.Module) -> ast.Module:
         facts = _ModuleFacts(tree)
@@ -771,17 +858,18 @@ class ConstFoldTransformer:
         self._has_walrus = facts.has_walrus
         self._bindings_memo = {}
         self._blocked = facts.blocked[tree]
+        self._outer_writes = facts.outer_writes
         bindings = _ScopeBindings(tree.body)
-        self._global_names = {name for name, count in bindings.names.items()
-                              if count == 1 and name not in facts.outer_writes}
-        # Parameterized annotations can carry Series/Persistent state instead
-        # of a native scalar value.
-        self._global_names.difference_update(
-            statement.target.id for statement in tree.body
-            if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name)
-            and isinstance(statement.annotation, ast.Subscript))
-        if bindings.wildcard_import:
-            self._global_names.clear()
+        self._global_names = _stable_names(tree.body, bindings, facts.outer_writes)
+        self._stable = frozenset(self._global_names)
+        # A name bound once, by the ``pine_cast`` import, is the cast itself
+        self._bool_casts = frozenset(
+            alias.asname or alias.name
+            for statement in tree.body
+            if isinstance(statement, ast.ImportFrom) and statement.module == _PINE_CAST
+            for alias in statement.names
+            if alias.name == 'cast_bool' and bindings.names.get(alias.asname or alias.name) == 1)
+        self._lexical_casts = self._bool_casts
         self._global_env: dict[str, int | float] = {}
         self._global_types: dict[str, str] = {}
         self._process_body(tree.body, self._global_env, self._global_types)
@@ -804,7 +892,10 @@ class ConstFoldTransformer:
 
     def _fold(self, node: ast.expr, env: dict[str, int | float],
               types: dict[str, str]) -> ast.expr:
-        return _ExprFolder(env, types).visit(node)  # type: ignore[return-value]
+        lexical_env, lexical_types = self._lexical_env or (env, types)
+        folder = _ExprFolder(env, types, self._bool_casts, self._lexical_casts,
+                             lexical_env, lexical_types, self._stable)
+        return folder.visit(node)  # type: ignore[return-value]
 
     def _process_stmt(self, stmt: ast.stmt, env: dict[str, int | float],
                       types: dict[str, str]) -> None:
@@ -824,11 +915,12 @@ class ConstFoldTransformer:
                     if kw_default is not None:
                         stmt.args.kw_defaults[i] = self._fold(kw_default, env, types)
                 env.pop(stmt.name, None)
-                bound = set(_ScopeBindings(stmt.body).names)
-                bound.update(arg.arg for arg in [*stmt.args.posonlyargs, *stmt.args.args,
-                                                  *stmt.args.kwonlyargs,
-                                                  stmt.args.vararg, stmt.args.kwarg]
-                             if arg is not None)
+                local_bindings = _ScopeBindings(stmt.body)
+                params = {arg.arg for arg in [*stmt.args.posonlyargs, *stmt.args.args,
+                                              *stmt.args.kwonlyargs,
+                                              stmt.args.vararg, stmt.args.kwarg]
+                          if arg is not None}
+                bound = set(local_bindings.names) | params
                 captured = {name: value for name, value in self._global_env.items()
                             if name in self._global_names and name not in bound}
                 captured_types = {name: self._global_types[name] for name in captured}
@@ -836,12 +928,30 @@ class ConstFoldTransformer:
                 self._global_env, self._global_types = captured, captured_types
                 outer_blocked = self._blocked
                 self._blocked = self._scope_blocked[stmt]
+                outer_casts, outer_lexical = self._bool_casts, self._lexical_casts
+                self._bool_casts = self._lexical_casts = outer_lexical - bound
+                outer_env, self._lexical_env = self._lexical_env, None
+                outer_stable = self._stable
+                self._stable = frozenset(captured).union(
+                    _stable_names(stmt.body, local_bindings, self._outer_writes) - params)
                 self._process_body(stmt.body, dict(captured), dict(captured_types))
+                self._stable = outer_stable
+                self._lexical_env = outer_env
+                self._bool_casts, self._lexical_casts = outer_casts, outer_lexical
                 self._blocked = outer_blocked
                 self._global_env, self._global_types = outer_globals, outer_types
             case ast.ClassDef():
                 env.pop(stmt.name, None)
+                outer_casts, outer_env = self._bool_casts, self._lexical_env
+                self._bool_casts = self._lexical_casts - set(_ScopeBindings(stmt.body).names)
+                # A class binding is invisible to a lambda or comprehension body:
+                # it sees the module constants a function would capture
+                captured = {name: value for name, value in self._global_env.items()
+                            if name in self._global_names}
+                self._lexical_env = captured, {name: self._global_types[name]
+                                               for name in captured}
                 self._process_body(stmt.body, {}, {})
+                self._bool_casts, self._lexical_env = outer_casts, outer_env
             case ast.Assign():
                 v = _try_eval(stmt.value, env)
                 targets = [t.id for t in stmt.targets if isinstance(t, ast.Name)]

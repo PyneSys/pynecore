@@ -278,7 +278,7 @@ NON_TRANSFORMABLE_FUNCTIONS = {
     'copy', 'dataclass', 'dccopy',
     'pytest.raises',
 
-    'pine_range',
+    'pine_range', 'pine_loop',
 
     # ``lib.math.sum``'s machine step: the state lives in the machine it is handed
     'rolling_sum_step',

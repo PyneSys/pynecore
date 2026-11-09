@@ -47,9 +47,13 @@ impl Engine<'_, '_> {
                     self.store(target, &ty, value, false, None, qual, false)?;
                     if ty == PINE_LOOP
                         && let Kind::Name { id, .. } = self.kind(target).clone()
-                        && let Kind::Call { args, .. } = self.kind(value).clone()
+                        && let Kind::Call { func, args, .. } = self.kind(value).clone()
                     {
-                        let counter = self.loop_bound(value, "pine_loop", &args, None)?;
+                        let what = match self.kind(func) {
+                            Kind::Name { id, .. } => id.clone(),
+                            _ => "pine_loop".to_string(),
+                        };
+                        let counter = self.loop_bound(value, &what, &args, None)?;
                         let top = self.top();
                         self.frames[top].loop_counters.insert(id, counter);
                     }

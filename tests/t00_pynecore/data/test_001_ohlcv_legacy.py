@@ -82,7 +82,8 @@ def __test_legacy_reader_range_and_phantom_filtering__(tmp_path):
         start = 1_609_459_260_000
         end = 1_609_459_380_000
         assert reader.get_positions(start, end) == (1, 4)
-        assert reader.get_size(start, end) == 3
+        assert reader.get_size(start, end) == 2
+        assert reader.get_size(start, end, skip_gaps=False) == 3
         filtered = list(reader.read_from(start, end))
         unfiltered = list(reader.read_from(start, end, skip_gaps=False))
 

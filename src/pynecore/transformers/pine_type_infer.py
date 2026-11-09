@@ -1419,8 +1419,10 @@ class _Inference:
                     self._store(target, ty, stmt.value, qual=qual)
                     if ty == PINE_LOOP and isinstance(target, ast.Name) \
                             and isinstance(stmt.value, ast.Call):
+                        func = stmt.value.func
+                        what = func.id if isinstance(func, ast.Name) else 'pine_loop'
                         self._frames[-1].loop_counters[target.id] = \
-                            self._loop_bound(stmt.value, 'pine_loop', stmt.value.args, None)
+                            self._loop_bound(stmt.value, what, stmt.value.args, None)
             case ast.AnnAssign():
                 declared: str | None = annotation_type(stmt.annotation, self._classes)
                 value_ty = self._expr(stmt.value) if stmt.value is not None else None
@@ -2630,19 +2632,25 @@ class _Inference:
 
         ``__loop_1__ = pine_loop(0, 1)`` / ``while __loop_1__.step(10)`` /
         ``i = __loop_1__.value`` is what a Pine ``for`` with a re-read bound
-        compiles to, and ``i`` has to be typed the way the ``for`` variable
-        is: from the bounds. The object has exactly the ``value`` field and
-        the ``step`` method; ``value`` is the counter type recorded for the
-        name, joined with every bound ``step`` was given so far.
+        compiles to (an ``entry=True`` loop takes ``by`` through
+        ``__loop_1__.enter(1)`` once ``__loop_1__.entering`` says so), and ``i``
+        has to be typed the way the ``for`` variable is: from the bounds. The
+        object has exactly the ``value`` and ``entering`` fields and the ``step``
+        and ``enter`` methods; ``value`` is the counter type recorded for the
+        name, joined with every bound ``step`` and ``enter`` were given so far.
 
         :param node: The attribute node
-        :return: The counter type for ``value``, OBJECT for ``step``
+        :return: The counter type for ``value``, BOOL for ``entering``, OBJECT
+                 for the methods
         """
-        if node.attr == 'step':
+        if node.attr in ('step', 'enter'):
             return OBJECT
+        if node.attr == 'entering':
+            return BOOL
         if node.attr != 'value':
             self._node_diag(f"the loop counter has no field '{node.attr}'", node, 'unknown-field',
-                            f'PineLoop.{node.attr}', fix="read 'value', or call 'step'")
+                            f'PineLoop.{node.attr}',
+                            fix="read 'value' or 'entering', or call 'step' or 'enter'")
             return UNKNOWN
         counter = self._loop_counter(node.value)
         if counter is None or counter == UNKNOWN:
@@ -2702,26 +2710,44 @@ class _Inference:
         """
         Type a ``loop.step(to)`` call: it advances the counter and says whether
         the loop goes on, so it is a bool, and the bound it passes widens the
-        counter the way the ``for`` variable widens with every bound.
+        counter the way the ``for`` variable widens with every bound. A
+        ``loop.enter(by)`` call widens it the same way and returns nothing.
 
         :param node: The call node
-        :param func: Its ``loop.step`` callee
-        :return: BOOL
+        :param func: Its ``loop.step`` or ``loop.enter`` callee
+        :return: BOOL for ``step``, VOID for ``enter``
         """
+        if func.attr == 'enter':
+            if len(node.args) > 1 or node.keywords:
+                self._node_diag(f"'enter' takes 0 or 1 argument(s), {_call_arity(node)} passed",
+                                node, 'bad-call', 'PineLoop.enter', fix="pass the step: 'enter(by)'")
+                return VOID
+            self._widen_loop_counter(node, func, 'enter')
+            return VOID
         if func.attr != 'step':
             return UNKNOWN
         if len(node.args) != 1 or node.keywords:
             self._node_diag(f"'step' takes 1 argument(s), {_call_arity(node)} passed", node,
                             'bad-call', 'PineLoop.step', fix="pass the bound: 'step(to)'")
             return BOOL
+        self._widen_loop_counter(node, func, 'step')
+        return BOOL
+
+    def _widen_loop_counter(self, node: ast.Call, func: ast.Attribute, what: str) -> None:
+        """
+        Join the counter recorded for a loop object with the bounds a call passes.
+
+        :param node: The ``step`` or ``enter`` call
+        :param func: Its callee attribute
+        :param what: The method name, for the message
+        """
         counter = self._loop_counter(func.value)
         if counter is not None and isinstance(func.value, ast.Name):
-            joined = self._loop_bound(node, 'step', node.args, counter)
+            joined = self._loop_bound(node, what, node.args, counter)
             for frame in reversed(self._frames):
                 if func.value.id in frame.loop_counters:
                     frame.loop_counters[func.value.id] = joined
                     break
-        return BOOL
 
     def _is_reference(self, node: ast.expr) -> bool:
         """

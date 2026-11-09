@@ -11,7 +11,7 @@ import math
 
 from pynecore.core.pine_cast import cast_bool
 from pynecore.core.pine_compare import EPSILON
-from pynecore.types.na import NA
+from pynecore.types.na import NA, set_bool_na
 
 
 def __test_float_within_the_tolerance_is_false__():
@@ -38,6 +38,20 @@ def __test_na_is_false__():
     assert cast_bool(float('nan')) is False
     assert cast_bool(NA(float)) is False
     assert cast_bool(NA(bool)) is False
+
+
+def __test_na_stays_na_for_the_three_state_bool__():
+    """ Under the v4/v5 three-state bool a na casts to the bool na (TV v5: ``na(bool(z))``) """
+    set_bool_na(True)
+    try:
+        assert cast_bool(float('nan')) is NA(bool)
+        assert cast_bool(NA(float)) is NA(bool)
+        assert cast_bool(NA(bool)) is NA(bool)
+        assert cast_bool(1e-11) is False
+        assert cast_bool(1.0) is True
+    finally:
+        set_bool_na(False)
+    assert cast_bool(float('nan')) is False
 
 
 def __test_non_floats_keep_exact_semantics__():

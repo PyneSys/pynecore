@@ -2205,6 +2205,62 @@ def main():
     assert [diag.line for diag in table.diags] == [6, 8]
 
 
+def __test_the_entry_form_of_the_compiled_loop_is_typed__():
+    """``pine_loop(from, entry=True)`` takes ``by`` through ``enter``: the counter
+    is typed from the bounds it was built, stepped and entered with, ``entering``
+    is the entry test and ``enter`` returns nothing"""
+    tree, table = _infer('''
+from pynecore import pine_loop
+
+
+def main(length: int):
+    __loop_1__ = pine_loop(1, entry=True)
+    while __loop_1__.step(length):
+        if __loop_1__.entering:
+            __loop_1__.enter(2)
+            continue
+        i = __loop_1__.value
+    __loop_2__ = pine_loop(0, entry=True)
+    while __loop_2__.step(3):
+        if __loop_2__.entering:
+            __loop_2__.enter(0.5)
+            continue
+        j = __loop_2__.value
+    __loop_3__ = pine_loop(0, entry=True)
+    while __loop_3__.step(length):
+        if __loop_3__.entering:
+            __loop_3__.enter()
+            continue
+        k = __loop_3__.value
+    return i + j + k
+''')
+    assert not table.diags
+    types = {name: binding.ty for name, binding in table.bindings['main'].items()}
+    assert types['i'] == INT and types['j'] == FLOAT and types['k'] == INT
+    entering = [node for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+                and node.attr == 'entering']
+    assert len(entering) == 3 and all(get_ty(node) == BOOL for node in entering)
+
+
+def __test_a_loop_enter_with_too_many_arguments_is_reported__():
+    """``enter`` takes at most the one ``by`` value"""
+    _, table = _infer('''
+from pynecore import pine_loop
+
+
+def main():
+    __loop_1__ = pine_loop(0, entry=True)
+    while __loop_1__.step(3):
+        if __loop_1__.entering:
+            __loop_1__.enter(1, 2)
+            continue
+        i = __loop_1__.value
+    return i
+''')
+    assert 'bad-call' in _reasons(table)
+    assert any("'enter' takes 0 or 1 argument(s)" in diag.message for diag in table.diags)
+
+
 def __test_a_compiled_library_export_proxy_is_a_callable_reference__(tmp_path, monkeypatch):
     """``name: _Protocol = Exported()`` is what a compiled library binds each export to
     at module level; it is nothing to report, and an importer reads the export's own

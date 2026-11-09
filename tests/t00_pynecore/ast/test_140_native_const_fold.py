@@ -425,6 +425,115 @@ def __test_native_const_fold_step_matches_python__(name):
     assert native.describe(native_tree) == native.describe(python_tree)
 
 
+#: Pine ``bool()`` casts: constant arguments fold to the exact truth value, a series one
+#: and a rebound or shadowed cast name stay calls
+__test_helper_BOOL_CASTS = '''
+from pynecore import lib
+from pynecore.lib import close
+from pynecore.core.pine_cast import cast_bool, cast_bool as to_bool
+C = 1e-10
+A = cast_bool(1e-10)
+B = cast_bool(C) and cast_bool(0.1 + 0.2 - 0.3)
+D = to_bool(-1e-10) or cast_bool(0.0) or cast_bool(-0.0)
+E = cast_bool(lib.math.abs(1e-10)) + cast_bool(close) + cast_bool(close * 0 + C)
+F = cast_bool(x=1e-10)
+G = (lambda cast_bool: cast_bool(1e-10))(bool)
+
+
+def f(x):
+    return cast_bool(C) or cast_bool(x) or [cast_bool(2.0) for cast_bool in (bool,)]
+
+
+def g(cast_bool):
+    return cast_bool(1e-10)
+
+
+class K:
+    flag = cast_bool(3)
+
+
+class L:
+    cast_bool = lambda x: False
+    flag = cast_bool(1.0)
+
+    def m(self):
+        return cast_bool(1.0)
+
+    class M:
+        flag = cast_bool(2.0)
+
+    anonymous = staticmethod(lambda: cast_bool(1e-10))
+    shadowed = staticmethod(lambda cast_bool: cast_bool(1e-10))
+    listed = [cast_bool(1e-10) for _ in (1,)]
+    outer = [x for x in (cast_bool(1e-10),)]
+    nested = [y for x in (1,) for y in (cast_bool(1e-10),) if cast_bool(x)]
+    mapped = {cast_bool(1e-10): cast_bool(2.0) for _ in (1,)}
+'''
+
+
+def __test_native_const_fold_bool_cast_matches_python__():
+    """A constant ``bool()`` cast folds natively exactly as in Python"""
+    __test_helper_require_native()
+    python_tree, native_tree = __test_helper_step(__test_helper_BOOL_CASTS)
+    assert native_tree is not None, 'the native step declined the module'
+    assert native.describe(native_tree) == native.describe(python_tree)
+
+
+def __test_native_const_fold_class_scope_constants_match_python__():
+    """A lambda or comprehension in a class body folds natively with the module
+    constants, as in Python; the outermost iterable keeps the class binding"""
+    __test_helper_require_native()
+    source = ('from pynecore.core.pine_cast import cast_bool\n'
+              'X = 1\nE = 1e-10\nR = 1\nR = 2\n'
+              'class K:\n'
+              '    X = 0\n    E = 0\n    R = 0\n'
+              '    anonymous = staticmethod(lambda: X)\n'
+              '    rebound = staticmethod(lambda: R)\n'
+              '    listed = [X for _ in (0,)]\n'
+              '    outer = [x for x in (X,)]\n'
+              '    nested = [y for x in (X,) for y in (X,) if X]\n'
+              '    mapped = {X: E for _ in (0,)}\n'
+              '    cast = staticmethod(lambda: cast_bool(E))\n'
+              '    class M:\n'
+              '        inner = staticmethod(lambda: X)\n'
+              '    def m(self):\n'
+              '        return lambda: X\n'
+              'def f():\n'
+              '    X = 5\n'
+              '    class N:\n'
+              '        X = 0\n'
+              '        anonymous = staticmethod(lambda: X)\n'
+              '    return N\n')
+    python_tree, native_tree = __test_helper_step(source)
+    assert native_tree is not None, 'the native step declined the module'
+    assert native.describe(native_tree) == native.describe(python_tree)
+
+
+def __test_native_const_fold_deferred_bodies_match_python__():
+    """A lambda or generator body folds natively only the names its scope never
+    rebinds, as in Python; a list comprehension folds the current value"""
+    __test_helper_require_native()
+    source = ('X = 1.5\nS = 2.0\n'
+              'f = lambda: X\n'
+              'g = (X for _ in range(int(X)) if X)\n'
+              'h = [X for _ in (0,)]\n'
+              'n = [lambda: X for _ in (0,)]\n'
+              'p = (lambda: [S for _ in (0,)])\n'
+              'k = lambda: S\n'
+              'X = 2.5\n'
+              'def m(a):\n'
+              '    Y = 1.5\n'
+              '    T = 3.0\n'
+              '    a = 1.0\n'
+              '    f = lambda: Y + a\n'
+              '    k = lambda: T + S\n'
+              '    Y = 2.5\n'
+              '    return f, k\n')
+    python_tree, native_tree = __test_helper_step(source)
+    assert native_tree is not None, 'the native step declined the module'
+    assert native.describe(native_tree) == native.describe(python_tree)
+
+
 def __test_native_const_fold_carries_a_big_int__():
     """An int beyond 64 bits folds natively as the double it rounds to, bound, read,
     negated and computed with"""

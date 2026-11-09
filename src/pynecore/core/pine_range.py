@@ -103,11 +103,30 @@ class PineLoop:
         while loop__1.step(array.size(levels) - 1):
             i = loop__1.value
             ...
+
+    MEASURED on TradingView (CAPITALCOM:EURUSD@60): the exact order is ``from``,
+    ``to``, ``by``, then ``to`` before every iteration -- ``for i = a() to b() by
+    c()`` runs ``a, b, c, b, body, b, body, b`` -- and every read of ``to`` is one
+    call site (a ``var`` counter in the bound function advances on each). The
+    plain form above reads ``by`` first and has no separate entry read of ``to``,
+    which only shows when the header calls something with an effect or state. For
+    such a header the compiler passes ``entry=True``: the first :meth:`step` is
+    the entry read that fixes the direction, the body hands over ``by`` once
+    through :meth:`enter` and goes back to the condition for the first check::
+
+        loop__1 = pine_loop(a(), entry=True)
+        while loop__1.step(b()):
+            if loop__1.entering:
+                loop__1.enter(c())
+                continue
+            i = loop__1.value
+            ...
     """
 
-    __slots__ = ('value', '_by', '_step', '_ascending', '_started')
+    __slots__ = ('value', 'entering', '_by', '_step', '_ascending', '_entry', '_phase')
 
-    def __init__(self, from_num: PyneInt | PyneFloat, step_num: PyneInt | PyneFloat | None = None):
+    def __init__(self, from_num: PyneInt | PyneFloat, step_num: PyneInt | PyneFloat | None = None,
+                 *, entry: bool = False):
         # The counter is a Pine number: a float from the first value on (an NA
         # object passes through the addition unchanged)
         self.value = from_num + 0.0
@@ -116,39 +135,78 @@ class PineLoop:
         self._by = step_num
         self._step: PyneInt | PyneFloat = 1
         self._ascending = True
-        self._started = False
+        self._entry = entry
+        # True between the entry read and :meth:`enter`
+        self.entering = False
+        # 0: not entered, 1: entered, ``by`` pending, 2: next step() is the first
+        # bound check, 3: running
+        self._phase = 0
+
+    def _signed_step(self, by: PyneInt | PyneFloat | None) -> PyneInt | PyneFloat:
+        """
+        The step the ``by`` value gives in the direction fixed on entry.
+
+        :param by: The loop's ``by`` value, or None when the loop has none
+        :return: The signed step
+        :raises ValueError: If the step is zero
+        """
+        if by is None:
+            return 1 if self._ascending else -1
+        if by == 0:
+            raise ValueError("Step cannot be zero in pine_loop")
+        return -by if (by < 0) == self._ascending else by
 
     def step(self, to_num: PyneInt | PyneFloat) -> bool:
         """
         Advance the counter and report whether the body must run again.
 
+        In ``entry`` mode the first call is the entry read of ``to``: it fixes the
+        direction and returns True, and the body then calls :meth:`enter`.
+
         :param to_num: The loop's ``to`` bound, freshly evaluated by the caller
         :return: True while the counter is still within the bound
         :raises ValueError: If the step is zero
         """
-        if self._started:
+        phase = self._phase
+        if phase == 3:
             self.value += self._step
-        else:
-            self._started = True
+        elif phase == 0:
             # Direction is fixed when the loop is entered: it is what gives the
             # default step its sign, and Pine never flips it mid-loop.
             self._ascending = self.value <= to_num
-            if self._by is None:
-                self._step = 1 if self._ascending else -1
-            elif self._by == 0:
-                raise ValueError("Step cannot be zero in pine_loop")
-            else:
-                self._step = -self._by if (self._by < 0) == self._ascending else self._by
+            if self._entry:
+                self._phase = 1
+                self.entering = True
+                return True
+            self._step = self._signed_step(self._by)
+            self._phase = 3
+        else:
+            self._phase = 3
         return self.value <= to_num if self._ascending else self.value >= to_num
+
+    def enter(self, step_num: PyneInt | PyneFloat | None = None) -> None:
+        """
+        Take the ``by`` value after the entry read of an ``entry`` mode loop.
+
+        :param step_num: The loop's ``by`` value, or None when the loop has none
+        :raises ValueError: If the step is zero
+        """
+        self._step = self._signed_step(step_num)
+        self.entering = False
+        self._phase = 2
 
 
 def pine_loop(from_num: PyneInt | PyneFloat,
-              step_num: PyneInt | PyneFloat | None = None) -> PineLoop:
+              step_num: PyneInt | PyneFloat | None = None,
+              *, entry: bool = False) -> PineLoop:
     """
     Start a Pine ``for`` loop with a bound that has to be re-read each iteration.
 
     :param from_num: Start value (inclusive), evaluated once
-    :param step_num: Step value (optional), evaluated once
+    :param step_num: Step value (optional), evaluated once; an ``entry`` mode loop
+                     takes it through :meth:`PineLoop.enter` instead
+    :param entry: Read ``to`` once on entry before ``by`` and the first check, as
+                  TradingView does (see :class:`PineLoop`)
     :return: The loop counter the ``while`` condition drives
     """
-    return PineLoop(from_num, step_num)
+    return PineLoop(from_num, step_num, entry=entry)
