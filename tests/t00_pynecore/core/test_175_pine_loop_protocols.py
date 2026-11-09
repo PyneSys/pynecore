@@ -42,12 +42,27 @@ def __test_pine_loop_keeps_its_protocol__():
     assert __test_helper_run_old(0, [3, 3, 3, 3, 3]) == [0.0, 1.0, 2.0, 3.0]
     assert __test_helper_run_old(0, [5, 5, 5, 5], by=2) == [0.0, 2.0, 4.0]
     assert __test_helper_run_old(3, [0, 0, 0, 0, 0]) == [3.0, 2.0, 1.0, 0.0]
-    # A negative ``by`` on an ascending loop takes the loop's direction
-    assert __test_helper_run_old(0, [4, 4, 4, 4], by=-2) == [0.0, 2.0, 4.0]
     # A bound that shrinks while the loop runs ends it early
     assert __test_helper_run_old(0, [5, 1, 1]) == [0.0, 1.0]
+    # MEASURED (CAPITALCOM:EURUSD 60, v4-v6): a ``by`` of zero or below is a run
+    # time error, a descending loop's too
     with pytest.raises(ValueError):
         __test_helper_run_old(0, [3], by=0)
+    with pytest.raises(ValueError):
+        __test_helper_run_old(0, [4], by=-2)
+    with pytest.raises(ValueError):
+        __test_helper_run_old(4, [0], by=-2)
+
+
+def __test_the_bound_is_checked_with_the_pine_tolerance__():
+    """MEASURED: ``for i = 1.0 to 0.1 by 0.3`` runs four times, the counter
+    accumulated to 0.09999999999999998; a difference of exactly ``EPSILON`` is in,
+    0.1 ulp above it is out"""
+    assert __test_helper_run_old(1.0, [0.1] * 6, by=0.3) == [
+        1.0, 0.7, 0.39999999999999997, 0.09999999999999998]
+    assert __test_helper_run_old(1.0, [0.0 + 1e-10] * 4, by=1.0) == [1.0, 0.0]
+    assert __test_helper_run_old(0.0, [1.0 - 1e-10] * 4, by=1.0) == [0.0]
+    assert __test_helper_run_old(0.0, [1.0 - 9e-11] * 4, by=1.0) == [0.0, 1.0]
 
 
 def __test_entry_form_follows_the_measured_order__():

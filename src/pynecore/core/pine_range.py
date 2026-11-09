@@ -1,6 +1,13 @@
 from typing import Iterable
 
+from pynecore.core.pine_compare import EPSILON
 from pynecore.types.pine_types import PyneFloat, PyneInt
+
+#: MEASURED on TradingView (CAPITALCOM:EURUSD@60, v4-v6): a ``by`` of zero or
+#: below stops the script at run time, also on a descending loop -- ``by`` is
+#: the step's size, the direction comes from ``from`` and ``to``. A na ``by``
+#: is no error: the counter turns na after the first iteration and the loop ends.
+_STEP_ERROR = "The step of a for loop must be greater than zero"
 
 
 def pine_range(from_num: PyneInt | PyneFloat, to_num: PyneInt | PyneFloat,
@@ -10,14 +17,20 @@ def pine_range(from_num: PyneInt | PyneFloat, to_num: PyneInt | PyneFloat,
 
     The counter is a Pine number, so every value it takes is a float: a Pine int
     is a double at runtime, and a ``for`` loop does not truncate its bounds
-    (MEASURED: a fractional ``from`` or ``by`` makes the counter fractional).
+    (MEASURED: a fractional ``from`` makes the counter fractional). The counter
+    is accumulated step by step and checked against ``to`` with Pine's tolerant
+    comparison (MEASURED: ``for i = 1.0 to 0.1 by 0.3`` runs four times, the last
+    one at 0.09999999999999998; a difference of exactly ``EPSILON`` is still in).
 
     :param from_num: Start value (inclusive)
     :param to_num: End value (inclusive)
-    :param step_num: Step value (optional, defaults to +1/-1 based on direction)
+    :param step_num: Step size (optional, defaults to 1); the direction comes from
+                     ``from_num`` and ``to_num``
     :return: The counter values from from_num to to_num (inclusive)
-    :raises ValueError: If step_num is zero
+    :raises ValueError: If step_num is zero or negative
     """
+    if step_num is not None and step_num <= 0:
+        raise ValueError(_STEP_ERROR)
     # Fast path: integral bounds map exactly onto a native range, which iterates at C
     # speed instead of resuming a Python generator on every step; ``map(float, ...)``
     # hands the values over as floats without a Python-level frame per step. The vast
@@ -27,17 +40,12 @@ def pine_range(from_num: PyneInt | PyneFloat, to_num: PyneInt | PyneFloat,
     if from_num % 1 == 0 and to_num % 1 == 0 and (step_num is None or step_num % 1 == 0):
         start = int(from_num)
         stop = int(to_num)
+        step = 1 if step_num is None else int(step_num)
         if start <= stop:
-            step = 1 if step_num is None else abs(int(step_num))
-            if step == 0:
-                raise ValueError("Step cannot be zero in pine_range")
             # +1 makes the upper bound inclusive, matching Pine's `to`
             return map(float, range(start, stop + 1, step))
-        step = -1 if step_num is None else -abs(int(step_num))
-        if step == 0:
-            raise ValueError("Step cannot be zero in pine_range")
         # -1 makes the lower bound inclusive for the descending direction
-        return map(float, range(start, stop - 1, step))
+        return map(float, range(start, stop - 1, -step))
 
     return _pine_range_float(from_num, to_num, step_num)
 
@@ -48,37 +56,28 @@ def _pine_range_float(from_num: PyneFloat, to_num: PyneFloat, step_num: PyneFloa
 
     :param from_num: Start value (inclusive)
     :param to_num: End value (inclusive)
-    :param step_num: Step value (optional, defaults to +1/-1 based on direction)
+    :param step_num: Step size (optional, defaults to 1), already checked positive
     :return: A generator that yields values from from_num to to_num (inclusive)
-    :raises ValueError: If step_num is zero
     """
     # Determine direction based on from_num and to_num
     direction = 1 if from_num <= to_num else -1
 
-    # Use default step if none provided
-    step_val = step_num if step_num is not None else direction
-
-    # Prevent infinite loops
-    if step_val == 0:
-        raise ValueError("Step cannot be zero in pine_range")
-
-    # Ensure step direction matches the from->to direction
-    if (direction > 0 > step_val) or (direction < 0 < step_val):
-        step_val = -step_val
+    # The step's size, signed by the direction
+    step_val = direction if step_num is None else step_num * direction
 
     # Generate values: the counter is a Pine number, a float from the first value on
     current = from_num + 0.0
     if direction > 0:
-        # Ascending loop
-        while current <= to_num:
+        # Ascending loop: Pine's tolerant ``<=``
+        while current - to_num <= EPSILON:
             yield current
             current += step_val
             # Safety check to prevent infinite loops due to floating point precision
             if step_val > 0 and current > to_num + abs(step_val):
                 break
     else:
-        # Descending loop
-        while current >= to_num:
+        # Descending loop: Pine's tolerant ``>=``
+        while to_num - current <= EPSILON:
             yield current
             current += step_val
             # Safety check to prevent infinite loops due to floating point precision
@@ -148,13 +147,13 @@ class PineLoop:
 
         :param by: The loop's ``by`` value, or None when the loop has none
         :return: The signed step
-        :raises ValueError: If the step is zero
+        :raises ValueError: If the step is zero or negative
         """
         if by is None:
             return 1 if self._ascending else -1
-        if by == 0:
-            raise ValueError("Step cannot be zero in pine_loop")
-        return -by if (by < 0) == self._ascending else by
+        if by <= 0:
+            raise ValueError(_STEP_ERROR)
+        return by if self._ascending else -by
 
     def step(self, to_num: PyneInt | PyneFloat) -> bool:
         """
@@ -165,7 +164,7 @@ class PineLoop:
 
         :param to_num: The loop's ``to`` bound, freshly evaluated by the caller
         :return: True while the counter is still within the bound
-        :raises ValueError: If the step is zero
+        :raises ValueError: If the step is zero or negative
         """
         phase = self._phase
         if phase == 3:
@@ -182,14 +181,17 @@ class PineLoop:
             self._phase = 3
         else:
             self._phase = 3
-        return self.value <= to_num if self._ascending else self.value >= to_num
+        # Pine's tolerant ``<=`` / ``>=``
+        if self._ascending:
+            return self.value - to_num <= EPSILON
+        return to_num - self.value <= EPSILON
 
     def enter(self, step_num: PyneInt | PyneFloat | None = None) -> None:
         """
         Take the ``by`` value after the entry read of an ``entry`` mode loop.
 
         :param step_num: The loop's ``by`` value, or None when the loop has none
-        :raises ValueError: If the step is zero
+        :raises ValueError: If the step is zero or negative
         """
         self._step = self._signed_step(step_num)
         self.entering = False

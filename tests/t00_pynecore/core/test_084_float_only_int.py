@@ -77,3 +77,18 @@ def __test_the_loop_counter_is_a_float__():
     assert list(pine_range(3.0, 1.0)) == [3.0, 2.0, 1.0]
     assert list(pine_range(0, 1, 0.5)) == [0.0, 0.5, 1.0]
     assert list(pine_range(float('nan'), 3)) == []
+    # MEASURED (CAPITALCOM:EURUSD 60, v4-v6): the counter is accumulated and the
+    # end compared with Pine's tolerance; ``by`` is the step's size only
+    assert list(pine_range(1.0, 0.1, 0.3)) == [1.0, 0.7, 0.39999999999999997, 0.09999999999999998]
+    assert list(pine_range(0.1, 1.0, 0.3)) == [0.1, 0.4, 0.7, 1.0]
+    assert list(pine_range(2.0, 0, 0.5)) == [2.0, 1.5, 1.0, 0.5, 0.0]
+    assert list(pine_range(0, 1 - 9e-11, 1)) == [0.0, 1.0]
+    assert list(pine_range(0, 1 - 1e-10, 1)) == [0.0]
+    assert list(pine_range(1, 0 + 1e-10, 1)) == [1.0, 0.0]
+    for bad in (0, -1, -0.5):
+        try:
+            pine_range(4, 0, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'by {bad} must be rejected')

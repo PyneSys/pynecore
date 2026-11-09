@@ -18,9 +18,9 @@ def pine_range(from_num: _TNum, to_num: _TNum, step_num: _TNum | None = None) ->
 
     :param from_num: Start value (inclusive)
     :param to_num: End value (inclusive)
-    :param step_num: Step value (optional, defaults to +1/-1 based on direction)
+    :param step_num: Step size (optional, defaults to 1); the direction comes from the bounds
     :return: The counter values from from_num to to_num (inclusive)
-    :raises ValueError: If step_num is zero
+    :raises ValueError: If step_num is zero or negative
     """
 
 
@@ -45,7 +45,7 @@ class PineLoop(Generic[_TNum]):
 
         :param to_num: The loop's ``to`` bound, freshly evaluated by the caller
         :return: True while the counter is still within the bound
-        :raises ValueError: If the step is zero
+        :raises ValueError: If the step is zero or negative
         """
 
     def enter(self, step_num: int | float | None = None) -> None:
@@ -53,7 +53,7 @@ class PineLoop(Generic[_TNum]):
         Take the ``by`` value after the entry read of an ``entry`` mode loop.
 
         :param step_num: The loop's ``by`` value, or None when the loop has none
-        :raises ValueError: If the step is zero
+        :raises ValueError: If the step is zero or negative
         """
 
 
