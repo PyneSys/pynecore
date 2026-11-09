@@ -684,10 +684,15 @@ def __test_every_unknown_operand_is_a_root__():
 
 
 def __test_every_compiler_dunder_is_let_through__():
-    """The names the compiler emits for blocks, switches and loops are Pine's"""
+    """The names the compiler emits for blocks, switches, loops, ``var`` block
+    initializers and call-history aliases are Pine's"""
     assert not _gate(HEAD + '__switch_1__ = 1\n__loop_2__ = 1\n__block_keep_3__ = 1\n'
-                            '__switch__ = 1\n__block_result__ = 1\n')
+                            '__switch__ = 1\n__block_result__ = 1\n__loop_2___ = 1\n'
+                            '__var_init_4__ = 1\n__hist_atr__ = 1\n__hist_hl2_x__ = 1\n'
+                            '__hist_atr___ = 1\n')
     assert _reasons(_gate(HEAD + '__switch_x__ = 1\n')) == ['edge-name']
+    assert _reasons(_gate(HEAD + '__var_init_x__ = 1\n')) == ['edge-name']
+    assert _reasons(_gate(HEAD + '__hist__ = 1\n')) == ['edge-name']
 
 
 def __test_a_rejected_expression_covers_its_parts__(tmp_path, monkeypatch):

@@ -49,10 +49,14 @@ EXTRAS: dict[str, Any] = {
     'func_decorators': [['pynecore.core.overload', 'overload']],
     # Double-underscore names are the pipeline's: a script may spell only the
     # ones the compiler emits (the ``__main__`` guard, block results, switch
-    # subjects, input parameters) and a signature shim's ``__call__``
+    # subjects, loop counters, input parameters, the run-once flag of a ``var``
+    # block initializer, the call-history alias of an outer series, which takes
+    # trailing underscores where the script already has the name) and a
+    # signature shim's ``__call__``
     'dunder_names': ['__all__', '__name__', '__file__', '__call__'],
     'dunder_patterns': ['^__block_result(_\\d+)?__$', '^__block_keep_\\d+__$',
-                        '^__switch(_\\d+)?__$', '^__loop_\\d+__$', '^__input_\\d+__$'],
+                        '^__switch(_\\d+)?__$', '^__loop_\\d+__+$', '^__input_\\d+__$',
+                        '^__var_init_\\d+__$', '^__hist_\\w+__$'],
 }
 
 

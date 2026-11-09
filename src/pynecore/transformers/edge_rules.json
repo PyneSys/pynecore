@@ -56,8 +56,10 @@
       "^__block_result(_\\d+)?__$",
       "^__block_keep_\\d+__$",
       "^__switch(_\\d+)?__$",
-      "^__loop_\\d+__$",
-      "^__input_\\d+__$"
+      "^__loop_\\d+__+$",
+      "^__input_\\d+__$",
+      "^__var_init_\\d+__$",
+      "^__hist_\\w+__$"
     ],
     "func_decorators": [
       [
