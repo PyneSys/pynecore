@@ -1,4 +1,4 @@
-"""Cross-platform file primitives used by atomic OHLCV publication."""
+"""Cross-platform file primitives: atomic file publication and file locks."""
 
 import os
 import sys
@@ -37,6 +37,7 @@ if sys.platform == "win32":
     _FILE_RENAME_REPLACE_IF_EXISTS = 0x00000001
     _FILE_RENAME_POSIX_SEMANTICS = 0x00000002
     _LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
+    _LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
     _ERROR_NOT_SUPPORTED = 50
     _ERROR_INVALID_PARAMETER = 87
 
@@ -294,3 +295,146 @@ def exclusive_file_lock(path: str | Path) -> Iterator[None]:
                 yield
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+class ProcessLifetimeLock:
+    """Exclusive file lock that lasts until it is released or its holder process ends.
+
+    The operating system drops the lock however its holder ends: a clean exit,
+    a crash, ``SIGKILL``, a power loss with the reboot after it. A lock that
+    cannot be taken therefore proves a live holder, and a lock that can be taken
+    proves that its previous holder released it or ended. :meth:`try_acquire`
+    never waits.
+
+    The holder can leave a short tag next to the lock (:meth:`write_tag`): the
+    next process that takes the lock reads in it (:meth:`read_tag`) who held the
+    lock before and is gone now.
+
+    The lock lives in the open file of this object, so keep a reference to the
+    object for as long as the lock must stay held.
+
+    :param path: Lock-file path; the parent directory is created on demand. The
+        file is never deleted: removing it while another process holds it would
+        let a third process lock a fresh file next to the held one.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self._path = Path(path)
+        self._tag_path = self._path.with_name(self._path.name + ".tag")
+        self._file: BinaryIO | None = None
+
+    @property
+    def held(self) -> bool:
+        """Whether this object holds the lock."""
+        return self._file is not None
+
+    def try_acquire(self) -> bool:
+        """Take the lock if no live process holds it.
+
+        A lock file that cannot be created or locked (an unwritable directory, a
+        file system without lock support) reports ``False`` as well: the holder
+        cannot be proved gone.
+
+        :return: Whether this object holds the lock now.
+        """
+        if self._file is not None:
+            return True
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            lock_file = open_shared_binary(self._path, "a+b")
+        except OSError:
+            return False
+        try:
+            if os.fstat(lock_file.fileno()).st_size == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            locked = _try_lock_exclusive(lock_file)
+        except OSError:
+            locked = False
+        except BaseException:
+            lock_file.close()
+            raise
+        if not locked:
+            lock_file.close()
+            return False
+        self._file = lock_file
+        return True
+
+    def read_tag(self) -> str | None:
+        """Read the tag the last holder of the lock wrote.
+
+        :return: The tag, or ``None`` when no holder wrote a readable one.
+        :raises RuntimeError: If this object does not hold the lock.
+        """
+        if self._file is None:
+            raise RuntimeError(f"lock is not held: {self._path}")
+        try:
+            with open_shared_binary(self._tag_path, "rb") as tag_file:
+                return tag_file.read().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    def write_tag(self, tag: str) -> None:
+        """Record ``tag`` for the next holder of the lock.
+
+        The tag file is replaced atomically and synced to disk, so a power loss
+        leaves either the old tag or the new one behind, never a torn mix.
+
+        :param tag: Text to record.
+        :raises RuntimeError: If this object does not hold the lock.
+        """
+        if self._file is None:
+            raise RuntimeError(f"lock is not held: {self._path}")
+        # Only the holder writes, so a fixed scratch name cannot collide.
+        scratch = self._tag_path.with_name(self._tag_path.name + ".tmp")
+        with open_shared_binary(scratch, "w+b") as tag_file:
+            tag_file.write(tag.encode("utf-8"))
+            os.fsync(tag_file.fileno())
+        replace_file(scratch, self._tag_path)
+
+    def release(self) -> None:
+        """Give the lock up. Repeated calls are no-ops."""
+        lock_file, self._file = self._file, None
+        if lock_file is None:
+            return
+        try:
+            _unlock(lock_file)
+        finally:
+            lock_file.close()
+
+
+def _try_lock_exclusive(lock_file: BinaryIO) -> bool:
+    """Lock the first byte of ``lock_file`` exclusively without waiting."""
+    if sys.platform == "win32":
+        overlapped = _Overlapped()
+        handle = msvcrt.get_osfhandle(lock_file.fileno())
+        return bool(_kernel32.LockFileEx(
+            handle,
+            _LOCKFILE_EXCLUSIVE_LOCK | _LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            ctypes.byref(overlapped),
+        ))
+
+    import fcntl
+
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def _unlock(lock_file: BinaryIO) -> None:
+    """Release a lock taken by :func:`_try_lock_exclusive`."""
+    if sys.platform == "win32":
+        overlapped = _Overlapped()
+        handle = msvcrt.get_osfhandle(lock_file.fileno())
+        if not _kernel32.UnlockFileEx(handle, 0, 1, 0, ctypes.byref(overlapped)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return
+
+    import fcntl
+
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)

@@ -29,7 +29,9 @@ Two crash-recovery mechanisms run side by side:
    always sees the right answer even if physical cleanup has not run
    yet.
 2. **Active** — every ``open_run()`` closes expired rows by setting
-   ``ended_ts_ms`` and writing a ``stale_run_cleaned`` event.
+   ``ended_ts_ms`` and writing a ``stale_run_cleaned`` event. A row whose
+   process is proven gone by the run's owner lock is closed the same way at
+   once, without waiting for its heartbeat to expire.
 
 Transactionality: every compound operation (e.g. ``close_order`` =
 update orders + delete order_refs + insert events) runs in a single
@@ -37,6 +39,7 @@ update orders + delete order_refs + insert events) runs in a single
 half-lost log.
 """
 import contextlib
+import hashlib
 import json
 import logging
 import sqlite3
@@ -47,6 +50,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
+from pynecore.core._file_io import ProcessLifetimeLock
 from pynecore.core.broker.models import QuarantineKind
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.store_helpers import STATE_REJECTED
@@ -91,6 +95,26 @@ PURGE_INTERVAL_MS: Final[int] = 24 * 60 * 60 * 1000  # 1 day
 def _now_ms() -> int:
     """Current time in ms, UTC. Centralised so the time import lives in one place."""
     return int(time.time() * 1000)
+
+
+def _gone_owner_instance(owner_lock: ProcessLifetimeLock) -> int | None:
+    """Return the ``run_instance_id`` a taken owner lock's tag names.
+
+    The lock is free, so the instance that wrote the tag no longer holds it:
+    its process ended, or it closed its run.
+
+    :return: The named ``run_instance_id``, or ``None`` when the lock is not
+        held or carries no valid tag.
+    """
+    if not owner_lock.held:
+        return None
+    tag = owner_lock.read_tag()
+    if tag is None:
+        return None
+    try:
+        return int(tag)
+    except ValueError:
+        return None
 
 
 # === Replay-result dataclasses =============================================
@@ -699,6 +723,10 @@ class BrokerStore:
         # Gate for :meth:`maybe_cleanup_old_data` — 0 means the first
         # caller (``open_run``) purges immediately.
         self._last_purge_ms = 0
+        # Owner locks of the runs this store opened and has not closed yet.
+        # Holding the reference keeps the lock alive; :meth:`close` releases
+        # every lock left, since no run of a closed store can be driven.
+        self._owner_locks: set[ProcessLifetimeLock] = set()
         # ``isolation_level=""`` = default; we open explicit transactions
         # via :meth:`transaction` (which wraps ``with conn:``). The
         # sqlite3 module's autocommit mode is not what it looks like at
@@ -879,13 +907,23 @@ class BrokerStore:
         return self._plugin_name
 
     def close(self) -> None:
-        """Close the connection. Repeated calls are no-ops."""
+        """Release the owner locks of the runs left open and close the connection.
+
+        Repeated calls are no-ops.
+        """
         if self._conn is None:
             return
+        with self._lock:
+            owner_locks, self._owner_locks = self._owner_locks, set()
         try:
-            self._conn.close()
+            with contextlib.ExitStack() as releases:
+                for owner_lock in owner_locks:
+                    releases.callback(owner_lock.release)
         finally:
-            self._conn = None  # type: ignore[assignment]
+            try:
+                self._conn.close()
+            finally:
+                self._conn = None  # type: ignore[assignment]
 
     def __enter__(self) -> 'BrokerStore':
         return self
@@ -904,15 +942,26 @@ class BrokerStore:
     ) -> 'RunContext':
         """Open a new run instance.
 
-        Four steps in a single transaction:
+        A previous instance of the same ``run_id`` that died without closing
+        its row (a crash, ``SIGKILL``, a power loss) blocks the run until its
+        heartbeat expires, unless its process is proven gone. The proof is
+        the run's owner lock: every instance holds a
+        :class:`ProcessLifetimeLock` for its ``run_id`` while it lives (in a
+        ``.run-locks`` directory next to the DB file) and records its
+        ``run_instance_id`` in the lock's tag. A lock that can be taken while
+        its tag names a live row proves the owner of that row gone.
+
+        Five steps in a single transaction:
 
         1. Stale-run cleanup: every row marked alive whose
            ``last_heartbeat_ts_ms`` has expired is closed by setting
            ``ended_ts_ms`` and gets a ``stale_run_cleaned`` event.
-        2. Live-collision check: if a live row with the same ``run_id``
+        2. Gone-owner cleanup: the live row the taken owner lock's tag names
+           is closed the same way, at once.
+        3. Live-collision check: if a live row with the same ``run_id``
            still exists after cleanup, raise ``RuntimeError``.
-        3. INSERT a new ``runs`` row.
-        4. Order adoption: every live order
+        4. INSERT a new ``runs`` row.
+        5. Order adoption: every live order
            (``closed_ts_ms IS NULL``) and its ``order_refs`` rows
            that still belong to a previous (now ended) instance of the
            same logical ``run_id`` get re-pointed to the fresh
@@ -922,6 +971,10 @@ class BrokerStore:
            would not see pending dispatches left behind by a crashed
            instance, and :meth:`DispatchJournal.recover_pending` would
            return an empty result after a real restart.
+
+        After the commit the new instance records its ``run_instance_id`` in
+        the owner lock's tag. :meth:`RunContext.close` releases the lock, and
+        so does :meth:`close` for every run left open.
 
         :param identity: Logical identity of the run
             (strategy, symbol, ...).
@@ -935,13 +988,58 @@ class BrokerStore:
         """
         run_id = identity.run_id
         run_tag = identity.make_run_tag(script_source)
+        owner_lock = self._acquire_owner_lock(run_id)
+        try:
+            run_instance_id = self._open_run_inside_lock(
+                identity, run_tag=run_tag, script_path=script_path,
+                gone_owner=_gone_owner_instance(owner_lock),
+            )
+        except BaseException:
+            self._release_owner_lock(owner_lock)
+            raise
+        self._record_owner(owner_lock, run_instance_id)
+
+        # Retention purge piggybacks on startup; the other trigger is
+        # the daily gate in :meth:`RunContext.heartbeat`. Outside the
+        # main transaction — a purge failure must not block the run.
+        self.maybe_cleanup_old_data()
+
+        return RunContext(
+            run_id=run_id,
+            run_instance_id=run_instance_id,
+            run_tag=run_tag,
+            _store=self,
+            _owner_lock=owner_lock,
+        )
+
+    def _open_run_inside_lock(
+            self,
+            identity: RunIdentity,
+            *,
+            run_tag: str,
+            script_path: str | Path,
+            gone_owner: int | None,
+    ) -> int:
+        """Run the transaction of :meth:`open_run` and return the new ``run_instance_id``.
+
+        :param gone_owner: The ``run_instance_id`` whose process the owner
+            lock proved gone, or ``None``.
+        """
+        run_id = identity.run_id
         now = _now_ms()
 
         with self.transaction():
             # (1) Stale cleanup — close every expired live row
             self._cleanup_stale_runs_inside_tx(now=now)
 
-            # (2) Collision check AFTER cleanup
+            # (2) Gone-owner cleanup — the owner lock proved the process of
+            #     this row gone, so its heartbeat need not expire first
+            if gone_owner is not None:
+                self._end_run_of_gone_owner_inside_tx(
+                    now=now, run_id=run_id, run_instance_id=gone_owner,
+                )
+
+            # (3) Collision check AFTER cleanup
             row = self._conn.execute(
                 "SELECT run_instance_id, last_heartbeat_ts_ms FROM runs "
                 "WHERE run_id = ? AND ended_ts_ms IS NULL",
@@ -955,7 +1053,7 @@ class BrokerStore:
                     f"Pass `--run-label`, or stop the previous instance."
                 )
 
-            # (3) INSERT a new instance
+            # (4) INSERT a new instance
             cur = self._conn.execute(
                 "INSERT INTO runs ("
                 "  run_id, run_tag, strategy_id, script_path, symbol, timeframe,"
@@ -978,24 +1076,106 @@ class BrokerStore:
                 # happy.
                 raise RuntimeError("sqlite3 lastrowid is None after INSERT")
 
-            # (4) Adopt orphan live orders + refs left behind by previous
+            # (5) Adopt orphan live orders + refs left behind by previous
             #     instances of the same run_id (crash recovery).
             self._adopt_orphan_rows_inside_tx(
                 now=now,
                 new_run_instance_id=run_instance_id,
                 run_id=run_id,
             )
+        return run_instance_id
 
-        # Retention purge piggybacks on startup; the other trigger is
-        # the daily gate in :meth:`RunContext.heartbeat`. Outside the
-        # main transaction — a purge failure must not block the run.
-        self.maybe_cleanup_old_data()
+    def _acquire_owner_lock(self, run_id: str) -> ProcessLifetimeLock:
+        """Try to take the owner lock of ``run_id``; the result may not hold it.
 
-        return RunContext(
-            run_id=run_id,
-            run_instance_id=run_instance_id,
-            run_tag=run_tag,
-            _store=self,
+        A lock another live instance holds, or one the file system cannot
+        provide, leaves the run on the heartbeat semantics alone.
+        """
+        digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:32]
+        owner_lock = ProcessLifetimeLock(
+            self._path.with_name(self._path.name + ".run-locks") / f"{digest}.lock"
+        )
+        if owner_lock.try_acquire():
+            with self._lock:
+                self._owner_locks.add(owner_lock)
+        return owner_lock
+
+    def _release_owner_lock(self, owner_lock: ProcessLifetimeLock) -> None:
+        """Release one owner lock and forget it."""
+        with self._lock:
+            self._owner_locks.discard(owner_lock)
+        owner_lock.release()
+
+    @staticmethod
+    def _record_owner(owner_lock: ProcessLifetimeLock, run_instance_id: int) -> None:
+        """Name the new instance in the owner lock's tag for its successor."""
+        if not owner_lock.held:
+            return
+        try:
+            owner_lock.write_tag(str(run_instance_id))
+        except OSError as error:
+            _log.warning(
+                "broker storage: cannot record the owner of run_instance_id=%d "
+                "(%s); a restart after a crash of this run waits until its "
+                "heartbeat expires", run_instance_id, error,
+            )
+
+    def _end_run_of_gone_owner_inside_tx(
+            self, *, now: int, run_id: str, run_instance_id: int,
+    ) -> None:
+        """Close the live row whose process the owner lock proved gone.
+
+        Caller owns the surrounding :meth:`transaction` block. A row that is
+        already closed, or belongs to another ``run_id``, is left alone.
+        """
+        row = self._conn.execute(
+            "SELECT last_heartbeat_ts_ms FROM runs "
+            "WHERE run_instance_id = ? AND run_id = ? AND ended_ts_ms IS NULL",
+            (run_instance_id, run_id),
+        ).fetchone()
+        if row is None:
+            return
+        last_hb = row['last_heartbeat_ts_ms']
+        self._end_dead_run_inside_tx(
+            now=now, run_instance_id=run_instance_id, run_id=run_id,
+            last_hb=last_hb, reason='owner_process_gone',
+        )
+        # A crash recovery the restart handles by itself: nothing for the
+        # operator to do, so INFO, not WARNING.
+        _log.info(
+            "broker storage: the process of run_instance_id=%d run_id=%r is "
+            "gone (last heartbeat %d); taking its run over",
+            run_instance_id, run_id, last_hb,
+        )
+
+    def _end_dead_run_inside_tx(
+            self, *, now: int, run_instance_id: int, run_id: str, last_hb: int,
+            reason: str,
+    ) -> None:
+        """Close a dead instance's row at its last heartbeat and audit it.
+
+        Caller owns the surrounding :meth:`transaction` block.
+
+        :param reason: ``heartbeat_expired`` or ``owner_process_gone``, stored
+            in the ``stale_run_cleaned`` event's payload.
+        """
+        self._conn.execute(
+            "UPDATE runs SET ended_ts_ms = ? WHERE run_instance_id = ?",
+            (last_hb, run_instance_id),
+        )
+        self._conn.execute(
+            "INSERT INTO events ("
+            "  run_instance_id, ts_ms, plugin_name, kind, payload"
+            ") VALUES (?, ?, ?, ?, ?)",
+            (
+                run_instance_id, now, self._plugin_name, 'stale_run_cleaned',
+                json.dumps({
+                    'run_id': run_id,
+                    'last_heartbeat_ts_ms': last_hb,
+                    'cleaned_at_ts_ms': now,
+                    'reason': reason,
+                }),
+            ),
         )
 
     def _adopt_orphan_rows_inside_tx(
@@ -1208,22 +1388,9 @@ class BrokerStore:
         for row in rows:
             rid = row['run_instance_id']
             last_hb = row['last_heartbeat_ts_ms']
-            self._conn.execute(
-                "UPDATE runs SET ended_ts_ms = ? WHERE run_instance_id = ?",
-                (last_hb, rid),
-            )
-            self._conn.execute(
-                "INSERT INTO events ("
-                "  run_instance_id, ts_ms, plugin_name, kind, payload"
-                ") VALUES (?, ?, ?, ?, ?)",
-                (
-                    rid, now, self._plugin_name, 'stale_run_cleaned',
-                    json.dumps({
-                        'run_id': row['run_id'],
-                        'last_heartbeat_ts_ms': last_hb,
-                        'cleaned_at_ts_ms': now,
-                    }),
-                ),
+            self._end_dead_run_inside_tx(
+                now=now, run_instance_id=rid, run_id=row['run_id'],
+                last_hb=last_hb, reason='heartbeat_expired',
             )
             _log.warning(
                 "broker storage: stale run cleaned run_instance_id=%d run_id=%r "
@@ -1396,14 +1563,18 @@ class RunContext:
     every method already filters on this run.
 
     ``close()`` is the happy-path teardown (``SIGINT`` / ``SIGTERM`` /
-    context manager). The crash path is handled by the stale-cleanup
-    that runs at the start of ``BrokerStore.open_run``.
+    context manager). The crash path is handled at the start of the next
+    ``BrokerStore.open_run``: at once when the run's owner lock proves the
+    process gone, otherwise by the stale-cleanup once the heartbeat expires.
     """
     run_id: str
     run_instance_id: int
     run_tag: str
     _store: BrokerStore
     _last_heartbeat_write_ms: int = 0
+    # Owner lock of the run (see :meth:`BrokerStore.open_run`); it may not
+    # hold the lock when another instance or the file system kept it.
+    _owner_lock: ProcessLifetimeLock | None = field(default=None, repr=False, compare=False)
 
     # --- Composite writes ---------------------------------------------------
 
@@ -2909,12 +3080,14 @@ class RunContext:
         self._store.maybe_cleanup_old_data()
 
     def close(self) -> None:
-        """Happy-path run teardown: populate ``ended_ts_ms``.
+        """Happy-path run teardown: populate ``ended_ts_ms``, release the owner lock.
 
         Repeated calls are no-ops (after the first UPDATE
         ``ended_ts_ms`` is non-NULL and the WHERE clause excludes the
-        row). SIGKILL is handled by stale-cleanup; this method is only
-        the controlled-shutdown path.
+        row). SIGKILL is handled by the next ``open_run``; this method is
+        only the controlled-shutdown path. The owner lock is released only
+        after the row is closed: a failed close keeps it until the store
+        closes or the process ends.
         """
         now = _now_ms()
         with self._store.transaction():
@@ -2923,6 +3096,8 @@ class RunContext:
                 "WHERE run_instance_id = ? AND ended_ts_ms IS NULL",
                 (now, now, self.run_instance_id),
             )
+        if self._owner_lock is not None:
+            self._store._release_owner_lock(self._owner_lock)
 
     def __enter__(self) -> 'RunContext':
         return self

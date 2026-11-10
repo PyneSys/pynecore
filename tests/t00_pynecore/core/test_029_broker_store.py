@@ -8,6 +8,8 @@ integration — only the storage layer in isolation. End-to-end
 """
 import json
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -276,6 +278,122 @@ def __test_stale_run_auto_cleaned_on_open_run__(tmp_path: Path) -> None:
         assert ev is not None
         payload = json.loads(ev['payload'])
         assert payload['run_id'] == ctx_crashed.run_id
+        assert payload['reason'] == 'heartbeat_expired'
+
+
+# The holder opens the run the way a bot does, journals one live order, reports
+# its run_instance_id and then blocks on stdin until the test kills it.
+_RUN_HOLDER_SCRIPT = """
+import sys
+from pynecore.core.broker.run_identity import RunIdentity
+from pynecore.core.broker.storage import BrokerStore
+
+store = BrokerStore(sys.argv[1], plugin_name=sys.argv[2])
+ctx = store.open_run(
+    RunIdentity(
+        strategy_id="ema_cross", symbol="EURUSD", timeframe="60",
+        account_id="capitalcom-demo-1234567", label=None,
+    ),
+    script_source=sys.argv[3],
+)
+ctx.upsert_order(
+    "coid-held", symbol="EURUSD", side="buy", qty=1.0, state="submitted",
+)
+print(ctx.run_instance_id, flush=True)
+sys.stdin.readline()
+"""
+
+
+def __test_open_run_takes_over_run_of_killed_process__(tmp_path: Path) -> None:
+    """A killed owner's run is taken over at once; a live owner's run stays blocked.
+
+    Power-loss scenario: the previous process died seconds ago, so its heartbeat
+    is still fresh, yet its released owner lock proves it gone.
+    """
+    db = tmp_path / "broker.sqlite"
+    with BrokerStore(db, plugin_name=PLUGIN):
+        pass
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _RUN_HOLDER_SCRIPT, str(db), PLUGIN, SCRIPT_SOURCE],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        held_instance = int(holder.stdout.readline())
+
+        with BrokerStore(db, plugin_name=PLUGIN) as store:
+            with pytest.raises(RuntimeError, match="Active run_id already exists"):
+                _open_run(store)
+    finally:
+        holder.kill()
+        holder.wait()
+
+    with BrokerStore(db, plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        assert ctx.run_instance_id != held_instance
+
+        old = store._conn.execute(
+            "SELECT ended_ts_ms, last_heartbeat_ts_ms FROM runs WHERE run_instance_id = ?",
+            (held_instance,),
+        ).fetchone()
+        assert old['ended_ts_ms'] == old['last_heartbeat_ts_ms']
+
+        ev = store._conn.execute(
+            "SELECT payload FROM events "
+            "WHERE run_instance_id = ? AND kind = 'stale_run_cleaned'",
+            (held_instance,),
+        ).fetchone()
+        assert ev is not None
+        assert json.loads(ev['payload'])['reason'] == 'owner_process_gone'
+
+        adopted = ctx.get_order("coid-held")
+        assert adopted is not None
+        assert adopted.state == "submitted"
+
+
+def __test_open_run_keeps_live_row_its_lock_does_not_name__(tmp_path: Path) -> None:
+    """A free owner lock proves only the instance its tag names gone.
+
+    A live row whose instance never recorded itself in the tag (a process that
+    could not take the lock) keeps blocking the run until its heartbeat expires.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx_live = _open_run(store)
+        assert ctx_live._owner_lock is not None
+        tag_path = ctx_live._owner_lock._tag_path
+        store._release_owner_lock(ctx_live._owner_lock)
+        tag_path.unlink()
+
+        with pytest.raises(RuntimeError, match="Active run_id already exists"):
+            _open_run(store)
+        assert not store._owner_locks
+
+
+def __test_close_releases_owner_lock__(tmp_path: Path) -> None:
+    """A cleanly closed run hands its owner lock to the next instance."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx_first = _open_run(store)
+        ctx_first.close()
+
+        ctx_next = _open_run(store)
+        assert ctx_next._owner_lock is not None
+        assert ctx_next._owner_lock.held
+
+
+def __test_open_run_takes_over_run_of_closed_store__(tmp_path: Path) -> None:
+    """Closing the store releases the owner locks of the runs it left open."""
+    db = tmp_path / "broker.sqlite"
+    with BrokerStore(db, plugin_name=PLUGIN) as store_a:
+        ctx_a = _open_run(store_a)
+
+    with BrokerStore(db, plugin_name=PLUGIN) as store_b:
+        ctx_b = _open_run(store_b)
+        assert ctx_b.run_instance_id != ctx_a.run_instance_id
+        old = store_b._conn.execute(
+            "SELECT ended_ts_ms FROM runs WHERE run_instance_id = ?",
+            (ctx_a.run_instance_id,),
+        ).fetchone()
+        assert old['ended_ts_ms'] is not None
 
 
 def __test_cleanup_stale_runs_public_api__(tmp_path: Path) -> None:
