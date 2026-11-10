@@ -1,5 +1,7 @@
 """Tests for the PluggableCommand CLI parameter injection system."""
 
+from pathlib import Path
+
 import pytest
 import typer
 from typer.testing import CliRunner
@@ -120,6 +122,37 @@ def __test_typed_and_choice_params__():
 
     bad = CliRunner().invoke(test_app, ["--field", "nonexistent"])
     assert bad.exit_code != 0
+
+
+def __test_path_multiple_and_keyword_name__():
+    """
+    Path and custom converters, repeated options and a keyword parameter name
+    give the same values on every supported Typer version.
+    """
+    received = {}
+
+    test_app = typer.Typer()
+
+    @test_app.command(cls=PluggableCommand)
+    def show(ctx: typer.Context):
+        received.update(getattr(ctx, "plugin_params", {}))
+
+    cmd = _get_command(test_app)
+    assert cmd.register_plugin_param(CLIOption("--path", type=Path))
+    assert cmd.register_plugin_param(CLIOption("--hex", type=lambda v: int(v, 16)))
+    assert cmd.register_plugin_param(CLIOption(("--tag", "-t"), multiple=True))
+    assert cmd.register_plugin_param(CLIOption("--from", default="start"))
+
+    result = CliRunner().invoke(
+        test_app, ["--path", "/tmp/x", "--hex", "ff", "-t", "a", "-t", "b", "--from", "end"],
+    )
+    assert result.exit_code == 0, result.output
+    assert received == {"path": Path("/tmp/x"), "hex": 255, "tag": ("a", "b"), "from": "end"}
+
+    received.clear()
+    result = CliRunner().invoke(test_app, [])
+    assert result.exit_code == 0, result.output
+    assert received == {"path": None, "hex": None, "tag": (), "from": "start"}
 
 
 def __test_conflict_with_core_param__():

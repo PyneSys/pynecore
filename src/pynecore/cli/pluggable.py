@@ -13,6 +13,13 @@ and since Typer 0.26 it is not a Typer dependency either — Typer vendors a
 reduced fork of it, whose parser cannot handle foreign ``click.Option``
 instances.
 
+The parser objects are not constructed directly either.  Typer's parameter
+classes and their constructors are internal and change between releases
+(0.29 replaced the ``type`` argument with a type descriptor and dropped its
+choice type), so each option is declared through Typer's public API — a
+``typer.Option`` on a throwaway command — and the parameter Typer built for
+that command is reused.
+
 Plugin parameters are separated from core parameters before the callback is
 invoked, so the original function signature does not need to change.  The
 injected values are stored on ``ctx.plugin_params``.
@@ -24,12 +31,11 @@ The registry is therefore class-level, keyed by command name, and every rebuilt
 :class:`PluggableCommand` reads its injected parameters back from it.
 """
 
-from typing import Any, TypeAlias
+import inspect
+from typing import Any, Literal, TypeAlias
 
+import typer
 from typer.core import TyperCommand, TyperOption
-# Typer has no public choice type; ``typer.main`` only re-exports this one
-# noinspection PyProtectedMember
-from typer._types import TyperChoice
 
 from ..core.plugin import CLIOption
 
@@ -40,29 +46,78 @@ __all__ = ['PluggableCommand']
 # portably here.
 Context: TypeAlias = Any
 
+# Converters the parser itself applies when given as annotations, on every
+# supported Typer version: they keep Typer's own help metavar.  Any other
+# callable is passed as ``parser=``.  ``Path`` is not one of them: before Typer
+# 0.29 the parser yields a ``str`` for it, and the conversion happens in the
+# command callback wrapper, which plugin values never pass through.
+_ANNOTATION_TYPES = (str, int, float, bool)
+
+
+def _param_name(decls: tuple[str, ...]) -> str:
+    """
+    Derive the parameter name from the option strings, the way Click does.
+
+    :param decls: The option strings, e.g. ``("--output", "-o")``.
+    :return: The name of the first long option (``output``), or of the first
+        option string when there is no long one.
+    """
+    decl = next((d for d in decls if d.startswith('--')), decls[0])
+    return decl.lstrip('-').replace('-', '_').lower()
+
 
 def _build_option(spec: CLIOption) -> TyperOption:
     """
     Build the parser object Typer expects from a backend-agnostic option spec.
 
+    The option is declared on a throwaway single-command Typer app, and the
+    parameter Typer builds for it is returned.
+
     :param spec: The plugin-provided option description.
     :return: A Typer option ready to be added to a command.
     """
-    param_type: Any = TyperChoice(list(spec.choices)) if spec.choices is not None else spec.type
-    return TyperOption(
-        param_decls=list(spec.decls),
+    parser: Any = None
+    annotation: Any
+    if spec.is_flag:
+        annotation = bool
+    elif spec.choices is not None:
+        # Built from runtime values, which the subscription syntax rejects in
+        # static type checking
+        annotation = getattr(Literal, '__getitem__')(tuple(spec.choices))
+    elif spec.type is None or spec.type in _ANNOTATION_TYPES:
+        annotation = spec.type or str
+    else:
+        annotation = Any
+        parser = spec.type
+    if spec.multiple:
+        annotation = list[annotation]
+
+    option = typer.Option(
+        ... if spec.required else spec.default,
+        *spec.decls,
         help=spec.help or None,
-        default=spec.default,
-        # ``None`` leaves the flag/value decision to Typer's own inference
-        is_flag=spec.is_flag or None,
-        type=param_type,
         metavar=spec.metavar,
-        required=spec.required,
-        multiple=spec.multiple,
         hidden=spec.hidden,
         envvar=spec.envvar,
         rich_help_panel=spec.rich_help_panel,
+        parser=parser,
     )
+
+    def callback(**_kwargs: Any) -> None:
+        """Never invoked: only its signature is read by Typer."""
+
+    # A fixed Python name, because the real one may be a keyword (``--from``)
+    setattr(callback, '__signature__', inspect.Signature([
+        inspect.Parameter('value', inspect.Parameter.KEYWORD_ONLY,
+                          default=option, annotation=annotation),
+    ]))
+
+    app = typer.Typer(add_completion=False)
+    app.command()(callback)
+    (param,) = typer.main.get_command(app).params
+    assert isinstance(param, TyperOption)
+    param.name = _param_name(tuple(spec.decls))
+    return param
 
 
 class PluggableCommand(TyperCommand):
@@ -128,5 +183,10 @@ class PluggableCommand(TyperCommand):
         ctx.plugin_params = {}
         for p in self._plugin_params():
             if p.name in ctx.params:
-                ctx.plugin_params[p.name] = ctx.params.pop(p.name)
+                value = ctx.params.pop(p.name)
+                # Typer 0.29 collects a repeated option given on the command
+                # line into a list (its empty default stays a tuple)
+                if p.multiple and isinstance(value, list):
+                    value = tuple(value)
+                ctx.plugin_params[p.name] = value
         return super().invoke(ctx)
