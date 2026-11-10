@@ -125,6 +125,7 @@ def __test_ccxt_live_generator_integration__():
     _skip_if_no_ccxt()
 
     from pynecore.core.live_runner import live_ohlcv_generator
+    from pynecore.core.script_runner import LIVE_TRANSITION
 
     provider = CCXTProvider(
         symbol="BYBIT:BTC/USDT:USDT",
@@ -135,6 +136,9 @@ def __test_ccxt_live_generator_integration__():
     received = []
     for ohlcv in live_ohlcv_generator(provider, "BTC/USDT:USDT", "1",
                                       shutdown_timeout=5.0):
+        if ohlcv is LIVE_TRANSITION:
+            # The generator marks the end of the warmup inline
+            continue
         received.append(ohlcv)
         assert isinstance(ohlcv, OHLCV)
         assert ohlcv.timestamp > 0
