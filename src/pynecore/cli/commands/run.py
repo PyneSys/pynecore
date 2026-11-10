@@ -841,7 +841,12 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
                         elapsed_seconds = int((current_time - time_from_dl).total_seconds())
                         progress.update(task, completed=elapsed_seconds)
 
-                    provider_instance.download_ohlcv(time_from_dl, time_to_dl, on_progress=cb_progress)
+                    # One batch for the whole download: a provider that saves bar by
+                    # bar would otherwise pay two fsyncs per bar.
+                    with ohlcv_writer.batched():
+                        provider_instance.download_ohlcv(
+                            time_from_dl, time_to_dl, on_progress=cb_progress,
+                        )
 
                 if bar_count is None:
                     break

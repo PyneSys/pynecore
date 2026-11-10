@@ -234,8 +234,11 @@ def download_to_file(
         # rejected as a duplicate timestamp.
         provider.resume_timestamp = ohlcv_writer.end_timestamp
         try:
-            provider.download_ohlcv(resolved_from, resolved_to, on_progress=cb,
-                                    limit=chunk_size, with_extra=extra_data)
+            # One batch for the whole download: a provider that saves bar by bar
+            # would otherwise pay two fsyncs per bar (see ``OHLCVWriter.batched``).
+            with ohlcv_writer.batched():
+                provider.download_ohlcv(resolved_from, resolved_to, on_progress=cb,
+                                        limit=chunk_size, with_extra=extra_data)
         finally:
             provider.resume_timestamp = None
         bars_written = ohlcv_writer.size - size_before

@@ -1693,6 +1693,18 @@ def __test_batched_publishes_what_a_failed_block_wrote__(tmp_path: Path):
         assert reader.size == 2
 
 
+def __test_long_batch_publishes_in_slices__(tmp_path: Path, monkeypatch):
+    """A batch publishes every full slice of pending records, not only at its end."""
+    monkeypatch.setattr(ohlcv, "_BATCH_PUBLISH_RECORDS", 3)
+    path = tmp_path / "batch_slices.ohlcv"
+    with OHLCVWriter(path, "1", truncate=True) as writer:
+        with writer.batched():
+            for i in range(7):
+                writer.write(OHLCV(i * 60_000, 1.0, 2.0, 0.0, 1.5, 1.0))
+                assert record_count(path) == (i + 1) // 3 * 3
+        assert record_count(path) == 7
+
+
 def __test_reopen_drops_an_unpublished_batch_tail__(tmp_path: Path, monkeypatch):
     """A crash mid-batch leaves a tail the next open truncates away."""
     path = tmp_path / "batch_tail.ohlcv"

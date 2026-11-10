@@ -116,6 +116,9 @@ class _RowWriter(Protocol):
 
 
 _HAS_POSITIONAL_IO = hasattr(os, "pread") and hasattr(os, "pwrite")
+# A batch publishes its records whenever this many are pending, so a long batch
+# (a whole download) pays two fsyncs per slice and a crash loses at most one slice.
+_BATCH_PUBLISH_RECORDS = 4096
 
 
 def _pread(file_descriptor: int, size: int, offset: int) -> bytes:
@@ -1084,10 +1087,13 @@ class OHLCVWriter:
         a device barrier.
 
         The protocol is unchanged, only its granularity: the block's records are
-        fsynced together and the header then names all of them at once. A crash loses
-        the unpublished tail, which :meth:`open` truncates away — the same repair an
-        interrupted single append already needs. Use it only where that tail can be
-        recomputed or re-fetched, never for live bars.
+        fsynced together and the header then names all of them at once. A long block
+        publishes a slice whenever :data:`_BATCH_PUBLISH_RECORDS` records are pending,
+        so a crash loses at most that unpublished tail, which :meth:`open` truncates
+        away — the same repair an interrupted single append already needs. Use it only
+        where that tail can be recomputed or re-fetched, never for live bars.
+
+        Blocks nest; only the outermost one publishes at its end.
 
         :return: This writer, so the block can bind it.
         """
@@ -1421,6 +1427,11 @@ class OHLCVWriter:
         self._collect_price_data(candle)
         self._collect_volume_data(candle)
         self._collect_trading_hours(candle)
+        if self._size - self._published_size >= _BATCH_PUBLISH_RECORDS:
+            # Only a batch leaves records pending. A failure here propagates out of
+            # the block, which answers it like a failure at its own end: the bar is
+            # written and stays counted.
+            self._publish()
 
     def truncate(self) -> None:
         """Reset the open file to an empty valid v2 file with the same schema and period.

@@ -316,9 +316,11 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         daylight-saving shifts move it). Bars past that boundary must still be
         strictly increasing — the writer rejects them otherwise.
 
-        One call is one publication: a live bar arrives alone and is made durable on
-        its own, while a download page is fsynced once instead of once per bar. A
-        crash between pages costs the page, which the resume logic re-fetches anyway.
+        One call is one batch of the writer (:meth:`OHLCVWriter.batched`): a bar saved
+        alone is made durable on its own, a list is fsynced once instead of once per
+        bar. The core runs a whole download inside one outer batch, which publishes
+        in slices, so a provider may save bar by bar there without paying two fsyncs
+        per bar. A crash costs the unpublished tail, which the resume logic re-fetches.
 
         :param data: Single OHLCV record or list of records.
         """
