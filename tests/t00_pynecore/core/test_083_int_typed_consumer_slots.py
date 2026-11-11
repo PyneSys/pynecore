@@ -36,8 +36,12 @@ NORMALIZERS = {"int", "_native_int_or", "_trade_index", "_na_size", "_coord"}
 # fraction places a format mask spells out -- ``len()`` of a pattern slice,
 # capped at 16 inside the module -- never an argument of a script-callable.
 # ``size`` is a mask's grouping size, likewise a ``len()`` of a pattern slice.
+# ``open_seq`` / ``entry_seq`` are the engine's entry sequence numbers, which the
+# coin-flip bookkeeping keys a dict by; the engine passes them, never a script.
 ALLOWED = {
     ("strategy/__init__.py", "_settle_close_pass_trades", "closed_before"),
+    ("strategy/__init__.py", "flip", "open_seq"),
+    ("strategy/__init__.py", "filled", "entry_seq"),
     ("string.py", "_round_digits_fast", "decimals"),
     ("string.py", "_group_digits", "size"),
 }
@@ -90,8 +94,8 @@ def _bare_uses(func: ast.FunctionDef | ast.AsyncFunctionDef,
     """Collect ``(lineno, parameter, slot kind)`` for every bare consumption."""
     found: list[tuple[int, str, str]] = []
 
-    def named(node: ast.expr | None) -> str | None:
-        return node.id if isinstance(node, ast.Name) and node.id in params else None
+    def named(expr: ast.expr | None) -> str | None:
+        return expr.id if isinstance(expr, ast.Name) and expr.id in params else None
 
     for node in ast.walk(func):
         if isinstance(node, ast.Subscript):
