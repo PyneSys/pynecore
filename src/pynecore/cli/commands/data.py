@@ -217,10 +217,11 @@ def download(
                                              "Useful for exchanges with timeframe-specific limits (e.g., Bitget 1w: 12). "
                                              "Lower values = slower but safer, higher values = faster but may hit API limits."),
         extra_data: bool = Option(False, '--extra-data/--no-extra-data', '-ed',
-                                  help="Also download provider extra fields (ask/bid/spread) into a "
-                                       ".extra.csv sidecar. Off by default: extra fields cost extra "
-                                       "requests and slow every later backtest that loads them. "
-                                       "Ignored by providers that have no extra fields."),
+                                  help="Also download per-bar data that costs the provider extra "
+                                       "requests, such as an ask side rebuilt from tick history "
+                                       "(cTrader). Off by default. Providers that receive the ask "
+                                       "side with the bars (Capital.com) always store it. Ignored "
+                                       "by providers with nothing extra to fetch."),
 ):
     """
     Download historical OHLCV data

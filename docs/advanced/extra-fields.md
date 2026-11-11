@@ -43,13 +43,11 @@ When reading CSV directly (e.g., via `CSVReader` or standalone execution), extra
 
 ### Downloaded Data (providers)
 
-Some data providers deliver more than plain OHLCV per bar — Capital.com returns the ask-side OHLC alongside the bid bars, cTrader reconstructs it from ask tick history. `pyne data download` fetches those values only when asked for them:
+Provider data does not use the sidecar. The one extra per-bar value providers deliver today, the ask side of a bid/ask feed, is stored in the `.ohlcv` file itself and reaches scripts through the `bid` and `ask` built-ins (see [Ask Side](ohlcv-reader-writer.md#ask-side)). Capital.com returns the ask OHLC with every bar, so it is always stored. cTrader has no ask bars and rebuilds the ask side from tick history, which costs several requests per trading day of history, so it is fetched only on request:
 
 ```bash
-pyne data download capitalcom:EURUSD@60 --extra-data
+pyne data download ctrader:EURUSD@60 --extra-data
 ```
-
-They are written to the very same `.extra.csv` sidecar as user CSV extras, and are read back into `extra_fields` in exactly the same way. The flag is off by default because extra fields cost extra requests while downloading and slow every later backtest that loads the sidecar; providers that have no extra per-bar fields (CCXT, TradingView, Bybit, Coinbase) ignore it.
 
 ## Usage in Scripts
 
@@ -126,10 +124,10 @@ The alignment is enforced, not assumed: opening the OHLCV file fails if the side
 
 ## Limitations
 
-- **Extra fields live outside the binary**: The `.ohlcv` file stores only the columns declared in its header, and everything the writer produces is a standard OHLCV column; extra fields are kept in the sidecar CSV. The record layout comes from that header (a 64-byte fixed header plus a 24-byte descriptor per column), so the record size follows the schema instead of being one fixed number for every file — the standard profile is 36 bytes per record, 48 when high/low/close have to be stored as absolute float64.
+- **Extra fields live outside the binary**: The `.ohlcv` file stores only the columns declared in its header, and everything the writer produces is a standard OHLCV column or an ask-side column; extra fields are kept in the sidecar CSV. The record layout comes from that header (a 64-byte fixed header plus a 24-byte descriptor per column), so the record size follows the schema instead of being one fixed number for every file — the standard profile is 36 bytes per record, 48 when high/low/close have to be stored as absolute float64, and 52 with the ask side.
 - **JSON source files**: Extra field extraction is currently supported for CSV and TXT source formats, not JSON. Converting a JSON source deletes any sidecar left over from an earlier conversion.
 - **Memory**: The sidecar is loaded entirely into memory when opening the OHLCV file. For typical datasets (up to a few hundred thousand bars with a handful of extra columns), this is negligible.
-- **Provider extras are opt-in**: Providers that have extra per-bar fields deliver them only with `--extra-data`; providers without them (CCXT, TradingView, Bybit, Coinbase) never produce a sidecar.
+- **User data only**: The sidecar holds the extra columns of your own source files; downloaded provider data never produces one.
 
 ## See Also
 

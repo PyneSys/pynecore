@@ -2114,11 +2114,12 @@ def run(
                         spinner_state['price'] = candle.close
                         # Prefer the live quote snapshot over ``candle.close``:
                         # on a closed OHLC bar ``candle.close`` is the previous
-                        # period's bid-side close, not the current quote.
-                        _apply_quote(
-                            extra.get('bid_close', candle.close),
-                            extra.get('ask_close'),
-                        )
+                        # period's bid-side close, not the current quote. Without
+                        # a snapshot the bar's own ask side is the quote.
+                        ask = extra.get('ask_close')
+                        if ask is None and candle.ask is not None:
+                            ask = candle.ask.close
+                        _apply_quote(extra.get('bid_close', candle.close), ask)
                         progress.update(task, description=_spinner_text())
 
                     stop_reason = "completed"

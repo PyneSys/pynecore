@@ -130,7 +130,8 @@ def download_to_file(
         to "now", as the future takes forever to download.
     :param truncate: Drop the existing file content before downloading.
     :param chunk_size: Override the provider's per-request bar count.
-    :param extra_data: Also fetch the provider's extra fields (``.extra.csv``).
+    :param extra_data: Also fetch per-bar data that costs the provider extra requests
+        (see ``with_extra`` of :meth:`ProviderPlugin.download_ohlcv`).
     :param syminfo: Already-loaded symbol info. When None it is fetched (and
         persisted) *before* the download, best-effort, so an interrupted
         download still leaves a resumable file.

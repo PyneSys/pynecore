@@ -448,10 +448,16 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo',
     props['close'] = c
     props['extra_fields'] = ohlcv.extra_fields if ohlcv.extra_fields else {}
 
-    # Pine's ``bid``/``ask`` only carry real values on the ``"1T"`` (tick) feed; on every
-    # other timeframe TradingView reports ``na``. PyneCore does not support tick data, so
-    # they are always ``na`` — matching TV behaviour on bar timeframes.
-    props['bid'] = props['ask'] = na_float
+    # TradingView fills ``bid``/``ask`` only on the ``"1T"`` (tick) feed and reports ``na``
+    # on every bar timeframe. A feed that stores the ask side gives both real values on
+    # every quoted bar instead -- the bid side is the main OHLC there. Both stay ``na``
+    # together wherever the ask is missing, so data without it keeps the TV behaviour.
+    ask = ohlcv.ask
+    if ask is None or ask.close != ask.close:
+        props['bid'] = props['ask'] = na_float
+    else:
+        props['bid'] = c
+        props['ask'] = ask.close
 
     props['hl2'] = (h + lo) / 2.0
     props['hlc3'] = (h + lo + c) / 3.0
@@ -4103,8 +4109,13 @@ class ScriptRunner:
                         # ran would make orders appear before the bar that
                         # caused them.
                         if self._log_ohlcv:
-                            extra = candle.extra_fields or {}
-                            spread = extra.get('spread')
+                            # The bar's own ask side when the feed quotes it, otherwise
+                            # the live quote snapshot a plugin attaches as an extra field.
+                            candle_ask = candle.ask
+                            if candle_ask is not None and candle_ask.close == candle_ask.close:
+                                spread = candle_ask.close - candle.close
+                            else:
+                                spread = (candle.extra_fields or {}).get('spread')
                             d = self._price_decimals
                             if spread is not None:
                                 ohlcv_info(

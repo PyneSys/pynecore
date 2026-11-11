@@ -346,11 +346,11 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         :param time_to: The end time.
         :param on_progress: Optional progress callback.
         :param limit: Override the automatic chunk size (number of bars per API request).
-        :param with_extra: When ``True``, also fetch and persist the provider's
-            extra per-bar fields (e.g. ask/bid/spread) to the ``.extra.csv``
-            sidecar. Off by default: the extra fields cost extra requests to
-            fetch and slow every later backtest that loads the sidecar, so they
-            are only produced on request. Providers without extra fields ignore it.
+        :param with_extra: When ``True``, also fetch per-bar data that costs extra
+            requests, such as an ask side the provider has to rebuild from tick
+            history. Off by default; providers with nothing extra to fetch ignore it.
+            A provider that receives the ask side with the bars stores it
+            (:attr:`~OHLCV.ask`) regardless.
         """
 
     def load_ohlcv_data(self) -> OHLCVReader:

@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pynecore.core._file_io import open_shared_binary, replace_file
 from pynecore.core.ohlcv_legacy import OHLCVReader as _LegacyOHLCVReader
 from pynecore.core.syminfo import SymInfoInterval, tick_grid
-from pynecore.types.ohlcv import OHLCV
+from pynecore.types.ohlcv import OHLCV, AskOHLC
 
 __all__ = ["OHLCVWriter", "OHLCVReader", "ChartBarWindow", "parse_timezone_name",
            "record_count", "copy_ohlcv_tail", "restore_f32_volume"]
@@ -63,6 +63,22 @@ _REQUIRED_OHLCV_ROLES = frozenset(
     {_ROLE_TIMESTAMP, _ROLE_OPEN, _ROLE_HIGH, _ROLE_LOW, _ROLE_CLOSE, _ROLE_VOLUME}
 )
 _DELTA_CANDIDATE_ROLES = (_ROLE_HIGH, _ROLE_LOW, _ROLE_CLOSE)
+# A feed that quotes both sides stores its main OHLC as the bid side and the ask side in
+# these four columns, each an f32 delta from the bid price of the same field: the
+# delta is the spread, which f32 holds far below a tick.
+_ROLE_ASK_OPEN = 6
+_ROLE_ASK_HIGH = 7
+_ROLE_ASK_LOW = 8
+_ROLE_ASK_CLOSE = 9
+_ASK_ROLES = frozenset({_ROLE_ASK_OPEN, _ROLE_ASK_HIGH, _ROLE_ASK_LOW, _ROLE_ASK_CLOSE})
+_ASK_COLUMN_DEFINITIONS = (
+    (_ROLE_ASK_OPEN, _ROLE_OPEN, "ask_open"),
+    (_ROLE_ASK_HIGH, _ROLE_HIGH, "ask_high"),
+    (_ROLE_ASK_LOW, _ROLE_LOW, "ask_low"),
+    (_ROLE_ASK_CLOSE, _ROLE_CLOSE, "ask_close"),
+)
+#: Price columns the writer may store as an f32 delta, and so may have to promote.
+_PROMOTABLE_ROLES = frozenset(_DELTA_CANDIDATE_ROLES) | _ASK_ROLES
 
 _CANONICAL_NAN32 = struct.unpack("<f", bytes.fromhex("0000c07f"))[0]
 _CANONICAL_NAN64 = struct.unpack("<d", bytes.fromhex("000000000000f87f"))[0]
@@ -293,15 +309,25 @@ def _pack_descriptor(column: _Column) -> bytes:
     )
 
 
-def _make_default_columns(promoted_roles: frozenset[int] = frozenset()) -> tuple[_Column, ...]:
-    definitions = (
+def _make_default_columns(promoted_roles: frozenset[int] = frozenset(),
+                          with_ask: bool = False) -> tuple[_Column, ...]:
+    """Build the packed standard layout the writer produces.
+
+    :param promoted_roles: Price roles stored as absolute f64 instead of an f32 delta.
+    :param with_ask: Append the four ask-side columns after ``volume``.
+    :return: Columns in byte order.
+    """
+    definitions = [
         (_ROLE_TIMESTAMP, 2, _ABSOLUTE_BASE, "timestamp"),
         (_ROLE_OPEN, 6, _ABSOLUTE_BASE, "open"),
         (_ROLE_HIGH, 5, _ROLE_OPEN, "high"),
         (_ROLE_LOW, 5, _ROLE_OPEN, "low"),
         (_ROLE_CLOSE, 5, _ROLE_OPEN, "close"),
         (_ROLE_VOLUME, 6, _ABSOLUTE_BASE, "volume"),
-    )
+    ]
+    if with_ask:
+        for role, base, name in _ASK_COLUMN_DEFINITIONS:
+            definitions.append((role, 5, base, name))
     columns: list[_Column] = []
     byte_offset = 0
     for role, dtype, base, name in definitions:
@@ -311,17 +337,6 @@ def _make_default_columns(promoted_roles: frozenset[int] = frozenset()) -> tuple
         columns.append(_Column(role, dtype, base, byte_offset, name))
         byte_offset += _DTYPE_SIZE[dtype]
     return tuple(columns)
-
-
-def _promote_columns(columns: tuple[_Column, ...], roles: frozenset[int]) -> tuple[_Column, ...]:
-    promoted: list[_Column] = []
-    byte_offset = 0
-    for column in sorted(columns, key=lambda item: item.byte_offset):
-        dtype = 6 if column.role in roles else column.dtype
-        base = _ABSOLUTE_BASE if column.role in roles else column.base
-        promoted.append(_Column(column.role, dtype, base, byte_offset, column.name))
-        byte_offset += _DTYPE_SIZE[dtype]
-    return tuple(promoted)
 
 
 def _record_struct(columns: tuple[_Column, ...]) -> struct.Struct:
@@ -540,6 +555,8 @@ def _validate_candle(candle: OHLCV) -> None:
     values = (candle.open, candle.high, candle.low, candle.close, candle.volume)
     if any(math.isinf(value) for value in values):
         raise ValueError("OHLCV values cannot contain positive or negative infinity")
+    if candle.ask is not None and any(math.isinf(value) for value in candle.ask):
+        raise ValueError("OHLCV ask values cannot contain positive or negative infinity")
 
     if not (math.isnan(candle.open) or math.isnan(candle.close) or math.isnan(candle.high)):
         bound = max(candle.open, candle.close)
@@ -645,6 +662,9 @@ def _failing_delta_roles(candle: OHLCV, minmove: int, pricescale: int) -> frozen
     mintick with delta encoding, while promoting on absence would inflate the base
     profile from 36 to 48 bytes per record.
 
+    The ask columns are measured the same way against their own base, the bid price
+    of the same field.
+
     :param candle: Bar the decision is measured on.
     :param minmove: Tick-grid numerator, or zero for an unknown grid.
     :param pricescale: Tick-grid denominator, or zero for an unknown grid.
@@ -656,17 +676,26 @@ def _failing_delta_roles(candle: OHLCV, minmove: int, pricescale: int) -> frozen
     failed: set[int] = set()
     half_tick = minmove / pricescale / 2.0
     grid_scale = pricescale / minmove
-    for role, target in (
-        (_ROLE_HIGH, candle.high),
-        (_ROLE_LOW, candle.low),
-        (_ROLE_CLOSE, candle.close),
-    ):
+    checks = [
+        (_ROLE_HIGH, candle.high, candle.open),
+        (_ROLE_LOW, candle.low, candle.open),
+        (_ROLE_CLOSE, candle.close, candle.open),
+    ]
+    ask = candle.ask
+    if ask is not None:
+        checks += (
+            (_ROLE_ASK_OPEN, ask.open, candle.open),
+            (_ROLE_ASK_HIGH, ask.high, candle.high),
+            (_ROLE_ASK_LOW, ask.low, candle.low),
+            (_ROLE_ASK_CLOSE, ask.close, candle.close),
+        )
+    for role, target, base in checks:
         if math.isnan(target):
             continue
-        if math.isnan(candle.open):
+        if math.isnan(base):
             failed.add(role)
             continue
-        resolution = _f32_resolution(target - candle.open)
+        resolution = _f32_resolution(target - base)
         if resolution is None or resolution >= half_tick:
             failed.add(role)
             continue
@@ -828,6 +857,8 @@ class OHLCVWriter:
         "_truncate_requested",
         "_file",
         "_columns",
+        "_has_ask",
+        "_promoted_roles",
         "_record_struct",
         "_ordered_columns",
         "_header_size",
@@ -901,11 +932,14 @@ class OHLCVWriter:
         self._interval_unit = interval_unit
         self._truncate_requested = truncate
         self._file: BinaryIO | None = None
-        self._columns = _make_default_columns()
-        self._record_struct = _record_struct(self._columns)
-        self._ordered_columns = tuple(sorted(self._columns, key=lambda column: column.byte_offset))
-        self._header_size = _FIXED_HEADER_SIZE + len(self._columns) * _DESCRIPTOR.size
-        self._record_size = self._record_struct.size
+        self._columns: tuple[_Column, ...] = ()
+        self._has_ask = False
+        self._promoted_roles: frozenset[int] = frozenset()
+        self._ordered_columns: tuple[_Column, ...] = ()
+        self._record_struct = struct.Struct("<")
+        self._header_size = 0
+        self._record_size = 0
+        self._set_columns(_make_default_columns())
         self._size = 0
         self._start_timestamp: int | None = None
         self._last_timestamp: int | None = None
@@ -1352,16 +1386,11 @@ class OHLCVWriter:
                 f"{candle.timestamp} follows {self._last_timestamp}"
             )
 
-        f32_roles = frozenset(
-            column.role
-            for column in self._columns
-            if column.dtype == 5 and column.base == _ROLE_OPEN
-        )
         old_count = self._size
-        promoted_roles = _failing_delta_roles(candle, self._minmove, self._pricescale) & f32_roles
-        if promoted_roles:
+        new_columns = self._columns_for(candle)
+        if new_columns != self._columns:
             if self._size == 0:
-                self._set_columns(_promote_columns(self._columns, promoted_roles))
+                self._set_columns(new_columns)
                 self._write_empty_file()
             else:
                 # The rebuild copies the records the file publishes, so a pending
@@ -1376,7 +1405,7 @@ class OHLCVWriter:
                     # replaced file would otherwise commit a record whose extra values
                     # a crash can still take away.
                     self._sync_extra_csv()
-                    self._rebuild_with_append(candle, promoted_roles)
+                    self._rebuild_with_append(candle, new_columns)
                 except Exception:
                     # Once the rebuilt file is in place the bar is committed, so its
                     # sidecar row has to stay: trimming it would leave the pair one row
@@ -2032,8 +2061,40 @@ class OHLCVWriter:
             ]
         self._analyzed_opening_hours = hours
 
+    def _columns_for(self, candle: OHLCV) -> tuple[_Column, ...]:
+        """Return the layout the file needs so ``candle`` is stored losslessly.
+
+        The layout only ever widens: a price column promoted to absolute f64 stays
+        promoted, and once a bar has brought ask prices the ask columns stay, so a
+        later bar without them stores NaN there. A bar quoting the ask side on a file
+        without ask columns adds them; the records already written read back with an
+        ``na`` ask.
+
+        :param candle: Bar about to be appended.
+        :return: The current columns when they already fit, otherwise the widened layout.
+        """
+        has_ask = self._has_ask or candle.ask is not None
+        failing = _failing_delta_roles(candle, self._minmove, self._pricescale)
+        newly_promoted = failing - self._promoted_roles
+        if has_ask == self._has_ask and not newly_promoted:
+            return self._columns
+        return _make_default_columns(self._promoted_roles | newly_promoted, has_ask)
+
+    @property
+    def has_ask(self) -> bool:
+        """Return whether the file stores ask-side prices.
+
+        :return: Whether the layout carries the four ask columns.
+        """
+        return self._has_ask
+
     def _set_columns(self, columns: tuple[_Column, ...]) -> None:
         self._columns = columns
+        self._has_ask = any(column.role == _ROLE_ASK_OPEN for column in columns)
+        self._promoted_roles = frozenset(
+            column.role for column in columns
+            if column.role in _PROMOTABLE_ROLES and column.dtype == 6
+        )
         self._ordered_columns = tuple(sorted(columns, key=lambda column: column.byte_offset))
         self._record_struct = _record_struct(columns)
         self._header_size = _FIXED_HEADER_SIZE + len(columns) * _DESCRIPTOR.size
@@ -2064,7 +2125,8 @@ class OHLCVWriter:
     @staticmethod
     def _validate_writer_schema(columns: tuple[_Column, ...]) -> None:
         roles = {column.role for column in columns}
-        if roles != _REQUIRED_OHLCV_ROLES or len(columns) != len(_REQUIRED_OHLCV_ROLES):
+        with_ask = roles == _REQUIRED_OHLCV_ROLES | _ASK_ROLES
+        if (roles != _REQUIRED_OHLCV_ROLES and not with_ask) or len(columns) != len(roles):
             raise ValueError("OHLCV writer can append only to the standard OHLCV profile")
         by_role = {column.role: column for column in columns}
         expected_absolute = {
@@ -2076,17 +2138,18 @@ class OHLCVWriter:
             column = by_role[role]
             if column.dtype != dtype or column.base != _ABSOLUTE_BASE:
                 raise ValueError(f"Unsupported standard OHLCV schema for column {column.name!r}")
-        for role in _DELTA_CANDIDATE_ROLES:
+        delta_bases = {role: _ROLE_OPEN for role in _DELTA_CANDIDATE_ROLES}
+        if with_ask:
+            delta_bases.update((role, base) for role, base, _name in _ASK_COLUMN_DEFINITIONS)
+        for role, base in delta_bases.items():
             column = by_role[role]
-            valid_delta = column.dtype == 5 and column.base == _ROLE_OPEN
+            valid_delta = column.dtype == 5 and column.base == base
             valid_absolute = column.dtype == 6 and column.base == _ABSOLUTE_BASE
             if not (valid_delta or valid_absolute):
                 raise ValueError(f"Unsupported standard OHLCV schema for column {column.name!r}")
 
-        promoted_roles = frozenset(
-            role for role in _DELTA_CANDIDATE_ROLES if by_role[role].dtype == 6
-        )
-        if columns != _make_default_columns(promoted_roles):
+        promoted_roles = frozenset(role for role in delta_bases if by_role[role].dtype == 6)
+        if columns != _make_default_columns(promoted_roles, with_ask):
             raise ValueError("OHLCV schema does not match the packed standard profile layout")
 
     def _pack_record(self, candle: OHLCV) -> bytes:
@@ -2098,6 +2161,16 @@ class OHLCVWriter:
             _ROLE_CLOSE: candle.close,
             _ROLE_VOLUME: candle.volume,
         }
+        if self._has_ask:
+            ask = candle.ask
+            if ask is None:
+                logical_values[_ROLE_ASK_OPEN] = logical_values[_ROLE_ASK_HIGH] = math.nan
+                logical_values[_ROLE_ASK_LOW] = logical_values[_ROLE_ASK_CLOSE] = math.nan
+            else:
+                logical_values[_ROLE_ASK_OPEN] = ask.open
+                logical_values[_ROLE_ASK_HIGH] = ask.high
+                logical_values[_ROLE_ASK_LOW] = ask.low
+                logical_values[_ROLE_ASK_CLOSE] = ask.close
         values: list[int | float] = []
         for column in self._ordered_columns:
             value = logical_values[column.role]
@@ -2139,9 +2212,13 @@ class OHLCVWriter:
             return self._dense and boundary_matches
         return False
 
-    def _rebuild_with_append(self, candle: OHLCV, failed_roles: frozenset[int]) -> None:
+    def _rebuild_with_append(self, candle: OHLCV, promoted_columns: tuple[_Column, ...]) -> None:
+        """Rewrite the file under a wider layout and append ``candle`` to it.
+
+        :param candle: Bar whose values the current layout cannot store.
+        :param promoted_columns: The widened layout from :meth:`_columns_for`.
+        """
         assert self._file is not None
-        promoted_columns = _promote_columns(self._columns, failed_roles)
         path = Path(self.path)
         temp_name: str | None = None
         record_total = 0
@@ -2167,8 +2244,11 @@ class OHLCVWriter:
                 old_columns = self._columns
                 old_ordered = self._ordered_columns
                 old_struct = self._record_struct
+                old_has_ask = self._has_ask
                 try:
                     self._columns = promoted_columns
+                    self._has_ask = any(column.role == _ROLE_ASK_OPEN
+                                        for column in promoted_columns)
                     self._ordered_columns = tuple(
                         sorted(promoted_columns, key=lambda candidate: candidate.byte_offset)
                     )
@@ -2253,6 +2333,7 @@ class OHLCVWriter:
                     self._columns = old_columns
                     self._ordered_columns = old_ordered
                     self._record_struct = old_struct
+                    self._has_ask = old_has_ask
 
             assert temp_name is not None
             old_file = self._file
@@ -2314,6 +2395,7 @@ class _V2OHLCVReader:
         "_base_indices",
         "_base_roles",
         "_standard_ohlcv",
+        "_has_ask",
         "_timestamp_offset",
         "_timestamp_struct",
         "_extra_data",
@@ -2354,6 +2436,7 @@ class _V2OHLCVReader:
         self._base_indices: dict[int, int] = {}
         self._base_roles: dict[int, int] = {}
         self._standard_ohlcv = False
+        self._has_ask = False
         self._timestamp_offset = 0
         self._timestamp_struct = struct.Struct("<q")
         self._extra_data: list[dict[str, int | float | str]] | None = None
@@ -2436,13 +2519,21 @@ class _V2OHLCVReader:
         :return: Whether the OHLC prices need no storage clean-up.
         """
         for column in self._columns:
-            if column.role != _ROLE_OPEN and column.role not in _DELTA_CANDIDATE_ROLES:
+            if column.role != _ROLE_OPEN and column.role not in _PROMOTABLE_ROLES:
                 continue
             if column.dtype == 6 and column.base == _ABSOLUTE_BASE:
                 continue
             if not (self._standard_ohlcv and self._pricescale):
                 return False
         return True
+
+    @property
+    def has_ask(self) -> bool:
+        """Return whether the file stores ask-side prices.
+
+        :return: Whether every read bar carries an :class:`~pynecore.types.ohlcv.AskOHLC`.
+        """
+        return self._has_ask
 
     @property
     def lossless_volume(self) -> bool:
@@ -2532,6 +2623,7 @@ class _V2OHLCVReader:
             }
             self._base_roles = {column.role: column.base for column in ordered}
             by_role = {column.role: column for column in ordered}
+            self._has_ask = _ASK_ROLES.issubset(roles)
             self._standard_ohlcv = (
                 by_role[_ROLE_OPEN].base == _ABSOLUTE_BASE
                 and by_role[_ROLE_VOLUME].base == _ABSOLUTE_BASE
@@ -2539,6 +2631,10 @@ class _V2OHLCVReader:
                     by_role[role].base in (_ABSOLUTE_BASE, _ROLE_OPEN)
                     for role in _DELTA_CANDIDATE_ROLES
                 )
+                and (not self._has_ask or all(
+                    by_role[role].base in (_ABSOLUTE_BASE, base)
+                    for role, base, _name in _ASK_COLUMN_DEFINITIONS
+                ))
             )
             timestamp_column = next(
                 column for column in layout.columns if column.role == _ROLE_TIMESTAMP
@@ -2688,6 +2784,12 @@ class _V2OHLCVReader:
                 self._decode_value(values, _ROLE_CLOSE),
                 self._decode_value(values, _ROLE_VOLUME),
                 extra_fields=extra_fields,
+                ask=AskOHLC(
+                    self._decode_value(values, _ROLE_ASK_OPEN),
+                    self._decode_value(values, _ROLE_ASK_HIGH),
+                    self._decode_value(values, _ROLE_ASK_LOW),
+                    self._decode_value(values, _ROLE_ASK_CLOSE),
+                ) if self._has_ask else None,
             )
 
         open_value = values[role_indices[_ROLE_OPEN]]
@@ -2774,6 +2876,15 @@ class _V2OHLCVReader:
                 else volume_base + volume
             )
 
+        ask = None
+        if self._has_ask:
+            ask = AskOHLC(
+                self._decode_ask(values, _ROLE_ASK_OPEN, open_value),
+                self._decode_ask(values, _ROLE_ASK_HIGH, high),
+                self._decode_ask(values, _ROLE_ASK_LOW, low),
+                self._decode_ask(values, _ROLE_ASK_CLOSE, close),
+            )
+
         return OHLCV(
             int(timestamp),
             open_value,
@@ -2782,7 +2893,35 @@ class _V2OHLCVReader:
             close,
             volume,
             extra_fields=extra_fields,
+            ask=ask,
         )
+
+    def _decode_ask(self, values: tuple[int | float, ...], role: int, bid: float) -> float:
+        """Decode one ask price of the standard layout, snapped like the bid prices.
+
+        :param values: Unpacked record.
+        :param role: Ask role to decode.
+        :param bid: The decoded bid price of the same field, the delta's base.
+        :return: The ask price, NaN when it or its base is missing.
+        """
+        value = values[self._role_indices[role]]
+        if math.isnan(value):
+            return math.nan
+        snap_scale = self._snap_scale
+        if self._base_indices[role] < 0:
+            if snap_scale > 0.0:
+                snapped = round(value * snap_scale) * self._snap_minmove / self._snap_pricescale
+                if abs(snapped - value) <= abs(value) * _F64_SNAP_REL:
+                    return snapped
+            return value
+        if math.isnan(bid):
+            return math.nan
+        decoded = bid + value
+        if snap_scale > 0.0:
+            snapped = round(decoded * snap_scale) * self._snap_minmove / self._snap_pricescale
+            if abs(snapped - decoded) <= abs(value) * _F32_SNAP_REL + abs(decoded) * _F64_SNAP_REL:
+                return snapped
+        return decoded
 
     def _decode_value(self, values: tuple[int | float, ...], role: int) -> float:
         value = float(values[self._role_indices[role]])
@@ -2863,16 +3002,23 @@ class _V2OHLCVReader:
         """
         with open(path, "w", newline="") as file:
             writer = csv.writer(file)
-            writer.writerow(("time" if as_datetime else "timestamp", "open", "high", "low", "close", "volume"))
+            header = ["time" if as_datetime else "timestamp", "open", "high", "low", "close",
+                      "volume"]
+            if self._has_ask:
+                header += [name for _role, _base, name in _ASK_COLUMN_DEFINITIONS]
+            writer.writerow(header)
             for candle in self:
                 timestamp: int | datetime
                 if as_datetime:
                     timestamp = datetime.fromtimestamp(candle.timestamp / 1000, UTC)
                 else:
                     timestamp = candle.timestamp
-                writer.writerow(
-                    (timestamp, candle.open, candle.high, candle.low, candle.close, candle.volume)
-                )
+                row: list[int | float | datetime] = [
+                    timestamp, candle.open, candle.high, candle.low, candle.close, candle.volume
+                ]
+                if candle.ask is not None:
+                    row += candle.ask
+                writer.writerow(row)
 
     def save_to_json(self, path: str | Path, as_datetime: bool = False) -> None:
         """Export every committed record to JSON.
@@ -2888,16 +3034,18 @@ class _V2OHLCVReader:
                 timestamp = datetime.fromtimestamp(candle.timestamp / 1000, UTC).isoformat()
             else:
                 timestamp = candle.timestamp
-            data.append(
-                {
-                    timestamp_key: timestamp,
-                    "open": candle.open,
-                    "high": candle.high,
-                    "low": candle.low,
-                    "close": candle.close,
-                    "volume": candle.volume,
-                }
-            )
+            record: dict[str, int | float | str] = {
+                timestamp_key: timestamp,
+                "open": candle.open,
+                "high": candle.high,
+                "low": candle.low,
+                "close": candle.close,
+                "volume": candle.volume,
+            }
+            if candle.ask is not None:
+                for (_role, _base, name), value in zip(_ASK_COLUMN_DEFINITIONS, candle.ask):
+                    record[name] = value
+            data.append(record)
         with open(path, "w") as file:
             json.dump(data, file, indent=2, allow_nan=True)
 
@@ -3033,6 +3181,15 @@ class OHLCVReader:
         """
         reader = self._reader
         return reader.lossless_prices if isinstance(reader, _V2OHLCVReader) else False
+
+    @property
+    def has_ask(self) -> bool:
+        """Return whether the bars carry ask-side prices.
+
+        :return: Whether the file stores ask columns; always ``False`` for legacy v1 files.
+        """
+        reader = self._reader
+        return reader.has_ask if isinstance(reader, _V2OHLCVReader) else False
 
     @property
     def lossless_volume(self) -> bool:

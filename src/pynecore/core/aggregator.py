@@ -8,6 +8,7 @@ n > 1) live on the year-reset scheduled grid (see ``resampler`` module docs);
 source stream, which reproduces TradingView's holiday-aware grid.
 """
 import logging
+import math
 from datetime import date, datetime, timezone as dt_timezone
 from decimal import Decimal
 from pathlib import Path
@@ -23,7 +24,7 @@ from .resampler import (
 from .security import _day_session_ends, _exclusive_session_end, _match_session_end
 # noinspection PyProtectedMember
 from ..lib.timeframe import _in_seconds, _process_tf
-from ..types.ohlcv import OHLCV
+from ..types.ohlcv import OHLCV, AskOHLC
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,22 @@ def _merge_candles(candles: list[OHLCV], bar_time: int,
     # TradingView aggregates volume server-side as the exact DECIMAL sum of the feed's
     # volumes. A binary float sum drifts from it by an ulp on many bars, and the drift
     # carries into every volume-weighted series computed on the aggregated context.
+    # The ask side folds like the bid side, but only from a window that quotes it on
+    # every source bar: a partial fold would pass off one bar's spread as the period's.
+    # A file with ask columns reads an unquoted bar back as an all-NaN ask.
+    asks: list[AskOHLC] = []
+    for candle in candles:
+        candle_ask = candle.ask
+        if candle_ask is not None and not math.isnan(candle_ask.close):
+            asks.append(candle_ask)
+    ask = None
+    if len(asks) == len(candles):
+        ask = AskOHLC(
+            open=asks[0].open,
+            high=max(a.high for a in asks),
+            low=min(a.low for a in asks),
+            close=asks[-1].close,
+        )
     return OHLCV(
         timestamp=bar_time,
         open=candles[0].open,
@@ -101,6 +118,7 @@ def _merge_candles(candles: list[OHLCV], bar_time: int,
         low=min(c.low for c in candles),
         close=candles[-1].close,
         volume=float(sum(Decimal(repr(v)) for v in volumes)),
+        ask=ask,
     )
 
 

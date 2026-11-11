@@ -51,7 +51,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pynecore.core.syminfo import SymInfo
-from pynecore.types.ohlcv import OHLCV
+from pynecore.types.ohlcv import OHLCV, AskOHLC
 from pynecore.core.plugin import is_retryable_provider_error
 from pynecore.core.plugin.live_provider import LiveProviderPlugin
 from pynecore.core.script_runner import LIVE_TRANSITION
@@ -1471,7 +1471,7 @@ def live_ohlcv_generator(
                         # close, V=0), shifting the strategy's view of the
                         # close. The finalised bar is REAL data, so it ends
                         # the idle streak rather than counting as synth, and
-                        # keeps its own ``extra_fields`` (ask/spread).
+                        # keeps its own ask side and ``extra_fields``.
                         if (last_forming_bar is not None
                                 and last_forming_bar.timestamp == synth_ts):
                             finalized = last_forming_bar._replace(is_closed=True)
@@ -1522,6 +1522,8 @@ def live_ohlcv_generator(
                             )
                             continue
                         last_close = last_closed_bar.close
+                        # The ask side freezes the same way as the bid side
+                        last_ask = last_closed_bar.ask
                         synth = OHLCV(
                             timestamp=synth_ts,
                             open=last_close,
@@ -1531,6 +1533,9 @@ def live_ohlcv_generator(
                             volume=0.0,
                             extra_fields=last_closed_bar.extra_fields,
                             is_closed=True,
+                            ask=None if last_ask is None else AskOHLC(
+                                last_ask.close, last_ask.close, last_ask.close,
+                                last_ask.close),
                         )
                         last_closed_bar = synth
                         # Explicit log marker so the V=0 in the next

@@ -83,7 +83,7 @@ To see which providers are installed, run `pyne plugin list` (provider plugins a
 - `--force-save-info`, `-fi`: Force save symbol information
 - `--truncate`, `-tr`: Truncate file before downloading (all data will be lost)
 - `--chunk-size`, `-cs`: Bars per API request (overrides the provider's automatic limit)
-- `--extra-data`, `-ed`: Also download the provider's extra per-bar fields (ask/bid/spread) into a `.extra.csv` sidecar; off by default, ignored by providers that have none (see [Extra Fields](../advanced/extra-fields.md))
+- `--extra-data`, `-ed`: Also download per-bar data that costs the provider extra requests, such as the ask side cTrader rebuilds from tick history; off by default, and ignored by providers with nothing extra to fetch. Providers that receive the ask side with the bars (Capital.com) always store it (see [Ask Side](../advanced/ohlcv-reader-writer.md#ask-side))
 - `--symbol`, `-s` / `--timeframe`, `-tf`: Supply the symbol/timeframe separately instead of writing them into the provider string (see [Alternative form](#alternative-separate-provider-symbol-and-timeframe))
 
 ### Interactive Symbol Browser

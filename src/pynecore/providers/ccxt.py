@@ -495,7 +495,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         :param time_to: The end time.
         :param on_progress: Optional callback to call on progress.
         :param limit: Override the automatic chunk size.
-        :param with_extra: Ignored; CCXT OHLCV has no extra per-bar fields.
+        :param with_extra: Ignored; CCXT OHLCV has no extra per-bar data.
         """
         import ccxt
 

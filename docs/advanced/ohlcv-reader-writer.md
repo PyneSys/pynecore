@@ -100,7 +100,7 @@ Each column is described by a 24-byte descriptor:
 | 4      | byte_offset | uint16   | Offset of the column inside the packed record                       |
 | 6      | name        | 18 bytes | ASCII column name, NUL-padded                                       |
 
-Role `0` is the timestamp and roles `1`-`5` are open, high, low, close and volume; codes up to `13` are reserved for future well-known columns, and `255` marks a named custom column. The descriptors must tile the record exactly — consecutive `byte_offset` values, no gaps, no overlaps, covering precisely `record_size` bytes — and delta chains must terminate at an absolute column without cycles. All of this is checked when the file is opened.
+Role `0` is the timestamp and roles `1`-`5` are open, high, low, close and volume; roles `6`-`9` are the ask-side open, high, low and close (see [Ask Side](#ask-side)); codes up to `13` are reserved for future well-known columns, and `255` marks a named custom column. The descriptors must tile the record exactly — consecutive `byte_offset` values, no gaps, no overlaps, covering precisely `record_size` bytes — and delta chains must terminate at an absolute column without cycles. All of this is checked when the file is opened.
 
 ### Record Layout
 
@@ -116,6 +116,34 @@ The standard OHLCV profile stores 36 bytes per record. The columns sit in the fi
 | 28     | volume    | float64 | absolute | Trading volume                          |
 
 Record *N* starts at `header_size + N * record_size`, so random access by position is a single offset computation.
+
+### Ask Side
+
+A feed that quotes both sides of the market — a forex or CFD broker such as Capital.com — delivers its bars as bid-side OHLC plus a separate ask-side OHLC. The bid side is the file's main `open`/`high`/`low`/`close`; the ask side gets four more columns after `volume`, which makes the record 52 bytes:
+
+| Offset | Column    | Type    | Base    | Meaning                                       |
+|--------|-----------|---------|---------|-----------------------------------------------|
+| 36     | ask_open  | float32 | `open`  | Ask open, stored as `ask_open - open`         |
+| 40     | ask_high  | float32 | `high`  | Ask high, stored as `ask_high - high`         |
+| 44     | ask_low   | float32 | `low`   | Ask low, stored as `ask_low - low`            |
+| 48     | ask_close | float32 | `close` | Ask close, stored as `ask_close - close`      |
+
+Each delta is the spread of that field, a number far smaller than the price, so float32 holds it well below a tick; the same promotion and snapping rules as for the bid side apply.
+
+Nothing has to be declared up front. Pass the ask side on the `OHLCV` you write and the writer adds the columns on the first bar that carries it:
+
+```python
+from pynecore.types.ohlcv import OHLCV, AskOHLC
+
+writer.write(OHLCV(timestamp, 1.1000, 1.1010, 1.0990, 1.1005, 120.0,
+                   ask=AskOHLC(1.1002, 1.1013, 1.0991, 1.1007)))
+```
+
+Files whose bars never carry an ask keep the 36-byte profile. When the first ask arrives on a file that already holds records — a continued download, for instance — the file is rebuilt with the ask columns the same way a promotion rebuilds it, and the bars stored before read back with an all-NaN ask. The columns stay once added, so a later bar without an ask stores NaN there as well.
+
+On read, `candle.ask` is an `AskOHLC` on every bar of a file with ask columns and `None` otherwise; `reader.has_ask` tells which kind of file it is. A script sees the ask side through the built-in `bid` and `ask` series: on a bar with a quoted ask, `bid` is the bar's close and `ask` its ask close, and on every other bar both are `na`. TradingView fills these two only on its tick (`1T`) timeframe, so this is a PyneCore extension; data without an ask side behaves exactly as there.
+
+Aggregating to a higher timeframe folds the ask side like the bid side — first open, highest high, lowest low, last close — but only for a period whose every source bar quotes it; otherwise the aggregated bar has no ask. CSV and JSON exports add the four ask columns when the file has them.
 
 ### Why float32 Deltas Are Safe
 
@@ -134,7 +162,7 @@ with OHLCVWriter(file_path, "1", minmove=1, pricescale=100) as writer:
     ...
 ```
 
-The pair declares the grid as `mintick = minmove / pricescale` — the same two integers TradingView's symbol info uses, so fractional grids like `25/1000` (0.025) or `1/32` are exact. Each float32 delta column is measured on each bar against two criteria: the float32 resolution at that delta value must be smaller than half a tick, and the price itself must be an exact grid multiple. A column that fails either is **promoted** to an absolute float64 for the whole file. If the failure happens on the very first bar, only the header and descriptors are rewritten; later, the file is rebuilt into a temporary file and atomically renamed into place, after which appending continues normally. With all three price columns promoted, the record grows from 36 to 48 bytes.
+The pair declares the grid as `mintick = minmove / pricescale` — the same two integers TradingView's symbol info uses, so fractional grids like `25/1000` (0.025) or `1/32` are exact. Each float32 delta column is measured on each bar against two criteria: the float32 resolution at that delta value must be smaller than half a tick, and the price itself must be an exact grid multiple. A column that fails either is **promoted** to an absolute float64 for the whole file; the ask columns are measured the same way against their own bid-side base. If the failure happens on the very first bar, only the header and descriptors are rewritten; later, the file is rebuilt into a temporary file and atomically renamed into place, after which appending continues normally. With all three price columns promoted, the record grows from 36 to 48 bytes.
 
 Without a declared grid there is nothing to measure against, and float32 deltas are kept: no instrument in the measured corpus loses half a tick to them, and promoting on absence alone would inflate every file by a third.
 
@@ -273,7 +301,7 @@ For everyday use, the `pyne data convert-from` CLI command wraps exactly this fl
 
 ### Extra Fields
 
-Columns a source file carries beyond OHLCV — an indicator value, a signal label, a bid/ask snapshot — are stored in a `.extra.csv` sidecar next to the binary file. The sidecar holds **exactly one data row per committed record**, so row *N* always describes record *N*, and the reader attaches it automatically:
+Columns a source file carries beyond OHLCV — an indicator value, a signal label — are stored in a `.extra.csv` sidecar next to the binary file. The sidecar holds **exactly one data row per committed record**, so row *N* always describes record *N*, and the reader attaches it automatically:
 
 ```python
 with OHLCVReader(file_path) as reader:
