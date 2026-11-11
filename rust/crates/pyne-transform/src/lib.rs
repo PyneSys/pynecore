@@ -130,6 +130,17 @@ pub trait Host {
         Err(Unsupported(format!("no host to read {path}")))
     }
 
+    /// The static interface of a module source file built ahead, for a host that
+    /// does not hold the file's source (see [`module_interface::read_static_interface`]);
+    /// `None` for any other file.
+    fn prebuilt_static_interface(
+        &self,
+        path: &str,
+    ) -> Result<Option<module_interface::StaticInterface>, Unsupported> {
+        let _ = path;
+        Ok(None)
+    }
+
     /// The interface an imported module publishes, from its resolved source path
     /// (`module_interface.lookup(path, analyse, pipeline_hash)`); `None` when there is
     /// none to be had. The host may analyse the module to answer.

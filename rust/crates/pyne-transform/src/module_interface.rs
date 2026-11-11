@@ -1109,11 +1109,15 @@ pub fn static_interface(ast: &Ast, tree: NodeId) -> StaticInterface {
 
 /// The static interface of a module source file (`read_static_interface`); `None`
 /// when the file cannot be read. A source the native parser does not take answers
-/// `Unsupported`, where Python reads a `SyntaxError` as no interface.
+/// `Unsupported`, where Python reads a `SyntaxError` as no interface. A host that
+/// holds the module's static interface built ahead answers it without the source.
 pub fn read_static_interface(
     host: &dyn Host,
     path: &str,
 ) -> Result<Option<StaticInterface>, Unsupported> {
+    if let Some(prebuilt) = host.prebuilt_static_interface(path)? {
+        return Ok(Some(prebuilt));
+    }
     let Some(read) = host.read_source(path)? else { return Ok(None) };
     let source = std::str::from_utf8(&read.data)
         .map_err(|_| Unsupported(format!("the source of {path} is not UTF-8")))?;

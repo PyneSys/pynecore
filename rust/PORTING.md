@@ -339,6 +339,19 @@ returned as a `needs` list, so its caller answers every one and sends the reques
 again. `pyne-parse` takes the interpreter's version too (`parse_module_as`): before
 3.12 an f-string has CPython 3.11's locations and refuses what 3.11 cannot tokenize.
 
+A host can ship what a resolver works out of a fixed set of modules instead of
+their source. `Resolver::prebuild` runs over the files with their bytes and
+returns a `Prebuilt`: every interface its registry ends up holding (the settled
+interface of each Pyne module, with every dependency transformed on the way) and
+the static interface of each module. `Resolver::with_prebuilt` takes it over
+files that are only found and stated, with no bytes: the interfaces are
+registered as if this host had transformed the modules already, and
+`read_static_interface` asks `Host::prebuilt_static_interface` before it reads a
+source (the Python host answers `None`). The fields are public, so a host can
+build the table into its binary as code. The enum capture still reads an imported
+module's source; a host that ships a module bare has to know that module
+declares no enum member the capture could find.
+
 `rust/tools/wasm_gate.py` gates it: every corpus input runs through the whole
 pipeline in the WebAssembly module and through the Python pipeline with
 `compile_interface` as its analyser; the gate answers each `needs` from this

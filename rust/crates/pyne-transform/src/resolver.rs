@@ -17,9 +17,13 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use indexmap::IndexMap;
 use pyne_ast::{Ast, Constant, FieldRef, Kind, NodeId, Unsupported, Value};
 
-use crate::module_interface::{self as interfaces, Interface, SOURCE_DIGEST, build_interface};
+use crate::module_interface::{
+    self as interfaces, Interface, SOURCE_DIGEST, StaticInterface, build_interface,
+    read_static_interface,
+};
 use crate::pine_type_table::{
     CallInterface, DepRecord, ModuleInterface, PineTypeTable, TABLE_ATTR,
 };
@@ -72,6 +76,17 @@ pub struct Options {
     pub security_slice_disabled: bool,
 }
 
+/// What a [`Resolver`] knows of modules whose source it does not hold: what a
+/// resolver over their source worked out ([`Resolver::prebuild`]), so a host can
+/// ship the answers instead of the files ([`Resolver::with_prebuilt`]).
+#[derive(Clone, Debug, Default)]
+pub struct Prebuilt {
+    /// Every interface the registry held, the dependencies' included, by path
+    pub interfaces: Vec<Interface>,
+    /// Resolved path -> the static interface its source gives
+    pub statics: IndexMap<String, StaticInterface>,
+}
+
 /// One transform of a dependency that a lookup started, while it runs (`Compile`).
 struct Compile {
     path: String,
@@ -120,6 +135,8 @@ pub struct Resolver<F: Files> {
     compiles: RefCell<Vec<Compile>>,
     /// The Pyne modules whose transform is running (`import_hook._transforming`)
     transforming: RefCell<HashSet<String>>,
+    /// Resolved path -> the static interface built ahead ([`Prebuilt::statics`])
+    statics: HashMap<String, StaticInterface>,
 }
 
 impl<F: Files> Resolver<F> {
@@ -132,7 +149,40 @@ impl<F: Files> Resolver<F> {
             scopes: RefCell::new(Vec::new()),
             compiles: RefCell::new(Vec::new()),
             transforming: RefCell::new(HashSet::new()),
+            statics: HashMap::new(),
         }
+    }
+
+    /// A resolver that answers from `prebuilt` for the modules it covers, as one
+    /// over their source would: their interfaces are registered, as if this host
+    /// had transformed them already, and their static interfaces need no source.
+    pub fn with_prebuilt(files: F, options: Options, prebuilt: Prebuilt) -> R<Resolver<F>> {
+        let mut resolver = Resolver::new(files, options);
+        for interface in prebuilt.interfaces {
+            resolver.register(interface)?;
+        }
+        for (path, found) in prebuilt.statics {
+            let key = resolver.key(&path)?;
+            resolver.statics.insert(key, found);
+        }
+        Ok(resolver)
+    }
+
+    /// What [`Self::with_prebuilt`] needs to answer for `paths` without their source:
+    /// the settled interface of each Pyne module among them, with every interface
+    /// the transforms registered on the way, and each one's static interface.
+    pub fn prebuild(&self, paths: &[String]) -> R<Prebuilt> {
+        let mut statics = IndexMap::new();
+        for path in paths {
+            self.lookup(path, true)?;
+            if let Some(found) = read_static_interface(self, path)? {
+                statics.insert(self.key(path)?, found);
+            }
+        }
+        let mut interfaces: Vec<Interface> =
+            self.registry.borrow().values().map(|interface| (**interface).clone()).collect();
+        interfaces.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(Prebuilt { interfaces, statics })
     }
 
     /// The identity a module is registered and looked up under (`_key`).
@@ -496,6 +546,13 @@ impl<F: Files> Host for Resolver<F> {
         Ok(self.lookup(path, false)?.map(|interface| interface.types()))
     }
 
+    fn prebuilt_static_interface(&self, path: &str) -> R<Option<StaticInterface>> {
+        if self.statics.is_empty() {
+            return Ok(None);
+        }
+        Ok(self.statics.get(&self.key(path)?).cloned())
+    }
+
     fn closes_cycle(&self, path: &str) -> R<bool> {
         Ok(!path.is_empty() && self.closes(&self.key(path)?))
     }
@@ -816,6 +873,105 @@ pub fn is_pipeline_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::module_interface::read_static_interface;
+
+    const LIB: &str = "/p/pynecore/lib/_fix.py";
+    const PLAIN: &str = "/p/pynecore/core/plain.py";
+
+    /// Two modules of a package, with or without their bytes.
+    struct Mem {
+        data: bool,
+    }
+
+    impl Mem {
+        fn source(path: &str) -> Option<&'static str> {
+            match path {
+                LIB => Some(concat!(
+                    "\"\"\"\n@pyne lib\n\"\"\"\n",
+                    "from typing import Any\n",
+                    "from pynecore.types import NA, Persistent\n",
+                    "__all__ = ['fix']\n",
+                    "def fix(source: float) -> float:\n",
+                    "    last: Persistent[Any] = NA(None)\n",
+                    "    last = last if not (source == source) else source\n",
+                    "    return last\n",
+                )),
+                PLAIN => Some(concat!(
+                    "from .other import helper\n",
+                    "__all__ = ['plain', 'helper']\n",
+                    "def plain(a):\n",
+                    "    return a\n",
+                    "class Holder:\n",
+                    "    pass\n",
+                )),
+                _ => None,
+            }
+        }
+    }
+
+    impl Files for Mem {
+        fn python(&self) -> (u32, u32) {
+            (3, 14)
+        }
+
+        fn package(&self) -> &str {
+            "/p/pynecore"
+        }
+
+        fn spec_origin(&self, _: &str) -> R<Option<String>> {
+            Ok(None)
+        }
+
+        fn module_origin(&self, _: &str, _: &str, _: i64) -> R<Option<String>> {
+            Ok(None)
+        }
+
+        fn file(&self, path: &str) -> R<Option<File>> {
+            Ok(Mem::source(path).map(|source| File {
+                resolved: path.to_string(),
+                mtime_ns: 7,
+                size: source.len() as i64,
+                data: self.data.then(|| Rc::from(source.as_bytes())),
+            }))
+        }
+    }
+
+    fn options() -> Options {
+        Options { analyse: true, sequential: false, security_slice_disabled: false }
+    }
+
+    #[test]
+    fn a_prebuilt_resolver_answers_as_one_over_the_source() {
+        let paths = [LIB.to_string(), PLAIN.to_string()];
+        let prebuilt = Resolver::new(Mem { data: true }, options()).prebuild(&paths).unwrap();
+        assert!(prebuilt.interfaces.iter().any(|interface| interface.path == LIB));
+        assert!(prebuilt.statics.contains_key(LIB) && prebuilt.statics.contains_key(PLAIN));
+
+        let source = Resolver::new(Mem { data: true }, options());
+        let bare = Resolver::with_prebuilt(Mem { data: false }, options(), prebuilt).unwrap();
+        for path in &paths {
+            assert_eq!(bare.interface(path).unwrap(), source.interface(path).unwrap(), "{path}");
+            for settled in [false, true] {
+                assert_eq!(
+                    bare.call_interface(path, settled).unwrap(),
+                    source.call_interface(path, settled).unwrap(),
+                    "{path}"
+                );
+            }
+            let found = |host: &dyn Host| {
+                read_static_interface(host, path).unwrap().map(|found| {
+                    let mut bound: Vec<String> = found.bound.into_iter().collect();
+                    bound.sort();
+                    (found.call_routes, found.reexports, found.all, bound, found.open)
+                })
+            };
+            assert_eq!(found(&bare), found(&source), "{path}");
+        }
+        // Without the table, the bare files give no answer at all
+        let none = Resolver::new(Mem { data: false }, options());
+        assert_eq!(none.interface(LIB).unwrap(), None);
+        assert!(read_static_interface(&none, PLAIN).unwrap().is_none());
+    }
 
     #[test]
     fn pyne_heads() {
