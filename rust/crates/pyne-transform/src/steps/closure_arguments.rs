@@ -5,13 +5,20 @@
 //! method takes them right after its receiver, publishes their names as
 //! `__pyne_closure__`, and a `method_call` passing them carries the names as
 //! `pyne_closure_args` (or hands them over as `__pyne_captures__=(...)` when its
-//! receiver is unpacked).
+//! receiver is unpacked). A direct call of such a method with an unpacked receiver
+//! (`m(*args)`) is rejected.
+//!
+//! A call inside another inner function passes a capture by the CALLER's name for it,
+//! so a caller binding that name itself (a parameter or a local) takes `main`'s value
+//! as a capture of its own under `__capture·<name>__` and passes that on.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use pyne_ast::locations::{anchor_at, fix_locations};
-use pyne_ast::walk::{Transformer, Visited, children, generic_visit, walk, walk_statements};
-use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId, Unsupported, Value};
+use pyne_ast::walk::{
+    Transformer, Visited, children, generic_visit, visit_field, walk, walk_statements,
+};
+use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId, Value};
 
 use crate::{Context, Error};
 
@@ -82,6 +89,93 @@ fn has_decorator(ast: &Ast, decorators: &[NodeId], names: &[&str]) -> bool {
     })
 }
 
+/// The parameter that carries `main`'s `var` into a function that binds `var` itself.
+fn capture_param(var: &str) -> String {
+    format!("__capture·{var}__")
+}
+
+/// The name of the function a call reaches by name: its callee, or the method handed
+/// to `method_call` by reference.
+fn called_function(ast: &Ast, call: NodeId) -> Option<String> {
+    let Kind::Call { func, args, .. } = ast.kind(call) else { return None };
+    let Kind::Name { id, .. } = ast.kind(*func) else { return None };
+    if id != "method_call" {
+        return Some(id.clone());
+    }
+    match ast.kind(*args.first()?) {
+        Kind::Name { id, .. } => Some(id.clone()),
+        _ => None,
+    }
+}
+
+/// The captures of every inner function of `main`: `main`'s variable -> the parameter
+/// that carries it. A function takes its free variables under their own names; one
+/// that calls a function taking `var` while binding `var` itself takes it as a capture
+/// of its own under `__capture·var__`, which in turn reaches every function calling it.
+fn thread_captures(
+    closure_vars: &HashMap<String, BTreeSet<String>>,
+    scope_variables: &HashMap<String, HashSet<String>>,
+    scope_calls: &HashMap<String, HashSet<String>>,
+) -> HashMap<String, BTreeMap<String, String>> {
+    let mut captures: HashMap<String, BTreeMap<String, String>> = closure_vars
+        .iter()
+        .filter(|(_, vars)| !vars.is_empty())
+        .map(|(key, vars)| (key.clone(), vars.iter().map(|v| (v.clone(), v.clone())).collect()))
+        .collect();
+    let empty = HashSet::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (caller, callees) in scope_calls {
+            if !caller.strip_prefix("main.").is_some_and(|rest| !rest.contains('.')) {
+                continue;
+            }
+            let bound = scope_variables.get(caller).unwrap_or(&empty);
+            let needed: Vec<String> = callees
+                .iter()
+                .filter_map(|callee| captures.get(&function_key(callee)))
+                .flat_map(|callee| callee.keys())
+                .filter(|var| bound.contains(*var))
+                .cloned()
+                .collect();
+            let own = captures.entry(caller.clone()).or_default();
+            for var in needed {
+                if let std::collections::btree_map::Entry::Vacant(slot) = own.entry(var) {
+                    let param = capture_param(slot.key());
+                    slot.insert(param);
+                    changed = true;
+                }
+            }
+        }
+    }
+    captures.retain(|_, own| !own.is_empty());
+    captures
+}
+
+/// Every parameter of a function, of every kind.
+fn parameters(ast: &Ast, arguments: NodeId) -> Vec<NodeId> {
+    let Kind::Arguments { posonlyargs, args, vararg, kwonlyargs, kwarg, .. } = ast.kind(arguments)
+    else {
+        unreachable!()
+    };
+    let mut params: Vec<NodeId> =
+        posonlyargs.iter().chain(args).chain(kwonlyargs).copied().collect();
+    params.extend(vararg.iter().chain(kwarg));
+    params
+}
+
+/// Insert parameters at a position of the positional parameters: among the
+/// positional-only ones when the position falls before their end.
+fn insert_positional(ast: &mut Ast, arguments: NodeId, index: usize, new_args: Vec<NodeId>) {
+    let Kind::Arguments { posonlyargs, args, .. } = ast.kind_mut(arguments) else { unreachable!() };
+    if index < posonlyargs.len() {
+        posonlyargs.splice(index..index, new_args);
+    } else {
+        let index = index - posonlyargs.len();
+        args.splice(index..index, new_args);
+    }
+}
+
 /// Whether a `def` stands anywhere inside a function.
 fn has_nested_function(ast: &Ast, func: NodeId) -> bool {
     walk_statements(ast, func)
@@ -98,12 +192,18 @@ struct Collector {
     scope_key: String,
     scope_variables: HashMap<String, HashSet<String>>,
     scope_uses: HashMap<String, HashSet<String>>,
+    /// Scope key -> the functions it calls by name
+    scope_calls: HashMap<String, HashSet<String>>,
     /// Scope key -> its closure variables, sorted as the parameters list them
     closure_vars: HashMap<String, BTreeSet<String>>,
     /// `scope.var` -> the annotation it was declared with
     closure_var_types: HashMap<String, NodeId>,
     /// `scope.var` keys declared with a Persistent annotation
     persistent_vars: HashSet<String>,
+    /// The inner functions of `main`, by name
+    inner_functions: HashSet<String>,
+    /// The inner functions of `main` declared methods
+    method_definitions: HashSet<String>,
     in_main_function: bool,
 }
 
@@ -128,12 +228,31 @@ impl Collector {
     }
 
     fn visit_function(&mut self, ast: &Ast, id: NodeId) {
-        let Kind::FunctionDef { name, args, decorator_list, .. } = ast.kind(id) else {
+        let Kind::FunctionDef { name, args, body, decorator_list, returns, .. } = ast.kind(id)
+        else {
             unreachable!()
         };
         let is_main = name == "main" && has_decorator(ast, decorator_list, &MAIN_DECORATORS);
         let old_function = self.current_function.clone();
         let old_in_main = self.in_main_function;
+
+        if self.in_main_function && old_function.as_deref() == Some("main") && name != "main" {
+            self.inner_functions.insert(name.clone());
+            if has_decorator(ast, decorator_list, &METHOD_DECORATORS) {
+                self.method_definitions.insert(name.clone());
+            }
+        }
+
+        // The defaults, decorators and annotations belong to the enclosing scope: they
+        // run there when the `def` executes
+        for &decorator in decorator_list {
+            self.visit(ast, decorator);
+        }
+        self.visit(ast, *args);
+        if let Some(returns) = *returns {
+            self.visit(ast, returns);
+        }
+
         if is_main {
             self.in_main_function = true;
         }
@@ -143,11 +262,11 @@ impl Collector {
         let scope_key = self.scope_key.clone();
         self.scope_variables.insert(scope_key.clone(), HashSet::new());
         self.scope_uses.insert(scope_key.clone(), HashSet::new());
+        self.scope_calls.insert(scope_key.clone(), HashSet::new());
 
         // An annotated parameter carries the same type information as an annotated
         // assignment does
-        let Kind::Arguments { args: positional, .. } = ast.kind(*args) else { unreachable!() };
-        for &param in positional {
+        for param in parameters(ast, *args) {
             let Kind::Arg { arg, annotation, .. } = ast.kind(param) else { unreachable!() };
             self.scope_variables.get_mut(&scope_key).unwrap().insert(arg.clone());
             let Some(annotation) = *annotation else { continue };
@@ -158,7 +277,9 @@ impl Collector {
             }
         }
 
-        self.generic_visit(ast, id);
+        for &stmt in body {
+            self.visit(ast, stmt);
+        }
 
         if self.in_main_function
             && self.function_stack.len() > 1
@@ -216,6 +337,12 @@ impl Collector {
                 }
             }
             Kind::For { target, .. } if in_function => self.define_target(ast, *target),
+            Kind::Call { .. } if in_function => {
+                if let Some(callee) = called_function(ast, id) {
+                    let key = self.scope_key.clone();
+                    self.scope_calls.entry(key).or_default().insert(callee);
+                }
+            }
             Kind::ExceptHandler { name: Some(name), .. } if in_function => self.define(name),
             _ => {}
         }
@@ -232,13 +359,16 @@ impl Collector {
 struct ClosureArguments {
     in_main_function: bool,
     current_function: Option<String>,
-    /// The inner functions of `main` met so far, by name
+    /// The inner function of `main` the visit is in
+    caller: Option<String>,
+    /// The inner functions of `main`, by name
     inner_functions: HashSet<String>,
-    closure_vars: HashMap<String, BTreeSet<String>>,
+    /// Scope key -> its captures: `main`'s variable -> its parameter
+    captures: HashMap<String, BTreeMap<String, String>>,
     closure_var_types: HashMap<String, NodeId>,
     /// Inner functions called as methods: their closure variables follow the receiver
     method_functions: HashSet<String>,
-    error: Option<Unsupported>,
+    error: Option<Error>,
 }
 
 /// The key of an inner function of `main`.
@@ -254,12 +384,19 @@ fn load_names(ast: &mut Ast, names: &[String]) -> Vec<NodeId> {
 }
 
 impl ClosureArguments {
-    /// The closure variables of an inner function, when it has any.
-    fn closure_vars_of(&self, name: &str) -> Option<Vec<String>> {
-        self.closure_vars
-            .get(&function_key(name))
-            .filter(|vars| !vars.is_empty())
-            .map(|vars| vars.iter().cloned().collect())
+    /// The captures of an inner function, when it has any.
+    fn captures_of(&self, name: &str) -> Option<BTreeMap<String, String>> {
+        self.captures.get(&function_key(name)).filter(|own| !own.is_empty()).cloned()
+    }
+
+    /// The names that pass `main`'s variables to a function taking them as captures,
+    /// in its parameter order: `main`'s own variable in `main`, the caller's capture
+    /// parameter for it inside an inner function (`main`'s value even where the caller
+    /// binds the name itself).
+    fn passed(&self, captures: &BTreeMap<String, String>) -> Vec<String> {
+        let own =
+            self.caller.as_deref().and_then(|caller| self.captures.get(&function_key(caller)));
+        captures.keys().map(|var| own.and_then(|own| own.get(var)).unwrap_or(var).clone()).collect()
     }
 
     fn visit_function(&mut self, ast: &mut Ast, id: NodeId) -> Visited {
@@ -269,83 +406,83 @@ impl ClosureArguments {
         let (name, args) = (name.clone(), *args);
         let is_main_decorated =
             name == "main" && has_decorator(ast, decorator_list, &MAIN_DECORATORS);
-        let is_method = has_decorator(ast, decorator_list, &METHOD_DECORATORS);
 
         let old_in_main = self.in_main_function;
-        let old_current = self.current_function.take();
-        if is_main_decorated {
-            self.in_main_function = true;
-        }
-        self.current_function = Some(name.clone());
+        let old_current = self.current_function.clone();
 
         // The ``__pyne_closure__`` publication of a method's captures
         let mut marker = None;
 
-        if self.in_main_function && old_current.as_deref() == Some("main") && name != "main" {
-            if is_method {
-                self.method_functions.insert(name.clone());
-            }
-            if let Some(closure_vars) = self.closure_vars_of(&name) {
-                let mut new_args = Vec::with_capacity(closure_vars.len());
-                for var in &closure_vars {
-                    let mut annotation = self.closure_var_types.get(&function_key(var)).copied();
-                    if let Some(found) = annotation
-                        && is_persistent_annotation(ast, found)
-                    {
-                        annotation = extract_inner_type(ast, found);
-                    }
-                    new_args.push(ast.add(Kind::Arg {
-                        arg: var.clone(),
-                        annotation,
-                        type_comment: None,
-                    }));
+        let old_caller = self.caller.clone();
+        let is_inner =
+            self.in_main_function && old_current.as_deref() == Some("main") && name != "main";
+        if is_inner && let Some(captures) = self.captures_of(&name) {
+            let mut new_args = Vec::with_capacity(captures.len());
+            for (var, param) in &captures {
+                let mut annotation = self.closure_var_types.get(&function_key(var)).copied();
+                if let Some(found) = annotation
+                    && is_persistent_annotation(ast, found)
+                {
+                    annotation = extract_inner_type(ast, found);
                 }
-                let Kind::Arguments { args: positional, .. } = ast.kind(args) else {
-                    unreachable!()
-                };
-                if self.method_functions.contains(&name) && !positional.is_empty() {
-                    let Kind::Arguments { args: positional, .. } = ast.kind_mut(args) else {
-                        unreachable!()
-                    };
-                    positional.splice(1..1, new_args);
-                    let base = ast.add(Kind::Name { id: name.clone(), ctx: ExprContext::Load });
-                    let target = ast.add(Kind::Attribute {
-                        value: base,
-                        attr: "__pyne_closure__".into(),
-                        ctx: ExprContext::Store,
-                    });
-                    let elts = closure_vars
-                        .iter()
-                        .map(|var| {
-                            ast.add(Kind::Constant {
-                                value: Constant::Str(var.clone()),
-                                kind: None,
-                            })
-                        })
-                        .collect();
-                    let value = ast.add(Kind::Tuple { elts, ctx: ExprContext::Load });
-                    let assign =
-                        ast.add(Kind::Assign { targets: vec![target], value, type_comment: None });
-                    if let Err(err) = anchor_at(ast, assign, id)
-                        .and_then(|assign| fix_locations(ast, assign, 1, 0))
-                    {
-                        self.error.get_or_insert(err);
-                    }
-                    marker = Some(assign);
-                } else {
-                    let Kind::Arguments { args: positional, .. } = ast.kind_mut(args) else {
-                        unreachable!()
-                    };
-                    positional.splice(0..0, new_args);
-                }
+                new_args.push(ast.add(Kind::Arg {
+                    arg: param.clone(),
+                    annotation,
+                    type_comment: None,
+                }));
             }
-            self.inner_functions.insert(name);
+            let Kind::Arguments { posonlyargs, args: positional, .. } = ast.kind(args) else {
+                unreachable!()
+            };
+            if self.method_functions.contains(&name)
+                && !(posonlyargs.is_empty() && positional.is_empty())
+            {
+                insert_positional(ast, args, 1, new_args);
+                let base = ast.add(Kind::Name { id: name.clone(), ctx: ExprContext::Load });
+                let target = ast.add(Kind::Attribute {
+                    value: base,
+                    attr: "__pyne_closure__".into(),
+                    ctx: ExprContext::Store,
+                });
+                let elts = captures
+                    .values()
+                    .map(|param| {
+                        ast.add(Kind::Constant { value: Constant::Str(param.clone()), kind: None })
+                    })
+                    .collect();
+                let value = ast.add(Kind::Tuple { elts, ctx: ExprContext::Load });
+                let assign =
+                    ast.add(Kind::Assign { targets: vec![target], value, type_comment: None });
+                if let Err(err) =
+                    anchor_at(ast, assign, id).and_then(|assign| fix_locations(ast, assign, 1, 0))
+                {
+                    self.error.get_or_insert(err.into());
+                }
+                marker = Some(assign);
+            } else {
+                insert_positional(ast, args, 0, new_args);
+            }
         }
 
-        generic_visit(self, ast, id);
+        // The defaults, decorators and annotations run in the enclosing scope when the
+        // `def` executes; only the body runs as the function itself
+        let fields = ast.kind(id).class().fields;
+        let body = fields.iter().position(|field| field.name == "body").unwrap();
+        for index in (0..fields.len()).filter(|&index| index != body) {
+            visit_field(self, ast, id, index);
+        }
+        if is_main_decorated {
+            self.in_main_function = true;
+        }
+        self.current_function = Some(name.clone());
+        if is_inner {
+            self.caller = Some(name);
+        }
+        visit_field(self, ast, id, body);
 
         self.in_main_function = old_in_main;
         self.current_function = old_current;
+        self.caller = old_caller;
 
         match marker {
             Some(marker) => Visited::Many(vec![id, marker]),
@@ -362,12 +499,24 @@ impl ClosureArguments {
         let Kind::Name { id: func_name, .. } = ast.kind(*func) else { return };
 
         if self.inner_functions.contains(func_name) {
-            let Some(closure_vars) = self.closure_vars_of(func_name) else { return };
+            let Some(captures) = self.captures_of(func_name) else { return };
+            let passed = self.passed(&captures);
             if self.method_functions.contains(func_name) {
+                if args
+                    .first()
+                    .is_some_and(|&first| matches!(ast.kind(first), Kind::Starred { .. }))
+                {
+                    self.error.get_or_insert(Error::Rejected(format!(
+                        "{func_name}() uses variables of main(), so its receiver cannot come \
+                         from an unpacked argument; pass the receiver explicitly: \
+                         {func_name}(receiver, *args)"
+                    )));
+                    return;
+                }
                 // After the receiver, where the method declares them
-                thread_after_receiver(ast, id, &closure_vars);
+                thread_after_receiver(ast, id, &captures, &passed);
             } else {
-                let names = load_names(ast, &closure_vars);
+                let names = load_names(ast, &passed);
                 let Kind::Call { args, .. } = ast.kind_mut(id) else { unreachable!() };
                 args.splice(0..0, names);
             }
@@ -378,9 +527,9 @@ impl ClosureArguments {
             if !self.inner_functions.contains(method_name) {
                 return;
             }
-            let Some(closure_vars) = self.closure_vars_of(method_name) else { return };
+            let Some(captures) = self.captures_of(method_name) else { return };
             let unpacked = matches!(ast.kind(args[1]), Kind::Starred { .. });
-            let names = load_names(ast, &closure_vars);
+            let names = load_names(ast, &self.passed(&captures));
             if unpacked {
                 let tuple = ast.add(Kind::Tuple { elts: names, ctx: ExprContext::Load });
                 let keyword =
@@ -390,29 +539,34 @@ impl ClosureArguments {
             } else {
                 let Kind::Call { args, .. } = ast.kind_mut(id) else { unreachable!() };
                 args.splice(2..2, names);
-                let names = closure_vars.into_iter().map(Value::Str).collect();
+                let names = captures.into_values().map(Value::Str).collect();
                 ast.set_extra(id, "pyne_closure_args", Value::Tuple(names));
             }
         }
     }
 }
 
-/// Pass a method's closure variables right after its receiver argument; a receiver
-/// passed by keyword or unpacked leaves no position to follow, so they go by keyword.
-fn thread_after_receiver(ast: &mut Ast, call: NodeId, closure_vars: &[String]) {
+/// Pass a method's closure variables (`passed`, in parameter order) right after its
+/// receiver argument; a receiver passed by keyword leaves no position to follow, so
+/// they go by keyword, under the parameter names.
+fn thread_after_receiver(
+    ast: &mut Ast,
+    call: NodeId,
+    captures: &BTreeMap<String, String>,
+    passed: &[String],
+) {
     let Kind::Call { args, .. } = ast.kind(call) else { unreachable!() };
-    let positional =
-        args.first().is_some_and(|&first| !matches!(ast.kind(first), Kind::Starred { .. }));
-    if positional {
-        let names = load_names(ast, closure_vars);
+    if !args.is_empty() {
+        let names = load_names(ast, passed);
         let Kind::Call { args, .. } = ast.kind_mut(call) else { unreachable!() };
         args.splice(1..1, names);
     } else {
-        let keywords: Vec<NodeId> = closure_vars
-            .iter()
-            .map(|var| {
+        let keywords: Vec<NodeId> = captures
+            .values()
+            .zip(passed)
+            .map(|(param, var)| {
                 let value = ast.add(Kind::Name { id: var.clone(), ctx: ExprContext::Load });
-                ast.add(Kind::Keyword { arg: Some(var.clone()), value })
+                ast.add(Kind::Keyword { arg: Some(param.clone()), value })
             })
             .collect();
         let Kind::Call { keywords: slot, .. } = ast.kind_mut(call) else { unreachable!() };
@@ -446,7 +600,7 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
 
     let mut collector = Collector::default();
     collector.visit(ast, module);
-    let mut method_functions = HashSet::new();
+    let mut method_functions = collector.method_definitions;
     for call in walk(ast, module) {
         if let Kind::Call { func, args, .. } = ast.kind(call)
             && matches!(ast.kind(*func), Kind::Name { id, .. } if id == "method_call")
@@ -469,18 +623,21 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
         });
     }
 
+    let captures =
+        thread_captures(&closure_vars, &collector.scope_variables, &collector.scope_calls);
     let mut transform = ClosureArguments {
         in_main_function: false,
         current_function: None,
-        inner_functions: HashSet::new(),
-        closure_vars,
+        caller: None,
+        inner_functions: collector.inner_functions,
+        captures,
         closure_var_types: collector.closure_var_types,
         method_functions,
         error: None,
     };
     generic_visit(&mut transform, ast, module);
     match transform.error {
-        Some(err) => Err(err.into()),
+        Some(err) => Err(err),
         None => Ok(module),
     }
 }

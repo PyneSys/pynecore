@@ -39,13 +39,28 @@ assignment right after its definition) for the runtime to drop them, and every
 ``pyne_closure_args`` for the type pass. A ``method_call`` whose receiver is
 unpacked has no position to follow, so it hands the captures over as
 ``__pyne_captures__=(length, x)``, which ``method_call`` passes to the method
-alone, after the receiver.
+alone, after the receiver. A DIRECT call of such a method whose receiver is unpacked
+(``m(*args)``) is rejected: the receiver has to be passed explicitly.
+
+A call inside another inner function passes a capture by the CALLER's name for
+it, so a caller binding the same name itself (a parameter or a local) would hand
+its own value over instead of ``main``'s. Such a caller takes ``main``'s value as
+a capture of its own, under ``__capture·<name>__``, and passes that on::
+
+    def reader(g):                     # was: return g
+        return g
+
+    def f(__capture·g__, g):           # was: def f(g): return reader()
+        return reader(__capture·g__)
+
+    f(g, 7.0)
 """
 
 import ast
 from typing import Set, Dict, List, Optional, cast, Any
 
 from . import ast_walk
+from .emission_settings import PYNE_RESERVED_NAME_CHAR
 from .locations import anchor_at, fix_locations
 
 
@@ -85,6 +100,77 @@ def _get_decorator_name(decorator: Any) -> Optional[str]:
     return None
 
 
+def _capture_param(var: str) -> str:
+    """The parameter that carries ``main``'s ``var`` into a function that binds
+    ``var`` itself."""
+    return f'__capture{PYNE_RESERVED_NAME_CHAR}{var}__'
+
+
+def _called_function(call: ast.Call) -> Optional[str]:
+    """The name of the function a call reaches by name: its callee, or the method
+    handed to ``method_call`` by reference."""
+    if not isinstance(call.func, ast.Name):
+        return None
+    if call.func.id == 'method_call' and call.args:
+        handed = call.args[0]
+        return handed.id if isinstance(handed, ast.Name) else None
+    return call.func.id
+
+
+def _thread_captures(closure_vars: Dict[str, Set[str]],
+                     scope_variables: Dict[str, Set[str]],
+                     scope_calls: Dict[str, Set[str]]) -> Dict[str, Dict[str, str]]:
+    """The captures of every inner function of ``main``: ``main``'s variable ->
+    the parameter that carries it.
+
+    A function takes its free variables under their own names. A function that
+    calls one taking ``var`` while binding ``var`` itself cannot pass ``main``'s
+    value by that name, so it takes ``var`` as a capture of its own under
+    ``__capture·var__``; that in turn reaches every function calling it.
+
+    :param closure_vars: Scope key -> the free variables it reads from ``main``
+    :param scope_variables: Scope key -> the names it binds
+    :param scope_calls: Scope key -> the names of the functions it calls
+    :return: Scope key -> captures, sorted by ``main``'s variable name
+    """
+    captures = {key: {var: var for var in vars_} for key, vars_ in closure_vars.items() if vars_}
+    changed = True
+    while changed:
+        changed = False
+        for caller, callees in scope_calls.items():
+            if caller.count('.') != 1 or not caller.startswith('main.'):
+                continue
+            bound = scope_variables.get(caller, set())
+            own = captures.setdefault(caller, {})
+            for callee in callees:
+                for var in captures.get('main.' + callee, {}):
+                    if var in bound and var not in own:
+                        own[var] = _capture_param(var)
+                        changed = True
+    return {key: dict(sorted(own.items())) for key, own in captures.items() if own}
+
+
+def _parameters(arguments: ast.arguments) -> List[ast.arg]:
+    """Every parameter of a function, of every kind."""
+    params = arguments.posonlyargs + arguments.args + arguments.kwonlyargs
+    return params + [arg for arg in (arguments.vararg, arguments.kwarg) if arg is not None]
+
+
+def _insert_positional(arguments: ast.arguments, index: int, new_args: List[ast.arg]) -> None:
+    """Insert parameters at a position of the positional parameters: among the
+    positional-only ones when the position falls before their end.
+
+    :param arguments: The parameters of the function, changed in place
+    :param index: The position among all positional parameters
+    :param new_args: The parameters to insert
+    """
+    if index < len(arguments.posonlyargs):
+        arguments.posonlyargs[index:index] = new_args
+    else:
+        index -= len(arguments.posonlyargs)
+        arguments.args[index:index] = new_args
+
+
 def _has_nested_function(func: ast.FunctionDef) -> bool:
     """Whether a ``def`` stands anywhere inside a function."""
     return any(isinstance(stmt, ast.FunctionDef) and stmt is not func
@@ -101,12 +187,14 @@ class ClosureArgumentsTransformer(ast_walk.NodeTransformer):
         self.current_function: Optional[str] = None
         # Stack of function scopes for nested functions
         self.function_stack: List[str] = []
+        # The inner function of ``main`` the visit is in
+        self.caller: Optional[str] = None
         # Variables defined in each scope
         self.scope_variables: Dict[str, Set[str]] = {}
-        # Track function definitions to update calls
-        self.inner_functions: Dict[str, ast.FunctionDef] = {}
-        # Track closure variables for each inner function
-        self.closure_vars: Dict[str, Set[str]] = {}
+        # The inner functions of ``main``, by name
+        self.inner_functions: Set[str] = set()
+        # Each inner function's captures: ``main``'s variable -> its parameter
+        self.captures: Dict[str, Dict[str, str]] = {}
         # Track type annotations for closure variables
         self.closure_var_types: Dict[str, ast.AST] = {}
         # ``scope.var`` keys declared Persistent (a PersistentSeries is both)
@@ -115,6 +203,8 @@ class ClosureArgumentsTransformer(ast_walk.NodeTransformer):
         # function handed to ``method_call``. Their closure variables follow
         # the receiver instead of preceding it
         self.method_functions: Set[str] = set()
+        # The script path, for located errors
+        self._module_file = '<script>'
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
         # Only a function defined inside the decorated main can have closure
@@ -126,14 +216,16 @@ class ClosureArgumentsTransformer(ast_walk.NodeTransformer):
                    for stmt in ast_walk.walk_statements(node)):
             return node
 
+        self._module_file = getattr(node, '_module_file_path', '<script>')
+
         # First pass: collect all function definitions and their closure variables
         collector = ClosureVariableCollector()
         collector.visit(node)
         self.scope_variables = collector.scope_variables
-        self.closure_vars = collector.closure_vars
         self.closure_var_types = collector.closure_var_types
         self.persistent_vars = collector.persistent_vars
-        self.method_functions = set()
+        self.inner_functions = collector.inner_functions
+        self.method_functions = set(collector.method_definitions)
         for call in ast_walk.walk(node):
             if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) \
                     and call.func.id == 'method_call' and call.args:
@@ -150,20 +242,25 @@ class ClosureArgumentsTransformer(ast_walk.NodeTransformer):
         # (advancing once per call, not once per bar), so a function invoked a
         # bar-varying number of times reads the wrong history (issue #67). Drop
         # them here so neither the parameter list nor the call sites thread them.
-        self._drop_series_closures()
+        self._drop_series_closures(collector.closure_vars)
+        self.captures = _thread_captures(collector.closure_vars, collector.scope_variables,
+                                         collector.scope_calls)
 
         # Second pass: transform the functions
         return cast(ast.Module, self.generic_visit(node))
 
-    def _drop_series_closures(self) -> None:
+    def _drop_series_closures(self, closure_vars_of: Dict[str, Set[str]]) -> None:
         """Remove plain-Series closure variables — they resolve through the
         scope chain, not through argument passing.
 
         A PersistentSeries is left threaded: its Series slot in the parent is
         pruned by the UnusedSeriesDetector (the only history read sits in the
         inner function), so the scope-chain path has no slot to reach and the
-        value argument is what carries the per-bar history into the call."""
-        for scope_key, closure_vars in self.closure_vars.items():
+        value argument is what carries the per-bar history into the call.
+
+        :param closure_vars_of: Scope key -> its closure variables, changed in place
+        """
+        for scope_key, closure_vars in closure_vars_of.items():
             parent_scope = scope_key.rsplit('.', 1)[0]
             kept = {var for var in closure_vars
                     if f"{parent_scope}.{var}" in self.persistent_vars
@@ -184,32 +281,23 @@ class ClosureArgumentsTransformer(ast_walk.NodeTransformer):
         old_in_main = self.in_main_function
         old_current = self.current_function
 
-        # Update state
-        if is_main_decorated:
-            self.in_main_function = True
-        self.current_function = node.name
-        if self.current_function:
-            self.function_stack.append(self.current_function)
-
         # The ``__pyne_closure__`` publication of a method's captures
         marker: ast.stmt | None = None
 
         # Process inner functions if we're in main
-        if self.in_main_function and old_current == 'main' and node.name != 'main':
+        old_caller = self.caller
+        is_inner = self.in_main_function and old_current == 'main' and node.name != 'main'
+        if is_inner:
             # This is an inner function in main
-            func_key = self._get_function_key(node.name)
-
-            if any(_get_decorator_name(decorator) in _METHOD_DECORATORS
-                   for decorator in node.decorator_list):
-                self.method_functions.add(node.name)
+            captures = self.captures.get(self._get_function_key(node.name))
 
             # Check if function has closure variables
-            if func_key in self.closure_vars and self.closure_vars[func_key]:
+            if captures:
                 # Add closure variables as parameters at the beginning -- after
                 # the receiver for a method
-                closure_vars = sorted(self.closure_vars[func_key])
+                params = list(captures.values())
                 new_args = []
-                for var in closure_vars:
+                for var, param in captures.items():
                     # Get type annotation for this closure variable
                     parent_scope = 'main'  # closure vars come from main scope
                     var_key = f"{parent_scope}.{var}"
@@ -220,31 +308,40 @@ class ClosureArgumentsTransformer(ast_walk.NodeTransformer):
                         annotation = self._extract_inner_type(annotation)
 
                     # Add closure vars at the beginning with processed annotation
-                    new_args.append(ast.arg(arg=var, annotation=cast(ast.expr, annotation)))
+                    new_args.append(ast.arg(arg=param, annotation=cast(ast.expr, annotation)))
                 # Add original args after closure vars
-                if node.name in self.method_functions and node.args.args:
-                    node.args.args = node.args.args[:1] + new_args + node.args.args[1:]
+                if node.name in self.method_functions \
+                        and (node.args.posonlyargs or node.args.args):
+                    _insert_positional(node.args, 1, new_args)
                     marker = anchor_at(ast.Assign(
                         targets=[ast.Attribute(value=ast.Name(id=node.name, ctx=ast.Load()),
                                                attr='__pyne_closure__', ctx=ast.Store())],
-                        value=ast.Tuple(elts=[ast.Constant(value=var) for var in closure_vars],
+                        value=ast.Tuple(elts=[ast.Constant(value=param) for param in params],
                                         ctx=ast.Load())), node)
                     fix_locations(marker)
                 else:
-                    new_args.extend(node.args.args)
-                    node.args.args = new_args
+                    _insert_positional(node.args, 0, new_args)
 
-            # Store the function definition
-            self.inner_functions[node.name] = node
-
-        # Visit the function body
+        # The defaults, decorators and annotations run in the enclosing scope when
+        # the ``def`` executes; only the body runs as the function itself
+        body = node.body
+        node.body = []
         node = cast(ast.FunctionDef, self.generic_visit(node))
+
+        # Update state
+        if is_main_decorated:
+            self.in_main_function = True
+        self.current_function = node.name
+        self.function_stack.append(node.name)
+        if is_inner:
+            self.caller = node.name
+        node.body = cast(ast.Module, self.generic_visit(ast.Module(body=body, type_ignores=[]))).body
 
         # Restore state
         self.in_main_function = old_in_main
         self.current_function = old_current
-        if self.function_stack:
-            self.function_stack.pop()
+        self.caller = old_caller
+        self.function_stack.pop()
 
         return node if marker is None else [node, marker]
 
@@ -258,21 +355,16 @@ class ClosureArgumentsTransformer(ast_walk.NodeTransformer):
 
             # Handle regular function calls
             if func_name in self.inner_functions:
-                # Get the closure variables for this function
-                func_key = self._get_function_key(func_name)
-                if func_key in self.closure_vars and self.closure_vars[func_key]:
-                    closure_vars = sorted(self.closure_vars[func_key])
+                captures = self.captures.get(self._get_function_key(func_name))
+                if captures:
                     if func_name in self.method_functions:
+                        if node.args and isinstance(node.args[0], ast.Starred):
+                            self._reject_unpacked_receiver(node, func_name)
                         # After the receiver, where the method declares them
-                        self._thread_after_receiver(node, closure_vars)
+                        self._thread_after_receiver(node, captures, self._passed(captures))
                     else:
                         # Add closure variables as arguments at the beginning
-                        new_args = []
-                        for var in closure_vars:
-                            new_args.append(ast.Name(id=var, ctx=ast.Load()))
-                        # Add original args after closure vars
-                        new_args.extend(node.args)
-                        node.args = new_args
+                        node.args = self._passed(captures) + node.args
 
             # Handle method_call() calls - these need special handling
             elif func_name == 'method_call' and len(node.args) >= 2:
@@ -290,46 +382,72 @@ class ClosureArgumentsTransformer(ast_walk.NodeTransformer):
                 if isinstance(first_arg, ast.Name):
                     method_name = first_arg.id
 
-                if method_name:
-                    # Check if this method name corresponds to an inner function
-                    if method_name in self.inner_functions:
-                        # Get the closure variables for this function
-                        func_key = self._get_function_key(method_name)
-                        if func_key in self.closure_vars and self.closure_vars[func_key]:
-                            # method_call(method_ref, this_obj, closure_vars..., original_args...)
-                            # — the converted method declares its closure
-                            # parameters right after the receiver
-                            closure_vars = sorted(self.closure_vars[func_key])
-                            if isinstance(node.args[1], ast.Starred):
-                                node.keywords.append(ast.keyword(
-                                    arg='__pyne_captures__',
-                                    value=ast.Tuple(elts=[ast.Name(id=var, ctx=ast.Load())
-                                                          for var in closure_vars],
-                                                    ctx=ast.Load())))
-                            else:
-                                node.args[2:2] = [ast.Name(id=var, ctx=ast.Load())
-                                                  for var in closure_vars]
-                                setattr(node, 'pyne_closure_args', tuple(closure_vars))
+                # Check if this method name corresponds to an inner function
+                if method_name and method_name in self.inner_functions:
+                    captures = self.captures.get(self._get_function_key(method_name))
+                    if captures:
+                        # method_call(method_ref, this_obj, closure_vars..., original_args...)
+                        # — the converted method declares its closure
+                        # parameters right after the receiver
+                        if isinstance(node.args[1], ast.Starred):
+                            node.keywords.append(ast.keyword(
+                                arg='__pyne_captures__',
+                                value=ast.Tuple(elts=self._passed(captures), ctx=ast.Load())))
+                        else:
+                            node.args[2:2] = self._passed(captures)
+                            setattr(node, 'pyne_closure_args', tuple(captures.values()))
 
         return node
 
+    def _passed(self, captures: Dict[str, str]) -> List[ast.expr]:
+        """The arguments that pass ``main``'s variables to a function taking them
+        as captures, in its parameter order.
+
+        A call in ``main`` reads ``main``'s own variable; a call inside an inner
+        function reads it through the caller's capture parameter for it, which
+        carries ``main``'s value even where the caller binds the name itself.
+
+        :param captures: The callee's captures: ``main``'s variable -> its parameter
+        :return: One ``Name`` load per capture
+        """
+        own = self.captures.get(self._get_function_key(self.caller), {}) \
+            if self.caller is not None else {}
+        return [ast.Name(id=own.get(var, var), ctx=ast.Load()) for var in captures]
+
+    def _reject_unpacked_receiver(self, node: ast.Call, name: str) -> None:
+        """Raise the located error for a direct method call whose receiver
+        comes from an unpacked sequence.
+
+        The closure variables must follow the receiver, and the position after
+        the first element of an unpacked sequence is only known at run time.
+
+        :param node: The call node
+        :param name: The called method
+        """
+        raise SyntaxError(
+            f"{name}() uses variables of main(), so its receiver cannot come from an "
+            f"unpacked argument; pass the receiver explicitly: {name}(receiver, *args)",
+            (self._module_file, getattr(node, 'lineno', 0),
+             getattr(node, 'col_offset', 0) + 1, None))
+
     @staticmethod
-    def _thread_after_receiver(node: ast.Call, closure_vars: List[str]) -> None:
+    def _thread_after_receiver(node: ast.Call, captures: Dict[str, str],
+                               passed: List[ast.expr]) -> None:
         """Pass a method's closure variables right after its receiver argument
         in a direct call of the method.
 
-        A receiver passed by keyword (or an unpacked one) leaves no position to
-        follow, so the closure variables go by keyword there: the parameters
-        carry their names.
+        A receiver passed by keyword leaves no position to follow, so the
+        closure variables go by keyword there, under the parameter names.
 
         :param node: The call node
-        :param closure_vars: The method's closure variables, in parameter order
+        :param captures: The method's captures: ``main``'s variable -> its parameter
+        :param passed: The values passed for them, in parameter order
         """
-        if node.args and not isinstance(node.args[0], ast.Starred):
-            node.args[1:1] = [ast.Name(id=var, ctx=ast.Load()) for var in closure_vars]
+        if node.args:
+            node.args[1:1] = passed
         else:
-            node.keywords.extend(ast.keyword(arg=var, value=ast.Name(id=var, ctx=ast.Load()))
-                                 for var in closure_vars)
+            node.keywords.extend(ast.keyword(arg=param, value=value)
+                                 for param, value in zip(captures.values(), passed))
 
     @staticmethod
     def _get_function_key(func_name: str) -> str:
@@ -370,6 +488,11 @@ class ClosureVariableCollector(ast_walk.NodeVisitor):
         self.scope_variables: Dict[str, Set[str]] = {}
         # Variables used in each scope
         self.scope_uses: Dict[str, Set[str]] = {}
+        # The functions each scope calls by name
+        self.scope_calls: Dict[str, Set[str]] = {}
+        # The inner functions of ``main``, by name, and those declared methods
+        self.inner_functions: Set[str] = set()
+        self.method_definitions: Set[str] = set()
         # Closure variables for each inner function
         self.closure_vars: Dict[str, Set[str]] = {}
         # Type annotations for closure variables
@@ -390,6 +513,20 @@ class ClosureVariableCollector(ast_walk.NodeVisitor):
         old_function = self.current_function
         old_in_main = self.in_main_function
 
+        if self.in_main_function and old_function == 'main' and node.name != 'main':
+            self.inner_functions.add(node.name)
+            if any(_get_decorator_name(decorator) in _METHOD_DECORATORS
+                   for decorator in node.decorator_list):
+                self.method_definitions.add(node.name)
+
+        # The defaults, decorators and annotations belong to the enclosing scope:
+        # they run there when the ``def`` executes
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        self.visit(node.args)
+        if node.returns is not None:
+            self.visit(node.returns)
+
         # Update state
         if is_main:
             self.in_main_function = True
@@ -400,6 +537,7 @@ class ClosureVariableCollector(ast_walk.NodeVisitor):
             scope_key = self._get_scope_key()
             self.scope_variables[scope_key] = set()
             self.scope_uses[scope_key] = set()
+            self.scope_calls[scope_key] = set()
 
             # Add function parameters to scope variables. An annotated
             # parameter carries the same type information as an annotated
@@ -407,7 +545,7 @@ class ClosureVariableCollector(ast_walk.NodeVisitor):
             # exactly like a ``s: Series[T]`` declaration in its body — so it
             # is recorded the same way, or ``_drop_series_closures`` cannot see
             # it and the inner function gets the series value-passed.
-            for arg in node.args.args:
+            for arg in _parameters(node.args):
                 self.scope_variables[scope_key].add(arg.arg)
                 if arg.annotation is None:
                     continue
@@ -417,7 +555,8 @@ class ClosureVariableCollector(ast_walk.NodeVisitor):
                     self.persistent_vars.add(arg_key)
 
         # Visit function body
-        self.generic_visit(node)
+        for stmt in node.body:
+            self.visit(stmt)
 
         # Calculate closure variables if this is an inner function in main
         if self.in_main_function and len(self.function_stack) > 1 and self.function_stack[0] == 'main':
@@ -451,6 +590,12 @@ class ClosureVariableCollector(ast_walk.NodeVisitor):
             elif isinstance(node.ctx, ast.Load):
                 # Variable use
                 self.scope_uses[scope_key].add(node.id)
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        callee = _called_function(node)
+        if self.current_function and callee is not None:
+            self.scope_calls[self._get_scope_key()].add(callee)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:

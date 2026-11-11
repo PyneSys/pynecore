@@ -77,7 +77,7 @@
   },
   "ClosureArguments": {
     "module": "closure_arguments_transformer",
-    "digest": "5b8846ed649c91213b1fba6f11c660ff2d1971b2e04f75781b35056ba6820c24"
+    "digest": "6bee5ea696f867fbc257780a05761c9b73bab0569d73bc37a5aa0c601e0829d4"
   },
   "PineType": {
     "module": "pine_type_transformer",
