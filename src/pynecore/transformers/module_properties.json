@@ -2746,6 +2746,17 @@
       "type": "variable"
     }
   },
+  "lib.strategy.spread": {
+    "Spread": {
+      "type": "variable"
+    },
+    "none": {
+      "type": "variable"
+    },
+    "trade": {
+      "type": "variable"
+    }
+  },
   "lib.string": {
     "Decimal": {
       "type": "variable"

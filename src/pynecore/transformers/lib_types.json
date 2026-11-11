@@ -1,5 +1,11 @@
 {
  "classes": {
+  "AskOHLC": {
+   "close": "f",
+   "high": "f",
+   "low": "f",
+   "open": "f"
+  },
   "Box": {
    "bgcolor": "c",
    "border_color": "c",
@@ -77,6 +83,7 @@
    "data": "a:o"
   },
   "OHLCV": {
+   "ask": "o:lib#AskOHLC",
    "close": "f",
    "extra_fields": "o",
    "high": "f",
@@ -6896,6 +6903,14 @@
    "kind": "value",
    "ty": "o:lib#Direction"
   },
+  "strategy.spread.none": {
+   "kind": "value",
+   "ty": "o:lib#Spread"
+  },
+  "strategy.spread.trade": {
+   "kind": "value",
+   "ty": "o:lib#Spread"
+  },
   "strategy.wintrades": {
    "callable": true,
    "kind": "value",
@@ -9554,6 +9569,7 @@
   "Shape": "s",
   "Size": "s",
   "Splits": "s",
+  "Spread": "s",
   "StrLiteral": "s",
   "Weekdays": "i",
   "WrapEnum": "s",

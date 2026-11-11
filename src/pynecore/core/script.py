@@ -192,6 +192,7 @@ class Script:
     slippage: int = 0
     commission_type: _strategy.commission.Commission = _strategy.commission.percent  # type: ignore
     commission_value: int | float = 0.0
+    spread_type: _strategy.spread.Spread = _strategy.spread.none  # type: ignore
     process_orders_on_close: bool = False
     close_entries_rule: str = 'FIFO'
     margin_long: int | float = 100.0  # Defaulted to 100.0 in Pine Script v6
@@ -600,6 +601,7 @@ class Script:
 
             na_bool=False,
             close_by_id=False,
+            spread_type: _strategy.spread.Spread = _strategy.spread.none,  # type: ignore
             *_, **__
     ) -> Callable[..., Any]:
         """
@@ -657,6 +659,11 @@ class Script:
         :param close_by_id: Keep Pine v4/v5's ``strategy.close()`` order slots: every close
                             of one entry id on a bar modifies the same pending order, so the
                             last call wins; v6 gives every close statement its own slot
+        :param spread_type: How the simulator charges the bid/ask spread, a PyneCore extension.
+                            ``strategy.spread.none`` (default) fills every order on the bar's
+                            prices as TradingView does. ``strategy.spread.trade`` fills buy
+                            orders at the ask: the bid price plus the bar's spread, taken from
+                            the data's ask side, or ``syminfo.avg_spread`` on a bar without one
         :param _broker_requirements: Broker capability requirements of the script, internal use only
         """
         script = cls()
@@ -684,6 +691,7 @@ class Script:
         script.slippage = slippage
         script.commission_type = _COMMISSION_TYPE_ALIASES.get(commission_type, commission_type)
         script.commission_value = commission_value
+        script.spread_type = spread_type
         script.process_orders_on_close = process_orders_on_close
         script.close_entries_rule = close_entries_rule
         script.margin_long = margin_long

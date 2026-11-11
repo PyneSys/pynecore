@@ -455,9 +455,11 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo',
     ask = ohlcv.ask
     if ask is None or ask.close != ask.close:
         props['bid'] = props['ask'] = na_float
+        props['_ask_bar'] = None
     else:
         props['bid'] = c
         props['ask'] = ask.close
+        props['_ask_bar'] = ask
 
     props['hl2'] = (h + lo) / 2.0
     props['hlc3'] = (h + lo + c) / 3.0
@@ -551,6 +553,7 @@ def _reset_lib_vars():
 
     lib._last_close = na_float
     lib._last_close_bar = None
+    lib._ask_bar = None
 
     lib._time = 0
     lib._next_time = 0

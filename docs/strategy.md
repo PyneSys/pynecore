@@ -60,6 +60,23 @@ The `@script.strategy` decorator accepts numerous parameters to configure backte
 )
 ```
 
+### Spread Costs
+
+TradingView fills every order on the bar's prices, which for a forex or CFD feed are the bid side, so a buy never pays the spread. `spread_type` is a PyneCore extension that charges it:
+
+```python
+@script.strategy("Spread-aware strategy", spread_type=strategy.spread.trade)
+```
+
+| Value                   | Effect                                                                                     |
+|-------------------------|--------------------------------------------------------------------------------------------|
+| `strategy.spread.none`  | Default. Orders fill on the bar's prices, as on TradingView                                |
+| `strategy.spread.trade` | Buy fills pay the spread on top of the bid-side price; sell fills stay on the bid side    |
+
+The spread is taken from the data's ask side (see [Ask Side](advanced/ohlcv-reader-writer.md#ask-side)), at the point of the bar the fill happens on: the open for a market order, the extreme a stop triggered on, the close for an order filled on the close. On a bar without an ask side the spread is `syminfo.avg_spread`, so the setting also works on bid-only data. Like slippage, the spread is charged on market and stop-triggered fills, not on limit fills, which fill at their limit price. Orders are still triggered by the bid side, and commission is charged on top of the spread.
+
+`spread_type` is an ordinary setting, so the `[script]` section of the TOML file can override it like any other.
+
 ### Configuration with TOML Files
 
 One of the powerful features of PyneCore is that strategy settings can be modified without changing the code. When you

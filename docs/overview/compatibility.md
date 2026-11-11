@@ -53,6 +53,7 @@ with PyneComp, run by PyneCore, and every comparable output is compared with Tra
 | no-lookahead | Implemented; differs only where TradingView would leak future data — see [No lookahead, ever](#no-lookahead-ever) |
 | no data feed | API present, but the data has no offline source: the call returns `na` or raises — see notes                      |
 | no renderer  | Full API and state; exported with `pyne run --viz`, but PyneCore draws no chart                                   |
+| extension    | PyneCore's own addition, no TradingView counterpart; off by default, never changes a TradingView result           |
 | —            | Not applicable to offline execution                                                                               |
 
 ## Technical Analysis (ta)
@@ -80,6 +81,7 @@ with PyneComp, run by PyneCore, and every comparable output is compared with Tra
 | Commission models            | full         | Fixed, percent, per-contract                                                                                                                |
 | Margin calls                 | full         | TradingView-exact 10-step algorithm                                                                                                         |
 | Slippage                     | full         | Configurable tick-based slippage                                                                                                            |
+| Spread costs                 | extension    | `spread_type=strategy.spread.trade` charges buys the bid/ask spread; TradingView has no such setting                                        |
 | Equity tracking              | full         | Equity curve, drawdown, P&L                                                                                                                 |
 | Trade logging                | full         | CSV export with all trade fields                                                                                                            |
 | `strategy.close_all()`       | full         |                                                                                                                                             |

@@ -24,6 +24,7 @@ from ..core.module_property import module_property, module_function_property
 from ..core.series import SeriesImpl as _SeriesImpl
 
 from ..types.color import Color as _Color
+from ..types.ohlcv import AskOHLC as _AskOHLC
 from ..types.na import NA, na_int
 from ..types import Series, PyneInt
 from ..types.pine_types import pine_int
@@ -142,6 +143,10 @@ hlcc4: float = Source("hlcc4")
 # window, because TradingView's own sar dies on na when a call is skipped.
 _last_close: float = _math.nan
 _last_close_bar: int | None = None
+
+# The current bar's ask side when the feed quotes it, ``None`` otherwise; the strategy
+# simulator prices its spread from it (``strategy(spread_type=...)``).
+_ask_bar: _AskOHLC | None = None
 
 # Store time as integer as in Pine Scripts timestamp format
 _time: int = 0

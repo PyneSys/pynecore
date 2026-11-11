@@ -27,6 +27,7 @@ from ...types.pine_types import pine_int
 from . import direction as direction
 from . import commission as _commission
 from . import oca as _oca
+from . import spread as _spread
 
 from . import closedtrades, opentrades
 
@@ -50,7 +51,7 @@ __all__ = [
 # transformer routes bare reads and calls to the module's self-named function
 #
 
-from ...types.ohlcv import OHLCV
+from ...types.ohlcv import OHLCV, AskOHLC as _AskOHLC  # underscore-aliased: kept out of the module-property registry
 
 if TYPE_CHECKING:
     from ...core import script as _core_script
@@ -59,7 +60,7 @@ if TYPE_CHECKING:
     # Static-only public aliases: at runtime the submodule import above already
     # sets these attributes on the package; the underscore aliases keep them out
     # of the module-property registry.
-    from . import commission as commission, oca as oca
+    from . import commission as commission, oca as oca, spread as spread
 
 
 #
@@ -1169,6 +1170,7 @@ class SimPosition(PositionBase):
         '_fill_counter', '_last_fill_price', '_partial_close_bar',
         '_entry_book', '_entry_seq', '_act_counter', '_deferred_immediate_closes', '_coof_cursor', '_market_fill_price',
         '_walk_node', '_path_node', '_leg_start', '_spawned_trail_legs', '_triggered_stop_limits',
+        '_spread_nodes', '_spread_at_close',
         'exit_listener'
     )
 
@@ -1303,6 +1305,12 @@ class SimPosition(PositionBase):
         # the tick source, so a step is a sub-bar index instead.
         self._walk_node: int = 0
         self._path_node: int = 0
+        # ``strategy(spread_type=strategy.spread.trade)``: the spread at each node of
+        # the bar being walked, ``(open, near extreme, far extreme, close)`` in the
+        # order of :meth:`_path_price`; ``None`` when no spread is charged. The close
+        # pass prices at the close node whatever node the walk last stood on.
+        self._spread_nodes: tuple[float, float, float, float] | None = None
+        self._spread_at_close = False
         # Price the leg being walked starts at: a limit or stop already on the
         # wrong side of it fills there (see _walk_leg).
         self._leg_start: float = 0.0
@@ -2358,9 +2366,10 @@ class SimPosition(PositionBase):
         Fill an order
 
         :param order: The order to fill
-        :param price: The price to fill at
+        :param price: The price to fill at, on the bid side of the bar
         :return: True if the side of the position has changed
         """
+        price += self._buy_spread(order)
         close_only = False
         # Apply risk management only to entry orders, not normal orders from strategy.order()
         if order.order_type == _order_type_entry or order.order_type == _order_type_normal:
@@ -2579,7 +2588,7 @@ class SimPosition(PositionBase):
                 order_type=_order_type_close,
                 comment=f"Close Position ({reason})",
             )
-            self._fill_order(close_order, price)
+            self._fill_order(close_order, price + self._buy_spread(close_order))
         self.risk_halt_trading = True
         self.risk_halt_day = self.risk_last_trading_day if until_day_end else -1
 
@@ -2623,7 +2632,8 @@ class SimPosition(PositionBase):
                 order_type=_order_type_close,
                 comment="Close Position (Max number of filled orders in one day)",
             )
-            self._fill_order(close_order, cap_close_price, counts_as_filled_order=False)
+            self._fill_order(close_order, cap_close_price + self._buy_spread(close_order),
+                             counts_as_filled_order=False)
 
     def _enforce_post_bar_risk(self) -> None:
         """Run the post-bar ``strategy.risk.*`` checks that depend on bar-end P&L.
@@ -4031,7 +4041,7 @@ class SimPosition(PositionBase):
         for order in orders:
             order.is_market_order = False
             order.bar_index = bar_index
-            self._fill_order(order, fill_price)
+            self._fill_order(order, fill_price + self._buy_spread(order))
 
     def _apply_mc_ghosts(self, check_price: float, for_short: bool) -> None:
         """
@@ -4072,7 +4082,7 @@ class SimPosition(PositionBase):
                 order.target_trade = trade
                 order.is_market_order = False
                 order.bar_index = bar_index
-                self._fill_order(order, fill_price)
+                self._fill_order(order, fill_price + self._buy_spread(order))
                 cut = True
         if cut:
             self._reattach_exits(check_price)
@@ -4550,6 +4560,51 @@ class SimPosition(PositionBase):
             return True
         return False
 
+    def _set_bar_spread(self, ask: _AskOHLC | None) -> None:
+        """Price the spread at the nodes of the bar (or sub-bar) about to be walked.
+
+        A node's spread is the ask minus the bid at that point of the bar: the
+        feed's quoted ask side where the bar has one, ``syminfo.avg_spread`` on
+        every node otherwise. Called after :attr:`~SimPosition.o` .. :attr:`~SimPosition.c`
+        hold the bar's tick-rounded prices, which are the bid side.
+
+        :param ask: The bar's ask side, or ``None`` when it is not quoted.
+        """
+        if lib._script.spread_type != _spread.trade:
+            self._spread_nodes = None
+            return
+        avg = syminfo.avg_spread
+        fallback = float(avg) if isinstance(avg, (int, float)) and avg > 0.0 else 0.0
+        if ask is None or ask.close != ask.close:
+            self._spread_nodes = (fallback, fallback, fallback, fallback) if fallback else None
+            return
+        o, h, l, c = self.o, self.h, self.l, self.c
+        # A missing ask node takes the fallback; a crossed quote charges nothing.
+        s_open = max(ask.open - o, 0.0) if ask.open == ask.open else fallback
+        s_high = max(ask.high - h, 0.0) if ask.high == ask.high else fallback
+        s_low = max(ask.low - l, 0.0) if ask.low == ask.low else fallback
+        s_close = max(ask.close - c, 0.0)
+        near, far = (s_high, s_low) if h - o < o - l else (s_low, s_high)
+        self._spread_nodes = (s_open, near, far, s_close)
+
+    def _buy_spread(self, order: Order) -> float:
+        """Spread a buy fill pays on top of the bid-side price the walk found.
+
+        Charged like slippage: on market and stop-triggered fills, not on limit
+        fills, which fill at the limit price or better. A sell fills on the bid
+        side as it is.
+
+        :param order: The order about to fill.
+        :return: The spread at the node the walk stands on, zero when none applies.
+        """
+        nodes = self._spread_nodes
+        if nodes is None or order.size <= 0.0 or order.filled_by_type == 'profit':
+            return 0.0
+        if self._spread_at_close:
+            return nodes[3]
+        node = self._walk_node
+        return nodes[node] if 0 <= node <= 3 else nodes[0]
+
     def _path_price(self, node: int) -> float:
         """Price of a node of the bar's assumed path.
 
@@ -4622,6 +4677,7 @@ class SimPosition(PositionBase):
         self.h = int(lib.high / mintick + 0.5) * minmove / pricescale
         self.l = int(lib.low / mintick + 0.5) * minmove / pricescale
         self.c = int(lib.close / mintick + 0.5) * minmove / pricescale
+        self._set_bar_spread(lib._ask_bar)
 
         # The path walk restarts with the bar; the COOF passes of one bar share it.
         if self._coof_cursor < 0:
@@ -5734,7 +5790,12 @@ class SimPosition(PositionBase):
                     self._remove_order(order)
                     return
 
-            self.fill_order(order, fill_price)
+            # The fill is at the close node, whatever node the bar's walk ended on
+            self._spread_at_close = True
+            try:
+                self.fill_order(order, fill_price)
+            finally:
+                self._spread_at_close = False
 
         # Phase 1: fill the initial candidates (market entries, previously-open
         # tick exits, current-bar limit/stop orders already executable at close).
@@ -5894,6 +5955,8 @@ class SimPosition(PositionBase):
             self.l = int(first.low / mintick + 0.5) * minmove / pricescale
             # Use aggregated close for margin deferral checks
             self.c = int(aggregated.close / mintick + 0.5) * minmove / pricescale
+            # Only the open node is read before the sub-bar walk below re-prices it
+            self._set_bar_spread(first.ask)
 
             # Phase 1: at-open processing (gap detection, market orders, margin at open)
             ohlc = self.h - self.o < self.o - self.l
@@ -5913,6 +5976,7 @@ class SimPosition(PositionBase):
             self.h = int(sub_bar.high / mintick + 0.5) * minmove / pricescale
             self.l = int(sub_bar.low / mintick + 0.5) * minmove / pricescale
             self.c = int(sub_bar.close / mintick + 0.5) * minmove / pricescale
+            self._set_bar_spread(sub_bar.ask)
             ohlc = self.h - self.o < self.o - self.l
             self._process_limit_stop_orders(ohlc)
 

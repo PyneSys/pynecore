@@ -70,5 +70,9 @@ class Commission(StrLiteral):
     ...
 
 
+class Spread(StrLiteral):
+    ...
+
+
 class Oca(StrLiteral):
     ...
