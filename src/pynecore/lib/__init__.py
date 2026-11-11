@@ -163,6 +163,9 @@ _bar_opens: list[int] = [0] * _BAR_OPENS_SIZE
 # Datetime object in the exchange timezone
 _datetime: datetime = datetime.fromtimestamp(0, UTC)
 
+# The Unix epoch, which an na time reads as
+_EPOCH: datetime = datetime.fromtimestamp(0, UTC)
+
 # Script settings from `script.indicator`, `script.strategy` or `script.library`
 _script: 'script' = None  # type: ignore[assignment]
 
@@ -267,12 +270,18 @@ def max_bars_back(var: Any, num: int) -> None:
 ### Date / Time ###
 
 # noinspection PyShadowingNames
-def _get_dt(time: int | float | None = None, timezone: str | None = None) -> datetime | None:
-    """ Get datetime object from time and timezone, None for an na time """
-    if time is not None and not (time == time):  # is_na_arg
-        return None
-    dt = _datetime if time is None else datetime.fromtimestamp(time / 1000, UTC)
-    assert dt is not None
+def _get_dt(time: int | float | None = None, timezone: str | None = None) -> datetime:
+    """ Get datetime object from time and timezone """
+    if time is None:
+        dt = _datetime
+    elif time == time:  # is_na_arg
+        dt = datetime.fromtimestamp(time / 1000, UTC)
+    else:
+        # TradingView reads an na time as the Unix epoch (measured on CAPITALCOM:EURUSD,
+        # exchange zone America/New_York: year/month/dayofmonth/hour/minute/second/
+        # dayofweek/weekofyear of na are 1969/12/31/19/0/0/4/1, and with "UTC" they
+        # are 1970/1/1/0/0/0/5/1), never as na
+        dt = _EPOCH
     return dt.astimezone(_parse_timezone(timezone))
 
 
@@ -1157,7 +1166,7 @@ def dayofmonth(time: int | float | None = None, timezone: str | None = None) -> 
     :return: The day of the month
     """
     dt = _get_dt(time, timezone)
-    return na_int if dt is None else pine_int(dt.day)
+    return pine_int(dt.day)
 
 
 # noinspection PyShadowingNames
@@ -1171,7 +1180,7 @@ def hour(time: int | float | None = None, timezone: str | None = None) -> PyneIn
     :return: The hour of the day
     """
     dt = _get_dt(time, timezone)
-    return na_int if dt is None else pine_int(dt.hour)
+    return pine_int(dt.hour)
 
 
 # noinspection PyShadowingNames
@@ -1185,7 +1194,7 @@ def minute(time: int | float | None = None, timezone: str | None = None) -> Pyne
     :return: The minute of the hour
     """
     dt = _get_dt(time, timezone)
-    return na_int if dt is None else pine_int(dt.minute)
+    return pine_int(dt.minute)
 
 
 # noinspection PyShadowingNames
@@ -1199,7 +1208,7 @@ def month(time: int | float | None = None, timezone: str | None = None) -> PyneI
     :return: The month of the year
     """
     dt = _get_dt(time, timezone)
-    return na_int if dt is None else pine_int(dt.month)
+    return pine_int(dt.month)
 
 
 # noinspection PyShadowingNames
@@ -1213,7 +1222,7 @@ def second(time: int | float | None = None, timezone: str | None = None) -> Pyne
     :return: The second of the minute
     """
     dt = _get_dt(time, timezone)
-    return na_int if dt is None else pine_int(dt.second)
+    return pine_int(dt.second)
 
 
 ### Session parsing and validation helpers ###
@@ -3444,7 +3453,7 @@ def weekofyear(time: int | float | None = None, timezone: str | None = None) -> 
     :return: The week of the year
     """
     dt = _get_dt(time, timezone)
-    return na_int if dt is None else pine_int(dt.isocalendar()[1])
+    return pine_int(dt.isocalendar()[1])
 
 
 # noinspection PyShadowingNames
@@ -3458,4 +3467,4 @@ def year(time: int | float | None = None, timezone: str | None = None) -> PyneIn
     :return: The year
     """
     dt = _get_dt(time, timezone)
-    return na_int if dt is None else pine_int(dt.year)
+    return pine_int(dt.year)

@@ -2,8 +2,8 @@
 //! cloned per direct-`Name` call site, so each call site gets its own security
 //! contexts (Pine's instantiation semantics).
 //!
-//! A function is security-bearing when its subtree holds a
-//! `lib.request.security[_lower_tf]` call or a direct call of another bearer. Each
+//! A function is security-bearing when one instance of it holds a
+//! `lib.request.security[_lower_tf]` call, its calls resolved lexically. Each
 //! further call site of a bearer gets a deep copy of it, inserted after the
 //! original, until no bearer with more than one call site is left; then every
 //! bearer with a single call site gets that site's static arguments pinned at the
@@ -13,14 +13,17 @@
 use std::collections::{HashMap, HashSet};
 
 use pyne_ast::locations::anchor_all_at;
-use pyne_ast::walk::{clone, descendants, docstring_end, walk, walk_statements};
+use pyne_ast::walk::{children, clone, descendants, docstring_end, walk, walk_statements};
 use pyne_ast::{Ast, ExprContext, FieldMut, FieldRef, Kind, NodeId, Unsupported};
 
 use super::security::predicates::{has_security_call, is_security_call, is_security_lower_tf_call};
 use crate::{Context, Error};
 
-/// Hard ceiling on clones per module (`_MAX_CLONES`).
-const MAX_CLONES: usize = 64;
+/// The most security calls one called function may reach through the functions
+/// it calls (`_MAX_FUNCTION_REQUESTS`): TradingView bounds a function's request
+/// values at 254, and counting each security call once never rejects a script
+/// it accepts.
+const MAX_FUNCTION_REQUESTS: usize = 254;
 
 /// A statement list: the list field `field` of node `owner`.
 #[derive(Clone, Copy, Debug)]
@@ -58,6 +61,77 @@ fn function_name(ast: &Ast, function: NodeId) -> &str {
         Kind::FunctionDef { name, .. } | Kind::AsyncFunctionDef { name, .. } => name,
         _ => unreachable!(),
     }
+}
+
+/// The name an import alias binds: `asname`, or the first component of `name`.
+fn alias_binding(name: &str, asname: Option<&str>) -> String {
+    asname.unwrap_or(name).split('.').next().unwrap_or_default().to_string()
+}
+
+/// The names a function binds in its own scope other than by a nested `def`,
+/// and the names it declares `global` (`_local_bindings`).
+///
+/// A binding is a parameter, an assignment, `for` / `with` / `except` / `match` /
+/// walrus target, `del`, an import or a class definition. Nested functions,
+/// lambdas and class bodies have scopes of their own, and a comprehension target
+/// binds only inside the comprehension.
+fn local_bindings(ast: &Ast, function: NodeId) -> (HashSet<String>, HashSet<String>) {
+    let mut bound = HashSet::new();
+    let mut global_names = HashSet::new();
+    let (arguments, body) = match ast.kind(function) {
+        Kind::FunctionDef { args, body, .. } | Kind::AsyncFunctionDef { args, body, .. } => {
+            (*args, body.clone())
+        }
+        _ => unreachable!(),
+    };
+    if let Kind::Arguments { posonlyargs, args, vararg, kwonlyargs, kwarg, .. } =
+        ast.kind(arguments)
+    {
+        let all = posonlyargs.iter().chain(args).chain(vararg).chain(kwonlyargs).chain(kwarg);
+        for &arg in all {
+            if let Kind::Arg { arg, .. } = ast.kind(arg) {
+                bound.insert(arg.clone());
+            }
+        }
+    }
+    let mut todo = body;
+    while let Some(node) = todo.pop() {
+        match ast.kind(node) {
+            Kind::FunctionDef { .. } | Kind::AsyncFunctionDef { .. } | Kind::Lambda { .. } => {
+                continue;
+            }
+            Kind::ClassDef { name, .. } => {
+                bound.insert(name.clone());
+                continue;
+            }
+            Kind::Comprehension { iter, ifs, .. } => {
+                todo.push(*iter);
+                todo.extend(ifs.iter().copied());
+                continue;
+            }
+            Kind::Name { id, ctx } => {
+                if *ctx != ExprContext::Load {
+                    bound.insert(id.clone());
+                }
+            }
+            Kind::Alias { name, asname } => {
+                bound.insert(alias_binding(name, asname.as_deref()));
+            }
+            Kind::ExceptHandler { name: Some(name), .. }
+            | Kind::MatchAs { name: Some(name), .. }
+            | Kind::MatchStar { name: Some(name) }
+            | Kind::MatchMapping { rest: Some(name), .. } => {
+                bound.insert(name.clone());
+            }
+            Kind::Global { names } => {
+                global_names.extend(names.iter().cloned());
+            }
+            _ => {}
+        }
+        todo.extend(children(ast, node));
+    }
+    bound.retain(|name| !global_names.contains(name));
+    (bound, global_names)
 }
 
 /// One function definition eligible for instantiation analysis (`_FuncInfo`).
@@ -117,7 +191,8 @@ fn scan_sub(ast: &Ast, statement: NodeId, region: NodeId, out: &mut Vec<FuncInfo
 struct RegionIndex {
     /// Direct-`Name` call sites per callee name, in source order
     call_sites: HashMap<String, Vec<NodeId>>,
-    /// Names referenced outside a direct-call func position, or declared global /
+    /// Names referenced outside a direct-call func position, bound as a
+    /// parameter, import, class, `except` or `match` name, or declared global /
     /// nonlocal
     non_call_refs: HashSet<String>,
 }
@@ -144,6 +219,19 @@ impl RegionIndex {
                 }
                 Kind::Global { names } | Kind::Nonlocal { names } => {
                     index.non_call_refs.extend(names.iter().cloned());
+                }
+                Kind::Arg { arg, .. } => {
+                    index.non_call_refs.insert(arg.clone());
+                }
+                Kind::Alias { name, asname } => {
+                    index.non_call_refs.insert(alias_binding(name, asname.as_deref()));
+                }
+                Kind::ExceptHandler { name: Some(name), .. }
+                | Kind::MatchAs { name: Some(name), .. }
+                | Kind::MatchStar { name: Some(name) }
+                | Kind::ClassDef { name, .. }
+                | Kind::MatchMapping { rest: Some(name), .. } => {
+                    index.non_call_refs.insert(name.clone());
                 }
                 _ => {}
             }
@@ -183,33 +271,25 @@ fn candidates(ast: &Ast, module: NodeId) -> Vec<Candidate> {
         *by_name.entry(function_name(ast, info.node)).or_default() += 1;
     }
 
-    // Direct bearers and the name-level call edges among module functions
-    let mut bearing: HashSet<String> = HashSet::new();
+    // A function bears security when one instance of it holds a security call, by
+    // the same lexical resolution the fan-out bound counts with, so cloning never
+    // expands what the bound did not count. The name-level call edges among module
+    // functions only serve the cycle detection
+    let mut totals = RequestTotals::new(ast, module, &infos);
+    let bearing: HashSet<String> = infos
+        .iter()
+        .filter(|info| totals.total(info.node) > 0)
+        .map(|info| function_name(ast, info.node).to_string())
+        .collect();
     let mut edges: HashMap<String, HashSet<String>> = HashMap::new();
     for info in &infos {
-        let name = function_name(ast, info.node);
-        let callees = edges.entry(name.to_string()).or_default();
+        let callees = edges.entry(function_name(ast, info.node).to_string()).or_default();
         for node in walk(ast, info.node) {
-            let Kind::Call { func, .. } = ast.kind(node) else { continue };
-            if is_security_call(ast, node) || is_security_lower_tf_call(ast, node) {
-                bearing.insert(name.to_string());
-            }
-            if let Kind::Name { id, .. } = ast.kind(*func)
+            if let Kind::Call { func, .. } = ast.kind(node)
+                && let Kind::Name { id, .. } = ast.kind(*func)
                 && by_name.contains_key(id.as_str())
             {
                 callees.insert(id.clone());
-            }
-        }
-    }
-
-    // Transitive closure: calling a bearer makes the caller a bearer
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (name, callees) in &edges {
-            if !bearing.contains(name) && callees.iter().any(|callee| bearing.contains(callee)) {
-                bearing.insert(name.clone());
-                changed = true;
             }
         }
     }
@@ -326,6 +406,196 @@ fn specialize(ast: &mut Ast, function: NodeId, site: NodeId) -> Result<(), Unsup
     Ok(())
 }
 
+/// The number of security calls one instance of a function holds after
+/// instantiation, memoized per definition node (`_request_totals`).
+///
+/// It counts the security calls of the body (lambdas and class bodies included,
+/// since cloning copies them too), plus the count of every function it calls, once
+/// per call site, plus the count of each function defined inside it that it does
+/// not call by name. Calls on a recursive cycle count nothing. A call resolves
+/// lexically, to the definitions of the nearest enclosing scope that defines the
+/// name; when that scope defines it more than once, the call counts as the largest
+/// of them: such a function is never cloned, but its callers are. A scope that
+/// binds the name in any other way ([`local_bindings`]) and does not define it
+/// binds the call to that value, which counts nothing; a `global` declaration
+/// resolves the name in the module.
+struct RequestTotals<'a> {
+    ast: &'a Ast,
+    module: NodeId,
+    scoped: HashMap<(NodeId, String), Vec<NodeId>>,
+    parent: HashMap<NodeId, NodeId>,
+    nested: HashMap<NodeId, Vec<NodeId>>,
+    own: HashMap<NodeId, usize>,
+    callees: HashMap<NodeId, Vec<String>>,
+    bound: HashMap<NodeId, HashSet<String>>,
+    global_names: HashMap<NodeId, HashSet<String>>,
+    totals: HashMap<NodeId, usize>,
+    /// Stack depth of every function under count.
+    visiting: HashMap<NodeId, usize>,
+    /// The smallest depth a recursive call was cut at while counting the current
+    /// function.
+    low: usize,
+}
+
+impl<'a> RequestTotals<'a> {
+    fn new(ast: &'a Ast, module: NodeId, infos: &[FuncInfo]) -> RequestTotals<'a> {
+        let mut nested: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        let mut scoped: HashMap<(NodeId, String), Vec<NodeId>> = HashMap::new();
+        let mut parent: HashMap<NodeId, NodeId> = HashMap::new();
+        for info in infos {
+            let name = function_name(ast, info.node).to_string();
+            scoped.entry((info.region, name)).or_default().push(info.node);
+            parent.insert(info.node, info.region);
+            nested.entry(info.region).or_default().push(info.node);
+        }
+        let defined: HashSet<NodeId> = infos.iter().map(|info| info.node).collect();
+
+        let mut own: HashMap<NodeId, usize> = HashMap::new();
+        let mut callees: HashMap<NodeId, Vec<String>> = HashMap::new();
+        let mut bound: HashMap<NodeId, HashSet<String>> = HashMap::new();
+        let mut global_names: HashMap<NodeId, HashSet<String>> = HashMap::new();
+        for info in infos {
+            let (locals, globals) = local_bindings(ast, info.node);
+            bound.insert(info.node, locals);
+            global_names.insert(info.node, globals);
+            let mut count = 0;
+            let mut names = Vec::new();
+            let mut todo = children(ast, info.node);
+            while let Some(node) = todo.pop() {
+                if defined.contains(&node) {
+                    continue;
+                }
+                todo.extend(children(ast, node));
+                let Kind::Call { func, .. } = ast.kind(node) else { continue };
+                if is_security_call(ast, node) || is_security_lower_tf_call(ast, node) {
+                    count += 1;
+                }
+                if let Kind::Name { id, .. } = ast.kind(*func) {
+                    names.push(id.clone());
+                }
+            }
+            own.insert(info.node, count);
+            callees.insert(info.node, names);
+        }
+
+        RequestTotals {
+            ast,
+            module,
+            scoped,
+            parent,
+            nested,
+            own,
+            callees,
+            bound,
+            global_names,
+            totals: HashMap::new(),
+            visiting: HashMap::new(),
+            low: usize::MAX,
+        }
+    }
+
+    fn resolve(&mut self, name: &str, mut scope: NodeId) -> usize {
+        // The nearest enclosing scope that defines the name binds the call; a
+        // name it defines more than once is never cloned itself, but its callers
+        // are, so it counts as its largest definition there. A scope binding the
+        // name to another value calls that value
+        loop {
+            if let Some(defs) = self.scoped.get(&(scope, name.to_string())) {
+                let defs = defs.clone();
+                return defs.into_iter().map(|def| self.total(def)).max().unwrap_or(0);
+            }
+            if scope == self.module || self.bound[&scope].contains(name) {
+                return 0;
+            }
+            scope = if self.global_names[&scope].contains(name) {
+                self.module
+            } else {
+                self.parent[&scope]
+            };
+        }
+    }
+
+    fn total(&mut self, node: NodeId) -> usize {
+        // A count cut at this function or one above it belongs to a recursive
+        // cycle and depends on where the cycle was entered: it is not memoized, so
+        // every count is the same whatever the order
+        if let Some(&done) = self.totals.get(&node) {
+            return done;
+        }
+        if let Some(&cut_at) = self.visiting.get(&node) {
+            self.low = self.low.min(cut_at);
+            return 0;
+        }
+        let depth = self.visiting.len();
+        self.visiting.insert(node, depth);
+        let outer_low = std::mem::replace(&mut self.low, usize::MAX);
+        let names = self.callees[&node].clone();
+        let mut result = self.own[&node];
+        for callee in &names {
+            result += self.resolve(callee, node);
+        }
+        let inner_defs = self.nested.get(&node).cloned().unwrap_or_default();
+        for inner in inner_defs {
+            let inner_name = function_name(self.ast, inner);
+            if !names.iter().any(|n| n == inner_name) {
+                result += self.total(inner);
+            }
+        }
+        self.visiting.remove(&node);
+        if self.low > depth {
+            self.totals.insert(node, result);
+        }
+        self.low = self.low.min(outer_low);
+        result
+    }
+}
+
+/// Reject a script in which a called function reaches more security calls than
+/// TradingView lets one function use (`_check_request_fanout`).
+///
+/// The count of a function is the number of security calls one instance of it
+/// holds after instantiation ([`RequestTotals`]), worked out on the call graph
+/// without cloning. A function called from nowhere is the global scope and is not
+/// bounded.
+fn check_request_fanout(ast: &Ast, module: NodeId) -> Result<(), Error> {
+    let infos = collect_functions(ast, module);
+    let mut totals = RequestTotals::new(ast, module, &infos);
+    let mut order: Vec<String> = Vec::new();
+    let mut by_name: HashMap<String, Vec<NodeId>> = HashMap::new();
+    let mut called: HashSet<String> = HashSet::new();
+    for info in &infos {
+        let name = function_name(ast, info.node).to_string();
+        let defs = by_name.entry(name.clone()).or_default();
+        if defs.is_empty() {
+            order.push(name);
+        }
+        defs.push(info.node);
+        for node in walk(ast, info.node) {
+            if let Kind::Call { func, .. } = ast.kind(node)
+                && let Kind::Name { id, .. } = ast.kind(*func)
+            {
+                called.insert(id.clone());
+            }
+        }
+    }
+
+    for name in &order {
+        let defs = &by_name[name];
+        if defs.len() != 1 || !called.contains(name) {
+            continue;
+        }
+        let reached = totals.total(defs[0]);
+        if reached > MAX_FUNCTION_REQUESTS {
+            return Err(Error::Rejected(format!(
+                "function '{name}' reaches {reached} request.security calls through the \
+                 functions it calls; a function can use at most {MAX_FUNCTION_REQUESTS} \
+                 request values"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The whole-module fixpoint (`SecurityInstantiationTransformer`).
 struct Instantiation {
     clones_made: usize,
@@ -372,13 +642,6 @@ impl Instantiation {
         // clone inserted after the original (source order preserved)
         for (offset, &site) in sites.iter().enumerate().skip(1) {
             self.clones_made += 1;
-            if self.clones_made > MAX_CLONES {
-                return Err(Error::Rejected(format!(
-                    "security instantiation exceeded {MAX_CLONES} function clones — the \
-                     script's request.security call graph is too large to instantiate per \
-                     call site"
-                )));
-            }
             let copy = clone(ast, info.node, &mut HashMap::new());
             let clone_name = self.unique_name(&name, &mut existing);
             match ast.kind_mut(copy) {
@@ -412,13 +675,12 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
         return Ok(module);
     }
     let mut pass = Instantiation { clones_made: 0, candidates_now: None };
+    check_request_fanout(ast, module)?;
     // Fixpoint: cloning a caller duplicates its callees' call sites, so re-analyze
-    // until no eligible multi-site bearer remains, bounded by the clone cap
-    for _ in 0..=MAX_CLONES {
-        if !pass.clone_one(ast, module)? {
-            break;
-        }
-    }
+    // until no eligible multi-site bearer remains. It ends because recursive
+    // functions are never cloned, and the fan-out bound keeps the number of clones
+    // polynomial in the script's size
+    while pass.clone_one(ast, module)? {}
     pass.specialize_all(ast, module)?;
     Ok(module)
 }

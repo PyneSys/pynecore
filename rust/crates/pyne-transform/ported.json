@@ -13,7 +13,7 @@
   },
   "BuiltinShadow": {
     "module": "builtin_shadow",
-    "digest": "0f1a58e09d7992bc66606cc9941b8a977599c032c4803f072461fb8eaf8231a5"
+    "digest": "814ee5c280f06ed546985f6353a67404edbfcdff807fcb20ca13b423ffdb9004"
   },
   "ImportNormalizer": {
     "module": "import_normalizer",
@@ -37,7 +37,7 @@
   },
   "ConstFold": {
     "module": "const_fold",
-    "digest": "4a85a58e680b05810df0baf4d739ed93c50191919532e048c3e4bb3065aec14a"
+    "digest": "853adab0767394e2b38dc07d883021aecec97dcbb0d1e2ef3d3cb577b094704b"
   },
   "DynamicDefault": {
     "module": "dynamic_default",
@@ -53,7 +53,7 @@
   },
   "SecurityInstantiation": {
     "module": "security_instantiation",
-    "digest": "956581677cb5539fa88bcccfa2b52492b86058174bfa950c074c30e81a18c171"
+    "digest": "3c55148b14485bff3caeb6c00d82d5423c985d0d0999dd4deb30f05c7325df8a"
   },
   "Security": {
     "module": "security",
@@ -69,7 +69,7 @@
   },
   "ModuleProperty": {
     "module": "module_property",
-    "digest": "f47dfbc9a8457547fcbdd3bbf0b4d1c6b128b54266a1a876727009296d7de3c7"
+    "digest": "0b8b38abc0f560a2e56f537e98a112eacd51cb62c99a2b36346881d274a8bb93"
   },
   "TaVariableHoist": {
     "module": "ta_variable_hoist",

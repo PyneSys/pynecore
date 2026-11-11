@@ -24,7 +24,8 @@ Bail-outs — the affected function keeps the legacy shared-context behavior:
 - recursive functions (any name-level call-graph cycle),
 - decorated functions (the runtime value is the decorator's return value),
 - functions whose name is referenced outside a direct-call position
-  (aliases, callbacks, stores),
+  (aliases, callbacks, stores) or rebound in their scope region (parameters,
+  imports, class, ``except`` and ``match`` names),
 - duplicate top-of-scope definitions of the same name (shadowing),
 - attribute-style call sites (methods, cross-module library calls) are not
   rewritten — a library function with security calls instantiated from
@@ -35,6 +36,7 @@ Must run after ImportNormalizerTransformer (security calls are in their
 ``lib.request.security`` form) and before SecurityTransformer.
 """
 import ast
+from collections.abc import Callable
 
 from . import ast_walk
 from .locations import anchor_all_at
@@ -42,10 +44,22 @@ from .security_calls import has_security_call, is_security_call, is_security_low
 
 __all__ = ['SecurityInstantiationTransformer']
 
-# Hard ceiling on clones per module — far above any real script (TradingView
-# itself caps unique request.* calls at 40) but low enough to stop a
-# pathological call-graph blow-up with a clear error instead of a hang.
-_MAX_CLONES = 64
+# The call graph is acyclic once recursive functions are excluded, so cloning
+# always terminates, but a call chain that calls its callee more than once at
+# every level grows exponentially. TradingView instantiates every call path as
+# well and bounds it per function: the request values one function uses,
+# transitively through the functions it calls, count as its "external
+# elements", at most 254 of them, an int/float/bool value counting 2 (measured:
+# ``f7() => f6() + f6()`` over a ``request.security(..., close)`` leaf, 128 calls,
+# is rejected with 256 elements; ``f6``, 64 calls and 120 clones here, runs).
+# The script's global scope (``main``) has no such bound (measured: 130
+# identical global ``request.security`` float calls run). So a called function
+# reaching more than 254 security calls cannot be a valid script, while every
+# valid one keeps each function's instance count within 254 per call from the
+# global scope -- a polynomial, not exponential, amount of cloning. Counting
+# only ``request.security[_lower_tf]`` calls, at one element each, never
+# rejects a script TradingView accepts.
+_MAX_FUNCTION_REQUESTS = 254
 
 
 class _FuncInfo:
@@ -88,7 +102,8 @@ class _RegionIndex:
         # whole function instead
         self.call_sites: dict[str, list[ast.Call]] = {}
         # Names referenced outside a direct-call func position (alias,
-        # callback argument, store, ...) or declared global / nonlocal
+        # callback argument, store, ...), bound as a parameter, import, class,
+        # ``except`` or ``match`` name, or declared global / nonlocal
         self.non_call_refs: set[str] = set()
         call_funcs: set[int] = set()
         for n in _ordered_walk(region):
@@ -103,6 +118,16 @@ class _RegionIndex:
                     self.non_call_refs.add(n.id)
             elif isinstance(n, (ast.Global, ast.Nonlocal)):
                 self.non_call_refs.update(n.names)
+            elif isinstance(n, ast.arg):
+                self.non_call_refs.add(n.arg)
+            elif isinstance(n, ast.alias):
+                self.non_call_refs.add((n.asname or n.name).partition('.')[0])
+            elif isinstance(n, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar, ast.ClassDef)):
+                if n.name is not None:
+                    self.non_call_refs.add(n.name)
+            elif isinstance(n, ast.MatchMapping):
+                if n.rest is not None:
+                    self.non_call_refs.add(n.rest)
 
 
 class SecurityInstantiationTransformer:
@@ -178,32 +203,22 @@ class SecurityInstantiationTransformer:
         for info in infos:
             by_name.setdefault(info.node.name, []).append(info)
 
-        # Direct bearers (subtree contains a security call) and name-level
-        # call edges among module functions (for transitivity and cycle
-        # detection), from one walk per function. Both are sets, so the walk
-        # need not follow the source order.
-        bearing: set[str] = set()
+        # A function bears security when one instance of it holds a security
+        # call, by the same lexical resolution the fan-out bound counts with:
+        # a caller of a name that resolves to a stateless local definition is
+        # not a bearer, so cloning never expands what the bound did not count.
+        # The name-level call edges among module functions only serve the cycle
+        # detection; a set, so the walk need not follow the source order.
+        total = self._request_totals(module, infos)
+        bearing: set[str] = {info.node.name for info in infos if total(info.node) > 0}
         edges: dict[str, set[str]] = {}
         for info in infos:
-            name = info.node.name
-            callees = edges.setdefault(name, set())
+            callees = edges.setdefault(info.node.name, set())
             for n in ast_walk.walk(info.node):
-                if not isinstance(n, ast.Call):
-                    continue
-                if self._is_security_call(n):
-                    bearing.add(name)
-                func = n.func
-                if isinstance(func, ast.Name) and func.id in by_name:
-                    callees.add(func.id)
-
-        # Transitive closure: calling a bearer makes the caller a bearer.
-        changed = True
-        while changed:
-            changed = False
-            for name, callees in edges.items():
-                if name not in bearing and callees & bearing:
-                    bearing.add(name)
-                    changed = True
+                if isinstance(n, ast.Call):
+                    func = n.func
+                    if isinstance(func, ast.Name) and func.id in by_name:
+                        callees.add(func.id)
 
         # Cycle detection over the bearing subgraph — any bearer on a cycle
         # (recursion, mutual recursion) is excluded, or cloning would never
@@ -244,6 +259,197 @@ class SecurityInstantiationTransformer:
             eligible.append((info, index.call_sites.get(name, [])))
         return eligible
 
+    # --- request fan-out bound ---
+
+    @staticmethod
+    def _local_bindings(node: ast.FunctionDef | ast.AsyncFunctionDef
+                        ) -> tuple[set[str], set[str]]:
+        """The names a function binds in its own scope other than by a nested
+        ``def``, and the names it declares ``global``.
+
+        A binding is a parameter, an assignment, ``for`` / ``with`` / ``except``
+        / ``match`` / walrus target, ``del``, an import or a class definition.
+        Nested functions, lambdas and class bodies have scopes of their own, and
+        a comprehension target binds only inside the comprehension.
+
+        :param node: The function definition
+        :return: The locally bound names and the ``global`` names
+        """
+        bound: set[str] = set()
+        global_names: set[str] = set()
+        arguments = node.args
+        for arg in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+                    arguments.vararg, arguments.kwarg):
+            if arg is not None:
+                bound.add(arg.arg)
+        todo: list[ast.AST] = list(node.body)
+        while todo:
+            n = todo.pop()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            if isinstance(n, ast.ClassDef):
+                bound.add(n.name)
+                continue
+            if isinstance(n, ast.comprehension):
+                todo.append(n.iter)
+                todo.extend(n.ifs)
+                continue
+            if isinstance(n, ast.Name):
+                if not isinstance(n.ctx, ast.Load):
+                    bound.add(n.id)
+            elif isinstance(n, ast.alias):
+                bound.add((n.asname or n.name).partition('.')[0])
+            elif isinstance(n, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+                if n.name is not None:
+                    bound.add(n.name)
+            elif isinstance(n, ast.MatchMapping):
+                if n.rest is not None:
+                    bound.add(n.rest)
+            elif isinstance(n, ast.Global):
+                global_names.update(n.names)
+            todo.extend(ast_walk.iter_child_nodes(n))
+        return bound - global_names, global_names
+
+    @classmethod
+    def _request_totals(cls, module: ast.Module, infos: list[_FuncInfo]
+                        ) -> Callable[[ast.FunctionDef | ast.AsyncFunctionDef], int]:
+        """The number of security calls one instance of a function holds after
+        instantiation, as a memoized function of its definition node.
+
+        It counts the security calls of the body (lambdas and class bodies
+        included, since cloning copies them too), plus the count of every
+        function it calls, once per call site, plus the count of each function
+        defined inside it that it does not call by name (a clone copies that
+        definition as well). Calls on a recursive cycle count nothing: such
+        functions are never cloned. A call resolves lexically, to the
+        definitions of the nearest enclosing scope that defines the name; when
+        that scope defines it more than once, the call counts as the largest of
+        them: such a function is never cloned, but its callers are. A scope that
+        binds the name in any other way (:meth:`_local_bindings`) and does not
+        define it binds the call to that value, which counts nothing; a
+        ``global`` declaration resolves the name in the module.
+
+        :param module: The module the functions belong to
+        :param infos: Every function of the module (:meth:`_collect_functions`)
+        :return: The count of a function definition of ``infos``
+        """
+        nested: dict[int, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+        scoped: dict[tuple[int, str], list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+        parent: dict[int, ast.AST] = {}
+        for info in infos:
+            nested.setdefault(id(info.region), []).append(info.node)
+            scoped.setdefault((id(info.region), info.node.name), []).append(info.node)
+            parent[id(info.node)] = info.region
+        defined = {id(info.node) for info in infos}
+
+        own: dict[int, int] = {}
+        callees: dict[int, list[str]] = {}
+        bound: dict[int, set[str]] = {}
+        global_names: dict[int, set[str]] = {}
+        for info in infos:
+            bound[id(info.node)], global_names[id(info.node)] = cls._local_bindings(info.node)
+            count = 0
+            names: list[str] = []
+            todo = list(ast_walk.iter_child_nodes(info.node))
+            while todo:
+                n = todo.pop()
+                if id(n) in defined:
+                    continue
+                todo.extend(ast_walk.iter_child_nodes(n))
+                if not isinstance(n, ast.Call):
+                    continue
+                if cls._is_security_call(n):
+                    count += 1
+                func = n.func
+                if isinstance(func, ast.Name):
+                    names.append(func.id)
+            own[id(info.node)] = count
+            callees[id(info.node)] = names
+
+        totals: dict[int, int] = {}
+        # Stack depth of every function under count; ``low`` is the smallest
+        # depth a recursive call was cut at while counting the current function
+        visiting: dict[int, int] = {}
+        low = len(infos)
+
+        def resolve(func_name: str, scope: ast.AST) -> int:
+            # The nearest enclosing scope that defines the name binds the call;
+            # a name it defines more than once is never cloned itself, but its
+            # callers are, so it counts as its largest definition there. A
+            # scope binding the name to another value calls that value
+            while True:
+                defs = scoped.get((id(scope), func_name))
+                if defs:
+                    return max(total(node) for node in defs)
+                if scope is module or func_name in bound[id(scope)]:
+                    return 0
+                if func_name in global_names[id(scope)]:
+                    scope = module
+                else:
+                    scope = parent[id(scope)]
+
+        def total(node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
+            # A count cut at this function or one above it belongs to a
+            # recursive cycle and depends on where the cycle was entered: it is
+            # not memoized, so every count is the same whatever the order
+            nonlocal low
+            key = id(node)
+            done = totals.get(key)
+            if done is not None:
+                return done
+            cut_at = visiting.get(key)
+            if cut_at is not None:
+                low = min(low, cut_at)
+                return 0
+            depth = len(visiting)
+            visiting[key] = depth
+            outer_low, low = low, len(infos)
+            called_names = callees[key]
+            result = own[key] + sum(resolve(callee, node) for callee in called_names)
+            for inner in nested.get(key, ()):
+                if inner.name not in called_names:
+                    result += total(inner)
+            del visiting[key]
+            if low > depth:
+                totals[key] = result
+            low = min(outer_low, low)
+            return result
+
+        return total
+
+    def _check_request_fanout(self, module: ast.Module) -> None:
+        """Reject a script in which a called function reaches more security
+        calls than TradingView lets one function use.
+
+        The count of a function is the number of security calls one instance
+        of it holds after instantiation (:meth:`_request_totals`), computed on
+        the call graph without cloning anything. A function called from
+        nowhere is the global scope and is not bounded.
+
+        :param module: The module before instantiation
+        :raises SyntaxError: If a called function exceeds the bound
+        """
+        infos = self._collect_functions(module)
+        total = self._request_totals(module, infos)
+        by_name: dict[str, list[_FuncInfo]] = {}
+        called: set[str] = set()
+        for info in infos:
+            by_name.setdefault(info.node.name, []).append(info)
+            for n in ast_walk.walk(info.node):
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                    called.add(n.func.id)
+
+        for name, defs in by_name.items():
+            if len(defs) != 1 or name not in called:
+                continue
+            reached = total(defs[0].node)
+            if reached > _MAX_FUNCTION_REQUESTS:
+                raise SyntaxError(
+                    f"function '{name}' reaches {reached} request.security calls through "
+                    f"the functions it calls; a function can use at most "
+                    f"{_MAX_FUNCTION_REQUESTS} request values"
+                )
+
     # --- cloning ---
 
     def _unique_name(self, base: str, existing: set[str]) -> str:
@@ -275,12 +481,6 @@ class SecurityInstantiationTransformer:
         # fresh clone inserted after the original (source order preserved).
         for k, site in enumerate(sites[1:], start=2):
             self._clones_made += 1
-            if self._clones_made > _MAX_CLONES:
-                raise SyntaxError(
-                    f"security instantiation exceeded {_MAX_CLONES} function "
-                    f"clones — the script's request.security call graph is "
-                    f"too large to instantiate per call site"
-                )
             clone = ast_walk.clone(info.node)
             clone.name = self._unique_name(name, existing)
             info.owner_body.insert(index + k - 1, clone)
@@ -369,11 +569,12 @@ class SecurityInstantiationTransformer:
         if not has_security_call(module):
             return module
         self._candidates_now = None
+        self._check_request_fanout(module)
         # Fixpoint: cloning a caller duplicates its callees' call sites, so
-        # re-analyze until no eligible multi-site bearer remains. Bounded by
-        # the clone cap (each iteration makes at least one clone).
-        for _ in range(_MAX_CLONES + 1):
-            if not self._clone_one(module):
-                break
+        # re-analyze until no eligible multi-site bearer remains. It ends
+        # because recursive functions are never cloned, and the fan-out bound
+        # keeps the number of clones polynomial in the script's size.
+        while self._clone_one(module):
+            pass
         self._specialize_all(module)
         return module

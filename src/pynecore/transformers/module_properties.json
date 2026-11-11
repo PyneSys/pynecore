@@ -929,9 +929,6 @@
     "monday": {
       "type": "variable"
     },
-    "na_int": {
-      "type": "variable"
-    },
     "pine_int": {
       "type": "variable"
     },

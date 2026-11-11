@@ -7,12 +7,10 @@ from datetime import datetime, timedelta, timezone as dt_timezone, tzinfo, UTC
 from functools import cache, lru_cache
 
 # Standard formats for non-ISO dates
-# %b = abbreviated month (Jan, Feb), %B = full month (January, February)
+# %b = abbreviated month (Jan, Feb); every month word is reduced to that form first
 STANDARD_FORMATS = [
     "%d %b %Y %H:%M:%S %z",  # "20 Feb 2020 15:30:00 +0200"
     "%d %b %Y %H:%M %z",  # "01 Jan 2018 00:00 +0000"
-    "%d %B %Y %H:%M:%S %z",  # "20 February 2020 15:30:00 +0200"
-    "%d %B %Y %H:%M %z",  # "1 January 2018 00:00 +0000"
     "%Y-%m-%d %H:%M:%S %z",  # "2021-01-01 00:00:00 +0000"
     "%Y-%m-%d %H:%M %z",  # "2021-01-01 00:00 +0000"
     "%m %d %Y %H:%M:%S %z",  # "05 12 2000 10:20:30 +0000" (month-first)
@@ -21,7 +19,7 @@ STANDARD_FORMATS = [
 ]
 
 # Pine Script specific formats (without timezone)
-# %b = abbreviated month (Jan, Feb), %B = full month (January, February)
+# %b = abbreviated month (Jan, Feb); every month word is reduced to that form first
 # Numeric dates are MONTH-FIRST (MM-DD-YYYY) with '-', '/', '.' or ' ' separators:
 # TradingView parses "03-04-2023" (and "05 12 2000") as March 4 / May 12 and
 # rejects a day-first "13-04-2023" ("31 1 2000") outright ("timestamp(s):
@@ -33,13 +31,7 @@ PINE_FORMATS = [
     "%d %b %Y %H:%M",  # "01 Jan 2018 00:00"
     "%b %d %Y",  # "Feb 01 2020"
     "%d %b %Y",  # "04 Dec 1995"
-    "%B %d %Y %H:%M:%S",  # "February 01 2020 22:10:05"
-    "%d %B %Y %H:%M:%S",  # "04 December 1995 00:12:00"
-    "%d %B %Y %H:%M",  # "01 January 2018 00:00"
-    "%B %d %Y",  # "February 01 2020"
-    "%d %B %Y",  # "04 December 1995"
     "%b %Y",  # "Jan 2025" (day defaults to the 1st)
-    "%B %Y",  # "January 2025" (day defaults to the 1st)
     "%Y-%m-%d",  # "2020-02-20"
     "%Y-%m-%d %H:%M:%S",  # "2021-01-01 00:00:00"
     "%Y-%m-%d %H:%M",  # "2021-01-01 00:00"
@@ -68,9 +60,44 @@ _ZONE_NAME_OFFSETS = {
 
 _MONTH_NAMES = frozenset((
     "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-    "january", "february", "march", "april", "june", "july", "august", "september",
-    "october", "november", "december",
 ))
+
+# A word of a date string is a run of characters from "A" (0x41) up, whitespace
+# excluded, so letters glue to "[", "_", "~" and non-ASCII letters but not to
+# digits or ".,:+-". A word is a month when its first three characters spell an
+# English month abbreviation in any letter case; the rest of it is ignored
+# (measured: "Janv", "Janvier", "Janxyz", "Janu", "Jan_x", "Jan[x", "Jan~",
+# "Decé", "Sept", "Septembre", "Junk", "Mars", "Marzo", "Februar" all read as
+# their month, followed by "." or "," too, while "Ja", "Févr", "Avr", "Mai",
+# "Juin", "Juil", "Déc", "Mrz", "Okt", "Dez" are rejected). Of several month
+# words the last one wins (measured: "1 Jan Feb 2017" is 2017-02-01, "Feb 1 Jan
+# 2017" is 2017-01-01).
+_MONTH_WORD_RE = re.compile(r'(?<![^\x00-\x40\s])[^\x00-\x40\s]{3,}[.,]*')
+
+
+def _normalize_month_words(datestring: str) -> str:
+    """
+    Reduce every month word of a date string to its English abbreviation.
+
+    The last month word becomes the three-letter abbreviation, earlier ones are
+    dropped, and any other word is left as it is.
+
+    :param datestring: Stripped date string
+    :return: The date string with at most one month word, spelled "Jan".."Dec"
+    """
+    months = [match for match in _MONTH_WORD_RE.finditer(datestring)
+              if match.group()[:3].lower() in _MONTH_NAMES]
+    if not months:
+        return datestring
+    parts = []
+    position = 0
+    for match in months:
+        parts.append(datestring[position:match.start()])
+        parts.append(' ')
+        position = match.end()
+    parts[-1] = f' {months[-1].group()[:3].title()} '
+    parts.append(datestring[position:])
+    return ' '.join(''.join(parts).split())
 
 
 def normalize_timezone(datestring: str) -> str:
@@ -282,6 +309,7 @@ def parse_datestring(datestring: str) -> datetime:
     datestring = datestring.strip()
     if not datestring:
         return datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    datestring = _normalize_month_words(datestring)
 
     # Leading words carry no meaning -- measured on NASDAQ:AAPL: "UTC 01 Jan 2022
     # 00:00", "EST ...", "America/New_York ...", "Sat, ...", "Foo ..." and "hello
