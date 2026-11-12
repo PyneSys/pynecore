@@ -30,6 +30,22 @@ class Broker(NamedTuple):
     name: str = ""
 
 
+class ExtraData(NamedTuple):
+    """The optional per-bar data a provider downloads only on request.
+
+    Front-ends offer it as an opt-in switch of the download (``--extra-data`` in
+    the CLI, a checkbox in an editor) and pass the choice on as ``with_extra`` of
+    :meth:`~ProviderPlugin.download_ohlcv`.
+
+    :ivar label: Short name of the data, used as the switch's label
+        (e.g. ``"Ask side (bid/ask)"``).
+    :ivar help: One or two sentences on what the data is and what fetching it
+        costs, shown as the switch's help text.
+    """
+    label: str
+    help: str
+
+
 class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
     """
     Base class for all data providers.
@@ -75,6 +91,11 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
     of the provider string after the provider name selects the broker
     (e.g. ``ccxt:BYBIT:BTC/USDT:USDT`` → broker ``BYBIT``). Single-broker
     providers leave this ``False`` and treat the whole string as the symbol."""
+
+    extra_data: ExtraData | None = None
+    """The per-bar data this provider fetches only when ``with_extra`` of
+    :meth:`download_ohlcv` is set, or ``None`` when it has nothing extra to fetch.
+    Front-ends offer the opt-in switch only for providers that declare it."""
 
     mincontract_estimated: bool = False
     """True when the last :meth:`get_symbol_info` fetch had to estimate

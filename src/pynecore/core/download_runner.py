@@ -131,7 +131,9 @@ def download_to_file(
     :param truncate: Drop the existing file content before downloading.
     :param chunk_size: Override the provider's per-request bar count.
     :param extra_data: Also fetch per-bar data that costs the provider extra requests
-        (see ``with_extra`` of :meth:`ProviderPlugin.download_ohlcv`).
+        (see ``with_extra`` of :meth:`ProviderPlugin.download_ohlcv`). A continued
+        file that already stores the ask side keeps fetching it either way, so the
+        new bars do not lose it.
     :param syminfo: Already-loaded symbol info. When None it is fetched (and
         persisted) *before* the download, best-effort, so an interrupted
         download still leaves a resumable file.
@@ -229,6 +231,11 @@ def download_to_file(
 
         cb = cb_progress if (progress_cb is not None and not fetch_all) else None
 
+        # Continuing a file that stores the ask side: keep it on the new bars too. A
+        # conflict truncation keeps the ask schema but no bars, so nothing is kept there.
+        with_extra = extra_data or (provider.extra_data is not None and ohlcv_writer.has_ask
+                                    and ohlcv_writer.size > 0)
+
         size_before = ohlcv_writer.size
         # Everything up to here is already stored; a continuation asks for a window
         # that overlaps it on purpose, so the overlap must be dropped rather than
@@ -239,7 +246,7 @@ def download_to_file(
             # would otherwise pay two fsyncs per bar (see ``OHLCVWriter.batched``).
             with ohlcv_writer.batched():
                 provider.download_ohlcv(resolved_from, resolved_to, on_progress=cb,
-                                        limit=chunk_size, with_extra=extra_data)
+                                        limit=chunk_size, with_extra=with_extra)
         finally:
             provider.resume_timestamp = None
         bars_written = ohlcv_writer.size - size_before

@@ -277,6 +277,30 @@ out, users uncomment and edit what they need:
 The Generic type parameter (`ProviderPlugin[FooConfig]`) gives your IDE
 full type information on `self.config` — no more `object | None` warnings.
 
+#### Opt-in extra data
+
+Some per-bar data costs the provider extra requests, such as an ask side it has
+to rebuild from tick history. Fetch it only when `download_ohlcv` gets
+`with_extra=True`, and declare it with the `extra_data` class attribute so the
+front-ends can offer the switch (`--extra-data` in the CLI, a checkbox in
+PyneIDE's symbol browser):
+
+```python
+from pynecore.core.plugin import ExtraData
+
+class FooProvider(ProviderPlugin[FooConfig]):
+    extra_data = ExtraData(
+        label="Ask side (bid/ask)",
+        help="Rebuilds the ask side of every bar from tick history; much slower.",
+    )
+```
+
+`label` names the switch, `help` says what the data is and what fetching it
+costs. Leave `extra_data` at `None` when there is nothing to opt into, also when
+the provider receives the ask side with the bars anyway. A download that
+continues a file already storing the ask side keeps fetching it, so the new
+bars do not lose it.
+
 #### Multi-broker providers
 
 A single provider plugin can serve many brokers/exchanges (CCXT reaches 100+). Declare it with the `multi_broker` class attribute and the provider string's broker segment is parsed for you:
